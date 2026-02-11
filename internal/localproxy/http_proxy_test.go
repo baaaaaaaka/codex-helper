@@ -13,7 +13,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 )
 
 func TestHTTPProxy_HealthEndpoint(t *testing.T) {
@@ -229,4 +228,3 @@ func (d *recordingDialer) SawAddr(addr string) bool {
 	}
 	return false
 }
-

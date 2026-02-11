@@ -85,6 +85,10 @@ func TestFindNativeBinaryWithMockStructure(t *testing.T) {
 	// <dir>/bin/codex.js
 	// <dir>/vendor/<triple>/codex/codex
 	dir := t.TempDir()
+	// Resolve symlinks so comparisons work on macOS where /var -> /private/var.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	binDir := filepath.Join(dir, "bin")
 	nativeDir := filepath.Join(dir, "vendor", triple, "codex")
 	pathDir := filepath.Join(dir, "vendor", triple, "path")
@@ -124,6 +128,9 @@ func TestFindNativeBinaryNoPathDir(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	binDir := filepath.Join(dir, "bin")
 	nativeDir := filepath.Join(dir, "vendor", triple, "codex")
 
