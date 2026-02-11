@@ -81,6 +81,8 @@ jobs:
             fetcher: curl
           - image: rockylinux:8
             fetcher: wget
+          - image: centos:7
+            fetcher: curl
 
     steps:
       - name: Checkout

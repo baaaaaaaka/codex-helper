@@ -37,6 +37,25 @@ jobs:
             exit 1
           fi
 
+      - name: go mod tidy (verify)
+        shell: bash
+        run: |
+          go mod tidy
+          if ! git diff --quiet go.mod go.sum; then
+            echo "go.mod/go.sum not tidy"
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+      - name: Cross-compile check (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          GOOS=darwin  GOARCH=arm64 go build ./...
+          GOOS=darwin  GOARCH=amd64 go build ./...
+          GOOS=windows GOARCH=amd64 go build ./...
+          GOOS=linux   GOARCH=arm64 go build ./...
+
       - name: Setup SSHD for integration tests (Linux only)
         if: runner.os == 'Linux'
         shell: bash
@@ -120,8 +139,22 @@ jobs:
           name: coverage
           path: coverage.out
 
+      - name: Codex patch integration test (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CODEX_PATCH_TEST: "1"
+        run: |
+          set -euo pipefail
+          npm install -g @anthropic-ai/codex 2>/dev/null || npm install -g codex 2>/dev/null || true
+          if command -v codex >/dev/null 2>&1; then
+            go test ./internal/cloudgate -run TestCodexPatchIntegration -count=1 -v
+          else
+            echo "Codex not available, skipping patch integration test"
+          fi
+
   linux-distro-smoke:
-    name: Linux distro smoke (Rocky8/Ubuntu20.04)
+    name: Linux distro smoke (CentOS7/Rocky8/Ubuntu20.04)
     runs-on: ubuntu-latest
     needs: [test]
 
@@ -146,7 +179,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for img in rockylinux:8 ubuntu:20.04; do
+          for img in centos:7 rockylinux:8 ubuntu:20.04; do
             echo "==> $img"
-            docker run --rm -v "$PWD/dist:/dist:ro" "$img" /dist/codex-proxy proxy doctor
+            if [ "$img" = "centos:7" ]; then
+              docker run --rm -v "$PWD/dist:/dist:ro" "$img" bash -c '
+                sed -i "s/^mirrorlist=/#mirrorlist=/g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
+                sed -i "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
+                /dist/codex-proxy proxy doctor'
+            else
+              docker run --rm -v "$PWD/dist:/dist:ro" "$img" /dist/codex-proxy proxy doctor
+            fi
+          done
+
+      - name: Build CLI test binary
+        shell: bash
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cli -c -o dist/codex_cli_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cloudgate -c -o dist/codex_cloudgate_test
+          chmod +x dist/codex_cli_test dist/codex_cloudgate_test
+
+      - name: Run tests in containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          for img in rockylinux:8 ubuntu:20.04; do
+            echo "==> $img (cloudgate tests)"
+            docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+              /dist/codex_cloudgate_test -test.v -test.count=1
+            echo "==> $img (cli tests)"
+            docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+              /dist/codex_cli_test -test.v -test.count=1 -test.run 'Test[^I]'
           done

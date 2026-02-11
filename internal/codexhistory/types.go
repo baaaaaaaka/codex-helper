@@ -3,6 +3,7 @@ package codexhistory
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -73,4 +74,18 @@ func DefaultCodexDir() string {
 		return ""
 	}
 	return filepath.Join(home, ".codex")
+}
+
+func ResolveCodexDir(override string) (string, error) {
+	if v := strings.TrimSpace(override); v != "" {
+		return filepath.Clean(os.ExpandEnv(v)), nil
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvCodexDir)); v != "" {
+		return filepath.Clean(os.ExpandEnv(v)), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex"), nil
 }
