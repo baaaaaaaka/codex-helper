@@ -8,9 +8,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/localproxy"
 )
 
 func buildCodexResumeCommand(
@@ -24,6 +27,9 @@ func buildCodexResumeCommand(
 	}
 
 	cwd := codexhistory.SessionWorkingDir(session)
+	if cwd == "" {
+		cwd = project.Path
+	}
 	if cwd == "" {
 		return "", nil, "", fmt.Errorf("cannot determine session working directory")
 	}
@@ -43,7 +49,9 @@ func buildCodexResumeCommand(
 
 	args := []string{"resume", session.SessionID}
 	if yolo {
-		args = append([]string{"--yolo"}, args...)
+		if yoloFlags := codexYoloArgs(path); len(yoloFlags) > 0 {
+			args = append(yoloFlags, args...)
+		}
 	}
 	return path, args, cwd, nil
 }
@@ -89,10 +97,18 @@ func runCodexSession(
 	}
 	codexPath = codexPathResolved
 
-	if useYolo && !supportsYoloFlag(codexPath) {
-		_ = persistYoloEnabled(store, false)
-		useYolo = false
+	// Layer 3: Patch the native Codex binary to use permissive system requirements.
+	extraEnv := []string{}
+	if useYolo {
+		configDir := filepath.Dir(store.Path())
+		patchResult, patchEnv, patchErr := cloudgate.PrepareYoloBinary(codexPath, configDir)
+		if patchErr == nil && patchResult != nil && patchResult.PatchedBinary != "" {
+			codexPath = patchResult.PatchedBinary
+			extraEnv = append(extraEnv, patchEnv...)
+			defer patchResult.Cleanup()
+		}
 	}
+
 	path, args, cwd, err := buildCodexResumeCommand(codexPath, session, project, useYolo)
 	if err != nil {
 		return err
@@ -100,7 +116,6 @@ func runCodexSession(
 
 	cmdArgs := append([]string{path}, args...)
 
-	extraEnv := []string{}
 	if codexDir != "" {
 		extraEnv = append(extraEnv, codexhistory.EnvCodexDir+"="+codexDir)
 	}
@@ -115,12 +130,37 @@ func runCodexSession(
 			return persistYoloEnabled(store, false)
 		},
 	}
+
+	if useYolo {
+		configDir := filepath.Dir(store.Path())
+		gateCfg, gateErr := cloudgate.Setup(configDir)
+		if gateErr != nil {
+			gateCfg = cloudgate.SetupFingerprintOnly()
+		}
+		defer gateCfg.Cleanup()
+		opts.CloudGate = gateCfg
+	}
+
 	if useProxy {
 		if profile == nil {
 			return fmt.Errorf("proxy mode enabled but no profile configured")
 		}
 		return runWithProfileOptions(ctx, store, *profile, instances, cmdArgs, opts)
 	}
+
+	if useYolo && opts.CloudGate != nil {
+		dialer := localproxy.DirectDialer(10 * time.Second)
+		proxy := localproxy.NewHTTPProxy(dialer, localproxy.Options{CloudGate: opts.CloudGate})
+		addr, startErr := proxy.Start("127.0.0.1:0")
+		if startErr != nil {
+			return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
+		}
+		defer proxy.Close(ctx)
+		proxyURL := "http://" + addr
+		opts.UseProxy = true
+		return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, nil, nil, opts)
+	}
+
 	return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
 }
 
@@ -151,16 +191,26 @@ func runCodexNewSession(
 		return err
 	}
 	codexPath = codexPathResolved
-	if useYolo && !supportsYoloFlag(codexPath) {
-		_ = persistYoloEnabled(store, false)
-		useYolo = false
-	}
-	cmdArgs := []string{codexPath}
+
+	// Layer 3: Patch the native Codex binary to use permissive system requirements.
+	extraEnv := []string{}
 	if useYolo {
-		cmdArgs = append(cmdArgs, "--yolo")
+		configDir := filepath.Dir(store.Path())
+		patchResult, patchEnv, patchErr := cloudgate.PrepareYoloBinary(codexPath, configDir)
+		if patchErr == nil && patchResult != nil && patchResult.PatchedBinary != "" {
+			codexPath = patchResult.PatchedBinary
+			extraEnv = append(extraEnv, patchEnv...)
+			defer patchResult.Cleanup()
+		}
 	}
 
-	extraEnv := []string{}
+	cmdArgs := []string{codexPath}
+	if useYolo {
+		if yoloFlags := codexYoloArgs(codexPath); len(yoloFlags) > 0 {
+			cmdArgs = append(cmdArgs, yoloFlags...)
+		}
+	}
+
 	if codexDir != "" {
 		extraEnv = append(extraEnv, codexhistory.EnvCodexDir+"="+codexDir)
 	}
@@ -175,11 +225,36 @@ func runCodexNewSession(
 			return persistYoloEnabled(store, false)
 		},
 	}
+
+	if useYolo {
+		configDir := filepath.Dir(store.Path())
+		gateCfg, gateErr := cloudgate.Setup(configDir)
+		if gateErr != nil {
+			gateCfg = cloudgate.SetupFingerprintOnly()
+		}
+		defer gateCfg.Cleanup()
+		opts.CloudGate = gateCfg
+	}
+
 	if useProxy {
 		if profile == nil {
 			return fmt.Errorf("proxy mode enabled but no profile configured")
 		}
 		return runWithProfileOptions(ctx, store, *profile, instances, cmdArgs, opts)
 	}
+
+	if useYolo && opts.CloudGate != nil {
+		dialer := localproxy.DirectDialer(10 * time.Second)
+		proxy := localproxy.NewHTTPProxy(dialer, localproxy.Options{CloudGate: opts.CloudGate})
+		addr, startErr := proxy.Start("127.0.0.1:0")
+		if startErr != nil {
+			return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
+		}
+		defer proxy.Close(ctx)
+		proxyURL := "http://" + addr
+		opts.UseProxy = true
+		return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, nil, nil, opts)
+	}
+
 	return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
 }

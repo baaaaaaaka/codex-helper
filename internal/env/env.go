@@ -77,3 +77,10 @@ func fromMap(m map[string]string) []string {
 	}
 	return out
 }
+
+// WithSSLCertFile adds SSL_CERT_FILE to the environment.
+func WithSSLCertFile(base []string, path string) []string {
+	m := toMap(base)
+	m["SSL_CERT_FILE"] = path
+	return fromMap(m)
+}

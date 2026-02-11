@@ -1,0 +1,102 @@
+package cli
+
+import (
+	"bufio"
+	"context"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
+)
+
+func TestEnsureProxyPreferenceRespectsExistingValue(t *testing.T) {
+	store := newTempStore(t)
+	enabled := true
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &enabled}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	got, cfg, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("n\n")))
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if !got || cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
+		t.Fatalf("expected proxy enabled from config")
+	}
+}
+
+func TestEnsureProxyPreferencePromptsWhenNoProfiles(t *testing.T) {
+	store := newTempStore(t)
+
+	got, _, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("y\n")))
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if !got {
+		t.Fatalf("expected proxy enabled from prompt")
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
+		t.Fatalf("expected proxy enabled in config")
+	}
+}
+
+func TestEnsureProxyPreferenceDefaultsToProxyWhenProfilesExist(t *testing.T) {
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version:  config.CurrentVersion,
+		Profiles: []config.Profile{{ID: "p1", Name: "p1"}},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	got, cfg, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("n\n")))
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if !got || cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
+		t.Fatalf("expected proxy enabled when profiles exist")
+	}
+}
+
+func TestEnsureProxyPreferenceWriteFailure(t *testing.T) {
+	store := newTempStore(t)
+	if err := os.MkdirAll(store.Path(), 0o700); err != nil {
+		t.Fatalf("mkdir config path: %v", err)
+	}
+
+	reader := bufio.NewReader(strings.NewReader("y\n"))
+	_, _, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, reader)
+	if err == nil {
+		t.Fatalf("expected error when config dir is read-only")
+	}
+}
+
+func TestEnsureProxyPreferenceUsesStdin(t *testing.T) {
+	store := newTempStore(t)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() { os.Stdin = prevStdin })
+
+	if _, err := writer.Write([]byte("y\n")); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	_ = writer.Close()
+
+	enabled, _, err := ensureProxyPreference(context.Background(), store, "", io.Discard)
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected proxy enabled from stdin input")
+	}
+}

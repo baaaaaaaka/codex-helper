@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/localproxy"
 	"github.com/baaaaaaaka/codex-helper/internal/ssh"
@@ -16,6 +17,7 @@ import (
 type Options struct {
 	SocksPort      int
 	HTTPListenAddr string
+	CloudGate      *cloudgate.Config
 
 	SocksReadyTimeout time.Duration
 
@@ -84,7 +86,7 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 		return nil, err
 	}
 
-	hp := localproxy.NewHTTPProxy(dialer, localproxy.Options{InstanceID: instanceID})
+	hp := localproxy.NewHTTPProxy(dialer, localproxy.Options{InstanceID: instanceID, CloudGate: opts.CloudGate})
 	httpAddr, err := hp.Start(opts.HTTPListenAddr)
 	if err != nil {
 		return nil, err

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	xproxy "golang.org/x/net/proxy"
+
+	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 )
 
 type Dialer interface {
@@ -21,6 +23,7 @@ type Dialer interface {
 type HTTPProxy struct {
 	instanceID string
 	dialer     Dialer
+	cloudGate  *cloudgate.Config
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -29,12 +32,14 @@ type HTTPProxy struct {
 
 type Options struct {
 	InstanceID string
+	CloudGate  *cloudgate.Config
 }
 
 func NewHTTPProxy(d Dialer, opts Options) *HTTPProxy {
 	return &HTTPProxy{
 		instanceID: opts.InstanceID,
 		dialer:     d,
+		cloudGate:  opts.CloudGate,
 	}
 }
 
@@ -124,6 +129,23 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CloudGate intercept: hijack early and hand off to cloudgate.
+	if p.cloudGate != nil && p.cloudGate.ShouldIntercept(dest) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		clientConn, _, err := hj.Hijack()
+		if err != nil {
+			http.Error(w, "hijack: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		_ = cloudgate.HandleConnect(clientConn, dest, cloudgateDialer{p.dialer}, p.cloudGate)
+		return
+	}
+
 	upstream, err := p.dialer.Dial("tcp", dest)
 	if err != nil {
 		http.Error(w, "dial upstream: "+err.Error(), http.StatusBadGateway)
@@ -153,6 +175,22 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	_, _ = io.Copy(clientConn, upstream)
 	_ = clientConn.Close()
+}
+
+// cloudgateDialer wraps localproxy.Dialer to satisfy cloudgate.Dialer.
+type cloudgateDialer struct {
+	d Dialer
+}
+
+func (c cloudgateDialer) Dial(network, addr string) (net.Conn, error) {
+	return c.d.Dial(network, addr)
+}
+
+// DirectDialer returns a Dialer that connects directly (no SOCKS proxy).
+func DirectDialer(timeout time.Duration) Dialer {
+	return dialerFunc(func(network, addr string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: timeout}).Dial(network, addr)
+	})
 }
 
 func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {

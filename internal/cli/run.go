@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
@@ -122,7 +123,7 @@ func runWithNewStackOptions(
 		return err
 	}
 
-	st, err := stackStart(profile, instanceID, stack.Options{})
+	st, err := stackStart(profile, instanceID, stack.Options{CloudGate: opts.CloudGate})
 	if err != nil {
 		return err
 	}
@@ -196,9 +197,10 @@ func runWithProfileOptions(
 }
 
 type runTargetOptions struct {
-	Cwd      string
-	ExtraEnv []string
-	UseProxy bool
+	Cwd       string
+	ExtraEnv  []string
+	UseProxy  bool
+	CloudGate *cloudgate.Config
 	// PreserveTTY keeps stdout/stderr attached to the terminal for interactive CLIs.
 	PreserveTTY    bool
 	YoloEnabled    bool
@@ -348,6 +350,9 @@ func runTargetOnceWithOptions(
 	envVars := os.Environ()
 	if opts.UseProxy {
 		envVars = env.WithProxy(envVars, proxyURL)
+	}
+	if opts.CloudGate != nil && opts.CloudGate.MITM != nil {
+		envVars = env.WithSSLCertFile(envVars, opts.CloudGate.MITM.BundlePath)
 	}
 	if len(opts.ExtraEnv) > 0 {
 		envVars = append(envVars, opts.ExtraEnv...)
