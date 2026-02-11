@@ -12,12 +12,15 @@ import (
 
 // sessionFileMeta holds lightweight metadata extracted by scanning a session file.
 type sessionFileMeta struct {
-	SessionID    string
-	ProjectPath  string
-	FirstPrompt  string
-	MessageCount int
-	CreatedAt    time.Time
-	ModifiedAt   time.Time
+	SessionID      string
+	ProjectPath    string
+	FirstPrompt    string
+	MessageCount   int
+	CreatedAt      time.Time
+	ModifiedAt     time.Time
+	IsSubagent     bool
+	SubagentType   string // "thread_spawn", "review", "compact"
+	ParentThreadID string // only set for thread_spawn
 }
 
 // codexEnvelope is the outer JSON structure of every line in a Codex JSONL file.
@@ -29,8 +32,9 @@ type codexEnvelope struct {
 }
 
 type codexSessionMetaPayload struct {
-	ID  string `json:"id"`
-	Cwd string `json:"cwd"`
+	ID     string          `json:"id"`
+	Cwd    string          `json:"cwd"`
+	Source json.RawMessage `json:"source"`
 }
 
 // codexResponsePayload is a unified struct for response_item payloads.
@@ -79,6 +83,54 @@ func readSessionFileMeta(filePath string) (sessionFileMeta, error) {
 	return meta, nil
 }
 
+// parseSessionSource parses the polymorphic source field from session_meta.
+// Returns (isSubagent, subagentType, parentThreadID).
+//
+// Possible shapes:
+//   - string: "cli", "vscode", "exec", "mcp" → not a subagent
+//   - {"subagent": "review"} or {"subagent": "compact"} → subagent with string type
+//   - {"subagent": {"thread_spawn": {"parent_thread_id": "uuid", "depth": 1}}} → thread_spawn subagent
+func parseSessionSource(raw json.RawMessage) (isSubagent bool, subagentType string, parentThreadID string) {
+	if len(raw) == 0 {
+		return false, "", ""
+	}
+
+	// Fast path: try as plain string (e.g. "cli", "vscode").
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return false, "", ""
+	}
+
+	// Object path: try {"subagent": ...}.
+	var outer struct {
+		Subagent json.RawMessage `json:"subagent"`
+	}
+	if json.Unmarshal(raw, &outer) != nil || len(outer.Subagent) == 0 {
+		return false, "", ""
+	}
+
+	// Subagent value is itself polymorphic: string or object.
+	var subStr string
+	if json.Unmarshal(outer.Subagent, &subStr) == nil {
+		// e.g. "review", "compact"
+		return true, subStr, ""
+	}
+
+	// Try as {"thread_spawn": {"parent_thread_id": "...", "depth": N}}.
+	var subObj struct {
+		ThreadSpawn struct {
+			ParentThreadID string `json:"parent_thread_id"`
+			Depth          int    `json:"depth"`
+		} `json:"thread_spawn"`
+	}
+	if json.Unmarshal(outer.Subagent, &subObj) == nil && subObj.ThreadSpawn.ParentThreadID != "" {
+		return true, "thread_spawn", subObj.ThreadSpawn.ParentThreadID
+	}
+
+	// Unknown subagent format — still mark as subagent.
+	return true, "unknown", ""
+}
+
 func processMetaLine(line []byte, meta *sessionFileMeta) {
 	var env codexEnvelope
 	if json.Unmarshal(line, &env) != nil {
@@ -104,6 +156,12 @@ func processMetaLine(line []byte, meta *sessionFileMeta) {
 			}
 			if meta.ProjectPath == "" && payload.Cwd != "" {
 				meta.ProjectPath = payload.Cwd
+			}
+			isSub, subType, parentID := parseSessionSource(payload.Source)
+			if isSub {
+				meta.IsSubagent = true
+				meta.SubagentType = subType
+				meta.ParentThreadID = parentID
 			}
 		}
 

@@ -31,6 +31,7 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 	var firstErr error
 	sessionIndex := map[string]int{}
 	sessions := make([]Session, 0, len(files))
+	var pendingSubagents []SubagentSession
 
 	for _, filePath := range files {
 		name := filepath.Base(filePath)
@@ -74,6 +75,22 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 			meta.ModifiedAt = meta.CreatedAt
 		}
 
+		// Separate subagents from main sessions.
+		if meta.IsSubagent {
+			sub := SubagentSession{
+				AgentID:         meta.SubagentType,
+				ParentSessionID: meta.ParentThreadID,
+				SessionID:       sessionID,
+				FirstPrompt:     meta.FirstPrompt,
+				MessageCount:    meta.MessageCount,
+				CreatedAt:       meta.CreatedAt,
+				ModifiedAt:      meta.ModifiedAt,
+				FilePath:        filePath,
+			}
+			pendingSubagents = append(pendingSubagents, sub)
+			continue
+		}
+
 		sess := Session{
 			SessionID:    sessionID,
 			FirstPrompt:  meta.FirstPrompt,
@@ -95,6 +112,9 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 		sessions = append(sessions, sess)
 	}
 
+	// Associate subagents with parent sessions; orphans become top-level.
+	sessions = attachSubagents(sessions, sessionIndex, pendingSubagents)
+
 	sessions = filterEmptySessions(sessions)
 
 	sort.Slice(sessions, func(i, j int) bool {
@@ -111,6 +131,67 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 		return projects, firstErr
 	}
 	return projects, nil
+}
+
+// attachSubagents associates pending subagents with their parent sessions.
+// Subagents with a ParentSessionID that matches a known session are attached
+// to that session's Subagents slice. Orphan subagents (no parent or parent
+// not found) are promoted to top-level sessions so they are not lost.
+// Each parent's Subagents are sorted by ModifiedAt descending.
+func attachSubagents(sessions []Session, sessionIndex map[string]int, pending []SubagentSession) []Session {
+	if len(pending) == 0 {
+		return sessions
+	}
+
+	// Build lookup by session ID for parent matching.
+	sessionByID := make(map[string]int, len(sessions))
+	for i, sess := range sessions {
+		if sess.SessionID != "" {
+			sessionByID[sess.SessionID] = i
+		}
+	}
+
+	var orphans []SubagentSession
+	for _, sub := range pending {
+		if sub.ParentSessionID != "" {
+			if idx, ok := sessionByID[sub.ParentSessionID]; ok {
+				sessions[idx].Subagents = append(sessions[idx].Subagents, sub)
+				continue
+			}
+		}
+		orphans = append(orphans, sub)
+	}
+
+	// Sort each parent's subagents by ModifiedAt descending.
+	for i := range sessions {
+		if len(sessions[i].Subagents) > 1 {
+			subs := sessions[i].Subagents
+			sort.Slice(subs, func(a, b int) bool {
+				return subs[a].ModifiedAt.After(subs[b].ModifiedAt)
+			})
+		}
+	}
+
+	// Promote orphan subagents to top-level sessions.
+	for _, orphan := range orphans {
+		summary := fmt.Sprintf("[%s subagent]", orphan.AgentID)
+		if orphan.AgentID == "" {
+			summary = "[subagent]"
+		}
+		sess := Session{
+			SessionID:    orphan.SessionID,
+			Summary:      summary,
+			FirstPrompt:  orphan.FirstPrompt,
+			MessageCount: orphan.MessageCount,
+			CreatedAt:    orphan.CreatedAt,
+			ModifiedAt:   orphan.ModifiedAt,
+			FilePath:     orphan.FilePath,
+		}
+		sessionIndex[orphan.SessionID] = len(sessions)
+		sessions = append(sessions, sess)
+	}
+
+	return sessions
 }
 
 func groupByProject(sessions []Session) []Project {
