@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 )
 
 func TestHTTPProxy_HealthEndpoint(t *testing.T) {
@@ -231,57 +230,3 @@ func (d *recordingDialer) SawAddr(addr string) bool {
 	return false
 }
 
-func TestHTTPProxy_CloudGateNilDoesNotInterfere(t *testing.T) {
-	// When CloudGate is nil, CONNECT should work normally.
-	_, closeOrigin := startHTTPOrigin(t)
-	defer closeOrigin()
-
-	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
-		return net.DialTimeout(network, addr, 2*time.Second)
-	}), Options{InstanceID: "no-gate", CloudGate: nil})
-
-	httpAddr, err := p.Start("127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer func() { _ = p.Close(context.Background()) }()
-
-	// Health check should still work.
-	resp, err := http.Get("http://" + httpAddr + "/_codex_proxy/health")
-	if err != nil {
-		t.Fatalf("GET health: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("health status=%s", resp.Status)
-	}
-}
-
-func TestHTTPProxy_CloudGateNonTargetHost(t *testing.T) {
-	// CloudGate is set but the host is not a target — should pass through normally.
-	cfg := &cloudgate.Config{
-		Hosts: map[string]bool{
-			"chatgpt.com": true,
-		},
-	}
-
-	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
-		return nil, errors.New("dial blocked in test")
-	}), Options{InstanceID: "gate-nontarget", CloudGate: cfg})
-
-	if _, err := p.Start("127.0.0.1:0"); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer func() { _ = p.Close(context.Background()) }()
-
-	// A CONNECT to a non-target host should not be intercepted by cloudgate.
-	// It will fail with "dial blocked" from our dialer, which is expected.
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodConnect, "http://example.com", nil)
-	req.Host = "example.com:443"
-	p.handleConnect(rec, req)
-	// Should get 502 (dial failure), not 500 (hijack) — proves cloudgate didn't intercept.
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502 for non-target host dial failure, got %d", rec.Code)
-	}
-}

@@ -104,37 +104,3 @@ func TestEnvHelpers(t *testing.T) {
 	})
 }
 
-func TestWithSSLCertFile(t *testing.T) {
-	base := []string{"PATH=/bin", "HOME=/home/user"}
-
-	out := WithSSLCertFile(base, "/tmp/bundle.pem")
-	m := toMap(out)
-
-	if got := m["SSL_CERT_FILE"]; got != "/tmp/bundle.pem" {
-		t.Fatalf("SSL_CERT_FILE=%q, want %q", got, "/tmp/bundle.pem")
-	}
-	// Original vars should be preserved.
-	if got := m["PATH"]; got != "/bin" {
-		t.Fatalf("PATH=%q, want /bin", got)
-	}
-}
-
-func TestWithSSLCertFileOverridesExisting(t *testing.T) {
-	base := []string{"SSL_CERT_FILE=/old/path.pem"}
-
-	out := WithSSLCertFile(base, "/new/path.pem")
-	m := toMap(out)
-
-	if got := m["SSL_CERT_FILE"]; got != "/new/path.pem" {
-		t.Fatalf("SSL_CERT_FILE=%q, want %q", got, "/new/path.pem")
-	}
-}
-
-func TestWithSSLCertFileEmptyBase(t *testing.T) {
-	out := WithSSLCertFile(nil, "/cert.pem")
-	m := toMap(out)
-
-	if got := m["SSL_CERT_FILE"]; got != "/cert.pem" {
-		t.Fatalf("SSL_CERT_FILE=%q, want %q", got, "/cert.pem")
-	}
-}

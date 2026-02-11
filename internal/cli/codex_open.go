@@ -8,12 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
-	"github.com/baaaaaaaka/codex-helper/internal/localproxy"
 )
 
 func buildCodexResumeCommand(
@@ -131,34 +129,11 @@ func runCodexSession(
 		},
 	}
 
-	if useYolo {
-		configDir := filepath.Dir(store.Path())
-		gateCfg, gateErr := cloudgate.Setup(configDir)
-		if gateErr != nil {
-			gateCfg = cloudgate.SetupFingerprintOnly()
-		}
-		defer gateCfg.Cleanup()
-		opts.CloudGate = gateCfg
-	}
-
 	if useProxy {
 		if profile == nil {
 			return fmt.Errorf("proxy mode enabled but no profile configured")
 		}
 		return runWithProfileOptions(ctx, store, *profile, instances, cmdArgs, opts)
-	}
-
-	if useYolo && opts.CloudGate != nil {
-		dialer := localproxy.DirectDialer(10 * time.Second)
-		proxy := localproxy.NewHTTPProxy(dialer, localproxy.Options{CloudGate: opts.CloudGate})
-		addr, startErr := proxy.Start("127.0.0.1:0")
-		if startErr != nil {
-			return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
-		}
-		defer proxy.Close(ctx)
-		proxyURL := "http://" + addr
-		opts.UseProxy = true
-		return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, nil, nil, opts)
 	}
 
 	return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
@@ -226,34 +201,11 @@ func runCodexNewSession(
 		},
 	}
 
-	if useYolo {
-		configDir := filepath.Dir(store.Path())
-		gateCfg, gateErr := cloudgate.Setup(configDir)
-		if gateErr != nil {
-			gateCfg = cloudgate.SetupFingerprintOnly()
-		}
-		defer gateCfg.Cleanup()
-		opts.CloudGate = gateCfg
-	}
-
 	if useProxy {
 		if profile == nil {
 			return fmt.Errorf("proxy mode enabled but no profile configured")
 		}
 		return runWithProfileOptions(ctx, store, *profile, instances, cmdArgs, opts)
-	}
-
-	if useYolo && opts.CloudGate != nil {
-		dialer := localproxy.DirectDialer(10 * time.Second)
-		proxy := localproxy.NewHTTPProxy(dialer, localproxy.Options{CloudGate: opts.CloudGate})
-		addr, startErr := proxy.Start("127.0.0.1:0")
-		if startErr != nil {
-			return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
-		}
-		defer proxy.Close(ctx)
-		proxyURL := "http://" + addr
-		opts.UseProxy = true
-		return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, nil, nil, opts)
 	}
 
 	return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
