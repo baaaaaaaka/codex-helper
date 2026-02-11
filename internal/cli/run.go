@@ -279,16 +279,6 @@ func (b *limitedBuffer) String() string {
 	return string(b.buf)
 }
 
-func runTargetWithFallback(
-	ctx context.Context,
-	cmdArgs []string,
-	proxyURL string,
-	healthCheck func() error,
-	fatalCh <-chan error,
-) error {
-	return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, healthCheck, fatalCh, defaultRunTargetOptions())
-}
-
 func runTargetWithFallbackWithOptions(
 	ctx context.Context,
 	cmdArgs []string,

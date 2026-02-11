@@ -7,11 +7,9 @@ import (
 )
 
 type sessionFileCacheEntry struct {
-	mtime        time.Time
-	sessionID    string
-	hasSessionID bool
-	meta         sessionFileMeta
-	hasMeta      bool
+	mtime   time.Time
+	meta    sessionFileMeta
+	hasMeta bool
 }
 
 var sessionFileCache = struct {

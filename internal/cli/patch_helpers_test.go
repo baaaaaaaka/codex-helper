@@ -6,28 +6,6 @@ import (
 	"testing"
 )
 
-func TestSupportsYoloFlag(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip shell script test on windows")
-	}
-	dir := t.TempDir()
-
-	pathWithFlag := writeProbeScript(t, dir, "has-flag", "#!/bin/sh\necho \"--yolo\"; exit 0\n")
-	if !supportsYoloFlag(pathWithFlag) {
-		t.Fatalf("expected support when flag appears in help output")
-	}
-
-	pathWithUsage := writeProbeScript(t, dir, "usage", "#!/bin/sh\necho \"usage: codex\"; exit 0\n")
-	if supportsYoloFlag(pathWithUsage) {
-		t.Fatalf("expected no support for plain usage output")
-	}
-
-	pathWithError := writeProbeScript(t, dir, "error", "#!/bin/sh\nexit 1\n")
-	if !supportsYoloFlag(pathWithError) {
-		t.Fatalf("expected support when help command fails")
-	}
-}
-
 func TestIsYoloFailure(t *testing.T) {
 	cases := []struct {
 		output string

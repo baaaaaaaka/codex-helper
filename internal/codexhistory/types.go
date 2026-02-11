@@ -65,17 +65,6 @@ func (s SubagentSession) DisplayTitle() string {
 	return "untitled"
 }
 
-func DefaultCodexDir() string {
-	if v := os.Getenv(EnvCodexDir); v != "" {
-		return v
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".codex")
-}
-
 func ResolveCodexDir(override string) (string, error) {
 	if v := strings.TrimSpace(override); v != "" {
 		return filepath.Clean(os.ExpandEnv(v)), nil

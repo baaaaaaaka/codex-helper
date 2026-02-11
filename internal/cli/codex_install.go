@@ -8,17 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
-type installProxyOptions struct {
-	UseProxy  bool
-	Profile   *config.Profile
-	Instances []config.Instance
-}
-
-func ensureCodexInstalled(_ context.Context, codexPath string, out io.Writer, _ installProxyOptions) (string, error) {
+func ensureCodexInstalled(_ context.Context, codexPath string, out io.Writer) (string, error) {
 	if strings.TrimSpace(codexPath) != "" {
 		if executableExists(codexPath) {
 			return codexPath, nil

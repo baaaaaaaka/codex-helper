@@ -287,26 +287,3 @@ func extractContentText(raw json.RawMessage) string {
 	}
 	return ""
 }
-
-func selectProjectPath(sessions []Session) string {
-	counts := map[string]int{}
-	for _, sess := range sessions {
-		path := strings.TrimSpace(sess.ProjectPath)
-		if path == "" {
-			continue
-		}
-		counts[path]++
-	}
-	if len(counts) == 0 {
-		return ""
-	}
-	best := ""
-	bestCount := -1
-	for path, count := range counts {
-		if count > bestCount || (count == bestCount && strings.ToLower(path) < strings.ToLower(best)) {
-			best = path
-			bestCount = count
-		}
-	}
-	return best
-}

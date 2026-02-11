@@ -54,21 +54,6 @@ func extractVersion(output string) string {
 	return ""
 }
 
-func supportsYoloFlag(path string) bool {
-	out, err := runCodexProbe(path, "--help")
-	if strings.Contains(out, "--yolo") {
-		return true
-	}
-	if err != nil {
-		return true
-	}
-	lower := strings.ToLower(out)
-	if strings.Contains(lower, "usage") || strings.Contains(lower, "codex") {
-		return false
-	}
-	return true
-}
-
 // codexYoloArgs returns the CLI arguments to enable yolo mode for the given
 // Codex binary. Returns nil if no yolo mechanism is available.
 func codexYoloArgs(path string) []string {

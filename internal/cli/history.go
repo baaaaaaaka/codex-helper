@@ -195,11 +195,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			profile = &p
 		}
 
-		resolvedCodexPath, err := ensureCodexInstalled(ctx, codexPath, cmd.ErrOrStderr(), installProxyOptions{
-			UseProxy:  useProxy,
-			Profile:   profile,
-			Instances: cfg.Instances,
-		})
+		resolvedCodexPath, err := ensureCodexInstalled(ctx, codexPath, cmd.ErrOrStderr())
 		if err != nil {
 			return err
 		}

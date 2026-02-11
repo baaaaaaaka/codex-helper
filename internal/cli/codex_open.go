@@ -85,11 +85,7 @@ func runCodexSession(
 	useYolo bool,
 	log io.Writer,
 ) error {
-	codexPathResolved, err := ensureCodexInstalled(ctx, codexPath, log, installProxyOptions{
-		UseProxy:  useProxy,
-		Profile:   profile,
-		Instances: instances,
-	})
+	codexPathResolved, err := ensureCodexInstalled(ctx, codexPath, log)
 	if err != nil {
 		return err
 	}
@@ -157,11 +153,7 @@ func runCodexNewSession(
 		return err
 	}
 
-	codexPathResolved, err := ensureCodexInstalled(ctx, codexPath, log, installProxyOptions{
-		UseProxy:  useProxy,
-		Profile:   profile,
-		Instances: instances,
-	})
+	codexPathResolved, err := ensureCodexInstalled(ctx, codexPath, log)
 	if err != nil {
 		return err
 	}

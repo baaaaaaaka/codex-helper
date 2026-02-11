@@ -1,9 +1,6 @@
 package cli
 
 import (
-	"fmt"
-	"os"
-
 	"github.com/spf13/cobra"
 )
 
@@ -63,15 +60,4 @@ func buildVersion() string {
 		v += " " + date
 	}
 	return v
-}
-
-func newNotImplementedCmd(use, short string) *cobra.Command {
-	return &cobra.Command{
-		Use:   use,
-		Short: short,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			_, _ = fmt.Fprintln(os.Stderr, "not implemented yet")
-			return fmt.Errorf("not implemented")
-		},
-	}
 }
