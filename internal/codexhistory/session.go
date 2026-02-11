@@ -119,6 +119,11 @@ func parseMessagePayload(payload codexResponsePayload, ts time.Time) []Message {
 		return nil
 	}
 
+	// Skip system-injected user messages (AGENTS.md, environment_context, etc.)
+	if role == "user" && shouldSkipFirstPrompt(text) {
+		return nil
+	}
+
 	displayRole := role
 	if role == "assistant" {
 		phase := strings.ToLower(payload.Phase)

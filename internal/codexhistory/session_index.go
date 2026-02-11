@@ -119,12 +119,17 @@ func processMetaLine(line []byte, meta *sessionFileMeta) {
 		if role != "user" && role != "assistant" {
 			return
 		}
-		meta.MessageCount++
-		if role == "user" && meta.FirstPrompt == "" {
+		if role == "user" {
 			text := extractContentText(payload.Content)
-			if !shouldSkipFirstPrompt(text) {
+			if shouldSkipFirstPrompt(text) {
+				return // system-injected user message, skip entirely
+			}
+			meta.MessageCount++
+			if meta.FirstPrompt == "" {
 				meta.FirstPrompt = text
 			}
+		} else {
+			meta.MessageCount++
 		}
 
 	case "event_msg":
