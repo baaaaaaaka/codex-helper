@@ -1,0 +1,5 @@
+dist/
+coverage.out
+*.test
+/codex-proxy
+/codex-proxy.exe

@@ -1,0 +1,55 @@
+version: 2
+
+project_name: codex-proxy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: codex-proxy
+    main: ./cmd/codex-proxy
+    binary: codex-proxy
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/baaaaaaaka/codex-helper/internal/cli.version={{.Version}}
+      - -X github.com/baaaaaaaka/codex-helper/internal/cli.commit={{.Commit}}
+      - -X github.com/baaaaaaaka/codex-helper/internal/cli.date={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: binaries
+    formats: [binary]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  extra_files:
+    - glob: install.sh
+    - glob: install.ps1
+    - glob: README.md
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: gofmt (verify)
+        shell: bash
+        run: |
+          bad="$(gofmt -l .)"
+          if [ -n "$bad" ]; then
+            echo "gofmt required for:"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Setup SSHD for integration tests (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          SSH_TEST_USER="ssh-test"
+          if ! id -u "$SSH_TEST_USER" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash -p '$6$ci$WiNqQDjl.EMvmwex4uixbzCpYwPdZ5pjMhtV6AMb004JamOVMOgqYaNOYOgWVmv/1Eq9TSb.yuZ94xGrgVNuS/' "$SSH_TEST_USER"
+          fi
+          SSH_TEST_DIR="$(mktemp -d)"
+          ssh-keygen -t ed25519 -N "" -f "$SSH_TEST_DIR/host_key"
+          ssh-keygen -t ed25519 -N "" -f "$SSH_TEST_DIR/test_key"
+          sudo install -d -m 700 -o "$SSH_TEST_USER" -g "$SSH_TEST_USER" "/home/$SSH_TEST_USER/.ssh"
+          sudo install -m 600 -o "$SSH_TEST_USER" -g "$SSH_TEST_USER" "$SSH_TEST_DIR/test_key.pub" "/home/$SSH_TEST_USER/.ssh/authorized_keys"
+          chmod 700 "$SSH_TEST_DIR"
+          chmod 600 "$SSH_TEST_DIR/test_key" "$SSH_TEST_DIR/test_key.pub" "$SSH_TEST_DIR/host_key"
+          cat > "$SSH_TEST_DIR/sshd_config" <<EOF
+          Port 22222
+          ListenAddress 127.0.0.1
+          HostKey $SSH_TEST_DIR/host_key
+          AuthorizedKeysFile /home/$SSH_TEST_USER/.ssh/authorized_keys
+          PasswordAuthentication no
+          ChallengeResponseAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM no
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          StrictModes no
+          AllowTcpForwarding yes
+          PermitOpen any
+          PidFile $SSH_TEST_DIR/sshd.pid
+          AllowUsers ${SSH_TEST_USER}
+          LogLevel ERROR
+          EOF
+          sudo /usr/sbin/sshd -t -f "$SSH_TEST_DIR/sshd_config"
+          sudo /usr/sbin/sshd -f "$SSH_TEST_DIR/sshd_config"
+          for i in {1..20}; do
+            if ssh -i "$SSH_TEST_DIR/test_key" -p 22222 \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o BatchMode=yes \
+              "${SSH_TEST_USER}@127.0.0.1" exit; then
+              break
+            fi
+            sleep 0.2
+          done
+          echo "SSH_TEST_ENABLED=1" >> "$GITHUB_ENV"
+          echo "SSH_TEST_HOST=127.0.0.1" >> "$GITHUB_ENV"
+          echo "SSH_TEST_PORT=22222" >> "$GITHUB_ENV"
+          echo "SSH_TEST_USER=${SSH_TEST_USER}" >> "$GITHUB_ENV"
+          echo "SSH_TEST_KEY=$SSH_TEST_DIR/test_key" >> "$GITHUB_ENV"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (with coverage)
+        shell: bash
+        run: |
+          go test -coverprofile=coverage.out ./...
+
+      - name: go test -race (Linux only)
+        if: runner.os == 'Linux'
+        run: go test -race ./...
+
+      - name: Coverage gate (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          threshold="25.0"
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$NF); print $NF}')"
+          echo "Total coverage: ${total}% (threshold ${threshold}%)"
+          awk -v total="$total" -v threshold="$threshold" 'BEGIN { if (total+0 < threshold+0) { printf("coverage %.2f%% < %.2f%%\n", total, threshold); exit 1 } }'
+
+      - name: Upload coverage artifact (Linux only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  linux-distro-smoke:
+    name: Linux distro smoke (Rocky8/Ubuntu20.04)
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Build static linux-amd64 binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/codex-proxy ./cmd/codex-proxy
+          chmod +x dist/codex-proxy
+
+      - name: Smoke test in containers (doctor)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for img in rockylinux:8 ubuntu:20.04; do
+            echo "==> $img"
+            docker run --rm -v "$PWD/dist:/dist:ro" "$img" /dist/codex-proxy proxy doctor
+          done

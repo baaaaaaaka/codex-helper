@@ -1,0 +1,354 @@
+//go:build !windows
+
+package installtest
+
+import (
+	"crypto/sha256"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func TestInstallShLatestViaAPI(t *testing.T) {
+	runInstallSh(t, false, false)
+}
+
+func TestInstallShLatestViaRedirect(t *testing.T) {
+	runInstallSh(t, true, false)
+}
+
+func TestInstallShSkipsPathUpdateWhenAlreadySet(t *testing.T) {
+	runInstallSh(t, false, true)
+}
+
+func TestInstallShChecksumMismatch(t *testing.T) {
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		if _, err := exec.LookPath("shasum"); err != nil {
+			t.Skip("no checksum tool available")
+		}
+	}
+
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_CHECKSUMS", strings.Repeat("0", 64)+"  "+run.asset+"\n")
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected checksum mismatch error")
+	}
+	if !strings.Contains(string(output), "Checksum mismatch") {
+		t.Fatalf("expected checksum mismatch output, got %s", string(output))
+	}
+}
+
+func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "")
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh failed: %v\n%s", err, string(output))
+	}
+
+	profilePath := filepath.Join(run.homeDir, ".profile")
+	contents, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatalf("read profile: %v", err)
+	}
+	text := string(contents)
+	pathLine := fmt.Sprintf("export PATH=\"%s:$PATH\"", run.installDir)
+	if !strings.Contains(text, pathLine) {
+		t.Fatalf("missing PATH update in profile")
+	}
+	if !strings.Contains(text, "alias cxp='codex-proxy'") {
+		t.Fatalf("missing cxp alias in profile")
+	}
+}
+
+func TestInstallShRejectsUnknownArg(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.sh")
+	cmd := exec.Command("sh", scriptPath, "--unknown")
+	cmd.Dir = repoRoot
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected unknown arg error")
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected ExitError, got %T", err)
+	}
+	if exitErr.ExitCode() != 2 {
+		t.Fatalf("expected exit code 2, got %d\n%s", exitErr.ExitCode(), string(output))
+	}
+}
+
+func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
+	t.Helper()
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.sh")
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	writeStubCurl(t, binDir)
+
+	homeDir := t.TempDir()
+	installDir := t.TempDir()
+	version := "v1.2.3"
+	verNoV := strings.TrimPrefix(version, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_%s_%s", verNoV, runtime.GOOS, runtime.GOARCH)
+	assetData := []byte("fake-binary")
+	checksum := sha256.Sum256(assetData)
+	checksums := fmt.Sprintf("%x  %s\n", checksum, asset)
+	apiJSON := fmt.Sprintf("{\"tag_name\":\"%s\"}", version)
+	latestURL := "https://github.com/owner/name/releases/tag/" + version
+
+	pathValue := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	if pathAlreadySet {
+		pathValue = installDir + string(os.PathListSeparator) + pathValue
+	}
+	env := append([]string{}, os.Environ()...)
+	env = append(env,
+		"PATH="+pathValue,
+		"HOME="+homeDir,
+		"SHELL=/bin/bash",
+		"CODEX_PROXY_REPO=owner/name",
+		"CODEX_PROXY_VERSION=latest",
+		"CODEX_PROXY_INSTALL_DIR="+installDir,
+		"CODEX_PROXY_TEST_API_FAIL="+boolEnv(apiFail),
+		"CODEX_PROXY_TEST_API_JSON="+apiJSON,
+		"CODEX_PROXY_TEST_LATEST_URL="+latestURL,
+		"CODEX_PROXY_TEST_ASSET="+asset,
+		"CODEX_PROXY_TEST_ASSET_DATA="+string(assetData),
+		"CODEX_PROXY_TEST_CHECKSUMS="+checksums,
+	)
+
+	cmd := exec.Command("sh", scriptPath)
+	cmd.Dir = repoRoot
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh failed: %v\n%s", err, string(output))
+	}
+
+	installed := filepath.Join(installDir, "codex-proxy")
+	got, err := os.ReadFile(installed)
+	if err != nil {
+		t.Fatalf("read installed: %v", err)
+	}
+	if string(got) != string(assetData) {
+		t.Fatalf("installed payload mismatch")
+	}
+
+	cxpPath := filepath.Join(installDir, "cxp")
+	cxpData, err := os.ReadFile(cxpPath)
+	if err != nil {
+		t.Fatalf("read cxp: %v", err)
+	}
+	if string(cxpData) != string(assetData) {
+		t.Fatalf("cxp payload mismatch")
+	}
+
+	configPath := expectedBashConfigPath(homeDir)
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read shell config: %v", err)
+	}
+	text := string(contents)
+	pathLine := fmt.Sprintf("export PATH=\"%s:$PATH\"", installDir)
+	if pathAlreadySet {
+		if strings.Contains(text, pathLine) {
+			t.Fatalf("unexpected PATH update in shell config")
+		}
+	} else {
+		if !strings.Contains(text, pathLine) {
+			t.Fatalf("missing PATH update in shell config")
+		}
+	}
+	if !strings.Contains(text, "alias cxp='codex-proxy'") {
+		t.Fatalf("missing cxp alias in shell config")
+	}
+}
+
+type installShRun struct {
+	repoRoot   string
+	scriptPath string
+	homeDir    string
+	installDir string
+	asset      string
+	assetData  []byte
+	env        []string
+}
+
+func newInstallShRun(t *testing.T, apiFail bool, pathAlreadySet bool) installShRun {
+	t.Helper()
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.sh")
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	writeStubCurl(t, binDir)
+
+	homeDir := t.TempDir()
+	installDir := t.TempDir()
+	version := "v1.2.3"
+	verNoV := strings.TrimPrefix(version, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_%s_%s", verNoV, runtime.GOOS, runtime.GOARCH)
+	assetData := []byte("fake-binary")
+	checksum := sha256.Sum256(assetData)
+	checksums := fmt.Sprintf("%x  %s\n", checksum, asset)
+	apiJSON := fmt.Sprintf("{\"tag_name\":\"%s\"}", version)
+	latestURL := "https://github.com/owner/name/releases/tag/" + version
+
+	pathValue := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	if pathAlreadySet {
+		pathValue = installDir + string(os.PathListSeparator) + pathValue
+	}
+	env := append([]string{}, os.Environ()...)
+	env = append(env,
+		"PATH="+pathValue,
+		"HOME="+homeDir,
+		"SHELL=/bin/bash",
+		"CODEX_PROXY_REPO=owner/name",
+		"CODEX_PROXY_VERSION=latest",
+		"CODEX_PROXY_INSTALL_DIR="+installDir,
+		"CODEX_PROXY_TEST_API_FAIL="+boolEnv(apiFail),
+		"CODEX_PROXY_TEST_API_JSON="+apiJSON,
+		"CODEX_PROXY_TEST_LATEST_URL="+latestURL,
+		"CODEX_PROXY_TEST_ASSET="+asset,
+		"CODEX_PROXY_TEST_ASSET_DATA="+string(assetData),
+		"CODEX_PROXY_TEST_CHECKSUMS="+checksums,
+	)
+
+	return installShRun{
+		repoRoot:   repoRoot,
+		scriptPath: scriptPath,
+		homeDir:    homeDir,
+		installDir: installDir,
+		asset:      asset,
+		assetData:  assetData,
+		env:        env,
+	}
+}
+
+func overrideEnv(env []string, key, value string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if k == key {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, key+"="+value)
+}
+
+func boolEnv(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
+}
+
+func writeStubCurl(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "curl")
+	script := `#!/usr/bin/env sh
+set -e
+out=""
+write_effective=""
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o)
+      out="$2"
+      shift 2
+      ;;
+    -w)
+      write_effective="$2"
+      shift 2
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ -n "$write_effective" ]; then
+  if [ -z "${CODEX_PROXY_TEST_LATEST_URL:-}" ]; then
+    exit 1
+  fi
+  printf "%s" "$CODEX_PROXY_TEST_LATEST_URL"
+  exit 0
+fi
+
+if [ -z "$out" ]; then
+  exit 1
+fi
+
+case "$url" in
+  *"/repos/"*"/releases/latest")
+    if [ "${CODEX_PROXY_TEST_API_FAIL:-}" = "1" ]; then
+      exit 22
+    fi
+    printf "%s" "${CODEX_PROXY_TEST_API_JSON:-}" > "$out"
+    ;;
+  *"/checksums.txt")
+    printf "%s" "${CODEX_PROXY_TEST_CHECKSUMS:-}" > "$out"
+    ;;
+  *"/${CODEX_PROXY_TEST_ASSET}")
+    printf "%s" "${CODEX_PROXY_TEST_ASSET_DATA:-}" > "$out"
+    ;;
+  *)
+    exit 22
+    ;;
+esac
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub curl: %v", err)
+	}
+}
+
+func expectedBashConfigPath(home string) string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(home, ".bash_profile")
+	}
+	return filepath.Join(home, ".bashrc")
+}
