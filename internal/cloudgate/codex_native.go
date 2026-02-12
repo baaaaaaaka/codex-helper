@@ -105,7 +105,9 @@ func parseNpmCmdShim(cmdPath string) (string, error) {
 		return "", fmt.Errorf("could not find .js path in %s", cmdPath)
 	}
 	cmdDir := filepath.Dir(cmdPath)
-	jsPath := filepath.Join(cmdDir, filepath.FromSlash(string(m[1])))
+	// .cmd files always use backslashes; normalize to the OS separator.
+	relPath := strings.ReplaceAll(string(m[1]), `\`, string(filepath.Separator))
+	jsPath := filepath.Join(cmdDir, relPath)
 	if _, err := os.Stat(jsPath); err != nil {
 		return "", fmt.Errorf("resolved .js not found: %s", jsPath)
 	}
