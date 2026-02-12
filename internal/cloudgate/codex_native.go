@@ -24,6 +24,13 @@ func targetTriple() string {
 		case "arm64":
 			return "aarch64-apple-darwin"
 		}
+	case "windows":
+		switch runtime.GOARCH {
+		case "amd64":
+			return "x86_64-pc-windows-msvc"
+		case "arm64":
+			return "aarch64-pc-windows-msvc"
+		}
 	}
 	return ""
 }
@@ -45,14 +52,19 @@ func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string
 	}
 
 	// The wrapper script is at <pkg>/bin/codex.js
-	// The native binary is at <pkg>/vendor/<triple>/codex/codex
+	// The native binary is at <pkg>/vendor/<triple>/codex/codex[.exe]
 	pkgDir := filepath.Dir(filepath.Dir(resolved))
 
+	binaryName := "codex"
+	if runtime.GOOS == "windows" {
+		binaryName = "codex.exe"
+	}
+
 	// Try both with and without .js extension.
-	nativeBin = filepath.Join(pkgDir, "vendor", triple, "codex", "codex")
+	nativeBin = filepath.Join(pkgDir, "vendor", triple, "codex", binaryName)
 	if _, err := os.Stat(nativeBin); err != nil {
 		// Try one level up (in case wrapper is directly in the package).
-		nativeBin = filepath.Join(filepath.Dir(resolved), "..", "vendor", triple, "codex", "codex")
+		nativeBin = filepath.Join(filepath.Dir(resolved), "..", "vendor", triple, "codex", binaryName)
 		if _, err := os.Stat(nativeBin); err != nil {
 			return "", "", fmt.Errorf("native binary not found for %s (looked in %s)", triple, pkgDir)
 		}
@@ -84,7 +96,7 @@ func PrepareYoloBinary(codexWrapperPath string, cacheDir string) (*PatchResult, 
 	if pathDir != "" {
 		// Prepend the vendor path directory to PATH, mirroring the Node.js wrapper.
 		currentPath := os.Getenv("PATH")
-		extraEnv = append(extraEnv, "PATH="+pathDir+":"+currentPath)
+		extraEnv = append(extraEnv, "PATH="+pathDir+string(os.PathListSeparator)+currentPath)
 	}
 	// The Node.js wrapper sets this; some codex features may check for it.
 	extraEnv = append(extraEnv, "CODEX_MANAGED_BY_NPM=1")

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 const (
@@ -120,7 +121,11 @@ func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) 
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
-	patchedPath := filepath.Join(cacheDir, "codex-patched")
+	patchedName := "codex-patched"
+	if runtime.GOOS == "windows" {
+		patchedName = "codex-patched.exe"
+	}
+	patchedPath := filepath.Join(cacheDir, patchedName)
 	if err := os.WriteFile(patchedPath, data, 0o755); err != nil {
 		return nil, fmt.Errorf("write patched binary: %w", err)
 	}

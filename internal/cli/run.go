@@ -366,7 +366,13 @@ func runTargetOnceWithOptions(
 	cmd.Stdin = os.Stdin
 	if opts.PreserveTTY {
 		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		// Always tee stderr to the capture buffer so that isYoloFailure
+		// can detect approval_policy errors even in TTY mode.
+		if stderrBuf != nil {
+			cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
+		} else {
+			cmd.Stderr = os.Stderr
+		}
 	} else {
 		if stdoutBuf != nil {
 			cmd.Stdout = io.MultiWriter(os.Stdout, stdoutBuf)

@@ -42,8 +42,19 @@ func TestTargetTriple(t *testing.T) {
 			}
 		}
 	case "windows":
-		if triple != "" {
-			t.Errorf("expected empty triple on Windows, got %q", triple)
+		switch runtime.GOARCH {
+		case "amd64":
+			if triple != "x86_64-pc-windows-msvc" {
+				t.Errorf("expected x86_64-pc-windows-msvc, got %q", triple)
+			}
+		case "arm64":
+			if triple != "aarch64-pc-windows-msvc" {
+				t.Errorf("expected aarch64-pc-windows-msvc, got %q", triple)
+			}
+		default:
+			if triple != "" {
+				t.Errorf("expected empty triple for unsupported arch %s, got %q", runtime.GOARCH, triple)
+			}
 		}
 	}
 }
@@ -104,7 +115,11 @@ func TestFindNativeBinaryWithMockStructure(t *testing.T) {
 		t.Fatalf("write wrapper: %v", err)
 	}
 
-	nativePath := filepath.Join(nativeDir, "codex")
+	binaryName := "codex"
+	if runtime.GOOS == "windows" {
+		binaryName = "codex.exe"
+	}
+	nativePath := filepath.Join(nativeDir, binaryName)
 	if err := os.WriteFile(nativePath, []byte("native binary"), 0o755); err != nil {
 		t.Fatalf("write native: %v", err)
 	}
@@ -144,7 +159,11 @@ func TestFindNativeBinaryNoPathDir(t *testing.T) {
 	if err := os.WriteFile(wrapperPath, []byte("wrapper"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	nativePath := filepath.Join(nativeDir, "codex")
+	binaryName := "codex"
+	if runtime.GOOS == "windows" {
+		binaryName = "codex.exe"
+	}
+	nativePath := filepath.Join(nativeDir, binaryName)
 	if err := os.WriteFile(nativePath, []byte("native"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
