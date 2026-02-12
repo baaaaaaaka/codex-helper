@@ -211,19 +211,17 @@ func runCodexNewSession(
 }
 
 // preparePatchedBinary wraps cloudgate.PrepareYoloBinary with patch-history
-// awareness. It skips patching if the binary was already successfully patched
-// or if a previous patch was recorded as failed.
+// awareness. It skips patching only if a previous patch was recorded as failed
+// (to avoid retrying a known-broken patch). Otherwise it always re-patches
+// because the patched binary is ephemeral (removed by Cleanup after each session).
 // Returns (result, env, patchRunInfo, skipped).
 func preparePatchedBinary(codexPath string, configDir string) (*cloudgate.PatchResult, []string, *patchRunInfo, bool) {
 	origHash, hashErr := hashFileSHA256(codexPath)
 
-	// Try to consult patch history.
+	// Only skip if a previous patch is known to have failed (crashed binary).
 	phs, phsErr := config.NewPatchHistoryStore(configDir)
 	if phsErr == nil && hashErr == nil {
 		if failed, _ := phs.IsFailed(codexPath, origHash); failed {
-			return nil, nil, nil, true
-		}
-		if patched, _ := phs.IsPatched(codexPath, origHash); patched {
 			return nil, nil, nil, true
 		}
 	}
