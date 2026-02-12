@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strings"
 )
 
 // targetTriple returns the Rust target triple for the current platform.
@@ -35,47 +37,140 @@ func targetTriple() string {
 	return ""
 }
 
+// platformPackageName returns the npm optional-dependency package name
+// that ships the native binary for the current platform (e.g.
+// "@openai/codex-win32-x64"). Returns "" if unknown.
+func platformPackageName() string {
+	switch targetTriple() {
+	case "x86_64-unknown-linux-musl":
+		return filepath.Join("@openai", "codex-linux-x64")
+	case "aarch64-unknown-linux-musl":
+		return filepath.Join("@openai", "codex-linux-arm64")
+	case "x86_64-apple-darwin":
+		return filepath.Join("@openai", "codex-darwin-x64")
+	case "aarch64-apple-darwin":
+		return filepath.Join("@openai", "codex-darwin-arm64")
+	case "x86_64-pc-windows-msvc":
+		return filepath.Join("@openai", "codex-win32-x64")
+	case "aarch64-pc-windows-msvc":
+		return filepath.Join("@openai", "codex-win32-arm64")
+	}
+	return ""
+}
+
+// nativeBinaryName returns "codex.exe" on Windows, "codex" elsewhere.
+func nativeBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "codex.exe"
+	}
+	return "codex"
+}
+
+// resolveWrapper resolves the codex wrapper path to the actual codex.js
+// entry point. On Unix this follows symlinks; on Windows it parses the
+// npm .cmd shim to extract the .js path.
+func resolveWrapper(wrapperPath string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(wrapperPath)
+	if err != nil {
+		return "", fmt.Errorf("eval symlinks: %w", err)
+	}
+
+	// On Windows npm creates .cmd shims instead of symlinks.
+	// Parse the .cmd to find the actual .js entry point.
+	if strings.HasSuffix(strings.ToLower(resolved), ".cmd") {
+		jsPath, err := parseNpmCmdShim(resolved)
+		if err != nil {
+			return "", fmt.Errorf("parse cmd shim: %w", err)
+		}
+		return jsPath, nil
+	}
+
+	return resolved, nil
+}
+
+// npmCmdShimRe matches the relative .js path in an npm .cmd shim, e.g.:
+//
+//	"%dp0%\node_modules\@openai\codex\bin\codex.js"
+var npmCmdShimRe = regexp.MustCompile(`%~?dp0%[\\\/]([^"]+\.js)`)
+
+// parseNpmCmdShim reads an npm .cmd shim and extracts the path to
+// the .js entry point, resolved relative to the .cmd's directory.
+func parseNpmCmdShim(cmdPath string) (string, error) {
+	data, err := os.ReadFile(cmdPath)
+	if err != nil {
+		return "", err
+	}
+	m := npmCmdShimRe.FindSubmatch(data)
+	if m == nil {
+		return "", fmt.Errorf("could not find .js path in %s", cmdPath)
+	}
+	cmdDir := filepath.Dir(cmdPath)
+	jsPath := filepath.Join(cmdDir, filepath.FromSlash(string(m[1])))
+	if _, err := os.Stat(jsPath); err != nil {
+		return "", fmt.Errorf("resolved .js not found: %s", jsPath)
+	}
+	return jsPath, nil
+}
+
+// findVendorBinary searches for the native binary + path dir under a given
+// vendor root. Returns ("", "", nil) if not found.
+func findVendorBinary(vendorRoot string) (nativeBin string, pathDir string) {
+	triple := targetTriple()
+	binName := nativeBinaryName()
+	candidate := filepath.Join(vendorRoot, triple, "codex", binName)
+	if _, err := os.Stat(candidate); err != nil {
+		return "", ""
+	}
+	pathDir = filepath.Join(vendorRoot, triple, "path")
+	if _, err := os.Stat(pathDir); err != nil {
+		pathDir = ""
+	}
+	return candidate, pathDir
+}
+
 // FindNativeBinary locates the native Codex binary given the path to the
-// codex Node.js wrapper (e.g. /home/user/.npm-global/bin/codex).
-// It resolves symlinks and finds the vendor/<triple>/codex/codex binary.
+// codex wrapper (e.g. /home/user/.npm-global/bin/codex on Unix or
+// C:\Users\...\npm\codex.cmd on Windows).
+//
+// It handles:
+//   - Unix symlink resolution (wrapper → <pkg>/bin/codex.js)
+//   - Windows npm .cmd shim parsing
+//   - Vendor directory in the main package (<pkg>/vendor/<triple>/...)
+//   - Platform-specific npm sub-packages (<pkg>/node_modules/@openai/codex-<plat>/vendor/...)
 func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string, err error) {
 	triple := targetTriple()
 	if triple == "" {
 		return "", "", fmt.Errorf("unsupported platform: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
-	// The wrapper is at <prefix>/bin/codex.js or <prefix>/bin/codex.
-	// Resolve symlinks to find the real location.
-	resolved, err := filepath.EvalSymlinks(codexWrapperPath)
+	resolved, err := resolveWrapper(codexWrapperPath)
 	if err != nil {
-		return "", "", fmt.Errorf("eval symlinks: %w", err)
+		return "", "", err
 	}
 
-	// The wrapper script is at <pkg>/bin/codex.js
-	// The native binary is at <pkg>/vendor/<triple>/codex/codex[.exe]
+	// The resolved wrapper should be at <pkg>/bin/codex.js
 	pkgDir := filepath.Dir(filepath.Dir(resolved))
 
-	binaryName := "codex"
-	if runtime.GOOS == "windows" {
-		binaryName = "codex.exe"
+	// Strategy 1: vendor/ directly in the package root.
+	if bin, pd := findVendorBinary(filepath.Join(pkgDir, "vendor")); bin != "" {
+		return bin, pd, nil
 	}
 
-	// Try both with and without .js extension.
-	nativeBin = filepath.Join(pkgDir, "vendor", triple, "codex", binaryName)
-	if _, err := os.Stat(nativeBin); err != nil {
-		// Try one level up (in case wrapper is directly in the package).
-		nativeBin = filepath.Join(filepath.Dir(resolved), "..", "vendor", triple, "codex", binaryName)
-		if _, err := os.Stat(nativeBin); err != nil {
-			return "", "", fmt.Errorf("native binary not found for %s (looked in %s)", triple, pkgDir)
+	// Strategy 2: platform-specific npm sub-package.
+	// e.g. <pkg>/node_modules/@openai/codex-win32-x64/vendor/<triple>/...
+	if platPkg := platformPackageName(); platPkg != "" {
+		subVendor := filepath.Join(pkgDir, "node_modules", platPkg, "vendor")
+		if bin, pd := findVendorBinary(subVendor); bin != "" {
+			return bin, pd, nil
 		}
 	}
 
-	pathDir = filepath.Join(pkgDir, "vendor", triple, "path")
-	if _, err := os.Stat(pathDir); err != nil {
-		pathDir = "" // Optional; doesn't always exist.
+	// Strategy 3: one level up (wrapper directly in the package).
+	if bin, pd := findVendorBinary(filepath.Join(filepath.Dir(resolved), "..", "vendor")); bin != "" {
+		return bin, pd, nil
 	}
 
-	return nativeBin, pathDir, nil
+	return "", "", fmt.Errorf("native binary not found for %s (looked in %s)", triple, pkgDir)
 }
 
 // PrepareYoloBinary finds the native Codex binary, patches it for yolo mode

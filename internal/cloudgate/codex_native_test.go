@@ -59,6 +59,32 @@ func TestTargetTriple(t *testing.T) {
 	}
 }
 
+func TestPlatformPackageName(t *testing.T) {
+	name := platformPackageName()
+	if targetTriple() == "" {
+		if name != "" {
+			t.Errorf("expected empty platform package for unsupported triple, got %q", name)
+		}
+		return
+	}
+	if name == "" {
+		t.Error("expected non-empty platform package name")
+	}
+}
+
+func TestNativeBinaryName(t *testing.T) {
+	name := nativeBinaryName()
+	if runtime.GOOS == "windows" {
+		if name != "codex.exe" {
+			t.Errorf("expected codex.exe on windows, got %q", name)
+		}
+	} else {
+		if name != "codex" {
+			t.Errorf("expected codex on non-windows, got %q", name)
+		}
+	}
+}
+
 func TestFindNativeBinaryNotFound(t *testing.T) {
 	dir := t.TempDir()
 	wrapper := filepath.Join(dir, "bin", "codex.js")
@@ -86,25 +112,22 @@ func TestFindNativeBinaryUnsupportedPlatform(t *testing.T) {
 	}
 }
 
+// TestFindNativeBinaryWithMockStructure tests Strategy 1: vendor/ in pkg root.
 func TestFindNativeBinaryWithMockStructure(t *testing.T) {
 	triple := targetTriple()
 	if triple == "" {
 		t.Skip("unsupported platform for this test")
 	}
 
-	// Create a mock package structure:
-	// <dir>/bin/codex.js
-	// <dir>/vendor/<triple>/codex/codex
 	dir := t.TempDir()
-	// Resolve symlinks so comparisons work on macOS where /var -> /private/var.
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = resolved
 	}
 	binDir := filepath.Join(dir, "bin")
 	nativeDir := filepath.Join(dir, "vendor", triple, "codex")
-	pathDir := filepath.Join(dir, "vendor", triple, "path")
+	pathDirExpected := filepath.Join(dir, "vendor", triple, "path")
 
-	for _, d := range []string{binDir, nativeDir, pathDir} {
+	for _, d := range []string{binDir, nativeDir, pathDirExpected} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
@@ -115,11 +138,7 @@ func TestFindNativeBinaryWithMockStructure(t *testing.T) {
 		t.Fatalf("write wrapper: %v", err)
 	}
 
-	binaryName := "codex"
-	if runtime.GOOS == "windows" {
-		binaryName = "codex.exe"
-	}
-	nativePath := filepath.Join(nativeDir, binaryName)
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
 	if err := os.WriteFile(nativePath, []byte("native binary"), 0o755); err != nil {
 		t.Fatalf("write native: %v", err)
 	}
@@ -131,8 +150,8 @@ func TestFindNativeBinaryWithMockStructure(t *testing.T) {
 	if gotBin != nativePath {
 		t.Errorf("expected native binary %q, got %q", nativePath, gotBin)
 	}
-	if gotPath != pathDir {
-		t.Errorf("expected path dir %q, got %q", pathDir, gotPath)
+	if gotPath != pathDirExpected {
+		t.Errorf("expected path dir %q, got %q", pathDirExpected, gotPath)
 	}
 }
 
@@ -159,11 +178,7 @@ func TestFindNativeBinaryNoPathDir(t *testing.T) {
 	if err := os.WriteFile(wrapperPath, []byte("wrapper"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	binaryName := "codex"
-	if runtime.GOOS == "windows" {
-		binaryName = "codex.exe"
-	}
-	nativePath := filepath.Join(nativeDir, binaryName)
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
 	if err := os.WriteFile(nativePath, []byte("native"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -174,6 +189,150 @@ func TestFindNativeBinaryNoPathDir(t *testing.T) {
 	}
 	if gotPath != "" {
 		t.Errorf("expected empty path dir when vendor/path doesn't exist, got %q", gotPath)
+	}
+}
+
+// TestFindNativeBinaryPlatformSubPackage tests Strategy 2: platform-specific
+// npm sub-package (e.g. node_modules/@openai/codex-win32-x64/vendor/...).
+func TestFindNativeBinaryPlatformSubPackage(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	platPkg := platformPackageName()
+	if platPkg == "" {
+		t.Skip("no platform package for this platform")
+	}
+
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+
+	// <dir>/bin/codex.js  (wrapper)
+	// <dir>/node_modules/<platPkg>/vendor/<triple>/codex/codex[.exe]
+	binDir := filepath.Join(dir, "bin")
+	nativeDir := filepath.Join(dir, "node_modules", platPkg, "vendor", triple, "codex")
+	pathDirExpected := filepath.Join(dir, "node_modules", platPkg, "vendor", triple, "path")
+
+	for _, d := range []string{binDir, nativeDir, pathDirExpected} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	wrapperPath := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
+	if err := os.WriteFile(nativePath, []byte("native binary"), 0o755); err != nil {
+		t.Fatalf("write native: %v", err)
+	}
+
+	gotBin, gotPath, err := FindNativeBinary(wrapperPath)
+	if err != nil {
+		t.Fatalf("FindNativeBinary: %v", err)
+	}
+	if gotBin != nativePath {
+		t.Errorf("expected native binary %q, got %q", nativePath, gotBin)
+	}
+	if gotPath != pathDirExpected {
+		t.Errorf("expected path dir %q, got %q", pathDirExpected, gotPath)
+	}
+}
+
+// TestParseNpmCmdShim verifies extraction of the .js path from an npm .cmd shim.
+func TestParseNpmCmdShim(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a mock codex.js at the resolved path.
+	jsDir := filepath.Join(dir, "node_modules", "@openai", "codex", "bin")
+	if err := os.MkdirAll(jsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	jsPath := filepath.Join(jsDir, "codex.js")
+	if err := os.WriteFile(jsPath, []byte("// entry"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Create a .cmd shim that references the .js via %dp0%.
+	cmdContent := `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+`
+	cmdPath := filepath.Join(dir, "codex.cmd")
+	if err := os.WriteFile(cmdPath, []byte(cmdContent), 0o644); err != nil {
+		t.Fatalf("write cmd: %v", err)
+	}
+
+	got, err := parseNpmCmdShim(cmdPath)
+	if err != nil {
+		t.Fatalf("parseNpmCmdShim: %v", err)
+	}
+	if got != jsPath {
+		t.Errorf("expected %q, got %q", jsPath, got)
+	}
+}
+
+// TestParseNpmCmdShimNotFound returns error if .js file does not exist.
+func TestParseNpmCmdShimNotFound(t *testing.T) {
+	dir := t.TempDir()
+	cmdContent := `endLocal & "%_prog%"  "%dp0%\node_modules\codex\bin\codex.js" %*`
+	cmdPath := filepath.Join(dir, "codex.cmd")
+	if err := os.WriteFile(cmdPath, []byte(cmdContent), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := parseNpmCmdShim(cmdPath)
+	if err == nil {
+		t.Fatal("expected error for missing .js file")
+	}
+}
+
+// TestParseNpmCmdShimNoMatch returns error for .cmd without a .js reference.
+func TestParseNpmCmdShimNoMatch(t *testing.T) {
+	dir := t.TempDir()
+	cmdPath := filepath.Join(dir, "other.cmd")
+	if err := os.WriteFile(cmdPath, []byte("@echo hello"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := parseNpmCmdShim(cmdPath)
+	if err == nil {
+		t.Fatal("expected error for .cmd without .js reference")
+	}
+}
+
+// TestResolveWrapperJS verifies that a .js wrapper is returned as-is (after symlink resolution).
+func TestResolveWrapperJS(t *testing.T) {
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	jsPath := filepath.Join(dir, "codex.js")
+	if err := os.WriteFile(jsPath, []byte("// entry"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := resolveWrapper(jsPath)
+	if err != nil {
+		t.Fatalf("resolveWrapper: %v", err)
+	}
+	if got != jsPath {
+		t.Errorf("expected %q, got %q", jsPath, got)
+	}
+}
+
+// TestFindVendorBinaryMissing returns empty strings for missing vendor dir.
+func TestFindVendorBinaryMissing(t *testing.T) {
+	bin, pd := findVendorBinary("/nonexistent/vendor")
+	if bin != "" || pd != "" {
+		t.Errorf("expected empty results, got bin=%q path=%q", bin, pd)
 	}
 }
 
