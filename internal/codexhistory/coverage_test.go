@@ -4,10 +4,18 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+// jsonEscapePath escapes backslashes so a path can be safely embedded in a JSON
+// string literal.  This is a no-op on Unix but required on Windows where
+// filepath.Join produces backslash separators.
+func jsonEscapePath(p string) string {
+	return strings.ReplaceAll(p, `\`, `\\`)
+}
 
 // fixedTime returns a deterministic timestamp for tests.
 func fixedTime() time.Time {
@@ -301,8 +309,9 @@ func TestResolveCodexDir_Override(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	if got != "/custom/path" {
-		t.Errorf("got %q, want /custom/path", got)
+	want := filepath.FromSlash("/custom/path")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -311,8 +320,9 @@ func TestResolveCodexDir_OverrideWithWhitespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	if got != "/custom/path" {
-		t.Errorf("got %q, want /custom/path", got)
+	want := filepath.FromSlash("/custom/path")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -322,8 +332,9 @@ func TestResolveCodexDir_EnvVar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	if got != "/env/codex" {
-		t.Errorf("got %q, want /env/codex", got)
+	want := filepath.FromSlash("/env/codex")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -669,7 +680,7 @@ func TestFindSessionByID_FoundViaDiscoveryFallback(t *testing.T) {
 	}
 	sessionID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
-	content := `{"timestamp":"2026-06-01T10:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content := `{"timestamp":"2026-06-01T10:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 {"timestamp":"2026-06-01T10:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"nested find"}]}}
 `
 	if err := os.WriteFile(filepath.Join(subdir, fname), []byte(content), 0o644); err != nil {
@@ -1182,10 +1193,10 @@ func TestDiscoverProjects_DeduplicateBySessionID(t *testing.T) {
 	// Write two files with the same session ID (simulating duplicate).
 	f1 := filepath.Join(sessionsDir, "rollout-2026-01-01T00-00-00-"+sessionID+".jsonl")
 	f2 := filepath.Join(sessionsDir, "rollout-2026-01-02T00-00-00-"+sessionID+".jsonl")
-	content1 := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content1 := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 {"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first copy"}]}}
 `
-	content2 := `{"timestamp":"2026-01-02T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content2 := `{"timestamp":"2026-01-02T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 {"timestamp":"2026-01-02T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second copy"}]}}
 `
 	if err := os.WriteFile(f1, []byte(content1), 0o644); err != nil {
@@ -1234,7 +1245,7 @@ func TestDiscoverProjects_HistoryEnrichment(t *testing.T) {
 
 	// Session file with no user message.
 	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
-	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 `
 	if err := os.WriteFile(filepath.Join(sessionsDir, fname), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -1266,7 +1277,7 @@ func TestDiscoverProjects_HistoryEnrichmentTimestamps(t *testing.T) {
 
 	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
 	// No timestamp field in the envelope.
-	content := `{"type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content := `{"type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 `
 	if err := os.WriteFile(filepath.Join(sessionsDir, fname), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -1299,7 +1310,7 @@ func TestDiscoverProjects_TimestampFromFilename(t *testing.T) {
 	sessionID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 	fname := "rollout-2026-03-15T10-30-00-" + sessionID + ".jsonl"
-	content := `{"type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content := `{"type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"prompt"}]}}
 `
 	if err := os.WriteFile(filepath.Join(sessionsDir, fname), []byte(content), 0o644); err != nil {
@@ -1326,7 +1337,7 @@ func TestDiscoverProjects_SessionIDFromFilename(t *testing.T) {
 	sessionID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
-	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"","cwd":"` + projDir + `","source":"cli"}}
+	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 {"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"no meta id"}]}}
 `
 	if err := os.WriteFile(filepath.Join(sessionsDir, fname), []byte(content), 0o644); err != nil {
@@ -1386,6 +1397,9 @@ func TestDiscoverProjects_UnreadableFileReturnsFirstErr(t *testing.T) {
 	if err := os.WriteFile(badPath, []byte("content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 000 does not restrict reads on Windows")
+	}
 	if err := os.Chmod(badPath, 0o000); err != nil {
 		t.Skip("cannot chmod on this platform")
 	}
@@ -1409,7 +1423,7 @@ func TestDiscoverProjects_ModifiedAtFallbackToCreatedAt(t *testing.T) {
 
 	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
 	// Only one timestamp → CreatedAt = ModifiedAt = same value.
-	content := `{"timestamp":"2026-06-01T12:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content := `{"timestamp":"2026-06-01T12:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 {"timestamp":"2026-06-01T12:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"single ts"}]}}
 `
 	if err := os.WriteFile(filepath.Join(sessionsDir, fname), []byte(content), 0o644); err != nil {
@@ -1555,7 +1569,7 @@ func TestFindSessionByID_HistoryEnrichment(t *testing.T) {
 
 	// Session with no user message.
 	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
-	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":"cli"}}
+	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}
 `
 	if err := os.WriteFile(filepath.Join(sessionsDir, fname), []byte(content), 0o644); err != nil {
 		t.Fatal(err)

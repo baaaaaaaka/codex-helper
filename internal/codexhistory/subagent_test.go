@@ -586,8 +586,11 @@ func writeSessionFile(t *testing.T, sessionsDir, sessionID, ts, projDir, sourceJ
 	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
 	fpath := filepath.Join(sessionsDir, fname)
 
+	// Escape backslashes so the path is valid inside a JSON string (Windows).
+	jsonDir := strings.ReplaceAll(projDir, `\`, `\\`)
+
 	var lines []string
-	meta := `{"timestamp":"` + ts + `","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + projDir + `","source":` + sourceJSON + `}}`
+	meta := `{"timestamp":"` + ts + `","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonDir + `","source":` + sourceJSON + `}}`
 	lines = append(lines, meta)
 	if userMsg != "" {
 		msg := `{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"` + userMsg + `"}]}}`
@@ -839,7 +842,7 @@ func TestDiscoverProjects_SubagentInSubdirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	childFile := filepath.Join(subDir, "rollout-2026-01-01T00-00-00-"+childID+".jsonl")
-	childContent := `{"timestamp":"` + ts + `","type":"session_meta","payload":{"id":"` + childID + `","cwd":"` + projDir + `","source":{"subagent":{"thread_spawn":{"parent_thread_id":"` + parentID + `","depth":1}}}}}
+	childContent := `{"timestamp":"` + ts + `","type":"session_meta","payload":{"id":"` + childID + `","cwd":"` + jsonEscapePath(projDir) + `","source":{"subagent":{"thread_spawn":{"parent_thread_id":"` + parentID + `","depth":1}}}}}
 {"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"nested child"}]}}
 `
 	if err := os.WriteFile(childFile, []byte(childContent), 0o644); err != nil {
