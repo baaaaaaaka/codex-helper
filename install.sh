@@ -356,6 +356,30 @@ if [ ! -f "$cxp_dst" ]; then
 fi
 chmod 0755 "$cxp_dst" 2>/dev/null || true
 
+# Clean up legacy binary names from before the rename (claude-proxy → codex-proxy).
+for legacy_name in claude-proxy clp; do
+  legacy_path="$install_dir/$legacy_name"
+  if [ -f "$legacy_path" ] || [ -L "$legacy_path" ]; then
+    # Only remove if it points to codex-proxy or is itself a codex-proxy build.
+    should_remove=0
+    if [ -L "$legacy_path" ]; then
+      link_target="$(readlink "$legacy_path" 2>/dev/null || true)"
+      case "$link_target" in
+        *codex-proxy*|*claude-proxy*) should_remove=1 ;;
+      esac
+    elif [ -f "$legacy_path" ]; then
+      legacy_version="$("$legacy_path" --version 2>/dev/null || true)"
+      case "$legacy_version" in
+        *codex-proxy*) should_remove=1 ;;
+      esac
+    fi
+    if [ "$should_remove" -eq 1 ]; then
+      rm -f "$legacy_path"
+      echo "Removed legacy: $legacy_path"
+    fi
+  fi
+done
+
 echo "Installed: $dst"
 update_shell_config
 echo "Run: $dst proxy doctor"

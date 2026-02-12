@@ -179,6 +179,31 @@ if ($profileUpdated) {
   }
 }
 
+# Clean up legacy binary names from before the rename (claude-proxy -> codex-proxy).
+foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
+  $legacyPath = Join-Path $installDirResolved $legacyName
+  if (Test-Path $legacyPath) {
+    $shouldRemove = $false
+    if ($legacyName -like "clp*") {
+      # clp.cmd / clp.exe are always legacy wrappers in this directory.
+      $content = Get-Content -Path $legacyPath -Raw -ErrorAction SilentlyContinue
+      if ($content -and ($content -match "claude-proxy" -or $content -match "codex-proxy")) {
+        $shouldRemove = $true
+      }
+    } else {
+      # claude-proxy.exe — check if it identifies as codex-proxy.
+      try {
+        $ver = & $legacyPath --version 2>&1 | Out-String
+        if ($ver -match "codex-proxy") { $shouldRemove = $true }
+      } catch { }
+    }
+    if ($shouldRemove) {
+      Remove-Item -Force $legacyPath -ErrorAction SilentlyContinue
+      Write-Host "Removed legacy: $legacyPath"
+    }
+  }
+}
+
 Write-Host "Installed: $dst"
 Write-Host "Hint: add to PATH for current session:"
 Write-Host "  `$env:Path = `"$installDirResolved;`$env:Path`""
