@@ -2,6 +2,12 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -104,6 +110,89 @@ func isYoloFailure(err error, output string) bool {
 		return true
 	}
 	return false
+}
+
+// isPatchedBinaryStartupFailure returns true if err + output indicate that a
+// patched Codex binary failed to start properly.
+func isPatchedBinaryStartupFailure(err error, output string) bool {
+	if err == nil {
+		return false
+	}
+	if isPatchedBinaryFailure(err, output) {
+		return true
+	}
+	if exitDueToFatalSignal(err) {
+		return true
+	}
+	// Binary not found or not executable after patching.
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return true
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return true
+	}
+	return false
+}
+
+// isPatchedBinaryFailure checks output for error patterns specific to a
+// patched Codex binary (corrupted binary, missing libraries, etc.).
+func isPatchedBinaryFailure(err error, output string) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(output)
+	patterns := []string{
+		"not a valid executable",
+		"exec format error",
+		"cannot execute binary",
+		"bad cpu type",
+		"killed",
+		"segmentation fault",
+		"bus error",
+		"illegal instruction",
+		"abort",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// hashFileSHA256 computes the SHA-256 hex digest of the file at path.
+func hashFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hash %s: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+const maxFailureReasonLen = 256
+
+// formatFailureReason builds a short human-readable failure description.
+func formatFailureReason(err error, output string) string {
+	parts := make([]string, 0, 2)
+	if err != nil {
+		parts = append(parts, err.Error())
+	}
+	out := strings.TrimSpace(output)
+	if out != "" {
+		parts = append(parts, out)
+	}
+	reason := strings.Join(parts, ": ")
+	if len(reason) > maxFailureReasonLen {
+		reason = reason[:maxFailureReasonLen-3] + "..."
+	}
+	return reason
 }
 
 func stripYoloArgs(cmdArgs []string) []string {

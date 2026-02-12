@@ -4,6 +4,8 @@ package cloudgate
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -260,4 +262,124 @@ func TestPatchResultCleanupNilSafe(t *testing.T) {
 
 	result2 := &PatchResult{}
 	result2.Cleanup() // empty path, should not panic
+}
+
+func TestPatchCodexBinaryOrigSHA256_Patched(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t,
+		origReqPath,
+		"/api/codex/config/requirements",
+		"/wham/config/requirements",
+	)
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+
+	// OrigSHA256 should match the SHA-256 of the original binary data.
+	sum := sha256.Sum256(data)
+	want := hex.EncodeToString(sum[:])
+	if result.OrigSHA256 != want {
+		t.Errorf("OrigSHA256 = %q, want %q", result.OrigSHA256, want)
+	}
+}
+
+func TestPatchCodexBinaryOrigSHA256_NoPatchNeeded(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	// Binary that already has the patched paths — no patches needed.
+	data := buildSyntheticBinary(t,
+		patchedReqPath,
+		"/api/codex/config/requirementz",
+		"/wham/config/requirementz",
+	)
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+
+	// Even when no patches applied, OrigSHA256 should be set.
+	sum := sha256.Sum256(data)
+	want := hex.EncodeToString(sum[:])
+	if result.OrigSHA256 != want {
+		t.Errorf("OrigSHA256 = %q, want %q (even when no patches applied)", result.OrigSHA256, want)
+	}
+	if result.PatchedBinary != "" {
+		t.Errorf("expected empty PatchedBinary, got %q", result.PatchedBinary)
+	}
+}
+
+func TestPatchCodexBinaryOrigSHA256_NoTargetStrings(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t, "unrelated content only")
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+
+	sum := sha256.Sum256(data)
+	want := hex.EncodeToString(sum[:])
+	if result.OrigSHA256 != want {
+		t.Errorf("OrigSHA256 = %q, want %q", result.OrigSHA256, want)
+	}
+}
+
+func TestPatchCodexBinaryOrigSHA256_DifferentFromPatched(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t,
+		origReqPath,
+		"/api/codex/config/requirements",
+	)
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+
+	if result.PatchedBinary == "" {
+		t.Fatal("expected patched binary")
+	}
+
+	// Read patched binary and compute its hash.
+	patchedData, err := os.ReadFile(result.PatchedBinary)
+	if err != nil {
+		t.Fatalf("read patched: %v", err)
+	}
+	patchedSum := sha256.Sum256(patchedData)
+	patchedHash := hex.EncodeToString(patchedSum[:])
+
+	// OrigSHA256 should differ from the patched binary's hash.
+	if result.OrigSHA256 == patchedHash {
+		t.Error("OrigSHA256 should differ from the patched binary's hash")
+	}
 }

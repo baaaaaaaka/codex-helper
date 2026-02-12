@@ -2,6 +2,8 @@ package cloudgate
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,6 +55,8 @@ type PatchResult struct {
 	PatchedBinary string
 	// RequirementsPath is the path to the permissive requirements file.
 	RequirementsPath string
+	// OrigSHA256 is the SHA-256 hex digest of the original binary before patching.
+	OrigSHA256 string
 }
 
 // Cleanup removes the patched binary and requirements file.
@@ -75,6 +79,9 @@ func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) 
 	if err != nil {
 		return nil, fmt.Errorf("read binary: %w", err)
 	}
+
+	sum := sha256.Sum256(data)
+	origHash := hex.EncodeToString(sum[:])
 
 	patched := false
 
@@ -106,7 +113,7 @@ func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) 
 	}
 
 	if !patched {
-		return &PatchResult{}, nil
+		return &PatchResult{OrigSHA256: origHash}, nil
 	}
 
 	// Write patched binary.
@@ -130,5 +137,6 @@ func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) 
 	return &PatchResult{
 		PatchedBinary:    patchedPath,
 		RequirementsPath: patchedReqPath,
+		OrigSHA256:       origHash,
 	}, nil
 }

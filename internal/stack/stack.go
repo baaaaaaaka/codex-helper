@@ -39,6 +39,49 @@ type Stack struct {
 	stopCh  chan struct{}
 }
 
+// proxySetup holds the local HTTP proxy components created by setupHTTPProxy.
+type proxySetup struct {
+	proxy    *localproxy.HTTPProxy
+	httpAddr string
+	httpPort int
+}
+
+// setupHTTPProxy creates a SOCKS5 dialer pointing at socksAddr, builds an
+// HTTP proxy on top of it, and starts listening on httpListenAddr.
+func setupHTTPProxy(socksAddr, httpListenAddr, instanceID string) (*proxySetup, error) {
+	dialer, err := localproxy.NewSOCKS5Dialer(socksAddr, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	hp := localproxy.NewHTTPProxy(dialer, localproxy.Options{InstanceID: instanceID})
+	httpAddr, err := hp.Start(httpListenAddr)
+	if err != nil {
+		return nil, err
+	}
+	_, portStr, err := net.SplitHostPort(httpAddr)
+	if err != nil {
+		_ = hp.Close(context.Background())
+		return nil, err
+	}
+	httpPort, err := parsePort(portStr)
+	if err != nil {
+		_ = hp.Close(context.Background())
+		return nil, err
+	}
+	return &proxySetup{proxy: hp, httpAddr: httpAddr, httpPort: httpPort}, nil
+}
+
+// reservePort allocates a TCP port on the loopback interface and returns the
+// port number together with the held listener. The caller must close the
+// listener to release the port (typically right before handing it to SSH).
+func reservePort() (int, net.Listener, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, nil, err
+	}
+	return ln.Addr().(*net.TCPAddr).Port, ln, nil
+}
+
 func Start(profile config.Profile, instanceID string, opts Options) (*Stack, error) {
 	if profile.Host == "" {
 		return nil, errors.New("profile host is required")
@@ -69,59 +112,86 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 		opts.SocksReadyTimeout = 30 * time.Second
 	}
 
+	// Reserve SOCKS port: hold the listener open so that the HTTP proxy
+	// (which also binds :0) cannot accidentally grab the same port.
 	socksPort := opts.SocksPort
+	var socksReserve net.Listener
 	if socksPort == 0 {
-		p, err := pickFreePort()
+		port, ln, err := reservePort()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reserve socks port: %w", err)
 		}
-		socksPort = p
+		socksPort = port
+		socksReserve = ln
 	}
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
-	dialer, err := localproxy.NewSOCKS5Dialer(socksAddr, 10*time.Second)
+	ps, err := setupHTTPProxy(socksAddr, opts.HTTPListenAddr, instanceID)
 	if err != nil {
+		if socksReserve != nil {
+			socksReserve.Close()
+		}
 		return nil, err
 	}
 
-	hp := localproxy.NewHTTPProxy(dialer, localproxy.Options{InstanceID: instanceID})
-	httpAddr, err := hp.Start(opts.HTTPListenAddr)
-	if err != nil {
-		return nil, err
-	}
-	_, portStr, err := net.SplitHostPort(httpAddr)
-	if err != nil {
-		_ = hp.Close(context.Background())
-		return nil, err
-	}
-	httpPort, err := parsePort(portStr)
-	if err != nil {
-		_ = hp.Close(context.Background())
-		return nil, err
-	}
+	// Only retry with new ports when the SOCKS port was auto-selected.
+	// When an explicit port was requested, honour the caller's choice:
+	// return exactly that port or an error.
+	canRetry := opts.SocksPort == 0
+	const maxPortRetries = 3
 
-	tun, err := newTunnel(profile, socksPort)
-	if err != nil {
-		_ = hp.Close(context.Background())
-		return nil, err
-	}
-	if err := tun.Start(); err != nil {
-		_ = hp.Close(context.Background())
-		return nil, err
-	}
-	if err := waitForTCPTunnel(socksAddr, opts.SocksReadyTimeout, tun); err != nil {
-		_ = tun.Stop(opts.TunnelStopGrace)
-		_ = hp.Close(context.Background())
-		return nil, err
+	// Release the reserved SOCKS port and immediately start the SSH tunnel.
+	// If the tunnel fails to bind, retry with a freshly reserved port.
+	var tun *ssh.Tunnel
+	for attempt := 0; ; attempt++ {
+		if socksReserve != nil {
+			socksReserve.Close()
+			socksReserve = nil
+		}
+		t, terr := newTunnel(profile, socksPort)
+		if terr != nil {
+			_ = ps.proxy.Close(context.Background())
+			return nil, terr
+		}
+		if terr := t.Start(); terr != nil {
+			_ = ps.proxy.Close(context.Background())
+			return nil, terr
+		}
+		if terr := waitForTCPTunnel(socksAddr, opts.SocksReadyTimeout, t); terr != nil {
+			_ = t.Stop(opts.TunnelStopGrace)
+			if canRetry && attempt < maxPortRetries {
+				// Reserve a new port (held open until the next iteration
+				// releases it), then rebuild the HTTP proxy for the new
+				// SOCKS address.
+				port, ln, reserveErr := reservePort()
+				if reserveErr == nil {
+					socksPort = port
+					socksReserve = ln
+					socksAddr = fmt.Sprintf("127.0.0.1:%d", socksPort)
+					_ = ps.proxy.Close(context.Background())
+					newPs, psErr := setupHTTPProxy(socksAddr, opts.HTTPListenAddr, instanceID)
+					if psErr != nil {
+						socksReserve.Close()
+						return nil, psErr
+					}
+					ps = newPs
+					continue
+				}
+			}
+			_ = ps.proxy.Close(context.Background())
+			return nil, terr
+		}
+		tun = t
+		break
 	}
 
 	s := &Stack{
 		InstanceID: instanceID,
 		Profile:    profile,
 		SocksPort:  socksPort,
-		HTTPAddr:   httpAddr,
-		HTTPPort:   httpPort,
-		proxy:      hp,
+		HTTPAddr:   ps.httpAddr,
+		HTTPPort:   ps.httpPort,
+		proxy:      ps.proxy,
 		tunnel:     tun,
 		fatalCh:    make(chan error, 1),
 		stopCh:     make(chan struct{}),
@@ -178,6 +248,12 @@ func (s *Stack) monitor(opts Options) {
 
 		time.Sleep(opts.RestartBackoff)
 
+		// Reconnect using the same SOCKS port. If the port is now occupied
+		// by another process the tunnel will fail and we report fatal rather
+		// than switching ports, because changing the SOCKS address would
+		// require rebuilding the dialer and HTTP proxy. Port conflicts during
+		// reconnect are rare; when they occur the caller should recreate the
+		// entire stack.
 		tun, terr := newTunnel(s.Profile, s.SocksPort)
 		if terr != nil {
 			s.fatalCh <- terr

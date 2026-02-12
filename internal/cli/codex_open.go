@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
@@ -93,12 +94,14 @@ func runCodexSession(
 
 	// Layer 3: Patch the native Codex binary to use permissive system requirements.
 	extraEnv := []string{}
+	var pInfo *patchRunInfo
 	if useYolo {
 		configDir := filepath.Dir(store.Path())
-		patchResult, patchEnv, patchErr := cloudgate.PrepareYoloBinary(codexPath, configDir)
-		if patchErr == nil && patchResult != nil && patchResult.PatchedBinary != "" {
+		patchResult, patchEnv, info, skipped := preparePatchedBinary(codexPath, configDir)
+		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
 			codexPath = patchResult.PatchedBinary
 			extraEnv = append(extraEnv, patchEnv...)
+			pInfo = info
 			defer patchResult.Cleanup()
 		}
 	}
@@ -120,6 +123,7 @@ func runCodexSession(
 		UseProxy:    useProxy,
 		PreserveTTY: true,
 		YoloEnabled: useYolo,
+		PatchInfo:   pInfo,
 		OnYoloFallback: func() error {
 			return persistYoloEnabled(store, false)
 		},
@@ -161,12 +165,14 @@ func runCodexNewSession(
 
 	// Layer 3: Patch the native Codex binary to use permissive system requirements.
 	extraEnv := []string{}
+	var pInfo *patchRunInfo
 	if useYolo {
 		configDir := filepath.Dir(store.Path())
-		patchResult, patchEnv, patchErr := cloudgate.PrepareYoloBinary(codexPath, configDir)
-		if patchErr == nil && patchResult != nil && patchResult.PatchedBinary != "" {
+		patchResult, patchEnv, info, skipped := preparePatchedBinary(codexPath, configDir)
+		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
 			codexPath = patchResult.PatchedBinary
 			extraEnv = append(extraEnv, patchEnv...)
+			pInfo = info
 			defer patchResult.Cleanup()
 		}
 	}
@@ -188,6 +194,7 @@ func runCodexNewSession(
 		UseProxy:    useProxy,
 		PreserveTTY: true,
 		YoloEnabled: useYolo,
+		PatchInfo:   pInfo,
 		OnYoloFallback: func() error {
 			return persistYoloEnabled(store, false)
 		},
@@ -201,4 +208,51 @@ func runCodexNewSession(
 	}
 
 	return runTargetWithFallbackWithOptions(ctx, cmdArgs, "", nil, nil, opts)
+}
+
+// preparePatchedBinary wraps cloudgate.PrepareYoloBinary with patch-history
+// awareness. It skips patching if the binary was already successfully patched
+// or if a previous patch was recorded as failed.
+// Returns (result, env, patchRunInfo, skipped).
+func preparePatchedBinary(codexPath string, configDir string) (*cloudgate.PatchResult, []string, *patchRunInfo, bool) {
+	origHash, hashErr := hashFileSHA256(codexPath)
+
+	// Try to consult patch history.
+	phs, phsErr := config.NewPatchHistoryStore(configDir)
+	if phsErr == nil && hashErr == nil {
+		if failed, _ := phs.IsFailed(codexPath, origHash); failed {
+			return nil, nil, nil, true
+		}
+		if patched, _ := phs.IsPatched(codexPath, origHash); patched {
+			return nil, nil, nil, true
+		}
+	}
+
+	patchResult, patchEnv, patchErr := cloudgate.PrepareYoloBinary(codexPath, configDir)
+	if patchErr != nil {
+		return nil, nil, nil, false
+	}
+
+	var info *patchRunInfo
+	if hashErr == nil {
+		info = &patchRunInfo{
+			OrigBinaryPath: codexPath,
+			OrigSHA256:     origHash,
+			ConfigDir:      configDir,
+		}
+	}
+
+	// Record successful patch in history.
+	if phs != nil && hashErr == nil && patchResult != nil && patchResult.PatchedBinary != "" {
+		patchedHash, _ := hashFileSHA256(patchResult.PatchedBinary)
+		_ = phs.Upsert(config.PatchHistoryEntry{
+			Path:          codexPath,
+			OrigSHA256:    origHash,
+			PatchedSHA256: patchedHash,
+			ProxyVersion:  currentProxyVersion(),
+			PatchedAt:     time.Now(),
+		})
+	}
+
+	return patchResult, patchEnv, info, false
 }

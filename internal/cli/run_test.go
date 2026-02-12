@@ -3,7 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/stack"
 	"github.com/spf13/cobra"
 )
 
@@ -185,5 +189,242 @@ func TestRunLikeRejectsMultipleProfiles(t *testing.T) {
 	root := &rootOptions{}
 	if err := runLike(cmd, root, false); err == nil {
 		t.Fatalf("expected error for multiple profile args")
+	}
+}
+
+// startHealthServer starts an HTTP server that responds to the codex-proxy
+// health endpoint for the given instanceID. Returns the port and a cleanup function.
+func startHealthServer(t *testing.T, instanceID string) int {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_codex_proxy/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":         true,
+			"instanceId": instanceID,
+		})
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { srv.Close() })
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func TestRunWithProfileOptionsUsesSnapshotFirst(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	instanceID := "test-inst-snapshot"
+	httpPort := startHealthServer(t, instanceID)
+
+	// Fresh store with NO instances on disk.
+	store := newTempStore(t)
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		t.Fatal("stackStart should not be called when snapshot already has instance")
+		return nil, nil
+	}
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ok.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	now := time.Now()
+	instances := []config.Instance{{
+		ID:         instanceID,
+		ProfileID:  "prof-1",
+		HTTPPort:   httpPort,
+		SocksPort:  0,
+		DaemonPID:  os.Getpid(),
+		StartedAt:  now,
+		LastSeenAt: now,
+	}}
+
+	profile := config.Profile{ID: "prof-1", Name: "test"}
+	err := runWithProfileOptions(
+		context.Background(),
+		store,
+		profile,
+		instances,
+		[]string{script},
+		defaultRunTargetOptions(),
+	)
+	if err != nil {
+		t.Fatalf("runWithProfileOptions error: %v", err)
+	}
+}
+
+func TestRunWithProfileOptionsCreatesNewStack(t *testing.T) {
+	store := newTempStore(t)
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	sentinel := errors.New("mock: stackStart called")
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		return nil, sentinel
+	}
+
+	profile := config.Profile{ID: "prof-1", Name: "test"}
+	// Both snapshot and disk are empty → must fall through to new stack.
+	err := runWithProfileOptions(
+		context.Background(),
+		store,
+		profile,
+		nil,
+		[]string{"true"},
+		defaultRunTargetOptions(),
+	)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel from stackStart, got: %v", err)
+	}
+}
+
+func TestRunWithProfileOptionsLoadErrorFallsThrough(t *testing.T) {
+	// Create a store backed by corrupt JSON so store.Load() fails.
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(configPath, []byte("not valid json"), 0o600); err != nil {
+		t.Fatalf("write corrupt config: %v", err)
+	}
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	sentinel := errors.New("mock: stackStart after load error")
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		return nil, sentinel
+	}
+
+	profile := config.Profile{ID: "prof-1", Name: "test"}
+	// Snapshot empty, store.Load fails → should still fall through to new stack.
+	err = runWithProfileOptions(
+		context.Background(),
+		store,
+		profile,
+		nil,
+		[]string{"true"},
+		defaultRunTargetOptions(),
+	)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel from stackStart, got: %v", err)
+	}
+}
+
+func TestRunWithProfileOptionsSkipsWrongProfile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	// Health server for a different profile's instance.
+	instanceID := "inst-wrong-prof"
+	httpPort := startHealthServer(t, instanceID)
+
+	store := newTempStore(t)
+	now := time.Now()
+	// Write instance with profileID "other" to disk.
+	if err := store.Update(func(cfg *config.Config) error {
+		cfg.UpsertInstance(config.Instance{
+			ID:         instanceID,
+			ProfileID:  "other",
+			HTTPPort:   httpPort,
+			SocksPort:  0,
+			DaemonPID:  os.Getpid(),
+			StartedAt:  now,
+			LastSeenAt: now,
+		})
+		return nil
+	}); err != nil {
+		t.Fatalf("record instance: %v", err)
+	}
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	sentinel := errors.New("mock: stackStart for correct profile")
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		return nil, sentinel
+	}
+
+	// Request profile "prof-1" — neither snapshot nor disk has a match.
+	profile := config.Profile{ID: "prof-1", Name: "test"}
+	err := runWithProfileOptions(
+		context.Background(),
+		store,
+		profile,
+		nil,
+		[]string{"true"},
+		defaultRunTargetOptions(),
+	)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel (wrong profile should not match), got: %v", err)
+	}
+}
+
+func TestRunWithProfileOptionsRefreshesInstances(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	instanceID := "test-inst-refresh"
+	httpPort := startHealthServer(t, instanceID)
+
+	// Create a store and record the instance on disk.
+	store := newTempStore(t)
+	now := time.Now()
+	inst := config.Instance{
+		ID:         instanceID,
+		ProfileID:  "prof-1",
+		HTTPPort:   httpPort,
+		SocksPort:  0,
+		DaemonPID:  os.Getpid(),
+		StartedAt:  now,
+		LastSeenAt: now,
+	}
+	if err := store.Update(func(cfg *config.Config) error {
+		cfg.UpsertInstance(inst)
+		return nil
+	}); err != nil {
+		t.Fatalf("record instance: %v", err)
+	}
+
+	// Override stackStart so we can detect if it's called (it shouldn't be).
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		t.Fatal("stackStart should not be called when refresh finds an instance")
+		return nil, nil
+	}
+
+	// Create a simple script that exits 0.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ok.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	profile := config.Profile{ID: "prof-1", Name: "test"}
+	// Pass nil instances (simulating a stale/empty snapshot).
+	// runWithProfileOptions should reload from disk and find the instance.
+	err := runWithProfileOptions(
+		context.Background(),
+		store,
+		profile,
+		nil,
+		[]string{script},
+		defaultRunTargetOptions(),
+	)
+	if err != nil {
+		t.Fatalf("runWithProfileOptions error: %v", err)
 	}
 }

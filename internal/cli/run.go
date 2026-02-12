@@ -192,6 +192,13 @@ func runWithProfileOptions(
 	if inst := manager.FindReusableInstance(instances, profile.ID, hc); inst != nil {
 		return runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
 	}
+	// Re-read config from disk to catch instances recorded by other
+	// processes after our initial snapshot was loaded.
+	if freshCfg, err := store.Load(); err == nil {
+		if inst := manager.FindReusableInstance(freshCfg.Instances, profile.ID, hc); inst != nil {
+			return runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
+		}
+	}
 	return runWithNewStackOptions(ctx, store, profile, cmdArgs, opts)
 }
 
@@ -203,6 +210,15 @@ type runTargetOptions struct {
 	PreserveTTY    bool
 	YoloEnabled    bool
 	OnYoloFallback func() error
+	// PatchInfo, when set, records patch failure on startup crash.
+	PatchInfo *patchRunInfo
+}
+
+// patchRunInfo carries context for recording patch failures.
+type patchRunInfo struct {
+	OrigBinaryPath string
+	OrigSHA256     string
+	ConfigDir      string
 }
 
 func defaultRunTargetOptions() runTargetOptions {
@@ -305,6 +321,10 @@ func runTargetWithFallbackWithOptions(
 			opts.YoloEnabled = false
 			continue
 		}
+		// Record patch failure if the patched binary crashed on startup.
+		if opts.PatchInfo != nil && isPatchedBinaryStartupFailure(err, out) {
+			recordPatchFailure(opts.PatchInfo, err, out)
+		}
 		return err
 	}
 }
@@ -399,4 +419,24 @@ func runTargetOnceWithOptions(
 			failures = 0
 		}
 	}
+}
+
+// recordPatchFailure persists a failure entry in the patch history store so
+// subsequent runs skip the same broken patch.
+func recordPatchFailure(info *patchRunInfo, err error, output string) {
+	if info == nil || info.ConfigDir == "" {
+		return
+	}
+	phs, phsErr := config.NewPatchHistoryStore(info.ConfigDir)
+	if phsErr != nil {
+		return
+	}
+	_ = phs.Upsert(config.PatchHistoryEntry{
+		Path:          info.OrigBinaryPath,
+		OrigSHA256:    info.OrigSHA256,
+		ProxyVersion:  currentProxyVersion(),
+		PatchedAt:     time.Now(),
+		Failed:        true,
+		FailureReason: formatFailureReason(err, output),
+	})
 }
