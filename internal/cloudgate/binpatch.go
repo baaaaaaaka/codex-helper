@@ -60,6 +60,25 @@ type PatchResult struct {
 	OrigSHA256 string
 }
 
+// RemoveCloudRequirementsCache deletes the cloud requirements cache file
+// from the given Codex data directory. Codex caches cloud requirements at
+// <codexDir>/cloud-requirements-cache.json; if this cache exists, Codex
+// skips the URL fetch entirely, bypassing our binary URL-sabotage patches.
+func RemoveCloudRequirementsCache(codexDir string) error {
+	if codexDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		codexDir = filepath.Join(home, ".codex")
+	}
+	p := filepath.Join(codexDir, "cloud-requirements-cache.json")
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // Cleanup removes the patched binary and requirements file.
 func (r *PatchResult) Cleanup() {
 	if r == nil {

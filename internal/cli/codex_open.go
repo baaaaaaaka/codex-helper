@@ -103,6 +103,9 @@ func runCodexSession(
 			extraEnv = append(extraEnv, patchEnv...)
 			pInfo = info
 			defer patchResult.Cleanup()
+			// Delete the cloud requirements cache so Codex is forced to
+			// fetch (and 404 on the sabotaged URL), triggering fail-open.
+			_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
 		}
 	}
 
@@ -174,6 +177,9 @@ func runCodexNewSession(
 			extraEnv = append(extraEnv, patchEnv...)
 			pInfo = info
 			defer patchResult.Cleanup()
+			// Delete the cloud requirements cache so Codex is forced to
+			// fetch (and 404 on the sabotaged URL), triggering fail-open.
+			_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
 		}
 	}
 
