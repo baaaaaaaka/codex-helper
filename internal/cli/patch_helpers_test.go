@@ -83,7 +83,7 @@ func TestStripYoloArgsNoMatch(t *testing.T) {
 }
 
 func TestStripYoloArgs_AskForApproval(t *testing.T) {
-	in := []string{"codex", "--ask-for-approval", "never", "resume", "abc"}
+	in := []string{"codex", "--ask-for-approval", "never", "--sandbox", "danger-full-access", "resume", "abc"}
 	out := stripYoloArgs(in)
 	want := []string{"codex", "resume", "abc"}
 	if len(out) != len(want) {

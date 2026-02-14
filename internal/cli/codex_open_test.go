@@ -147,9 +147,9 @@ func TestBuildCodexResumeCommandAddsYoloArgs(t *testing.T) {
 	session := codexhistory.Session{SessionID: "abc"}
 	project := codexhistory.Project{Path: dir}
 
-	// Create a fake codex that responds to --help with --ask-for-approval.
+	// Create a fake codex that responds to --help with --ask-for-approval and --sandbox.
 	scriptPath := filepath.Join(t.TempDir(), "codex")
-	script := "#!/bin/sh\necho 'usage codex --ask-for-approval <POLICY>'\n"
+	script := "#!/bin/sh\necho 'usage codex --ask-for-approval <POLICY> --sandbox <MODE>'\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestBuildCodexResumeCommandAddsYoloArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildCodexResumeCommand error: %v", err)
 	}
-	want := []string{"--ask-for-approval", "never", "resume", "abc"}
+	want := []string{"--ask-for-approval", "never", "--sandbox", "danger-full-access", "resume", "abc"}
 	if len(args) != len(want) {
 		t.Fatalf("expected args %v, got %v", want, args)
 	}
@@ -355,9 +355,9 @@ func TestRunCodexNewSessionAddsYoloArgs(t *testing.T) {
 	outFile := filepath.Join(t.TempDir(), "args.txt")
 	scriptPath := filepath.Join(t.TempDir(), "codex")
 	// The script must respond to --help with a string containing --ask-for-approval
-	// so that codexYoloArgs detects yolo support. For any other invocation it
-	// records the arguments.
-	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --ask-for-approval <POLICY>' ;; *) printf '%%s\\n' \"$@\" > %q ;; esac\n", outFile)
+	// and --sandbox so that codexYoloArgs detects yolo support. For any other
+	// invocation it records the arguments.
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --ask-for-approval <POLICY> --sandbox <MODE>' ;; *) printf '%%s\\n' \"$@\" > %q ;; esac\n", outFile)
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
@@ -388,9 +388,10 @@ func TestRunCodexNewSessionAddsYoloArgs(t *testing.T) {
 		t.Fatalf("read output: %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
-	// Should have --ask-for-approval never as the first two args.
-	if len(lines) < 2 || lines[0] != "--ask-for-approval" || lines[1] != "never" {
-		t.Fatalf("expected yolo args [--ask-for-approval never ...], got %v", lines)
+	// Should have --ask-for-approval never --sandbox danger-full-access as the first args.
+	if len(lines) < 4 || lines[0] != "--ask-for-approval" || lines[1] != "never" ||
+		lines[2] != "--sandbox" || lines[3] != "danger-full-access" {
+		t.Fatalf("expected yolo args [--ask-for-approval never --sandbox danger-full-access ...], got %v", lines)
 	}
 }
 

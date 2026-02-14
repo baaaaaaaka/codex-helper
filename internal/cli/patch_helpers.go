@@ -68,7 +68,11 @@ func codexYoloArgs(path string) []string {
 		return []string{"--yolo"}
 	}
 	if strings.Contains(out, "--ask-for-approval") {
-		return []string{"--ask-for-approval", "never"}
+		args := []string{"--ask-for-approval", "never"}
+		if strings.Contains(out, "--sandbox") {
+			args = append(args, "--sandbox", "danger-full-access")
+		}
+		return args
 	}
 	if strings.Contains(out, "--dangerously-bypass-approvals-and-sandbox") {
 		return []string{"--dangerously-bypass-approvals-and-sandbox"}
@@ -204,7 +208,7 @@ func stripYoloArgs(cmdArgs []string) []string {
 		switch cmdArgs[i] {
 		case "--yolo", "--dangerously-bypass-approvals-and-sandbox":
 			continue
-		case "--ask-for-approval":
+		case "--ask-for-approval", "--sandbox":
 			// Skip the flag and its value.
 			if i+1 < len(cmdArgs) {
 				i++
