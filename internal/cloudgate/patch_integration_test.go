@@ -67,4 +67,14 @@ func TestCodexPatchIntegration(t *testing.T) {
 		t.Error("requirements file missing allowed_sandbox_modes")
 	}
 	t.Logf("requirements written to: %s", result.RequirementsPath)
+
+	// 6. Verify patched binary is executable (especially important on macOS).
+	cmd := exec.Command(result.PatchedBinary, "--version")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("patched binary is not executable: %v\noutput: %s", err, string(out))
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "codex") {
+		t.Fatalf("unexpected --version output from patched binary: %s", string(out))
+	}
 }

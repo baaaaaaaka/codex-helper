@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,140 @@ func buildSyntheticBinary(t *testing.T, markers ...string) []byte {
 	}
 	buf.WriteString("TRAILER_PADDING")
 	return buf.Bytes()
+}
+
+func buildMachOSyntheticBinary(t *testing.T, markers ...string) []byte {
+	t.Helper()
+	data := buildSyntheticBinary(t, markers...)
+	copy(data[:4], []byte{0xFE, 0xED, 0xFA, 0xCF})
+	return data
+}
+
+func TestLooksLikeMachO(t *testing.T) {
+	for i, magic := range machOMagics {
+		data := append([]byte{}, magic...)
+		data = append(data, 0x00, 0x00)
+		if !looksLikeMachO(data) {
+			t.Fatalf("expected magic[%d] to be recognized as Mach-O", i)
+		}
+	}
+
+	if looksLikeMachO([]byte("not-a-mach-o")) {
+		t.Fatal("unexpected Mach-O detection for plain text")
+	}
+	if looksLikeMachO([]byte{0xCA, 0xFE, 0xBA}) {
+		t.Fatal("unexpected Mach-O detection for short buffer")
+	}
+}
+
+func TestPatchCodexBinaryWithRuntime_DarwinMachOSigns(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildMachOSyntheticBinary(t, origReqPath, "/api/codex/config/requirements")
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	called := false
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "darwin", func(path string) error {
+		called = true
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("sign target should exist: %v", statErr)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+
+	if !called {
+		t.Fatal("expected darwin Mach-O patch to invoke codesign")
+	}
+	if result.PatchedBinary == "" {
+		t.Fatal("expected patched binary")
+	}
+}
+
+func TestPatchCodexBinaryWithRuntime_DarwinSignFailureCleansPatchedBinary(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildMachOSyntheticBinary(t, origReqPath, "/api/codex/config/requirements")
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "darwin", func(string) error {
+		return fmt.Errorf("codesign failed")
+	})
+	if err == nil {
+		t.Fatal("expected error when codesign fails")
+	}
+	if !strings.Contains(err.Error(), "ad-hoc sign patched binary") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	patchedPath := filepath.Join(cacheDir, "codex-patched")
+	if _, statErr := os.Stat(patchedPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected patched binary cleanup on sign failure, stat err=%v", statErr)
+	}
+}
+
+func TestPatchCodexBinaryWithRuntime_NonDarwinSkipsCodesign(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildMachOSyntheticBinary(t, origReqPath, "/api/codex/config/requirements")
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	called := false
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "linux", func(string) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+
+	if called {
+		t.Fatal("did not expect codesign on non-darwin runtime")
+	}
+}
+
+func TestPatchCodexBinaryWithRuntime_DarwinNonMachOSkipsCodesign(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t, origReqPath, "/api/codex/config/requirements")
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	called := false
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "darwin", func(string) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+
+	if called {
+		t.Fatal("did not expect codesign for non-Mach-O binary")
+	}
 }
 
 func TestPatchCodexBinaryBasic(t *testing.T) {

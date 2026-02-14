@@ -81,7 +81,7 @@ func codexYoloArgs(path string) []string {
 }
 
 func runCodexProbe(path string, arg string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, arg)
 	out, err := cmd.CombinedOutput()
@@ -121,6 +121,9 @@ func isYoloFailure(err error, output string) bool {
 func isPatchedBinaryStartupFailure(err error, output string) bool {
 	if err == nil {
 		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "signal: killed") {
+		return true
 	}
 	if isPatchedBinaryFailure(err, output) {
 		return true

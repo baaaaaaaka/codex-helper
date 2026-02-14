@@ -312,6 +312,25 @@ func TestIsPatchedBinaryStartupFailure_FatalSignal(t *testing.T) {
 	}
 }
 
+func TestIsPatchedBinaryStartupFailure_SignalKilledString(t *testing.T) {
+	if !isPatchedBinaryStartupFailure(fmt.Errorf("signal: killed"), "") {
+		t.Error("expected true for signal: killed")
+	}
+}
+
+func TestIsPatchedBinaryStartupFailure_SignalKilledStringCaseInsensitive(t *testing.T) {
+	if !isPatchedBinaryStartupFailure(fmt.Errorf("Signal: KILLED"), "") {
+		t.Error("expected true for case-insensitive signal: killed match")
+	}
+}
+
+func TestIsPatchedBinaryStartupFailure_WrappedSignalKilledString(t *testing.T) {
+	err := fmt.Errorf("run failed: %w", fmt.Errorf("signal: killed"))
+	if !isPatchedBinaryStartupFailure(err, "") {
+		t.Error("expected true for wrapped signal: killed error")
+	}
+}
+
 // --- hashFileSHA256 tests ---
 
 func TestHashFileSHA256(t *testing.T) {
