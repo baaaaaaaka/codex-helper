@@ -1,0 +1,311 @@
+name: Codex Release Monitor
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-release-monitor
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect latest @openai/codex release
+    runs-on: ubuntu-latest
+    outputs:
+      latest_version: ${{ steps.detect.outputs.latest_version }}
+      missing_versions: ${{ steps.detect.outputs.missing_versions }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Detect versions to test
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_version="$(npm view @openai/codex version | tr -d '\r\n')"
+          if [ -z "$latest_version" ]; then
+            echo "Failed to resolve latest @openai/codex version" >&2
+            exit 1
+          fi
+          echo "Latest @openai/codex: $latest_version"
+          export LATEST_VERSION="$latest_version"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          latest = os.environ["LATEST_VERSION"].strip().lstrip("v")
+          platforms = ["linux", "mac", "windows", "rockylinux8", "ubuntu20.04"]
+
+          table_path = Path("docs/codex_compatibility.md")
+          rows = {}
+          columns = []
+          if table_path.exists():
+              for line in table_path.read_text(encoding="utf-8").splitlines():
+                  if not line.startswith("|"):
+                      continue
+                  parts = [part.strip() for part in line.strip().strip("|").split("|")]
+                  if len(parts) < 2:
+                      continue
+                  if not columns:
+                      columns = parts
+                      continue
+                  if all(re.fullmatch(r"-+", part or "") for part in parts):
+                      continue
+                  row = {columns[i]: parts[i] for i in range(min(len(columns), len(parts)))}
+                  version = row.get("Codex version", "").lstrip("v")
+                  if re.fullmatch(r"\d+(?:\.\d+)+", version):
+                      rows[version] = row
+
+          missing = []
+          row = rows.get(latest)
+          if not row:
+              missing.append(latest)
+          else:
+              status_ok = all(row.get(platform, "").lower() == "pass" for platform in platforms)
+              if not status_ok:
+                  missing.append(latest)
+
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a", encoding="utf-8") as output:
+              output.write(f"latest_version={latest}\n")
+              output.write(f"missing_versions={json.dumps(missing)}\n")
+          PY
+
+  test:
+    name: Test Codex release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: detect
+    if: needs.detect.outputs.missing_versions != '[]' && needs.detect.outputs.missing_versions != ''
+    env:
+      CODEX_VERSION: ${{ needs.detect.outputs.latest_version }}
+      PLATFORM_NAME: ${{ fromJSON('{"ubuntu-latest":"linux","macos-latest":"mac","windows-latest":"windows"}')[matrix.os] }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install latest Codex (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g "@openai/codex@${CODEX_VERSION}"
+
+      - name: Install latest Codex (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm install -g "@openai/codex@$env:CODEX_VERSION"
+
+      - name: Run Codex patch + yolo smoke tests
+        id: smoke
+        continue-on-error: true
+        shell: bash
+        env:
+          CODEX_PATCH_TEST: "1"
+          CODEX_YOLO_PATCH_TEST: "1"
+        run: |
+          set -euo pipefail
+          go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
+
+      - name: Write platform result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="fail"
+          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
+            status="pass"
+          fi
+          mkdir -p results
+          cat > "results/${PLATFORM_NAME}.json" <<EOF
+          {"platform":"${PLATFORM_NAME}","results":{"${CODEX_VERSION}":"${status}"}}
+          EOF
+
+      - name: Upload patch+yolo results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-monitor-results-${{ env.PLATFORM_NAME }}
+          path: results/${{ env.PLATFORM_NAME }}.json
+
+      - name: Fail when smoke failed
+        if: steps.smoke.outcome != 'success'
+        shell: bash
+        run: |
+          echo "Codex patch+yolo smoke failed on ${PLATFORM_NAME}" >&2
+          exit 1
+
+  test-linux-distros:
+    name: Test Codex release (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.missing_versions != '[]' && needs.detect.outputs.missing_versions != ''
+    env:
+      CODEX_VERSION: ${{ needs.detect.outputs.latest_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: rockylinux8
+            image: rockylinux:8
+            install_cmd: dnf install -y ca-certificates nodejs npm
+          - platform: ubuntu20.04
+            image: ubuntu:20.04
+            install_cmd: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl nodejs npm
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Build cloudgate integration test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_bin="$GITHUB_WORKSPACE/codex_cloudgate_test"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cloudgate -c -o "$test_bin"
+          chmod +x "$test_bin"
+          echo "TEST_BIN_PATH=$test_bin" >> "$GITHUB_ENV"
+
+      - name: Run Codex patch + yolo smoke tests (container)
+        id: smoke
+        continue-on-error: true
+        shell: bash
+        env:
+          PLATFORM_NAME: ${{ matrix.platform }}
+          IMAGE: ${{ matrix.image }}
+          INSTALL_CMD: ${{ matrix.install_cmd }}
+        run: |
+          set -euo pipefail
+          run_cmd="${INSTALL_CMD} && npm install -g @openai/codex@${CODEX_VERSION} && CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration'"
+          docker run --rm \
+            -v "${TEST_BIN_PATH}:/codex_cloudgate_test:ro" \
+            "${IMAGE}" /bin/sh -lc "$run_cmd"
+
+      - name: Write distro result
+        if: always()
+        shell: bash
+        env:
+          PLATFORM_NAME: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          status="fail"
+          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
+            status="pass"
+          fi
+          mkdir -p results
+          cat > "results/${PLATFORM_NAME}.json" <<EOF
+          {"platform":"${PLATFORM_NAME}","results":{"${CODEX_VERSION}":"${status}"}}
+          EOF
+
+      - name: Upload patch+yolo results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-monitor-results-${{ matrix.platform }}
+          path: results/${{ matrix.platform }}.json
+
+      - name: Fail when smoke failed
+        if: steps.smoke.outcome != 'success'
+        shell: bash
+        run: |
+          echo "Codex patch+yolo smoke failed on ${{ matrix.platform }}" >&2
+          exit 1
+
+  update:
+    name: Update Codex compatibility table
+    runs-on: ubuntu-latest
+    needs: [detect, test, test-linux-distros]
+    if: ${{ always() && needs.detect.result == 'success' && needs.detect.outputs.missing_versions != '[]' && needs.detect.outputs.missing_versions != '' }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Download patch+yolo results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: codex-monitor-results-*
+          path: results
+          merge-multiple: true
+
+      - name: Update compatibility table
+        shell: bash
+        env:
+          LATEST_VERSION: ${{ needs.detect.outputs.latest_version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/codex_compatibility_sync.py \
+            --version "$LATEST_VERSION" \
+            --results-dir results \
+            --table-path docs/codex_compatibility.md
+
+      - name: Cleanup results
+        if: always()
+        shell: bash
+        run: |
+          rm -rf results
+
+      - name: Commit changes
+        shell: bash
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git add docs/codex_compatibility.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: update Codex compatibility table"
+          git push

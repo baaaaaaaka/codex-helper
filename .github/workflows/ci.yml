@@ -146,7 +146,7 @@ jobs:
           CODEX_PATCH_TEST: "1"
         run: |
           set -euo pipefail
-          npm install -g @anthropic-ai/codex 2>/dev/null || npm install -g codex 2>/dev/null || true
+          npm install -g @openai/codex || true
           if command -v codex >/dev/null 2>&1; then
             go test ./internal/cloudgate -run TestCodexPatchIntegration -count=1 -v
           else
