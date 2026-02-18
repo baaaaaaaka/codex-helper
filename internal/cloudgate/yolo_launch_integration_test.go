@@ -72,15 +72,15 @@ func detectYoloArgs(t *testing.T, codexPath string) []string {
 	if strings.Contains(out, "--yolo") {
 		return []string{"--yolo"}
 	}
+	if strings.Contains(out, "--dangerously-bypass-approvals-and-sandbox") {
+		return []string{"--dangerously-bypass-approvals-and-sandbox"}
+	}
 	if strings.Contains(out, "--ask-for-approval") {
 		args := []string{"--ask-for-approval", "never"}
 		if strings.Contains(out, "--sandbox") {
 			args = append(args, "--sandbox", "danger-full-access")
 		}
 		return args
-	}
-	if strings.Contains(out, "--dangerously-bypass-approvals-and-sandbox") {
-		return []string{"--dangerously-bypass-approvals-and-sandbox"}
 	}
 	return nil
 }

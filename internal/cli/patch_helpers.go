@@ -67,15 +67,19 @@ func codexYoloArgs(path string) []string {
 	if strings.Contains(out, "--yolo") {
 		return []string{"--yolo"}
 	}
+	// Prefer --dangerously-bypass-approvals-and-sandbox over the individual
+	// --ask-for-approval / --sandbox flags because the combined flag
+	// expresses full yolo intent in a single argument and also skips the
+	// git-repo safety check that the individual flags still enforce.
+	if strings.Contains(out, "--dangerously-bypass-approvals-and-sandbox") {
+		return []string{"--dangerously-bypass-approvals-and-sandbox"}
+	}
 	if strings.Contains(out, "--ask-for-approval") {
 		args := []string{"--ask-for-approval", "never"}
 		if strings.Contains(out, "--sandbox") {
 			args = append(args, "--sandbox", "danger-full-access")
 		}
 		return args
-	}
-	if strings.Contains(out, "--dangerously-bypass-approvals-and-sandbox") {
-		return []string{"--dangerously-bypass-approvals-and-sandbox"}
 	}
 	return nil
 }

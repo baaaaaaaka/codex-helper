@@ -169,6 +169,37 @@ func TestBuildCodexResumeCommandAddsYoloArgs(t *testing.T) {
 	}
 }
 
+func TestBuildCodexResumeCommandPrefersDangerouslyBypass(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	session := codexhistory.Session{SessionID: "abc"}
+	project := codexhistory.Project{Path: dir}
+
+	// Simulate Codex ≥0.104 where --help includes both --ask-for-approval
+	// and --dangerously-bypass-approvals-and-sandbox.
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\necho 'usage codex --ask-for-approval <POLICY> --sandbox <MODE> --dangerously-bypass-approvals-and-sandbox'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	_, args, _, err := buildCodexResumeCommand(scriptPath, session, project, true)
+	if err != nil {
+		t.Fatalf("buildCodexResumeCommand error: %v", err)
+	}
+	want := []string{"--dangerously-bypass-approvals-and-sandbox", "resume", "abc"}
+	if len(args) != len(want) {
+		t.Fatalf("expected args %v, got %v", want, args)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("expected args %v, got %v", want, args)
+		}
+	}
+}
+
 func TestBuildCodexResumeCommandRejectsMissingSession(t *testing.T) {
 	dir := t.TempDir()
 	session := codexhistory.Session{}
@@ -395,6 +426,52 @@ func TestRunCodexNewSessionAddsYoloArgs(t *testing.T) {
 	}
 }
 
+func TestRunCodexNewSessionPrefersDangerouslyBypass(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	outFile := filepath.Join(t.TempDir(), "args.txt")
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	// Simulate Codex ≥0.104 where --help includes both --ask-for-approval
+	// and --dangerously-bypass-approvals-and-sandbox.
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --ask-for-approval <POLICY> --sandbox <MODE> --dangerously-bypass-approvals-and-sandbox' ;; *) printf '%%s\\n' \"$@\" > %q ;; esac\n", outFile)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil,
+		nil,
+		dir,
+		scriptPath,
+		"",
+		false,
+		true,
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
+	// Should prefer --dangerously-bypass-approvals-and-sandbox over individual flags.
+	if len(lines) < 1 || lines[0] != "--dangerously-bypass-approvals-and-sandbox" {
+		t.Fatalf("expected yolo args [--dangerously-bypass-approvals-and-sandbox ...], got %v", lines)
+	}
+}
+
 func TestRunCodexNewSessionRejectsProxyWithoutProfile(t *testing.T) {
 	dir := t.TempDir()
 	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
@@ -564,5 +641,347 @@ func TestPreparePatchedBinaryRecordsHistory(t *testing.T) {
 	}
 	if entry.ProxyVersion == "" {
 		t.Fatal("entry should have proxy version")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cloud requirements cache deletion tests
+// ---------------------------------------------------------------------------
+
+// writeFakeCache creates a dummy cloud-requirements-cache.json in dir and
+// returns its path.
+func writeFakeCache(t *testing.T, dir string) string {
+	t.Helper()
+	p := filepath.Join(dir, "cloud-requirements-cache.json")
+	if err := os.WriteFile(p, []byte(`{"signed_payload":{"contents":"allowed_approval_policies = [\"on-request\"]"}}`), 0o644); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+	return p
+}
+
+// cacheExists returns true if the cloud requirements cache file exists.
+func cacheExists(t *testing.T, dir string) bool {
+	t.Helper()
+	_, err := os.Stat(filepath.Join(dir, "cloud-requirements-cache.json"))
+	if err == nil {
+		return true
+	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	t.Fatalf("stat cache: %v", err)
+	return false
+}
+
+// TestRunCodexNewSessionDeletesCacheOnYolo verifies that the cloud
+// requirements cache is always deleted when yolo mode is enabled, even when
+// binary patching fails (e.g. no native binary found for the fake script).
+func TestRunCodexNewSessionDeletesCacheOnYolo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	writeFakeCache(t, codexDir)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil, nil,
+		dir,
+		scriptPath,
+		codexDir,
+		false,
+		true, // yolo
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+
+	if cacheExists(t, codexDir) {
+		t.Fatal("cloud requirements cache should be deleted when yolo is enabled")
+	}
+}
+
+// TestRunCodexNewSessionPreservesCacheWithoutYolo verifies that the cache is
+// NOT deleted when yolo mode is disabled.
+func TestRunCodexNewSessionPreservesCacheWithoutYolo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	writeFakeCache(t, codexDir)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil, nil,
+		dir,
+		scriptPath,
+		codexDir,
+		false,
+		false, // yolo off
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+
+	if !cacheExists(t, codexDir) {
+		t.Fatal("cloud requirements cache should be preserved when yolo is disabled")
+	}
+}
+
+// TestRunCodexNewSessionDeletesCacheWhenPatchSkipped verifies that the cache
+// is deleted even when binary patching is skipped because a previous patch was
+// recorded as failed. This is the core regression test for the fix that moved
+// RemoveCloudRequirementsCache outside the patch-success block.
+func TestRunCodexNewSessionDeletesCacheWhenPatchSkipped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	// Create a config store in a specific directory so we can populate
+	// patch history in the same location.
+	configDir := t.TempDir()
+	store, err := config.NewStore(filepath.Join(configDir, "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	// Record a failed patch in history for this script's hash so that
+	// preparePatchedBinary will skip patching entirely.
+	origHash, err := hashFileSHA256(scriptPath)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	phs, err := config.NewPatchHistoryStore(configDir)
+	if err != nil {
+		t.Fatalf("patch history: %v", err)
+	}
+	if err := phs.Upsert(config.PatchHistoryEntry{
+		Path:          scriptPath,
+		OrigSHA256:    origHash,
+		Failed:        true,
+		FailureReason: "test: simulated crash",
+		PatchedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	writeFakeCache(t, codexDir)
+
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil, nil,
+		dir,
+		scriptPath,
+		codexDir,
+		false,
+		true, // yolo
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+
+	if cacheExists(t, codexDir) {
+		t.Fatal("cloud requirements cache should be deleted even when patching is skipped due to failure history")
+	}
+}
+
+// TestRunCodexSessionDeletesCacheOnYolo mirrors the new-session test for the
+// resume (runCodexSession) path.
+func TestRunCodexSessionDeletesCacheOnYolo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	writeFakeCache(t, codexDir)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	projectDir := t.TempDir()
+	session := codexhistory.Session{SessionID: "sess-cache", ProjectPath: projectDir}
+	project := codexhistory.Project{Path: projectDir}
+
+	err = runCodexSession(
+		context.Background(),
+		&rootOptions{configPath: store.Path()},
+		store,
+		nil, nil,
+		session,
+		project,
+		scriptPath,
+		codexDir,
+		false,
+		true, // yolo
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexSession error: %v", err)
+	}
+
+	if cacheExists(t, codexDir) {
+		t.Fatal("cloud requirements cache should be deleted when yolo is enabled (resume path)")
+	}
+}
+
+// TestRunCodexSessionPreservesCacheWithoutYolo verifies cache is preserved
+// when yolo is off on the resume path.
+func TestRunCodexSessionPreservesCacheWithoutYolo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	writeFakeCache(t, codexDir)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	projectDir := t.TempDir()
+	session := codexhistory.Session{SessionID: "sess-nocache", ProjectPath: projectDir}
+	project := codexhistory.Project{Path: projectDir}
+
+	err = runCodexSession(
+		context.Background(),
+		&rootOptions{configPath: store.Path()},
+		store,
+		nil, nil,
+		session,
+		project,
+		scriptPath,
+		codexDir,
+		false,
+		false, // yolo off
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexSession error: %v", err)
+	}
+
+	if !cacheExists(t, codexDir) {
+		t.Fatal("cloud requirements cache should be preserved when yolo is disabled (resume path)")
+	}
+}
+
+// TestRunCodexSessionDeletesCacheWhenPatchSkipped mirrors the new-session
+// test: cache is deleted even when patching is skipped from failure history.
+func TestRunCodexSessionDeletesCacheWhenPatchSkipped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	configDir := t.TempDir()
+	store, err := config.NewStore(filepath.Join(configDir, "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	origHash, err := hashFileSHA256(scriptPath)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	phs, err := config.NewPatchHistoryStore(configDir)
+	if err != nil {
+		t.Fatalf("patch history: %v", err)
+	}
+	if err := phs.Upsert(config.PatchHistoryEntry{
+		Path:          scriptPath,
+		OrigSHA256:    origHash,
+		Failed:        true,
+		FailureReason: "test: simulated crash",
+		PatchedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	writeFakeCache(t, codexDir)
+
+	projectDir := t.TempDir()
+	session := codexhistory.Session{SessionID: "sess-skip", ProjectPath: projectDir}
+	project := codexhistory.Project{Path: projectDir}
+
+	err = runCodexSession(
+		context.Background(),
+		&rootOptions{configPath: store.Path()},
+		store,
+		nil, nil,
+		session,
+		project,
+		scriptPath,
+		codexDir,
+		false,
+		true, // yolo
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexSession error: %v", err)
+	}
+
+	if cacheExists(t, codexDir) {
+		t.Fatal("cloud requirements cache should be deleted even when patching is skipped (resume path)")
 	}
 }
