@@ -103,10 +103,11 @@ func runCodexSession(
 			extraEnv = append(extraEnv, patchEnv...)
 			pInfo = info
 			defer patchResult.Cleanup()
-			// Delete the cloud requirements cache so Codex is forced to
-			// fetch (and 404 on the sabotaged URL), triggering fail-open.
-			_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
 		}
+		// Always delete the cloud requirements cache when yolo is
+		// requested, even if patching was skipped or failed. The cached
+		// cloud requirements would otherwise override yolo flags.
+		_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
 	}
 
 	path, args, cwd, err := buildCodexResumeCommand(codexPath, session, project, useYolo)
@@ -177,10 +178,11 @@ func runCodexNewSession(
 			extraEnv = append(extraEnv, patchEnv...)
 			pInfo = info
 			defer patchResult.Cleanup()
-			// Delete the cloud requirements cache so Codex is forced to
-			// fetch (and 404 on the sabotaged URL), triggering fail-open.
-			_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
 		}
+		// Always delete the cloud requirements cache when yolo is
+		// requested, even if patching was skipped or failed. The cached
+		// cloud requirements would otherwise override yolo flags.
+		_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
 	}
 
 	cmdArgs := []string{codexPath}

@@ -693,3 +693,111 @@ func TestRecordPatchFailure_SetsProxyVersion(t *testing.T) {
 		t.Fatalf("ProxyVersion = %q, want v0.0.5-test", entry.ProxyVersion)
 	}
 }
+
+// --- codexYoloArgs priority tests ---
+
+func TestCodexYoloArgsPrefersYoloFlag(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	// --help output contains all three yolo mechanisms.
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --yolo --ask-for-approval <POLICY> --sandbox <MODE> --dangerously-bypass-approvals-and-sandbox'\n")
+
+	got := codexYoloArgs(script)
+	want := []string{"--yolo"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("codexYoloArgs = %v, want %v", got, want)
+	}
+}
+
+func TestCodexYoloArgsPrefersDangerouslyBypassOverIndividual(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	// --help output has both --ask-for-approval and --dangerously-bypass,
+	// but NOT --yolo.
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --ask-for-approval <POLICY> --sandbox <MODE> --dangerously-bypass-approvals-and-sandbox'\n")
+
+	got := codexYoloArgs(script)
+	want := []string{"--dangerously-bypass-approvals-and-sandbox"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("codexYoloArgs = %v, want %v", got, want)
+	}
+}
+
+func TestCodexYoloArgsFallsBackToIndividualFlags(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	// --help output only has --ask-for-approval and --sandbox.
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --ask-for-approval <POLICY> --sandbox <MODE>'\n")
+
+	got := codexYoloArgs(script)
+	want := []string{"--ask-for-approval", "never", "--sandbox", "danger-full-access"}
+	if len(got) != len(want) {
+		t.Fatalf("codexYoloArgs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("codexYoloArgs = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestCodexYoloArgsFallsBackToAskForApprovalWithoutSandbox(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	// --help output only has --ask-for-approval, no --sandbox.
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --ask-for-approval <POLICY>'\n")
+
+	got := codexYoloArgs(script)
+	want := []string{"--ask-for-approval", "never"}
+	if len(got) != len(want) {
+		t.Fatalf("codexYoloArgs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("codexYoloArgs = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestCodexYoloArgsReturnsNilForUnknownHelp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	// --help output contains none of the known yolo flags.
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex [options] [prompt]'\n")
+
+	got := codexYoloArgs(script)
+	if got != nil {
+		t.Fatalf("codexYoloArgs = %v, want nil", got)
+	}
+}
+
+func TestCodexYoloArgsOnlyDangerouslyBypass(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	// --help output only has --dangerously-bypass.
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --dangerously-bypass-approvals-and-sandbox'\n")
+
+	got := codexYoloArgs(script)
+	want := []string{"--dangerously-bypass-approvals-and-sandbox"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("codexYoloArgs = %v, want %v", got, want)
+	}
+}
