@@ -60,6 +60,12 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	resolvedCmd, err := resolveRunCommand(ctx, after, cmd.ErrOrStderr())
+	if err != nil {
+		return err
+	}
+	after = resolvedCmd
+
 	store, err := config.NewStore(root.configPath)
 	if err != nil {
 		return err

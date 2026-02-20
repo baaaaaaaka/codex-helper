@@ -185,10 +185,10 @@ jobs:
         include:
           - platform: rockylinux8
             image: rockylinux:8
-            install_cmd: dnf install -y ca-certificates nodejs npm
+            install_cmd: dnf install -y ca-certificates curl xz tar
           - platform: ubuntu20.04
             image: ubuntu:20.04
-            install_cmd: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl nodejs npm
+            install_cmd: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl xz-utils
 
     steps:
       - name: Checkout default branch
@@ -221,9 +221,10 @@ jobs:
           INSTALL_CMD: ${{ matrix.install_cmd }}
         run: |
           set -euo pipefail
-          run_cmd="${INSTALL_CMD} && npm install -g @openai/codex@${CODEX_VERSION} && CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration'"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration'"
           docker run --rm \
             -v "${TEST_BIN_PATH}:/codex_cloudgate_test:ro" \
+            -v "${GITHUB_WORKSPACE}/scripts/ci:/ci:ro" \
             "${IMAGE}" /bin/sh -lc "$run_cmd"
 
       - name: Write distro result

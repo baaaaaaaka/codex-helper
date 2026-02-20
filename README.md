@@ -156,7 +156,11 @@ codex-proxy history open <session-id>
 This uses the current proxy mode (direct or SSH proxy). If proxy mode is
 enabled but no profile exists, you will be prompted to configure SSH.
 
-If `codex` is not in PATH:
+If `codex` is not in PATH, `codex-proxy` will automatically install
+`@openai/codex` in a user-local location (and bootstrap a private Node.js
+runtime when the system Node.js is missing or too old).
+
+To use a specific Codex binary:
 
 ```bash
 codex-proxy history --codex-path /path/to/codex tui

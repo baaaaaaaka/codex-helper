@@ -27,6 +27,13 @@ jobs:
           go-version: "1.24.12"
           cache: true
 
+      - name: Check CI helper scripts (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/ci/install_node_local.sh
+
       - name: gofmt (verify)
         shell: bash
         run: |
