@@ -308,5 +308,34 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
+          if ! python3 - <<'PY'
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          table = Path("docs/codex_compatibility.md")
+          new = table.read_text(encoding="utf-8")
+          try:
+              old = subprocess.check_output(
+                  ["git", "show", "HEAD:docs/codex_compatibility.md"],
+                  text=True,
+              )
+          except subprocess.CalledProcessError:
+              sys.exit(0)
+
+          timestamp_re = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+          def normalize(content: str) -> str:
+              return timestamp_re.sub("<ts>", content)
+
+          if normalize(old) == normalize(new):
+              sys.exit(1)
+          sys.exit(0)
+          PY
+          then
+            echo "Only timestamp changes detected; skipping commit."
+            exit 0
+          fi
           git commit -m "chore: update Codex compatibility table"
           git push

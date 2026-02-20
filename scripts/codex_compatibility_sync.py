@@ -125,7 +125,18 @@ def main() -> int:
     base = rows.get(version, {})
     merged = {platform: base.get(platform, "not-run") for platform in PLATFORMS}
     merged.update(updates.get(version, {}))
-    merged["last_tested_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    status_changed = version not in rows
+    if not status_changed:
+        status_changed = any(merged[p] != base.get(p, "not-run") for p in PLATFORMS)
+
+    if status_changed:
+        merged["last_tested_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        # Keep existing timestamp when only rerun metadata changes, so CI
+        # does not generate timestamp-only churn commits.
+        merged["last_tested_utc"] = base.get("last_tested_utc", "")
+
     rows[version] = merged
 
     write_table(table_path, rows)
