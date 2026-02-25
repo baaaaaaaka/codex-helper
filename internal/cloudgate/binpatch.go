@@ -23,8 +23,15 @@ const (
 
 	// Permissive requirements TOML that allows all policies.
 	// Values must be lowercase kebab-case to match Codex's serde deserialization.
+	//
+	// Both original and patched key names are included so the file works
+	// regardless of whether the TOML-key binary patches were applied.
+	// Codex's ConfigRequirementsToml does NOT use serde(deny_unknown_fields),
+	// so the unrecognized duplicate keys are silently ignored.
 	permissiveRequirements = `allowed_approval_policies = ["never", "on-request", "on-failure", "untrusted"]
+allowed_approval_policiez = ["never", "on-request", "on-failure", "untrusted"]
 allowed_sandbox_modes = ["danger-full-access", "workspace-write", "read-only"]
+allowed_sandbox_modez = ["danger-full-access", "workspace-write", "read-only"]
 `
 
 	adhocCodesignTimeout = 10 * time.Second
@@ -52,6 +59,31 @@ var cloudRequirementsPatches = []binaryPatch{
 		old:  []byte("/wham/config/requirements"),
 		new:  []byte("/wham/config/requirementz"),
 		name: "cloud requirements WHAM path",
+	},
+}
+
+// tomlKeyPatches renames the serde field names that Codex uses to
+// deserialize cloud requirements TOML. When these keys are patched,
+// the cloud requirements response (which uses the original key names)
+// can no longer be parsed, causing Codex to treat it as "no cloud
+// requirements" (fail-open). The local permissive requirements file
+// uses the patched key names so it is still parsed correctly.
+//
+// This is necessary because ChatGPT-authenticated sessions fetch cloud
+// requirements via the multiplexed backend-api connection rather than
+// dedicated REST endpoints, so URL sabotage alone is insufficient.
+var tomlKeyPatches = []binaryPatch{
+	{
+		// "allowed_approval_policies" (25 bytes) → change last char 's' → 'z'
+		old:  []byte("allowed_approval_policies"),
+		new:  []byte("allowed_approval_policiez"),
+		name: "approval policies TOML key",
+	},
+	{
+		// "allowed_sandbox_modes" (21 bytes) → change last char 's' → 'z'
+		old:  []byte("allowed_sandbox_modes"),
+		new:  []byte("allowed_sandbox_modez"),
+		name: "sandbox modes TOML key",
 	},
 }
 
@@ -183,7 +215,18 @@ func patchCodexBinaryWithRuntime(
 			patched = true
 		}
 		// count == 0: already patched; count > 1: ambiguous, skip.
-		// count == 0: already patched, skip.
+	}
+
+	// Patch 3: Rename TOML field names used for cloud requirements parsing.
+	for _, p := range tomlKeyPatches {
+		if len(p.old) != len(p.new) {
+			return nil, fmt.Errorf("%s: length mismatch %d vs %d", p.name, len(p.old), len(p.new))
+		}
+		if count := bytes.Count(data, p.old); count == 1 {
+			data = bytes.Replace(data, p.old, p.new, 1)
+			patched = true
+		}
+		// count == 0: already patched; count > 1: ambiguous, skip.
 	}
 
 	if !patched {
@@ -228,6 +271,10 @@ func patchCodexBinaryWithRuntime(
 // PatchCodexBinary patches a Codex binary:
 //  1. Redirects the system requirements path to a user-writable permissive file.
 //  2. Sabotages the cloud requirements URL paths so the fetch 404s (fail-open).
+//  3. Renames TOML field names so cloud requirements responses can't be parsed
+//     (fail-open). This covers ChatGPT-authenticated sessions where cloud
+//     requirements are fetched via the multiplexed backend-api connection
+//     rather than dedicated REST endpoints.
 //
 // The original binary is not modified; a copy is placed in cacheDir.
 func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) {

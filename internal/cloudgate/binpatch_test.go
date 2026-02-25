@@ -167,6 +167,8 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		origReqPath,
 		"/api/codex/config/requirements",
 		"/wham/config/requirements",
+		"allowed_approval_policies",
+		"allowed_sandbox_modes",
 	)
 	if err := os.WriteFile(origPath, data, 0o755); err != nil {
 		t.Fatalf("write: %v", err)
@@ -199,6 +201,14 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		t.Error("patched binary still contains original WHAM path")
 	}
 
+	// Original TOML keys should be gone.
+	if bytes.Contains(patched, []byte("allowed_approval_policies")) {
+		t.Error("patched binary still contains original approval policies key")
+	}
+	if bytes.Contains(patched, []byte("allowed_sandbox_modes")) {
+		t.Error("patched binary still contains original sandbox modes key")
+	}
+
 	// Replacement paths should be present.
 	if !bytes.Contains(patched, []byte(patchedReqPath)) {
 		t.Error("patched binary missing new requirements path")
@@ -210,16 +220,35 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		t.Error("patched binary missing sabotaged WHAM path")
 	}
 
-	// Requirements file should exist.
+	// Patched TOML keys should be present.
+	if !bytes.Contains(patched, []byte("allowed_approval_policiez")) {
+		t.Error("patched binary missing renamed approval policies key")
+	}
+	if !bytes.Contains(patched, []byte("allowed_sandbox_modez")) {
+		t.Error("patched binary missing renamed sandbox modes key")
+	}
+
+	// Requirements file should contain both original and patched key names.
 	reqData, err := os.ReadFile(patchedReqPath)
 	if err != nil {
 		t.Fatalf("read requirements: %v", err)
 	}
-	if !strings.Contains(string(reqData), `"never"`) {
+	reqStr := string(reqData)
+	if !strings.Contains(reqStr, `"never"`) {
 		t.Error("requirements missing never policy")
 	}
-	if !strings.Contains(string(reqData), `"danger-full-access"`) {
+	if !strings.Contains(reqStr, `"danger-full-access"`) {
 		t.Error("requirements missing danger-full-access sandbox mode")
+	}
+	for _, key := range []string{
+		"allowed_approval_policies",
+		"allowed_approval_policiez",
+		"allowed_sandbox_modes",
+		"allowed_sandbox_modez",
+	} {
+		if !strings.Contains(reqStr, key) {
+			t.Errorf("requirements missing key %q", key)
+		}
 	}
 }
 
@@ -231,6 +260,8 @@ func TestPatchCodexBinaryIdempotent(t *testing.T) {
 		patchedReqPath,
 		"/api/codex/config/requirementz",
 		"/wham/config/requirementz",
+		"allowed_approval_policiez",
+		"allowed_sandbox_modez",
 	)
 	origPath := filepath.Join(dir, "codex")
 	if err := os.WriteFile(origPath, data, 0o755); err != nil {
@@ -347,15 +378,25 @@ func TestPatchLengthConsistency(t *testing.T) {
 			t.Errorf("%s: length mismatch: %d vs %d", p.name, len(p.old), len(p.new))
 		}
 	}
+	for _, p := range tomlKeyPatches {
+		if len(p.old) != len(p.new) {
+			t.Errorf("%s: length mismatch: %d vs %d", p.name, len(p.old), len(p.new))
+		}
+	}
 }
 
 func TestPermissiveRequirementsFormat(t *testing.T) {
-	// Validate the TOML content matches expected format.
-	if !strings.Contains(permissiveRequirements, "allowed_approval_policies") {
-		t.Error("missing allowed_approval_policies key")
-	}
-	if !strings.Contains(permissiveRequirements, "allowed_sandbox_modes") {
-		t.Error("missing allowed_sandbox_modes key")
+	// Both original and patched key names must be present so the file
+	// works regardless of whether the TOML-key binary patches applied.
+	for _, key := range []string{
+		"allowed_approval_policies",
+		"allowed_approval_policiez",
+		"allowed_sandbox_modes",
+		"allowed_sandbox_modez",
+	} {
+		if !strings.Contains(permissiveRequirements, key) {
+			t.Errorf("missing key %q", key)
+		}
 	}
 
 	// Check all expected values are present.
@@ -406,6 +447,8 @@ func TestPatchCodexBinaryOrigSHA256_Patched(t *testing.T) {
 		origReqPath,
 		"/api/codex/config/requirements",
 		"/wham/config/requirements",
+		"allowed_approval_policies",
+		"allowed_sandbox_modes",
 	)
 	if err := os.WriteFile(origPath, data, 0o755); err != nil {
 		t.Fatalf("write: %v", err)
@@ -436,6 +479,8 @@ func TestPatchCodexBinaryOrigSHA256_NoPatchNeeded(t *testing.T) {
 		patchedReqPath,
 		"/api/codex/config/requirementz",
 		"/wham/config/requirementz",
+		"allowed_approval_policiez",
+		"allowed_sandbox_modez",
 	)
 	if err := os.WriteFile(origPath, data, 0o755); err != nil {
 		t.Fatalf("write: %v", err)
