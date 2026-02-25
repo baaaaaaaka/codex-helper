@@ -189,6 +189,11 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		if useProxy {
 			p, cfgWithProfile, err := ensureProfile(ctx, store, profileRef, true, cmd.OutOrStdout())
 			if err != nil {
+				// Rollback proxy preference so next launch re-asks.
+				_ = store.Update(func(c *config.Config) error {
+					c.ProxyEnabled = nil
+					return nil
+				})
 				return err
 			}
 			cfg = cfgWithProfile
@@ -234,6 +239,11 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 				}
 				if toggle.Enable && toggle.RequireConfig {
 					if _, err := initProfileInteractive(ctx, store); err != nil {
+						// Rollback proxy preference so next launch re-asks.
+						_ = store.Update(func(c *config.Config) error {
+							c.ProxyEnabled = nil
+							return nil
+						})
 						return err
 					}
 				}
