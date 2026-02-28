@@ -567,6 +567,27 @@ func TestEnsureCodexInstalledClearsRelativeCachedPath(t *testing.T) {
 	}
 }
 
+func TestCodexInstallLockIsContended(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "codex_install.lock")
+
+	if codexInstallLockIsContended(lockPath, nil) {
+		t.Fatal("nil error should not be treated as lock contention")
+	}
+	if !codexInstallLockIsContended(lockPath, os.ErrPermission) {
+		t.Fatal("permission error should be treated as lock contention")
+	}
+	if codexInstallLockIsContended(lockPath, io.EOF) {
+		t.Fatal("unexpected non-lock error should not be treated as contention")
+	}
+
+	if err := os.Mkdir(lockPath, 0o700); err != nil {
+		t.Fatalf("create lock dir: %v", err)
+	}
+	if !codexInstallLockIsContended(lockPath, io.EOF) {
+		t.Fatal("existing lock path should be treated as contention")
+	}
+}
+
 func TestWithCodexInstallLockFallsBackAfterTimeout(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())

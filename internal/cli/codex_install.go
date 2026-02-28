@@ -439,7 +439,7 @@ func withCodexInstallLock(ctx context.Context, out io.Writer, fn func() error) e
 			defer func() { _ = os.Remove(lockPath) }()
 			return fn()
 		}
-		if !os.IsExist(err) {
+		if !codexInstallLockIsContended(lockPath, err) {
 			return fmt.Errorf("acquire codex install lock: %w", err)
 		}
 		stale, staleErr := codexInstallLockStale(lockPath)
@@ -466,6 +466,17 @@ func withCodexInstallLock(ctx context.Context, out io.Writer, fn func() error) e
 		case <-time.After(codexInstallLockPollDelay):
 		}
 	}
+}
+
+func codexInstallLockIsContended(lockPath string, err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.IsExist(err) || os.IsPermission(err) {
+		return true
+	}
+	_, statErr := os.Stat(lockPath)
+	return statErr == nil
 }
 
 func codexInstallLockStale(lockPath string) (bool, error) {
