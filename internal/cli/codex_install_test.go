@@ -570,6 +570,10 @@ func TestEnsureCodexInstalledClearsRelativeCachedPath(t *testing.T) {
 func TestWithCodexInstallLockFallsBackAfterTimeout(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	if runtime.GOOS == "windows" {
+		t.Setenv("LOCALAPPDATA", t.TempDir())
+		t.Setenv("APPDATA", t.TempDir())
+	}
 
 	lockPath := codexInstallLockPath()
 	if lockPath == "" {
@@ -581,6 +585,7 @@ func TestWithCodexInstallLockFallsBackAfterTimeout(t *testing.T) {
 	if err := os.Mkdir(lockPath, 0o700); err != nil {
 		t.Fatalf("create held lock: %v", err)
 	}
+	defer os.Remove(lockPath)
 
 	prevPoll := codexInstallLockPollDelay
 	prevWait := codexInstallLockMaxWait
@@ -614,6 +619,10 @@ func TestWithCodexInstallLockFallsBackAfterTimeout(t *testing.T) {
 func TestWithCodexInstallLockAcquiresAfterRelease(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	if runtime.GOOS == "windows" {
+		t.Setenv("LOCALAPPDATA", t.TempDir())
+		t.Setenv("APPDATA", t.TempDir())
+	}
 
 	lockPath := codexInstallLockPath()
 	if lockPath == "" {
@@ -625,6 +634,7 @@ func TestWithCodexInstallLockAcquiresAfterRelease(t *testing.T) {
 	if err := os.Mkdir(lockPath, 0o700); err != nil {
 		t.Fatalf("create held lock: %v", err)
 	}
+	defer os.Remove(lockPath)
 
 	prevPoll := codexInstallLockPollDelay
 	prevWait := codexInstallLockMaxWait

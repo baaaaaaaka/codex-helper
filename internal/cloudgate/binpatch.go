@@ -410,6 +410,12 @@ func patchCodexBinaryWithRuntime(
 	if err := os.WriteFile(patchedPath, data, 0o755); err != nil {
 		return nil, fmt.Errorf("write patched binary: %w", err)
 	}
+	if goos != "windows" {
+		if err := os.Chmod(patchedPath, 0o755); err != nil {
+			_ = os.Remove(patchedPath)
+			return nil, fmt.Errorf("set patched binary executable: %w", err)
+		}
+	}
 	if goos == "darwin" && looksLikeMachO(data) {
 		if err := codesignFn(patchedPath); err != nil {
 			_ = os.Remove(patchedPath)

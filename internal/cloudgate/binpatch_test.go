@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -253,6 +254,36 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		if !strings.Contains(reqStr, key) {
 			t.Errorf("requirements missing key %q", key)
 		}
+	}
+}
+
+func TestPatchCodexBinarySetsExecutablePermission(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("executable permission bits are not meaningful on windows")
+	}
+
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t, origReqPath, "/api/codex/config/requirements")
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, runtime.GOOS, nil)
+	if err != nil {
+		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+
+	info, err := os.Stat(result.PatchedBinary)
+	if err != nil {
+		t.Fatalf("stat patched binary: %v", err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("patched binary should be executable, mode=%#o", info.Mode().Perm())
 	}
 }
 

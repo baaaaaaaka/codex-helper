@@ -156,6 +156,7 @@ jobs:
           npm install -g @openai/codex || true
           if command -v codex >/dev/null 2>&1; then
             go test ./internal/cloudgate -run TestCodexPatchIntegration -count=1 -v
+            go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
           else
             echo "Codex not available, skipping patch integration test"
           fi

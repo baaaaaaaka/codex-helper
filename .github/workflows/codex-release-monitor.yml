@@ -143,6 +143,7 @@ jobs:
         run: |
           set -euo pipefail
           go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
+          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
 
       - name: Write platform result
         if: always()
@@ -202,7 +203,7 @@ jobs:
           go-version: "1.24.12"
           cache: true
 
-      - name: Build cloudgate integration test binary
+      - name: Build integration test binaries
         shell: bash
         run: |
           set -euo pipefail
@@ -210,6 +211,10 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cloudgate -c -o "$test_bin"
           chmod +x "$test_bin"
           echo "TEST_BIN_PATH=$test_bin" >> "$GITHUB_ENV"
+          cli_test_bin="$GITHUB_WORKSPACE/codex_cli_test"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cli -c -o "$cli_test_bin"
+          chmod +x "$cli_test_bin"
+          echo "CLI_TEST_BIN_PATH=$cli_test_bin" >> "$GITHUB_ENV"
 
       - name: Run Codex patch + yolo smoke tests (container)
         id: smoke
@@ -221,9 +226,10 @@ jobs:
           INSTALL_CMD: ${{ matrix.install_cmd }}
         run: |
           set -euo pipefail
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration'"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run TestProbeCodexIntegration"
           docker run --rm \
             -v "${TEST_BIN_PATH}:/codex_cloudgate_test:ro" \
+            -v "${CLI_TEST_BIN_PATH}:/codex_cli_test:ro" \
             -v "${GITHUB_WORKSPACE}/scripts/ci:/ci:ro" \
             "${IMAGE}" /bin/sh -lc "$run_cmd"
 
