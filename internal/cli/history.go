@@ -200,12 +200,6 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			profile = &p
 		}
 
-		resolvedCodexPath, err := ensureCodexInstalled(ctx, codexPath, cmd.ErrOrStderr())
-		if err != nil {
-			return err
-		}
-		codexPath = resolvedCodexPath
-
 		defaultCwd, _ := os.Getwd()
 		selection, err := selectSession(ctx, tui.Options{
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {

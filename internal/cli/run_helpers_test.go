@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -48,6 +50,202 @@ func TestRunWithExistingInstance(t *testing.T) {
 	}
 	if err := runWithExistingInstance(context.Background(), manager.HealthClient{Timeout: time.Second}, inst, []string{shell, "-c", "exit 0"}); err != nil {
 		t.Fatalf("runWithExistingInstance error: %v", err)
+	}
+}
+
+func TestRunWithExistingInstanceOptionsInstallsCodexUsingProxyEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based test on windows")
+	}
+
+	instanceID := "inst-install-proxy"
+	httpPort := startHealthServer(t, instanceID)
+	inst := config.Instance{
+		ID:         instanceID,
+		ProfileID:  "p1",
+		HTTPPort:   httpPort,
+		DaemonPID:  os.Getpid(),
+		LastSeenAt: time.Now(),
+	}
+
+	home := t.TempDir()
+	installDir := filepath.Join(home, ".local", "share", "codex-proxy", "npm-global", "bin")
+	codexPath := filepath.Join(installDir, "codex")
+	expectedProxy := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
+
+	binDir := t.TempDir()
+	installer := filepath.Join(binDir, "bash")
+	script := "#!/bin/sh\n" +
+		"if [ \"$HTTP_PROXY\" != \"" + expectedProxy + "\" ]; then\n" +
+		"  echo \"unexpected HTTP_PROXY=$HTTP_PROXY\" >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"mkdir -p \"" + installDir + "\"\n" +
+		"cat > \"" + codexPath + "\" <<'EOF'\n" +
+		"#!/bin/sh\nexit 0\n" +
+		"EOF\n" +
+		"chmod +x \"" + codexPath + "\"\n"
+	if err := os.WriteFile(installer, []byte(script), 0o700); err != nil {
+		t.Fatalf("write installer: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("PATH", strings.Join([]string{binDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
+	clearCachedCodexPath()
+
+	opts := runTargetOptions{UseProxy: false, Log: io.Discard}
+	if err := runWithExistingInstanceOptions(context.Background(), manager.HealthClient{Timeout: time.Second}, inst, []string{"codex", "--help"}, opts); err != nil {
+		t.Fatalf("runWithExistingInstanceOptions error: %v", err)
+	}
+	if _, err := os.Stat(codexPath); err != nil {
+		t.Fatalf("expected installed codex at %q: %v", codexPath, err)
+	}
+}
+
+func TestWithProfileInstallEnvUsesExistingInstance(t *testing.T) {
+	instanceID := "inst-profile-install-env"
+	httpPort := startHealthServer(t, instanceID)
+	profile := config.Profile{ID: "p1"}
+	instances := []config.Instance{{
+		ID:         instanceID,
+		ProfileID:  profile.ID,
+		HTTPPort:   httpPort,
+		DaemonPID:  os.Getpid(),
+		LastSeenAt: time.Now(),
+	}}
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		t.Fatal("stackStart should not be called when reusable instance exists")
+		return nil, nil
+	}
+
+	store := newTempStore(t)
+	expectedProxy := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
+	if err := withProfileInstallEnv(context.Background(), store, profile, instances, func(installerEnv []string) error {
+		got := ""
+		for _, kv := range installerEnv {
+			if strings.HasPrefix(kv, "HTTP_PROXY=") {
+				got = strings.TrimPrefix(kv, "HTTP_PROXY=")
+				break
+			}
+		}
+		if got != expectedProxy {
+			t.Fatalf("expected HTTP_PROXY %q, got %q", expectedProxy, got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withProfileInstallEnv error: %v", err)
+	}
+}
+
+func TestWithProfileInstallEnvFallsBackToNewStackWhenReusableInstallFails(t *testing.T) {
+	existingID := "inst-profile-install-fallback"
+	existingHTTPPort := startHealthServer(t, existingID)
+	profile := config.Profile{ID: "p1"}
+	instances := []config.Instance{{
+		ID:         existingID,
+		ProfileID:  profile.ID,
+		HTTPPort:   existingHTTPPort,
+		DaemonPID:  os.Getpid(),
+		LastSeenAt: time.Now(),
+	}}
+
+	newStackHTTPPort := 22345
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		return stack.NewStackForTest(newStackHTTPPort, 23456), nil
+	}
+
+	store := newTempStore(t)
+	existingProxy := fmt.Sprintf("http://127.0.0.1:%d", existingHTTPPort)
+	newProxy := fmt.Sprintf("http://127.0.0.1:%d", newStackHTTPPort)
+	seen := []string{}
+	if err := withProfileInstallEnv(context.Background(), store, profile, instances, func(installerEnv []string) error {
+		got := ""
+		for _, kv := range installerEnv {
+			if strings.HasPrefix(kv, "HTTP_PROXY=") {
+				got = strings.TrimPrefix(kv, "HTTP_PROXY=")
+				break
+			}
+		}
+		seen = append(seen, got)
+		if got == existingProxy {
+			return fmt.Errorf("simulated reusable instance install failure")
+		}
+		if got != newProxy {
+			return fmt.Errorf("unexpected HTTP_PROXY %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withProfileInstallEnv error: %v", err)
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected reusable + fallback install attempts, got %v", seen)
+	}
+}
+
+func TestRunWithProfileOptionsFallsBackToNewStackWhenReusableInstallFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based test on windows")
+	}
+
+	existingID := "inst-existing-fail"
+	existingHTTPPort := startHealthServer(t, existingID)
+	profile := config.Profile{ID: "p1", Name: "profile", Host: "host", Port: 22, User: "user"}
+	instances := []config.Instance{{
+		ID:         existingID,
+		ProfileID:  profile.ID,
+		HTTPPort:   existingHTTPPort,
+		DaemonPID:  os.Getpid(),
+		LastSeenAt: time.Now(),
+	}}
+
+	store := newTempStore(t)
+
+	home := t.TempDir()
+	installDir := filepath.Join(home, ".local", "share", "codex-proxy", "npm-global", "bin")
+	codexPath := filepath.Join(installDir, "codex")
+
+	newStackHTTPPort := 12345
+	expectedNewProxy := fmt.Sprintf("http://127.0.0.1:%d", newStackHTTPPort)
+
+	binDir := t.TempDir()
+	installer := filepath.Join(binDir, "bash")
+	script := "#!/bin/sh\n" +
+		"if [ \"$HTTP_PROXY\" != \"" + expectedNewProxy + "\" ]; then\n" +
+		"  echo \"reject proxy: $HTTP_PROXY\" >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"mkdir -p \"" + installDir + "\"\n" +
+		"cat > \"" + codexPath + "\" <<'EOF'\n" +
+		"#!/bin/sh\nexit 0\n" +
+		"EOF\n" +
+		"chmod +x \"" + codexPath + "\"\n"
+	if err := os.WriteFile(installer, []byte(script), 0o700); err != nil {
+		t.Fatalf("write installer: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("PATH", strings.Join([]string{binDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
+	clearCachedCodexPath()
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		return stack.NewStackForTest(newStackHTTPPort, 23456), nil
+	}
+
+	opts := runTargetOptions{UseProxy: true, Log: io.Discard}
+	if err := runWithProfileOptions(context.Background(), store, profile, instances, []string{"codex", "--help"}, opts); err != nil {
+		t.Fatalf("runWithProfileOptions error: %v", err)
+	}
+	if _, err := os.Stat(codexPath); err != nil {
+		t.Fatalf("expected codex installed after fallback to new stack: %v", err)
 	}
 }
 

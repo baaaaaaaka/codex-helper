@@ -86,7 +86,16 @@ func runCodexSession(
 	useYolo bool,
 	log io.Writer,
 ) error {
-	codexPathResolved, err := ensureCodexInstalled(ctx, codexPath, log)
+	installOpts := codexInstallOptions{}
+	if useProxy {
+		if profile == nil {
+			return fmt.Errorf("proxy mode enabled but no profile configured")
+		}
+		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
+			return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
+		}
+	}
+	codexPathResolved, err := ensureCodexInstalledWithOptions(ctx, codexPath, log, installOpts)
 	if err != nil {
 		return err
 	}
@@ -134,9 +143,6 @@ func runCodexSession(
 	}
 
 	if useProxy {
-		if profile == nil {
-			return fmt.Errorf("proxy mode enabled but no profile configured")
-		}
 		return runWithProfileOptions(ctx, store, *profile, instances, cmdArgs, opts)
 	}
 
@@ -161,7 +167,16 @@ func runCodexNewSession(
 		return err
 	}
 
-	codexPathResolved, err := ensureCodexInstalled(ctx, codexPath, log)
+	installOpts := codexInstallOptions{}
+	if useProxy {
+		if profile == nil {
+			return fmt.Errorf("proxy mode enabled but no profile configured")
+		}
+		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
+			return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
+		}
+	}
+	codexPathResolved, err := ensureCodexInstalledWithOptions(ctx, codexPath, log, installOpts)
 	if err != nil {
 		return err
 	}
@@ -209,9 +224,6 @@ func runCodexNewSession(
 	}
 
 	if useProxy {
-		if profile == nil {
-			return fmt.Errorf("proxy mode enabled but no profile configured")
-		}
 		return runWithProfileOptions(ctx, store, *profile, instances, cmdArgs, opts)
 	}
 

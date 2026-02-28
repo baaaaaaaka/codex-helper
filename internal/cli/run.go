@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -60,12 +61,6 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	resolvedCmd, err := resolveRunCommand(ctx, after, cmd.ErrOrStderr())
-	if err != nil {
-		return err
-	}
-	after = resolvedCmd
-
 	store, err := config.NewStore(root.configPath)
 	if err != nil {
 		return err
@@ -76,7 +71,9 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		return err
 	}
 
-	return runWithProfile(ctx, store, profile, cfg.Instances, after)
+	opts := defaultRunTargetOptions()
+	opts.Log = cmd.ErrOrStderr()
+	return runWithProfileOptions(ctx, store, profile, cfg.Instances, after, opts)
 }
 
 func selectProfile(cfg config.Config, ref string) (config.Profile, error) {
@@ -107,6 +104,18 @@ func runWithExistingInstanceOptions(
 	opts runTargetOptions,
 ) error {
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)
+	log := opts.Log
+	if log == nil {
+		log = os.Stderr
+	}
+	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, cmdArgs, log, codexInstallOptions{
+		installerEnv: env.WithProxy(os.Environ(), proxyURL),
+	})
+	if err != nil {
+		return codexResolveError{err: err}
+	}
+	cmdArgs = resolvedCmd
+
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
 		return hc.CheckHTTPProxy(inst.HTTPPort, inst.ID)
 	}, nil, opts)
@@ -169,6 +178,17 @@ func runWithNewStackOptions(
 	if len(cmdArgs) == 0 {
 		return fmt.Errorf("missing command")
 	}
+	log := opts.Log
+	if log == nil {
+		log = os.Stderr
+	}
+	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, cmdArgs, log, codexInstallOptions{
+		installerEnv: env.WithProxy(os.Environ(), proxyURL),
+	})
+	if err != nil {
+		return err
+	}
+	cmdArgs = resolvedCmd
 
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
@@ -196,13 +216,31 @@ func runWithProfileOptions(
 ) error {
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
 	if inst := manager.FindReusableInstance(instances, profile.ID, hc); inst != nil {
-		return runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
+		err := runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
+		if err == nil {
+			return nil
+		}
+		if !isCodexResolveError(err) {
+			return err
+		}
+		if opts.Log != nil {
+			_, _ = fmt.Fprintln(opts.Log, "reusable proxy instance failed during codex install; starting a fresh proxy instance...")
+		}
 	}
 	// Re-read config from disk to catch instances recorded by other
 	// processes after our initial snapshot was loaded.
 	if freshCfg, err := store.Load(); err == nil {
 		if inst := manager.FindReusableInstance(freshCfg.Instances, profile.ID, hc); inst != nil {
-			return runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
+			err := runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
+			if err == nil {
+				return nil
+			}
+			if !isCodexResolveError(err) {
+				return err
+			}
+			if opts.Log != nil {
+				_, _ = fmt.Fprintln(opts.Log, "reusable proxy instance failed during codex install; starting a fresh proxy instance...")
+			}
 		}
 	}
 	return runWithNewStackOptions(ctx, store, profile, cmdArgs, opts)
@@ -212,12 +250,33 @@ type runTargetOptions struct {
 	Cwd      string
 	ExtraEnv []string
 	UseProxy bool
+	Log      io.Writer
 	// PreserveTTY keeps stdout/stderr attached to the terminal for interactive CLIs.
 	PreserveTTY    bool
 	YoloEnabled    bool
 	OnYoloFallback func() error
 	// PatchInfo, when set, records patch failure on startup crash.
 	PatchInfo *patchRunInfo
+}
+
+type codexResolveError struct {
+	err error
+}
+
+func (e codexResolveError) Error() string {
+	if e.err == nil {
+		return "codex resolve failed"
+	}
+	return e.err.Error()
+}
+
+func (e codexResolveError) Unwrap() error {
+	return e.err
+}
+
+func isCodexResolveError(err error) bool {
+	var target codexResolveError
+	return errors.As(err, &target)
 }
 
 // patchRunInfo carries context for recording patch failures.
@@ -229,6 +288,59 @@ type patchRunInfo struct {
 
 func defaultRunTargetOptions() runTargetOptions {
 	return runTargetOptions{UseProxy: true}
+}
+
+func withProfileInstallEnv(
+	ctx context.Context,
+	store *config.Store,
+	profile config.Profile,
+	instances []config.Instance,
+	runInstall func([]string) error,
+) error {
+	installViaProxy := func(proxyURL string) error {
+		return runInstall(env.WithProxy(os.Environ(), proxyURL))
+	}
+
+	var reuseErr error
+	hc := manager.HealthClient{Timeout: 1 * time.Second}
+	if inst := manager.FindReusableInstance(instances, profile.ID, hc); inst != nil {
+		if err := installViaProxy(fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)); err == nil {
+			return nil
+		} else {
+			reuseErr = err
+		}
+	}
+	if store != nil {
+		if freshCfg, err := store.Load(); err == nil {
+			if inst := manager.FindReusableInstance(freshCfg.Instances, profile.ID, hc); inst != nil {
+				if err := installViaProxy(fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)); err == nil {
+					return nil
+				} else if reuseErr == nil {
+					reuseErr = err
+				}
+			}
+		}
+	}
+
+	instanceID, err := ids.New()
+	if err != nil {
+		return err
+	}
+	st, err := stackStart(profile, instanceID, stack.Options{})
+	if err != nil {
+		if reuseErr != nil {
+			return fmt.Errorf("reusable proxy install failed (%v) and fallback stack startup failed: %w", reuseErr, err)
+		}
+		return err
+	}
+	defer func() { _ = st.Close(context.Background()) }()
+	if err := installViaProxy(st.HTTPProxyURL()); err != nil {
+		if reuseErr != nil {
+			return fmt.Errorf("reusable proxy install failed (%v) and fallback stack install failed: %w", reuseErr, err)
+		}
+		return err
+	}
+	return nil
 }
 
 func runTargetSupervised(

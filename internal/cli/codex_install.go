@@ -9,7 +9,25 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
+
+const (
+	codexPathCacheFile   = "codex_path"
+	codexInstallLockName = "codex_install.lock"
+	codexProbeTimeout    = 5 * time.Second
+)
+
+var (
+	codexInstallLockPollDelay  = 200 * time.Millisecond
+	codexInstallLockStaleAfter = 30 * time.Minute
+	codexInstallLockMaxWait    = 30 * time.Second
+)
+
+type codexInstallOptions struct {
+	installerEnv     []string
+	withInstallerEnv func(context.Context, func([]string) error) error
+}
 
 type codexInstallCmd struct {
 	path string
@@ -21,6 +39,9 @@ const codexInstallBootstrap = `set -eu
 min_major="${CODEX_NODE_MIN_MAJOR:-16}"
 target_major="${CODEX_NODE_MAJOR:-22}"
 home_dir="${HOME:-}"
+if [ -z "$home_dir" ]; then
+  home_dir="$(cd ~ 2>/dev/null && pwd || true)"
+fi
 if [ -z "$home_dir" ]; then
   home_dir="$(pwd)"
 fi
@@ -35,17 +56,12 @@ parse_major() {
   esac
 }
 
-node_bin_dir=""
-npm_cmd=""
-if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-  node_major="$(parse_major "$(node -v 2>/dev/null || true)")"
-  if [ -n "$node_major" ] && [ "$node_major" -ge "$min_major" ]; then
-    node_bin_dir="$(dirname "$(command -v node)")"
-    npm_cmd="$(command -v npm)"
-  fi
-fi
+is_wsl=false
+case "$(uname -r 2>/dev/null || true)" in
+  *[Mm]icrosoft*|*WSL*) is_wsl=true ;;
+esac
 
-if [ -z "$npm_cmd" ]; then
+download_local_node() {
   os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
   case "$os_name" in
     linux|darwin) ;;
@@ -129,6 +145,7 @@ if [ -z "$npm_cmd" ]; then
     rm -rf "$install_dir"
     mkdir -p "$install_dir"
     tar -xJf "$archive_path" --strip-components=1 -C "$install_dir"
+    rm -rf "$tmp_dir"
   fi
 
   if [ ! -x "$npm_path" ]; then
@@ -137,11 +154,44 @@ if [ -z "$npm_cmd" ]; then
   fi
   node_bin_dir="$install_dir/bin"
   npm_cmd="$npm_path"
+}
+
+node_bin_dir=""
+npm_cmd=""
+used_system_node=false
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  node_found="$(command -v node)"
+  skip_system=false
+  # On WSL, Windows binaries under /mnt/ are visible via PATH interop but
+  # npm would install wrong platform-specific optional dependencies.
+  if $is_wsl; then
+    case "$node_found" in
+      /mnt/*) skip_system=true ;;
+    esac
+  fi
+  if ! $skip_system; then
+    node_major="$(parse_major "$(node -v 2>/dev/null || true)")"
+    if [ -n "$node_major" ] && [ "$node_major" -ge "$min_major" ]; then
+      node_bin_dir="$(dirname "$node_found")"
+      npm_cmd="$(command -v npm)"
+      used_system_node=true
+    fi
+  fi
+fi
+
+if [ -z "$npm_cmd" ]; then
+  download_local_node
 fi
 
 prefix="${CODEX_NPM_PREFIX:-$home_dir/.local/share/codex-proxy/npm-global}"
 mkdir -p "$prefix"
 PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex
+
+if ! "$prefix/bin/codex" --version >/dev/null 2>&1 && $used_system_node; then
+  echo "codex installed with system node is not functional; retrying with local node..." >&2
+  download_local_node
+  PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex
+fi
 `
 
 const codexInstallBootstrapWindows = `$ErrorActionPreference = 'Stop'
@@ -179,19 +229,7 @@ if ([string]::IsNullOrWhiteSpace($npmPrefix)) {
   $npmPrefix = Join-Path $baseDir 'codex-proxy\npm-global'
 }
 
-$nodeDir = $null
-$npmCmd = $null
-$systemNode = Get-Command node -ErrorAction SilentlyContinue
-$systemNpm = Get-Command npm -ErrorAction SilentlyContinue
-if ($systemNode -and $systemNpm) {
-  $major = Get-NodeMajor $systemNode.Source
-  if ($major -ge $minMajor) {
-    $nodeDir = Split-Path -Parent $systemNode.Source
-    $npmCmd = $systemNpm.Source
-  }
-}
-
-if (-not $npmCmd) {
+function Install-LocalNode {
   $arch = 'x64'
   if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -match 'ARM64') {
     $arch = 'arm64'
@@ -238,8 +276,26 @@ if (-not $npmCmd) {
     }
   }
 
-  $nodeDir = $installDir
-  $npmCmd = Join-Path $nodeDir 'npm.cmd'
+  $script:nodeDir = $installDir
+  $script:npmCmd = Join-Path $installDir 'npm.cmd'
+}
+
+$nodeDir = $null
+$npmCmd = $null
+$usedSystemNode = $false
+$systemNode = Get-Command node -ErrorAction SilentlyContinue
+$systemNpm = Get-Command npm -ErrorAction SilentlyContinue
+if ($systemNode -and $systemNpm) {
+  $major = Get-NodeMajor $systemNode.Source
+  if ($major -ge $minMajor) {
+    $nodeDir = Split-Path -Parent $systemNode.Source
+    $npmCmd = $systemNpm.Source
+    $usedSystemNode = $true
+  }
+}
+
+if (-not $npmCmd) {
+  Install-LocalNode
 }
 
 if (-not (Test-Path $npmCmd)) {
@@ -253,34 +309,248 @@ $env:PATH = "$nodeDir;$npmPrefix;$prefixBin;$env:PATH"
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
+
+$codexCmd = Join-Path $npmPrefix 'codex.cmd'
+$probeOk = $false
+try {
+  & $codexCmd --version 2>$null | Out-Null
+  if ($LASTEXITCODE -eq 0) { $probeOk = $true }
+} catch {}
+if (-not $probeOk -and $usedSystemNode) {
+  Write-Host "codex installed with system node is not functional; retrying with local node..." -ForegroundColor Yellow
+  Install-LocalNode
+  if (-not (Test-Path $npmCmd)) {
+    throw "npm is not available for Codex install"
+  }
+  $env:PATH = "$nodeDir;$npmPrefix;$prefixBin;$env:PATH"
+  & $npmCmd install -g --prefix $npmPrefix @openai/codex
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
+}
 `
 
+// probeCodex runs a quick smoke test to verify the codex binary is functional.
+// Returns true if `codex --version` exits 0 within 5 seconds.
+func probeCodex(ctx context.Context, codexPath string) bool {
+	ctx, cancel := context.WithTimeout(ctx, codexProbeTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, codexPath, "--version").Run() == nil
+}
+
 func ensureCodexInstalled(ctx context.Context, codexPath string, out io.Writer) (string, error) {
+	return ensureCodexInstalledWithOptions(ctx, codexPath, out, codexInstallOptions{})
+}
+
+func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out io.Writer, opts codexInstallOptions) (string, error) {
 	if strings.TrimSpace(codexPath) != "" {
-		if executableExists(codexPath) {
-			return codexPath, nil
+		resolvedPath := normalizeExecutablePath(codexPath)
+		if executableExists(resolvedPath) && probeCodex(ctx, resolvedPath) {
+			writeCachedCodexPath(resolvedPath)
+			return resolvedPath, nil
+		}
+		if executableExists(resolvedPath) {
+			return "", fmt.Errorf("codex at %s is not functional", resolvedPath)
 		}
 		return "", fmt.Errorf("codex not found at %s", codexPath)
 	}
 
 	if path, err := exec.LookPath("codex"); err == nil {
+		path = normalizeExecutablePath(path)
+		if probeCodex(ctx, path) {
+			writeCachedCodexPath(path)
+			return path, nil
+		}
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "codex at %s is not functional; installing a local copy...\n", path)
+		}
+	}
+
+	if cached := strings.TrimSpace(readCachedCodexPath()); cached != "" {
+		if !filepath.IsAbs(cached) {
+			clearCachedCodexPath()
+		} else if executableExists(cached) && probeCodex(ctx, cached) {
+			writeCachedCodexPath(cached)
+			return cached, nil
+		} else {
+			clearCachedCodexPath()
+		}
+	}
+
+	if path, err := findInstalledCodexInCandidates(ctx); err == nil {
+		writeCachedCodexPath(path)
 		return path, nil
 	}
 
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "codex not found; installing...")
 	}
-	if err := runCodexInstaller(ctx, out); err != nil {
+
+	var installedPath string
+	if err := withCodexInstallLock(ctx, out, func() error {
+		// Another process may have installed Codex while we waited for the lock.
+		if path, err := findInstalledCodex(ctx); err == nil {
+			installedPath = path
+			return nil
+		}
+
+		runInstall := func(installerEnv []string) error {
+			return runCodexInstaller(ctx, out, installerEnv)
+		}
+		if opts.withInstallerEnv != nil {
+			if err := opts.withInstallerEnv(ctx, runInstall); err != nil {
+				return err
+			}
+		} else {
+			if err := runInstall(opts.installerEnv); err != nil {
+				return err
+			}
+		}
+
+		path, err := findInstalledCodex(ctx)
+		if err != nil {
+			return fmt.Errorf("codex installation finished but binary not found in PATH")
+		}
+		installedPath = path
+		return nil
+	}); err != nil {
 		return "", err
 	}
 
-	if path, err := findInstalledCodex(); err == nil {
-		return path, nil
+	if installedPath != "" {
+		writeCachedCodexPath(installedPath)
+		return installedPath, nil
 	}
 	return "", fmt.Errorf("codex installation finished but binary not found in PATH")
 }
 
-func runCodexInstaller(ctx context.Context, out io.Writer) error {
+func withCodexInstallLock(ctx context.Context, out io.Writer, fn func() error) error {
+	lockPath := codexInstallLockPath()
+	if lockPath == "" {
+		return fn()
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return fmt.Errorf("create codex install lock dir: %w", err)
+	}
+	waitStart := time.Time{}
+	for {
+		err := os.Mkdir(lockPath, 0o700)
+		if err == nil {
+			defer func() { _ = os.Remove(lockPath) }()
+			return fn()
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("acquire codex install lock: %w", err)
+		}
+		stale, staleErr := codexInstallLockStale(lockPath)
+		if staleErr == nil && stale {
+			if rmErr := os.Remove(lockPath); rmErr == nil || os.IsNotExist(rmErr) {
+				continue
+			}
+		}
+		if waitStart.IsZero() {
+			waitStart = time.Now()
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "codex installation lock is held by another process; waiting up to %s...\n", codexInstallLockMaxWait)
+			}
+		}
+		if time.Since(waitStart) >= codexInstallLockMaxWait {
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "codex installation lock still held after %s; continuing without lock.\n", codexInstallLockMaxWait)
+			}
+			return fn()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(codexInstallLockPollDelay):
+		}
+	}
+}
+
+func codexInstallLockStale(lockPath string) (bool, error) {
+	info, err := os.Stat(lockPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return time.Since(info.ModTime()) > codexInstallLockStaleAfter, nil
+}
+
+func codexInstallLockPath() string {
+	cacheFile := cachedCodexPathFile()
+	if cacheFile != "" {
+		return filepath.Join(filepath.Dir(cacheFile), codexInstallLockName)
+	}
+	if tmp := strings.TrimSpace(os.TempDir()); tmp != "" {
+		return filepath.Join(tmp, "codex-proxy", codexInstallLockName)
+	}
+	return ""
+}
+
+func normalizeExecutablePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if !filepath.IsAbs(path) {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+	}
+	return filepath.Clean(path)
+}
+
+func cachedCodexPathFile() string {
+	base, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(base) == "" {
+		home := preferredHomeDir()
+		if home == "" {
+			return ""
+		}
+		base = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(base, "codex-proxy", codexPathCacheFile)
+}
+
+func readCachedCodexPath() string {
+	cacheFile := cachedCodexPathFile()
+	if cacheFile == "" {
+		return ""
+	}
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func writeCachedCodexPath(path string) {
+	path = normalizeExecutablePath(path)
+	if path == "" || !filepath.IsAbs(path) {
+		return
+	}
+	cacheFile := cachedCodexPathFile()
+	if cacheFile == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(cacheFile), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(cacheFile, []byte(path+"\n"), 0o600)
+}
+
+func clearCachedCodexPath() {
+	cacheFile := cachedCodexPathFile()
+	if cacheFile == "" {
+		return
+	}
+	_ = os.Remove(cacheFile)
+}
+
+func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string) error {
 	candidates := codexInstallerCandidates(runtime.GOOS)
 	if len(candidates) == 0 {
 		return fmt.Errorf("no supported installer available for %s", runtime.GOOS)
@@ -294,6 +564,9 @@ func runCodexInstaller(ctx context.Context, out io.Writer) error {
 		}
 
 		cmd := exec.CommandContext(ctx, candidate.path, candidate.args...)
+		if len(installerEnv) > 0 {
+			cmd.Env = installerEnv
+		}
 		cmd.Stdout = out
 		cmd.Stderr = out
 		cmd.Stdin = os.Stdin
@@ -334,49 +607,103 @@ func installerAttemptLabel(cmd codexInstallCmd) string {
 	return fmt.Sprintf("%s %s", cmd.path, cmd.args[0])
 }
 
-func findInstalledCodex() (string, error) {
+func findInstalledCodex(ctx context.Context) (string, error) {
 	if path, err := exec.LookPath("codex"); err == nil {
-		return path, nil
+		path = normalizeExecutablePath(path)
+		if probeCodex(ctx, path) {
+			return path, nil
+		}
 	}
+	return findInstalledCodexInCandidates(ctx)
+}
+
+func findInstalledCodexInCandidates(ctx context.Context) (string, error) {
 	for _, candidate := range codexBinaryCandidates() {
-		if executableExists(candidate) {
-			return candidate, nil
+		if executableExists(candidate) && probeCodex(ctx, candidate) {
+			return normalizeExecutablePath(candidate), nil
 		}
 	}
 	return "", fmt.Errorf("codex binary not found")
 }
 
 func codexBinaryCandidates() []string {
-	candidates := make([]string, 0, 8)
+	return codexBinaryCandidatesForEnv(
+		runtime.GOOS,
+		preferredHomeDir(),
+		os.Getenv("CODEX_NPM_PREFIX"),
+		os.Getenv("LOCALAPPDATA"),
+		os.Getenv("APPDATA"),
+		os.TempDir(),
+	)
+}
 
-	home, _ := os.UserHomeDir()
-	if home != "" {
-		candidates = append(candidates,
-			filepath.Join(home, ".local", "share", "codex-proxy", "npm-global", "bin", "codex"),
-			filepath.Join(home, ".npm-global", "bin", "codex"),
-			filepath.Join(home, ".local", "bin", "codex"),
-		)
+func codexBinaryCandidatesForEnv(goos, home, npmPrefix, localAppData, appData, tempDir string) []string {
+	candidates := make([]string, 0, 16)
+	seen := map[string]struct{}{}
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		candidates = append(candidates, path)
 	}
 
-	if runtime.GOOS == "windows" {
-		localAppData := os.Getenv("LOCALAPPDATA")
-		if localAppData != "" {
-			candidates = append(candidates,
-				filepath.Join(localAppData, "codex-proxy", "npm-global", "codex.cmd"),
-				filepath.Join(localAppData, "codex-proxy", "npm-global", "bin", "codex.cmd"),
-				filepath.Join(localAppData, "codex-proxy", "npm-global", "codex.exe"),
-			)
+	isWindows := strings.EqualFold(goos, "windows")
+
+	if prefix := strings.TrimSpace(npmPrefix); prefix != "" {
+		if isWindows {
+			add(filepath.Join(prefix, "codex.cmd"))
+			add(filepath.Join(prefix, "codex.exe"))
+			add(filepath.Join(prefix, "bin", "codex.cmd"))
+			add(filepath.Join(prefix, "bin", "codex.exe"))
+		} else {
+			add(filepath.Join(prefix, "bin", "codex"))
+			add(filepath.Join(prefix, "codex"))
 		}
-		appData := os.Getenv("APPDATA")
+	}
+
+	if home = strings.TrimSpace(home); home != "" {
+		add(filepath.Join(home, ".local", "share", "codex-proxy", "npm-global", "bin", "codex"))
+		add(filepath.Join(home, ".npm-global", "bin", "codex"))
+		add(filepath.Join(home, ".local", "bin", "codex"))
+	}
+
+	if isWindows {
+		localAppData = strings.TrimSpace(localAppData)
+		if localAppData == "" {
+			localAppData = strings.TrimSpace(tempDir)
+		}
+		if localAppData != "" {
+			add(filepath.Join(localAppData, "codex-proxy", "npm-global", "codex.cmd"))
+			add(filepath.Join(localAppData, "codex-proxy", "npm-global", "bin", "codex.cmd"))
+			add(filepath.Join(localAppData, "codex-proxy", "npm-global", "codex.exe"))
+		}
+		appData = strings.TrimSpace(appData)
 		if appData != "" {
-			candidates = append(candidates,
-				filepath.Join(appData, "npm", "codex.cmd"),
-				filepath.Join(appData, "npm", "codex.exe"),
-			)
+			add(filepath.Join(appData, "npm", "codex.cmd"))
+			add(filepath.Join(appData, "npm", "codex.exe"))
 		}
 	}
 
 	return candidates
+}
+
+func preferredHomeDir() string {
+	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+		return filepath.Clean(home)
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Clean(home)
+	}
+	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+		return filepath.Clean(cwd)
+	}
+	return ""
 }
 
 func isCodexCommand(command string) bool {
@@ -398,6 +725,10 @@ func hasPathSeparator(command string) bool {
 }
 
 func resolveRunCommand(ctx context.Context, cmdArgs []string, out io.Writer) ([]string, error) {
+	return resolveRunCommandWithInstallOptions(ctx, cmdArgs, out, codexInstallOptions{})
+}
+
+func resolveRunCommandWithInstallOptions(ctx context.Context, cmdArgs []string, out io.Writer, installOpts codexInstallOptions) ([]string, error) {
 	if len(cmdArgs) == 0 {
 		return cmdArgs, nil
 	}
@@ -409,12 +740,15 @@ func resolveRunCommand(ctx context.Context, cmdArgs []string, out io.Writer) ([]
 	var resolved string
 	var err error
 	if filepath.IsAbs(cmd) || hasPathSeparator(cmd) {
-		resolved, err = ensureCodexInstalled(ctx, cmd, out)
+		resolved, err = ensureCodexInstalledWithOptions(ctx, cmd, out, installOpts)
 	} else {
-		if _, lookErr := exec.LookPath(cmd); lookErr == nil {
-			return cmdArgs, nil
+		if path, lookErr := exec.LookPath(cmd); lookErr == nil {
+			path = normalizeExecutablePath(path)
+			if probeCodex(ctx, path) {
+				return cmdArgs, nil
+			}
 		}
-		resolved, err = ensureCodexInstalled(ctx, "", out)
+		resolved, err = ensureCodexInstalledWithOptions(ctx, "", out, installOpts)
 	}
 	if err != nil {
 		return nil, err

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // buildSyntheticBinary creates a fake binary containing the expected marker strings.
@@ -100,9 +101,12 @@ func TestPatchCodexBinaryWithRuntime_DarwinSignFailureCleansPatchedBinary(t *tes
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	patchedPath := filepath.Join(cacheDir, "codex-patched")
-	if _, statErr := os.Stat(patchedPath); !os.IsNotExist(statErr) {
-		t.Fatalf("expected patched binary cleanup on sign failure, stat err=%v", statErr)
+	matches, globErr := filepath.Glob(filepath.Join(cacheDir, "codex-patched-*"))
+	if globErr != nil {
+		t.Fatalf("glob patched binaries: %v", globErr)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected patched binary cleanup on sign failure, found %v", matches)
 	}
 }
 
@@ -421,12 +425,128 @@ func TestCleanupRemovesPatchedBinary(t *testing.T) {
 	if err := os.WriteFile(patchedPath, []byte("test"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	leasePath := patchLeasePath(patchedPath)
+	if err := os.WriteFile(leasePath, []byte("123\n"), 0o600); err != nil {
+		t.Fatalf("write lease: %v", err)
+	}
 
-	result := &PatchResult{PatchedBinary: patchedPath}
+	result := &PatchResult{PatchedBinary: patchedPath, leasePath: leasePath}
 	result.Cleanup()
 
 	if _, err := os.Stat(patchedPath); err == nil {
 		t.Error("patched binary should be removed after Cleanup")
+	}
+	if _, err := os.Stat(leasePath); err == nil {
+		t.Error("patch lease should be removed after Cleanup")
+	}
+}
+
+func writeManagedLeaseForTest(t *testing.T, leasePath string, pid int, heartbeatAt time.Time, modTime time.Time) {
+	t.Helper()
+	if err := writePatchLease(leasePath, pid, heartbeatAt); err != nil {
+		t.Fatalf("write managed lease: %v", err)
+	}
+	if !modTime.IsZero() {
+		if err := os.Chtimes(leasePath, modTime, modTime); err != nil {
+			t.Fatalf("set lease modtime: %v", err)
+		}
+	}
+}
+
+func TestCleanupStalePatchedBinariesRemovesOnlyStaleManagedLeases(t *testing.T) {
+	cacheDir := t.TempDir()
+	staleTime := time.Now().Add(-patchLeaseStaleAfter - time.Minute)
+
+	stalePath := filepath.Join(cacheDir, "codex-patched-stale")
+	if err := os.WriteFile(stalePath, []byte("stale"), 0o755); err != nil {
+		t.Fatalf("write stale patch: %v", err)
+	}
+	writeManagedLeaseForTest(t, patchLeasePath(stalePath), 2147483647, staleTime, staleTime)
+
+	livePath := filepath.Join(cacheDir, "codex-patched-live")
+	if err := os.WriteFile(livePath, []byte("live"), 0o755); err != nil {
+		t.Fatalf("write live patch: %v", err)
+	}
+	writeManagedLeaseForTest(t, patchLeasePath(livePath), 2147483647, time.Now(), time.Now())
+
+	staleLivePIDPath := filepath.Join(cacheDir, "codex-patched-stale-live-pid")
+	if err := os.WriteFile(staleLivePIDPath, []byte("stale-live-pid"), 0o755); err != nil {
+		t.Fatalf("write stale-live-pid patch: %v", err)
+	}
+	writeManagedLeaseForTest(t, patchLeasePath(staleLivePIDPath), os.Getpid(), staleTime, staleTime)
+
+	unleasedPath := filepath.Join(cacheDir, "codex-patched-unleased")
+	if err := os.WriteFile(unleasedPath, []byte("unleased"), 0o755); err != nil {
+		t.Fatalf("write unleased patch: %v", err)
+	}
+
+	cleanupStalePatchedBinaries(cacheDir)
+
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("stale patch should be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(patchLeasePath(stalePath)); !os.IsNotExist(err) {
+		t.Fatalf("stale lease should be removed, stat err=%v", err)
+	}
+
+	if _, err := os.Stat(livePath); err != nil {
+		t.Fatalf("live patch should be preserved: %v", err)
+	}
+	if _, err := os.Stat(patchLeasePath(livePath)); err != nil {
+		t.Fatalf("live lease should be preserved: %v", err)
+	}
+
+	if _, err := os.Stat(staleLivePIDPath); err != nil {
+		t.Fatalf("stale lease with live local pid should be preserved: %v", err)
+	}
+	if _, err := os.Stat(patchLeasePath(staleLivePIDPath)); err != nil {
+		t.Fatalf("stale lease with live local pid should be preserved: %v", err)
+	}
+
+	if _, err := os.Stat(unleasedPath); err != nil {
+		t.Fatalf("unleased patch should be preserved: %v", err)
+	}
+}
+
+func TestCleanupStalePatchedBinariesPreservesInvalidLease(t *testing.T) {
+	cacheDir := t.TempDir()
+	path := filepath.Join(cacheDir, "codex-patched-invalid-lease")
+	if err := os.WriteFile(path, []byte("bin"), 0o755); err != nil {
+		t.Fatalf("write patch: %v", err)
+	}
+	lease := patchLeasePath(path)
+	if err := os.WriteFile(lease, []byte("not-a-pid\n"), 0o600); err != nil {
+		t.Fatalf("write invalid lease: %v", err)
+	}
+
+	cleanupStalePatchedBinaries(cacheDir)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("patch with invalid lease should be preserved: %v", err)
+	}
+	if _, err := os.Stat(lease); err != nil {
+		t.Fatalf("invalid lease should be preserved: %v", err)
+	}
+}
+
+func TestCleanupStalePatchedBinariesPreservesLegacyPIDLease(t *testing.T) {
+	cacheDir := t.TempDir()
+	path := filepath.Join(cacheDir, "codex-patched-legacy-pid")
+	if err := os.WriteFile(path, []byte("bin"), 0o755); err != nil {
+		t.Fatalf("write patch: %v", err)
+	}
+	lease := patchLeasePath(path)
+	if err := os.WriteFile(lease, []byte("2147483647\n"), 0o600); err != nil {
+		t.Fatalf("write legacy lease: %v", err)
+	}
+
+	cleanupStalePatchedBinaries(cacheDir)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("patch with legacy pid lease should be preserved: %v", err)
+	}
+	if _, err := os.Stat(lease); err != nil {
+		t.Fatalf("legacy pid lease should be preserved: %v", err)
 	}
 }
 

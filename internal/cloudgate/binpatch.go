@@ -5,13 +5,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
 const (
@@ -35,6 +39,11 @@ allowed_sandbox_modez = ["danger-full-access", "workspace-write", "read-only"]
 `
 
 	adhocCodesignTimeout = 10 * time.Second
+	patchLeaseSuffix     = ".lease"
+	// Keep heartbeats infrequent to reduce churn on shared filesystems.
+	patchLeaseHeartbeatInterval = 15 * time.Second
+	// A lease must miss multiple heartbeats before cleanup can reclaim it.
+	patchLeaseStaleAfter = 2 * time.Minute
 )
 
 // binaryPatch defines a single byte-level patch: find old, replace with new (same length).
@@ -108,6 +117,9 @@ type PatchResult struct {
 	RequirementsPath string
 	// OrigSHA256 is the SHA-256 hex digest of the original binary before patching.
 	OrigSHA256 string
+
+	leasePath          string
+	stopLeaseHeartbeat func()
 }
 
 // RemoveCloudRequirementsCache deletes the cloud requirements cache file
@@ -134,8 +146,155 @@ func (r *PatchResult) Cleanup() {
 	if r == nil {
 		return
 	}
+	if r.stopLeaseHeartbeat != nil {
+		r.stopLeaseHeartbeat()
+		r.stopLeaseHeartbeat = nil
+	}
+	if r.leasePath != "" {
+		_ = os.Remove(r.leasePath)
+	}
 	if r.PatchedBinary != "" {
 		_ = os.Remove(r.PatchedBinary)
+	}
+}
+
+func patchLeasePath(binaryPath string) string {
+	return binaryPath + patchLeaseSuffix
+}
+
+type patchLease struct {
+	Version       int   `json:"version"`
+	PID           int   `json:"pid"`
+	HeartbeatUnix int64 `json:"heartbeat_unix"`
+}
+
+func parsePatchLease(data []byte) (patchLease, bool) {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return patchLease{}, false
+	}
+	var lease patchLease
+	if err := json.Unmarshal([]byte(raw), &lease); err != nil {
+		return patchLease{}, false
+	}
+	if lease.Version != 1 || lease.PID <= 0 || lease.HeartbeatUnix <= 0 {
+		return patchLease{}, false
+	}
+	return lease, true
+}
+
+func writePatchLease(path string, pid int, at time.Time) error {
+	payload, err := json.Marshal(patchLease{
+		Version:       1,
+		PID:           pid,
+		HeartbeatUnix: at.Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	return os.WriteFile(path, payload, 0o600)
+}
+
+func createPatchLease(binaryPath string) (string, func(), error) {
+	lease := patchLeasePath(binaryPath)
+	pid := os.Getpid()
+	if pid <= 0 {
+		return "", nil, fmt.Errorf("invalid pid for lease: %d", pid)
+	}
+	if err := writePatchLease(lease, pid, time.Now()); err != nil {
+		return "", nil, err
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(patchLeaseHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = writePatchLease(lease, pid, time.Now())
+			}
+		}
+	}()
+
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			<-stopped
+		})
+	}
+
+	return lease, stop, nil
+}
+
+func patchLeaseLastSeenAt(lease patchLease, leaseModTime time.Time) time.Time {
+	heartbeatAt := time.Unix(lease.HeartbeatUnix, 0)
+	if leaseModTime.After(heartbeatAt) {
+		return leaseModTime
+	}
+	return heartbeatAt
+}
+
+// cleanupStalePatchedBinaries removes patched binaries with stale managed
+// leases. Files without a valid lease are preserved conservatively.
+func cleanupStalePatchedBinaries(cacheDir string) {
+	if strings.TrimSpace(cacheDir) == "" {
+		return
+	}
+	now := time.Now()
+	patterns := []string{
+		filepath.Join(cacheDir, "codex-patched-*"),
+		filepath.Join(cacheDir, "codex-patched-*.exe"),
+	}
+	seen := map[string]struct{}{}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, candidate := range matches {
+			if strings.HasSuffix(candidate, patchLeaseSuffix) {
+				continue
+			}
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			info, err := os.Stat(candidate)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			lease := patchLeasePath(candidate)
+			leaseData, err := os.ReadFile(lease)
+			if err != nil {
+				continue
+			}
+			leaseInfo, err := os.Stat(lease)
+			if err != nil || leaseInfo.IsDir() {
+				continue
+			}
+			leaseMeta, ok := parsePatchLease(leaseData)
+			if !ok {
+				continue
+			}
+			lastSeenAt := patchLeaseLastSeenAt(leaseMeta, leaseInfo.ModTime())
+			age := now.Sub(lastSeenAt)
+			if age < 0 || age <= patchLeaseStaleAfter {
+				continue
+			}
+			if proc.IsAlive(leaseMeta.PID) {
+				continue
+			}
+			_ = os.Remove(candidate)
+			_ = os.Remove(lease)
+		}
 	}
 }
 
@@ -180,6 +339,7 @@ func patchCodexBinaryWithRuntime(
 	if codesignFn == nil {
 		codesignFn = adHocCodesign
 	}
+	cleanupStalePatchedBinaries(cacheDir)
 
 	data, err := os.ReadFile(origBinary)
 	if err != nil {
@@ -237,11 +397,16 @@ func patchCodexBinaryWithRuntime(
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
-	patchedName := "codex-patched"
+	pattern := "codex-patched-*"
 	if goos == "windows" {
-		patchedName = "codex-patched.exe"
+		pattern = "codex-patched-*.exe"
 	}
-	patchedPath := filepath.Join(cacheDir, patchedName)
+	tmpPatched, err := os.CreateTemp(cacheDir, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("create patched binary path: %w", err)
+	}
+	patchedPath := tmpPatched.Name()
+	_ = tmpPatched.Close()
 	if err := os.WriteFile(patchedPath, data, 0o755); err != nil {
 		return nil, fmt.Errorf("write patched binary: %w", err)
 	}
@@ -261,10 +426,18 @@ func patchCodexBinaryWithRuntime(
 		return nil, fmt.Errorf("write requirements: %w", err)
 	}
 
+	leasePath, stopLeaseHeartbeat, err := createPatchLease(patchedPath)
+	if err != nil {
+		_ = os.Remove(patchedPath)
+		return nil, fmt.Errorf("create patch lease: %w", err)
+	}
+
 	return &PatchResult{
-		PatchedBinary:    patchedPath,
-		RequirementsPath: patchedReqPath,
-		OrigSHA256:       origHash,
+		PatchedBinary:      patchedPath,
+		RequirementsPath:   patchedReqPath,
+		OrigSHA256:         origHash,
+		leasePath:          leasePath,
+		stopLeaseHeartbeat: stopLeaseHeartbeat,
 	}, nil
 }
 
