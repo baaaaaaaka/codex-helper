@@ -512,6 +512,76 @@ func TestCodexBinaryCandidatesIncludeCustomPrefix(t *testing.T) {
 	}
 }
 
+func TestManagedNodeBinCandidatesForEnvUnixDefaultRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only test")
+	}
+	arch := nodeRuntimeArch(runtime.GOARCH)
+	if arch == "" {
+		t.Skip("unsupported runtime arch for managed-node test")
+	}
+
+	home := t.TempDir()
+	installDir := filepath.Join(home, ".cache", "codex-proxy", "node", "v22-linux-"+arch)
+	nodeBin := filepath.Join(installDir, "bin")
+	if err := os.MkdirAll(nodeBin, 0o755); err != nil {
+		t.Fatalf("mkdir node bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeBin, "node"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write node: %v", err)
+	}
+
+	candidates := managedNodeBinCandidatesForEnv("linux", runtime.GOARCH, home, "", "", "", "")
+	if !containsPath(candidates, nodeBin) {
+		t.Fatalf("expected managed node bin candidate %q in %v", nodeBin, candidates)
+	}
+}
+
+func TestEnsureCodexInstalledUsesManagedNodeForCandidateProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	arch := nodeRuntimeArch(runtime.GOARCH)
+	if arch == "" {
+		t.Skip("unsupported runtime arch for managed-node probe test")
+	}
+
+	home := t.TempDir()
+	nodeBin := filepath.Join(home, ".cache", "codex-proxy", "node", "v22-"+runtime.GOOS+"-"+arch, "bin")
+	if err := os.MkdirAll(nodeBin, 0o755); err != nil {
+		t.Fatalf("mkdir node bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeBin, "node"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write node: %v", err)
+	}
+
+	codexPath := filepath.Join(home, ".local", "share", "codex-proxy", "npm-global", "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(codexPath), 0o755); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	codexScript := "#!/bin/sh\n" +
+		"command -v node >/dev/null 2>&1 || exit 1\n" +
+		"exit 0\n"
+	if err := os.WriteFile(codexPath, []byte(codexScript), 0o700); err != nil {
+		t.Fatalf("write codex: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+
+	got, err := ensureCodexInstalled(context.Background(), "", io.Discard)
+	if err != nil {
+		t.Fatalf("ensureCodexInstalled error: %v", err)
+	}
+	if got != codexPath {
+		t.Fatalf("expected candidate codex %q, got %q", codexPath, got)
+	}
+	if !containsPath(filepath.SplitList(os.Getenv("PATH")), nodeBin) {
+		t.Fatalf("expected PATH to include managed node bin %q, got %q", nodeBin, os.Getenv("PATH"))
+	}
+}
+
 func TestCodexBinaryCandidatesForWindowsIncludeCustomPrefix(t *testing.T) {
 	prefix := "/custom/prefix"
 	candidates := codexBinaryCandidatesForEnv("windows", "", prefix, "", "", "")

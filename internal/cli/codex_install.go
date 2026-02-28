@@ -343,6 +343,8 @@ func ensureCodexInstalled(ctx context.Context, codexPath string, out io.Writer) 
 }
 
 func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out io.Writer, opts codexInstallOptions) (string, error) {
+	ensureManagedNodeOnPath()
+
 	if strings.TrimSpace(codexPath) != "" {
 		resolvedPath := normalizeExecutablePath(codexPath)
 		if executableExists(resolvedPath) && probeCodex(ctx, resolvedPath) {
@@ -619,6 +621,8 @@ func installerAttemptLabel(cmd codexInstallCmd) string {
 }
 
 func findInstalledCodex(ctx context.Context) (string, error) {
+	ensureManagedNodeOnPath()
+
 	if path, err := exec.LookPath("codex"); err == nil {
 		path = normalizeExecutablePath(path)
 		if probeCodex(ctx, path) {
@@ -646,6 +650,177 @@ func codexBinaryCandidates() []string {
 		os.Getenv("APPDATA"),
 		os.TempDir(),
 	)
+}
+
+func ensureManagedNodeOnPath() {
+	candidates := managedNodeBinCandidates()
+	if len(candidates) == 0 {
+		return
+	}
+
+	currentPath := os.Getenv("PATH")
+	pathParts := filepath.SplitList(currentPath)
+	seen := make(map[string]struct{}, len(pathParts)+len(candidates))
+	normalize := func(path string) string {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if runtime.GOOS == "windows" {
+			path = strings.ToLower(path)
+		}
+		return path
+	}
+	for _, part := range pathParts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			seen[normalize(trimmed)] = struct{}{}
+		}
+	}
+
+	prepend := make([]string, 0, len(candidates))
+	for _, dir := range candidates {
+		normalized := normalize(dir)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		prepend = append(prepend, filepath.Clean(dir))
+	}
+	if len(prepend) == 0 {
+		return
+	}
+
+	updated := append(prepend, pathParts...)
+	_ = os.Setenv("PATH", strings.Join(updated, string(os.PathListSeparator)))
+}
+
+func managedNodeBinCandidates() []string {
+	return managedNodeBinCandidatesForEnv(
+		runtime.GOOS,
+		runtime.GOARCH,
+		preferredHomeDir(),
+		os.Getenv("CODEX_NODE_INSTALL_ROOT"),
+		os.Getenv("CODEX_NODE_MAJOR"),
+		os.Getenv("LOCALAPPDATA"),
+		os.TempDir(),
+	)
+}
+
+func managedNodeBinCandidatesForEnv(goos, goarch, home, nodeRoot, nodeMajor, localAppData, tempDir string) []string {
+	candidates := make([]string, 0, 8)
+	seen := map[string]struct{}{}
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		candidates = append(candidates, path)
+	}
+
+	nodeRoot = strings.TrimSpace(nodeRoot)
+	isWindows := strings.EqualFold(goos, "windows")
+	if nodeRoot == "" {
+		if isWindows {
+			baseDir := strings.TrimSpace(localAppData)
+			if baseDir == "" {
+				baseDir = strings.TrimSpace(tempDir)
+			}
+			if baseDir != "" {
+				nodeRoot = filepath.Join(baseDir, "codex-proxy", "node")
+			}
+		} else {
+			if home = strings.TrimSpace(home); home != "" {
+				nodeRoot = filepath.Join(home, ".cache", "codex-proxy", "node")
+			}
+		}
+	}
+	if nodeRoot == "" {
+		return candidates
+	}
+
+	major := strings.TrimPrefix(strings.TrimSpace(nodeMajor), "v")
+	if major == "" {
+		major = "22"
+	}
+	for _, ch := range major {
+		if ch < '0' || ch > '9' {
+			major = "22"
+			break
+		}
+	}
+
+	arch := nodeRuntimeArch(goarch)
+	if isWindows {
+		nodeFile := "node.exe"
+		addInstallDir := func(installDir string) {
+			installDir = strings.TrimSpace(installDir)
+			if installDir == "" {
+				return
+			}
+			if executableExists(filepath.Join(installDir, nodeFile)) {
+				add(installDir)
+			}
+		}
+
+		if arch != "" {
+			addInstallDir(filepath.Join(nodeRoot, fmt.Sprintf("v%s-win-%s", major, arch)))
+		}
+		pattern := filepath.Join(nodeRoot, "v*-win-*")
+		if arch != "" {
+			pattern = filepath.Join(nodeRoot, fmt.Sprintf("v*-win-%s", arch))
+		}
+		if matches, err := filepath.Glob(pattern); err == nil {
+			for _, match := range matches {
+				addInstallDir(match)
+			}
+		}
+		return candidates
+	}
+
+	osName := strings.ToLower(strings.TrimSpace(goos))
+	if osName != "linux" && osName != "darwin" {
+		return candidates
+	}
+	addInstallDir := func(installDir string) {
+		installDir = strings.TrimSpace(installDir)
+		if installDir == "" {
+			return
+		}
+		binDir := filepath.Join(installDir, "bin")
+		if executableExists(filepath.Join(binDir, "node")) {
+			add(binDir)
+		}
+	}
+
+	if arch != "" {
+		addInstallDir(filepath.Join(nodeRoot, fmt.Sprintf("v%s-%s-%s", major, osName, arch)))
+	}
+	pattern := filepath.Join(nodeRoot, fmt.Sprintf("v*-%s-*", osName))
+	if arch != "" {
+		pattern = filepath.Join(nodeRoot, fmt.Sprintf("v*-%s-%s", osName, arch))
+	}
+	if matches, err := filepath.Glob(pattern); err == nil {
+		for _, match := range matches {
+			addInstallDir(match)
+		}
+	}
+	return candidates
+}
+
+func nodeRuntimeArch(goarch string) string {
+	switch strings.ToLower(strings.TrimSpace(goarch)) {
+	case "amd64", "x86_64":
+		return "x64"
+	case "arm64", "aarch64":
+		return "arm64"
+	default:
+		return ""
+	}
 }
 
 func codexBinaryCandidatesForEnv(goos, home, npmPrefix, localAppData, appData, tempDir string) []string {
