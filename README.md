@@ -75,6 +75,7 @@ codex-proxy proxy doctor
 | Command | Description |
 |---------|-------------|
 | `codex-proxy` | Open the TUI (default) |
+| `codex-proxy --upgrade-codex` | Reinstall Codex CLI using detected install source |
 | `codex-proxy init` | Create an SSH profile |
 | `codex-proxy run [profile] -- <cmd> [args...]` | Run a command through the proxy |
 | `codex-proxy tui` | Browse Codex history in a terminal UI |
@@ -180,6 +181,21 @@ Optional flags:
 - `--repo owner/name` (override GitHub repo)
 - `--version vX.Y.Z` (install a specific version)
 - `--install-path /path/to/codex-proxy` (override install path)
+
+Upgrade Codex CLI itself (reinstall-style):
+
+```bash
+codex-proxy --upgrade-codex
+```
+
+Behavior:
+
+- Uses current proxy preference: proxy on -> upgrade through proxy; proxy off -> direct.
+- Requires Codex to already be installed; it will not install from scratch in this mode.
+- Keeps install source when recognized:
+  - system npm global install -> `npm install -g @openai/codex`
+  - managed/local npm install (`codex-proxy` prefix) -> managed reinstall path
+- Fails fast when source cannot be determined (to avoid changing install topology unexpectedly).
 
 ## Long-lived instances (optional)
 

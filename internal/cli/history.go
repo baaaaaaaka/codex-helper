@@ -17,9 +17,14 @@ import (
 )
 
 var (
-	selectSession        = tui.SelectSession
-	runCodexSessionFunc  = runCodexSession
-	runCodexNewSessionFn = runCodexNewSession
+	selectSession              = tui.SelectSession
+	runCodexSessionFunc        = runCodexSession
+	runCodexNewSessionFn       = runCodexNewSession
+	findSessionWithProjectFunc = codexhistory.FindSessionWithProject
+	ensureProxyPreferenceFunc  = ensureProxyPreference
+	ensureProfileFunc          = ensureProfile
+	persistProxyPreferenceFunc = persistProxyPreference
+	initProfileInteractiveFunc = initProfileInteractive
 )
 
 const defaultRefreshInterval = 5 * time.Second
@@ -124,24 +129,31 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 				return err
 			}
 
-			useProxy, cfg, err := ensureProxyPreference(cmd.Context(), store, *profileRef, cmd.ErrOrStderr())
+			useProxy, cfg, err := ensureProxyPreferenceFunc(cmd.Context(), store, *profileRef, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
 
 			var profile *config.Profile
 			if useProxy {
-				p, cfgWithProfile, err := ensureProfile(cmd.Context(), store, *profileRef, true, cmd.OutOrStdout())
+				p, cfgWithProfile, err := ensureProfileFunc(cmd.Context(), store, *profileRef, true, cmd.OutOrStdout())
 				if err != nil {
 					return err
 				}
 				cfg = cfgWithProfile
+				if cfg.ProxyEnabled == nil {
+					enabled := true
+					if err := persistProxyPreferenceFunc(store, enabled); err != nil {
+						return err
+					}
+					cfg.ProxyEnabled = &enabled
+				}
 				profile = &p
 			}
 			useYolo := resolveYoloEnabled(cfg)
 
 			sessionID := args[0]
-			session, project, err := codexhistory.FindSessionWithProject(*codexDir, sessionID)
+			session, project, err := findSessionWithProjectFunc(*codexDir, sessionID)
 			if err != nil {
 				return err
 			}
@@ -152,7 +164,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 			if project != nil {
 				proj = *project
 			}
-			return runCodexSession(
+			return runCodexSessionFunc(
 				cmd.Context(),
 				root,
 				store,
@@ -179,7 +191,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 	}
 
 	for {
-		useProxy, cfg, err := ensureProxyPreference(ctx, store, profileRef, cmd.ErrOrStderr())
+		useProxy, cfg, err := ensureProxyPreferenceFunc(ctx, store, profileRef, cmd.ErrOrStderr())
 		if err != nil {
 			return err
 		}
@@ -187,16 +199,18 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 
 		var profile *config.Profile
 		if useProxy {
-			p, cfgWithProfile, err := ensureProfile(ctx, store, profileRef, true, cmd.OutOrStdout())
+			p, cfgWithProfile, err := ensureProfileFunc(ctx, store, profileRef, true, cmd.OutOrStdout())
 			if err != nil {
-				// Rollback proxy preference so next launch re-asks.
-				_ = store.Update(func(c *config.Config) error {
-					c.ProxyEnabled = nil
-					return nil
-				})
 				return err
 			}
 			cfg = cfgWithProfile
+			if cfg.ProxyEnabled == nil {
+				enabled := true
+				if err := persistProxyPreferenceFunc(store, enabled); err != nil {
+					return err
+				}
+				cfg.ProxyEnabled = &enabled
+			}
 			profile = &p
 		}
 
@@ -228,18 +242,13 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			}
 			var toggle tui.ProxyToggleRequested
 			if errors.As(err, &toggle) {
-				if err := persistProxyPreference(store, toggle.Enable); err != nil {
-					return err
-				}
 				if toggle.Enable && toggle.RequireConfig {
-					if _, err := initProfileInteractive(ctx, store); err != nil {
-						// Rollback proxy preference so next launch re-asks.
-						_ = store.Update(func(c *config.Config) error {
-							c.ProxyEnabled = nil
-							return nil
-						})
+					if _, err := initProfileInteractiveFunc(ctx, store); err != nil {
 						return err
 					}
+				}
+				if err := persistProxyPreferenceFunc(store, toggle.Enable); err != nil {
+					return err
 				}
 				continue
 			}

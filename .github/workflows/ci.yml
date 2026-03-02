@@ -160,6 +160,75 @@ jobs:
           $ErrorActionPreference = "Stop"
           npm install -g @openai/codex
 
+      - name: Codex upgrade integration (system npm, Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g @openai/codex
+          system_prefix="$(npm prefix -g)"
+          go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-system.json" --upgrade-codex
+          codex --version >/dev/null
+          upgraded_path="$(command -v codex)"
+          case "$upgraded_path" in
+            "$system_prefix"/*) ;;
+            *)
+              echo "expected system npm codex under $system_prefix, got $upgraded_path"
+              exit 1
+              ;;
+          esac
+
+      - name: Codex upgrade integration (local npm, Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          local_prefix="$RUNNER_TEMP/codex-local-prefix"
+          npm install -g --prefix "$local_prefix" @openai/codex
+          export CODEX_NPM_PREFIX="$local_prefix"
+          export PATH="$local_prefix/bin:$local_prefix:$PATH"
+          go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-local.json" --upgrade-codex
+          codex --version >/dev/null
+          upgraded_path="$(command -v codex)"
+          case "$upgraded_path" in
+            "$local_prefix"/*) ;;
+            *)
+              echo "expected local npm codex under $local_prefix, got $upgraded_path"
+              exit 1
+              ;;
+          esac
+
+      - name: Codex upgrade integration (system npm, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm install -g @openai/codex
+          $systemPrefix = (npm prefix -g).Trim()
+          go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-system.json" --upgrade-codex
+          & codex --version | Out-Null
+          $upgradedPath = (Get-Command codex).Source
+          if (-not $upgradedPath.ToLower().StartsWith($systemPrefix.ToLower())) {
+            throw "expected system npm codex under $systemPrefix, got $upgradedPath"
+          }
+
+      - name: Codex upgrade integration (local npm, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $localPrefix = Join-Path $env:RUNNER_TEMP "codex-local-prefix"
+          npm install -g --prefix $localPrefix @openai/codex
+          $localBin = Join-Path $localPrefix "bin"
+          $env:CODEX_NPM_PREFIX = $localPrefix
+          $env:PATH = "$localPrefix;$localBin;$env:PATH"
+          go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-local.json" --upgrade-codex
+          & codex --version | Out-Null
+          $upgradedPath = (Get-Command codex).Source
+          if (-not $upgradedPath.ToLower().StartsWith($localPrefix.ToLower())) {
+            throw "expected local npm codex under $localPrefix, got $upgradedPath"
+          }
+
       - name: Codex patch+yolo integration test (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -254,4 +323,59 @@ jobs:
             echo "==> $img (cli tests)"
             docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
               /dist/codex_cli_test -test.v -test.count=1 -test.run 'Test[^I]'
+          done
+
+      - name: Codex upgrade smoke in Linux containers (system/local)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for img in rockylinux:8 ubuntu:20.04; do
+            echo "==> $img (codex upgrade command)"
+            docker run --rm \
+              -v "$PWD/dist:/dist:ro" \
+              -v "$PWD/scripts/ci:/ci:ro" \
+              "$img" bash -lc '
+                set -euo pipefail
+                if command -v apt-get >/dev/null 2>&1; then
+                  export DEBIAN_FRONTEND=noninteractive
+                  apt-get update
+                  apt-get install -y --no-install-recommends ca-certificates curl xz-utils tar
+                elif command -v dnf >/dev/null 2>&1; then
+                  dnf -y install ca-certificates curl xz tar
+                else
+                  echo "unsupported package manager for codex upgrade smoke"
+                  exit 1
+                fi
+
+                NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR="$(bash /ci/install_node_local.sh)"
+                export PATH="$NODE_BIN_DIR:$PATH"
+
+                npm install -g @openai/codex
+                system_prefix="$(npm prefix -g)"
+                /dist/codex-proxy --config /tmp/codex-upgrade-system.json --upgrade-codex
+                codex --version >/dev/null
+                system_path="$(command -v codex)"
+                case "$system_path" in
+                  "$system_prefix"/*) ;;
+                  *)
+                    echo "expected system codex under $system_prefix, got $system_path"
+                    exit 1
+                    ;;
+                esac
+
+                local_prefix="/tmp/codex-local-prefix"
+                npm install -g --prefix "$local_prefix" @openai/codex
+                export CODEX_NPM_PREFIX="$local_prefix"
+                export PATH="$local_prefix/bin:$local_prefix:$PATH"
+                /dist/codex-proxy --config /tmp/codex-upgrade-local.json --upgrade-codex
+                codex --version >/dev/null
+                local_path="$(command -v codex)"
+                case "$local_path" in
+                  "$local_prefix"/*) ;;
+                  *)
+                    echo "expected local codex under $local_prefix, got $local_path"
+                    exit 1
+                    ;;
+                esac
+              '
           done

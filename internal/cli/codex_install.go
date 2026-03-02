@@ -27,11 +27,27 @@ var (
 type codexInstallOptions struct {
 	installerEnv     []string
 	withInstallerEnv func(context.Context, func([]string) error) error
+	upgradeCodex     bool
 }
 
 type codexInstallCmd struct {
 	path string
 	args []string
+}
+
+type codexInstallOrigin string
+
+const (
+	codexInstallOriginUnknown codexInstallOrigin = "unknown"
+	codexInstallOriginSystem  codexInstallOrigin = "system-npm"
+	codexInstallOriginManaged codexInstallOrigin = "managed-npm"
+)
+
+type codexUpgradeSource struct {
+	origin      codexInstallOrigin
+	codexPath   string
+	npmPrefix   string
+	displayName string
 }
 
 const codexInstallBootstrap = `set -eu
@@ -343,6 +359,13 @@ func ensureCodexInstalled(ctx context.Context, codexPath string, out io.Writer) 
 }
 
 func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out io.Writer, opts codexInstallOptions) (string, error) {
+	if opts.upgradeCodex {
+		if strings.TrimSpace(codexPath) != "" {
+			return "", fmt.Errorf("--upgrade-codex cannot be used with --codex-path")
+		}
+		return upgradeCodexInstalledWithOptions(ctx, out, opts)
+	}
+
 	ensureManagedNodeOnPath()
 
 	if strings.TrimSpace(codexPath) != "" {
@@ -424,6 +447,330 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 		return installedPath, nil
 	}
 	return "", fmt.Errorf("codex installation finished but binary not found in PATH")
+}
+
+func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts codexInstallOptions) (string, error) {
+	ensureManagedNodeOnPath()
+
+	var upgradedPath string
+	if err := withCodexInstallLock(ctx, out, func() error {
+		source, err := detectCodexUpgradeSource(ctx, opts.installerEnv)
+		if err != nil {
+			return err
+		}
+		if source.origin == codexInstallOriginUnknown {
+			return fmt.Errorf("cannot determine codex installation origin; refusing automatic upgrade")
+		}
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "upgrading codex (%s)...\n", source.displayName)
+		}
+
+		runUpgrade := func(installerEnv []string) error {
+			return runCodexUpgradeBySource(ctx, out, installerEnv, source)
+		}
+		if opts.withInstallerEnv != nil {
+			if err := opts.withInstallerEnv(ctx, runUpgrade); err != nil {
+				return err
+			}
+		} else {
+			if err := runUpgrade(opts.installerEnv); err != nil {
+				return err
+			}
+		}
+
+		path, err := resolveUpgradedCodexPath(ctx, source.codexPath)
+		if err != nil {
+			return fmt.Errorf("codex upgrade finished but binary not found in PATH")
+		}
+		upgradedPath = path
+		return nil
+	}); err != nil {
+		return "", err
+	}
+
+	if upgradedPath == "" {
+		return "", fmt.Errorf("codex upgrade finished but binary not found in PATH")
+	}
+	writeCachedCodexPath(upgradedPath)
+	return upgradedPath, nil
+}
+
+func detectCodexUpgradeSource(ctx context.Context, installerEnv []string) (codexUpgradeSource, error) {
+	codexPath, err := findInstalledCodexWithoutProbe()
+	if err != nil {
+		return codexUpgradeSource{}, fmt.Errorf("codex is not installed; cannot upgrade")
+	}
+
+	if prefix, ok := managedCodexPrefixForPath(codexPath, installerEnv); ok {
+		return codexUpgradeSource{
+			origin:      codexInstallOriginManaged,
+			codexPath:   codexPath,
+			npmPrefix:   prefix,
+			displayName: "managed npm",
+		}, nil
+	}
+
+	systemPrefix, err := npmGlobalPrefix(ctx, installerEnv)
+	if err == nil && pathWithinDir(codexPath, systemPrefix) {
+		return codexUpgradeSource{
+			origin:      codexInstallOriginSystem,
+			codexPath:   codexPath,
+			npmPrefix:   systemPrefix,
+			displayName: "system npm",
+		}, nil
+	}
+
+	return codexUpgradeSource{
+		origin:      codexInstallOriginUnknown,
+		codexPath:   codexPath,
+		displayName: "unknown source",
+	}, nil
+}
+
+func runCodexUpgradeBySource(ctx context.Context, out io.Writer, installerEnv []string, source codexUpgradeSource) error {
+	switch source.origin {
+	case codexInstallOriginManaged:
+		if strings.TrimSpace(source.npmPrefix) == "" {
+			return fmt.Errorf("managed codex install path is missing npm prefix")
+		}
+		envWithPrefix := setEnvValue(installerEnv, "CODEX_NPM_PREFIX", source.npmPrefix)
+		return runCodexInstaller(ctx, out, envWithPrefix)
+	case codexInstallOriginSystem:
+		return runSystemNpmCodexUpgrade(ctx, out, installerEnv)
+	default:
+		return fmt.Errorf("cannot determine codex installation origin; refusing automatic upgrade")
+	}
+}
+
+func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv []string) error {
+	npmPath, err := exec.LookPath("npm")
+	if err != nil {
+		return fmt.Errorf("npm not found in PATH: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, npmPath, "install", "-g", "@openai/codex")
+	if len(installerEnv) > 0 {
+		cmd.Env = installerEnv
+	}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("system npm codex upgrade failed: %w", err)
+	}
+	return nil
+}
+
+func resolveUpgradedCodexPath(ctx context.Context, preferred string) (string, error) {
+	preferred = normalizeExecutablePath(preferred)
+	if preferred != "" && executableExists(preferred) && probeCodex(ctx, preferred) {
+		return preferred, nil
+	}
+	return findInstalledCodex(ctx)
+}
+
+func findInstalledCodexWithoutProbe() (string, error) {
+	ensureManagedNodeOnPath()
+
+	if path, err := exec.LookPath("codex"); err == nil {
+		path = normalizeExecutablePath(path)
+		if executableExists(path) {
+			return path, nil
+		}
+	}
+
+	if cached := strings.TrimSpace(readCachedCodexPath()); cached != "" {
+		cached = normalizeExecutablePath(cached)
+		if filepath.IsAbs(cached) && executableExists(cached) {
+			return cached, nil
+		}
+	}
+
+	for _, candidate := range codexBinaryCandidates() {
+		if executableExists(candidate) {
+			return normalizeExecutablePath(candidate), nil
+		}
+	}
+	return "", fmt.Errorf("codex not installed")
+}
+
+func managedCodexPrefixForPath(codexPath string, installerEnv []string) (string, bool) {
+	for _, prefix := range managedCodexPrefixCandidates(installerEnv) {
+		if pathWithinDir(codexPath, prefix) {
+			return filepath.Clean(prefix), true
+		}
+	}
+	return inferManagedPrefixFromPath(codexPath)
+}
+
+func managedCodexPrefixCandidates(installerEnv []string) []string {
+	out := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		path = normalizeExecutablePath(path)
+		if path == "" {
+			return
+		}
+		key := path
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(key)
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, path)
+	}
+
+	add(envValue(installerEnv, "CODEX_NPM_PREFIX"))
+	if runtime.GOOS == "windows" {
+		localAppData := strings.TrimSpace(envValue(installerEnv, "LOCALAPPDATA"))
+		if localAppData == "" {
+			localAppData = strings.TrimSpace(envTempDir(installerEnv))
+		}
+		if localAppData != "" {
+			add(filepath.Join(localAppData, "codex-proxy", "npm-global"))
+		}
+	} else if home := strings.TrimSpace(envValue(installerEnv, "HOME")); home != "" {
+		add(filepath.Join(home, ".local", "share", "codex-proxy", "npm-global"))
+	} else {
+		if home := preferredHomeDir(); home != "" {
+			add(filepath.Join(home, ".local", "share", "codex-proxy", "npm-global"))
+		}
+	}
+
+	return out
+}
+
+func inferManagedPrefixFromPath(path string) (string, bool) {
+	path = normalizeExecutablePath(path)
+	if path == "" {
+		return "", false
+	}
+
+	asSlash := filepath.ToSlash(path)
+	search := "/codex-proxy/npm-global"
+	lookup := asSlash
+	if runtime.GOOS == "windows" {
+		lookup = strings.ToLower(asSlash)
+	}
+	idx := strings.Index(lookup, search)
+	if idx < 0 {
+		return "", false
+	}
+	prefix := asSlash[:idx+len(search)]
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "", false
+	}
+	return normalizeExecutablePath(filepath.FromSlash(prefix)), true
+}
+
+func npmGlobalPrefix(ctx context.Context, installerEnv []string) (string, error) {
+	npmPath, err := exec.LookPath("npm")
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, npmPath, "prefix", "-g")
+	if len(installerEnv) > 0 {
+		cmd.Env = installerEnv
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolve npm global prefix: %w", err)
+	}
+	prefix := normalizeExecutablePath(strings.TrimSpace(string(out)))
+	if prefix == "" {
+		return "", fmt.Errorf("resolve npm global prefix: empty output")
+	}
+	return prefix, nil
+}
+
+func pathWithinDir(path string, dir string) bool {
+	path = normalizeExecutablePath(path)
+	dir = normalizeExecutablePath(dir)
+	if path == "" || dir == "" {
+		return false
+	}
+
+	p := path
+	d := dir
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+		d = strings.ToLower(d)
+	}
+
+	if p == d {
+		return true
+	}
+	if !strings.HasSuffix(d, string(os.PathSeparator)) {
+		d += string(os.PathSeparator)
+	}
+	return strings.HasPrefix(p, d)
+}
+
+func setEnvValue(base []string, key, value string) []string {
+	env := make([]string, 0, len(base)+1)
+	if len(base) == 0 {
+		env = append(env, os.Environ()...)
+	} else {
+		env = append(env, base...)
+	}
+
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			out = append(out, kv)
+			continue
+		}
+		if envKeyEqual(k, key) {
+			if !replaced {
+				out = append(out, key+"="+value)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, kv)
+	}
+	if !replaced {
+		out = append(out, key+"="+value)
+	}
+	return out
+}
+
+func envValue(env []string, key string) string {
+	for i := len(env) - 1; i >= 0; i-- {
+		k, v, ok := strings.Cut(env[i], "=")
+		if !ok {
+			continue
+		}
+		if envKeyEqual(k, key) {
+			return v
+		}
+	}
+	return os.Getenv(key)
+}
+
+func envKeyEqual(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func envTempDir(env []string) string {
+	for _, key := range []string{"TMPDIR", "TEMP", "TMP"} {
+		if v := strings.TrimSpace(envValue(env, key)); v != "" {
+			return v
+		}
+	}
+	return os.TempDir()
 }
 
 func withCodexInstallLock(ctx context.Context, out io.Writer, fn func() error) error {

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -47,6 +48,13 @@ func writeProbeableCodex(t *testing.T, dir string, ok bool) string {
 		t.Fatalf("write codex: %v", err)
 	}
 	return path
+}
+
+func writeExecutable(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+		t.Fatalf("write executable %s: %v", path, err)
+	}
 }
 
 func TestCodexInstallerCandidatesLinux(t *testing.T) {
@@ -263,6 +271,260 @@ func TestEnsureCodexInstalledInstallsWhenMissing(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "codex not found; installing...") {
 		t.Fatalf("expected install log, got %q", out.String())
+	}
+}
+
+func TestDetectCodexUpgradeSourceManaged(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, ".local", "share", "codex-proxy", "npm-global")
+	codexDir := filepath.Join(prefix, "bin")
+	if runtime.GOOS == "windows" {
+		codexDir = prefix
+	}
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, codexDir, true)
+
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", codexDir)
+
+	source, err := detectCodexUpgradeSource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSource error: %v", err)
+	}
+	if source.origin != codexInstallOriginManaged {
+		t.Fatalf("expected managed origin, got %q", source.origin)
+	}
+	if source.codexPath != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, source.codexPath)
+	}
+	if source.npmPrefix != prefix {
+		t.Fatalf("expected npm prefix %q, got %q", prefix, source.npmPrefix)
+	}
+}
+
+func TestDetectCodexUpgradeSourceSystemNpm(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based source detection test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, globalBin, true)
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+
+	source, err := detectCodexUpgradeSource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSource error: %v", err)
+	}
+	if source.origin != codexInstallOriginSystem {
+		t.Fatalf("expected system origin, got %q", source.origin)
+	}
+	if source.codexPath != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, source.codexPath)
+	}
+	if source.npmPrefix != globalPrefix {
+		t.Fatalf("expected npm prefix %q, got %q", globalPrefix, source.npmPrefix)
+	}
+}
+
+func TestDetectCodexUpgradeSourceUnknown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based source detection test on windows")
+	}
+
+	codexDir := t.TempDir()
+	_ = writeProbeableCodex(t, codexDir, true)
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + filepath.Join(t.TempDir(), "unrelated-prefix") + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{codexDir, binDir}, string(os.PathListSeparator)))
+
+	source, err := detectCodexUpgradeSource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSource error: %v", err)
+	}
+	if source.origin != codexInstallOriginUnknown {
+		t.Fatalf("expected unknown origin, got %q", source.origin)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsRequiresInstalledCodex(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err == nil {
+		t.Fatal("expected error when codex is not installed")
+	}
+	if !strings.Contains(err.Error(), "cannot upgrade") {
+		t.Fatalf("expected cannot-upgrade error, got %q", err.Error())
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsSkipsProxySetupWhenPrecheckFails(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	called := false
+	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{
+		upgradeCodex: true,
+		withInstallerEnv: func(context.Context, func([]string) error) error {
+			called = true
+			return fmt.Errorf("unexpected withInstallerEnv call")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when codex is not installed")
+	}
+	if called {
+		t.Fatal("expected withInstallerEnv not to run when precheck fails")
+	}
+	if !strings.Contains(err.Error(), "cannot upgrade") {
+		t.Fatalf("expected cannot-upgrade error, got %q", err.Error())
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsSystemUsesNpmInstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, globalBin, true)
+	marker := filepath.Join(root, "npm-install-hit")
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"  echo hit > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	got, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err != nil {
+		t.Fatalf("upgradeCodexInstalledWithOptions error: %v", err)
+	}
+	if got != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected npm install marker: %v", err)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsManagedUsesManagedPrefix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	prefix := filepath.Join(root, "custom-managed-prefix")
+	codexDir := filepath.Join(prefix, "bin")
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, codexDir, true)
+	marker := filepath.Join(root, "managed-install-hit")
+
+	binDir := t.TempDir()
+	bashPath := filepath.Join(binDir, "bash")
+	script := "#!/bin/sh\n" +
+		"if [ \"$CODEX_NPM_PREFIX\" != \"" + prefix + "\" ]; then\n" +
+		"  echo \"unexpected CODEX_NPM_PREFIX=$CODEX_NPM_PREFIX\" >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"echo hit > \"" + marker + "\"\n" +
+		"exit 0\n"
+	writeExecutable(t, bashPath, script)
+
+	t.Setenv("CODEX_NPM_PREFIX", prefix)
+	t.Setenv("PATH", strings.Join([]string{codexDir, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	got, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err != nil {
+		t.Fatalf("upgradeCodexInstalledWithOptions error: %v", err)
+	}
+	if got != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected managed install marker: %v", err)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsRejectsUnknownSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	codexDir := t.TempDir()
+	_ = writeProbeableCodex(t, codexDir, true)
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + filepath.Join(t.TempDir(), "different-prefix") + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{codexDir, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err == nil {
+		t.Fatal("expected unknown-source error")
+	}
+	if !strings.Contains(err.Error(), "cannot determine codex installation origin") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

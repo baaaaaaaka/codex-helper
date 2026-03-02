@@ -5,13 +5,14 @@ import (
 )
 
 var (
-	version = "v0.0.16"
+	version = "v0.0.17"
 	commit  = ""
 	date    = ""
 )
 
 type rootOptions struct {
-	configPath string
+	configPath   string
+	upgradeCodex bool
 }
 
 func Execute() int {
@@ -33,11 +34,15 @@ func newRootCmd() *cobra.Command {
 		Version:       buildVersion(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_ = args
+			if opts.upgradeCodex {
+				return runUpgradeCodexFromRoot(cmd, opts)
+			}
 			return runDefaultTui(cmd, opts)
 		},
 	}
 
 	cmd.PersistentFlags().StringVar(&opts.configPath, "config", "", "Override config file path (default: OS user config dir)")
+	cmd.Flags().BoolVar(&opts.upgradeCodex, "upgrade-codex", false, "Reinstall Codex CLI using its detected install source")
 
 	cmd.AddCommand(
 		newInitCmd(opts),

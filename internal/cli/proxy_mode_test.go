@@ -76,8 +76,8 @@ func TestEnsureProxyPreferenceResetsIncompleteStateAcceptsYes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
-		t.Fatalf("expected ProxyEnabled=true persisted, got %v", cfg.ProxyEnabled)
+	if cfg.ProxyEnabled != nil {
+		t.Fatalf("expected ProxyEnabled to remain unset until profile setup completes, got %v", cfg.ProxyEnabled)
 	}
 }
 
@@ -172,8 +172,8 @@ func TestEnsureProxyPreferencePromptsWhenNoProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
-		t.Fatalf("expected proxy enabled in config")
+	if cfg.ProxyEnabled != nil {
+		t.Fatalf("expected proxy preference to remain unset before profile setup, got %v", cfg.ProxyEnabled)
 	}
 }
 
@@ -201,7 +201,7 @@ func TestEnsureProxyPreferenceWriteFailure(t *testing.T) {
 		t.Fatalf("mkdir config path: %v", err)
 	}
 
-	reader := bufio.NewReader(strings.NewReader("y\n"))
+	reader := bufio.NewReader(strings.NewReader("n\n"))
 	_, _, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, reader)
 	if err == nil {
 		t.Fatalf("expected error when config dir is read-only")

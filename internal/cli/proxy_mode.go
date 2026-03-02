@@ -54,8 +54,12 @@ func ensureProxyPreferenceWithReader(
 	}
 	defaultYes := profileRef != ""
 	enabled := promptYesNo(reader, "Use SSH proxy for Codex?", defaultYes)
-	if err := persistProxyPreference(store, enabled); err != nil {
-		return false, cfg, err
+	// Do not persist ProxyEnabled=true until proxy setup is complete
+	// (i.e. at least one profile has been created successfully).
+	if !enabled {
+		if err := persistProxyPreference(store, enabled); err != nil {
+			return false, cfg, err
+		}
 	}
 	cfg.ProxyEnabled = &enabled
 	return enabled, cfg, nil
