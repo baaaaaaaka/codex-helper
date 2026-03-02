@@ -924,3 +924,57 @@ func TestProbeCodexIntegration(t *testing.T) {
 	}
 	t.Logf("findInstalledCodex returned: %s", found)
 }
+
+func TestEnsureCodexInstalledIntegrationManagedNode(t *testing.T) {
+	if os.Getenv("CODEX_INSTALL_TEST") != "1" {
+		t.Skip("skipping: set CODEX_INSTALL_TEST=1 to run installer integration")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("managed-node integration test currently targets unix installer flow")
+	}
+
+	arch := nodeRuntimeArch(runtime.GOARCH)
+	if arch == "" {
+		t.Skip("unsupported runtime arch for managed-node integration")
+	}
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	cacheDir := filepath.Join(root, "cache")
+	npmPrefix := filepath.Join(root, "npm-global")
+	nodeRoot := filepath.Join(root, "node")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", cacheDir)
+	t.Setenv("CODEX_NPM_PREFIX", npmPrefix)
+	t.Setenv("CODEX_NODE_INSTALL_ROOT", nodeRoot)
+	t.Setenv("CODEX_NODE_MIN_MAJOR", "999")
+	t.Setenv("CODEX_NODE_MAJOR", "22")
+	// Keep PATH minimal so no usable system node/npm is discovered.
+	t.Setenv("PATH", "/usr/bin:/bin")
+	clearCachedCodexPath()
+
+	var out bytes.Buffer
+	got, err := ensureCodexInstalled(context.Background(), "", &out)
+	if err != nil {
+		t.Fatalf("ensureCodexInstalled error: %v\ninstaller output:\n%s", err, out.String())
+	}
+	if !probeCodex(context.Background(), got) {
+		t.Fatalf("installed codex is not functional: %s", got)
+	}
+	if !strings.HasPrefix(filepath.Clean(got), filepath.Clean(npmPrefix)+string(os.PathSeparator)) {
+		t.Fatalf("expected installed codex under npm prefix %q, got %q", npmPrefix, got)
+	}
+
+	nodeBin := filepath.Join(nodeRoot, "v22-"+runtime.GOOS+"-"+arch, "bin")
+	nodePath := filepath.Join(nodeBin, "node")
+	if !executableExists(nodePath) {
+		t.Fatalf("expected managed node binary at %q, installer output:\n%s", nodePath, out.String())
+	}
+	if !containsPath(filepath.SplitList(os.Getenv("PATH")), nodeBin) {
+		t.Fatalf("expected PATH to include managed node bin %q, got %q", nodeBin, os.Getenv("PATH"))
+	}
+}
