@@ -121,7 +121,8 @@ codex-proxy history --codex-dir /path/to/.codex tui
 
 Controls:
 
-- Navigation: Up/Down, PageUp/PageDown (also `j`/`k`)
+- Navigation: Up/Down
+- Preview scroll: PageUp/PageDown, Home/End
 - Switch pane: Tab / Left / Right (also `h`/`l`)
 - Search: `/` then type, Enter apply, Esc cancel (`n`/`N` next/prev in preview)
 - Open: Enter (opens in Codex and sets cwd)

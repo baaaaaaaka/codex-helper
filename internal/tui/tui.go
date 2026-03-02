@@ -733,7 +733,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		}
 	} else if state.focus == "preview" {
 		statusSegments = []statusSegment{
-			{text: "Up/Down PgUp/PgDn: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: "PgUp/PgDn Home/End: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
 			{text: yoloLabel, style: yoloStatusStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}
@@ -1323,13 +1323,8 @@ func previewScrollToMatch(matchLine int, viewH int) int {
 
 func isPreviewNavKey(ev *tcell.EventKey) bool {
 	switch ev.Key() {
-	case tcell.KeyUp, tcell.KeyDown, tcell.KeyPgUp, tcell.KeyPgDn, tcell.KeyHome, tcell.KeyEnd:
+	case tcell.KeyPgUp, tcell.KeyPgDn, tcell.KeyHome, tcell.KeyEnd:
 		return true
-	case tcell.KeyRune:
-		switch ev.Rune() {
-		case 'j', 'J', 'k', 'K', 'g', 'G':
-			return true
-		}
 	}
 	return false
 }
@@ -1396,10 +1391,6 @@ func applyPreviewNavigation(state *previewState, nLines int, viewH int, ev *tcel
 		return
 	}
 	switch ev.Key() {
-	case tcell.KeyUp:
-		state.scroll = clamp(state.scroll-1, 0, max(0, nLines-viewH))
-	case tcell.KeyDown:
-		state.scroll = clamp(state.scroll+1, 0, max(0, nLines-viewH))
 	case tcell.KeyPgUp:
 		state.scroll = clamp(state.scroll-max(1, viewH), 0, max(0, nLines-viewH))
 	case tcell.KeyPgDn:
@@ -1408,19 +1399,6 @@ func applyPreviewNavigation(state *previewState, nLines int, viewH int, ev *tcel
 		state.scroll = 0
 	case tcell.KeyEnd:
 		state.scroll = max(0, nLines-viewH)
-	case tcell.KeyRune:
-		switch ev.Rune() {
-		case 'k', 'K':
-			state.scroll = clamp(state.scroll-1, 0, max(0, nLines-viewH))
-		case 'j', 'J':
-			state.scroll = clamp(state.scroll+1, 0, max(0, nLines-viewH))
-		case 'g':
-			state.scroll = 0
-		case 'G':
-			state.scroll = max(0, nLines-viewH)
-		default:
-			return
-		}
 	}
 }
 

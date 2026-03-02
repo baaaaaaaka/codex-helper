@@ -590,14 +590,17 @@ func TestPreviewTextHelpers(t *testing.T) {
 }
 
 func TestIsPreviewNavKey(t *testing.T) {
-	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyUp, 0, 0)) {
-		t.Fatalf("expected KeyUp to be preview nav key")
+	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyPgUp, 0, 0)) {
+		t.Fatalf("expected KeyPgUp to be preview nav key")
 	}
-	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyRune, 'j', 0)) {
-		t.Fatalf("expected rune j to be preview nav key")
+	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyEnd, 0, 0)) {
+		t.Fatalf("expected KeyEnd to be preview nav key")
 	}
-	if isPreviewNavKey(tcell.NewEventKey(tcell.KeyRune, 'x', 0)) {
-		t.Fatalf("expected rune x to be non-nav key")
+	if isPreviewNavKey(tcell.NewEventKey(tcell.KeyUp, 0, 0)) {
+		t.Fatalf("expected KeyUp to be non-nav key")
+	}
+	if isPreviewNavKey(tcell.NewEventKey(tcell.KeyRune, 'j', 0)) {
+		t.Fatalf("expected rune j to be non-nav key")
 	}
 }
 
@@ -640,7 +643,7 @@ func TestApplyListNavigation(t *testing.T) {
 
 func TestApplyPreviewNavigation(t *testing.T) {
 	state := &previewState{scroll: 5}
-	applyPreviewNavigation(state, 0, 2, tcell.NewEventKey(tcell.KeyUp, 0, 0))
+	applyPreviewNavigation(state, 0, 2, tcell.NewEventKey(tcell.KeyPgUp, 0, 0))
 	if state.scroll != 0 {
 		t.Fatalf("expected reset when no lines")
 	}
@@ -649,16 +652,10 @@ func TestApplyPreviewNavigation(t *testing.T) {
 		ev   *tcell.EventKey
 		want int
 	}{
-		{tcell.NewEventKey(tcell.KeyUp, 0, 0), 0},
-		{tcell.NewEventKey(tcell.KeyDown, 0, 0), 2},
 		{tcell.NewEventKey(tcell.KeyPgUp, 0, 0), 0},
 		{tcell.NewEventKey(tcell.KeyPgDn, 0, 0), 3},
 		{tcell.NewEventKey(tcell.KeyHome, 0, 0), 0},
 		{tcell.NewEventKey(tcell.KeyEnd, 0, 0), 8},
-		{tcell.NewEventKey(tcell.KeyRune, 'k', 0), 0},
-		{tcell.NewEventKey(tcell.KeyRune, 'j', 0), 2},
-		{tcell.NewEventKey(tcell.KeyRune, 'g', 0), 0},
-		{tcell.NewEventKey(tcell.KeyRune, 'G', 0), 8},
 	}
 	for _, tc := range cases {
 		state = &previewState{scroll: 1}
@@ -669,7 +666,7 @@ func TestApplyPreviewNavigation(t *testing.T) {
 	}
 
 	state = &previewState{scroll: 1}
-	applyPreviewNavigation(state, 10, 2, tcell.NewEventKey(tcell.KeyRune, 'x', 0))
+	applyPreviewNavigation(state, 10, 2, tcell.NewEventKey(tcell.KeyUp, 0, 0))
 	if state.scroll != 1 {
 		t.Fatalf("expected scroll to remain unchanged")
 	}
@@ -1011,7 +1008,7 @@ func TestHandleKeyCtrlYTogglesYoloOff(t *testing.T) {
 	}
 }
 
-func TestPreviewArrowScrollsWhenFocused(t *testing.T) {
+func TestPreviewPageDownScrollsWhenFocused(t *testing.T) {
 	screen := newTestScreen(t, 60, 12)
 	project := codexhistory.Project{
 		Key:  "one",
@@ -1026,7 +1023,7 @@ func TestPreviewArrowScrollsWhenFocused(t *testing.T) {
 	state.sessionState.selected = 1
 	state.previewCache[previewCacheKey(&project.Sessions[0], nil)] = strings.Repeat("line ", 80)
 
-	_, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyDown, 0, 0))
+	_, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyPgDn, 0, 0))
 	if err != nil {
 		t.Fatalf("handleKey error: %v", err)
 	}
@@ -1091,6 +1088,27 @@ func TestPreviewSearchMatches(t *testing.T) {
 func TestHandleKeyCtrlURequestsUpdateWhenAvailable(t *testing.T) {
 	screen := newTestScreen(t, 80, 20)
 	state := newTestState([]codexhistory.Project{{Key: "one", Path: "/tmp"}})
+	state.updateStatus = &update.Status{Supported: true, UpdateAvailable: true}
+
+	_, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyCtrlU, 0, 0))
+	if !errors.As(err, &UpdateRequested{}) {
+		t.Fatalf("expected update requested error, got %v", err)
+	}
+}
+
+func TestHandleKeyCtrlURequestsUpdateWhenPreviewFocused(t *testing.T) {
+	screen := newTestScreen(t, 60, 12)
+	project := codexhistory.Project{
+		Key:  "one",
+		Path: "/tmp/one",
+		Sessions: []codexhistory.Session{
+			{SessionID: "sess-ctrlu", Summary: "preview ctrl-u"},
+		},
+	}
+	state := newTestState([]codexhistory.Project{project})
+	state.focus = "preview"
+	state.lastListFocus = "sessions"
+	state.sessionState.selected = 1
 	state.updateStatus = &update.Status{Supported: true, UpdateAvailable: true}
 
 	_, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyCtrlU, 0, 0))
