@@ -717,9 +717,6 @@ func TestRunCodexNewSessionDeletesCacheOnYolo(t *testing.T) {
 // TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo verifies that cache
 // cleanup failures are silently ignored and do not break session startup.
 func TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip chmod permission test on windows")
-	}
 	dir := t.TempDir()
 
 	scriptPath := filepath.Join(t.TempDir(), "codex")
@@ -728,17 +725,12 @@ func TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo(t *testing.T) {
 		t.Fatalf("write script: %v", err)
 	}
 
-	codexDir := t.TempDir()
-	cachePath := writeFakeCache(t, codexDir)
-
-	// Make the cache directory non-writable so os.Remove(cachePath) fails.
-	if err := os.Chmod(codexDir, 0o555); err != nil {
-		t.Fatalf("chmod cache dir read-only: %v", err)
+	// Use a regular file as codexDir so RemoveCloudRequirementsCache hits a
+	// deterministic ENOTDIR path (codexDir/cloud-requirements-cache.json).
+	codexDirFile := filepath.Join(t.TempDir(), "codex-dir-file")
+	if err := os.WriteFile(codexDirFile, []byte("not-a-directory"), 0o644); err != nil {
+		t.Fatalf("write codexDir file: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = os.Chmod(cachePath, 0o644)
-		_ = os.Chmod(codexDir, 0o755)
-	})
 
 	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
 	if err != nil {
@@ -753,16 +745,13 @@ func TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo(t *testing.T) {
 		nil, nil,
 		dir,
 		scriptPath,
-		codexDir,
+		codexDirFile,
 		false,
 		true, // yolo
 		&log,
 	)
 	if err != nil {
 		t.Fatalf("runCodexNewSession error: %v", err)
-	}
-	if !cacheExists(t, codexDir) {
-		t.Fatal("cache file should remain when delete fails")
 	}
 	if strings.Contains(strings.ToLower(log.String()), "warn") {
 		t.Fatalf("expected no warning output, got: %q", log.String())
