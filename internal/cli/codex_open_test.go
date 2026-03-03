@@ -717,6 +717,9 @@ func TestRunCodexNewSessionDeletesCacheOnYolo(t *testing.T) {
 // TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo verifies that cache
 // cleanup failures are silently ignored and do not break session startup.
 func TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
 	dir := t.TempDir()
 
 	scriptPath := filepath.Join(t.TempDir(), "codex")
