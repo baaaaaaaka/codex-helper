@@ -5,9 +5,33 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func pathWithinTempRoot(path string) bool {
+	path = filepath.Clean(path)
+	tmpRoot := filepath.Clean(os.TempDir())
+	if path == "" || tmpRoot == "" || path == "." || tmpRoot == "." {
+		return false
+	}
+
+	a := path
+	b := tmpRoot
+	if runtime.GOOS == "windows" {
+		a = strings.ToLower(a)
+		b = strings.ToLower(b)
+	}
+
+	if a == b {
+		return true
+	}
+	if !strings.HasSuffix(b, string(filepath.Separator)) {
+		b += string(filepath.Separator)
+	}
+	return strings.HasPrefix(a, b)
+}
 
 func cleanupRequirementsDir(path string) {
 	path = strings.TrimSpace(path)
@@ -18,7 +42,7 @@ func cleanupRequirementsDir(path string) {
 	if dir == "." || dir == string(filepath.Separator) {
 		return
 	}
-	if !strings.HasPrefix(dir, string(filepath.Separator)+"tmp"+string(filepath.Separator)) {
+	if !pathWithinTempRoot(dir) || dir == filepath.Clean(os.TempDir()) {
 		return
 	}
 	_ = os.RemoveAll(dir)
