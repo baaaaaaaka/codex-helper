@@ -9,6 +9,50 @@ import (
 	"testing"
 )
 
+func cleanupRequirementsDir(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" || !filepath.IsAbs(path) {
+		return
+	}
+	dir := filepath.Clean(filepath.Dir(path))
+	if dir == "." || dir == string(filepath.Separator) {
+		return
+	}
+	if !strings.HasPrefix(dir, string(filepath.Separator)+"tmp"+string(filepath.Separator)) {
+		return
+	}
+	_ = os.RemoveAll(dir)
+}
+
+func TestCleanupRequirementsDirEmptySafe(t *testing.T) {
+	cleanupRequirementsDir("")
+	cleanupRequirementsDir("   ")
+}
+
+func TestCleanupRequirementsDirRelativeSafe(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	if err := os.WriteFile(marker, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	cleanupRequirementsDir("relative/reqs.toml")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("relative path should be ignored, marker missing: %v", err)
+	}
+}
+
+func TestCleanupRequirementsDirRemovesTmpDir(t *testing.T) {
+	dir := t.TempDir()
+	reqPath := filepath.Join(dir, "reqs.toml")
+	if err := os.WriteFile(reqPath, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write req: %v", err)
+	}
+	cleanupRequirementsDir(reqPath)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("tmp requirements dir should be removed, stat err=%v", err)
+	}
+}
+
 // TestCodexPatchIntegration is an integration test that requires a real Codex
 // installation. It is skipped unless CODEX_PATCH_TEST=1 is set.
 // CI installs Codex via npm before running this test.
@@ -38,7 +82,7 @@ func TestCodexPatchIntegration(t *testing.T) {
 		t.Fatalf("PatchCodexBinary: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer cleanupRequirementsDir(result.RequirementsPath)
 
 	if result.PatchedBinary == "" {
 		t.Fatal("expected a patched binary (binary may already be patched)")

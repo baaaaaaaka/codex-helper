@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,8 +23,9 @@ const (
 	// Original path embedded in the Codex binary (28 bytes).
 	origReqPath = "/etc/codex/requirements.toml"
 
-	// Replacement path — same length (28 bytes), user-writable.
-	patchedReqPath = "/tmp/cxreq/requirements.toml"
+	// Requirements path patching relies on fixed-length byte replacement in the
+	// binary. Keep derived replacement paths exactly this many bytes.
+	reqPathPatchLen = len(origReqPath)
 
 	// Permissive requirements TOML that allows all policies.
 	// Values must be lowercase kebab-case to match Codex's serde deserialization.
@@ -45,6 +47,61 @@ allowed_sandbox_modez = ["danger-full-access", "workspace-write", "read-only"]
 	// A lease must miss multiple heartbeats before cleanup can reclaim it.
 	patchLeaseStaleAfter = 2 * time.Minute
 )
+
+var (
+	currentUserLookup = user.Current
+	userHomeDirLookup = os.UserHomeDir
+	hostnameLookup    = os.Hostname
+	getenvLookup      = os.Getenv
+)
+
+// derivePatchedReqPath builds a user-scoped requirements path with a fixed
+// length so it can be embedded via byte-level binary patching.
+func derivePatchedReqPath() (string, error) {
+	identities := make([]string, 0, 8)
+	addIdentity := func(raw string, prefix string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		identities = append(identities, prefix+raw)
+	}
+
+	if current, err := currentUserLookup(); err == nil && current != nil {
+		addIdentity(current.Uid, "")
+		addIdentity(current.Username, "u:")
+	}
+	addIdentity(getenvLookup("UID"), "")
+	addIdentity(getenvLookup("USER"), "u:")
+	addIdentity(getenvLookup("USERNAME"), "u:")
+	addIdentity(getenvLookup("HOME"), "h:")
+	if home, err := userHomeDirLookup(); err == nil {
+		addIdentity(home, "h:")
+	}
+	if host, err := hostnameLookup(); err == nil {
+		addIdentity(host, "n:")
+	}
+	identity := "unknown"
+	if len(identities) > 0 {
+		identity = identities[0]
+	}
+	return derivePatchedReqPathForIdentity(identity)
+}
+
+func derivePatchedReqPathForIdentity(identity string) (string, error) {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return "", fmt.Errorf("empty identity")
+	}
+
+	sum := sha256.Sum256([]byte(identity))
+	hash := hex.EncodeToString(sum[:])
+	path := fmt.Sprintf("/tmp/cx%s-%s/reqs.toml", hash[:6], hash[6:10])
+	if len(path) != reqPathPatchLen {
+		return "", fmt.Errorf("path length mismatch: %d vs %d", reqPathPatchLen, len(path))
+	}
+	return path, nil
+}
 
 // binaryPatch defines a single byte-level patch: find old, replace with new (same length).
 type binaryPatch struct {
@@ -141,7 +198,7 @@ func RemoveCloudRequirementsCache(codexDir string) error {
 	return nil
 }
 
-// Cleanup removes the patched binary and requirements file.
+// Cleanup removes patched binary artifacts for this launch.
 func (r *PatchResult) Cleanup() {
 	if r == nil {
 		return
@@ -350,6 +407,10 @@ func patchCodexBinaryWithRuntime(
 	origHash := hex.EncodeToString(sum[:])
 
 	patched := false
+	patchedReqPath, err := derivePatchedReqPath()
+	if err != nil {
+		return nil, fmt.Errorf("derive requirements path: %w", err)
+	}
 
 	// Patch 1: Redirect system requirements path.
 	old := []byte(origReqPath)
@@ -425,11 +486,17 @@ func patchCodexBinaryWithRuntime(
 
 	// Write permissive requirements.
 	reqDir := filepath.Dir(patchedReqPath)
-	if err := os.MkdirAll(reqDir, 0o755); err != nil {
+	if err := os.MkdirAll(reqDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create requirements dir: %w", err)
 	}
-	if err := os.WriteFile(patchedReqPath, []byte(permissiveRequirements), 0o644); err != nil {
+	if err := os.Chmod(reqDir, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod requirements dir: %w", err)
+	}
+	if err := os.WriteFile(patchedReqPath, []byte(permissiveRequirements), 0o600); err != nil {
 		return nil, fmt.Errorf("write requirements: %w", err)
+	}
+	if err := os.Chmod(patchedReqPath, 0o600); err != nil {
+		return nil, fmt.Errorf("chmod requirements: %w", err)
 	}
 
 	leasePath, stopLeaseHeartbeat, err := createPatchLease(patchedPath)

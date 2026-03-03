@@ -41,7 +41,7 @@ func TestCodexPatchedYoloLaunchIntegration(t *testing.T) {
 		t.Fatalf("PrepareYoloBinary: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer cleanupRequirementsDir(result.RequirementsPath)
 
 	if result.PatchedBinary == "" {
 		t.Fatal("expected patched binary path")

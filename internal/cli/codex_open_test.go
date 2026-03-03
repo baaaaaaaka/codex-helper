@@ -505,7 +505,6 @@ func TestRunCodexNewSessionRejectsProxyWithoutProfile(t *testing.T) {
 func TestPreparePatchedBinaryRePatchesAfterCleanup(t *testing.T) {
 	wrapperPath, _ := setupMockCodexInstall(t)
 	configDir := filepath.Join(t.TempDir(), "config")
-	defer os.RemoveAll("/tmp/cxreq") // clean up permissive requirements
 
 	// --- First call: should produce a patched binary ---
 	result1, _, info1, skipped1 := preparePatchedBinary(wrapperPath, configDir)
@@ -573,7 +572,6 @@ func TestPreparePatchedBinaryRePatchesAfterCleanup(t *testing.T) {
 func TestPreparePatchedBinarySkipsOnFailed(t *testing.T) {
 	wrapperPath, _ := setupMockCodexInstall(t)
 	configDir := filepath.Join(t.TempDir(), "config")
-	defer os.RemoveAll("/tmp/cxreq")
 
 	// Compute wrapper hash to pre-populate failure in history.
 	origHash, err := hashFileSHA256(wrapperPath)
@@ -613,7 +611,6 @@ func TestPreparePatchedBinarySkipsOnFailed(t *testing.T) {
 func TestPreparePatchedBinaryRecordsHistory(t *testing.T) {
 	wrapperPath, _ := setupMockCodexInstall(t)
 	configDir := filepath.Join(t.TempDir(), "config")
-	defer os.RemoveAll("/tmp/cxreq")
 
 	result, _, info, skipped := preparePatchedBinary(wrapperPath, configDir)
 	if skipped || result == nil || result.PatchedBinary == "" {
@@ -714,6 +711,61 @@ func TestRunCodexNewSessionDeletesCacheOnYolo(t *testing.T) {
 
 	if cacheExists(t, codexDir) {
 		t.Fatal("cloud requirements cache should be deleted when yolo is enabled")
+	}
+}
+
+// TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo verifies that cache
+// cleanup failures are silently ignored and do not break session startup.
+func TestRunCodexNewSessionIgnoresCacheDeleteErrorWithYolo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip chmod permission test on windows")
+	}
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	cachePath := writeFakeCache(t, codexDir)
+
+	// Make the cache directory non-writable so os.Remove(cachePath) fails.
+	if err := os.Chmod(codexDir, 0o555); err != nil {
+		t.Fatalf("chmod cache dir read-only: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(cachePath, 0o644)
+		_ = os.Chmod(codexDir, 0o755)
+	})
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	var log bytes.Buffer
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil, nil,
+		dir,
+		scriptPath,
+		codexDir,
+		false,
+		true, // yolo
+		&log,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+	if !cacheExists(t, codexDir) {
+		t.Fatal("cache file should remain when delete fails")
+	}
+	if strings.Contains(strings.ToLower(log.String()), "warn") {
+		t.Fatalf("expected no warning output, got: %q", log.String())
 	}
 }
 

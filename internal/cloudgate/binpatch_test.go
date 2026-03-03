@@ -6,12 +6,22 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func mustPatchedReqPath(t *testing.T) string {
+	t.Helper()
+	path, err := derivePatchedReqPath()
+	if err != nil {
+		t.Fatalf("derivePatchedReqPath: %v", err)
+	}
+	return path
+}
 
 // buildSyntheticBinary creates a fake binary containing the expected marker strings.
 func buildSyntheticBinary(t *testing.T, markers ...string) []byte {
@@ -50,6 +60,76 @@ func TestLooksLikeMachO(t *testing.T) {
 	}
 }
 
+func TestDerivePatchedReqPathForIdentityDeterministic(t *testing.T) {
+	path1, err := derivePatchedReqPathForIdentity("1001")
+	if err != nil {
+		t.Fatalf("derivePatchedReqPathForIdentity first call: %v", err)
+	}
+	path2, err := derivePatchedReqPathForIdentity("1001")
+	if err != nil {
+		t.Fatalf("derivePatchedReqPathForIdentity second call: %v", err)
+	}
+	if path1 != path2 {
+		t.Fatalf("expected deterministic path, got %q vs %q", path1, path2)
+	}
+	if len(path1) != len(origReqPath) {
+		t.Fatalf("path length mismatch: got %d want %d", len(path1), len(origReqPath))
+	}
+	if !strings.HasPrefix(path1, "/tmp/") {
+		t.Fatalf("expected /tmp path, got %q", path1)
+	}
+}
+
+func TestDerivePatchedReqPathForIdentityIsolated(t *testing.T) {
+	pathA, err := derivePatchedReqPathForIdentity("1001")
+	if err != nil {
+		t.Fatalf("derivePatchedReqPathForIdentity for user A: %v", err)
+	}
+	pathB, err := derivePatchedReqPathForIdentity("1002")
+	if err != nil {
+		t.Fatalf("derivePatchedReqPathForIdentity for user B: %v", err)
+	}
+	if pathA == pathB {
+		t.Fatalf("expected isolated paths for different identities, got %q", pathA)
+	}
+}
+
+func TestDerivePatchedReqPathForIdentityRejectsEmpty(t *testing.T) {
+	if _, err := derivePatchedReqPathForIdentity("   "); err == nil {
+		t.Fatal("expected error for empty identity")
+	}
+}
+
+func TestDerivePatchedReqPathFallsBackWhenIdentityUnavailable(t *testing.T) {
+	prevCurrentUserLookup := currentUserLookup
+	prevGetenvLookup := getenvLookup
+	prevUserHomeDirLookup := userHomeDirLookup
+	prevHostnameLookup := hostnameLookup
+	t.Cleanup(func() {
+		currentUserLookup = prevCurrentUserLookup
+		getenvLookup = prevGetenvLookup
+		userHomeDirLookup = prevUserHomeDirLookup
+		hostnameLookup = prevHostnameLookup
+	})
+
+	currentUserLookup = func() (*user.User, error) { return nil, fmt.Errorf("no user lookup") }
+	getenvLookup = func(string) string { return "" }
+	userHomeDirLookup = func() (string, error) { return "", fmt.Errorf("no home dir") }
+	hostnameLookup = func() (string, error) { return "", fmt.Errorf("no hostname") }
+
+	got, err := derivePatchedReqPath()
+	if err != nil {
+		t.Fatalf("derivePatchedReqPath: %v", err)
+	}
+	want, err := derivePatchedReqPathForIdentity("unknown")
+	if err != nil {
+		t.Fatalf("derivePatchedReqPathForIdentity: %v", err)
+	}
+	if got != want {
+		t.Fatalf("fallback path = %q, want %q", got, want)
+	}
+}
+
 func TestPatchCodexBinaryWithRuntime_DarwinMachOSigns(t *testing.T) {
 	dir := t.TempDir()
 	cacheDir := filepath.Join(dir, "cache")
@@ -72,7 +152,7 @@ func TestPatchCodexBinaryWithRuntime_DarwinMachOSigns(t *testing.T) {
 		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	if !called {
 		t.Fatal("expected darwin Mach-O patch to invoke codesign")
@@ -130,7 +210,7 @@ func TestPatchCodexBinaryWithRuntime_NonDarwinSkipsCodesign(t *testing.T) {
 		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	if called {
 		t.Fatal("did not expect codesign on non-darwin runtime")
@@ -156,7 +236,7 @@ func TestPatchCodexBinaryWithRuntime_DarwinNonMachOSkipsCodesign(t *testing.T) {
 		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	if called {
 		t.Fatal("did not expect codesign for non-Mach-O binary")
@@ -184,7 +264,7 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		t.Fatalf("PatchCodexBinary: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	if result.PatchedBinary == "" {
 		t.Fatal("expected patched binary path")
@@ -215,7 +295,7 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 	}
 
 	// Replacement paths should be present.
-	if !bytes.Contains(patched, []byte(patchedReqPath)) {
+	if !bytes.Contains(patched, []byte(mustPatchedReqPath(t))) {
 		t.Error("patched binary missing new requirements path")
 	}
 	if !bytes.Contains(patched, []byte("/api/codex/config/requirementz")) {
@@ -234,7 +314,7 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 	}
 
 	// Requirements file should contain both original and patched key names.
-	reqData, err := os.ReadFile(patchedReqPath)
+	reqData, err := os.ReadFile(mustPatchedReqPath(t))
 	if err != nil {
 		t.Fatalf("read requirements: %v", err)
 	}
@@ -276,7 +356,7 @@ func TestPatchCodexBinarySetsExecutablePermission(t *testing.T) {
 		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	info, err := os.Stat(result.PatchedBinary)
 	if err != nil {
@@ -287,12 +367,50 @@ func TestPatchCodexBinarySetsExecutablePermission(t *testing.T) {
 	}
 }
 
+func TestPatchCodexBinarySetsRequirementsPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not meaningful on windows")
+	}
+
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t, origReqPath, "/api/codex/config/requirements")
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, runtime.GOOS, nil)
+	if err != nil {
+		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
+
+	reqInfo, err := os.Stat(result.RequirementsPath)
+	if err != nil {
+		t.Fatalf("stat requirements file: %v", err)
+	}
+	if got := reqInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("requirements file mode = %#o, want %#o", got, 0o600)
+	}
+
+	dirInfo, err := os.Stat(filepath.Dir(result.RequirementsPath))
+	if err != nil {
+		t.Fatalf("stat requirements dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("requirements dir mode = %#o, want %#o", got, 0o700)
+	}
+}
+
 func TestPatchCodexBinaryIdempotent(t *testing.T) {
 	dir := t.TempDir()
 
 	// Binary that already has the patched paths (simulating a re-patch).
 	data := buildSyntheticBinary(t,
-		patchedReqPath,
+		mustPatchedReqPath(t),
 		"/api/codex/config/requirementz",
 		"/wham/config/requirementz",
 		"allowed_approval_policiez",
@@ -385,7 +503,7 @@ func TestPatchCodexBinaryPartialPatches(t *testing.T) {
 		t.Fatalf("PatchCodexBinary: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	if result.PatchedBinary == "" {
 		t.Fatal("expected patched binary for partial match")
@@ -405,8 +523,8 @@ func TestPatchCodexBinaryPartialPatches(t *testing.T) {
 
 func TestPatchLengthConsistency(t *testing.T) {
 	// Verify all patch pairs have equal byte lengths.
-	if len(origReqPath) != len(patchedReqPath) {
-		t.Errorf("requirements path length mismatch: %d vs %d", len(origReqPath), len(patchedReqPath))
+	if len(origReqPath) != len(mustPatchedReqPath(t)) {
+		t.Errorf("requirements path length mismatch: %d vs %d", len(origReqPath), len(mustPatchedReqPath(t)))
 	}
 	for _, p := range cloudRequirementsPatches {
 		if len(p.old) != len(p.new) {
@@ -610,7 +728,7 @@ func TestPatchCodexBinaryOrigSHA256_Patched(t *testing.T) {
 		t.Fatalf("PatchCodexBinary: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	// OrigSHA256 should match the SHA-256 of the original binary data.
 	sum := sha256.Sum256(data)
@@ -627,7 +745,7 @@ func TestPatchCodexBinaryOrigSHA256_NoPatchNeeded(t *testing.T) {
 
 	// Binary that already has the patched paths — no patches needed.
 	data := buildSyntheticBinary(t,
-		patchedReqPath,
+		mustPatchedReqPath(t),
 		"/api/codex/config/requirementz",
 		"/wham/config/requirementz",
 		"allowed_approval_policiez",
@@ -693,7 +811,7 @@ func TestPatchCodexBinaryOrigSHA256_DifferentFromPatched(t *testing.T) {
 		t.Fatalf("PatchCodexBinary: %v", err)
 	}
 	defer result.Cleanup()
-	defer os.RemoveAll(filepath.Dir(patchedReqPath))
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
 
 	if result.PatchedBinary == "" {
 		t.Fatal("expected patched binary")
