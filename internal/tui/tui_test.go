@@ -30,6 +30,7 @@ func newTestScreen(t *testing.T, w, h int) tcell.Screen {
 
 type sizedScreen struct {
 	tcell.Screen
+	initDone chan struct{}
 }
 
 func (s *sizedScreen) Init() error {
@@ -37,7 +38,40 @@ func (s *sizedScreen) Init() error {
 		return err
 	}
 	s.Screen.SetSize(80, 24)
+	if s.initDone != nil {
+		close(s.initDone)
+	}
 	return nil
+}
+
+func newSelectSessionTestScreen(t *testing.T) (tcell.Screen, <-chan struct{}) {
+	t.Helper()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	initDone := make(chan struct{})
+	prevNewScreen := newScreen
+	newScreen = func() (tcell.Screen, error) {
+		return &sizedScreen{Screen: screen, initDone: initDone}, nil
+	}
+	t.Cleanup(func() { newScreen = prevNewScreen })
+	return screen, initDone
+}
+
+func waitForScreenInit(t *testing.T, initDone <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-initDone:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for screen init")
+	}
+}
+
+func postEventsAfterInit(initDone <-chan struct{}, screen tcell.Screen, events ...tcell.Event) {
+	go func() {
+		<-initDone
+		for _, event := range events {
+			screen.PostEvent(event)
+		}
+	}()
 }
 
 func newTestState(projects []codexhistory.Project) *uiState {
@@ -867,12 +901,7 @@ func TestEnsurePreview(t *testing.T) {
 }
 
 func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
-	screen := tcell.NewSimulationScreen("UTF-8")
-	prevNewScreen := newScreen
-	newScreen = func() (tcell.Screen, error) {
-		return &sizedScreen{Screen: screen}, nil
-	}
-	t.Cleanup(func() { newScreen = prevNewScreen })
+	screen, initDone := newSelectSessionTestScreen(t)
 
 	projectPath := t.TempDir()
 	projects := []codexhistory.Project{{
@@ -887,12 +916,11 @@ func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
-	}()
+	postEventsAfterInit(initDone, screen,
+		tcell.NewEventKey(tcell.KeyRune, 'l', 0),
+		tcell.NewEventKey(tcell.KeyDown, 0, 0),
+		tcell.NewEventKey(tcell.KeyEnter, 0, 0),
+	)
 
 	selection, err := SelectSession(ctx, Options{
 		LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
@@ -908,19 +936,11 @@ func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
 }
 
 func TestSelectSessionQuit(t *testing.T) {
-	screen := tcell.NewSimulationScreen("UTF-8")
-	prevNewScreen := newScreen
-	newScreen = func() (tcell.Screen, error) {
-		return &sizedScreen{Screen: screen}, nil
-	}
-	t.Cleanup(func() { newScreen = prevNewScreen })
+	screen, initDone := newSelectSessionTestScreen(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
-	}()
+	postEventsAfterInit(initDone, screen, tcell.NewEventKey(tcell.KeyRune, 'q', 0))
 
 	selection, err := SelectSession(ctx, Options{
 		LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
@@ -936,12 +956,7 @@ func TestSelectSessionQuit(t *testing.T) {
 }
 
 func TestSelectSessionRefreshInterval(t *testing.T) {
-	screen := tcell.NewSimulationScreen("UTF-8")
-	prevNewScreen := newScreen
-	newScreen = func() (tcell.Screen, error) {
-		return &sizedScreen{Screen: screen}, nil
-	}
-	t.Cleanup(func() { newScreen = prevNewScreen })
+	screen, initDone := newSelectSessionTestScreen(t)
 
 	var mu sync.Mutex
 	calls := 0
@@ -974,6 +989,7 @@ func TestSelectSessionRefreshInterval(t *testing.T) {
 		t.Fatalf("timeout waiting for refresh")
 	}
 
+	waitForScreenInit(t, initDone)
 	screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
 
 	select {
@@ -993,12 +1009,7 @@ func TestSelectSessionRefreshInterval(t *testing.T) {
 }
 
 func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
-	screen := tcell.NewSimulationScreen("UTF-8")
-	prevNewScreen := newScreen
-	newScreen = func() (tcell.Screen, error) {
-		return &sizedScreen{Screen: screen}, nil
-	}
-	t.Cleanup(func() { newScreen = prevNewScreen })
+	screen, initDone := newSelectSessionTestScreen(t)
 
 	projectPath1 := t.TempDir()
 	projectPath2 := t.TempDir()
@@ -1032,7 +1043,7 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		time.Sleep(20 * time.Millisecond)
+		<-initDone
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'j', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
