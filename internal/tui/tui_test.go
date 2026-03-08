@@ -170,8 +170,8 @@ func TestBuildProjectItemsPinsCurrent(t *testing.T) {
 	if items[0].project.Path != cwd {
 		t.Fatalf("expected current path %s, got %s", cwd, items[0].project.Path)
 	}
-	if !strings.Contains(items[0].label, "[current]") {
-		t.Fatalf("expected current label, got %q", items[0].label)
+	if items[0].label != cwd {
+		t.Fatalf("expected raw search label %q, got %q", cwd, items[0].label)
 	}
 }
 
@@ -181,6 +181,65 @@ func TestBuildProjectItemsMarksExistingCurrent(t *testing.T) {
 	items := buildProjectItems(projects, cwd)
 	if len(items) == 0 || !items[0].isCurrent {
 		t.Fatalf("expected current project first, got %#v", items)
+	}
+}
+
+func TestBuildProjectItemsSortsByRecentActivity(t *testing.T) {
+	now := time.Now()
+	older := codexhistory.Project{
+		Path: "/tmp/older",
+		Sessions: []codexhistory.Session{{
+			SessionID:  "sess-1",
+			ModifiedAt: now.Add(-2 * time.Hour),
+		}},
+	}
+	newer := codexhistory.Project{
+		Path: "/tmp/newer",
+		Sessions: []codexhistory.Session{{
+			SessionID:  "sess-2",
+			ModifiedAt: now,
+		}},
+	}
+
+	items := buildProjectItems([]codexhistory.Project{older, newer}, "")
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].project.Path != newer.Path {
+		t.Fatalf("expected newer project first, got %q", items[0].project.Path)
+	}
+	if items[1].project.Path != older.Path {
+		t.Fatalf("expected older project second, got %q", items[1].project.Path)
+	}
+}
+
+func TestBuildProjectItemsSortsBySubagentActivity(t *testing.T) {
+	now := time.Now()
+	withSubagent := codexhistory.Project{
+		Path: "/tmp/with-subagent",
+		Sessions: []codexhistory.Session{{
+			SessionID:  "sess-1",
+			ModifiedAt: now.Add(-2 * time.Hour),
+			Subagents: []codexhistory.SubagentSession{{
+				SessionID:  "sub-1",
+				ModifiedAt: now,
+			}},
+		}},
+	}
+	regular := codexhistory.Project{
+		Path: "/tmp/regular",
+		Sessions: []codexhistory.Session{{
+			SessionID:  "sess-2",
+			ModifiedAt: now.Add(-time.Hour),
+		}},
+	}
+
+	items := buildProjectItems([]codexhistory.Project{regular, withSubagent}, "")
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].project.Path != withSubagent.Path {
+		t.Fatalf("expected subagent-active project first, got %q", items[0].project.Path)
 	}
 }
 
@@ -530,6 +589,102 @@ func TestTextHelpers(t *testing.T) {
 		}
 		if got := versionLabel("v2.0.0"); got != "v2.0.0" {
 			t.Fatalf("expected existing prefix to remain, got %q", got)
+		}
+	})
+
+	t.Run("compressMiddle keeps both ends visible", func(t *testing.T) {
+		got := compressMiddle("donut-eclipse-foundation-garlic", 18)
+		if !strings.HasPrefix(got, "don") {
+			t.Fatalf("expected head to remain visible, got %q", got)
+		}
+		if !strings.Contains(got, "...") {
+			t.Fatalf("expected ellipsis, got %q", got)
+		}
+		if !strings.HasSuffix(got, "rlic") {
+			t.Fatalf("expected tail to remain visible, got %q", got)
+		}
+	})
+
+	t.Run("compressMiddle never exceeds width", func(t *testing.T) {
+		txt := "donut-eclipse-foundation-garlic"
+		for width := 1; width <= 8; width++ {
+			got := compressMiddle(txt, width)
+			if displayWidth(got) > width {
+				t.Fatalf("width=%d produced %q with display width %d", width, got, displayWidth(got))
+			}
+		}
+	})
+
+	t.Run("formatProjectRow keeps leaf and count", func(t *testing.T) {
+		item := projectItem{
+			project: codexhistory.Project{
+				Path:     "/alice/bob/cherry/donut-eclipse-foundation-garlic",
+				Sessions: []codexhistory.Session{{SessionID: "sess-1"}, {SessionID: "sess-2"}},
+			},
+		}
+		got := formatProjectRow(item, 36)
+		if !strings.Contains(got, "/donut") {
+			t.Fatalf("expected leaf marker to remain visible, got %q", got)
+		}
+		if !strings.Contains(got, "garlic") {
+			t.Fatalf("expected leaf tail to remain visible, got %q", got)
+		}
+		if !strings.HasSuffix(got, "  (2)") {
+			t.Fatalf("expected session count suffix, got %q", got)
+		}
+		if displayWidth(got) > 36 {
+			t.Fatalf("expected width <= 36, got %d for %q", displayWidth(got), got)
+		}
+	})
+
+	t.Run("formatProjectRow aligns slash column", func(t *testing.T) {
+		left := projectItem{
+			project: codexhistory.Project{
+				Path:     "/alice/bob/cherry/donut-eclipse-foundation-garlic",
+				Sessions: []codexhistory.Session{{SessionID: "sess-1"}},
+			},
+		}
+		right := projectItem{
+			project: codexhistory.Project{
+				Path:     "/tiny/x",
+				Sessions: []codexhistory.Session{{SessionID: "sess-2"}},
+			},
+		}
+
+		leftRow := formatProjectRow(left, 36)
+		rightRow := formatProjectRow(right, 36)
+		if strings.LastIndex(leftRow, "/") != strings.LastIndex(rightRow, "/") {
+			t.Fatalf("expected last slash to align, got %q and %q", leftRow, rightRow)
+		}
+	})
+
+	t.Run("formatProjectRow keeps current prefix visible", func(t *testing.T) {
+		item := projectItem{
+			project: codexhistory.Project{
+				Path:     "/alice/bob/cherry/donut-eclipse-foundation-garlic",
+				Sessions: []codexhistory.Session{{SessionID: "sess-1"}},
+			},
+			isCurrent: true,
+		}
+		got := formatProjectRow(item, 32)
+		if !strings.HasPrefix(got, "[current] ") {
+			t.Fatalf("expected current prefix, got %q", got)
+		}
+		if !strings.Contains(got, "garlic") {
+			t.Fatalf("expected final directory to remain visible, got %q", got)
+		}
+		if displayWidth(got) > 32 {
+			t.Fatalf("expected width <= 32, got %d for %q", displayWidth(got), got)
+		}
+	})
+
+	t.Run("formatProjectRow preserves width with unknown projects", func(t *testing.T) {
+		item := projectItem{
+			project: codexhistory.Project{Key: "(unknown)"},
+		}
+		got := formatProjectRow(item, 10)
+		if displayWidth(got) > 10 {
+			t.Fatalf("expected width <= 10, got %d for %q", displayWidth(got), got)
 		}
 	})
 }

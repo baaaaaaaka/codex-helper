@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -808,7 +809,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		drawList(
 			screen,
 			layoutMode.projects,
-			renderProjectRows(filteredProjects, listFocus == "projects", state.projectState, layoutMode.projects.h-2),
+			renderProjectRows(filteredProjects, listFocus == "projects", state.projectState, layoutMode.projects.w-2, layoutMode.projects.h-2),
 		)
 		if listFocus == "sessions" {
 			drawList(
@@ -822,7 +823,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		drawList(
 			screen,
 			layoutMode.projects,
-			renderProjectRows(filteredProjects, state.focus == "projects", state.projectState, layoutMode.projects.h-2),
+			renderProjectRows(filteredProjects, state.focus == "projects", state.projectState, layoutMode.projects.w-2, layoutMode.projects.h-2),
 		)
 
 		drawBox(screen, layoutMode.sessions, "Sessions", state.focus == "sessions", sessionFilter)
@@ -914,26 +915,19 @@ func ensurePreview(
 }
 
 func buildProjectItems(projects []codexhistory.Project, defaultCwd string) []projectItem {
-	items := make([]projectItem, 0, len(projects)+1)
+	orderedProjects := append([]codexhistory.Project(nil), projects...)
+	sort.SliceStable(orderedProjects, func(i, j int) bool {
+		return projectLess(orderedProjects[i], orderedProjects[j])
+	})
+
+	items := make([]projectItem, 0, len(orderedProjects)+1)
 	currentPath := strings.TrimSpace(defaultCwd)
 	currentResolved := normalizePathForCompare(currentPath)
 	currentIdx := -1
 
-	for _, project := range projects {
-		label := project.Path
-		if label == "" {
-			label = project.Key
-		}
-		if label == "" {
-			label = "Unknown project"
-		}
-		if len(project.Sessions) > 0 {
-			label = fmt.Sprintf("%s  (%d)", label, len(project.Sessions))
-		}
+	for _, project := range orderedProjects {
+		label := projectSearchLabel(project)
 		isCurrent := currentResolved != "" && isSamePath(project.Path, currentResolved)
-		if isCurrent {
-			label = "[current] " + label
-		}
 		items = append(items, projectItem{
 			label:         label,
 			project:       project,
@@ -948,9 +942,8 @@ func buildProjectItems(projects []codexhistory.Project, defaultCwd string) []pro
 	if currentResolved != "" {
 		if currentIdx == -1 {
 			project := codexhistory.Project{Path: currentPath}
-			label := "[current] " + currentPath
 			items = append([]projectItem{{
-				label:         label,
+				label:         projectSearchLabel(project),
 				project:       project,
 				isCurrent:     true,
 				alwaysVisible: true,
@@ -1008,6 +1001,286 @@ func buildSessionItems(project codexhistory.Project, expanded map[string]bool) [
 		}
 	}
 	return items
+}
+
+func projectSearchLabel(project codexhistory.Project) string {
+	label := strings.TrimSpace(project.Path)
+	if label == "" {
+		label = strings.TrimSpace(project.Key)
+	}
+	if label == "" {
+		label = "Unknown project"
+	}
+	return label
+}
+
+func projectLess(left, right codexhistory.Project) bool {
+	leftTime := projectModifiedAt(left)
+	rightTime := projectModifiedAt(right)
+	switch {
+	case leftTime.IsZero() && !rightTime.IsZero():
+		return false
+	case !leftTime.IsZero() && rightTime.IsZero():
+		return true
+	case !leftTime.Equal(rightTime):
+		return leftTime.After(rightTime)
+	}
+	return projectSortKey(left) < projectSortKey(right)
+}
+
+func projectModifiedAt(project codexhistory.Project) time.Time {
+	var latest time.Time
+	for _, session := range project.Sessions {
+		if session.ModifiedAt.After(latest) {
+			latest = session.ModifiedAt
+		}
+		for _, subagent := range session.Subagents {
+			if subagent.ModifiedAt.After(latest) {
+				latest = subagent.ModifiedAt
+			}
+		}
+	}
+	return latest
+}
+
+func projectSortKey(project codexhistory.Project) string {
+	key := strings.TrimSpace(project.Path)
+	if key == "" {
+		key = strings.TrimSpace(project.Key)
+	}
+	return strings.ToLower(key)
+}
+
+func formatProjectRow(item projectItem, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	prefix := ""
+	if item.isCurrent {
+		prefix = "[current] "
+	}
+
+	suffix := ""
+	if count := len(item.project.Sessions); count > 0 {
+		suffix = fmt.Sprintf("  (%d)", count)
+	}
+
+	bodyWidth := width - displayWidth(prefix) - displayWidth(suffix)
+	if bodyWidth <= 0 {
+		return truncate(prefix+suffix, width)
+	}
+
+	body := formatProjectPath(item.project, bodyWidth)
+	row := prefix + body + suffix
+	if displayWidth(row) > width {
+		return truncate(row, width)
+	}
+	return row
+}
+
+func formatProjectPath(project codexhistory.Project, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	path := strings.TrimSpace(project.Path)
+	if path == "" {
+		return padRight(compressMiddle(projectSearchLabel(project), width), width)
+	}
+
+	parent, leaf, ok := splitProjectPath(path)
+	if !ok {
+		return padRight(compressMiddle(path, width), width)
+	}
+	if parent == "" {
+		return padRight(compressLeaf(leaf, width), width)
+	}
+
+	slashWidth := displayWidth("/")
+	if width <= slashWidth+1 {
+		return padRight(compressLeaf(leaf, width), width)
+	}
+
+	parentAreaWidth := min(6, max(2, width/4))
+	leafAreaWidth := width - slashWidth - parentAreaWidth
+	if leafAreaWidth < 1 {
+		return padRight(compressLeaf(leaf, width), width)
+	}
+
+	parentDisplay := fitParentForSlash(parent, parentAreaWidth)
+	leafDisplay := compressLeaf(leaf, leafAreaWidth)
+	body := padLeft(parentDisplay, parentAreaWidth) + "/" + padRight(leafDisplay, leafAreaWidth)
+	if displayWidth(body) > width {
+		return padRight(truncate(body, width), width)
+	}
+	return body
+}
+
+func splitProjectPath(path string) (parent, leaf string, ok bool) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", "", false
+	}
+
+	cut := strings.LastIndexAny(trimmed, `/\`)
+	if cut < 0 {
+		return "", trimmed, true
+	}
+
+	leaf = strings.Trim(trimmed[cut+1:], `/\`)
+	parent = strings.Trim(trimmed[:cut], `/\`)
+	if leaf == "" {
+		leaf = strings.Trim(trimmed, `/\`)
+		parent = ""
+	}
+	if leaf == "" {
+		return "", "", false
+	}
+	return parent, leaf, true
+}
+
+func compressMiddle(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if displayWidth(s) <= width {
+		return s
+	}
+	if width <= displayWidth("...") {
+		return truncate(s, width)
+	}
+
+	remaining := width - displayWidth("...")
+	headWidth := 0
+	tailWidth := 0
+	switch {
+	case remaining == 1:
+		headWidth = 1
+	case remaining == 2:
+		headWidth = 1
+		tailWidth = 1
+	default:
+		tailWidth = max(1, min(remaining-1, (remaining*3)/5))
+		headWidth = remaining - tailWidth
+	}
+
+	head := headByDisplayWidth(s, headWidth)
+	tail := tailByDisplayWidth(s, tailWidth)
+	if head == "" && tail == "" {
+		return truncate(s, width)
+	}
+	if tail == "" {
+		return head + "..."
+	}
+	if head == "" {
+		return "..." + tail
+	}
+	return head + "..." + tail
+}
+
+func compressLeaf(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if displayWidth(s) <= width {
+		return s
+	}
+
+	token := trailingToken(s)
+	if token != "" && token != s {
+		tokenWidth := displayWidth(token)
+		ellipsisWidth := displayWidth("...")
+		if tokenWidth+ellipsisWidth < width {
+			headWidth := width - ellipsisWidth - tokenWidth
+			head := headByDisplayWidth(s, headWidth)
+			if head != "" {
+				return head + "..." + token
+			}
+		}
+	}
+
+	return compressMiddle(s, width)
+}
+
+func headByDisplayWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	var buf strings.Builder
+	curWidth := 0
+	for _, ch := range s {
+		chWidth := runewidth.RuneWidth(ch)
+		if chWidth == 0 {
+			buf.WriteRune(ch)
+			continue
+		}
+		if curWidth+chWidth > width {
+			break
+		}
+		buf.WriteRune(ch)
+		curWidth += chWidth
+	}
+	return buf.String()
+}
+
+func tailByDisplayWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	start := len(runes)
+	curWidth := 0
+	for start > 0 {
+		ch := runes[start-1]
+		chWidth := runewidth.RuneWidth(ch)
+		if chWidth == 0 {
+			start--
+			continue
+		}
+		if curWidth+chWidth > width {
+			break
+		}
+		start--
+		curWidth += chWidth
+	}
+	return string(runes[start:])
+}
+
+func fitParentForSlash(parent string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	parent = strings.TrimSpace(parent)
+	if parent == "" {
+		return ""
+	}
+	if displayWidth(parent) <= width {
+		return parent
+	}
+	if width <= 2 {
+		return truncate(parent, width)
+	}
+	return ".." + tailByDisplayWidth(parent, width-2)
+}
+
+func trailingToken(s string) string {
+	if s == "" {
+		return ""
+	}
+	cut := strings.LastIndexAny(s, "-_. ")
+	if cut < 0 || cut == len(s)-1 {
+		return ""
+	}
+	return s[cut+1:]
+}
+
+func padLeft(s string, width int) string {
+	curWidth := displayWidth(s)
+	if curWidth >= width {
+		return s
+	}
+	return strings.Repeat(" ", width-curWidth) + s
 }
 
 func selectedProject(items []projectItem, idx int) codexhistory.Project {
@@ -1193,12 +1466,15 @@ func buildPreviewLines(
 	return lines
 }
 
-func renderProjectRows(items []projectItem, focused bool, state listState, viewH int) []row {
+func renderProjectRows(items []projectItem, focused bool, state listState, viewW, viewH int) []row {
 	rows := make([]row, 0, min(len(items), viewH))
 	start := clamp(state.scroll, 0, max(0, len(items)))
 	end := min(len(items), start+max(0, viewH))
 	for i := start; i < end; i++ {
-		rows = append(rows, row{label: items[i].label, bold: items[i].isCurrent})
+		rows = append(rows, row{
+			label: formatProjectRow(items[i], viewW),
+			bold:  items[i].isCurrent,
+		})
 	}
 	return applySelection(rows, focused, listState{selected: state.selected - start})
 }
