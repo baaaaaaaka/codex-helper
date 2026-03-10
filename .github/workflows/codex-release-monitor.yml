@@ -37,6 +37,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: codex-release-monitor
@@ -368,11 +369,79 @@ jobs:
               )
           PY
 
+      - name: Plan monitor issues
+        id: issue_plan
+        if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'release') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSIONS_TO_UPDATE: ${{ needs.detect.outputs.versions_to_test }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh issue list --state open --limit 1000 --json title,body,url > open_issues.json
+          python3 scripts/codex_monitor_issues.py \
+            --results-dir results \
+            --versions-json "$VERSIONS_TO_UPDATE" \
+            --open-issues-path open_issues.json \
+            --run-url "$RUN_URL" \
+            --repository "${{ github.repository }}" \
+            --event-name "${{ github.event_name }}" \
+            --sha "${{ github.sha }}" > issue_plan.json
+          cat issue_plan.json
+          issue_count="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          plan = Path("issue_plan.json")
+          if not plan.exists():
+              print(0)
+          else:
+              print(len(json.loads(plan.read_text(encoding="utf-8"))))
+          PY
+          )"
+          echo "issue_count=${issue_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Create monitor issues
+        if: ${{ steps.issue_plan.outcome == 'success' && steps.issue_plan.outputs.issue_count != '0' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          issues = json.loads(Path("issue_plan.json").read_text(encoding="utf-8"))
+          for issue in issues:
+              with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as body_file:
+                  body_file.write(issue["body"])
+                  body_path = Path(body_file.name)
+              try:
+                  subprocess.run(
+                      [
+                          "gh",
+                          "issue",
+                          "create",
+                          "--title",
+                          issue["title"],
+                          "--body-file",
+                          str(body_path),
+                      ],
+                      check=True,
+                  )
+              finally:
+                  body_path.unlink(missing_ok=True)
+          PY
+
       - name: Cleanup results
         if: always()
         shell: bash
         run: |
-          rm -rf results
+          rm -rf results open_issues.json issue_plan.json
 
       - name: Commit changes
         shell: bash
