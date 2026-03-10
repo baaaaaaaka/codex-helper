@@ -118,8 +118,26 @@ func TestCodexPatchIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read patched binary: %v", err)
 	}
-	if bytes.Contains(patched, []byte(origReqPath)) {
-		t.Error("patched binary still contains original requirements path")
+
+	checks := []struct {
+		orig    string
+		patched string
+	}{
+		{orig: origReqPath, patched: result.RequirementsPath},
+		{orig: "/api/codex/config/requirements", patched: "/api/codex/config/requirementz"},
+		{orig: "/wham/config/requirements", patched: "/wham/config/requirementz"},
+		{orig: "chatgpt_plan_type", patched: "chatgpt_plan_typf"},
+		{orig: "allowed_approval_policies", patched: "allowed_approval_policiez"},
+		{orig: "allowed_sandbox_modes", patched: "allowed_sandbox_modez"},
+	}
+	for _, check := range checks {
+		origCount := bytes.Count(patched, []byte(check.orig))
+		if origCount != 0 {
+			t.Fatalf("patched binary still contains %d occurrences of %q", origCount, check.orig)
+		}
+		if bytes.Count(patched, []byte(check.patched)) == 0 {
+			t.Fatalf("patched binary missing patched marker %q", check.patched)
+		}
 	}
 
 	// 5. Verify the permissive requirements file was written correctly.

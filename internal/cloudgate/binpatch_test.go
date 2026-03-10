@@ -252,6 +252,7 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		origReqPath,
 		"/api/codex/config/requirements",
 		"/wham/config/requirements",
+		"chatgpt_plan_type",
 		"allowed_approval_policies",
 		"allowed_sandbox_modes",
 	)
@@ -287,6 +288,9 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 	}
 
 	// Original TOML keys should be gone.
+	if bytes.Contains(patched, []byte("chatgpt_plan_type")) {
+		t.Error("patched binary still contains original ChatGPT plan claim key")
+	}
 	if bytes.Contains(patched, []byte("allowed_approval_policies")) {
 		t.Error("patched binary still contains original approval policies key")
 	}
@@ -306,6 +310,9 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 	}
 
 	// Patched TOML keys should be present.
+	if !bytes.Contains(patched, []byte("chatgpt_plan_typf")) {
+		t.Error("patched binary missing renamed ChatGPT plan claim key")
+	}
 	if !bytes.Contains(patched, []byte("allowed_approval_policiez")) {
 		t.Error("patched binary missing renamed approval policies key")
 	}
@@ -334,6 +341,81 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		if !strings.Contains(reqStr, key) {
 			t.Errorf("requirements missing key %q", key)
 		}
+	}
+}
+
+func TestPatchCodexBinaryReplacesAllRepeatedMarkers(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	markers := []string{
+		origReqPath,
+		origReqPath,
+		"/api/codex/config/requirements",
+		"/wham/config/requirements",
+	}
+	for range 2 {
+		markers = append(markers, "chatgpt_plan_type")
+	}
+	for range 6 {
+		markers = append(markers, "allowed_approval_policies")
+		markers = append(markers, "allowed_sandbox_modes")
+	}
+
+	data := buildSyntheticBinary(t, markers...)
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
+
+	patched, err := os.ReadFile(result.PatchedBinary)
+	if err != nil {
+		t.Fatalf("read patched: %v", err)
+	}
+
+	if got := bytes.Count(patched, []byte(origReqPath)); got != 0 {
+		t.Fatalf("patched binary still contains %d original requirements paths", got)
+	}
+	if got := bytes.Count(patched, []byte("/api/codex/config/requirements")); got != 0 {
+		t.Fatalf("patched binary still contains %d original API paths", got)
+	}
+	if got := bytes.Count(patched, []byte("/wham/config/requirements")); got != 0 {
+		t.Fatalf("patched binary still contains %d original WHAM paths", got)
+	}
+	if got := bytes.Count(patched, []byte("chatgpt_plan_type")); got != 0 {
+		t.Fatalf("patched binary still contains %d original plan claim keys", got)
+	}
+	if got := bytes.Count(patched, []byte("allowed_approval_policies")); got != 0 {
+		t.Fatalf("patched binary still contains %d original approval policy keys", got)
+	}
+	if got := bytes.Count(patched, []byte("allowed_sandbox_modes")); got != 0 {
+		t.Fatalf("patched binary still contains %d original sandbox mode keys", got)
+	}
+
+	if got := bytes.Count(patched, []byte(mustPatchedReqPath(t))); got != 2 {
+		t.Fatalf("patched binary contains %d patched requirements paths, want 2", got)
+	}
+	if got := bytes.Count(patched, []byte("/api/codex/config/requirementz")); got != 1 {
+		t.Fatalf("patched binary contains %d sabotaged API paths, want 1", got)
+	}
+	if got := bytes.Count(patched, []byte("/wham/config/requirementz")); got != 1 {
+		t.Fatalf("patched binary contains %d sabotaged WHAM paths, want 1", got)
+	}
+	if got := bytes.Count(patched, []byte("chatgpt_plan_typf")); got != 2 {
+		t.Fatalf("patched binary contains %d renamed plan claim keys, want 2", got)
+	}
+	if got := bytes.Count(patched, []byte("allowed_approval_policiez")); got != 6 {
+		t.Fatalf("patched binary contains %d renamed approval policy keys, want 6", got)
+	}
+	if got := bytes.Count(patched, []byte("allowed_sandbox_modez")); got != 6 {
+		t.Fatalf("patched binary contains %d renamed sandbox mode keys, want 6", got)
 	}
 }
 
@@ -413,6 +495,7 @@ func TestPatchCodexBinaryIdempotent(t *testing.T) {
 		mustPatchedReqPath(t),
 		"/api/codex/config/requirementz",
 		"/wham/config/requirementz",
+		"chatgpt_plan_typf",
 		"allowed_approval_policiez",
 		"allowed_sandbox_modez",
 	)
@@ -436,7 +519,7 @@ func TestPatchCodexBinaryIdempotent(t *testing.T) {
 func TestPatchCodexBinaryMultipleOccurrences(t *testing.T) {
 	dir := t.TempDir()
 
-	// Binary with the requirements path appearing twice.
+	// Binary with the requirements path appearing twice should patch both.
 	data := buildSyntheticBinary(t,
 		origReqPath,
 		"MIDDLE",
@@ -448,12 +531,22 @@ func TestPatchCodexBinaryMultipleOccurrences(t *testing.T) {
 	}
 
 	cacheDir := filepath.Join(dir, "cache")
-	_, err := PatchCodexBinary(origPath, cacheDir)
-	if err == nil {
-		t.Fatal("expected error for multiple occurrences")
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
 	}
-	if !strings.Contains(err.Error(), "expected 1 occurrence") {
-		t.Fatalf("unexpected error: %v", err)
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
+
+	patched, err := os.ReadFile(result.PatchedBinary)
+	if err != nil {
+		t.Fatalf("read patched: %v", err)
+	}
+	if got := bytes.Count(patched, []byte(origReqPath)); got != 0 {
+		t.Fatalf("patched binary still contains %d original requirements paths", got)
+	}
+	if got := bytes.Count(patched, []byte(mustPatchedReqPath(t))); got != 2 {
+		t.Fatalf("patched binary contains %d patched requirements paths, want 2", got)
 	}
 }
 
@@ -527,6 +620,11 @@ func TestPatchLengthConsistency(t *testing.T) {
 		t.Errorf("requirements path length mismatch: %d vs %d", len(origReqPath), len(mustPatchedReqPath(t)))
 	}
 	for _, p := range cloudRequirementsPatches {
+		if len(p.old) != len(p.new) {
+			t.Errorf("%s: length mismatch: %d vs %d", p.name, len(p.old), len(p.new))
+		}
+	}
+	for _, p := range accountPlanTypePatches {
 		if len(p.old) != len(p.new) {
 			t.Errorf("%s: length mismatch: %d vs %d", p.name, len(p.old), len(p.new))
 		}
@@ -716,6 +814,7 @@ func TestPatchCodexBinaryOrigSHA256_Patched(t *testing.T) {
 		origReqPath,
 		"/api/codex/config/requirements",
 		"/wham/config/requirements",
+		"chatgpt_plan_type",
 		"allowed_approval_policies",
 		"allowed_sandbox_modes",
 	)
@@ -748,6 +847,7 @@ func TestPatchCodexBinaryOrigSHA256_NoPatchNeeded(t *testing.T) {
 		mustPatchedReqPath(t),
 		"/api/codex/config/requirementz",
 		"/wham/config/requirementz",
+		"chatgpt_plan_typf",
 		"allowed_approval_policiez",
 		"allowed_sandbox_modez",
 	)

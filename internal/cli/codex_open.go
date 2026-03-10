@@ -15,6 +15,28 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
+func logYoloPatchStatus(
+	log io.Writer,
+	patchResult *cloudgate.PatchResult,
+	skipped bool,
+	patchErr error,
+) {
+	if log == nil {
+		return
+	}
+
+	switch {
+	case skipped:
+		_, _ = fmt.Fprintln(log, "yolo patch skipped due to previous startup failure; launching original codex binary.")
+	case patchErr != nil:
+		_, _ = fmt.Fprintf(log, "yolo patch failed: %v; launching original codex binary.\n", patchErr)
+	case patchResult != nil && patchResult.PatchedBinary != "":
+		_, _ = fmt.Fprintf(log, "yolo patch active; launching patched codex binary: %s\n", patchResult.PatchedBinary)
+	case patchResult != nil:
+		_, _ = fmt.Fprintln(log, "yolo patch produced no modified binary; launching original codex binary.")
+	}
+}
+
 func buildCodexResumeCommand(
 	codexPath string,
 	session codexhistory.Session,
@@ -104,19 +126,17 @@ func runCodexSession(
 	// Layer 3: Patch the native Codex binary to use permissive system requirements.
 	extraEnv := []string{}
 	var pInfo *patchRunInfo
+	effectiveCodexHome := ""
 	if useYolo {
 		configDir := filepath.Dir(store.Path())
-		patchResult, patchEnv, info, skipped := preparePatchedBinary(codexPath, configDir)
+		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinary(codexPath, configDir)
+		logYoloPatchStatus(log, patchResult, skipped, patchErr)
 		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
 			codexPath = patchResult.PatchedBinary
 			extraEnv = append(extraEnv, patchEnv...)
 			pInfo = info
 			defer patchResult.Cleanup()
 		}
-		// Always delete the cloud requirements cache when yolo is
-		// requested, even if patching was skipped or failed. The cached
-		// cloud requirements would otherwise override yolo flags.
-		_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
 	}
 
 	path, args, cwd, err := buildCodexResumeCommand(codexPath, session, project, useYolo)
@@ -124,10 +144,30 @@ func runCodexSession(
 		return err
 	}
 
+	if useYolo {
+		codexHome, homeErr := resolveCodexHome(codexDir, cwd)
+		if homeErr != nil {
+			return homeErr
+		}
+		effectiveCodexHome = codexHome
+		authOverride, authErr := prepareYoloAuthOverride(codexHome)
+		logYoloAuthStatus(log, authOverride, authErr)
+		if authOverride != nil {
+			defer authOverride.Cleanup()
+		}
+		// Always delete the cloud requirements cache when yolo is
+		// requested, even if patching was skipped or failed. The cached
+		// cloud requirements would otherwise override yolo flags.
+		_ = cloudgate.RemoveCloudRequirementsCache(codexHome)
+	}
+
 	cmdArgs := append([]string{path}, args...)
 
-	if codexDir != "" {
+	if effectiveCodexHome != "" {
+		extraEnv = append(extraEnv, yoloCodexHomeEnv(effectiveCodexHome)...)
+	} else if codexDir != "" {
 		extraEnv = append(extraEnv, codexhistory.EnvCodexDir+"="+codexDir)
+		extraEnv = append(extraEnv, envCodexHome+"="+codexDir)
 	}
 
 	opts := runTargetOptions{
@@ -185,19 +225,31 @@ func runCodexNewSession(
 	// Layer 3: Patch the native Codex binary to use permissive system requirements.
 	extraEnv := []string{}
 	var pInfo *patchRunInfo
+	effectiveCodexHome := ""
 	if useYolo {
 		configDir := filepath.Dir(store.Path())
-		patchResult, patchEnv, info, skipped := preparePatchedBinary(codexPath, configDir)
+		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinary(codexPath, configDir)
+		logYoloPatchStatus(log, patchResult, skipped, patchErr)
 		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
 			codexPath = patchResult.PatchedBinary
 			extraEnv = append(extraEnv, patchEnv...)
 			pInfo = info
 			defer patchResult.Cleanup()
 		}
+		codexHome, homeErr := resolveCodexHome(codexDir, cwd)
+		if homeErr != nil {
+			return homeErr
+		}
+		effectiveCodexHome = codexHome
+		authOverride, authErr := prepareYoloAuthOverride(codexHome)
+		logYoloAuthStatus(log, authOverride, authErr)
+		if authOverride != nil {
+			defer authOverride.Cleanup()
+		}
 		// Always delete the cloud requirements cache when yolo is
 		// requested, even if patching was skipped or failed. The cached
 		// cloud requirements would otherwise override yolo flags.
-		_ = cloudgate.RemoveCloudRequirementsCache(codexDir)
+		_ = cloudgate.RemoveCloudRequirementsCache(codexHome)
 	}
 
 	cmdArgs := []string{codexPath}
@@ -207,8 +259,11 @@ func runCodexNewSession(
 		}
 	}
 
-	if codexDir != "" {
+	if effectiveCodexHome != "" {
+		extraEnv = append(extraEnv, yoloCodexHomeEnv(effectiveCodexHome)...)
+	} else if codexDir != "" {
 		extraEnv = append(extraEnv, codexhistory.EnvCodexDir+"="+codexDir)
+		extraEnv = append(extraEnv, envCodexHome+"="+codexDir)
 	}
 
 	opts := runTargetOptions{
@@ -234,21 +289,21 @@ func runCodexNewSession(
 // awareness. It skips patching only if a previous patch was recorded as failed
 // (to avoid retrying a known-broken patch). Otherwise it always re-patches
 // because the patched binary is ephemeral (removed by Cleanup after each session).
-// Returns (result, env, patchRunInfo, skipped).
-func preparePatchedBinary(codexPath string, configDir string) (*cloudgate.PatchResult, []string, *patchRunInfo, bool) {
+// Returns (result, env, patchRunInfo, skipped, err).
+func preparePatchedBinary(codexPath string, configDir string) (*cloudgate.PatchResult, []string, *patchRunInfo, bool, error) {
 	origHash, hashErr := hashFileSHA256(codexPath)
 
 	// Only skip if a previous patch is known to have failed (crashed binary).
 	phs, phsErr := config.NewPatchHistoryStore(configDir)
 	if phsErr == nil && hashErr == nil {
 		if failed, _ := phs.IsFailed(codexPath, origHash); failed {
-			return nil, nil, nil, true
+			return nil, nil, nil, true, nil
 		}
 	}
 
 	patchResult, patchEnv, patchErr := cloudgate.PrepareYoloBinary(codexPath, configDir)
 	if patchErr != nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, false, patchErr
 	}
 
 	var info *patchRunInfo
@@ -272,5 +327,5 @@ func preparePatchedBinary(codexPath string, configDir string) (*cloudgate.PatchR
 		})
 	}
 
-	return patchResult, patchEnv, info, false
+	return patchResult, patchEnv, info, false, nil
 }
