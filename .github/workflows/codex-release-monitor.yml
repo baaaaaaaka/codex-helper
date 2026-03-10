@@ -180,6 +180,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           npm install -g "@openai/codex@$env:CODEX_VERSION"
 
       - name: Run Codex patch + yolo smoke tests
@@ -293,6 +294,7 @@ jobs:
         shell: bash
         env:
           PLATFORM_NAME: ${{ matrix.platform }}
+          CODEX_VERSION: ${{ matrix.version }}
         run: |
           set -euo pipefail
           status="fail"

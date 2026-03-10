@@ -58,6 +58,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           $installDir = Join-Path $env:USERPROFILE ".local\\bin"
           .\\install.ps1 -Repo $env:GITHUB_REPOSITORY -Version $env:GITHUB_REF_NAME -InstallDir $installDir
           $exe = Join-Path $installDir "codex-proxy.exe"

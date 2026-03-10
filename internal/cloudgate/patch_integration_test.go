@@ -2,6 +2,7 @@ package cloudgate
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,6 +78,65 @@ func TestCleanupRequirementsDirRemovesTmpDir(t *testing.T) {
 	}
 }
 
+func validatePatchedMarkerState(original, patched []byte, orig string, replacement string) error {
+	origCount := bytes.Count(original, []byte(orig))
+	patchedOrigCount := bytes.Count(patched, []byte(orig))
+	if patchedOrigCount != 0 {
+		return fmt.Errorf("patched binary still contains %d occurrences of %q", patchedOrigCount, orig)
+	}
+	if origCount == 0 {
+		return nil
+	}
+	patchedReplacementCount := bytes.Count(patched, []byte(replacement))
+	if patchedReplacementCount < origCount {
+		return fmt.Errorf(
+			"patched binary contains %d occurrences of %q, want at least %d",
+			patchedReplacementCount,
+			replacement,
+			origCount,
+		)
+	}
+	return nil
+}
+
+func TestValidatePatchedMarkerState(t *testing.T) {
+	t.Run("requires replacement when original marker existed", func(t *testing.T) {
+		err := validatePatchedMarkerState(
+			[]byte("before /api/codex/config/requirements after"),
+			[]byte("before /api/codex/config/requirementz after"),
+			"/api/codex/config/requirements",
+			"/api/codex/config/requirementz",
+		)
+		if err != nil {
+			t.Fatalf("validatePatchedMarkerState returned error: %v", err)
+		}
+	})
+
+	t.Run("allows binaries that never embedded the original marker", func(t *testing.T) {
+		err := validatePatchedMarkerState(
+			[]byte("no requirements path here"),
+			[]byte("still no requirements path here"),
+			origReqPath,
+			"/tmp/cx123456-7890/reqs.toml",
+		)
+		if err != nil {
+			t.Fatalf("validatePatchedMarkerState returned error: %v", err)
+		}
+	})
+
+	t.Run("fails when original marker remains", func(t *testing.T) {
+		err := validatePatchedMarkerState(
+			[]byte("before chatgpt_plan_type after"),
+			[]byte("before chatgpt_plan_type after"),
+			"chatgpt_plan_type",
+			"chatgpt_plan_typf",
+		)
+		if err == nil {
+			t.Fatal("validatePatchedMarkerState should have failed")
+		}
+	})
+}
+
 // TestCodexPatchIntegration is an integration test that requires a real Codex
 // installation. It is skipped unless CODEX_PATCH_TEST=1 is set.
 // CI installs Codex via npm before running this test.
@@ -98,6 +158,10 @@ func TestCodexPatchIntegration(t *testing.T) {
 		t.Skipf("FindNativeBinary: %v (native binary not bundled for this platform)", err)
 	}
 	t.Logf("native binary: %s", nativeBin)
+	original, err := os.ReadFile(nativeBin)
+	if err != nil {
+		t.Fatalf("read original binary: %v", err)
+	}
 
 	// 3. Patch the binary into a temp directory.
 	cacheDir := filepath.Join(t.TempDir(), "patch-cache")
@@ -131,12 +195,8 @@ func TestCodexPatchIntegration(t *testing.T) {
 		{orig: "allowed_sandbox_modes", patched: "allowed_sandbox_modez"},
 	}
 	for _, check := range checks {
-		origCount := bytes.Count(patched, []byte(check.orig))
-		if origCount != 0 {
-			t.Fatalf("patched binary still contains %d occurrences of %q", origCount, check.orig)
-		}
-		if bytes.Count(patched, []byte(check.patched)) == 0 {
-			t.Fatalf("patched binary missing patched marker %q", check.patched)
+		if err := validatePatchedMarkerState(original, patched, check.orig, check.patched); err != nil {
+			t.Fatal(err)
 		}
 	}
 

@@ -46,6 +46,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           py -3 -m unittest discover -s scripts/tests -p "test_*.py"
 
       - name: gofmt (verify)
@@ -172,6 +173,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           npm install -g @openai/codex
 
       - name: Codex upgrade integration (system npm, Linux/macOS)
@@ -217,6 +219,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           npm install -g @openai/codex
           $systemPrefix = (npm prefix -g).Trim()
           go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-system.json" --upgrade-codex
@@ -231,6 +234,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           $localPrefix = Join-Path $env:RUNNER_TEMP "codex-local-prefix"
           npm install -g --prefix $localPrefix @openai/codex
           $localBin = Join-Path $localPrefix "bin"
@@ -266,6 +270,7 @@ jobs:
           CODEX_YOLO_PATCH_TEST: "1"
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           if (Get-Command codex -ErrorAction SilentlyContinue) {
             go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
             go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
