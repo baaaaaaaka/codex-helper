@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -59,6 +60,29 @@ func TestTargetTriple(t *testing.T) {
 	}
 }
 
+func TestTargetTripleFor(t *testing.T) {
+	tests := []struct {
+		goos   string
+		goarch string
+		want   string
+	}{
+		{goos: "linux", goarch: "amd64", want: "x86_64-unknown-linux-musl"},
+		{goos: "linux", goarch: "arm64", want: "aarch64-unknown-linux-musl"},
+		{goos: "darwin", goarch: "amd64", want: "x86_64-apple-darwin"},
+		{goos: "darwin", goarch: "arm64", want: "aarch64-apple-darwin"},
+		{goos: "windows", goarch: "amd64", want: "x86_64-pc-windows-msvc"},
+		{goos: "windows", goarch: "arm64", want: "aarch64-pc-windows-msvc"},
+		{goos: "linux", goarch: "386", want: ""},
+		{goos: "freebsd", goarch: "amd64", want: ""},
+	}
+
+	for _, tt := range tests {
+		if got := targetTripleFor(tt.goos, tt.goarch); got != tt.want {
+			t.Fatalf("targetTripleFor(%q, %q) = %q, want %q", tt.goos, tt.goarch, got, tt.want)
+		}
+	}
+}
+
 func TestPlatformPackageName(t *testing.T) {
 	name := platformPackageName()
 	if targetTriple() == "" {
@@ -72,6 +96,27 @@ func TestPlatformPackageName(t *testing.T) {
 	}
 }
 
+func TestPlatformPackageNameForTriple(t *testing.T) {
+	tests := []struct {
+		triple string
+		want   string
+	}{
+		{triple: "x86_64-unknown-linux-musl", want: filepath.Join("@openai", "codex-linux-x64")},
+		{triple: "aarch64-unknown-linux-musl", want: filepath.Join("@openai", "codex-linux-arm64")},
+		{triple: "x86_64-apple-darwin", want: filepath.Join("@openai", "codex-darwin-x64")},
+		{triple: "aarch64-apple-darwin", want: filepath.Join("@openai", "codex-darwin-arm64")},
+		{triple: "x86_64-pc-windows-msvc", want: filepath.Join("@openai", "codex-win32-x64")},
+		{triple: "aarch64-pc-windows-msvc", want: filepath.Join("@openai", "codex-win32-arm64")},
+		{triple: "unknown", want: ""},
+	}
+
+	for _, tt := range tests {
+		if got := platformPackageNameForTriple(tt.triple); got != tt.want {
+			t.Fatalf("platformPackageNameForTriple(%q) = %q, want %q", tt.triple, got, tt.want)
+		}
+	}
+}
+
 func TestNativeBinaryName(t *testing.T) {
 	name := nativeBinaryName()
 	if runtime.GOOS == "windows" {
@@ -82,6 +127,15 @@ func TestNativeBinaryName(t *testing.T) {
 		if name != "codex" {
 			t.Errorf("expected codex on non-windows, got %q", name)
 		}
+	}
+}
+
+func TestNativeBinaryNameForOS(t *testing.T) {
+	if got := nativeBinaryNameForOS("windows"); got != "codex.exe" {
+		t.Fatalf("nativeBinaryNameForOS(windows) = %q, want codex.exe", got)
+	}
+	if got := nativeBinaryNameForOS("linux"); got != "codex" {
+		t.Fatalf("nativeBinaryNameForOS(linux) = %q, want codex", got)
 	}
 }
 
@@ -341,4 +395,121 @@ func TestPrepareYoloBinaryMissingWrapper(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing wrapper")
 	}
+}
+
+func TestPrepareYoloBinarySuccess(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+
+	binDir := filepath.Join(dir, "bin")
+	nativeDir := filepath.Join(dir, "vendor", triple, "codex")
+	pathDir := filepath.Join(dir, "vendor", triple, "path")
+	for _, p := range []string{binDir, nativeDir, pathDir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+	}
+
+	wrapperPath := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
+	data := buildSyntheticBinary(t,
+		origReqPath,
+		"/api/codex/config/requirements",
+		"/wham/config/requirements",
+		"chatgpt_plan_type",
+		"allowed_approval_policies",
+		"allowed_sandbox_modes",
+	)
+	if err := os.WriteFile(nativePath, data, 0o755); err != nil {
+		t.Fatalf("write native: %v", err)
+	}
+
+	result, extraEnv, err := PrepareYoloBinary(wrapperPath, filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("PrepareYoloBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
+
+	if result == nil || result.PatchedBinary == "" {
+		t.Fatal("expected patched binary result")
+	}
+	if result.PatchedBinary == nativePath {
+		t.Fatalf("expected patched binary path to differ from native path %q", nativePath)
+	}
+	if _, statErr := os.Stat(result.PatchedBinary); statErr != nil {
+		t.Fatalf("expected patched binary to exist: %v", statErr)
+	}
+	if !containsEnvPrefix(extraEnv, "PATH="+pathDir+string(os.PathListSeparator)) {
+		t.Fatalf("expected PATH override to include vendor path dir, got %v", extraEnv)
+	}
+	if !containsEnvValue(extraEnv, "CODEX_MANAGED_BY_NPM=1") {
+		t.Fatalf("expected npm marker env, got %v", extraEnv)
+	}
+}
+
+func TestRemoveCloudRequirementsCacheExplicitAndDefaultDir(t *testing.T) {
+	explicitDir := t.TempDir()
+	explicitCache := filepath.Join(explicitDir, "cloud-requirements-cache.json")
+	if err := os.WriteFile(explicitCache, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write explicit cache: %v", err)
+	}
+
+	if err := RemoveCloudRequirementsCache(explicitDir); err != nil {
+		t.Fatalf("RemoveCloudRequirementsCache explicit: %v", err)
+	}
+	if _, err := os.Stat(explicitCache); !os.IsNotExist(err) {
+		t.Fatalf("expected explicit cache removal, got err=%v", err)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	defaultDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(defaultDir, 0o755); err != nil {
+		t.Fatalf("mkdir default codex dir: %v", err)
+	}
+	defaultCache := filepath.Join(defaultDir, "cloud-requirements-cache.json")
+	if err := os.WriteFile(defaultCache, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write default cache: %v", err)
+	}
+
+	if err := RemoveCloudRequirementsCache(""); err != nil {
+		t.Fatalf("RemoveCloudRequirementsCache default: %v", err)
+	}
+	if _, err := os.Stat(defaultCache); !os.IsNotExist(err) {
+		t.Fatalf("expected default cache removal, got err=%v", err)
+	}
+	if err := RemoveCloudRequirementsCache(defaultDir); err != nil {
+		t.Fatalf("RemoveCloudRequirementsCache missing file: %v", err)
+	}
+}
+
+func containsEnvPrefix(env []string, prefix string) bool {
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEnvValue(env []string, want string) bool {
+	for _, item := range env {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }

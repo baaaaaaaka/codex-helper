@@ -209,6 +209,7 @@ func TestEnsureProxyPreferenceWriteFailure(t *testing.T) {
 }
 
 func TestEnsureProxyPreferenceUsesStdin(t *testing.T) {
+	lockCLITestHooks(t)
 	store := newTempStore(t)
 	reader, writer, err := os.Pipe()
 	if err != nil {

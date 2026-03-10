@@ -921,6 +921,7 @@ func TestCodexInstallLockIsContended(t *testing.T) {
 }
 
 func TestWithCodexInstallLockFallsBackAfterTimeout(t *testing.T) {
+	lockCLITestHooks(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	if runtime.GOOS == "windows" {
@@ -970,6 +971,7 @@ func TestWithCodexInstallLockFallsBackAfterTimeout(t *testing.T) {
 }
 
 func TestWithCodexInstallLockAcquiresAfterRelease(t *testing.T) {
+	lockCLITestHooks(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	if runtime.GOOS == "windows" {

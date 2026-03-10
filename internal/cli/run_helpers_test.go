@@ -104,6 +104,7 @@ func TestRunWithExistingInstanceOptionsInstallsCodexUsingProxyEnv(t *testing.T) 
 }
 
 func TestWithProfileInstallEnvUsesExistingInstance(t *testing.T) {
+	lockCLITestHooks(t)
 	instanceID := "inst-profile-install-env"
 	httpPort := startHealthServer(t, instanceID)
 	profile := config.Profile{ID: "p1"}
@@ -142,6 +143,7 @@ func TestWithProfileInstallEnvUsesExistingInstance(t *testing.T) {
 }
 
 func TestWithProfileInstallEnvFallsBackToNewStackWhenReusableInstallFails(t *testing.T) {
+	lockCLITestHooks(t)
 	existingID := "inst-profile-install-fallback"
 	existingHTTPPort := startHealthServer(t, existingID)
 	profile := config.Profile{ID: "p1"}
@@ -189,6 +191,7 @@ func TestWithProfileInstallEnvFallsBackToNewStackWhenReusableInstallFails(t *tes
 }
 
 func TestRunWithProfileOptionsFallsBackToNewStackWhenReusableInstallFails(t *testing.T) {
+	lockCLITestHooks(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell-based test on windows")
 	}
@@ -381,6 +384,7 @@ func TestRunTargetWithFallbackYoloRetry(t *testing.T) {
 }
 
 func TestRunWithNewStackOptionsSuccess(t *testing.T) {
+	lockCLITestHooks(t)
 	shell := requireShell(t)
 	store := newTempStore(t)
 	profile := config.Profile{ID: "p1", Host: "host", Port: 22, User: "user"}

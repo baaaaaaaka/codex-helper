@@ -149,7 +149,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          threshold="25.0"
+          threshold="40.0"
           total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$NF); print $NF}')"
           echo "Total coverage: ${total}% (threshold ${threshold}%)"
           awk -v total="$total" -v threshold="$threshold" 'BEGIN { if (total+0 < threshold+0) { printf("coverage %.2f%% < %.2f%%\n", total, threshold); exit 1 } }'

@@ -215,6 +215,7 @@ func startHealthServer(t *testing.T, instanceID string) int {
 }
 
 func TestRunWithProfileOptionsUsesSnapshotFirst(t *testing.T) {
+	lockCLITestHooks(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
 	}
@@ -264,6 +265,7 @@ func TestRunWithProfileOptionsUsesSnapshotFirst(t *testing.T) {
 }
 
 func TestRunWithProfileOptionsCreatesNewStack(t *testing.T) {
+	lockCLITestHooks(t)
 	store := newTempStore(t)
 
 	origStackStart := stackStart
@@ -289,6 +291,7 @@ func TestRunWithProfileOptionsCreatesNewStack(t *testing.T) {
 }
 
 func TestRunWithProfileOptionsLoadErrorFallsThrough(t *testing.T) {
+	lockCLITestHooks(t)
 	// Create a store backed by corrupt JSON so store.Load() fails.
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
@@ -323,6 +326,7 @@ func TestRunWithProfileOptionsLoadErrorFallsThrough(t *testing.T) {
 }
 
 func TestRunWithProfileOptionsSkipsWrongProfile(t *testing.T) {
+	lockCLITestHooks(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
 	}
@@ -372,6 +376,7 @@ func TestRunWithProfileOptionsSkipsWrongProfile(t *testing.T) {
 }
 
 func TestRunWithProfileOptionsRefreshesInstances(t *testing.T) {
+	lockCLITestHooks(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
 	}

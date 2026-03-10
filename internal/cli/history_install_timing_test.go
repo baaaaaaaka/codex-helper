@@ -11,6 +11,7 @@ import (
 )
 
 func TestRunHistoryTuiDoesNotRequireCodexBeforeSelection(t *testing.T) {
+	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {

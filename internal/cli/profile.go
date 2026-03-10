@@ -22,7 +22,7 @@ func ensureProfile(
 
 	var created *config.Profile
 	if len(cfg.Profiles) == 0 && autoInit {
-		p, err := initProfileInteractive(ctx, store)
+		p, err := initProfileInteractiveFunc(ctx, store)
 		if err != nil {
 			return config.Profile{}, cfg, err
 		}

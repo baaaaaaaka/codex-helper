@@ -11,23 +11,27 @@ import (
 
 // targetTriple returns the Rust target triple for the current platform.
 func targetTriple() string {
-	switch runtime.GOOS {
+	return targetTripleFor(runtime.GOOS, runtime.GOARCH)
+}
+
+func targetTripleFor(goos string, goarch string) string {
+	switch goos {
 	case "linux":
-		switch runtime.GOARCH {
+		switch goarch {
 		case "amd64":
 			return "x86_64-unknown-linux-musl"
 		case "arm64":
 			return "aarch64-unknown-linux-musl"
 		}
 	case "darwin":
-		switch runtime.GOARCH {
+		switch goarch {
 		case "amd64":
 			return "x86_64-apple-darwin"
 		case "arm64":
 			return "aarch64-apple-darwin"
 		}
 	case "windows":
-		switch runtime.GOARCH {
+		switch goarch {
 		case "amd64":
 			return "x86_64-pc-windows-msvc"
 		case "arm64":
@@ -41,7 +45,11 @@ func targetTriple() string {
 // that ships the native binary for the current platform (e.g.
 // "@openai/codex-win32-x64"). Returns "" if unknown.
 func platformPackageName() string {
-	switch targetTriple() {
+	return platformPackageNameForTriple(targetTriple())
+}
+
+func platformPackageNameForTriple(triple string) string {
+	switch triple {
 	case "x86_64-unknown-linux-musl":
 		return filepath.Join("@openai", "codex-linux-x64")
 	case "aarch64-unknown-linux-musl":
@@ -60,7 +68,11 @@ func platformPackageName() string {
 
 // nativeBinaryName returns "codex.exe" on Windows, "codex" elsewhere.
 func nativeBinaryName() string {
-	if runtime.GOOS == "windows" {
+	return nativeBinaryNameForOS(runtime.GOOS)
+}
+
+func nativeBinaryNameForOS(goos string) string {
+	if goos == "windows" {
 		return "codex.exe"
 	}
 	return "codex"

@@ -30,7 +30,7 @@ func newInitCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 
-			prof, err := initProfileInteractive(cmd.Context(), store)
+			prof, err := initProfileInteractiveFunc(cmd.Context(), store)
 			if err != nil {
 				return err
 			}

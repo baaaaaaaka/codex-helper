@@ -15,6 +15,7 @@ import (
 )
 
 func TestRunHistoryTuiPersistsProxyEnabledAfterProfileSetup(t *testing.T) {
+	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {
@@ -75,6 +76,7 @@ func TestRunHistoryTuiPersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 }
 
 func TestRunHistoryTuiDoesNotPersistProxyEnabledWhenProfileSetupFails(t *testing.T) {
+	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {
@@ -124,6 +126,7 @@ func TestRunHistoryTuiDoesNotPersistProxyEnabledWhenProfileSetupFails(t *testing
 }
 
 func TestRunHistoryTuiToggleEnablePersistsAfterInitSuccess(t *testing.T) {
+	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {
@@ -196,6 +199,7 @@ func TestRunHistoryTuiToggleEnablePersistsAfterInitSuccess(t *testing.T) {
 }
 
 func TestRunHistoryTuiToggleEnableDoesNotPersistWhenInitFails(t *testing.T) {
+	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {
@@ -260,6 +264,7 @@ func TestRunHistoryTuiToggleEnableDoesNotPersistWhenInitFails(t *testing.T) {
 }
 
 func TestHistoryOpenPersistsProxyEnabledAfterProfileSetup(t *testing.T) {
+	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {

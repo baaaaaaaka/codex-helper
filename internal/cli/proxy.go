@@ -24,6 +24,42 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 )
 
+type proxyStartedStack struct {
+	httpPort  int
+	socksPort int
+	fatalCh   <-chan error
+	close     func(context.Context) error
+}
+
+var (
+	proxyNow        = time.Now
+	proxyStartStack = func(profile config.Profile, instanceID string, opts stack.Options) (proxyStartedStack, error) {
+		st, err := stack.Start(profile, instanceID, opts)
+		if err != nil {
+			return proxyStartedStack{}, err
+		}
+		return proxyStartedStack{
+			httpPort:  st.HTTPPort,
+			socksPort: st.SocksPort,
+			fatalCh:   st.Fatal(),
+			close:     st.Close,
+		}, nil
+	}
+	proxyRecordInstance = manager.RecordInstance
+	proxyRemoveInstance = manager.RemoveInstance
+	proxyHeartbeat      = manager.Heartbeat
+	proxyProcessAlive   = proc.IsAlive
+	proxyFindProcess    = os.FindProcess
+	proxyTerminate      = terminateProcess
+	proxyLookPath       = exec.LookPath
+	proxyCheckHTTPProxy = func(hc manager.HealthClient, port int, expectedInstanceID string) error {
+		return hc.CheckHTTPProxy(port, expectedInstanceID)
+	}
+	proxyExecutable    = os.Executable
+	proxyCommand       = exec.Command
+	runProxyDaemonFunc = runProxyDaemon
+)
+
 func newProxyCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "proxy",
@@ -73,7 +109,7 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 
-			now := time.Now()
+			now := proxyNow()
 			inst := config.Instance{
 				ID:         instanceID,
 				ProfileID:  profile.ID,
@@ -83,15 +119,15 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 				StartedAt:  now,
 				LastSeenAt: now,
 			}
-			if err := manager.RecordInstance(store, inst); err != nil {
+			if err := proxyRecordInstance(store, inst); err != nil {
 				return err
 			}
 
 			if foreground {
-				return runProxyDaemon(cmd.Context(), store, instanceID)
+				return runProxyDaemonFunc(cmd.Context(), store, instanceID)
 			}
 
-			exe, err := os.Executable()
+			exe, err := proxyExecutable()
 			if err != nil {
 				return err
 			}
@@ -102,7 +138,7 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 			}
 			args = append(args, "proxy", "daemon", "--instance-id", instanceID)
 
-			c := exec.Command(exe, args...)
+			c := proxyCommand(exe, args...)
 			c.Stdin = nil
 
 			logPath := filepath.Join(filepath.Dir(store.Path()), "instances", instanceID+".log")
@@ -126,7 +162,7 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 				for i := range cfg.Instances {
 					if cfg.Instances[i].ID == instanceID {
 						cfg.Instances[i].DaemonPID = pid
-						cfg.Instances[i].LastSeenAt = time.Now()
+						cfg.Instances[i].LastSeenAt = proxyNow()
 						return nil
 					}
 				}
@@ -156,7 +192,7 @@ func newProxyDaemonCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runProxyDaemon(cmd.Context(), store, instanceID)
+			return runProxyDaemonFunc(cmd.Context(), store, instanceID)
 		},
 	}
 
@@ -207,35 +243,35 @@ func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID s
 		opts.HTTPListenAddr = fmt.Sprintf("127.0.0.1:%d", inst.HTTPPort)
 	}
 
-	st, err := stack.Start(prof, instanceID, opts)
+	st, err := proxyStartStack(prof, instanceID, opts)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = st.Close(context.Background()) }()
+	defer func() { _ = st.close(context.Background()) }()
 
-	now := time.Now()
+	now := proxyNow()
 	inst.DaemonPID = os.Getpid()
-	inst.SocksPort = st.SocksPort
-	inst.HTTPPort = st.HTTPPort
+	inst.SocksPort = st.socksPort
+	inst.HTTPPort = st.httpPort
 	if inst.StartedAt.IsZero() {
 		inst.StartedAt = now
 	}
 	inst.LastSeenAt = now
-	_ = manager.RecordInstance(store, inst)
+	_ = proxyRecordInstance(store, inst)
 
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
 
 	for {
 		select {
-		case err := <-st.Fatal():
-			_ = manager.RemoveInstance(store, instanceID)
+		case err := <-st.fatalCh:
+			_ = proxyRemoveInstance(store, instanceID)
 			return err
 		case <-ctx.Done():
-			_ = manager.RemoveInstance(store, instanceID)
+			_ = proxyRemoveInstance(store, instanceID)
 			return nil
 		case <-t.C:
-			_ = manager.Heartbeat(store, instanceID, time.Now())
+			_ = proxyHeartbeat(store, instanceID, proxyNow())
 		}
 	}
 }
@@ -260,10 +296,10 @@ func newProxyListCmd(root *rootOptions) *cobra.Command {
 			_, _ = fmt.Fprintln(w, "INSTANCE\tPROFILE\tPID\tHTTP\tSOCKS\tSTATUS\tLAST_SEEN")
 			for _, inst := range cfg.Instances {
 				status := "dead"
-				if inst.DaemonPID > 0 && proc.IsAlive(inst.DaemonPID) {
+				if inst.DaemonPID > 0 && proxyProcessAlive(inst.DaemonPID) {
 					status = "alive"
 					if inst.HTTPPort > 0 {
-						if err := hc.CheckHTTPProxy(inst.HTTPPort, inst.ID); err != nil {
+						if err := proxyCheckHTTPProxy(hc, inst.HTTPPort, inst.ID); err != nil {
 							status = "unhealthy"
 						}
 					}
@@ -324,11 +360,11 @@ func newProxyStopCmd(root *rootOptions) *cobra.Command {
 				return fmt.Errorf("instance %q not found", id)
 			}
 
-			if inst.DaemonPID > 0 && proc.IsAlive(inst.DaemonPID) {
-				p, _ := os.FindProcess(inst.DaemonPID)
-				_ = terminateProcess(p, 2*time.Second)
+			if inst.DaemonPID > 0 && proxyProcessAlive(inst.DaemonPID) {
+				p, _ := proxyFindProcess(inst.DaemonPID)
+				_ = proxyTerminate(p, 2*time.Second)
 			}
-			_ = manager.RemoveInstance(store, id)
+			_ = proxyRemoveInstance(store, id)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Stopped instance %s\n", id)
 			return nil
 		},
@@ -353,12 +389,12 @@ func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 			if err := store.Update(func(cfg *config.Config) error {
 				out := cfg.Instances[:0]
 				for _, inst := range cfg.Instances {
-					if inst.DaemonPID <= 0 || !proc.IsAlive(inst.DaemonPID) {
+					if inst.DaemonPID <= 0 || !proxyProcessAlive(inst.DaemonPID) {
 						removed++
 						continue
 					}
 					if inst.HTTPPort > 0 {
-						if err := hc.CheckHTTPProxy(inst.HTTPPort, inst.ID); err != nil {
+						if err := proxyCheckHTTPProxy(hc, inst.HTTPPort, inst.ID); err != nil {
 							removed++
 							continue
 						}
@@ -386,19 +422,19 @@ func newProxyDoctorCmd(root *rootOptions) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var issues []string
 
-			if _, err := exec.LookPath("ssh"); err != nil {
+			if _, err := proxyLookPath("ssh"); err != nil {
 				issues = append(issues, "missing `ssh` (OpenSSH client)")
 			}
-			if _, err := exec.LookPath("ssh-keygen"); err != nil {
+			if _, err := proxyLookPath("ssh-keygen"); err != nil {
 				issues = append(issues, "missing `ssh-keygen` (optional, only needed for `init` key creation)")
 			}
-			if _, err := exec.LookPath("npm"); err != nil {
+			if _, err := proxyLookPath("npm"); err != nil {
 				issues = append(issues, "missing `npm` (needed to install codex CLI: npm install -g @openai/codex)")
 			}
-			if _, err := exec.LookPath("node"); err != nil {
+			if _, err := proxyLookPath("node"); err != nil {
 				issues = append(issues, "missing `node` (Node.js runtime, required by codex CLI)")
 			}
-			if _, err := exec.LookPath("codex"); err != nil {
+			if _, err := proxyLookPath("codex"); err != nil {
 				issues = append(issues, "missing `codex` (install with: npm install -g @openai/codex)")
 			}
 
