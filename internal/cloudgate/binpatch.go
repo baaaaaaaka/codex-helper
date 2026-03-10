@@ -110,9 +110,20 @@ type binaryPatch struct {
 	name string // for error messages
 }
 
-// cloudRequirementsPatches sabotages the cloud requirements URL paths so the
-// server returns 404. The binary's fail-open behavior then treats this as
-// "no cloud requirements", allowing all approval policies.
+func applyBinaryPatchAll(data []byte, p binaryPatch) ([]byte, int, error) {
+	if len(p.old) != len(p.new) {
+		return nil, 0, fmt.Errorf("%s: length mismatch %d vs %d", p.name, len(p.old), len(p.new))
+	}
+	count := bytes.Count(data, p.old)
+	if count == 0 {
+		return data, 0, nil
+	}
+	return bytes.ReplaceAll(data, p.old, p.new), count, nil
+}
+
+// cloudRequirementsPatches sabotages the cloud requirements URL paths as a
+// best-effort fallback for Codex builds that still fetch cloud requirements
+// through dedicated endpoints.
 var cloudRequirementsPatches = []binaryPatch{
 	{
 		// "/api/codex/config/requirements" (30 bytes) → change last char 's' → 'z'
@@ -128,16 +139,28 @@ var cloudRequirementsPatches = []binaryPatch{
 	},
 }
 
-// tomlKeyPatches renames the serde field names that Codex uses to
-// deserialize cloud requirements TOML. When these keys are patched,
-// the cloud requirements response (which uses the original key names)
-// can no longer be parsed, causing Codex to treat it as "no cloud
-// requirements" (fail-open). The local permissive requirements file
-// uses the patched key names so it is still parsed correctly.
+// accountPlanTypePatches breaks the plan claim name that Codex uses to detect
+// Business/Enterprise accounts. Recent Codex builds fail closed on cloud
+// requirements parse errors, so the reliable bypass is to keep
+// account_plan_type() at Unknown and prevent cloud requirements from running.
+var accountPlanTypePatches = []binaryPatch{
+	{
+		// "chatgpt_plan_type" (17 bytes) → change last char 'e' → 'f'
+		old:  []byte("chatgpt_plan_type"),
+		new:  []byte("chatgpt_plan_typf"),
+		name: "chatgpt plan claim key",
+	},
+}
+
+// tomlKeyPatches keeps the legacy parse-failure bypass for older Codex builds
+// that still fail open on invalid cloud requirements TOML. The local
+// permissive requirements file uses the patched key names so it is still
+// parsed correctly when these replacements apply.
 //
 // This is necessary because ChatGPT-authenticated sessions fetch cloud
 // requirements via the multiplexed backend-api connection rather than
-// dedicated REST endpoints, so URL sabotage alone is insufficient.
+// dedicated REST endpoints, so URL sabotage alone is insufficient on those
+// older builds.
 var tomlKeyPatches = []binaryPatch{
 	{
 		// "allowed_approval_policies" (25 bytes) → change last char 's' → 'z'
@@ -412,42 +435,26 @@ func patchCodexBinaryWithRuntime(
 		return nil, fmt.Errorf("derive requirements path: %w", err)
 	}
 
-	// Patch 1: Redirect system requirements path.
-	old := []byte(origReqPath)
-	new := []byte(patchedReqPath)
-	if len(old) != len(new) {
-		return nil, fmt.Errorf("path length mismatch: %d vs %d", len(old), len(new))
+	patches := []binaryPatch{
+		{
+			old:  []byte(origReqPath),
+			new:  []byte(patchedReqPath),
+			name: "requirements path",
+		},
 	}
-	if count := bytes.Count(data, old); count == 1 {
-		data = bytes.Replace(data, old, new, 1)
-		patched = true
-	} else if count > 1 {
-		return nil, fmt.Errorf("expected 1 occurrence of %q, found %d", origReqPath, count)
-	}
-	// count == 0: already patched or not present, continue with other patches.
+	patches = append(patches, cloudRequirementsPatches...)
+	patches = append(patches, accountPlanTypePatches...)
+	patches = append(patches, tomlKeyPatches...)
 
-	// Patch 2: Sabotage cloud requirements URL paths.
-	for _, p := range cloudRequirementsPatches {
-		if len(p.old) != len(p.new) {
-			return nil, fmt.Errorf("%s: length mismatch %d vs %d", p.name, len(p.old), len(p.new))
+	for _, p := range patches {
+		var count int
+		data, count, err = applyBinaryPatchAll(data, p)
+		if err != nil {
+			return nil, err
 		}
-		if count := bytes.Count(data, p.old); count == 1 {
-			data = bytes.Replace(data, p.old, p.new, 1)
+		if count > 0 {
 			patched = true
 		}
-		// count == 0: already patched; count > 1: ambiguous, skip.
-	}
-
-	// Patch 3: Rename TOML field names used for cloud requirements parsing.
-	for _, p := range tomlKeyPatches {
-		if len(p.old) != len(p.new) {
-			return nil, fmt.Errorf("%s: length mismatch %d vs %d", p.name, len(p.old), len(p.new))
-		}
-		if count := bytes.Count(data, p.old); count == 1 {
-			data = bytes.Replace(data, p.old, p.new, 1)
-			patched = true
-		}
-		// count == 0: already patched; count > 1: ambiguous, skip.
 	}
 
 	if !patched {
@@ -516,11 +523,11 @@ func patchCodexBinaryWithRuntime(
 
 // PatchCodexBinary patches a Codex binary:
 //  1. Redirects the system requirements path to a user-writable permissive file.
-//  2. Sabotages the cloud requirements URL paths so the fetch 404s (fail-open).
-//  3. Renames TOML field names so cloud requirements responses can't be parsed
-//     (fail-open). This covers ChatGPT-authenticated sessions where cloud
-//     requirements are fetched via the multiplexed backend-api connection
-//     rather than dedicated REST endpoints.
+//  2. Best-effort sabotages the cloud requirements URL paths.
+//  3. Hides the ChatGPT plan claim so Business/Enterprise accounts are treated
+//     as Unknown and cloud requirements are skipped.
+//  4. Keeps the legacy TOML-key rename for older Codex builds that still
+//     fail open on cloud requirements parse errors.
 //
 // The original binary is not modified; a copy is placed in cacheDir.
 func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) {

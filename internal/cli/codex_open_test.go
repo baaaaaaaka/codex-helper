@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
@@ -507,9 +508,12 @@ func TestPreparePatchedBinaryRePatchesAfterCleanup(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "config")
 
 	// --- First call: should produce a patched binary ---
-	result1, _, info1, skipped1 := preparePatchedBinary(wrapperPath, configDir)
+	result1, _, info1, skipped1, patchErr1 := preparePatchedBinary(wrapperPath, configDir)
 	if skipped1 {
 		t.Fatal("first call should not be skipped")
+	}
+	if patchErr1 != nil {
+		t.Fatalf("first call should not fail: %v", patchErr1)
 	}
 	if result1 == nil || result1.PatchedBinary == "" {
 		t.Fatal("first call should produce a patched binary")
@@ -545,9 +549,12 @@ func TestPreparePatchedBinaryRePatchesAfterCleanup(t *testing.T) {
 	}
 
 	// --- Second call: must re-patch despite history saying "already patched" ---
-	result2, _, info2, skipped2 := preparePatchedBinary(wrapperPath, configDir)
+	result2, _, info2, skipped2, patchErr2 := preparePatchedBinary(wrapperPath, configDir)
 	if skipped2 {
 		t.Fatal("second call should NOT be skipped — this was the bug (IsPatched caused skip)")
+	}
+	if patchErr2 != nil {
+		t.Fatalf("second call should not fail: %v", patchErr2)
 	}
 	if result2 == nil || result2.PatchedBinary == "" {
 		t.Fatal("second call should produce a new patched binary")
@@ -597,9 +604,12 @@ func TestPreparePatchedBinarySkipsOnFailed(t *testing.T) {
 	}
 
 	// Call preparePatchedBinary — should be skipped due to failure history.
-	result, _, _, skipped := preparePatchedBinary(wrapperPath, configDir)
+	result, _, _, skipped, patchErr := preparePatchedBinary(wrapperPath, configDir)
 	if !skipped {
 		t.Fatal("should be skipped when history records a failed patch")
+	}
+	if patchErr != nil {
+		t.Fatalf("skipped call should not fail: %v", patchErr)
 	}
 	if result != nil {
 		t.Fatal("skipped call should return nil result")
@@ -612,9 +622,12 @@ func TestPreparePatchedBinaryRecordsHistory(t *testing.T) {
 	wrapperPath, _ := setupMockCodexInstall(t)
 	configDir := filepath.Join(t.TempDir(), "config")
 
-	result, _, info, skipped := preparePatchedBinary(wrapperPath, configDir)
+	result, _, info, skipped, patchErr := preparePatchedBinary(wrapperPath, configDir)
 	if skipped || result == nil || result.PatchedBinary == "" {
 		t.Fatal("expected successful patch")
+	}
+	if patchErr != nil {
+		t.Fatalf("expected successful patch, got error: %v", patchErr)
 	}
 	defer result.Cleanup()
 
@@ -638,6 +651,134 @@ func TestPreparePatchedBinaryRecordsHistory(t *testing.T) {
 	}
 	if entry.ProxyVersion == "" {
 		t.Fatal("entry should have proxy version")
+	}
+}
+
+func TestLogYoloPatchStatusReportsActive(t *testing.T) {
+	var log bytes.Buffer
+	logYoloPatchStatus(&log, &cloudgate.PatchResult{PatchedBinary: "/tmp/codex-patched"}, false, nil)
+	got := log.String()
+	if !strings.Contains(got, "yolo patch active") {
+		t.Fatalf("expected active log, got %q", got)
+	}
+	if !strings.Contains(got, "/tmp/codex-patched") {
+		t.Fatalf("expected patched path in log, got %q", got)
+	}
+}
+
+func TestLogYoloPatchStatusReportsSkip(t *testing.T) {
+	var log bytes.Buffer
+	logYoloPatchStatus(&log, nil, true, nil)
+	if got := log.String(); !strings.Contains(got, "yolo patch skipped") {
+		t.Fatalf("expected skip log, got %q", got)
+	}
+}
+
+func TestLogYoloPatchStatusReportsFailure(t *testing.T) {
+	var log bytes.Buffer
+	logYoloPatchStatus(&log, nil, false, fmt.Errorf("boom"))
+	got := log.String()
+	if !strings.Contains(got, "yolo patch failed") {
+		t.Fatalf("expected failure log, got %q", got)
+	}
+	if !strings.Contains(got, "boom") {
+		t.Fatalf("expected error detail in log, got %q", got)
+	}
+}
+
+func TestRunCodexNewSessionLogsPatchFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	var log bytes.Buffer
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil, nil,
+		dir,
+		scriptPath,
+		"",
+		false,
+		true,
+		&log,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+
+	if got := log.String(); !strings.Contains(got, "yolo patch failed") {
+		t.Fatalf("expected patch failure log, got %q", got)
+	}
+}
+
+func TestRunCodexNewSessionLogsPatchSkip(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	configDir := t.TempDir()
+	store, err := config.NewStore(filepath.Join(configDir, "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	origHash, err := hashFileSHA256(scriptPath)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	phs, err := config.NewPatchHistoryStore(configDir)
+	if err != nil {
+		t.Fatalf("patch history: %v", err)
+	}
+	if err := phs.Upsert(config.PatchHistoryEntry{
+		Path:          scriptPath,
+		OrigSHA256:    origHash,
+		Failed:        true,
+		FailureReason: "test: simulated crash",
+		PatchedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	var log bytes.Buffer
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil, nil,
+		dir,
+		scriptPath,
+		"",
+		false,
+		true,
+		&log,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+
+	if got := log.String(); !strings.Contains(got, "yolo patch skipped") {
+		t.Fatalf("expected patch skip log, got %q", got)
 	}
 }
 

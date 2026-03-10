@@ -124,19 +124,22 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 		Short: "Open a session in Codex",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := withSignalContext(cmd.Context())
+			defer stop()
+
 			store, err := config.NewStore(root.configPath)
 			if err != nil {
 				return err
 			}
 
-			useProxy, cfg, err := ensureProxyPreferenceFunc(cmd.Context(), store, *profileRef, cmd.ErrOrStderr())
+			useProxy, cfg, err := ensureProxyPreferenceFunc(ctx, store, *profileRef, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
 
 			var profile *config.Profile
 			if useProxy {
-				p, cfgWithProfile, err := ensureProfileFunc(cmd.Context(), store, *profileRef, true, cmd.OutOrStdout())
+				p, cfgWithProfile, err := ensureProfileFunc(ctx, store, *profileRef, true, cmd.OutOrStdout())
 				if err != nil {
 					return err
 				}
@@ -165,7 +168,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 				proj = *project
 			}
 			return runCodexSessionFunc(
-				cmd.Context(),
+				ctx,
 				root,
 				store,
 				profile,
@@ -184,7 +187,9 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 }
 
 func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, codexDir string, codexPath string, refreshInterval time.Duration) error {
-	ctx := cmd.Context()
+	ctx, stop := withSignalContext(cmd.Context())
+	defer stop()
+
 	store, err := config.NewStore(root.configPath)
 	if err != nil {
 		return err

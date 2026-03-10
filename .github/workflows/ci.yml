@@ -34,6 +34,20 @@ jobs:
           set -euo pipefail
           bash -n scripts/ci/install_node_local.sh
 
+      - name: Script unit tests (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Script unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          py -3 -m unittest discover -s scripts/tests -p "test_*.py"
+
       - name: gofmt (verify)
         shell: bash
         run: |
@@ -239,21 +253,22 @@ jobs:
           set -euo pipefail
           if command -v codex >/dev/null 2>&1; then
             go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
-            go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+            go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
           else
             echo "Codex not available, skipping patch+yolo integration test"
           fi
 
-      - name: Codex patch integration test (Windows)
+      - name: Codex patch+yolo integration test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           CODEX_PATCH_TEST: "1"
+          CODEX_YOLO_PATCH_TEST: "1"
         run: |
           $ErrorActionPreference = "Stop"
           if (Get-Command codex -ErrorAction SilentlyContinue) {
-            go test ./internal/cloudgate -run TestCodexPatchIntegration -count=1 -v
-            go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+            go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
+            go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
           } else {
             Write-Host "Codex not available, skipping patch integration test"
           }

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict
 
 PLATFORMS = ["linux", "mac", "windows", "rockylinux8", "ubuntu20.04"]
+VERSION_RE = re.compile(r"\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?")
 HEADER = [
     "| Codex version | linux | mac | windows | rockylinux8 | ubuntu20.04 | last_tested_utc |",
     "| --- | --- | --- | --- | --- | --- | --- |",
@@ -41,7 +42,7 @@ def parse_table(table_path: Path) -> Dict[str, Dict[str, str]]:
             continue
         row = {columns[i]: parts[i] for i in range(min(len(columns), len(parts)))}
         version = normalize_version(row.get("Codex version", ""))
-        if not re.fullmatch(r"\d+(?:\.\d+)+", version):
+        if not VERSION_RE.fullmatch(version):
             continue
         parsed = {platform: row.get(platform, "").strip().lower() or "not-run" for platform in PLATFORMS}
         parsed["last_tested_utc"] = row.get("last_tested_utc", "").strip()
@@ -68,7 +69,7 @@ def load_results(results_dir: Path) -> Dict[str, Dict[str, str]]:
             continue
         for version, status in results.items():
             normalized = normalize_version(str(version))
-            if not re.fullmatch(r"\d+(?:\.\d+)+", normalized):
+            if not VERSION_RE.fullmatch(normalized):
                 continue
             normalized_status = str(status).strip().lower()
             if normalized_status not in {"pass", "fail", "not-run"}:
@@ -78,7 +79,18 @@ def load_results(results_dir: Path) -> Dict[str, Dict[str, str]]:
 
 
 def version_sort_key(version: str):
-    return tuple(int(part) for part in version.split("."))
+    release, _, prerelease = normalize_version(version).partition("-")
+    release_key = tuple(int(part) for part in release.split("."))
+    if not prerelease:
+        return release_key, 1, ()
+
+    prerelease_key = []
+    for part in prerelease.split("."):
+        if part.isdigit():
+            prerelease_key.append((0, int(part)))
+        else:
+            prerelease_key.append((1, part))
+    return release_key, 0, tuple(prerelease_key)
 
 
 def write_table(table_path: Path, rows: Dict[str, Dict[str, str]]) -> None:
@@ -115,7 +127,7 @@ def main() -> int:
     args = parser.parse_args()
 
     version = normalize_version(args.version)
-    if not re.fullmatch(r"\d+(?:\.\d+)+", version):
+    if not VERSION_RE.fullmatch(version):
         raise SystemExit(f"Invalid version: {args.version}")
 
     table_path = Path(args.table_path)
@@ -125,16 +137,15 @@ def main() -> int:
     base = rows.get(version, {})
     merged = {platform: base.get(platform, "not-run") for platform in PLATFORMS}
     merged.update(updates.get(version, {}))
+    had_results = version in updates
 
     status_changed = version not in rows
     if not status_changed:
         status_changed = any(merged[p] != base.get(p, "not-run") for p in PLATFORMS)
 
-    if status_changed:
+    if status_changed or had_results:
         merged["last_tested_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
-        # Keep existing timestamp when only rerun metadata changes, so CI
-        # does not generate timestamp-only churn commits.
         merged["last_tested_utc"] = base.get("last_tested_utc", "")
 
     rows[version] = merged
