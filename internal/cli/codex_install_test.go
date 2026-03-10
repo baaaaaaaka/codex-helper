@@ -994,15 +994,27 @@ func TestWithCodexInstallLockAcquiresAfterRelease(t *testing.T) {
 	prevPoll := codexInstallLockPollDelay
 	prevWait := codexInstallLockMaxWait
 	codexInstallLockPollDelay = 10 * time.Millisecond
-	codexInstallLockMaxWait = 300 * time.Millisecond
+	codexInstallLockMaxWait = 2 * time.Second
 	defer func() {
 		codexInstallLockPollDelay = prevPoll
 		codexInstallLockMaxWait = prevWait
 	}()
 
+	removeDone := make(chan error, 1)
 	go func() {
-		time.Sleep(30 * time.Millisecond)
-		_ = os.Remove(lockPath)
+		deadline := time.Now().Add(1500 * time.Millisecond)
+		for {
+			time.Sleep(25 * time.Millisecond)
+			err := os.Remove(lockPath)
+			if err == nil || os.IsNotExist(err) {
+				removeDone <- nil
+				return
+			}
+			if time.Now().After(deadline) {
+				removeDone <- err
+				return
+			}
+		}
 	}()
 
 	var out bytes.Buffer
@@ -1015,6 +1027,14 @@ func TestWithCodexInstallLockAcquiresAfterRelease(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected function to run after lock release")
+	}
+	select {
+	case err := <-removeDone:
+		if err != nil {
+			t.Fatalf("remove held lock: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for held lock to be released")
 	}
 	if strings.Contains(out.String(), "continuing without lock") {
 		t.Fatalf("unexpected fallback log when lock should be acquired: %q", out.String())
