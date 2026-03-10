@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -242,9 +243,22 @@ func TestHistoryListCmdPrintsDiscoveredProjects(t *testing.T) {
 		t.Fatalf("execute history list: %v", err)
 	}
 
-	text := out.String()
-	if !strings.Contains(text, `"projects"`) || !strings.Contains(text, sessionID) || !strings.Contains(text, projectDir) {
-		t.Fatalf("unexpected history list output: %q", text)
+	var payload struct {
+		Projects []codexhistory.Project `json:"projects"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+		t.Fatalf("unmarshal history list output: %v\noutput: %s", err, out.String())
+	}
+	if len(payload.Projects) != 1 || len(payload.Projects[0].Sessions) != 1 {
+		t.Fatalf("unexpected history list payload: %+v", payload)
+	}
+	if payload.Projects[0].Sessions[0].SessionID != sessionID {
+		t.Fatalf("unexpected session id in payload: %+v", payload.Projects[0].Sessions[0])
+	}
+	gotProjectDir := canonicalPath(t, payload.Projects[0].Path)
+	wantProjectDir := canonicalPath(t, projectDir)
+	if gotProjectDir != wantProjectDir {
+		t.Fatalf("unexpected project path: got %q want %q", gotProjectDir, wantProjectDir)
 	}
 }
 
@@ -265,7 +279,8 @@ func TestHistoryShowCmdPrintsFormattedSession(t *testing.T) {
 	}
 
 	text := out.String()
-	if !strings.Contains(text, "Session: "+sessionID) || !strings.Contains(text, "Project: "+projectDir) || !strings.Contains(text, "User:") {
+	expectedProjectLine := "Project: " + canonicalPath(t, projectDir)
+	if !strings.Contains(text, "Session: "+sessionID) || !strings.Contains(text, expectedProjectLine) || !strings.Contains(text, "User:") {
 		t.Fatalf("unexpected history show output: %q", text)
 	}
 }

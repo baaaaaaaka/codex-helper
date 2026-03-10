@@ -357,7 +357,7 @@ func TestProxyStopTerminatesAliveInstanceAndRemovesConfigEntry(t *testing.T) {
 
 	proxyProcessAlive = func(int) bool { return true }
 	proxyFindProcess = func(pid int) (*os.Process, error) {
-		return os.FindProcess(pid)
+		return &os.Process{Pid: pid}, nil
 	}
 
 	terminatedPID := 0
