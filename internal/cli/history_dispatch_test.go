@@ -279,8 +279,17 @@ func TestHistoryShowCmdPrintsFormattedSession(t *testing.T) {
 	}
 
 	text := out.String()
-	expectedProjectLine := "Project: " + canonicalPath(t, projectDir)
-	if !strings.Contains(text, "Session: "+sessionID) || !strings.Contains(text, expectedProjectLine) || !strings.Contains(text, "User:") {
+	projectLine := ""
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "Project: ") {
+			projectLine = strings.TrimPrefix(line, "Project: ")
+			break
+		}
+	}
+	if canonicalPath(t, projectLine) != canonicalPath(t, projectDir) {
+		t.Fatalf("unexpected project line: got %q want %q", projectLine, projectDir)
+	}
+	if !strings.Contains(text, "Session: "+sessionID) || !strings.Contains(text, "User:") {
 		t.Fatalf("unexpected history show output: %q", text)
 	}
 }

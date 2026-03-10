@@ -112,8 +112,10 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 		opts.SocksReadyTimeout = 30 * time.Second
 	}
 
-	// Reserve SOCKS port: hold the listener open so that the HTTP proxy
-	// (which also binds :0) cannot accidentally grab the same port.
+	// Reserve the requested SOCKS port: hold the listener open so that the HTTP
+	// proxy (which also binds :0 by default) cannot accidentally grab the same
+	// port before SSH starts. For explicit ports this also fails fast if the
+	// caller asked for a port that is already unavailable.
 	socksPort := opts.SocksPort
 	var socksReserve net.Listener
 	if socksPort == 0 {
@@ -122,6 +124,12 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 			return nil, fmt.Errorf("reserve socks port: %w", err)
 		}
 		socksPort = port
+		socksReserve = ln
+	} else {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort))
+		if err != nil {
+			return nil, fmt.Errorf("reserve requested socks port %d: %w", socksPort, err)
+		}
 		socksReserve = ln
 	}
 

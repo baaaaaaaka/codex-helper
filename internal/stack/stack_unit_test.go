@@ -271,6 +271,13 @@ func fakeSSHScript(counterFile string) string {
 	return fmt.Sprintf("#!/bin/sh\necho x >> '%s'\nexec /usr/bin/sleep 30\n", counterFile)
 }
 
+// fakeFailingSSHScript returns a shell script that increments a counter file
+// and then exits immediately with a failure code. This makes tunnel startup
+// deterministically fail before the SOCKS port can become ready.
+func fakeFailingSSHScript(counterFile string) string {
+	return fmt.Sprintf("#!/bin/sh\necho x >> '%s'\nexit 1\n", counterFile)
+}
+
 func TestStartRetriesWithAutoPort(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
@@ -312,19 +319,17 @@ func TestStartExplicitPortDoesNotRetry(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
 	}
-	if _, err := os.Stat("/usr/bin/sleep"); err != nil {
-		t.Skip("skip: /usr/bin/sleep not available")
-	}
 
 	dir := t.TempDir()
 	counterFile := filepath.Join(dir, "counter")
 	script := filepath.Join(dir, "ssh")
-	if err := os.WriteFile(script, []byte(fakeSSHScript(counterFile)), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte(fakeFailingSSHScript(counterFile)), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 	t.Setenv("PATH", dir)
 
-	// Use a port that is (very likely) free.
+	// Use a port that is free. The fake SSH exits immediately, so Start should
+	// fail after a single invocation without retrying the explicit port.
 	tmpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
