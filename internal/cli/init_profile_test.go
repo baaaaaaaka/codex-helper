@@ -195,6 +195,7 @@ func TestNewInitCmdUsesInteractiveInitializer(t *testing.T) {
 
 	cmd := newInitCmd(&rootOptions{configPath: store.Path()})
 	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 

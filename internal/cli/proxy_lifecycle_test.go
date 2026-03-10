@@ -269,6 +269,7 @@ func TestProxyListReportsAliveUnhealthyAndDead(t *testing.T) {
 
 	cmd := newProxyListCmd(&rootOptions{configPath: store.Path()})
 	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 
@@ -315,6 +316,7 @@ func TestProxyPruneRemovesDeadAndUnhealthyInstances(t *testing.T) {
 
 	cmd := newProxyPruneCmd(&rootOptions{configPath: store.Path()})
 	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 
@@ -412,6 +414,7 @@ func TestProxyDoctorReportsMissingTools(t *testing.T) {
 
 	cmd := newProxyDoctorCmd(&rootOptions{configPath: store.Path()})
 	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 
