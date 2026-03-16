@@ -243,10 +243,17 @@ func sshProbe(ctx context.Context, prof config.Profile, interactive bool) error 
 	if err := tun.Start(); err != nil {
 		return newSSHProbeError(err, out.String())
 	}
-	defer func() { _ = tun.Stop(500 * time.Millisecond) }()
+	needStop := true
+	defer func() {
+		if needStop {
+			_ = tun.Stop(500 * time.Millisecond)
+		}
+	}()
 
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(probePort))
 	if err := waitForSSHProbeReady(ctx, addr, 10*time.Second, tun); err != nil {
+		needStop = false
+		_ = tun.Stop(500 * time.Millisecond)
 		return newSSHProbeError(err, out.String())
 	}
 	return nil
