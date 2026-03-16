@@ -5,9 +5,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
@@ -15,6 +19,7 @@ import (
 type fakeSSHOps struct {
 	probeErrs   []error
 	probes      []config.Profile
+	generated   []config.Profile
 	keyPath     string
 	generateErr error
 	installErr  error
@@ -31,7 +36,8 @@ func (f *fakeSSHOps) probe(_ context.Context, prof config.Profile, _ bool) error
 	return err
 }
 
-func (f *fakeSSHOps) generateKeypair(context.Context, *config.Store, config.Profile) (string, error) {
+func (f *fakeSSHOps) generateKeypair(_ context.Context, _ *config.Store, prof config.Profile) (string, error) {
+	f.generated = append(f.generated, prof)
 	if f.generateErr != nil {
 		return "", f.generateErr
 	}
@@ -86,7 +92,7 @@ func TestInitProfileInteractiveWithDepsFallsBackToManagedKey(t *testing.T) {
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("host.example\n22\ncarol\n"))
 	ops := &fakeSSHOps{
-		probeErrs: []error{errors.New("direct ssh failed"), nil},
+		probeErrs: []error{&sshProbeError{kind: sshProbeFailureAuth, err: errors.New("direct ssh failed")}, nil},
 		keyPath:   filepath.Join(t.TempDir(), "id_ed25519_test"),
 	}
 	var out bytes.Buffer
@@ -114,8 +120,11 @@ func TestInitProfileInteractiveWithDepsReturnsWrappedKeyProbeError(t *testing.T)
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("host.example\n22\ndana\n"))
 	ops := &fakeSSHOps{
-		probeErrs: []error{errors.New("direct ssh failed"), errors.New("still blocked")},
-		keyPath:   filepath.Join(t.TempDir(), "id_ed25519_test"),
+		probeErrs: []error{
+			&sshProbeError{kind: sshProbeFailureAuth, err: errors.New("direct ssh failed")},
+			&sshProbeError{kind: sshProbeFailureOther, err: errors.New("still blocked")},
+		},
+		keyPath: filepath.Join(t.TempDir(), "id_ed25519_test"),
 	}
 
 	_, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, ioDiscard{})
@@ -132,6 +141,134 @@ func TestInitProfileInteractiveWithDepsReturnsWrappedKeyProbeError(t *testing.T)
 	}
 	if len(cfg.Profiles) != 0 {
 		t.Fatalf("expected no saved profiles after failure, got %+v", cfg.Profiles)
+	}
+}
+
+func TestInitProfileInteractiveWithDepsDoesNotInstallManagedKeyForNonAuthProbeErrors(t *testing.T) {
+	store := newTempStore(t)
+	reader := bufio.NewReader(strings.NewReader("host.example\n22\nerin\n"))
+	ops := &fakeSSHOps{
+		probeErrs: []error{
+			&sshProbeError{kind: sshProbeFailureOther, err: errors.New("forwarding disabled"), output: "administratively prohibited"},
+		},
+		keyPath: filepath.Join(t.TempDir(), "id_ed25519_test"),
+	}
+
+	_, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, ioDiscard{})
+	if err == nil {
+		t.Fatal("expected probe error")
+	}
+	if len(ops.generated) != 0 {
+		t.Fatalf("expected no key generation, got %d", len(ops.generated))
+	}
+	if len(ops.installed) != 0 {
+		t.Fatalf("expected no key installation, got %v", ops.installed)
+	}
+	if !strings.Contains(err.Error(), "administratively prohibited") {
+		t.Fatalf("expected original probe error, got %v", err)
+	}
+}
+
+func TestSSHProbeUsesTunnelReadinessForNonInteractiveChecks(t *testing.T) {
+	lockCLITestHooks(t)
+
+	dir := t.TempDir()
+	helperBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	writeStub(
+		t,
+		dir,
+		"ssh",
+		fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestSSHProbeHelperProcess -- \"$@\"\n", helperBin),
+		fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestSSHProbeHelperProcess -- %%*\r\n", helperBin),
+	)
+	t.Setenv("PATH", dir)
+	t.Setenv("GO_WANT_SSH_HELPER_PROCESS", "1")
+	t.Setenv("SSH_HELPER_MODE", "socks-ready")
+
+	err = sshProbe(context.Background(), config.Profile{
+		Host: "example.com",
+		Port: 3211,
+		User: "starh",
+	}, false)
+	if err != nil {
+		t.Fatalf("sshProbe error: %v", err)
+	}
+}
+
+func TestSSHProbeOmitsTrailingColonWhenSSHReturnsNoOutput(t *testing.T) {
+	lockCLITestHooks(t)
+
+	dir := t.TempDir()
+	helperBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	writeStub(
+		t,
+		dir,
+		"ssh",
+		fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestSSHProbeHelperProcess -- \"$@\"\n", helperBin),
+		fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestSSHProbeHelperProcess -- %%*\r\n", helperBin),
+	)
+	t.Setenv("PATH", dir)
+	t.Setenv("GO_WANT_SSH_HELPER_PROCESS", "1")
+	t.Setenv("SSH_HELPER_MODE", "empty-fail")
+
+	err = sshProbe(context.Background(), config.Profile{
+		Host: "example.com",
+		Port: 3211,
+		User: "starh",
+	}, false)
+	if err == nil {
+		t.Fatal("expected sshProbe to fail")
+	}
+	if strings.HasSuffix(err.Error(), ":") {
+		t.Fatalf("expected error without trailing colon, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "exit status 1:") {
+		t.Fatalf("expected empty stderr not to add a dangling separator, got %q", err.Error())
+	}
+}
+
+func TestSSHProbeHonorsContextCancellation(t *testing.T) {
+	lockCLITestHooks(t)
+
+	dir := t.TempDir()
+	helperBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	writeStub(
+		t,
+		dir,
+		"ssh",
+		fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestSSHProbeHelperProcess -- \"$@\"\n", helperBin),
+		fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestSSHProbeHelperProcess -- %%*\r\n", helperBin),
+	)
+	t.Setenv("PATH", dir)
+	t.Setenv("GO_WANT_SSH_HELPER_PROCESS", "1")
+	t.Setenv("SSH_HELPER_MODE", "block")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err = sshProbe(ctx, config.Profile{
+		Host: "example.com",
+		Port: 3211,
+		User: "starh",
+	}, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("expected prompt cancellation, took %s", time.Since(start))
 	}
 }
 
@@ -210,3 +347,69 @@ func TestNewInitCmdUsesInteractiveInitializer(t *testing.T) {
 type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestSSHProbeHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_SSH_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	sep := -1
+	for i, arg := range args {
+		if arg == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 {
+		return
+	}
+	args = args[sep+1:]
+
+	switch os.Getenv("SSH_HELPER_MODE") {
+	case "socks-ready":
+		for _, arg := range args {
+			if arg == "exit" {
+				os.Exit(1)
+			}
+		}
+
+		spec := ""
+		for i := 0; i < len(args)-1; i++ {
+			if args[i] == "-D" {
+				spec = args[i+1]
+				break
+			}
+		}
+		if spec == "" {
+			_, _ = fmt.Fprint(os.Stderr, "missing -D")
+			os.Exit(1)
+		}
+
+		host, port, err := net.SplitHostPort(spec)
+		if err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
+		if err != nil {
+			_, _ = fmt.Fprint(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		defer ln.Close()
+
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+
+	case "empty-fail":
+		os.Exit(1)
+
+	case "block":
+		time.Sleep(30 * time.Second)
+	}
+}
