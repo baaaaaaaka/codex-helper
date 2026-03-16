@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
+	internalssh "github.com/baaaaaaaka/codex-helper/internal/ssh"
 )
 
 func newInitCmd(root *rootOptions) *cobra.Command {
@@ -48,6 +51,28 @@ type sshOps interface {
 }
 
 type defaultSSHOps struct{}
+
+type sshProbeFailureKind int
+
+const (
+	sshProbeFailureOther sshProbeFailureKind = iota
+	sshProbeFailureAuth
+)
+
+type sshProbeError struct {
+	kind   sshProbeFailureKind
+	err    error
+	output string
+}
+
+func (e *sshProbeError) Error() string {
+	if e.output == "" {
+		return e.err.Error()
+	}
+	return fmt.Sprintf("%v: %s", e.err, e.output)
+}
+
+func (e *sshProbeError) Unwrap() error { return e.err }
 
 func (defaultSSHOps) probe(ctx context.Context, prof config.Profile, interactive bool) error {
 	return sshProbe(ctx, prof, interactive)
@@ -97,6 +122,9 @@ func initProfileInteractiveWithDeps(
 	}
 
 	if err := ops.probe(ctx, prof, false); err != nil {
+		if !shouldInstallManagedKey(err) {
+			return config.Profile{}, err
+		}
 		if out != nil {
 			_, _ = fmt.Fprintln(out, "Direct SSH access failed; creating a dedicated codex-proxy key and installing it.")
 		}
@@ -178,33 +206,139 @@ func promptYesNo(r *bufio.Reader, label string, def bool) bool {
 }
 
 func sshProbe(ctx context.Context, prof config.Profile, interactive bool) error {
-	args := []string{
-		"-p", strconv.Itoa(prof.Port),
-	}
-	if !interactive {
-		args = append(args,
-			"-o", "BatchMode=yes",
-			"-o", "ConnectTimeout=5",
-		)
-	}
-	args = append(args, prof.SSHArgs...)
-
 	dest := prof.User + "@" + prof.Host
-	args = append(args, dest, "exit")
-
-	c := exec.CommandContext(ctx, "ssh", args...)
 	if interactive {
+		args := []string{
+			"-p", strconv.Itoa(prof.Port),
+		}
+		args = append(args, prof.SSHArgs...)
+		args = append(args, dest)
+
+		c := exec.CommandContext(ctx, "ssh", args...)
 		c.Stdin = os.Stdin
 		c.Stdout = os.Stdout
 		c.Stderr = os.Stderr
 		return c.Run()
 	}
 
-	out, err := c.CombinedOutput()
+	probePort, err := pickFreeTCPPort()
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+		return err
+	}
+
+	var out bytes.Buffer
+	tun, err := internalssh.NewTunnel(internalssh.TunnelConfig{
+		Host:      prof.Host,
+		Port:      prof.Port,
+		User:      prof.User,
+		SocksPort: probePort,
+		ExtraArgs: prof.SSHArgs,
+		BatchMode: true,
+		Stdout:    &out,
+		Stderr:    &out,
+	})
+	if err != nil {
+		return newSSHProbeError(err, out.String())
+	}
+	if err := tun.Start(); err != nil {
+		return newSSHProbeError(err, out.String())
+	}
+	defer func() { _ = tun.Stop(500 * time.Millisecond) }()
+
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(probePort))
+	if err := waitForSSHProbeReady(ctx, addr, 10*time.Second, tun); err != nil {
+		return newSSHProbeError(err, out.String())
 	}
 	return nil
+}
+
+func pickFreeTCPPort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer ln.Close()
+
+	_, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(portStr)
+}
+
+func waitForSSHProbeReady(ctx context.Context, addr string, timeout time.Duration, tun *internalssh.Tunnel) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tun.Done():
+			return fmt.Errorf("ssh tunnel exited before SOCKS ready: %w", tun.Wait())
+		default:
+		}
+
+		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			return nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tun.Done():
+			return fmt.Errorf("ssh tunnel exited before SOCKS ready: %w", tun.Wait())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("timeout waiting for ssh SOCKS listener on %s: %w", addr, lastErr)
+	}
+	return fmt.Errorf("timeout waiting for ssh SOCKS listener on %s", addr)
+}
+
+func newSSHProbeError(err error, output string) error {
+	if err == nil {
+		return nil
+	}
+	output = strings.TrimSpace(output)
+	return &sshProbeError{
+		kind:   classifySSHProbeFailure(output),
+		err:    err,
+		output: output,
+	}
+}
+
+func classifySSHProbeFailure(output string) sshProbeFailureKind {
+	output = strings.ToLower(strings.TrimSpace(output))
+	if output == "" {
+		return sshProbeFailureOther
+	}
+
+	authHints := []string{
+		"permission denied",
+		"authentication failed",
+		"no more authentication methods available",
+		"no supported authentication methods available",
+		"too many authentication failures",
+		"sign_and_send_pubkey",
+	}
+	for _, hint := range authHints {
+		if strings.Contains(output, hint) {
+			return sshProbeFailureAuth
+		}
+	}
+	return sshProbeFailureOther
+}
+
+func shouldInstallManagedKey(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var probeErr *sshProbeError
+	return errors.As(err, &probeErr) && probeErr.kind == sshProbeFailureAuth
 }
 
 func generateKeypair(ctx context.Context, store *config.Store, prof config.Profile) (string, error) {
