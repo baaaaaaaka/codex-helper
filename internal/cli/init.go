@@ -65,6 +65,17 @@ type sshProbeError struct {
 	output string
 }
 
+type sshTunnel interface {
+	Start() error
+	Stop(grace time.Duration) error
+	Done() <-chan struct{}
+	Wait() error
+}
+
+var newSSHTunnel = func(cfg internalssh.TunnelConfig) (sshTunnel, error) {
+	return internalssh.NewTunnel(cfg)
+}
+
 func (e *sshProbeError) Error() string {
 	if e.output == "" {
 		return e.err.Error()
@@ -227,7 +238,7 @@ func sshProbe(ctx context.Context, prof config.Profile, interactive bool) error 
 	}
 
 	var out bytes.Buffer
-	tun, err := internalssh.NewTunnel(internalssh.TunnelConfig{
+	tun, err := newSSHTunnel(internalssh.TunnelConfig{
 		Host:      prof.Host,
 		Port:      prof.Port,
 		User:      prof.User,
@@ -273,7 +284,7 @@ func pickFreeTCPPort() (int, error) {
 	return strconv.Atoi(portStr)
 }
 
-func waitForSSHProbeReady(ctx context.Context, addr string, timeout time.Duration, tun *internalssh.Tunnel) error {
+func waitForSSHProbeReady(ctx context.Context, addr string, timeout time.Duration, tun sshTunnel) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {

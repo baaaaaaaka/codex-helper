@@ -5,15 +5,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"net"
-	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	internalssh "github.com/baaaaaaaka/codex-helper/internal/ssh"
 )
 
 type fakeSSHOps struct {
@@ -171,24 +172,16 @@ func TestInitProfileInteractiveWithDepsDoesNotInstallManagedKeyForNonAuthProbeEr
 
 func TestSSHProbeUsesTunnelReadinessForNonInteractiveChecks(t *testing.T) {
 	lockCLITestHooks(t)
+	prevNewSSHTunnel := newSSHTunnel
+	t.Cleanup(func() { newSSHTunnel = prevNewSSHTunnel })
 
-	dir := t.TempDir()
-	helperBin, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve test binary: %v", err)
+	var gotCfg internalssh.TunnelConfig
+	newSSHTunnel = func(cfg internalssh.TunnelConfig) (sshTunnel, error) {
+		gotCfg = cfg
+		return newFakeReadyTunnel(cfg)
 	}
-	writeStub(
-		t,
-		dir,
-		"ssh",
-		fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestSSHProbeHelperProcess -- \"$@\"\n", helperBin),
-		fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestSSHProbeHelperProcess -- %%*\r\n", helperBin),
-	)
-	t.Setenv("PATH", dir)
-	t.Setenv("GO_WANT_SSH_HELPER_PROCESS", "1")
-	t.Setenv("SSH_HELPER_MODE", "socks-ready")
 
-	err = sshProbe(context.Background(), config.Profile{
+	err := sshProbe(context.Background(), config.Profile{
 		Host: "example.com",
 		Port: 3211,
 		User: "starh",
@@ -196,28 +189,26 @@ func TestSSHProbeUsesTunnelReadinessForNonInteractiveChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sshProbe error: %v", err)
 	}
+	if gotCfg.Host != "example.com" || gotCfg.Port != 3211 || gotCfg.User != "starh" {
+		t.Fatalf("unexpected tunnel config: %+v", gotCfg)
+	}
+	if gotCfg.SocksPort == 0 {
+		t.Fatalf("expected probe to allocate a socks port, got %+v", gotCfg)
+	}
+	if !gotCfg.BatchMode {
+		t.Fatalf("expected batch mode for probe tunnel, got %+v", gotCfg)
+	}
 }
 
 func TestSSHProbeOmitsTrailingColonWhenSSHReturnsNoOutput(t *testing.T) {
 	lockCLITestHooks(t)
-
-	dir := t.TempDir()
-	helperBin, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve test binary: %v", err)
+	prevNewSSHTunnel := newSSHTunnel
+	t.Cleanup(func() { newSSHTunnel = prevNewSSHTunnel })
+	newSSHTunnel = func(internalssh.TunnelConfig) (sshTunnel, error) {
+		return &fakeProbeTunnel{startErr: errors.New("exit status 1"), done: make(chan struct{})}, nil
 	}
-	writeStub(
-		t,
-		dir,
-		"ssh",
-		fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestSSHProbeHelperProcess -- \"$@\"\n", helperBin),
-		fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestSSHProbeHelperProcess -- %%*\r\n", helperBin),
-	)
-	t.Setenv("PATH", dir)
-	t.Setenv("GO_WANT_SSH_HELPER_PROCESS", "1")
-	t.Setenv("SSH_HELPER_MODE", "empty-fail")
 
-	err = sshProbe(context.Background(), config.Profile{
+	err := sshProbe(context.Background(), config.Profile{
 		Host: "example.com",
 		Port: 3211,
 		User: "starh",
@@ -235,22 +226,11 @@ func TestSSHProbeOmitsTrailingColonWhenSSHReturnsNoOutput(t *testing.T) {
 
 func TestSSHProbeHonorsContextCancellation(t *testing.T) {
 	lockCLITestHooks(t)
-
-	dir := t.TempDir()
-	helperBin, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve test binary: %v", err)
+	prevNewSSHTunnel := newSSHTunnel
+	t.Cleanup(func() { newSSHTunnel = prevNewSSHTunnel })
+	newSSHTunnel = func(internalssh.TunnelConfig) (sshTunnel, error) {
+		return newFakeBlockingTunnel(), nil
 	}
-	writeStub(
-		t,
-		dir,
-		"ssh",
-		fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestSSHProbeHelperProcess -- \"$@\"\n", helperBin),
-		fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestSSHProbeHelperProcess -- %%*\r\n", helperBin),
-	)
-	t.Setenv("PATH", dir)
-	t.Setenv("GO_WANT_SSH_HELPER_PROCESS", "1")
-	t.Setenv("SSH_HELPER_MODE", "block")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -259,7 +239,7 @@ func TestSSHProbeHonorsContextCancellation(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err = sshProbe(ctx, config.Profile{
+	err := sshProbe(ctx, config.Profile{
 		Host: "example.com",
 		Port: 3211,
 		User: "starh",
@@ -348,68 +328,73 @@ type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
 
-func TestSSHProbeHelperProcess(t *testing.T) {
-	if os.Getenv("GO_WANT_SSH_HELPER_PROCESS") != "1" {
-		return
-	}
+type fakeProbeTunnel struct {
+	startErr error
+	waitErr  error
+	startFn  func() error
+	stopFn   func() error
 
-	args := os.Args
-	sep := -1
-	for i, arg := range args {
-		if arg == "--" {
-			sep = i
-			break
-		}
-	}
-	if sep < 0 {
-		return
-	}
-	args = args[sep+1:]
+	done chan struct{}
+	once sync.Once
+}
 
-	switch os.Getenv("SSH_HELPER_MODE") {
-	case "socks-ready":
-		for _, arg := range args {
-			if arg == "exit" {
-				os.Exit(1)
-			}
-		}
+func newFakeReadyTunnel(cfg internalssh.TunnelConfig) (*fakeProbeTunnel, error) {
+	tun := &fakeProbeTunnel{done: make(chan struct{})}
 
-		spec := ""
-		for i := 0; i < len(args)-1; i++ {
-			if args[i] == "-D" {
-				spec = args[i+1]
-				break
-			}
-		}
-		if spec == "" {
-			_, _ = fmt.Fprint(os.Stderr, "missing -D")
-			os.Exit(1)
-		}
-
-		host, port, err := net.SplitHostPort(spec)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.SocksPort))
+	var ln net.Listener
+	tun.startFn = func() error {
+		var err error
+		ln, err = net.Listen("tcp", addr)
 		if err != nil {
-			_, _ = fmt.Fprint(os.Stderr, err.Error())
-			os.Exit(1)
+			return err
 		}
-		ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
-		if err != nil {
-			_, _ = fmt.Fprint(os.Stderr, err.Error())
-			os.Exit(1)
-		}
-		defer ln.Close()
-
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
 			}
-			_ = conn.Close()
-		}
-
-	case "empty-fail":
-		os.Exit(1)
-
-	case "block":
-		time.Sleep(30 * time.Second)
+		}()
+		return nil
 	}
+	tun.stopFn = func() error {
+		if ln != nil {
+			_ = ln.Close()
+		}
+		return nil
+	}
+	return tun, nil
+}
+
+func newFakeBlockingTunnel() *fakeProbeTunnel {
+	return &fakeProbeTunnel{done: make(chan struct{})}
+}
+
+func (t *fakeProbeTunnel) Start() error {
+	if t.startFn != nil {
+		if err := t.startFn(); err != nil {
+			return err
+		}
+	}
+	return t.startErr
+}
+
+func (t *fakeProbeTunnel) Stop(time.Duration) error {
+	if t.stopFn != nil {
+		if err := t.stopFn(); err != nil {
+			return err
+		}
+	}
+	t.once.Do(func() { close(t.done) })
+	return t.waitErr
+}
+
+func (t *fakeProbeTunnel) Done() <-chan struct{} { return t.done }
+
+func (t *fakeProbeTunnel) Wait() error {
+	<-t.done
+	return t.waitErr
 }
