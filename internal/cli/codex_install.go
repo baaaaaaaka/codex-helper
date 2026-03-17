@@ -1378,9 +1378,10 @@ func isCodexCommand(command string) bool {
 	if command == "" {
 		return false
 	}
+	command = strings.ReplaceAll(command, "\\", "/")
 	base := strings.ToLower(filepath.Base(command))
 	switch base {
-	case "codex", "codex.exe", "codex.cmd", "codex.bat":
+	case "codex", "codex.exe", "codex.cmd", "codex.bat", "codex.ps1", "codex.js", "codex.mjs", "codex.cjs":
 		return true
 	default:
 		return false

@@ -115,6 +115,35 @@ func TestInstallerAttemptLabel(t *testing.T) {
 	}
 }
 
+func TestIsCodexCommandRecognizesShimAndScriptNames(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"codex",
+		"/tmp/codex",
+		`C:\tools\codex.cmd`,
+		"/tmp/codex.ps1",
+		"/tmp/codex.js",
+		"/tmp/codex.mjs",
+		"/tmp/codex.cjs",
+	} {
+		if !isCodexCommand(path) {
+			t.Fatalf("expected %q to be recognized as codex command", path)
+		}
+	}
+
+	for _, path := range []string{
+		"",
+		"/tmp/node",
+		"/tmp/codex-linux-x64",
+		"/tmp/not-codex.js",
+	} {
+		if isCodexCommand(path) {
+			t.Fatalf("expected %q to not be recognized as codex command", path)
+		}
+	}
+}
+
 func TestEnsureCodexInstalledWithMissingPath(t *testing.T) {
 	_, err := ensureCodexInstalled(context.Background(), filepath.Join(t.TempDir(), "missing"), io.Discard)
 	if err == nil {

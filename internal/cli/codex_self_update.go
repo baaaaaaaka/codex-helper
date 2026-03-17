@@ -153,9 +153,17 @@ func isNpmGlobalCodexInstallArgs(args []string) bool {
 	commandSeen := false
 	global := false
 	hasCodex := false
+	expectLocationValue := false
 	for _, arg := range args {
 		arg = strings.TrimSpace(arg)
 		if arg == "" {
+			continue
+		}
+		if expectLocationValue {
+			expectLocationValue = false
+			if strings.EqualFold(arg, "global") {
+				global = true
+			}
 			continue
 		}
 		if !commandSeen {
@@ -163,17 +171,34 @@ func isNpmGlobalCodexInstallArgs(args []string) bool {
 			case "-g", "--global":
 				global = true
 				continue
+			case "--location":
+				expectLocationValue = true
+				continue
 			case "install", "i":
 				commandSeen = true
 				continue
 			default:
+				if strings.HasPrefix(arg, "--location=") {
+					if strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(arg, "--location=")), "global") {
+						global = true
+					}
+					continue
+				}
 				return false
 			}
 		}
 		switch arg {
 		case "-g", "--global":
 			global = true
+		case "--location":
+			expectLocationValue = true
 		default:
+			if strings.HasPrefix(arg, "--location=") {
+				if strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(arg, "--location=")), "global") {
+					global = true
+				}
+				continue
+			}
 			if isCodexPackageSpec(arg) {
 				hasCodex = true
 				continue
