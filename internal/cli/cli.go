@@ -5,7 +5,7 @@ import (
 )
 
 var (
-	version = "v0.0.24"
+	version = "v0.0.25"
 	commit  = ""
 	date    = ""
 )
@@ -45,6 +45,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&opts.upgradeCodex, "upgrade-codex", false, "Reinstall Codex CLI using its detected install source")
 
 	cmd.AddCommand(
+		newInternalNpmWrapperCmd(),
 		newInitCmd(opts),
 		newRunCmd(opts),
 		newTuiCmd(opts),

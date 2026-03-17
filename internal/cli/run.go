@@ -480,6 +480,19 @@ func runTargetOnceWithOptions(
 	if len(opts.ExtraEnv) > 0 {
 		envVars = append(envVars, opts.ExtraEnv...)
 	}
+	guardCleanup := func() {}
+	if isCodexCommand(cmdArgs[0]) {
+		guardEnv, cleanup, err := prepareCodexSelfUpdateGuardEnv(ctx, cmdArgs[0], envVars)
+		if err != nil {
+			if opts.Log != nil {
+				_, _ = fmt.Fprintf(opts.Log, "failed to arm codex self-update guard: %v\n", err)
+			}
+		} else {
+			envVars = guardEnv
+			guardCleanup = cleanup
+		}
+	}
+	defer guardCleanup()
 	cmd.Env = envVars
 	cmd.Stdin = os.Stdin
 	if opts.PreserveTTY {
