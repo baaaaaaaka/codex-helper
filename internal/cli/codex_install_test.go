@@ -580,7 +580,7 @@ func TestCodexRetirePathEmpty(t *testing.T) {
 }
 
 func TestCodexPackageDirForPrefixForOS(t *testing.T) {
-	prefix := filepath.Join(string(os.PathSeparator), "tmp", "npm")
+	prefix := t.TempDir()
 
 	if got := codexPackageDirForPrefixForOS("linux", prefix); got != filepath.Join(prefix, "lib", "node_modules", "@openai", "codex") {
 		t.Fatalf("unexpected linux package dir: %q", got)
@@ -718,7 +718,7 @@ func TestEnsureCodexInstalledLeavesStaleSystemNpmRetiredPathsAlone(t *testing.T)
 }
 
 func TestCodexBinCandidatesForPrefixForOSWindowsIncludesAllNpmShims(t *testing.T) {
-	prefix := filepath.Join(string(os.PathSeparator), "tmp", "npm")
+	prefix := t.TempDir()
 	got := codexBinCandidatesForPrefixForOS("windows", prefix)
 	for _, want := range []string{
 		filepath.Join(prefix, "codex"),
