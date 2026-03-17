@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -632,9 +633,10 @@ func TestCleanupStaleCodexRetiredPathsForSourceInspectError(t *testing.T) {
 }
 
 func TestCleanupStaleCodexRetiredPathsForSourceRemoveError(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("permission-based remove test is unix-specific")
-	}
+	lockCLITestHooks(t)
+	prevRemoveAll := codexRemoveAll
+	t.Cleanup(func() { codexRemoveAll = prevRemoveAll })
+	codexRemoveAll = func(string) error { return errors.New("boom") }
 
 	root := t.TempDir()
 	codexPath := filepath.Join(root, "codex")
@@ -642,12 +644,6 @@ func TestCleanupStaleCodexRetiredPathsForSourceRemoveError(t *testing.T) {
 	if err := os.WriteFile(retired, []byte("stale\n"), 0o600); err != nil {
 		t.Fatalf("write stale file: %v", err)
 	}
-	if err := os.Chmod(root, 0o500); err != nil {
-		t.Fatalf("chmod root: %v", err)
-	}
-	defer func() {
-		_ = os.Chmod(root, 0o700)
-	}()
 
 	err := cleanupStaleCodexRetiredPathsForSource(io.Discard, codexUpgradeSource{codexPath: codexPath})
 	if err == nil {
@@ -958,9 +954,10 @@ func TestUpgradeCodexInstalledWithOptionsErrorsWhenCodexDisappearsAfterUpgrade(t
 }
 
 func TestUpgradeCodexInstalledWithOptionsFailsWhenCleanupFails(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("permission-based cleanup failure test is unix-specific")
-	}
+	lockCLITestHooks(t)
+	prevRemoveAll := codexRemoveAll
+	t.Cleanup(func() { codexRemoveAll = prevRemoveAll })
+	codexRemoveAll = func(string) error { return errors.New("boom") }
 
 	root := t.TempDir()
 	globalPrefix := filepath.Join(root, "system-global")
@@ -974,12 +971,6 @@ func TestUpgradeCodexInstalledWithOptionsFailsWhenCleanupFails(t *testing.T) {
 	if err := os.WriteFile(staleBinPath, []byte("stale\n"), 0o700); err != nil {
 		t.Fatalf("write stale bin file: %v", err)
 	}
-	if err := os.Chmod(globalBin, 0o500); err != nil {
-		t.Fatalf("chmod global bin: %v", err)
-	}
-	defer func() {
-		_ = os.Chmod(globalBin, 0o700)
-	}()
 
 	binDir := t.TempDir()
 	npmPath := filepath.Join(binDir, "npm")

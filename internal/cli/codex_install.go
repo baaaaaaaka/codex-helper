@@ -24,6 +24,7 @@ var (
 	codexInstallLockPollDelay  = 200 * time.Millisecond
 	codexInstallLockStaleAfter = 30 * time.Minute
 	codexInstallLockMaxWait    = 30 * time.Second
+	codexRemoveAll             = os.RemoveAll
 )
 
 type codexInstallOptions struct {
@@ -556,7 +557,7 @@ func cleanupStaleCodexRetiredPathsForSource(out io.Writer, source codexUpgradeSo
 			}
 			return fmt.Errorf("inspect stale npm retired path %s: %w", retired, err)
 		}
-		if err := os.RemoveAll(retired); err != nil {
+		if err := codexRemoveAll(retired); err != nil {
 			return fmt.Errorf("remove stale npm retired path %s: %w", retired, err)
 		}
 		if out != nil {
