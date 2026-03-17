@@ -127,11 +127,13 @@ func TestIsNpmGlobalCodexInstallArgs(t *testing.T) {
 		{name: "global short flag first", args: []string{"-g", "install", "@openai/codex"}, want: true},
 		{name: "global short flag last", args: []string{"install", "@openai/codex", "-g"}, want: true},
 		{name: "alias command", args: []string{"i", "-g", "@openai/codex"}, want: true},
+		{name: "update command", args: []string{"update", "-g", "@openai/codex"}, want: true},
+		{name: "update alias command", args: []string{"up", "-g", "@openai/codex"}, want: true},
 		{name: "missing global", args: []string{"install", "@openai/codex"}, want: false},
 		{name: "non-global location", args: []string{"install", "--location=project", "@openai/codex"}, want: false},
 		{name: "wrong package", args: []string{"install", "-g", "lodash"}, want: false},
 		{name: "wrong scoped package", args: []string{"install", "-g", "@openai/codex-linux-x64"}, want: false},
-		{name: "wrong command", args: []string{"update", "-g", "@openai/codex"}, want: false},
+		{name: "wrong command", args: []string{"remove", "-g", "@openai/codex"}, want: false},
 	}
 
 	for _, tc := range tests {

@@ -174,7 +174,7 @@ func isNpmGlobalCodexInstallArgs(args []string) bool {
 			case "--location":
 				expectLocationValue = true
 				continue
-			case "install", "i":
+			case "install", "i", "update", "up":
 				commandSeen = true
 				continue
 			default:
