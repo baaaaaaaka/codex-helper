@@ -954,6 +954,10 @@ func TestUpgradeCodexInstalledWithOptionsErrorsWhenCodexDisappearsAfterUpgrade(t
 }
 
 func TestUpgradeCodexInstalledWithOptionsFailsWhenCleanupFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
 	lockCLITestHooks(t)
 	prevRemoveAll := codexRemoveAll
 	t.Cleanup(func() { codexRemoveAll = prevRemoveAll })
