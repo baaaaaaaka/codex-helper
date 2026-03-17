@@ -118,6 +118,7 @@ func runInternalNpmWrapper(ctx context.Context, args []string, stderr io.Writer)
 		return 1
 	}
 
+	npmEnv := sanitizeCodexSelfUpdateEnv(os.Environ())
 	if isNpmGlobalCodexInstallArgs(args) {
 		source := codexUpgradeSource{
 			origin:    codexInstallOrigin(strings.TrimSpace(os.Getenv(envCodexProxyUpdateOrigin))),
@@ -130,9 +131,15 @@ func runInternalNpmWrapper(ctx context.Context, args []string, stderr io.Writer)
 				return 1
 			}
 		}
+		var err error
+		npmEnv, err = codexSelfUpdateEnvForSource(source, npmEnv)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "codex self-update preflight failed: %v\n", err)
+			return 1
+		}
 	}
 
-	if err := codexSelfUpdateRunRealNpm(ctx, realNpm, args, sanitizeCodexSelfUpdateEnv(os.Environ())); err != nil {
+	if err := codexSelfUpdateRunRealNpm(ctx, realNpm, args, npmEnv); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return exitErr.ExitCode()
 		}
@@ -166,15 +173,36 @@ func isNpmGlobalCodexInstallArgs(args []string) bool {
 		switch arg {
 		case "-g", "--global":
 			global = true
-		case "@openai/codex":
-			hasCodex = true
 		default:
+			if isCodexPackageSpec(arg) {
+				hasCodex = true
+				continue
+			}
 			if strings.HasPrefix(arg, "-") {
 				continue
 			}
 		}
 	}
 	return commandSeen && global && hasCodex
+}
+
+func isCodexPackageSpec(arg string) bool {
+	arg = strings.TrimSpace(arg)
+	if arg == "@openai/codex" {
+		return true
+	}
+	return strings.HasPrefix(arg, "@openai/codex@")
+}
+
+func codexSelfUpdateEnvForSource(source codexUpgradeSource, env []string) ([]string, error) {
+	if source.origin != codexInstallOriginManaged {
+		return env, nil
+	}
+	prefix := strings.TrimSpace(source.npmPrefix)
+	if prefix == "" {
+		return nil, fmt.Errorf("managed codex self-update is missing npm prefix")
+	}
+	return setEnvValue(env, "npm_config_prefix", prefix), nil
 }
 
 func sanitizeCodexSelfUpdateEnv(env []string) []string {

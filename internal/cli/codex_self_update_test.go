@@ -40,8 +40,9 @@ func TestPrepareCodexSelfUpdateGuardEnvPrependsWrapper(t *testing.T) {
 			npmPrefix: "/tmp/npm-global",
 		}, nil
 	}
+	privateNpmPath := "/tmp/codex-proxy/node/v22-linux-x64/bin/npm"
 	codexSelfUpdateLookPath = func(string) (string, error) {
-		return "/usr/bin/npm", nil
+		return privateNpmPath, nil
 	}
 	codexSelfUpdateExecutable = func() (string, error) {
 		return "/usr/bin/codex-proxy", nil
@@ -57,7 +58,7 @@ func TestPrepareCodexSelfUpdateGuardEnvPrependsWrapper(t *testing.T) {
 	}
 	t.Cleanup(cleanup)
 
-	if got := envValue(updated, envCodexProxyRealNPM); got != "/usr/bin/npm" {
+	if got := envValue(updated, envCodexProxyRealNPM); got != privateNpmPath {
 		t.Fatalf("expected real npm path, got %q", got)
 	}
 	if got := envValue(updated, envCodexProxyUpdateNPMPrefix); got != "/tmp/npm-global" {
@@ -118,11 +119,14 @@ func TestIsNpmGlobalCodexInstallArgs(t *testing.T) {
 		want bool
 	}{
 		{name: "global long flag", args: []string{"install", "--global", "@openai/codex"}, want: true},
+		{name: "global latest tag", args: []string{"install", "--global", "@openai/codex@latest"}, want: true},
+		{name: "global pinned version", args: []string{"install", "--global", "@openai/codex@0.115.0"}, want: true},
 		{name: "global short flag first", args: []string{"-g", "install", "@openai/codex"}, want: true},
 		{name: "global short flag last", args: []string{"install", "@openai/codex", "-g"}, want: true},
 		{name: "alias command", args: []string{"i", "-g", "@openai/codex"}, want: true},
 		{name: "missing global", args: []string{"install", "@openai/codex"}, want: false},
 		{name: "wrong package", args: []string{"install", "-g", "lodash"}, want: false},
+		{name: "wrong scoped package", args: []string{"install", "-g", "@openai/codex-linux-x64"}, want: false},
 		{name: "wrong command", args: []string{"update", "-g", "@openai/codex"}, want: false},
 	}
 
@@ -223,8 +227,64 @@ func TestRunInternalNpmWrapperCleansBeforeGlobalInstall(t *testing.T) {
 	if got := envValue(ranEnv, "PATH"); got != "/usr/bin:/bin" {
 		t.Fatalf("expected restored PATH, got %q", got)
 	}
+	if got, ok := sliceEnvValue(ranEnv, "npm_config_prefix"); ok {
+		t.Fatalf("expected system npm env to avoid prefix override, got %q", got)
+	}
 	if got, ok := sliceEnvValue(ranEnv, envCodexProxyRealNPM); ok {
 		t.Fatalf("expected wrapper env removed, got %q", got)
+	}
+}
+
+func TestRunInternalNpmWrapperManagedInstallForcesManagedPrefixWithPrivateNpm(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevCleanup := codexSelfUpdateCleanupStale
+	prevRun := codexSelfUpdateRunRealNpm
+	t.Cleanup(func() {
+		codexSelfUpdateCleanupStale = prevCleanup
+		codexSelfUpdateRunRealNpm = prevRun
+	})
+
+	privateNpmPath := "/tmp/codex-proxy/node/v22-linux-x64/bin/npm"
+	t.Setenv(envCodexProxyRealNPM, privateNpmPath)
+	t.Setenv(envCodexProxyOriginalPath, "/usr/bin:/bin")
+	t.Setenv(envCodexProxyUpdateOrigin, string(codexInstallOriginManaged))
+	t.Setenv(envCodexProxyUpdateCodexPath, "/tmp/managed/bin/codex")
+	t.Setenv(envCodexProxyUpdateNPMPrefix, "/tmp/managed")
+
+	cleaned := false
+	codexSelfUpdateCleanupStale = func(_ io.Writer, source codexUpgradeSource) error {
+		cleaned = true
+		if source.origin != codexInstallOriginManaged || source.npmPrefix != "/tmp/managed" {
+			t.Fatalf("unexpected cleanup source: %+v", source)
+		}
+		return nil
+	}
+
+	var ranEnv []string
+	codexSelfUpdateRunRealNpm = func(_ context.Context, npmPath string, args []string, env []string) error {
+		if npmPath != privateNpmPath {
+			t.Fatalf("expected real npm path, got %q", npmPath)
+		}
+		if strings.Join(args, " ") != "install --global @openai/codex@latest" {
+			t.Fatalf("unexpected args: %#v", args)
+		}
+		ranEnv = append([]string{}, env...)
+		return nil
+	}
+
+	code := runInternalNpmWrapper(context.Background(), []string{"install", "--global", "@openai/codex@latest"}, io.Discard)
+	if code != 0 {
+		t.Fatalf("expected success, got %d", code)
+	}
+	if !cleaned {
+		t.Fatal("expected stale cleanup to run")
+	}
+	if got := envValue(ranEnv, "PATH"); got != "/usr/bin:/bin" {
+		t.Fatalf("expected restored PATH, got %q", got)
+	}
+	if got := envValue(ranEnv, "npm_config_prefix"); got != "/tmp/managed" {
+		t.Fatalf("expected managed npm prefix override, got %q", got)
 	}
 }
 
@@ -288,5 +348,47 @@ func TestRunInternalNpmWrapperReturnsFailureOnCleanupError(t *testing.T) {
 	}
 	if ran {
 		t.Fatal("expected npm execution skipped after cleanup failure")
+	}
+}
+
+func TestRunInternalNpmWrapperManagedInstallRequiresPrefix(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevCleanup := codexSelfUpdateCleanupStale
+	prevRun := codexSelfUpdateRunRealNpm
+	t.Cleanup(func() {
+		codexSelfUpdateCleanupStale = prevCleanup
+		codexSelfUpdateRunRealNpm = prevRun
+	})
+
+	t.Setenv(envCodexProxyRealNPM, "/usr/bin/npm")
+	t.Setenv(envCodexProxyOriginalPath, "/usr/bin:/bin")
+	t.Setenv(envCodexProxyUpdateOrigin, string(codexInstallOriginManaged))
+	t.Setenv(envCodexProxyUpdateCodexPath, "/tmp/managed/bin/codex")
+
+	cleaned := false
+	codexSelfUpdateCleanupStale = func(_ io.Writer, source codexUpgradeSource) error {
+		cleaned = true
+		if source.origin != codexInstallOriginManaged {
+			t.Fatalf("unexpected cleanup source: %+v", source)
+		}
+		return nil
+	}
+
+	ran := false
+	codexSelfUpdateRunRealNpm = func(context.Context, string, []string, []string) error {
+		ran = true
+		return nil
+	}
+
+	code := runInternalNpmWrapper(context.Background(), []string{"install", "-g", "@openai/codex"}, io.Discard)
+	if code != 1 {
+		t.Fatalf("expected failure exit code, got %d", code)
+	}
+	if !cleaned {
+		t.Fatal("expected cleanup to run before prefix validation failure")
+	}
+	if ran {
+		t.Fatal("expected npm execution skipped when managed prefix is missing")
 	}
 }
