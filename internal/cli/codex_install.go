@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -464,6 +466,9 @@ func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts c
 		if out != nil {
 			_, _ = fmt.Fprintf(out, "upgrading codex (%s)...\n", source.displayName)
 		}
+		if err := cleanupStaleCodexRetiredPathsForSource(out, source); err != nil {
+			return err
+		}
 
 		runUpgrade := func(installerEnv []string) error {
 			return runCodexUpgradeBySource(ctx, out, installerEnv, source)
@@ -496,8 +501,19 @@ func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts c
 }
 
 func detectCodexUpgradeSource(ctx context.Context, installerEnv []string) (codexUpgradeSource, error) {
-	codexPath, err := findInstalledCodexWithoutProbe()
-	if err != nil {
+	return detectCodexUpgradeSourceForPath(ctx, "", installerEnv)
+}
+
+func detectCodexUpgradeSourceForPath(ctx context.Context, codexPath string, installerEnv []string) (codexUpgradeSource, error) {
+	var err error
+	if strings.TrimSpace(codexPath) == "" {
+		codexPath, err = findInstalledCodexWithoutProbe()
+		if err != nil {
+			return codexUpgradeSource{}, fmt.Errorf("codex is not installed; cannot upgrade")
+		}
+	}
+	codexPath = normalizeExecutablePath(codexPath)
+	if codexPath == "" {
 		return codexUpgradeSource{}, fmt.Errorf("codex is not installed; cannot upgrade")
 	}
 
@@ -525,6 +541,123 @@ func detectCodexUpgradeSource(ctx context.Context, installerEnv []string) (codex
 		codexPath:   codexPath,
 		displayName: "unknown source",
 	}, nil
+}
+
+func cleanupStaleCodexRetiredPathsForSource(out io.Writer, source codexUpgradeSource) error {
+	targets := codexRetiredPathTargets(source)
+	for _, target := range targets {
+		retired := codexRetirePath(target)
+		if retired == "" || retired == target {
+			continue
+		}
+		if _, err := os.Lstat(retired); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("inspect stale npm retired path %s: %w", retired, err)
+		}
+		if err := os.RemoveAll(retired); err != nil {
+			return fmt.Errorf("remove stale npm retired path %s: %w", retired, err)
+		}
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "removed stale npm update backup: %s\n", retired)
+		}
+	}
+	return nil
+}
+
+func codexRetiredPathTargets(source codexUpgradeSource) []string {
+	targets := make([]string, 0, 6)
+	seen := map[string]struct{}{}
+	add := func(path string) {
+		path = normalizeExecutablePath(path)
+		if path == "" {
+			return
+		}
+		key := path
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(key)
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, path)
+	}
+
+	if source.npmPrefix != "" {
+		add(codexPackageDirForPrefix(source.npmPrefix))
+		for _, path := range codexBinCandidatesForPrefix(source.npmPrefix) {
+			add(path)
+		}
+	}
+	add(source.codexPath)
+	return targets
+}
+
+func codexPackageDirForPrefix(prefix string) string {
+	return codexPackageDirForPrefixForOS(runtime.GOOS, prefix)
+}
+
+func codexPackageDirForPrefixForOS(goos, prefix string) string {
+	prefix = normalizeExecutablePath(prefix)
+	if prefix == "" {
+		return ""
+	}
+	if strings.EqualFold(goos, "windows") {
+		return filepath.Join(prefix, "node_modules", "@openai", "codex")
+	}
+	return filepath.Join(prefix, "lib", "node_modules", "@openai", "codex")
+}
+
+func codexBinCandidatesForPrefix(prefix string) []string {
+	return codexBinCandidatesForPrefixForOS(runtime.GOOS, prefix)
+}
+
+func codexBinCandidatesForPrefixForOS(goos, prefix string) []string {
+	prefix = normalizeExecutablePath(prefix)
+	if prefix == "" {
+		return nil
+	}
+	if strings.EqualFold(goos, "windows") {
+		return []string{
+			filepath.Join(prefix, "codex"),
+			filepath.Join(prefix, "codex.cmd"),
+			filepath.Join(prefix, "codex.ps1"),
+			filepath.Join(prefix, "codex.exe"),
+			filepath.Join(prefix, "bin", "codex"),
+			filepath.Join(prefix, "bin", "codex.cmd"),
+			filepath.Join(prefix, "bin", "codex.ps1"),
+			filepath.Join(prefix, "bin", "codex.exe"),
+		}
+	}
+	return []string{
+		filepath.Join(prefix, "bin", "codex"),
+	}
+}
+
+func codexRetirePath(path string) string {
+	path = normalizeExecutablePath(path)
+	if path == "" {
+		return ""
+	}
+
+	sum := sha1.Sum([]byte(path))
+	encoded := base64.StdEncoding.EncodeToString(sum[:])
+	var slug strings.Builder
+	slug.Grow(8)
+	for _, ch := range encoded {
+		if ('a' <= ch && ch <= 'z') || ('A' <= ch && ch <= 'Z') || ('0' <= ch && ch <= '9') {
+			slug.WriteRune(ch)
+			if slug.Len() == 8 {
+				break
+			}
+		}
+	}
+	if slug.Len() == 0 {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+"-"+slug.String())
 }
 
 func runCodexUpgradeBySource(ctx context.Context, out io.Writer, installerEnv []string, source codexUpgradeSource) error {

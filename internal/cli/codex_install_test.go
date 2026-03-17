@@ -455,6 +455,312 @@ func TestUpgradeCodexInstalledWithOptionsSystemUsesNpmInstall(t *testing.T) {
 	}
 }
 
+func TestUpgradeCodexInstalledWithOptionsUsesWithInstallerEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, globalBin, true)
+	marker := filepath.Join(root, "npm-install-hit")
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"  if [ \"$TEST_INSTALLER_ENV\" != \"1\" ]; then\n" +
+		"    echo \"missing TEST_INSTALLER_ENV\" >&2\n" +
+		"    exit 1\n" +
+		"  fi\n" +
+		"  echo hit > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	called := false
+	got, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{
+		upgradeCodex: true,
+		withInstallerEnv: func(_ context.Context, runUpgrade func([]string) error) error {
+			called = true
+			return runUpgrade([]string{"TEST_INSTALLER_ENV=1"})
+		},
+	})
+	if err != nil {
+		t.Fatalf("upgradeCodexInstalledWithOptions error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected withInstallerEnv to run")
+	}
+	if got != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected npm install marker: %v", err)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsPropagatesWithInstallerEnvError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	_ = writeProbeableCodex(t, globalBin, true)
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo unexpected >&2\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	called := false
+	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{
+		upgradeCodex: true,
+		withInstallerEnv: func(context.Context, func([]string) error) error {
+			called = true
+			return fmt.Errorf("proxy bootstrap failed")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected withInstallerEnv error")
+	}
+	if !called {
+		t.Fatal("expected withInstallerEnv to run")
+	}
+	if !strings.Contains(err.Error(), "proxy bootstrap failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCodexRetirePathMatchesNpmArborist(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip unix-style arborist retire path assertion on windows")
+	}
+
+	path := "/home/baka/.npm-global/lib/node_modules/@openai/codex"
+	got := codexRetirePath(path)
+	want := "/home/baka/.npm-global/lib/node_modules/@openai/.codex-WofhFpbS"
+	if got != want {
+		t.Fatalf("expected retire path %q, got %q", want, got)
+	}
+}
+
+func TestCodexRetirePathEmpty(t *testing.T) {
+	if got := codexRetirePath(""); got != "" {
+		t.Fatalf("expected empty retire path, got %q", got)
+	}
+}
+
+func TestCodexPackageDirForPrefixForOS(t *testing.T) {
+	prefix := filepath.Join(string(os.PathSeparator), "tmp", "npm")
+
+	if got := codexPackageDirForPrefixForOS("linux", prefix); got != filepath.Join(prefix, "lib", "node_modules", "@openai", "codex") {
+		t.Fatalf("unexpected linux package dir: %q", got)
+	}
+	if got := codexPackageDirForPrefixForOS("windows", prefix); got != filepath.Join(prefix, "node_modules", "@openai", "codex") {
+		t.Fatalf("unexpected windows package dir: %q", got)
+	}
+	if got := codexPackageDirForPrefixForOS("linux", ""); got != "" {
+		t.Fatalf("expected empty package dir for empty prefix, got %q", got)
+	}
+}
+
+func TestCodexRetiredPathTargetsIgnoreEmptyPath(t *testing.T) {
+	got := codexRetiredPathTargets(codexUpgradeSource{})
+	if len(got) != 0 {
+		t.Fatalf("expected no targets, got %v", got)
+	}
+}
+
+func TestDetectCodexUpgradeSourceForPathUsesExplicitManagedPath(t *testing.T) {
+	prefix := filepath.Join(t.TempDir(), "managed-prefix")
+	codexPath := filepath.Join(prefix, "bin", "codex")
+
+	source, err := detectCodexUpgradeSourceForPath(context.Background(), codexPath, []string{"CODEX_NPM_PREFIX=" + prefix})
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSourceForPath error: %v", err)
+	}
+	if source.origin != codexInstallOriginManaged {
+		t.Fatalf("expected managed origin, got %q", source.origin)
+	}
+	if source.codexPath != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, source.codexPath)
+	}
+	if source.npmPrefix != prefix {
+		t.Fatalf("expected npm prefix %q, got %q", prefix, source.npmPrefix)
+	}
+}
+
+func TestCleanupStaleCodexRetiredPathsForSourceInspectError(t *testing.T) {
+	source := codexUpgradeSource{codexPath: "\x00codex"}
+
+	err := cleanupStaleCodexRetiredPathsForSource(io.Discard, source)
+	if err == nil {
+		t.Fatal("expected inspect error")
+	}
+	if !strings.Contains(err.Error(), "inspect stale npm retired path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCleanupStaleCodexRetiredPathsForSourceRemoveError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based remove test is unix-specific")
+	}
+
+	root := t.TempDir()
+	codexPath := filepath.Join(root, "codex")
+	retired := codexRetirePath(codexPath)
+	if err := os.WriteFile(retired, []byte("stale\n"), 0o600); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+	if err := os.Chmod(root, 0o500); err != nil {
+		t.Fatalf("chmod root: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(root, 0o700)
+	}()
+
+	err := cleanupStaleCodexRetiredPathsForSource(io.Discard, codexUpgradeSource{codexPath: codexPath})
+	if err == nil {
+		t.Fatal("expected remove error")
+	}
+	if !strings.Contains(err.Error(), "remove stale npm retired path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEnsureCodexInstalledLeavesStaleSystemNpmRetiredPathsAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based system npm test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, globalBin, true)
+
+	packageDir := codexPackageDirForPrefix(globalPrefix)
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatalf("mkdir package dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte("{\"name\":\"@openai/codex\"}\n"), 0o600); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+
+	stalePackageDir := codexRetirePath(packageDir)
+	if err := os.MkdirAll(stalePackageDir, 0o755); err != nil {
+		t.Fatalf("mkdir stale package dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stalePackageDir, "README.md"), []byte("stale\n"), 0o600); err != nil {
+		t.Fatalf("write stale package file: %v", err)
+	}
+
+	staleBinPath := codexRetirePath(filepath.Join(globalBin, "codex"))
+	if err := os.WriteFile(staleBinPath, []byte("stale\n"), 0o700); err != nil {
+		t.Fatalf("write stale bin file: %v", err)
+	}
+
+	t.Setenv("PATH", globalBin)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	got, err := ensureCodexInstalled(context.Background(), "", io.Discard)
+	if err != nil {
+		t.Fatalf("ensureCodexInstalled error: %v", err)
+	}
+	if got != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, got)
+	}
+	if _, err := os.Stat(stalePackageDir); err != nil {
+		t.Fatalf("expected stale package dir to remain, stat err=%v", err)
+	}
+	if _, err := os.Stat(staleBinPath); err != nil {
+		t.Fatalf("expected stale bin path to remain, stat err=%v", err)
+	}
+	if _, err := os.Stat(packageDir); err != nil {
+		t.Fatalf("expected active package dir to remain: %v", err)
+	}
+	if _, err := os.Stat(codexPath); err != nil {
+		t.Fatalf("expected active codex to remain: %v", err)
+	}
+}
+
+func TestCodexBinCandidatesForPrefixForOSWindowsIncludesAllNpmShims(t *testing.T) {
+	prefix := filepath.Join(string(os.PathSeparator), "tmp", "npm")
+	got := codexBinCandidatesForPrefixForOS("windows", prefix)
+	for _, want := range []string{
+		filepath.Join(prefix, "codex"),
+		filepath.Join(prefix, "codex.cmd"),
+		filepath.Join(prefix, "codex.ps1"),
+		filepath.Join(prefix, "bin", "codex"),
+		filepath.Join(prefix, "bin", "codex.cmd"),
+		filepath.Join(prefix, "bin", "codex.ps1"),
+	} {
+		if !containsPath(got, want) {
+			t.Fatalf("expected windows shim candidate %q in %v", want, got)
+		}
+	}
+}
+
+func TestCodexBinCandidatesForPrefixForOSEmptyPrefix(t *testing.T) {
+	got := codexBinCandidatesForPrefixForOS("windows", "")
+	if got != nil {
+		t.Fatalf("expected nil candidates for empty prefix, got %v", got)
+	}
+}
+
+func TestRunCodexUpgradeBySourceRejectsManagedWithoutPrefix(t *testing.T) {
+	err := runCodexUpgradeBySource(context.Background(), io.Discard, nil, codexUpgradeSource{origin: codexInstallOriginManaged})
+	if err == nil {
+		t.Fatal("expected managed prefix error")
+	}
+	if !strings.Contains(err.Error(), "missing npm prefix") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunCodexUpgradeBySourceRejectsUnknownSource(t *testing.T) {
+	err := runCodexUpgradeBySource(context.Background(), io.Discard, nil, codexUpgradeSource{origin: codexInstallOriginUnknown})
+	if err == nil {
+		t.Fatal("expected unknown-origin error")
+	}
+	if !strings.Contains(err.Error(), "cannot determine codex installation origin") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestUpgradeCodexInstalledWithOptionsManagedUsesManagedPrefix(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell-based upgrade test on windows")
@@ -494,6 +800,218 @@ func TestUpgradeCodexInstalledWithOptionsManagedUsesManagedPrefix(t *testing.T) 
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("expected managed install marker: %v", err)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsRemovesStaleSystemRetiredPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, globalBin, true)
+	marker := filepath.Join(root, "npm-install-hit")
+
+	packageDir := codexPackageDirForPrefix(globalPrefix)
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatalf("mkdir package dir: %v", err)
+	}
+	stalePackageDir := codexRetirePath(packageDir)
+	if err := os.MkdirAll(stalePackageDir, 0o755); err != nil {
+		t.Fatalf("mkdir stale package dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stalePackageDir, "README.md"), []byte("stale\n"), 0o600); err != nil {
+		t.Fatalf("write stale package file: %v", err)
+	}
+
+	staleBinPath := codexRetirePath(filepath.Join(globalBin, "codex"))
+	if err := os.WriteFile(staleBinPath, []byte("stale\n"), 0o700); err != nil {
+		t.Fatalf("write stale bin file: %v", err)
+	}
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"  if [ -e \"" + stalePackageDir + "\" ] || [ -e \"" + staleBinPath + "\" ]; then\n" +
+		"    echo \"stale retired path still present\" >&2\n" +
+		"    exit 1\n" +
+		"  fi\n" +
+		"  echo hit > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	got, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err != nil {
+		t.Fatalf("upgradeCodexInstalledWithOptions error: %v", err)
+	}
+	if got != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected npm install marker: %v", err)
+	}
+	if _, err := os.Stat(stalePackageDir); !os.IsNotExist(err) {
+		t.Fatalf("expected stale package dir to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(staleBinPath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale bin path to be removed, stat err=%v", err)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsPropagatesUpgradeFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	_ = writeProbeableCodex(t, globalBin, true)
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"  exit 7\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err == nil {
+		t.Fatal("expected upgrade failure")
+	}
+	if !strings.Contains(err.Error(), "system npm codex upgrade failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsErrorsWhenCodexDisappearsAfterUpgrade(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, globalBin, true)
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"  cat > \"" + codexPath + "\" <<'EOF'\n" +
+		"#!/bin/sh\n" +
+		"exit 1\n" +
+		"EOF\n" +
+		"  chmod 700 \"" + codexPath + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err == nil {
+		t.Fatal("expected missing-binary error")
+	}
+	if !strings.Contains(err.Error(), "codex upgrade finished but binary not found in PATH") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUpgradeCodexInstalledWithOptionsFailsWhenCleanupFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based cleanup failure test is unix-specific")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	_ = writeProbeableCodex(t, globalBin, true)
+
+	staleBinPath := codexRetirePath(filepath.Join(globalBin, "codex"))
+	if err := os.WriteFile(staleBinPath, []byte("stale\n"), 0o700); err != nil {
+		t.Fatalf("write stale bin file: %v", err)
+	}
+	if err := os.Chmod(globalBin, 0o500); err != nil {
+		t.Fatalf("chmod global bin: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(globalBin, 0o700)
+	}()
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo unexpected >&2\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	called := false
+	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{
+		upgradeCodex: true,
+		withInstallerEnv: func(context.Context, func([]string) error) error {
+			called = true
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatal("expected cleanup failure")
+	}
+	if !strings.Contains(err.Error(), "remove stale npm retired path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Fatal("expected withInstallerEnv not to run when stale cleanup fails")
 	}
 }
 

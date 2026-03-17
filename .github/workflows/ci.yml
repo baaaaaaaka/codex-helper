@@ -181,8 +181,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          retire_path() {
+            node -e 'const crypto=require("crypto"); const path=require("path"); const p=process.argv[1]; const hash=crypto.createHash("sha1").update(p).digest("base64").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 8); console.log(path.resolve(path.dirname(p), `.${path.basename(p)}-${hash}`));' "$1"
+          }
+          seed_stale_codex_backup() {
+            local prefix="$1"
+            local pkg_dir="$prefix/lib/node_modules/@openai/codex"
+            local pkg_retired
+            pkg_retired="$(retire_path "$pkg_dir")"
+            mkdir -p "$pkg_retired"
+            echo stale > "$pkg_retired/README.md"
+            local bin_retired
+            bin_retired="$(retire_path "$prefix/bin/codex")"
+            echo stale > "$bin_retired"
+          }
           npm install -g @openai/codex
           system_prefix="$(npm prefix -g)"
+          seed_stale_codex_backup "$system_prefix"
           go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-system.json" --upgrade-codex
           codex --version >/dev/null
           upgraded_path="$(command -v codex)"
@@ -199,10 +214,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          retire_path() {
+            node -e 'const crypto=require("crypto"); const path=require("path"); const p=process.argv[1]; const hash=crypto.createHash("sha1").update(p).digest("base64").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 8); console.log(path.resolve(path.dirname(p), `.${path.basename(p)}-${hash}`));' "$1"
+          }
+          seed_stale_codex_backup() {
+            local prefix="$1"
+            local pkg_dir="$prefix/lib/node_modules/@openai/codex"
+            local pkg_retired
+            pkg_retired="$(retire_path "$pkg_dir")"
+            mkdir -p "$pkg_retired"
+            echo stale > "$pkg_retired/README.md"
+            local bin_retired
+            bin_retired="$(retire_path "$prefix/bin/codex")"
+            echo stale > "$bin_retired"
+          }
           local_prefix="$RUNNER_TEMP/codex-local-prefix"
           npm install -g --prefix "$local_prefix" @openai/codex
           export CODEX_NPM_PREFIX="$local_prefix"
           export PATH="$local_prefix/bin:$local_prefix:$PATH"
+          seed_stale_codex_backup "$local_prefix"
           go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-local.json" --upgrade-codex
           codex --version >/dev/null
           upgraded_path="$(command -v codex)"
@@ -220,8 +250,31 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
+          function Get-RetirePath([string]$PathValue) {
+            $sha1 = [System.Security.Cryptography.SHA1]::Create()
+            try {
+              $hashBytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($PathValue))
+            } finally {
+              $sha1.Dispose()
+            }
+            $base64 = [Convert]::ToBase64String($hashBytes)
+            $slug = -join ($base64.ToCharArray() | Where-Object { [char]::IsLetterOrDigit($_) })
+            if ($slug.Length -gt 8) {
+              $slug = $slug.Substring(0, 8)
+            }
+            Join-Path (Split-Path -Parent $PathValue) ('.' + (Split-Path -Leaf $PathValue) + '-' + $slug)
+          }
+          function New-StaleCodexBackup([string]$Prefix) {
+            $pkgDir = Join-Path $Prefix "node_modules\@openai\codex"
+            $pkgRetired = Get-RetirePath $pkgDir
+            New-Item -ItemType Directory -Force -Path $pkgRetired | Out-Null
+            Set-Content -Path (Join-Path $pkgRetired "README.md") -Value "stale"
+            $ps1Retired = Get-RetirePath (Join-Path $Prefix "codex.ps1")
+            Set-Content -Path $ps1Retired -Value "stale"
+          }
           npm install -g @openai/codex
           $systemPrefix = (npm prefix -g).Trim()
+          New-StaleCodexBackup $systemPrefix
           go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-system.json" --upgrade-codex
           & codex --version | Out-Null
           $upgradedPath = (Get-Command codex).Source
@@ -235,11 +288,34 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
+          function Get-RetirePath([string]$PathValue) {
+            $sha1 = [System.Security.Cryptography.SHA1]::Create()
+            try {
+              $hashBytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($PathValue))
+            } finally {
+              $sha1.Dispose()
+            }
+            $base64 = [Convert]::ToBase64String($hashBytes)
+            $slug = -join ($base64.ToCharArray() | Where-Object { [char]::IsLetterOrDigit($_) })
+            if ($slug.Length -gt 8) {
+              $slug = $slug.Substring(0, 8)
+            }
+            Join-Path (Split-Path -Parent $PathValue) ('.' + (Split-Path -Leaf $PathValue) + '-' + $slug)
+          }
+          function New-StaleCodexBackup([string]$Prefix) {
+            $pkgDir = Join-Path $Prefix "node_modules\@openai\codex"
+            $pkgRetired = Get-RetirePath $pkgDir
+            New-Item -ItemType Directory -Force -Path $pkgRetired | Out-Null
+            Set-Content -Path (Join-Path $pkgRetired "README.md") -Value "stale"
+            $ps1Retired = Get-RetirePath (Join-Path $Prefix "codex.ps1")
+            Set-Content -Path $ps1Retired -Value "stale"
+          }
           $localPrefix = Join-Path $env:RUNNER_TEMP "codex-local-prefix"
           npm install -g --prefix $localPrefix @openai/codex
           $localBin = Join-Path $localPrefix "bin"
           $env:CODEX_NPM_PREFIX = $localPrefix
           $env:PATH = "$localPrefix;$localBin;$env:PATH"
+          New-StaleCodexBackup $localPrefix
           go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-local.json" --upgrade-codex
           & codex --version | Out-Null
           $upgradedPath = (Get-Command codex).Source
