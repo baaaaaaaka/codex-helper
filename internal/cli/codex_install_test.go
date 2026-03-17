@@ -1141,7 +1141,7 @@ func TestResolveRunCommandInstallsCodexWhenMissing(t *testing.T) {
 	}
 }
 
-func TestResolveRunCommandKeepsCodexWhenOnPath(t *testing.T) {
+func TestResolveRunCommandResolvesCodexOnPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell PATH test on windows")
 	}
@@ -1165,8 +1165,8 @@ func TestResolveRunCommandKeepsCodexWhenOnPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveRunCommand error: %v", err)
 	}
-	if len(got) != len(args) || got[0] != args[0] || got[1] != args[1] {
-		t.Fatalf("expected unchanged args, got %v", got)
+	if len(got) != len(args) || got[0] != codexPath || got[1] != args[1] {
+		t.Fatalf("expected resolved codex path, got %v", got)
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("installer should not run when codex is already on PATH")

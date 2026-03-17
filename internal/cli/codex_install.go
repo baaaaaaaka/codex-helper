@@ -1412,7 +1412,10 @@ func resolveRunCommandWithInstallOptions(ctx context.Context, cmdArgs []string, 
 		if path, lookErr := exec.LookPath(cmd); lookErr == nil {
 			path = normalizeExecutablePath(path)
 			if probeCodex(ctx, path) {
-				return cmdArgs, nil
+				updated := make([]string, len(cmdArgs))
+				copy(updated, cmdArgs)
+				updated[0] = path
+				return updated, nil
 			}
 		}
 		resolved, err = ensureCodexInstalledWithOptions(ctx, "", out, installOpts)
