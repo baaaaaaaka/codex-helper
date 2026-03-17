@@ -481,8 +481,14 @@ func runTargetOnceWithOptions(
 		envVars = append(envVars, opts.ExtraEnv...)
 	}
 	guardCleanup := func() {}
+	guardCodexPath := ""
 	if isCodexCommand(cmdArgs[0]) {
-		guardEnv, cleanup, err := prepareCodexSelfUpdateGuardEnv(ctx, cmdArgs[0], envVars)
+		guardCodexPath = cmdArgs[0]
+	} else if opts.PatchInfo != nil && isCodexCommand(opts.PatchInfo.OrigBinaryPath) {
+		guardCodexPath = opts.PatchInfo.OrigBinaryPath
+	}
+	if guardCodexPath != "" {
+		guardEnv, cleanup, err := prepareCodexSelfUpdateGuardEnv(ctx, guardCodexPath, envVars)
 		if err != nil {
 			if opts.Log != nil {
 				_, _ = fmt.Fprintf(opts.Log, "failed to arm codex self-update guard: %v\n", err)

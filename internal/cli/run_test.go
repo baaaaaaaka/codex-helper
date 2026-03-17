@@ -100,6 +100,67 @@ func TestRunTargetOnceWithOptionsNoProxyKeepsEnv(t *testing.T) {
 	}
 }
 
+func TestRunTargetOnceWithOptionsUsesPatchInfoForSelfUpdateGuard(t *testing.T) {
+	lockCLITestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	prevDetect := codexSelfUpdateDetectSource
+	prevLookPath := codexSelfUpdateLookPath
+	prevExecutable := codexSelfUpdateExecutable
+	t.Cleanup(func() {
+		codexSelfUpdateDetectSource = prevDetect
+		codexSelfUpdateLookPath = prevLookPath
+		codexSelfUpdateExecutable = prevExecutable
+	})
+
+	origCodexPath := "/tmp/managed/bin/codex"
+	privateNpmPath := "/tmp/codex-proxy/node/v22-linux-x64/bin/npm"
+	codexSelfUpdateDetectSource = func(context.Context, string, []string) (codexUpgradeSource, error) {
+		return codexUpgradeSource{
+			origin:    codexInstallOriginManaged,
+			codexPath: origCodexPath,
+			npmPrefix: "/tmp/managed",
+		}, nil
+	}
+	codexSelfUpdateLookPath = func(string) (string, error) {
+		return privateNpmPath, nil
+	}
+	codexSelfUpdateExecutable = func() (string, error) {
+		return "/usr/bin/codex-proxy", nil
+	}
+
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "guard-env.txt")
+	script := filepath.Join(dir, "patched-binary")
+	content := "#!/bin/sh\n" +
+		"printf 'UPDATE=%s\\nREAL=%s\\n' \"$CODEX_PROXY_UPDATE_CODEX_PATH\" \"$CODEX_PROXY_REAL_NPM\" > \"$OUT_FILE\"\n"
+	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	opts := runTargetOptions{
+		ExtraEnv: []string{"OUT_FILE=" + outFile},
+		UseProxy: false,
+		PatchInfo: &patchRunInfo{
+			OrigBinaryPath: origCodexPath,
+		},
+	}
+
+	if err := runTargetOnceWithOptions(context.Background(), []string{script}, "", nil, nil, &bytes.Buffer{}, &bytes.Buffer{}, opts); err != nil {
+		t.Fatalf("runTargetOnceWithOptions error: %v", err)
+	}
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read guard env file: %v", err)
+	}
+	want := "UPDATE=/tmp/managed/bin/codex\nREAL=/tmp/codex-proxy/node/v22-linux-x64/bin/npm\n"
+	if string(got) != want {
+		t.Fatalf("expected guard env %q, got %q", want, string(got))
+	}
+}
+
 func TestTerminateProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip process signal test on windows")
