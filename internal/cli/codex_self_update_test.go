@@ -152,6 +152,8 @@ func TestSanitizeCodexSelfUpdateEnvRestoresPath(t *testing.T) {
 
 	env := []string{
 		"PATH=/tmp/wrapper:/usr/bin:/bin",
+		"npm_config_prefix=/tmp/inherited",
+		"NPM_CONFIG_PREFIX=/tmp/inherited-uppercase",
 		envCodexProxyOriginalPath + "=/usr/bin:/bin",
 		envCodexProxyRealNPM + "=/usr/bin/npm",
 		envCodexProxyUpdateOrigin + "=system-npm",
@@ -167,6 +169,12 @@ func TestSanitizeCodexSelfUpdateEnvRestoresPath(t *testing.T) {
 	}
 	if got := envValue(sanitized, "KEEP"); got != "1" {
 		t.Fatalf("expected KEEP env preserved, got %q", got)
+	}
+	if got, ok := sliceEnvValue(sanitized, "npm_config_prefix"); ok {
+		t.Fatalf("expected inherited npm_config_prefix removed, got %q", got)
+	}
+	if got, ok := sliceEnvValue(sanitized, "NPM_CONFIG_PREFIX"); ok {
+		t.Fatalf("expected inherited NPM_CONFIG_PREFIX removed, got %q", got)
 	}
 	for _, key := range []string{
 		envCodexProxyOriginalPath,
@@ -197,6 +205,7 @@ func TestRunInternalNpmWrapperCleansBeforeGlobalInstall(t *testing.T) {
 	t.Setenv(envCodexProxyUpdateOrigin, string(codexInstallOriginSystem))
 	t.Setenv(envCodexProxyUpdateCodexPath, "/tmp/codex")
 	t.Setenv(envCodexProxyUpdateNPMPrefix, "/tmp/prefix")
+	t.Setenv(envNpmConfigPrefix, "/tmp/inherited-prefix")
 
 	cleaned := false
 	codexSelfUpdateCleanupStale = func(_ io.Writer, source codexUpgradeSource) error {

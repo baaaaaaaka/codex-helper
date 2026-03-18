@@ -20,6 +20,7 @@ const (
 	envCodexProxyUpdateCodexPath = "CODEX_PROXY_UPDATE_CODEX_PATH"
 	envCodexProxyUpdateNPMPrefix = "CODEX_PROXY_UPDATE_NPM_PREFIX"
 	envCodexProxyWrapperExe      = "CODEX_PROXY_NPM_WRAPPER_EXE"
+	envNpmConfigPrefix           = "npm_config_prefix"
 )
 
 var (
@@ -227,7 +228,7 @@ func codexSelfUpdateEnvForSource(source codexUpgradeSource, env []string) ([]str
 	if prefix == "" {
 		return nil, fmt.Errorf("managed codex self-update is missing npm prefix")
 	}
-	return setEnvValue(env, "npm_config_prefix", prefix), nil
+	return setEnvValue(env, envNpmConfigPrefix, prefix), nil
 }
 
 func sanitizeCodexSelfUpdateEnv(env []string) []string {
@@ -247,6 +248,11 @@ func sanitizeCodexSelfUpdateEnv(env []string) []string {
 		key, _, ok := strings.Cut(kv, "=")
 		if !ok {
 			continue
+		}
+		// Never inherit an ambient npm prefix into self-update runs. Managed
+		// installs add their own explicit prefix back after sanitization.
+		if strings.EqualFold(key, envNpmConfigPrefix) {
+			goto nextEntry
 		}
 		for _, dropKey := range keysToDrop {
 			if envKeyEqual(key, dropKey) {
