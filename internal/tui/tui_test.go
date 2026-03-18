@@ -1353,12 +1353,28 @@ func TestDrawHidesUpdateErrorAfterTimeout(t *testing.T) {
 	}
 }
 
-func TestDrawShowsYoloStatus(t *testing.T) {
+func TestDrawHidesYoloStatusByDefault(t *testing.T) {
 	screen := newTestScreen(t, 160, 20)
 	state := newTestState([]codexhistory.Project{})
 
 	previewCh := make(chan previewEvent, 1)
 	if err := draw(screen, state, Options{}, previewCh); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+
+	_, h := screen.Size()
+	line := readScreenLine(screen, h-1)
+	if strings.Contains(line, "YOLO mode (Ctrl+Y): off") {
+		t.Fatalf("expected yolo hint to be hidden, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestDrawShowsYoloStatusWhenToggleVisible(t *testing.T) {
+	screen := newTestScreen(t, 160, 20)
+	state := newTestState([]codexhistory.Project{})
+
+	previewCh := make(chan previewEvent, 1)
+	if err := draw(screen, state, Options{ShowYoloToggle: true}, previewCh); err != nil {
 		t.Fatalf("draw error: %v", err)
 	}
 
@@ -1383,6 +1399,73 @@ func TestDrawShowsYoloWarningWhenEnabled(t *testing.T) {
 	line := readScreenLine(screen, h-1)
 	if !strings.Contains(line, "[!] YOLO mode (Ctrl+Y): on") {
 		t.Fatalf("expected yolo warning in status line, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestDrawShowsYoloStatusAfterCtrlYWhenInitiallyHidden(t *testing.T) {
+	screen := newTestScreen(t, 160, 20)
+	state := newTestState([]codexhistory.Project{{Key: "one", Path: "/tmp"}})
+
+	_, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyCtrlY, 0, 0))
+	if err != nil {
+		t.Fatalf("handleKey error: %v", err)
+	}
+
+	previewCh := make(chan previewEvent, 1)
+	if err := draw(screen, state, Options{}, previewCh); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+
+	_, h := screen.Size()
+	line := readScreenLine(screen, h-1)
+	if !strings.Contains(line, "[!] YOLO mode (Ctrl+Y): on") {
+		t.Fatalf("expected yolo warning after Ctrl+Y, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestDrawShowsYoloStatusInInputModeWhenToggleVisible(t *testing.T) {
+	screen := newTestScreen(t, 160, 20)
+	state := newTestState([]codexhistory.Project{{Key: "one", Path: "/tmp"}})
+	state.inputMode = "projects"
+	state.inputBuffer = "abc"
+
+	previewCh := make(chan previewEvent, 1)
+	if err := draw(screen, state, Options{ShowYoloToggle: true}, previewCh); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+
+	_, h := screen.Size()
+	line := readScreenLine(screen, h-1)
+	if !strings.Contains(line, "YOLO mode (Ctrl+Y): off") {
+		t.Fatalf("expected yolo hint in input mode, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestDrawShowsYoloStatusInLoadErrorStateWhenToggleVisible(t *testing.T) {
+	screen := newTestScreen(t, 160, 20)
+	state := newTestState(nil)
+	state.loadError = errors.New("boom")
+
+	previewCh := make(chan previewEvent, 1)
+	if err := draw(screen, state, Options{ShowYoloToggle: true, DefaultCwd: "/tmp"}, previewCh); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+
+	_, h := screen.Size()
+	line := readScreenLine(screen, h-1)
+	if !strings.Contains(line, "YOLO mode (Ctrl+Y): off") {
+		t.Fatalf("expected yolo hint in load error state, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestInsertYoloStatusHandlesEmptySegments(t *testing.T) {
+	style := tcell.StyleDefault
+	got := insertYoloStatus(nil, true, "YOLO mode (Ctrl+Y): off", style)
+	if len(got) != 1 {
+		t.Fatalf("expected one segment, got %d", len(got))
+	}
+	if got[0].text != "YOLO mode (Ctrl+Y): off" {
+		t.Fatalf("unexpected segment text: %q", got[0].text)
 	}
 }
 

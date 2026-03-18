@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -28,6 +29,24 @@ var (
 )
 
 const defaultRefreshInterval = 5 * time.Second
+
+func shouldShowYoloToggle(cfg config.Config, configPath string) bool {
+	if cfg.YoloEnabled != nil {
+		return true
+	}
+
+	phs, err := config.NewPatchHistoryStore(filepath.Dir(configPath))
+	if err != nil {
+		return true
+	}
+
+	history, err := phs.Load()
+	if err != nil {
+		return true
+	}
+
+	return len(history.Entries) > 0
+}
 
 func newHistoryCmd(root *rootOptions) *cobra.Command {
 	var codexDir string
@@ -220,6 +239,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		}
 
 		defaultCwd, _ := os.Getwd()
+		showYoloToggle := shouldShowYoloToggle(cfg, store.Path())
 		selection, err := selectSession(ctx, tui.Options{
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
 				return codexhistory.DiscoverProjects(codexDir)
@@ -228,6 +248,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			ProxyEnabled:    useProxy,
 			ProxyConfigured: len(cfg.Profiles) > 0,
 			YoloEnabled:     useYolo,
+			ShowYoloToggle:  showYoloToggle,
 			RefreshInterval: refreshInterval,
 			DefaultCwd:      defaultCwd,
 			PersistYolo: func(enabled bool) error {
