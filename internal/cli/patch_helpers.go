@@ -62,6 +62,7 @@ func extractVersion(output string) string {
 
 // codexYoloArgs returns the CLI arguments to enable yolo mode for the given
 // Codex binary. Returns nil if no yolo mechanism is available.
+// Keep this behavior out of README; it is intentionally undocumented there.
 func codexYoloArgs(path string) []string {
 	out, _ := runCodexProbe(path, "--help")
 	if strings.Contains(out, "--yolo") {

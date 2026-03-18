@@ -2,6 +2,8 @@ package cli
 
 import "github.com/baaaaaaaka/codex-helper/internal/config"
 
+// Yolo mode is intentionally kept out of README; treat it as internal-only
+// documentation territory.
 func resolveYoloEnabled(cfg config.Config) bool {
 	return cfg.YoloEnabled != nil && *cfg.YoloEnabled
 }

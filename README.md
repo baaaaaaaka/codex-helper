@@ -24,9 +24,9 @@ Windows (PowerShell):
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1 | iex"
 ```
 
-The installer drops a `cxp` shim alongside `codex-proxy` and tries to add the
-install directory to PATH (plus a `cxp` alias). Open a new shell if the
-command is not found.
+The installer drops a `cxp` shim alongside `codex-proxy`, tries to add the
+install directory to PATH, and also adds a `cxp` shell alias where applicable.
+Open a new shell if the command is not found.
 
 ### 2) **Run**
 
@@ -36,18 +36,20 @@ codex-proxy
 cxp
 ```
 
-On first run you'll be asked whether to use the SSH proxy. Choose **no** for
-direct connections. Choose **yes** to enter SSH host/port/user and let the
-tool create a dedicated key if needed. You can toggle proxy mode later with
-`Ctrl+P` in the TUI.
+On first run, if no proxy preference or profile has been saved yet, you'll be
+asked whether to use the SSH proxy. Choose **no** for direct connections.
+Choose **yes** to enter SSH host/port/user and let the tool create a dedicated
+key if needed. You can toggle proxy mode later with `Ctrl+P` in the TUI.
 
 ### 3) Next steps
 
-- Press Enter to open a Codex session.
+- Press Enter to open the selected Codex session.
 - If there is no history yet, Enter starts a new session in the current directory.
 - If you have multiple profiles, select one with `codex-proxy <profile>`.
-- Run any command through the proxy (requires a profile):
-  `codex-proxy run <profile> -- <cmd> [args...]`.
+- Run any command through the proxy with
+  `codex-proxy run [profile] -- <cmd> [args...]`.
+- If no command is given after `--`, `run` launches `codex`.
+- If no proxy profile exists yet, `run` will guide you through creating one.
 - Example: `codex-proxy run pdx -- curl https://example.com`.
 
 ### Optional: preconfigure a proxy profile
@@ -59,12 +61,17 @@ codex-proxy init
 Config is stored under your OS user config directory (Linux typically
 `~/.config/codex-proxy/config.json`).
 
-## Requirements (runtime)
+## Requirements
 
-- `ssh` (OpenSSH client) is required
+- Proxy mode requires `ssh` (OpenSSH client)
 - `ssh-keygen` is optional (only needed when proxy mode creates a dedicated key)
+- Direct mode does not require SSH tools
+- If `codex` is missing or unusable, `codex-proxy` can install `@openai/codex`
+  in a user-local location and bootstrap a managed Node.js runtime when needed
 
-Check your environment:
+Check your environment (`proxy doctor` is informational and may also report
+missing `node`, `npm`, or `codex` even though `codex-proxy` can install managed
+copies later):
 
 ```bash
 codex-proxy proxy doctor
@@ -74,20 +81,29 @@ codex-proxy proxy doctor
 
 | Command | Description |
 |---------|-------------|
-| `codex-proxy` | Open the TUI (default) |
+| `codex-proxy [profile]` | Open the TUI (default) |
 | `codex-proxy --upgrade-codex` | Reinstall Codex CLI using detected install source |
+| `codex-proxy completion <shell>` | Generate shell completion |
 | `codex-proxy init` | Create an SSH profile |
-| `codex-proxy run [profile] -- <cmd> [args...]` | Run a command through the proxy |
+| `codex-proxy run [profile] -- <cmd> [args...]` | Run a command through the proxy (`codex` by default) |
 | `codex-proxy tui` | Browse Codex history in a terminal UI |
+| `codex-proxy history tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
 | `codex-proxy history show <session-id>` | Print full history for a session |
 | `codex-proxy history open <session-id>` | Open a session in Codex |
-| `codex-proxy proxy start <profile>` | Start a long-lived proxy daemon |
+| `codex-proxy proxy start [profile]` | Start a long-lived proxy daemon |
 | `codex-proxy proxy list` | List known proxy instances |
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
 | `codex-proxy proxy prune` | Remove dead/unhealthy instances |
-| `codex-proxy proxy doctor` | Check required tools and configuration |
+| `codex-proxy proxy doctor` | Report environment issues and installation hints |
 | `codex-proxy upgrade` | Self-update from GitHub Releases |
+
+Common flags:
+
+- `--config /path/to/config.json` overrides the config file location
+- `tui` / `history tui` support `--codex-dir`, `--codex-path`, `--profile`, and `--refresh-interval` (default `5s`, use `0` to disable)
+- `history open` supports `--codex-dir`, `--codex-path`, and `--profile`
+- `history list` / `history show` support `--codex-dir`
 
 ## Codex history
 
@@ -117,7 +133,7 @@ codex-proxy tui --profile <profile>
 Default data dir is `~/.codex`. You can override it with:
 
 ```bash
-codex-proxy history --codex-dir /path/to/.codex tui
+codex-proxy tui --codex-dir /path/to/.codex
 ```
 
 Controls:
@@ -130,7 +146,6 @@ Controls:
 - New session: `(New Agent)` entry or `Ctrl+N` (in selected project or current dir)
 - Expand/collapse subagents: `Ctrl+O`
 - Proxy mode: `Ctrl+P` toggle (status shows `Proxy mode (Ctrl+P): on/off`)
-- YOLO mode: `Ctrl+Y` toggle (`--permission-mode bypassPermissions`, status shows warning)
 - Refresh: `r` (or `Ctrl+R`)
 - Quit: `q`, `Esc`, `Ctrl+C`
 - In-app update: `Ctrl+U` (when an update is available)
@@ -158,14 +173,14 @@ codex-proxy history open <session-id>
 This uses the current proxy mode (direct or SSH proxy). If proxy mode is
 enabled but no profile exists, you will be prompted to configure SSH.
 
-If `codex` is not in PATH, `codex-proxy` will automatically install
+If `codex` is missing or unusable, `codex-proxy` will automatically install
 `@openai/codex` in a user-local location (and bootstrap a private Node.js
 runtime when the system Node.js is missing or too old).
 
 To use a specific Codex binary:
 
 ```bash
-codex-proxy history --codex-path /path/to/codex tui
+codex-proxy tui --codex-path /path/to/codex
 ```
 
 ## Upgrade
@@ -180,7 +195,7 @@ Optional flags:
 
 - `--repo owner/name` (override GitHub repo)
 - `--version vX.Y.Z` (install a specific version)
-- `--install-path /path/to/codex-proxy` (override install path)
+- `--install-path /path/to/codex-proxy` (override install path; file or directory)
 
 Upgrade Codex CLI itself (reinstall-style):
 
@@ -202,9 +217,11 @@ Behavior:
 Start a reusable daemon instance:
 
 ```bash
-codex-proxy proxy start <profile>
+codex-proxy proxy start [profile]
 codex-proxy proxy list
 ```
+
+Use `--foreground` to keep the daemon attached to the current terminal.
 
 Stop an instance:
 
@@ -234,7 +251,7 @@ export PATH="$HOME/.local/bin:$PATH"
 Install a specific version (example):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.sh | sh -s -- --version v0.0.5
+curl -fsSL https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.sh | sh -s -- --version vX.Y.Z
 ```
 
 ### Windows (PowerShell one-liner)
@@ -243,18 +260,26 @@ curl -fsSL https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/instal
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1 | iex"
 ```
 
+By default it installs to `%USERPROFILE%\.local\bin\codex-proxy.exe`.
+
 Install a specific version:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1'; $p=Join-Path $env:TEMP 'codex-proxy-install.ps1'; iwr -useb $u -OutFile $p; & $p -Version v0.0.5; Remove-Item -Force $p"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1'; $p=Join-Path $env:TEMP 'codex-proxy-install.ps1'; iwr -useb $u -OutFile $p; & $p -Version vX.Y.Z; Remove-Item -Force $p"
 ```
 
 ### Environment variables
+
+These variables are used by the installer scripts. `codex-proxy upgrade` also
+honors `CODEX_PROXY_REPO`, `CODEX_PROXY_VERSION`, and
+`CODEX_PROXY_INSTALL_DIR`.
 
 | Variable | Description |
 |----------|-------------|
 | `CODEX_PROXY_REPO` | Override GitHub repo (default: `baaaaaaaka/codex-helper`) |
 | `CODEX_PROXY_VERSION` | Override version (default: `latest`) |
-| `CODEX_PROXY_INSTALL_DIR` | Override install directory (default: `~/.local/bin`) |
+| `CODEX_PROXY_INSTALL_DIR` | Override install directory (Unix default: `~/.local/bin`; Windows default: `%USERPROFILE%\.local\bin`) |
 | `CODEX_PROXY_API_BASE` | Override GitHub API base URL |
 | `CODEX_PROXY_RELEASE_BASE` | Override GitHub release base URL |
+| `CODEX_PROXY_SKIP_PATH_UPDATE` | Windows installer only: skip persistent PATH updates when set to `1` |
+| `CODEX_PROXY_PROFILE_PATH` | Windows installer only: override which PowerShell profile is updated |
