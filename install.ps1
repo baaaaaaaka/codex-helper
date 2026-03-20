@@ -47,7 +47,7 @@ function Remove-ProfileLine([string]$path, [string]$line) {
   if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($line) -or -not (Test-Path -LiteralPath $path)) {
     return $false
   }
-  $lines = Get-Content -Path $path
+  $lines = @(Get-Content -Path $path)
   $filtered = @($lines | Where-Object { $_ -ne $line })
   if ($filtered.Count -eq $lines.Count) {
     return $false
