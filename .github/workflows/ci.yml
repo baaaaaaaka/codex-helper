@@ -133,6 +133,21 @@ jobs:
           echo "SSH_TEST_USER=${SSH_TEST_USER}" >> "$GITHUB_ENV"
           echo "SSH_TEST_KEY=$SSH_TEST_DIR/test_key" >> "$GITHUB_ENV"
 
+      - name: Installer shell matrix tests (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test . -count=1 -run 'TestInstallSh'
+
+      - name: Installer PATH/profile tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          go test . -count=1 -run 'TestInstallPs1'
+
       - name: go vet
         run: go vet ./...
 

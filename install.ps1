@@ -43,42 +43,122 @@ function Ensure-ProfileLine([string]$path, [string]$line) {
   return $false
 }
 
-function Test-PathInEnv([string]$pathValue) {
-  if ([string]::IsNullOrWhiteSpace($pathValue)) {
+function Remove-ProfileLine([string]$path, [string]$line) {
+  if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($line) -or -not (Test-Path -LiteralPath $path)) {
     return $false
   }
-  $target = $pathValue.TrimEnd("\")
-  $parts = $env:Path -split ";"
+  $lines = Get-Content -Path $path
+  $filtered = @($lines | Where-Object { $_ -ne $line })
+  if ($filtered.Count -eq $lines.Count) {
+    return $false
+  }
+  Set-Content -Path $path -Value $filtered -Encoding UTF8
+  return $true
+}
+
+function Normalize-PathEntry([string]$pathValue) {
+  if ([string]::IsNullOrWhiteSpace($pathValue)) {
+    return ""
+  }
+  try {
+    $pathValue = [IO.Path]::GetFullPath($pathValue)
+  } catch {
+    # Leave the original value when it cannot be normalized further.
+  }
+  return $pathValue.TrimEnd("\")
+}
+
+function Test-PathInValue([string]$pathText, [string]$pathValue) {
+  $target = Normalize-PathEntry $pathValue
+  if ([string]::IsNullOrWhiteSpace($target)) {
+    return $false
+  }
+  $parts = @()
+  if (-not [string]::IsNullOrWhiteSpace($pathText)) {
+    $parts = $pathText -split ";"
+  }
   foreach ($part in $parts) {
     if ([string]::IsNullOrWhiteSpace($part)) { continue }
-    if ($part.TrimEnd("\") -ieq $target) {
+    if ((Normalize-PathEntry $part) -ieq $target) {
       return $true
     }
   }
   return $false
 }
 
-function Add-PathPersistent([string]$pathValue) {
-  if ([string]::IsNullOrWhiteSpace($pathValue)) {
-    return
+function Test-PathInEnv([string]$pathValue) {
+  return Test-PathInValue -pathText $env:Path -pathValue $pathValue
+}
+
+function Prepend-PathEntries([string]$pathText, [string[]]$pathValues) {
+  $parts = New-Object System.Collections.Generic.List[string]
+  if (-not [string]::IsNullOrWhiteSpace($pathText)) {
+    foreach ($part in ($pathText -split ";")) {
+      if (-not [string]::IsNullOrWhiteSpace($part)) {
+        $parts.Add($part)
+      }
+    }
   }
-  $current = [Environment]::GetEnvironmentVariable("Path", "User")
-  $paths = @()
-  if (-not [string]::IsNullOrWhiteSpace($current)) {
-    $paths = $current -split ";"
+
+  $seen = @{}
+  foreach ($part in $parts) {
+    $normalized = Normalize-PathEntry $part
+    if (-not [string]::IsNullOrWhiteSpace($normalized)) {
+      $seen[$normalized.ToLowerInvariant()] = $true
+    }
   }
-  if ($paths -contains $pathValue) {
-    return
+
+  $prepend = New-Object System.Collections.Generic.List[string]
+  foreach ($pathValue in $pathValues) {
+    $normalized = Normalize-PathEntry $pathValue
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+      continue
+    }
+    $key = $normalized.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) {
+      continue
+    }
+    $seen[$key] = $true
+    $prepend.Add($normalized)
   }
-  $newPath = if ([string]::IsNullOrWhiteSpace($current)) { $pathValue } else { "$pathValue;$current" }
+
+  if ($prepend.Count -eq 0) {
+    return $pathText
+  }
+
+  $combined = New-Object System.Collections.Generic.List[string]
+  foreach ($entry in $prepend) {
+    $combined.Add($entry)
+  }
+  foreach ($entry in $parts) {
+    $combined.Add($entry)
+  }
+  return ($combined | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ";"
+}
+
+function Add-PathPersistent([string[]]$pathValues) {
   if ($env:CODEX_PROXY_SKIP_PATH_UPDATE -eq "1") {
     return
   }
   try {
-    & setx PATH "$newPath" | Out-Null
+    $current = [Environment]::GetEnvironmentVariable("Path", "User")
+    $newPath = Prepend-PathEntries -pathText $current -pathValues $pathValues
+    if ($newPath -ceq $current) {
+      return
+    }
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
   } catch {
     Write-Warning "Failed to persist PATH update: $_"
   }
+}
+
+function New-ProfilePathLine([string]$pathValue) {
+  $normalized = Normalize-PathEntry $pathValue
+  if ([string]::IsNullOrWhiteSpace($normalized)) {
+    return ""
+  }
+  $literal = $normalized.Replace("'", "''")
+  return "if (-not ((`$env:Path -split ';') | Where-Object { -not [string]::IsNullOrWhiteSpace(`$_) -and `$_.TrimEnd('\') -ieq '$literal' })) { `$env:Path = '$literal;' + `$env:Path }"
 }
 
 function Get-LatestTag([string]$repo) {
@@ -145,25 +225,44 @@ Move-Item -Force -Path $tmp -Destination $dst
 $cxpCmd = Join-Path $installDirResolved "cxp.cmd"
 $cxpContent = "@echo off`r`n`"%~dp0codex-proxy.exe`" %*`r`n"
 Set-Content -Path $cxpCmd -Value $cxpContent -Encoding ASCII
+$legacyClpExe = Join-Path $installDirResolved "clp.exe"
+if (Test-Path $legacyClpExe) {
+  Remove-Item -Force $legacyClpExe -ErrorAction SilentlyContinue
+}
+$clpCmd = Join-Path $installDirResolved "clp.cmd"
+Set-Content -Path $clpCmd -Value $cxpContent -Encoding ASCII
+$managedPrefix = $env:CODEX_NPM_PREFIX
+if ([string]::IsNullOrWhiteSpace($managedPrefix)) {
+  $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+  if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+    $managedPrefix = Join-Path $localAppData "codex-proxy\npm-global"
+  }
+}
+$pathEntries = New-Object System.Collections.Generic.List[string]
+$pathEntries.Add($installDirResolved)
+if (-not [string]::IsNullOrWhiteSpace($managedPrefix)) {
+  $managedPrefixResolved = [IO.Path]::GetFullPath($managedPrefix)
+  $pathEntries.Add($managedPrefixResolved)
+  $pathEntries.Add((Join-Path $managedPrefixResolved "bin"))
+}
 
-$pathInEnv = Test-PathInEnv -pathValue $installDirResolved
-if (-not $pathInEnv) {
-  $env:Path = "$installDirResolved;$env:Path"
-}
-if (-not $pathInEnv) {
-  Add-PathPersistent -pathValue $installDirResolved
-}
+$env:Path = Prepend-PathEntries -pathText $env:Path -pathValues $pathEntries
+Add-PathPersistent -pathValues $pathEntries
 
 $profilePath = $env:CODEX_PROXY_PROFILE_PATH
 if ([string]::IsNullOrWhiteSpace($profilePath)) {
   $profilePath = $PROFILE
 }
-$pathLine = '$env:Path = "' + $installDirResolved + ';$env:Path"'
 $aliasLine = 'Set-Alias -Name cxp -Value codex-proxy'
 
 $profileUpdated = $false
-if (-not $pathInEnv) {
-  if (Ensure-ProfileLine -path $profilePath -line $pathLine) {
+foreach ($pathValue in $pathEntries) {
+  $legacyLine = '$env:Path = "' + (Normalize-PathEntry $pathValue) + ';$env:Path"'
+  if (Remove-ProfileLine -path $profilePath -line $legacyLine) {
+    $profileUpdated = $true
+  }
+  $pathLine = New-ProfilePathLine -pathValue $pathValue
+  if (-not [string]::IsNullOrWhiteSpace($pathLine) -and (Ensure-ProfileLine -path $profilePath -line $pathLine)) {
     $profileUpdated = $true
   }
 }
@@ -180,12 +279,12 @@ if ($profileUpdated) {
 }
 
 # Clean up legacy binary names from before the rename (claude-proxy -> codex-proxy).
-foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
+foreach ($legacyName in @("claude-proxy.exe")) {
   $legacyPath = Join-Path $installDirResolved $legacyName
   if (Test-Path $legacyPath) {
     $shouldRemove = $false
     if ($legacyName -like "clp*") {
-      # clp.cmd / clp.exe are always legacy wrappers in this directory.
+      # clp.exe is always a legacy wrapper/binary in this directory.
       $content = Get-Content -Path $legacyPath -Raw -ErrorAction SilentlyContinue
       if ($content -and ($content -match "claude-proxy" -or $content -match "codex-proxy")) {
         $shouldRemove = $true
@@ -205,7 +304,5 @@ foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
 }
 
 Write-Host "Installed: $dst"
-Write-Host "Hint: add to PATH for current session:"
-Write-Host "  `$env:Path = `"$installDirResolved;`$env:Path`""
-Write-Host "Shell profile checked for PATH and alias 'cxp' (reload attempted):"
+Write-Host "Shell profile and user PATH checked for install/managed CLI directories (reload attempted):"
 Write-Host "  $profilePath"

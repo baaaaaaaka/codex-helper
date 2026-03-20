@@ -21,7 +21,7 @@ func TestInstallShLatestViaRedirect(t *testing.T) {
 	runInstallSh(t, true, false)
 }
 
-func TestInstallShSkipsPathUpdateWhenAlreadySet(t *testing.T) {
+func TestInstallShKeepsPathSetupWhenInstallDirAlreadySet(t *testing.T) {
 	runInstallSh(t, false, true)
 }
 
@@ -51,27 +51,207 @@ func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	run.env = overrideEnv(run.env, "SHELL", "")
 
-	cmd := exec.Command("sh", run.scriptPath)
-	cmd.Dir = run.repoRoot
-	cmd.Env = run.env
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("install.sh failed: %v\n%s", err, string(output))
-	}
-
+	runInstallShCommand(t, run)
 	profilePath := filepath.Join(run.homeDir, ".profile")
 	contents, err := os.ReadFile(profilePath)
 	if err != nil {
 		t.Fatalf("read profile: %v", err)
 	}
 	text := string(contents)
-	pathLine := fmt.Sprintf("export PATH=\"%s:$PATH\"", run.installDir)
-	if !strings.Contains(text, pathLine) {
-		t.Fatalf("missing PATH update in profile")
+	sourceLine := expectedPosixSourceLine(run.homeDir)
+	if !strings.Contains(text, sourceLine) {
+		t.Fatalf("missing PATH source line in profile")
 	}
 	if !strings.Contains(text, "alias cxp='codex-proxy'") {
 		t.Fatalf("missing cxp alias in profile")
 	}
+	assertUnixPathSnippet(t, run.homeDir, run.installDir)
+}
+
+func TestInstallShWritesZshPathSources(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/bin/zsh")
+
+	runInstallShCommand(t, run)
+
+	sourceLine := expectedPosixSourceLine(run.homeDir)
+	zprofilePath := filepath.Join(run.homeDir, ".zprofile")
+	zprofile, err := os.ReadFile(zprofilePath)
+	if err != nil {
+		t.Fatalf("read zprofile: %v", err)
+	}
+	if !strings.Contains(string(zprofile), sourceLine) {
+		t.Fatalf("missing PATH source line in zprofile")
+	}
+
+	zshrcPath := filepath.Join(run.homeDir, ".zshrc")
+	zshrc, err := os.ReadFile(zshrcPath)
+	if err != nil {
+		t.Fatalf("read zshrc: %v", err)
+	}
+	zshrcText := string(zshrc)
+	if !strings.Contains(zshrcText, sourceLine) {
+		t.Fatalf("missing PATH source line in zshrc")
+	}
+	if !strings.Contains(zshrcText, "alias cxp='codex-proxy'") {
+		t.Fatalf("missing cxp alias in zshrc")
+	}
+
+	assertUnixPathSnippet(t, run.homeDir, run.installDir)
+}
+
+func TestInstallShWritesBashAliasToLoginAndInteractiveConfigs(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/bin/bash")
+	bashProfilePath := filepath.Join(run.homeDir, ".bash_profile")
+	if err := os.WriteFile(bashProfilePath, []byte("# existing bash profile\n"), 0o644); err != nil {
+		t.Fatalf("write bash_profile: %v", err)
+	}
+
+	runInstallShCommand(t, run)
+
+	for _, path := range []string{bashProfilePath, filepath.Join(run.homeDir, ".bashrc")} {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		text := string(contents)
+		if !strings.Contains(text, "alias cxp='codex-proxy'") {
+			t.Fatalf("missing cxp alias in %s", path)
+		}
+	}
+}
+
+func TestInstallShUsesBashLoginWhenPresent(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/bin/bash")
+	bashLoginPath := filepath.Join(run.homeDir, ".bash_login")
+	if err := os.WriteFile(bashLoginPath, []byte("# existing bash login\n"), 0o644); err != nil {
+		t.Fatalf("write bash_login: %v", err)
+	}
+
+	runInstallShCommand(t, run)
+
+	contents, err := os.ReadFile(bashLoginPath)
+	if err != nil {
+		t.Fatalf("read bash_login: %v", err)
+	}
+	text := string(contents)
+	if !strings.Contains(text, expectedPosixSourceLine(run.homeDir)) {
+		t.Fatalf("missing PATH source line in bash_login")
+	}
+	if !strings.Contains(text, "alias cxp='codex-proxy'") {
+		t.Fatalf("missing cxp alias in bash_login")
+	}
+}
+
+func TestInstallShWritesFishPathSnippet(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/usr/bin/fish")
+
+	runInstallShCommand(t, run)
+
+	fishSnippetPath := expectedFishPathSnippetPath(run.homeDir)
+	fishSnippet, err := os.ReadFile(fishSnippetPath)
+	if err != nil {
+		t.Fatalf("read fish PATH snippet: %v", err)
+	}
+	fishText := string(fishSnippet)
+	if !strings.Contains(fishText, run.installDir) {
+		t.Fatalf("missing install dir in fish PATH snippet")
+	}
+	if !strings.Contains(fishText, defaultManagedBinDir(run.homeDir)) {
+		t.Fatalf("missing managed CLI dir in fish PATH snippet")
+	}
+
+	fishConfigPath := filepath.Join(run.homeDir, ".config", "fish", "config.fish")
+	fishConfig, err := os.ReadFile(fishConfigPath)
+	if err != nil {
+		t.Fatalf("read fish config: %v", err)
+	}
+	fishConfigText := string(fishConfig)
+	if !strings.Contains(fishConfigText, "alias cxp \"codex-proxy\"") {
+		t.Fatalf("missing cxp alias in fish config")
+	}
+	if strings.Contains(fishConfigText, fmt.Sprintf("set -gx PATH \"%s\" $PATH", run.installDir)) {
+		t.Fatalf("unexpected legacy PATH update in fish config")
+	}
+}
+
+func TestInstallShWritesCshPathSnippet(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/bin/csh")
+
+	runInstallShCommand(t, run)
+
+	cshrcPath := filepath.Join(run.homeDir, ".cshrc")
+	cshrc, err := os.ReadFile(cshrcPath)
+	if err != nil {
+		t.Fatalf("read cshrc: %v", err)
+	}
+	cshrcText := string(cshrc)
+	if !strings.Contains(cshrcText, expectedCshSourceLine(run.homeDir)) {
+		t.Fatalf("missing PATH source line in cshrc")
+	}
+	if !strings.Contains(cshrcText, "alias cxp codex-proxy") {
+		t.Fatalf("missing cxp alias in cshrc")
+	}
+
+	assertCshPathSnippet(t, run.homeDir, run.installDir)
+}
+
+func TestInstallShWritesTcshPathSnippetToCshrcWhenTcshrcMissing(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/bin/tcsh")
+
+	runInstallShCommand(t, run)
+
+	cshrcPath := filepath.Join(run.homeDir, ".cshrc")
+	cshrc, err := os.ReadFile(cshrcPath)
+	if err != nil {
+		t.Fatalf("read cshrc: %v", err)
+	}
+	cshrcText := string(cshrc)
+	if !strings.Contains(cshrcText, expectedCshSourceLine(run.homeDir)) {
+		t.Fatalf("missing PATH source line in cshrc for tcsh without tcshrc")
+	}
+	if !strings.Contains(cshrcText, "alias cxp codex-proxy") {
+		t.Fatalf("missing cxp alias in cshrc for tcsh without tcshrc")
+	}
+}
+
+func TestInstallShWritesTcshPathSnippetWithoutChangingTcshrcPrecedence(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/bin/tcsh")
+	tcshrcPath := filepath.Join(run.homeDir, ".tcshrc")
+	if err := os.WriteFile(tcshrcPath, []byte("# existing tcshrc\n"), 0o644); err != nil {
+		t.Fatalf("write tcshrc: %v", err)
+	}
+
+	runInstallShCommand(t, run)
+
+	cshrcPath := filepath.Join(run.homeDir, ".cshrc")
+	cshrc, err := os.ReadFile(cshrcPath)
+	if err != nil {
+		t.Fatalf("read cshrc: %v", err)
+	}
+	if !strings.Contains(string(cshrc), expectedCshSourceLine(run.homeDir)) {
+		t.Fatalf("missing PATH source line in cshrc for tcsh")
+	}
+
+	tcshrc, err := os.ReadFile(tcshrcPath)
+	if err != nil {
+		t.Fatalf("read tcshrc: %v", err)
+	}
+	tcshrcText := string(tcshrc)
+	if !strings.Contains(tcshrcText, expectedCshSourceLine(run.homeDir)) {
+		t.Fatalf("missing PATH source line in tcshrc")
+	}
+	if !strings.Contains(tcshrcText, "alias cxp codex-proxy") {
+		t.Fatalf("missing cxp alias in tcshrc")
+	}
+
+	assertCshPathSnippet(t, run.homeDir, run.installDir)
 }
 
 func TestInstallShRejectsUnknownArg(t *testing.T) {
@@ -147,10 +327,7 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	cmd := exec.Command("sh", scriptPath)
 	cmd.Dir = repoRoot
 	cmd.Env = env
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("install.sh failed: %v\n%s", err, string(output))
-	}
+	runInstallShCommandWithCmd(t, cmd)
 
 	installed := filepath.Join(installDir, "codex-proxy")
 	got, err := os.ReadFile(installed)
@@ -169,26 +346,49 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if string(cxpData) != string(assetData) {
 		t.Fatalf("cxp payload mismatch")
 	}
-
-	configPath := expectedBashConfigPath(homeDir)
-	contents, err := os.ReadFile(configPath)
+	clpPath := filepath.Join(installDir, "clp")
+	clpData, err := os.ReadFile(clpPath)
 	if err != nil {
-		t.Fatalf("read shell config: %v", err)
+		t.Fatalf("read clp: %v", err)
 	}
-	text := string(contents)
-	pathLine := fmt.Sprintf("export PATH=\"%s:$PATH\"", installDir)
-	if pathAlreadySet {
-		if strings.Contains(text, pathLine) {
-			t.Fatalf("unexpected PATH update in shell config")
-		}
-	} else {
-		if !strings.Contains(text, pathLine) {
-			t.Fatalf("missing PATH update in shell config")
-		}
+	if string(clpData) != string(assetData) {
+		t.Fatalf("clp payload mismatch")
 	}
-	if !strings.Contains(text, "alias cxp='codex-proxy'") {
-		t.Fatalf("missing cxp alias in shell config")
+
+	bashrcPath := filepath.Join(homeDir, ".bashrc")
+	bashrc, err := os.ReadFile(bashrcPath)
+	if err != nil {
+		t.Fatalf("read bashrc: %v", err)
 	}
+	bashrcText := string(bashrc)
+	sourceLine := expectedPosixSourceLine(homeDir)
+	if !strings.Contains(bashrcText, sourceLine) {
+		t.Fatalf("missing PATH source line in bashrc")
+	}
+	if strings.Contains(bashrcText, fmt.Sprintf("export PATH=\"%s:$PATH\"", installDir)) {
+		t.Fatalf("unexpected legacy PATH update in bashrc")
+	}
+	if !strings.Contains(bashrcText, "alias cxp='codex-proxy'") {
+		t.Fatalf("missing cxp alias in bashrc")
+	}
+
+	profilePath := filepath.Join(homeDir, ".profile")
+	profile, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatalf("read profile: %v", err)
+	}
+	profileText := string(profile)
+	if !strings.Contains(profileText, sourceLine) {
+		t.Fatalf("missing PATH source line in profile")
+	}
+	if strings.Contains(profileText, fmt.Sprintf("export PATH=\"%s:$PATH\"", installDir)) {
+		t.Fatalf("unexpected legacy PATH update in profile")
+	}
+	if !strings.Contains(profileText, "alias cxp='codex-proxy'") {
+		t.Fatalf("missing cxp alias in profile")
+	}
+
+	assertUnixPathSnippet(t, homeDir, installDir)
 }
 
 type installShRun struct {
@@ -346,9 +546,78 @@ esac
 	}
 }
 
-func expectedBashConfigPath(home string) string {
-	if runtime.GOOS == "darwin" {
-		return filepath.Join(home, ".bash_profile")
+func runInstallShCommand(t *testing.T, run installShRun) {
+	t.Helper()
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	runInstallShCommandWithCmd(t, cmd)
+}
+
+func runInstallShCommandWithCmd(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh failed: %v\n%s", err, string(output))
 	}
-	return filepath.Join(home, ".bashrc")
+}
+
+func expectedPosixPathSnippetPath(home string) string {
+	return filepath.Join(home, ".config", "codex-proxy", "shell", "path.sh")
+}
+
+func expectedPosixSourceLine(home string) string {
+	snippet := expectedPosixPathSnippetPath(home)
+	return fmt.Sprintf("[ -f \"%s\" ] && . \"%s\"", snippet, snippet)
+}
+
+func expectedFishPathSnippetPath(home string) string {
+	return filepath.Join(home, ".config", "fish", "conf.d", "codex-proxy-path.fish")
+}
+
+func expectedCshPathSnippetPath(home string) string {
+	return filepath.Join(home, ".config", "codex-proxy", "shell", "path.csh")
+}
+
+func expectedCshSourceLine(home string) string {
+	return fmt.Sprintf("source \"%s\"", expectedCshPathSnippetPath(home))
+}
+
+func defaultManagedBinDir(home string) string {
+	return filepath.Join(home, ".local", "share", "codex-proxy", "npm-global", "bin")
+}
+
+func assertUnixPathSnippet(t *testing.T, home, installDir string) {
+	t.Helper()
+	snippetPath := expectedPosixPathSnippetPath(home)
+	contents, err := os.ReadFile(snippetPath)
+	if err != nil {
+		t.Fatalf("read PATH snippet: %v", err)
+	}
+	text := string(contents)
+	if !strings.Contains(text, installDir) {
+		t.Fatalf("missing install dir in PATH snippet")
+	}
+	if !strings.Contains(text, defaultManagedBinDir(home)) {
+		t.Fatalf("missing managed CLI dir in PATH snippet")
+	}
+	if strings.Count(text, installDir) != 1 {
+		t.Fatalf("expected install dir once in PATH snippet, got %q", text)
+	}
+}
+
+func assertCshPathSnippet(t *testing.T, home, installDir string) {
+	t.Helper()
+	snippetPath := expectedCshPathSnippetPath(home)
+	contents, err := os.ReadFile(snippetPath)
+	if err != nil {
+		t.Fatalf("read csh PATH snippet: %v", err)
+	}
+	text := string(contents)
+	if !strings.Contains(text, installDir) {
+		t.Fatalf("missing install dir in csh PATH snippet")
+	}
+	if !strings.Contains(text, defaultManagedBinDir(home)) {
+		t.Fatalf("missing managed CLI dir in csh PATH snippet")
+	}
 }

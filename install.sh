@@ -134,6 +134,23 @@ add_source_file() {
   esac
 }
 
+remove_line() {
+  file="$1"
+  line="$2"
+  if [ -z "${file:-}" ] || [ -z "${line:-}" ] || [ ! -f "$file" ]; then
+    return 0
+  fi
+
+  tmp="$file.codex-proxy.$$"
+  grep -Fvx "$line" "$file" >"$tmp" 2>/dev/null || true
+  if ! cmp -s "$file" "$tmp" 2>/dev/null; then
+    cat "$tmp" >"$file"
+    CONFIG_UPDATED=1
+    add_source_file "$file"
+  fi
+  rm -f "$tmp"
+}
+
 ensure_line() {
   file="$1"
   line="$2"
@@ -154,19 +171,147 @@ ensure_line() {
   fi
 }
 
-path_has_dir() {
-  target="${1%/}"
-  old_ifs="$IFS"
-  IFS=":"
-  for part in $PATH; do
-    part="${part%/}"
-    if [ "$part" = "$target" ]; then
-      IFS="$old_ifs"
-      return 0
+escape_double_quotes() {
+  if have_cmd sed; then
+    printf '%s' "$1" | sed 's/[\\\"`$]/\\&/g'
+    return 0
+  fi
+  printf '%s' "$1"
+}
+
+resolve_dir_path() {
+  dir="$1"
+  if [ -z "${dir:-}" ]; then
+    return 0
+  fi
+  mkdir -p "$dir" 2>/dev/null || true
+  resolved="$(cd "$dir" 2>/dev/null && pwd -P || true)"
+  if [ -n "${resolved:-}" ]; then
+    printf '%s' "$resolved"
+    return 0
+  fi
+  printf '%s' "$dir"
+}
+
+write_posix_path_snippet() {
+  file="$1"
+  install_path="$2"
+  managed_path="$3"
+
+  dir="$(dirname "$file")"
+  mkdir -p "$dir" 2>/dev/null || true
+
+  tmp="$file.codex-proxy.$$"
+  install_escaped="$(escape_double_quotes "$install_path")"
+  managed_escaped="$(escape_double_quotes "$managed_path")"
+  {
+    printf '%s\n' "# added by codex-proxy installer"
+    printf '_path_entry="%s"\n' "$install_escaped"
+    cat <<'EOF'
+case ":$PATH:" in
+  *":$_path_entry:"*) ;;
+  *) PATH="$_path_entry${PATH:+:$PATH}" ;;
+esac
+EOF
+    if [ -n "${managed_path:-}" ]; then
+      printf '\n'
+      printf '_path_entry="%s"\n' "$managed_escaped"
+      cat <<'EOF'
+case ":$PATH:" in
+  *":$_path_entry:"*) ;;
+  *) PATH="$_path_entry${PATH:+:$PATH}" ;;
+esac
+EOF
     fi
-  done
-  IFS="$old_ifs"
-  return 1
+    printf '\n%s\n' 'export PATH'
+    printf '%s\n' 'unset _path_entry'
+  } >"$tmp"
+
+  if [ ! -f "$file" ] || ! cmp -s "$file" "$tmp" 2>/dev/null; then
+    cat "$tmp" >"$file"
+    CONFIG_UPDATED=1
+    add_source_file "$file"
+  fi
+  rm -f "$tmp"
+}
+
+write_fish_path_snippet() {
+  file="$1"
+  install_path="$2"
+  managed_path="$3"
+
+  dir="$(dirname "$file")"
+  mkdir -p "$dir" 2>/dev/null || true
+
+  tmp="$file.codex-proxy.$$"
+  install_escaped="$(escape_double_quotes "$install_path")"
+  managed_escaped="$(escape_double_quotes "$managed_path")"
+  {
+    printf '%s\n' "# added by codex-proxy installer"
+    printf 'if not contains -- "%s" $PATH\n' "$install_escaped"
+    printf '  set -gx PATH "%s" $PATH\n' "$install_escaped"
+    printf '%s\n' 'end'
+    if [ -n "${managed_path:-}" ]; then
+      printf '\n'
+      printf 'if not contains -- "%s" $PATH\n' "$managed_escaped"
+      printf '  set -gx PATH "%s" $PATH\n' "$managed_escaped"
+      printf '%s\n' 'end'
+    fi
+  } >"$tmp"
+
+  if [ ! -f "$file" ] || ! cmp -s "$file" "$tmp" 2>/dev/null; then
+    cat "$tmp" >"$file"
+    CONFIG_UPDATED=1
+    add_source_file "$file"
+  fi
+  rm -f "$tmp"
+}
+
+write_csh_path_snippet() {
+  file="$1"
+  install_path="$2"
+  managed_path="$3"
+
+  dir="$(dirname "$file")"
+  mkdir -p "$dir" 2>/dev/null || true
+
+  tmp="$file.codex-proxy.$$"
+  install_escaped="$(escape_double_quotes "$install_path")"
+  managed_escaped="$(escape_double_quotes "$managed_path")"
+  {
+    printf '%s\n' "# added by codex-proxy installer"
+    printf 'set _path_entry = "%s"\n' "$install_escaped"
+    cat <<'EOF'
+if ( $?PATH ) then
+  if ( ":$PATH:" !~ *":$_path_entry:"* ) then
+    setenv PATH "$_path_entry:$PATH"
+  endif
+else
+  setenv PATH "$_path_entry"
+endif
+EOF
+    if [ -n "${managed_path:-}" ]; then
+      printf '\n'
+      printf 'set _path_entry = "%s"\n' "$managed_escaped"
+      cat <<'EOF'
+if ( $?PATH ) then
+  if ( ":$PATH:" !~ *":$_path_entry:"* ) then
+    setenv PATH "$_path_entry:$PATH"
+  endif
+else
+  setenv PATH "$_path_entry"
+endif
+EOF
+    fi
+    printf '\n%s\n' 'unset _path_entry'
+  } >"$tmp"
+
+  if [ ! -f "$file" ] || ! cmp -s "$file" "$tmp" 2>/dev/null; then
+    cat "$tmp" >"$file"
+    CONFIG_UPDATED=1
+    add_source_file "$file"
+  fi
+  rm -f "$tmp"
 }
 
 source_config_file() {
@@ -190,6 +335,18 @@ source_config_file() {
         fish -c "source \"$file\"" >/dev/null 2>&1 || true
       fi
       ;;
+    csh)
+      if have_cmd csh; then
+        csh -c "source \"$file\"" >/dev/null 2>&1 || true
+      fi
+      ;;
+    tcsh)
+      if have_cmd tcsh; then
+        tcsh -c "source \"$file\"" >/dev/null 2>&1 || true
+      elif have_cmd csh; then
+        csh -c "source \"$file\"" >/dev/null 2>&1 || true
+      fi
+      ;;
     *)
       . "$file" >/dev/null 2>&1 || true
       ;;
@@ -201,62 +358,90 @@ update_shell_config() {
     return 0
   fi
 
-  install_dir_resolved="$install_dir"
-  if [ -d "$install_dir" ]; then
-    resolved="$(cd "$install_dir" 2>/dev/null && pwd -P || true)"
-    if [ -n "${resolved:-}" ]; then
-      install_dir_resolved="$resolved"
-    fi
-  fi
-
-  path_needs_update=1
-  if path_has_dir "$install_dir" || path_has_dir "$install_dir_resolved"; then
-    path_needs_update=0
-  fi
-
-  path_line="export PATH=\"$install_dir:\$PATH\""
+  install_dir_resolved="$(resolve_dir_path "$install_dir")"
+  config_root="${XDG_CONFIG_HOME:-$HOME/.config}"
+  managed_prefix="${CODEX_NPM_PREFIX:-$HOME/.local/share/codex-proxy/npm-global}"
+  managed_prefix_resolved="$(resolve_dir_path "$managed_prefix")"
+  managed_bin_dir="$managed_prefix_resolved/bin"
+  posix_path_snippet="$config_root/codex-proxy/shell/path.sh"
+  csh_path_snippet="$config_root/codex-proxy/shell/path.csh"
+  fish_path_snippet="$config_root/fish/conf.d/codex-proxy-path.fish"
+  posix_source_line="[ -f \"$posix_path_snippet\" ] && . \"$posix_path_snippet\""
+  csh_source_line="source \"$csh_path_snippet\""
+  legacy_path_line="export PATH=\"$install_dir:\$PATH\""
+  legacy_path_line_resolved="export PATH=\"$install_dir_resolved:\$PATH\""
+  legacy_fish_path_line="set -gx PATH \"$install_dir\" \$PATH"
+  legacy_fish_path_line_resolved="set -gx PATH \"$install_dir_resolved\" \$PATH"
   alias_line="alias cxp='codex-proxy'"
-  path_file=""
   alias_file=""
+  login_file=""
+  interactive_file=""
 
   case "$shell_name" in
     bash)
-      if [ "$os" = "darwin" ]; then
-        path_file="$HOME/.bash_profile"
+      if [ -f "$HOME/.bash_profile" ]; then
+        login_file="$HOME/.bash_profile"
+      elif [ -f "$HOME/.bash_login" ]; then
+        login_file="$HOME/.bash_login"
+      elif [ -f "$HOME/.profile" ]; then
+        login_file="$HOME/.profile"
       else
-        if [ -f "$HOME/.bashrc" ]; then
-          path_file="$HOME/.bashrc"
-        elif [ -f "$HOME/.bash_profile" ]; then
-          path_file="$HOME/.bash_profile"
-        else
-          path_file="$HOME/.bashrc"
-        fi
+        login_file="$HOME/.profile"
       fi
-      alias_file="$path_file"
+      interactive_file="$HOME/.bashrc"
+      write_posix_path_snippet "$posix_path_snippet" "$install_dir_resolved" "$managed_bin_dir"
+      remove_line "$login_file" "$legacy_path_line"
+      remove_line "$login_file" "$legacy_path_line_resolved"
+      remove_line "$interactive_file" "$legacy_path_line"
+      remove_line "$interactive_file" "$legacy_path_line_resolved"
+      ensure_line "$login_file" "$posix_source_line"
+      ensure_line "$interactive_file" "$posix_source_line"
+      ensure_line "$login_file" "$alias_line"
+      alias_file="$interactive_file"
       ;;
     zsh)
-      if [ "$os" = "darwin" ] || [ -f "$HOME/.zprofile" ]; then
-        path_file="$HOME/.zprofile"
-      else
-        path_file="$HOME/.zshrc"
-      fi
-      alias_file="$HOME/.zshrc"
+      login_file="$HOME/.zprofile"
+      interactive_file="$HOME/.zshrc"
+      write_posix_path_snippet "$posix_path_snippet" "$install_dir_resolved" "$managed_bin_dir"
+      remove_line "$login_file" "$legacy_path_line"
+      remove_line "$login_file" "$legacy_path_line_resolved"
+      remove_line "$interactive_file" "$legacy_path_line"
+      remove_line "$interactive_file" "$legacy_path_line_resolved"
+      ensure_line "$login_file" "$posix_source_line"
+      ensure_line "$interactive_file" "$posix_source_line"
+      alias_file="$interactive_file"
       ;;
     fish)
-      path_file="$HOME/.config/fish/config.fish"
-      alias_file="$path_file"
-      path_line="set -gx PATH \"$install_dir\" \$PATH"
+      write_fish_path_snippet "$fish_path_snippet" "$install_dir_resolved" "$managed_bin_dir"
+      alias_file="$HOME/.config/fish/config.fish"
       alias_line="alias cxp \"codex-proxy\""
+      remove_line "$alias_file" "$legacy_fish_path_line"
+      remove_line "$alias_file" "$legacy_fish_path_line_resolved"
+      ;;
+    csh|tcsh)
+      cshrc_file="$HOME/.cshrc"
+      tcshrc_file="$HOME/.tcshrc"
+      write_csh_path_snippet "$csh_path_snippet" "$install_dir_resolved" "$managed_bin_dir"
+      ensure_line "$cshrc_file" "$csh_source_line"
+      if [ "$shell_name" = "tcsh" ] && [ -f "$tcshrc_file" ]; then
+        ensure_line "$tcshrc_file" "$csh_source_line"
+        ensure_line "$tcshrc_file" "alias cxp codex-proxy"
+      else
+        ensure_line "$cshrc_file" "alias cxp codex-proxy"
+      fi
+      alias_file=""
+      alias_line=""
       ;;
     *)
-      path_file="$HOME/.profile"
-      alias_file="$path_file"
+      login_file="$HOME/.profile"
+      write_posix_path_snippet "$posix_path_snippet" "$install_dir_resolved" "$managed_bin_dir"
+      remove_line "$login_file" "$legacy_path_line"
+      remove_line "$login_file" "$legacy_path_line_resolved"
+      ensure_line "$login_file" "$posix_source_line"
+      alias_file="$login_file"
       ;;
   esac
 
-  if [ "$path_needs_update" -eq 1 ]; then
-    ensure_line "$path_file" "$path_line"
-  fi
   ensure_line "$alias_file" "$alias_line"
 
   if [ "$CONFIG_UPDATED" -eq 1 ]; then
@@ -381,8 +566,17 @@ if [ ! -f "$cxp_dst" ]; then
 fi
 chmod 0755 "$cxp_dst" 2>/dev/null || true
 
+clp_dst="$install_dir/clp"
+if have_cmd ln; then
+  ln -sf "$dst" "$clp_dst" 2>/dev/null || true
+fi
+if [ ! -f "$clp_dst" ]; then
+  cp -f "$dst" "$clp_dst" 2>/dev/null || true
+fi
+chmod 0755 "$clp_dst" 2>/dev/null || true
+
 # Clean up legacy binary names from before the rename (claude-proxy → codex-proxy).
-for legacy_name in claude-proxy clp; do
+for legacy_name in claude-proxy; do
   legacy_path="$install_dir/$legacy_name"
   if [ -f "$legacy_path" ] || [ -L "$legacy_path" ]; then
     # Only remove if it points to codex-proxy or is itself a codex-proxy build.
@@ -408,4 +602,4 @@ done
 echo "Installed: $dst"
 update_shell_config
 echo "Run: $dst proxy doctor"
-echo "Shell config checked for PATH and alias 'cxp' (reload attempted)"
+echo "Shell config checked for install/managed CLI PATH and alias 'cxp' (reload attempted)"

@@ -23,7 +23,7 @@ func TestInstallPs1LatestViaRedirect(t *testing.T) {
 	runInstallPs1(t, true, false)
 }
 
-func TestInstallPs1SkipsPathUpdateWhenAlreadySet(t *testing.T) {
+func TestInstallPs1KeepsPathSetupWhenInstallDirAlreadySet(t *testing.T) {
 	runInstallPs1(t, false, true)
 }
 
@@ -50,8 +50,13 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	defer server.Close()
 
 	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
 	tempDir := t.TempDir()
 	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+	legacyClpExe := filepath.Join(installDir, "clp.exe")
+	if err := os.WriteFile(legacyClpExe, []byte("legacy clp exe"), 0o644); err != nil {
+		t.Fatalf("write clp.exe: %v", err)
+	}
 	basePath := os.Getenv("SystemRoot")
 	if basePath == "" {
 		basePath = `C:\Windows`
@@ -71,15 +76,17 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 		"CODEX_PROXY_RELEASE_BASE="+server.URL,
 		"CODEX_PROXY_PROFILE_PATH="+profilePath,
 		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
 		"Path="+pathValue,
 		"TEMP="+tempDir,
 	)
-	pathContainsInstall := pathInEnvViaPowerShell(t, cmd.Env, installDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install.ps1 failed: %v\n%s", err, string(output))
 	}
 	installDirResolved := resolvePathViaPowerShell(t, cmd.Env, installDir)
+	managedPrefixResolved := resolvePathViaPowerShell(t, cmd.Env, managedPrefix)
+	managedBinResolved := resolvePathViaPowerShell(t, cmd.Env, filepath.Join(managedPrefix, "bin"))
 
 	installed := filepath.Join(installDir, "codex-proxy.exe")
 	got, err := os.ReadFile(installed)
@@ -97,6 +104,17 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if !strings.Contains(strings.ToLower(string(cmdData)), "codex-proxy.exe") {
 		t.Fatalf("cxp.cmd does not reference codex-proxy.exe")
 	}
+	clpCmd := filepath.Join(installDir, "clp.cmd")
+	clpData, err := os.ReadFile(clpCmd)
+	if err != nil {
+		t.Fatalf("read clp.cmd: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(string(clpData)), "codex-proxy.exe") {
+		t.Fatalf("clp.cmd does not reference codex-proxy.exe")
+	}
+	if _, err := os.Stat(legacyClpExe); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy clp.exe removed, stat err=%v", err)
+	}
 
 	profile, err := os.ReadFile(profilePath)
 	if err != nil {
@@ -106,13 +124,9 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if !strings.Contains(profileText, "Set-Alias -Name cxp -Value codex-proxy") {
 		t.Fatalf("missing cxp alias in profile")
 	}
-	if pathContainsInstall {
-		if hasPathLineForDir(profileText, installDirResolved) {
-			t.Fatalf("unexpected PATH update in profile")
-		}
-	} else {
-		if !hasPathLineForDir(profileText, installDirResolved) {
-			t.Fatalf("missing PATH update in profile")
+	for _, dir := range []string{installDirResolved, managedPrefixResolved, managedBinResolved} {
+		if !hasPathLineForDir(profileText, dir) {
+			t.Fatalf("missing PATH update in profile for %s", dir)
 		}
 	}
 }
@@ -127,26 +141,6 @@ func hasPathLineForDir(profileText, installDir string) bool {
 		}
 	}
 	return false
-}
-
-func pathInEnvViaPowerShell(t *testing.T, env []string, installDir string) bool {
-	t.Helper()
-	script := `$target = [IO.Path]::GetFullPath($env:TEST_INSTALL_DIR);` +
-		`$parts = $env:Path -split ';';` +
-		`$found = $false;` +
-		`foreach ($part in $parts) {` +
-		` if ([string]::IsNullOrWhiteSpace($part)) { continue }` +
-		` if ($part.TrimEnd('\') -ieq $target) { $found = $true; break }` +
-		`}` +
-		`if ($found) { 'true' } else { 'false' }`
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
-	cmd.Env = append([]string{}, env...)
-	cmd.Env = append(cmd.Env, "TEST_INSTALL_DIR="+installDir)
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("compute pathInEnv: %v", err)
-	}
-	return strings.EqualFold(strings.TrimSpace(string(out)), "true")
 }
 
 func resolvePathViaPowerShell(t *testing.T, env []string, installDir string) string {

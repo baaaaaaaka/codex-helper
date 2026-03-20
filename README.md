@@ -24,9 +24,10 @@ Windows (PowerShell):
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1 | iex"
 ```
 
-The installer drops a `cxp` shim alongside `codex-proxy`, tries to add the
-install directory to PATH, and also adds a `cxp` shell alias where applicable.
-Open a new shell if the command is not found.
+The installer drops `cxp` and `clp` shims alongside `codex-proxy`, tries to add
+the install directory plus the managed CLI directory to PATH, and also adds a
+`cxp` shell alias where applicable. Open a new shell if the command is not
+found.
 
 ### 2) **Run**
 
@@ -34,6 +35,8 @@ Open a new shell if the command is not found.
 codex-proxy
 # or
 cxp
+# or
+clp
 ```
 
 On first run, if no proxy preference or profile has been saved yet, you'll be
@@ -239,9 +242,9 @@ sh -c 'url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/insta
 
 By default it installs to `~/.local/bin/codex-proxy`.
 
-The installer drops a `cxp` shim alongside `codex-proxy` and tries to add
-`~/.local/bin` to PATH (plus a `cxp` alias). Open a new shell if the command is
-not found.
+The installer drops `cxp` and `clp` shims alongside `codex-proxy` and tries to
+add `~/.local/bin` plus the managed CLI directory to PATH (plus a `cxp` alias).
+Open a new shell if the command is not found.
 If you need to update PATH manually:
 
 ```bash
@@ -261,6 +264,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.gi
 ```
 
 By default it installs to `%USERPROFILE%\.local\bin\codex-proxy.exe`.
+The installer also writes `cxp.cmd` and `clp.cmd` there and updates PATH for
+that directory plus the managed CLI directory.
 
 Install a specific version:
 
@@ -279,6 +284,7 @@ honors `CODEX_PROXY_REPO`, `CODEX_PROXY_VERSION`, and
 | `CODEX_PROXY_REPO` | Override GitHub repo (default: `baaaaaaaka/codex-helper`) |
 | `CODEX_PROXY_VERSION` | Override version (default: `latest`) |
 | `CODEX_PROXY_INSTALL_DIR` | Override install directory (Unix default: `~/.local/bin`; Windows default: `%USERPROFILE%\.local\bin`) |
+| `CODEX_NPM_PREFIX` | Override the managed CLI npm prefix whose executable directory is added to PATH |
 | `CODEX_PROXY_API_BASE` | Override GitHub API base URL |
 | `CODEX_PROXY_RELEASE_BASE` | Override GitHub release base URL |
 | `CODEX_PROXY_SKIP_PATH_UPDATE` | Windows installer only: skip persistent PATH updates when set to `1` |
