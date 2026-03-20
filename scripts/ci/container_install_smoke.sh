@@ -6,47 +6,18 @@ tag="${TAG:?}"
 fetcher="${FETCHER:?}"
 
 install_deps() {
+  local pkgs=(ca-certificates)
   if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    local pkgs=(ca-certificates openssh-client openssh-server)
-    if [[ "$fetcher" == "curl" ]]; then
-      pkgs+=(curl)
-    else
-      pkgs+=(wget)
-    fi
-    apt-get install -y --no-install-recommends "${pkgs[@]}"
-    return
+    pkgs+=(openssh-client openssh-server)
+  else
+    pkgs+=(openssh-server openssh-clients)
   fi
-
-  if command -v dnf >/dev/null 2>&1; then
-    local pkgs=(ca-certificates openssh-server openssh-clients)
-    if [[ "$fetcher" == "curl" ]]; then
-      pkgs+=(curl)
-    else
-      pkgs+=(wget)
-    fi
-    dnf -y install "${pkgs[@]}"
-    return
+  if [[ "$fetcher" == "curl" ]]; then
+    pkgs+=(curl)
+  else
+    pkgs+=(wget)
   fi
-
-  if command -v yum >/dev/null 2>&1; then
-    if [[ -f /etc/yum.repos.d/CentOS-Base.repo ]]; then
-      sed -i 's/^mirrorlist=/#mirrorlist=/g' /etc/yum.repos.d/CentOS-Base.repo || true
-      sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-Base.repo || true
-    fi
-    local pkgs=(ca-certificates openssh-server openssh-clients)
-    if [[ "$fetcher" == "curl" ]]; then
-      pkgs+=(curl)
-    else
-      pkgs+=(wget)
-    fi
-    yum -y install "${pkgs[@]}"
-    return
-  fi
-
-  echo "No supported package manager found" >&2
-  exit 1
+  bash /ci/install_container_packages.sh "${pkgs[@]}"
 }
 
 force_fetcher() {
@@ -142,10 +113,14 @@ fetcher="${FETCHER:?}"
 mkdir -p "$HOME/.local/bin"
 
 script_url="https://github.com/${repo}/releases/download/${tag}/install.sh"
+installer="$(mktemp)"
+trap 'rm -f "$installer"' EXIT
 if [[ "$fetcher" == "curl" ]]; then
-  curl -fsSL "$script_url" | sh -s -- --repo "$repo" --version "$tag" --dir "$HOME/.local/bin"
+  bash /ci/retry.sh 5 5 curl --connect-timeout 30 -fsSL -o "$installer" "$script_url"
+  sh "$installer" --repo "$repo" --version "$tag" --dir "$HOME/.local/bin"
 else
-  wget -qO- "$script_url" | sh -s -- --repo "$repo" --version "$tag" --dir "$HOME/.local/bin"
+  bash /ci/retry.sh 5 5 wget --tries=1 --timeout=30 -q -O "$installer" "$script_url"
+  sh "$installer" --repo "$repo" --version "$tag" --dir "$HOME/.local/bin"
 fi
 
 "$HOME/.local/bin/codex-proxy" --version | grep -q "${tag#v}"

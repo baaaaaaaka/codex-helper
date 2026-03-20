@@ -81,7 +81,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 base_url="https://nodejs.org/dist/latest-v${node_preferred_major}.x"
 shasums_file="${tmp_dir}/SHASUMS256.txt"
-curl -fsSL "${base_url}/SHASUMS256.txt" -o "$shasums_file"
+curl --retry 5 --retry-delay 5 --connect-timeout 30 -fsSL "${base_url}/SHASUMS256.txt" -o "$shasums_file"
 
 tarball="$(
   awk -v major="${node_preferred_major}" -v os="${node_os}" -v arch="${node_arch}" '
@@ -103,7 +103,7 @@ if [ -z "$expected_sha" ]; then
 fi
 
 archive_path="${tmp_dir}/${tarball}"
-curl -fsSL "${base_url}/${tarball}" -o "$archive_path"
+curl --retry 5 --retry-delay 5 --connect-timeout 30 -fsSL "${base_url}/${tarball}" -o "$archive_path"
 
 if command -v sha256sum >/dev/null 2>&1; then
   actual_sha="$(sha256sum "$archive_path" | awk '{print $1}')"

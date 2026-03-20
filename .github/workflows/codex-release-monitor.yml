@@ -78,12 +78,15 @@ jobs:
           input_min_version="${INPUT_MIN_VERSION:-0.104.0}"
           input_max_version="${INPUT_MAX_VERSION:-}"
           input_include_prerelease="${INPUT_INCLUDE_PRERELEASE:-true}"
-          latest_version="$(npm view @openai/codex version | tr -d '\r\n')"
+          latest_version="$(bash scripts/ci/retry.sh 5 5 npm view @openai/codex version | tr -d '\r\n')"
           if [ -z "$latest_version" ]; then
             echo "Failed to resolve latest @openai/codex version" >&2
             exit 1
           fi
-          alpha_version="$(npm view @openai/codex dist-tags.alpha 2>/dev/null | tr -d '\r\n')"
+          alpha_version=""
+          if ! alpha_version="$(bash scripts/ci/retry.sh 5 5 npm view @openai/codex dist-tags.alpha 2>/dev/null | tr -d '\r\n')"; then
+            alpha_version=""
+          fi
           echo "Latest @openai/codex: $latest_version"
           if [ -n "$alpha_version" ]; then
             echo "Latest @openai/codex alpha: $alpha_version"
@@ -174,7 +177,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install -g "@openai/codex@${CODEX_VERSION}"
+          bash scripts/ci/retry.sh 5 5 npm install -g "@openai/codex@${CODEX_VERSION}"
 
       - name: Install latest Codex (Windows)
         if: runner.os == 'Windows'
@@ -182,7 +185,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          npm install -g "@openai/codex@$env:CODEX_VERSION"
+          & .\scripts\ci\retry.ps1 5 5 npm install -g "@openai/codex@$env:CODEX_VERSION"
 
       - name: Run Codex patch + yolo smoke tests
         id: smoke
@@ -272,18 +275,18 @@ jobs:
           case "${PLATFORM_NAME}" in
             rockylinux8)
               IMAGE="rockylinux:8"
-              INSTALL_CMD="dnf install -y ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
               ;;
             ubuntu20.04)
               IMAGE="ubuntu:20.04"
-              INSTALL_CMD="apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl xz-utils"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils"
               ;;
             *)
               echo "unsupported platform ${PLATFORM_NAME}" >&2
               exit 1
               ;;
           esac
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration'"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration'"
           docker run --rm \
             -v "${TEST_BIN_PATH}:/codex_cloudgate_test:ro" \
             -v "${CLI_TEST_BIN_PATH}:/codex_cli_test:ro" \

@@ -83,15 +83,40 @@ fi
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+curl_run() {
+  curl --retry 5 --retry-delay 5 --connect-timeout 30 -fsSL "$@"
+}
+
+wget_run() {
+  if wget --help 2>/dev/null | grep -q -- '--waitretry'; then
+    wget --tries=5 --waitretry=5 --timeout=30 "$@"
+    return 0
+  fi
+
+  attempt=1
+  while [ "$attempt" -le 5 ]; do
+    if wget "$@"; then
+      return 0
+    fi
+    if [ "$attempt" -eq 5 ]; then
+      break
+    fi
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
 http_get() {
   url="$1"
   out="$2"
   if have_cmd curl; then
-    curl -fsSL -o "$out" "$url"
+    curl_run -o "$out" "$url"
     return 0
   fi
   if have_cmd wget; then
-    wget -q -O "$out" "$url"
+    wget_run -q -O "$out" "$url"
     return 0
   fi
   echo "Missing downloader: need curl or wget" >&2
@@ -246,7 +271,7 @@ get_latest_tag_from_redirect() {
   tag=""
 
   if have_cmd curl; then
-    if final="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$url")"; then
+    if final="$(curl_run -o /dev/null -w '%{url_effective}' "$url")"; then
       tag="${final##*/}"
       if [ -n "${tag:-}" ] && [ "$tag" != "latest" ]; then
         printf "%s" "$tag"
@@ -256,7 +281,7 @@ get_latest_tag_from_redirect() {
   fi
 
   if have_cmd wget; then
-    headers="$(wget -qO /dev/null --max-redirect=0 --server-response "$url" 2>&1 || true)"
+    headers="$(wget_run -qO /dev/null --max-redirect=0 --server-response "$url" 2>&1 || true)"
     if [ -n "${headers:-}" ]; then
       if have_cmd awk; then
         location="$(printf "%s" "$headers" | awk '/^  Location: /{print $2}' | head -n 1)"
