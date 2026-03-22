@@ -644,9 +644,21 @@ func containsPathEntry(pathValue, target string) bool {
 
 func normalizeComparablePath(pathValue string) string {
 	cleaned := filepath.Clean(pathValue)
+	if runtime.GOOS == "darwin" {
+		cleaned = strings.TrimPrefix(cleaned, "/private")
+		if cleaned == "" {
+			cleaned = string(filepath.Separator)
+		}
+	}
 	resolved, err := filepath.EvalSymlinks(cleaned)
 	if err == nil {
-		return filepath.Clean(resolved)
+		cleaned = filepath.Clean(resolved)
+		if runtime.GOOS == "darwin" {
+			cleaned = strings.TrimPrefix(cleaned, "/private")
+			if cleaned == "" {
+				cleaned = string(filepath.Separator)
+			}
+		}
 	}
 	return cleaned
 }
