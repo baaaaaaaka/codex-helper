@@ -68,6 +68,134 @@ func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
 	assertUnixPathSnippet(t, run.homeDir, run.installDir)
 }
 
+func TestInstallShReloadsPathWhenHomeContainsSpaces(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	root := t.TempDir()
+	run.homeDir = filepath.Join(root, "home dir")
+	run.installDir = filepath.Join(root, "install dir")
+	run.env = overrideEnv(run.env, "HOME", run.homeDir)
+	run.env = overrideEnv(run.env, "XDG_CONFIG_HOME", filepath.Join(run.homeDir, ".config"))
+	run.env = overrideEnv(run.env, "CODEX_PROXY_INSTALL_DIR", run.installDir)
+	run.env = overrideEnv(run.env, "SHELL", "")
+
+	outFile := filepath.Join(t.TempDir(), "path.txt")
+	cmd := exec.Command("sh", "-c", `. "$SCRIPT_PATH" >/dev/null 2>&1; printf '%s' "$PATH" > "$OUT_FILE"`)
+	cmd.Dir = run.repoRoot
+	cmd.Env = append([]string{}, run.env...)
+	cmd.Env = append(cmd.Env,
+		"SCRIPT_PATH="+run.scriptPath,
+		"OUT_FILE="+outFile,
+	)
+	runInstallShCommandWithCmd(t, cmd)
+
+	pathData, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read PATH capture: %v", err)
+	}
+	pathValue := string(pathData)
+	if !containsPathEntry(pathValue, run.installDir) {
+		t.Fatalf("expected PATH to include install dir %q, got %q", run.installDir, pathValue)
+	}
+	if !containsPathEntry(pathValue, defaultManagedBinDir(run.homeDir)) {
+		t.Fatalf("expected PATH to include managed CLI dir %q, got %q", defaultManagedBinDir(run.homeDir), pathValue)
+	}
+}
+
+func TestInstallShRemovesLegacyCodexClp(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	legacyClpPath := filepath.Join(run.installDir, "clp")
+	legacyClpData := []byte("#!/bin/sh\necho codex-proxy 0.0.0\n")
+	if err := os.WriteFile(legacyClpPath, legacyClpData, 0o755); err != nil {
+		t.Fatalf("write legacy clp: %v", err)
+	}
+
+	runInstallShCommand(t, run)
+
+	if _, err := os.Stat(legacyClpPath); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy clp removed, stat err=%v", err)
+	}
+}
+
+func TestInstallShRemovesLegacyCodexClaudeProxyAndClpSymlink(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	legacyClaudeProxyPath := filepath.Join(run.installDir, "claude-proxy")
+	legacyClaudeProxyData := []byte("#!/bin/sh\n# github.com/baaaaaaaka/codex-helper\nif [ \"$1\" = \"--version\" ]; then\n  echo claude-proxy 0.0.0\n  exit 0\nfi\nexit 0\n")
+	if err := os.WriteFile(legacyClaudeProxyPath, legacyClaudeProxyData, 0o755); err != nil {
+		t.Fatalf("write legacy claude-proxy: %v", err)
+	}
+	legacyClpPath := filepath.Join(run.installDir, "clp")
+	if err := os.Symlink("claude-proxy", legacyClpPath); err != nil {
+		t.Fatalf("symlink clp: %v", err)
+	}
+
+	runInstallShCommand(t, run)
+
+	if _, err := os.Stat(legacyClaudeProxyPath); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy claude-proxy removed, stat err=%v", err)
+	}
+	if _, err := os.Lstat(legacyClpPath); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy clp symlink removed, stat err=%v", err)
+	}
+}
+
+func TestInstallShRemovesCodexOwnedClaudeProxyWithoutVersionOutput(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	legacyClaudeProxyPath := filepath.Join(run.installDir, "claude-proxy")
+	legacyClaudeProxyData := []byte("#!/bin/sh\n# github.com/baaaaaaaka/codex-helper\nexit 0\n")
+	if err := os.WriteFile(legacyClaudeProxyPath, legacyClaudeProxyData, 0o755); err != nil {
+		t.Fatalf("write legacy claude-proxy: %v", err)
+	}
+
+	runInstallShCommand(t, run)
+
+	if _, err := os.Stat(legacyClaudeProxyPath); !os.IsNotExist(err) {
+		t.Fatalf("expected codex-owned claude-proxy removed without version output, stat err=%v", err)
+	}
+}
+
+func TestInstallShPreservesExternalClpSymlinkToClaudeProxy(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	legacyClaudeProxyPath := filepath.Join(run.installDir, "claude-proxy")
+	legacyClaudeProxyData := []byte("#!/bin/sh\necho external claude-proxy\n")
+	if err := os.WriteFile(legacyClaudeProxyPath, legacyClaudeProxyData, 0o755); err != nil {
+		t.Fatalf("write external claude-proxy: %v", err)
+	}
+	legacyClpPath := filepath.Join(run.installDir, "clp")
+	if err := os.Symlink("claude-proxy", legacyClpPath); err != nil {
+		t.Fatalf("symlink clp: %v", err)
+	}
+
+	runInstallShCommand(t, run)
+
+	claudeProxyData, err := os.ReadFile(legacyClaudeProxyPath)
+	if err != nil {
+		t.Fatalf("read external claude-proxy: %v", err)
+	}
+	if string(claudeProxyData) != string(legacyClaudeProxyData) {
+		t.Fatalf("expected installer to preserve external claude-proxy, got %q", string(claudeProxyData))
+	}
+
+	info, err := os.Lstat(legacyClpPath)
+	if err != nil {
+		t.Fatalf("lstat clp symlink: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected clp to remain a symlink, mode=%v", info.Mode())
+	}
+	linkTarget, err := os.Readlink(legacyClpPath)
+	if err != nil {
+		t.Fatalf("readlink clp: %v", err)
+	}
+	if linkTarget != "claude-proxy" {
+		t.Fatalf("expected clp to keep pointing at claude-proxy, got %q", linkTarget)
+	}
+}
+
 func TestInstallShWritesZshPathSources(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	run.env = overrideEnv(run.env, "SHELL", "/bin/zsh")
@@ -325,6 +453,17 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 		"CODEX_PROXY_TEST_CHECKSUMS="+checksums,
 	)
 
+	preexistingClpPath := filepath.Join(installDir, "clp")
+	preexistingClpData := []byte("#!/bin/sh\necho external clp\n")
+	if err := os.WriteFile(preexistingClpPath, preexistingClpData, 0o755); err != nil {
+		t.Fatalf("write preexisting clp: %v", err)
+	}
+	preexistingClaudeProxyPath := filepath.Join(installDir, "claude-proxy")
+	preexistingClaudeProxyData := []byte("#!/bin/sh\necho external claude-proxy\n")
+	if err := os.WriteFile(preexistingClaudeProxyPath, preexistingClaudeProxyData, 0o755); err != nil {
+		t.Fatalf("write preexisting claude-proxy: %v", err)
+	}
+
 	cmd := exec.Command("sh", scriptPath)
 	cmd.Dir = repoRoot
 	cmd.Env = env
@@ -350,10 +489,18 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	clpPath := filepath.Join(installDir, "clp")
 	clpData, err := os.ReadFile(clpPath)
 	if err != nil {
-		t.Fatalf("read clp: %v", err)
+		t.Fatalf("read preexisting clp: %v", err)
 	}
-	if string(clpData) != string(assetData) {
-		t.Fatalf("clp payload mismatch")
+	if string(clpData) != string(preexistingClpData) {
+		t.Fatalf("expected installer to preserve unrelated clp, got %q", string(clpData))
+	}
+	claudeProxyPath := filepath.Join(installDir, "claude-proxy")
+	claudeProxyData, err := os.ReadFile(claudeProxyPath)
+	if err != nil {
+		t.Fatalf("read preexisting claude-proxy: %v", err)
+	}
+	if string(claudeProxyData) != string(preexistingClaudeProxyData) {
+		t.Fatalf("expected installer to preserve unrelated claude-proxy, got %q", string(claudeProxyData))
 	}
 
 	bashrcPath := filepath.Join(homeDir, ".bashrc")
@@ -483,6 +630,16 @@ func boolEnv(v bool) string {
 		return "1"
 	}
 	return "0"
+}
+
+func containsPathEntry(pathValue, target string) bool {
+	target = filepath.Clean(target)
+	for _, entry := range filepath.SplitList(pathValue) {
+		if filepath.Clean(entry) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func writeStubCurl(t *testing.T, dir string) {

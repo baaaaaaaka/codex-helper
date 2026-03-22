@@ -56,6 +56,34 @@ function Remove-ProfileLine([string]$path, [string]$line) {
   return $true
 }
 
+function Test-FileContainsMarker([string]$path, [string[]]$markers) {
+  if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+    return $false
+  }
+  try {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+  } catch {
+    return $false
+  }
+  $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+  foreach ($marker in $markers) {
+    if ([string]::IsNullOrWhiteSpace($marker)) {
+      continue
+    }
+    if ($text.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Test-IsCodexOwnedLegacyFile([string]$path) {
+  return Test-FileContainsMarker -path $path -markers @(
+    "github.com/baaaaaaaka/codex-helper",
+    "codex-proxy"
+  )
+}
+
 function Normalize-PathEntry([string]$pathValue) {
   if ([string]::IsNullOrWhiteSpace($pathValue)) {
     return ""
@@ -225,12 +253,6 @@ Move-Item -Force -Path $tmp -Destination $dst
 $cxpCmd = Join-Path $installDirResolved "cxp.cmd"
 $cxpContent = "@echo off`r`n`"%~dp0codex-proxy.exe`" %*`r`n"
 Set-Content -Path $cxpCmd -Value $cxpContent -Encoding ASCII
-$legacyClpExe = Join-Path $installDirResolved "clp.exe"
-if (Test-Path $legacyClpExe) {
-  Remove-Item -Force $legacyClpExe -ErrorAction SilentlyContinue
-}
-$clpCmd = Join-Path $installDirResolved "clp.cmd"
-Set-Content -Path $clpCmd -Value $cxpContent -Encoding ASCII
 $managedPrefix = $env:CODEX_NPM_PREFIX
 if ([string]::IsNullOrWhiteSpace($managedPrefix)) {
   $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
@@ -278,23 +300,44 @@ if ($profileUpdated) {
   }
 }
 
-# Clean up legacy binary names from before the rename (claude-proxy -> codex-proxy).
-foreach ($legacyName in @("claude-proxy.exe")) {
+# Clean up legacy command names when they can be positively identified as
+# codex-proxy-owned leftovers from earlier installs.
+$legacyClaudeProxyExe = Join-Path $installDirResolved "claude-proxy.exe"
+$legacyClaudeProxyOwned = Test-IsCodexOwnedLegacyFile -path $legacyClaudeProxyExe
+foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
   $legacyPath = Join-Path $installDirResolved $legacyName
   if (Test-Path $legacyPath) {
     $shouldRemove = $false
-    if ($legacyName -like "clp*") {
-      # clp.exe is always a legacy wrapper/binary in this directory.
-      $content = Get-Content -Path $legacyPath -Raw -ErrorAction SilentlyContinue
-      if ($content -and ($content -match "claude-proxy" -or $content -match "codex-proxy")) {
-        $shouldRemove = $true
-      }
-    } else {
-      # claude-proxy.exe — check if it identifies as codex-proxy.
+    $content = Get-Content -Path $legacyPath -Raw -ErrorAction SilentlyContinue
+    $isCodexOwned = Test-IsCodexOwnedLegacyFile -path $legacyPath
+    if ($content -and ($content -match "codex-proxy")) {
+      $shouldRemove = $true
+    }
+    if ($legacyName -like "*.exe") {
       try {
         $ver = & $legacyPath --version 2>&1 | Out-String
         if ($ver -match "codex-proxy") { $shouldRemove = $true }
+        if (-not $shouldRemove -and $legacyName -ieq "claude-proxy.exe" -and $ver -match "claude-proxy" -and $isCodexOwned) {
+          $shouldRemove = $true
+        }
+        if (-not $shouldRemove -and $legacyName -ieq "clp.exe" -and $ver -match "claude-proxy" -and $isCodexOwned) {
+          $shouldRemove = $true
+        }
       } catch { }
+    }
+    if (-not $shouldRemove -and $legacyName -ieq "claude-proxy.exe" -and $isCodexOwned) {
+      $shouldRemove = $true
+    }
+    if (-not $shouldRemove -and $legacyName -ieq "clp.exe" -and $isCodexOwned) {
+      $shouldRemove = $true
+    }
+    if (-not $shouldRemove -and $legacyName -ieq "clp.cmd" -and $content -match "claude-proxy\.exe") {
+      if ($legacyClaudeProxyOwned) {
+        $shouldRemove = $true
+      }
+    }
+    if (-not $shouldRemove -and $legacyName -ieq "clp.cmd" -and $isCodexOwned) {
+      $shouldRemove = $true
     }
     if ($shouldRemove) {
       Remove-Item -Force $legacyPath -ErrorAction SilentlyContinue

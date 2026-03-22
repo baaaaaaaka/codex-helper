@@ -83,6 +83,29 @@ fi
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+file_contains_text() {
+  file="$1"
+  text="$2"
+  [ -f "$file" ] || return 1
+  LC_ALL=C grep -aF "$text" "$file" >/dev/null 2>&1
+}
+
+is_codex_owned_legacy_file() {
+  file="$1"
+  file_contains_text "$file" "github.com/baaaaaaaka/codex-helper" && return 0
+  file_contains_text "$file" "codex-proxy" && return 0
+  return 1
+}
+
+resolve_legacy_target_path() {
+  base_dir="$1"
+  target="$2"
+  case "$target" in
+    /*) printf '%s\n' "$target" ;;
+    *) printf '%s/%s\n' "$base_dir" "$target" ;;
+  esac
+}
+
 curl_run() {
   curl --retry 5 --retry-delay 5 --connect-timeout 30 -fsSL "$@"
 }
@@ -128,9 +151,20 @@ SOURCE_FILES=""
 
 add_source_file() {
   file="$1"
-  case " $SOURCE_FILES " in
-    *" $file "*) ;;
-    *) SOURCE_FILES="$SOURCE_FILES $file" ;;
+  case "
+$SOURCE_FILES
+" in
+    *"
+$file
+"*) ;;
+    *)
+      if [ -n "$SOURCE_FILES" ]; then
+        SOURCE_FILES="$SOURCE_FILES
+$file"
+      else
+        SOURCE_FILES="$file"
+      fi
+      ;;
   esac
 }
 
@@ -445,9 +479,14 @@ update_shell_config() {
   ensure_line "$alias_file" "$alias_line"
 
   if [ "$CONFIG_UPDATED" -eq 1 ]; then
+    old_ifs="$IFS"
+    IFS='
+'
     for file in $SOURCE_FILES; do
+      [ -n "${file:-}" ] || continue
       source_config_file "$file"
     done
+    IFS="$old_ifs"
   fi
 }
 
@@ -566,31 +605,45 @@ if [ ! -f "$cxp_dst" ]; then
 fi
 chmod 0755 "$cxp_dst" 2>/dev/null || true
 
-clp_dst="$install_dir/clp"
-if have_cmd ln; then
-  ln -sf "$dst" "$clp_dst" 2>/dev/null || true
+legacy_claude_proxy_owned=0
+legacy_claude_proxy_path="$install_dir/claude-proxy"
+if [ -f "$legacy_claude_proxy_path" ] && is_codex_owned_legacy_file "$legacy_claude_proxy_path"; then
+  legacy_claude_proxy_owned=1
 fi
-if [ ! -f "$clp_dst" ]; then
-  cp -f "$dst" "$clp_dst" 2>/dev/null || true
-fi
-chmod 0755 "$clp_dst" 2>/dev/null || true
 
-# Clean up legacy binary names from before the rename (claude-proxy → codex-proxy).
-for legacy_name in claude-proxy; do
+# Clean up legacy command names when they can be positively identified as
+# codex-proxy-owned leftovers from earlier installs.
+for legacy_name in claude-proxy clp; do
   legacy_path="$install_dir/$legacy_name"
   if [ -f "$legacy_path" ] || [ -L "$legacy_path" ]; then
     # Only remove if it points to codex-proxy or is itself a codex-proxy build.
     should_remove=0
     if [ -L "$legacy_path" ]; then
       link_target="$(readlink "$legacy_path" 2>/dev/null || true)"
-      case "$link_target" in
-        *codex-proxy*|*claude-proxy*) should_remove=1 ;;
+      resolved_target="$(resolve_legacy_target_path "$install_dir" "$link_target")"
+      case "$legacy_name:$link_target" in
+        claude-proxy:*codex-proxy*) should_remove=1 ;;
+        clp:*codex-proxy*) should_remove=1 ;;
+        claude-proxy:*claude-proxy*|clp:*claude-proxy*)
+          if is_codex_owned_legacy_file "$resolved_target" || [ "$legacy_claude_proxy_owned" -eq 1 ]; then
+            should_remove=1
+          fi
+          ;;
       esac
     elif [ -f "$legacy_path" ]; then
       legacy_version="$("$legacy_path" --version 2>/dev/null || true)"
-      case "$legacy_version" in
-        *codex-proxy*) should_remove=1 ;;
+      case "$legacy_name:$legacy_version" in
+        claude-proxy:*codex-proxy*) should_remove=1 ;;
+        clp:*codex-proxy*) should_remove=1 ;;
+        claude-proxy:*claude-proxy*|clp:*claude-proxy*)
+          if is_codex_owned_legacy_file "$legacy_path" || [ "$legacy_claude_proxy_owned" -eq 1 ]; then
+            should_remove=1
+          fi
+          ;;
       esac
+      if [ "$should_remove" -eq 0 ] && is_codex_owned_legacy_file "$legacy_path"; then
+        should_remove=1
+      fi
     fi
     if [ "$should_remove" -eq 1 ]; then
       rm -f "$legacy_path"

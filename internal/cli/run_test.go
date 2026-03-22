@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -250,6 +252,383 @@ func TestRunLikeRejectsMultipleProfiles(t *testing.T) {
 	root := &rootOptions{}
 	if err := runLike(cmd, root, false); err == nil {
 		t.Fatalf("expected error for multiple profile args")
+	}
+}
+
+func TestRunLikeUsesDirectModeWhenProxyDisabled(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	disabled := false
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &disabled,
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("runWithProfile should not be called when proxy preference is disabled")
+		return nil
+	}
+
+	var gotCmdArgs []string
+	var gotOpts runTargetOptions
+	runTargetWithFallbackWithOptionsFn = func(ctx context.Context, cmdArgs []string, proxyURL string, healthCheck func() error, fatalCh <-chan error, opts runTargetOptions) error {
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		gotOpts = opts
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{"--", "echo", "ok"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	if err := runLike(cmd, root, false); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	if gotOpts.UseProxy {
+		t.Fatal("expected direct mode to disable proxy env injection")
+	}
+	wantCmdArgs := []string{"echo", "ok"}
+	if !reflect.DeepEqual(gotCmdArgs, wantCmdArgs) {
+		t.Fatalf("expected direct command %v, got %v", wantCmdArgs, gotCmdArgs)
+	}
+}
+
+func TestRunLikeUsesDefaultCodexCommandInDirectMode(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	disabled := false
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &disabled,
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	codexPath := filepath.Join(codexDir, "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", codexDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("runWithProfile should not be called when proxy preference is disabled")
+		return nil
+	}
+
+	var gotCmdArgs []string
+	runTargetWithFallbackWithOptionsFn = func(ctx context.Context, cmdArgs []string, proxyURL string, healthCheck func() error, fatalCh <-chan error, opts runTargetOptions) error {
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		if opts.UseProxy {
+			t.Fatal("expected default direct command to disable proxy env injection")
+		}
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	if err := runLike(cmd, root, false); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	wantCmdArgs := []string{codexPath}
+	if !reflect.DeepEqual(gotCmdArgs, wantCmdArgs) {
+		t.Fatalf("expected default direct command %v, got %v", wantCmdArgs, gotCmdArgs)
+	}
+}
+
+func TestRunLikeUsesProxyPreferenceWhenEnabled(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	enabled := true
+	profile := config.Profile{ID: "p1", Name: "primary", Host: "example.com", User: "coder", CreatedAt: time.Now()}
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{profile},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("direct runner should not be used when proxy preference is enabled")
+		return nil
+	}
+
+	var gotProfile config.Profile
+	var gotCmdArgs []string
+	runWithProfileFn = func(ctx context.Context, _ *config.Store, prof config.Profile, _ []config.Instance, cmdArgs []string) error {
+		gotProfile = prof
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{"--", "echo", "ok"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	if err := runLike(cmd, root, false); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	if gotProfile.ID != profile.ID {
+		t.Fatalf("expected profile %q, got %q", profile.ID, gotProfile.ID)
+	}
+	wantCmdArgs := []string{"echo", "ok"}
+	if !reflect.DeepEqual(gotCmdArgs, wantCmdArgs) {
+		t.Fatalf("expected proxy command %v, got %v", wantCmdArgs, gotCmdArgs)
+	}
+}
+
+func TestRunLikeExplicitProfileForcesProxy(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	disabled := false
+	profile := config.Profile{ID: "p1", Name: "primary", Host: "example.com", User: "coder", CreatedAt: time.Now()}
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &disabled,
+		Profiles:     []config.Profile{profile},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("explicit profile should keep the proxy execution path")
+		return nil
+	}
+
+	var gotProfile config.Profile
+	runWithProfileFn = func(ctx context.Context, _ *config.Store, prof config.Profile, _ []config.Instance, _ []string) error {
+		gotProfile = prof
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{"primary", "--", "echo", "ok"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	if err := runLike(cmd, root, false); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	if gotProfile.ID != profile.ID {
+		t.Fatalf("expected explicit profile %q, got %q", profile.ID, gotProfile.ID)
+	}
+
+	updated, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if updated.ProxyEnabled == nil || *updated.ProxyEnabled {
+		t.Fatalf("expected explicit profile run to preserve ProxyEnabled=false, got %v", updated.ProxyEnabled)
+	}
+}
+
+func TestRunLikePersistsProxyEnabledAfterProfileSetup(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	prevEnsureProxy := ensureProxyPreferenceRunFn
+	prevEnsureProfile := ensureProfileRunFn
+	prevPersist := persistProxyPreferenceRunFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+		ensureProxyPreferenceRunFn = prevEnsureProxy
+		ensureProfileRunFn = prevEnsureProfile
+		persistProxyPreferenceRunFn = prevPersist
+	})
+
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("direct runner should not be used when proxy preference is enabled")
+		return nil
+	}
+
+	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		return true, config.Config{Version: config.CurrentVersion}, nil
+	}
+
+	profile := config.Profile{ID: "p1", Name: "primary"}
+	ensureProfileRunFn = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
+		return profile, config.Config{
+			Version:  config.CurrentVersion,
+			Profiles: []config.Profile{profile},
+		}, nil
+	}
+
+	persistCalls := 0
+	persistProxyPreferenceRunFn = func(s *config.Store, enabled bool) error {
+		persistCalls++
+		if !enabled {
+			t.Fatalf("expected persist true after profile setup")
+		}
+		return persistProxyPreference(s, enabled)
+	}
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{"--", "echo", "ok"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	root := &rootOptions{configPath: cfgPath}
+	if err := runLike(cmd, root, true); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	if persistCalls != 1 {
+		t.Fatalf("expected 1 persist call, got %d", persistCalls)
+	}
+
+	updated, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if updated.ProxyEnabled == nil || !*updated.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=true persisted, got %v", updated.ProxyEnabled)
+	}
+}
+
+func TestRunLikeExplicitProfilePersistsProxyEnabledAfterProfileSetup(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	prevEnsureProfile := ensureProfileRunFn
+	prevPersist := persistProxyPreferenceRunFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+		ensureProfileRunFn = prevEnsureProfile
+		persistProxyPreferenceRunFn = prevPersist
+	})
+
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("direct runner should not be used for explicit profile runs")
+		return nil
+	}
+
+	profile := config.Profile{ID: "p1", Name: "primary"}
+	ensureProfileRunFn = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
+		return profile, config.Config{
+			Version:  config.CurrentVersion,
+			Profiles: []config.Profile{profile},
+		}, nil
+	}
+
+	persistCalls := 0
+	persistProxyPreferenceRunFn = func(s *config.Store, enabled bool) error {
+		persistCalls++
+		if !enabled {
+			t.Fatalf("expected persist true after explicit profile setup")
+		}
+		return persistProxyPreference(s, enabled)
+	}
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{"primary", "--", "echo", "ok"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	root := &rootOptions{configPath: cfgPath}
+	if err := runLike(cmd, root, true); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	if persistCalls != 1 {
+		t.Fatalf("expected 1 persist call, got %d", persistCalls)
+	}
+
+	updated, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if updated.ProxyEnabled == nil || !*updated.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=true persisted, got %v", updated.ProxyEnabled)
 	}
 }
 

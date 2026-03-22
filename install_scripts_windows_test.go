@@ -27,6 +27,227 @@ func TestInstallPs1KeepsPathSetupWhenInstallDirAlreadySet(t *testing.T) {
 	runInstallPs1(t, false, true)
 }
 
+func TestInstallPs1RemovesLegacyCodexClpExe(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+
+	repo := "owner/name"
+	tag := "v1.2.3"
+	verNoV := strings.TrimPrefix(tag, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
+	assetData := []byte("fake-binary")
+	checksum := sha256.Sum256(assetData)
+
+	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
+	tempDir := t.TempDir()
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+
+	legacyClpExe := filepath.Join(installDir, "clp.exe")
+	legacyClpExeData := []byte("codex-proxy legacy clp exe")
+	if err := os.WriteFile(legacyClpExe, legacyClpExeData, 0o644); err != nil {
+		t.Fatalf("write clp.exe: %v", err)
+	}
+	legacyClpCmd := filepath.Join(installDir, "clp.cmd")
+	legacyClpCmdData := []byte("@echo off\r\n\"%~dp0codex-proxy.exe\" %*\r\n")
+	if err := os.WriteFile(legacyClpCmd, legacyClpCmdData, 0o644); err != nil {
+		t.Fatalf("write clp.cmd: %v", err)
+	}
+
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	pathValue := filepath.Join(basePath, "System32")
+
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+		"-Repo", repo,
+		"-Version", "latest",
+		"-InstallDir", installDir,
+	)
+	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = append(cmd.Env,
+		"CODEX_PROXY_API_BASE="+server.URL,
+		"CODEX_PROXY_RELEASE_BASE="+server.URL,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"Path="+pathValue,
+		"TEMP="+tempDir,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.ps1 failed: %v\n%s", err, string(output))
+	}
+
+	if _, err := os.Stat(legacyClpExe); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy clp.exe removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(legacyClpCmd); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy clp.cmd removed, stat err=%v", err)
+	}
+}
+
+func TestInstallPs1RemovesLegacyCodexClaudeProxyAndClpCmd(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+
+	repo := "owner/name"
+	tag := "v1.2.3"
+	verNoV := strings.TrimPrefix(tag, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
+	assetData := []byte("fake-binary")
+	checksum := sha256.Sum256(assetData)
+
+	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
+	tempDir := t.TempDir()
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+
+	legacyClaudeProxyExe := filepath.Join(installDir, "claude-proxy.exe")
+	legacyClaudeProxyExeData := []byte("github.com/baaaaaaaka/codex-helper claude-proxy legacy exe")
+	if err := os.WriteFile(legacyClaudeProxyExe, legacyClaudeProxyExeData, 0o644); err != nil {
+		t.Fatalf("write claude-proxy.exe: %v", err)
+	}
+	legacyClpCmd := filepath.Join(installDir, "clp.cmd")
+	legacyClpCmdData := []byte("@echo off\r\n\"%~dp0claude-proxy.exe\" %*\r\n")
+	if err := os.WriteFile(legacyClpCmd, legacyClpCmdData, 0o644); err != nil {
+		t.Fatalf("write clp.cmd: %v", err)
+	}
+
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	pathValue := filepath.Join(basePath, "System32")
+
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+		"-Repo", repo,
+		"-Version", "latest",
+		"-InstallDir", installDir,
+	)
+	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = append(cmd.Env,
+		"CODEX_PROXY_API_BASE="+server.URL,
+		"CODEX_PROXY_RELEASE_BASE="+server.URL,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"Path="+pathValue,
+		"TEMP="+tempDir,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.ps1 failed: %v\n%s", err, string(output))
+	}
+
+	if _, err := os.Stat(legacyClaudeProxyExe); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy claude-proxy.exe removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(legacyClpCmd); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy clp.cmd removed, stat err=%v", err)
+	}
+}
+
+func TestInstallPs1PreservesExternalClpCmdReferencingClaudeProxy(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+
+	repo := "owner/name"
+	tag := "v1.2.3"
+	verNoV := strings.TrimPrefix(tag, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
+	assetData := []byte("fake-binary")
+	checksum := sha256.Sum256(assetData)
+
+	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
+	tempDir := t.TempDir()
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+
+	legacyClaudeProxyExe := filepath.Join(installDir, "claude-proxy.exe")
+	legacyClaudeProxyExeData := []byte("external claude-proxy exe")
+	if err := os.WriteFile(legacyClaudeProxyExe, legacyClaudeProxyExeData, 0o644); err != nil {
+		t.Fatalf("write claude-proxy.exe: %v", err)
+	}
+	legacyClpCmd := filepath.Join(installDir, "clp.cmd")
+	legacyClpCmdData := []byte("@echo off\r\n\"%~dp0claude-proxy.exe\" %*\r\n")
+	if err := os.WriteFile(legacyClpCmd, legacyClpCmdData, 0o644); err != nil {
+		t.Fatalf("write clp.cmd: %v", err)
+	}
+
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	pathValue := filepath.Join(basePath, "System32")
+
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+		"-Repo", repo,
+		"-Version", "latest",
+		"-InstallDir", installDir,
+	)
+	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = append(cmd.Env,
+		"CODEX_PROXY_API_BASE="+server.URL,
+		"CODEX_PROXY_RELEASE_BASE="+server.URL,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"Path="+pathValue,
+		"TEMP="+tempDir,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.ps1 failed: %v\n%s", err, string(output))
+	}
+
+	claudeProxyExeData, err := os.ReadFile(legacyClaudeProxyExe)
+	if err != nil {
+		t.Fatalf("read claude-proxy.exe: %v", err)
+	}
+	if !bytes.Equal(claudeProxyExeData, legacyClaudeProxyExeData) {
+		t.Fatalf("expected external claude-proxy.exe preserved")
+	}
+	clpCmdData, err := os.ReadFile(legacyClpCmd)
+	if err != nil {
+		t.Fatalf("read clp.cmd: %v", err)
+	}
+	if !bytes.Equal(clpCmdData, legacyClpCmdData) {
+		t.Fatalf("expected clp.cmd referencing external claude-proxy.exe preserved")
+	}
+}
+
 func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	t.Helper()
 	if _, err := exec.LookPath("powershell"); err != nil {
@@ -53,9 +274,20 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	managedPrefix := t.TempDir()
 	tempDir := t.TempDir()
 	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+	legacyClaudeProxyExe := filepath.Join(installDir, "claude-proxy.exe")
+	legacyClaudeProxyExeData := []byte("external claude-proxy exe")
+	if err := os.WriteFile(legacyClaudeProxyExe, legacyClaudeProxyExeData, 0o644); err != nil {
+		t.Fatalf("write claude-proxy.exe: %v", err)
+	}
 	legacyClpExe := filepath.Join(installDir, "clp.exe")
-	if err := os.WriteFile(legacyClpExe, []byte("legacy clp exe"), 0o644); err != nil {
+	legacyClpExeData := []byte("external clp exe")
+	if err := os.WriteFile(legacyClpExe, legacyClpExeData, 0o644); err != nil {
 		t.Fatalf("write clp.exe: %v", err)
+	}
+	legacyClpCmd := filepath.Join(installDir, "clp.cmd")
+	legacyClpCmdData := []byte("@echo off\r\necho external clp\r\n")
+	if err := os.WriteFile(legacyClpCmd, legacyClpCmdData, 0o644); err != nil {
+		t.Fatalf("write clp.cmd: %v", err)
 	}
 	basePath := os.Getenv("SystemRoot")
 	if basePath == "" {
@@ -104,16 +336,26 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if !strings.Contains(strings.ToLower(string(cmdData)), "codex-proxy.exe") {
 		t.Fatalf("cxp.cmd does not reference codex-proxy.exe")
 	}
-	clpCmd := filepath.Join(installDir, "clp.cmd")
-	clpData, err := os.ReadFile(clpCmd)
+	claudeProxyExeData, err := os.ReadFile(legacyClaudeProxyExe)
+	if err != nil {
+		t.Fatalf("read claude-proxy.exe: %v", err)
+	}
+	if !bytes.Equal(claudeProxyExeData, legacyClaudeProxyExeData) {
+		t.Fatalf("expected claude-proxy.exe preserved")
+	}
+	clpExeData, err := os.ReadFile(legacyClpExe)
+	if err != nil {
+		t.Fatalf("read clp.exe: %v", err)
+	}
+	if !bytes.Equal(clpExeData, legacyClpExeData) {
+		t.Fatalf("expected clp.exe preserved")
+	}
+	clpCmdData, err := os.ReadFile(legacyClpCmd)
 	if err != nil {
 		t.Fatalf("read clp.cmd: %v", err)
 	}
-	if !strings.Contains(strings.ToLower(string(clpData)), "codex-proxy.exe") {
-		t.Fatalf("clp.cmd does not reference codex-proxy.exe")
-	}
-	if _, err := os.Stat(legacyClpExe); !os.IsNotExist(err) {
-		t.Fatalf("expected legacy clp.exe removed, stat err=%v", err)
+	if !bytes.Equal(clpCmdData, legacyClpCmdData) {
+		t.Fatalf("expected clp.cmd preserved")
 	}
 
 	profile, err := os.ReadFile(profilePath)
@@ -123,6 +365,9 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	profileText := string(profile)
 	if !strings.Contains(profileText, "Set-Alias -Name cxp -Value codex-proxy") {
 		t.Fatalf("missing cxp alias in profile")
+	}
+	if strings.Contains(strings.ToLower(profileText), "clp") {
+		t.Fatalf("unexpected clp reference in profile")
 	}
 	for _, dir := range []string{installDirResolved, managedPrefixResolved, managedBinResolved} {
 		if !hasPathLineForDir(profileText, dir) {

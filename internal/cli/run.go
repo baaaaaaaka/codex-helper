@@ -23,10 +23,18 @@ import (
 
 var stackStart = stack.Start
 
+var (
+	runWithProfileFn                   = runWithProfile
+	runTargetWithFallbackWithOptionsFn = runTargetWithFallbackWithOptions
+	ensureProxyPreferenceRunFn         = ensureProxyPreference
+	ensureProfileRunFn                 = ensureProfile
+	persistProxyPreferenceRunFn        = persistProxyPreference
+)
+
 func newRunCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run [profile] -- [cmd args...]",
-		Short: "Run a command through an SSH-backed local proxy",
+		Short: "Run a command using direct mode or an SSH-backed local proxy",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Keep `run` working, but also auto-init when no profiles exist.
@@ -66,14 +74,50 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		return err
 	}
 
-	profile, cfg, err := ensureProfile(ctx, store, profileRef, autoInit, cmd.OutOrStdout())
+	if profileRef != "" {
+		profile, cfg, err := ensureProfileRunFn(ctx, store, profileRef, autoInit, cmd.OutOrStdout())
+		if err != nil {
+			return err
+		}
+		if cfg.ProxyEnabled == nil {
+			enabled := true
+			if err := persistProxyPreferenceRunFn(store, enabled); err != nil {
+				return err
+			}
+			cfg.ProxyEnabled = &enabled
+		}
+		return runWithProfileFn(ctx, store, profile, cfg.Instances, after)
+	}
+
+	useProxy, _, err := ensureProxyPreferenceRunFn(ctx, store, "", cmd.ErrOrStderr())
+	if err != nil {
+		return err
+	}
+	if useProxy {
+		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, "", autoInit, cmd.OutOrStdout())
+		if err != nil {
+			return err
+		}
+		if cfgWithProfile.ProxyEnabled == nil {
+			enabled := true
+			if err := persistProxyPreferenceRunFn(store, enabled); err != nil {
+				return err
+			}
+			cfgWithProfile.ProxyEnabled = &enabled
+		}
+		return runWithProfileFn(ctx, store, profile, cfgWithProfile.Instances, after)
+	}
+
+	log := cmd.ErrOrStderr()
+	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{})
 	if err != nil {
 		return err
 	}
 
 	opts := defaultRunTargetOptions()
-	opts.Log = cmd.ErrOrStderr()
-	return runWithProfileOptions(ctx, store, profile, cfg.Instances, after, opts)
+	opts.UseProxy = false
+	opts.Log = log
+	return runTargetWithFallbackWithOptionsFn(ctx, resolvedCmd, "", nil, nil, opts)
 }
 
 func selectProfile(cfg config.Config, ref string) (config.Profile, error) {

@@ -24,10 +24,9 @@ Windows (PowerShell):
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1 | iex"
 ```
 
-The installer drops `cxp` and `clp` shims alongside `codex-proxy`, tries to add
-the install directory plus the managed CLI directory to PATH, and also adds a
-`cxp` shell alias where applicable. Open a new shell if the command is not
-found.
+The installer drops a `cxp` shim alongside `codex-proxy`, tries to add the
+install directory plus the managed CLI directory to PATH, and also adds a `cxp`
+shell alias where applicable. Open a new shell if the command is not found.
 
 ### 2) **Run**
 
@@ -35,8 +34,6 @@ found.
 codex-proxy
 # or
 cxp
-# or
-clp
 ```
 
 On first run, if no proxy preference or profile has been saved yet, you'll be
@@ -49,7 +46,9 @@ key if needed. You can toggle proxy mode later with `Ctrl+P` in the TUI.
 - Press Enter to open the selected Codex session.
 - If there is no history yet, Enter starts a new session in the current directory.
 - If you have multiple profiles, select one with `codex-proxy <profile>`.
-- Run any command through the proxy with
+- Run any command using the current direct/proxy mode with
+  `codex-proxy run -- <cmd> [args...]`.
+- Force proxy mode for one command with
   `codex-proxy run [profile] -- <cmd> [args...]`.
 - If no command is given after `--`, `run` launches `codex`.
 - If no proxy profile exists yet, `run` will guide you through creating one.
@@ -88,7 +87,7 @@ codex-proxy proxy doctor
 | `codex-proxy --upgrade-codex` | Reinstall Codex CLI using detected install source |
 | `codex-proxy completion <shell>` | Generate shell completion |
 | `codex-proxy init` | Create an SSH profile |
-| `codex-proxy run [profile] -- <cmd> [args...]` | Run a command through the proxy (`codex` by default) |
+| `codex-proxy run [profile] -- <cmd> [args...]` | Run a command using the current mode, or force proxy when a profile is given (`codex` by default) |
 | `codex-proxy tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
@@ -242,8 +241,8 @@ sh -c 'url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/insta
 
 By default it installs to `~/.local/bin/codex-proxy`.
 
-The installer drops `cxp` and `clp` shims alongside `codex-proxy` and tries to
-add `~/.local/bin` plus the managed CLI directory to PATH (plus a `cxp` alias).
+The installer drops a `cxp` shim alongside `codex-proxy` and tries to add
+`~/.local/bin` plus the managed CLI directory to PATH (plus a `cxp` alias).
 Open a new shell if the command is not found.
 If you need to update PATH manually:
 
@@ -264,8 +263,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.gi
 ```
 
 By default it installs to `%USERPROFILE%\.local\bin\codex-proxy.exe`.
-The installer also writes `cxp.cmd` and `clp.cmd` there and updates PATH for
-that directory plus the managed CLI directory.
+The installer also writes `cxp.cmd` there and updates PATH for that directory
+plus the managed CLI directory.
 
 Install a specific version:
 

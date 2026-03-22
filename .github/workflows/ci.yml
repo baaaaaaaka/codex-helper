@@ -148,6 +148,23 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           go test . -count=1 -run 'TestInstallPs1'
 
+      - name: Recent run/installer regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test . -count=1 -run 'TestInstallSh(ReloadsPathWhenHomeContainsSpaces|RemovesLegacyCodexClp|RemovesLegacyCodexClaudeProxyAndClpSymlink|RemovesCodexOwnedClaudeProxyWithoutVersionOutput|PreservesExternalClpSymlinkToClaudeProxy)$'
+
+      - name: Recent run/installer regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test . -count=1 -run 'TestInstallPs1(RemovesLegacyCodexClpExe|RemovesLegacyCodexClaudeProxyAndClpCmd|PreservesExternalClpCmdReferencingClaudeProxy)$'
+
       - name: go vet
         run: go vet ./...
 
