@@ -633,13 +633,22 @@ func boolEnv(v bool) string {
 }
 
 func containsPathEntry(pathValue, target string) bool {
-	target = filepath.Clean(target)
+	target = normalizeComparablePath(target)
 	for _, entry := range filepath.SplitList(pathValue) {
-		if filepath.Clean(entry) == target {
+		if normalizeComparablePath(entry) == target {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizeComparablePath(pathValue string) string {
+	cleaned := filepath.Clean(pathValue)
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err == nil {
+		return filepath.Clean(resolved)
+	}
+	return cleaned
 }
 
 func writeStubCurl(t *testing.T, dir string) {

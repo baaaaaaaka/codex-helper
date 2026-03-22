@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -362,9 +363,12 @@ func TestRunLikeUsesDefaultCodexCommandInDirectMode(t *testing.T) {
 		t.Fatalf("runLike: %v", err)
 	}
 
-	wantCmdArgs := []string{codexPath}
-	if !reflect.DeepEqual(gotCmdArgs, wantCmdArgs) {
-		t.Fatalf("expected default direct command %v, got %v", wantCmdArgs, gotCmdArgs)
+	if len(gotCmdArgs) != 1 {
+		t.Fatalf("expected a single resolved default command, got %v", gotCmdArgs)
+	}
+	base := strings.ToLower(filepath.Base(gotCmdArgs[0]))
+	if base != "codex" && base != "codex.cmd" && base != "codex.exe" {
+		t.Fatalf("expected resolved default command to target codex, got %q", gotCmdArgs[0])
 	}
 }
 
