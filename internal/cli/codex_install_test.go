@@ -404,9 +404,7 @@ func TestDetectCodexUpgradeSourceUnknown(t *testing.T) {
 }
 
 func TestUpgradeCodexInstalledWithOptionsRequiresInstalledCodex(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	setMissingCodexEnv(t)
 
 	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
 	if err == nil {
@@ -418,9 +416,7 @@ func TestUpgradeCodexInstalledWithOptionsRequiresInstalledCodex(t *testing.T) {
 }
 
 func TestUpgradeCodexInstalledWithOptionsSkipsProxySetupWhenPrecheckFails(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	setMissingCodexEnv(t)
 
 	called := false
 	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{
@@ -438,6 +434,23 @@ func TestUpgradeCodexInstalledWithOptionsSkipsProxySetupWhenPrecheckFails(t *tes
 	}
 	if !strings.Contains(err.Error(), "cannot upgrade") {
 		t.Fatalf("expected cannot-upgrade error, got %q", err.Error())
+	}
+}
+
+func setMissingCodexEnv(t *testing.T) {
+	t.Helper()
+
+	homeDir := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("CODEX_NPM_PREFIX", t.TempDir())
+	t.Setenv("CODEX_NODE_INSTALL_ROOT", t.TempDir())
+
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+		t.Setenv("LOCALAPPDATA", t.TempDir())
+		t.Setenv("APPDATA", t.TempDir())
 	}
 }
 
