@@ -2,61 +2,61 @@
 
 Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 
-| Codex version | linux | mac | windows | rockylinux8 | ubuntu20.04 | last_tested_utc |
-| --- | --- | --- | --- | --- | --- | --- |
-| 0.117.0-alpha.8 | pass | pass | pass | pass | pass | 2026-03-21T21:45:23Z |
-| 0.117.0-alpha.7 | pass | pass | pass | pass | pass | 2026-03-21T18:21:18Z |
-| 0.117.0-alpha.6 | pass | pass | pass | pass | pass | 2026-03-20T23:19:23Z |
-| 0.117.0-alpha.5 | pass | pass | pass | pass | pass | 2026-03-20T08:44:07Z |
-| 0.117.0-alpha.3 | pass | pass | pass | pass | pass | 2026-03-20T05:12:17Z |
-| 0.117.0-alpha.2 | pass | pass | pass | pass | pass | 2026-03-19T23:51:26Z |
-| 0.116.0 | pass | pass | pass | pass | pass | 2026-03-22T18:21:53Z |
-| 0.116.0-alpha.12 | pass | pass | pass | pass | pass | 2026-03-19T17:30:25Z |
-| 0.116.0-alpha.11 | pass | pass | pass | pass | pass | 2026-03-19T03:59:42Z |
-| 0.116.0-alpha.10 | pass | pass | pass | pass | pass | 2026-03-19T01:08:17Z |
-| 0.116.0-alpha.9 | pass | pass | pass | pass | pass | 2026-03-18T23:50:05Z |
-| 0.116.0-alpha.8 | pass | pass | pass | pass | pass | 2026-03-18T18:44:53Z |
-| 0.116.0-alpha.6 | pass | pass | pass | pass | pass | 2026-03-18T05:26:43Z |
-| 0.116.0-alpha.5 | pass | pass | pass | pass | pass | 2026-03-18T01:09:08Z |
-| 0.116.0-alpha.4 | pass | pass | pass | pass | pass | 2026-03-17T23:01:16Z |
-| 0.116.0-alpha.3 | pass | pass | pass | pass | pass | 2026-03-17T06:37:21Z |
-| 0.116.0-alpha.1 | pass | pass | pass | pass | pass | 2026-03-16T22:31:36Z |
-| 0.115.0 | pass | pass | pass | pass | pass | 2026-03-22T20:15:27Z |
-| 0.115.0-alpha.27 | pass | pass | pass | pass | pass | 2026-03-16T17:53:43Z |
-| 0.115.0-alpha.26 | pass | pass | pass | pass | pass | 2026-03-16T07:22:47Z |
-| 0.115.0-alpha.25 | pass | pass | pass | pass | pass | 2026-03-16T06:01:48Z |
-| 0.115.0-alpha.24 | pass | pass | pass | pass | pass | 2026-03-14T18:22:29Z |
-| 0.115.0-alpha.23 | pass | pass | pass | pass | pass | 2026-03-14T06:04:40Z |
-| 0.115.0-alpha.22 | pass | pass | pass | pass | pass | 2026-03-14T03:38:53Z |
-| 0.115.0-alpha.21 | pass | pass | pass | pass | pass | 2026-03-13T23:18:29Z |
-| 0.115.0-alpha.20 | pass | pass | pass | pass | pass | 2026-03-13T22:20:07Z |
-| 0.115.0-alpha.19 | pass | pass | pass | pass | pass | 2026-03-13T19:53:25Z |
-| 0.115.0-alpha.18 | pass | pass | pass | pass | pass | 2026-03-13T08:01:42Z |
-| 0.115.0-alpha.17 | pass | pass | pass | pass | pass | 2026-03-13T07:17:25Z |
-| 0.115.0-alpha.16 | pass | pass | pass | pass | pass | 2026-03-13T03:40:46Z |
-| 0.115.0-alpha.15 | pass | pass | pass | pass | pass | 2026-03-13T01:02:58Z |
-| 0.115.0-alpha.14 | pass | pass | pass | pass | pass | 2026-03-12T22:20:07Z |
-| 0.115.0-alpha.13 | pass | pass | pass | pass | pass | 2026-03-12T20:23:58Z |
-| 0.115.0-alpha.12 | pass | pass | pass | pass | pass | 2026-03-12T17:43:22Z |
-| 0.115.0-alpha.11 | pass | pass | pass | pass | pass | 2026-03-12T08:01:24Z |
-| 0.115.0-alpha.9 | pass | pass | pass | pass | pass | 2026-03-12T07:17:29Z |
-| 0.115.0-alpha.7 | pass | pass | pass | pass | pass | 2026-03-12T06:10:39Z |
-| 0.115.0-alpha.6 | pass | pass | pass | pass | pass | 2026-03-11T19:36:31Z |
-| 0.115.0-alpha.4 | pass | pass | pass | pass | pass | 2026-03-11T17:41:54Z |
-| 0.115.0-alpha.3 | pass | pass | pass | pass | pass | 2026-03-11T04:58:00Z |
-| 0.115.0-alpha.2 | pass | pass | pass | pass | pass | 2026-03-11T03:27:31Z |
-| 0.114.0 | pass | pass | pass | pass | pass | 2026-03-23T04:02:18Z |
-| 0.114.0-alpha.7 | pass | pass | pass | pass | pass | 2026-03-11T22:47:38Z |
-| 0.114.0-alpha.4 | pass | pass | pass | pass | pass | 2026-03-10T23:18:43Z |
-| 0.114.0-alpha.3 | pass | pass | pass | pass | pass | 2026-03-10T19:31:49Z |
-| 0.114.0-alpha.2 | pass | pass | pass | pass | pass | 2026-03-10T18:34:45Z |
-| 0.114.0-alpha.1 | pass | pass | pass | pass | pass | 2026-03-10T07:35:24Z |
-| 0.113.0 | pass | pass | pass | pass | pass | 2026-03-19T07:31:10Z |
-| 0.113.0-alpha.2 | pass | pass | pass | pass | pass | 2026-03-10T06:16:32Z |
-| 0.112.0 | pass | pass | pass | pass | pass | 2026-03-14T21:17:40Z |
-| 0.111.0 | pass | pass | pass | pass | pass | 2026-03-10T06:16:32Z |
-| 0.110.0 | pass | pass | fail | pass | pass | 2026-03-10T04:56:12Z |
-| 0.107.0 | pass | pass | pass | pass | pass | 2026-03-02T18:06:46Z |
-| 0.106.0 | pass | pass | pass | pass | pass | 2026-02-26T23:25:14Z |
-| 0.105.0 | pass | pass | pass | pass | pass | 2026-02-25T18:49:52Z |
-| 0.104.0 | pass | pass | pass | pass | pass | 2026-02-20T13:10:21Z |
+| Codex version | linux | mac | windows | centos7 | rockylinux8 | ubuntu20.04 | last_tested_utc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.117.0-alpha.8 | pass | pass | pass | not-run | pass | pass | 2026-03-21T21:45:23Z |
+| 0.117.0-alpha.7 | pass | pass | pass | not-run | pass | pass | 2026-03-21T18:21:18Z |
+| 0.117.0-alpha.6 | pass | pass | pass | not-run | pass | pass | 2026-03-20T23:19:23Z |
+| 0.117.0-alpha.5 | pass | pass | pass | not-run | pass | pass | 2026-03-20T08:44:07Z |
+| 0.117.0-alpha.3 | pass | pass | pass | not-run | pass | pass | 2026-03-20T05:12:17Z |
+| 0.117.0-alpha.2 | pass | pass | pass | not-run | pass | pass | 2026-03-19T23:51:26Z |
+| 0.116.0 | pass | pass | pass | not-run | pass | pass | 2026-03-22T18:21:53Z |
+| 0.116.0-alpha.12 | pass | pass | pass | not-run | pass | pass | 2026-03-19T17:30:25Z |
+| 0.116.0-alpha.11 | pass | pass | pass | not-run | pass | pass | 2026-03-19T03:59:42Z |
+| 0.116.0-alpha.10 | pass | pass | pass | not-run | pass | pass | 2026-03-19T01:08:17Z |
+| 0.116.0-alpha.9 | pass | pass | pass | not-run | pass | pass | 2026-03-18T23:50:05Z |
+| 0.116.0-alpha.8 | pass | pass | pass | not-run | pass | pass | 2026-03-18T18:44:53Z |
+| 0.116.0-alpha.6 | pass | pass | pass | not-run | pass | pass | 2026-03-18T05:26:43Z |
+| 0.116.0-alpha.5 | pass | pass | pass | not-run | pass | pass | 2026-03-18T01:09:08Z |
+| 0.116.0-alpha.4 | pass | pass | pass | not-run | pass | pass | 2026-03-17T23:01:16Z |
+| 0.116.0-alpha.3 | pass | pass | pass | not-run | pass | pass | 2026-03-17T06:37:21Z |
+| 0.116.0-alpha.1 | pass | pass | pass | not-run | pass | pass | 2026-03-16T22:31:36Z |
+| 0.115.0 | pass | pass | pass | not-run | pass | pass | 2026-03-22T20:15:27Z |
+| 0.115.0-alpha.27 | pass | pass | pass | not-run | pass | pass | 2026-03-16T17:53:43Z |
+| 0.115.0-alpha.26 | pass | pass | pass | not-run | pass | pass | 2026-03-16T07:22:47Z |
+| 0.115.0-alpha.25 | pass | pass | pass | not-run | pass | pass | 2026-03-16T06:01:48Z |
+| 0.115.0-alpha.24 | pass | pass | pass | not-run | pass | pass | 2026-03-14T18:22:29Z |
+| 0.115.0-alpha.23 | pass | pass | pass | not-run | pass | pass | 2026-03-14T06:04:40Z |
+| 0.115.0-alpha.22 | pass | pass | pass | not-run | pass | pass | 2026-03-14T03:38:53Z |
+| 0.115.0-alpha.21 | pass | pass | pass | not-run | pass | pass | 2026-03-13T23:18:29Z |
+| 0.115.0-alpha.20 | pass | pass | pass | not-run | pass | pass | 2026-03-13T22:20:07Z |
+| 0.115.0-alpha.19 | pass | pass | pass | not-run | pass | pass | 2026-03-13T19:53:25Z |
+| 0.115.0-alpha.18 | pass | pass | pass | not-run | pass | pass | 2026-03-13T08:01:42Z |
+| 0.115.0-alpha.17 | pass | pass | pass | not-run | pass | pass | 2026-03-13T07:17:25Z |
+| 0.115.0-alpha.16 | pass | pass | pass | not-run | pass | pass | 2026-03-13T03:40:46Z |
+| 0.115.0-alpha.15 | pass | pass | pass | not-run | pass | pass | 2026-03-13T01:02:58Z |
+| 0.115.0-alpha.14 | pass | pass | pass | not-run | pass | pass | 2026-03-12T22:20:07Z |
+| 0.115.0-alpha.13 | pass | pass | pass | not-run | pass | pass | 2026-03-12T20:23:58Z |
+| 0.115.0-alpha.12 | pass | pass | pass | not-run | pass | pass | 2026-03-12T17:43:22Z |
+| 0.115.0-alpha.11 | pass | pass | pass | not-run | pass | pass | 2026-03-12T08:01:24Z |
+| 0.115.0-alpha.9 | pass | pass | pass | not-run | pass | pass | 2026-03-12T07:17:29Z |
+| 0.115.0-alpha.7 | pass | pass | pass | not-run | pass | pass | 2026-03-12T06:10:39Z |
+| 0.115.0-alpha.6 | pass | pass | pass | not-run | pass | pass | 2026-03-11T19:36:31Z |
+| 0.115.0-alpha.4 | pass | pass | pass | not-run | pass | pass | 2026-03-11T17:41:54Z |
+| 0.115.0-alpha.3 | pass | pass | pass | not-run | pass | pass | 2026-03-11T04:58:00Z |
+| 0.115.0-alpha.2 | pass | pass | pass | not-run | pass | pass | 2026-03-11T03:27:31Z |
+| 0.114.0 | pass | pass | pass | not-run | pass | pass | 2026-03-23T04:02:18Z |
+| 0.114.0-alpha.7 | pass | pass | pass | not-run | pass | pass | 2026-03-11T22:47:38Z |
+| 0.114.0-alpha.4 | pass | pass | pass | not-run | pass | pass | 2026-03-10T23:18:43Z |
+| 0.114.0-alpha.3 | pass | pass | pass | not-run | pass | pass | 2026-03-10T19:31:49Z |
+| 0.114.0-alpha.2 | pass | pass | pass | not-run | pass | pass | 2026-03-10T18:34:45Z |
+| 0.114.0-alpha.1 | pass | pass | pass | not-run | pass | pass | 2026-03-10T07:35:24Z |
+| 0.113.0 | pass | pass | pass | not-run | pass | pass | 2026-03-19T07:31:10Z |
+| 0.113.0-alpha.2 | pass | pass | pass | not-run | pass | pass | 2026-03-10T06:16:32Z |
+| 0.112.0 | pass | pass | pass | not-run | pass | pass | 2026-03-14T21:17:40Z |
+| 0.111.0 | pass | pass | pass | not-run | pass | pass | 2026-03-10T06:16:32Z |
+| 0.110.0 | pass | pass | fail | not-run | pass | pass | 2026-03-10T04:56:12Z |
+| 0.107.0 | pass | pass | pass | not-run | pass | pass | 2026-03-02T18:06:46Z |
+| 0.106.0 | pass | pass | pass | not-run | pass | pass | 2026-02-26T23:25:14Z |
+| 0.105.0 | pass | pass | pass | not-run | pass | pass | 2026-02-25T18:49:52Z |
+| 0.104.0 | pass | pass | pass | not-run | pass | pass | 2026-02-20T13:10:21Z |

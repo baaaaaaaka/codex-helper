@@ -11,9 +11,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import codex_release_monitor_select as monitor_select
 
 
-def compatibility_row(version: str, *, linux: str = "pass", mac: str = "pass", windows: str = "pass", rockylinux8: str = "pass", ubuntu20: str = "pass", tested_at: str = "2026-03-10T00:00:00Z") -> str:
+def compatibility_row(
+    version: str,
+    *,
+    linux: str = "pass",
+    mac: str = "pass",
+    windows: str = "pass",
+    centos7: str = "pass",
+    rockylinux8: str = "pass",
+    ubuntu20: str = "pass",
+    tested_at: str = "2026-03-10T00:00:00Z",
+) -> str:
     return (
-        f"| {version} | {linux} | {mac} | {windows} | {rockylinux8} | "
+        f"| {version} | {linux} | {mac} | {windows} | {centos7} | {rockylinux8} | "
         f"{ubuntu20} | {tested_at} |"
     )
 
@@ -25,6 +35,7 @@ class CodexReleaseMonitorSelectTests(unittest.TestCase):
                 "linux": "pass",
                 "mac": "pass",
                 "windows": "pass",
+                "centos7": "pass",
                 "rockylinux8": "pass",
                 "ubuntu20.04": "pass",
                 "last_tested_utc": "2026-03-10T09:00:00Z",
@@ -33,6 +44,7 @@ class CodexReleaseMonitorSelectTests(unittest.TestCase):
                 "linux": "pass",
                 "mac": "pass",
                 "windows": "pass",
+                "centos7": "pass",
                 "rockylinux8": "pass",
                 "ubuntu20.04": "pass",
                 "last_tested_utc": "2026-03-05T00:00:00Z",
@@ -41,6 +53,7 @@ class CodexReleaseMonitorSelectTests(unittest.TestCase):
                 "linux": "pass",
                 "mac": "pass",
                 "windows": "fail",
+                "centos7": "pass",
                 "rockylinux8": "pass",
                 "ubuntu20.04": "pass",
                 "last_tested_utc": "2026-03-10T09:00:00Z",
@@ -49,6 +62,7 @@ class CodexReleaseMonitorSelectTests(unittest.TestCase):
                 "linux": "fail",
                 "mac": "fail",
                 "windows": "fail",
+                "centos7": "fail",
                 "rockylinux8": "fail",
                 "ubuntu20.04": "fail",
                 "last_tested_utc": "2026-03-01T00:00:00Z",
@@ -69,8 +83,8 @@ class CodexReleaseMonitorSelectTests(unittest.TestCase):
             [
                 "# Codex Compatibility",
                 "",
-                "| Codex version | linux | mac | windows | rockylinux8 | ubuntu20.04 | last_tested_utc |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
+                "| Codex version | linux | mac | windows | centos7 | rockylinux8 | ubuntu20.04 | last_tested_utc |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- |",
                 compatibility_row("0.113.0-alpha.2"),
                 compatibility_row("0.112.0"),
             ]

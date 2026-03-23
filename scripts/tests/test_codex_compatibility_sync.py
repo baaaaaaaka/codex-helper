@@ -21,9 +21,9 @@ class CodexCompatibilitySyncTests(unittest.TestCase):
                     [
                         "# Codex Compatibility",
                         "",
-                        "| Codex version | linux | mac | windows | rockylinux8 | ubuntu20.04 | last_tested_utc |",
-                        "| --- | --- | --- | --- | --- | --- | --- |",
-                        "| 0.112.0 | pass | pass | pass | pass | pass | 2026-03-01T00:00:00Z |",
+                        "| Codex version | linux | mac | windows | centos7 | rockylinux8 | ubuntu20.04 | last_tested_utc |",
+                        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                        "| 0.112.0 | pass | pass | pass | pass | pass | pass | 2026-03-01T00:00:00Z |",
                     ]
                 )
                 + "\n",
@@ -51,7 +51,7 @@ class CodexCompatibilitySyncTests(unittest.TestCase):
 
             updated = table_path.read_text(encoding="utf-8")
 
-        self.assertIn("| 0.112.0 | pass | pass | pass | pass | pass |", updated)
+        self.assertIn("| 0.112.0 | pass | pass | pass | pass | pass | pass |", updated)
         self.assertNotIn("2026-03-01T00:00:00Z", updated)
         self.assertRegex(updated, re.compile(r"2026-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"))
 

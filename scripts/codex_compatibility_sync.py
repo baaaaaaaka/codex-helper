@@ -10,11 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
 
-PLATFORMS = ["linux", "mac", "windows", "rockylinux8", "ubuntu20.04"]
+PLATFORMS = ["linux", "mac", "windows", "centos7", "rockylinux8", "ubuntu20.04"]
 VERSION_RE = re.compile(r"\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?")
 HEADER = [
-    "| Codex version | linux | mac | windows | rockylinux8 | ubuntu20.04 | last_tested_utc |",
-    "| --- | --- | --- | --- | --- | --- | --- |",
+    "| Codex version | linux | mac | windows | centos7 | rockylinux8 | ubuntu20.04 | last_tested_utc |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
 ]
 
 
@@ -107,7 +107,7 @@ def write_table(table_path: Path, rows: Dict[str, Dict[str, str]]) -> None:
         row = rows[version]
         line = (
             f"| {version} | {row.get('linux', 'not-run')} | {row.get('mac', 'not-run')} | "
-            f"{row.get('windows', 'not-run')} | {row.get('rockylinux8', 'not-run')} | "
+            f"{row.get('windows', 'not-run')} | {row.get('centos7', 'not-run')} | {row.get('rockylinux8', 'not-run')} | "
             f"{row.get('ubuntu20.04', 'not-run')} | {row.get('last_tested_utc', '')} |"
         )
         out.append(line)

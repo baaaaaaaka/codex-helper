@@ -75,6 +75,56 @@ parse_major() {
   esac
 }
 
+parse_minor() {
+  raw="$1"
+  raw="${raw#v}"
+  case "$raw" in
+    *.*) raw="${raw#*.}" ;;
+    *) echo ""; return ;;
+  esac
+  raw="${raw%%.*}"
+  case "$raw" in
+    ''|*[!0-9]*) echo ""; return ;;
+    *) echo "$raw"; return ;;
+  esac
+}
+
+resolve_glibc_version() {
+  if command -v getconf >/dev/null 2>&1; then
+    glibc_raw="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+    case "$glibc_raw" in
+      glibc\ *) printf '%s\n' "${glibc_raw#glibc }"; return ;;
+    esac
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    ldd_line="$(ldd --version 2>/dev/null | head -n 1 || true)"
+    printf '%s\n' "$ldd_line" | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1
+    return
+  fi
+
+  printf '\n'
+}
+
+version_lt() {
+  left="$1"
+  right="$2"
+  left_major="$(parse_major "$left")"
+  left_minor="$(parse_minor "$left")"
+  right_major="$(parse_major "$right")"
+  right_minor="$(parse_minor "$right")"
+  if [ -z "$left_major" ] || [ -z "$left_minor" ] || [ -z "$right_major" ] || [ -z "$right_minor" ]; then
+    return 1
+  fi
+  if [ "$left_major" -lt "$right_major" ]; then
+    return 0
+  fi
+  if [ "$left_major" -gt "$right_major" ]; then
+    return 1
+  fi
+  [ "$left_minor" -lt "$right_minor" ]
+}
+
 is_wsl=false
 case "$(uname -r 2>/dev/null || true)" in
   *[Mm]icrosoft*|*WSL*) is_wsl=true ;;
@@ -109,27 +159,90 @@ download_local_node() {
     }
     trap cleanup EXIT INT TERM
 
-    base_url="https://nodejs.org/dist/latest-v${target_major}.x"
-    shasums_file="$tmp_dir/SHASUMS256.txt"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$base_url/SHASUMS256.txt" -o "$shasums_file"
-    elif command -v wget >/dev/null 2>&1; then
-      wget -qO "$shasums_file" "$base_url/SHASUMS256.txt"
-    else
-      echo "need curl or wget to download Node.js" >&2
-      exit 1
+    download_file() {
+      src="$1"
+      dest="$2"
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$src" -o "$dest"
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$dest" "$src"
+      else
+        echo "need curl or wget to download Node.js" >&2
+        exit 1
+      fi
+    }
+
+    resolve_official_node_version() {
+      latest_shasums="$tmp_dir/latest-SHASUMS256.txt"
+      download_file "https://nodejs.org/dist/latest-v${target_major}.x/SHASUMS256.txt" "$latest_shasums"
+      latest_tarball="$(
+        awk -v major="$target_major" -v os="$os_name" -v arch="$node_arch" '
+          $2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-" os "-" arch "\\.tar\\.(gz|xz)$") {
+            print $2
+            exit
+          }
+        ' "$latest_shasums"
+      )"
+      if [ -z "$latest_tarball" ]; then
+        echo "failed to resolve latest Node.js version for ${os_name}-${node_arch}" >&2
+        exit 1
+      fi
+      latest_version="${latest_tarball#node-v}"
+      latest_version="${latest_version%-${os_name}-${node_arch}.tar.gz}"
+      latest_version="${latest_version%-${os_name}-${node_arch}.tar.xz}"
+      if [ -z "$latest_version" ]; then
+        echo "failed to parse latest Node.js version from ${latest_tarball}" >&2
+        exit 1
+      fi
+      printf '%s\n' "$latest_version"
+    }
+
+    legacy_glibc=false
+    if [ "$os_name" = "linux" ] && [ "$node_arch" = "x64" ]; then
+      glibc_version="$(resolve_glibc_version)"
+      if [ -n "$glibc_version" ] && version_lt "$glibc_version" "2.28"; then
+        legacy_glibc=true
+      fi
     fi
 
-    tarball="$(
-      awk -v major="$target_major" -v os="$os_name" -v arch="$node_arch" '
-        $2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-" os "-" arch "\\.tar\\.xz$") {
-          print $2
-          exit
-        }
-      ' "$shasums_file"
-    )"
+    if $legacy_glibc; then
+      unofficial_index="$tmp_dir/unofficial-index.tab"
+      download_file "https://unofficial-builds.nodejs.org/download/release/index.tab" "$unofficial_index"
+      latest_version="$(
+        awk -F '\t' -v major="$target_major" '
+          $1 ~ ("^v" major "\\.") && $3 ~ /(^|,)linux-x64-glibc-217(,|$)/ {
+            version=$1
+            sub(/^v/, "", version)
+            print version
+            exit
+          }
+        ' "$unofficial_index"
+      )"
+      if [ -z "$latest_version" ]; then
+        echo "failed to resolve legacy glibc Node.js version for major ${target_major}" >&2
+        exit 1
+      fi
+      base_url="https://unofficial-builds.nodejs.org/download/release/v${latest_version}"
+      tarball_pattern="node-v${latest_version}-${os_name}-${node_arch}-glibc-217"
+    else
+      latest_version="$(resolve_official_node_version)"
+      base_url="https://nodejs.org/dist/v${latest_version}"
+      tarball_pattern="node-v${latest_version}-${os_name}-${node_arch}"
+    fi
+
+    shasums_file="$tmp_dir/SHASUMS256.txt"
+    download_file "$base_url/SHASUMS256.txt" "$shasums_file"
+
+    tarball=""
+    for ext in tar.gz tar.xz; do
+      candidate="${tarball_pattern}.${ext}"
+      if awk -v target="$candidate" '$2 == target { found=1; exit } END { exit found ? 0 : 1 }' "$shasums_file"; then
+        tarball="$candidate"
+        break
+      fi
+    done
     if [ -z "$tarball" ]; then
-      echo "failed to resolve Node.js tarball for ${os_name}-${node_arch}" >&2
+      echo "failed to resolve Node.js tarball for ${tarball_pattern}" >&2
       exit 1
     fi
 
@@ -140,11 +253,7 @@ download_local_node() {
     fi
 
     archive_path="$tmp_dir/$tarball"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$base_url/$tarball" -o "$archive_path"
-    else
-      wget -qO "$archive_path" "$base_url/$tarball"
-    fi
+    download_file "$base_url/$tarball" "$archive_path"
 
     if command -v sha256sum >/dev/null 2>&1; then
       actual_sha="$(sha256sum "$archive_path" | awk '{print $1}')"
@@ -163,7 +272,14 @@ download_local_node() {
 
     rm -rf "$install_dir"
     mkdir -p "$install_dir"
-    tar -xJf "$archive_path" --strip-components=1 -C "$install_dir"
+    case "$tarball" in
+      *.tar.gz) tar -xzf "$archive_path" --strip-components=1 -C "$install_dir" ;;
+      *.tar.xz) tar -xJf "$archive_path" --strip-components=1 -C "$install_dir" ;;
+      *)
+        echo "unsupported Node.js archive format: $tarball" >&2
+        exit 1
+        ;;
+    esac
     rm -rf "$tmp_dir"
   fi
 

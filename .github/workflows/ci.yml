@@ -446,7 +446,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for img in rockylinux:8 ubuntu:20.04; do
+          for img in centos:7 rockylinux:8 ubuntu:20.04; do
             echo "==> $img (cloudgate tests)"
             docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
               /dist/codex_cloudgate_test -test.v -test.count=1
@@ -459,7 +459,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for img in rockylinux:8 ubuntu:20.04; do
+          for img in centos:7 rockylinux:8 ubuntu:20.04; do
             echo "==> $img (codex upgrade command)"
             docker run --rm \
               -v "$PWD/dist:/dist:ro" \
@@ -469,6 +469,8 @@ jobs:
                 if command -v apt-get >/dev/null 2>&1; then
                   bash /ci/install_container_packages.sh ca-certificates curl xz-utils tar
                 elif command -v dnf >/dev/null 2>&1; then
+                  bash /ci/install_container_packages.sh ca-certificates curl xz tar
+                elif command -v yum >/dev/null 2>&1; then
                   bash /ci/install_container_packages.sh ca-certificates curl xz tar
                 else
                   echo "unsupported package manager for codex upgrade smoke"

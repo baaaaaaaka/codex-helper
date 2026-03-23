@@ -20,6 +20,7 @@ class CodexMonitorIssuesTests(unittest.TestCase):
                 "linux": "pass",
                 "mac": "pass",
                 "windows": "fail",
+                "centos7": "pass",
                 "rockylinux8": "pass",
                 "ubuntu20.04": "pass",
             },
@@ -27,6 +28,7 @@ class CodexMonitorIssuesTests(unittest.TestCase):
                 "linux": "pass",
                 "mac": "pass",
                 "windows": "pass",
+                "centos7": "pass",
                 "rockylinux8": "pass",
                 "ubuntu20.04": "pass",
             },
@@ -62,6 +64,7 @@ class CodexMonitorIssuesTests(unittest.TestCase):
         self.assertEqual(len(planned), 1)
         self.assertIn("`mac`: `not-run`", planned[0]["body"])
         self.assertIn("`windows`: `not-run`", planned[0]["body"])
+        self.assertIn("`centos7`: `not-run`", planned[0]["body"])
 
     def test_plan_issues_skips_duplicate_open_issue(self) -> None:
         version = "0.112.0"
@@ -72,6 +75,7 @@ class CodexMonitorIssuesTests(unittest.TestCase):
                     "linux": "fail",
                     "mac": "pass",
                     "windows": "pass",
+                    "centos7": "pass",
                     "rockylinux8": "pass",
                     "ubuntu20.04": "pass",
                 }

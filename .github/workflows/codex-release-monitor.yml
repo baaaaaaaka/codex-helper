@@ -236,7 +236,7 @@ jobs:
       fail-fast: false
       matrix:
         version: ${{ fromJSON(needs.detect.outputs.versions_to_test) }}
-        platform: [rockylinux8, ubuntu20.04]
+        platform: [centos7, rockylinux8, ubuntu20.04]
 
     steps:
       - name: Checkout default branch
@@ -273,6 +273,10 @@ jobs:
         run: |
           set -euo pipefail
           case "${PLATFORM_NAME}" in
+            centos7)
+              IMAGE="centos:7"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              ;;
             rockylinux8)
               IMAGE="rockylinux:8"
               INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"

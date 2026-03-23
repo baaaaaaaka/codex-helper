@@ -8,7 +8,7 @@ import json
 import re
 from pathlib import Path
 
-PLATFORMS = ["linux", "mac", "windows", "rockylinux8", "ubuntu20.04"]
+PLATFORMS = ["linux", "mac", "windows", "centos7", "rockylinux8", "ubuntu20.04"]
 VERSION_RE = re.compile(r"\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?")
 
 

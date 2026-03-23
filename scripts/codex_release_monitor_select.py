@@ -11,7 +11,7 @@ from pathlib import Path
 
 from codex_version_sweep import normalize_version, select_versions as sweep_select_versions, version_sort_key
 
-PLATFORMS = ["linux", "mac", "windows", "rockylinux8", "ubuntu20.04"]
+PLATFORMS = ["linux", "mac", "windows", "centos7", "rockylinux8", "ubuntu20.04"]
 VERSION_RE = re.compile(r"\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?")
 
 

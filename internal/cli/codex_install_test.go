@@ -1730,6 +1730,21 @@ func TestBootstrapScriptContainsSelfValidation(t *testing.T) {
 	}
 }
 
+func TestBootstrapScriptContainsLegacyGlibcFallback(t *testing.T) {
+	if !strings.Contains(codexInstallBootstrap, "unofficial-builds.nodejs.org") {
+		t.Fatal("bootstrap script missing unofficial-builds mirror for legacy glibc")
+	}
+	if !strings.Contains(codexInstallBootstrap, "glibc-217") {
+		t.Fatal("bootstrap script missing glibc-217 tarball selection")
+	}
+	if !strings.Contains(codexInstallBootstrap, "download/release/index.tab") {
+		t.Fatal("bootstrap script missing unofficial-builds index lookup")
+	}
+	if !strings.Contains(codexInstallBootstrap, "getconf GNU_LIBC_VERSION") {
+		t.Fatal("bootstrap script missing glibc detection")
+	}
+}
+
 func TestBootstrapWindowsScriptContainsSelfValidation(t *testing.T) {
 	if !strings.Contains(codexInstallBootstrapWindows, "$usedSystemNode") {
 		t.Fatal("Windows bootstrap script missing usedSystemNode flag")
