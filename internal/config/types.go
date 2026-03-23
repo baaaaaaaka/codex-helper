@@ -22,9 +22,12 @@ type Profile struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+const InstanceKindDaemon = "daemon"
+
 type Instance struct {
 	ID         string    `json:"id"`
 	ProfileID  string    `json:"profileId"`
+	Kind       string    `json:"kind,omitempty"`
 	HTTPPort   int       `json:"httpPort"`
 	SocksPort  int       `json:"socksPort"`
 	DaemonPID  int       `json:"daemonPid"`

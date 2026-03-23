@@ -114,11 +114,22 @@ func applyBinaryPatchAll(data []byte, p binaryPatch) ([]byte, int, error) {
 	if len(p.old) != len(p.new) {
 		return nil, 0, fmt.Errorf("%s: length mismatch %d vs %d", p.name, len(p.old), len(p.new))
 	}
-	count := bytes.Count(data, p.old)
-	if count == 0 {
-		return data, 0, nil
+	if len(p.old) == 0 {
+		return nil, 0, fmt.Errorf("%s: empty patch pattern", p.name)
 	}
-	return bytes.ReplaceAll(data, p.old, p.new), count, nil
+
+	count := 0
+	start := 0
+	for {
+		idx := bytes.Index(data[start:], p.old)
+		if idx < 0 {
+			return data, count, nil
+		}
+		idx += start
+		copy(data[idx:idx+len(p.new)], p.new)
+		count++
+		start = idx + len(p.old)
+	}
 }
 
 // cloudRequirementsPatches sabotages the cloud requirements URL paths as a

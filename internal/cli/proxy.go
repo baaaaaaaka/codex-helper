@@ -113,6 +113,7 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 			inst := config.Instance{
 				ID:         instanceID,
 				ProfileID:  profile.ID,
+				Kind:       config.InstanceKindDaemon,
 				HTTPPort:   0,
 				SocksPort:  0,
 				DaemonPID:  0,
@@ -251,6 +252,7 @@ func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID s
 
 	now := proxyNow()
 	inst.DaemonPID = os.Getpid()
+	inst.Kind = config.InstanceKindDaemon
 	inst.SocksPort = st.socksPort
 	inst.HTTPPort = st.httpPort
 	if inst.StartedAt.IsZero() {
@@ -293,7 +295,7 @@ func newProxyListCmd(root *rootOptions) *cobra.Command {
 
 			hc := manager.HealthClient{Timeout: 500 * time.Millisecond}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			_, _ = fmt.Fprintln(w, "INSTANCE\tPROFILE\tPID\tHTTP\tSOCKS\tSTATUS\tLAST_SEEN")
+			_, _ = fmt.Fprintln(w, "INSTANCE\tTYPE\tPROFILE\tPID\tHTTP\tSOCKS\tSTATUS\tLAST_SEEN")
 			for _, inst := range cfg.Instances {
 				status := "dead"
 				if inst.DaemonPID > 0 && proxyProcessAlive(inst.DaemonPID) {
@@ -311,11 +313,16 @@ func newProxyListCmd(root *rootOptions) *cobra.Command {
 						break
 					}
 				}
+				instanceType := inst.Kind
+				if instanceType == "" {
+					instanceType = "legacy"
+				}
 
 				_, _ = fmt.Fprintf(
 					w,
-					"%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
+					"%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
 					inst.ID,
+					instanceType,
 					profileName,
 					inst.DaemonPID,
 					inst.HTTPPort,

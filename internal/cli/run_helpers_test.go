@@ -45,6 +45,7 @@ func TestRunWithExistingInstance(t *testing.T) {
 	inst := config.Instance{
 		ID:        "inst-1",
 		ProfileID: "p1",
+		Kind:      config.InstanceKindDaemon,
 		HTTPPort:  0,
 		DaemonPID: os.Getpid(),
 	}
@@ -63,6 +64,7 @@ func TestRunWithExistingInstanceOptionsInstallsCodexUsingProxyEnv(t *testing.T) 
 	inst := config.Instance{
 		ID:         instanceID,
 		ProfileID:  "p1",
+		Kind:       config.InstanceKindDaemon,
 		HTTPPort:   httpPort,
 		DaemonPID:  os.Getpid(),
 		LastSeenAt: time.Now(),
@@ -111,6 +113,7 @@ func TestWithProfileInstallEnvUsesExistingInstance(t *testing.T) {
 	instances := []config.Instance{{
 		ID:         instanceID,
 		ProfileID:  profile.ID,
+		Kind:       config.InstanceKindDaemon,
 		HTTPPort:   httpPort,
 		DaemonPID:  os.Getpid(),
 		LastSeenAt: time.Now(),
@@ -150,6 +153,7 @@ func TestWithProfileInstallEnvFallsBackToNewStackWhenReusableInstallFails(t *tes
 	instances := []config.Instance{{
 		ID:         existingID,
 		ProfileID:  profile.ID,
+		Kind:       config.InstanceKindDaemon,
 		HTTPPort:   existingHTTPPort,
 		DaemonPID:  os.Getpid(),
 		LastSeenAt: time.Now(),
@@ -202,6 +206,7 @@ func TestRunWithProfileOptionsFallsBackToNewStackWhenReusableInstallFails(t *tes
 	instances := []config.Instance{{
 		ID:         existingID,
 		ProfileID:  profile.ID,
+		Kind:       config.InstanceKindDaemon,
 		HTTPPort:   existingHTTPPort,
 		DaemonPID:  os.Getpid(),
 		LastSeenAt: time.Now(),
@@ -282,6 +287,7 @@ func TestRunWithProfileUsesExistingInstance(t *testing.T) {
 	instances := []config.Instance{{
 		ID:         "inst-1",
 		ProfileID:  profile.ID,
+		Kind:       config.InstanceKindDaemon,
 		HTTPPort:   port,
 		DaemonPID:  os.Getpid(),
 		LastSeenAt: time.Now(),
@@ -404,5 +410,40 @@ func TestRunWithNewStackOptionsSuccess(t *testing.T) {
 	}
 	if len(cfg.Instances) != 0 {
 		t.Fatalf("expected instances to be removed, got %d", len(cfg.Instances))
+	}
+}
+
+func TestWithProfileInstallEnvSkipsLegacyInstance(t *testing.T) {
+	lockCLITestHooks(t)
+	profile := config.Profile{ID: "p1"}
+	instances := []config.Instance{{
+		ID:         "inst-legacy",
+		ProfileID:  profile.ID,
+		HTTPPort:   18080,
+		DaemonPID:  os.Getpid(),
+		LastSeenAt: time.Now(),
+	}}
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		return stack.NewStackForTest(22345, 23456), nil
+	}
+
+	store := newTempStore(t)
+	expectedProxy := "http://127.0.0.1:22345"
+	if err := withProfileInstallEnv(context.Background(), store, profile, instances, func(installerEnv []string) error {
+		for _, kv := range installerEnv {
+			if strings.HasPrefix(kv, "HTTP_PROXY=") {
+				if got := strings.TrimPrefix(kv, "HTTP_PROXY="); got != expectedProxy {
+					t.Fatalf("expected fallback HTTP_PROXY %q, got %q", expectedProxy, got)
+				}
+				return nil
+			}
+		}
+		t.Fatal("missing HTTP_PROXY")
+		return nil
+	}); err != nil {
+		t.Fatalf("withProfileInstallEnv error: %v", err)
 	}
 }

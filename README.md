@@ -223,6 +223,9 @@ codex-proxy proxy start [profile]
 codex-proxy proxy list
 ```
 
+Normal `run`, `history open`, and TUI-launched sessions use private proxy stacks.
+Only instances started with `proxy start` are shared/reused across sessions.
+
 Use `--foreground` to keep the daemon attached to the current terminal.
 
 Stop an instance:

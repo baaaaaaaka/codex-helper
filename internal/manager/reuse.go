@@ -7,6 +7,11 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
+var (
+	reuseProcessAlive           = proc.IsAlive
+	reuseLooksLikeProxyDaemonFn = proc.LooksLikeProxyDaemon
+)
+
 func FindReusableInstance(instances []config.Instance, profileID string, hc HealthClient) *config.Instance {
 	var best *config.Instance
 	for i := range instances {
@@ -14,7 +19,10 @@ func FindReusableInstance(instances []config.Instance, profileID string, hc Heal
 		if inst.ProfileID != profileID {
 			continue
 		}
-		if inst.DaemonPID <= 0 || !proc.IsAlive(inst.DaemonPID) {
+		if !isReusableDaemon(inst) {
+			continue
+		}
+		if inst.DaemonPID <= 0 || !reuseProcessAlive(inst.DaemonPID) {
 			continue
 		}
 		if err := hc.CheckHTTPProxy(inst.HTTPPort, inst.ID); err != nil {
@@ -27,6 +35,20 @@ func FindReusableInstance(instances []config.Instance, profileID string, hc Heal
 		}
 	}
 	return best
+}
+
+func isReusableDaemon(inst *config.Instance) bool {
+	if inst == nil {
+		return false
+	}
+	if inst.Kind == config.InstanceKindDaemon {
+		return true
+	}
+	if inst.Kind != "" {
+		return false
+	}
+	ok, err := reuseLooksLikeProxyDaemonFn(inst.DaemonPID)
+	return err == nil && ok
 }
 
 func IsInstanceStale(inst config.Instance, now time.Time, maxAge time.Duration) bool {

@@ -148,21 +148,23 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           go test . -count=1 -run 'TestInstallPs1'
 
-      - name: Recent run/installer regressions (Linux/macOS)
+      - name: Recent run/installer/reuse regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
           go test . -count=1 -run 'TestInstallSh(ReloadsPathWhenHomeContainsSpaces|RemovesLegacyCodexClp|RemovesLegacyCodexClaudeProxyAndClpSymlink|RemovesCodexOwnedClaudeProxyWithoutVersionOutput|PreservesExternalClpSymlinkToClaudeProxy)$'
 
-      - name: Recent run/installer regressions (Windows)
+      - name: Recent run/installer/reuse regressions (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
           go test . -count=1 -run 'TestInstallPs1(RemovesLegacyCodexClpExe|RemovesLegacyCodexClaudeProxyAndClpCmd|PreservesExternalClpCmdReferencingClaudeProxy)$'
 
       - name: go vet

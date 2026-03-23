@@ -65,12 +65,15 @@ func TestProxyStartForegroundRecordsInstanceAndRunsDaemon(t *testing.T) {
 	if cfg.Instances[0].ID != gotInstanceID || cfg.Instances[0].ProfileID != "p1" {
 		t.Fatalf("unexpected recorded instance: %+v", cfg.Instances[0])
 	}
+	if cfg.Instances[0].Kind != config.InstanceKindDaemon {
+		t.Fatalf("expected daemon kind, got %+v", cfg.Instances[0])
+	}
 }
 
 func TestRunProxyDaemonRemovesInstanceOnFatal(t *testing.T) {
 	lockCLITestHooks(t)
 	store := newTempStore(t)
-	inst := config.Instance{ID: "inst-1", ProfileID: "p1"}
+	inst := config.Instance{ID: "inst-1", ProfileID: "p1", Kind: config.InstanceKindDaemon}
 	if err := store.Save(config.Config{
 		Version: config.CurrentVersion,
 		Profiles: []config.Profile{{
@@ -242,7 +245,7 @@ func TestProxyListReportsAliveUnhealthyAndDead(t *testing.T) {
 		}},
 		Instances: []config.Instance{
 			{ID: "inst-alive", ProfileID: "p1", DaemonPID: 11, HTTPPort: 18081, LastSeenAt: ts},
-			{ID: "inst-bad", ProfileID: "p1", DaemonPID: 22, HTTPPort: 18082, LastSeenAt: ts},
+			{ID: "inst-bad", ProfileID: "p1", Kind: config.InstanceKindDaemon, DaemonPID: 22, HTTPPort: 18082, LastSeenAt: ts},
 			{ID: "inst-dead", ProfileID: "missing", DaemonPID: 33, HTTPPort: 18083, LastSeenAt: ts},
 		},
 	}); err != nil {
@@ -278,9 +281,10 @@ func TestProxyListReportsAliveUnhealthyAndDead(t *testing.T) {
 	}
 
 	text := out.String()
-	assertLineContains(t, text, "inst-alive", "alive")
+	assertLineContains(t, text, "inst-alive", "legacy", "alive")
+	assertLineContains(t, text, "inst-bad", "daemon", "unhealthy")
 	assertLineContains(t, text, "inst-bad", "unhealthy")
-	assertLineContains(t, text, "inst-dead", "dead")
+	assertLineContains(t, text, "inst-dead", "legacy", "dead")
 	assertLineContains(t, text, "inst-alive", "dev")
 	assertLineContains(t, text, "inst-dead", "missing")
 }

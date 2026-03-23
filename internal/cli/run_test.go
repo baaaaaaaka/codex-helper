@@ -687,6 +687,7 @@ func TestRunWithProfileOptionsUsesSnapshotFirst(t *testing.T) {
 	instances := []config.Instance{{
 		ID:         instanceID,
 		ProfileID:  "prof-1",
+		Kind:       config.InstanceKindDaemon,
 		HTTPPort:   httpPort,
 		SocksPort:  0,
 		DaemonPID:  os.Getpid(),
@@ -786,6 +787,7 @@ func TestRunWithProfileOptionsSkipsWrongProfile(t *testing.T) {
 		cfg.UpsertInstance(config.Instance{
 			ID:         instanceID,
 			ProfileID:  "other",
+			Kind:       config.InstanceKindDaemon,
 			HTTPPort:   httpPort,
 			SocksPort:  0,
 			DaemonPID:  os.Getpid(),
@@ -834,6 +836,7 @@ func TestRunWithProfileOptionsRefreshesInstances(t *testing.T) {
 	inst := config.Instance{
 		ID:         instanceID,
 		ProfileID:  "prof-1",
+		Kind:       config.InstanceKindDaemon,
 		HTTPPort:   httpPort,
 		SocksPort:  0,
 		DaemonPID:  os.Getpid(),
@@ -875,5 +878,41 @@ func TestRunWithProfileOptionsRefreshesInstances(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("runWithProfileOptions error: %v", err)
+	}
+}
+
+func TestRunWithProfileOptionsSkipsLegacyInstance(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+
+	origStackStart := stackStart
+	defer func() { stackStart = origStackStart }()
+	sentinel := errors.New("mock: stackStart for legacy instance")
+	stackStart = func(_ config.Profile, _ string, _ stack.Options) (*stack.Stack, error) {
+		return nil, sentinel
+	}
+
+	now := time.Now()
+	instances := []config.Instance{{
+		ID:         "legacy-inst",
+		ProfileID:  "prof-1",
+		HTTPPort:   18080,
+		SocksPort:  0,
+		DaemonPID:  os.Getpid(),
+		StartedAt:  now,
+		LastSeenAt: now,
+	}}
+
+	profile := config.Profile{ID: "prof-1", Name: "test"}
+	err := runWithProfileOptions(
+		context.Background(),
+		store,
+		profile,
+		instances,
+		[]string{"true"},
+		defaultRunTargetOptions(),
+	)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel from stackStart, got: %v", err)
 	}
 }

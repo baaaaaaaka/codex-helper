@@ -43,6 +43,102 @@ func buildMachOSyntheticBinary(t *testing.T, markers ...string) []byte {
 	return data
 }
 
+func TestApplyBinaryPatchAllPatchesInPlace(t *testing.T) {
+	data := buildSyntheticBinary(t,
+		"allowed_sandbox_modes",
+		"MIDDLE",
+		"allowed_sandbox_modes",
+	)
+	original := append([]byte(nil), data...)
+	patch := binaryPatch{
+		old:  []byte("allowed_sandbox_modes"),
+		new:  []byte("allowed_sandbox_modez"),
+		name: "sandbox modes TOML key",
+	}
+
+	got, count, err := applyBinaryPatchAll(data, patch)
+	if err != nil {
+		t.Fatalf("applyBinaryPatchAll: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("replacement count = %d, want 2", count)
+	}
+	want := bytes.ReplaceAll(original, patch.old, patch.new)
+	if !bytes.Equal(got, want) {
+		t.Fatal("patched bytes differ from ReplaceAll output")
+	}
+	if len(got) == 0 || &got[0] != &data[0] {
+		t.Fatal("expected applyBinaryPatchAll to reuse the input buffer")
+	}
+}
+
+func TestApplyBinaryPatchAllRejectsEmptyPattern(t *testing.T) {
+	data := buildSyntheticBinary(t, "unchanged")
+	_, _, err := applyBinaryPatchAll(data, binaryPatch{
+		old:  []byte(""),
+		new:  []byte(""),
+		name: "empty",
+	})
+	if err == nil {
+		t.Fatal("expected error for empty patch pattern")
+	}
+}
+
+func TestApplyBinaryPatchAllWithoutMatchReusesInputBuffer(t *testing.T) {
+	data := buildSyntheticBinary(t, "unchanged")
+	original := append([]byte(nil), data...)
+	patch := binaryPatch{
+		old:  []byte("allowed_sandbox_modes"),
+		new:  []byte("allowed_sandbox_modez"),
+		name: "sandbox modes TOML key",
+	}
+
+	got, count, err := applyBinaryPatchAll(data, patch)
+	if err != nil {
+		t.Fatalf("applyBinaryPatchAll: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("replacement count = %d, want 0", count)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatal("expected unmatched patch to leave data unchanged")
+	}
+	if len(got) == 0 || &got[0] != &data[0] {
+		t.Fatal("expected unmatched patch to reuse the input buffer")
+	}
+}
+
+func TestApplyBinaryPatchAllDoesNotAllocateForInPlaceReplacement(t *testing.T) {
+	template := buildSyntheticBinary(t,
+		"allowed_sandbox_modes",
+		"MIDDLE",
+		"allowed_sandbox_modes",
+	)
+	buf := make([]byte, len(template))
+	patch := binaryPatch{
+		old:  []byte("allowed_sandbox_modes"),
+		new:  []byte("allowed_sandbox_modez"),
+		name: "sandbox modes TOML key",
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		copy(buf, template)
+		got, count, err := applyBinaryPatchAll(buf, patch)
+		if err != nil {
+			t.Fatalf("applyBinaryPatchAll: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("replacement count = %d, want 2", count)
+		}
+		if len(got) == 0 || &got[0] != &buf[0] {
+			t.Fatal("expected applyBinaryPatchAll to reuse the input buffer")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("allocs per run = %v, want 0", allocs)
+	}
+}
+
 func TestLooksLikeMachO(t *testing.T) {
 	for i, magic := range machOMagics {
 		data := append([]byte{}, magic...)
