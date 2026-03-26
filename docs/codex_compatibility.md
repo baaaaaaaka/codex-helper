@@ -4,6 +4,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 
 | Codex version | linux | mac | windows | centos7 | rockylinux8 | ubuntu20.04 | last_tested_utc |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.117.0-alpha.25 | pass | pass | pass | pass | pass | pass | 2026-03-26T21:23:14Z |
 | 0.117.0-alpha.24 | pass | pass | pass | pass | pass | pass | 2026-03-26T20:26:41Z |
 | 0.117.0-alpha.23 | pass | pass | pass | pass | pass | pass | 2026-03-26T17:52:25Z |
 | 0.117.0-alpha.22 | pass | pass | pass | pass | pass | pass | 2026-03-26T08:41:57Z |
