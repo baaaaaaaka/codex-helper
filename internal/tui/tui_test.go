@@ -908,10 +908,52 @@ func TestPreviewTextHelpers(t *testing.T) {
 func TestBuildPreviewLinesShowsLoadingWhileProjectsLoading(t *testing.T) {
 	state := newTestState(nil)
 	state.loadingProjects = true
+	state.loadingStartedAt = time.Now().Add(-1500 * time.Millisecond)
 
 	lines := buildPreviewLines(codexhistory.Project{}, nil, nil, false, state, "", Options{})
-	if !reflect.DeepEqual(lines, []string{"Loading Codex session history..."}) {
+	if len(lines) != 3 {
 		t.Fatalf("unexpected loading preview lines: %#v", lines)
+	}
+	if !strings.Contains(lines[0], "Loading Codex session history...") {
+		t.Fatalf("unexpected loading preview title: %q", lines[0])
+	}
+	if lines[1] != "Large histories can take a while." {
+		t.Fatalf("unexpected loading preview hint: %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "Elapsed: ") {
+		t.Fatalf("unexpected loading preview lines: %#v", lines)
+	}
+}
+
+func TestBuildPreviewLinesPreservesSessionContentWhileProjectsLoadingWithExistingProjects(t *testing.T) {
+	project := codexhistory.Project{
+		Key:  "proj-1",
+		Path: "/tmp/proj-1",
+	}
+	session := codexhistory.Session{
+		SessionID: "sess-1",
+		Summary:   "hello",
+	}
+	state := newTestState([]codexhistory.Project{project})
+	state.loadingProjects = true
+	state.loadingStartedAt = time.Now().Add(-1500 * time.Millisecond)
+
+	lines := buildPreviewLines(project, &session, nil, false, state, "preview text", Options{})
+	if len(lines) == 0 {
+		t.Fatal("expected preview lines")
+	}
+	if strings.Contains(lines[0], "Loading Codex session history...") {
+		t.Fatalf("expected existing session content, got %#v", lines)
+	}
+	foundSession := false
+	for _, line := range lines {
+		if line == "Session:" {
+			foundSession = true
+			break
+		}
+	}
+	if !foundSession {
+		t.Fatalf("expected session details, got %#v", lines)
 	}
 }
 
@@ -1103,8 +1145,8 @@ func TestSelectSessionInitialLoadDoesNotBlockScreenInit(t *testing.T) {
 		t.Fatal("timeout waiting for initial load to start")
 	}
 
-	_, h := screen.Size()
-	waitForScreenLineContains(t, screen, h-1, "Loading history...")
+	waitForScreenContains(t, screen, "Loading Codex session history...")
+	waitForScreenContains(t, screen, "Large histories can take a while.")
 
 	close(releaseLoad)
 	screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
@@ -1865,11 +1907,104 @@ func TestDrawShowsLoadingStatusWhenProjectsLoading(t *testing.T) {
 
 	_, h := screen.Size()
 	line := readScreenLine(screen, h-1)
-	if !strings.Contains(line, "Loading history...") {
+	if !strings.Contains(line, "Loading Codex session history...") {
 		t.Fatalf("expected loading hint in status line, got %q", strings.TrimSpace(line))
+	}
+	if !strings.Contains(line, "Elapsed:") {
+		t.Fatalf("expected elapsed time in loading state, got %q", strings.TrimSpace(line))
 	}
 	if !strings.Contains(line, "YOLO mode (Ctrl+Y): off") {
 		t.Fatalf("expected yolo hint in loading state, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestDrawShowsLoadingRowsWhenProjectsLoading(t *testing.T) {
+	screen := newTestScreen(t, 160, 20)
+	state := newTestState(nil)
+	state.loadingProjects = true
+	state.loadingStartedAt = time.Now().Add(-1500 * time.Millisecond)
+
+	previewCh := make(chan previewEvent, 1)
+	if err := draw(screen, state, Options{}, previewCh); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+
+	line1 := readScreenLine(screen, 1)
+	line2 := readScreenLine(screen, 2)
+	line3 := readScreenLine(screen, 3)
+	if !strings.Contains(line1, "Loading Codex session history...") {
+		t.Fatalf("expected loading rows in list panes, got %q", strings.TrimSpace(line1))
+	}
+	if !strings.Contains(line2, "Large histories can take a while.") {
+		t.Fatalf("expected loading hint in list panes, got %q", strings.TrimSpace(line2))
+	}
+	if !strings.Contains(line3, "Elapsed: ") {
+		t.Fatalf("expected elapsed line in list panes, got %q", strings.TrimSpace(line3))
+	}
+}
+
+func TestDrawPreservesExistingRowsWhileProjectsLoading(t *testing.T) {
+	screen := newTestScreen(t, 160, 20)
+	state := newTestState([]codexhistory.Project{{
+		Key:  "proj-1",
+		Path: "/tmp/visible-project",
+	}})
+	state.loadingProjects = true
+	state.loadingStartedAt = time.Now().Add(-1500 * time.Millisecond)
+
+	previewCh := make(chan previewEvent, 1)
+	if err := draw(screen, state, Options{}, previewCh); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+
+	line1 := readScreenLine(screen, 1)
+	if strings.Contains(line1, "Loading Codex session history...") {
+		t.Fatalf("expected existing rows to remain visible, got %q", strings.TrimSpace(line1))
+	}
+	if !strings.Contains(line1, "visible-project") {
+		t.Fatalf("expected existing project row to remain visible, got %q", strings.TrimSpace(line1))
+	}
+}
+
+func TestLoadingRowsRespectViewHeight(t *testing.T) {
+	state := newTestState(nil)
+	state.loadingProjects = true
+	state.loadingStartedAt = time.Now().Add(-1500 * time.Millisecond)
+
+	rows := loadingRows(state, 1)
+	if len(rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(rows))
+	}
+	if !strings.Contains(rows[0].label, "Loading Codex session history...") {
+		t.Fatalf("unexpected primary loading row: %#v", rows[0])
+	}
+
+	rows = loadingRows(state, 2)
+	if len(rows) != 2 {
+		t.Fatalf("expected two rows, got %d", len(rows))
+	}
+	if rows[1].label != "Large histories can take a while." {
+		t.Fatalf("unexpected secondary loading row: %#v", rows[1])
+	}
+
+	rows = loadingRows(state, 3)
+	if len(rows) != 3 {
+		t.Fatalf("expected three rows, got %d", len(rows))
+	}
+	if !strings.HasPrefix(rows[2].label, "Elapsed: ") {
+		t.Fatalf("unexpected elapsed loading row: %#v", rows[2])
+	}
+}
+
+func TestFormatLoadingElapsedThresholds(t *testing.T) {
+	if got := formatLoadingElapsed(950 * time.Millisecond); got != "950ms" {
+		t.Fatalf("expected milliseconds formatting, got %q", got)
+	}
+	if got := formatLoadingElapsed(1500 * time.Millisecond); got != "1.5s" {
+		t.Fatalf("expected fractional seconds formatting, got %q", got)
+	}
+	if got := formatLoadingElapsed(12*time.Second + 300*time.Millisecond); got != "12s" {
+		t.Fatalf("expected whole seconds formatting, got %q", got)
 	}
 }
 

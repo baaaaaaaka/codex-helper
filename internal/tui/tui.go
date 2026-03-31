@@ -32,6 +32,7 @@ var errQuit = errors.New("quit")
 const updateErrorDisplayDuration = 4 * time.Second
 
 var newScreen = tcell.NewScreen
+var loadingFrames = []string{"-", "\\", "|", "/"}
 
 type Selection struct {
 	Project  codexhistory.Project
@@ -153,6 +154,7 @@ type uiState struct {
 	projects         []codexhistory.Project
 	loadError        error
 	loadingProjects  bool
+	loadingStartedAt time.Time
 	focus            string
 	lastListFocus    string
 	inputMode        string
@@ -190,6 +192,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 
 	state := &uiState{
 		loadingProjects:  true,
+		loadingStartedAt: time.Now(),
 		focus:            "projects",
 		lastListFocus:    "projects",
 		proxyEnabled:     opts.ProxyEnabled,
@@ -215,6 +218,8 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 	defer close(done)
 	loadCtx, cancelLoad := context.WithCancel(ctx)
 	defer cancelLoad()
+	loadingTickerCtx, cancelLoadingTicker := context.WithCancel(ctx)
+	defer cancelLoadingTicker()
 
 	projectLoadCh := make(chan projectLoadEvent, 1)
 	go func() {
@@ -227,6 +232,21 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 		case projectLoadCh <- projectLoadEvent{projects: projects, err: err}:
 		}
 		postUIEventWithRetry(loadCtx, done, screen, &uiEvent{when: time.Now(), kind: "load"})
+	}()
+
+	go func() {
+		ticker := time.NewTicker(125 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				postUIEventWithRetry(loadingTickerCtx, done, screen, &uiEvent{when: time.Now(), kind: "loading"})
+			case <-done:
+				return
+			case <-loadingTickerCtx.Done():
+				return
+			}
+		}
 	}()
 
 	updateCh := make(chan updateEvent, 2)
@@ -303,6 +323,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 				for {
 					select {
 					case ev := <-projectLoadCh:
+						cancelLoadingTicker()
 						state.loadingProjects = false
 						state.projects = ev.projects
 						state.loadError = ev.err
@@ -797,7 +818,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 	statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
 	if state.loadingProjects {
 		statusSegments = []statusSegment{
-			{text: "Loading history...  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: loadingStatusText(state) + "  " + proxyLabel + "  ", style: baseStatusStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}
 		statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
@@ -875,6 +896,13 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 	}
 
 	if layoutMode.mode == "1col" {
+		projectRows := renderProjectRows(filteredProjects, listFocus == "projects", state.projectState, layoutMode.projects.w-2, layoutMode.projects.h-2)
+		sessionRows := renderSessionRows(filteredSessions, listFocus == "sessions", state.sessionState, layoutMode.projects.h-2)
+		if shouldShowLoadingRows(state) {
+			projectRows = loadingRows(state, layoutMode.projects.h-2)
+			sessionRows = loadingRows(state, layoutMode.projects.h-2)
+		}
+
 		title := "Projects"
 		listFilter := projectFilter
 		if listFocus == "sessions" {
@@ -885,28 +913,35 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		drawList(
 			screen,
 			layoutMode.projects,
-			renderProjectRows(filteredProjects, listFocus == "projects", state.projectState, layoutMode.projects.w-2, layoutMode.projects.h-2),
+			projectRows,
 		)
 		if listFocus == "sessions" {
 			drawList(
 				screen,
 				layoutMode.projects,
-				renderSessionRows(filteredSessions, listFocus == "sessions", state.sessionState, layoutMode.projects.h-2),
+				sessionRows,
 			)
 		}
 	} else {
+		projectRows := renderProjectRows(filteredProjects, state.focus == "projects", state.projectState, layoutMode.projects.w-2, layoutMode.projects.h-2)
+		sessionRows := renderSessionRows(filteredSessions, state.focus == "sessions", state.sessionState, layoutMode.sessions.h-2)
+		if shouldShowLoadingRows(state) {
+			projectRows = loadingRows(state, layoutMode.projects.h-2)
+			sessionRows = loadingRows(state, layoutMode.sessions.h-2)
+		}
+
 		drawBox(screen, layoutMode.projects, "Projects", state.focus == "projects", projectFilter)
 		drawList(
 			screen,
 			layoutMode.projects,
-			renderProjectRows(filteredProjects, state.focus == "projects", state.projectState, layoutMode.projects.w-2, layoutMode.projects.h-2),
+			projectRows,
 		)
 
 		drawBox(screen, layoutMode.sessions, "Sessions", state.focus == "sessions", sessionFilter)
 		drawList(
 			screen,
 			layoutMode.sessions,
-			renderSessionRows(filteredSessions, state.focus == "sessions", state.sessionState, layoutMode.sessions.h-2),
+			sessionRows,
 		)
 	}
 
@@ -1456,8 +1491,8 @@ func buildPreviewLines(
 	if state.loadError != nil {
 		return []string{fmt.Sprintf("Load error: %v", state.loadError)}
 	}
-	if state.loadingProjects {
-		return []string{"Loading Codex session history..."}
+	if shouldShowLoadingRows(state) {
+		return loadingPreviewLines(state)
 	}
 	if project.Path == "" && len(state.projects) == 0 {
 		return []string{"No Codex sessions found.", "Run Codex to create a session first."}
@@ -1571,6 +1606,91 @@ func renderSessionRows(items []sessionItem, focused bool, state listState, viewH
 		rows = append(rows, rowItem)
 	}
 	return applySelection(rows, focused, listState{selected: state.selected - start})
+}
+
+func loadingRows(state *uiState, viewH int) []row {
+	if viewH <= 0 {
+		return nil
+	}
+	rows := []row{{
+		label: loadingPrimaryText(state),
+		bold:  true,
+		dim:   true,
+	}}
+	if viewH > 1 {
+		rows = append(rows, row{
+			label: loadingSecondaryText(),
+			dim:   true,
+		})
+	}
+	if viewH > 2 {
+		rows = append(rows, row{
+			label: loadingElapsedText(state),
+			dim:   true,
+		})
+	}
+	return rows
+}
+
+func shouldShowLoadingRows(state *uiState) bool {
+	return state.loadingProjects && len(state.projects) == 0
+}
+
+func loadingPrimaryText(state *uiState) string {
+	return fmt.Sprintf("%s Loading Codex session history...", loadingFrame(state))
+}
+
+func loadingSecondaryText() string {
+	return "Large histories can take a while."
+}
+
+func loadingElapsedText(state *uiState) string {
+	return "Elapsed: " + formatLoadingElapsed(loadingElapsed(state))
+}
+
+func loadingPreviewLines(state *uiState) []string {
+	return []string{
+		loadingPrimaryText(state),
+		loadingSecondaryText(),
+		loadingElapsedText(state),
+	}
+}
+
+func loadingStatusText(state *uiState) string {
+	return loadingPrimaryText(state) + "  " + loadingElapsedText(state)
+}
+
+func loadingFrame(state *uiState) string {
+	if len(loadingFrames) == 0 {
+		return "-"
+	}
+	elapsed := loadingElapsed(state)
+	frame := int(elapsed / (125 * time.Millisecond))
+	return loadingFrames[frame%len(loadingFrames)]
+}
+
+func loadingElapsed(state *uiState) time.Duration {
+	if state == nil || state.loadingStartedAt.IsZero() {
+		return 0
+	}
+	return maxDuration(0, time.Since(state.loadingStartedAt))
+}
+
+func formatLoadingElapsed(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < 10*time.Second {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	return fmt.Sprintf("%ds", int(d.Round(time.Second)/time.Second))
+}
+
+func maxDuration(a time.Duration, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 type row struct {
