@@ -3,6 +3,7 @@ package codexhistory
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -48,7 +49,14 @@ type codexResponsePayload struct {
 }
 
 func readSessionFileMeta(filePath string) (sessionFileMeta, error) {
+	return readSessionFileMetaContext(context.Background(), filePath)
+}
+
+func readSessionFileMetaContext(ctx context.Context, filePath string) (sessionFileMeta, error) {
 	var meta sessionFileMeta
+	if err := ctx.Err(); err != nil {
+		return meta, err
+	}
 	f, err := os.Open(filePath)
 	if err != nil {
 		return meta, err
@@ -57,6 +65,9 @@ func readSessionFileMeta(filePath string) (sessionFileMeta, error) {
 
 	reader := bufio.NewReaderSize(f, 64*1024)
 	for {
+		if err := ctx.Err(); err != nil {
+			return meta, err
+		}
 		line, err := reader.ReadBytes('\n')
 		if err != nil && err != io.EOF {
 			return meta, err
@@ -91,17 +102,23 @@ func readSessionFileMeta(filePath string) (sessionFileMeta, error) {
 //   - {"subagent": "review"} or {"subagent": "compact"} → subagent with string type
 //   - {"subagent": {"thread_spawn": {"parent_thread_id": "uuid", "depth": 1}}} → thread_spawn subagent
 func parseSessionSource(raw json.RawMessage) (isSubagent bool, subagentType string, parentThreadID string) {
+	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
 		return false, "", ""
 	}
 
-	// Fast path: try as plain string (e.g. "cli", "vscode").
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
+	// Fast path: plain string sources like "cli", "vscode", "exec", "mcp".
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return false, "", ""
+		}
+	}
+
+	if raw[0] != '{' {
 		return false, "", ""
 	}
 
-	// Object path: try {"subagent": ...}.
 	var outer struct {
 		Subagent json.RawMessage `json:"subagent"`
 	}
@@ -109,22 +126,34 @@ func parseSessionSource(raw json.RawMessage) (isSubagent bool, subagentType stri
 		return false, "", ""
 	}
 
-	// Subagent value is itself polymorphic: string or object.
-	var subStr string
-	if json.Unmarshal(outer.Subagent, &subStr) == nil {
-		// e.g. "review", "compact"
-		return true, subStr, ""
+	sub := bytes.TrimSpace(outer.Subagent)
+	if len(sub) == 0 {
+		return false, "", ""
 	}
 
-	// Try as {"thread_spawn": {"parent_thread_id": "...", "depth": N}}.
-	var subObj struct {
-		ThreadSpawn struct {
-			ParentThreadID string `json:"parent_thread_id"`
-			Depth          int    `json:"depth"`
-		} `json:"thread_spawn"`
+	// Preserve the current odd-but-tested behavior for {"subagent": null}.
+	if bytes.Equal(sub, []byte("null")) {
+		return true, "", ""
 	}
-	if json.Unmarshal(outer.Subagent, &subObj) == nil && subObj.ThreadSpawn.ParentThreadID != "" {
-		return true, "thread_spawn", subObj.ThreadSpawn.ParentThreadID
+
+	if sub[0] == '"' {
+		var subStr string
+		if json.Unmarshal(sub, &subStr) == nil {
+			// e.g. "review", "compact"
+			return true, subStr, ""
+		}
+	}
+
+	if sub[0] == '{' {
+		var subObj struct {
+			ThreadSpawn struct {
+				ParentThreadID string `json:"parent_thread_id"`
+				Depth          int    `json:"depth"`
+			} `json:"thread_spawn"`
+		}
+		if json.Unmarshal(sub, &subObj) == nil && subObj.ThreadSpawn.ParentThreadID != "" {
+			return true, "thread_spawn", subObj.ThreadSpawn.ParentThreadID
+		}
 	}
 
 	// Unknown subagent format — still mark as subagent.
@@ -166,18 +195,27 @@ func processMetaLine(line []byte, meta *sessionFileMeta) {
 		}
 
 	case "response_item":
-		var payload codexResponsePayload
-		if json.Unmarshal(env.Payload, &payload) != nil {
+		var header struct {
+			Type string `json:"type"`
+			Role string `json:"role"`
+		}
+		if json.Unmarshal(env.Payload, &header) != nil {
 			return
 		}
-		if payload.Type != "message" {
+		if header.Type != "message" {
 			return
 		}
-		role := strings.ToLower(payload.Role)
+		role := strings.ToLower(header.Role)
 		if role != "user" && role != "assistant" {
 			return
 		}
 		if role == "user" {
+			var payload struct {
+				Content json.RawMessage `json:"content"`
+			}
+			if json.Unmarshal(env.Payload, &payload) != nil {
+				return
+			}
 			text := extractContentText(payload.Content)
 			if shouldSkipFirstPrompt(text) {
 				return // system-injected user message, skip entirely
@@ -262,28 +300,32 @@ func parseTimestamp(raw string) time.Time {
 // extractContentText extracts text from a Codex content array.
 // Content is always [{type: "input_text"/"output_text", text: "..."}].
 func extractContentText(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
 		return ""
 	}
 
-	var items []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &items) == nil {
-		var parts []string
-		for _, item := range items {
-			if item.Text != "" {
-				parts = append(parts, item.Text)
-			}
+	if raw[0] == '[' {
+		var items []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
 		}
-		return strings.Join(parts, "\n")
+		if json.Unmarshal(raw, &items) == nil {
+			var parts []string
+			for _, item := range items {
+				if item.Text != "" {
+					parts = append(parts, item.Text)
+				}
+			}
+			return strings.Join(parts, "\n")
+		}
 	}
 
-	// Fallback: try as plain string
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return s
+		}
 	}
 	return ""
 }

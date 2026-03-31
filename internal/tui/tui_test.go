@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -44,6 +45,44 @@ func (s *sizedScreen) Init() error {
 	return nil
 }
 
+type failLoadPostEventOnceScreen struct {
+	tcell.Screen
+	initDone      chan struct{}
+	mu            sync.Mutex
+	failLoadPosts int
+}
+
+func (s *failLoadPostEventOnceScreen) Init() error {
+	if err := s.Screen.Init(); err != nil {
+		return err
+	}
+	s.Screen.SetSize(80, 24)
+	if s.initDone != nil {
+		close(s.initDone)
+	}
+	return nil
+}
+
+func (s *failLoadPostEventOnceScreen) PostEvent(ev tcell.Event) error {
+	if uiEv, ok := ev.(*uiEvent); ok && uiEv.kind == "load" {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.failLoadPosts > 0 {
+			s.failLoadPosts--
+			return tcell.ErrEventQFull
+		}
+	}
+	return s.Screen.PostEvent(ev)
+}
+
+type alwaysFullPostEventScreen struct {
+	tcell.Screen
+}
+
+func (s *alwaysFullPostEventScreen) PostEvent(tcell.Event) error {
+	return tcell.ErrEventQFull
+}
+
 func newSelectSessionTestScreen(t *testing.T) (tcell.Screen, <-chan struct{}) {
 	t.Helper()
 	screen := tcell.NewSimulationScreen("UTF-8")
@@ -63,6 +102,33 @@ func waitForScreenInit(t *testing.T, initDone <-chan struct{}) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("timeout waiting for screen init")
 	}
+}
+
+func waitForScreenLineContains(t *testing.T, screen tcell.Screen, y int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if strings.Contains(readScreenLine(screen, y), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for screen line %d to contain %q; got %q", y, want, strings.TrimSpace(readScreenLine(screen, y)))
+}
+
+func waitForScreenContains(t *testing.T, screen tcell.Screen, want string) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, h := screen.Size()
+		for y := 0; y < h; y++ {
+			if strings.Contains(readScreenLine(screen, y), want) {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for screen to contain %q", want)
 }
 
 func postEventsAfterInit(initDone <-chan struct{}, screen tcell.Screen, events ...tcell.Event) {
@@ -527,6 +593,34 @@ func TestHandleKeyEnterStartsNewSessionWhenNoHistory(t *testing.T) {
 	}
 }
 
+func TestHandleKeyEnterIgnoredWhileProjectsLoading(t *testing.T) {
+	screen := newTestScreen(t, 120, 40)
+	state := newTestState(nil)
+	state.loadingProjects = true
+
+	selection, err := handleKey(context.Background(), screen, state, Options{DefaultCwd: t.TempDir()}, tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	if err != nil {
+		t.Fatalf("handleKey error: %v", err)
+	}
+	if selection != nil {
+		t.Fatalf("expected no selection while projects are loading, got %#v", selection)
+	}
+}
+
+func TestHandleKeyCtrlNIgnoredWhileProjectsLoading(t *testing.T) {
+	screen := newTestScreen(t, 120, 40)
+	state := newTestState(nil)
+	state.loadingProjects = true
+
+	selection, err := handleKey(context.Background(), screen, state, Options{DefaultCwd: t.TempDir()}, tcell.NewEventKey(tcell.KeyCtrlN, 0, 0))
+	if err != nil {
+		t.Fatalf("handleKey error: %v", err)
+	}
+	if selection != nil {
+		t.Fatalf("expected no selection while projects are loading, got %#v", selection)
+	}
+}
+
 func TestRefreshStateUpdatesOrPreserves(t *testing.T) {
 	t.Run("preserves projects on error", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -587,6 +681,39 @@ func TestRefreshStateUpdatesOrPreserves(t *testing.T) {
 			t.Fatalf("expected selection to be preserved, got %#v %#v %#v", state.projectState, state.sessionState, state.previewState)
 		}
 	})
+}
+
+func TestHandleKeyRefreshIgnoredWhileProjectsLoading(t *testing.T) {
+	screen := newTestScreen(t, 120, 40)
+
+	for _, tc := range []struct {
+		name string
+		ev   *tcell.EventKey
+	}{
+		{name: "ctrl-r", ev: tcell.NewEventKey(tcell.KeyCtrlR, 0, 0)},
+		{name: "rune-r", ev: tcell.NewEventKey(tcell.KeyRune, 'r', 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newTestState([]codexhistory.Project{{Key: "one"}})
+			state.loadingProjects = true
+			called := false
+			selection, err := handleKey(context.Background(), screen, state, Options{
+				LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+					called = true
+					return nil, nil
+				},
+			}, tc.ev)
+			if err != nil {
+				t.Fatalf("handleKey error: %v", err)
+			}
+			if selection != nil {
+				t.Fatalf("expected no selection, got %#v", selection)
+			}
+			if called {
+				t.Fatal("expected refresh to be ignored while projects are loading")
+			}
+		})
+	}
 }
 
 func TestTextHelpers(t *testing.T) {
@@ -778,6 +905,16 @@ func TestPreviewTextHelpers(t *testing.T) {
 	}
 }
 
+func TestBuildPreviewLinesShowsLoadingWhileProjectsLoading(t *testing.T) {
+	state := newTestState(nil)
+	state.loadingProjects = true
+
+	lines := buildPreviewLines(codexhistory.Project{}, nil, nil, false, state, "", Options{})
+	if !reflect.DeepEqual(lines, []string{"Loading Codex session history..."}) {
+		t.Fatalf("unexpected loading preview lines: %#v", lines)
+	}
+}
+
 func TestIsPreviewNavKey(t *testing.T) {
 	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyPgUp, 0, 0)) {
 		t.Fatalf("expected KeyPgUp to be preview nav key")
@@ -916,11 +1053,13 @@ func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	postEventsAfterInit(initDone, screen,
-		tcell.NewEventKey(tcell.KeyRune, 'l', 0),
-		tcell.NewEventKey(tcell.KeyDown, 0, 0),
-		tcell.NewEventKey(tcell.KeyEnter, 0, 0),
-	)
+	go func() {
+		<-initDone
+		waitForScreenContains(t, screen, "sess-1")
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	}()
 
 	selection, err := SelectSession(ctx, Options{
 		LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
@@ -932,6 +1071,261 @@ func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
 	}
 	if selection == nil || selection.Session.SessionID != "sess-1" {
 		t.Fatalf("unexpected selection: %#v", selection)
+	}
+}
+
+func TestSelectSessionInitialLoadDoesNotBlockScreenInit(t *testing.T) {
+	screen, initDone := newSelectSessionTestScreen(t)
+
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	done := make(chan error, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		_, err := SelectSession(ctx, Options{
+			LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+				close(loadStarted)
+				<-releaseLoad
+				return nil, nil
+			},
+		})
+		done <- err
+	}()
+
+	waitForScreenInit(t, initDone)
+
+	select {
+	case <-loadStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for initial load to start")
+	}
+
+	_, h := screen.Size()
+	waitForScreenLineContains(t, screen, h-1, "Loading history...")
+
+	close(releaseLoad)
+	screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SelectSession error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for SelectSession to exit")
+	}
+}
+
+func TestSelectSessionInitialLoadPreservesProjectsOnPartialError(t *testing.T) {
+	screen, initDone := newSelectSessionTestScreen(t)
+
+	projectPath := t.TempDir()
+	projects := []codexhistory.Project{{
+		Key:  "proj-1",
+		Path: projectPath,
+		Sessions: []codexhistory.Session{{
+			SessionID:   "sess-1",
+			ProjectPath: projectPath,
+			FilePath:    filepath.Join(projectPath, "sess-1.jsonl"),
+		}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		<-initDone
+		waitForScreenContains(t, screen, "sess-1")
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	}()
+
+	selection, err := SelectSession(ctx, Options{
+		LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			return projects, errors.New("partial load failure")
+		},
+	})
+	if err != nil {
+		t.Fatalf("SelectSession error: %v", err)
+	}
+	if selection == nil || selection.Session.SessionID != "sess-1" {
+		t.Fatalf("unexpected selection: %#v", selection)
+	}
+}
+
+func TestSelectSessionCancelsInitialLoadOnQuit(t *testing.T) {
+	screen, initDone := newSelectSessionTestScreen(t)
+
+	loadStarted := make(chan struct{})
+	loadCanceled := make(chan struct{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		<-initDone
+		<-loadStarted
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
+	}()
+
+	selection, err := SelectSession(ctx, Options{
+		LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
+			close(loadStarted)
+			<-ctx.Done()
+			close(loadCanceled)
+			return nil, ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatalf("SelectSession error: %v", err)
+	}
+	if selection != nil {
+		t.Fatalf("expected nil selection, got %#v", selection)
+	}
+
+	select {
+	case <-loadCanceled:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for initial load to be canceled")
+	}
+}
+
+func TestSelectSessionInitialLoadRecoversFromEventQueueFull(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	initDone := make(chan struct{})
+	prevNewScreen := newScreen
+	newScreen = func() (tcell.Screen, error) {
+		return &failLoadPostEventOnceScreen{
+			Screen:        screen,
+			initDone:      initDone,
+			failLoadPosts: 1,
+		}, nil
+	}
+	t.Cleanup(func() { newScreen = prevNewScreen })
+
+	projectPath := t.TempDir()
+	projects := []codexhistory.Project{{
+		Key:  "proj-1",
+		Path: projectPath,
+		Sessions: []codexhistory.Session{{
+			SessionID:   "sess-1",
+			ProjectPath: projectPath,
+			FilePath:    filepath.Join(projectPath, "sess-1.jsonl"),
+		}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		<-initDone
+		waitForScreenContains(t, screen, "sess-1")
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	}()
+
+	selection, err := SelectSession(ctx, Options{
+		LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			return projects, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("SelectSession error: %v", err)
+	}
+	if selection == nil || selection.Session.SessionID != "sess-1" {
+		t.Fatalf("unexpected selection: %#v", selection)
+	}
+}
+
+func TestPostUIEventWithRetryReturnsOnContextCancelAfterEventQueueFull(t *testing.T) {
+	screen := newTestScreen(t, 80, 24)
+	fullScreen := &alwaysFullPostEventScreen{Screen: screen}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	returned := make(chan struct{})
+
+	go func() {
+		postUIEventWithRetry(ctx, done, fullScreen, &uiEvent{when: time.Now(), kind: "load"})
+		close(returned)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-returned:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for postUIEventWithRetry to return after context cancellation")
+	}
+}
+
+func TestSelectSessionCancelsInitialLoadUnderPersistentCacheLockContention(t *testing.T) {
+	screen, initDone := newSelectSessionTestScreen(t)
+
+	cacheHome := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	t.Setenv("HOME", cacheHome)
+	t.Setenv("LOCALAPPDATA", cacheHome)
+
+	codexDir := t.TempDir()
+	sessionsDir := filepath.Join(codexDir, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	sessionID := "11111111-1111-1111-1111-111111111111"
+	sessionPath := filepath.Join(sessionsDir, "rollout-2026-01-01T00-00-00-"+sessionID+".jsonl")
+	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + filepath.ToSlash(codexDir) + `","source":"cli"}}` + "\n" +
+		`{"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"prompt"}]}}` + "\n"
+	if err := os.WriteFile(sessionPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	cachePath := filepath.Join(cacheHome, "codex-proxy", "codexhistory", "session_meta_cache.json")
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		t.Fatalf("mkdir cache dir: %v", err)
+	}
+	lock := flock.New(cachePath + ".lock")
+	if err := lock.Lock(); err != nil {
+		t.Fatalf("lock session meta cache: %v", err)
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	loadReturned := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		<-initDone
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
+	}()
+
+	selection, err := SelectSession(ctx, Options{
+		LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
+			projects, err := codexhistory.DiscoverProjectsContext(ctx, codexDir)
+			loadReturned <- err
+			return projects, err
+		},
+	})
+	if err != nil {
+		t.Fatalf("SelectSession error: %v", err)
+	}
+	if selection != nil {
+		t.Fatalf("expected nil selection, got %#v", selection)
+	}
+
+	select {
+	case err := <-loadReturned:
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("LoadProjects error = %v, want context cancellation", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for initial load to return under cache lock contention")
 	}
 }
 
@@ -1044,6 +1438,7 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 
 	go func() {
 		<-initDone
+		waitForScreenContains(t, screen, "sess-1")
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'j', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
@@ -1455,6 +1850,26 @@ func TestDrawShowsYoloStatusInLoadErrorStateWhenToggleVisible(t *testing.T) {
 	line := readScreenLine(screen, h-1)
 	if !strings.Contains(line, "YOLO mode (Ctrl+Y): off") {
 		t.Fatalf("expected yolo hint in load error state, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestDrawShowsLoadingStatusWhenProjectsLoading(t *testing.T) {
+	screen := newTestScreen(t, 160, 20)
+	state := newTestState(nil)
+	state.loadingProjects = true
+
+	previewCh := make(chan previewEvent, 1)
+	if err := draw(screen, state, Options{ShowYoloToggle: true}, previewCh); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+
+	_, h := screen.Size()
+	line := readScreenLine(screen, h-1)
+	if !strings.Contains(line, "Loading history...") {
+		t.Fatalf("expected loading hint in status line, got %q", strings.TrimSpace(line))
+	}
+	if !strings.Contains(line, "YOLO mode (Ctrl+Y): off") {
+		t.Fatalf("expected yolo hint in loading state, got %q", strings.TrimSpace(line))
 	}
 }
 

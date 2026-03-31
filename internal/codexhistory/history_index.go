@@ -3,6 +3,7 @@ package codexhistory
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -31,22 +32,46 @@ type codexHistoryEntry struct {
 }
 
 func loadHistoryIndex(root string) historyIndex {
+	idx, _ := loadHistoryIndexContext(context.Background(), root)
+	return idx
+}
+
+func loadHistoryIndexContext(ctx context.Context, root string) (historyIndex, error) {
 	idx := historyIndex{sessions: map[string]*historySessionInfo{}}
+	if err := ctx.Err(); err != nil {
+		return idx, err
+	}
 	path := filepath.Join(root, "history.jsonl")
-	f, err := os.Open(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return idx
+			if err := deletePersistentHistoryIndexContext(ctx, path); err != nil {
+				return idx, err
+			}
+			return idx, nil
 		}
-		return idx
+		return idx, nil
+	}
+	if cached, ok, err := readPersistentHistoryIndexContext(ctx, path, info); err != nil {
+		return idx, err
+	} else if ok {
+		return cached, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return idx, nil
 	}
 	defer f.Close()
 
 	reader := bufio.NewReader(f)
 	for {
+		if err := ctx.Err(); err != nil {
+			return idx, err
+		}
 		line, err := reader.ReadBytes('\n')
 		if err != nil && err != io.EOF {
-			return idx
+			return idx, nil
 		}
 		line = bytes.TrimSpace(line)
 		if len(line) > 0 {
@@ -71,7 +96,10 @@ func loadHistoryIndex(root string) historyIndex {
 			break
 		}
 	}
-	return idx
+	if err := writePersistentHistoryIndexContext(ctx, path, info, idx); err != nil {
+		return idx, err
+	}
+	return idx, nil
 }
 
 func (idx historyIndex) lookup(sessionID string) (historySessionInfo, bool) {

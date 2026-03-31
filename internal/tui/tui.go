@@ -62,9 +62,38 @@ type uiEvent struct {
 
 func (e *uiEvent) When() time.Time { return e.when }
 
+func postUIEventWithRetry(ctx context.Context, done <-chan struct{}, screen tcell.Screen, event *uiEvent) {
+	for {
+		err := screen.PostEvent(event)
+		if err == nil || !errors.Is(err, tcell.ErrEventQFull) {
+			return
+		}
+
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 type previewEvent struct {
 	cacheKey string
 	text     string
+	err      error
+}
+
+type projectLoadEvent struct {
+	projects []codexhistory.Project
 	err      error
 }
 
@@ -123,6 +152,7 @@ const (
 type uiState struct {
 	projects         []codexhistory.Project
 	loadError        error
+	loadingProjects  bool
 	focus            string
 	lastListFocus    string
 	inputMode        string
@@ -158,10 +188,8 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 		return nil, errors.New("LoadProjects is required")
 	}
 
-	projects, err := opts.LoadProjects(ctx)
 	state := &uiState{
-		projects:         projects,
-		loadError:        err,
+		loadingProjects:  true,
 		focus:            "projects",
 		lastListFocus:    "projects",
 		proxyEnabled:     opts.ProxyEnabled,
@@ -185,6 +213,21 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 
 	done := make(chan struct{})
 	defer close(done)
+	loadCtx, cancelLoad := context.WithCancel(ctx)
+	defer cancelLoad()
+
+	projectLoadCh := make(chan projectLoadEvent, 1)
+	go func() {
+		projects, err := opts.LoadProjects(loadCtx)
+		select {
+		case <-done:
+			return
+		case <-loadCtx.Done():
+			return
+		case projectLoadCh <- projectLoadEvent{projects: projects, err: err}:
+		}
+		postUIEventWithRetry(loadCtx, done, screen, &uiEvent{when: time.Now(), kind: "load"})
+	}()
 
 	updateCh := make(chan updateEvent, 2)
 	if opts.CheckUpdate != nil {
@@ -242,7 +285,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 
 	go func() {
 		<-ctx.Done()
-		screen.PostEvent(&uiEvent{when: time.Now(), kind: "quit"})
+		postUIEventWithRetry(ctx, done, screen, &uiEvent{when: time.Now(), kind: "quit"})
 	}()
 
 	for {
@@ -256,6 +299,17 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 			switch tev.kind {
 			case "quit":
 				return nil, ctx.Err()
+			case "load":
+				for {
+					select {
+					case ev := <-projectLoadCh:
+						state.loadingProjects = false
+						state.projects = ev.projects
+						state.loadError = ev.err
+					default:
+						goto nextEvent
+					}
+				}
 			case "update":
 				for {
 					select {
@@ -288,7 +342,9 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 					}
 				}
 			case "refresh":
-				refreshStatePreserveSelection(ctx, state, opts)
+				if !state.loadingProjects {
+					refreshStatePreserveSelection(ctx, state, opts)
+				}
 			case "preview":
 				for {
 					select {
@@ -403,6 +459,9 @@ func handleKey(
 		state.yoloEnabled = enable
 		return nil, nil
 	case tcell.KeyCtrlR:
+		if state.loadingProjects {
+			return nil, nil
+		}
 		refreshState(ctx, state, opts)
 		return nil, nil
 	case tcell.KeyCtrlC:
@@ -414,6 +473,9 @@ func handleKey(
 		case 'q', 'Q':
 			return nil, errQuit
 		case 'r', 'R':
+			if state.loadingProjects {
+				return nil, nil
+			}
 			refreshState(ctx, state, opts)
 			return nil, nil
 		case '/':
@@ -512,6 +574,16 @@ func handleKey(
 		selectedIsNew = false
 	}
 
+	enterPressed := ev.Key() == tcell.KeyEnter || ev.Key() == tcell.KeyCtrlJ || ev.Key() == tcell.KeyCtrlM
+	if ev.Key() == tcell.KeyRune {
+		if ev.Rune() == '\n' || ev.Rune() == '\r' {
+			enterPressed = true
+		}
+	}
+	if state.loadingProjects && (ev.Key() == tcell.KeyCtrlN || enterPressed) {
+		return nil, nil
+	}
+
 	if ev.Key() == tcell.KeyCtrlO {
 		if listFocus != "sessions" {
 			return nil, nil
@@ -541,12 +613,6 @@ func handleKey(
 		return nil, nil
 	}
 
-	enterPressed := ev.Key() == tcell.KeyEnter || ev.Key() == tcell.KeyCtrlJ || ev.Key() == tcell.KeyCtrlM
-	if ev.Key() == tcell.KeyRune {
-		if ev.Rune() == '\n' || ev.Rune() == '\r' {
-			enterPressed = true
-		}
-	}
 	if enterPressed {
 		if selectedSession != nil {
 			return &Selection{Project: selectedProject, Session: *selectedSession, UseProxy: state.proxyEnabled, UseYolo: state.yoloEnabled}, nil
@@ -729,7 +795,13 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		{text: "  q: quit", style: baseStatusStyle},
 	}
 	statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
-	if state.inputMode != "" {
+	if state.loadingProjects {
+		statusSegments = []statusSegment{
+			{text: "Loading history...  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: "  q: quit", style: baseStatusStyle},
+		}
+		statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
+	} else if state.inputMode != "" {
 		statusSegments = []statusSegment{
 			{text: "Type to search. Enter: apply  Esc: cancel  " + proxyLabel + "  ", style: baseStatusStyle},
 		}
@@ -1383,6 +1455,9 @@ func buildPreviewLines(
 ) []string {
 	if state.loadError != nil {
 		return []string{fmt.Sprintf("Load error: %v", state.loadError)}
+	}
+	if state.loadingProjects {
+		return []string{"Loading Codex session history..."}
 	}
 	if project.Path == "" && len(state.projects) == 0 {
 		return []string{"No Codex sessions found.", "Run Codex to create a session first."}

@@ -1,6 +1,8 @@
 package codexhistory
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +11,16 @@ import (
 )
 
 func DiscoverProjects(codexDir string) ([]Project, error) {
+	return DiscoverProjectsContext(context.Background(), codexDir)
+}
+
+func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []Project, retErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	root, err := ResolveCodexDir(codexDir)
 	if err != nil {
 		return nil, err
@@ -18,10 +30,28 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 		return nil, fmt.Errorf("Codex sessions dir not found: %s", sessionsDir)
 	}
 
-	historyIdx := loadHistoryIndex(root)
+	ctx, sessionMetaBatch := withSessionMetaPersistentBatch(ctx)
+	defer func() {
+		if errors.Is(retErr, context.Canceled) || errors.Is(retErr, context.DeadlineExceeded) {
+			return
+		}
+		if err := flushPersistentSessionMetaBatchContext(ctx, sessionMetaBatch); err != nil {
+			if retErr == nil {
+				retErr = err
+			}
+		}
+	}()
 
-	files, err := collectSessionFiles(sessionsDir)
+	historyIdx, err := loadHistoryIndexContext(ctx, root)
 	if err != nil {
+		return nil, err
+	}
+
+	files, err := collectSessionFilesContext(ctx, sessionsDir)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("walk sessions dir: %w", err)
 	}
 	if len(files) == 0 {
@@ -34,14 +64,20 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 	var pendingSubagents []SubagentSession
 
 	for _, filePath := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		name := filepath.Base(filePath)
 		sessionID := parseSessionIDFromFilename(name)
 		if sessionID == "" {
 			continue
 		}
 
-		meta, err := readSessionFileMetaCached(filePath)
+		meta, err := readSessionFileMetaCachedContext(ctx, filePath)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("read session %s: %w", filePath, err)
 			}
@@ -121,7 +157,7 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 		return sessions[i].ModifiedAt.After(sessions[j].ModifiedAt)
 	})
 
-	projects := groupByProject(sessions)
+	projects = groupByProject(sessions)
 
 	sort.Slice(projects, func(i, j int) bool {
 		return strings.ToLower(projects[i].Path) < strings.ToLower(projects[j].Path)

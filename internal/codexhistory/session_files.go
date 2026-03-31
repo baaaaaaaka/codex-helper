@@ -1,6 +1,7 @@
 package codexhistory
 
 import (
+	"context"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -9,8 +10,15 @@ import (
 // collectSessionFiles walks sessionsDir (e.g. ~/.codex/sessions/) recursively
 // and returns all .jsonl file paths.
 func collectSessionFiles(sessionsDir string) ([]string, error) {
+	return collectSessionFilesContext(context.Background(), sessionsDir)
+}
+
+func collectSessionFilesContext(ctx context.Context, sessionsDir string) ([]string, error) {
 	var files []string
 	err := filepath.WalkDir(sessionsDir, func(path string, d fs.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return nil
 		}

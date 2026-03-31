@@ -1,6 +1,7 @@
 package codexhistory
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -1183,6 +1184,17 @@ func TestDiscoverProjects_EmptySessionsDir(t *testing.T) {
 	}
 	if projects != nil {
 		t.Errorf("expected nil for empty sessions dir, got %v", projects)
+	}
+}
+
+func TestDiscoverProjectsContext_Canceled(t *testing.T) {
+	tmpDir, _, _ := setupCodexDir(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := DiscoverProjectsContext(ctx, tmpDir)
+	if err != context.Canceled {
+		t.Fatalf("error = %v, want context.Canceled", err)
 	}
 }
 

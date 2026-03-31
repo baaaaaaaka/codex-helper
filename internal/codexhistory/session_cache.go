@@ -1,6 +1,7 @@
 package codexhistory
 
 import (
+	"context"
 	"os"
 	"sync"
 	"time"
@@ -25,22 +26,22 @@ func resetSessionFileCache() {
 	sessionFileCache.mu.Unlock()
 }
 
-func getSessionFileCacheEntry(filePath string) (sessionFileCacheEntry, bool, error) {
+func getSessionFileCacheEntry(filePath string) (sessionFileCacheEntry, os.FileInfo, bool, error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		sessionFileCache.mu.Lock()
 		delete(sessionFileCache.entries, filePath)
 		sessionFileCache.mu.Unlock()
-		return sessionFileCacheEntry{}, false, err
+		return sessionFileCacheEntry{}, nil, false, err
 	}
 	mtime := info.ModTime()
 	sessionFileCache.mu.Lock()
 	entry, ok := sessionFileCache.entries[filePath]
 	sessionFileCache.mu.Unlock()
 	if ok && entry.mtime.Equal(mtime) {
-		return entry, true, nil
+		return entry, info, true, nil
 	}
-	return sessionFileCacheEntry{mtime: mtime}, false, nil
+	return sessionFileCacheEntry{mtime: mtime}, info, false, nil
 }
 
 func setSessionFileCacheEntry(filePath string, entry sessionFileCacheEntry) {
@@ -50,19 +51,44 @@ func setSessionFileCacheEntry(filePath string, entry sessionFileCacheEntry) {
 }
 
 func readSessionFileMetaCached(filePath string) (sessionFileMeta, error) {
-	entry, ok, err := getSessionFileCacheEntry(filePath)
+	return readSessionFileMetaCachedContext(context.Background(), filePath)
+}
+
+func readSessionFileMetaCachedContext(ctx context.Context, filePath string) (sessionFileMeta, error) {
+	if err := ctx.Err(); err != nil {
+		return sessionFileMeta{}, err
+	}
+	entry, info, ok, err := getSessionFileCacheEntry(filePath)
 	if err != nil {
+		if !stagePersistentSessionMetaDelete(ctx, filePath) {
+			if delErr := deletePersistentSessionMetaContext(ctx, filePath); delErr != nil {
+				return sessionFileMeta{}, delErr
+			}
+		}
 		return sessionFileMeta{}, err
 	}
 	if ok && entry.hasMeta {
 		return entry.meta, nil
 	}
-	meta, err := readSessionFileMeta(filePath)
+	if meta, ok, err := readPersistentSessionMetaContext(ctx, filePath, info); err != nil {
+		return sessionFileMeta{}, err
+	} else if ok {
+		entry.meta = meta
+		entry.hasMeta = true
+		setSessionFileCacheEntry(filePath, entry)
+		return meta, nil
+	}
+	meta, err := readSessionFileMetaContext(ctx, filePath)
 	if err != nil {
 		return meta, err
 	}
 	entry.meta = meta
 	entry.hasMeta = true
 	setSessionFileCacheEntry(filePath, entry)
+	if !stagePersistentSessionMetaWrite(ctx, filePath, info, meta) {
+		if err := writePersistentSessionMetaContext(ctx, filePath, info, meta); err != nil {
+			return meta, err
+		}
+	}
 	return meta, nil
 }

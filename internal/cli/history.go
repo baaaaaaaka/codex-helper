@@ -242,7 +242,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		showYoloToggle := shouldShowYoloToggle(cfg, store.Path())
 		selection, err := selectSession(ctx, tui.Options{
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
-				return codexhistory.DiscoverProjects(codexDir)
+				return codexhistory.DiscoverProjectsContext(ctx, codexDir)
 			},
 			Version:         version,
 			ProxyEnabled:    useProxy,
