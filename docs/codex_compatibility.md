@@ -33,7 +33,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.117.0-alpha.5 | pass | pass | pass | not-run | pass | pass | 2026-03-20T08:44:07Z |
 | 0.117.0-alpha.3 | pass | pass | pass | not-run | pass | pass | 2026-03-20T05:12:17Z |
 | 0.117.0-alpha.2 | pass | pass | pass | not-run | pass | pass | 2026-03-19T23:51:26Z |
-| 0.116.0 | pass | pass | pass | pass | pass | pass | 2026-03-29T07:45:21Z |
+| 0.116.0 | pass | pass | pass | pass | pass | pass | 2026-04-01T07:59:53Z |
 | 0.116.0-alpha.12 | pass | pass | pass | not-run | pass | pass | 2026-03-19T17:30:25Z |
 | 0.116.0-alpha.11 | pass | pass | pass | not-run | pass | pass | 2026-03-19T03:59:42Z |
 | 0.116.0-alpha.10 | pass | pass | pass | not-run | pass | pass | 2026-03-19T01:08:17Z |
