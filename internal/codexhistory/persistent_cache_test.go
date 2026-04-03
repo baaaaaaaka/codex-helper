@@ -740,6 +740,38 @@ func TestEnsureSharedPersistentCacheDir_RejectsSymlinkedPath(t *testing.T) {
 	}
 }
 
+func TestEnsureSharedPersistentCacheDir_AllowsSystemStyleSymlinkedAncestor(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation for this test is Unix-specific")
+	}
+
+	realParent := t.TempDir()
+	linkRoot := filepath.Join(t.TempDir(), "linked-root")
+	if err := os.Symlink(realParent, linkRoot); err != nil {
+		t.Fatalf("symlink ancestor path: %v", err)
+	}
+
+	dir := filepath.Join(linkRoot, ".codex-proxy", "codexhistory", "session-meta")
+	if err := ensureSharedPersistentCacheDir(dir); err != nil {
+		t.Fatalf("ensureSharedPersistentCacheDir under symlinked ancestor: %v", err)
+	}
+
+	for _, path := range []string{
+		filepath.Join(realParent, ".codex-proxy"),
+		filepath.Join(realParent, ".codex-proxy", "codexhistory"),
+		filepath.Join(realParent, ".codex-proxy", "codexhistory", "session-meta"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat shared cache dir %q: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("shared cache path %q is not a directory", path)
+		}
+	}
+}
+
 func TestDefaultPersistentCacheWriterID_PersistsRandomLocalToken(t *testing.T) {
 	lockCodexHistoryTestHooks(t)
 	setTestUserCacheDir(t)

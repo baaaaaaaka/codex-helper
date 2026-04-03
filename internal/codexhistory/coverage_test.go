@@ -519,7 +519,8 @@ func TestIsFile_WhitespacePath(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIsDir_Nonexistent(t *testing.T) {
-	if isDir("/nonexistent/dir") {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if isDir(missing) {
 		t.Error("expected false")
 	}
 }

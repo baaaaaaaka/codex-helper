@@ -276,32 +276,12 @@ func ensureSharedPersistentCacheDir(dir string) error {
 	codexHistoryDir := filepath.Dir(dir)
 	proxyDir := filepath.Dir(codexHistoryDir)
 	for _, candidate := range []string{proxyDir, codexHistoryDir, dir} {
-		if err := ensureSharedPersistentCacheDirComponent(candidate, sharedPersistentCacheDirMode); err != nil {
+		if err := ensureSharedPersistentCacheDirStep(candidate, sharedPersistentCacheDirMode); err != nil {
 			return err
 		}
 		// Best-effort: make shared cache directories multi-user writable when possible.
 		if info, err := os.Lstat(candidate); err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() {
 			_ = os.Chmod(candidate, sharedPersistentCacheDirMode)
-		}
-	}
-	return nil
-}
-
-func ensureSharedPersistentCacheDirComponent(path string, mode os.FileMode) error {
-	root, parts := splitSharedPersistentCachePath(path)
-	current := root
-	if current != "" {
-		if err := validateSharedPersistentCacheDir(current); err != nil {
-			return err
-		}
-	}
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		current = joinSharedPersistentCachePath(current, part)
-		if err := ensureSharedPersistentCacheDirStep(current, mode); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -329,42 +309,6 @@ func ensureSharedPersistentCacheDirStep(path string, mode os.FileMode) error {
 			return err
 		}
 	}
-}
-
-func validateSharedPersistentCacheDir(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("shared cache path %q is a symlink", path)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("shared cache path %q is not a directory", path)
-	}
-	return nil
-}
-
-func splitSharedPersistentCachePath(path string) (string, []string) {
-	path = filepath.Clean(path)
-	volume := filepath.VolumeName(path)
-	rest := strings.TrimPrefix(path, volume)
-	root := volume
-	if strings.HasPrefix(rest, string(os.PathSeparator)) {
-		root += string(os.PathSeparator)
-		rest = strings.TrimPrefix(rest, string(os.PathSeparator))
-	}
-	if rest == "" || rest == "." {
-		return root, nil
-	}
-	return root, strings.Split(rest, string(os.PathSeparator))
-}
-
-func joinSharedPersistentCachePath(current string, part string) string {
-	if current == "" {
-		return part
-	}
-	return filepath.Join(current, part)
 }
 
 func readSharedPersistentSessionMetaContext(ctx context.Context, filePath string, info os.FileInfo) (sessionFileMeta, bool, error) {
