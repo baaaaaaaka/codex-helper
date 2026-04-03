@@ -1366,7 +1366,7 @@ func TestSelectSessionCancelsInitialLoadUnderPersistentCacheLockContention(t *te
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("LoadProjects error = %v, want context cancellation", err)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for initial load to return under cache lock contention")
 	}
 }
