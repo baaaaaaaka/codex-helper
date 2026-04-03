@@ -31,6 +31,8 @@ type codexHistoryEntry struct {
 	Text      string `json:"text"`
 }
 
+var openHistoryIndexFile = os.Open
+
 func loadHistoryIndex(root string) historyIndex {
 	idx, _ := loadHistoryIndexContext(context.Background(), root)
 	return idx
@@ -58,7 +60,7 @@ func loadHistoryIndexContext(ctx context.Context, root string) (historyIndex, er
 		return cached, nil
 	}
 
-	f, err := os.Open(path)
+	f, err := openHistoryIndexFile(path)
 	if err != nil {
 		return idx, nil
 	}

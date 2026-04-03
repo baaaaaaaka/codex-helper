@@ -41,6 +41,69 @@ func resetPersistentCacheStatesForTest() {
 	persistentHistoryIndexState.loaded = false
 	persistentHistoryIndexState.cache = persistentHistoryIndexCache{}
 	persistentHistoryIndexState.mu.Unlock()
+
+	persistentSharedSessionMetaState.mu.Lock()
+	persistentSharedSessionMetaState.path = ""
+	persistentSharedSessionMetaState.ownerID = ""
+	persistentSharedSessionMetaState.cacheFilePresent = false
+	persistentSharedSessionMetaState.cacheFileMtime = 0
+	persistentSharedSessionMetaState.loaded = false
+	persistentSharedSessionMetaState.entries = nil
+	persistentSharedSessionMetaState.mu.Unlock()
+
+	persistentSharedHistoryIndexState.mu.Lock()
+	persistentSharedHistoryIndexState.path = ""
+	persistentSharedHistoryIndexState.ownerID = ""
+	persistentSharedHistoryIndexState.cacheFilePresent = false
+	persistentSharedHistoryIndexState.cacheFileMtime = 0
+	persistentSharedHistoryIndexState.loaded = false
+	persistentSharedHistoryIndexState.entries = nil
+	persistentSharedHistoryIndexState.mu.Unlock()
+
+	persistentCacheLocalWriterState.mu.Lock()
+	persistentCacheLocalWriterState.path = ""
+	persistentCacheLocalWriterState.value = ""
+	persistentCacheLocalWriterState.mu.Unlock()
+}
+
+func setPersistentCacheWriterIDForTest(t *testing.T, id string) {
+	t.Helper()
+
+	prevWriterID := persistentCacheWriterID
+	persistentCacheWriterID = func(context.Context) (string, error) { return id, nil }
+	t.Cleanup(func() { persistentCacheWriterID = prevWriterID })
+}
+
+func setPersistentCacheWriterScopeIDForTest(t *testing.T, id string) {
+	t.Helper()
+
+	prevScopeID := persistentCacheWriterScopeID
+	persistentCacheWriterScopeID = func() (string, error) { return id, nil }
+	t.Cleanup(func() { persistentCacheWriterScopeID = prevScopeID })
+}
+
+func setSharedPersistentCacheOwnerIDForTest(t *testing.T, fn func(path string, info os.FileInfo) (string, bool)) {
+	t.Helper()
+
+	prev := sharedPersistentCacheOwnerID
+	sharedPersistentCacheOwnerID = fn
+	t.Cleanup(func() { sharedPersistentCacheOwnerID = prev })
+}
+
+func setReadSharedSessionMetaCacheFileForTest(t *testing.T, fn func(path string) ([]byte, error)) {
+	t.Helper()
+
+	prev := readSharedSessionMetaCacheFile
+	readSharedSessionMetaCacheFile = fn
+	t.Cleanup(func() { readSharedSessionMetaCacheFile = prev })
+}
+
+func setReadSharedHistoryIndexCacheFileForTest(t *testing.T, fn func(path string) ([]byte, error)) {
+	t.Helper()
+
+	prev := readSharedHistoryIndexCacheFile
+	readSharedHistoryIndexCacheFile = fn
+	t.Cleanup(func() { readSharedHistoryIndexCacheFile = prev })
 }
 
 func writeSessionMetaFile(t *testing.T, path, sessionID, cwd, prompt string) {
@@ -314,6 +377,695 @@ func TestDiscoverProjects_BatchesSessionMetaPersistentCacheWrites(t *testing.T) 
 		if !found {
 			t.Fatalf("missing cache entry for session %s", sessionID)
 		}
+	}
+}
+
+func TestDiscoverProjects_UsesSharedSessionMetaCacheAcrossWriters(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "root-writer")
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "44444444-4444-4444-4444-444444444444"
+	fileName := "rollout-2026-01-01T00-00-04-" + sessionID + ".jsonl"
+	filePath := filepath.Join(sessionsDir, fileName)
+	writeSessionMetaFile(t, filePath, sessionID, projDir, "shared prompt")
+
+	projects, err := DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects warm cache: %v", err)
+	}
+	if sess := findSession(collectAllSessions(projects), sessionID); sess == nil || sess.FirstPrompt != "shared prompt" {
+		t.Fatalf("warm cache session = %#v, want shared prompt", sess)
+	}
+
+	prevOpenSessionMetaFile := openSessionMetaFile
+	openSessionMetaFile = func(string) (*os.File, error) {
+		return nil, errors.New("session parse should not be needed when shared cache is warm")
+	}
+	t.Cleanup(func() { openSessionMetaFile = prevOpenSessionMetaFile })
+
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "user-writer")
+
+	projects, err = DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects shared cache reuse: %v", err)
+	}
+	sess := findSession(collectAllSessions(projects), sessionID)
+	if sess == nil {
+		t.Fatal("expected session from shared session-meta cache")
+	}
+	if sess.FirstPrompt != "shared prompt" {
+		t.Fatalf("FirstPrompt = %q, want %q", sess.FirstPrompt, "shared prompt")
+	}
+
+	sharedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta", "root-writer.json")
+	if _, err := os.Stat(sharedShard); err != nil {
+		t.Fatalf("expected shared shard %q: %v", sharedShard, err)
+	}
+}
+
+func TestDiscoverProjects_UsesSharedHistoryIndexCacheAcrossWriters(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "root-writer")
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "55555555-5555-5555-5555-555555555555"
+	fileName := "rollout-2026-01-01T00-00-05-" + sessionID + ".jsonl"
+	filePath := filepath.Join(sessionsDir, fileName)
+	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}` + "\n"
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	historyPath := filepath.Join(tmpDir, "history.jsonl")
+	if err := os.WriteFile(historyPath, []byte(`{"session_id":"`+sessionID+`","ts":1770777540,"text":"history prompt"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write history file: %v", err)
+	}
+
+	projects, err := DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects warm history cache: %v", err)
+	}
+	if sess := findSession(collectAllSessions(projects), sessionID); sess == nil || sess.FirstPrompt != "history prompt" {
+		t.Fatalf("warm history session = %#v, want history prompt", sess)
+	}
+
+	prevOpenHistoryIndexFile := openHistoryIndexFile
+	openHistoryIndexFile = func(string) (*os.File, error) {
+		return nil, errors.New("history index parse should not be needed when shared cache is warm")
+	}
+	t.Cleanup(func() { openHistoryIndexFile = prevOpenHistoryIndexFile })
+
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "user-writer")
+
+	projects, err = DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects shared history reuse: %v", err)
+	}
+	sess := findSession(collectAllSessions(projects), sessionID)
+	if sess == nil {
+		t.Fatal("expected session from shared history-index cache")
+	}
+	if sess.FirstPrompt != "history prompt" {
+		t.Fatalf("FirstPrompt = %q, want %q", sess.FirstPrompt, "history prompt")
+	}
+
+	sharedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "history-index", "root-writer.json")
+	if _, err := os.Stat(sharedShard); err != nil {
+		t.Fatalf("expected shared shard %q: %v", sharedShard, err)
+	}
+}
+
+func TestDiscoverProjects_IgnoresForgedSharedSessionMetaShardFromDifferentOwner(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "root-writer")
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "77777777-7777-7777-7777-777777777777"
+	fileName := "rollout-2026-01-01T00-00-07-" + sessionID + ".jsonl"
+	filePath := filepath.Join(sessionsDir, fileName)
+	writeSessionMetaFile(t, filePath, sessionID, projDir, "shared prompt")
+
+	projects, err := DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects warm shared cache: %v", err)
+	}
+	if sess := findSession(collectAllSessions(projects), sessionID); sess == nil || sess.FirstPrompt != "shared prompt" {
+		t.Fatalf("warm session = %#v, want shared prompt", sess)
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat session file: %v", err)
+	}
+	forgedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta", "attacker-writer.json")
+	forgedCache := persistentSessionMetaCache{
+		Version: persistentCacheVersion,
+		Entries: map[string]persistentSessionMetaEntry{
+			filepath.Clean(filePath): {
+				FileCacheKey: newFileCacheKey(filePath, info),
+				Meta: sessionFileMeta{
+					SessionID:   sessionID,
+					ProjectPath: "/tmp/forged-project",
+					FirstPrompt: "forged prompt",
+				},
+			},
+		},
+	}
+	if err := writeJSONAtomicallyWithOptions(forgedShard, forgedCache, persistentCacheWriteOptions{
+		dirMode:  sharedPersistentCacheDirMode,
+		fileMode: sharedPersistentCacheFileMode,
+	}); err != nil {
+		t.Fatalf("write forged shard: %v", err)
+	}
+
+	setSharedPersistentCacheOwnerIDForTest(t, func(path string, info os.FileInfo) (string, bool) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(filePath):
+			return "uid:1000", true
+		case filepath.Clean(filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta", "root-writer.json")):
+			return "uid:1000", true
+		case filepath.Clean(forgedShard):
+			return "uid:2000", true
+		default:
+			return persistentCacheOwnerID(path, info)
+		}
+	})
+
+	prevOpenSessionMetaFile := openSessionMetaFile
+	openSessionMetaFile = func(string) (*os.File, error) {
+		return nil, errors.New("session parse should not be needed when trusted shared cache is warm")
+	}
+	t.Cleanup(func() { openSessionMetaFile = prevOpenSessionMetaFile })
+
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "user-writer")
+
+	projects, err = DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects with forged shard: %v", err)
+	}
+	sess := findSession(collectAllSessions(projects), sessionID)
+	if sess == nil {
+		t.Fatal("expected session from trusted shared session-meta cache")
+	}
+	if sess.FirstPrompt != "shared prompt" {
+		t.Fatalf("FirstPrompt = %q, want %q", sess.FirstPrompt, "shared prompt")
+	}
+	if sess.ProjectPath != projDir {
+		t.Fatalf("ProjectPath = %q, want %q", sess.ProjectPath, projDir)
+	}
+}
+
+func TestDiscoverProjects_IgnoresForgedSharedHistoryIndexShardFromDifferentOwner(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "root-writer")
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "88888888-8888-8888-8888-888888888888"
+	fileName := "rollout-2026-01-01T00-00-08-" + sessionID + ".jsonl"
+	filePath := filepath.Join(sessionsDir, fileName)
+	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}` + "\n"
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	historyPath := filepath.Join(tmpDir, "history.jsonl")
+	if err := os.WriteFile(historyPath, []byte(`{"session_id":"`+sessionID+`","ts":1770777540,"text":"history prompt"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write history file: %v", err)
+	}
+
+	projects, err := DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects warm history cache: %v", err)
+	}
+	if sess := findSession(collectAllSessions(projects), sessionID); sess == nil || sess.FirstPrompt != "history prompt" {
+		t.Fatalf("warm history session = %#v, want history prompt", sess)
+	}
+
+	info, err := os.Stat(historyPath)
+	if err != nil {
+		t.Fatalf("stat history file: %v", err)
+	}
+	forgedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "history-index", "attacker-writer.json")
+	forgedCache := persistentHistoryIndexCache{
+		Version: persistentCacheVersion,
+		Entries: map[string]persistentHistoryIndexEntry{
+			filepath.Clean(historyPath): {
+				FileCacheKey: newFileCacheKey(historyPath, info),
+				Sessions: map[string]*historySessionInfo{
+					sessionID: {FirstPrompt: "forged history prompt"},
+				},
+			},
+		},
+	}
+	if err := writeJSONAtomicallyWithOptions(forgedShard, forgedCache, persistentCacheWriteOptions{
+		dirMode:  sharedPersistentCacheDirMode,
+		fileMode: sharedPersistentCacheFileMode,
+	}); err != nil {
+		t.Fatalf("write forged history shard: %v", err)
+	}
+
+	setSharedPersistentCacheOwnerIDForTest(t, func(path string, info os.FileInfo) (string, bool) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(historyPath):
+			return "uid:1000", true
+		case filepath.Clean(filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "history-index", "root-writer.json")):
+			return "uid:1000", true
+		case filepath.Clean(forgedShard):
+			return "uid:2000", true
+		default:
+			return persistentCacheOwnerID(path, info)
+		}
+	})
+
+	prevOpenHistoryIndexFile := openHistoryIndexFile
+	openHistoryIndexFile = func(string) (*os.File, error) {
+		return nil, errors.New("history index parse should not be needed when trusted shared cache is warm")
+	}
+	t.Cleanup(func() { openHistoryIndexFile = prevOpenHistoryIndexFile })
+
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "user-writer")
+
+	projects, err = DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects with forged history shard: %v", err)
+	}
+	sess := findSession(collectAllSessions(projects), sessionID)
+	if sess == nil {
+		t.Fatal("expected session from trusted shared history-index cache")
+	}
+	if sess.FirstPrompt != "history prompt" {
+		t.Fatalf("FirstPrompt = %q, want %q", sess.FirstPrompt, "history prompt")
+	}
+}
+
+func TestSharedPersistentCache_UsesMultiUserFriendlyPermissions(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("sticky-bit permissions are Unix-specific")
+	}
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "root-writer")
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "66666666-6666-6666-6666-666666666666"
+	fileName := "rollout-2026-01-01T00-00-06-" + sessionID + ".jsonl"
+	writeSessionMetaFile(t, filepath.Join(sessionsDir, fileName), sessionID, projDir, "permission prompt")
+	if err := os.WriteFile(filepath.Join(tmpDir, "history.jsonl"), []byte(`{"session_id":"`+sessionID+`","ts":1770777540,"text":"permission prompt"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write history file: %v", err)
+	}
+
+	if _, err := DiscoverProjects(tmpDir); err != nil {
+		t.Fatalf("DiscoverProjects: %v", err)
+	}
+
+	for _, dir := range []string{
+		filepath.Join(tmpDir, ".codex-proxy"),
+		filepath.Join(tmpDir, ".codex-proxy", "codexhistory"),
+		filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta"),
+		filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "history-index"),
+	} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("stat shared dir %q: %v", dir, err)
+		}
+		if info.Mode()&os.ModeSticky == 0 {
+			t.Fatalf("expected sticky bit on %q, mode=%#o", dir, info.Mode())
+		}
+		if info.Mode().Perm() != 0o777 {
+			t.Fatalf("expected %#o perms on %q, got %#o", 0o777, dir, info.Mode().Perm())
+		}
+	}
+
+	for _, file := range []string{
+		filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta", "root-writer.json"),
+		filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "history-index", "root-writer.json"),
+	} {
+		info, err := os.Stat(file)
+		if err != nil {
+			t.Fatalf("stat shared file %q: %v", file, err)
+		}
+		if info.Mode().Perm() != sharedPersistentCacheFileMode {
+			t.Fatalf("expected %#o perms on %q, got %#o", sharedPersistentCacheFileMode, file, info.Mode().Perm())
+		}
+	}
+}
+
+func TestEnsureSharedPersistentCacheDir_RejectsSymlinkedPath(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation for this test is Unix-specific")
+	}
+
+	tmpDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsideInfoBefore, err := os.Stat(outsideDir)
+	if err != nil {
+		t.Fatalf("stat outside dir before: %v", err)
+	}
+
+	linkPath := filepath.Join(tmpDir, ".codex-proxy")
+	if err := os.Symlink(outsideDir, linkPath); err != nil {
+		t.Fatalf("symlink shared cache dir: %v", err)
+	}
+
+	err = ensureSharedPersistentCacheDir(filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta"))
+	if err == nil {
+		t.Fatal("expected symlinked shared cache path to be rejected")
+	}
+
+	outsideInfoAfter, err := os.Stat(outsideDir)
+	if err != nil {
+		t.Fatalf("stat outside dir after: %v", err)
+	}
+	if outsideInfoAfter.Mode() != outsideInfoBefore.Mode() {
+		t.Fatalf("outside dir mode changed via symlink: before=%#o after=%#o", outsideInfoBefore.Mode(), outsideInfoAfter.Mode())
+	}
+}
+
+func TestDefaultPersistentCacheWriterID_PersistsRandomLocalToken(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+
+	id1 := defaultPersistentCacheWriterID()
+	if len(id1) != 32 {
+		t.Fatalf("writer id length = %d, want 32", len(id1))
+	}
+	for _, r := range id1 {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			t.Fatalf("writer id %q contains non-hex rune %q", id1, string(r))
+		}
+	}
+
+	resetPersistentCacheStatesForTest()
+
+	id2 := defaultPersistentCacheWriterID()
+	if id1 != id2 {
+		t.Fatalf("writer id = %q after reset, want %q", id2, id1)
+	}
+
+	path, err := persistentCacheWriterIDFile()
+	if err != nil {
+		t.Fatalf("persistentCacheWriterIDFile: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read writer id file: %v", err)
+	}
+	if got := normalizePersistentCacheWriterID(data); got != id1 {
+		t.Fatalf("persisted writer id = %q, want %q", got, id1)
+	}
+}
+
+func TestDefaultPersistentCacheWriterID_UsesPerScopeLocalFiles(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+
+	setPersistentCacheWriterScopeIDForTest(t, "uid-0")
+	rootID := defaultPersistentCacheWriterID()
+	rootPath, err := persistentCacheWriterIDFile()
+	if err != nil {
+		t.Fatalf("persistentCacheWriterIDFile root: %v", err)
+	}
+	if !strings.Contains(filepath.Base(rootPath), "uid-0") {
+		t.Fatalf("root writer id path = %q, want scope suffix", rootPath)
+	}
+
+	resetPersistentCacheStatesForTest()
+	setPersistentCacheWriterScopeIDForTest(t, "uid-1000")
+	userID := defaultPersistentCacheWriterID()
+	userPath, err := persistentCacheWriterIDFile()
+	if err != nil {
+		t.Fatalf("persistentCacheWriterIDFile user: %v", err)
+	}
+	if !strings.Contains(filepath.Base(userPath), "uid-1000") {
+		t.Fatalf("user writer id path = %q, want scope suffix", userPath)
+	}
+	if rootPath == userPath {
+		t.Fatalf("writer id paths should differ across scopes: %q", rootPath)
+	}
+	if rootID == "" || userID == "" {
+		t.Fatalf("writer ids should be non-empty, got root=%q user=%q", rootID, userID)
+	}
+
+	rootData, err := os.ReadFile(rootPath)
+	if err != nil {
+		t.Fatalf("read root writer id file: %v", err)
+	}
+	userData, err := os.ReadFile(userPath)
+	if err != nil {
+		t.Fatalf("read user writer id file: %v", err)
+	}
+	if got := normalizePersistentCacheWriterID(rootData); got != rootID {
+		t.Fatalf("persisted root writer id = %q, want %q", got, rootID)
+	}
+	if got := normalizePersistentCacheWriterID(userData); got != userID {
+		t.Fatalf("persisted user writer id = %q, want %q", got, userID)
+	}
+}
+
+func TestDefaultPersistentCacheWriterIDContext_CanceledWhileWaitingOnLock(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+
+	path, err := persistentCacheWriterIDFile()
+	if err != nil {
+		t.Fatalf("persistentCacheWriterIDFile: %v", err)
+	}
+	lock := flock.New(path + ".lock")
+	if err := lock.Lock(); err != nil {
+		t.Fatalf("lock writer id file: %v", err)
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err = defaultPersistentCacheWriterIDContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("defaultPersistentCacheWriterIDContext error = %v, want context cancellation", err)
+	}
+}
+
+func TestDiscoverProjects_SkipsUntrustedSharedSessionMetaShardBeforeRead(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "root-writer")
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	filePath := filepath.Join(sessionsDir, "rollout-2026-01-01T00-00-10-"+sessionID+".jsonl")
+	writeSessionMetaFile(t, filePath, sessionID, projDir, "trusted prompt")
+
+	projects, err := DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects warm cache: %v", err)
+	}
+	if sess := findSession(collectAllSessions(projects), sessionID); sess == nil || sess.FirstPrompt != "trusted prompt" {
+		t.Fatalf("warm cache session = %#v, want trusted prompt", sess)
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat session file: %v", err)
+	}
+	forgedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta", "attacker-writer.json")
+	forgedCache := persistentSessionMetaCache{
+		Version: persistentCacheVersion,
+		Entries: map[string]persistentSessionMetaEntry{
+			filepath.Clean(filePath): {
+				FileCacheKey: newFileCacheKey(filePath, info),
+				Meta: sessionFileMeta{
+					SessionID:   sessionID,
+					ProjectPath: "/tmp/forged-project",
+					FirstPrompt: "forged prompt",
+				},
+			},
+		},
+	}
+	if err := writeJSONAtomicallyWithOptions(forgedShard, forgedCache, persistentCacheWriteOptions{
+		dirMode:  sharedPersistentCacheDirMode,
+		fileMode: sharedPersistentCacheFileMode,
+	}); err != nil {
+		t.Fatalf("write forged shard: %v", err)
+	}
+
+	trustedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta", "root-writer.json")
+	setSharedPersistentCacheOwnerIDForTest(t, func(path string, info os.FileInfo) (string, bool) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(filePath):
+			return "uid:1000", true
+		case filepath.Clean(trustedShard):
+			return "uid:1000", true
+		case filepath.Clean(forgedShard):
+			return "uid:2000", true
+		default:
+			return persistentCacheOwnerID(path, info)
+		}
+	})
+
+	attackerReads := 0
+	setReadSharedSessionMetaCacheFileForTest(t, func(path string) ([]byte, error) {
+		if filepath.Clean(path) == filepath.Clean(forgedShard) {
+			attackerReads++
+		}
+		return os.ReadFile(path)
+	})
+
+	prevOpenSessionMetaFile := openSessionMetaFile
+	openSessionMetaFile = func(string) (*os.File, error) {
+		return nil, errors.New("session parse should not be needed when trusted shared cache is warm")
+	}
+	t.Cleanup(func() { openSessionMetaFile = prevOpenSessionMetaFile })
+
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "user-writer")
+
+	projects, err = DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects with forged shard: %v", err)
+	}
+	if attackerReads != 0 {
+		t.Fatalf("untrusted shared session-meta shard was read %d times", attackerReads)
+	}
+	sess := findSession(collectAllSessions(projects), sessionID)
+	if sess == nil || sess.FirstPrompt != "trusted prompt" {
+		t.Fatalf("session = %#v, want trusted prompt", sess)
+	}
+}
+
+func TestDiscoverProjects_SkipsUntrustedSharedHistoryIndexShardBeforeRead(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "root-writer")
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	filePath := filepath.Join(sessionsDir, "rollout-2026-01-01T00-00-11-"+sessionID+".jsonl")
+	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonEscapePath(projDir) + `","source":"cli"}}` + "\n"
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	historyPath := filepath.Join(tmpDir, "history.jsonl")
+	if err := os.WriteFile(historyPath, []byte(`{"session_id":"`+sessionID+`","ts":1770777540,"text":"trusted history prompt"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write history file: %v", err)
+	}
+
+	projects, err := DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects warm history cache: %v", err)
+	}
+	if sess := findSession(collectAllSessions(projects), sessionID); sess == nil || sess.FirstPrompt != "trusted history prompt" {
+		t.Fatalf("warm history session = %#v, want trusted history prompt", sess)
+	}
+
+	info, err := os.Stat(historyPath)
+	if err != nil {
+		t.Fatalf("stat history file: %v", err)
+	}
+	forgedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "history-index", "attacker-writer.json")
+	forgedCache := persistentHistoryIndexCache{
+		Version: persistentCacheVersion,
+		Entries: map[string]persistentHistoryIndexEntry{
+			filepath.Clean(historyPath): {
+				FileCacheKey: newFileCacheKey(historyPath, info),
+				Sessions: map[string]*historySessionInfo{
+					sessionID: {FirstPrompt: "forged history prompt"},
+				},
+			},
+		},
+	}
+	if err := writeJSONAtomicallyWithOptions(forgedShard, forgedCache, persistentCacheWriteOptions{
+		dirMode:  sharedPersistentCacheDirMode,
+		fileMode: sharedPersistentCacheFileMode,
+	}); err != nil {
+		t.Fatalf("write forged history shard: %v", err)
+	}
+
+	trustedShard := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "history-index", "root-writer.json")
+	setSharedPersistentCacheOwnerIDForTest(t, func(path string, info os.FileInfo) (string, bool) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(historyPath):
+			return "uid:1000", true
+		case filepath.Clean(trustedShard):
+			return "uid:1000", true
+		case filepath.Clean(forgedShard):
+			return "uid:2000", true
+		default:
+			return persistentCacheOwnerID(path, info)
+		}
+	})
+
+	attackerReads := 0
+	setReadSharedHistoryIndexCacheFileForTest(t, func(path string) ([]byte, error) {
+		if filepath.Clean(path) == filepath.Clean(forgedShard) {
+			attackerReads++
+		}
+		return os.ReadFile(path)
+	})
+
+	prevOpenHistoryIndexFile := openHistoryIndexFile
+	openHistoryIndexFile = func(string) (*os.File, error) {
+		return nil, errors.New("history parse should not be needed when trusted shared cache is warm")
+	}
+	t.Cleanup(func() { openHistoryIndexFile = prevOpenHistoryIndexFile })
+
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+	setPersistentCacheWriterIDForTest(t, "user-writer")
+
+	projects, err = DiscoverProjects(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverProjects with forged history shard: %v", err)
+	}
+	if attackerReads != 0 {
+		t.Fatalf("untrusted shared history-index shard was read %d times", attackerReads)
+	}
+	sess := findSession(collectAllSessions(projects), sessionID)
+	if sess == nil || sess.FirstPrompt != "trusted history prompt" {
+		t.Fatalf("session = %#v, want trusted history prompt", sess)
+	}
+}
+
+func TestWriteSharedPersistentSessionMetaContext_SkipsShardWhenWriterIDUnavailable(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+
+	prevWriterID := persistentCacheWriterID
+	persistentCacheWriterID = func(context.Context) (string, error) {
+		return "", errors.New("writer id unavailable")
+	}
+	t.Cleanup(func() { persistentCacheWriterID = prevWriterID })
+
+	tmpDir, sessionsDir, projDir := setupCodexDir(t)
+	sessionID := "99999999-9999-9999-9999-999999999999"
+	filePath := filepath.Join(sessionsDir, "rollout-2026-01-01T00-00-09-"+sessionID+".jsonl")
+	writeSessionMetaFile(t, filePath, sessionID, projDir, "skip shared write")
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat session file: %v", err)
+	}
+	if err := writeSharedPersistentSessionMetaContext(context.Background(), filePath, info, sessionFileMeta{
+		SessionID:   sessionID,
+		ProjectPath: projDir,
+		FirstPrompt: "skip shared write",
+	}); err != nil {
+		t.Fatalf("writeSharedPersistentSessionMetaContext: %v", err)
+	}
+
+	shardDir := filepath.Join(tmpDir, ".codex-proxy", "codexhistory", "session-meta")
+	entries, err := os.ReadDir(shardDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", shardDir, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unexpected shared shards when writer id is unavailable: %d", len(entries))
 	}
 }
 

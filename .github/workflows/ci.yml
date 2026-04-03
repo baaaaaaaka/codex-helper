@@ -167,6 +167,21 @@ jobs:
           go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
           go test . -count=1 -run 'TestInstallPs1(RemovesLegacyCodexClpExe|RemovesLegacyCodexClaudeProxyAndClpCmd|PreservesExternalClpCmdReferencingClaudeProxy)$'
 
+      - name: Recent codexhistory shared-cache regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/codexhistory ./internal/tui -count=1
+
+      - name: Recent codexhistory shared-cache regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          go test ./internal/codexhistory ./internal/tui -count=1
+
       - name: go vet
         run: go vet ./...
 

@@ -109,7 +109,7 @@ func persistentCacheDir() (string, error) {
 		base = filepath.Join(home, ".cache")
 	}
 	dir := filepath.Join(base, "codex-proxy", "codexhistory")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, localPersistentCacheDirMode); err != nil {
 		return "", fmt.Errorf("create codexhistory cache dir: %w", err)
 	}
 	return dir, nil
@@ -138,25 +138,27 @@ func readPersistentSessionMeta(filePath string, info os.FileInfo) (sessionFileMe
 
 func readPersistentSessionMetaContext(ctx context.Context, filePath string, info os.FileInfo) (sessionFileMeta, bool, error) {
 	cachePath, err := sessionMetaCacheFile()
-	if err != nil {
-		return sessionFileMeta{}, false, nil
-	}
-
-	persistentSessionMetaState.mu.Lock()
-	cache, err := loadSessionMetaPersistentStateLockedContext(ctx, cachePath)
-	persistentSessionMetaState.mu.Unlock()
-	if err != nil {
-		if isContextError(err) {
-			return sessionFileMeta{}, false, err
+	if err == nil {
+		persistentSessionMetaState.mu.Lock()
+		cache, loadErr := loadSessionMetaPersistentStateLockedContext(ctx, cachePath)
+		persistentSessionMetaState.mu.Unlock()
+		if loadErr != nil {
+			if isContextError(loadErr) {
+				return sessionFileMeta{}, false, loadErr
+			}
+		} else {
+			entry, ok := cache.Entries[filepath.Clean(filePath)]
+			if ok && matchesFileInfo(filePath, info, entry.FileCacheKey) {
+				return entry.Meta, true, nil
+			}
 		}
-		return sessionFileMeta{}, false, nil
 	}
-
-	entry, ok := cache.Entries[filepath.Clean(filePath)]
-	if !ok || !matchesFileInfo(filePath, info, entry.FileCacheKey) {
-		return sessionFileMeta{}, false, nil
+	if meta, ok, sharedErr := readSharedPersistentSessionMetaContext(ctx, filePath, info); sharedErr != nil {
+		return sessionFileMeta{}, false, sharedErr
+	} else if ok {
+		return meta, true, nil
 	}
-	return entry.Meta, true, nil
+	return sessionFileMeta{}, false, nil
 }
 
 func writePersistentSessionMeta(filePath string, info os.FileInfo, meta sessionFileMeta) {
@@ -165,37 +167,35 @@ func writePersistentSessionMeta(filePath string, info os.FileInfo, meta sessionF
 
 func writePersistentSessionMetaContext(ctx context.Context, filePath string, info os.FileInfo, meta sessionFileMeta) error {
 	cachePath, err := sessionMetaCacheFile()
-	if err != nil {
-		return nil
-	}
-
 	cleanPath := filepath.Clean(filePath)
 	entry := persistentSessionMetaEntry{
 		FileCacheKey: newFileCacheKey(filePath, info),
 		Meta:         meta,
 	}
-	if err := updatePersistentSessionMetaCacheContext(ctx, cachePath, func(cache *persistentSessionMetaCache) {
-		cache.Entries[cleanPath] = entry
-	}); err != nil {
-		if isContextError(err) {
-			return err
-		}
-		return nil
-	}
 
-	persistentSessionMetaState.mu.Lock()
-	defer persistentSessionMetaState.mu.Unlock()
-	if persistentSessionMetaState.loaded && persistentSessionMetaState.path == cachePath {
-		if persistentSessionMetaState.cache.Entries == nil {
-			persistentSessionMetaState.cache = newPersistentSessionMetaCache()
+	if err == nil {
+		if updateErr := updatePersistentSessionMetaCacheContext(ctx, cachePath, func(cache *persistentSessionMetaCache) {
+			cache.Entries[cleanPath] = entry
+		}); updateErr != nil {
+			if isContextError(updateErr) {
+				return updateErr
+			}
+		} else {
+			persistentSessionMetaState.mu.Lock()
+			if persistentSessionMetaState.loaded && persistentSessionMetaState.path == cachePath {
+				if persistentSessionMetaState.cache.Entries == nil {
+					persistentSessionMetaState.cache = newPersistentSessionMetaCache()
+				}
+				persistentSessionMetaState.cache.Entries[cleanPath] = entry
+			} else {
+				persistentSessionMetaState.path = cachePath
+				persistentSessionMetaState.loaded = false
+			}
+			persistentSessionMetaState.cacheFilePresent, persistentSessionMetaState.cacheFileMtime = cacheFileState(cachePath)
+			persistentSessionMetaState.mu.Unlock()
 		}
-		persistentSessionMetaState.cache.Entries[cleanPath] = entry
-	} else {
-		persistentSessionMetaState.path = cachePath
-		persistentSessionMetaState.loaded = false
 	}
-	persistentSessionMetaState.cacheFilePresent, persistentSessionMetaState.cacheFileMtime = cacheFileState(cachePath)
-	return nil
+	return writeSharedPersistentSessionMetaContext(ctx, filePath, info, meta)
 }
 
 func deletePersistentSessionMeta(filePath string) {
@@ -204,30 +204,27 @@ func deletePersistentSessionMeta(filePath string) {
 
 func deletePersistentSessionMetaContext(ctx context.Context, filePath string) error {
 	cachePath, err := sessionMetaCacheFile()
-	if err != nil {
-		return nil
-	}
-
 	cleanPath := filepath.Clean(filePath)
-	if err := updatePersistentSessionMetaCacheContext(ctx, cachePath, func(cache *persistentSessionMetaCache) {
-		delete(cache.Entries, cleanPath)
-	}); err != nil {
-		if isContextError(err) {
-			return err
+	if err == nil {
+		if updateErr := updatePersistentSessionMetaCacheContext(ctx, cachePath, func(cache *persistentSessionMetaCache) {
+			delete(cache.Entries, cleanPath)
+		}); updateErr != nil {
+			if isContextError(updateErr) {
+				return updateErr
+			}
+		} else {
+			persistentSessionMetaState.mu.Lock()
+			if persistentSessionMetaState.loaded && persistentSessionMetaState.path == cachePath && persistentSessionMetaState.cache.Entries != nil {
+				delete(persistentSessionMetaState.cache.Entries, cleanPath)
+			} else {
+				persistentSessionMetaState.path = cachePath
+				persistentSessionMetaState.loaded = false
+			}
+			persistentSessionMetaState.cacheFilePresent, persistentSessionMetaState.cacheFileMtime = cacheFileState(cachePath)
+			persistentSessionMetaState.mu.Unlock()
 		}
-		return nil
 	}
-
-	persistentSessionMetaState.mu.Lock()
-	defer persistentSessionMetaState.mu.Unlock()
-	if persistentSessionMetaState.loaded && persistentSessionMetaState.path == cachePath && persistentSessionMetaState.cache.Entries != nil {
-		delete(persistentSessionMetaState.cache.Entries, cleanPath)
-	} else {
-		persistentSessionMetaState.path = cachePath
-		persistentSessionMetaState.loaded = false
-	}
-	persistentSessionMetaState.cacheFilePresent, persistentSessionMetaState.cacheFileMtime = cacheFileState(cachePath)
-	return nil
+	return deleteSharedPersistentSessionMetaContext(ctx, filePath)
 }
 
 func readPersistentHistoryIndex(path string, info os.FileInfo) (historyIndex, bool) {
@@ -237,25 +234,27 @@ func readPersistentHistoryIndex(path string, info os.FileInfo) (historyIndex, bo
 
 func readPersistentHistoryIndexContext(ctx context.Context, path string, info os.FileInfo) (historyIndex, bool, error) {
 	cachePath, err := historyIndexCacheFile()
-	if err != nil {
-		return historyIndex{}, false, nil
-	}
-
-	persistentHistoryIndexState.mu.Lock()
-	cache, err := loadHistoryIndexPersistentStateLockedContext(ctx, cachePath)
-	persistentHistoryIndexState.mu.Unlock()
-	if err != nil {
-		if isContextError(err) {
-			return historyIndex{}, false, err
+	if err == nil {
+		persistentHistoryIndexState.mu.Lock()
+		cache, loadErr := loadHistoryIndexPersistentStateLockedContext(ctx, cachePath)
+		persistentHistoryIndexState.mu.Unlock()
+		if loadErr != nil {
+			if isContextError(loadErr) {
+				return historyIndex{}, false, loadErr
+			}
+		} else {
+			entry, ok := cache.Entries[filepath.Clean(path)]
+			if ok && matchesFileInfo(path, info, entry.FileCacheKey) {
+				return historyIndex{sessions: entry.Sessions}, true, nil
+			}
 		}
-		return historyIndex{}, false, nil
 	}
-
-	entry, ok := cache.Entries[filepath.Clean(path)]
-	if !ok || !matchesFileInfo(path, info, entry.FileCacheKey) {
-		return historyIndex{}, false, nil
+	if idx, ok, sharedErr := readSharedPersistentHistoryIndexContext(ctx, path, info); sharedErr != nil {
+		return historyIndex{}, false, sharedErr
+	} else if ok {
+		return idx, true, nil
 	}
-	return historyIndex{sessions: entry.Sessions}, true, nil
+	return historyIndex{}, false, nil
 }
 
 func writePersistentHistoryIndex(path string, info os.FileInfo, idx historyIndex) {
@@ -264,37 +263,35 @@ func writePersistentHistoryIndex(path string, info os.FileInfo, idx historyIndex
 
 func writePersistentHistoryIndexContext(ctx context.Context, path string, info os.FileInfo, idx historyIndex) error {
 	cachePath, err := historyIndexCacheFile()
-	if err != nil {
-		return nil
-	}
-
 	cleanPath := filepath.Clean(path)
 	entry := persistentHistoryIndexEntry{
 		FileCacheKey: newFileCacheKey(path, info),
 		Sessions:     cloneHistorySessions(idx.sessions),
 	}
-	if err := updatePersistentHistoryIndexCacheContext(ctx, cachePath, func(cache *persistentHistoryIndexCache) {
-		cache.Entries[cleanPath] = entry
-	}); err != nil {
-		if isContextError(err) {
-			return err
-		}
-		return nil
-	}
 
-	persistentHistoryIndexState.mu.Lock()
-	defer persistentHistoryIndexState.mu.Unlock()
-	if persistentHistoryIndexState.loaded && persistentHistoryIndexState.path == cachePath {
-		if persistentHistoryIndexState.cache.Entries == nil {
-			persistentHistoryIndexState.cache = newPersistentHistoryIndexCache()
+	if err == nil {
+		if updateErr := updatePersistentHistoryIndexCacheContext(ctx, cachePath, func(cache *persistentHistoryIndexCache) {
+			cache.Entries[cleanPath] = entry
+		}); updateErr != nil {
+			if isContextError(updateErr) {
+				return updateErr
+			}
+		} else {
+			persistentHistoryIndexState.mu.Lock()
+			if persistentHistoryIndexState.loaded && persistentHistoryIndexState.path == cachePath {
+				if persistentHistoryIndexState.cache.Entries == nil {
+					persistentHistoryIndexState.cache = newPersistentHistoryIndexCache()
+				}
+				persistentHistoryIndexState.cache.Entries[cleanPath] = entry
+			} else {
+				persistentHistoryIndexState.path = cachePath
+				persistentHistoryIndexState.loaded = false
+			}
+			persistentHistoryIndexState.cacheFilePresent, persistentHistoryIndexState.cacheFileMtime = cacheFileState(cachePath)
+			persistentHistoryIndexState.mu.Unlock()
 		}
-		persistentHistoryIndexState.cache.Entries[cleanPath] = entry
-	} else {
-		persistentHistoryIndexState.path = cachePath
-		persistentHistoryIndexState.loaded = false
 	}
-	persistentHistoryIndexState.cacheFilePresent, persistentHistoryIndexState.cacheFileMtime = cacheFileState(cachePath)
-	return nil
+	return writeSharedPersistentHistoryIndexContext(ctx, path, info, idx)
 }
 
 func deletePersistentHistoryIndex(path string) {
@@ -303,30 +300,27 @@ func deletePersistentHistoryIndex(path string) {
 
 func deletePersistentHistoryIndexContext(ctx context.Context, path string) error {
 	cachePath, err := historyIndexCacheFile()
-	if err != nil {
-		return nil
-	}
-
 	cleanPath := filepath.Clean(path)
-	if err := updatePersistentHistoryIndexCacheContext(ctx, cachePath, func(cache *persistentHistoryIndexCache) {
-		delete(cache.Entries, cleanPath)
-	}); err != nil {
-		if isContextError(err) {
-			return err
+	if err == nil {
+		if updateErr := updatePersistentHistoryIndexCacheContext(ctx, cachePath, func(cache *persistentHistoryIndexCache) {
+			delete(cache.Entries, cleanPath)
+		}); updateErr != nil {
+			if isContextError(updateErr) {
+				return updateErr
+			}
+		} else {
+			persistentHistoryIndexState.mu.Lock()
+			if persistentHistoryIndexState.loaded && persistentHistoryIndexState.path == cachePath && persistentHistoryIndexState.cache.Entries != nil {
+				delete(persistentHistoryIndexState.cache.Entries, cleanPath)
+			} else {
+				persistentHistoryIndexState.path = cachePath
+				persistentHistoryIndexState.loaded = false
+			}
+			persistentHistoryIndexState.cacheFilePresent, persistentHistoryIndexState.cacheFileMtime = cacheFileState(cachePath)
+			persistentHistoryIndexState.mu.Unlock()
 		}
-		return nil
 	}
-
-	persistentHistoryIndexState.mu.Lock()
-	defer persistentHistoryIndexState.mu.Unlock()
-	if persistentHistoryIndexState.loaded && persistentHistoryIndexState.path == cachePath && persistentHistoryIndexState.cache.Entries != nil {
-		delete(persistentHistoryIndexState.cache.Entries, cleanPath)
-	} else {
-		persistentHistoryIndexState.path = cachePath
-		persistentHistoryIndexState.loaded = false
-	}
-	persistentHistoryIndexState.cacheFilePresent, persistentHistoryIndexState.cacheFileMtime = cacheFileState(cachePath)
-	return nil
+	return deleteSharedPersistentHistoryIndexContext(ctx, path)
 }
 
 func withSessionMetaPersistentBatch(ctx context.Context) (context.Context, *sessionMetaPersistentBatch) {
@@ -404,41 +398,39 @@ func flushPersistentSessionMetaBatchContext(ctx context.Context, batch *sessionM
 	batch.mu.Unlock()
 
 	cachePath, err := sessionMetaCacheFile()
-	if err != nil {
-		return nil
+	if err == nil {
+		if updateErr := updatePersistentSessionMetaCacheContext(ctx, cachePath, func(cache *persistentSessionMetaCache) {
+			for path := range deletes {
+				delete(cache.Entries, path)
+			}
+			for path, entry := range updates {
+				cache.Entries[path] = entry
+			}
+		}); updateErr != nil {
+			if isContextError(updateErr) {
+				return updateErr
+			}
+		} else {
+			persistentSessionMetaState.mu.Lock()
+			if persistentSessionMetaState.loaded && persistentSessionMetaState.path == cachePath {
+				if persistentSessionMetaState.cache.Entries == nil {
+					persistentSessionMetaState.cache = newPersistentSessionMetaCache()
+				}
+				for path := range deletes {
+					delete(persistentSessionMetaState.cache.Entries, path)
+				}
+				for path, entry := range updates {
+					persistentSessionMetaState.cache.Entries[path] = entry
+				}
+			} else {
+				persistentSessionMetaState.path = cachePath
+				persistentSessionMetaState.loaded = false
+			}
+			persistentSessionMetaState.cacheFilePresent, persistentSessionMetaState.cacheFileMtime = cacheFileState(cachePath)
+			persistentSessionMetaState.mu.Unlock()
+		}
 	}
-	if err := updatePersistentSessionMetaCacheContext(ctx, cachePath, func(cache *persistentSessionMetaCache) {
-		for path := range deletes {
-			delete(cache.Entries, path)
-		}
-		for path, entry := range updates {
-			cache.Entries[path] = entry
-		}
-	}); err != nil {
-		if isContextError(err) {
-			return err
-		}
-		return nil
-	}
-
-	persistentSessionMetaState.mu.Lock()
-	defer persistentSessionMetaState.mu.Unlock()
-	if persistentSessionMetaState.loaded && persistentSessionMetaState.path == cachePath {
-		if persistentSessionMetaState.cache.Entries == nil {
-			persistentSessionMetaState.cache = newPersistentSessionMetaCache()
-		}
-		for path := range deletes {
-			delete(persistentSessionMetaState.cache.Entries, path)
-		}
-		for path, entry := range updates {
-			persistentSessionMetaState.cache.Entries[path] = entry
-		}
-	} else {
-		persistentSessionMetaState.path = cachePath
-		persistentSessionMetaState.loaded = false
-	}
-	persistentSessionMetaState.cacheFilePresent, persistentSessionMetaState.cacheFileMtime = cacheFileState(cachePath)
-	return nil
+	return writeSharedPersistentSessionMetaBatchContext(ctx, updates, deletes)
 }
 
 func matchesFileInfo(path string, info os.FileInfo, key fileCacheKey) bool {
@@ -792,8 +784,21 @@ func withLockedCacheContext(ctx context.Context, path string, fn func() error) e
 }
 
 func writeJSONAtomically(path string, payload any) error {
+	return writeJSONAtomicallyWithOptions(path, payload, persistentCacheWriteOptions{
+		dirMode:  localPersistentCacheDirMode,
+		fileMode: localPersistentCacheFileMode,
+	})
+}
+
+func writeJSONAtomicallyWithOptions(path string, payload any, opts persistentCacheWriteOptions) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if opts.dirMode == 0 {
+		opts.dirMode = localPersistentCacheDirMode
+	}
+	if opts.fileMode == 0 {
+		opts.fileMode = localPersistentCacheFileMode
+	}
+	if err := os.MkdirAll(dir, opts.dirMode); err != nil {
 		return err
 	}
 
@@ -816,7 +821,7 @@ func writeJSONAtomically(path string, payload any) error {
 	if _, err := tmp.Write(data); err != nil {
 		return err
 	}
-	if err := tmp.Chmod(0o600); err != nil {
+	if err := tmp.Chmod(opts.fileMode); err != nil {
 		return err
 	}
 	if err := tmp.Close(); err != nil {

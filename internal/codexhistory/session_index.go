@@ -48,6 +48,8 @@ type codexResponsePayload struct {
 	Content json.RawMessage `json:"content"`
 }
 
+var openSessionMetaFile = os.Open
+
 func readSessionFileMeta(filePath string) (sessionFileMeta, error) {
 	return readSessionFileMetaContext(context.Background(), filePath)
 }
@@ -57,7 +59,7 @@ func readSessionFileMetaContext(ctx context.Context, filePath string) (sessionFi
 	if err := ctx.Err(); err != nil {
 		return meta, err
 	}
-	f, err := os.Open(filePath)
+	f, err := openSessionMetaFile(filePath)
 	if err != nil {
 		return meta, err
 	}
