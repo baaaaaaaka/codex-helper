@@ -108,6 +108,7 @@ func TestProxyStartBackgroundPassesResolvedConfigPathToDaemon(t *testing.T) {
 	cmd.SetContext(context.Background())
 	var out bytes.Buffer
 	cmd.SetOut(&out)
+	cmd.SetArgs([]string{})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute proxy start: %v", err)
