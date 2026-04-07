@@ -83,8 +83,12 @@ func TestResolveEffectivePaths_KeepsAliasRootHome(t *testing.T) {
 	if got.CodexDir != filepath.Join(currentHome, ".codex") {
 		t.Fatalf("CodexDir = %q", got.CodexDir)
 	}
-	if got.ConfigPath != filepath.Join(currentHome, ".config", "codex-proxy", "config.json") {
-		t.Fatalf("ConfigPath = %q", got.ConfigPath)
+	wantConfig, err := config.DefaultPathForHome(currentHome)
+	if err != nil {
+		t.Fatalf("DefaultPathForHome: %v", err)
+	}
+	if got.ConfigPath != wantConfig {
+		t.Fatalf("ConfigPath = %q, want %q", got.ConfigPath, wantConfig)
 	}
 	if !got.AliasRootHome {
 		t.Fatal("expected AliasRootHome=true")
@@ -240,8 +244,12 @@ func TestResolveEffectivePaths_DoesNotGuessWithoutTrustedHint(t *testing.T) {
 	if got.CodexDir != filepath.Join(currentHome, ".codex") {
 		t.Fatalf("CodexDir = %q", got.CodexDir)
 	}
-	if got.ConfigPath != filepath.Join(currentHome, ".config", "codex-proxy", "config.json") {
-		t.Fatalf("ConfigPath = %q", got.ConfigPath)
+	wantConfig, err := config.DefaultPathForHome(currentHome)
+	if err != nil {
+		t.Fatalf("DefaultPathForHome: %v", err)
+	}
+	if got.ConfigPath != wantConfig {
+		t.Fatalf("ConfigPath = %q, want %q", got.ConfigPath, wantConfig)
 	}
 	if got.AliasRootHome {
 		t.Fatal("expected AliasRootHome=false")
