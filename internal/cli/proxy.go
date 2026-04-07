@@ -86,7 +86,7 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 		Short: "Start a long-lived proxy instance (daemon)",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			store, err := config.NewStore(root.configPath)
+			store, _, err := newRootStore(root, "")
 			if err != nil {
 				return err
 			}
@@ -133,11 +133,7 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 
-			args := []string{}
-			if root.configPath != "" {
-				args = append(args, "--config", root.configPath)
-			}
-			args = append(args, "proxy", "daemon", "--instance-id", instanceID)
+			args := []string{"--config", store.Path(), "proxy", "daemon", "--instance-id", instanceID}
 
 			c := proxyCommand(exe, args...)
 			c.Stdin = nil
@@ -189,7 +185,7 @@ func newProxyDaemonCmd(root *rootOptions) *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			store, err := config.NewStore(root.configPath)
+			store, _, err := newRootStore(root, "")
 			if err != nil {
 				return err
 			}
@@ -284,7 +280,7 @@ func newProxyListCmd(root *rootOptions) *cobra.Command {
 		Short: "List known proxy instances",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			store, err := config.NewStore(root.configPath)
+			store, _, err := newRootStore(root, "")
 			if err != nil {
 				return err
 			}
@@ -344,7 +340,7 @@ func newProxyStopCmd(root *rootOptions) *cobra.Command {
 		Short: "Stop a proxy instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := config.NewStore(root.configPath)
+			store, _, err := newRootStore(root, "")
 			if err != nil {
 				return err
 			}
@@ -385,7 +381,7 @@ func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 		Short: "Remove dead/unhealthy proxy instances from config",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			store, err := config.NewStore(root.configPath)
+			store, _, err := newRootStore(root, "")
 			if err != nil {
 				return err
 			}
@@ -445,7 +441,7 @@ func newProxyDoctorCmd(root *rootOptions) *cobra.Command {
 				issues = append(issues, "missing `codex` (install with: npm install -g @openai/codex)")
 			}
 
-			store, err := config.NewStore(root.configPath)
+			store, _, err := newRootStore(root, "")
 			if err != nil {
 				issues = append(issues, "config store error: "+err.Error())
 			} else {

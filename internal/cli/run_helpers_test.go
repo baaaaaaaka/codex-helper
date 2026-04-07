@@ -54,6 +54,56 @@ func TestRunWithExistingInstance(t *testing.T) {
 	}
 }
 
+func TestRunWithExistingInstanceOptionsPreservesExplicitCodexHomeEnv(t *testing.T) {
+	lockCLITestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based test on windows")
+	}
+
+	binDir := t.TempDir()
+	outFile := filepath.Join(t.TempDir(), "env.txt")
+	codexPath := filepath.Join(binDir, "codex")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"printf 'HOME=%s\\nDIR=%s\\n' \"$CODEX_HOME\" \"$CODEX_DIR\" > \"$OUT_FILE\"\n"
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	inst := config.Instance{
+		ID:         "inst-explicit-home",
+		ProfileID:  "p1",
+		Kind:       config.InstanceKindDaemon,
+		HTTPPort:   18080,
+		DaemonPID:  os.Getpid(),
+		LastSeenAt: time.Now(),
+	}
+	opts := runTargetOptions{
+		UseProxy: true,
+		ExtraEnv: []string{
+			"OUT_FILE=" + outFile,
+			"CODEX_HOME=/explicit/codex-home",
+			"CODEX_DIR=/explicit/codex-home",
+		},
+	}
+
+	if err := runWithExistingInstanceOptions(context.Background(), manager.HealthClient{Timeout: time.Second}, inst, []string{"codex"}, opts); err != nil {
+		t.Fatalf("runWithExistingInstanceOptions error: %v", err)
+	}
+
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	want := "HOME=/explicit/codex-home\nDIR=/explicit/codex-home\n"
+	if string(got) != want {
+		t.Fatalf("expected explicit codex env %q, got %q", want, string(got))
+	}
+}
+
 func TestRunWithExistingInstanceOptionsInstallsCodexUsingProxyEnv(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell-based test on windows")
@@ -410,6 +460,57 @@ func TestRunWithNewStackOptionsSuccess(t *testing.T) {
 	}
 	if len(cfg.Instances) != 0 {
 		t.Fatalf("expected instances to be removed, got %d", len(cfg.Instances))
+	}
+}
+
+func TestRunWithNewStackOptionsPreservesExplicitCodexHomeEnv(t *testing.T) {
+	lockCLITestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based test on windows")
+	}
+
+	store := newTempStore(t)
+	profile := config.Profile{ID: "p1", Host: "host", Port: 22, User: "user"}
+
+	binDir := t.TempDir()
+	outFile := filepath.Join(t.TempDir(), "env.txt")
+	codexPath := filepath.Join(binDir, "codex")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"printf 'HOME=%s\\nDIR=%s\\n' \"$CODEX_HOME\" \"$CODEX_DIR\" > \"$OUT_FILE\"\n"
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	prevStart := stackStart
+	t.Cleanup(func() { stackStart = prevStart })
+	stackStart = func(profile config.Profile, instanceID string, opts stack.Options) (*stack.Stack, error) {
+		return stack.NewStackForTest(12345, 23456), nil
+	}
+
+	opts := runTargetOptions{
+		UseProxy: true,
+		ExtraEnv: []string{
+			"OUT_FILE=" + outFile,
+			"CODEX_HOME=/explicit/new-stack-home",
+			"CODEX_DIR=/explicit/new-stack-home",
+		},
+	}
+
+	if err := runWithNewStackOptions(context.Background(), store, profile, []string{"codex"}, opts); err != nil {
+		t.Fatalf("runWithNewStackOptions error: %v", err)
+	}
+
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	want := "HOME=/explicit/new-stack-home\nDIR=/explicit/new-stack-home\n"
+	if string(got) != want {
+		t.Fatalf("expected explicit codex env %q, got %q", want, string(got))
 	}
 }
 

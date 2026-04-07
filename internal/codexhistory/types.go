@@ -1,9 +1,6 @@
 package codexhistory
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -66,15 +63,9 @@ func (s SubagentSession) DisplayTitle() string {
 }
 
 func ResolveCodexDir(override string) (string, error) {
-	if v := strings.TrimSpace(override); v != "" {
-		return filepath.Clean(os.ExpandEnv(v)), nil
-	}
-	if v := strings.TrimSpace(os.Getenv(EnvCodexDir)); v != "" {
-		return filepath.Clean(os.ExpandEnv(v)), nil
-	}
-	home, err := os.UserHomeDir()
+	resolution, err := ResolveCodexDirSelection(override)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".codex"), nil
+	return resolution.Dir, nil
 }

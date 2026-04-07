@@ -28,7 +28,7 @@ func newInitCmd(root *rootOptions) *cobra.Command {
 		Short: "Create an SSH profile",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			store, err := config.NewStore(root.configPath)
+			store, _, err := newRootStore(root, "")
 			if err != nil {
 				return err
 			}

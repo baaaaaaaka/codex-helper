@@ -20,6 +20,7 @@ type yoloAuthOverride struct {
 	sanitized  []byte
 	backupPath string
 	leasePath  string
+	identity   *execIdentity
 }
 
 func logYoloAuthStatus(log io.Writer, override *yoloAuthOverride, err error) {
@@ -36,20 +37,11 @@ func logYoloAuthStatus(log io.Writer, override *yoloAuthOverride, err error) {
 }
 
 func resolveCodexHome(override string, workingDir string) (string, error) {
-	if v := strings.TrimSpace(override); v != "" {
-		return resolveCodexHomePath(v, workingDir)
-	}
-	if v := strings.TrimSpace(os.Getenv(envCodexHome)); v != "" {
-		return resolveCodexHomePath(v, workingDir)
-	}
-	if v := strings.TrimSpace(os.Getenv(codexhistory.EnvCodexDir)); v != "" {
-		return resolveCodexHomePath(v, workingDir)
-	}
-	home, err := os.UserHomeDir()
+	paths, err := resolveEffectivePaths("", override, workingDir)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".codex"), nil
+	return paths.CodexDir, nil
 }
 
 func resolveCodexHomePath(raw string, workingDir string) (string, error) {
@@ -63,7 +55,7 @@ func resolveCodexHomePath(raw string, workingDir string) (string, error) {
 	return filepath.Abs(path)
 }
 
-func yoloCodexHomeEnv(codexHome string) []string {
+func codexHomeEnv(codexHome string) []string {
 	if strings.TrimSpace(codexHome) == "" {
 		return nil
 	}
@@ -73,7 +65,11 @@ func yoloCodexHomeEnv(codexHome string) []string {
 	}
 }
 
-func prepareYoloAuthOverride(codexHome string) (*yoloAuthOverride, error) {
+func yoloCodexHomeEnv(codexHome string) []string {
+	return codexHomeEnv(codexHome)
+}
+
+func prepareYoloAuthOverride(codexHome string, identity *execIdentity) (*yoloAuthOverride, error) {
 	codexHome, err := resolveCodexHomePath(codexHome, "")
 	if err != nil {
 		return nil, err
@@ -113,7 +109,16 @@ func prepareYoloAuthOverride(codexHome string) (*yoloAuthOverride, error) {
 		if err := os.WriteFile(backupPath, original, 0o600); err != nil {
 			return nil, err
 		}
+		if err := ensurePathOwnedByIdentity(backupPath, identity); err != nil {
+			_ = os.Remove(backupPath)
+			return nil, err
+		}
 		if err := os.WriteFile(authPath, sanitized, mode); err != nil {
+			_ = os.Remove(backupPath)
+			return nil, err
+		}
+		if err := ensurePathOwnedByIdentity(authPath, identity); err != nil {
+			_ = os.WriteFile(authPath, original, mode)
 			_ = os.Remove(backupPath)
 			return nil, err
 		}
@@ -129,12 +134,21 @@ func prepareYoloAuthOverride(codexHome string) (*yoloAuthOverride, error) {
 		}
 		return nil, err
 	}
+	if err := ensurePathOwnedByIdentity(leasePath, identity); err != nil {
+		_ = os.Remove(leasePath)
+		if changed {
+			_ = os.WriteFile(authPath, original, mode)
+			_ = os.Remove(backupPath)
+		}
+		return nil, err
+	}
 
 	return &yoloAuthOverride{
 		path:       authPath,
 		sanitized:  sanitized,
 		backupPath: backupPath,
 		leasePath:  leasePath,
+		identity:   identity,
 	}, nil
 }
 
@@ -171,6 +185,7 @@ func (o *yoloAuthOverride) Cleanup() {
 		mode = info.Mode().Perm()
 	}
 	if err := os.WriteFile(o.path, backup, mode); err == nil {
+		_ = ensurePathOwnedByIdentity(o.path, o.identity)
 		_ = os.Remove(o.backupPath)
 	}
 }

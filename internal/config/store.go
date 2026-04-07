@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/gofrs/flock"
@@ -21,6 +23,24 @@ func DefaultPath() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("get user config dir: %w", err)
+	}
+	return filepath.Join(base, "codex-proxy", "config.json"), nil
+}
+
+func DefaultPathForHome(home string) (string, error) {
+	home = filepath.Clean(strings.TrimSpace(home))
+	if home == "" {
+		return "", fmt.Errorf("empty home dir")
+	}
+
+	base := home
+	switch runtime.GOOS {
+	case "windows":
+		base = filepath.Join(home, "AppData", "Roaming")
+	case "darwin":
+		base = filepath.Join(home, "Library", "Application Support")
+	default:
+		base = filepath.Join(home, ".config")
 	}
 	return filepath.Join(base, "codex-proxy", "config.json"), nil
 }

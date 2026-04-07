@@ -374,7 +374,7 @@ func TestHistoryListCmdPrintsDiscoveredProjects(t *testing.T) {
 	projectDir := t.TempDir()
 	writeCodexSessionFile(t, codexDir, sessionID, projectDir, "build the release")
 
-	cmd := newHistoryListCmd(&codexDir)
+	cmd := newHistoryListCmd(&rootOptions{}, &codexDir)
 	cmd.SetContext(context.Background())
 	var out strings.Builder
 	cmd.SetOut(&out)
@@ -409,7 +409,7 @@ func TestHistoryShowCmdPrintsFormattedSession(t *testing.T) {
 	projectDir := t.TempDir()
 	writeCodexSessionFile(t, codexDir, sessionID, projectDir, "open the dashboard")
 
-	cmd := newHistoryShowCmd(&codexDir)
+	cmd := newHistoryShowCmd(&rootOptions{}, &codexDir)
 	cmd.SetContext(context.Background())
 	var out strings.Builder
 	cmd.SetOut(&out)

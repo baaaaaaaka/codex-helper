@@ -53,6 +53,7 @@ var (
 	userHomeDirLookup = os.UserHomeDir
 	hostnameLookup    = os.Hostname
 	getenvLookup      = os.Getenv
+	patchResultChown  = os.Chown
 )
 
 // derivePatchedReqPath builds a user-scoped requirements path with a fixed
@@ -84,6 +85,13 @@ func derivePatchedReqPath() (string, error) {
 	identity := "unknown"
 	if len(identities) > 0 {
 		identity = identities[0]
+	}
+	return derivePatchedReqPathForIdentity(identity)
+}
+
+func derivePatchedReqPathWithIdentity(identity string) (string, error) {
+	if strings.TrimSpace(identity) == "" {
+		return derivePatchedReqPath()
 	}
 	return derivePatchedReqPathForIdentity(identity)
 }
@@ -247,6 +255,35 @@ func (r *PatchResult) Cleanup() {
 	if r.PatchedBinary != "" {
 		_ = os.Remove(r.PatchedBinary)
 	}
+}
+
+func (r *PatchResult) EnsureOwnership(uid int, gid int) error {
+	if r == nil || uid <= 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	paths := []string{
+		filepath.Dir(strings.TrimSpace(r.PatchedBinary)),
+		strings.TrimSpace(r.PatchedBinary),
+		filepath.Dir(strings.TrimSpace(r.RequirementsPath)),
+		strings.TrimSpace(r.RequirementsPath),
+		strings.TrimSpace(r.leasePath),
+	}
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		if err := patchResultChown(path, uid, gid); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func patchLeasePath(binaryPath string) string {
@@ -424,6 +461,7 @@ func adHocCodesign(path string) error {
 func patchCodexBinaryWithRuntime(
 	origBinary string,
 	cacheDir string,
+	reqIdentity string,
 	goos string,
 	codesignFn func(string) error,
 ) (*PatchResult, error) {
@@ -441,7 +479,7 @@ func patchCodexBinaryWithRuntime(
 	origHash := hex.EncodeToString(sum[:])
 
 	patched := false
-	patchedReqPath, err := derivePatchedReqPath()
+	patchedReqPath, err := derivePatchedReqPathWithIdentity(reqIdentity)
 	if err != nil {
 		return nil, fmt.Errorf("derive requirements path: %w", err)
 	}
@@ -542,5 +580,9 @@ func patchCodexBinaryWithRuntime(
 //
 // The original binary is not modified; a copy is placed in cacheDir.
 func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) {
-	return patchCodexBinaryWithRuntime(origBinary, cacheDir, runtime.GOOS, nil)
+	return patchCodexBinaryWithRuntime(origBinary, cacheDir, "", runtime.GOOS, nil)
+}
+
+func PatchCodexBinaryForIdentity(origBinary string, cacheDir string, reqIdentity string) (*PatchResult, error) {
+	return patchCodexBinaryWithRuntime(origBinary, cacheDir, reqIdentity, runtime.GOOS, nil)
 }

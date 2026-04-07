@@ -63,8 +63,8 @@ func newHistoryCmd(root *rootOptions) *cobra.Command {
 
 	cmd.AddCommand(
 		newHistoryTuiCmd(root, &codexDir, &codexPath, &profileRef),
-		newHistoryListCmd(&codexDir),
-		newHistoryShowCmd(&codexDir),
+		newHistoryListCmd(root, &codexDir),
+		newHistoryShowCmd(root, &codexDir),
 		newHistoryOpenCmd(root, &codexDir, &codexPath, &profileRef),
 	)
 	return cmd
@@ -84,7 +84,7 @@ func newHistoryTuiCmd(root *rootOptions, codexDir *string, codexPath *string, pr
 	return cmd
 }
 
-func newHistoryListCmd(codexDir *string) *cobra.Command {
+func newHistoryListCmd(root *rootOptions, codexDir *string) *cobra.Command {
 	var pretty bool
 
 	cmd := &cobra.Command{
@@ -92,7 +92,11 @@ func newHistoryListCmd(codexDir *string) *cobra.Command {
 		Short: "List discovered projects and sessions as JSON",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			projects, err := codexhistory.DiscoverProjects(*codexDir)
+			paths, err := resolveEffectivePaths(root.configPath, *codexDir, "")
+			if err != nil {
+				return err
+			}
+			projects, err := codexhistory.DiscoverProjects(paths.CodexDir)
 			if err != nil && len(projects) == 0 {
 				return err
 			}
@@ -115,14 +119,18 @@ func newHistoryListCmd(codexDir *string) *cobra.Command {
 	return cmd
 }
 
-func newHistoryShowCmd(codexDir *string) *cobra.Command {
+func newHistoryShowCmd(root *rootOptions, codexDir *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "show <session-id>",
 		Short: "Print full history for a session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sessionID := args[0]
-			session, err := codexhistory.FindSessionByID(*codexDir, sessionID)
+			paths, err := resolveEffectivePaths(root.configPath, *codexDir, "")
+			if err != nil {
+				return err
+			}
+			session, err := codexhistory.FindSessionByID(paths.CodexDir, sessionID)
 			if err != nil {
 				return err
 			}
@@ -146,7 +154,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 			ctx, stop := withSignalContext(cmd.Context())
 			defer stop()
 
-			store, err := config.NewStore(root.configPath)
+			store, paths, err := newRootStore(root, *codexDir)
 			if err != nil {
 				return err
 			}
@@ -175,7 +183,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 			useYolo := resolveYoloEnabled(cfg)
 
 			sessionID := args[0]
-			session, project, err := findSessionWithProjectFunc(*codexDir, sessionID)
+			session, project, err := findSessionWithProjectFunc(paths.CodexDir, sessionID)
 			if err != nil {
 				return err
 			}
@@ -209,7 +217,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 	ctx, stop := withSignalContext(cmd.Context())
 	defer stop()
 
-	store, err := config.NewStore(root.configPath)
+	store, paths, err := newRootStore(root, codexDir)
 	if err != nil {
 		return err
 	}
@@ -242,7 +250,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		showYoloToggle := shouldShowYoloToggle(cfg, store.Path())
 		selection, err := selectSession(ctx, tui.Options{
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
-				return codexhistory.DiscoverProjectsContext(ctx, codexDir)
+				return codexhistory.DiscoverProjectsContext(ctx, paths.CodexDir)
 			},
 			Version:         version,
 			ProxyEnabled:    useProxy,

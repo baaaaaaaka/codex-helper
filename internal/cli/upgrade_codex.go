@@ -38,7 +38,7 @@ func runUpgradeCodexFromRoot(cmd *cobra.Command, root *rootOptions) error {
 		return err
 	}
 
-	store, err := config.NewStore(root.configPath)
+	store, _, err := newRootStore(root, "")
 	if err != nil {
 		return err
 	}

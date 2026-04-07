@@ -298,6 +298,42 @@ func TestRunCodexNewSessionSuccess(t *testing.T) {
 	}
 }
 
+func TestRunCodexNewSessionPropagatesResolvedCodexHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script execution on windows")
+	}
+
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("CODEX_DIR", "")
+	outFile := filepath.Join(t.TempDir(), "env.txt")
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n%%s\\n' \"$CODEX_HOME\" \"$CODEX_DIR\" > %q\n", outFile)
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write codex: %v", err)
+	}
+
+	store := newTempStore(t)
+	root := &rootOptions{configPath: store.Path()}
+	projectDir := t.TempDir()
+
+	if err := runCodexNewSession(context.Background(), root, store, nil, nil, projectDir, codexPath, "", false, false, io.Discard); err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read env output: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 env lines, got %q", string(got))
+	}
+	if lines[0] != codexHome || lines[1] != codexHome {
+		t.Fatalf("expected propagated codex home %q, got %v", codexHome, lines)
+	}
+}
+
 func TestRunCodexSessionRequiresProfileWhenProxyEnabled(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script execution on windows")
@@ -315,6 +351,44 @@ func TestRunCodexSessionRequiresProfileWhenProxyEnabled(t *testing.T) {
 
 	if err := runCodexSession(context.Background(), root, store, nil, nil, session, project, codexPath, "", true, false, io.Discard); err == nil {
 		t.Fatalf("expected proxy mode error")
+	}
+}
+
+func TestRunCodexSessionPropagatesResolvedCodexHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script execution on windows")
+	}
+
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("CODEX_DIR", "")
+	outFile := filepath.Join(t.TempDir(), "env.txt")
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n%%s\\n' \"$CODEX_HOME\" \"$CODEX_DIR\" > %q\n", outFile)
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write codex: %v", err)
+	}
+
+	store := newTempStore(t)
+	root := &rootOptions{configPath: store.Path()}
+	projectDir := t.TempDir()
+	session := codexhistory.Session{SessionID: "sess-1", ProjectPath: projectDir}
+	project := codexhistory.Project{Path: projectDir}
+
+	if err := runCodexSession(context.Background(), root, store, nil, nil, session, project, codexPath, "", false, false, io.Discard); err != nil {
+		t.Fatalf("runCodexSession error: %v", err)
+	}
+
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read env output: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 env lines, got %q", string(got))
+	}
+	if lines[0] != codexHome || lines[1] != codexHome {
+		t.Fatalf("expected propagated codex home %q, got %v", codexHome, lines)
 	}
 }
 
@@ -651,6 +725,89 @@ func TestPreparePatchedBinaryRecordsHistory(t *testing.T) {
 	}
 	if entry.ProxyVersion == "" {
 		t.Fatal("entry should have proxy version")
+	}
+}
+
+func TestPreparePatchedBinaryForLaunchUsesAccessibleArtifactsForExecIdentity(t *testing.T) {
+	lockCLITestHooks(t)
+
+	wrapperPath, _ := setupMockCodexInstall(t)
+	historyDir := filepath.Join(t.TempDir(), "config")
+
+	prevPrepare := preparePatchedYoloBinaryFunc
+	prevEnsure := ensurePatchedBinaryOwnership
+	prevTempRoot := yoloArtifactTempRoot
+	sharedTempRoot := filepath.Join(t.TempDir(), "shared-tmp")
+	t.Cleanup(func() {
+		preparePatchedYoloBinaryFunc = prevPrepare
+		ensurePatchedBinaryOwnership = prevEnsure
+		yoloArtifactTempRoot = prevTempRoot
+	})
+	yoloArtifactTempRoot = func() string { return sharedTempRoot }
+
+	var gotCacheDir string
+	var gotReqIdentity string
+	preparePatchedYoloBinaryFunc = func(codexPath string, cacheDir string, reqIdentity string) (*cloudgate.PatchResult, []string, error) {
+		gotCacheDir = cacheDir
+		gotReqIdentity = reqIdentity
+		if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+			return nil, nil, err
+		}
+		patchedPath := filepath.Join(cacheDir, "codex-patched-test")
+		if err := os.WriteFile(patchedPath, []byte("patched"), 0o700); err != nil {
+			return nil, nil, err
+		}
+		reqPath := filepath.Join(t.TempDir(), "reqs.toml")
+		if err := os.WriteFile(reqPath, []byte("reqs"), 0o600); err != nil {
+			return nil, nil, err
+		}
+		return &cloudgate.PatchResult{
+			PatchedBinary:    patchedPath,
+			RequirementsPath: reqPath,
+		}, []string{"CODEX_MANAGED_BY_NPM=1"}, nil
+	}
+
+	var ensured bool
+	ensurePatchedBinaryOwnership = func(result *cloudgate.PatchResult, identity *execIdentity) error {
+		ensured = true
+		if identity == nil || identity.UID != 1000 || identity.GID != 1001 {
+			t.Fatalf("unexpected identity: %+v", identity)
+		}
+		if result == nil || result.PatchedBinary == "" {
+			t.Fatalf("unexpected patch result: %+v", result)
+		}
+		return nil
+	}
+
+	result, patchEnv, info, skipped, patchErr := preparePatchedBinaryForLaunch(wrapperPath, historyDir, &execIdentity{
+		UID:      1000,
+		GID:      1001,
+		Username: "alice",
+		Home:     "/home/alice",
+	})
+	if skipped {
+		t.Fatal("launch patch should not be skipped")
+	}
+	if patchErr != nil {
+		t.Fatalf("preparePatchedBinaryForLaunch: %v", patchErr)
+	}
+	if result == nil || info == nil {
+		t.Fatalf("expected patch result and info, got result=%+v info=%+v", result, info)
+	}
+	if gotCacheDir != filepath.Join(sharedTempRoot, "codex-proxy-yolo-uid-1000") {
+		t.Fatalf("unexpected cache dir %q", gotCacheDir)
+	}
+	if !strings.Contains(gotReqIdentity, "uid:1000") || !strings.Contains(gotReqIdentity, "home:/home/alice") {
+		t.Fatalf("unexpected req identity %q", gotReqIdentity)
+	}
+	if info.ConfigDir != historyDir {
+		t.Fatalf("expected patch history dir %q, got %q", historyDir, info.ConfigDir)
+	}
+	if len(patchEnv) != 1 || patchEnv[0] != "CODEX_MANAGED_BY_NPM=1" {
+		t.Fatalf("unexpected patch env %v", patchEnv)
+	}
+	if !ensured {
+		t.Fatal("expected patch result ownership fix for exec identity")
 	}
 }
 

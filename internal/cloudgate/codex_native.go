@@ -191,12 +191,16 @@ func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string
 // (permissive system requirements), and returns the patched binary path plus
 // any extra environment variables.
 func PrepareYoloBinary(codexWrapperPath string, cacheDir string) (*PatchResult, []string, error) {
+	return PrepareYoloBinaryForIdentity(codexWrapperPath, cacheDir, "")
+}
+
+func PrepareYoloBinaryForIdentity(codexWrapperPath string, cacheDir string, reqIdentity string) (*PatchResult, []string, error) {
 	nativeBin, pathDir, err := FindNativeBinary(codexWrapperPath)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	result, err := PatchCodexBinary(nativeBin, cacheDir)
+	result, err := PatchCodexBinaryForIdentity(nativeBin, cacheDir, reqIdentity)
 	if err != nil {
 		return nil, nil, fmt.Errorf("patch binary: %w", err)
 	}

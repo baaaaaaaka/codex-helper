@@ -107,7 +107,7 @@ func TestPrepareYoloAuthOverrideMasksPlanAndRestores(t *testing.T) {
 	codexDir := t.TempDir()
 	original := writeTestAuthJSON(t, codexDir, true)
 
-	override, err := prepareYoloAuthOverride(codexDir)
+	override, err := prepareYoloAuthOverride(codexDir, nil)
 	if err != nil {
 		t.Fatalf("prepareYoloAuthOverride: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestYoloAuthOverrideCleanupPreservesChangedFile(t *testing.T) {
 	codexDir := t.TempDir()
 	writeTestAuthJSON(t, codexDir, true)
 
-	override, err := prepareYoloAuthOverride(codexDir)
+	override, err := prepareYoloAuthOverride(codexDir, nil)
 	if err != nil {
 		t.Fatalf("prepareYoloAuthOverride: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestPrepareYoloAuthOverrideWaitsForLastLeaseBeforeRestore(t *testing.T) {
 	codexDir := t.TempDir()
 	original := writeTestAuthJSON(t, codexDir, true)
 
-	first, err := prepareYoloAuthOverride(codexDir)
+	first, err := prepareYoloAuthOverride(codexDir, nil)
 	if err != nil {
 		t.Fatalf("prepareYoloAuthOverride first: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestPrepareYoloAuthOverrideWaitsForLastLeaseBeforeRestore(t *testing.T) {
 		t.Fatal("expected first auth override")
 	}
 
-	second, err := prepareYoloAuthOverride(codexDir)
+	second, err := prepareYoloAuthOverride(codexDir, nil)
 	if err != nil {
 		t.Fatalf("prepareYoloAuthOverride second: %v", err)
 	}

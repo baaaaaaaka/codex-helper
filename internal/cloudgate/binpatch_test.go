@@ -237,7 +237,7 @@ func TestPatchCodexBinaryWithRuntime_DarwinMachOSigns(t *testing.T) {
 	}
 
 	called := false
-	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "darwin", func(path string) error {
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "", "darwin", func(path string) error {
 		called = true
 		if _, statErr := os.Stat(path); statErr != nil {
 			t.Fatalf("sign target should exist: %v", statErr)
@@ -268,7 +268,7 @@ func TestPatchCodexBinaryWithRuntime_DarwinSignFailureCleansPatchedBinary(t *tes
 		t.Fatalf("write: %v", err)
 	}
 
-	_, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "darwin", func(string) error {
+	_, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "", "darwin", func(string) error {
 		return fmt.Errorf("codesign failed")
 	})
 	if err == nil {
@@ -298,7 +298,7 @@ func TestPatchCodexBinaryWithRuntime_NonDarwinSkipsCodesign(t *testing.T) {
 	}
 
 	called := false
-	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "linux", func(string) error {
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "", "linux", func(string) error {
 		called = true
 		return nil
 	})
@@ -324,7 +324,7 @@ func TestPatchCodexBinaryWithRuntime_DarwinNonMachOSkipsCodesign(t *testing.T) {
 	}
 
 	called := false
-	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "darwin", func(string) error {
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "", "darwin", func(string) error {
 		called = true
 		return nil
 	})
@@ -529,7 +529,7 @@ func TestPatchCodexBinarySetsExecutablePermission(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, runtime.GOOS, nil)
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "", runtime.GOOS, nil)
 	if err != nil {
 		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
 	}
@@ -559,7 +559,7 @@ func TestPatchCodexBinarySetsRequirementsPermissions(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, runtime.GOOS, nil)
+	result, err := patchCodexBinaryWithRuntime(origPath, cacheDir, "", runtime.GOOS, nil)
 	if err != nil {
 		t.Fatalf("patchCodexBinaryWithRuntime: %v", err)
 	}

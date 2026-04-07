@@ -182,6 +182,23 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/codexhistory ./internal/tui -count=1
 
+      - name: Root/home/identity regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareYoloAuthOverrideReownsAuthFilesForExecIdentity|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|PreparePatchedBinaryForLaunchUsesAccessibleArtifactsForExecIdentity|RunWith(ExistingInstanceOptionsPreservesExplicitCodexHomeEnv|NewStackOptionsPreservesExplicitCodexHomeEnv)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          go test ./internal/cli ./internal/codexhistory ./internal/config ./internal/cloudgate -count=1 -run "$pattern"
+
+      - name: Root/home/identity regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareYoloAuthOverrideReownsAuthFilesForExecIdentity|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|PreparePatchedBinaryForLaunchUsesAccessibleArtifactsForExecIdentity|RunWith(ExistingInstanceOptionsPreservesExplicitCodexHomeEnv|NewStackOptionsPreservesExplicitCodexHomeEnv)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          go test ./internal/cli ./internal/codexhistory ./internal/config ./internal/cloudgate -count=1 -run $pattern
+
       - name: go vet
         run: go vet ./...
 

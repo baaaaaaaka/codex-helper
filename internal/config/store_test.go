@@ -57,6 +57,26 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDefaultPathForHome(t *testing.T) {
+	home := filepath.Join(string(filepath.Separator), "tmp", "test-home")
+
+	got, err := DefaultPathForHome(home)
+	if err != nil {
+		t.Fatalf("DefaultPathForHome: %v", err)
+	}
+
+	want := filepath.Join(home, ".config", "codex-proxy", "config.json")
+	switch runtime.GOOS {
+	case "windows":
+		want = filepath.Join(home, "AppData", "Roaming", "codex-proxy", "config.json")
+	case "darwin":
+		want = filepath.Join(home, "Library", "Application Support", "codex-proxy", "config.json")
+	}
+	if got != want {
+		t.Fatalf("DefaultPathForHome = %q, want %q", got, want)
+	}
+}
+
 func TestStore_UpdateIsSerialized(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewStore(filepath.Join(dir, "config.json"))

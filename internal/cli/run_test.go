@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 	"github.com/spf13/cobra"
@@ -217,6 +219,85 @@ func TestRunTargetWithFallbackDisablesYolo(t *testing.T) {
 	}
 }
 
+func TestCodexExecutionContextForRunRequiresRunnableIdentityForForeignHome(t *testing.T) {
+	lockCLITestHooks(t)
+	setEffectivePathsHooksForTest(t)
+
+	currentHome := t.TempDir()
+	candidateHome := t.TempDir()
+	t.Setenv("HOME", currentHome)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv(envUserHomeHint, candidateHome)
+	t.Setenv(codexhistory.EnvCodexDir, "")
+	t.Setenv(envCodexHome, "")
+
+	effectivePathsRunningAsRoot = func() bool { return true }
+	effectivePathsUserHomeDir = func() (string, error) { return currentHome, nil }
+	effectivePathsExecIdentityHome = func(string) (*execIdentity, error) { return nil, nil }
+
+	envVars, identity, err := codexExecutionContextForRun("")
+	if err == nil {
+		t.Fatal("expected error when foreign home has no runnable identity")
+	}
+	var targetErr *execIdentityRequired
+	if !errors.As(err, &targetErr) {
+		t.Fatalf("expected execIdentityRequired, got %T %v", err, err)
+	}
+	if envVars != nil {
+		t.Fatalf("expected env to be nil on error, got %v", envVars)
+	}
+	if identity != nil {
+		t.Fatalf("expected identity to be nil on error, got %+v", identity)
+	}
+}
+
+func TestCodexExecutionContextForRunUsesResolvedForeignHomeAndExecIdentity(t *testing.T) {
+	lockCLITestHooks(t)
+	setEffectivePathsHooksForTest(t)
+
+	currentHome := t.TempDir()
+	candidateHome := t.TempDir()
+	t.Setenv("HOME", currentHome)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv(envUserHomeHint, candidateHome)
+	t.Setenv(codexhistory.EnvCodexDir, "")
+	t.Setenv(envCodexHome, "")
+
+	effectivePathsRunningAsRoot = func() bool { return true }
+	effectivePathsUserHomeDir = func() (string, error) { return currentHome, nil }
+	effectivePathsExecIdentityHome = func(home string) (*execIdentity, error) {
+		if home != candidateHome {
+			t.Fatalf("unexpected identity lookup home: %q", home)
+		}
+		return &execIdentity{
+			UID:         1000,
+			GID:         1001,
+			Groups:      []uint32{1002},
+			GroupsKnown: true,
+			Username:    "alice",
+			Home:        candidateHome,
+		}, nil
+	}
+
+	envVars, identity, err := codexExecutionContextForRun("")
+	if err != nil {
+		t.Fatalf("codexExecutionContextForRun: %v", err)
+	}
+	wantHome := filepath.Join(candidateHome, ".codex")
+	if !slices.Contains(envVars, codexhistory.EnvCodexDir+"="+wantHome) {
+		t.Fatalf("expected %s env for %q, got %v", codexhistory.EnvCodexDir, wantHome, envVars)
+	}
+	if !slices.Contains(envVars, envCodexHome+"="+wantHome) {
+		t.Fatalf("expected %s env for %q, got %v", envCodexHome, wantHome, envVars)
+	}
+	if identity == nil {
+		t.Fatal("expected exec identity")
+	}
+	if identity.UID != 1000 || identity.GID != 1001 || !identity.GroupsKnown {
+		t.Fatalf("unexpected identity: %+v", identity)
+	}
+}
+
 func TestLimitedBufferWrite(t *testing.T) {
 	buf := &limitedBuffer{max: 5}
 	if _, err := buf.Write([]byte("abc")); err != nil {
@@ -369,6 +450,56 @@ func TestRunLikeUsesDefaultCodexCommandInDirectMode(t *testing.T) {
 	base := strings.ToLower(filepath.Base(gotCmdArgs[0]))
 	if base != "codex" && base != "codex.cmd" && base != "codex.exe" {
 		t.Fatalf("expected resolved default command to target codex, got %q", gotCmdArgs[0])
+	}
+}
+
+func TestRunLikePropagatesCodexHomeEnv(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	disabled := false
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &disabled,
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", filepath.Dir(codexPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CODEX_HOME", codexDir)
+	t.Setenv("CODEX_DIR", "")
+
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRunTarget })
+
+	var gotEnv []string
+	runTargetWithFallbackWithOptionsFn = func(ctx context.Context, cmdArgs []string, proxyURL string, healthCheck func() error, fatalCh <-chan error, opts runTargetOptions) error {
+		gotEnv = append([]string(nil), opts.ExtraEnv...)
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	if err := runLike(cmd, &rootOptions{configPath: store.Path()}, false); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	if !slices.Contains(gotEnv, "CODEX_HOME="+codexDir) {
+		t.Fatalf("expected CODEX_HOME in env, got %v", gotEnv)
+	}
+	if !slices.Contains(gotEnv, "CODEX_DIR="+codexDir) {
+		t.Fatalf("expected CODEX_DIR in env, got %v", gotEnv)
 	}
 }
 

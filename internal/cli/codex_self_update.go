@@ -47,6 +47,7 @@ func prepareCodexSelfUpdateGuardEnv(
 	ctx context.Context,
 	codexPath string,
 	envVars []string,
+	identity *execIdentity,
 ) ([]string, func(), error) {
 	if !isCodexCommand(codexPath) {
 		return envVars, func() {}, nil
@@ -69,12 +70,22 @@ func prepareCodexSelfUpdateGuardEnv(
 		return envVars, func() {}, err
 	}
 
-	wrapperDir, err := os.MkdirTemp("", "codex-proxy-npm-")
+	tempDir := strings.TrimSpace(envTempDir(envVars))
+	wrapperDir, err := os.MkdirTemp(tempDir, "codex-proxy-npm-")
 	if err != nil {
 		return envVars, func() {}, err
 	}
 	cleanup := func() { _ = os.RemoveAll(wrapperDir) }
-	if err := writeCodexSelfUpdateNpmWrapper(wrapperDir); err != nil {
+	wrapperPath, err := writeCodexSelfUpdateNpmWrapper(wrapperDir)
+	if err != nil {
+		cleanup()
+		return envVars, func() {}, err
+	}
+	if err := ensurePathOwnedByIdentity(wrapperDir, identity); err != nil {
+		cleanup()
+		return envVars, func() {}, err
+	}
+	if err := ensurePathOwnedByIdentity(wrapperPath, identity); err != nil {
 		cleanup()
 		return envVars, func() {}, err
 	}
@@ -96,20 +107,24 @@ func prepareCodexSelfUpdateGuardEnv(
 	return updated, cleanup, nil
 }
 
-func writeCodexSelfUpdateNpmWrapper(dir string) error {
+func writeCodexSelfUpdateNpmWrapper(dir string) (string, error) {
 	if strings.EqualFold(runtime.GOOS, "windows") {
 		content := "@echo off\r\n" +
 			"\"%" + envCodexProxyWrapperExe + "%\" __internal-npm-wrapper %*\r\n"
-		return os.WriteFile(filepath.Join(dir, "npm.cmd"), []byte(content), 0o600)
+		path := filepath.Join(dir, "npm.cmd")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			return "", err
+		}
+		return path, nil
 	}
 
 	content := "#!/bin/sh\n" +
 		"exec \"$" + envCodexProxyWrapperExe + "\" __internal-npm-wrapper \"$@\"\n"
 	path := filepath.Join(dir, "npm")
 	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
-		return err
+		return "", err
 	}
-	return nil
+	return path, nil
 }
 
 func runInternalNpmWrapper(ctx context.Context, args []string, stderr io.Writer) int {

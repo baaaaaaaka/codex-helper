@@ -15,6 +15,17 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
+var (
+	preparePatchedYoloBinaryFunc = cloudgate.PrepareYoloBinaryForIdentity
+	ensurePatchedBinaryOwnership = func(result *cloudgate.PatchResult, identity *execIdentity) error {
+		if result == nil || identity == nil || identity.UID == 0 {
+			return nil
+		}
+		return result.EnsureOwnership(int(identity.UID), int(identity.GID))
+	}
+	yoloArtifactTempRoot = cliSharedTempRoot
+)
+
 func logYoloPatchStatus(
 	log io.Writer,
 	patchResult *cloudgate.PatchResult,
@@ -123,13 +134,23 @@ func runCodexSession(
 	}
 	codexPath = codexPathResolved
 
+	path, args, cwd, err := buildCodexResumeCommand(codexPath, session, project, useYolo)
+	if err != nil {
+		return err
+	}
+
+	paths, err := resolveEffectiveLaunchPaths("", codexDir, cwd)
+	if err != nil {
+		return err
+	}
+
 	// Layer 3: Patch the native Codex binary to use permissive system requirements.
 	extraEnv := []string{}
 	var pInfo *patchRunInfo
 	effectiveCodexHome := ""
 	if useYolo {
-		configDir := filepath.Dir(store.Path())
-		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinary(codexPath, configDir)
+		historyDir := filepath.Dir(store.Path())
+		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinaryForLaunch(codexPath, historyDir, paths.ExecIdentity)
 		logYoloPatchStatus(log, patchResult, skipped, patchErr)
 		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
 			codexPath = patchResult.PatchedBinary
@@ -139,18 +160,16 @@ func runCodexSession(
 		}
 	}
 
-	path, args, cwd, err := buildCodexResumeCommand(codexPath, session, project, useYolo)
+	path, args, _, err = buildCodexResumeCommand(codexPath, session, project, useYolo)
 	if err != nil {
 		return err
 	}
+	codexHome := paths.CodexDir
+	effectiveCodexHome = codexHome
+	extraEnv = append(extraEnv, codexHomeEnv(effectiveCodexHome)...)
 
 	if useYolo {
-		codexHome, homeErr := resolveCodexHome(codexDir, cwd)
-		if homeErr != nil {
-			return homeErr
-		}
-		effectiveCodexHome = codexHome
-		authOverride, authErr := prepareYoloAuthOverride(codexHome)
+		authOverride, authErr := prepareYoloAuthOverride(codexHome, paths.ExecIdentity)
 		logYoloAuthStatus(log, authOverride, authErr)
 		if authOverride != nil {
 			defer authOverride.Cleanup()
@@ -163,20 +182,14 @@ func runCodexSession(
 
 	cmdArgs := append([]string{path}, args...)
 
-	if effectiveCodexHome != "" {
-		extraEnv = append(extraEnv, yoloCodexHomeEnv(effectiveCodexHome)...)
-	} else if codexDir != "" {
-		extraEnv = append(extraEnv, codexhistory.EnvCodexDir+"="+codexDir)
-		extraEnv = append(extraEnv, envCodexHome+"="+codexDir)
-	}
-
 	opts := runTargetOptions{
-		Cwd:         cwd,
-		ExtraEnv:    extraEnv,
-		UseProxy:    useProxy,
-		PreserveTTY: true,
-		YoloEnabled: useYolo,
-		PatchInfo:   pInfo,
+		Cwd:          cwd,
+		ExtraEnv:     extraEnv,
+		UseProxy:     useProxy,
+		PreserveTTY:  true,
+		ExecIdentity: paths.ExecIdentity,
+		YoloEnabled:  useYolo,
+		PatchInfo:    pInfo,
 		OnYoloFallback: func() error {
 			return persistYoloEnabled(store, false)
 		},
@@ -222,13 +235,18 @@ func runCodexNewSession(
 	}
 	codexPath = codexPathResolved
 
+	paths, err := resolveEffectiveLaunchPaths("", codexDir, cwd)
+	if err != nil {
+		return err
+	}
+
 	// Layer 3: Patch the native Codex binary to use permissive system requirements.
 	extraEnv := []string{}
 	var pInfo *patchRunInfo
 	effectiveCodexHome := ""
 	if useYolo {
-		configDir := filepath.Dir(store.Path())
-		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinary(codexPath, configDir)
+		historyDir := filepath.Dir(store.Path())
+		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinaryForLaunch(codexPath, historyDir, paths.ExecIdentity)
 		logYoloPatchStatus(log, patchResult, skipped, patchErr)
 		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
 			codexPath = patchResult.PatchedBinary
@@ -236,12 +254,13 @@ func runCodexNewSession(
 			pInfo = info
 			defer patchResult.Cleanup()
 		}
-		codexHome, homeErr := resolveCodexHome(codexDir, cwd)
-		if homeErr != nil {
-			return homeErr
-		}
-		effectiveCodexHome = codexHome
-		authOverride, authErr := prepareYoloAuthOverride(codexHome)
+	}
+	codexHome := paths.CodexDir
+	effectiveCodexHome = codexHome
+	extraEnv = append(extraEnv, codexHomeEnv(effectiveCodexHome)...)
+
+	if useYolo {
+		authOverride, authErr := prepareYoloAuthOverride(codexHome, paths.ExecIdentity)
 		logYoloAuthStatus(log, authOverride, authErr)
 		if authOverride != nil {
 			defer authOverride.Cleanup()
@@ -259,20 +278,14 @@ func runCodexNewSession(
 		}
 	}
 
-	if effectiveCodexHome != "" {
-		extraEnv = append(extraEnv, yoloCodexHomeEnv(effectiveCodexHome)...)
-	} else if codexDir != "" {
-		extraEnv = append(extraEnv, codexhistory.EnvCodexDir+"="+codexDir)
-		extraEnv = append(extraEnv, envCodexHome+"="+codexDir)
-	}
-
 	opts := runTargetOptions{
-		Cwd:         cwd,
-		ExtraEnv:    extraEnv,
-		UseProxy:    useProxy,
-		PreserveTTY: true,
-		YoloEnabled: useYolo,
-		PatchInfo:   pInfo,
+		Cwd:          cwd,
+		ExtraEnv:     extraEnv,
+		UseProxy:     useProxy,
+		PreserveTTY:  true,
+		ExecIdentity: paths.ExecIdentity,
+		YoloEnabled:  useYolo,
+		PatchInfo:    pInfo,
 		OnYoloFallback: func() error {
 			return persistYoloEnabled(store, false)
 		},
@@ -291,19 +304,69 @@ func runCodexNewSession(
 // because the patched binary is ephemeral (removed by Cleanup after each session).
 // Returns (result, env, patchRunInfo, skipped, err).
 func preparePatchedBinary(codexPath string, configDir string) (*cloudgate.PatchResult, []string, *patchRunInfo, bool, error) {
+	return preparePatchedBinaryWithArtifacts(codexPath, configDir, configDir, "", nil)
+}
+
+func preparePatchedBinaryForLaunch(
+	codexPath string,
+	historyDir string,
+	identity *execIdentity,
+) (*cloudgate.PatchResult, []string, *patchRunInfo, bool, error) {
+	artifactDir := historyDir
+	reqIdentity := ""
+	if identity != nil && identity.UID != 0 {
+		artifactDir = filepath.Join(yoloArtifactTempRoot(), fmt.Sprintf("codex-proxy-yolo-uid-%d", identity.UID))
+		reqIdentity = yoloPatchIdentityKey(identity)
+	}
+	return preparePatchedBinaryWithArtifacts(codexPath, historyDir, artifactDir, reqIdentity, identity)
+}
+
+func yoloPatchIdentityKey(identity *execIdentity) string {
+	if identity == nil {
+		return ""
+	}
+	home := strings.TrimSpace(identity.Home)
+	if home != "" {
+		home = filepath.Clean(home)
+	}
+	return fmt.Sprintf(
+		"uid:%d gid:%d user:%s home:%s",
+		identity.UID,
+		identity.GID,
+		strings.TrimSpace(identity.Username),
+		home,
+	)
+}
+
+// preparePatchedBinaryWithArtifacts wraps cloudgate.PrepareYoloBinary with
+// patch-history awareness while allowing launch-time artifacts to live outside
+// the patch-history/config directory.
+func preparePatchedBinaryWithArtifacts(
+	codexPath string,
+	historyDir string,
+	artifactDir string,
+	reqIdentity string,
+	identity *execIdentity,
+) (*cloudgate.PatchResult, []string, *patchRunInfo, bool, error) {
 	origHash, hashErr := hashFileSHA256(codexPath)
 
 	// Only skip if a previous patch is known to have failed (crashed binary).
-	phs, phsErr := config.NewPatchHistoryStore(configDir)
+	phs, phsErr := config.NewPatchHistoryStore(historyDir)
 	if phsErr == nil && hashErr == nil {
 		if failed, _ := phs.IsFailed(codexPath, origHash); failed {
 			return nil, nil, nil, true, nil
 		}
 	}
 
-	patchResult, patchEnv, patchErr := cloudgate.PrepareYoloBinary(codexPath, configDir)
+	patchResult, patchEnv, patchErr := preparePatchedYoloBinaryFunc(codexPath, artifactDir, reqIdentity)
 	if patchErr != nil {
 		return nil, nil, nil, false, patchErr
+	}
+	if err := ensurePatchedBinaryOwnership(patchResult, identity); err != nil {
+		if patchResult != nil {
+			patchResult.Cleanup()
+		}
+		return nil, nil, nil, false, err
 	}
 
 	var info *patchRunInfo
@@ -311,7 +374,7 @@ func preparePatchedBinary(codexPath string, configDir string) (*cloudgate.PatchR
 		info = &patchRunInfo{
 			OrigBinaryPath: codexPath,
 			OrigSHA256:     origHash,
-			ConfigDir:      configDir,
+			ConfigDir:      historyDir,
 		}
 	}
 

@@ -8,11 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
@@ -26,6 +28,7 @@ var stackStart = stack.Start
 var (
 	runWithProfileFn                   = runWithProfile
 	runTargetWithFallbackWithOptionsFn = runTargetWithFallbackWithOptions
+	runTargetCommand                   = exec.Command
 	ensureProxyPreferenceRunFn         = ensureProxyPreference
 	ensureProfileRunFn                 = ensureProfile
 	persistProxyPreferenceRunFn        = persistProxyPreference
@@ -69,7 +72,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := config.NewStore(root.configPath)
+	store, _, err := newRootStore(root, "")
 	if err != nil {
 		return err
 	}
@@ -117,6 +120,14 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	opts := defaultRunTargetOptions()
 	opts.UseProxy = false
 	opts.Log = log
+	if isCodexCommand(resolvedCmd[0]) {
+		extraEnv, execIdentity, err := codexExecutionContextForRun("")
+		if err != nil {
+			return err
+		}
+		opts.ExtraEnv = append(opts.ExtraEnv, extraEnv...)
+		opts.ExecIdentity = execIdentity
+	}
 	return runTargetWithFallbackWithOptionsFn(ctx, resolvedCmd, "", nil, nil, opts)
 }
 
@@ -159,6 +170,11 @@ func runWithExistingInstanceOptions(
 		return codexResolveError{err: err}
 	}
 	cmdArgs = resolvedCmd
+	if isCodexCommand(cmdArgs[0]) {
+		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
+			return err
+		}
+	}
 
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
 		return hc.CheckHTTPProxy(inst.HTTPPort, inst.ID)
@@ -203,6 +219,11 @@ func runWithNewStackOptions(
 		return err
 	}
 	cmdArgs = resolvedCmd
+	if isCodexCommand(cmdArgs[0]) {
+		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
+			return err
+		}
+	}
 
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
@@ -261,10 +282,11 @@ func runWithProfileOptions(
 }
 
 type runTargetOptions struct {
-	Cwd      string
-	ExtraEnv []string
-	UseProxy bool
-	Log      io.Writer
+	Cwd          string
+	ExtraEnv     []string
+	UseProxy     bool
+	Log          io.Writer
+	ExecIdentity *execIdentity
 	// PreserveTTY keeps stdout/stderr attached to the terminal for interactive CLIs.
 	PreserveTTY    bool
 	YoloEnabled    bool
@@ -275,6 +297,39 @@ type runTargetOptions struct {
 
 type codexResolveError struct {
 	err error
+}
+
+func codexExecutionContextForRun(workingDir string) ([]string, *execIdentity, error) {
+	paths, err := resolveEffectiveLaunchPaths("", "", workingDir)
+	if err != nil || strings.TrimSpace(paths.CodexDir) == "" {
+		return nil, nil, err
+	}
+	codexHome, err := resolveCodexHomePath(paths.CodexDir, workingDir)
+	if err != nil || strings.TrimSpace(codexHome) == "" {
+		return nil, nil, err
+	}
+	return codexHomeEnv(codexHome), paths.ExecIdentity, nil
+}
+
+func hasExplicitCodexHomeEnv(extraEnv []string) bool {
+	return strings.TrimSpace(envValue(extraEnv, envCodexHome)) != "" ||
+		strings.TrimSpace(envValue(extraEnv, codexhistory.EnvCodexDir)) != ""
+}
+
+func applyDefaultCodexExecutionContext(opts *runTargetOptions) error {
+	if opts == nil {
+		return nil
+	}
+	if opts.ExecIdentity != nil || hasExplicitCodexHomeEnv(opts.ExtraEnv) {
+		return nil
+	}
+	extraEnv, execIdentity, err := codexExecutionContextForRun(opts.Cwd)
+	if err != nil {
+		return err
+	}
+	opts.ExtraEnv = append(opts.ExtraEnv, extraEnv...)
+	opts.ExecIdentity = execIdentity
+	return nil
 }
 
 func (e codexResolveError) Error() string {
@@ -483,7 +538,7 @@ func runTargetOnceWithOptions(
 	stderrBuf io.Writer,
 	opts runTargetOptions,
 ) error {
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	cmd := runTargetCommand(cmdArgs[0], cmdArgs[1:]...)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -494,6 +549,7 @@ func runTargetOnceWithOptions(
 	if len(opts.ExtraEnv) > 0 {
 		envVars = append(envVars, opts.ExtraEnv...)
 	}
+	envVars = applyExecIdentityEnv(envVars, opts.ExecIdentity)
 	guardCleanup := func() {}
 	guardCodexPath := ""
 	if isCodexCommand(cmdArgs[0]) {
@@ -502,7 +558,7 @@ func runTargetOnceWithOptions(
 		guardCodexPath = opts.PatchInfo.OrigBinaryPath
 	}
 	if guardCodexPath != "" {
-		guardEnv, cleanup, err := prepareCodexSelfUpdateGuardEnv(ctx, guardCodexPath, envVars)
+		guardEnv, cleanup, err := prepareCodexSelfUpdateGuardEnv(ctx, guardCodexPath, envVars, opts.ExecIdentity)
 		if err != nil {
 			if opts.Log != nil {
 				_, _ = fmt.Fprintf(opts.Log, "failed to arm codex self-update guard: %v\n", err)
@@ -513,7 +569,11 @@ func runTargetOnceWithOptions(
 		}
 	}
 	defer guardCleanup()
-	cmd.Env = envVars
+	updatedEnv, identityErr := applyExecIdentity(cmd, envVars, opts.ExecIdentity)
+	if identityErr != nil {
+		return identityErr
+	}
+	cmd.Env = updatedEnv
 	cmd.Stdin = os.Stdin
 	if opts.PreserveTTY {
 		cmd.Stdout = os.Stdout

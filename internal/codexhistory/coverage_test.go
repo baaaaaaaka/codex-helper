@@ -340,7 +340,10 @@ func TestResolveCodexDir_EnvVar(t *testing.T) {
 }
 
 func TestResolveCodexDir_Default(t *testing.T) {
+	setResolveCodexDirHooksForTest(t)
 	t.Setenv(EnvCodexDir, "")
+	t.Setenv(envCodexHome, "")
+	resolveCodexDirRunningAsRoot = func() bool { return false }
 	got, err := ResolveCodexDir("")
 	if err != nil {
 		t.Fatalf("error: %v", err)

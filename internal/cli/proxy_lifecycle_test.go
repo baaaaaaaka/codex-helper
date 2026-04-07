@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +68,65 @@ func TestProxyStartForegroundRecordsInstanceAndRunsDaemon(t *testing.T) {
 	}
 	if cfg.Instances[0].Kind != config.InstanceKindDaemon {
 		t.Fatalf("expected daemon kind, got %+v", cfg.Instances[0])
+	}
+}
+
+func TestProxyStartBackgroundPassesResolvedConfigPathToDaemon(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		Profiles: []config.Profile{{
+			ID:   "p1",
+			Name: "dev",
+			Host: "host",
+			Port: 22,
+			User: "alice",
+		}},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevExecutable := proxyExecutable
+	prevCommand := proxyCommand
+	t.Cleanup(func() {
+		proxyExecutable = prevExecutable
+		proxyCommand = prevCommand
+	})
+
+	proxyExecutable = func() (string, error) { return "/fake/codex-proxy", nil }
+
+	var gotName string
+	var gotArgs []string
+	proxyCommand = func(name string, args ...string) *exec.Cmd {
+		gotName = name
+		gotArgs = append([]string{}, args...)
+		return exec.Command("sh", "-c", "exit 0")
+	}
+
+	cmd := newProxyStartCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy start: %v", err)
+	}
+
+	if gotName != "/fake/codex-proxy" {
+		t.Fatalf("expected daemon executable %q, got %q", "/fake/codex-proxy", gotName)
+	}
+	if len(gotArgs) != 6 {
+		t.Fatalf("unexpected daemon args: %v", gotArgs)
+	}
+	if gotArgs[0] != "--config" || gotArgs[1] != store.Path() {
+		t.Fatalf("expected daemon config args %q, got %v", store.Path(), gotArgs)
+	}
+	if gotArgs[2] != "proxy" || gotArgs[3] != "daemon" || gotArgs[4] != "--instance-id" || strings.TrimSpace(gotArgs[5]) == "" {
+		t.Fatalf("unexpected daemon args: %v", gotArgs)
+	}
+	if !strings.Contains(out.String(), "Started instance ") {
+		t.Fatalf("unexpected output: %q", out.String())
 	}
 }
 

@@ -52,6 +52,7 @@ func TestPrepareCodexSelfUpdateGuardEnvPrependsWrapper(t *testing.T) {
 		context.Background(),
 		"/tmp/codex",
 		[]string{"PATH=/usr/bin:/bin", "FOO=bar"},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("prepare guard env: %v", err)
@@ -99,7 +100,7 @@ func TestPrepareCodexSelfUpdateGuardEnvSkipsUnknownSource(t *testing.T) {
 	}
 
 	input := []string{"PATH=/usr/bin:/bin"}
-	updated, cleanup, err := prepareCodexSelfUpdateGuardEnv(context.Background(), "/tmp/codex", input)
+	updated, cleanup, err := prepareCodexSelfUpdateGuardEnv(context.Background(), "/tmp/codex", input, nil)
 	if err != nil {
 		t.Fatalf("prepare guard env: %v", err)
 	}
@@ -184,7 +185,7 @@ func TestSanitizeCodexSelfUpdateEnvRestoresPath(t *testing.T) {
 		envCodexProxyUpdateNPMPrefix,
 		envCodexProxyWrapperExe,
 	} {
-		if got := envValue(sanitized, key); got != "" {
+		if got, ok := sliceEnvValue(sanitized, key); ok {
 			t.Fatalf("expected %s removed, got %q", key, got)
 		}
 	}
@@ -380,6 +381,7 @@ func TestRunInternalNpmWrapperManagedInstallRequiresPrefix(t *testing.T) {
 	t.Setenv(envCodexProxyOriginalPath, "/usr/bin:/bin")
 	t.Setenv(envCodexProxyUpdateOrigin, string(codexInstallOriginManaged))
 	t.Setenv(envCodexProxyUpdateCodexPath, "/tmp/managed/bin/codex")
+	t.Setenv(envCodexProxyUpdateNPMPrefix, "")
 
 	cleaned := false
 	codexSelfUpdateCleanupStale = func(_ io.Writer, source codexUpgradeSource) error {
