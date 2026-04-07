@@ -797,7 +797,7 @@ func TestPreparePatchedBinaryForLaunchUsesAccessibleArtifactsForExecIdentity(t *
 	if gotCacheDir != filepath.Join(sharedTempRoot, "codex-proxy-yolo-uid-1000") {
 		t.Fatalf("unexpected cache dir %q", gotCacheDir)
 	}
-	if !strings.Contains(gotReqIdentity, "uid:1000") || !strings.Contains(gotReqIdentity, "home:/home/alice") {
+	if !strings.Contains(gotReqIdentity, "uid:1000") || !strings.Contains(gotReqIdentity, "home:"+filepath.Clean("/home/alice")) {
 		t.Fatalf("unexpected req identity %q", gotReqIdentity)
 	}
 	if info.ConfigDir != historyDir {

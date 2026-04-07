@@ -222,6 +222,9 @@ func TestRunTargetWithFallbackDisablesYolo(t *testing.T) {
 func TestCodexExecutionContextForRunRequiresRunnableIdentityForForeignHome(t *testing.T) {
 	lockCLITestHooks(t)
 	setEffectivePathsHooksForTest(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("windows does not enforce exec identity requirements")
+	}
 
 	currentHome := t.TempDir()
 	candidateHome := t.TempDir()

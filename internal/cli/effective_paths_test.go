@@ -139,9 +139,9 @@ func TestResolveEffectivePaths_SwitchesToTrustedUserHomeHint(t *testing.T) {
 	if got.CodexDir != filepath.Join(candidateHome, ".codex") {
 		t.Fatalf("CodexDir = %q", got.CodexDir)
 	}
-	wantConfig, err := config.DefaultPathForHome(currentHome)
+	wantConfig, err := config.DefaultPath()
 	if err != nil {
-		t.Fatalf("DefaultPathForHome: %v", err)
+		t.Fatalf("DefaultPath: %v", err)
 	}
 	if got.ConfigPath != wantConfig {
 		t.Fatalf("ConfigPath = %q, want %q", got.ConfigPath, wantConfig)
@@ -244,9 +244,9 @@ func TestResolveEffectivePaths_DoesNotGuessWithoutTrustedHint(t *testing.T) {
 	if got.CodexDir != filepath.Join(currentHome, ".codex") {
 		t.Fatalf("CodexDir = %q", got.CodexDir)
 	}
-	wantConfig, err := config.DefaultPathForHome(currentHome)
+	wantConfig, err := config.DefaultPath()
 	if err != nil {
-		t.Fatalf("DefaultPathForHome: %v", err)
+		t.Fatalf("DefaultPath: %v", err)
 	}
 	if got.ConfigPath != wantConfig {
 		t.Fatalf("ConfigPath = %q, want %q", got.ConfigPath, wantConfig)
@@ -342,6 +342,9 @@ func TestNewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity(t *testin
 func TestResolveEffectiveLaunchPaths_ForeignHomeRequiresResolvableIdentity(t *testing.T) {
 	lockCLITestHooks(t)
 	setEffectivePathsHooksForTest(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("windows does not enforce exec identity requirements")
+	}
 
 	currentHome := t.TempDir()
 	candidateHome := t.TempDir()
