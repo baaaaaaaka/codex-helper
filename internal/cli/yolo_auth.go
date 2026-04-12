@@ -9,11 +9,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
+	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
-const envCodexHome = "CODEX_HOME"
+const (
+	envCodexHome                = "CODEX_HOME"
+	yoloAuthLeaseHeartbeatAfter = 15 * time.Second
+	yoloAuthLeaseStaleAfter     = 2 * time.Minute
+	yoloAuthLegacyLeaseMaxAge   = 24 * time.Hour
+)
 
 type yoloAuthOverride struct {
 	path       string
@@ -21,6 +29,7 @@ type yoloAuthOverride struct {
 	backupPath string
 	leasePath  string
 	identity   *execIdentity
+	stopLease  func()
 }
 
 func logYoloAuthStatus(log io.Writer, override *yoloAuthOverride, err error) {
@@ -94,10 +103,19 @@ func prepareYoloAuthOverride(codexHome string, identity *execIdentity) (*yoloAut
 		return nil, err
 	}
 	if !changed && !hasLeases {
-		if _, statErr := os.Stat(backupPath); os.IsNotExist(statErr) {
+		backup, readErr := os.ReadFile(backupPath)
+		switch {
+		case os.IsNotExist(readErr):
 			return nil, nil
-		} else if statErr != nil {
-			return nil, statErr
+		case readErr != nil:
+			return nil, readErr
+		}
+
+		backupSanitized, backupChanged, sanitizeErr := sanitizeAuthJSONPlanClaim(backup)
+		if sanitizeErr != nil || !backupChanged || !bytes.Equal(backupSanitized, original) {
+			// The backup is stale or unrelated to the current masked auth file.
+			_ = os.Remove(backupPath)
+			return nil, nil
 		}
 	}
 
@@ -126,7 +144,7 @@ func prepareYoloAuthOverride(codexHome string, identity *execIdentity) (*yoloAut
 		sanitized = original
 	}
 
-	leasePath, err := createYoloAuthLease(authPath)
+	leasePath, stopLease, err := createYoloAuthLease(authPath)
 	if err != nil {
 		if changed {
 			_ = os.WriteFile(authPath, original, mode)
@@ -149,6 +167,7 @@ func prepareYoloAuthOverride(codexHome string, identity *execIdentity) (*yoloAut
 		backupPath: backupPath,
 		leasePath:  leasePath,
 		identity:   identity,
+		stopLease:  stopLease,
 	}, nil
 }
 
@@ -157,6 +176,10 @@ func (o *yoloAuthOverride) Cleanup() {
 		return
 	}
 
+	if o.stopLease != nil {
+		o.stopLease()
+		o.stopLease = nil
+	}
 	if o.leasePath != "" {
 		_ = os.Remove(o.leasePath)
 	}
@@ -198,17 +221,95 @@ func yoloAuthBackupPath(authPath string) string {
 	return authPath + ".yolo-auth-backup"
 }
 
-func createYoloAuthLease(authPath string) (string, error) {
+type yoloAuthLease struct {
+	Version       int   `json:"version"`
+	PID           int   `json:"pid"`
+	HeartbeatUnix int64 `json:"heartbeat_unix"`
+}
+
+func parseYoloAuthLease(data []byte) (yoloAuthLease, bool) {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return yoloAuthLease{}, false
+	}
+	var lease yoloAuthLease
+	if err := json.Unmarshal([]byte(raw), &lease); err != nil {
+		return yoloAuthLease{}, false
+	}
+	if lease.Version != 1 || lease.PID <= 0 || lease.HeartbeatUnix <= 0 {
+		return yoloAuthLease{}, false
+	}
+	return lease, true
+}
+
+func writeYoloAuthLease(path string, pid int, at time.Time) error {
+	payload, err := json.Marshal(yoloAuthLease{
+		Version:       1,
+		PID:           pid,
+		HeartbeatUnix: at.Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	return os.WriteFile(path, payload, 0o600)
+}
+
+func createYoloAuthLease(authPath string) (string, func(), error) {
 	file, err := os.CreateTemp(filepath.Dir(authPath), yoloAuthLeasePrefix(authPath)+"*")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	path := file.Name()
 	if closeErr := file.Close(); closeErr != nil {
 		_ = os.Remove(path)
-		return "", closeErr
+		return "", nil, closeErr
 	}
-	return path, nil
+
+	pid := os.Getpid()
+	if pid <= 0 {
+		_ = os.Remove(path)
+		return "", nil, fmt.Errorf("invalid pid for auth lease: %d", pid)
+	}
+	if err := writeYoloAuthLease(path, pid, time.Now()); err != nil {
+		_ = os.Remove(path)
+		return "", nil, err
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(yoloAuthLeaseHeartbeatAfter)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = writeYoloAuthLease(path, pid, time.Now())
+			}
+		}
+	}()
+
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			<-stopped
+		})
+	}
+
+	return path, stop, nil
+}
+
+func yoloAuthLeaseLastSeenAt(lease yoloAuthLease, leaseModTime time.Time) time.Time {
+	heartbeatAt := time.Unix(lease.HeartbeatUnix, 0)
+	if leaseModTime.After(heartbeatAt) {
+		return leaseModTime
+	}
+	return heartbeatAt
 }
 
 func hasOtherYoloAuthLeases(authPath string, ownLeasePath string) (bool, error) {
@@ -225,6 +326,34 @@ func hasOtherYoloAuthLeases(authPath string, ownLeasePath string) (bool, error) 
 		}
 		candidate := filepath.Join(dir, entry.Name())
 		if filepath.Clean(candidate) == ownLeasePath {
+			continue
+		}
+
+		info, statErr := entry.Info()
+		if statErr != nil {
+			return true, nil
+		}
+
+		data, readErr := os.ReadFile(candidate)
+		if readErr != nil {
+			return true, nil
+		}
+
+		if lease, ok := parseYoloAuthLease(data); ok {
+			lastSeenAt := yoloAuthLeaseLastSeenAt(lease, info.ModTime())
+			age := time.Since(lastSeenAt)
+			if age > yoloAuthLeaseStaleAfter && !proc.IsAlive(lease.PID) {
+				_ = os.Remove(candidate)
+				continue
+			}
+			return true, nil
+		}
+
+		// Legacy zero-byte leases from older builds never carried process
+		// metadata. Clean up obviously stale ones so they don't pin auth.json
+		// and the backup file forever after an unclean exit.
+		if time.Since(info.ModTime()) > yoloAuthLegacyLeaseMaxAge {
+			_ = os.Remove(candidate)
 			continue
 		}
 		return true, nil

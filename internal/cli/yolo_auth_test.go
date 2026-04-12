@@ -36,24 +36,33 @@ func encodeTestJWT(t *testing.T, payload map[string]any) string {
 		base64.RawURLEncoding.EncodeToString([]byte("sig"))
 }
 
-func writeTestAuthJSON(t *testing.T, codexDir string, includePlan bool) []byte {
+func writeTestAuthJSONWithPlans(t *testing.T, codexDir string, idTokenPlan bool, accessTokenPlan bool) []byte {
 	t.Helper()
-	authClaims := map[string]any{
-		"chatgpt_account_id": "org_test",
-		"chatgpt_user_id":    "user_test",
+
+	buildAuthClaims := func(includePlan bool) map[string]any {
+		authClaims := map[string]any{
+			"chatgpt_account_id": "org_test",
+			"chatgpt_user_id":    "user_test",
+		}
+		if includePlan {
+			authClaims["chatgpt_plan_type"] = "business"
+		}
+		return authClaims
 	}
-	if includePlan {
-		authClaims["chatgpt_plan_type"] = "business"
-	}
+
 	idToken := encodeTestJWT(t, map[string]any{
 		"email":                       "user@example.com",
-		"https://api.openai.com/auth": authClaims,
+		"https://api.openai.com/auth": buildAuthClaims(idTokenPlan),
+	})
+	accessToken := encodeTestJWT(t, map[string]any{
+		"scope":                       "openid profile email",
+		"https://api.openai.com/auth": buildAuthClaims(accessTokenPlan),
 	})
 	doc := map[string]any{
 		"auth_mode": "chatgpt",
 		"tokens": map[string]any{
 			"id_token":      idToken,
-			"access_token":  "access",
+			"access_token":  accessToken,
 			"refresh_token": "refresh",
 			"account_id":    "org_test",
 		},
@@ -69,6 +78,38 @@ func writeTestAuthJSON(t *testing.T, codexDir string, includePlan bool) []byte {
 	return data
 }
 
+func writeTestAuthJSON(t *testing.T, codexDir string, includePlan bool) []byte {
+	t.Helper()
+	return writeTestAuthJSONWithPlans(t, codexDir, includePlan, includePlan)
+}
+
+func rewriteAuthToken(t *testing.T, authPath string, tokenKey string, tokenValue string) []byte {
+	t.Helper()
+
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read auth json: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse auth json: %v", err)
+	}
+	tokens, ok := doc["tokens"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing tokens object: %#v", doc["tokens"])
+	}
+	tokens[tokenKey] = tokenValue
+	updated, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal auth json: %v", err)
+	}
+	updated = append(updated, '\n')
+	if err := os.WriteFile(authPath, updated, 0o600); err != nil {
+		t.Fatalf("write auth json: %v", err)
+	}
+	return updated
+}
+
 func authJSONHasPlanClaim(t *testing.T, data []byte) bool {
 	t.Helper()
 	var doc map[string]any
@@ -80,8 +121,8 @@ func authJSONHasPlanClaim(t *testing.T, data []byte) bool {
 		t.Fatalf("missing tokens object: %#v", doc["tokens"])
 	}
 	idToken, ok := tokens["id_token"].(string)
-	if !ok {
-		t.Fatalf("missing id_token: %#v", tokens["id_token"])
+	if !ok || idToken == "" {
+		return false
 	}
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
@@ -131,6 +172,166 @@ func TestPrepareYoloAuthOverrideMasksPlanAndRestores(t *testing.T) {
 	}
 	if !bytes.Equal(restored, original) {
 		t.Fatal("auth.json should be restored after cleanup")
+	}
+}
+
+func TestPrepareYoloAuthOverrideIgnoresAccessTokenOnlyPlan(t *testing.T) {
+	codexDir := t.TempDir()
+	original := writeTestAuthJSONWithPlans(t, codexDir, false, true)
+
+	override, err := prepareYoloAuthOverride(codexDir, nil)
+	if err != nil {
+		t.Fatalf("prepareYoloAuthOverride: %v", err)
+	}
+	if override != nil {
+		t.Fatal("expected no auth override when only access_token contains the plan claim")
+	}
+
+	current, err := os.ReadFile(filepath.Join(codexDir, "auth.json"))
+	if err != nil {
+		t.Fatalf("read auth.json: %v", err)
+	}
+	if !bytes.Equal(current, original) {
+		t.Fatal("auth.json should remain unchanged")
+	}
+}
+
+func TestPrepareYoloAuthOverrideIgnoresOpaqueThreePartAccessToken(t *testing.T) {
+	codexDir := t.TempDir()
+	authPath := filepath.Join(codexDir, "auth.json")
+	_ = writeTestAuthJSONWithPlans(t, codexDir, true, false)
+	original := rewriteAuthToken(t, authPath, "access_token", "opaque.token.value")
+
+	override, err := prepareYoloAuthOverride(codexDir, nil)
+	if err != nil {
+		t.Fatalf("prepareYoloAuthOverride: %v", err)
+	}
+	if override == nil {
+		t.Fatal("expected auth override")
+	}
+
+	sanitized, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read sanitized auth.json: %v", err)
+	}
+	if authJSONHasPlanClaim(t, sanitized) {
+		t.Fatal("sanitized auth.json should not contain chatgpt_plan_type in id_token")
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(sanitized, &doc); err != nil {
+		t.Fatalf("parse sanitized auth json: %v", err)
+	}
+	tokens, ok := doc["tokens"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing tokens object: %#v", doc["tokens"])
+	}
+	if got := tokens["access_token"]; got != "opaque.token.value" {
+		t.Fatalf("access_token = %#v, want opaque token unchanged", got)
+	}
+
+	override.Cleanup()
+
+	restored, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read restored auth.json: %v", err)
+	}
+	if !bytes.Equal(restored, original) {
+		t.Fatal("auth.json should be restored after cleanup")
+	}
+}
+
+func TestPrepareYoloAuthOverrideRecoversMaskedAuthFromBackupAfterStaleLease(t *testing.T) {
+	codexDir := t.TempDir()
+	original := writeTestAuthJSON(t, codexDir, true)
+	authPath := filepath.Join(codexDir, "auth.json")
+	backupPath := yoloAuthBackupPath(authPath)
+	if err := os.WriteFile(backupPath, original, 0o600); err != nil {
+		t.Fatalf("write backup: %v", err)
+	}
+
+	sanitized, changed, err := sanitizeAuthJSONPlanClaim(original)
+	if err != nil {
+		t.Fatalf("sanitizeAuthJSONPlanClaim: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected sanitized auth to differ from original")
+	}
+	if err := os.WriteFile(authPath, sanitized, 0o600); err != nil {
+		t.Fatalf("write sanitized auth: %v", err)
+	}
+
+	staleLease := filepath.Join(codexDir, yoloAuthLeasePrefix(authPath)+"stale")
+	if err := os.WriteFile(staleLease, nil, 0o600); err != nil {
+		t.Fatalf("write stale lease: %v", err)
+	}
+	staleAt := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(staleLease, staleAt, staleAt); err != nil {
+		t.Fatalf("chtimes stale lease: %v", err)
+	}
+
+	override, err := prepareYoloAuthOverride(codexDir, nil)
+	if err != nil {
+		t.Fatalf("prepareYoloAuthOverride: %v", err)
+	}
+	if override == nil {
+		t.Fatal("expected auth override to preserve and restore the original backup")
+	}
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("expected backup to be preserved, stat err=%v", err)
+	}
+
+	override.Cleanup()
+
+	restored, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read restored auth.json: %v", err)
+	}
+	if !bytes.Equal(restored, original) {
+		t.Fatal("auth.json should be restored from backup after cleanup")
+	}
+}
+
+func TestPrepareYoloAuthOverrideDropsStaleLeaseAndBackupWhenAuthAlreadyClean(t *testing.T) {
+	codexDir := t.TempDir()
+	original := writeTestAuthJSONWithPlans(t, codexDir, false, false)
+	authPath := filepath.Join(codexDir, "auth.json")
+	backupDir := t.TempDir()
+	staleBackup := writeTestAuthJSONWithPlans(t, backupDir, true, true)
+	backupPath := yoloAuthBackupPath(authPath)
+	if err := os.WriteFile(backupPath, staleBackup, 0o600); err != nil {
+		t.Fatalf("write stale backup: %v", err)
+	}
+
+	staleLease := filepath.Join(codexDir, yoloAuthLeasePrefix(authPath)+"stale")
+	if err := os.WriteFile(staleLease, nil, 0o600); err != nil {
+		t.Fatalf("write stale lease: %v", err)
+	}
+	staleAt := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(staleLease, staleAt, staleAt); err != nil {
+		t.Fatalf("chtimes stale lease: %v", err)
+	}
+
+	override, err := prepareYoloAuthOverride(codexDir, nil)
+	if err != nil {
+		t.Fatalf("prepareYoloAuthOverride: %v", err)
+	}
+	if override != nil {
+		t.Fatal("expected no auth override when auth is already clean")
+	}
+
+	current, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read auth.json: %v", err)
+	}
+	if !bytes.Equal(current, original) {
+		t.Fatal("auth.json should remain unchanged")
+	}
+	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		t.Fatalf("stale backup should be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(staleLease); !os.IsNotExist(err) {
+		t.Fatalf("stale lease should be removed, stat err=%v", err)
 	}
 }
 

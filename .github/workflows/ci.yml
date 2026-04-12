@@ -199,6 +199,23 @@ jobs:
           $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareYoloAuthOverrideReownsAuthFilesForExecIdentity|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|PreparePatchedBinaryForLaunchUsesAccessibleArtifactsForExecIdentity|RunWith(ExistingInstanceOptionsPreservesExplicitCodexHomeEnv|NewStackOptionsPreservesExplicitCodexHomeEnv)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
           go test ./internal/cli ./internal/codexhistory ./internal/config ./internal/cloudgate -count=1 -run $pattern
 
+      - name: Yolo auth regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='Test(PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
+          go test ./internal/cli -count=1 -run "$pattern"
+
+      - name: Yolo auth regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $pattern = 'Test(PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
+          go test ./internal/cli -count=1 -run $pattern
+
       - name: go vet
         run: go vet ./...
 
