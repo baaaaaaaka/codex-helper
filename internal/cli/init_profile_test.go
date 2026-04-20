@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -18,17 +19,21 @@ import (
 )
 
 type fakeSSHOps struct {
-	probeErrs   []error
-	probes      []config.Profile
-	generated   []config.Profile
-	keyPath     string
-	generateErr error
-	installErr  error
-	installed   []string
+	probeErrs        []error
+	probes           []config.Profile
+	probeInteractive []bool
+	probeStdin       []io.Reader
+	generated        []config.Profile
+	keyPath          string
+	generateErr      error
+	installErr       error
+	installed        []string
 }
 
-func (f *fakeSSHOps) probe(_ context.Context, prof config.Profile, _ bool) error {
+func (f *fakeSSHOps) probe(_ context.Context, prof config.Profile, interactive bool, stdin io.Reader) error {
 	f.probes = append(f.probes, prof)
+	f.probeInteractive = append(f.probeInteractive, interactive)
+	f.probeStdin = append(f.probeStdin, stdin)
 	if len(f.probeErrs) == 0 {
 		return nil
 	}
@@ -106,6 +111,12 @@ func TestInitProfileInteractiveWithDepsFallsBackToManagedKey(t *testing.T) {
 	if len(ops.probes) != 2 {
 		t.Fatalf("expected 2 probes, got %d", len(ops.probes))
 	}
+	if got := ops.probeInteractive; len(got) != 2 || got[0] || got[1] {
+		t.Fatalf("expected non-interactive managed-key probes, got %v", got)
+	}
+	if got := ops.probeStdin; len(got) != 2 || got[0] != nil || got[1] != nil {
+		t.Fatalf("expected managed-key probes without stdin override, got %v", got)
+	}
 	if len(ops.installed) != 1 || ops.installed[0] != ops.keyPath+".pub" {
 		t.Fatalf("expected installed pubkey %q, got %v", ops.keyPath+".pub", ops.installed)
 	}
@@ -170,6 +181,84 @@ func TestInitProfileInteractiveWithDepsDoesNotInstallManagedKeyForNonAuthProbeEr
 	}
 }
 
+func TestInitProfileInteractiveWithDepsOffersInteractiveHostKeyCheckEvenIfInteractiveSessionFails(t *testing.T) {
+	store := newTempStore(t)
+	reader := bufio.NewReader(strings.NewReader("host.example\n22\nfrank\ny\n"))
+	ops := &fakeSSHOps{
+		probeErrs: []error{
+			&sshProbeError{kind: sshProbeFailureHostKey, err: errors.New("host key failed"), output: "Host key verification failed"},
+			errors.New("shell access denied"),
+			nil,
+		},
+	}
+	var out bytes.Buffer
+
+	prof, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, &out)
+	if err != nil {
+		t.Fatalf("initProfileInteractiveWithDeps error: %v", err)
+	}
+
+	if prof.Host != "host.example" || prof.User != "frank" {
+		t.Fatalf("unexpected profile: %+v", prof)
+	}
+	if len(ops.probes) != 3 {
+		t.Fatalf("expected 3 probes, got %d", len(ops.probes))
+	}
+	if got := ops.probeInteractive; len(got) != 3 || got[0] || !got[1] || got[2] {
+		t.Fatalf("expected probe order [false true false], got %v", got)
+	}
+	if got := ops.probeStdin; len(got) != 3 || got[0] != nil || got[1] != reader || got[2] != nil {
+		t.Fatalf("expected only interactive retry to reuse init reader, got %v", got)
+	}
+	if !strings.Contains(out.String(), "SSH could not verify the host key") {
+		t.Fatalf("expected host key guidance, got %q", out.String())
+	}
+	if len(ops.generated) != 0 || len(ops.installed) != 0 {
+		t.Fatalf("expected no managed key flow, got generated=%v installed=%v", ops.generated, ops.installed)
+	}
+
+	cfg, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("load config: %v", loadErr)
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].ID != prof.ID {
+		t.Fatalf("expected saved profile, got %+v", cfg.Profiles)
+	}
+}
+
+func TestInitProfileInteractiveWithDepsReturnsOriginalHostKeyErrorWhenDeclined(t *testing.T) {
+	store := newTempStore(t)
+	reader := bufio.NewReader(strings.NewReader("host.example\n22\ngrace\nn\n"))
+	ops := &fakeSSHOps{
+		probeErrs: []error{
+			&sshProbeError{kind: sshProbeFailureHostKey, err: errors.New("host key failed"), output: "Host key verification failed"},
+		},
+	}
+	var out bytes.Buffer
+
+	_, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, &out)
+	if err == nil {
+		t.Fatal("expected host key error")
+	}
+	if !strings.Contains(err.Error(), "Host key verification failed") {
+		t.Fatalf("expected original host key error, got %v", err)
+	}
+	if got := ops.probeInteractive; len(got) != 1 || got[0] {
+		t.Fatalf("expected only the initial non-interactive probe, got %v", got)
+	}
+	if got := ops.probeStdin; len(got) != 1 || got[0] != nil {
+		t.Fatalf("expected declined flow to avoid interactive stdin override, got %v", got)
+	}
+
+	cfg, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("load config: %v", loadErr)
+	}
+	if len(cfg.Profiles) != 0 {
+		t.Fatalf("expected no saved profiles after decline, got %+v", cfg.Profiles)
+	}
+}
+
 func TestSSHProbeUsesTunnelReadinessForNonInteractiveChecks(t *testing.T) {
 	lockCLITestHooks(t)
 	prevNewSSHTunnel := newSSHTunnel
@@ -185,7 +274,7 @@ func TestSSHProbeUsesTunnelReadinessForNonInteractiveChecks(t *testing.T) {
 		Host: "example.com",
 		Port: 3211,
 		User: "starh",
-	}, false)
+	}, false, nil)
 	if err != nil {
 		t.Fatalf("sshProbe error: %v", err)
 	}
@@ -212,7 +301,7 @@ func TestSSHProbeOmitsTrailingColonWhenSSHReturnsNoOutput(t *testing.T) {
 		Host: "example.com",
 		Port: 3211,
 		User: "starh",
-	}, false)
+	}, false, nil)
 	if err == nil {
 		t.Fatal("expected sshProbe to fail")
 	}
@@ -243,7 +332,7 @@ func TestSSHProbeHonorsContextCancellation(t *testing.T) {
 		Host: "example.com",
 		Port: 3211,
 		User: "starh",
-	}, false)
+	}, false, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context canceled, got %v", err)
 	}
@@ -321,6 +410,13 @@ func TestNewInitCmdUsesInteractiveInitializer(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `Saved profile "dev@host" (p1)`) {
 		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
+func TestClassifySSHProbeFailureDoesNotTreatBannerOffendingAsHostKey(t *testing.T) {
+	output := "WARNING: offending users will be prosecuted.\nPermission denied (publickey)."
+	if got := classifySSHProbeFailure(output); got != sshProbeFailureAuth {
+		t.Fatalf("expected auth failure classification, got %v", got)
 	}
 }
 

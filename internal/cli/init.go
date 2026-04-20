@@ -45,7 +45,7 @@ func newInitCmd(root *rootOptions) *cobra.Command {
 }
 
 type sshOps interface {
-	probe(ctx context.Context, prof config.Profile, interactive bool) error
+	probe(ctx context.Context, prof config.Profile, interactive bool, stdin io.Reader) error
 	generateKeypair(ctx context.Context, store *config.Store, prof config.Profile) (string, error)
 	installPublicKey(ctx context.Context, prof config.Profile, pubKeyPath string) error
 }
@@ -57,6 +57,7 @@ type sshProbeFailureKind int
 const (
 	sshProbeFailureOther sshProbeFailureKind = iota
 	sshProbeFailureAuth
+	sshProbeFailureHostKey
 )
 
 type sshProbeError struct {
@@ -85,8 +86,8 @@ func (e *sshProbeError) Error() string {
 
 func (e *sshProbeError) Unwrap() error { return e.err }
 
-func (defaultSSHOps) probe(ctx context.Context, prof config.Profile, interactive bool) error {
-	return sshProbe(ctx, prof, interactive)
+func (defaultSSHOps) probe(ctx context.Context, prof config.Profile, interactive bool, stdin io.Reader) error {
+	return sshProbe(ctx, prof, interactive, stdin)
 }
 
 func (defaultSSHOps) generateKeypair(ctx context.Context, store *config.Store, prof config.Profile) (string, error) {
@@ -132,7 +133,7 @@ func initProfileInteractiveWithDeps(
 		CreatedAt: time.Now(),
 	}
 
-	if err := ops.probe(ctx, prof, false); err != nil {
+	if err := initialSSHProbe(ctx, reader, ops, prof, out); err != nil {
 		if !shouldInstallManagedKey(err) {
 			return config.Profile{}, err
 		}
@@ -148,7 +149,7 @@ func initProfileInteractiveWithDeps(
 		}
 		prof.SSHArgs = []string{"-i", keyPath}
 
-		if err := ops.probe(ctx, prof, false); err != nil {
+		if err := ops.probe(ctx, prof, false, nil); err != nil {
 			return config.Profile{}, fmt.Errorf("key-based ssh probe failed: %w", err)
 		}
 	}
@@ -161,6 +162,32 @@ func initProfileInteractiveWithDeps(
 	}
 
 	return prof, nil
+}
+
+func initialSSHProbe(
+	ctx context.Context,
+	reader *bufio.Reader,
+	ops sshOps,
+	prof config.Profile,
+	out io.Writer,
+) error {
+	err := ops.probe(ctx, prof, false, nil)
+	if err == nil {
+		return nil
+	}
+	if !shouldOfferInteractiveHostKeyCheck(err) {
+		return err
+	}
+
+	if out != nil {
+		_, _ = fmt.Fprintln(out, "SSH could not verify the host key in non-interactive mode.")
+		_, _ = fmt.Fprintln(out, "Open one interactive SSH check to review and accept or update the host key.")
+	}
+	if !promptYesNo(reader, "Open interactive SSH host key check now?", true) {
+		return err
+	}
+	_ = ops.probe(ctx, prof, true, reader)
+	return ops.probe(ctx, prof, false, nil)
 }
 
 func prompt(r *bufio.Reader, label, def string) string {
@@ -216,17 +243,22 @@ func promptYesNo(r *bufio.Reader, label string, def bool) bool {
 	}
 }
 
-func sshProbe(ctx context.Context, prof config.Profile, interactive bool) error {
+func sshProbe(ctx context.Context, prof config.Profile, interactive bool, stdin io.Reader) error {
 	dest := prof.User + "@" + prof.Host
 	if interactive {
 		args := []string{
+			"-T",
 			"-p", strconv.Itoa(prof.Port),
 		}
 		args = append(args, prof.SSHArgs...)
 		args = append(args, dest)
+		args = append(args, "exit")
 
 		c := exec.CommandContext(ctx, "ssh", args...)
-		c.Stdin = os.Stdin
+		if stdin == nil {
+			stdin = os.Stdin
+		}
+		c.Stdin = stdin
 		c.Stdout = os.Stdout
 		c.Stderr = os.Stderr
 		return c.Run()
@@ -334,6 +366,17 @@ func classifySSHProbeFailure(output string) sshProbeFailureKind {
 		return sshProbeFailureOther
 	}
 
+	hostKeyHints := []string{
+		"host key verification failed",
+		"remote host identification has changed",
+		"no host key is known for",
+	}
+	for _, hint := range hostKeyHints {
+		if strings.Contains(output, hint) {
+			return sshProbeFailureHostKey
+		}
+	}
+
 	authHints := []string{
 		"permission denied",
 		"authentication failed",
@@ -357,6 +400,15 @@ func shouldInstallManagedKey(err error) bool {
 
 	var probeErr *sshProbeError
 	return errors.As(err, &probeErr) && probeErr.kind == sshProbeFailureAuth
+}
+
+func shouldOfferInteractiveHostKeyCheck(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var probeErr *sshProbeError
+	return errors.As(err, &probeErr) && probeErr.kind == sshProbeFailureHostKey
 }
 
 func generateKeypair(ctx context.Context, store *config.Store, prof config.Profile) (string, error) {
