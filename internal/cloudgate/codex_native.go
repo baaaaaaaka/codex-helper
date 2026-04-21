@@ -142,6 +142,63 @@ func findVendorBinary(vendorRoot string) (nativeBin string, pathDir string) {
 	return candidate, pathDir
 }
 
+func dedupePaths(paths []string) []string {
+	deduped := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		deduped = append(deduped, path)
+	}
+	return deduped
+}
+
+func candidatePlatformPackageRoots(moduleDir string, platPkg string) []string {
+	if platPkg == "" {
+		return nil
+	}
+
+	candidates := []string{
+		filepath.Join(moduleDir, "node_modules", platPkg),
+		filepath.Join(filepath.Dir(moduleDir), "node_modules", platPkg),
+	}
+
+	// Mirror the relevant parts of Node's ancestor node_modules lookup so global
+	// installs such as <prefix>/lib/node_modules/@openai/codex and sibling alias
+	// packages like <prefix>/lib/node_modules/@openai/codex-darwin-arm64 resolve
+	// in the same order as require.resolve(.../package.json).
+	for dir := filepath.Clean(filepath.Dir(moduleDir)); ; dir = filepath.Dir(dir) {
+		if filepath.Base(dir) == "node_modules" {
+			candidates = append(candidates, filepath.Join(dir, platPkg))
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+	}
+
+	return dedupePaths(candidates)
+}
+
+func firstResolvedPlatformVendorRoot(moduleDir string, platPkg string) (vendorRoot string, packageRoot string, found bool, err error) {
+	for _, pkgRoot := range candidatePlatformPackageRoots(moduleDir, platPkg) {
+		packageJSON := filepath.Join(pkgRoot, "package.json")
+		if _, statErr := os.Stat(packageJSON); statErr == nil {
+			return filepath.Join(pkgRoot, "vendor"), pkgRoot, true, nil
+		} else if !os.IsNotExist(statErr) {
+			return "", "", false, fmt.Errorf("stat %s: %w", packageJSON, statErr)
+		}
+	}
+	return "", "", false, nil
+}
+
+func missingBinaryErrorForVendorRoot(triple string, vendorRoot string) error {
+	return fmt.Errorf("native binary not found for %s in resolved platform package vendor %s", triple, filepath.Clean(vendorRoot))
+}
+
 // FindNativeBinary locates the native Codex binary given the path to the
 // codex wrapper (e.g. /home/user/.npm-global/bin/codex on Unix or
 // C:\Users\...\npm\codex.cmd on Windows).
@@ -151,6 +208,7 @@ func findVendorBinary(vendorRoot string) (nativeBin string, pathDir string) {
 //   - Windows npm .cmd shim parsing
 //   - Vendor directory in the main package (<pkg>/vendor/<triple>/...)
 //   - Platform-specific npm sub-packages (<pkg>/node_modules/@openai/codex-<plat>/vendor/...)
+//   - Ancestor node_modules roots used by npm global installs and sibling aliases
 func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string, err error) {
 	triple := targetTriple()
 	if triple == "" {
@@ -162,29 +220,36 @@ func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string
 		return "", "", err
 	}
 
-	// The resolved wrapper should be at <pkg>/bin/codex.js
-	pkgDir := filepath.Dir(filepath.Dir(resolved))
-
-	// Strategy 1: vendor/ directly in the package root.
-	if bin, pd := findVendorBinary(filepath.Join(pkgDir, "vendor")); bin != "" {
-		return bin, pd, nil
-	}
-
-	// Strategy 2: platform-specific npm sub-package.
-	// e.g. <pkg>/node_modules/@openai/codex-win32-x64/vendor/<triple>/...
-	if platPkg := platformPackageName(); platPkg != "" {
-		subVendor := filepath.Join(pkgDir, "node_modules", platPkg, "vendor")
-		if bin, pd := findVendorBinary(subVendor); bin != "" {
-			return bin, pd, nil
+	moduleDir := filepath.Dir(resolved)
+	pkgDir := filepath.Dir(moduleDir)
+	platPkg := platformPackageName()
+	if platPkg != "" {
+		vendorRoot, _, found, err := firstResolvedPlatformVendorRoot(moduleDir, platPkg)
+		if err != nil {
+			return "", "", err
+		}
+		if found {
+			if bin, pd := findVendorBinary(vendorRoot); bin != "" {
+				return bin, pd, nil
+			}
+			return "", "", missingBinaryErrorForVendorRoot(triple, vendorRoot)
 		}
 	}
 
-	// Strategy 3: one level up (wrapper directly in the package).
-	if bin, pd := findVendorBinary(filepath.Join(filepath.Dir(resolved), "..", "vendor")); bin != "" {
+	localVendorRoot := filepath.Join(pkgDir, "vendor")
+	if bin, pd := findVendorBinary(localVendorRoot); bin != "" {
 		return bin, pd, nil
 	}
 
-	return "", "", fmt.Errorf("native binary not found for %s (looked in %s)", triple, pkgDir)
+	candidates := []string{localVendorRoot}
+	if platPkg != "" {
+		candidates = append(candidates, candidatePlatformPackageRoots(moduleDir, platPkg)...)
+	}
+	return "", "", fmt.Errorf(
+		"native binary not found for %s (checked %s)",
+		triple,
+		strings.Join(dedupePaths(candidates), ", "),
+	)
 }
 
 // PrepareYoloBinary finds the native Codex binary, patches it for yolo mode

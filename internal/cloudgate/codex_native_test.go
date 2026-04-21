@@ -266,10 +266,11 @@ func TestFindNativeBinaryPlatformSubPackage(t *testing.T) {
 	// <dir>/bin/codex.js  (wrapper)
 	// <dir>/node_modules/<platPkg>/vendor/<triple>/codex/codex[.exe]
 	binDir := filepath.Join(dir, "bin")
+	platformPkgDir := filepath.Join(dir, "node_modules", platPkg)
 	nativeDir := filepath.Join(dir, "node_modules", platPkg, "vendor", triple, "codex")
 	pathDirExpected := filepath.Join(dir, "node_modules", platPkg, "vendor", triple, "path")
 
-	for _, d := range []string{binDir, nativeDir, pathDirExpected} {
+	for _, d := range []string{binDir, platformPkgDir, nativeDir, pathDirExpected} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
@@ -278,6 +279,9 @@ func TestFindNativeBinaryPlatformSubPackage(t *testing.T) {
 	wrapperPath := filepath.Join(binDir, "codex.js")
 	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
 		t.Fatalf("write wrapper: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(platformPkgDir, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write platform package.json: %v", err)
 	}
 
 	nativePath := filepath.Join(nativeDir, nativeBinaryName())
@@ -294,6 +298,179 @@ func TestFindNativeBinaryPlatformSubPackage(t *testing.T) {
 	}
 	if gotPath != pathDirExpected {
 		t.Errorf("expected path dir %q, got %q", pathDirExpected, gotPath)
+	}
+}
+
+// TestFindNativeBinaryPlatformSiblingPackage covers npm layouts where the
+// scoped platform package is installed next to @openai/codex under the same
+// node_modules root.
+func TestFindNativeBinaryPlatformSiblingPackage(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	platPkg := platformPackageName()
+	if platPkg == "" {
+		t.Skip("no platform package for this platform")
+	}
+
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+
+	nodeModulesRoot := filepath.Join(dir, "node_modules")
+	binDir := filepath.Join(nodeModulesRoot, "@openai", "codex", "bin")
+	platformPkgDir := filepath.Join(nodeModulesRoot, platPkg)
+	nativeDir := filepath.Join(nodeModulesRoot, platPkg, "vendor", triple, "codex")
+	pathDirExpected := filepath.Join(nodeModulesRoot, platPkg, "vendor", triple, "path")
+
+	for _, d := range []string{binDir, platformPkgDir, nativeDir, pathDirExpected} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	wrapperPath := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(platformPkgDir, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write platform package.json: %v", err)
+	}
+
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
+	if err := os.WriteFile(nativePath, []byte("native binary"), 0o755); err != nil {
+		t.Fatalf("write native: %v", err)
+	}
+
+	gotBin, gotPath, err := FindNativeBinary(wrapperPath)
+	if err != nil {
+		t.Fatalf("FindNativeBinary: %v", err)
+	}
+	if gotBin != nativePath {
+		t.Errorf("expected native binary %q, got %q", nativePath, gotBin)
+	}
+	if gotPath != pathDirExpected {
+		t.Errorf("expected path dir %q, got %q", pathDirExpected, gotPath)
+	}
+}
+
+func TestFindNativeBinaryPrefersNestedPlatformSubPackage(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	platPkg := platformPackageName()
+	if platPkg == "" {
+		t.Skip("no platform package for this platform")
+	}
+
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+
+	nodeModulesRoot := filepath.Join(dir, "node_modules")
+	pkgDir := filepath.Join(nodeModulesRoot, "@openai", "codex")
+	binDir := filepath.Join(pkgDir, "bin")
+	nestedPkgDir := filepath.Join(pkgDir, "node_modules", platPkg)
+	nestedNativeDir := filepath.Join(pkgDir, "node_modules", platPkg, "vendor", triple, "codex")
+	nestedPathDir := filepath.Join(pkgDir, "node_modules", platPkg, "vendor", triple, "path")
+	siblingPkgDir := filepath.Join(nodeModulesRoot, platPkg)
+	siblingNativeDir := filepath.Join(nodeModulesRoot, platPkg, "vendor", triple, "codex")
+	siblingPathDir := filepath.Join(nodeModulesRoot, platPkg, "vendor", triple, "path")
+
+	for _, d := range []string{binDir, nestedPkgDir, nestedNativeDir, nestedPathDir, siblingPkgDir, siblingNativeDir, siblingPathDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	wrapperPath := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedPkgDir, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write nested package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(siblingPkgDir, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write sibling package.json: %v", err)
+	}
+
+	nestedNativePath := filepath.Join(nestedNativeDir, nativeBinaryName())
+	if err := os.WriteFile(nestedNativePath, []byte("nested native binary"), 0o755); err != nil {
+		t.Fatalf("write nested native: %v", err)
+	}
+	siblingNativePath := filepath.Join(siblingNativeDir, nativeBinaryName())
+	if err := os.WriteFile(siblingNativePath, []byte("sibling native binary"), 0o755); err != nil {
+		t.Fatalf("write sibling native: %v", err)
+	}
+
+	gotBin, gotPath, err := FindNativeBinary(wrapperPath)
+	if err != nil {
+		t.Fatalf("FindNativeBinary: %v", err)
+	}
+	if gotBin != nestedNativePath {
+		t.Errorf("expected nested native binary %q, got %q", nestedNativePath, gotBin)
+	}
+	if gotPath != nestedPathDir {
+		t.Errorf("expected nested path dir %q, got %q", nestedPathDir, gotPath)
+	}
+}
+
+func TestFindNativeBinaryDoesNotFallBackAfterBrokenNestedPlatformPackage(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	platPkg := platformPackageName()
+	if platPkg == "" {
+		t.Skip("no platform package for this platform")
+	}
+
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+
+	nodeModulesRoot := filepath.Join(dir, "node_modules")
+	pkgDir := filepath.Join(nodeModulesRoot, "@openai", "codex")
+	binDir := filepath.Join(pkgDir, "bin")
+	nestedPkgDir := filepath.Join(pkgDir, "node_modules", platPkg)
+	siblingNativeDir := filepath.Join(nodeModulesRoot, platPkg, "vendor", triple, "codex")
+	siblingPathDir := filepath.Join(nodeModulesRoot, platPkg, "vendor", triple, "path")
+
+	for _, d := range []string{binDir, nestedPkgDir, siblingNativeDir, siblingPathDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	wrapperPath := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+
+	nestedPackageJSON := filepath.Join(nestedPkgDir, "package.json")
+	if err := os.WriteFile(nestedPackageJSON, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write nested package.json: %v", err)
+	}
+
+	siblingNativePath := filepath.Join(siblingNativeDir, nativeBinaryName())
+	if err := os.WriteFile(siblingNativePath, []byte("sibling native binary"), 0o755); err != nil {
+		t.Fatalf("write sibling native: %v", err)
+	}
+
+	_, _, err := FindNativeBinary(wrapperPath)
+	if err == nil {
+		t.Fatal("expected error for missing nested platform vendor binary")
+	}
+	if !strings.Contains(err.Error(), filepath.Join(nestedPkgDir, "vendor")) {
+		t.Fatalf("expected error to mention nested vendor root, got %v", err)
+	}
+	if strings.Contains(err.Error(), siblingNativePath) {
+		t.Fatalf("expected error to stop before sibling native binary, got %v", err)
 	}
 }
 

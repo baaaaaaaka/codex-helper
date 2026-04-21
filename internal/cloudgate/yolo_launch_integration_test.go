@@ -30,9 +30,16 @@ func TestCodexPatchedYoloLaunchIntegration(t *testing.T) {
 		t.Fatalf("codex not found in PATH: %v", err)
 	}
 
-	yoloArgs := detectYoloArgs(t, wrapper)
+	yoloArgs, helpOut, helpErr := detectYoloArgs(wrapper)
 	if len(yoloArgs) == 0 {
-		t.Fatal("could not detect yolo flags from `codex --help`")
+		if helpErr != nil {
+			t.Fatalf(
+				"could not detect yolo flags from `codex --help`: %v\noutput=%s",
+				helpErr,
+				formatProbeOutput(helpOut),
+			)
+		}
+		t.Fatalf("could not detect yolo flags from `codex --help`\noutput=%s", formatProbeOutput(helpOut))
 	}
 
 	cacheDir := filepath.Join(t.TempDir(), "patch-cache")
@@ -62,27 +69,31 @@ func TestCodexPatchedYoloLaunchIntegration(t *testing.T) {
 	}
 }
 
-func detectYoloArgs(t *testing.T, codexPath string) []string {
-	t.Helper()
+func detectYoloArgs(codexPath string) ([]string, string, error) {
 	out, err := runProbe(codexPath, "--help")
-	if err != nil {
-		t.Logf("codex --help exited non-zero: %v", err)
-	}
 
 	if strings.Contains(out, "--yolo") {
-		return []string{"--yolo"}
+		return []string{"--yolo"}, out, err
 	}
 	if strings.Contains(out, "--dangerously-bypass-approvals-and-sandbox") {
-		return []string{"--dangerously-bypass-approvals-and-sandbox"}
+		return []string{"--dangerously-bypass-approvals-and-sandbox"}, out, err
 	}
 	if strings.Contains(out, "--ask-for-approval") {
 		args := []string{"--ask-for-approval", "never"}
 		if strings.Contains(out, "--sandbox") {
 			args = append(args, "--sandbox", "danger-full-access")
 		}
-		return args
+		return args, out, err
 	}
-	return nil
+	return nil, out, err
+}
+
+func formatProbeOutput(out string) string {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "<empty>"
+	}
+	return out
 }
 
 func runProbe(path string, arg string) (string, error) {

@@ -187,6 +187,31 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           & .\scripts\ci\retry.ps1 5 5 npm install -g "@openai/codex@$env:CODEX_VERSION"
 
+      - name: Probe installed Codex wrapper (Linux/macOS)
+        if: runner.os != 'Windows'
+        id: wrapper_probe_unix
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex --version 2>&1
+          codex --help 2>&1 || true
+
+      - name: Probe installed Codex wrapper (Windows)
+        if: runner.os == 'Windows'
+        id: wrapper_probe_windows
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          & codex --version 2>&1
+          try {
+            & codex --help 2>&1 | Out-Host
+          } catch {
+            $_ | Out-Host
+          }
+
       - name: Run Codex patch + yolo smoke tests
         id: smoke
         continue-on-error: true
@@ -202,10 +227,19 @@ jobs:
       - name: Write platform result
         if: always()
         shell: bash
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          PROBE_OUTCOME_UNIX: ${{ steps.wrapper_probe_unix.outcome }}
+          PROBE_OUTCOME_WINDOWS: ${{ steps.wrapper_probe_windows.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
         run: |
           set -euo pipefail
           status="fail"
-          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
+          probe_outcome="$PROBE_OUTCOME_UNIX"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            probe_outcome="$PROBE_OUTCOME_WINDOWS"
+          fi
+          if [ "$probe_outcome" = "success" ] && [ "$SMOKE_OUTCOME" = "success" ]; then
             status="pass"
           fi
           mkdir -p results
@@ -220,11 +254,11 @@ jobs:
           name: codex-monitor-results-${{ env.PLATFORM_NAME }}-${{ env.CODEX_VERSION }}
           path: results/${{ env.PLATFORM_NAME }}-${{ env.CODEX_VERSION }}.json
 
-      - name: Fail when smoke failed
-        if: steps.smoke.outcome != 'success'
+      - name: Fail when probe or smoke failed
+        if: steps.smoke.outcome != 'success' || (runner.os == 'Windows' && steps.wrapper_probe_windows.outcome != 'success') || (runner.os != 'Windows' && steps.wrapper_probe_unix.outcome != 'success')
         shell: bash
         run: |
-          echo "Codex patch+yolo smoke failed on ${PLATFORM_NAME}" >&2
+          echo "Codex wrapper probe or patch+yolo smoke failed on ${PLATFORM_NAME}" >&2
           exit 1
 
   test-linux-distros:
@@ -262,6 +296,38 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cli -c -o "$cli_test_bin"
           chmod +x "$cli_test_bin"
           echo "CLI_TEST_BIN_PATH=$cli_test_bin" >> "$GITHUB_ENV"
+
+      - name: Probe installed Codex wrapper (container)
+        id: wrapper_probe
+        continue-on-error: true
+        shell: bash
+        env:
+          PLATFORM_NAME: ${{ matrix.platform }}
+          CODEX_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          case "${PLATFORM_NAME}" in
+            centos7)
+              IMAGE="centos:7"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              ;;
+            rockylinux8)
+              IMAGE="rockylinux:8"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              ;;
+            ubuntu20.04)
+              IMAGE="ubuntu:20.04"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils"
+              ;;
+            *)
+              echo "unsupported platform ${PLATFORM_NAME}" >&2
+              exit 1
+              ;;
+          esac
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" codex --version && (PATH=\"\${NODE_BIN_DIR}:\$PATH\" codex --help || true)"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/scripts/ci:/ci:ro" \
+            "${IMAGE}" /bin/sh -lc "$run_cmd"
 
       - name: Run Codex patch + yolo smoke tests (container)
         id: smoke
@@ -303,10 +369,12 @@ jobs:
         env:
           PLATFORM_NAME: ${{ matrix.platform }}
           CODEX_VERSION: ${{ matrix.version }}
+          PROBE_OUTCOME: ${{ steps.wrapper_probe.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
         run: |
           set -euo pipefail
           status="fail"
-          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
+          if [ "$PROBE_OUTCOME" = "success" ] && [ "$SMOKE_OUTCOME" = "success" ]; then
             status="pass"
           fi
           mkdir -p results
@@ -321,11 +389,11 @@ jobs:
           name: codex-monitor-results-${{ matrix.platform }}-${{ matrix.version }}
           path: results/${{ matrix.platform }}-${{ matrix.version }}.json
 
-      - name: Fail when smoke failed
-        if: steps.smoke.outcome != 'success'
+      - name: Fail when probe or smoke failed
+        if: steps.wrapper_probe.outcome != 'success' || steps.smoke.outcome != 'success'
         shell: bash
         run: |
-          echo "Codex patch+yolo smoke failed on ${{ matrix.platform }}" >&2
+          echo "Codex wrapper probe or patch+yolo smoke failed on ${{ matrix.platform }}" >&2
           exit 1
 
   update:

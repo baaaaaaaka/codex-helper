@@ -155,7 +155,10 @@ func TestCodexPatchIntegration(t *testing.T) {
 	// 2. Locate the native binary.
 	nativeBin, _, err := FindNativeBinary(wrapper)
 	if err != nil {
-		t.Skipf("FindNativeBinary: %v (native binary not bundled for this platform)", err)
+		if targetTriple() == "" {
+			t.Skipf("FindNativeBinary: %v", err)
+		}
+		t.Fatalf("FindNativeBinary: %v", err)
 	}
 	t.Logf("native binary: %s", nativeBin)
 	original, err := os.ReadFile(nativeBin)
