@@ -1,6 +1,46 @@
 #!/usr/bin/env sh
 set -eu
 
+INSTALL_SHOW_SUMMARY=1
+INSTALL_FAILURE_REASON=""
+INSTALL_SUCCESS_DETAILS=""
+INSTALL_MIN_FREE_KB="${CODEX_PROXY_INSTALL_MIN_FREE_KB:-131072}"
+
+print_install_banner() {
+  title="$1"
+  printf '\n%s\n' "============================================================" >&2
+  printf '  %s\n' "$title" >&2
+  printf '%s\n' "============================================================" >&2
+}
+
+finish_install() {
+  status="${1:-$?}"
+  trap - EXIT
+  if [ "${INSTALL_SHOW_SUMMARY:-1}" != "1" ]; then
+    exit "$status"
+  fi
+  if [ "$status" -eq 0 ]; then
+    print_install_banner "CODEX-PROXY INSTALL SUCCESS"
+    if [ -n "${INSTALL_SUCCESS_DETAILS:-}" ]; then
+      printf '%s\n' "$INSTALL_SUCCESS_DETAILS" >&2
+    fi
+  else
+    print_install_banner "CODEX-PROXY INSTALL FAILED"
+    if [ -n "${INSTALL_FAILURE_REASON:-}" ]; then
+      printf 'Reason: %s\n' "$INSTALL_FAILURE_REASON" >&2
+    else
+      printf 'Reason: unexpected installer error; check the last error above.\n' >&2
+    fi
+  fi
+  exit "$status"
+}
+trap finish_install EXIT
+
+fail_install() {
+  INSTALL_FAILURE_REASON="$1"
+  exit "${2:-1}"
+}
+
 usage() {
   cat <<'EOF'
 codex-proxy installer (no root required)
@@ -33,6 +73,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help)
       usage
+      INSTALL_SHOW_SUMMARY=0
       exit 0
       ;;
     --repo)
@@ -48,7 +89,8 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     *)
-      echo "Unknown argument: $1" >&2
+      INSTALL_FAILURE_REASON="Unknown argument: $1"
+      echo "$INSTALL_FAILURE_REASON" >&2
       usage >&2
       exit 2
       ;;
@@ -62,8 +104,7 @@ case "$os" in
   Linux) os=linux ;;
   Darwin) os=darwin ;;
   *)
-    echo "Unsupported OS: $os" >&2
-    exit 1
+    fail_install "Unsupported OS: $os"
     ;;
 esac
 
@@ -71,8 +112,7 @@ case "$arch" in
   x86_64|amd64) arch=amd64 ;;
   aarch64|arm64) arch=arm64 ;;
   *)
-    echo "Unsupported architecture: $arch" >&2
-    exit 1
+    fail_install "Unsupported architecture: $arch"
     ;;
 esac
 
@@ -82,6 +122,92 @@ if [ -z "${shell_name:-}" ]; then
 fi
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+is_positive_integer() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$1" -gt 0 ] ;;
+  esac
+}
+
+existing_path_for_space_check() {
+  path="$1"
+  if [ -z "${path:-}" ]; then
+    return 1
+  fi
+  while [ ! -e "$path" ]; do
+    parent="$(dirname "$path")"
+    if [ "$parent" = "$path" ]; then
+      return 1
+    fi
+    path="$parent"
+  done
+  printf '%s\n' "$path"
+}
+
+available_kb_for_path() {
+  path="$1"
+  if ! have_cmd df || ! have_cmd awk; then
+    return 1
+  fi
+  existing="$(existing_path_for_space_check "$path" 2>/dev/null || true)"
+  if [ -z "${existing:-}" ]; then
+    return 1
+  fi
+  df -Pk "$existing" 2>/dev/null | awk 'NR==2 { print $4 }'
+}
+
+disk_space_failure_reason() {
+  label="$1"
+  path="$2"
+  min_kb="${3:-}"
+  if ! is_positive_integer "$min_kb"; then
+    return 1
+  fi
+  available_kb="$(available_kb_for_path "$path" 2>/dev/null || true)"
+  if ! is_positive_integer "$available_kb"; then
+    return 1
+  fi
+  if [ "$available_kb" -lt "$min_kb" ]; then
+    need_mb=$(( (min_kb + 1023) / 1024 ))
+    have_mb=$(( available_kb / 1024 ))
+    printf 'Not enough disk space for %s (%s): %s MiB available, need at least %s MiB.' "$label" "$path" "$have_mb" "$need_mb"
+    return 0
+  fi
+  return 1
+}
+
+check_disk_space() {
+  label="$1"
+  path="$2"
+  min_kb="${3:-}"
+  reason="$(disk_space_failure_reason "$label" "$path" "$min_kb" 2>/dev/null || true)"
+  if [ -n "${reason:-}" ]; then
+    fail_install "$reason"
+  fi
+  if ! is_positive_integer "$min_kb"; then
+    return 0
+  fi
+  available_kb="$(available_kb_for_path "$path" 2>/dev/null || true)"
+  if ! is_positive_integer "$available_kb"; then
+    echo "Warning: could not reliably check free disk space for $label ($path); continuing." >&2
+  fi
+}
+
+fail_write_or_disk() {
+  label="$1"
+  path="$2"
+  fallback="$3"
+  reason="$(disk_space_failure_reason "$label" "$path" "$INSTALL_MIN_FREE_KB" 2>/dev/null || true)"
+  if [ -n "${reason:-}" ]; then
+    fail_install "$reason"
+  fi
+  fail_install "$fallback"
+}
+
+ensure_write_space() {
+  check_disk_space "$1" "$2" "$INSTALL_MIN_FREE_KB"
+}
 
 file_contains_text() {
   file="$1"
@@ -142,7 +268,8 @@ http_get() {
     wget_run -q -O "$out" "$url"
     return 0
   fi
-  echo "Missing downloader: need curl or wget" >&2
+  INSTALL_FAILURE_REASON="Missing downloader: need curl or wget"
+  echo "$INSTALL_FAILURE_REASON" >&2
   return 1
 }
 
@@ -176,9 +303,16 @@ remove_line() {
   fi
 
   tmp="$file.codex-proxy.$$"
-  grep -Fvx "$line" "$file" >"$tmp" 2>/dev/null || true
+  ensure_write_space "shell profile update" "$tmp"
+  grep_status=0
+  grep -Fvx "$line" "$file" >"$tmp" 2>/dev/null || grep_status=$?
+  if [ "$grep_status" -gt 1 ]; then
+    rm -f "$tmp"
+    fail_write_or_disk "shell profile update" "$tmp" "Failed to update shell profile: $file"
+  fi
   if ! cmp -s "$file" "$tmp" 2>/dev/null; then
-    cat "$tmp" >"$file"
+    ensure_write_space "shell profile update" "$file"
+    cat "$tmp" >"$file" || fail_write_or_disk "shell profile update" "$file" "Failed to update shell profile: $file"
     CONFIG_UPDATED=1
     add_source_file "$file"
   fi
@@ -193,13 +327,16 @@ ensure_line() {
   fi
   dir="$(dirname "$file")"
   if [ -n "${dir:-}" ]; then
-    mkdir -p "$dir" 2>/dev/null || true
+    ensure_write_space "shell profile directory" "$dir"
+    mkdir -p "$dir" 2>/dev/null || fail_write_or_disk "shell profile directory" "$dir" "Failed to create shell profile directory: $dir"
   fi
   if [ ! -f "$file" ]; then
-    : > "$file"
+    ensure_write_space "shell profile" "$file"
+    : > "$file" || fail_write_or_disk "shell profile" "$file" "Failed to create shell profile: $file"
   fi
   if ! grep -Fqx "$line" "$file" 2>/dev/null; then
-    printf "\n%s\n" "$line" >> "$file"
+    ensure_write_space "shell profile" "$file"
+    printf "\n%s\n" "$line" >> "$file" || fail_write_or_disk "shell profile" "$file" "Failed to update shell profile: $file"
     CONFIG_UPDATED=1
     add_source_file "$file"
   fi
@@ -218,7 +355,8 @@ resolve_dir_path() {
   if [ -z "${dir:-}" ]; then
     return 0
   fi
-  mkdir -p "$dir" 2>/dev/null || true
+  ensure_write_space "directory creation" "$dir"
+  mkdir -p "$dir" 2>/dev/null || fail_write_or_disk "directory creation" "$dir" "Failed to create directory: $dir"
   resolved="$(cd "$dir" 2>/dev/null && pwd -P || true)"
   if [ -n "${resolved:-}" ]; then
     printf '%s' "$resolved"
@@ -233,12 +371,14 @@ write_posix_path_snippet() {
   managed_path="$3"
 
   dir="$(dirname "$file")"
-  mkdir -p "$dir" 2>/dev/null || true
+  ensure_write_space "shell PATH snippet directory" "$dir"
+  mkdir -p "$dir" 2>/dev/null || fail_write_or_disk "shell PATH snippet directory" "$dir" "Failed to create shell PATH snippet directory: $dir"
 
   tmp="$file.codex-proxy.$$"
   install_escaped="$(escape_double_quotes "$install_path")"
   managed_escaped="$(escape_double_quotes "$managed_path")"
-  {
+  ensure_write_space "shell PATH snippet" "$tmp"
+  if ! {
     printf '%s\n' "# added by codex-proxy installer"
     printf '_path_entry="%s"\n' "$install_escaped"
     cat <<'EOF'
@@ -259,10 +399,13 @@ EOF
     fi
     printf '\n%s\n' 'export PATH'
     printf '%s\n' 'unset _path_entry'
-  } >"$tmp"
+  } >"$tmp"; then
+    fail_write_or_disk "shell PATH snippet" "$tmp" "Failed to write shell PATH snippet: $tmp"
+  fi
 
   if [ ! -f "$file" ] || ! cmp -s "$file" "$tmp" 2>/dev/null; then
-    cat "$tmp" >"$file"
+    ensure_write_space "shell PATH snippet" "$file"
+    cat "$tmp" >"$file" || fail_write_or_disk "shell PATH snippet" "$file" "Failed to install shell PATH snippet: $file"
     CONFIG_UPDATED=1
     add_source_file "$file"
   fi
@@ -275,12 +418,14 @@ write_fish_path_snippet() {
   managed_path="$3"
 
   dir="$(dirname "$file")"
-  mkdir -p "$dir" 2>/dev/null || true
+  ensure_write_space "fish PATH snippet directory" "$dir"
+  mkdir -p "$dir" 2>/dev/null || fail_write_or_disk "fish PATH snippet directory" "$dir" "Failed to create fish PATH snippet directory: $dir"
 
   tmp="$file.codex-proxy.$$"
   install_escaped="$(escape_double_quotes "$install_path")"
   managed_escaped="$(escape_double_quotes "$managed_path")"
-  {
+  ensure_write_space "fish PATH snippet" "$tmp"
+  if ! {
     printf '%s\n' "# added by codex-proxy installer"
     printf 'if not contains -- "%s" $PATH\n' "$install_escaped"
     printf '  set -gx PATH "%s" $PATH\n' "$install_escaped"
@@ -291,10 +436,13 @@ write_fish_path_snippet() {
       printf '  set -gx PATH "%s" $PATH\n' "$managed_escaped"
       printf '%s\n' 'end'
     fi
-  } >"$tmp"
+  } >"$tmp"; then
+    fail_write_or_disk "fish PATH snippet" "$tmp" "Failed to write fish PATH snippet: $tmp"
+  fi
 
   if [ ! -f "$file" ] || ! cmp -s "$file" "$tmp" 2>/dev/null; then
-    cat "$tmp" >"$file"
+    ensure_write_space "fish PATH snippet" "$file"
+    cat "$tmp" >"$file" || fail_write_or_disk "fish PATH snippet" "$file" "Failed to install fish PATH snippet: $file"
     CONFIG_UPDATED=1
     add_source_file "$file"
   fi
@@ -307,12 +455,14 @@ write_csh_path_snippet() {
   managed_path="$3"
 
   dir="$(dirname "$file")"
-  mkdir -p "$dir" 2>/dev/null || true
+  ensure_write_space "csh PATH snippet directory" "$dir"
+  mkdir -p "$dir" 2>/dev/null || fail_write_or_disk "csh PATH snippet directory" "$dir" "Failed to create csh PATH snippet directory: $dir"
 
   tmp="$file.codex-proxy.$$"
   install_escaped="$(escape_double_quotes "$install_path")"
   managed_escaped="$(escape_double_quotes "$managed_path")"
-  {
+  ensure_write_space "csh PATH snippet" "$tmp"
+  if ! {
     printf '%s\n' "# added by codex-proxy installer"
     printf 'set _path_entry = "%s"\n' "$install_escaped"
     cat <<'EOF'
@@ -338,10 +488,13 @@ endif
 EOF
     fi
     printf '\n%s\n' 'unset _path_entry'
-  } >"$tmp"
+  } >"$tmp"; then
+    fail_write_or_disk "csh PATH snippet" "$tmp" "Failed to write csh PATH snippet: $tmp"
+  fi
 
   if [ ! -f "$file" ] || ! cmp -s "$file" "$tmp" 2>/dev/null; then
-    cat "$tmp" >"$file"
+    ensure_write_space "csh PATH snippet" "$file"
+    cat "$tmp" >"$file" || fail_write_or_disk "csh PATH snippet" "$file" "Failed to install csh PATH snippet: $file"
     CONFIG_UPDATED=1
     add_source_file "$file"
   fi
@@ -554,10 +707,27 @@ get_latest_tag() {
 }
 
 tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t codex-proxy)"
-trap 'rm -rf "$tmpdir"' EXIT INT TERM
+cleanup_tmp_and_finish() {
+  status=$?
+  rm -rf "$tmpdir"
+  finish_install "$status"
+}
+trap cleanup_tmp_and_finish EXIT
+trap 'INSTALL_FAILURE_REASON="Interrupted"; exit 130' INT
+trap 'INSTALL_FAILURE_REASON="Terminated"; exit 143' TERM
+
+check_disk_space "temporary download directory" "$tmpdir" "$INSTALL_MIN_FREE_KB"
+check_disk_space "install directory" "$install_dir" "$INSTALL_MIN_FREE_KB"
 
 if [ "$version" = "latest" ] || [ -z "${version:-}" ]; then
-  version="$(get_latest_tag "$tmpdir/latest.json")"
+  ensure_write_space "temporary latest-version metadata" "$tmpdir/latest.json"
+  if ! version="$(get_latest_tag "$tmpdir/latest.json")"; then
+    reason="$(disk_space_failure_reason "temporary latest-version metadata" "$tmpdir/latest.json" "$INSTALL_MIN_FREE_KB" 2>/dev/null || true)"
+    if [ -n "${reason:-}" ]; then
+      fail_install "$reason"
+    fi
+    fail_install "Failed to determine latest version automatically; pass --version vX.Y.Z"
+  fi
 fi
 
 ver_nov="${version#v}"
@@ -567,11 +737,20 @@ url="$release_base/$repo/releases/download/$version/$asset"
 checksums_url="$release_base/$repo/releases/download/$version/checksums.txt"
 
 bin_tmp="$tmpdir/$asset"
-http_get "$url" "$bin_tmp"
+ensure_write_space "release asset download" "$bin_tmp"
+if ! http_get "$url" "$bin_tmp"; then
+  fail_write_or_disk "release asset download" "$bin_tmp" "Failed to download release asset: $url"
+fi
 
 # Optional checksum verification.
 if have_cmd sha256sum || have_cmd shasum; then
-  http_get "$checksums_url" "$tmpdir/checksums.txt" || true
+  ensure_write_space "checksum download" "$tmpdir/checksums.txt"
+  if ! http_get "$checksums_url" "$tmpdir/checksums.txt"; then
+    reason="$(disk_space_failure_reason "checksum download" "$tmpdir/checksums.txt" "$INSTALL_MIN_FREE_KB" 2>/dev/null || true)"
+    if [ -n "${reason:-}" ]; then
+      fail_install "$reason"
+    fi
+  fi
   if [ -s "$tmpdir/checksums.txt" ] && have_cmd awk; then
     expected="$(awk -v a="$asset" '$2==a {print $1}' "$tmpdir/checksums.txt" | head -n 1 || true)"
     if [ -n "${expected:-}" ]; then
@@ -584,24 +763,28 @@ if have_cmd sha256sum || have_cmd shasum; then
         echo "Checksum mismatch for $asset" >&2
         echo "Expected: $expected" >&2
         echo "Actual:   $actual" >&2
-        exit 1
+        fail_install "Checksum mismatch for $asset"
       fi
     fi
   fi
 fi
 
-mkdir -p "$install_dir"
+ensure_write_space "install directory" "$install_dir"
+mkdir -p "$install_dir" || fail_write_or_disk "install directory" "$install_dir" "Failed to create install directory: $install_dir"
 chmod 0755 "$bin_tmp" 2>/dev/null || true
 
 dst="$install_dir/codex-proxy"
-mv -f "$bin_tmp" "$dst"
+ensure_write_space "codex-proxy binary install" "$dst"
+mv -f "$bin_tmp" "$dst" || fail_write_or_disk "codex-proxy binary install" "$dst" "Failed to move codex-proxy into $dst"
 
 cxp_dst="$install_dir/cxp"
 if have_cmd ln; then
+  ensure_write_space "cxp shim install" "$cxp_dst"
   ln -sf "$dst" "$cxp_dst" 2>/dev/null || true
 fi
 if [ ! -f "$cxp_dst" ]; then
-  cp -f "$dst" "$cxp_dst" 2>/dev/null || true
+  ensure_write_space "cxp shim install" "$cxp_dst"
+  cp -f "$dst" "$cxp_dst" 2>/dev/null || fail_write_or_disk "cxp shim install" "$cxp_dst" "Failed to install cxp shim: $cxp_dst"
 fi
 chmod 0755 "$cxp_dst" 2>/dev/null || true
 
@@ -652,7 +835,10 @@ for legacy_name in claude-proxy clp; do
   fi
 done
 
-echo "Installed: $dst"
 update_shell_config
-echo "Run: $dst proxy doctor"
-echo "Shell config checked for install/managed CLI PATH and alias 'cxp' (reload attempted)"
+INSTALL_SUCCESS_DETAILS="$(cat <<EOF
+Installed: $dst
+Run: $dst proxy doctor
+Shell config checked for install/managed CLI PATH and alias 'cxp' (reload attempted)
+EOF
+)"

@@ -45,6 +45,130 @@ func TestInstallShChecksumMismatch(t *testing.T) {
 	if !strings.Contains(string(output), "Checksum mismatch") {
 		t.Fatalf("expected checksum mismatch output, got %s", string(output))
 	}
+	if !strings.Contains(string(output), "CODEX-PROXY INSTALL FAILED") {
+		t.Fatalf("expected failure banner, got %s", string(output))
+	}
+}
+
+func TestInstallShSuccessBanner(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh failed: %v\n%s", err, string(output))
+	}
+	text := string(output)
+	if !strings.Contains(text, "CODEX-PROXY INSTALL SUCCESS") {
+		t.Fatalf("expected success banner, got %s", text)
+	}
+	if !strings.Contains(text, "Installed: "+filepath.Join(run.installDir, "codex-proxy")) {
+		t.Fatalf("expected installed path in success output, got %s", text)
+	}
+}
+
+func TestInstallShChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_CHECKSUMS_FAIL", "1")
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh should ignore checksum download failure: %v\n%s", err, string(output))
+	}
+	text := string(output)
+	if !strings.Contains(text, "CODEX-PROXY INSTALL SUCCESS") {
+		t.Fatalf("expected success banner, got %s", text)
+	}
+	installed := filepath.Join(run.installDir, "codex-proxy")
+	got, err := os.ReadFile(installed)
+	if err != nil {
+		t.Fatalf("read installed binary: %v", err)
+	}
+	if string(got) != string(run.assetData) {
+		t.Fatalf("installed payload mismatch")
+	}
+}
+
+func TestInstallShDiskSpaceFailureBanner(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	dfDir := t.TempDir()
+	writeStubDf(t, dfDir, 1)
+	pathValue := dfDir + string(os.PathListSeparator) + envValueForTest(run.env, "PATH")
+	run.env = overrideEnv(run.env, "PATH", pathValue)
+	run.env = overrideEnv(run.env, "CODEX_PROXY_INSTALL_MIN_FREE_KB", "2048")
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected disk space failure")
+	}
+	text := string(output)
+	if !strings.Contains(text, "CODEX-PROXY INSTALL FAILED") {
+		t.Fatalf("expected failure banner, got %s", text)
+	}
+	if !strings.Contains(text, "Not enough disk space") {
+		t.Fatalf("expected disk space reason, got %s", text)
+	}
+}
+
+func TestInstallShDiskSpaceUnknownWarnsButContinues(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+
+	dfDir := t.TempDir()
+	writeBrokenDf(t, dfDir)
+	pathValue := dfDir + string(os.PathListSeparator) + envValueForTest(run.env, "PATH")
+	run.env = overrideEnv(run.env, "PATH", pathValue)
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh should continue when disk space cannot be checked reliably: %v\n%s", err, string(output))
+	}
+	text := string(output)
+	if !strings.Contains(strings.ToLower(text), "warning: could not reliably check free disk space") {
+		t.Fatalf("expected unreliable disk check warning, got %s", text)
+	}
+	if !strings.Contains(text, "CODEX-PROXY INSTALL SUCCESS") {
+		t.Fatalf("expected success banner, got %s", text)
+	}
+}
+
+func TestInstallPs1ChecksumDownloadRemainsBestEffort(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+	data, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	text := string(data)
+	checksumBlockStart := strings.Index(text, "# Optional checksum verification.")
+	if checksumBlockStart < 0 {
+		t.Fatal("install.ps1 missing optional checksum block")
+	}
+	checksumBlockEnd := strings.Index(text[checksumBlockStart:], "$dst = Join-Path")
+	if checksumBlockEnd < 0 {
+		t.Fatal("install.ps1 checksum block end marker not found")
+	}
+	checksumBlock := text[checksumBlockStart : checksumBlockStart+checksumBlockEnd]
+	if strings.Contains(checksumBlock, "Invoke-DiskWrite -Label \"checksum download\"") {
+		t.Fatalf("checksum download must stay best-effort for non-disk failures, got:\n%s", checksumBlock)
+	}
+	if !strings.Contains(checksumBlock, "Test-DiskSpaceError") {
+		t.Fatalf("checksum block should still promote disk-space failures, got:\n%s", checksumBlock)
+	}
 }
 
 func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
@@ -632,6 +756,16 @@ func boolEnv(v bool) string {
 	return "0"
 }
 
+func envValueForTest(env []string, key string) string {
+	for i := len(env) - 1; i >= 0; i-- {
+		k, v, ok := strings.Cut(env[i], "=")
+		if ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+
 func containsPathEntry(pathValue, target string) bool {
 	target = normalizeComparablePath(target)
 	for _, entry := range filepath.SplitList(pathValue) {
@@ -711,6 +845,9 @@ case "$url" in
     printf "%s" "${CODEX_PROXY_TEST_API_JSON:-}" > "$out"
     ;;
   *"/checksums.txt")
+    if [ "${CODEX_PROXY_TEST_CHECKSUMS_FAIL:-}" = "1" ]; then
+      exit 22
+    fi
     printf "%s" "${CODEX_PROXY_TEST_CHECKSUMS:-}" > "$out"
     ;;
   *"/${CODEX_PROXY_TEST_ASSET}")
@@ -723,6 +860,30 @@ esac
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write stub curl: %v", err)
+	}
+}
+
+func writeStubDf(t *testing.T, dir string, availableKB int) {
+	t.Helper()
+	path := filepath.Join(dir, "df")
+	script := fmt.Sprintf(`#!/usr/bin/env sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'stub 4096 4095 %d 99%% /\n'
+`, availableKB)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub df: %v", err)
+	}
+}
+
+func writeBrokenDf(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "df")
+	script := `#!/usr/bin/env sh
+printf 'df unavailable\n' >&2
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write broken df: %v", err)
 	}
 }
 

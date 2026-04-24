@@ -13,6 +13,36 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$script:InstallFailureReason = $null
+$script:InstallSuccessDetails = @()
+$script:InstallShowSummary = $true
+$installMinFreeKB = 131072
+if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PROXY_INSTALL_MIN_FREE_KB)) {
+  $parsedMinFreeKB = 0L
+  if ([long]::TryParse($env:CODEX_PROXY_INSTALL_MIN_FREE_KB, [ref]$parsedMinFreeKB) -and $parsedMinFreeKB -gt 0) {
+    $installMinFreeKB = $parsedMinFreeKB
+  }
+}
+$script:InstallMinFreeBytes = $installMinFreeKB * 1024L
+
+function Write-InstallBanner([string]$title) {
+  Write-Host ""
+  Write-Host "============================================================"
+  Write-Host ("  " + $title)
+  Write-Host "============================================================"
+}
+
+trap {
+  if ([string]::IsNullOrWhiteSpace($script:InstallFailureReason)) {
+    $script:InstallFailureReason = $_.Exception.Message
+  }
+  if ($script:InstallShowSummary) {
+    Write-InstallBanner "CODEX-PROXY INSTALL FAILED"
+    Write-Host ("Reason: " + $script:InstallFailureReason)
+  }
+  exit 1
+}
+
 $apiBase = $env:CODEX_PROXY_API_BASE
 if ([string]::IsNullOrWhiteSpace($apiBase)) {
   $apiBase = "https://api.github.com"
@@ -31,13 +61,19 @@ function Ensure-ProfileLine([string]$path, [string]$line) {
   }
   $dir = Split-Path -Parent $path
   if (-not (Test-Path -LiteralPath $dir)) {
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Invoke-DiskWrite -Label "shell profile directory" -PathValue $dir -DefaultReason "Failed to create shell profile directory: $dir" -Action {
+      New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
   }
   if (-not (Test-Path -LiteralPath $path)) {
-    New-Item -ItemType File -Force -Path $path | Out-Null
+    Invoke-DiskWrite -Label "shell profile" -PathValue $path -DefaultReason "Failed to create shell profile: $path" -Action {
+      New-Item -ItemType File -Force -Path $path | Out-Null
+    }
   }
   if (-not (Select-String -Path $path -SimpleMatch -Quiet -Pattern $line)) {
-    Add-Content -Path $path -Value $line
+    Invoke-DiskWrite -Label "shell profile" -PathValue $path -DefaultReason "Failed to update shell profile: $path" -Action {
+      Add-Content -Path $path -Value $line
+    }
     return $true
   }
   return $false
@@ -52,7 +88,9 @@ function Remove-ProfileLine([string]$path, [string]$line) {
   if ($filtered.Count -eq $lines.Count) {
     return $false
   }
-  Set-Content -Path $path -Value $filtered -Encoding UTF8
+  Invoke-DiskWrite -Label "shell profile" -PathValue $path -DefaultReason "Failed to update shell profile: $path" -Action {
+    Set-Content -Path $path -Value $filtered -Encoding UTF8
+  }
   return $true
 }
 
@@ -180,6 +218,104 @@ function Add-PathPersistent([string[]]$pathValues) {
   }
 }
 
+function Get-ExistingPathForSpaceCheck([string]$pathValue) {
+  if ([string]::IsNullOrWhiteSpace($pathValue)) {
+    return $null
+  }
+  try {
+    $candidate = [IO.Path]::GetFullPath($pathValue)
+  } catch {
+    return $null
+  }
+  while (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-Path -LiteralPath $candidate)) {
+    $parent = Split-Path -Parent $candidate
+    if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $candidate) {
+      return $null
+    }
+    $candidate = $parent
+  }
+  return $candidate
+}
+
+function Get-FreeBytesForPath([string]$pathValue) {
+  $existing = Get-ExistingPathForSpaceCheck $pathValue
+  if ([string]::IsNullOrWhiteSpace($existing)) {
+    return $null
+  }
+  try {
+    $full = [IO.Path]::GetFullPath($existing)
+    $root = [IO.Path]::GetPathRoot($full)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+      return $null
+    }
+    $drive = [System.IO.DriveInfo]::new($root)
+    if (-not $drive.IsReady) {
+      return $null
+    }
+    return [long]$drive.AvailableFreeSpace
+  } catch {
+    return $null
+  }
+}
+
+function Get-DiskSpaceFailureReason([string]$label, [string]$pathValue, [long]$minBytes) {
+  if ($minBytes -le 0) { return $null }
+  $freeBytes = Get-FreeBytesForPath $pathValue
+  if ($null -eq $freeBytes) { return $null }
+  if ($freeBytes -lt $minBytes) {
+    $haveMiB = [math]::Floor($freeBytes / 1MB)
+    $needMiB = [math]::Ceiling($minBytes / 1MB)
+    return "Not enough disk space for $label ($pathValue): $haveMiB MiB available, need at least $needMiB MiB."
+  }
+  return $null
+}
+
+function Test-DiskSpaceError([object]$errorRecord) {
+  $text = ""
+  if ($null -ne $errorRecord) {
+    $text = $errorRecord.ToString()
+    if ($errorRecord.Exception -and $errorRecord.Exception.Message) {
+      $text = $text + "`n" + $errorRecord.Exception.Message
+    }
+  }
+  return ($text -match '(?i)(no space left|not enough space|disk full|insufficient disk|quota)')
+}
+
+function Assert-DiskSpace([string]$label, [string]$pathValue, [long]$minBytes) {
+  if ($minBytes -le 0) {
+    return
+  }
+  $reason = Get-DiskSpaceFailureReason -label $label -pathValue $pathValue -minBytes $minBytes
+  if (-not [string]::IsNullOrWhiteSpace($reason)) {
+    $script:InstallFailureReason = $reason
+    throw $script:InstallFailureReason
+  }
+  if ($null -eq (Get-FreeBytesForPath $pathValue)) {
+    Write-Warning "Could not reliably check free disk space for $label ($pathValue); continuing."
+  }
+}
+
+function Invoke-DiskWrite([string]$Label, [string]$PathValue, [string]$DefaultReason, [scriptblock]$Action) {
+  Assert-DiskSpace -label $Label -pathValue $PathValue -minBytes $script:InstallMinFreeBytes
+  try {
+    & $Action
+  } catch {
+    $reason = Get-DiskSpaceFailureReason -label $Label -pathValue $PathValue -minBytes $script:InstallMinFreeBytes
+    if ([string]::IsNullOrWhiteSpace($reason) -and (Test-DiskSpaceError $_)) {
+      $reason = "Not enough disk space for $Label ($PathValue)."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($reason)) {
+      $script:InstallFailureReason = $reason
+      throw $script:InstallFailureReason
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DefaultReason)) {
+      $script:InstallFailureReason = "$DefaultReason`: $($_.Exception.Message)"
+      throw $script:InstallFailureReason
+    }
+    throw
+  }
+}
+
 function New-ProfilePathLine([string]$pathValue) {
   $normalized = Normalize-PathEntry $pathValue
   if ([string]::IsNullOrWhiteSpace($normalized)) {
@@ -215,6 +351,9 @@ function Get-LatestTag([string]$repo) {
   throw "Failed to determine latest tag from $apiUri"
 }
 
+Assert-DiskSpace -label "temporary download directory" -pathValue $env:TEMP -minBytes $script:InstallMinFreeBytes
+Assert-DiskSpace -label "install directory" -pathValue $InstallDir -minBytes $script:InstallMinFreeBytes
+
 $tag = $Version
 if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq "latest") {
   $tag = Get-LatestTag -repo $Repo
@@ -226,16 +365,33 @@ $asset = "codex-proxy_${verNoV}_windows_${arch}.exe"
 $url = "$releaseBase/$Repo/releases/download/$tag/$asset"
 $checksumsUrl = "$releaseBase/$Repo/releases/download/$tag/checksums.txt"
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+Invoke-DiskWrite -Label "install directory" -PathValue $InstallDir -DefaultReason "Failed to create install directory: $InstallDir" -Action {
+  New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+}
 $installDirResolved = [IO.Path]::GetFullPath($InstallDir)
 
 $tmp = Join-Path $env:TEMP "$asset"
-Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+Invoke-DiskWrite -Label "release asset download" -PathValue $tmp -DefaultReason "Failed to download release asset: $url" -Action {
+  Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+}
 
 # Optional checksum verification.
 try {
   $checksumsTmp = Join-Path $env:TEMP "checksums.txt"
-  Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsTmp -UseBasicParsing
+  Assert-DiskSpace -label "checksum download" -pathValue $checksumsTmp -minBytes $script:InstallMinFreeBytes
+  try {
+    Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsTmp -UseBasicParsing
+  } catch {
+    $reason = Get-DiskSpaceFailureReason -label "checksum download" -pathValue $checksumsTmp -minBytes $script:InstallMinFreeBytes
+    if ([string]::IsNullOrWhiteSpace($reason) -and (Test-DiskSpaceError $_)) {
+      $reason = "Not enough disk space for checksum download ($checksumsTmp)."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($reason)) {
+      $script:InstallFailureReason = $reason
+      throw $script:InstallFailureReason
+    }
+    throw
+  }
   $expected = (Select-String -Path $checksumsTmp -Pattern ("\s{1}" + [regex]::Escape($asset) + "$") | Select-Object -First 1).Line.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[0]
   if ($expected) {
     $actual = (Get-FileHash -Algorithm SHA256 -Path $tmp).Hash.ToLowerInvariant()
@@ -244,15 +400,30 @@ try {
     }
   }
 } catch {
+  if (Test-DiskSpaceError $_) {
+    $reason = Get-DiskSpaceFailureReason -label "checksum download" -pathValue $checksumsTmp -minBytes $script:InstallMinFreeBytes
+    if ([string]::IsNullOrWhiteSpace($reason)) {
+      $reason = "Not enough disk space for checksum download ($checksumsTmp)."
+    }
+    $script:InstallFailureReason = $reason
+    throw $script:InstallFailureReason
+  }
+  if (-not [string]::IsNullOrWhiteSpace($script:InstallFailureReason)) {
+    throw
+  }
   # Best-effort only; do not fail installation if checksum fetch/parse fails.
 }
 
 $dst = Join-Path $installDirResolved "codex-proxy.exe"
-Move-Item -Force -Path $tmp -Destination $dst
+Invoke-DiskWrite -Label "codex-proxy binary install" -PathValue $dst -DefaultReason "Failed to move codex-proxy into $dst" -Action {
+  Move-Item -Force -Path $tmp -Destination $dst
+}
 
 $cxpCmd = Join-Path $installDirResolved "cxp.cmd"
 $cxpContent = "@echo off`r`n`"%~dp0codex-proxy.exe`" %*`r`n"
-Set-Content -Path $cxpCmd -Value $cxpContent -Encoding ASCII
+Invoke-DiskWrite -Label "cxp shim install" -PathValue $cxpCmd -DefaultReason "Failed to install cxp shim: $cxpCmd" -Action {
+  Set-Content -Path $cxpCmd -Value $cxpContent -Encoding ASCII
+}
 $managedPrefix = $env:CODEX_NPM_PREFIX
 if ([string]::IsNullOrWhiteSpace($managedPrefix)) {
   $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
@@ -346,6 +517,12 @@ foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
   }
 }
 
-Write-Host "Installed: $dst"
-Write-Host "Shell profile and user PATH checked for install/managed CLI directories (reload attempted):"
-Write-Host "  $profilePath"
+$script:InstallSuccessDetails = @(
+  "Installed: $dst",
+  "Shell profile and user PATH checked for install/managed CLI directories (reload attempted):",
+  "  $profilePath"
+)
+Write-InstallBanner "CODEX-PROXY INSTALL SUCCESS"
+foreach ($line in $script:InstallSuccessDetails) {
+  Write-Host $line
+}

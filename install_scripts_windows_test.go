@@ -27,6 +27,120 @@ func TestInstallPs1KeepsPathSetupWhenInstallDirAlreadySet(t *testing.T) {
 	runInstallPs1(t, false, true)
 }
 
+func TestInstallPs1ChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+
+	repo := "owner/name"
+	tag := "v1.2.3"
+	verNoV := strings.TrimPrefix(tag, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
+	assetData := []byte("fake-binary")
+	checksum := sha256.Sum256(assetData)
+
+	server := newInstallServerWithChecksumStatus(t, repo, tag, asset, assetData, false, checksum, http.StatusNotFound)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
+	tempDir := t.TempDir()
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	pathValue := filepath.Join(basePath, "System32")
+
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+		"-Repo", repo,
+		"-Version", "latest",
+		"-InstallDir", installDir,
+	)
+	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = append(cmd.Env,
+		"CODEX_PROXY_API_BASE="+server.URL,
+		"CODEX_PROXY_RELEASE_BASE="+server.URL,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"Path="+pathValue,
+		"TEMP="+tempDir,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.ps1 should ignore checksum download failure: %v\n%s", err, string(output))
+	}
+	text := string(output)
+	if !strings.Contains(text, "CODEX-PROXY INSTALL SUCCESS") {
+		t.Fatalf("expected success banner, got %s", text)
+	}
+	installed := filepath.Join(installDir, "codex-proxy.exe")
+	got, err := os.ReadFile(installed)
+	if err != nil {
+		t.Fatalf("read installed binary: %v", err)
+	}
+	if !bytes.Equal(got, assetData) {
+		t.Fatalf("installed payload mismatch")
+	}
+}
+
+func TestInstallPs1DiskSpaceFailureBanner(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+
+	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
+	tempDir := t.TempDir()
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	pathValue := filepath.Join(basePath, "System32")
+
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+		"-Repo", "owner/name",
+		"-Version", "v1.2.3",
+		"-InstallDir", installDir,
+	)
+	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = append(cmd.Env,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"CODEX_PROXY_INSTALL_MIN_FREE_KB=999999999999",
+		"Path="+pathValue,
+		"TEMP="+tempDir,
+	)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected disk space failure, got success:\n%s", string(output))
+	}
+	text := string(output)
+	if !strings.Contains(text, "CODEX-PROXY INSTALL FAILED") {
+		t.Fatalf("expected failure banner, got %s", text)
+	}
+	if !strings.Contains(text, "Not enough disk space") {
+		t.Fatalf("expected disk space reason, got %s", text)
+	}
+}
+
 func TestInstallPs1RemovesLegacyCodexClpExe(t *testing.T) {
 	if _, err := exec.LookPath("powershell"); err != nil {
 		t.Skip("powershell not available")
@@ -316,6 +430,9 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if err != nil {
 		t.Fatalf("install.ps1 failed: %v\n%s", err, string(output))
 	}
+	if !strings.Contains(string(output), "CODEX-PROXY INSTALL SUCCESS") {
+		t.Fatalf("expected success banner, got %s", string(output))
+	}
 	installDirResolved := resolvePathViaPowerShell(t, cmd.Env, installDir)
 	managedPrefixResolved := resolvePathViaPowerShell(t, cmd.Env, managedPrefix)
 	managedBinResolved := resolvePathViaPowerShell(t, cmd.Env, filepath.Join(managedPrefix, "bin"))
@@ -425,6 +542,19 @@ func newInstallServer(
 	apiFail bool,
 	checksum [32]byte,
 ) *httptest.Server {
+	return newInstallServerWithChecksumStatus(t, repo, tag, asset, assetData, apiFail, checksum, http.StatusOK)
+}
+
+func newInstallServerWithChecksumStatus(
+	t *testing.T,
+	repo string,
+	tag string,
+	asset string,
+	assetData []byte,
+	apiFail bool,
+	checksum [32]byte,
+	checksumStatus int,
+) *httptest.Server {
 	t.Helper()
 	apiPath := "/repos/" + repo + "/releases/latest"
 	latestPath := "/" + repo + "/releases/latest"
@@ -450,6 +580,10 @@ func newInstallServer(
 			w.Header().Set("Content-Type", "application/octet-stream")
 			_, _ = w.Write(assetData)
 		case r.URL.Path == checksumsPath:
+			if checksumStatus != http.StatusOK {
+				http.Error(w, "checksums unavailable", checksumStatus)
+				return
+			}
 			w.Header().Set("Content-Type", "text/plain")
 			_, _ = fmt.Fprintf(w, "%x  %s\n", checksum, asset)
 		default:

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,7 @@ const (
 	codexPathCacheFile   = "codex_path"
 	codexInstallLockName = "codex_install.lock"
 	codexProbeTimeout    = 5 * time.Second
+	codexInstallDiskExit = 75
 )
 
 var (
@@ -64,6 +66,108 @@ fi
 if [ -z "$home_dir" ]; then
   home_dir="$(pwd)"
 fi
+min_free_kb="${CODEX_PROXY_CODEX_INSTALL_MIN_FREE_KB:-524288}"
+
+is_positive_integer() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$1" -gt 0 ] ;;
+  esac
+}
+
+print_codex_install_failure() {
+  reason="$1"
+  printf '\n%s\n' "============================================================" >&2
+  printf '  %s\n' "CODEX CLI INSTALL FAILED" >&2
+  printf '%s\n' "============================================================" >&2
+  printf 'Reason: %s\n' "$reason" >&2
+}
+
+fail_codex_install() {
+  reason="$1"
+  code="${2:-1}"
+  print_codex_install_failure "$reason"
+  exit "$code"
+}
+
+existing_path_for_space_check() {
+  path="$1"
+  if [ -z "${path:-}" ]; then
+    return 1
+  fi
+  while [ ! -e "$path" ]; do
+    parent="$(dirname "$path")"
+    if [ "$parent" = "$path" ]; then
+      return 1
+    fi
+    path="$parent"
+  done
+  printf '%s\n' "$path"
+}
+
+available_kb_for_path() {
+  path="$1"
+  if ! command -v df >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+    return 1
+  fi
+  existing="$(existing_path_for_space_check "$path" 2>/dev/null || true)"
+  if [ -z "${existing:-}" ]; then
+    return 1
+  fi
+  df -Pk "$existing" 2>/dev/null | awk 'NR==2 { print $4 }'
+}
+
+check_disk_space() {
+  label="$1"
+  path="$2"
+  if ! is_positive_integer "$min_free_kb"; then
+    return 0
+  fi
+  available_kb="$(available_kb_for_path "$path" 2>/dev/null || true)"
+  if ! is_positive_integer "$available_kb"; then
+    echo "warning: could not reliably check free disk space for $label ($path); continuing." >&2
+    return 0
+  fi
+  if [ "$available_kb" -lt "$min_free_kb" ]; then
+    need_mb=$(( (min_free_kb + 1023) / 1024 ))
+    have_mb=$(( available_kb / 1024 ))
+    fail_codex_install "Not enough disk space for $label ($path): ${have_mb} MiB available, need at least ${need_mb} MiB." 75
+  fi
+}
+
+disk_space_failure_reason() {
+  label="$1"
+  path="$2"
+  if ! is_positive_integer "$min_free_kb"; then
+    return 1
+  fi
+  available_kb="$(available_kb_for_path "$path" 2>/dev/null || true)"
+  if ! is_positive_integer "$available_kb"; then
+    return 1
+  fi
+  if [ "$available_kb" -lt "$min_free_kb" ]; then
+    need_mb=$(( (min_free_kb + 1023) / 1024 ))
+    have_mb=$(( available_kb / 1024 ))
+    printf 'Not enough disk space for %s (%s): %s MiB available, need at least %s MiB.' "$label" "$path" "$have_mb" "$need_mb"
+    return 0
+  fi
+  return 1
+}
+
+fail_if_disk_space_low() {
+  reason="$(disk_space_failure_reason "$1" "$2" 2>/dev/null || true)"
+  if [ -n "${reason:-}" ]; then
+    fail_codex_install "$reason" 75
+  fi
+}
+
+fail_write_or_disk() {
+  label="$1"
+  path="$2"
+  fallback="$3"
+  fail_if_disk_space_low "$label" "$path"
+  fail_codex_install "$fallback"
+}
 
 parse_major() {
   raw="$1"
@@ -130,6 +234,29 @@ case "$(uname -r 2>/dev/null || true)" in
   *[Mm]icrosoft*|*WSL*) is_wsl=true ;;
 esac
 
+node_root="${CODEX_NODE_INSTALL_ROOT:-$home_dir/.cache/codex-proxy/node}"
+prefix="${CODEX_NPM_PREFIX:-$home_dir/.local/share/codex-proxy/npm-global}"
+npm_cache_dir="${npm_config_cache:-${NPM_CONFIG_CACHE:-$home_dir/.npm}}"
+check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
+check_disk_space "managed npm prefix" "$prefix"
+check_disk_space "managed Node.js install root" "$node_root"
+check_disk_space "npm cache" "$npm_cache_dir"
+
+npm_usable_with_path() {
+  npm_path="$1"
+  npm_node_bin="$2"
+  if [ ! -x "$npm_path" ]; then
+    return 1
+  fi
+  if [ -n "${npm_node_bin:-}" ]; then
+    PATH="$npm_node_bin:$PATH" "$npm_path" --version >/dev/null 2>&1 || return 1
+    PATH="$npm_node_bin:$PATH" "$npm_path" prefix -g >/dev/null 2>&1 || return 1
+  else
+    "$npm_path" --version >/dev/null 2>&1 || return 1
+    "$npm_path" prefix -g >/dev/null 2>&1 || return 1
+  fi
+}
+
 download_local_node() {
   os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
   case "$os_name" in
@@ -144,16 +271,27 @@ download_local_node() {
     *) echo "unsupported architecture: $arch_raw" >&2; exit 1 ;;
   esac
 
-  node_root="${CODEX_NODE_INSTALL_ROOT:-$home_dir/.cache/codex-proxy/node}"
   install_dir="$node_root/v${target_major}-${os_name}-${node_arch}"
   node_path="$install_dir/bin/node"
   npm_path="$install_dir/bin/npm"
+  node_bin_candidate="$install_dir/bin"
   installed_major=""
   if [ -x "$node_path" ]; then
     installed_major="$(parse_major "$("$node_path" -v 2>/dev/null || true)")"
   fi
+  needs_install=false
   if [ -z "$installed_major" ] || [ "$installed_major" -lt "$min_major" ]; then
-    tmp_dir="$(mktemp -d)"
+    needs_install=true
+  elif ! npm_usable_with_path "$npm_path" "$node_bin_candidate"; then
+    echo "managed Node.js/npm install is missing or broken; reinstalling: $install_dir" >&2
+    needs_install=true
+  fi
+  if $needs_install; then
+    check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
+    tmp_dir="$(mktemp -d 2>/dev/null || true)"
+    if [ -z "${tmp_dir:-}" ]; then
+      fail_write_or_disk "temporary directory" "${TMPDIR:-/tmp}" "failed to create temporary directory for Node.js download"
+    fi
     cleanup() {
       rm -rf "$tmp_dir"
     }
@@ -162,10 +300,11 @@ download_local_node() {
     download_file() {
       src="$1"
       dest="$2"
+      check_disk_space "download destination" "$dest"
       if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$src" -o "$dest"
+        curl -fsSL "$src" -o "$dest" || fail_write_or_disk "download destination" "$dest" "failed to download $src"
       elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$dest" "$src"
+        wget -qO "$dest" "$src" || fail_write_or_disk "download destination" "$dest" "failed to download $src"
       else
         echo "need curl or wget to download Node.js" >&2
         exit 1
@@ -270,11 +409,14 @@ download_local_node() {
       exit 1
     fi
 
-    rm -rf "$install_dir"
-    mkdir -p "$install_dir"
+    check_disk_space "managed Node.js install directory" "$install_dir"
+    rm -rf "$install_dir" || fail_codex_install "failed to remove incomplete managed Node.js/npm install: $install_dir"
+    check_disk_space "managed Node.js install directory" "$install_dir"
+    mkdir -p "$install_dir" || fail_write_or_disk "managed Node.js install directory" "$install_dir" "failed to create managed Node.js/npm install directory: $install_dir"
+    check_disk_space "managed Node.js extraction" "$install_dir"
     case "$tarball" in
-      *.tar.gz) tar -xzf "$archive_path" --strip-components=1 -C "$install_dir" ;;
-      *.tar.xz) tar -xJf "$archive_path" --strip-components=1 -C "$install_dir" ;;
+      *.tar.gz) tar -xzf "$archive_path" --strip-components=1 -C "$install_dir" || fail_write_or_disk "managed Node.js extraction" "$install_dir" "failed to extract Node.js archive into $install_dir" ;;
+      *.tar.xz) tar -xJf "$archive_path" --strip-components=1 -C "$install_dir" || fail_write_or_disk "managed Node.js extraction" "$install_dir" "failed to extract Node.js archive into $install_dir" ;;
       *)
         echo "unsupported Node.js archive format: $tarball" >&2
         exit 1
@@ -283,9 +425,8 @@ download_local_node() {
     rm -rf "$tmp_dir"
   fi
 
-  if [ ! -x "$npm_path" ]; then
-    echo "npm not found in local Node.js install: $npm_path" >&2
-    exit 1
+  if ! npm_usable_with_path "$npm_path" "$node_bin_candidate"; then
+    fail_codex_install "npm is not usable in managed Node.js install: $npm_path"
   fi
   node_bin_dir="$install_dir/bin"
   npm_cmd="$npm_path"
@@ -308,8 +449,13 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
     node_major="$(parse_major "$(node -v 2>/dev/null || true)")"
     if [ -n "$node_major" ] && [ "$node_major" -ge "$min_major" ]; then
       node_bin_dir="$(dirname "$node_found")"
-      npm_cmd="$(command -v npm)"
-      used_system_node=true
+      npm_found="$(command -v npm)"
+      if npm_usable_with_path "$npm_found" "$node_bin_dir"; then
+        npm_cmd="$npm_found"
+        used_system_node=true
+      else
+        echo "system npm is not usable; installing managed Node.js/npm..." >&2
+      fi
     fi
   fi
 fi
@@ -318,14 +464,30 @@ if [ -z "$npm_cmd" ]; then
   download_local_node
 fi
 
-prefix="${CODEX_NPM_PREFIX:-$home_dir/.local/share/codex-proxy/npm-global}"
-mkdir -p "$prefix"
-PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex
+check_disk_space "managed npm prefix" "$prefix"
+mkdir -p "$prefix" || fail_write_or_disk "managed npm prefix" "$prefix" "failed to create managed npm prefix: $prefix"
+check_disk_space "managed npm prefix" "$prefix"
+check_disk_space "npm cache" "$npm_cache_dir"
+check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
+if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex; then
+  fail_if_disk_space_low "managed npm prefix" "$prefix"
+  fail_if_disk_space_low "npm cache" "$npm_cache_dir"
+  fail_if_disk_space_low "temporary directory" "${TMPDIR:-/tmp}"
+  fail_codex_install "npm install -g @openai/codex failed"
+fi
 
 if ! "$prefix/bin/codex" --version >/dev/null 2>&1 && $used_system_node; then
   echo "codex installed with system node is not functional; retrying with local node..." >&2
   download_local_node
-  PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex
+  check_disk_space "managed npm prefix" "$prefix"
+  check_disk_space "npm cache" "$npm_cache_dir"
+  check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
+  if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex; then
+    fail_if_disk_space_low "managed npm prefix" "$prefix"
+    fail_if_disk_space_low "npm cache" "$npm_cache_dir"
+    fail_if_disk_space_low "temporary directory" "${TMPDIR:-/tmp}"
+    fail_codex_install "npm install -g @openai/codex failed after switching to managed Node.js/npm"
+  fi
 fi
 `
 
@@ -337,6 +499,26 @@ $targetMajorRaw = [Environment]::GetEnvironmentVariable('CODEX_NODE_MAJOR')
 if ([string]::IsNullOrWhiteSpace($targetMajorRaw)) { $targetMajorRaw = '22' }
 $minMajor = [int]$minMajorRaw
 $targetMajor = [int]$targetMajorRaw
+$minFreeKBRaw = [Environment]::GetEnvironmentVariable('CODEX_PROXY_CODEX_INSTALL_MIN_FREE_KB')
+if ([string]::IsNullOrWhiteSpace($minFreeKBRaw)) { $minFreeKBRaw = '524288' }
+$minFreeKB = 524288L
+$parsedMinFreeKB = 0L
+if ([int64]::TryParse($minFreeKBRaw, [ref]$parsedMinFreeKB)) {
+  $minFreeKB = $parsedMinFreeKB
+}
+
+function Write-CodexInstallFailure([string]$reason) {
+  Write-Host ""
+  Write-Host "============================================================" -ForegroundColor Red
+  Write-Host "  CODEX CLI INSTALL FAILED" -ForegroundColor Red
+  Write-Host "============================================================" -ForegroundColor Red
+  Write-Host ("Reason: " + $reason) -ForegroundColor Red
+}
+
+function Fail-CodexInstall([string]$reason, [int]$code = 1) {
+  Write-CodexInstallFailure $reason
+  exit $code
+}
 
 function Get-NodeMajor([string]$nodeExe) {
   try {
@@ -363,6 +545,126 @@ $npmPrefix = [Environment]::GetEnvironmentVariable('CODEX_NPM_PREFIX')
 if ([string]::IsNullOrWhiteSpace($npmPrefix)) {
   $npmPrefix = Join-Path $baseDir 'codex-proxy\npm-global'
 }
+$npmCacheDir = [Environment]::GetEnvironmentVariable('npm_config_cache')
+if ([string]::IsNullOrWhiteSpace($npmCacheDir)) {
+  $npmCacheDir = [Environment]::GetEnvironmentVariable('NPM_CONFIG_CACHE')
+}
+if ([string]::IsNullOrWhiteSpace($npmCacheDir)) {
+  $npmCacheDir = Join-Path $baseDir 'npm-cache'
+}
+
+function Get-ExistingPathForSpaceCheck([string]$pathValue) {
+  if ([string]::IsNullOrWhiteSpace($pathValue)) { return $null }
+  try {
+    $candidate = [IO.Path]::GetFullPath($pathValue)
+  } catch {
+    return $null
+  }
+  while (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-Path -LiteralPath $candidate)) {
+    $parent = Split-Path -Parent $candidate
+    if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $candidate) { return $null }
+    $candidate = $parent
+  }
+  return $candidate
+}
+
+function Get-FreeBytesForPath([string]$pathValue) {
+  $existing = Get-ExistingPathForSpaceCheck $pathValue
+  if ([string]::IsNullOrWhiteSpace($existing)) { return $null }
+  try {
+    $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($existing))
+    if ([string]::IsNullOrWhiteSpace($root)) { return $null }
+    $drive = [System.IO.DriveInfo]::new($root)
+    if (-not $drive.IsReady) { return $null }
+    return [int64]$drive.AvailableFreeSpace
+  } catch {
+    return $null
+  }
+}
+
+function Get-DiskSpaceFailureReason([string]$label, [string]$pathValue) {
+  if ($minFreeKB -le 0) { return }
+  $minBytes = $minFreeKB * 1024L
+  $freeBytes = Get-FreeBytesForPath $pathValue
+  if ($null -eq $freeBytes) { return $null }
+  if ($freeBytes -lt $minBytes) {
+    $haveMiB = [math]::Floor($freeBytes / 1MB)
+    $needMiB = [math]::Ceiling($minBytes / 1MB)
+    return "Not enough disk space for $label ($pathValue): $haveMiB MiB available, need at least $needMiB MiB."
+  }
+  return $null
+}
+
+function Test-DiskSpaceError([object]$errorRecord) {
+  $text = ""
+  if ($null -ne $errorRecord) {
+    $text = $errorRecord.ToString()
+    if ($errorRecord.Exception -and $errorRecord.Exception.Message) {
+      $text = $text + [Environment]::NewLine + $errorRecord.Exception.Message
+    }
+  }
+  return ($text -match '(?i)(no space left|not enough space|disk full|insufficient disk|quota)')
+}
+
+function Assert-DiskSpace([string]$label, [string]$pathValue) {
+  if ($minFreeKB -le 0) { return }
+  $reason = Get-DiskSpaceFailureReason $label $pathValue
+  if (-not [string]::IsNullOrWhiteSpace($reason)) {
+    Fail-CodexInstall $reason 75
+  }
+  if ($null -eq (Get-FreeBytesForPath $pathValue)) {
+    Write-Warning "Could not reliably check free disk space for $label ($pathValue); continuing."
+  }
+}
+
+function Fail-IfDiskSpaceLow([string]$label, [string]$pathValue) {
+  $reason = Get-DiskSpaceFailureReason $label $pathValue
+  if (-not [string]::IsNullOrWhiteSpace($reason)) {
+    Fail-CodexInstall $reason 75
+  }
+}
+
+function Invoke-DiskWrite([string]$label, [string]$pathValue, [string]$defaultReason, [scriptblock]$action) {
+  Assert-DiskSpace $label $pathValue
+  try {
+    & $action
+  } catch {
+    $reason = Get-DiskSpaceFailureReason $label $pathValue
+    if ([string]::IsNullOrWhiteSpace($reason) -and (Test-DiskSpaceError $_)) {
+      $reason = "Not enough disk space for $label ($pathValue)."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($reason)) {
+      Fail-CodexInstall $reason 75
+    }
+    if (-not [string]::IsNullOrWhiteSpace($defaultReason)) {
+      Fail-CodexInstall ($defaultReason + ": " + $_.Exception.Message)
+    }
+    throw
+  }
+}
+
+function Test-NpmUsable([string]$npmPath, [string]$nodePathDir) {
+  if ([string]::IsNullOrWhiteSpace($npmPath) -or -not (Test-Path $npmPath)) { return $false }
+  $oldPath = $env:PATH
+  try {
+    if (-not [string]::IsNullOrWhiteSpace($nodePathDir)) {
+      $env:PATH = "$nodePathDir;$oldPath"
+    }
+    & $npmPath --version 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    & $npmPath prefix -g 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+  } catch {
+    return $false
+  } finally {
+    $env:PATH = $oldPath
+  }
+}
+
+Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
+Assert-DiskSpace "managed npm prefix" $npmPrefix
+Assert-DiskSpace "managed Node.js install root" $nodeRoot
+Assert-DiskSpace "npm cache" $npmCacheDir
 
 function Install-LocalNode {
   $arch = 'x64'
@@ -371,14 +673,27 @@ function Install-LocalNode {
   }
   $installDir = Join-Path $nodeRoot ("v{0}-win-{1}" -f $targetMajor, $arch)
   $nodeExe = Join-Path $installDir 'node.exe'
+  $localNpmCmd = Join-Path $installDir 'npm.cmd'
 
+  $needsInstall = $false
   if (-not (Test-Path $nodeExe) -or ((Get-NodeMajor $nodeExe) -lt $minMajor)) {
+    $needsInstall = $true
+  } elseif (-not (Test-NpmUsable $localNpmCmd $installDir)) {
+    Write-Host "managed Node.js/npm install is missing or broken; reinstalling: $installDir" -ForegroundColor Yellow
+    $needsInstall = $true
+  }
+
+  if ($needsInstall) {
     $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ("codex-node-" + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    Invoke-DiskWrite "temporary directory" $tmpDir "failed to create temporary directory for Node.js download" {
+      New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    }
     try {
       $baseUrl = "https://nodejs.org/dist/latest-v$targetMajor.x"
       $shasumsPath = Join-Path $tmpDir 'SHASUMS256.txt'
-      Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/SHASUMS256.txt" -OutFile $shasumsPath
+      Invoke-DiskWrite "Node.js checksum download" $shasumsPath "failed to download Node.js checksums" {
+        Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/SHASUMS256.txt" -OutFile $shasumsPath
+      }
 
       $pattern = " node-v$targetMajor\.\d+\.\d+-win-$arch\.zip$"
       $line = Get-Content $shasumsPath | Where-Object { $_ -match $pattern } | Select-Object -First 1
@@ -389,14 +704,18 @@ function Install-LocalNode {
       $expected = $parts[0].ToLower()
       $zipName = $parts[1]
       $zipPath = Join-Path $tmpDir $zipName
-      Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$zipName" -OutFile $zipPath
+      Invoke-DiskWrite "Node.js archive download" $zipPath "failed to download Node.js archive" {
+        Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$zipName" -OutFile $zipPath
+      }
       $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLower()
       if ($actual -ne $expected) {
         throw "Node.js checksum mismatch for $zipName"
       }
 
       $extractRoot = Join-Path $tmpDir 'extract'
-      Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+      Invoke-DiskWrite "Node.js archive extraction" $extractRoot "failed to extract Node.js archive" {
+        Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+      }
       $expanded = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
       if (-not $expanded) {
         throw "failed to extract Node.js archive"
@@ -404,15 +723,23 @@ function Install-LocalNode {
       if (Test-Path $installDir) {
         Remove-Item -Recurse -Force $installDir
       }
-      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $installDir) | Out-Null
-      Move-Item -Path $expanded.FullName -Destination $installDir -Force
+      $installParent = Split-Path -Parent $installDir
+      Invoke-DiskWrite "managed Node.js install root" $installParent "failed to create managed Node.js install root" {
+        New-Item -ItemType Directory -Force -Path $installParent | Out-Null
+      }
+      Invoke-DiskWrite "managed Node.js install directory" $installDir "failed to install managed Node.js" {
+        Move-Item -Path $expanded.FullName -Destination $installDir -Force
+      }
     } finally {
       Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
     }
   }
 
   $script:nodeDir = $installDir
-  $script:npmCmd = Join-Path $installDir 'npm.cmd'
+  $script:npmCmd = $localNpmCmd
+  if (-not (Test-NpmUsable $script:npmCmd $script:nodeDir)) {
+    Fail-CodexInstall "npm is not usable in managed Node.js install: $script:npmCmd"
+  }
 }
 
 $nodeDir = $null
@@ -424,8 +751,12 @@ if ($systemNode -and $systemNpm) {
   $major = Get-NodeMajor $systemNode.Source
   if ($major -ge $minMajor) {
     $nodeDir = Split-Path -Parent $systemNode.Source
-    $npmCmd = $systemNpm.Source
-    $usedSystemNode = $true
+    if (Test-NpmUsable $systemNpm.Source $nodeDir) {
+      $npmCmd = $systemNpm.Source
+      $usedSystemNode = $true
+    } else {
+      Write-Host "system npm is not usable; installing managed Node.js/npm..." -ForegroundColor Yellow
+    }
   }
 }
 
@@ -433,16 +764,24 @@ if (-not $npmCmd) {
   Install-LocalNode
 }
 
-if (-not (Test-Path $npmCmd)) {
-  throw "npm is not available for Codex install"
+if (-not (Test-NpmUsable $npmCmd $nodeDir)) {
+  Fail-CodexInstall "npm is not available for Codex install"
 }
 
-New-Item -ItemType Directory -Force -Path $npmPrefix | Out-Null
+Invoke-DiskWrite "managed npm prefix" $npmPrefix "failed to create managed npm prefix" {
+  New-Item -ItemType Directory -Force -Path $npmPrefix | Out-Null
+}
 $prefixBin = Join-Path $npmPrefix 'bin'
 $env:PATH = "$nodeDir;$npmPrefix;$prefixBin;$env:PATH"
+Assert-DiskSpace "managed npm prefix" $npmPrefix
+Assert-DiskSpace "npm cache" $npmCacheDir
+Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
 & $npmCmd install -g --prefix $npmPrefix @openai/codex
 if ($LASTEXITCODE -ne 0) {
-  exit $LASTEXITCODE
+  Fail-IfDiskSpaceLow "managed npm prefix" $npmPrefix
+  Fail-IfDiskSpaceLow "npm cache" $npmCacheDir
+  Fail-IfDiskSpaceLow "temporary directory" ([IO.Path]::GetTempPath())
+  Fail-CodexInstall "npm install -g @openai/codex failed" $LASTEXITCODE
 }
 
 $codexCmd = Join-Path $npmPrefix 'codex.cmd'
@@ -454,13 +793,19 @@ try {
 if (-not $probeOk -and $usedSystemNode) {
   Write-Host "codex installed with system node is not functional; retrying with local node..." -ForegroundColor Yellow
   Install-LocalNode
-  if (-not (Test-Path $npmCmd)) {
-    throw "npm is not available for Codex install"
+  if (-not (Test-NpmUsable $npmCmd $nodeDir)) {
+    Fail-CodexInstall "npm is not available for Codex install"
   }
   $env:PATH = "$nodeDir;$npmPrefix;$prefixBin;$env:PATH"
+  Assert-DiskSpace "managed npm prefix" $npmPrefix
+  Assert-DiskSpace "npm cache" $npmCacheDir
+  Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
   & $npmCmd install -g --prefix $npmPrefix @openai/codex
   if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+    Fail-IfDiskSpaceLow "managed npm prefix" $npmPrefix
+    Fail-IfDiskSpaceLow "npm cache" $npmCacheDir
+    Fail-IfDiskSpaceLow "temporary directory" ([IO.Path]::GetTempPath())
+    Fail-CodexInstall "npm install -g @openai/codex failed after switching to managed Node.js/npm" $LASTEXITCODE
   }
 }
 `
@@ -786,6 +1131,11 @@ func runCodexUpgradeBySource(ctx context.Context, out io.Writer, installerEnv []
 		envWithPrefix := setEnvValue(installerEnv, "CODEX_NPM_PREFIX", source.npmPrefix)
 		return runCodexInstaller(ctx, out, envWithPrefix)
 	case codexInstallOriginSystem:
+		if err := ensureCodexInstallDiskSpaceForTargets(out, installerEnv, codexInstallDiskTargets(installerEnv, []codexInstallDiskTarget{
+			{label: "system npm prefix", path: source.npmPrefix},
+		}, false)); err != nil {
+			return err
+		}
 		return runSystemNpmCodexUpgrade(ctx, out, installerEnv)
 	default:
 		return fmt.Errorf("cannot determine codex installation origin; refusing automatic upgrade")
@@ -797,6 +1147,13 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 	if err != nil {
 		return fmt.Errorf("npm not found in PATH: %w", err)
 	}
+	var diskTargets []codexInstallDiskTarget
+	if prefix, prefixErr := npmGlobalPrefix(ctx, installerEnv); prefixErr == nil {
+		diskTargets = append(diskTargets, codexInstallDiskTarget{label: "system npm prefix", path: prefix})
+	}
+	if err := ensureCodexInstallDiskSpaceForTargets(out, installerEnv, codexInstallDiskTargets(installerEnv, diskTargets, false)); err != nil {
+		return err
+	}
 
 	cmd := exec.CommandContext(ctx, npmPath, "install", "-g", "@openai/codex")
 	if len(installerEnv) > 0 {
@@ -806,6 +1163,9 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 	cmd.Stderr = out
 	cmd.Stdin = os.Stdin
 	if err := cmd.Run(); err != nil {
+		if diskErr := ensureCodexInstallDiskSpaceForTargets(out, installerEnv, codexInstallDiskTargets(installerEnv, diskTargets, false)); diskErr != nil {
+			return diskErr
+		}
 		return fmt.Errorf("system npm codex upgrade failed: %w", err)
 	}
 	return nil
@@ -1028,7 +1388,18 @@ func withCodexInstallLock(ctx context.Context, out io.Writer, fn func() error) e
 	if lockPath == "" {
 		return fn()
 	}
+	lockDir := filepath.Dir(lockPath)
+	if err := ensureCodexInstallDiskSpace(out, nil, []codexInstallDiskTarget{
+		{label: "codex install lock directory", path: lockDir},
+	}); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		if diskErr := ensureCodexInstallDiskSpace(out, nil, []codexInstallDiskTarget{
+			{label: "codex install lock directory", path: lockDir},
+		}); diskErr != nil {
+			return diskErr
+		}
 		return fmt.Errorf("create codex install lock dir: %w", err)
 	}
 	waitStart := time.Time{}
@@ -1161,6 +1532,10 @@ func clearCachedCodexPath() {
 }
 
 func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string) error {
+	if err := ensureCodexInstallDiskSpace(out, installerEnv, nil); err != nil {
+		return err
+	}
+
 	candidates := codexInstallerCandidates(runtime.GOOS)
 	if len(candidates) == 0 {
 		return fmt.Errorf("no supported installer available for %s", runtime.GOOS)
@@ -1181,7 +1556,14 @@ func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string
 		cmd.Stderr = out
 		cmd.Stdin = os.Stdin
 		if err := cmd.Run(); err != nil {
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s: %v", installerAttemptLabel(candidate), err))
+			attemptError := fmt.Sprintf("%s: %v", installerAttemptLabel(candidate), err)
+			if exitCode, ok := commandExitCode(err); ok && exitCode == codexInstallDiskExit {
+				return fmt.Errorf("failed to install codex CLI for %s (%s)", runtime.GOOS, attemptError)
+			}
+			if diskErr := ensureCodexInstallDiskSpace(out, installerEnv, nil); diskErr != nil {
+				return diskErr
+			}
+			attemptErrors = append(attemptErrors, attemptError)
 			continue
 		}
 		return nil
@@ -1191,6 +1573,14 @@ func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string
 		return fmt.Errorf("no supported installer available for %s", runtime.GOOS)
 	}
 	return fmt.Errorf("failed to install codex CLI for %s (%s)", runtime.GOOS, strings.Join(attemptErrors, "; "))
+}
+
+func commandExitCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return 0, false
+	}
+	return exitErr.ExitCode(), true
 }
 
 func codexInstallerCandidates(goos string) []codexInstallCmd {

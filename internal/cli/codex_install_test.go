@@ -799,6 +799,134 @@ func TestRunCodexUpgradeBySourceRejectsUnknownSource(t *testing.T) {
 	}
 }
 
+func TestRunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+	lockCLITestHooks(t)
+
+	root := t.TempDir()
+	systemPrefix := filepath.Join(root, "system-prefix")
+	managedPrefix := filepath.Join(root, "managed-prefix")
+	managedNodeRoot := filepath.Join(root, "managed-node")
+	tmpDir := filepath.Join(root, "tmp")
+	for _, dir := range []string{systemPrefix, managedPrefix, managedNodeRoot, tmpDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	binDir := t.TempDir()
+	marker := filepath.Join(root, "system-install-hit")
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + systemPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"  echo hit > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)))
+
+	var checked []string
+	prevDiskFree := codexInstallDiskFreeBytes
+	t.Cleanup(func() { codexInstallDiskFreeBytes = prevDiskFree })
+	codexInstallDiskFreeBytes = func(path string) (uint64, error) {
+		checked = append(checked, filepath.Clean(path))
+		if filepath.Clean(path) == filepath.Clean(managedPrefix) || filepath.Clean(path) == filepath.Clean(managedNodeRoot) {
+			return 1024, nil
+		}
+		return 1024 * 1024 * 1024, nil
+	}
+
+	installerEnv := append(os.Environ(),
+		"TMPDIR="+tmpDir,
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"CODEX_NODE_INSTALL_ROOT="+managedNodeRoot,
+	)
+	err := runCodexUpgradeBySource(context.Background(), io.Discard, installerEnv, codexUpgradeSource{
+		origin:    codexInstallOriginSystem,
+		npmPrefix: systemPrefix,
+	})
+	if err != nil {
+		t.Fatalf("runCodexUpgradeBySource error: %v; checked paths: %v", err, checked)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected system npm install marker: %v", err)
+	}
+	for _, path := range checked {
+		if path == filepath.Clean(managedPrefix) || path == filepath.Clean(managedNodeRoot) {
+			t.Fatalf("system npm upgrade should not check managed disk target %q; checked paths: %v", path, checked)
+		}
+	}
+}
+
+func TestEnsureCodexInstallDiskSpaceWarnsAndContinuesWhenUnknown(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevDiskFree := codexInstallDiskFreeBytes
+	t.Cleanup(func() { codexInstallDiskFreeBytes = prevDiskFree })
+	codexInstallDiskFreeBytes = func(string) (uint64, error) {
+		return 0, errors.New("statfs unavailable")
+	}
+
+	root := t.TempDir()
+	installerEnv := []string{
+		"TMPDIR=" + filepath.Join(root, "tmp"),
+		"HOME=" + filepath.Join(root, "home"),
+		"CODEX_NPM_PREFIX=" + filepath.Join(root, "npm-prefix"),
+		"CODEX_NODE_INSTALL_ROOT=" + filepath.Join(root, "node-root"),
+		envCodexInstallMinFreeKB + "=2048",
+	}
+	var out bytes.Buffer
+	err := ensureCodexInstallDiskSpace(&out, installerEnv, []codexInstallDiskTarget{
+		{label: "npm cache", path: filepath.Join(root, "npm-cache")},
+	})
+	if err != nil {
+		t.Fatalf("disk check should continue when free space cannot be checked reliably: %v", err)
+	}
+	if !strings.Contains(out.String(), "warning: could not reliably check free disk space") {
+		t.Fatalf("expected unreliable disk warning, got %q", out.String())
+	}
+}
+
+func TestEnsureCodexInstallDiskSpaceDeduplicatesTargets(t *testing.T) {
+	lockCLITestHooks(t)
+
+	root := t.TempDir()
+	prevDiskFree := codexInstallDiskFreeBytes
+	t.Cleanup(func() { codexInstallDiskFreeBytes = prevDiskFree })
+	calls := 0
+	codexInstallDiskFreeBytes = func(path string) (uint64, error) {
+		calls++
+		if filepath.Clean(path) != filepath.Clean(root) {
+			t.Fatalf("unexpected disk check path %q", path)
+		}
+		return 1024 * 1024 * 1024, nil
+	}
+
+	installerEnv := []string{
+		"TMPDIR=" + root,
+		"CODEX_NPM_PREFIX=" + root,
+		"CODEX_NODE_INSTALL_ROOT=" + root,
+		envCodexInstallMinFreeKB + "=2048",
+	}
+	err := ensureCodexInstallDiskSpace(io.Discard, installerEnv, []codexInstallDiskTarget{
+		{label: "duplicate extra target", path: root},
+	})
+	if err != nil {
+		t.Fatalf("ensureCodexInstallDiskSpace error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected duplicate disk targets to be checked once, got %d calls", calls)
+	}
+}
+
 func TestUpgradeCodexInstalledWithOptionsManagedUsesManagedPrefix(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell-based upgrade test on windows")
@@ -1136,6 +1264,208 @@ func TestRunCodexInstallerReturnsCombinedErrors(t *testing.T) {
 	}
 	if !strings.Contains(msg, "sh -c:") {
 		t.Fatalf("expected sh attempt in error, got %q", msg)
+	}
+}
+
+func TestRunCodexInstallerDiskSpacePrecheckFailsBeforeShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell installer test on windows")
+	}
+	lockCLITestHooks(t)
+	prevDiskFree := codexInstallDiskFreeBytes
+	t.Cleanup(func() { codexInstallDiskFreeBytes = prevDiskFree })
+	codexInstallDiskFreeBytes = func(string) (uint64, error) {
+		return 1024, nil
+	}
+
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "installer-ran")
+	script := "#!/bin/sh\n" +
+		"echo ran > \"" + marker + "\"\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bash"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake bash: %v", err)
+	}
+
+	t.Setenv("PATH", binDir)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMPDIR", t.TempDir())
+
+	var out bytes.Buffer
+	err := runCodexInstaller(context.Background(), &out, nil)
+	if err == nil {
+		t.Fatal("expected disk space error")
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("installer should not run after disk precheck failure, stat err=%v", statErr)
+	}
+	text := out.String()
+	if !strings.Contains(text, "CODEX CLI INSTALL FAILED") {
+		t.Fatalf("expected failure banner, got %q", text)
+	}
+	if !strings.Contains(text, "Not enough disk space") {
+		t.Fatalf("expected disk space reason, got %q", text)
+	}
+}
+
+func TestRunCodexInstallerRechecksDiskSpaceAfterShellFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell installer test on windows")
+	}
+	lockCLITestHooks(t)
+
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "installer-ran")
+	script := "#!/bin/sh\n" +
+		"echo ran > \"" + marker + "\"\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bash"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake bash: %v", err)
+	}
+
+	prevDiskFree := codexInstallDiskFreeBytes
+	t.Cleanup(func() { codexInstallDiskFreeBytes = prevDiskFree })
+	codexInstallDiskFreeBytes = func(string) (uint64, error) {
+		if _, err := os.Stat(marker); err == nil {
+			return 1024, nil
+		}
+		return 1024 * 1024 * 1024, nil
+	}
+
+	t.Setenv("PATH", binDir)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMPDIR", t.TempDir())
+
+	var out bytes.Buffer
+	err := runCodexInstaller(context.Background(), &out, nil)
+	if err == nil {
+		t.Fatal("expected disk space error")
+	}
+	text := out.String()
+	if !strings.Contains(text, "CODEX CLI INSTALL FAILED") {
+		t.Fatalf("expected failure banner, got %q", text)
+	}
+	if !strings.Contains(text, "Not enough disk space") {
+		t.Fatalf("expected disk space reason, got %q", text)
+	}
+	if strings.Contains(err.Error(), "bash -c") {
+		t.Fatalf("expected disk error to replace shell attempt error, got %v", err)
+	}
+}
+
+func TestRunSystemNpmCodexUpgradeDiskPrecheckFailsBeforeInstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based npm test on windows")
+	}
+	lockCLITestHooks(t)
+
+	root := t.TempDir()
+	systemPrefix := filepath.Join(root, "system-prefix")
+	tmpDir := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(systemPrefix, 0o755); err != nil {
+		t.Fatalf("mkdir system prefix: %v", err)
+	}
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("mkdir tmp dir: %v", err)
+	}
+
+	binDir := t.TempDir()
+	marker := filepath.Join(root, "npm-install-ran")
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + systemPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ]; then\n" +
+		"  echo ran > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+	t.Setenv("PATH", binDir)
+
+	prevDiskFree := codexInstallDiskFreeBytes
+	t.Cleanup(func() { codexInstallDiskFreeBytes = prevDiskFree })
+	codexInstallDiskFreeBytes = func(path string) (uint64, error) {
+		if filepath.Clean(path) == filepath.Clean(systemPrefix) {
+			return 1024, nil
+		}
+		return 1024 * 1024 * 1024, nil
+	}
+
+	var out bytes.Buffer
+	err := runSystemNpmCodexUpgrade(context.Background(), &out, []string{
+		"PATH=" + binDir,
+		"TMPDIR=" + tmpDir,
+		envCodexInstallMinFreeKB + "=2048",
+	})
+	if err == nil {
+		t.Fatal("expected disk space error")
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("npm install should not run after disk precheck failure, stat err=%v", statErr)
+	}
+	if !strings.Contains(out.String(), "CODEX CLI INSTALL FAILED") || !strings.Contains(err.Error(), "Not enough disk space") {
+		t.Fatalf("expected explicit disk failure, err=%v output=%q", err, out.String())
+	}
+}
+
+func TestRunSystemNpmCodexUpgradeReportsDiskSpaceAfterNpmFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based npm test on windows")
+	}
+	lockCLITestHooks(t)
+
+	root := t.TempDir()
+	systemPrefix := filepath.Join(root, "system-prefix")
+	tmpDir := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(systemPrefix, 0o755); err != nil {
+		t.Fatalf("mkdir system prefix: %v", err)
+	}
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("mkdir tmp dir: %v", err)
+	}
+
+	binDir := t.TempDir()
+	marker := filepath.Join(root, "npm-install-ran")
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + systemPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"  echo ran > \"" + marker + "\"\n" +
+		"  exit 17\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+	t.Setenv("PATH", binDir)
+
+	prevDiskFree := codexInstallDiskFreeBytes
+	t.Cleanup(func() { codexInstallDiskFreeBytes = prevDiskFree })
+	codexInstallDiskFreeBytes = func(path string) (uint64, error) {
+		if _, err := os.Stat(marker); err == nil && filepath.Clean(path) == filepath.Clean(systemPrefix) {
+			return 1024, nil
+		}
+		return 1024 * 1024 * 1024, nil
+	}
+
+	var out bytes.Buffer
+	err := runSystemNpmCodexUpgrade(context.Background(), &out, []string{
+		"PATH=" + binDir,
+		"TMPDIR=" + tmpDir,
+		envCodexInstallMinFreeKB + "=2048",
+	})
+	if err == nil {
+		t.Fatal("expected disk space error after npm failure")
+	}
+	if !strings.Contains(out.String(), "CODEX CLI INSTALL FAILED") || !strings.Contains(err.Error(), "Not enough disk space") {
+		t.Fatalf("expected explicit disk failure, err=%v output=%q", err, out.String())
+	}
+	if strings.Contains(err.Error(), "system npm codex upgrade failed") {
+		t.Fatalf("expected disk error to replace npm exit error, got %v", err)
 	}
 }
 
@@ -1718,6 +2048,34 @@ func TestBootstrapScriptContainsHomeFallback(t *testing.T) {
 	}
 }
 
+func TestBootstrapScriptContainsDiskSpacePreflight(t *testing.T) {
+	for _, want := range []string{
+		"CODEX_PROXY_CODEX_INSTALL_MIN_FREE_KB",
+		"check_disk_space \"temporary directory\"",
+		"check_disk_space \"managed npm prefix\"",
+		"check_disk_space \"npm cache\"",
+		"fail_write_or_disk",
+		"CODEX CLI INSTALL FAILED",
+	} {
+		if !strings.Contains(codexInstallBootstrap, want) {
+			t.Fatalf("bootstrap script missing %q", want)
+		}
+	}
+}
+
+func TestBootstrapScriptChecksNpmUsability(t *testing.T) {
+	for _, want := range []string{
+		"npm_usable_with_path",
+		"system npm is not usable",
+		"managed Node.js/npm install is missing or broken; reinstalling",
+		"prefix -g",
+	} {
+		if !strings.Contains(codexInstallBootstrap, want) {
+			t.Fatalf("bootstrap script missing %q", want)
+		}
+	}
+}
+
 func TestBootstrapScriptContainsSelfValidation(t *testing.T) {
 	if !strings.Contains(codexInstallBootstrap, "used_system_node") {
 		t.Fatal("bootstrap script missing used_system_node flag")
@@ -1754,6 +2112,23 @@ func TestBootstrapWindowsScriptContainsSelfValidation(t *testing.T) {
 	}
 	if !strings.Contains(codexInstallBootstrapWindows, "--version") {
 		t.Fatal("Windows bootstrap script missing post-install probe")
+	}
+}
+
+func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
+	for _, want := range []string{
+		"CODEX_PROXY_CODEX_INSTALL_MIN_FREE_KB",
+		"Assert-DiskSpace \"temporary directory\"",
+		"Test-NpmUsable",
+		"Invoke-DiskWrite",
+		"Fail-IfDiskSpaceLow",
+		"Assert-DiskSpace \"npm cache\"",
+		"system npm is not usable",
+		"managed Node.js/npm install is missing or broken; reinstalling",
+	} {
+		if !strings.Contains(codexInstallBootstrapWindows, want) {
+			t.Fatalf("Windows bootstrap script missing %q", want)
+		}
 	}
 }
 

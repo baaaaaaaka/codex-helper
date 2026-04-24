@@ -148,6 +148,23 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           go test . -count=1 -run 'TestInstallPs1'
 
+      - name: Recent install disk/npm regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test . -count=1 -run 'TestInstallSh(Checksum(DownloadFailureRemainsBestEffort|Mismatch)|SuccessBanner|DiskSpace(FailureBanner|UnknownWarnsButContinues))|TestInstallPs1ChecksumDownloadRemainsBestEffort'
+          go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexInstallerDiskSpace(PrecheckFailsBeforeShell|RechecksDiskSpaceAfterShellFailure)|RunSystemNpmCodexUpgrade(DiskPrecheckFailsBeforeInstall|ReportsDiskSpaceAfterNpmFailure)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|BootstrapScript(ContainsDiskSpacePreflight|ChecksNpmUsability)|BootstrapWindowsScriptContainsDiskAndNpmChecks)$'
+
+      - name: Recent install disk/npm regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          go test . -count=1 -run 'TestInstallPs1(ChecksumDownloadFailureRemainsBestEffort|DiskSpaceFailureBanner|LatestViaAPI|KeepsPathSetupWhenInstallDirAlreadySet)'
+          go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|BootstrapWindowsScriptContainsDiskAndNpmChecks)$'
+
       - name: Recent run/installer/reuse regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
