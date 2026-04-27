@@ -450,9 +450,11 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if err != nil {
 		t.Fatalf("read cxp.cmd: %v", err)
 	}
-	wantCxpCmd := "@echo off\r\n\"%~dp0codex-proxy.exe\" %*\r\n"
-	if string(cmdData) != wantCxpCmd {
-		t.Fatalf("cxp.cmd content mismatch\ngot:\n%q\nwant:\n%q", string(cmdData), wantCxpCmd)
+	cmdText := strings.ReplaceAll(string(cmdData), "\r\n", "\n")
+	cmdText = strings.TrimRight(cmdText, "\n")
+	wantCxpCmd := "@echo off\n\"%~dp0codex-proxy.exe\" %*"
+	if cmdText != wantCxpCmd {
+		t.Fatalf("cxp.cmd content mismatch\ngot:\n%q\nwant:\n%q", cmdText, wantCxpCmd)
 	}
 	claudeProxyExeData, err := os.ReadFile(legacyClaudeProxyExe)
 	if err != nil {
