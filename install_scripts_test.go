@@ -94,6 +94,26 @@ func TestInstallShChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
 	}
 }
 
+func TestInstallShAssetDownloadFailureReportsDownloadFailure(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_ASSET_FAIL", "1")
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected release asset download failure")
+	}
+	text := string(output)
+	if !strings.Contains(text, "Failed to download release asset") {
+		t.Fatalf("expected download failure reason, got %s", text)
+	}
+	if strings.Contains(text, "Checksum mismatch") {
+		t.Fatalf("download failure must not be masked as checksum mismatch, got %s", text)
+	}
+}
+
 func TestInstallShDiskSpaceFailureBanner(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 
@@ -861,6 +881,10 @@ case "$url" in
     printf "%s" "${CODEX_PROXY_TEST_CHECKSUMS:-}" > "$out"
     ;;
   *"/${CODEX_PROXY_TEST_ASSET}")
+    if [ "${CODEX_PROXY_TEST_ASSET_FAIL:-}" = "1" ]; then
+      printf "partial download" > "$out"
+      exit 16
+    fi
     printf "%s" "${CODEX_PROXY_TEST_ASSET_DATA:-}" > "$out"
     ;;
   *)

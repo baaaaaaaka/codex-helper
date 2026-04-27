@@ -700,11 +700,11 @@ function Set-CodexManagedNodeShims {
 
   $codexPs1 = Join-Path $npmPrefix 'codex.ps1'
   if (Test-Path $codexPs1) {
-    $nodeLeafPs = $nodeLeaf.Replace("'", "''")
-    $codexJsRelPs = $codexJsRel.Replace("'", "''")
+    $nodeLeafLiteral = '"' + $nodeLeaf + '"'
+    $codexJsRelLiteral = '"' + $codexJsRel + '"'
     $psShim = @(
       '$basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent',
-      '$nodeLeaf = ''' + $nodeLeafPs + '''',
+      ('$nodeLeaf = ' + $nodeLeafLiteral),
       '$nodeRoot = $env:CODEX_NODE_INSTALL_ROOT',
       'if ([string]::IsNullOrWhiteSpace($nodeRoot) -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {',
       '  $nodeRoot = Join-Path $env:LOCALAPPDATA ''codex-proxy\node''',
@@ -720,7 +720,7 @@ function Set-CodexManagedNodeShims {
       '  Write-Error "Managed Node.js not found: $nodePath"',
       '  exit 1',
       '}',
-      '$scriptPath = Join-Path $basedir ''' + $codexJsRelPs + '''',
+      ('$scriptPath = Join-Path $basedir ' + $codexJsRelLiteral),
       'if (-not (Test-Path $scriptPath)) {',
       '  Write-Error "Codex JS entrypoint not found: $scriptPath"',
       '  exit 1',

@@ -232,8 +232,20 @@ resolve_legacy_target_path() {
   esac
 }
 
+curl_supports() {
+  curl --help all 2>/dev/null | grep -q -- "$1" || curl --help 2>/dev/null | grep -q -- "$1"
+}
+
 curl_run() {
-  curl --retry 5 --retry-delay 5 --connect-timeout 30 -fsSL "$@"
+  retry_all=""
+  http_version=""
+  if curl_supports '--retry-all-errors'; then
+    retry_all="--retry-all-errors"
+  fi
+  if curl_supports '--http1.1'; then
+    http_version="--http1.1"
+  fi
+  curl --retry 5 --retry-delay 5 --connect-timeout 30 $retry_all $http_version -fsSL "$@"
 }
 
 wget_run() {
@@ -261,12 +273,18 @@ http_get() {
   url="$1"
   out="$2"
   if have_cmd curl; then
-    curl_run -o "$out" "$url"
-    return 0
+    if curl_run -o "$out" "$url"; then
+      return 0
+    fi
+    rm -f "$out" 2>/dev/null || true
+    return 1
   fi
   if have_cmd wget; then
-    wget_run -q -O "$out" "$url"
-    return 0
+    if wget_run -q -O "$out" "$url"; then
+      return 0
+    fi
+    rm -f "$out" 2>/dev/null || true
+    return 1
   fi
   INSTALL_FAILURE_REASON="Missing downloader: need curl or wget"
   echo "$INSTALL_FAILURE_REASON" >&2

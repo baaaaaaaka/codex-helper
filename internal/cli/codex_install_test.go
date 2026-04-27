@@ -2185,6 +2185,14 @@ func TestBootstrapWindowsScriptContainsSelfValidation(t *testing.T) {
 	if strings.Contains(codexInstallBootstrapWindows, "Join-Path $npmPrefix 'node.cmd'") {
 		t.Fatal("Windows bootstrap script must not publish a generic node.cmd in the npm prefix")
 	}
+	if !strings.Contains(codexInstallBootstrapWindows, "$nodeLeafLiteral") ||
+		!strings.Contains(codexInstallBootstrapWindows, "$codexJsRelLiteral") {
+		t.Fatal("Windows bootstrap script should generate PowerShell shim literals without fragile quote concatenation")
+	}
+	if strings.Contains(codexInstallBootstrapWindows, "$nodeLeaf = '''") ||
+		strings.Contains(codexInstallBootstrapWindows, "$scriptPath = Join-Path $basedir '''") {
+		t.Fatal("Windows bootstrap script must not build codex.ps1 values with nested single-quote concatenation")
+	}
 	if !strings.Contains(codexInstallBootstrapWindows, "--version") {
 		t.Fatal("Windows bootstrap script missing post-install probe")
 	}
