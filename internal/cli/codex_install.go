@@ -683,23 +683,14 @@ function Set-CodexManagedNodeShims {
   }
 
   if (Test-Path $codexCmd) {
-    $codexJsCmd = '%~dp0' + $codexJsRel
     $cmdShim = @(
       '@echo off',
       'setlocal',
-      'set "_prog=%CODEX_NODE_INSTALL_ROOT%\' + $nodeLeaf + '\node.exe"',
-      'if "%CODEX_NODE_INSTALL_ROOT%"=="" set "_prog=%LOCALAPPDATA%\codex-proxy\node\' + $nodeLeaf + '\node.exe"',
-      'if not exist "%_prog%" set "_prog=%~dp0..\node\' + $nodeLeaf + '\node.exe"',
-      'set "_script=' + $codexJsCmd + '"',
-      'if not exist "%_prog%" (',
-      '  echo Managed Node.js not found: %_prog% 1>&2',
-      '  exit /b 1',
-      ')',
-      'if not exist "%_script%" (',
-      '  echo Codex JS entrypoint not found: %_script% 1>&2',
-      '  exit /b 1',
-      ')',
-      '"%_prog%" "%_script%" %*',
+      ('rem "%~dp0{0}"' -f $codexJsRel),
+      'set "_codex_ps=%~dp0codex.ps1"',
+      'set "_powershell=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"',
+      'if not exist "%_powershell%" set "_powershell=powershell"',
+      '"%_powershell%" -NoProfile -ExecutionPolicy Bypass -File "%_codex_ps%" %*',
       'exit /b %ERRORLEVEL%'
     )
     Invoke-DiskWrite "codex command shim" $codexCmd "failed to update codex command shim" {

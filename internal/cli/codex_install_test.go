@@ -2268,6 +2268,10 @@ func TestEnsureCodexInstalledIntegrationManagedNode(t *testing.T) {
 	var out bytes.Buffer
 	got, err := ensureCodexInstalled(context.Background(), "", &out)
 	if err != nil {
+		if runtime.GOOS == "windows" {
+			logFileIfExists(t, filepath.Join(npmPrefix, "codex.cmd"))
+			logFileIfExists(t, filepath.Join(npmPrefix, "codex.ps1"))
+		}
 		t.Fatalf("ensureCodexInstalled error: %v\ninstaller output:\n%s", err, out.String())
 	}
 	if !probeCodex(context.Background(), got) {
@@ -2355,11 +2359,27 @@ func assertWindowsManagedCodexInstall(t *testing.T, npmPrefix string, installerO
 		t.Fatalf("read codex.cmd: %v", err)
 	}
 	shimText := string(shim)
-	if !strings.Contains(shimText, "CODEX_NODE_INSTALL_ROOT") {
-		t.Fatalf("expected codex.cmd to resolve private managed Node, got:\n%s", shimText)
+	if !strings.Contains(shimText, `node_modules\@openai\codex\bin\codex.js`) {
+		t.Fatalf("expected codex.cmd to preserve native binary discovery hint, got:\n%s", shimText)
+	}
+	if !strings.Contains(shimText, "codex.ps1") {
+		t.Fatalf("expected codex.cmd to delegate to codex.ps1, got:\n%s", shimText)
 	}
 	if strings.Contains(strings.ToLower(shimText), "node.cmd") {
 		t.Fatalf("codex.cmd must not depend on a public node.cmd shim, got:\n%s", shimText)
+	}
+
+	codexPs1 := filepath.Join(npmPrefix, "codex.ps1")
+	ps1, err := os.ReadFile(codexPs1)
+	if err != nil {
+		t.Fatalf("read codex.ps1: %v", err)
+	}
+	ps1Text := string(ps1)
+	if !strings.Contains(ps1Text, "CODEX_NODE_INSTALL_ROOT") {
+		t.Fatalf("expected codex.ps1 to resolve private managed Node, got:\n%s", ps1Text)
+	}
+	if strings.Contains(strings.ToLower(ps1Text), "node.cmd") {
+		t.Fatalf("codex.ps1 must not depend on a public node.cmd shim, got:\n%s", ps1Text)
 	}
 
 	nativeBin, _, err := cloudgate.FindNativeBinary(codexCmd)
@@ -2369,4 +2389,15 @@ func assertWindowsManagedCodexInstall(t *testing.T, npmPrefix string, installerO
 	if !executableExists(nativeBin) {
 		t.Fatalf("native codex binary discovered from managed shim does not exist: %s", nativeBin)
 	}
+}
+
+func logFileIfExists(t *testing.T, path string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Logf("%s not readable: %v", path, err)
+		return
+	}
+	t.Logf("%s:\n%s", path, string(data))
 }
