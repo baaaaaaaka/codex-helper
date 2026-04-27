@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 )
 
 func containsPath(paths []string, target string) bool {
@@ -301,6 +303,43 @@ func TestEnsureCodexInstalledInstallsWhenMissing(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "codex not found; installing...") {
 		t.Fatalf("expected install log, got %q", out.String())
+	}
+}
+
+func TestEnsureCodexInstalledReportsNonfunctionalAfterInstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	home := t.TempDir()
+	installDir := filepath.Join(home, ".local", "share", "codex-proxy", "npm-global", "bin")
+	codexPath := filepath.Join(installDir, "codex")
+
+	binDir := t.TempDir()
+	installer := filepath.Join(binDir, "bash")
+	script := "#!/bin/sh\n" +
+		"mkdir -p \"" + installDir + "\"\n" +
+		"cat > \"" + codexPath + "\" <<'EOF'\n" +
+		"#!/bin/sh\n" +
+		"echo probe boom >&2\n" +
+		"exit 7\n" +
+		"EOF\n" +
+		"chmod +x \"" + codexPath + "\"\n"
+	if err := os.WriteFile(installer, []byte(script), 0o700); err != nil {
+		t.Fatalf("write installer: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", strings.Join([]string{binDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
+
+	_, err := ensureCodexInstalled(context.Background(), "", io.Discard)
+	if err == nil {
+		t.Fatal("expected install error")
+	}
+	if !strings.Contains(err.Error(), "codex installation finished but installed binary is not functional") {
+		t.Fatalf("expected nonfunctional install error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "probe boom") {
+		t.Fatalf("expected probe output in error, got %v", err)
 	}
 }
 
@@ -1116,9 +1155,9 @@ func TestUpgradeCodexInstalledWithOptionsErrorsWhenCodexDisappearsAfterUpgrade(t
 
 	_, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
 	if err == nil {
-		t.Fatal("expected missing-binary error")
+		t.Fatal("expected nonfunctional-binary error")
 	}
-	if !strings.Contains(err.Error(), "codex upgrade finished but binary not found in PATH") {
+	if !strings.Contains(err.Error(), "codex upgrade finished but installed binary is not functional") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -1684,6 +1723,27 @@ func TestManagedNodeBinCandidatesForEnvUnixDefaultRoot(t *testing.T) {
 	}
 }
 
+func TestManagedNodeBinCandidatesForEnvWindowsDefaultRoot(t *testing.T) {
+	arch := nodeRuntimeArch(runtime.GOARCH)
+	if arch == "" {
+		t.Skip("unsupported runtime arch for managed-node test")
+	}
+
+	localAppData := t.TempDir()
+	installDir := filepath.Join(localAppData, "codex-proxy", "node", "v22-win-"+arch)
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatalf("mkdir node dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, "node.exe"), []byte("node"), 0o700); err != nil {
+		t.Fatalf("write node.exe: %v", err)
+	}
+
+	candidates := managedNodeBinCandidatesForEnv("windows", runtime.GOARCH, "", "", "", localAppData, "")
+	if !containsPath(candidates, installDir) {
+		t.Fatalf("expected managed node install dir candidate %q in %v", installDir, candidates)
+	}
+}
+
 func TestEnsureCodexInstalledUsesManagedNodeForCandidateProbe(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
@@ -2110,8 +2170,26 @@ func TestBootstrapWindowsScriptContainsSelfValidation(t *testing.T) {
 	if !strings.Contains(codexInstallBootstrapWindows, "Install-LocalNode") {
 		t.Fatal("Windows bootstrap script missing Install-LocalNode function")
 	}
+	if !strings.Contains(codexInstallBootstrapWindows, "Set-CodexManagedNodeShims") {
+		t.Fatal("Windows bootstrap script missing managed Node shim patch")
+	}
+	if !strings.Contains(codexInstallBootstrapWindows, "codex.cmd") {
+		t.Fatal("Windows bootstrap script missing codex.cmd shim patch")
+	}
+	if !strings.Contains(codexInstallBootstrapWindows, "codex.ps1") {
+		t.Fatal("Windows bootstrap script missing codex.ps1 shim patch")
+	}
+	if !strings.Contains(codexInstallBootstrapWindows, "CODEX_NODE_INSTALL_ROOT") {
+		t.Fatal("Windows bootstrap script missing managed Node root lookup in shim")
+	}
+	if strings.Contains(codexInstallBootstrapWindows, "Join-Path $npmPrefix 'node.cmd'") {
+		t.Fatal("Windows bootstrap script must not publish a generic node.cmd in the npm prefix")
+	}
 	if !strings.Contains(codexInstallBootstrapWindows, "--version") {
 		t.Fatal("Windows bootstrap script missing post-install probe")
+	}
+	if !strings.Contains(codexInstallBootstrapWindows, "codex installation finished but") {
+		t.Fatal("Windows bootstrap script missing final probe failure")
 	}
 }
 
@@ -2158,9 +2236,6 @@ func TestEnsureCodexInstalledIntegrationManagedNode(t *testing.T) {
 	if os.Getenv("CODEX_INSTALL_TEST") != "1" {
 		t.Skip("skipping: set CODEX_INSTALL_TEST=1 to run installer integration")
 	}
-	if runtime.GOOS == "windows" {
-		t.Skip("managed-node integration test currently targets unix installer flow")
-	}
 
 	arch := nodeRuntimeArch(runtime.GOARCH)
 	if arch == "" {
@@ -2172,18 +2247,20 @@ func TestEnsureCodexInstalledIntegrationManagedNode(t *testing.T) {
 	cacheDir := filepath.Join(root, "cache")
 	npmPrefix := filepath.Join(root, "npm-global")
 	nodeRoot := filepath.Join(root, "node")
+	npmCache := filepath.Join(root, "npm-cache")
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		t.Fatalf("mkdir home: %v", err)
 	}
 
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CACHE_HOME", cacheDir)
+	t.Setenv("npm_config_cache", npmCache)
 	t.Setenv("CODEX_NPM_PREFIX", npmPrefix)
 	t.Setenv("CODEX_NODE_INSTALL_ROOT", nodeRoot)
 	t.Setenv("CODEX_NODE_MIN_MAJOR", "999")
 	t.Setenv("CODEX_NODE_MAJOR", "22")
-	// Keep PATH minimal so no usable system node/npm is discovered.
-	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("PATH", managedNodeIntegrationPath(t))
 	clearCachedCodexPath()
 
 	var out bytes.Buffer
@@ -2198,12 +2275,90 @@ func TestEnsureCodexInstalledIntegrationManagedNode(t *testing.T) {
 		t.Fatalf("expected installed codex under npm prefix %q, got %q", npmPrefix, got)
 	}
 
-	nodeBin := filepath.Join(nodeRoot, "v22-"+runtime.GOOS+"-"+arch, "bin")
-	nodePath := filepath.Join(nodeBin, "node")
+	nodeBin, nodePath := managedNodeIntegrationNodePaths(nodeRoot, arch)
 	if !executableExists(nodePath) {
 		t.Fatalf("expected managed node binary at %q, installer output:\n%s", nodePath, out.String())
 	}
 	if !containsPath(filepath.SplitList(os.Getenv("PATH")), nodeBin) {
 		t.Fatalf("expected PATH to include managed node bin %q, got %q", nodeBin, os.Getenv("PATH"))
+	}
+
+	if runtime.GOOS == "windows" {
+		assertWindowsManagedCodexInstall(t, npmPrefix, out.String())
+	}
+}
+
+func managedNodeIntegrationPath(t *testing.T) string {
+	t.Helper()
+
+	if runtime.GOOS != "windows" {
+		// Keep PATH minimal so no usable system node/npm is discovered.
+		return "/usr/bin:/bin"
+	}
+
+	pathDirs := make([]string, 0, 2)
+	for _, name := range []string{"powershell", "pwsh"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		dir := filepath.Dir(path)
+		if !containsPath(pathDirs, dir) {
+			pathDirs = append(pathDirs, dir)
+		}
+	}
+	if len(pathDirs) == 0 {
+		t.Skip("powershell/pwsh not available for Windows managed-node integration")
+	}
+	return strings.Join(pathDirs, string(os.PathListSeparator))
+}
+
+func managedNodeIntegrationNodePaths(nodeRoot string, arch string) (nodeBin string, nodePath string) {
+	if runtime.GOOS == "windows" {
+		nodeBin = filepath.Join(nodeRoot, "v22-win-"+arch)
+		nodePath = filepath.Join(nodeBin, "node.exe")
+		return nodeBin, nodePath
+	}
+	nodeBin = filepath.Join(nodeRoot, "v22-"+runtime.GOOS+"-"+arch, "bin")
+	nodePath = filepath.Join(nodeBin, "node")
+	return nodeBin, nodePath
+}
+
+func assertWindowsManagedCodexInstall(t *testing.T, npmPrefix string, installerOutput string) {
+	t.Helper()
+
+	for _, forbidden := range []string{
+		filepath.Join(npmPrefix, "node.cmd"),
+		filepath.Join(npmPrefix, "node.exe"),
+		filepath.Join(npmPrefix, "bin", "node.cmd"),
+		filepath.Join(npmPrefix, "bin", "node.exe"),
+	} {
+		if executableExists(forbidden) {
+			t.Fatalf("managed Codex install must not publish generic node command %q; installer output:\n%s", forbidden, installerOutput)
+		}
+	}
+
+	codexCmd := filepath.Join(npmPrefix, "codex.cmd")
+	if !executableExists(codexCmd) {
+		t.Fatalf("expected managed codex shim at %q; installer output:\n%s", codexCmd, installerOutput)
+	}
+	shim, err := os.ReadFile(codexCmd)
+	if err != nil {
+		t.Fatalf("read codex.cmd: %v", err)
+	}
+	shimText := string(shim)
+	if !strings.Contains(shimText, "CODEX_NODE_INSTALL_ROOT") {
+		t.Fatalf("expected codex.cmd to resolve private managed Node, got:\n%s", shimText)
+	}
+	if strings.Contains(strings.ToLower(shimText), "node.cmd") {
+		t.Fatalf("codex.cmd must not depend on a public node.cmd shim, got:\n%s", shimText)
+	}
+
+	nativeBin, _, err := cloudgate.FindNativeBinary(codexCmd)
+	if err != nil {
+		t.Fatalf("managed codex shim must remain compatible with native binary discovery: %v\nshim:\n%s", err, shimText)
+	}
+	if !executableExists(nativeBin) {
+		t.Fatalf("native codex binary discovered from managed shim does not exist: %s", nativeBin)
 	}
 }

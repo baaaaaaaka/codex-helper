@@ -513,6 +513,36 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_
 	}
 }
 
+func TestParseNpmCmdShimManagedNodeForm(t *testing.T) {
+	dir := t.TempDir()
+
+	jsDir := filepath.Join(dir, "node_modules", "@openai", "codex", "bin")
+	if err := os.MkdirAll(jsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	jsPath := filepath.Join(jsDir, "codex.js")
+	if err := os.WriteFile(jsPath, []byte("// entry"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cmdContent := `@echo off
+set "_script=%~dp0node_modules\@openai\codex\bin\codex.js"
+"%_prog%" "%_script%" %*
+`
+	cmdPath := filepath.Join(dir, "codex.cmd")
+	if err := os.WriteFile(cmdPath, []byte(cmdContent), 0o644); err != nil {
+		t.Fatalf("write cmd: %v", err)
+	}
+
+	got, err := parseNpmCmdShim(cmdPath)
+	if err != nil {
+		t.Fatalf("parseNpmCmdShim: %v", err)
+	}
+	if got != jsPath {
+		t.Errorf("expected %q, got %q", jsPath, got)
+	}
+}
+
 // TestParseNpmCmdShimNotFound returns error if .js file does not exist.
 func TestParseNpmCmdShimNotFound(t *testing.T) {
 	dir := t.TempDir()

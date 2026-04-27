@@ -550,7 +550,7 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	version := "v1.2.3"
 	verNoV := strings.TrimPrefix(version, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_%s_%s", verNoV, runtime.GOOS, runtime.GOARCH)
-	assetData := []byte("fake-binary")
+	assetData := []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo codex-proxy 1.2.3\n  exit 0\nfi\nexit 0\n")
 	checksum := sha256.Sum256(assetData)
 	checksums := fmt.Sprintf("%x  %s\n", checksum, asset)
 	apiJSON := fmt.Sprintf("{\"tag_name\":\"%s\"}", version)
@@ -609,6 +609,13 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	}
 	if string(cxpData) != string(assetData) {
 		t.Fatalf("cxp payload mismatch")
+	}
+	cxpVersion, err := exec.Command(cxpPath, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("cxp --version failed: %v\n%s", err, string(cxpVersion))
+	}
+	if !strings.Contains(string(cxpVersion), "codex-proxy 1.2.3") {
+		t.Fatalf("unexpected cxp --version output: %s", string(cxpVersion))
 	}
 	clpPath := filepath.Join(installDir, "clp")
 	clpData, err := os.ReadFile(clpPath)
@@ -696,7 +703,7 @@ func newInstallShRun(t *testing.T, apiFail bool, pathAlreadySet bool) installShR
 	version := "v1.2.3"
 	verNoV := strings.TrimPrefix(version, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_%s_%s", verNoV, runtime.GOOS, runtime.GOARCH)
-	assetData := []byte("fake-binary")
+	assetData := []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo codex-proxy 1.2.3\n  exit 0\nfi\nexit 0\n")
 	checksum := sha256.Sum256(assetData)
 	checksums := fmt.Sprintf("%x  %s\n", checksum, asset)
 	apiJSON := fmt.Sprintf("{\"tag_name\":\"%s\"}", version)

@@ -27,6 +27,7 @@ var (
 	codexInstallLockStaleAfter = 30 * time.Minute
 	codexInstallLockMaxWait    = 30 * time.Second
 	codexRemoveAll             = os.RemoveAll
+	errCodexBinaryNotFound     = errors.New("codex binary not found")
 )
 
 type codexInstallOptions struct {
@@ -661,6 +662,117 @@ function Test-NpmUsable([string]$npmPath, [string]$nodePathDir) {
   }
 }
 
+function Set-CodexManagedNodeShims {
+  if ([string]::IsNullOrWhiteSpace($npmPrefix) -or [string]::IsNullOrWhiteSpace($nodeDir)) { return }
+  $nodeExe = Join-Path $nodeDir 'node.exe'
+  if (-not (Test-Path $nodeExe)) { return }
+
+  $nodeLeaf = Split-Path -Leaf $nodeDir
+  if ([string]::IsNullOrWhiteSpace($nodeLeaf)) { return }
+
+  $codexCmd = Join-Path $npmPrefix 'codex.cmd'
+  $codexJsRel = 'node_modules\@openai\codex\bin\codex.js'
+  if (Test-Path $codexCmd) {
+    try {
+      $cmdText = Get-Content -LiteralPath $codexCmd -Raw
+      $match = [regex]::Match($cmdText, '(?:%~?dp0%[\\/]|%~dp0)(?<rel>[^"]+\.js)')
+      if ($match.Success -and -not [string]::IsNullOrWhiteSpace($match.Groups['rel'].Value)) {
+        $codexJsRel = $match.Groups['rel'].Value.Replace('/', '\')
+      }
+    } catch {}
+  }
+
+  if (Test-Path $codexCmd) {
+    $codexJsCmd = '%~dp0' + $codexJsRel
+    $cmdShim = @(
+      '@echo off',
+      'setlocal',
+      'set "_codex_node_leaf=' + $nodeLeaf + '"',
+      'set "_prog=%CODEX_NODE_INSTALL_ROOT%\%_codex_node_leaf%\node.exe"',
+      'if "%CODEX_NODE_INSTALL_ROOT%"=="" set "_prog=%LOCALAPPDATA%\codex-proxy\node\%_codex_node_leaf%\node.exe"',
+      'if not exist "%_prog%" set "_prog=%~dp0..\node\%_codex_node_leaf%\node.exe"',
+      'set "_script=' + $codexJsCmd + '"',
+      'if not exist "%_prog%" (',
+      '  echo Managed Node.js not found: %_prog% 1>&2',
+      '  exit /b 1',
+      ')',
+      'if not exist "%_script%" (',
+      '  echo Codex JS entrypoint not found: %_script% 1>&2',
+      '  exit /b 1',
+      ')',
+      '"%_prog%" "%_script%" %*',
+      'exit /b %ERRORLEVEL%'
+    )
+    Invoke-DiskWrite "codex command shim" $codexCmd "failed to update codex command shim" {
+      Set-Content -Path $codexCmd -Value $cmdShim -Encoding ASCII
+    }
+  }
+
+  $codexPs1 = Join-Path $npmPrefix 'codex.ps1'
+  if (Test-Path $codexPs1) {
+    $nodeLeafPs = $nodeLeaf.Replace("'", "''")
+    $codexJsRelPs = $codexJsRel.Replace("'", "''")
+    $psShim = @(
+      '$basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent',
+      '$nodeLeaf = ''' + $nodeLeafPs + '''',
+      '$nodeRoot = $env:CODEX_NODE_INSTALL_ROOT',
+      'if ([string]::IsNullOrWhiteSpace($nodeRoot) -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {',
+      '  $nodeRoot = Join-Path $env:LOCALAPPDATA ''codex-proxy\node''',
+      '}',
+      '$nodePath = ''''',
+      'if (-not [string]::IsNullOrWhiteSpace($nodeRoot)) {',
+      '  $nodePath = Join-Path (Join-Path $nodeRoot $nodeLeaf) ''node.exe''',
+      '}',
+      'if ([string]::IsNullOrWhiteSpace($nodePath) -or -not (Test-Path $nodePath)) {',
+      '  $nodePath = Join-Path $basedir (''..\node\'' + $nodeLeaf + ''\node.exe'')',
+      '}',
+      'if (-not (Test-Path $nodePath)) {',
+      '  Write-Error "Managed Node.js not found: $nodePath"',
+      '  exit 1',
+      '}',
+      '$scriptPath = Join-Path $basedir ''' + $codexJsRelPs + '''',
+      'if (-not (Test-Path $scriptPath)) {',
+      '  Write-Error "Codex JS entrypoint not found: $scriptPath"',
+      '  exit 1',
+      '}',
+      'if ($MyInvocation.ExpectingInput) {',
+      '  $input | & $nodePath $scriptPath $args',
+      '} else {',
+      '  & $nodePath $scriptPath $args',
+      '}',
+      'exit $LASTEXITCODE'
+    )
+    Invoke-DiskWrite "codex PowerShell shim" $codexPs1 "failed to update codex PowerShell shim" {
+      Set-Content -Path $codexPs1 -Value $psShim -Encoding UTF8
+    }
+  }
+}
+
+function Test-CodexCommand([string]$codexPath) {
+  $script:codexProbeFailure = ""
+  if ([string]::IsNullOrWhiteSpace($codexPath) -or -not (Test-Path $codexPath)) {
+    $script:codexProbeFailure = "codex command not found: $codexPath"
+    return $false
+  }
+
+  try {
+    $probeOut = & $codexPath --version 2>&1
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+      return $true
+    }
+    $text = ($probeOut | Out-String).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+      $script:codexProbeFailure = "exit code ${code}: $text"
+    } else {
+      $script:codexProbeFailure = "exit code $code"
+    }
+  } catch {
+    $script:codexProbeFailure = $_.Exception.Message
+  }
+  return $false
+}
+
 Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
 Assert-DiskSpace "managed npm prefix" $npmPrefix
 Assert-DiskSpace "managed Node.js install root" $nodeRoot
@@ -745,6 +857,7 @@ function Install-LocalNode {
 $nodeDir = $null
 $npmCmd = $null
 $usedSystemNode = $false
+$usingManagedNode = $false
 $systemNode = Get-Command node -ErrorAction SilentlyContinue
 $systemNpm = Get-Command npm -ErrorAction SilentlyContinue
 if ($systemNode -and $systemNpm) {
@@ -762,6 +875,7 @@ if ($systemNode -and $systemNpm) {
 
 if (-not $npmCmd) {
   Install-LocalNode
+  $usingManagedNode = $true
 }
 
 if (-not (Test-NpmUsable $npmCmd $nodeDir)) {
@@ -783,16 +897,16 @@ if ($LASTEXITCODE -ne 0) {
   Fail-IfDiskSpaceLow "temporary directory" ([IO.Path]::GetTempPath())
   Fail-CodexInstall "npm install -g @openai/codex failed" $LASTEXITCODE
 }
+if ($usingManagedNode) {
+  Set-CodexManagedNodeShims
+}
 
 $codexCmd = Join-Path $npmPrefix 'codex.cmd'
-$probeOk = $false
-try {
-  & $codexCmd --version 2>$null | Out-Null
-  if ($LASTEXITCODE -eq 0) { $probeOk = $true }
-} catch {}
+$probeOk = Test-CodexCommand $codexCmd
 if (-not $probeOk -and $usedSystemNode) {
   Write-Host "codex installed with system node is not functional; retrying with local node..." -ForegroundColor Yellow
   Install-LocalNode
+  $usingManagedNode = $true
   if (-not (Test-NpmUsable $npmCmd $nodeDir)) {
     Fail-CodexInstall "npm is not available for Codex install"
   }
@@ -807,15 +921,55 @@ if (-not $probeOk -and $usedSystemNode) {
     Fail-IfDiskSpaceLow "temporary directory" ([IO.Path]::GetTempPath())
     Fail-CodexInstall "npm install -g @openai/codex failed after switching to managed Node.js/npm" $LASTEXITCODE
   }
+  Set-CodexManagedNodeShims
+  $probeOk = Test-CodexCommand $codexCmd
+}
+if (-not $probeOk) {
+  if ([string]::IsNullOrWhiteSpace($script:codexProbeFailure)) {
+    $script:codexProbeFailure = "unknown probe failure"
+  }
+  Fail-CodexInstall "codex installation finished but $codexCmd is not functional ($script:codexProbeFailure)"
 }
 `
 
 // probeCodex runs a quick smoke test to verify the codex binary is functional.
 // Returns true if `codex --version` exits 0 within 5 seconds.
 func probeCodex(ctx context.Context, codexPath string) bool {
+	return probeCodexVersion(ctx, codexPath) == nil
+}
+
+func probeCodexVersion(ctx context.Context, codexPath string) error {
 	ctx, cancel := context.WithTimeout(ctx, codexProbeTimeout)
 	defer cancel()
-	return exec.CommandContext(ctx, codexPath, "--version").Run() == nil
+	cmd := exec.CommandContext(ctx, codexPath, "--version")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("--version timed out after %s", codexProbeTimeout)
+	}
+	if err != nil {
+		output := summarizeProbeOutput(out)
+		if output != "" {
+			return fmt.Errorf("--version failed: %w: %s", err, output)
+		}
+		return fmt.Errorf("--version failed: %w", err)
+	}
+	return nil
+}
+
+func summarizeProbeOutput(out []byte) string {
+	text := strings.Join(strings.Fields(strings.TrimSpace(string(out))), " ")
+	const maxLen = 500
+	if len(text) > maxLen {
+		text = text[:maxLen] + "..."
+	}
+	return text
+}
+
+func codexPostInstallError(action string, err error) error {
+	if err == nil || errors.Is(err, errCodexBinaryNotFound) {
+		return fmt.Errorf("codex %s finished but binary not found in PATH", action)
+	}
+	return fmt.Errorf("codex %s finished but installed binary is not functional: %w", action, err)
 }
 
 func ensureCodexInstalled(ctx context.Context, codexPath string, out io.Writer) (string, error) {
@@ -834,24 +988,26 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 
 	if strings.TrimSpace(codexPath) != "" {
 		resolvedPath := normalizeExecutablePath(codexPath)
-		if executableExists(resolvedPath) && probeCodex(ctx, resolvedPath) {
-			writeCachedCodexPath(resolvedPath)
-			return resolvedPath, nil
-		}
 		if executableExists(resolvedPath) {
-			return "", fmt.Errorf("codex at %s is not functional", resolvedPath)
+			if err := probeCodexVersion(ctx, resolvedPath); err == nil {
+				writeCachedCodexPath(resolvedPath)
+				return resolvedPath, nil
+			} else {
+				return "", fmt.Errorf("codex at %s is not functional: %w", resolvedPath, err)
+			}
 		}
 		return "", fmt.Errorf("codex not found at %s", codexPath)
 	}
 
 	if path, err := exec.LookPath("codex"); err == nil {
 		path = normalizeExecutablePath(path)
-		if probeCodex(ctx, path) {
+		probeErr := probeCodexVersion(ctx, path)
+		if probeErr == nil {
 			writeCachedCodexPath(path)
 			return path, nil
 		}
 		if out != nil {
-			_, _ = fmt.Fprintf(out, "codex at %s is not functional; installing a local copy...\n", path)
+			_, _ = fmt.Fprintf(out, "codex at %s is not functional (%v); installing a local copy...\n", path, probeErr)
 		}
 	}
 
@@ -898,7 +1054,7 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 
 		path, err := findInstalledCodex(ctx)
 		if err != nil {
-			return fmt.Errorf("codex installation finished but binary not found in PATH")
+			return codexPostInstallError("installation", err)
 		}
 		installedPath = path
 		return nil
@@ -910,7 +1066,7 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 		writeCachedCodexPath(installedPath)
 		return installedPath, nil
 	}
-	return "", fmt.Errorf("codex installation finished but binary not found in PATH")
+	return "", codexPostInstallError("installation", nil)
 }
 
 func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts codexInstallOptions) (string, error) {
@@ -947,7 +1103,7 @@ func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts c
 
 		path, err := resolveUpgradedCodexPath(ctx, source.codexPath)
 		if err != nil {
-			return fmt.Errorf("codex upgrade finished but binary not found in PATH")
+			return codexPostInstallError("upgrade", err)
 		}
 		upgradedPath = path
 		return nil
@@ -956,7 +1112,7 @@ func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts c
 	}
 
 	if upgradedPath == "" {
-		return "", fmt.Errorf("codex upgrade finished but binary not found in PATH")
+		return "", codexPostInstallError("upgrade", nil)
 	}
 	writeCachedCodexPath(upgradedPath)
 	return upgradedPath, nil
@@ -1610,22 +1766,49 @@ func installerAttemptLabel(cmd codexInstallCmd) string {
 func findInstalledCodex(ctx context.Context) (string, error) {
 	ensureManagedNodeOnPath()
 
+	var pathProbeFailure string
 	if path, err := exec.LookPath("codex"); err == nil {
 		path = normalizeExecutablePath(path)
-		if probeCodex(ctx, path) {
+		if err := probeCodexVersion(ctx, path); err == nil {
 			return path, nil
+		} else {
+			pathProbeFailure = fmt.Sprintf("%s: %v", path, err)
 		}
 	}
-	return findInstalledCodexInCandidates(ctx)
+	path, err := findInstalledCodexInCandidates(ctx)
+	if err == nil {
+		return path, nil
+	}
+	if pathProbeFailure != "" && errors.Is(err, errCodexBinaryNotFound) {
+		return "", fmt.Errorf("codex binary found but not functional (%s)", pathProbeFailure)
+	}
+	return "", err
 }
 
 func findInstalledCodexInCandidates(ctx context.Context) (string, error) {
+	probeFailures := make([]string, 0, 3)
+	probeFailureCount := 0
 	for _, candidate := range codexBinaryCandidates() {
-		if executableExists(candidate) && probeCodex(ctx, candidate) {
+		if !executableExists(candidate) {
+			continue
+		}
+		if err := probeCodexVersion(ctx, candidate); err == nil {
 			return normalizeExecutablePath(candidate), nil
+		} else {
+			probeFailureCount++
+			if len(probeFailures) < 3 {
+				probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", filepath.Clean(candidate), err))
+			}
 		}
 	}
-	return "", fmt.Errorf("codex binary not found")
+	if len(probeFailures) > 0 {
+		msg := strings.Join(probeFailures, "; ")
+		if probeFailureCount > len(probeFailures) {
+			msg += fmt.Sprintf("; and %d more", probeFailureCount-len(probeFailures))
+		}
+		return "", fmt.Errorf("codex binary found but not functional (%s)", msg)
+	}
+	return "", errCodexBinaryNotFound
 }
 
 func codexBinaryCandidates() []string {

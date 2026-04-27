@@ -454,13 +454,23 @@ jobs:
             Write-Host "Codex not available, skipping patch integration test"
           }
 
-      - name: Managed-node install integration (Linux only)
+      - name: Managed-node install integration (Linux)
         if: runner.os == 'Linux'
         shell: bash
         env:
           CODEX_INSTALL_TEST: "1"
         run: |
           set -euo pipefail
+          go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
+
+      - name: Managed-node install integration (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CODEX_INSTALL_TEST: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
   linux-distro-smoke:

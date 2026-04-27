@@ -103,7 +103,11 @@ func resolveWrapper(wrapperPath string) (string, error) {
 // npmCmdShimRe matches the relative .js path in an npm .cmd shim, e.g.:
 //
 //	"%dp0%\node_modules\@openai\codex\bin\codex.js"
-var npmCmdShimRe = regexp.MustCompile(`%~?dp0%[\\\/]([^"]+\.js)`)
+//
+// It also accepts Codex's managed-Node shim form:
+//
+//	"%~dp0node_modules\@openai\codex\bin\codex.js"
+var npmCmdShimRe = regexp.MustCompile(`(?:%~?dp0%[\\\/]|%~dp0)([^"]+\.js)`)
 
 // parseNpmCmdShim reads an npm .cmd shim and extracts the path to
 // the .js entry point, resolved relative to the .cmd's directory.

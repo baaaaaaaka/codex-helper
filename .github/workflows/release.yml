@@ -51,6 +51,7 @@ jobs:
           chmod +x ./install.sh
           ./install.sh --repo "${GITHUB_REPOSITORY}" --version "${GITHUB_REF_NAME}" --dir "$HOME/.local/bin"
           "$HOME/.local/bin/codex-proxy" --version | grep -q "${GITHUB_REF_NAME#v}"
+          "$HOME/.local/bin/cxp" --version | grep -q "${GITHUB_REF_NAME#v}"
           "$HOME/.local/bin/codex-proxy" proxy doctor || true
 
       - name: Install (Windows)
@@ -62,7 +63,9 @@ jobs:
           $installDir = Join-Path $env:USERPROFILE ".local\\bin"
           .\\install.ps1 -Repo $env:GITHUB_REPOSITORY -Version $env:GITHUB_REF_NAME -InstallDir $installDir
           $exe = Join-Path $installDir "codex-proxy.exe"
+          $cxp = Join-Path $installDir "cxp.cmd"
           & $exe --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
+          & $cxp --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
           & $exe proxy doctor | Out-Default
 
   install-container-smoke:
