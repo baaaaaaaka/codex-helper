@@ -687,10 +687,9 @@ function Set-CodexManagedNodeShims {
     $cmdShim = @(
       '@echo off',
       'setlocal',
-      'set "_codex_node_leaf=' + $nodeLeaf + '"',
-      'set "_prog=%CODEX_NODE_INSTALL_ROOT%\%_codex_node_leaf%\node.exe"',
-      'if "%CODEX_NODE_INSTALL_ROOT%"=="" set "_prog=%LOCALAPPDATA%\codex-proxy\node\%_codex_node_leaf%\node.exe"',
-      'if not exist "%_prog%" set "_prog=%~dp0..\node\%_codex_node_leaf%\node.exe"',
+      'set "_prog=%CODEX_NODE_INSTALL_ROOT%\' + $nodeLeaf + '\node.exe"',
+      'if "%CODEX_NODE_INSTALL_ROOT%"=="" set "_prog=%LOCALAPPDATA%\codex-proxy\node\' + $nodeLeaf + '\node.exe"',
+      'if not exist "%_prog%" set "_prog=%~dp0..\node\' + $nodeLeaf + '\node.exe"',
       'set "_script=' + $codexJsCmd + '"',
       'if not exist "%_prog%" (',
       '  echo Managed Node.js not found: %_prog% 1>&2',
@@ -773,6 +772,25 @@ function Test-CodexCommand([string]$codexPath) {
   return $false
 }
 
+function Get-CodexSHA256Hex([string]$path) {
+  if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+    return (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
+  }
+
+  $stream = [System.IO.File]::OpenRead($path)
+  try {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $hashBytes = $sha.ComputeHash($stream)
+      return ([System.BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
+    } finally {
+      $sha.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
 Assert-DiskSpace "managed npm prefix" $npmPrefix
 Assert-DiskSpace "managed Node.js install root" $nodeRoot
@@ -819,7 +837,7 @@ function Install-LocalNode {
       Invoke-DiskWrite "Node.js archive download" $zipPath "failed to download Node.js archive" {
         Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$zipName" -OutFile $zipPath
       }
-      $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLower()
+      $actual = Get-CodexSHA256Hex $zipPath
       if ($actual -ne $expected) {
         throw "Node.js checksum mismatch for $zipName"
       }

@@ -2201,6 +2201,8 @@ func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
 		"Invoke-DiskWrite",
 		"Fail-IfDiskSpaceLow",
 		"Assert-DiskSpace \"npm cache\"",
+		"Get-CodexSHA256Hex",
+		"System.Security.Cryptography.SHA256",
 		"system npm is not usable",
 		"managed Node.js/npm install is missing or broken; reinstalling",
 	} {
@@ -2297,6 +2299,12 @@ func managedNodeIntegrationPath(t *testing.T) string {
 	}
 
 	pathDirs := make([]string, 0, 2)
+	if systemRoot := os.Getenv("SystemRoot"); systemRoot != "" {
+		system32 := filepath.Join(systemRoot, "System32")
+		if !containsPath(pathDirs, system32) {
+			pathDirs = append(pathDirs, system32)
+		}
+	}
 	for _, name := range []string{"powershell", "pwsh"} {
 		path, err := exec.LookPath(name)
 		if err != nil {

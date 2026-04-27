@@ -115,6 +115,25 @@ function Test-FileContainsMarker([string]$path, [string[]]$markers) {
   return $false
 }
 
+function Get-CodexProxySHA256Hex([string]$path) {
+  if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+    return (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
+  }
+
+  $stream = [System.IO.File]::OpenRead($path)
+  try {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $hashBytes = $sha.ComputeHash($stream)
+      return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLowerInvariant()
+    } finally {
+      $sha.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 function Test-IsCodexOwnedLegacyFile([string]$path) {
   return Test-FileContainsMarker -path $path -markers @(
     "github.com/baaaaaaaka/codex-helper",
@@ -394,7 +413,7 @@ try {
   }
   $expected = (Select-String -Path $checksumsTmp -Pattern ("\s{1}" + [regex]::Escape($asset) + "$") | Select-Object -First 1).Line.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[0]
   if ($expected) {
-    $actual = (Get-FileHash -Algorithm SHA256 -Path $tmp).Hash.ToLowerInvariant()
+    $actual = Get-CodexProxySHA256Hex $tmp
     if ($expected.ToLowerInvariant() -ne $actual) {
       throw "Checksum mismatch for $asset (expected $expected, got $actual)"
     }

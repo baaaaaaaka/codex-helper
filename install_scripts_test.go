@@ -169,6 +169,9 @@ func TestInstallPs1ChecksumDownloadRemainsBestEffort(t *testing.T) {
 	if !strings.Contains(checksumBlock, "Test-DiskSpaceError") {
 		t.Fatalf("checksum block should still promote disk-space failures, got:\n%s", checksumBlock)
 	}
+	if !strings.Contains(text, "Get-CodexProxySHA256Hex") || !strings.Contains(text, "System.Security.Cryptography.SHA256") {
+		t.Fatalf("install.ps1 should not depend solely on Get-FileHash for checksum verification")
+	}
 }
 
 func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
