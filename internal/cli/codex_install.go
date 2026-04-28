@@ -748,7 +748,8 @@ function Get-NativeExitStatus([int64]$code) {
   return [uint32]$code
 }
 
-function Test-CodexNativeRuntimeRepairable([uint32]$status) {
+function Test-CodexNativeRuntimeRepairable([int64]$code) {
+  $status = Get-NativeExitStatus $code
   return ($status -eq 0xC0000135 -or $status -eq 0xC0000139)
 }
 
