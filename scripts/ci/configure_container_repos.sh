@@ -8,12 +8,32 @@ root_path() {
   printf '%s%s' "$container_root" "$1"
 }
 
+sed_in_place() {
+  local expr="$1"
+  shift
+  sed -i.bak "$expr" "$@"
+  local file
+  for file in "$@"; do
+    rm -f "${file}.bak"
+  done
+}
+
+sed_in_place_ext() {
+  local expr="$1"
+  shift
+  sed -E -i.bak "$expr" "$@"
+  local file
+  for file in "$@"; do
+    rm -f "${file}.bak"
+  done
+}
+
 configure_centos_vault() {
   local repo_file
   repo_file="$(root_path /etc/yum.repos.d/CentOS-Base.repo)"
   if [[ -f "$repo_file" ]]; then
-    sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo_file" || true
-    sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo_file" || true
+    sed_in_place 's/^mirrorlist=/#mirrorlist=/g' "$repo_file"
+    sed_in_place 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo_file"
   fi
 }
 
@@ -22,8 +42,8 @@ configure_rocky_official() {
   repo_dir="$(root_path /etc/yum.repos.d)"
   local repos=("$repo_dir"/Rocky-*.repo)
   if [[ -e "${repos[0]}" ]]; then
-    sed -i 's|^mirrorlist=|#mirrorlist=|g' "${repos[@]}" || true
-    sed -i 's|^#baseurl=http://dl\.rockylinux\.org/|baseurl=https://dl.rockylinux.org/|g' "${repos[@]}" || true
+    sed_in_place 's|^mirrorlist=|#mirrorlist=|g' "${repos[@]}"
+    sed_in_place 's|^#baseurl=http://dl\.rockylinux\.org/|baseurl=https://dl.rockylinux.org/|g' "${repos[@]}"
     if [[ -z "$container_root" ]]; then
       dnf clean all >/dev/null 2>&1 || true
     fi
@@ -54,7 +74,7 @@ rewrite_ubuntu_archive_mirror() {
   fi
 
   for source_file in "${sources[@]}"; do
-    sed -i -E "s|https?://archive\.ubuntu\.com/ubuntu/?|http://${replacement_host}/ubuntu/|g" "$source_file" || true
+    sed_in_place_ext "s|https?://archive\.ubuntu\.com/ubuntu/?|http://${replacement_host}/ubuntu/|g" "$source_file"
   done
 
   local apt_lists

@@ -126,7 +126,7 @@ jobs:
           EOF
           sudo /usr/sbin/sshd -t -f "$SSH_TEST_DIR/sshd_config"
           sudo /usr/sbin/sshd -f "$SSH_TEST_DIR/sshd_config"
-          for i in {1..20}; do
+          for _ in {1..20}; do
             if ssh -i "$SSH_TEST_DIR/test_key" -p 22222 \
               -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
@@ -136,11 +136,13 @@ jobs:
             fi
             sleep 0.2
           done
-          echo "SSH_TEST_ENABLED=1" >> "$GITHUB_ENV"
-          echo "SSH_TEST_HOST=127.0.0.1" >> "$GITHUB_ENV"
-          echo "SSH_TEST_PORT=22222" >> "$GITHUB_ENV"
-          echo "SSH_TEST_USER=${SSH_TEST_USER}" >> "$GITHUB_ENV"
-          echo "SSH_TEST_KEY=$SSH_TEST_DIR/test_key" >> "$GITHUB_ENV"
+          {
+            echo "SSH_TEST_ENABLED=1"
+            echo "SSH_TEST_HOST=127.0.0.1"
+            echo "SSH_TEST_PORT=22222"
+            echo "SSH_TEST_USER=${SSH_TEST_USER}"
+            echo "SSH_TEST_KEY=$SSH_TEST_DIR/test_key"
+          } >> "$GITHUB_ENV"
 
       - name: Installer shell matrix tests (Linux/macOS)
         if: runner.os != 'Windows'
@@ -323,6 +325,7 @@ jobs:
         run: |
           set -euo pipefail
           retire_path() {
+            # shellcheck disable=SC2016
             node -e 'const crypto=require("crypto"); const path=require("path"); const p=process.argv[1]; const hash=crypto.createHash("sha1").update(p).digest("base64").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 8); console.log(path.resolve(path.dirname(p), `.${path.basename(p)}-${hash}`));' "$1"
           }
           seed_stale_codex_backup() {
@@ -356,6 +359,7 @@ jobs:
         run: |
           set -euo pipefail
           retire_path() {
+            # shellcheck disable=SC2016
             node -e 'const crypto=require("crypto"); const path=require("path"); const p=process.argv[1]; const hash=crypto.createHash("sha1").update(p).digest("base64").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 8); console.log(path.resolve(path.dirname(p), `.${path.basename(p)}-${hash}`));' "$1"
           }
           seed_stale_codex_backup() {
