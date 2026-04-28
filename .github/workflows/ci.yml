@@ -587,7 +587,7 @@ jobs:
               /dist/codex_cloudgate_test -test.v -test.count=1
             echo "==> $img (cli tests)"
             docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_cli_test -test.v -test.count=1 -test.run 'Test[^I]'
+              /dist/codex_cli_test -test.v -test.count=1 -test.run='Test[^I]'
           done
 
       - name: Codex upgrade smoke in Linux containers (system/local)
