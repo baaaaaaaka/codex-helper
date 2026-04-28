@@ -137,12 +137,26 @@ jobs:
             sleep 0.2
           done
           {
-            echo "SSH_TEST_ENABLED=1"
             echo "SSH_TEST_HOST=127.0.0.1"
             echo "SSH_TEST_PORT=22222"
             echo "SSH_TEST_USER=${SSH_TEST_USER}"
             echo "SSH_TEST_KEY=$SSH_TEST_DIR/test_key"
           } >> "$GITHUB_ENV"
+
+      - name: SSH live integration regressions (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SSH_TEST_ENABLED=1 go test ./internal/ssh -count=1 -run 'TestTunnelIntegrationStartStop$' -v
+          SSH_TEST_ENABLED=1 SSH_STACK_INTEGRATION_TEST=1 go test ./internal/stack -count=1 -run 'TestStackIntegrationHTTPProxyConnectThroughSSHTunnel$' -v
+
+      - name: SSH host-key retry regressions (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(InitProfileInteractiveWithDeps(OffersInteractiveHostKeyCheckEvenIfInteractiveSessionFails|ReturnsOriginalHostKeyErrorWhenDeclined)|ClassifySSHProbeFailureDoesNotTreatBannerOffendingAsHostKey)$' -v
 
       - name: Installer shell matrix tests (Linux/macOS)
         if: runner.os != 'Windows'

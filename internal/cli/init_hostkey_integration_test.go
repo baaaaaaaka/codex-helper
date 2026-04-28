@@ -16,6 +16,9 @@ func TestInitProfileHostKeyRetryIntegration(t *testing.T) {
 	if os.Getenv("SSH_TEST_ENABLED") != "1" {
 		t.Skip("SSH integration tests disabled")
 	}
+	if os.Getenv("SSH_HOSTKEY_RETRY_TEST") != "1" {
+		t.Skip("SSH host-key retry integration test disabled")
+	}
 	host := os.Getenv("SSH_TEST_HOST")
 	port := os.Getenv("SSH_TEST_PORT")
 	user := os.Getenv("SSH_TEST_USER")
