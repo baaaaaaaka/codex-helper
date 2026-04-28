@@ -46,7 +46,17 @@ try {
     throw "expected ARM64 download URL, got $($target.DownloadUrl)"
   }
 
-  $script:codexProbeNativeStartupStatus = 0xC0000135
+  if (-not (Test-CodexNativeRuntimeRepairable -1073741515)) {
+    throw 'signed STATUS_DLL_NOT_FOUND must be repairable'
+  }
+  if (-not (Test-CodexNativeRuntimeRepairable 3221225781)) {
+    throw 'unsigned STATUS_DLL_NOT_FOUND must be repairable'
+  }
+  if (-not (Test-CodexNativeRuntimeRepairable 3221225785)) {
+    throw 'unsigned STATUS_ENTRYPOINT_NOT_FOUND must be repairable'
+  }
+
+  $script:codexProbeNativeStartupStatus = 3221225781
   $script:wingetRepairCalled = $false
   function Confirm-CodexVCRedistInstall { return $true }
   function Install-CodexVCRedistWithWinget {

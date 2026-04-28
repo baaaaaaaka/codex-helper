@@ -748,9 +748,13 @@ function Get-NativeExitStatus([int64]$code) {
   return [uint32]$code
 }
 
+function Test-NativeExitStatus([uint32]$status, [string]$hexCode) {
+  return ($status -eq [Convert]::ToUInt32($hexCode, 16))
+}
+
 function Test-CodexNativeRuntimeRepairable([int64]$code) {
   $status = Get-NativeExitStatus $code
-  return ($status -eq 0xC0000135 -or $status -eq 0xC0000139)
+  return ((Test-NativeExitStatus $status 'C0000135') -or (Test-NativeExitStatus $status 'C0000139'))
 }
 
 function Get-CodexNativeStartupFailureHint([int64]$code) {
@@ -758,19 +762,17 @@ function Get-CodexNativeStartupFailureHint([int64]$code) {
 
   $redistTarget = Get-CodexVCRedistTarget
   $installHint = "run: winget install --id $($redistTarget.WingetId) -e"
-  switch ($status) {
-    0xC0000135 {
-      return "Windows native Codex exited with STATUS_DLL_NOT_FOUND (0xC0000135). This usually means the Microsoft Visual C++ 2015-2022 Redistributable ($($redistTarget.Display)) or Universal CRT is missing; $installHint.$(Get-CommonWindowsRuntimeDllStatus)"
-    }
-    0xC0000139 {
-      return "Windows native Codex exited with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139). This usually means a runtime DLL or Windows component is too old; install/update the Microsoft Visual C++ 2015-2022 Redistributable ($($redistTarget.Display)) and run Windows Update."
-    }
-    0xC000007B {
-      return "Windows native Codex exited with STATUS_INVALID_IMAGE_FORMAT (0xC000007B). This usually means a wrong-architecture or corrupt native package; clear the managed Codex install and reinstall, and verify the Windows architecture."
-    }
-    0xC000001D {
-      return "Windows native Codex exited with STATUS_ILLEGAL_INSTRUCTION (0xC000001D). This usually means the current native Codex build is not compatible with this CPU or Windows runtime; update Windows or use a compatible Codex version."
-    }
+  if (Test-NativeExitStatus $status 'C0000135') {
+    return "Windows native Codex exited with STATUS_DLL_NOT_FOUND (0xC0000135). This usually means the Microsoft Visual C++ 2015-2022 Redistributable ($($redistTarget.Display)) or Universal CRT is missing; $installHint.$(Get-CommonWindowsRuntimeDllStatus)"
+  }
+  if (Test-NativeExitStatus $status 'C0000139') {
+    return "Windows native Codex exited with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139). This usually means a runtime DLL or Windows component is too old; install/update the Microsoft Visual C++ 2015-2022 Redistributable ($($redistTarget.Display)) and run Windows Update."
+  }
+  if (Test-NativeExitStatus $status 'C000007B') {
+    return "Windows native Codex exited with STATUS_INVALID_IMAGE_FORMAT (0xC000007B). This usually means a wrong-architecture or corrupt native package; clear the managed Codex install and reinstall, and verify the Windows architecture."
+  }
+  if (Test-NativeExitStatus $status 'C000001D') {
+    return "Windows native Codex exited with STATUS_ILLEGAL_INSTRUCTION (0xC000001D). This usually means the current native Codex build is not compatible with this CPU or Windows runtime; update Windows or use a compatible Codex version."
   }
   return ""
 }
