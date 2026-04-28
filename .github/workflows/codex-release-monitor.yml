@@ -177,7 +177,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/ci/retry.sh 5 5 npm install -g "@openai/codex@${CODEX_VERSION}"
+          bash scripts/ci/retry.sh 5 5 npm install -g --include=optional "@openai/codex@${CODEX_VERSION}"
 
       - name: Install latest Codex (Windows)
         if: runner.os == 'Windows'
@@ -185,7 +185,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          & .\scripts\ci\retry.ps1 5 5 npm install -g "@openai/codex@$env:CODEX_VERSION"
+          & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional "@openai/codex@$env:CODEX_VERSION"
 
       - name: Probe installed Codex wrapper (Linux/macOS)
         if: runner.os != 'Windows'
@@ -324,7 +324,7 @@ jobs:
               exit 1
               ;;
           esac
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" codex --version && (PATH=\"\${NODE_BIN_DIR}:\$PATH\" codex --help || true)"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" codex --version && (PATH=\"\${NODE_BIN_DIR}:\$PATH\" codex --help || true)"
           docker run --rm \
             -v "${GITHUB_WORKSPACE}/scripts/ci:/ci:ro" \
             "${IMAGE}" /bin/sh -lc "$run_cmd"
@@ -356,7 +356,7 @@ jobs:
               exit 1
               ;;
           esac
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration'"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration'"
           docker run --rm \
             -v "${TEST_BIN_PATH}:/codex_cloudgate_test:ro" \
             -v "${CLI_TEST_BIN_PATH}:/codex_cli_test:ro" \

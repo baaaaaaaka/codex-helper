@@ -24,7 +24,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 
 			requested := update.ResolveVersion(versionOverride)
 			if strings.EqualFold(requested, "latest") {
-				status := update.CheckForUpdate(ctx, update.CheckOptions{
+				status := checkForUpdate(ctx, update.CheckOptions{
 					Repo:             repo,
 					InstalledVersion: version,
 					Timeout:          8 * time.Second,
@@ -35,7 +35,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				}
 			}
 
-			res, err := update.PerformUpdate(ctx, update.UpdateOptions{
+			res, err := performUpdate(ctx, update.UpdateOptions{
 				Repo:        repo,
 				Version:     versionOverride,
 				InstallPath: installPath,

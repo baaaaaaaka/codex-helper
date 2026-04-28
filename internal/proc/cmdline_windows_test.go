@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+func TestIsAlive(t *testing.T) {
+	if IsAlive(0) {
+		t.Fatalf("expected pid 0 to be dead")
+	}
+	if IsAlive(-1) {
+		t.Fatalf("expected negative pid to be dead")
+	}
+	if !IsAlive(os.Getpid()) {
+		t.Fatalf("expected current pid to be alive")
+	}
+}
+
 func TestCommandLine(t *testing.T) {
 	t.Run("invalid pid", func(t *testing.T) {
 		if _, err := CommandLine(0); err == nil {

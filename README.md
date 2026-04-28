@@ -268,6 +268,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.gi
 By default it installs to `%USERPROFILE%\.local\bin\codex-proxy.exe`.
 The installer also writes `cxp.cmd` there and updates PATH for that directory
 plus the managed CLI directory.
+The managed Codex CLI uses a native Windows binary; if it exits with
+`0xC0000135` or mentions `VCRUNTIME140*.dll`, install the Microsoft Visual C++
+2015-2022 Redistributable that matches the Codex architecture (x64:
+`Microsoft.VCRedist.2015+.x64`, ARM64: `Microsoft.VCRedist.2015+.arm64`).
+When this exact runtime failure is detected during managed Codex install,
+`cxp` automatically attempts to install the redistributable and trigger a
+Windows UAC prompt. Set `CODEX_PROXY_VCREDIST_INSTALL=never` to disable that,
+or `prompt` to ask in the terminal before showing the UAC prompt.
 
 Install a specific version:
 

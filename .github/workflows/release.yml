@@ -53,6 +53,10 @@ jobs:
           "$HOME/.local/bin/codex-proxy" --version | grep -q "${GITHUB_REF_NAME#v}"
           "$HOME/.local/bin/cxp" --version | grep -q "${GITHUB_REF_NAME#v}"
           "$HOME/.local/bin/codex-proxy" proxy doctor || true
+          upgrade_target="$RUNNER_TEMP/codex-proxy-upgrade-smoke/codex-proxy"
+          mkdir -p "$(dirname "$upgrade_target")"
+          "$HOME/.local/bin/codex-proxy" upgrade --repo "${GITHUB_REPOSITORY}" --version "${GITHUB_REF_NAME}" --install-path "$upgrade_target"
+          "$upgrade_target" --version | grep -q "${GITHUB_REF_NAME#v}"
 
       - name: Install (Windows)
         if: runner.os == 'Windows'
@@ -67,6 +71,11 @@ jobs:
           & $exe --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
           & $cxp --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
           & $exe proxy doctor | Out-Default
+          $upgradeDir = Join-Path $env:RUNNER_TEMP "codex-proxy-upgrade-smoke"
+          New-Item -ItemType Directory -Force -Path $upgradeDir | Out-Null
+          $upgradeTarget = Join-Path $upgradeDir "codex-proxy.exe"
+          & $exe upgrade --repo $env:GITHUB_REPOSITORY --version $env:GITHUB_REF_NAME --install-path $upgradeTarget
+          & $upgradeTarget --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
 
   install-container-smoke:
     name: Install smoke (containers)

@@ -82,12 +82,16 @@ func TestCodexInstallerCandidatesLinux(t *testing.T) {
 }
 
 func TestCodexInstallerCandidatesWindows(t *testing.T) {
+	t.Setenv("SystemRoot", `C:\Windows`)
+
 	cmds := codexInstallerCandidates("windows")
-	if len(cmds) != 2 {
-		t.Fatalf("expected 2 windows installers, got %d", len(cmds))
+	if len(cmds) != 3 {
+		t.Fatalf("expected 3 windows installers, got %d", len(cmds))
 	}
-	if cmds[0].path != "powershell" || cmds[1].path != "pwsh" {
-		t.Fatalf("expected powershell then pwsh installers, got %q then %q", cmds[0].path, cmds[1].path)
+	if cmds[0].path != `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` ||
+		cmds[1].path != "powershell" ||
+		cmds[2].path != "pwsh" {
+		t.Fatalf("unexpected windows installer order: %q, %q, %q", cmds[0].path, cmds[1].path, cmds[2].path)
 	}
 	for i, cmd := range cmds {
 		if len(cmd.args) < 5 {
@@ -343,6 +347,39 @@ func TestEnsureCodexInstalledReportsNonfunctionalAfterInstall(t *testing.T) {
 	}
 }
 
+func TestRunCodexInstallerStopsAfterDiagnosedInstallFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	binDir := t.TempDir()
+	fallbackMarker := filepath.Join(t.TempDir(), "fallback-ran")
+	writeExecutable(t, filepath.Join(binDir, "bash"), "#!/bin/sh\necho diagnosed failure >&2\nexit 76\n")
+	writeExecutable(t, filepath.Join(binDir, "sh"), "#!/bin/sh\necho fallback > \""+fallbackMarker+"\"\nexit 0\n")
+
+	t.Setenv("PATH", binDir)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	var out bytes.Buffer
+	err := runCodexInstaller(context.Background(), &out, nil)
+	if err == nil {
+		t.Fatal("expected installer error")
+	}
+	if !strings.Contains(err.Error(), "bash -c") {
+		t.Fatalf("expected first installer failure, got %v", err)
+	}
+	if strings.Contains(err.Error(), "; sh -c") {
+		t.Fatalf("expected fallback installer to be skipped, got %v", err)
+	}
+	if _, statErr := os.Stat(fallbackMarker); !os.IsNotExist(statErr) {
+		t.Fatalf("fallback installer should not run, stat err=%v", statErr)
+	}
+	if !strings.Contains(out.String(), "diagnosed failure") {
+		t.Fatalf("expected installer output to be preserved, got %q", out.String())
+	}
+}
+
 func TestDetectCodexUpgradeSourceManaged(t *testing.T) {
 	home := t.TempDir()
 	prefix := filepath.Join(home, ".local", "share", "codex-proxy", "npm-global")
@@ -514,7 +551,7 @@ func TestUpgradeCodexInstalledWithOptionsSystemUsesNpmInstall(t *testing.T) {
 		"  echo \"" + globalPrefix + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
-		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
 		"  echo hit > \"" + marker + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
@@ -558,7 +595,7 @@ func TestUpgradeCodexInstalledWithOptionsUsesWithInstallerEnv(t *testing.T) {
 		"  echo \"" + globalPrefix + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
-		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
 		"  if [ \"$TEST_INSTALLER_ENV\" != \"1\" ]; then\n" +
 		"    echo \"missing TEST_INSTALLER_ENV\" >&2\n" +
 		"    exit 1\n" +
@@ -863,7 +900,7 @@ func TestRunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets(t *testing.T) {
 		"  echo \"" + systemPrefix + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
-		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
 		"  echo hit > \"" + marker + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
@@ -1046,7 +1083,7 @@ func TestUpgradeCodexInstalledWithOptionsRemovesStaleSystemRetiredPaths(t *testi
 		"  echo \"" + globalPrefix + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
-		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
 		"  if [ -e \"" + stalePackageDir + "\" ] || [ -e \"" + staleBinPath + "\" ]; then\n" +
 		"    echo \"stale retired path still present\" >&2\n" +
 		"    exit 1\n" +
@@ -1099,7 +1136,7 @@ func TestUpgradeCodexInstalledWithOptionsPropagatesUpgradeFailure(t *testing.T) 
 		"  echo \"" + globalPrefix + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
-		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
 		"  exit 7\n" +
 		"fi\n" +
 		"exit 1\n"
@@ -1138,7 +1175,7 @@ func TestUpgradeCodexInstalledWithOptionsErrorsWhenCodexDisappearsAfterUpgrade(t
 		"  echo \"" + globalPrefix + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
-		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
 		"  cat > \"" + codexPath + "\" <<'EOF'\n" +
 		"#!/bin/sh\n" +
 		"exit 1\n" +
@@ -1474,7 +1511,7 @@ func TestRunSystemNpmCodexUpgradeReportsDiskSpaceAfterNpmFailure(t *testing.T) {
 		"  echo \"" + systemPrefix + "\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
-		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"@openai/codex\" ]; then\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
 		"  echo ran > \"" + marker + "\"\n" +
 		"  exit 17\n" +
 		"fi\n" +
@@ -2129,6 +2166,7 @@ func TestBootstrapScriptChecksNpmUsability(t *testing.T) {
 		"system npm is not usable",
 		"managed Node.js/npm install is missing or broken; reinstalling",
 		"prefix -g",
+		"--include=optional",
 	} {
 		if !strings.Contains(codexInstallBootstrap, want) {
 			t.Fatalf("bootstrap script missing %q", want)
@@ -2208,6 +2246,7 @@ func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
 		"Test-NpmUsable",
 		"Invoke-DiskWrite",
 		"Fail-IfDiskSpaceLow",
+		"--include=optional",
 		"Assert-DiskSpace \"npm cache\"",
 		"Get-CodexSHA256Hex",
 		"System.Security.Cryptography.SHA256",
@@ -2216,6 +2255,77 @@ func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
 	} {
 		if !strings.Contains(codexInstallBootstrapWindows, want) {
 			t.Fatalf("Windows bootstrap script missing %q", want)
+		}
+	}
+}
+
+func TestBootstrapWindowsScriptContainsNativeDllFailureHint(t *testing.T) {
+	for _, want := range []string{
+		"Fail-CodexInstall([string]$reason, [int]$code = 76)",
+		"Resolve-CodexNativeRuntimeArch",
+		"Get-CodexVCRedistTarget",
+		"Get-CodexNativeStartupFailureHint",
+		"CODEX_PROXY_VCREDIST_INSTALL",
+		"$mode = 'auto'",
+		"Install-CodexVCRedistIfNeeded",
+		"Start-Process -FilePath $winget.Source",
+		"-Verb RunAs",
+		"codex-win32-arm64",
+		"aarch64-pc-windows-msvc",
+		"win-arm64",
+		"$orderedArchs = @($preferredArch)",
+		"Microsoft.VCRedist.2015+.arm64",
+		"https://aka.ms/vc14/vc_redist.arm64.exe",
+		"vc_redist.arm64.exe",
+		"Microsoft.VCRedist.2015+.x64",
+		"https://aka.ms/vc14/vc_redist.x64.exe",
+		"vc_redist.x64.exe",
+		"Get-AuthenticodeSignature",
+		"Rechecking Codex CLI after VC++ runtime install",
+		"STATUS_DLL_NOT_FOUND",
+		"0xC0000135",
+		"STATUS_ENTRYPOINT_NOT_FOUND",
+		"0xC0000139",
+		"STATUS_INVALID_IMAGE_FORMAT",
+		"0xC000007B",
+		"STATUS_ILLEGAL_INSTRUCTION",
+		"0xC000001D",
+		"Microsoft Visual C++ 2015-2022 Redistributable",
+		"Microsoft.VCRedist.2015+.x64",
+		"VCRUNTIME140.dll",
+		"VCRUNTIME140_1.dll",
+		"api-ms-win-crt-runtime-l1-1-0.dll",
+	} {
+		if !strings.Contains(codexInstallBootstrapWindows, want) {
+			t.Fatalf("Windows bootstrap script missing %q", want)
+		}
+	}
+}
+
+func TestCodexProbeFailureHintForStatusDLLNotFound(t *testing.T) {
+	cases := []struct {
+		code int
+		want string
+	}{
+		{-1073741515, "STATUS_DLL_NOT_FOUND"},
+		{int(uint32(0xC0000135)), "STATUS_DLL_NOT_FOUND"},
+		{-1073741511, "STATUS_ENTRYPOINT_NOT_FOUND"},
+		{-1073741701, "STATUS_INVALID_IMAGE_FORMAT"},
+		{-1073741795, "STATUS_ILLEGAL_INSTRUCTION"},
+	}
+	for _, tc := range cases {
+		hint := codexProbeFailureHintForExitCode(tc.code)
+		if !strings.Contains(hint, tc.want) {
+			t.Fatalf("expected %s hint for %d, got %q", tc.want, tc.code, hint)
+		}
+	}
+	if hint := codexProbeFailureHintForExitCode(1); hint != "" {
+		t.Fatalf("expected no hint for generic exit code, got %q", hint)
+	}
+	dllHint := codexProbeFailureHintForExitCode(-1073741515)
+	for _, want := range []string{"Microsoft.VCRedist.2015+.x64", "Microsoft.VCRedist.2015+.arm64"} {
+		if !strings.Contains(dllHint, want) {
+			t.Fatalf("expected DLL hint to include %q, got %q", want, dllHint)
 		}
 	}
 }

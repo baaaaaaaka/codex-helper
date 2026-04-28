@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import sys
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -98,6 +102,77 @@ class CodexReleaseMonitorSelectTests(unittest.TestCase):
 
         self.assertIn("0.113.0-alpha.2", rows)
         self.assertIn("0.112.0", rows)
+
+    def test_invalid_timestamp_forces_revalidation(self) -> None:
+        selected = monitor_select.select_targeted_versions(
+            table_rows={
+                "0.112.0": {
+                    "linux": "pass",
+                    "mac": "pass",
+                    "windows": "pass",
+                    "centos7": "pass",
+                    "rockylinux8": "pass",
+                    "ubuntu20.04": "pass",
+                    "last_tested_utc": "not-a-timestamp",
+                }
+            },
+            latest_version="0.112.0",
+            now=datetime(2026, 3, 10, 12, 0, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(selected, ["0.112.0"])
+
+    def test_cli_range_mode_excludes_prerelease_when_disabled(self) -> None:
+        out = StringIO()
+        argv = [
+            "codex_release_monitor_select.py",
+            "--mode",
+            "range",
+            "--min-version",
+            "v0.110.0",
+            "--max-version",
+            "v0.112.0",
+            "--no-include-prerelease",
+        ]
+
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            monitor_select,
+            "sweep_select_versions",
+            return_value=["0.111.0", "0.112.0"],
+        ) as select_versions, redirect_stdout(out):
+            code = monitor_select.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue().strip(), '["0.111.0", "0.112.0"]')
+        select_versions.assert_called_once_with(
+            versions_arg="",
+            min_version="0.110.0",
+            max_version="0.112.0",
+            include_prerelease=False,
+        )
+
+    def test_cli_versions_mode_accepts_comma_newline_and_json(self) -> None:
+        cases = [
+            "v0.112.0,\n0.111.0",
+            '["v0.112.0", "0.111.0"]',
+        ]
+
+        for versions_arg in cases:
+            with self.subTest(versions_arg=versions_arg):
+                out = StringIO()
+                argv = [
+                    "codex_release_monitor_select.py",
+                    "--mode",
+                    "versions",
+                    "--versions",
+                    versions_arg,
+                ]
+
+                with mock.patch.object(sys, "argv", argv), redirect_stdout(out):
+                    code = monitor_select.main()
+
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(out.getvalue()), ["0.111.0", "0.112.0"])
 
 
 if __name__ == "__main__":

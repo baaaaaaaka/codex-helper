@@ -16,6 +16,7 @@ import (
 
 var (
 	performUpdate  = update.PerformUpdate
+	checkForUpdate = update.CheckForUpdate
 	executablePath = os.Executable
 	execSelf       = syscall.Exec
 	exitFunc       = os.Exit

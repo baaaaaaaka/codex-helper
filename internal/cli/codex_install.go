@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	codexPathCacheFile   = "codex_path"
-	codexInstallLockName = "codex_install.lock"
-	codexProbeTimeout    = 5 * time.Second
-	codexInstallDiskExit = 75
+	codexPathCacheFile      = "codex_path"
+	codexInstallLockName    = "codex_install.lock"
+	codexProbeTimeout       = 5 * time.Second
+	codexInstallDiskExit    = 75
+	codexInstallFailureExit = 76
 )
 
 var (
@@ -470,7 +471,7 @@ mkdir -p "$prefix" || fail_write_or_disk "managed npm prefix" "$prefix" "failed 
 check_disk_space "managed npm prefix" "$prefix"
 check_disk_space "npm cache" "$npm_cache_dir"
 check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
-if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex; then
+if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" --include=optional @openai/codex; then
   fail_if_disk_space_low "managed npm prefix" "$prefix"
   fail_if_disk_space_low "npm cache" "$npm_cache_dir"
   fail_if_disk_space_low "temporary directory" "${TMPDIR:-/tmp}"
@@ -483,7 +484,7 @@ if ! "$prefix/bin/codex" --version >/dev/null 2>&1 && $used_system_node; then
   check_disk_space "managed npm prefix" "$prefix"
   check_disk_space "npm cache" "$npm_cache_dir"
   check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
-  if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" @openai/codex; then
+  if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" --include=optional @openai/codex; then
     fail_if_disk_space_low "managed npm prefix" "$prefix"
     fail_if_disk_space_low "npm cache" "$npm_cache_dir"
     fail_if_disk_space_low "temporary directory" "${TMPDIR:-/tmp}"
@@ -516,7 +517,7 @@ function Write-CodexInstallFailure([string]$reason) {
   Write-Host ("Reason: " + $reason) -ForegroundColor Red
 }
 
-function Fail-CodexInstall([string]$reason, [int]$code = 1) {
+function Fail-CodexInstall([string]$reason, [int]$code = 76) {
   Write-CodexInstallFailure $reason
   exit $code
 }
@@ -662,6 +663,212 @@ function Test-NpmUsable([string]$npmPath, [string]$nodePathDir) {
   }
 }
 
+function Get-CommonWindowsRuntimeDllStatus {
+  $systemRoot = $env:SystemRoot
+  if ([string]::IsNullOrWhiteSpace($systemRoot)) { return "" }
+
+  $missing = @()
+  foreach ($dll in @('VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'api-ms-win-crt-runtime-l1-1-0.dll')) {
+    $path = Join-Path (Join-Path $systemRoot 'System32') $dll
+    if (-not (Test-Path -LiteralPath $path)) {
+      $missing += $dll
+    }
+  }
+  if ($missing.Count -eq 0) { return "" }
+  return " Missing common runtime DLLs: $($missing -join ', ')."
+}
+
+function Resolve-CodexNativeRuntimeArch {
+  $preferredArch = ''
+  if (-not [string]::IsNullOrWhiteSpace($nodeDir)) {
+    $leaf = (Split-Path -Leaf $nodeDir)
+    if ($leaf -match '(?i)win-arm64') { $preferredArch = 'arm64' }
+    if ($leaf -match '(?i)win-x64') { $preferredArch = 'x64' }
+  }
+  if ([string]::IsNullOrWhiteSpace($preferredArch)) {
+    if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -match 'ARM64') {
+      $preferredArch = 'arm64'
+    } else {
+      $preferredArch = 'x64'
+    }
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($npmPrefix)) {
+    $openaiRoot = Join-Path $npmPrefix 'node_modules\@openai'
+    $arm64Checks = @(
+      Join-Path $openaiRoot 'codex-win32-arm64\vendor\aarch64-pc-windows-msvc\codex\codex.exe',
+      Join-Path $openaiRoot 'codex\node_modules\@openai\codex-win32-arm64\vendor\aarch64-pc-windows-msvc\codex\codex.exe',
+      Join-Path $openaiRoot 'codex\vendor\aarch64-pc-windows-msvc\codex\codex.exe'
+    )
+    $x64Checks = @(
+      Join-Path $openaiRoot 'codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe',
+      Join-Path $openaiRoot 'codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe',
+      Join-Path $openaiRoot 'codex\vendor\x86_64-pc-windows-msvc\codex\codex.exe'
+    )
+    $orderedArchs = @($preferredArch)
+    if ($preferredArch -ne 'arm64') { $orderedArchs += 'arm64' }
+    if ($preferredArch -ne 'x64') { $orderedArchs += 'x64' }
+    foreach ($arch in $orderedArchs) {
+      $checks = if ($arch -eq 'arm64') { $arm64Checks } else { $x64Checks }
+      foreach ($checkPath in $checks) {
+        if (Test-Path -LiteralPath $checkPath) {
+          return $arch
+        }
+      }
+    }
+  }
+
+  return $preferredArch
+}
+
+function Get-CodexVCRedistTarget {
+  $arch = Resolve-CodexNativeRuntimeArch
+  if ($arch -eq 'arm64') {
+    return [pscustomobject]@{
+      Arch = 'arm64'
+      Display = 'ARM64'
+      WingetId = 'Microsoft.VCRedist.2015+.arm64'
+      DownloadUrl = 'https://aka.ms/vc14/vc_redist.arm64.exe'
+      FileName = 'vc_redist.arm64.exe'
+    }
+  }
+  return [pscustomobject]@{
+    Arch = 'x64'
+    Display = 'x64'
+    WingetId = 'Microsoft.VCRedist.2015+.x64'
+    DownloadUrl = 'https://aka.ms/vc14/vc_redist.x64.exe'
+    FileName = 'vc_redist.x64.exe'
+  }
+}
+
+function Get-NativeExitStatus([int64]$code) {
+  if ($code -lt 0) {
+    return [uint32]($code + 4294967296L)
+  }
+  return [uint32]$code
+}
+
+function Test-CodexNativeRuntimeRepairable([uint32]$status) {
+  return ($status -eq 0xC0000135 -or $status -eq 0xC0000139)
+}
+
+function Get-CodexNativeStartupFailureHint([int64]$code) {
+  $status = Get-NativeExitStatus $code
+
+  $redistTarget = Get-CodexVCRedistTarget
+  $installHint = "run: winget install --id $($redistTarget.WingetId) -e"
+  switch ($status) {
+    0xC0000135 {
+      return "Windows native Codex exited with STATUS_DLL_NOT_FOUND (0xC0000135). This usually means the Microsoft Visual C++ 2015-2022 Redistributable ($($redistTarget.Display)) or Universal CRT is missing; $installHint.$(Get-CommonWindowsRuntimeDllStatus)"
+    }
+    0xC0000139 {
+      return "Windows native Codex exited with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139). This usually means a runtime DLL or Windows component is too old; install/update the Microsoft Visual C++ 2015-2022 Redistributable ($($redistTarget.Display)) and run Windows Update."
+    }
+    0xC000007B {
+      return "Windows native Codex exited with STATUS_INVALID_IMAGE_FORMAT (0xC000007B). This usually means a wrong-architecture or corrupt native package; clear the managed Codex install and reinstall, and verify the Windows architecture."
+    }
+    0xC000001D {
+      return "Windows native Codex exited with STATUS_ILLEGAL_INSTRUCTION (0xC000001D). This usually means the current native Codex build is not compatible with this CPU or Windows runtime; update Windows or use a compatible Codex version."
+    }
+  }
+  return ""
+}
+
+function Confirm-CodexVCRedistInstall {
+  $mode = [Environment]::GetEnvironmentVariable('CODEX_PROXY_VCREDIST_INSTALL')
+  if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'auto' }
+  $mode = $mode.Trim().ToLowerInvariant()
+  if ($mode -in @('0', 'false', 'no', 'never', 'off', 'skip')) {
+    return $false
+  }
+  if ($mode -in @('1', 'true', 'yes', 'always', 'auto')) {
+    return $true
+  }
+  try {
+    if ([Console]::IsInputRedirected) { return $false }
+  } catch {
+    return $false
+  }
+
+  Write-Host ""
+  Write-Host "Codex needs the Microsoft Visual C++ 2015-2022 Redistributable." -ForegroundColor Yellow
+  Write-Host "A Windows administrator permission prompt may appear."
+  $answer = Read-Host "Install it now? [y/N]"
+  return ($answer -match '^(?i:y|yes)$')
+}
+
+function Test-CodexVCRedistInstallerExitCode([int]$code) {
+  return ($code -eq 0 -or $code -eq 3010 -or $code -eq 1638)
+}
+
+function Install-CodexVCRedistWithWinget {
+  $redistTarget = Get-CodexVCRedistTarget
+  $winget = Get-Command winget -ErrorAction SilentlyContinue
+  if (-not $winget) { return $false }
+
+  Write-Host "Installing Microsoft Visual C++ Redistributable ($($redistTarget.Display)) with winget..." -ForegroundColor Yellow
+  try {
+    $args = @(
+      'install',
+      '--id', $redistTarget.WingetId,
+      '-e',
+      '--accept-package-agreements',
+      '--accept-source-agreements'
+    )
+    $proc = Start-Process -FilePath $winget.Source -ArgumentList $args -Verb RunAs -Wait -PassThru
+    if ($proc -and (Test-CodexVCRedistInstallerExitCode $proc.ExitCode)) {
+      return $true
+    }
+    if ($proc) {
+      Write-Warning "winget VC++ runtime install exited with code $($proc.ExitCode)."
+    }
+  } catch {
+    Write-Warning "winget VC++ runtime install failed: $($_.Exception.Message)"
+  }
+  return $false
+}
+
+function Install-CodexVCRedistFromMicrosoft {
+  $redistTarget = Get-CodexVCRedistTarget
+  $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ("codex-vcredist-" + [Guid]::NewGuid().ToString('N'))
+  $installer = Join-Path $tmpDir $redistTarget.FileName
+  try {
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    Write-Host "Downloading Microsoft Visual C++ Redistributable ($($redistTarget.Display)) from Microsoft..." -ForegroundColor Yellow
+    Invoke-WebRequest -UseBasicParsing -Uri $redistTarget.DownloadUrl -OutFile $installer
+    $sig = Get-AuthenticodeSignature -FilePath $installer
+    if ($sig.Status -ne 'Valid' -or -not ($sig.SignerCertificate.Subject -match 'Microsoft')) {
+      throw "downloaded VC++ runtime installer signature is not trusted"
+    }
+    $proc = Start-Process -FilePath $installer -ArgumentList @('/install', '/quiet', '/norestart') -Verb RunAs -Wait -PassThru
+    if ($proc -and (Test-CodexVCRedistInstallerExitCode $proc.ExitCode)) {
+      return $true
+    }
+    if ($proc) {
+      Write-Warning "VC++ runtime installer exited with code $($proc.ExitCode)."
+    }
+  } catch {
+    Write-Warning "Microsoft VC++ runtime install failed: $($_.Exception.Message)"
+  } finally {
+    Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+  }
+  return $false
+}
+
+function Install-CodexVCRedistIfNeeded {
+  if (-not (Test-CodexNativeRuntimeRepairable $script:codexProbeNativeStartupStatus)) {
+    return $false
+  }
+  if (-not (Confirm-CodexVCRedistInstall)) {
+    return $false
+  }
+
+  if (Install-CodexVCRedistWithWinget) {
+    return $true
+  }
+  return Install-CodexVCRedistFromMicrosoft
+}
+
 function Set-CodexManagedNodeShims {
   if ([string]::IsNullOrWhiteSpace($npmPrefix) -or [string]::IsNullOrWhiteSpace($nodeDir)) { return }
   $nodeExe = Join-Path $nodeDir 'node.exe'
@@ -740,6 +947,7 @@ function Set-CodexManagedNodeShims {
 
 function Test-CodexCommand([string]$codexPath) {
   $script:codexProbeFailure = ""
+  $script:codexProbeNativeStartupStatus = 0
   if ([string]::IsNullOrWhiteSpace($codexPath) -or -not (Test-Path $codexPath)) {
     $script:codexProbeFailure = "codex command not found: $codexPath"
     return $false
@@ -752,10 +960,20 @@ function Test-CodexCommand([string]$codexPath) {
       return $true
     }
     $text = ($probeOut | Out-String).Trim()
+    $hint = Get-CodexNativeStartupFailureHint $code
+    if (-not [string]::IsNullOrWhiteSpace($hint)) {
+      $script:codexProbeNativeStartupStatus = Get-NativeExitStatus $code
+    }
     if (-not [string]::IsNullOrWhiteSpace($text)) {
+      if (-not [string]::IsNullOrWhiteSpace($hint)) {
+        $text = "$text; $hint"
+      }
       $script:codexProbeFailure = "exit code ${code}: $text"
     } else {
       $script:codexProbeFailure = "exit code $code"
+      if (-not [string]::IsNullOrWhiteSpace($hint)) {
+        $script:codexProbeFailure = $script:codexProbeFailure + ": " + $hint
+      }
     }
   } catch {
     $script:codexProbeFailure = $_.Exception.Message
@@ -899,7 +1117,7 @@ $env:PATH = "$nodeDir;$npmPrefix;$prefixBin;$env:PATH"
 Assert-DiskSpace "managed npm prefix" $npmPrefix
 Assert-DiskSpace "npm cache" $npmCacheDir
 Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
-& $npmCmd install -g --prefix $npmPrefix @openai/codex
+& $npmCmd install -g --prefix $npmPrefix --include=optional @openai/codex
 if ($LASTEXITCODE -ne 0) {
   Fail-IfDiskSpaceLow "managed npm prefix" $npmPrefix
   Fail-IfDiskSpaceLow "npm cache" $npmCacheDir
@@ -923,7 +1141,7 @@ if (-not $probeOk -and $usedSystemNode) {
   Assert-DiskSpace "managed npm prefix" $npmPrefix
   Assert-DiskSpace "npm cache" $npmCacheDir
   Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
-  & $npmCmd install -g --prefix $npmPrefix @openai/codex
+  & $npmCmd install -g --prefix $npmPrefix --include=optional @openai/codex
   if ($LASTEXITCODE -ne 0) {
     Fail-IfDiskSpaceLow "managed npm prefix" $npmPrefix
     Fail-IfDiskSpaceLow "npm cache" $npmCacheDir
@@ -931,6 +1149,10 @@ if (-not $probeOk -and $usedSystemNode) {
     Fail-CodexInstall "npm install -g @openai/codex failed after switching to managed Node.js/npm" $LASTEXITCODE
   }
   Set-CodexManagedNodeShims
+  $probeOk = Test-CodexCommand $codexCmd
+}
+if (-not $probeOk -and (Install-CodexVCRedistIfNeeded)) {
+  Write-Host "Rechecking Codex CLI after VC++ runtime install..." -ForegroundColor Yellow
   $probeOk = Test-CodexCommand $codexCmd
 }
 if (-not $probeOk) {
@@ -957,8 +1179,18 @@ func probeCodexVersion(ctx context.Context, codexPath string) error {
 	}
 	if err != nil {
 		output := summarizeProbeOutput(out)
+		hint := ""
+		if exitCode, ok := commandExitCode(err); ok {
+			hint = codexProbeFailureHintForExitCode(exitCode)
+		}
 		if output != "" {
+			if hint != "" {
+				output += " (" + hint + ")"
+			}
 			return fmt.Errorf("--version failed: %w: %s", err, output)
+		}
+		if hint != "" {
+			return fmt.Errorf("--version failed: %w: %s", err, hint)
 		}
 		return fmt.Errorf("--version failed: %w", err)
 	}
@@ -972,6 +1204,21 @@ func summarizeProbeOutput(out []byte) string {
 		text = text[:maxLen] + "..."
 	}
 	return text
+}
+
+func codexProbeFailureHintForExitCode(exitCode int) string {
+	switch uint32(exitCode) {
+	case 0xC0000135:
+		return "Windows native Codex exited with STATUS_DLL_NOT_FOUND (0xC0000135); install the Microsoft Visual C++ 2015-2022 Redistributable that matches Codex architecture (x64: winget install --id Microsoft.VCRedist.2015+.x64 -e; ARM64: winget install --id Microsoft.VCRedist.2015+.arm64 -e), then rerun cxp"
+	case 0xC0000139:
+		return "Windows native Codex exited with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139); install/update Microsoft Visual C++ 2015-2022 Redistributable and run Windows Update, then rerun cxp"
+	case 0xC000007B:
+		return "Windows native Codex exited with STATUS_INVALID_IMAGE_FORMAT (0xC000007B); clear the managed Codex install, reinstall, and verify the Windows architecture"
+	case 0xC000001D:
+		return "Windows native Codex exited with STATUS_ILLEGAL_INSTRUCTION (0xC000001D); update Windows or use a CPU-compatible Codex version"
+	default:
+		return ""
+	}
 }
 
 func codexPostInstallError(action string, err error) error {
@@ -1320,7 +1567,7 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, npmPath, "install", "-g", "@openai/codex")
+	cmd := exec.CommandContext(ctx, npmPath, "install", "-g", "--include=optional", "@openai/codex")
 	if len(installerEnv) > 0 {
 		cmd.Env = installerEnv
 	}
@@ -1722,8 +1969,10 @@ func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string
 		cmd.Stdin = os.Stdin
 		if err := cmd.Run(); err != nil {
 			attemptError := fmt.Sprintf("%s: %v", installerAttemptLabel(candidate), err)
-			if exitCode, ok := commandExitCode(err); ok && exitCode == codexInstallDiskExit {
-				return fmt.Errorf("failed to install codex CLI for %s (%s)", runtime.GOOS, attemptError)
+			if exitCode, ok := commandExitCode(err); ok {
+				if exitCode == codexInstallDiskExit || exitCode == codexInstallFailureExit {
+					return fmt.Errorf("failed to install codex CLI for %s (%s)", runtime.GOOS, attemptError)
+				}
 			}
 			if diskErr := ensureCodexInstallDiskSpace(out, installerEnv, nil); diskErr != nil {
 				return diskErr
@@ -1751,10 +2000,29 @@ func commandExitCode(err error) (int, bool) {
 func codexInstallerCandidates(goos string) []codexInstallCmd {
 	switch strings.ToLower(goos) {
 	case "windows":
-		return []codexInstallCmd{
-			{path: "powershell", args: []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", codexInstallBootstrapWindows}},
-			{path: "pwsh", args: []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", codexInstallBootstrapWindows}},
+		out := make([]codexInstallCmd, 0, 3)
+		seen := map[string]struct{}{}
+		add := func(path string) {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				return
+			}
+			key := strings.ToLower(path)
+			if _, ok := seen[key]; ok {
+				return
+			}
+			seen[key] = struct{}{}
+			out = append(out, codexInstallCmd{
+				path: path,
+				args: []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", codexInstallBootstrapWindows},
+			})
 		}
+		if systemRoot := strings.TrimSpace(os.Getenv("SystemRoot")); systemRoot != "" {
+			add(strings.TrimRight(systemRoot, `\/`) + `\System32\WindowsPowerShell\v1.0\powershell.exe`)
+		}
+		add("powershell")
+		add("pwsh")
+		return out
 	case "darwin", "linux":
 		return []codexInstallCmd{
 			{path: "bash", args: []string{"-c", codexInstallBootstrap}},

@@ -132,7 +132,7 @@ def run_smoke_for_version(version: str, *, repo_root: Path) -> dict[str, object]
     }
     try:
         install = subprocess.run(
-            ["npm", "install", "-g", f"--prefix={prefix}", f"@openai/codex@{version}"],
+            ["npm", "install", "-g", "--include=optional", f"--prefix={prefix}", f"@openai/codex@{version}"],
             cwd=str(repo_root),
             text=True,
             capture_output=True,

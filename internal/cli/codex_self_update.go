@@ -29,6 +29,7 @@ var (
 	codexSelfUpdateDetectSource = detectCodexUpgradeSourceForPath
 	codexSelfUpdateCleanupStale = cleanupStaleCodexRetiredPathsForSource
 	codexSelfUpdateRunRealNpm   = runCodexSelfUpdateRealNpm
+	internalNpmWrapperExit      = os.Exit
 )
 
 func newInternalNpmWrapperCmd() *cobra.Command {
@@ -38,7 +39,7 @@ func newInternalNpmWrapperCmd() *cobra.Command {
 		Hidden:             true,
 		DisableFlagParsing: true,
 		Run: func(cmd *cobra.Command, args []string) {
-			os.Exit(runInternalNpmWrapper(cmd.Context(), args, cmd.ErrOrStderr()))
+			internalNpmWrapperExit(runInternalNpmWrapper(cmd.Context(), args, cmd.ErrOrStderr()))
 		},
 	}
 }

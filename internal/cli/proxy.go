@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -424,6 +425,7 @@ func newProxyDoctorCmd(root *rootOptions) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var issues []string
+			ensureManagedNodeOnPath()
 
 			if _, err := proxyLookPath("ssh"); err != nil {
 				issues = append(issues, "missing `ssh` (OpenSSH client)")
@@ -437,8 +439,12 @@ func newProxyDoctorCmd(root *rootOptions) *cobra.Command {
 			if _, err := proxyLookPath("node"); err != nil {
 				issues = append(issues, "missing `node` (Node.js runtime, required by codex CLI)")
 			}
-			if _, err := proxyLookPath("codex"); err != nil {
-				issues = append(issues, "missing `codex` (install with: npm install -g @openai/codex)")
+			if _, err := findInstalledCodex(cmd.Context()); err != nil {
+				if !errors.Is(err, errCodexBinaryNotFound) && strings.Contains(err.Error(), "not functional") {
+					issues = append(issues, "codex is installed but not functional: "+err.Error())
+				} else {
+					issues = append(issues, "missing `codex` (install with: npm install -g @openai/codex)")
+				}
 			}
 
 			store, _, err := newRootStore(root, "")
@@ -476,7 +482,11 @@ func newProxyDoctorCmd(root *rootOptions) *cobra.Command {
 }
 
 func installHints() []string {
-	switch runtime.GOOS {
+	return installHintsForOS(runtime.GOOS, linuxOSReleaseID())
+}
+
+func installHintsForOS(goos string, linuxID string) []string {
+	switch goos {
 	case "darwin":
 		return []string{
 			"macOS usually ships with ssh; if not: `xcode-select --install`",
@@ -487,13 +497,13 @@ func installHints() []string {
 		return []string{
 			"Windows 10/11: enable/install OpenSSH Client in Optional Features",
 			"or via winget: `winget install Microsoft.OpenSSH.Beta`",
+			"Install Microsoft Visual C++ 2015-2022 Redistributable matching Codex architecture: x64 `winget install --id Microsoft.VCRedist.2015+.x64 -e`, ARM64 `winget install --id Microsoft.VCRedist.2015+.arm64 -e`",
 			"Install Node.js: https://nodejs.org/",
 			"Install codex CLI: `npm install -g @openai/codex`",
 		}
 	case "linux":
-		id := linuxOSReleaseID()
 		hints := []string{}
-		switch id {
+		switch linuxID {
 		case "ubuntu", "debian":
 			hints = append(hints, "Debian/Ubuntu: `sudo apt-get update && sudo apt-get install -y openssh-client`")
 		case "centos", "rhel":

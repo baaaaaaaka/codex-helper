@@ -11,10 +11,11 @@ retry_sleep_seconds="${RETRY_SLEEP_SECONDS:-5}"
 apt_retry_attempts="${APT_RETRY_ATTEMPTS:-6}"
 apt_retry_sleep_seconds="${APT_RETRY_SLEEP_SECONDS:-5}"
 apt_retry_max_sleep_seconds="${APT_RETRY_MAX_SLEEP_SECONDS:-20}"
+ci_script_dir="${CI_SCRIPT_DIR:-/ci}"
 packages=("$@")
 
 retry_cmd() {
-  bash /ci/retry.sh "$retry_attempts" "$retry_sleep_seconds" "$@"
+  bash "$ci_script_dir/retry.sh" "$retry_attempts" "$retry_sleep_seconds" "$@"
 }
 
 apt_retry_delay_seconds() {
@@ -97,7 +98,7 @@ Acquire::https::Timeout "30";
 EOF
   if ! strict_apt_update; then
     if is_ubuntu; then
-      bash /ci/configure_container_repos.sh ubuntu-azure-archive
+      bash "$ci_script_dir/configure_container_repos.sh" ubuntu-azure-archive
       run_strategy ubuntu-azure-archive strict_apt_update
     else
       return 1
@@ -151,7 +152,7 @@ if command -v dnf >/dev/null 2>&1; then
     if run_strategy rocky-default dnf_install; then
       exit 0
     fi
-    bash /ci/configure_container_repos.sh rocky-official
+    bash "$ci_script_dir/configure_container_repos.sh" rocky-official
     run_strategy rocky-official-baseurl dnf_install
     exit 0
   fi
@@ -162,7 +163,7 @@ fi
 
 if command -v yum >/dev/null 2>&1; then
   if [[ -f /etc/yum.repos.d/CentOS-Base.repo ]]; then
-    bash /ci/configure_container_repos.sh centos-vault
+    bash "$ci_script_dir/configure_container_repos.sh" centos-vault
   fi
   yum_install
   exit 0

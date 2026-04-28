@@ -43,6 +43,25 @@ func TestBuildArgs_IncludesRequiredOptions(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_UsesHostDestinationWithoutUserOrBatchMode(t *testing.T) {
+	args, err := BuildArgs(TunnelConfig{
+		Host:      "example.com",
+		Port:      22,
+		SocksPort: 12345,
+	})
+	if err != nil {
+		t.Fatalf("BuildArgs error: %v", err)
+	}
+	if args[len(args)-1] != "example.com" {
+		t.Fatalf("expected host-only destination, got %q", args[len(args)-1])
+	}
+	for i := 0; i < len(args); i++ {
+		if args[i] == "BatchMode=yes" {
+			t.Fatalf("expected BatchMode option to be absent, got %#v", args)
+		}
+	}
+}
+
 func TestBuildArgs_ValidatesPorts(t *testing.T) {
 	_, err := BuildArgs(TunnelConfig{
 		Host:      "h",

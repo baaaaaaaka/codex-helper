@@ -2,33 +2,51 @@
 set -euo pipefail
 
 strategy="${1:-auto}"
+container_root="${CI_CONTAINER_ROOT:-}"
+
+root_path() {
+  printf '%s%s' "$container_root" "$1"
+}
 
 configure_centos_vault() {
-  if [[ -f /etc/yum.repos.d/CentOS-Base.repo ]]; then
-    sed -i 's/^mirrorlist=/#mirrorlist=/g' /etc/yum.repos.d/CentOS-Base.repo || true
-    sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-Base.repo || true
+  local repo_file
+  repo_file="$(root_path /etc/yum.repos.d/CentOS-Base.repo)"
+  if [[ -f "$repo_file" ]]; then
+    sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo_file" || true
+    sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo_file" || true
   fi
 }
 
 configure_rocky_official() {
-  if ls /etc/yum.repos.d/Rocky-*.repo >/dev/null 2>&1; then
-    sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/Rocky-*.repo || true
-    sed -i 's|^#baseurl=http://dl\.rockylinux\.org/|baseurl=https://dl.rockylinux.org/|g' /etc/yum.repos.d/Rocky-*.repo || true
-    dnf clean all >/dev/null 2>&1 || true
+  local repo_dir
+  repo_dir="$(root_path /etc/yum.repos.d)"
+  local repos=("$repo_dir"/Rocky-*.repo)
+  if [[ -e "${repos[0]}" ]]; then
+    sed -i 's|^mirrorlist=|#mirrorlist=|g' "${repos[@]}" || true
+    sed -i 's|^#baseurl=http://dl\.rockylinux\.org/|baseurl=https://dl.rockylinux.org/|g' "${repos[@]}" || true
+    if [[ -z "$container_root" ]]; then
+      dnf clean all >/dev/null 2>&1 || true
+    fi
   fi
 }
 
 rewrite_ubuntu_archive_mirror() {
   local replacement_host="$1"
   local sources=()
-  if [[ -f /etc/apt/sources.list ]]; then
-    sources+=(/etc/apt/sources.list)
+  local sources_list
+  sources_list="$(root_path /etc/apt/sources.list)"
+  if [[ -f "$sources_list" ]]; then
+    sources+=("$sources_list")
   fi
-  if compgen -G "/etc/apt/sources.list.d/*.list" >/dev/null 2>&1; then
-    sources+=(/etc/apt/sources.list.d/*.list)
+  local sources_dir
+  sources_dir="$(root_path /etc/apt/sources.list.d)"
+  local list_sources=("$sources_dir"/*.list)
+  if [[ -e "${list_sources[0]}" ]]; then
+    sources+=("${list_sources[@]}")
   fi
-  if compgen -G "/etc/apt/sources.list.d/*.sources" >/dev/null 2>&1; then
-    sources+=(/etc/apt/sources.list.d/*.sources)
+  local deb822_sources=("$sources_dir"/*.sources)
+  if [[ -e "${deb822_sources[0]}" ]]; then
+    sources+=("${deb822_sources[@]}")
   fi
 
   if [[ "${#sources[@]}" -eq 0 ]]; then
@@ -39,7 +57,9 @@ rewrite_ubuntu_archive_mirror() {
     sed -i -E "s|https?://archive\.ubuntu\.com/ubuntu/?|http://${replacement_host}/ubuntu/|g" "$source_file" || true
   done
 
-  rm -rf /var/lib/apt/lists/*
+  local apt_lists
+  apt_lists="$(root_path /var/lib/apt/lists)"
+  rm -rf "$apt_lists"/*
 }
 
 configure_ubuntu_azure_archive() {

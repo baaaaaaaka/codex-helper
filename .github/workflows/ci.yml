@@ -27,12 +27,21 @@ jobs:
           go-version: "1.24.12"
           cache: true
 
+      - name: Workflow lint (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+
       - name: Check CI helper scripts (Linux only)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          bash -n scripts/ci/install_node_local.sh
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(find scripts/ci -name '*.sh' -print0)
 
       - name: Script unit tests (Linux/macOS)
         if: runner.os != 'Windows'
@@ -233,6 +242,38 @@ jobs:
           $pattern = 'Test(PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
           go test ./internal/cli -count=1 -run $pattern
 
+      - name: Self-update env pollution regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CODEX_PROXY_REAL_NPM: /tmp/codex-proxy-wrapper/npm
+          CODEX_PROXY_ORIGINAL_PATH: /usr/bin:/bin
+          CODEX_PROXY_UPDATE_ORIGIN: system-npm
+          CODEX_PROXY_UPDATE_CODEX_PATH: /tmp/codex-proxy-wrapper/codex
+          CODEX_PROXY_UPDATE_NPM_PREFIX: /tmp/codex-proxy-wrapper/prefix
+          CODEX_PROXY_NPM_WRAPPER_EXE: /tmp/codex-proxy-wrapper/codex-proxy
+          npm_config_prefix: /tmp/codex-proxy-wrapper/npm-prefix
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix)|RunTargetOnceWithOptionsUsesPatchInfoForSelfUpdateGuard)$'
+
+      - name: Self-update env pollution regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CODEX_PROXY_REAL_NPM: C:\codex-proxy-wrapper\npm.cmd
+          CODEX_PROXY_ORIGINAL_PATH: C:\Windows\System32
+          CODEX_PROXY_UPDATE_ORIGIN: system-npm
+          CODEX_PROXY_UPDATE_CODEX_PATH: C:\codex-proxy-wrapper\codex.cmd
+          CODEX_PROXY_UPDATE_NPM_PREFIX: C:\codex-proxy-wrapper\prefix
+          CODEX_PROXY_NPM_WRAPPER_EXE: C:\codex-proxy-wrapper\codex-proxy.exe
+          npm_config_prefix: C:\codex-proxy-wrapper\npm-prefix
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $pattern = 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix))$'
+          go test ./internal/cli -count=1 -run $pattern
+
       - name: go vet
         run: go vet ./...
 
@@ -266,7 +307,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/ci/retry.sh 5 5 npm install -g @openai/codex || true
+          bash scripts/ci/retry.sh 5 5 npm install -g --include=optional @openai/codex || true
 
       - name: Install Codex for integration (Windows)
         if: runner.os == 'Windows'
@@ -274,7 +315,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          & .\scripts\ci\retry.ps1 5 5 npm install -g '@openai/codex'
+          & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional '@openai/codex'
 
       - name: Codex upgrade integration (system npm, Linux/macOS)
         if: runner.os != 'Windows'
@@ -295,7 +336,7 @@ jobs:
             bin_retired="$(retire_path "$prefix/bin/codex")"
             echo stale > "$bin_retired"
           }
-          bash scripts/ci/retry.sh 5 5 npm install -g @openai/codex
+          bash scripts/ci/retry.sh 5 5 npm install -g --include=optional @openai/codex
           system_prefix="$(npm prefix -g)"
           seed_stale_codex_backup "$system_prefix"
           go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-system.json" --upgrade-codex
@@ -329,7 +370,7 @@ jobs:
             echo stale > "$bin_retired"
           }
           local_prefix="$RUNNER_TEMP/codex-local-prefix"
-          bash scripts/ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" @openai/codex
+          bash scripts/ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" --include=optional @openai/codex
           export CODEX_NPM_PREFIX="$local_prefix"
           export PATH="$local_prefix/bin:$local_prefix:$PATH"
           seed_stale_codex_backup "$local_prefix"
@@ -372,7 +413,7 @@ jobs:
             $ps1Retired = Get-RetirePath (Join-Path $Prefix "codex.ps1")
             Set-Content -Path $ps1Retired -Value "stale"
           }
-          & .\scripts\ci\retry.ps1 5 5 npm install -g '@openai/codex'
+          & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional '@openai/codex'
           $systemPrefix = (npm prefix -g).Trim()
           New-StaleCodexBackup $systemPrefix
           go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-system.json" --upgrade-codex
@@ -411,7 +452,7 @@ jobs:
             Set-Content -Path $ps1Retired -Value "stale"
           }
           $localPrefix = Join-Path $env:RUNNER_TEMP "codex-local-prefix"
-          & .\scripts\ci\retry.ps1 5 5 npm install -g --prefix $localPrefix '@openai/codex'
+          & .\scripts\ci\retry.ps1 5 5 npm install -g --prefix $localPrefix --include=optional '@openai/codex'
           $localBin = Join-Path $localPrefix "bin"
           $env:CODEX_NPM_PREFIX = $localPrefix
           $env:PATH = "$localPrefix;$localBin;$env:PATH"
@@ -454,8 +495,8 @@ jobs:
             Write-Host "Codex not available, skipping patch integration test"
           }
 
-      - name: Managed-node install integration (Linux)
-        if: runner.os == 'Linux'
+      - name: Managed-node install integration (Linux/macOS)
+        if: runner.os != 'Windows'
         shell: bash
         env:
           CODEX_INSTALL_TEST: "1"
@@ -556,7 +597,7 @@ jobs:
                 NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR="$(bash /ci/install_node_local.sh)"
                 export PATH="$NODE_BIN_DIR:$PATH"
 
-                bash /ci/retry.sh 5 5 npm install -g @openai/codex
+                bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex
                 system_prefix="$(npm prefix -g)"
                 /dist/codex-proxy --config /tmp/codex-upgrade-system.json --upgrade-codex
                 codex --version >/dev/null
@@ -570,7 +611,7 @@ jobs:
                 esac
 
                 local_prefix="/tmp/codex-local-prefix"
-                bash /ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" @openai/codex
+                bash /ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" --include=optional @openai/codex
                 export CODEX_NPM_PREFIX="$local_prefix"
                 export PATH="$local_prefix/bin:$local_prefix:$PATH"
                 /dist/codex-proxy --config /tmp/codex-upgrade-local.json --upgrade-codex

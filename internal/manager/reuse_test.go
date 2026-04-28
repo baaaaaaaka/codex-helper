@@ -105,6 +105,43 @@ func TestFindReusableInstanceSkipsUnhealthy(t *testing.T) {
 		}
 	})
 
+	t.Run("skips profile mismatch before health check", func(t *testing.T) {
+		prevAlive := reuseProcessAlive
+		t.Cleanup(func() { reuseProcessAlive = prevAlive })
+		reuseProcessAlive = func(int) bool {
+			t.Fatal("profile mismatch should skip process checks")
+			return true
+		}
+		instances := []config.Instance{{
+			ID:         "inst",
+			ProfileID:  "prof-other",
+			Kind:       config.InstanceKindDaemon,
+			HTTPPort:   1,
+			DaemonPID:  os.Getpid(),
+			LastSeenAt: time.Now(),
+		}}
+		if got := FindReusableInstance(instances, "prof-1", HealthClient{}); got != nil {
+			t.Fatalf("expected nil for profile mismatch, got %#v", got)
+		}
+	})
+
+	t.Run("skips dead process", func(t *testing.T) {
+		prevAlive := reuseProcessAlive
+		t.Cleanup(func() { reuseProcessAlive = prevAlive })
+		reuseProcessAlive = func(int) bool { return false }
+		instances := []config.Instance{{
+			ID:         "inst",
+			ProfileID:  "prof-1",
+			Kind:       config.InstanceKindDaemon,
+			HTTPPort:   1,
+			DaemonPID:  os.Getpid(),
+			LastSeenAt: time.Now(),
+		}}
+		if got := FindReusableInstance(instances, "prof-1", HealthClient{}); got != nil {
+			t.Fatalf("expected nil for dead process, got %#v", got)
+		}
+	})
+
 	t.Run("skips failed health check", func(t *testing.T) {
 		instances := []config.Instance{{
 			ID:         "inst",

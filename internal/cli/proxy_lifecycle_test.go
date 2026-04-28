@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -466,6 +467,7 @@ func TestProxyStopTerminatesAliveInstanceAndRemovesConfigEntry(t *testing.T) {
 
 func TestProxyDoctorReportsMissingTools(t *testing.T) {
 	lockCLITestHooks(t)
+	setMissingCodexEnv(t)
 	store := newTempStore(t)
 	prevLookPath := proxyLookPath
 	t.Cleanup(func() { proxyLookPath = prevLookPath })
@@ -496,6 +498,64 @@ func TestProxyDoctorReportsMissingTools(t *testing.T) {
 	}
 	if !strings.Contains(text, "Install hints:") {
 		t.Fatalf("expected install hints, got %q", text)
+	}
+}
+
+func TestProxyDoctorReportsNonFunctionalCodex(t *testing.T) {
+	lockCLITestHooks(t)
+	setMissingCodexEnv(t)
+	store := newTempStore(t)
+	prevLookPath := proxyLookPath
+	t.Cleanup(func() { proxyLookPath = prevLookPath })
+
+	codexDir := t.TempDir()
+	codexPath := filepath.Join(codexDir, "codex")
+	writeExecutable(t, codexPath, "#!/bin/sh\necho broken codex >&2\nexit 42\n")
+	t.Setenv("PATH", codexDir)
+
+	proxyLookPath = func(name string) (string, error) {
+		switch name {
+		case "ssh":
+			return "/usr/bin/ssh", nil
+		case "ssh-keygen":
+			return "/usr/bin/ssh-keygen", nil
+		case "npm":
+			return "/usr/bin/npm", nil
+		case "node":
+			return "/usr/bin/node", nil
+		default:
+			return "", errors.New("missing")
+		}
+	}
+
+	cmd := newProxyDoctorCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy doctor: %v", err)
+	}
+
+	text := out.String()
+	if !strings.Contains(text, "codex is installed but not functional") {
+		t.Fatalf("expected nonfunctional codex issue, got %q", text)
+	}
+	if !strings.Contains(text, "broken codex") {
+		t.Fatalf("expected probe output in doctor issue, got %q", text)
+	}
+}
+
+func TestWindowsInstallHintsIncludeNativeRuntime(t *testing.T) {
+	hints := strings.Join(installHintsForOS("windows", ""), "\n")
+	if !strings.Contains(hints, "Microsoft Visual C++ 2015-2022 Redistributable") {
+		t.Fatalf("expected VC++ redistributable hint, got %q", hints)
+	}
+	if !strings.Contains(hints, "Microsoft.VCRedist.2015+.x64") {
+		t.Fatalf("expected x64 winget package hint, got %q", hints)
+	}
+	if !strings.Contains(hints, "Microsoft.VCRedist.2015+.arm64") {
+		t.Fatalf("expected ARM64 winget package hint, got %q", hints)
 	}
 }
 

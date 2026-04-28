@@ -115,6 +115,32 @@ func TestHTTPProxyEdgeCases(t *testing.T) {
 		}
 	})
 
+	t.Run("Close releases listener", func(t *testing.T) {
+		p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+			return nil, io.EOF
+		}), Options{})
+		addr, err := p.Start("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if err := p.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			t.Fatalf("expected listener at %s to be closed", addr)
+		}
+		restartedAddr, err := p.Start("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Start after Close: %v", err)
+		}
+		defer func() { _ = p.Close(context.Background()) }()
+		if restartedAddr == "" {
+			t.Fatal("expected restarted proxy address")
+		}
+	})
+
 	t.Run("handleConnect validates host and hijack", func(t *testing.T) {
 		p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
 			return nil, errors.New("dial failed")
