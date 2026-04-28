@@ -696,14 +696,14 @@ function Resolve-CodexNativeRuntimeArch {
   if (-not [string]::IsNullOrWhiteSpace($npmPrefix)) {
     $openaiRoot = Join-Path $npmPrefix 'node_modules\@openai'
     $arm64Checks = @(
-      Join-Path $openaiRoot 'codex-win32-arm64\vendor\aarch64-pc-windows-msvc\codex\codex.exe',
-      Join-Path $openaiRoot 'codex\node_modules\@openai\codex-win32-arm64\vendor\aarch64-pc-windows-msvc\codex\codex.exe',
-      Join-Path $openaiRoot 'codex\vendor\aarch64-pc-windows-msvc\codex\codex.exe'
+      (Join-Path $openaiRoot 'codex-win32-arm64\vendor\aarch64-pc-windows-msvc\codex\codex.exe')
+      (Join-Path $openaiRoot 'codex\node_modules\@openai\codex-win32-arm64\vendor\aarch64-pc-windows-msvc\codex\codex.exe')
+      (Join-Path $openaiRoot 'codex\vendor\aarch64-pc-windows-msvc\codex\codex.exe')
     )
     $x64Checks = @(
-      Join-Path $openaiRoot 'codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe',
-      Join-Path $openaiRoot 'codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe',
-      Join-Path $openaiRoot 'codex\vendor\x86_64-pc-windows-msvc\codex\codex.exe'
+      (Join-Path $openaiRoot 'codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe')
+      (Join-Path $openaiRoot 'codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe')
+      (Join-Path $openaiRoot 'codex\vendor\x86_64-pc-windows-msvc\codex\codex.exe')
     )
     $orderedArchs = @($preferredArch)
     if ($preferredArch -ne 'arm64') { $orderedArchs += 'arm64' }

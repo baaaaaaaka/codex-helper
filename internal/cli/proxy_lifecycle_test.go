@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -509,9 +510,15 @@ func TestProxyDoctorReportsNonFunctionalCodex(t *testing.T) {
 	t.Cleanup(func() { proxyLookPath = prevLookPath })
 
 	codexDir := t.TempDir()
-	codexPath := filepath.Join(codexDir, "codex")
-	writeExecutable(t, codexPath, "#!/bin/sh\necho broken codex >&2\nexit 42\n")
-	t.Setenv("PATH", codexDir)
+	codexName := "codex"
+	codexScript := "#!/bin/sh\necho broken codex >&2\nexit 42\n"
+	if runtime.GOOS == "windows" {
+		codexName = "codex.cmd"
+		codexScript = "@echo off\r\necho broken codex 1>&2\r\nexit /b 42\r\n"
+	}
+	codexPath := filepath.Join(codexDir, codexName)
+	writeExecutable(t, codexPath, codexScript)
+	t.Setenv("PATH", codexDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	proxyLookPath = func(name string) (string, error) {
 		switch name {
