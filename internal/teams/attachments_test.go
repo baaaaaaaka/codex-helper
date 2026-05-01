@@ -96,7 +96,7 @@ func TestDownloadReferenceFileAttachmentsRequiresFileScope(t *testing.T) {
 
 func TestDownloadReferenceFileAttachmentsWritesPrivateFile(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "openid profile offline_access User.Read Chat.Read Files.Read")
 	graph, requested := newAttachmentGraph(t)
 	bridge := &Bridge{readGraph: graph}
@@ -130,7 +130,7 @@ func TestDownloadReferenceFileAttachmentsWritesPrivateFile(t *testing.T) {
 
 func TestDownloadHostedContentUsesWorkspaceRelativePromptAlias(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/hostedContents/content-1/$value") {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())

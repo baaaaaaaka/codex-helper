@@ -326,7 +326,7 @@ func TestDefaultAuthConfigAllowsDocumentedScopes(t *testing.T) {
 
 func TestDefaultFileWriteAuthConfigUsesSeparateCacheAndScopes(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_SCOPES", "")
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
@@ -348,7 +348,7 @@ func TestDefaultFileWriteAuthConfigUsesSeparateCacheAndScopes(t *testing.T) {
 
 func TestDefaultReadAuthConfigUsesReadClientCacheAndScopes(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", "")
@@ -366,7 +366,7 @@ func TestDefaultReadAuthConfigUsesReadClientCacheAndScopes(t *testing.T) {
 	if cfg.Scopes != defaultReadScopes {
 		t.Fatalf("read scopes = %q, want %q", cfg.Scopes, defaultReadScopes)
 	}
-	want := filepath.Join(tmp, "codex-helper", "teams", "profiles", "default", readTokenCacheName)
+	want := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", readTokenCacheName)
 	if cfg.CachePath != want {
 		t.Fatalf("read cache path = %q, want %q", cfg.CachePath, want)
 	}
@@ -387,7 +387,7 @@ func TestDefaultReadAuthConfigAllowsTeamsCLIReadScopes(t *testing.T) {
 
 func TestDefaultAuthConfigUsesProfileScopedCache(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
@@ -396,7 +396,7 @@ func TestDefaultAuthConfigUsesProfileScopedCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultAuthConfig error: %v", err)
 	}
-	want := filepath.Join(tmp, "codex-helper", "teams", "profiles", "default", chatWriteTokenCacheName)
+	want := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", chatWriteTokenCacheName)
 	if cfg.CachePath != want {
 		t.Fatalf("cache path = %q, want %q", cfg.CachePath, want)
 	}
@@ -404,11 +404,11 @@ func TestDefaultAuthConfigUsesProfileScopedCache(t *testing.T) {
 
 func TestDefaultAuthConfigKeepsExistingLegacyDefaultCache(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
-	legacy := filepath.Join(tmp, "codex-helper", chatWriteTokenCacheName)
+	legacy := filepath.Join(cacheBase, "codex-helper", chatWriteTokenCacheName)
 	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
 		t.Fatalf("mkdir legacy cache dir: %v", err)
 	}
@@ -427,12 +427,12 @@ func TestDefaultAuthConfigKeepsExistingLegacyDefaultCache(t *testing.T) {
 
 func TestDefaultAuthConfigUsesLegacyDefaultCacheWithBroadCachedScopes(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
-	legacy := filepath.Join(tmp, "codex-helper", chatWriteTokenCacheName)
+	legacy := filepath.Join(cacheBase, "codex-helper", chatWriteTokenCacheName)
 	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
 		t.Fatalf("mkdir legacy cache dir: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestDefaultAuthConfigUsesLegacyDefaultCacheWithBroadCachedScopes(t *testing
 
 func TestDefaultAuthConfigUsesTeamsProfileForCache(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "research/teams")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
@@ -460,7 +460,7 @@ func TestDefaultAuthConfigUsesTeamsProfileForCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultAuthConfig error: %v", err)
 	}
-	want := filepath.Join(tmp, "codex-helper", "teams", "profiles", "research_teams", chatWriteTokenCacheName)
+	want := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "research_teams", chatWriteTokenCacheName)
 	if cfg.CachePath != want {
 		t.Fatalf("cache path = %q, want %q", cfg.CachePath, want)
 	}
@@ -468,7 +468,7 @@ func TestDefaultAuthConfigUsesTeamsProfileForCache(t *testing.T) {
 
 func TestDefaultFileWriteAuthConfigUsesAuthProfileOverride(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "teams-profile")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "auth-profile")
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", "")
@@ -477,7 +477,7 @@ func TestDefaultFileWriteAuthConfigUsesAuthProfileOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
 	}
-	want := filepath.Join(tmp, "codex-helper", "teams", "profiles", "auth-profile", fileWriteTokenCacheName)
+	want := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "auth-profile", fileWriteTokenCacheName)
 	if cfg.CachePath != want {
 		t.Fatalf("file-write cache path = %q, want %q", cfg.CachePath, want)
 	}

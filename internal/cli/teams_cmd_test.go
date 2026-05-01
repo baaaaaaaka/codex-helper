@@ -21,8 +21,7 @@ func TestTeamsStatusReportsLocalStateWithoutCreatingDefaultState(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
 
 	registryPath := filepath.Join(tmp, "teams-registry.json")
 	cmd := newRootCmd()
@@ -44,7 +43,7 @@ func TestTeamsStatusReportsLocalStateWithoutCreatingDefaultState(t *testing.T) {
 			t.Fatalf("teams status output missing %q:\n%s", want, got)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "config", "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(configBase, "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
 		t.Fatalf("teams status should not create state file, stat err = %v", err)
 	}
 	if _, err := os.Stat(registryPath); !os.IsNotExist(err) {
@@ -56,9 +55,8 @@ func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
-	scopedStatePath := filepath.Join(tmp, "config", "codex-helper", "teams", "scopes", "scope-a", "state.json")
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	scopedStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope-a", "state.json")
 	st, err := teamsstore.Open(scopedStatePath)
 	if err != nil {
 		t.Fatalf("Open scoped store: %v", err)
@@ -102,8 +100,7 @@ func TestTeamsSetupPrintsSafeChecklistWithoutState(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
 
 	out := executeRootForTeamsTest(t, "teams", "setup")
 	for _, want := range []string{
@@ -119,7 +116,7 @@ func TestTeamsSetupPrintsSafeChecklistWithoutState(t *testing.T) {
 			t.Fatalf("setup output missing %q:\n%s", want, out)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "config", "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(configBase, "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
 		t.Fatalf("teams setup should not create state file, stat err = %v", err)
 	}
 }
@@ -128,7 +125,7 @@ func TestTeamsStatusAndControlPrintShowControlChatDetails(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	registryPath := filepath.Join(tmp, "teams-registry.json")
 	controlTopic := teams.ControlChatTitle(teams.ChatTitleOptions{MachineLabel: "host"})
 	reg := teams.Registry{
@@ -190,7 +187,7 @@ func TestTeamsPauseDrainResumePersistServiceControl(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateTeamsUserDirsForTest(t, tmp)
 
 	out := executeRootForTeamsTest(t, "teams", "pause", "upgrade")
 	if !strings.Contains(out, "Teams processing paused: upgrade") {
@@ -224,7 +221,7 @@ func TestTeamsStatusReportsPollDiagnostics(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	st, err := openTeamsStore()
 	if err != nil {
 		t.Fatalf("openTeamsStore error: %v", err)
@@ -246,8 +243,7 @@ func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	prevLive := runTeamsDoctorLiveCheck
 	prevProbe := runTeamsAppServerProbe
 	liveCalled := false
@@ -444,7 +440,7 @@ func TestTeamsSendFileMissingTokenFailsClosedWithoutDeviceLogin(t *testing.T) {
 	if err := os.WriteFile(file, []byte("report"), 0o600); err != nil {
 		t.Fatalf("write report: %v", err)
 	}
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", filepath.Join(tmp, "missing-file-token.json"))
 
 	out, err := executeRootForTeamsTestAllowError(t, "teams", "send-file", "--chat-id", "chat-1", "--yes", "--allow-local-path", file)
@@ -463,7 +459,7 @@ func TestTeamsRecoverMissingStateIsLocalNoop(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
 
 	cmd := newRootCmd()
 	cmd.SetArgs([]string{"teams", "recover"})
@@ -475,7 +471,7 @@ func TestTeamsRecoverMissingStateIsLocalNoop(t *testing.T) {
 	if !strings.Contains(out.String(), "Teams state unavailable") {
 		t.Fatalf("expected missing state message, got:\n%s", out.String())
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "config", "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(configBase, "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
 		t.Fatalf("teams recover should not create missing state file, stat err = %v", err)
 	}
 }
@@ -484,7 +480,7 @@ func TestTeamsRecoverRefusesLiveOwnerUnlessForced(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	st := seedRecoverableTeamsState(t)
 	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn:manual", time.Now())
 	if err != nil {
@@ -524,7 +520,7 @@ func TestTeamsRecoverAllowsStaleOwner(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	st := seedRecoverableTeamsState(t)
 	old := time.Now().Add(-time.Hour)
 	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn:manual", old)

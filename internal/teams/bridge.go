@@ -131,7 +131,7 @@ func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
 		desiredTopic := ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()), Profile: b.scope.Profile})
 		if desiredTopic != "" && b.reg.ControlChatTopic != desiredTopic {
 			if err := b.graph.UpdateChatTopic(ctx, b.reg.ControlChatID, desiredTopic); err == nil {
-				b.reg.ControlChatTopic = desiredTopic
+				b.reg.ControlChatTopic = SanitizeTopic(desiredTopic)
 				_ = b.recordControlChatBinding(ctx, Chat{ID: b.reg.ControlChatID, Topic: b.reg.ControlChatTopic, WebURL: b.reg.ControlChatURL})
 				_ = b.Save()
 			}

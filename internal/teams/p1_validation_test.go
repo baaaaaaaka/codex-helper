@@ -93,7 +93,7 @@ func TestP1RendererMatrixEscapesCRLFAndEmptyText(t *testing.T) {
 
 func TestP1ArtifactManifestWithoutFileWriteAuthLeavesFinalVisibleAndWarns(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", filepath.Join(tmp, "missing-file-write-token.json"))
 
 	resultText := "done\n```" + ArtifactManifestFenceInfo + "\n" +
@@ -189,7 +189,7 @@ func TestP1TranscriptFormattingStripsHiddenHelperPrompt(t *testing.T) {
 
 func TestP1ArtifactManifestRejectedAfterFinalWhenAuthExists(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)

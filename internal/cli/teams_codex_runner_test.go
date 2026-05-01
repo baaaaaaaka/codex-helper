@@ -171,7 +171,7 @@ func TestRunTeamsUpgradeCodexOnceUsesExistingUpgradePath(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg"))
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfgPath := filepath.Join(tmp, "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {
@@ -216,7 +216,7 @@ func TestRunTeamsUpgradeCodexOnceRejectsLiveTeamsOwnerBeforeUpgrade(t *testing.T
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg"))
+	isolateTeamsUserDirsForTest(t, tmp)
 
 	prevUpgrade := upgradeCodexInstalledForTeamsRun
 	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })

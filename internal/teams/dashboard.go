@@ -72,7 +72,7 @@ func ControlChatTitle(opts ChatTitleOptions) string {
 func WorkChatTitle(opts ChatTitleOptions) string {
 	marker := sanitizedTitlePart(opts.Marker, DefaultWorkChatMarker)
 	sessionID := shortTitleIDPart(opts.SessionID, "session")
-	return joinTitleParts(marker, DashboardDisplayTitle(opts.UserTitle, opts.Topic, opts.Cwd), machineTitlePart(opts.MachineLabel), sessionID)
+	return joinTitleParts(marker, sessionID, DashboardDisplayTitle(opts.UserTitle, opts.Topic, opts.Cwd), machineTitlePart(opts.MachineLabel))
 }
 
 func DashboardDisplayTitle(userTitle string, topic string, cwd string) string {

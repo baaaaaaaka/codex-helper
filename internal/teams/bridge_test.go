@@ -2584,7 +2584,7 @@ func TestBridgeSessionReferenceFileAttachmentIsDownloadedForCodexTurn(t *testing
 
 func TestBridgeSessionSendFileCommandUploadsOutboundAttachment(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
@@ -2626,7 +2626,7 @@ func TestBridgeSessionSendFileCommandUploadsOutboundAttachment(t *testing.T) {
 
 func TestBridgeSessionSendFileAttachmentUsesDurableOutboxOnRateLimit(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
@@ -2730,7 +2730,7 @@ func TestBridgeSessionSendFileAttachmentUsesDurableOutboxOnRateLimit(t *testing.
 
 func TestBridgeAttachmentSendFailureRestartReusesUploadedDriveItem(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
@@ -2859,7 +2859,7 @@ func TestBridgeAttachmentSendFailureRestartReusesUploadedDriveItem(t *testing.T)
 
 func TestBridgeSessionSendFileQueuesDurableOutboxBeforeUpload(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
@@ -2947,7 +2947,7 @@ func TestBridgeSessionSendFileQueuesDurableOutboxBeforeUpload(t *testing.T) {
 
 func TestBridgeAttachmentReplayRejectsTamperedStagedFileBeforeUpload(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
@@ -4381,7 +4381,7 @@ func TestBridgeSessionRenameUpdatesTeamsTopicAndDurableState(t *testing.T) {
 
 func TestBridgeUploadsArtifactManifestFromCodexResult(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)

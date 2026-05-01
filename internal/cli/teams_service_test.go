@@ -12,6 +12,25 @@ import (
 	"testing"
 )
 
+func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
+	t.Helper()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("APPDATA", filepath.Join(tmp, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "AppData", "Local"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	configBase, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("os.UserConfigDir: %v", err)
+	}
+	cacheBase, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatalf("os.UserCacheDir: %v", err)
+	}
+	return configBase, cacheBase
+}
+
 func teamsServiceTestAbsPath(t *testing.T, path string) string {
 	t.Helper()
 	out, err := filepath.Abs(path)
@@ -152,7 +171,7 @@ func TestTeamsServiceInstallRejectsGoRunTemporaryExecutable(t *testing.T) {
 
 func TestTeamsServiceAuthPreflightRequiresForegroundLogin(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	isolateTeamsUserDirsForTest(t, tmp)
 
 	err := defaultTeamsServiceAuthPreflight()
 	if err == nil || !strings.Contains(err.Error(), "teams auth") {
