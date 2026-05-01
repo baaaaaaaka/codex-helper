@@ -151,8 +151,7 @@ func TestUpgradeCmdPropagatesUpdateError(t *testing.T) {
 func isolateUpgradeTeamsServiceForTest(t *testing.T) *recordingTeamsServiceRunner {
 	t.Helper()
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	runner := &recordingTeamsServiceRunner{}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
@@ -164,11 +163,18 @@ func isolateUpgradeTeamsServiceForTest(t *testing.T) *recordingTeamsServiceRunne
 	return runner
 }
 
+func isolateUpgradeTeamsStateForTest(t *testing.T, tmp string) {
+	t.Helper()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+}
+
 func TestUpgradeCmdDrainsLiveTeamsOwnerBeforeUpdate(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval
@@ -237,7 +243,7 @@ func TestUpgradeCmdDrainsScopedTeamsStateBeforeUpdate(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval
@@ -291,7 +297,7 @@ func TestUpgradeCmdAllowsDeferredTeamsInboundWithoutOwner(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	t.Cleanup(func() {
@@ -334,7 +340,7 @@ func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) 
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	if err := os.MkdirAll(unitDir, 0o700); err != nil {
 		t.Fatalf("mkdir unit dir: %v", err)
@@ -403,7 +409,7 @@ func TestUpgradeCmdDelaysTeamsServiceRestartWhenUpdateNeedsProcessExit(t *testin
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	if err := os.MkdirAll(unitDir, 0o700); err != nil {
 		t.Fatalf("mkdir unit dir: %v", err)
@@ -560,7 +566,7 @@ func TestUpgradeCmdStopsActiveTeamsServiceWithoutStateFile(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	if err := os.MkdirAll(unitDir, 0o700); err != nil {
 		t.Fatalf("mkdir unit dir: %v", err)
@@ -610,7 +616,7 @@ func TestUpgradeCmdPreservesExistingTeamsDrain(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval
@@ -664,7 +670,7 @@ func TestUpgradeCmdRestoresTeamsDrainOnTimeout(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval
@@ -707,7 +713,7 @@ func TestUpgradeCmdTimesOutBeforeUpdatingWhenTeamsOwnerStaysLive(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval
