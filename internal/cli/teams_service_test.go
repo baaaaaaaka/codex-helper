@@ -144,7 +144,7 @@ func TestTeamsServiceInstallWithoutRegistryLetsBridgeUseScopedDefaults(t *testin
 	if strings.Contains(unit, "--registry") {
 		t.Fatalf("default service unit should not force a shared legacy registry:\n%s", unit)
 	}
-	if !strings.Contains(unit, "ExecStart="+exePath+" teams run") {
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(exePath)+" teams run") {
 		t.Fatalf("unit missing teams run ExecStart:\n%s", unit)
 	}
 }
@@ -270,12 +270,12 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	}
 	unit := string(data)
 	for _, want := range []string{
-		`Environment="CODEX_HOME=` + filepath.Join(tmp, "codex home") + `"`,
-		"Environment=CODEX_HELPER_TEAMS_PROFILE=work-profile",
-		"Environment=CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1",
-		"Environment=CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=" + filepath.Join(tmp, "read-token.json"),
-		"Environment=HTTPS_PROXY=http://proxy.example.test:8080",
-		"Environment=CODEX_HELPER_TEAMS_SERVICE_MODE=background",
+		"Environment=" + systemdQuoteArg("CODEX_HOME="+filepath.Join(tmp, "codex home")),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=work-profile"),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1"),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE="+filepath.Join(tmp, "read-token.json")),
+		"Environment=" + systemdQuoteArg("HTTPS_PROXY=http://proxy.example.test:8080"),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_SERVICE_MODE=background"),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing preserved env %q:\n%s", want, unit)

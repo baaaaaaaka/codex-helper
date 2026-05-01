@@ -422,6 +422,7 @@ func TestProbeAppServerCompatibilityRunsColdProbeRepeatedly(t *testing.T) {
 		if req.Command != "/managed/codex" || req.WorkingDir != "/work" {
 			t.Fatalf("start request = %#v", req)
 		}
+		time.Sleep(time.Millisecond)
 		return newFakeAppServerTransport(
 			`{"id":1,"result":{"userAgent":"codex-helper-test/0"}}`,
 			`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,

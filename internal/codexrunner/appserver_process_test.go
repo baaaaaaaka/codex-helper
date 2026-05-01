@@ -145,7 +145,9 @@ func TestAppServerProcessStarterStartFailureAndCanceledContext(t *testing.T) {
 	_, err := (AppServerProcessStarter{}).StartAppServer(context.Background(), AppServerStartRequest{
 		Command: missingCommand,
 	})
-	if err == nil || !strings.Contains(err.Error(), missingCommand) {
+	if err == nil ||
+		!strings.Contains(err.Error(), "start app-server process") ||
+		!strings.Contains(err.Error(), filepath.Base(missingCommand)) {
 		t.Fatalf("start failure did not include command path: %v", err)
 	}
 
