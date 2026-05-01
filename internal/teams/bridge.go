@@ -2109,6 +2109,7 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 	if err := b.graph.UpdateChatTopic(ctx, session.ChatID, topic); err != nil {
 		return b.sendToChat(ctx, session.ChatID, "rename failed: "+err.Error())
 	}
+	topic = SanitizeTopic(topic)
 	session.Topic = topic
 	session.UpdatedAt = time.Now()
 	if err := b.ensureDurableSession(ctx, session); err != nil {
