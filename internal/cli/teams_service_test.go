@@ -12,6 +12,23 @@ import (
 	"testing"
 )
 
+func teamsServiceTestAbsPath(t *testing.T, path string) string {
+	t.Helper()
+	out, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("filepath.Abs(%q): %v", path, err)
+	}
+	return out
+}
+
+func teamsServiceTestRegistryPath(cwd string, registryPath string) string {
+	registryPath = strings.TrimSpace(registryPath)
+	if filepath.IsAbs(registryPath) {
+		return registryPath
+	}
+	return filepath.Join(cwd, registryPath)
+}
+
 func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -610,14 +627,19 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		t.Fatalf("read WSL task config: %v", err)
 	}
 	config := string(data)
+	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
+	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/registry.json")
 	for _, want := range []string{
 		"TaskName=Codex Helper Teams Bridge (WSL Ubuntu-22.04 alice default ",
 		"Command=wsl.exe",
 		"-d Ubuntu-22.04",
 		"-u alice",
-		"--cd \"/home/alice/work dir\"",
+		"--cd ",
+		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex-home"),
-		"/home/alice/bin/codex-proxy teams run --registry /home/alice/registry.json",
+		wantExe + " teams run --registry",
+		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("WSL config missing %q:\n%s", want, config)

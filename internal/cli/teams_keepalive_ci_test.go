@@ -197,13 +197,18 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		t.Fatalf("read WSL task config: %v", err)
 	}
 	config := string(configData)
+	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
+	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/teams registry.json")
 	for _, want := range []string{
 		"Command=wsl.exe",
 		"-d Ubuntu/Dev",
 		"-u alice",
-		"--cd \"/home/alice/work dir\"",
+		"--cd ",
+		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex home"),
-		"/home/alice/bin/codex-proxy teams run --registry \"/home/alice/teams registry.json\"",
+		wantExe + " teams run --registry",
+		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("WSL config missing %q:\n%s", want, config)
