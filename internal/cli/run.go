@@ -287,6 +287,9 @@ type runTargetOptions struct {
 	UseProxy     bool
 	Log          io.Writer
 	ExecIdentity *execIdentity
+	Stdin        io.Reader
+	Stdout       io.Writer
+	Stderr       io.Writer
 	// PreserveTTY keeps stdout/stderr attached to the terminal for interactive CLIs.
 	PreserveTTY    bool
 	YoloEnabled    bool
@@ -574,26 +577,47 @@ func runTargetOnceWithOptions(
 		return identityErr
 	}
 	cmd.Env = updatedEnv
-	cmd.Stdin = os.Stdin
+	if opts.Stdin != nil {
+		cmd.Stdin = opts.Stdin
+	} else {
+		cmd.Stdin = os.Stdin
+	}
 	if opts.PreserveTTY {
-		cmd.Stdout = os.Stdout
+		stdout := os.Stdout
+		if opts.Stdout != nil {
+			cmd.Stdout = opts.Stdout
+		} else {
+			cmd.Stdout = stdout
+		}
 		// Always tee stderr to the capture buffer so that isYoloFailure
 		// can detect approval_policy errors even in TTY mode.
+		stderr := io.Writer(os.Stderr)
+		if opts.Stderr != nil {
+			stderr = opts.Stderr
+		}
 		if stderrBuf != nil {
-			cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
+			cmd.Stderr = io.MultiWriter(stderr, stderrBuf)
 		} else {
-			cmd.Stderr = os.Stderr
+			cmd.Stderr = stderr
 		}
 	} else {
+		stdout := io.Writer(os.Stdout)
+		if opts.Stdout != nil {
+			stdout = opts.Stdout
+		}
 		if stdoutBuf != nil {
-			cmd.Stdout = io.MultiWriter(os.Stdout, stdoutBuf)
+			cmd.Stdout = io.MultiWriter(stdout, stdoutBuf)
 		} else {
-			cmd.Stdout = os.Stdout
+			cmd.Stdout = stdout
+		}
+		stderr := io.Writer(os.Stderr)
+		if opts.Stderr != nil {
+			stderr = opts.Stderr
 		}
 		if stderrBuf != nil {
-			cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
+			cmd.Stderr = io.MultiWriter(stderr, stderrBuf)
 		} else {
-			cmd.Stderr = os.Stderr
+			cmd.Stderr = stderr
 		}
 	}
 

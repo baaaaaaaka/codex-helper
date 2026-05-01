@@ -3,3 +3,5 @@ coverage.out
 *.test
 /codex-proxy
 /codex-proxy.exe
+.codex
+.secrets/

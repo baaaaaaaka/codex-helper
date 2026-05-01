@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 	var repo string
 	var versionOverride string
 	var installPath string
+	var teamsDrainTimeout time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "upgrade",
@@ -35,12 +37,28 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				}
 			}
 
+			finishTeams, err := prepareTeamsForHelperUpgrade(ctx, cmd.OutOrStdout(), teamsDrainTimeout)
+			if err != nil {
+				return err
+			}
 			res, err := performUpdate(ctx, update.UpdateOptions{
 				Repo:        repo,
 				Version:     versionOverride,
 				InstallPath: installPath,
 				Timeout:     120 * time.Second,
 			})
+			if finishTeams != nil {
+				updateSucceeded := err == nil
+				restartMode := teamsUpgradeRestartImmediate
+				if updateSucceeded {
+					if res.RestartRequired {
+						restartMode = teamsUpgradeRestartDelayed
+					}
+				}
+				if cleanupErr := finishTeams(context.Background(), teamsUpgradeFinishOptions{Success: updateSucceeded, ServiceRestart: restartMode}); cleanupErr != nil && err == nil {
+					err = cleanupErr
+				}
+			}
 			if err != nil {
 				return err
 			}
@@ -58,6 +76,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&repo, "repo", "", "Override GitHub repo (owner/name)")
 	cmd.Flags().StringVar(&versionOverride, "version", "", "Install a specific version (default: latest)")
 	cmd.Flags().StringVar(&installPath, "install-path", "", "Override install path (file or directory)")
+	cmd.Flags().DurationVar(&teamsDrainTimeout, "teams-drain-timeout", 2*time.Minute, "How long to wait for an active Teams bridge to drain before upgrading")
 
 	return cmd
 }

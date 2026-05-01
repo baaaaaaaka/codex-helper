@@ -49,6 +49,7 @@ func newRootCmd() *cobra.Command {
 		newInitCmd(opts),
 		newRunCmd(opts),
 		newTuiCmd(opts),
+		newTeamsCmd(opts),
 		newProxyCmd(opts),
 		newUpgradeCmd(opts),
 		newHistoryCmd(opts),
