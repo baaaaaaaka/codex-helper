@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -106,6 +107,84 @@ func TestGraphRetriesTooManyRequestsAfterRetryAfter(t *testing.T) {
 	}
 	if len(sleeps) != 1 || sleeps[0] != 2*time.Second {
 		t.Fatalf("unexpected sleeps: %v", sleeps)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveGraphNetworkDisconnectThenNextCallRecoversCI(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var attempts int
+	graph := &GraphClient{
+		auth: auth,
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, fmt.Errorf("simulated network disconnect")
+			}
+			if got := req.URL.String(); got != "https://graph.example.test/me?$select=id,displayName,userPrincipalName" {
+				t.Fatalf("unexpected request URL: %s", got)
+			}
+			return jsonResponse(http.StatusOK, `{"id":"u1","displayName":"User One","userPrincipalName":"u1@example.test"}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 3,
+		backoffMin: time.Millisecond,
+		backoffMax: time.Millisecond,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+
+	if _, err := graph.Me(context.Background()); err == nil || !strings.Contains(err.Error(), "simulated network disconnect") {
+		t.Fatalf("first Graph call error = %v, want simulated network disconnect", err)
+	}
+	user, err := graph.Me(context.Background())
+	if err != nil {
+		t.Fatalf("second Graph call should recover after transport error: %v", err)
+	}
+	if attempts != 2 || user.ID != "u1" {
+		t.Fatalf("attempts=%d user=%#v, want second call recovery", attempts, user)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveGraphLongRetryAfterIsInterruptibleCI(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var sleeps []time.Duration
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Retry-After", "3600")
+		http.Error(w, `{"error":{"code":"TooManyRequests","message":"long throttle"}}`, http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, &sleeps)
+	graph.sleep = func(ctx context.Context, delay time.Duration) error {
+		sleeps = append(sleeps, delay)
+		return context.Canceled
+	}
+	_, err := graph.Me(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Graph long Retry-After error = %v, want context.Canceled", err)
+	}
+	if len(sleeps) != 1 || sleeps[0] != time.Hour {
+		t.Fatalf("Graph long Retry-After sleeps = %v, want 1h", sleeps)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveGraphServerDelayRespectsContextDeadlineCI(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := graph.Me(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Graph delayed server error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Graph delayed server did not respect context promptly: %v", elapsed)
 	}
 }
 
