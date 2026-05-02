@@ -18,7 +18,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "history", "init", "proxy", "run", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "history", "init", "proxy", "run", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -27,6 +27,49 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	if cmd.Flags().Lookup("upgrade-codex") == nil {
 		t.Fatal("expected --upgrade-codex flag")
+	}
+}
+
+func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
+	cmd := newRootCmd()
+	teamsCmd, _, err := cmd.Find([]string{"teams"})
+	if err != nil {
+		t.Fatalf("find teams command: %v", err)
+	}
+
+	var names []string
+	for _, sub := range teamsCmd.Commands() {
+		names = append(names, sub.Name())
+	}
+	sort.Strings(names)
+
+	want := []string{"auth", "control", "doctor", "drain", "pause", "recover", "resume", "run", "send-file", "service", "setup", "status"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("unexpected teams subcommands\n got: %#v\nwant: %#v", names, want)
+	}
+
+	runCmd, _, err := teamsCmd.Find([]string{"listen"})
+	if err != nil {
+		t.Fatalf("find teams listen alias: %v", err)
+	}
+	if runCmd.Name() != "run" {
+		t.Fatalf("teams listen should resolve to run, got %q", runCmd.Name())
+	}
+	if runCmd.Flags().Lookup("control-fallback-model") == nil {
+		t.Fatal("teams run should expose --control-fallback-model")
+	}
+
+	authCmd, _, err := teamsCmd.Find([]string{"auth"})
+	if err != nil {
+		t.Fatalf("find teams auth command: %v", err)
+	}
+	var authNames []string
+	for _, sub := range authCmd.Commands() {
+		authNames = append(authNames, sub.Name())
+	}
+	sort.Strings(authNames)
+	if want := []string{"file-write", "file-write-logout", "file-write-status", "logout", "read", "read-logout", "read-status", "status"}; !reflect.DeepEqual(authNames, want) {
+		t.Fatalf("unexpected teams auth subcommands\n got: %#v\nwant: %#v", authNames, want)
 	}
 }
 

@@ -40,6 +40,36 @@ func TestRunTargetOnceSuccess(t *testing.T) {
 	}
 }
 
+func TestRunTargetOnceWithOptionsHeadlessIO(t *testing.T) {
+	shell := requireShell(t)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := runTargetOnceWithOptions(
+		context.Background(),
+		[]string{shell, "-c", "cat; printf err >&2"},
+		"",
+		nil,
+		nil,
+		nil,
+		nil,
+		runTargetOptions{
+			UseProxy: false,
+			Stdin:    strings.NewReader("prompt via stdin"),
+			Stdout:   &stdout,
+			Stderr:   &stderr,
+		},
+	)
+	if err != nil {
+		t.Fatalf("runTargetOnceWithOptions error: %v", err)
+	}
+	if stdout.String() != "prompt via stdin" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if stderr.String() != "err" {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestRunWithExistingInstance(t *testing.T) {
 	shell := requireShell(t)
 	inst := config.Instance{

@@ -258,6 +258,47 @@ jobs:
           $pattern = 'Test(PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
           go test ./internal/cli -count=1 -run $pattern
 
+      - name: Teams background keepalive regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CODEX_HELPER_TEAMS_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-token.json
+          CODEX_HELPER_TEAMS_READ_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-read-token.json
+          CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-file-token.json
+        run: |
+          set -euo pipefail
+          teams_cli_keepalive='Test(TeamsBackgroundKeepalive|TeamsService(InstallWritesSystemdUserUnitWithoutEnabling|InstallWritesMacOSLaunchAgentPlist|InstallWritesWindowsTaskXMLAndRegistersTask|InstallWritesWSLWindowsTask|DoctorReportsWSLHint|DoctorReportsWSLReadinessFailure|ActiveQueriesSupervisorWithoutGeneratedConfig)|ScheduleDelayedTeamsServiceStartUses(WSLWindowsTask|ConfiguredPowerShell)|UpgradeCmd(StopsAndRestartsActiveTeamsServiceAroundUpdate|DelaysTeamsServiceRestartWhenUpdateNeedsProcessExit|RestoresTeamsDrainOnTimeout|TimesOutBeforeUpdatingWhenTeamsOwnerStaysLive))'
+          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|RefusesLiveOwnerWithDiagnostic)|RecoverStaleOwner(ReplacesStaleOwner|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
+          go test ./internal/cli -count=1 -run "$teams_cli_keepalive" -v
+          go test ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
+
+      - name: Teams background keepalive regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CODEX_HELPER_TEAMS_TOKEN_CACHE: ${{ runner.temp }}\teams-missing-token.json
+          CODEX_HELPER_TEAMS_READ_TOKEN_CACHE: ${{ runner.temp }}\teams-missing-read-token.json
+          CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE: ${{ runner.temp }}\teams-missing-file-token.json
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $teamsCliKeepalive = 'Test(TeamsBackgroundKeepalive|TeamsService(InstallWritesSystemdUserUnitWithoutEnabling|InstallWritesMacOSLaunchAgentPlist|InstallWritesWindowsTaskXMLAndRegistersTask|InstallWritesWSLWindowsTask|DoctorReportsWSLHint|DoctorReportsWSLReadinessFailure|ActiveQueriesSupervisorWithoutGeneratedConfig)|ScheduleDelayedTeamsServiceStartUses(WSLWindowsTask|ConfiguredPowerShell)|UpgradeCmd(StopsAndRestartsActiveTeamsServiceAroundUpdate|DelaysTeamsServiceRestartWhenUpdateNeedsProcessExit|RestoresTeamsDrainOnTimeout|TimesOutBeforeUpdatingWhenTeamsOwnerStaysLive))'
+          $teamsRuntimeKeepalive = 'Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|RefusesLiveOwnerWithDiagnostic)|RecoverStaleOwner(ReplacesStaleOwner|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
+          go test ./internal/cli -count=1 -run $teamsCliKeepalive -v
+          go test ./internal/teams ./internal/teams/store -count=1 -run $teamsRuntimeKeepalive -v
+
+      - name: Teams background keepalive race regressions (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CODEX_HELPER_TEAMS_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-token.json
+          CODEX_HELPER_TEAMS_READ_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-read-token.json
+          CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-file-token.json
+        run: |
+          set -euo pipefail
+          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|RefusesLiveOwnerWithDiagnostic)|RecoverStaleOwner(ReplacesStaleOwner|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
+          go test -race ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
+
       - name: Self-update env pollution regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -575,7 +616,9 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cli -c -o dist/codex_cli_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cloudgate -c -o dist/codex_cloudgate_test
-          chmod +x dist/codex_cli_test dist/codex_cloudgate_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams -c -o dist/codex_teams_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams/store -c -o dist/codex_teams_store_test
+          chmod +x dist/codex_cli_test dist/codex_cloudgate_test dist/codex_teams_test dist/codex_teams_store_test
 
       - name: Run tests in containers
         shell: bash
@@ -588,6 +631,42 @@ jobs:
             echo "==> $img (cli tests)"
             docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
               /dist/codex_cli_test -test.v -test.count=1 -test.run='Test[^I]'
+          done
+
+      - name: Teams background keepalive tests in containers (non-root)
+        shell: bash
+        run: |
+          set -euo pipefail
+          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|RefusesLiveOwnerWithDiagnostic)|RecoverStaleOwner(ReplacesStaleOwner|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
+          for img in centos:7 rockylinux:8 ubuntu:20.04; do
+            echo "==> $img (Teams keepalive tests as non-root uid 1000)"
+            docker run --rm --user 1000:1000 \
+              -e HOME=/tmp/codex-home \
+              -e XDG_CONFIG_HOME=/tmp/codex-config \
+              -e XDG_CACHE_HOME=/tmp/codex-cache \
+              -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+              -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+              -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+              -v "$PWD/dist:/dist:ro" "$img" \
+              /dist/codex_cli_test -test.v -test.count=1 -test.run='TestTeamsBackgroundKeepalive'
+            docker run --rm --user 1000:1000 \
+              -e HOME=/tmp/codex-home \
+              -e XDG_CONFIG_HOME=/tmp/codex-config \
+              -e XDG_CACHE_HOME=/tmp/codex-cache \
+              -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+              -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+              -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+              -v "$PWD/dist:/dist:ro" "$img" \
+              /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
+            docker run --rm --user 1000:1000 \
+              -e HOME=/tmp/codex-home \
+              -e XDG_CONFIG_HOME=/tmp/codex-config \
+              -e XDG_CACHE_HOME=/tmp/codex-cache \
+              -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+              -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+              -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+              -v "$PWD/dist:/dist:ro" "$img" \
+              /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestTeamsBackgroundKeepalive'
           done
 
       - name: Codex upgrade smoke in Linux containers (system/local)
