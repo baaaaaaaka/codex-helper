@@ -232,6 +232,9 @@ func TestTeamsServiceDoctorReportsAuthAndExecutableWithoutFailingFast(t *testing
 		"temporary go run binary",
 		"Teams service auth: not ready",
 		"auth missing",
+		"Linux: systemd --user keeps the Teams bridge independent of the terminal",
+		"if lingering is disabled",
+		"no user service can guarantee survival",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("doctor output missing %q:\n%s", want, got)

@@ -299,6 +299,19 @@ jobs:
           teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|RefusesLiveOwnerWithDiagnostic)|RecoverStaleOwner(ReplacesStaleOwner|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           go test -race ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
 
+      - name: Teams supervisor smoke (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/teams_supervisor_smoke.sh
+
+      - name: Teams supervisor smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\scripts\ci\teams_supervisor_smoke.ps1
+
       - name: Self-update env pollution regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -667,6 +680,12 @@ jobs:
               -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
               -v "$PWD/dist:/dist:ro" "$img" \
               /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestTeamsBackgroundKeepalive'
+            echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
+            docker run --rm --user 1000:1000 \
+              -e HOME=/tmp/codex-home \
+              -e RUNNER_TEMP=/tmp/codex-runner-temp \
+              -v "$PWD/scripts/ci:/ci:ro" "$img" \
+              bash /ci/teams_supervisor_smoke.sh
           done
 
       - name: Codex upgrade smoke in Linux containers (system/local)
