@@ -10,6 +10,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +22,13 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+type liveSurfaceMatrixResult struct {
+	Key      string
+	Chat     Chat
+	Errors   []string
+	Messages []string
+}
 
 const (
 	liveJasonWeiSafetyAckEnv   = "CODEX_HELPER_TEAMS_LIVE_JASON_WEI_ONLY"
@@ -814,6 +822,538 @@ func TestLiveTeamsTableStressOptIn(t *testing.T) {
 		t.Fatalf("read live table stress messages failed: %v", lastErr)
 	}
 	t.Fatalf("live table stress messages did not contain expected order/content.\nwant ordered subsequence: %#v\nwant content fragments: %#v\ngot: %#v", want, wantAny, got)
+}
+
+func TestLiveMeetingChatSurfaceBestEffortOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_MEETING_SURFACE_TEST")) != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_MEETING_SURFACE_TEST=1 to create one Jason Wei-only meeting chat and try the best-effort Teams visibility path")
+	}
+	if got := strings.TrimSpace(os.Getenv(liveJasonWeiSafetyAckEnv)); got != liveJasonWeiSafetyAckValue {
+		t.Fatalf("%s=%s is required before any live Teams chat read, send, mention, or file upload", liveJasonWeiSafetyAckEnv, liveJasonWeiSafetyAckValue)
+	}
+	requireLiveWriteOnce(t, "teams-meeting-surface-best-effort")
+
+	cfg, err := DefaultEffectiveAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(cfg.CachePath); err != nil {
+		t.Fatalf("read Teams chat token cache %s: %v", cfg.CachePath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	graph := NewGraphClient(NewAuthManager(cfg), io.Discard)
+	me, err := graph.Me(ctx)
+	if err != nil {
+		t.Fatalf("Graph /me failed: %v", err)
+	}
+	if normalizeLiveHumanName(me.DisplayName) != "jason wei" {
+		t.Fatalf("logged-in user displayName %q is not Jason Wei", me.DisplayName)
+	}
+
+	nonce := safeLiveMarkerPart(strings.TrimSpace(os.Getenv(liveWriteOnceEnv)))
+	title := "💬 Codex Work - surface test - " + nonce + " - " + machineLabel()
+	chat, err := graph.CreateMeetingChat(ctx, title)
+	if err != nil {
+		t.Fatalf("create live meeting-surface chat failed: %v", err)
+	}
+	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, chat.ID)
+	if refreshed, err := graph.GetChat(ctx, chat.ID); err == nil && strings.TrimSpace(refreshed.WebURL) != "" {
+		chat = refreshed
+	}
+	if strings.TrimSpace(chat.WebURL) == "" {
+		chat.WebURL = TeamsChatURL(chat.ID, cfg.TenantID)
+	}
+
+	t.Logf("LIVE_MEETING_SURFACE_CHAT_ID=%s", chat.ID)
+	t.Logf("LIVE_MEETING_SURFACE_CHAT_URL=%s", chat.WebURL)
+	t.Logf("LIVE_MEETING_SURFACE_CHAT_TOPIC=%s", chat.Topic)
+
+	if err := sendLiveMeetingSurfaceControlLink(ctx, t, graph, me, chat); err != nil {
+		t.Fatalf("send live meeting-surface control fallback link failed: %v", err)
+	}
+
+	if _, err := graph.SendHTML(ctx, chat.ID, `<p><strong>🔧 Helper:</strong></p><p>Meeting chat visibility test created.</p>`); err != nil {
+		t.Fatalf("send live meeting-surface creation message failed: %v", err)
+	}
+	if err := graph.UnhideChatForUser(ctx, chat.ID, me); err != nil {
+		t.Logf("LIVE_MEETING_SURFACE_UNHIDE=failed err=%v", err)
+	} else {
+		t.Logf("LIVE_MEETING_SURFACE_UNHIDE=ok")
+	}
+	readyHTML, mentions := HTMLMessageMentioningOwner("🔧 Helper", "Ready. This is a meeting-chat visibility test. If this chat appeared without opening the link, the best-effort path worked.", me)
+	if _, err := graph.SendHTMLWithMentions(ctx, chat.ID, readyHTML, mentions); err != nil {
+		t.Fatalf("send live meeting-surface owner mention failed: %v", err)
+	}
+
+	deadline := time.Now().Add(90 * time.Second)
+	var got []string
+	var lastErr error
+	for time.Now().Before(deadline) {
+		got, lastErr = liveRecentPlainMessagesAscending(ctx, graph, chat.ID, 20)
+		if lastErr == nil &&
+			containsAllLivePlainText(got, []string{"Meeting chat visibility test created.", "Ready. This is a meeting-chat visibility test."}) {
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if lastErr != nil {
+		t.Fatalf("read live meeting-surface messages failed: %v", lastErr)
+	}
+	t.Fatalf("live meeting-surface messages were not visible via Graph. got=%#v", got)
+}
+
+func TestLiveMeetingChatSurfaceMatrixOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_MEETING_SURFACE_MATRIX")) != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_MEETING_SURFACE_MATRIX=1 to create multiple Jason Wei-only Teams chats and compare visibility triggers")
+	}
+	if got := strings.TrimSpace(os.Getenv(liveJasonWeiSafetyAckEnv)); got != liveJasonWeiSafetyAckValue {
+		t.Fatalf("%s=%s is required before any live Teams chat read, send, mention, or file upload", liveJasonWeiSafetyAckEnv, liveJasonWeiSafetyAckValue)
+	}
+	requireLiveWriteOnce(t, "teams-meeting-surface-matrix")
+
+	cfg, err := DefaultEffectiveAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(cfg.CachePath); err != nil {
+		t.Fatalf("read Teams chat token cache %s: %v", cfg.CachePath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	graph := NewGraphClient(NewAuthManager(cfg), io.Discard)
+	me, err := graph.Me(ctx)
+	if err != nil {
+		t.Fatalf("Graph /me failed: %v", err)
+	}
+	if normalizeLiveHumanName(me.DisplayName) != "jason wei" {
+		t.Fatalf("logged-in user displayName %q is not Jason Wei", me.DisplayName)
+	}
+
+	nonce := safeLiveMarkerPart(strings.TrimSpace(os.Getenv(liveWriteOnceEnv)))
+	type candidate struct {
+		Key     string
+		Carrier string
+		Title   string
+	}
+	candidates := []candidate{
+		{
+			Key:     "group-mention-first",
+			Carrier: "group",
+			Title:   "💬 Codex Work - surface matrix group mention first - " + nonce + " - " + machineLabel(),
+		},
+		{
+			Key:     "meeting-mention-first",
+			Carrier: "meeting",
+			Title:   "💬 Codex Work - surface matrix mention first - " + nonce + " - " + machineLabel(),
+		},
+		{
+			Key:     "meeting-plain-then-mention",
+			Carrier: "meeting",
+			Title:   "💬 Codex Work - surface matrix plain then mention - " + nonce + " - " + machineLabel(),
+		},
+		{
+			Key:     "meeting-high-importance-mention",
+			Carrier: "meeting",
+			Title:   "💬 Codex Work - surface matrix high importance - " + nonce + " - " + machineLabel(),
+		},
+		{
+			Key:     "meeting-topic-update-then-mention",
+			Carrier: "meeting",
+			Title:   "💬 Codex Work - surface matrix topic update - " + nonce + " - " + machineLabel(),
+		},
+	}
+
+	var results []liveSurfaceMatrixResult
+	for _, tc := range candidates {
+		var chat Chat
+		var createErr error
+		switch tc.Carrier {
+		case "group":
+			chat, createErr = graph.CreateSingleMemberGroupChat(ctx, me.ID, tc.Title)
+		default:
+			chat, createErr = graph.CreateMeetingChat(ctx, tc.Title)
+		}
+		if createErr != nil {
+			results = append(results, liveSurfaceMatrixResult{Key: tc.Key, Errors: []string{"create: " + createErr.Error()}})
+			continue
+		}
+		requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, chat.ID)
+		if refreshed, err := graph.GetChat(ctx, chat.ID); err == nil && strings.TrimSpace(refreshed.WebURL) != "" {
+			chat = refreshed
+		}
+		if strings.TrimSpace(chat.WebURL) == "" {
+			chat.WebURL = TeamsChatURL(chat.ID, cfg.TenantID)
+		}
+
+		res := liveSurfaceMatrixResult{Key: tc.Key, Chat: chat}
+		switch tc.Key {
+		case "group-mention-first", "meeting-mention-first":
+			res.Messages = append(res.Messages, "mention-first")
+			if err := sendLiveSurfaceMatrixMention(ctx, graph, chat.ID, me, "Ready. Visibility matrix: "+tc.Key, ""); err != nil {
+				res.Errors = append(res.Errors, "mention-first: "+err.Error())
+			}
+		case "meeting-plain-then-mention":
+			res.Messages = append(res.Messages, "plain", "mention-after-delay")
+			if _, err := graph.SendHTML(ctx, chat.ID, `<p><strong>🔧 Helper:</strong></p><p>Visibility matrix plain message before mention.</p>`); err != nil {
+				res.Errors = append(res.Errors, "plain: "+err.Error())
+			}
+			time.Sleep(12 * time.Second)
+			if err := sendLiveSurfaceMatrixMention(ctx, graph, chat.ID, me, "Ready. Visibility matrix: plain message then delayed mention.", ""); err != nil {
+				res.Errors = append(res.Errors, "mention-after-delay: "+err.Error())
+			}
+		case "meeting-high-importance-mention":
+			res.Messages = append(res.Messages, "high-importance-mention")
+			if err := sendLiveSurfaceMatrixMention(ctx, graph, chat.ID, me, "Ready. Visibility matrix: high importance mention.", "high"); err != nil {
+				res.Errors = append(res.Errors, "high-importance-mention: "+err.Error())
+			}
+		case "meeting-topic-update-then-mention":
+			res.Messages = append(res.Messages, "plain", "topic-update", "mention")
+			if _, err := graph.SendHTML(ctx, chat.ID, `<p><strong>🔧 Helper:</strong></p><p>Visibility matrix message before topic update.</p>`); err != nil {
+				res.Errors = append(res.Errors, "plain: "+err.Error())
+			}
+			if err := graph.UpdateChatTopic(ctx, chat.ID, chat.Topic+" ready"); err != nil {
+				res.Errors = append(res.Errors, "topic-update: "+err.Error())
+			} else if refreshed, err := graph.GetChat(ctx, chat.ID); err == nil && strings.TrimSpace(refreshed.Topic) != "" {
+				chat = refreshed
+				res.Chat = refreshed
+			}
+			if err := sendLiveSurfaceMatrixMention(ctx, graph, chat.ID, me, "Ready. Visibility matrix: topic updated before mention.", ""); err != nil {
+				res.Errors = append(res.Errors, "mention: "+err.Error())
+			}
+		}
+		t.Logf("LIVE_SURFACE_MATRIX key=%s chat_id=%s url=%s topic=%q steps=%v errors=%v", tc.Key, chat.ID, chat.WebURL, chat.Topic, res.Messages, res.Errors)
+		results = append(results, res)
+	}
+
+	if err := sendLiveSurfaceMatrixControlSummary(ctx, t, graph, me, results); err != nil {
+		t.Fatalf("send live surface matrix control summary failed: %v", err)
+	}
+	for _, res := range results {
+		if len(res.Errors) > 0 {
+			t.Logf("LIVE_SURFACE_MATRIX_WARNING key=%s errors=%v", res.Key, res.Errors)
+		}
+	}
+}
+
+func TestLiveMeetingChatAPIVariantsOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_MEETING_API_VARIANTS")) != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_MEETING_API_VARIANTS=1 to create Jason Wei-only meeting chats through alternate onlineMeeting APIs")
+	}
+	if got := strings.TrimSpace(os.Getenv(liveJasonWeiSafetyAckEnv)); got != liveJasonWeiSafetyAckValue {
+		t.Fatalf("%s=%s is required before any live Teams chat read, send, mention, or file upload", liveJasonWeiSafetyAckEnv, liveJasonWeiSafetyAckValue)
+	}
+	requireLiveWriteOnce(t, "teams-meeting-api-variants")
+
+	cfg, err := DefaultEffectiveAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(cfg.CachePath); err != nil {
+		t.Fatalf("read Teams chat token cache %s: %v", cfg.CachePath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	graph := NewGraphClient(NewAuthManager(cfg), io.Discard)
+	me, err := graph.Me(ctx)
+	if err != nil {
+		t.Fatalf("Graph /me failed: %v", err)
+	}
+	if normalizeLiveHumanName(me.DisplayName) != "jason wei" {
+		t.Fatalf("logged-in user displayName %q is not Jason Wei", me.DisplayName)
+	}
+
+	nonce := safeLiveMarkerPart(strings.TrimSpace(os.Getenv(liveWriteOnceEnv)))
+	type apiVariant struct {
+		Key          string
+		Beta         bool
+		CreateOrGet  bool
+		ChatSettings bool
+	}
+	variants := []apiVariant{
+		{Key: "beta-createorget-self-attendee", Beta: true, CreateOrGet: true},
+		{Key: "v1-create-self-attendee-chat-enabled", ChatSettings: true},
+		{Key: "beta-createorget-self-attendee-chat-enabled", Beta: true, CreateOrGet: true, ChatSettings: true},
+	}
+
+	var results []liveSurfaceMatrixResult
+	for _, variant := range variants {
+		title := "💬 Codex Work - meeting api " + variant.Key + " - " + nonce + " - " + machineLabel()
+		chat, err := createLiveMeetingAPIVariant(ctx, graph, cfg, me, title, nonce, variant.Key, variant.Beta, variant.CreateOrGet, variant.ChatSettings)
+		if err != nil {
+			results = append(results, liveSurfaceMatrixResult{Key: variant.Key, Errors: []string{"create: " + err.Error()}})
+			t.Logf("LIVE_MEETING_API_VARIANT key=%s create_error=%v", variant.Key, err)
+			continue
+		}
+		requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, chat.ID)
+		if refreshed, err := graph.GetChat(ctx, chat.ID); err == nil && strings.TrimSpace(refreshed.WebURL) != "" {
+			chat = refreshed
+		}
+		if strings.TrimSpace(chat.WebURL) == "" {
+			chat.WebURL = TeamsChatURL(chat.ID, cfg.TenantID)
+		}
+		res := liveSurfaceMatrixResult{Key: variant.Key, Chat: chat, Messages: []string{"mention-first"}}
+		if err := sendLiveSurfaceMatrixMention(ctx, graph, chat.ID, me, "Ready. Meeting API visibility variant: "+variant.Key, ""); err != nil {
+			res.Errors = append(res.Errors, "mention-first: "+err.Error())
+		}
+		t.Logf("LIVE_MEETING_API_VARIANT key=%s chat_id=%s url=%s topic=%q errors=%v", variant.Key, chat.ID, chat.WebURL, chat.Topic, res.Errors)
+		results = append(results, res)
+	}
+
+	if err := sendLiveSurfaceMatrixControlSummary(ctx, t, graph, me, results); err != nil {
+		t.Fatalf("send live meeting API variant control summary failed: %v", err)
+	}
+	for _, res := range results {
+		if len(res.Errors) > 0 {
+			t.Logf("LIVE_MEETING_API_VARIANT_WARNING key=%s errors=%v", res.Key, res.Errors)
+		}
+	}
+}
+
+func createLiveMeetingAPIVariant(ctx context.Context, graph *GraphClient, cfg AuthConfig, me User, subject string, nonce string, key string, beta bool, createOrGet bool, chatSettings bool) (Chat, error) {
+	now := time.Now().UTC()
+	body := map[string]any{
+		"subject":       SanitizeTopic(subject),
+		"startDateTime": now.Format(time.RFC3339),
+		"endDateTime":   now.Add(24 * time.Hour).Format(time.RFC3339),
+		"participants": map[string]any{
+			"attendees": []map[string]any{
+				{
+					"upn":  strings.TrimSpace(me.UserPrincipalName),
+					"role": "attendee",
+					"identity": map[string]any{
+						"user": map[string]any{
+							"id": strings.TrimSpace(me.ID),
+						},
+					},
+				},
+			},
+		},
+	}
+	if chatSettings {
+		body["allowMeetingChat"] = "enabled"
+		body["shareMeetingChatHistoryDefault"] = "all"
+	}
+	path := "/me/onlineMeetings"
+	target := graph
+	if createOrGet {
+		path = "/me/onlineMeetings/createOrGet"
+		body["externalId"] = "codex-helper-" + safeLiveMarkerPart(nonce+"-"+key)
+	}
+	if beta {
+		clone := *graph
+		clone.baseURL = "https://graph.microsoft.com/beta"
+		target = &clone
+	}
+	var meeting OnlineMeeting
+	if err := target.do(ctx, http.MethodPost, path, body, &meeting); err != nil {
+		return Chat{}, err
+	}
+	threadID := strings.TrimSpace(meeting.ChatInfo.ThreadID)
+	if threadID == "" {
+		return Chat{}, fmt.Errorf("onlineMeeting response did not include chatInfo.threadId")
+	}
+	webURL := TeamsChatURL(threadID, cfg.TenantID)
+	if webURL == "" {
+		webURL = meeting.JoinWebURL
+	}
+	return Chat{
+		ID:       threadID,
+		Topic:    firstNonEmptyString(SanitizeTopic(meeting.Subject), SanitizeTopic(subject)),
+		ChatType: "meeting",
+		WebURL:   webURL,
+	}, nil
+}
+
+func TestLiveGraphAdaptiveCardButtonsOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_ADAPTIVE_CARD_BUTTONS")) != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_ADAPTIVE_CARD_BUTTONS=1 to send one live Graph Adaptive Card with OpenUrl buttons")
+	}
+	if got := strings.TrimSpace(os.Getenv(liveJasonWeiSafetyAckEnv)); got != liveJasonWeiSafetyAckValue {
+		t.Fatalf("%s=%s is required before any live Teams chat read, send, mention, or file upload", liveJasonWeiSafetyAckEnv, liveJasonWeiSafetyAckValue)
+	}
+	requireLiveWriteOnce(t, "teams-adaptive-card-buttons")
+
+	cfg, err := DefaultEffectiveAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(cfg.CachePath); err != nil {
+		t.Fatalf("read Teams chat token cache %s: %v", cfg.CachePath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	graph := NewGraphClient(NewAuthManager(cfg), io.Discard)
+	me, err := graph.Me(ctx)
+	if err != nil {
+		t.Fatalf("Graph /me failed: %v", err)
+	}
+	if normalizeLiveHumanName(me.DisplayName) != "jason wei" {
+		t.Fatalf("logged-in user displayName %q is not Jason Wei", me.DisplayName)
+	}
+
+	sendChatID := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_CARD_SEND_CHAT_ID"))
+	if sendChatID == "" {
+		t.Fatal("CODEX_HELPER_TEAMS_LIVE_CARD_SEND_CHAT_ID is required")
+	}
+	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, sendChatID)
+
+	actions := liveCardActionsFromEnv(t)
+	for _, action := range actions {
+		targetChatID, err := ExtractChatID(action.URL)
+		if err != nil {
+			t.Fatalf("extract card action chat id for %q: %v", action.Title, err)
+		}
+		requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, targetChatID)
+	}
+
+	msg, err := graph.SendOpenURLAdaptiveCard(ctx, sendChatID, "Open Codex chat", "Graph Adaptive Card button test. Pick the button style that is easiest to notice and tap.", actions)
+	if err != nil {
+		t.Fatalf("send live Graph Adaptive Card buttons failed: %v", err)
+	}
+	t.Logf("LIVE_ADAPTIVE_CARD_BUTTONS_SENT chat_id=%s message_id=%s buttons=%d", sendChatID, msg.ID, len(actions))
+}
+
+func liveCardActionsFromEnv(t *testing.T) []OpenURLCardAction {
+	t.Helper()
+	var actions []OpenURLCardAction
+	for i := 1; i <= 6; i++ {
+		label := strings.TrimSpace(os.Getenv(fmt.Sprintf("CODEX_HELPER_TEAMS_LIVE_CARD_BUTTON_%d_LABEL", i)))
+		rawURL := strings.TrimSpace(os.Getenv(fmt.Sprintf("CODEX_HELPER_TEAMS_LIVE_CARD_BUTTON_%d_URL", i)))
+		if label == "" && rawURL == "" {
+			continue
+		}
+		if label == "" || rawURL == "" {
+			t.Fatalf("card button %d requires both label and URL", i)
+		}
+		actions = append(actions, OpenURLCardAction{Title: label, URL: rawURL})
+	}
+	if len(actions) == 0 {
+		t.Fatal("at least one CODEX_HELPER_TEAMS_LIVE_CARD_BUTTON_<n>_LABEL/URL pair is required")
+	}
+	return actions
+}
+
+func sendLiveMeetingSurfaceControlLink(ctx context.Context, t *testing.T, graph *GraphClient, me User, chat Chat) error {
+	t.Helper()
+	controlChatID := liveScopedControlChatID(ctx, t, me)
+	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, controlChatID)
+	link := strings.TrimSpace(chat.WebURL)
+	if link == "" {
+		link = TeamsChatURL(chat.ID, graph.tenantID())
+	}
+	body := fmt.Sprintf(
+		`<p><strong>🔧 Helper:</strong> Created a new meeting visibility test chat.</p><p><a href="%s">Open test chat</a></p><p>Search title: %s</p>`,
+		html.EscapeString(link),
+		html.EscapeString(firstNonEmptyString(chat.Topic, chat.ID)),
+	)
+	_, err := graph.SendHTML(ctx, controlChatID, body)
+	return err
+}
+
+func liveScopedControlChatID(ctx context.Context, t *testing.T, me User) string {
+	t.Helper()
+	scope := ScopeIdentityForUser(me)
+	storePath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("resolve scoped Teams store path: %v", err)
+	}
+	store, err := teamstore.Open(storePath)
+	if err != nil {
+		t.Fatalf("open scoped Teams store %s: %v", storePath, err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load scoped Teams store %s: %v", storePath, err)
+	}
+	controlChatID := strings.TrimSpace(state.ControlChat.TeamsChatID)
+	if controlChatID == "" {
+		t.Fatalf("no scoped control chat found at %s; refusing to send fallback link to an unknown Teams chat", storePath)
+	}
+	return controlChatID
+}
+
+func sendLiveSurfaceMatrixControlSummary(ctx context.Context, t *testing.T, graph *GraphClient, me User, results []liveSurfaceMatrixResult) error {
+	t.Helper()
+	controlChatID := liveScopedControlChatID(ctx, t, me)
+	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, controlChatID)
+	var b strings.Builder
+	b.WriteString(`<p><strong>🔧 Helper:</strong> Created Teams visibility matrix test chats.</p>`)
+	b.WriteString(`<p>Check which chats appeared without opening links. Use the links below only after checking the chat list.</p>`)
+	b.WriteString(`<ol>`)
+	for _, res := range results {
+		if strings.TrimSpace(res.Chat.ID) == "" {
+			b.WriteString(`<li><strong>`)
+			b.WriteString(html.EscapeString(res.Key))
+			b.WriteString(`</strong>: creation failed</li>`)
+			continue
+		}
+		link := strings.TrimSpace(res.Chat.WebURL)
+		if link == "" {
+			link = TeamsChatURL(res.Chat.ID, graph.tenantID())
+		}
+		b.WriteString(`<li><a href="`)
+		b.WriteString(html.EscapeString(link))
+		b.WriteString(`">`)
+		b.WriteString(html.EscapeString(res.Key))
+		b.WriteString(`</a>`)
+		if strings.TrimSpace(res.Chat.Topic) != "" {
+			b.WriteString(` - `)
+			b.WriteString(html.EscapeString(res.Chat.Topic))
+		}
+		if len(res.Errors) > 0 {
+			b.WriteString(` - warning: `)
+			b.WriteString(html.EscapeString(strings.Join(res.Errors, "; ")))
+		}
+		b.WriteString(`</li>`)
+	}
+	b.WriteString(`</ol>`)
+	_, err := graph.SendHTML(ctx, controlChatID, b.String())
+	return err
+}
+
+func sendLiveSurfaceMatrixMention(ctx context.Context, graph *GraphClient, chatID string, owner User, text string, importance string) error {
+	bodyHTML, mentions := HTMLMessageMentioningOwner("🔧 Helper", text, owner)
+	body := map[string]any{
+		"body": map[string]any{
+			"contentType": "html",
+			"content":     bodyHTML,
+		},
+	}
+	if strings.TrimSpace(importance) != "" {
+		body["importance"] = strings.TrimSpace(importance)
+	}
+	if len(mentions) > 0 {
+		graphMentions := make([]map[string]any, 0, len(mentions))
+		for _, mention := range mentions {
+			text := strings.TrimSpace(mention.Text)
+			if text == "" {
+				text = firstNonEmptyString(mention.User.DisplayName, mention.User.UserPrincipalName, "owner")
+			}
+			graphMentions = append(graphMentions, map[string]any{
+				"id":          mention.ID,
+				"mentionText": text,
+				"mentioned": map[string]any{
+					"user": map[string]any{
+						"id":               mention.User.ID,
+						"displayName":      firstNonEmptyString(mention.User.DisplayName, text),
+						"userIdentityType": "aadUser",
+					},
+				},
+			})
+		}
+		body["mentions"] = graphMentions
+	}
+	var msg ChatMessage
+	return graph.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg)
 }
 
 func resolveLiveReadBenchmarkChat(ctx context.Context, t *testing.T, readGraph *GraphClient, safetyGraph *GraphClient) (string, string) {

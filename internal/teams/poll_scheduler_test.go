@@ -20,7 +20,8 @@ func TestInboundPollDecisionThresholds(t *testing.T) {
 		{name: "hot", idle: time.Minute, want: inboundPollStateHot, interval: inboundPollHotInterval},
 		{name: "warm", idle: 10 * time.Minute, want: inboundPollStateWarm, interval: inboundPollWarmInterval},
 		{name: "cool", idle: time.Hour, want: inboundPollStateCool, interval: inboundPollCoolInterval},
-		{name: "cold", idle: 24 * time.Hour, want: inboundPollStateCold, interval: inboundPollColdInterval},
+		{name: "cool below extended threshold", idle: 3 * time.Hour, want: inboundPollStateCool, interval: inboundPollCoolInterval},
+		{name: "cold", idle: 5 * time.Hour, want: inboundPollStateCold, interval: inboundPollColdInterval},
 		{name: "parked", idle: 49 * time.Hour, want: inboundPollStateParked, parked: true},
 		{name: "running overrides idle", idle: 49 * time.Hour, running: true, want: inboundPollStateRunning, interval: inboundPollRunningInterval},
 	}

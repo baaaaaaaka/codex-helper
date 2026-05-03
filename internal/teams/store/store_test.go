@@ -763,6 +763,95 @@ func TestPendingOutboxAtRespectsRateLimitExpiry(t *testing.T) {
 	}
 }
 
+func TestEarlierUnsentOutboxPreservesSameChatOrdering(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 30, 12, 30, 0, 0, time.UTC)
+	messages := []OutboxMessage{
+		{ID: "outbox:sent", TeamsChatID: "chat-1", Sequence: 1, Kind: "helper", Body: "already sent", CreatedAt: now},
+		{ID: "outbox:blocking", TeamsChatID: "chat-1", Sequence: 2, Kind: "helper", Body: "must send first", CreatedAt: now.Add(time.Second)},
+		{ID: "outbox:other-chat", TeamsChatID: "chat-2", Sequence: 1, Kind: "helper", Body: "other chat", CreatedAt: now.Add(2 * time.Second)},
+		{ID: "outbox:current", TeamsChatID: "chat-1", Sequence: 3, Kind: "helper", Body: "current", CreatedAt: now.Add(3 * time.Second)},
+	}
+	for _, msg := range messages {
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox(%s) error: %v", msg.ID, err)
+		}
+	}
+	if _, err := store.MarkOutboxSent(ctx, "outbox:sent", "teams-sent"); err != nil {
+		t.Fatalf("MarkOutboxSent error: %v", err)
+	}
+	current := messages[3]
+	earlier, ok, err := store.EarlierUnsentOutbox(ctx, current)
+	if err != nil {
+		t.Fatalf("EarlierUnsentOutbox error: %v", err)
+	}
+	if !ok || earlier.ID != "outbox:blocking" {
+		t.Fatalf("earlier unsent = %#v ok=%v, want outbox:blocking", earlier, ok)
+	}
+	if earlier.TeamsChatID != current.TeamsChatID || earlier.Sequence >= current.Sequence {
+		t.Fatalf("earlier outbox does not preserve same-chat ordering: earlier=%#v current=%#v", earlier, current)
+	}
+	if _, ok, err := store.EarlierUnsentOutbox(ctx, messages[1]); err != nil {
+		t.Fatalf("EarlierUnsentOutbox for first pending error: %v", err)
+	} else if ok {
+		t.Fatal("first pending same-chat message should not have an earlier unsent blocker")
+	}
+}
+
+func TestMarkOutboxDriveItemPersistsUploadMetadataAndClearsError(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:            "outbox:attachment",
+		TeamsChatID:   "chat-1",
+		Kind:          "attachment",
+		Body:          "artifact",
+		LastSendError: "previous upload failed",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+
+	updated, err := store.MarkOutboxDriveItem(ctx, msg.ID, " drive-item-1 ", " report.txt ", " https://sharepoint.example/report.txt ", " dav://report ")
+	if err != nil {
+		t.Fatalf("MarkOutboxDriveItem error: %v", err)
+	}
+	if updated.DriveItemID != "drive-item-1" ||
+		updated.DriveItemName != "report.txt" ||
+		updated.DriveItemWebURL != "https://sharepoint.example/report.txt" ||
+		updated.DriveItemWebDav != "dav://report" ||
+		updated.LastSendError != "" {
+		t.Fatalf("unexpected DriveItem metadata: %#v", updated)
+	}
+	reloaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := reloaded.OutboxMessages[msg.ID]; got.DriveItemID != "drive-item-1" || got.LastSendError != "" {
+		t.Fatalf("DriveItem metadata was not durable: %#v", got)
+	}
+}
+
+func TestChatRateLimitReturnsTrimmedStateAndRejectsEmptyChatID(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	blockedUntil := time.Date(2026, 4, 30, 13, 0, 0, 0, time.UTC)
+	if _, err := store.SetChatRateLimit(ctx, " chat-1 ", blockedUntil, "429 Retry-After"); err != nil {
+		t.Fatalf("SetChatRateLimit error: %v", err)
+	}
+	limit, ok, err := store.ChatRateLimit(ctx, " chat-1 ")
+	if err != nil {
+		t.Fatalf("ChatRateLimit error: %v", err)
+	}
+	if !ok || limit.ChatID != "chat-1" || !limit.BlockedUntil.Equal(blockedUntil) || limit.Reason != "429 Retry-After" {
+		t.Fatalf("unexpected chat rate limit: %#v ok=%v", limit, ok)
+	}
+	if _, _, err := store.ChatRateLimit(ctx, " "); err == nil {
+		t.Fatal("expected empty chat id rejection")
+	}
+}
+
 func TestServiceControlPauseResumeIsIdempotent(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

@@ -1,6 +1,8 @@
 package teams
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -108,6 +110,71 @@ func TestSendSchedulerPoisonItemDoesNotBlockOtherChats(t *testing.T) {
 	lease, ok = scheduler.Next(now.Add(4 * time.Second))
 	if !ok || lease.ItemID != "a-2" {
 		t.Fatalf("terminal poison should allow next same-chat sequence, lease=%#v ok=%v", lease, ok)
+	}
+}
+
+func TestSendSchedulerPersistedPlanDefaultsChatAndBatch(t *testing.T) {
+	now := time.Date(2026, 4, 30, 10, 20, 0, 0, time.UTC)
+	scheduler := NewSendScheduler(SendSchedulerOptions{})
+	plan := PersistedSendPlan{
+		BatchID: "batch-1",
+		ChatID:  "chat-a",
+		Items: []ScheduledSendItem{
+			{ID: "a-1", Sequence: 1},
+			{ID: "b-1", ChatID: "chat-b", Sequence: 1, SourceBatchID: "custom-batch"},
+		},
+	}
+	if err := scheduler.EnqueuePersistedSendPlan(context.Background(), plan); err != nil {
+		t.Fatalf("EnqueuePersistedSendPlan error: %v", err)
+	}
+	item, ok := scheduler.Item("a-1")
+	if !ok || item.ChatID != "chat-a" || item.SourceBatchID != "batch-1" {
+		t.Fatalf("defaulted persisted item = %#v ok=%v", item, ok)
+	}
+	item, ok = scheduler.Item("b-1")
+	if !ok || item.ChatID != "chat-b" || item.SourceBatchID != "custom-batch" {
+		t.Fatalf("explicit persisted item = %#v ok=%v", item, ok)
+	}
+	duplicatePlan := PersistedSendPlan{ChatID: "chat-a", Items: []ScheduledSendItem{{ID: "a-1", Sequence: 99}}}
+	if err := scheduler.EnqueuePersistedSendPlanAt(now.Add(time.Second), duplicatePlan); err != nil {
+		t.Fatalf("duplicate EnqueuePersistedSendPlanAt error: %v", err)
+	}
+	item, ok = scheduler.Item("a-1")
+	if !ok || item.Sequence != 1 {
+		t.Fatalf("duplicate persisted item should not replace existing item: %#v ok=%v", item, ok)
+	}
+}
+
+func TestSendSchedulerManualUnblockAndPoisonItem(t *testing.T) {
+	now := time.Date(2026, 4, 30, 10, 25, 0, 0, time.UTC)
+	scheduler := NewSendScheduler(SendSchedulerOptions{LeaseDuration: time.Minute})
+	if _, created, err := scheduler.Enqueue(ScheduledSendItem{ID: "a-1", ChatID: "chat-a", Sequence: 1, CreatedAt: now}); err != nil {
+		t.Fatalf("Enqueue error: %v", err)
+	} else if !created {
+		t.Fatal("Enqueue created=false")
+	}
+	blockedUntil := now.Add(time.Minute)
+	scheduler.BlockChatUntil("chat-a", blockedUntil)
+	if got, ok := scheduler.ChatBlockedUntil(" chat-a "); !ok || !got.Equal(blockedUntil) {
+		t.Fatalf("ChatBlockedUntil = %v ok=%v, want %v", got, ok, blockedUntil)
+	}
+	if lease, ok := scheduler.Next(now.Add(time.Second)); ok {
+		t.Fatalf("blocked chat should not lease, got %#v", lease)
+	}
+	scheduler.UnblockChat(" chat-a ")
+	lease, ok := scheduler.Next(now.Add(2 * time.Second))
+	if !ok || lease.ItemID != "a-1" {
+		t.Fatalf("unblocked chat lease = %#v ok=%v, want a-1", lease, ok)
+	}
+	if err := scheduler.PoisonItem("a-1", "bad payload", now.Add(3*time.Second)); err != nil {
+		t.Fatalf("PoisonItem error: %v", err)
+	}
+	item, ok := scheduler.Item("a-1")
+	if !ok || item.Status != SendStatusPoisoned || item.PoisonReason != "bad payload" || item.LeaseID != "" || !item.LeaseUntil.IsZero() {
+		t.Fatalf("poisoned item = %#v ok=%v", item, ok)
+	}
+	if err := scheduler.PoisonItem("missing", "bad", now); !errors.Is(err, ErrScheduledSendItemNotFound) {
+		t.Fatalf("missing PoisonItem error = %v, want ErrScheduledSendItemNotFound", err)
 	}
 }
 

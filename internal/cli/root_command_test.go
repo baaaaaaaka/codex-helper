@@ -68,7 +68,7 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 		authNames = append(authNames, sub.Name())
 	}
 	sort.Strings(authNames)
-	if want := []string{"config", "file-write", "file-write-logout", "file-write-status", "logout", "read", "read-logout", "read-status", "status"}; !reflect.DeepEqual(authNames, want) {
+	if want := []string{"config", "file-write", "file-write-logout", "file-write-status", "full", "full-logout", "full-status", "logout", "read", "read-logout", "read-status", "status"}; !reflect.DeepEqual(authNames, want) {
 		t.Fatalf("unexpected teams auth subcommands\n got: %#v\nwant: %#v", authNames, want)
 	}
 }

@@ -162,6 +162,7 @@ func TestTeamsAuthConfigWritesLocalClientIDs(t *testing.T) {
 		"Read client ID: configured",
 		"Chat write client ID: configured",
 		"File write client ID: using chat write client",
+		"Full client ID: using chat write client",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("auth config output missing %q:\n%s", want, out)
@@ -605,6 +606,95 @@ func TestTeamsRecoverAllowsStaleOwner(t *testing.T) {
 		t.Fatalf("ReadOwner error: %v", err)
 	} else if ok {
 		t.Fatal("owner should be cleared after stale recover")
+	}
+}
+
+func TestDrainTeamsBridgeForChatRecreateWaitsForOwnerAndClearsDrain(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	owner, err := teamsstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	prevPollInterval := teamsUpgradePollInterval
+	teamsUpgradePollInterval = time.Millisecond
+	t.Cleanup(func() { teamsUpgradePollInterval = prevPollInterval })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.After(2 * time.Second)
+		for {
+			control, err := st.ReadControl(context.Background())
+			if err == nil && control.Draining && control.Reason == "chat recreate" {
+				_ = st.ClearOwner(context.Background())
+				return
+			}
+			select {
+			case <-deadline:
+				return
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	var out bytes.Buffer
+	if err := drainTeamsBridgeForChatRecreate(context.Background(), &out, time.Second); err != nil {
+		t.Fatalf("drainTeamsBridgeForChatRecreate error: %v\noutput:\n%s", err, out.String())
+	}
+	<-done
+	control, err := st.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("ReadControl error: %v", err)
+	}
+	if control.Draining {
+		t.Fatalf("drain flag should be cleared after successful recreate drain: %#v", control)
+	}
+	if !strings.Contains(out.String(), "Waiting for active Teams listener") || !strings.Contains(out.String(), "Teams listener drained.") {
+		t.Fatalf("unexpected drain output:\n%s", out.String())
+	}
+}
+
+func TestDrainTeamsBridgeForChatRecreateTimeoutClearsDrain(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	owner, err := teamsstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	prevPollInterval := teamsUpgradePollInterval
+	teamsUpgradePollInterval = time.Millisecond
+	t.Cleanup(func() { teamsUpgradePollInterval = prevPollInterval })
+
+	err = drainTeamsBridgeForChatRecreate(context.Background(), nil, 5*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out waiting for Teams listener to drain") {
+		t.Fatalf("drain timeout error = %v", err)
+	}
+	control, readErr := st.ReadControl(context.Background())
+	if readErr != nil {
+		t.Fatalf("ReadControl error: %v", readErr)
+	}
+	if control.Draining {
+		t.Fatalf("drain flag should be cleared after timeout: %#v", control)
 	}
 }
 

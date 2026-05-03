@@ -19,9 +19,11 @@ const (
 	defaultReadScopes       = "openid profile offline_access User.Read Chat.Read Files.Read"
 	defaultScopes           = "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite"
 	defaultFileWriteScopes  = "openid profile offline_access User.Read Chat.ReadWrite Files.ReadWrite"
+	defaultFullScopes       = "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite"
 	readTokenCacheName      = "teams-read-token.json"
 	chatWriteTokenCacheName = "teams-chat-write-token.json"
 	fileWriteTokenCacheName = "teams-file-write-token.json"
+	fullTokenCacheName      = "teams-full-token.json"
 )
 
 type AuthConfig struct {
@@ -36,6 +38,7 @@ type TeamsAuthConfigFile struct {
 	Read      TeamsAuthCredentialConfig       `json:"read,omitempty"`
 	ChatWrite TeamsAuthCredentialConfig       `json:"chat_write,omitempty"`
 	FileWrite TeamsAuthCredentialConfig       `json:"file_write,omitempty"`
+	Full      TeamsAuthCredentialConfig       `json:"full,omitempty"`
 	Profiles  map[string]TeamsAuthProfileFile `json:"profiles,omitempty"`
 }
 
@@ -44,6 +47,7 @@ type TeamsAuthProfileFile struct {
 	Read      TeamsAuthCredentialConfig `json:"read,omitempty"`
 	ChatWrite TeamsAuthCredentialConfig `json:"chat_write,omitempty"`
 	FileWrite TeamsAuthCredentialConfig `json:"file_write,omitempty"`
+	Full      TeamsAuthCredentialConfig `json:"full,omitempty"`
 }
 
 type TeamsAuthCredentialConfig struct {
@@ -176,6 +180,14 @@ func DefaultReadAuthConfig() (AuthConfig, error) {
 	return cfg, nil
 }
 
+func DefaultEffectiveReadAuthConfig() (AuthConfig, error) {
+	cfg, err := DefaultReadAuthConfig()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	return withFullAuthFallback(cfg, "CODEX_HELPER_TEAMS_READ_TOKEN_CACHE")
+}
+
 func loadDefaultTeamsAuthConfigFile() (TeamsAuthConfigFile, error) {
 	path, err := DefaultTeamsAuthConfigPath()
 	if err != nil {
@@ -207,6 +219,8 @@ func authConfigClientFlag(label string) string {
 		return "read-client-id"
 	case "chat write":
 		return "chat-client-id"
+	case "full":
+		return "full-client-id"
 	default:
 		return "client-id"
 	}
@@ -249,6 +263,14 @@ func DefaultAuthConfig() (AuthConfig, error) {
 		}
 	}
 	return cfg, nil
+}
+
+func DefaultEffectiveAuthConfig() (AuthConfig, error) {
+	cfg, err := DefaultAuthConfig()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	return withFullAuthFallback(cfg, "CODEX_HELPER_TEAMS_TOKEN_CACHE")
 }
 
 func DefaultFileWriteAuthConfig() (AuthConfig, error) {
@@ -297,6 +319,159 @@ func DefaultFileWriteAuthConfig() (AuthConfig, error) {
 		}
 	}
 	return cfg, nil
+}
+
+func DefaultEffectiveFileWriteAuthConfig() (AuthConfig, error) {
+	cfg, err := DefaultFileWriteAuthConfig()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	return withFullAuthFallback(cfg, "CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE")
+}
+
+func DefaultFullAuthConfig() (AuthConfig, error) {
+	cachePath, err := defaultFullTokenCachePath()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	fileCfg, err := loadDefaultTeamsAuthConfigFile()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	profileCfg := fileCfg.profile(defaultTeamsAuthProfile())
+	cfg := AuthConfig{
+		TenantID: firstNonEmptyString(profileCfg.TenantID, fileCfg.TenantID),
+		ClientID: firstNonEmptyString(
+			profileCfg.Full.ClientID,
+			fileCfg.Full.ClientID,
+			profileCfg.ChatWrite.ClientID,
+			fileCfg.ChatWrite.ClientID,
+		),
+		Scopes:    firstNonEmptyString(profileCfg.Full.Scopes, fileCfg.Full.Scopes, defaultFullScopes),
+		CachePath: cachePath,
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FULL_TENANT_ID")); v != "" {
+		cfg.TenantID = v
+	} else if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_TENANT_ID")); v != "" {
+		cfg.TenantID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FULL_CLIENT_ID")); v != "" {
+		cfg.ClientID = v
+	} else if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_CLIENT_ID")); v != "" {
+		cfg.ClientID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FULL_SCOPES")); v != "" {
+		cfg.Scopes = v
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE")); v != "" {
+		cfg.CachePath = expandHome(v)
+	}
+	if err := requireTeamsAuthIDs(cfg, "full", "CODEX_HELPER_TEAMS_FULL_CLIENT_ID"); err != nil {
+		return AuthConfig{}, err
+	}
+	if !unsafeTeamsScopesAllowed() {
+		if err := validateTeamsScopes(cfg.Scopes); err != nil {
+			return AuthConfig{}, err
+		}
+	}
+	return cfg, nil
+}
+
+type authCacheState int
+
+const (
+	authCacheMissing authCacheState = iota
+	authCacheEmpty
+	authCacheUsable
+)
+
+func withFullAuthFallback(cfg AuthConfig, explicitTokenCacheEnv string) (AuthConfig, error) {
+	if strings.TrimSpace(os.Getenv(explicitTokenCacheEnv)) != "" {
+		return cfg, nil
+	}
+	state, err := classifyAuthCache(cfg.CachePath)
+	if err != nil || state == authCacheUsable {
+		return cfg, nil
+	}
+	fullCfg, fullErr := DefaultFullAuthConfig()
+	if fullErr != nil {
+		return cfg, nil
+	}
+	fullState, fullReadErr := classifyAuthCache(fullCfg.CachePath)
+	if fullReadErr != nil || fullState == authCacheUsable {
+		return fullCfg, nil
+	}
+	if promotedCfg, ok := cachedFullAuthAliasFromChatToken(fullCfg); ok {
+		return promotedCfg, nil
+	}
+	if state == authCacheMissing {
+		return fullCfg, nil
+	}
+	return cfg, nil
+}
+
+func cachedFullAuthAliasFromChatToken(fullCfg AuthConfig) (AuthConfig, bool) {
+	chatCfg, err := DefaultAuthConfig()
+	if err != nil {
+		return AuthConfig{}, false
+	}
+	if filepath.Clean(chatCfg.CachePath) == filepath.Clean(fullCfg.CachePath) {
+		return AuthConfig{}, false
+	}
+	if !tokenCacheCoversFeatureScopes(chatCfg.CachePath, "User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite") {
+		return AuthConfig{}, false
+	}
+	fullCfg.CachePath = chatCfg.CachePath
+	return fullCfg, true
+}
+
+func tokenCacheCoversFeatureScopes(path string, required string) bool {
+	tok, err := readTokenCache(path)
+	if err != nil {
+		return false
+	}
+	have := make(map[string]bool)
+	for _, scope := range strings.Fields(tok.Scope) {
+		have[scope] = true
+	}
+	for _, scope := range strings.Fields(required) {
+		if !scopeCoveredByToken(scope, have) {
+			return false
+		}
+	}
+	return true
+}
+
+func scopeCoveredByToken(scope string, have map[string]bool) bool {
+	if have[scope] {
+		return true
+	}
+	switch scope {
+	case "Chat.Read":
+		return have["Chat.ReadWrite"]
+	case "Files.Read":
+		return have["Files.ReadWrite"] || have["Files.Read.All"] || have["Files.ReadWrite.All"]
+	case "Files.ReadWrite":
+		return have["Files.ReadWrite.All"]
+	case "User.Read":
+		return have["User.Read.All"]
+	default:
+		return false
+	}
+}
+
+func classifyAuthCache(path string) (authCacheState, error) {
+	tok, err := readTokenCache(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return authCacheMissing, nil
+	}
+	if err != nil {
+		return authCacheEmpty, err
+	}
+	if tok.AccessToken != "" || tok.RefreshToken != "" {
+		return authCacheUsable, nil
+	}
+	return authCacheEmpty, nil
 }
 
 func NewAuthManager(cfg AuthConfig) *AuthManager {
@@ -397,6 +572,13 @@ func (a nonInteractiveAuth) loginInstruction() string {
 	return "codex-proxy teams auth"
 }
 
+func loginCommandForAuthCache(cachePath string, fallback string) string {
+	if filepath.Base(strings.TrimSpace(cachePath)) == fullTokenCacheName {
+		return "codex-proxy teams auth full"
+	}
+	return strings.TrimSpace(fallback)
+}
+
 func (a *AuthManager) AccessToken(ctx context.Context, out io.Writer, forceLogin bool) (string, error) {
 	serviceMode := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != ""
 	refreshFailed := error(nil)
@@ -416,16 +598,17 @@ func (a *AuthManager) AccessToken(ctx context.Context, out io.Writer, forceLogin
 			}
 		}
 		if serviceMode {
+			loginCommand := loginCommandForAuthCache(a.cfg.CachePath, "codex-proxy teams auth")
 			if errors.Is(err, os.ErrNotExist) {
-				return "", fmt.Errorf("Teams chat access auth cache is missing; run `codex-proxy teams auth` in a foreground terminal before starting the service")
+				return "", fmt.Errorf("Teams chat access auth cache is missing; run `%s` in a foreground terminal before starting the service", loginCommand)
 			}
 			if err != nil {
 				return "", err
 			}
 			if refreshFailed != nil {
-				return "", fmt.Errorf("Teams chat access token refresh failed: %w; run `codex-proxy teams auth` in a foreground terminal", refreshFailed)
+				return "", fmt.Errorf("Teams chat access token refresh failed: %w; run `%s` in a foreground terminal", refreshFailed, loginCommand)
 			}
-			return "", fmt.Errorf("Teams chat access auth cache is expired and has no refresh token; run `codex-proxy teams auth` in a foreground terminal before starting the service")
+			return "", fmt.Errorf("Teams chat access auth cache is expired and has no refresh token; run `%s` in a foreground terminal before starting the service", loginCommand)
 		}
 	}
 	tok, err := a.deviceLogin(ctx, out)
@@ -836,6 +1019,10 @@ func defaultReadTokenCachePath() (string, error) {
 
 func defaultFileWriteTokenCachePath() (string, error) {
 	return defaultTeamsTokenCachePath(fileWriteTokenCacheName)
+}
+
+func defaultFullTokenCachePath() (string, error) {
+	return defaultTeamsTokenCachePath(fullTokenCacheName)
 }
 
 func defaultTeamsTokenCachePath(fileName string) (string, error) {

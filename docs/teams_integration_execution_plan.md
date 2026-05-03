@@ -919,7 +919,8 @@ Write scope:
 
 Responsibilities:
 
-- Keep file upload behind a separate opt-in file-write auth profile and token cache.
+- Support a separate opt-in file-write auth profile, while allowing the one-shot
+  full auth token to satisfy file upload when the user chooses the simpler setup.
 - Upload only explicit files selected by the operator or session helper command.
 - Default session `helper file <relative-path>` to relative paths under the Teams outbound root.
 - Allow local arbitrary paths only through the local CLI with `--allow-local-path`.
@@ -931,6 +932,10 @@ Status:
 
 - Completed MVP: manual Graph proof of concept uploaded `.txt` and `.png` files to OneDrive and sent Teams reference attachments to the test chat.
 - Completed implementation: `teams auth file-write`, `teams auth file-write-status`, `teams auth file-write-logout`, `teams send-file`, and session `helper file`.
+- Completed one-shot auth follow-up: `teams auth full` can request read, send,
+  meeting-chat, and file-upload scopes once; runtime read/chat/file clients use
+  split tokens when present and fall back to the full token, or to an existing
+  broad chat token whose cached scopes explicitly cover the full feature set.
 - Completed tests: auth-profile separation, Graph upload/send payloads, outbound path restrictions, bridge helper-command upload path, CLI target resolution, and opt-in live Graph upload smoke hook.
 - Completed stress hardening: safe token-cache status checks, cached-token scope validation, outbound root permission repair, symlink-directory and TOCTOU-resistant file reads, subsecond upload names, production Graph `nextLink` normalization, drive item id validation, helper-prefixed attachment messages, pause/drain checks before attachment download or `helper retry`, outbox send lease, and active-service stop/restart during upgrade even when the Teams state file is absent.
 - Completed durable delivery hardening: `helper file` and Codex artifact
@@ -1301,9 +1306,9 @@ Responsibilities:
   | --- | --- | --- | --- |
   | `hot` | user just sent a message, work chat just resumed/created, or helper just sent a final answer | `1s`, respecting per-chat 1 rps | after `2 min` idle |
   | `running` | Codex turn is running | `3s` | turn completion moves to `hot`; no user/helper activity for `15 min` moves to `warm` unless the turn is still running |
-  | `warm` | recent conversation, no active turn | `10s` | after `15 min` idle |
-  | `cool` | quiet but still likely to be resumed soon | `30s` | after `2h` idle |
-  | `cold` | old conversation kept as low-frequency listener | `120s` | after `48h` idle |
+  | `warm` | recent conversation, no active turn | `5s` | after `15 min` idle |
+  | `cool` | quiet but still likely to be resumed soon | `10s` | after `4h` idle |
+  | `cold` | old conversation kept as low-frequency listener | `30s` | after `48h` idle |
   | `parked` | explicitly closed/parked or idle for `48h` | not polled | user sends stable `r <hash>` in control chat |
   | `catchup` | startup, reconnect, resume, or continuation path exists | budgeted ASAP, top `50` | after catch-up completes, return by latest activity |
   | `blocked` | Graph 429 or transport backoff | not polled | `blocked_until`/`Retry-After` expires, then return to prior state |

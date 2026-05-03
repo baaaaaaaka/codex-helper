@@ -20,15 +20,15 @@ const (
 
 	inboundPollHotInterval     = time.Second
 	inboundPollRunningInterval = 3 * time.Second
-	inboundPollWarmInterval    = 10 * time.Second
-	inboundPollCoolInterval    = 30 * time.Second
-	inboundPollColdInterval    = 120 * time.Second
+	inboundPollWarmInterval    = 5 * time.Second
+	inboundPollCoolInterval    = 10 * time.Second
+	inboundPollColdInterval    = 30 * time.Second
 	inboundPollControlInterval = 5 * time.Second
 	inboundPollCatchupInterval = 10 * time.Second
 
 	inboundPollHotWindow  = 2 * time.Minute
 	inboundPollWarmWindow = 15 * time.Minute
-	inboundPollCoolWindow = 2 * time.Hour
+	inboundPollCoolWindow = 4 * time.Hour
 	inboundPollParkAfter  = 48 * time.Hour
 
 	maxWorkChatPollsPerCycle = 8

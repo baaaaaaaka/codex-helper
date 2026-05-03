@@ -639,6 +639,10 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 			b.reg.MarkSeen(chatID, msg.ID)
 			continue
 		}
+		if isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
+			b.reg.MarkSeen(chatID, msg.ID)
+			continue
+		}
 		text := promptTextFromTeamsMessageHTML(msg.Body.Content)
 		if strings.TrimSpace(text) == "" && len(msg.Attachments) == 0 && len(HostedContentIDsFromHTML(msg.Body.Content)) == 0 {
 			b.reg.MarkSeen(chatID, msg.ID)
@@ -931,7 +935,7 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	if !b.annotateUserMessages || b.annotationDisabled || b.graph == nil {
 		return
 	}
-	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" {
+	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" || isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
 		return
 	}
 	annotated, ok := userAnnotatedMessageHTML(msg, b.user)
@@ -964,7 +968,7 @@ func shouldDisableUserMessageAnnotation(err error) bool {
 
 func userAnnotatedMessageHTML(msg ChatMessage, _ User) (string, bool) {
 	content := strings.TrimSpace(msg.Body.Content)
-	if content == "" || hasUserAnnotationPrefix(content) {
+	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
 		return "", false
 	}
 	label := incomingUserLabel()
@@ -1009,6 +1013,32 @@ func isUserAnnotationLabel(line string) bool {
 
 func incomingUserLabel() string {
 	return "🧑‍💻 User"
+}
+
+func isPromptlessTeamsAttachmentPlaceholderMessage(msg ChatMessage) bool {
+	if strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content)) != "" {
+		return false
+	}
+	if len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 {
+		return false
+	}
+	if hasAdaptiveCardAttachment(msg.Attachments) {
+		return true
+	}
+	return len(msg.Attachments) == 0 && hasTeamsAttachmentPlaceholder(msg.Body.Content)
+}
+
+func hasAdaptiveCardAttachment(attachments []MessageAttachment) bool {
+	for _, attachment := range attachments {
+		if strings.EqualFold(strings.TrimSpace(attachment.ContentType), "application/vnd.microsoft.card.adaptive") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTeamsAttachmentPlaceholder(content string) bool {
+	return strings.Contains(strings.ToLower(content), "<attachment")
 }
 
 func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text string) error {
@@ -1935,6 +1965,10 @@ func machineLabel() string {
 func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg ChatMessage, text string) error {
 	session := b.reg.SessionByChatID(chatID)
 	if session == nil {
+		return nil
+	}
+	if isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
+		b.reg.MarkSeen(chatID, msg.ID)
 		return nil
 	}
 	if parsed := ParseDashboardCommand(ChatScopeWork, text); parsed.HelperCommand {

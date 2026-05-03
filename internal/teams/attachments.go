@@ -192,7 +192,7 @@ func allowedSharePointHost(host string) bool {
 }
 
 func fileAttachmentScopesEnabled() bool {
-	cfg, err := DefaultReadAuthConfig()
+	cfg, err := DefaultEffectiveReadAuthConfig()
 	if err != nil {
 		return false
 	}

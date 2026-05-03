@@ -64,23 +64,21 @@ Configure the local Teams auth metadata in one command:
 ```sh
 codex-proxy teams auth config \
   --tenant-id "<tenant-id>" \
-  --read-client-id "<read-client-id>" \
-  --chat-client-id "<chat-write-client-id>" \
-  --file-write-client-id "<file-write-client-id>"
+  --client-id "<teams-graph-public-client-id>"
 ```
 
-If file upload is not needed yet, omit `--file-write-client-id`; the helper will
-fall back to the chat/write client for file-write auth when possible.
+This single client must be allowed to request the full delegated Graph scopes
+used by Teams helper. Advanced split-token deployments can still provide
+`--read-client-id`, `--chat-client-id`, `--file-write-client-id`, and
+`--full-client-id` separately.
 
 To keep scopes explicit, you may also configure them in the same command:
 
 ```sh
 codex-proxy teams auth config \
   --tenant-id "<tenant-id>" \
-  --read-client-id "<read-client-id>" \
-  --chat-client-id "<chat-write-client-id>" \
-  --read-scopes "openid profile offline_access User.Read Chat.Read" \
-  --chat-scopes "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite"
+  --client-id "<teams-graph-public-client-id>" \
+  --full-scopes "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite"
 ```
 
 The default chat scopes are designed for meeting-based Teams chats. The helper
@@ -89,27 +87,26 @@ calendar pollution for normal use.
 
 ## 4. Authenticate Teams
 
-Run read auth first. This token is used for lower-latency message polling:
+Run one full auth first. This token is used for message polling, chat creation,
+message sends, meeting-chat carriers, and helper file/image uploads:
 
 ```sh
-codex-proxy teams auth read
+codex-proxy teams auth full
 ```
 
 Open the device login URL shown by the command, enter the code, and complete SSO
 and MFA.
 
-Run chat/write auth next. This token is used to create meeting chats and send
-messages:
+Optional advanced split-token auths:
 
 ```sh
+codex-proxy teams auth read
 codex-proxy teams auth
-```
-
-Optional file upload support:
-
-```sh
 codex-proxy teams auth file-write
 ```
+
+The helper prefers split tokens when they exist, but falls back to the full token
+when read/chat/file-write caches are missing.
 
 Token caches are local secrets. They are stored under the user cache directory
 with private file permissions. Do not copy them to another machine and do not
@@ -120,6 +117,7 @@ commit them.
 Run local checks:
 
 ```sh
+codex-proxy teams auth full-status
 codex-proxy teams auth read-status
 codex-proxy teams auth status
 codex-proxy teams doctor --live
@@ -296,7 +294,8 @@ A final answer can include:
 ````
 
 The helper only accepts relative manifest paths under the outbound root. File
-upload requires successful `codex-proxy teams auth file-write`.
+upload requires `codex-proxy teams auth full` or the advanced split-token
+`codex-proxy teams auth file-write`.
 
 To send an existing local file manually from a work chat, put it under the
 outbound root and send:
@@ -392,9 +391,7 @@ file edits or terminal commands.
 Auth expired:
 
 ```sh
-codex-proxy teams auth read
-codex-proxy teams auth
-codex-proxy teams auth file-write
+codex-proxy teams auth full
 ```
 
 Service not running:

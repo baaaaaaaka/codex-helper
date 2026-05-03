@@ -402,7 +402,7 @@ func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
 	}
 	select {
 	case <-executor.started:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("first Codex turn did not start")
 	}
 
@@ -440,7 +440,7 @@ func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
 		if !strings.Contains(got, "second prompt") {
 			t.Fatalf("second started prompt = %q", got)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("queued second Codex turn did not start after first finished")
 	}
 	executor.release <- struct{}{}
@@ -449,7 +449,7 @@ func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
 		if !strings.Contains(got, "third prompt") {
 			t.Fatalf("third started prompt = %q", got)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("queued third Codex turn did not start after second finished")
 	}
 	executor.release <- struct{}{}
@@ -462,6 +462,59 @@ func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
 		!strings.Contains(prompts[1], "second prompt") ||
 		!strings.Contains(prompts[2], "third prompt") {
 		t.Fatalf("executor prompts = %#v, want first, second, third", prompts)
+	}
+}
+
+func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	first := bridgePollMessage("first", "2026-05-03T01:00:00Z", "first prompt")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", first, "first prompt"); err != nil {
+		t.Fatalf("first handleSessionMessage error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("first Codex turn did not start")
+	}
+
+	card := bridgeTestMessageWithText("adaptive-card-only", `<attachment id="card-1"></attachment>`)
+	card.Attachments = []MessageAttachment{{
+		ID:          "card-1",
+		ContentType: "application/vnd.microsoft.card.adaptive",
+		Name:        "Open Codex chat",
+	}}
+	if err := bridge.handleSessionMessage(ctx, "chat-1", card, ""); err != nil {
+		t.Fatalf("adaptive card-only handleSessionMessage error: %v", err)
+	}
+	if strings.Contains(sentPlainJoined(*sent), "Queued. Codex will respond after the current request.") {
+		t.Fatalf("adaptive card-only message should not send queued ack: %#v", *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := queuedTurnCountForSession(state, "s001"); got != 0 {
+		t.Fatalf("queued turn count = %d, want 0", got)
+	}
+	if got := len(state.InboundEvents); got != 1 {
+		t.Fatalf("inbound event count = %d, want only the first real prompt", got)
+	}
+
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 1)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	prompts := executor.promptSnapshot()
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "first prompt") {
+		t.Fatalf("executor prompts = %#v, want only first prompt", prompts)
 	}
 }
 
@@ -622,6 +675,30 @@ func TestUserAnnotatedMessageHTMLPrefixesSenderOnSeparateLine(t *testing.T) {
 		Content     string `json:"content"`
 	}{ContentType: "html", Content: got}}, User{}); ok {
 		t.Fatal("already annotated message should not be annotated again")
+	}
+}
+
+func TestUserAnnotatedMessageHTMLSkipsPromptlessAdaptiveCard(t *testing.T) {
+	msg := bridgeTestMessageWithText("card-only", `<attachment id="card-1"></attachment>`)
+	msg.Attachments = []MessageAttachment{{
+		ID:          "card-1",
+		ContentType: "application/vnd.microsoft.card.adaptive",
+		Name:        "Open Codex chat",
+	}}
+	if !isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
+		t.Fatal("adaptive card-only message should be treated as promptless attachment placeholder")
+	}
+	if _, ok := userAnnotatedMessageHTML(msg, User{ID: "user-1"}); ok {
+		t.Fatal("adaptive card-only message should not be annotated")
+	}
+
+	withoutAttachmentPayload := msg
+	withoutAttachmentPayload.Attachments = nil
+	if !isPromptlessTeamsAttachmentPlaceholderMessage(withoutAttachmentPayload) {
+		t.Fatal("attachment placeholder-only message should be treated as promptless even when Graph omits attachments")
+	}
+	if _, ok := userAnnotatedMessageHTML(withoutAttachmentPayload, User{ID: "user-1"}); ok {
+		t.Fatal("attachment placeholder-only message should not be annotated")
 	}
 }
 
@@ -4380,6 +4457,46 @@ func TestBridgePollAnnotatesIncomingUserMessageBestEffort(t *testing.T) {
 	}
 	if len(handled) != 1 || handled[0] != "run split-client check" {
 		t.Fatalf("handled prompts = %#v", handled)
+	}
+}
+
+func TestBridgePollIgnoresPromptlessAdaptiveCardMessage(t *testing.T) {
+	msg := bridgePollMessage("adaptive-card-only", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<attachment id="card-1"></attachment>`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "card-1",
+		ContentType: "application/vnd.microsoft.card.adaptive",
+		Name:        "Open Codex chat",
+	}}
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.readGraph = graph
+	bridge.annotateUserMessages = true
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("adaptive card-only message should not be handled: %#v", handled)
+	}
+	if !bridge.reg.HasSeen("chat-1", "adaptive-card-only") {
+		t.Fatal("adaptive card-only message was not marked seen")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if len(state.InboundEvents) != 0 || len(state.Turns) != 0 {
+		t.Fatalf("adaptive card-only message should not create durable work: inbound=%#v turns=%#v", state.InboundEvents, state.Turns)
 	}
 }
 

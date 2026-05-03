@@ -392,6 +392,34 @@ func TestDefaultAuthConfigUsesLocalAuthConfigFile(t *testing.T) {
 	if fileCfg.TenantID != "tenant-from-file" || fileCfg.ClientID != "chat-from-file" {
 		t.Fatalf("file config should fall back to chat client id: %#v", fileCfg)
 	}
+	fullCfg, err := DefaultFullAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultFullAuthConfig error: %v", err)
+	}
+	if fullCfg.TenantID != "tenant-from-file" || fullCfg.ClientID != "chat-from-file" {
+		t.Fatalf("full config should fall back to chat client id: %#v", fullCfg)
+	}
+}
+
+func TestDefaultFullAuthConfigUsesSeparateCacheAndScopes(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_SCOPES", "")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", "")
+	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
+
+	cfg, err := DefaultFullAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultFullAuthConfig error: %v", err)
+	}
+	if cfg.Scopes != defaultFullScopes {
+		t.Fatalf("full scopes = %q, want %q", cfg.Scopes, defaultFullScopes)
+	}
+	want := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", fullTokenCacheName)
+	if cfg.CachePath != want {
+		t.Fatalf("full cache path = %q, want %q", cfg.CachePath, want)
+	}
 }
 
 func TestDefaultFileWriteAuthConfigUsesSeparateCacheAndScopes(t *testing.T) {
@@ -414,6 +442,149 @@ func TestDefaultFileWriteAuthConfigUsesSeparateCacheAndScopes(t *testing.T) {
 	}
 	if strings.Contains(cfg.CachePath, "teams-chat-write-token.json") {
 		t.Fatalf("file-write cache should be separate from chat token cache: %q", cfg.CachePath)
+	}
+}
+
+func TestEffectiveAuthConfigsFallBackToFullTokenCache(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
+	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", "")
+	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
+	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", "")
+	fullPath := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", fullTokenCacheName)
+	if err := writeTokenCache(fullPath, TokenCache{
+		AccessToken:  "full-access",
+		RefreshToken: "full-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		Scope:        defaultFullScopes,
+	}); err != nil {
+		t.Fatalf("write full token cache: %v", err)
+	}
+
+	readCfg, err := DefaultEffectiveReadAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveReadAuthConfig error: %v", err)
+	}
+	if readCfg.CachePath != fullPath || readCfg.Scopes != defaultFullScopes {
+		t.Fatalf("effective read config = %#v, want full cache/scopes", readCfg)
+	}
+	chatCfg, err := DefaultEffectiveAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveAuthConfig error: %v", err)
+	}
+	if chatCfg.CachePath != fullPath || chatCfg.Scopes != defaultFullScopes {
+		t.Fatalf("effective chat config = %#v, want full cache/scopes", chatCfg)
+	}
+	fileCfg, err := DefaultEffectiveFileWriteAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveFileWriteAuthConfig error: %v", err)
+	}
+	if fileCfg.CachePath != fullPath || fileCfg.Scopes != defaultFullScopes {
+		t.Fatalf("effective file config = %#v, want full cache/scopes", fileCfg)
+	}
+}
+
+func TestEffectiveAuthConfigsPreferDedicatedTokenCache(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
+	readPath := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", readTokenCacheName)
+	fullPath := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", fullTokenCacheName)
+	if err := writeTokenCache(readPath, TokenCache{
+		AccessToken: "read-access",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+		Scope:       defaultReadScopes,
+	}); err != nil {
+		t.Fatalf("write read token cache: %v", err)
+	}
+	if err := writeTokenCache(fullPath, TokenCache{
+		AccessToken: "full-access",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+		Scope:       defaultFullScopes,
+	}); err != nil {
+		t.Fatalf("write full token cache: %v", err)
+	}
+
+	cfg, err := DefaultEffectiveReadAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveReadAuthConfig error: %v", err)
+	}
+	if cfg.CachePath != readPath {
+		t.Fatalf("effective read cache path = %q, want dedicated %q", cfg.CachePath, readPath)
+	}
+}
+
+func TestEffectiveAuthConfigsHonorExplicitTokenCacheOverride(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
+	explicitRead := filepath.Join(tmp, "explicit-read-token.json")
+	fullPath := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", fullTokenCacheName)
+	if err := writeTokenCache(fullPath, TokenCache{
+		AccessToken: "full-access",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+		Scope:       defaultFullScopes,
+	}); err != nil {
+		t.Fatalf("write full token cache: %v", err)
+	}
+	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", explicitRead)
+
+	cfg, err := DefaultEffectiveReadAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveReadAuthConfig error: %v", err)
+	}
+	if cfg.CachePath != explicitRead {
+		t.Fatalf("effective read cache path = %q, want explicit override %q", cfg.CachePath, explicitRead)
+	}
+}
+
+func TestEffectiveFileWriteAuthConfigPromotesBroadChatTokenCache(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
+	chatPath := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", chatWriteTokenCacheName)
+	if err := writeTokenCache(chatPath, TokenCache{
+		AccessToken:  "chat-access",
+		RefreshToken: "chat-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		Scope:        "User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite",
+	}); err != nil {
+		t.Fatalf("write chat token cache: %v", err)
+	}
+
+	cfg, err := DefaultEffectiveFileWriteAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveFileWriteAuthConfig error: %v", err)
+	}
+	if cfg.CachePath != chatPath {
+		t.Fatalf("effective file cache path = %q, want broad chat cache %q", cfg.CachePath, chatPath)
+	}
+	if cfg.Scopes != defaultFullScopes {
+		t.Fatalf("effective file scopes = %q, want full scopes %q", cfg.Scopes, defaultFullScopes)
+	}
+}
+
+func TestEffectiveFileWriteAuthConfigDoesNotPromoteNarrowChatTokenCache(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
+	chatPath := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", chatWriteTokenCacheName)
+	fullPath := filepath.Join(cacheBase, "codex-helper", "teams", "profiles", "default", fullTokenCacheName)
+	if err := writeTokenCache(chatPath, TokenCache{
+		AccessToken: "chat-access",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+		Scope:       "User.Read Chat.ReadWrite OnlineMeetings.ReadWrite",
+	}); err != nil {
+		t.Fatalf("write chat token cache: %v", err)
+	}
+
+	cfg, err := DefaultEffectiveFileWriteAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveFileWriteAuthConfig error: %v", err)
+	}
+	if cfg.CachePath != fullPath {
+		t.Fatalf("effective file cache path = %q, want missing full cache path %q", cfg.CachePath, fullPath)
 	}
 }
 

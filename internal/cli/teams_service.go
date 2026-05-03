@@ -358,7 +358,7 @@ func runTeamsServiceWSLReadinessCheck(ctx context.Context, out io.Writer) error 
 }
 
 func defaultTeamsServiceAuthPreflight() error {
-	readCfg, err := teams.DefaultReadAuthConfig()
+	readCfg, err := teams.DefaultEffectiveReadAuthConfig()
 	if err != nil {
 		return err
 	}
@@ -368,9 +368,9 @@ func defaultTeamsServiceAuthPreflight() error {
 	}
 	switch readStatus {
 	case "missing", "empty", "present, access token expired":
-		return fmt.Errorf("Teams read auth cache is not ready for background service (%s at %s); run `codex-proxy teams auth read` in a foreground terminal first", readStatus, readCfg.CachePath)
+		return fmt.Errorf("Teams read auth cache is not ready for background service (%s at %s); run `%s` in a foreground terminal first", readStatus, readCfg.CachePath, teamsAuthCommandForCache(readCfg.CachePath, "codex-proxy teams auth read"))
 	}
-	writeCfg, err := teams.DefaultAuthConfig()
+	writeCfg, err := teams.DefaultEffectiveAuthConfig()
 	if err != nil {
 		return err
 	}
@@ -380,7 +380,7 @@ func defaultTeamsServiceAuthPreflight() error {
 	}
 	switch writeStatus {
 	case "missing", "empty", "present, access token expired":
-		return fmt.Errorf("Teams write auth cache is not ready for background service (%s at %s); run `codex-proxy teams auth` in a foreground terminal first", writeStatus, writeCfg.CachePath)
+		return fmt.Errorf("Teams write auth cache is not ready for background service (%s at %s); run `%s` in a foreground terminal first", writeStatus, writeCfg.CachePath, teamsAuthCommandForCache(writeCfg.CachePath, "codex-proxy teams auth"))
 	}
 	return nil
 }

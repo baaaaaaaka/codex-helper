@@ -129,11 +129,17 @@ type ChatMention struct {
 	User User
 }
 
+type OpenURLCardAction struct {
+	Title string
+	URL   string
+}
+
 type GraphStatusError struct {
 	Method     string
 	Path       string
 	StatusCode int
 	Code       string
+	Message    string
 	RetryAfter time.Duration
 }
 
@@ -141,6 +147,9 @@ func (e *GraphStatusError) Error() string {
 	detail := ""
 	if e.Code != "" {
 		detail = ": code=" + e.Code
+	}
+	if e.Message != "" {
+		detail += ": " + e.Message
 	}
 	return fmt.Sprintf("Graph %s %s failed: HTTP %d %s%s", e.Method, redactGraphPath(pathWithoutQuery(e.Path)), e.StatusCode, http.StatusText(e.StatusCode), detail)
 }
@@ -158,11 +167,11 @@ func NewReadGraphClient(out io.Writer) (*GraphClient, error) {
 }
 
 func NewReadGraphClientWithHTTPClient(out io.Writer, client *http.Client) (*GraphClient, error) {
-	cfg, err := DefaultReadAuthConfig()
+	cfg, err := DefaultEffectiveReadAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	return newGraphClientWithHTTPClient(newNonInteractiveAuthManagerWithHTTPClient(cfg, client, "Teams message read", "codex-proxy teams auth read"), out, client), nil
+	return newGraphClientWithHTTPClient(newNonInteractiveAuthManagerWithHTTPClient(cfg, client, "Teams message read", loginCommandForAuthCache(cfg.CachePath, "codex-proxy teams auth read")), out, client), nil
 }
 
 func newGraphClient(auth graphAuth, out io.Writer) *GraphClient {
@@ -326,6 +335,87 @@ func (g *GraphClient) SendHTMLWithMentions(ctx context.Context, chatID string, h
 	return msg, err
 }
 
+func (g *GraphClient) SendOpenURLAdaptiveCard(ctx context.Context, chatID string, title string, text string, actions []OpenURLCardAction) (ChatMessage, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return ChatMessage{}, fmt.Errorf("chat id is required")
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return ChatMessage{}, fmt.Errorf("card title is required")
+	}
+	cardActions := make([]map[string]any, 0, len(actions))
+	for _, action := range actions {
+		actionTitle := strings.TrimSpace(action.Title)
+		actionURL := strings.TrimSpace(action.URL)
+		if actionTitle == "" || actionURL == "" {
+			return ChatMessage{}, fmt.Errorf("card action title and URL are required")
+		}
+		if !safeTeamsOpenURL(actionURL) {
+			return ChatMessage{}, fmt.Errorf("refusing unsafe Teams card URL")
+		}
+		cardActions = append(cardActions, map[string]any{
+			"type":  "Action.OpenUrl",
+			"title": actionTitle,
+			"url":   actionURL,
+		})
+	}
+	if len(cardActions) == 0 {
+		return ChatMessage{}, fmt.Errorf("at least one card action is required")
+	}
+	bodyBlocks := []map[string]any{
+		{
+			"type":   "TextBlock",
+			"text":   title,
+			"weight": "Bolder",
+			"size":   "Medium",
+			"wrap":   true,
+		},
+	}
+	if trimmed := strings.TrimSpace(text); trimmed != "" {
+		bodyBlocks = append(bodyBlocks, map[string]any{
+			"type": "TextBlock",
+			"text": trimmed,
+			"wrap": true,
+		})
+	}
+	card := map[string]any{
+		"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+		"type":    "AdaptiveCard",
+		"version": "1.4",
+		"body":    bodyBlocks,
+		"actions": cardActions,
+	}
+	cardJSON, err := json.Marshal(card)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	message := map[string]any{
+		"body": map[string]any{
+			"contentType": "html",
+			"content":     `<attachment id="card-1"></attachment>`,
+		},
+		"attachments": []map[string]any{
+			{
+				"id":          "card-1",
+				"contentType": "application/vnd.microsoft.card.adaptive",
+				"content":     string(cardJSON),
+			},
+		},
+	}
+	var msg ChatMessage
+	err = g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", message, &msg)
+	return msg, err
+}
+
+func safeTeamsOpenURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return parsed.Scheme == "https" && strings.EqualFold(parsed.Hostname(), "teams.microsoft.com")
+}
+
 func (g *GraphClient) UpdateChatMessageHTML(ctx context.Context, chatID string, messageID string, html string) error {
 	body := map[string]any{
 		"body": map[string]any{
@@ -341,6 +431,27 @@ func (g *GraphClient) UpdateChatTopic(ctx context.Context, chatID string, topic 
 		"topic": SanitizeTopic(topic),
 	}
 	return g.do(ctx, http.MethodPatch, "/chats/"+url.PathEscape(chatID), body, nil)
+}
+
+func (g *GraphClient) UnhideChatForUser(ctx context.Context, chatID string, user User) error {
+	chatID = strings.TrimSpace(chatID)
+	userID := strings.TrimSpace(user.ID)
+	if chatID == "" {
+		return fmt.Errorf("chat id is required")
+	}
+	if userID == "" {
+		return fmt.Errorf("user id is required")
+	}
+	userBody := map[string]any{
+		"id": userID,
+	}
+	if tenantID := strings.TrimSpace(g.tenantID()); tenantID != "" {
+		userBody["tenantId"] = tenantID
+	}
+	body := map[string]any{
+		"user": userBody,
+	}
+	return g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/unhideForUser", body, nil)
 }
 
 func HTMLMessageMentioningOwner(prefix string, text string, owner User) (string, []ChatMention) {
@@ -781,7 +892,17 @@ func isAllowedGraphRequest(method string, path string) bool {
 		}
 		return true
 	}
+	if method == http.MethodPost && clean == "/me/onlineMeetings/createOrGet" {
+		if q, ok := allowedGraphQuery(path); !ok || len(q) != 0 {
+			return false
+		}
+		return true
+	}
 	if method == http.MethodPatch && isChatPath(clean) {
+		q, ok := allowedGraphQuery(path)
+		return ok && len(q) == 0
+	}
+	if method == http.MethodPost && isChatUnhideForUserPath(clean) {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
 	}
@@ -1047,6 +1168,27 @@ func safeGraphErrorCode(raw []byte) string {
 	return code
 }
 
+func safeGraphErrorMessage(raw []byte) string {
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return ""
+	}
+	message := strings.Join(strings.Fields(payload.Error.Message), " ")
+	if message == "" || len(message) > 240 {
+		return ""
+	}
+	for _, r := range message {
+		if r < 0x20 || r == '<' || r == '>' {
+			return ""
+		}
+	}
+	return message
+}
+
 func allowedGraphQuery(path string) (url.Values, bool) {
 	_, query, _ := strings.Cut(path, "?")
 	if strings.Contains(query, "#") {
@@ -1167,6 +1309,14 @@ func isChatPath(path string) bool {
 func isChatMembersPath(path string) bool {
 	parts := strings.Split(path, "/")
 	if len(parts) != 4 || parts[0] != "" || parts[1] != "chats" || parts[2] == "" || parts[3] != "members" {
+		return false
+	}
+	return safeGraphDynamicID(parts[2])
+}
+
+func isChatUnhideForUserPath(path string) bool {
+	parts := strings.Split(path, "/")
+	if len(parts) != 4 || parts[0] != "" || parts[1] != "chats" || parts[2] == "" || parts[3] != "unhideForUser" {
 		return false
 	}
 	return safeGraphDynamicID(parts[2])

@@ -56,15 +56,15 @@ func newTeamsSetupCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintln(out, "Teams setup checklist")
-			_, _ = fmt.Fprintln(out, "1. Configure your tenant and Teams Graph client IDs with `codex-proxy teams auth config --tenant-id <tenant-id> --read-client-id <read-client-id> --chat-client-id <chat-client-id>`.")
-			_, _ = fmt.Fprintln(out, "2. Run `codex-proxy teams auth read` in a foreground terminal and finish Microsoft device login for low-latency polling.")
-			_, _ = fmt.Fprintln(out, "3. Run `codex-proxy teams auth` in a foreground terminal and finish Microsoft device login for chat creation and sends.")
+			_, _ = fmt.Fprintln(out, "1. Configure your tenant and Teams Graph client ID with `codex-proxy teams auth config --tenant-id <tenant-id> --client-id <client-id>`.")
+			_, _ = fmt.Fprintln(out, "2. Run `codex-proxy teams auth full` in a foreground terminal and finish Microsoft device login for Teams read, send, meeting chat, and file upload.")
+			_, _ = fmt.Fprintln(out, "3. Optional: run `codex-proxy teams auth read` later if you want a separate read-only token for low-latency polling experiments.")
 			_, _ = fmt.Fprintln(out, "4. Run `codex-proxy teams doctor --live` to verify Graph identity and existing chat read access for your account.")
 			_, _ = fmt.Fprintln(out, "5. Run `codex-proxy teams control` to create or show this machine's meeting-based control chat. This command may create a Teams chat and send an @mention plus a ready message.")
 			_, _ = fmt.Fprintln(out, "6. Run `codex-proxy teams service doctor` to check the no-root service backend for this platform.")
 			_, _ = fmt.Fprintln(out, "7. Start the foreground bridge with `codex-proxy teams run`, or install a user service with `codex-proxy teams service install` followed by `codex-proxy teams service enable` and `codex-proxy teams service start`.")
 			_, _ = fmt.Fprintln(out, "8. Foreground `teams run` stops when its terminal exits. Use the service path for terminal close, SSH disconnect, WSL, sleep/wake, and helper upgrade recovery.")
-			_, _ = fmt.Fprintln(out, "9. For file uploads, run `codex-proxy teams auth file-write` and keep files under the Teams outbound root shown by `helper file <relative-path>` errors.")
+			_, _ = fmt.Fprintln(out, "9. File uploads use the full token by default. Advanced split-token users can run `codex-proxy teams auth file-write` instead.")
 			_, _ = fmt.Fprintln(out, "Local checks: `codex-proxy teams status`, `codex-proxy teams control --print`, `codex-proxy teams doctor`, `codex-proxy teams service doctor`.")
 			return nil
 		},
@@ -83,10 +83,11 @@ func newTeamsAuthCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			defer func() { _ = httpClient.Close(context.Background()) }()
-			auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
+			cfg, err := teams.DefaultAuthConfig()
 			if err != nil {
 				return err
 			}
+			auth := teams.NewAuthManagerWithHTTPClient(cfg, httpClient.Client)
 			ctx := cmd.Context()
 			if _, err := auth.AccessToken(ctx, cmd.OutOrStdout(), force); err != nil {
 				return err
@@ -103,6 +104,9 @@ func newTeamsAuthCmd(root *rootOptions) *cobra.Command {
 	cmd.Flags().BoolVar(&force, "force", false, "Force a fresh device-code login")
 	cmd.AddCommand(
 		newTeamsAuthConfigCmd(),
+		newTeamsAuthFullCmd(root),
+		newTeamsAuthFullStatusCmd(),
+		newTeamsAuthFullLogoutCmd(),
 		newTeamsAuthReadCmd(root),
 		newTeamsAuthReadStatusCmd(),
 		newTeamsAuthReadLogoutCmd(),
@@ -120,9 +124,11 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 	var readClientID string
 	var chatClientID string
 	var fileWriteClientID string
+	var fullClientID string
 	var readScopes string
 	var chatScopes string
 	var fileWriteScopes string
+	var fullScopes string
 	cmd := &cobra.Command{
 		Use:   "config",
 		Short: "Configure local Teams Graph tenant and client IDs",
@@ -154,6 +160,10 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 				cfg.FileWrite.ClientID = strings.TrimSpace(fileWriteClientID)
 				changed = true
 			}
+			if cmd.Flags().Changed("full-client-id") {
+				cfg.Full.ClientID = strings.TrimSpace(fullClientID)
+				changed = true
+			}
 			if cmd.Flags().Changed("read-scopes") {
 				cfg.Read.Scopes = strings.TrimSpace(readScopes)
 				changed = true
@@ -164,6 +174,10 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 			}
 			if cmd.Flags().Changed("file-write-scopes") {
 				cfg.FileWrite.Scopes = strings.TrimSpace(fileWriteScopes)
+				changed = true
+			}
+			if cmd.Flags().Changed("full-scopes") {
+				cfg.Full.Scopes = strings.TrimSpace(fullScopes)
 				changed = true
 			}
 			if changed {
@@ -183,9 +197,11 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 	cmd.Flags().StringVar(&chatClientID, "chat-client-id", "", "Public client id for Teams chat creation/send scopes")
 	cmd.Flags().StringVar(&chatClientID, "client-id", "", "Alias for --chat-client-id")
 	cmd.Flags().StringVar(&fileWriteClientID, "file-write-client-id", "", "Public client id for Teams file upload scopes; defaults to chat client id when omitted")
+	cmd.Flags().StringVar(&fullClientID, "full-client-id", "", "Public client id for one-shot Teams full scopes; defaults to chat client id when omitted")
 	cmd.Flags().StringVar(&readScopes, "read-scopes", "", "Override Teams read scopes")
 	cmd.Flags().StringVar(&chatScopes, "chat-scopes", "", "Override Teams chat write scopes")
 	cmd.Flags().StringVar(&fileWriteScopes, "file-write-scopes", "", "Override Teams file write scopes")
+	cmd.Flags().StringVar(&fullScopes, "full-scopes", "", "Override Teams one-shot full scopes")
 	return cmd
 }
 
@@ -198,6 +214,11 @@ func printTeamsAuthConfigSummary(out io.Writer, cfg teams.TeamsAuthConfigFile) {
 		fileStatus = "using chat write client"
 	}
 	_, _ = fmt.Fprintf(out, "File write client ID: %s\n", fileStatus)
+	fullStatus := configuredStatus(cfg.Full.ClientID)
+	if strings.TrimSpace(cfg.Full.ClientID) == "" && strings.TrimSpace(cfg.ChatWrite.ClientID) != "" {
+		fullStatus = "using chat write client"
+	}
+	_, _ = fmt.Fprintf(out, "Full client ID: %s\n", fullStatus)
 }
 
 func configuredStatus(value string) string {
@@ -205,6 +226,90 @@ func configuredStatus(value string) string {
 		return "missing"
 	}
 	return "configured"
+}
+
+func newTeamsAuthFullCmd(root *rootOptions) *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "full",
+		Short: "Authenticate once for Teams read, send, meeting chats, and file uploads",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsFullAuthManagerWithHTTPClient(httpClient.Client)
+			if err != nil {
+				return err
+			}
+			ctx := cmd.Context()
+			if _, err := auth.AccessToken(ctx, cmd.OutOrStdout(), force); err != nil {
+				return err
+			}
+			graph := teams.NewGraphClientWithHTTPClient(auth, cmd.OutOrStdout(), httpClient.Client)
+			me, err := graph.Me(ctx)
+			if err != nil {
+				return err
+			}
+			cfg, _ := teams.DefaultFullAuthConfig()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated Teams full access as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Full token cache: %s\n", cfg.CachePath)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "Force a fresh device-code login")
+	return cmd
+}
+
+func newTeamsAuthFullStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "full-status",
+		Short: "Show local Teams full auth cache status",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := teams.DefaultFullAuthConfig()
+			if err != nil {
+				return err
+			}
+			status, err := readTeamsTokenStatus(cfg.CachePath)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams full auth cache: %s\n", status)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Full token cache: %s\n", cfg.CachePath)
+			if status == "missing" {
+				effectiveCfg, err := teams.DefaultEffectiveFileWriteAuthConfig()
+				if err == nil && filepath.Clean(effectiveCfg.CachePath) != filepath.Clean(cfg.CachePath) {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Runtime full fallback cache: %s\n", effectiveCfg.CachePath)
+				}
+			}
+			return nil
+		},
+	}
+}
+
+func newTeamsAuthFullLogoutCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "full-logout",
+		Short: "Remove the local Teams full auth cache",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := teams.DefaultFullAuthConfig()
+			if err != nil {
+				return err
+			}
+			if err := teams.RemoveTokenCache(cfg.CachePath); errors.Is(err, os.ErrNotExist) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams full auth cache already absent: %s\n", cfg.CachePath)
+				return nil
+			} else if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed Teams full auth cache: %s\n", cfg.CachePath)
+			return nil
+		},
+	}
 }
 
 func newTeamsAuthReadCmd(root *rootOptions) *cobra.Command {
@@ -219,10 +324,11 @@ func newTeamsAuthReadCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			defer func() { _ = httpClient.Close(context.Background()) }()
-			auth, err := newTeamsReadAuthManagerWithHTTPClient(httpClient.Client)
+			cfg, err := teams.DefaultReadAuthConfig()
 			if err != nil {
 				return err
 			}
+			auth := teams.NewAuthManagerWithHTTPClient(cfg, httpClient.Client)
 			ctx := cmd.Context()
 			if _, err := auth.AccessToken(ctx, cmd.OutOrStdout(), force); err != nil {
 				return err
@@ -232,7 +338,6 @@ func newTeamsAuthReadCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, _ := teams.DefaultReadAuthConfig()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated Teams read access as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Read token cache: %s\n", cfg.CachePath)
 			return nil
@@ -907,10 +1012,11 @@ func newTeamsAuthFileWriteCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			defer func() { _ = httpClient.Close(context.Background()) }()
-			auth, err := newTeamsFileWriteAuthManagerWithHTTPClient(httpClient.Client)
+			cfg, err := teams.DefaultFileWriteAuthConfig()
 			if err != nil {
 				return err
 			}
+			auth := teams.NewAuthManagerWithHTTPClient(cfg, httpClient.Client)
 			ctx := cmd.Context()
 			if _, err := auth.AccessToken(ctx, cmd.OutOrStdout(), force); err != nil {
 				return err
@@ -920,7 +1026,6 @@ func newTeamsAuthFileWriteCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, _ := teams.DefaultFileWriteAuthConfig()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated Teams file upload as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "File-write token cache: %s\n", cfg.CachePath)
 			return nil
@@ -1074,7 +1179,15 @@ func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, root *rootOptions, regis
 }
 
 func printTeamsAuthDoctorSummary(out io.Writer) error {
-	readCfg, err := teams.DefaultReadAuthConfig()
+	fullCfg, err := teams.DefaultFullAuthConfig()
+	if err == nil {
+		fullStatus, err := readTeamsTokenStatus(fullCfg.CachePath)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "Teams full auth cache: %s (%s)\n", fullStatus, fullCfg.CachePath)
+	}
+	readCfg, err := teams.DefaultEffectiveReadAuthConfig()
 	if err != nil {
 		return err
 	}
@@ -1084,9 +1197,9 @@ func printTeamsAuthDoctorSummary(out io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(out, "Teams read auth cache: %s (%s)\n", readStatus, readCfg.CachePath)
 	if readStatus == "missing" {
-		_, _ = fmt.Fprintln(out, "Read auth next step: run `codex-proxy teams auth read` in a foreground terminal.")
+		_, _ = fmt.Fprintf(out, "Read auth next step: run `%s` in a foreground terminal.\n", teamsAuthCommandForCache(readCfg.CachePath, "codex-proxy teams auth read"))
 	}
-	chatCfg, err := teams.DefaultAuthConfig()
+	chatCfg, err := teams.DefaultEffectiveAuthConfig()
 	if err != nil {
 		return err
 	}
@@ -1096,9 +1209,9 @@ func printTeamsAuthDoctorSummary(out io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(out, "Teams auth cache: %s (%s)\n", chatStatus, chatCfg.CachePath)
 	if chatStatus == "missing" {
-		_, _ = fmt.Fprintln(out, "Auth next step: run `codex-proxy teams auth` in a foreground terminal.")
+		_, _ = fmt.Fprintf(out, "Auth next step: run `%s` in a foreground terminal.\n", teamsAuthCommandForCache(chatCfg.CachePath, "codex-proxy teams auth"))
 	}
-	fileCfg, err := teams.DefaultFileWriteAuthConfig()
+	fileCfg, err := teams.DefaultEffectiveFileWriteAuthConfig()
 	if err != nil {
 		return err
 	}
@@ -1108,7 +1221,7 @@ func printTeamsAuthDoctorSummary(out io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(out, "Teams file-write auth cache: %s (%s)\n", fileStatus, fileCfg.CachePath)
 	if fileStatus == "missing" {
-		_, _ = fmt.Fprintln(out, "File upload next step: run `codex-proxy teams auth file-write` before using `helper file <relative-path>` or `codex-proxy teams send-file`.")
+		_, _ = fmt.Fprintf(out, "File upload next step: run `%s` before using `helper file <relative-path>` or `codex-proxy teams send-file`.\n", teamsAuthCommandForCache(fileCfg.CachePath, "codex-proxy teams auth file-write"))
 	}
 	return nil
 }
@@ -1159,7 +1272,15 @@ func newTeamsAuthManager() (*teams.AuthManager, error) {
 }
 
 func newTeamsAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
-	cfg, err := teams.DefaultAuthConfig()
+	cfg, err := teams.DefaultEffectiveAuthConfig()
+	if err != nil {
+		return nil, err
+	}
+	return teams.NewAuthManagerWithHTTPClient(cfg, client), nil
+}
+
+func newTeamsFullAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
+	cfg, err := teams.DefaultFullAuthConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -1171,7 +1292,7 @@ func newTeamsReadAuthManager() (*teams.AuthManager, error) {
 }
 
 func newTeamsReadAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
-	cfg, err := teams.DefaultReadAuthConfig()
+	cfg, err := teams.DefaultEffectiveReadAuthConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -1183,7 +1304,7 @@ func newTeamsFileWriteAuthManager() (*teams.AuthManager, error) {
 }
 
 func newTeamsFileWriteAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
-	cfg, err := teams.DefaultFileWriteAuthConfig()
+	cfg, err := teams.DefaultEffectiveFileWriteAuthConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -1553,4 +1674,11 @@ func existingTeamsStorePaths() ([]string, error) {
 
 func readTeamsTokenStatus(path string) (string, error) {
 	return teams.TokenCacheStatus(path)
+}
+
+func teamsAuthCommandForCache(path string, fallback string) string {
+	if filepath.Base(strings.TrimSpace(path)) == "teams-full-token.json" {
+		return "codex-proxy teams auth full"
+	}
+	return strings.TrimSpace(fallback)
 }

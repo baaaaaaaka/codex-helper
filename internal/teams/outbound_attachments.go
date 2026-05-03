@@ -60,15 +60,15 @@ func NewFileWriteGraphClient(out io.Writer) (*GraphClient, error) {
 }
 
 func NewFileWriteGraphClientWithHTTPClient(out io.Writer, client *http.Client) (*GraphClient, error) {
-	cfg, err := DefaultFileWriteAuthConfig()
+	cfg, err := DefaultEffectiveFileWriteAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	return newGraphClientWithHTTPClient(newNonInteractiveAuthManagerWithHTTPClient(cfg, client, "Teams file upload", "codex-proxy teams auth file-write"), out, client), nil
+	return newGraphClientWithHTTPClient(newNonInteractiveAuthManagerWithHTTPClient(cfg, client, "Teams file upload", loginCommandForAuthCache(cfg.CachePath, "codex-proxy teams auth file-write")), out, client), nil
 }
 
 func FileWriteAuthCacheAvailable() (string, bool, error) {
-	cfg, err := DefaultFileWriteAuthConfig()
+	cfg, err := DefaultEffectiveFileWriteAuthConfig()
 	if err != nil {
 		return "", false, err
 	}

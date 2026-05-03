@@ -25,6 +25,7 @@ type fakeGraphAuth struct {
 	refreshedToken string
 	accessCalls    int
 	refreshCalls   int
+	tenantID       string
 }
 
 func (a *fakeGraphAuth) AccessToken(context.Context, io.Writer, bool) (string, error) {
@@ -36,6 +37,10 @@ func (a *fakeGraphAuth) RefreshAccessToken(context.Context) (string, error) {
 	a.refreshCalls++
 	a.token = a.refreshedToken
 	return a.token, nil
+}
+
+func (a *fakeGraphAuth) TenantID() string {
+	return a.tenantID
 }
 
 func TestGraphRefreshesTokenAndRetriesOnceOnUnauthorized(t *testing.T) {
@@ -407,6 +412,9 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPatch, "/chats/a/messages"},
 		{http.MethodGet, "/chats/a/messages/message-id/hostedContents/../$value"},
 		{http.MethodGet, "/chats/a/messages/message-id/hostedContents/content-id/$value?$top=1"},
+		{http.MethodPost, "/chats/a/unhideForUser?$top=1"},
+		{http.MethodPost, "/chats/a/../unhideForUser"},
+		{http.MethodPost, "/me/onlineMeetings/createOrGet?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content/extra"},
 		{http.MethodGet, "/drives/drive-id/items/item-id/content"},
@@ -438,11 +446,13 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodGet, "/me/chats?$top=50"},
 		{http.MethodPost, "/chats"},
 		{http.MethodPost, "/me/onlineMeetings"},
+		{http.MethodPost, "/me/onlineMeetings/createOrGet"},
 		{http.MethodGet, "/chats/chat-id?$select=id,topic,chatType,webUrl"},
 		{http.MethodGet, "/chats/chat-id/members"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50"},
 		{http.MethodGet, "/chats/chat-id/messages/message-id"},
 		{http.MethodPatch, "/chats/chat-id/messages/message-id"},
+		{http.MethodPost, "/chats/chat-id/unhideForUser"},
 		{http.MethodGet, "/chats/chat-id/messages/message-id/hostedContents/content-id/$value"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content"},
 		{http.MethodPut, "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/file.txt:/content"},
@@ -479,6 +489,54 @@ func TestGraphListChats(t *testing.T) {
 	}
 	if len(chats) != 1 || chats[0].ID != "chat-1" || chats[0].ChatType != "group" || chats[0].WebURL == "" {
 		t.Fatalf("unexpected chats: %#v", chats)
+	}
+}
+
+func TestGraphCreateSingleMemberGroupChatUsesOwnerBindingAndSanitizedTopic(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	inputTopic := "  💬 Codex Work - s001 - repo - host  "
+	var sawCreate bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || r.URL.Path != "/chats" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		sawCreate = true
+		var payload struct {
+			ChatType string `json:"chatType"`
+			Topic    string `json:"topic"`
+			Members  []struct {
+				ODataType string   `json:"@odata.type"`
+				Roles     []string `json:"roles"`
+				UserBind  string   `json:"user@odata.bind"`
+			} `json:"members"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode create chat payload: %v", err)
+		}
+		if payload.ChatType != "group" || payload.Topic != SanitizeTopic(inputTopic) {
+			t.Fatalf("unexpected create chat payload header: %#v", payload)
+		}
+		if len(payload.Members) != 1 {
+			t.Fatalf("member count = %d, want 1", len(payload.Members))
+		}
+		member := payload.Members[0]
+		if member.ODataType != "#microsoft.graph.aadUserConversationMember" ||
+			len(member.Roles) != 1 || member.Roles[0] != "owner" ||
+			member.UserBind != "https://graph.microsoft.com/v1.0/users('user-1')" {
+			t.Fatalf("unexpected create chat member: %#v", member)
+		}
+		_, _ = fmt.Fprint(w, `{"id":"chat-1","topic":"💬 Codex Work - s001 - repo - host","chatType":"group","webUrl":"https://teams.example/chat-1"}`)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	chat, err := graph.CreateSingleMemberGroupChat(context.Background(), "user-1", inputTopic)
+	if err != nil {
+		t.Fatalf("CreateSingleMemberGroupChat error: %v", err)
+	}
+	if !sawCreate || chat.ID != "chat-1" || chat.ChatType != "group" || chat.WebURL == "" {
+		t.Fatalf("unexpected created chat: %#v sawCreate=%v", chat, sawCreate)
 	}
 }
 
@@ -821,6 +879,80 @@ func TestGraphSendHTMLWithOwnerMention(t *testing.T) {
 	}
 }
 
+func TestGraphSendOpenURLAdaptiveCard(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var sawMessage bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		sawMessage = true
+		var payload struct {
+			Body struct {
+				Content string `json:"content"`
+			} `json:"body"`
+			Attachments []struct {
+				ID          string `json:"id"`
+				ContentType string `json:"contentType"`
+				Content     string `json:"content"`
+			} `json:"attachments"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode adaptive card payload: %v", err)
+		}
+		if payload.Body.Content != `<attachment id="card-1"></attachment>` {
+			t.Fatalf("unexpected body content: %q", payload.Body.Content)
+		}
+		if len(payload.Attachments) != 1 || payload.Attachments[0].ID != "card-1" || payload.Attachments[0].ContentType != "application/vnd.microsoft.card.adaptive" {
+			t.Fatalf("unexpected attachments: %#v", payload.Attachments)
+		}
+		var card struct {
+			Type    string `json:"type"`
+			Actions []struct {
+				Type  string `json:"type"`
+				Title string `json:"title"`
+				URL   string `json:"url"`
+			} `json:"actions"`
+		}
+		if err := json.Unmarshal([]byte(payload.Attachments[0].Content), &card); err != nil {
+			t.Fatalf("decode card JSON: %v", err)
+		}
+		if card.Type != "AdaptiveCard" || len(card.Actions) != 1 || card.Actions[0].Type != "Action.OpenUrl" || card.Actions[0].URL != "https://teams.microsoft.com/l/chat/chat-2/0?tenantId=tenant" {
+			t.Fatalf("unexpected card: %#v", card)
+		}
+		_, _ = fmt.Fprint(w, `{"id":"message-1","messageType":"message"}`)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	msg, err := graph.SendOpenURLAdaptiveCard(context.Background(), "chat-1", "Open Codex chat", "Pick a button.", []OpenURLCardAction{{
+		Title: "Open",
+		URL:   "https://teams.microsoft.com/l/chat/chat-2/0?tenantId=tenant",
+	}})
+	if err != nil {
+		t.Fatalf("SendOpenURLAdaptiveCard error: %v", err)
+	}
+	if msg.ID != "message-1" || !sawMessage {
+		t.Fatalf("message result mismatch: msg=%#v saw=%v", msg, sawMessage)
+	}
+}
+
+func TestGraphSendOpenURLAdaptiveCardRejectsNonTeamsURL(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	graph := newTestGraphClient(auth, server, nil)
+	if _, err := graph.SendOpenURLAdaptiveCard(context.Background(), "chat-1", "Open", "", []OpenURLCardAction{{
+		Title: "Bad",
+		URL:   "https://example.com/",
+	}}); err == nil {
+		t.Fatal("expected unsafe URL rejection")
+	}
+	if auth.accessCalls != 0 {
+		t.Fatalf("auth should not be called for rejected card URL: %d", auth.accessCalls)
+	}
+}
+
 func TestGraphUpdateChatMessageHTML(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	var sawPatch bool
@@ -851,6 +983,39 @@ func TestGraphUpdateChatMessageHTML(t *testing.T) {
 	}
 	if !sawPatch {
 		t.Fatal("missing PATCH request")
+	}
+}
+
+func TestGraphUnhideChatForUser(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access", tenantID: "tenant-1"}
+	var sawUnhide bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/unhideForUser" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		sawUnhide = true
+		var payload struct {
+			User struct {
+				ID       string `json:"id"`
+				TenantID string `json:"tenantId"`
+			} `json:"user"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode unhide payload: %v", err)
+		}
+		if payload.User.ID != "user-1" || payload.User.TenantID != "tenant-1" {
+			t.Fatalf("unexpected unhide payload: %#v", payload)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	if err := graph.UnhideChatForUser(context.Background(), "chat-1", User{ID: "user-1"}); err != nil {
+		t.Fatalf("UnhideChatForUser error: %v", err)
+	}
+	if !sawUnhide {
+		t.Fatal("missing unhide request")
 	}
 }
 
