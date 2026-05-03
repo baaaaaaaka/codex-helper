@@ -61,6 +61,16 @@ type Chat struct {
 	WebURL          string `json:"webUrl"`
 }
 
+type OnlineMeeting struct {
+	ID         string `json:"id"`
+	Subject    string `json:"subject"`
+	JoinWebURL string `json:"joinWebUrl"`
+	ChatInfo   struct {
+		ThreadID  string `json:"threadId"`
+		MessageID string `json:"messageId,omitempty"`
+	} `json:"chatInfo"`
+}
+
 type ChatMember struct {
 	ID          string   `json:"id"`
 	Roles       []string `json:"roles,omitempty"`
@@ -139,20 +149,35 @@ func NewGraphClient(auth *AuthManager, out io.Writer) *GraphClient {
 	return newGraphClient(auth, out)
 }
 
+func NewGraphClientWithHTTPClient(auth *AuthManager, out io.Writer, client *http.Client) *GraphClient {
+	return newGraphClientWithHTTPClient(auth, out, client)
+}
+
 func NewReadGraphClient(out io.Writer) (*GraphClient, error) {
+	return NewReadGraphClientWithHTTPClient(out, nil)
+}
+
+func NewReadGraphClientWithHTTPClient(out io.Writer, client *http.Client) (*GraphClient, error) {
 	cfg, err := DefaultReadAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	return newGraphClient(newNonInteractiveAuthManager(cfg, "Teams message read", "codex-proxy teams auth read"), out), nil
+	return newGraphClientWithHTTPClient(newNonInteractiveAuthManagerWithHTTPClient(cfg, client, "Teams message read", "codex-proxy teams auth read"), out, client), nil
 }
 
 func newGraphClient(auth graphAuth, out io.Writer) *GraphClient {
-	return &GraphClient{
-		auth: auth,
-		client: &http.Client{
+	return newGraphClientWithHTTPClient(auth, out, nil)
+}
+
+func newGraphClientWithHTTPClient(auth graphAuth, out io.Writer, client *http.Client) *GraphClient {
+	if client == nil {
+		client = &http.Client{
 			Timeout: 30 * time.Second,
-		},
+		}
+	}
+	return &GraphClient{
+		auth:       auth,
+		client:     client,
 		out:        out,
 		baseURL:    graphBaseURL,
 		maxRetries: defaultGraphRetries,
@@ -195,6 +220,48 @@ func (g *GraphClient) CreateSingleMemberGroupChat(ctx context.Context, userID st
 	var chat Chat
 	err := g.do(ctx, http.MethodPost, "/chats", body, &chat)
 	return chat, err
+}
+
+func (g *GraphClient) CreateMeetingChat(ctx context.Context, topic string) (Chat, error) {
+	subject := SanitizeTopic(topic)
+	now := time.Now().UTC()
+	body := map[string]any{
+		"subject":       subject,
+		"startDateTime": now.Format(time.RFC3339),
+		"endDateTime":   now.Add(24 * time.Hour).Format(time.RFC3339),
+	}
+	var meeting OnlineMeeting
+	if err := g.do(ctx, http.MethodPost, "/me/onlineMeetings", body, &meeting); err != nil {
+		return Chat{}, err
+	}
+	threadID := strings.TrimSpace(meeting.ChatInfo.ThreadID)
+	if threadID == "" {
+		return Chat{}, fmt.Errorf("onlineMeeting response did not include chatInfo.threadId")
+	}
+	webURL := TeamsChatURL(threadID, g.tenantID())
+	if webURL == "" {
+		webURL = meeting.JoinWebURL
+	}
+	return Chat{
+		ID:       threadID,
+		Topic:    firstNonEmptyString(SanitizeTopic(meeting.Subject), subject),
+		ChatType: "meeting",
+		WebURL:   webURL,
+	}, nil
+}
+
+type graphAuthWithTenant interface {
+	TenantID() string
+}
+
+func (g *GraphClient) tenantID() string {
+	if g == nil || g.auth == nil {
+		return ""
+	}
+	if auth, ok := g.auth.(graphAuthWithTenant); ok {
+		return strings.TrimSpace(auth.TenantID())
+	}
+	return ""
 }
 
 func (g *GraphClient) GetChat(ctx context.Context, chatID string) (Chat, error) {
@@ -703,6 +770,12 @@ func isAllowedGraphRequest(method string, path string) bool {
 		return ok && allowedListChatsQuery(q)
 	}
 	if method == http.MethodPost && clean == "/chats" {
+		if q, ok := allowedGraphQuery(path); !ok || len(q) != 0 {
+			return false
+		}
+		return true
+	}
+	if method == http.MethodPost && clean == "/me/onlineMeetings" {
 		if q, ok := allowedGraphQuery(path); !ok || len(q) != 0 {
 			return false
 		}

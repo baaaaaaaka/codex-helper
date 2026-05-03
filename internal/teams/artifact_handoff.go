@@ -40,8 +40,8 @@ Control chat commands the helper understands:
 - projects: list Codex workspaces
 - project <number>: list sessions in a workspace shown by projects
 - sessions or history: list known Codex sessions
-- new <task>: create a new Teams work chat for a Codex task
-- new <directory> -- <task>: create the directory if needed, then create a work chat for that task
+- new <directory>: create a new Teams work chat for a directory
+- new <directory>: create the directory if needed, then create a work chat for that directory
 - mkdir <directory>: create a workspace directory
 - continue <number-or-session-id>: create a Teams work chat for an existing Codex session and import history
 - open <number>: show the linked Teams work chat for a session

@@ -123,6 +123,11 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 	if err != nil {
 		return codexrunner.LaunchResult{}, err
 	}
+	cfg, err := store.Load()
+	if err != nil {
+		return codexrunner.LaunchResult{}, err
+	}
+	useYolo := resolveYoloEnabled(cfg)
 	useProxy, _, err := ensureProxyPreferenceRunFn(ctx, store, "", log)
 	if err != nil {
 		return codexrunner.LaunchResult{}, err
@@ -130,12 +135,13 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 
 	stdoutWriter := codexrunner.NewEventStreamWriter(&stdout, req.EventHandler)
 	opts := runTargetOptions{
-		Cwd:      strings.TrimSpace(req.Dir),
-		UseProxy: useProxy,
-		Log:      log,
-		Stdin:    strings.NewReader(req.Stdin),
-		Stdout:   stdoutWriter,
-		Stderr:   &stderr,
+		Cwd:         strings.TrimSpace(req.Dir),
+		UseProxy:    useProxy,
+		Log:         log,
+		Stdin:       strings.NewReader(req.Stdin),
+		Stdout:      stdoutWriter,
+		Stderr:      &stderr,
+		YoloEnabled: useYolo,
 	}
 
 	var runErr error
@@ -146,7 +152,7 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 		}
 		runErr = runWithProfileOptions(ctx, store, profile, cfgWithProfile.Instances, cmdArgs, opts)
 	} else {
-		runErr = runTeamsCodexDirect(ctx, cmdArgs, log, stdoutWriter, &stderr, opts)
+		runErr = runTeamsCodexDirect(ctx, store, cmdArgs, log, stdoutWriter, &stderr, opts)
 	}
 
 	result := codexrunner.LaunchResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
@@ -163,6 +169,7 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 
 func runTeamsCodexDirect(
 	ctx context.Context,
+	store *config.Store,
 	cmdArgs []string,
 	log io.Writer,
 	stdout io.Writer,
@@ -176,6 +183,11 @@ func runTeamsCodexDirect(
 	if isCodexCommand(resolvedCmd[0]) {
 		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 			return err
+		}
+		var cleanup func()
+		resolvedCmd, cleanup = prepareYoloCodexCommandForRun(store, resolvedCmd, &opts)
+		if cleanup != nil {
+			defer cleanup()
 		}
 	}
 	opts.UseProxy = false

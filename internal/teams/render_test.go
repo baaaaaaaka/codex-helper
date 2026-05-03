@@ -44,7 +44,7 @@ func TestRenderTeamsHTMLLabelsSupportedKinds(t *testing.T) {
 		{TeamsRenderAssistant, "🤖 ✅ Codex answer"},
 		{TeamsRenderProgress, "🤖 ⏳ Codex status"},
 		{TeamsRenderHelper, "🔧 Helper"},
-		{TeamsRenderStatus, "📌 Session status"},
+		{TeamsRenderStatus, "🤖 ⏳ Codex status"},
 		{TeamsRenderCode, "💻 Code"},
 		{TeamsRenderCommand, "🤖 🛠️ Codex command"},
 	}
@@ -63,6 +63,16 @@ func TestRenderTeamsHTMLProgressBreaksAfterLabel(t *testing.T) {
 	}))
 	if got != "🤖 ⏳ Codex status:\nchecking tests" {
 		t.Fatalf("progress render = %q", got)
+	}
+}
+
+func TestRenderTeamsHTMLStatusUsesCodexStatusLabel(t *testing.T) {
+	got := PlainTextFromTeamsHTML(RenderTeamsHTML(TeamsRenderInput{
+		Kind: TeamsRenderStatus,
+		Text: "checking tests",
+	}))
+	if got != "🤖 ⏳ Codex status:\nchecking tests" {
+		t.Fatalf("status render = %q", got)
 	}
 }
 
@@ -213,12 +223,43 @@ func TestRenderTeamsHTMLUsesParagraphsForBlankLines(t *testing.T) {
 	if strings.Contains(got, "<br><br>") {
 		t.Fatalf("blank lines should become paragraphs, not repeated br tags: %s", got)
 	}
-	if !strings.Contains(got, `<p><strong>🔧 Helper:</strong> first</p><p>second<br>third</p>`) {
+	if !strings.Contains(got, `<p><strong>🔧 Helper:</strong><br>first</p><p>second<br>third</p>`) {
 		t.Fatalf("unexpected paragraph rendering: %s", got)
 	}
 	plain := PlainTextFromTeamsHTML(got)
 	if strings.Contains(plain, "\n\n\n") {
 		t.Fatalf("plain text has excessive blank lines: %q", plain)
+	}
+}
+
+func TestRenderTeamsFreezeNoticeHTML(t *testing.T) {
+	got := renderTeamsFreezeNoticeHTML("https://teams.microsoft.com/l/chat/chat-id/conversations", "r 8f3c9a2d", "Your Codex work is safe. Paused after 6h idle.")
+	for _, want := range []string{
+		`<strong>🔧 Helper:</strong><br>🧊 This chat is paused`,
+		`⚠ <strong>Messages here will not get a reply.</strong>`,
+		`<p>&nbsp;</p>`,
+		`▶️ <strong>Continue chat:</strong>`,
+		`Step 1: Open <a href="https://teams.microsoft.com/l/chat/chat-id/conversations">Control chat</a>`,
+		`Step 2: Send: <code>r 8f3c9a2d</code>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("freeze notice missing %q in:\n%s", want, got)
+		}
+	}
+	plain := PlainTextFromTeamsHTML(got)
+	if strings.Contains(plain, "https://teams.microsoft.com") {
+		t.Fatalf("freeze notice plain text leaked raw URL:\n%s", plain)
+	}
+	for _, want := range []string{
+		"🧊 This chat is paused",
+		"⚠ Messages here will not get a reply.",
+		"▶️ Continue chat:",
+		"Step 1: Open Control chat",
+		"Step 2: Send: r 8f3c9a2d",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("freeze notice plain text missing %q in:\n%s", want, plain)
+		}
 	}
 }
 

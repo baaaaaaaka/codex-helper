@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,11 +56,15 @@ func DefaultOutboundUploadFolder() string {
 }
 
 func NewFileWriteGraphClient(out io.Writer) (*GraphClient, error) {
+	return NewFileWriteGraphClientWithHTTPClient(out, nil)
+}
+
+func NewFileWriteGraphClientWithHTTPClient(out io.Writer, client *http.Client) (*GraphClient, error) {
 	cfg, err := DefaultFileWriteAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	return newGraphClient(newNonInteractiveAuthManager(cfg, "Teams file upload", "codex-proxy teams auth file-write"), out), nil
+	return newGraphClientWithHTTPClient(newNonInteractiveAuthManagerWithHTTPClient(cfg, client, "Teams file upload", "codex-proxy teams auth file-write"), out, client), nil
 }
 
 func FileWriteAuthCacheAvailable() (string, bool, error) {

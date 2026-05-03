@@ -20,6 +20,10 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "AppData", "Local"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
+	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "chat-client")
+	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client")
+	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID", "file-client")
 	configBase, err := os.UserConfigDir()
 	if err != nil {
 		t.Fatalf("os.UserConfigDir: %v", err)
@@ -29,6 +33,14 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 		t.Fatalf("os.UserCacheDir: %v", err)
 	}
 	return configBase, cacheBase
+}
+
+func setTeamsAuthIDsForCLITest(t *testing.T) {
+	t.Helper()
+	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
+	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "chat-client")
+	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client")
+	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID", "file-client")
 }
 
 func teamsServiceTestAbsPath(t *testing.T, path string) string {
@@ -283,6 +295,37 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing preserved env %q:\n%s", want, unit)
 		}
+	}
+}
+
+func TestTeamsServiceEnvironmentDropsLoopbackProxyByDefault(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:38471")
+	t.Setenv("HTTPS_PROXY", "http://localhost:38471")
+	t.Setenv("ALL_PROXY", "socks5://[::1]:38471")
+	t.Setenv("http_proxy", "http://127.0.0.1:38471")
+	t.Setenv("https_proxy", "http://localhost:38471")
+	t.Setenv("all_proxy", "socks5://[::1]:38471")
+	t.Setenv("NO_PROXY", "localhost,127.0.0.1,::1")
+	t.Setenv("no_proxy", "localhost,127.0.0.1,::1")
+
+	env := teamsServiceEnvironment()
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		if value := env[name]; value != "" {
+			t.Fatalf("%s = %q, want dropped loopback proxy", name, value)
+		}
+	}
+	if env["NO_PROXY"] == "" || env["no_proxy"] == "" {
+		t.Fatalf("NO_PROXY values should be preserved, got %#v", env)
+	}
+}
+
+func TestTeamsServiceEnvironmentCanKeepLoopbackProxyWhenExplicit(t *testing.T) {
+	t.Setenv("CODEX_HELPER_TEAMS_KEEP_LOCAL_PROXY", "1")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:38471")
+
+	env := teamsServiceEnvironment()
+	if got := env["HTTPS_PROXY"]; got != "http://127.0.0.1:38471" {
+		t.Fatalf("HTTPS_PROXY = %q, want explicit loopback proxy preserved", got)
 	}
 }
 

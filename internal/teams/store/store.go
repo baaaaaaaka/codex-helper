@@ -22,6 +22,9 @@ const (
 
 	dirMode  os.FileMode = 0o700
 	fileMode os.FileMode = 0o600
+
+	maxRetainedSentOutboxMessages      = 512
+	maxRetainedTranscriptLedgerRecords = 1024
 )
 
 type SessionStatus string
@@ -64,7 +67,11 @@ var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
 var ErrUpgradeInProgress = errors.New("Teams upgrade already in progress")
 
 const outboxSendLease = 2 * time.Minute
-const HelperUpgradeReason = "codex-proxy upgrade"
+
+const (
+	HelperUpgradeReason = "codex-proxy upgrade"
+	HelperReloadReason  = "codex-proxy reload"
+)
 
 type State struct {
 	SchemaVersion     int                               `json:"schema_version"`
@@ -341,6 +348,14 @@ type UpgradeRequest struct {
 type ChatPollState struct {
 	ChatID                string    `json:"chat_id"`
 	Seeded                bool      `json:"seeded,omitempty"`
+	PollState             string    `json:"state,omitempty"`
+	PreviousPollState     string    `json:"previous_state,omitempty"`
+	NextPollAt            time.Time `json:"next_poll_at,omitempty"`
+	LastActivityAt        time.Time `json:"last_activity_at,omitempty"`
+	BlockedUntil          time.Time `json:"blocked_until,omitempty"`
+	FailureCount          int       `json:"failure_count,omitempty"`
+	ParkedAt              time.Time `json:"parked_at,omitempty"`
+	ParkNoticeSentAt      time.Time `json:"park_notice_sent_at,omitempty"`
 	LastModifiedCursor    time.Time `json:"last_modified_cursor,omitempty"`
 	ContinuationPath      string    `json:"continuation_path,omitempty"`
 	LastSuccessfulPollAt  time.Time `json:"last_successful_poll_at,omitempty"`
@@ -349,6 +364,17 @@ type ChatPollState struct {
 	LastWindowFullAt      time.Time `json:"last_window_full_at,omitempty"`
 	LastWindowFullMessage string    `json:"last_window_full_message,omitempty"`
 	UpdatedAt             time.Time `json:"updated_at,omitempty"`
+}
+
+type ChatPollScheduleUpdate struct {
+	ChatID            string
+	PollState         string
+	PreviousPollState string
+	NextPollAt        time.Time
+	LastActivityAt    time.Time
+	BlockedUntil      time.Time
+	ClearBlockedUntil bool
+	ResetFailures     bool
 }
 
 type OwnerMetadata struct {
@@ -439,6 +465,7 @@ type OutboxMessage struct {
 	Sequence               int64        `json:"sequence,omitempty"`
 	PartIndex              int          `json:"part_index,omitempty"`
 	PartCount              int          `json:"part_count,omitempty"`
+	SourceTextHash         string       `json:"source_text_hash,omitempty"`
 	RenderedHash           string       `json:"rendered_hash,omitempty"`
 	RenderedBytes          int          `json:"rendered_bytes,omitempty"`
 	AttachmentPath         string       `json:"attachment_path,omitempty"`
@@ -1263,6 +1290,52 @@ func (s *Store) MarkTurnRunning(ctx context.Context, turnID string, codexThreadI
 	})
 }
 
+func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn, bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return Turn{}, false, fmt.Errorf("session id is required")
+	}
+	var out Turn
+	claimed := false
+	err := s.UpdateSession(ctx, sessionID, func(state *State) error {
+		for _, turn := range state.Turns {
+			if turn.SessionID == sessionID && turn.Status == TurnStatusRunning {
+				return nil
+			}
+		}
+		var queued []Turn
+		for _, turn := range state.Turns {
+			if turn.SessionID == sessionID && turn.Status == TurnStatusQueued {
+				queued = append(queued, turn)
+			}
+		}
+		if len(queued) == 0 {
+			return nil
+		}
+		sort.Slice(queued, func(i, j int) bool {
+			left := queuedTurnSortTime(queued[i])
+			right := queuedTurnSortTime(queued[j])
+			if !left.Equal(right) {
+				return left.Before(right)
+			}
+			return queued[i].ID < queued[j].ID
+		})
+		now := time.Now()
+		turn := queued[0]
+		turn.Status = TurnStatusRunning
+		if turn.StartedAt.IsZero() {
+			turn.StartedAt = now
+		}
+		turn.UpdatedAt = now
+		state.Turns[turn.ID] = turn
+		updateSessionFromTurn(state, turn, now)
+		out = turn
+		claimed = true
+		return nil
+	})
+	return out, claimed, err
+}
+
 func (s *Store) MarkTurnCompleted(ctx context.Context, turnID string, codexThreadID string, codexTurnID string) (Turn, error) {
 	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
 		if turn.Status == TurnStatusInterrupted {
@@ -1294,10 +1367,11 @@ func (s *Store) MarkTurnFailed(ctx context.Context, turnID string, message strin
 }
 
 func (s *Store) MarkTurnInterrupted(ctx context.Context, turnID string, reason string) (Turn, error) {
-	return s.updateTurn(ctx, turnID, func(_ *State, turn Turn, now time.Time) (Turn, error) {
+	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
 		turn.Status = TurnStatusInterrupted
 		turn.InterruptedAt = now
 		turn.RecoveryReason = reason
+		markInboundIgnoredForInterruptedTurn(state, turn, now)
 		return turn, nil
 	})
 }
@@ -1450,6 +1524,28 @@ func (s *Store) PendingOutbox(ctx context.Context) ([]OutboxMessage, error) {
 	return s.PendingOutboxAt(ctx, time.Now())
 }
 
+func (s *Store) HasDeliveredOutboxMessage(ctx context.Context, chatID string, teamsMessageID string) (bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if chatID == "" || teamsMessageID == "" {
+		return false, nil
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, msg := range state.OutboxMessages {
+		if msg.TeamsChatID != chatID || msg.TeamsMessageID != teamsMessageID {
+			continue
+		}
+		switch msg.Status {
+		case OutboxStatusAccepted, OutboxStatusSent:
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Store) PendingOutboxAt(ctx context.Context, now time.Time) ([]OutboxMessage, error) {
 	if now.IsZero() {
 		now = time.Now()
@@ -1551,6 +1647,8 @@ func (s *Store) RecordChatPollSuccessWithContinuation(ctx context.Context, chatI
 		poll.LastSuccessfulPollAt = now
 		poll.LastError = ""
 		poll.LastErrorAt = time.Time{}
+		poll.BlockedUntil = time.Time{}
+		poll.FailureCount = 0
 		poll.ContinuationPath = continuationPath
 		if windowFull {
 			poll.LastWindowFullAt = now
@@ -1567,6 +1665,10 @@ func (s *Store) RecordChatPollSuccessWithContinuation(ctx context.Context, chatI
 }
 
 func (s *Store) RecordChatPollError(ctx context.Context, chatID string, message string) error {
+	return s.RecordChatPollErrorWithBlock(ctx, chatID, message, time.Time{})
+}
+
+func (s *Store) RecordChatPollErrorWithBlock(ctx context.Context, chatID string, message string, blockedUntil time.Time) error {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return fmt.Errorf("chat id is required")
@@ -1578,10 +1680,89 @@ func (s *Store) RecordChatPollError(ctx context.Context, chatID string, message 
 		poll.ChatID = chatID
 		poll.LastError = message
 		poll.LastErrorAt = now
+		poll.FailureCount++
+		if blockedUntil.After(now) {
+			if poll.PollState != "" && poll.PollState != "blocked" {
+				poll.PreviousPollState = poll.PollState
+			}
+			poll.PollState = "blocked"
+			poll.BlockedUntil = blockedUntil
+			poll.NextPollAt = blockedUntil
+		}
 		poll.UpdatedAt = now
 		state.ChatPolls[chatID] = poll
 		return nil
 	})
+}
+
+func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollScheduleUpdate) (ChatPollState, error) {
+	chatID := strings.TrimSpace(update.ChatID)
+	if chatID == "" {
+		return ChatPollState{}, fmt.Errorf("chat id is required")
+	}
+	var out ChatPollState
+	err := s.Update(ctx, func(state *State) error {
+		now := time.Now()
+		poll := state.ChatPolls[chatID]
+		poll.ChatID = chatID
+		if update.PollState != "" {
+			if update.PollState == "blocked" {
+				previous := strings.TrimSpace(update.PreviousPollState)
+				if previous == "" && poll.PollState != "" && poll.PollState != "blocked" {
+					previous = poll.PollState
+				}
+				poll.PreviousPollState = previous
+			} else {
+				poll.PreviousPollState = strings.TrimSpace(update.PreviousPollState)
+			}
+			poll.PollState = strings.TrimSpace(update.PollState)
+			if poll.PollState == "parked" && poll.ParkedAt.IsZero() {
+				poll.ParkedAt = now
+			}
+			if poll.PollState != "parked" {
+				poll.ParkedAt = time.Time{}
+				poll.ParkNoticeSentAt = time.Time{}
+			}
+		}
+		poll.NextPollAt = update.NextPollAt
+		if update.LastActivityAt.After(poll.LastActivityAt) {
+			poll.LastActivityAt = update.LastActivityAt
+		}
+		if update.ClearBlockedUntil {
+			poll.BlockedUntil = time.Time{}
+		} else if !update.BlockedUntil.IsZero() {
+			poll.BlockedUntil = update.BlockedUntil
+		}
+		if update.ResetFailures {
+			poll.FailureCount = 0
+		}
+		poll.UpdatedAt = now
+		state.ChatPolls[chatID] = poll
+		out = poll
+		return nil
+	})
+	return out, err
+}
+
+func (s *Store) MarkChatPollParkNoticeSent(ctx context.Context, chatID string, at time.Time) (ChatPollState, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return ChatPollState{}, fmt.Errorf("chat id is required")
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	var out ChatPollState
+	err := s.Update(ctx, func(state *State) error {
+		poll := state.ChatPolls[chatID]
+		poll.ChatID = chatID
+		poll.ParkNoticeSentAt = at
+		poll.UpdatedAt = time.Now()
+		state.ChatPolls[chatID] = poll
+		out = poll
+		return nil
+	})
+	return out, err
 }
 
 func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
@@ -1597,11 +1778,27 @@ func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
 			turn.RecoveryReason = "ambiguous after restart"
 			turn.UpdatedAt = now
 			state.Turns[id] = turn
+			markInboundIgnoredForInterruptedTurn(state, turn, now)
 			report.InterruptedTurnIDs = append(report.InterruptedTurnIDs, id)
 		}
 		return nil
 	})
 	return report, err
+}
+
+func markInboundIgnoredForInterruptedTurn(state *State, turn Turn, now time.Time) {
+	if turn.InboundEventID == "" {
+		return
+	}
+	inbound, ok := state.InboundEvents[turn.InboundEventID]
+	if !ok {
+		return
+	}
+	if inbound.Status == InboundStatusQueued || inbound.Status == InboundStatusDeferred {
+		inbound.Status = InboundStatusIgnored
+		inbound.UpdatedAt = now
+		state.InboundEvents[inbound.ID] = inbound
+	}
 }
 
 func (s *Store) updateTurn(ctx context.Context, turnID string, fn func(*State, Turn, time.Time) (Turn, error)) (Turn, error) {
@@ -1724,12 +1921,92 @@ func (s *Store) loadUnlocked() (State, error) {
 
 func (s *Store) saveUnlocked(state State) error {
 	state.ensure(time.Now())
+	pruneSentOutboxMessages(&state)
+	pruneTranscriptLedgerRecords(&state)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
 	return atomicWriteFile(s.path, data, fileMode)
+}
+
+func pruneSentOutboxMessages(state *State) {
+	if state == nil || len(state.OutboxMessages) <= maxRetainedSentOutboxMessages {
+		return
+	}
+	type candidate struct {
+		id  string
+		msg OutboxMessage
+	}
+	var sent []candidate
+	for id, msg := range state.OutboxMessages {
+		if msg.Status != OutboxStatusSent {
+			continue
+		}
+		sent = append(sent, candidate{id: id, msg: msg})
+	}
+	if len(state.OutboxMessages)-len(sent) >= maxRetainedSentOutboxMessages || len(sent) == 0 {
+		return
+	}
+	sort.SliceStable(sent, func(i, j int) bool {
+		left := outboxRetentionTime(sent[i].msg)
+		right := outboxRetentionTime(sent[j].msg)
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return sent[i].id > sent[j].id
+	})
+	keepSent := maxRetainedSentOutboxMessages - (len(state.OutboxMessages) - len(sent))
+	if keepSent < 0 {
+		keepSent = 0
+	}
+	for _, item := range sent[keepSent:] {
+		delete(state.OutboxMessages, item.id)
+	}
+}
+
+func outboxRetentionTime(msg OutboxMessage) time.Time {
+	for _, value := range []time.Time{msg.SentAt, msg.UpdatedAt, msg.CreatedAt, msg.LastSendAttempt} {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
+func pruneTranscriptLedgerRecords(state *State) {
+	if state == nil || len(state.TranscriptLedger) <= maxRetainedTranscriptLedgerRecords {
+		return
+	}
+	type candidate struct {
+		id     string
+		record TranscriptLedgerRecord
+	}
+	records := make([]candidate, 0, len(state.TranscriptLedger))
+	for id, record := range state.TranscriptLedger {
+		records = append(records, candidate{id: id, record: record})
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		left := transcriptLedgerRetentionTime(records[i].record)
+		right := transcriptLedgerRetentionTime(records[j].record)
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return records[i].id > records[j].id
+	})
+	for _, item := range records[maxRetainedTranscriptLedgerRecords:] {
+		delete(state.TranscriptLedger, item.id)
+	}
+}
+
+func transcriptLedgerRetentionTime(record TranscriptLedgerRecord) time.Time {
+	for _, value := range []time.Time{record.UpdatedAt, record.ImportedAt, record.CreatedAt} {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
 }
 
 func (s *Store) withStateLock(ctx context.Context, fn func() error) error {
@@ -2048,6 +2325,15 @@ func updateSessionFromTurn(state *State, turn Turn, now time.Time) {
 	session.LatestTurnID = turn.ID
 	session.UpdatedAt = now
 	state.Sessions[session.ID] = session
+}
+
+func queuedTurnSortTime(turn Turn) time.Time {
+	for _, value := range []time.Time{turn.QueuedAt, turn.CreatedAt, turn.UpdatedAt, turn.StartedAt} {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
 }
 
 func allocateChatSequence(state *State, chatID string, now time.Time) int64 {

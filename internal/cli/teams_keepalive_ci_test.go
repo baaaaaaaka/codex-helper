@@ -123,7 +123,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
-		"<Interval>PT10S</Interval>",
+		"<Interval>PT60S</Interval>",
 		"<Count>999</Count>",
 		"<WorkingDirectory>" + spec.WorkingDir + "</WorkingDirectory>",
 	} {
@@ -171,6 +171,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"New-ScheduledTaskTrigger -AtLogOn",
 		"New-ScheduledTaskSettingsSet",
 		"RestartCount 999",
+		"New-TimeSpan -Seconds 60",
 		"Interactive",
 		"RunLevel Limited",
 		"Disable-ScheduledTask",

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,7 +23,18 @@ import (
 )
 
 const (
-	pollCursorOverlap = 2 * time.Second
+	pollCursorOverlap         = 2 * time.Minute
+	fastPollInterval          = time.Second
+	fastPollDuration          = 90 * time.Second
+	transcriptSyncMinInterval = 30 * time.Second
+	dashboardProjectsCacheTTL = 30 * time.Second
+
+	// Automatic transcript sync is for small local Codex CLI catch-up. Large
+	// history import must stay explicit, otherwise helper startup can flood a
+	// Teams chat and delay inbound polling.
+	transcriptSyncMaxRecordsPerSessionPerCycle = 8
+	transcriptSyncMaxAutoBacklogRecords        = 80
+	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
 	// body content. Split well below that to leave room for Teams-side changes,
@@ -33,6 +45,10 @@ const (
 
 var ownerMentionLongTurnThreshold = time.Minute
 var discoverCodexProjectsForTeams = codexhistory.DiscoverProjectsContext
+var helperRestartDelay = 3 * time.Second
+var codexIdleStatusInitialDelay = 2 * time.Minute
+var codexIdleStatusRepeatDelay = 5 * time.Minute
+var codexIdleStatusMessage = "Still working. No new Codex update yet."
 
 const controlFallbackSessionID = "__control_fallback__"
 
@@ -60,31 +76,52 @@ type BridgeOptions struct {
 	ControlFallbackExecutor Executor
 	ControlFallbackModel    string
 	Runner                  codexrunner.Runner
+	HelperRestarter         HelperRestarter
+	HelperReloader          HelperReloader
+}
+
+type HelperRestarter func(context.Context) error
+
+type HelperReloader func(context.Context, HelperReloadOptions) error
+
+type HelperReloadOptions struct {
+	Force         bool
+	BeforeRestart func(context.Context) error
 }
 
 type Bridge struct {
-	graph                   *GraphClient
-	readGraph               *GraphClient
-	fileGraph               *GraphClient
-	registryPath            string
-	reg                     Registry
-	user                    User
-	scope                   teamstore.ScopeIdentity
-	machine                 teamstore.MachineRecord
-	lease                   teamstore.ControlLease
-	leaseDuration           time.Duration
-	out                     io.Writer
-	executor                Executor
-	controlFallbackExecutor Executor
-	controlFallbackModel    string
-	store                   *teamstore.Store
-	ownerMu                 sync.Mutex
-	owner                   teamstore.OwnerMetadata
-	ownerStaleAfter         time.Duration
-	ownerHeartbeatInterval  time.Duration
-	annotateUserMessages    bool
-	annotationDisabled      bool
-	annotationWarned        bool
+	graph                     *GraphClient
+	readGraph                 *GraphClient
+	fileGraph                 *GraphClient
+	httpClient                *http.Client
+	registryPath              string
+	reg                       Registry
+	user                      User
+	scope                     teamstore.ScopeIdentity
+	machine                   teamstore.MachineRecord
+	lease                     teamstore.ControlLease
+	leaseDuration             time.Duration
+	out                       io.Writer
+	executor                  Executor
+	controlFallbackExecutor   Executor
+	controlFallbackModel      string
+	helperRestarter           HelperRestarter
+	helperReloader            HelperReloader
+	store                     *teamstore.Store
+	asyncTurns                bool
+	ownerMu                   sync.Mutex
+	owner                     teamstore.OwnerMetadata
+	ownerStaleAfter           time.Duration
+	ownerHeartbeatInterval    time.Duration
+	pollMu                    sync.Mutex
+	fastPollUntil             time.Time
+	lastTranscriptSync        time.Time
+	dashboardProjectsMu       sync.Mutex
+	dashboardProjectsCache    []codexhistory.Project
+	dashboardProjectsCachedAt time.Time
+	annotateUserMessages      bool
+	annotationDisabled        bool
+	annotationWarned          bool
 }
 
 func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer) (*Bridge, error) {
@@ -93,6 +130,19 @@ func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out 
 	if err != nil {
 		return nil, err
 	}
+	return newBridgeWithGraphClients(ctx, graph, readGraph, registryPath, out)
+}
+
+func NewBridgeWithHTTPClient(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer, client *http.Client) (*Bridge, error) {
+	graph := NewGraphClientWithHTTPClient(auth, out, client)
+	readGraph, err := NewReadGraphClientWithHTTPClient(out, client)
+	if err != nil {
+		return nil, err
+	}
+	return newBridgeWithGraphClients(ctx, graph, readGraph, registryPath, out)
+}
+
+func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGraph *GraphClient, registryPath string, out io.Writer) (*Bridge, error) {
 	user, err := graph.Me(ctx)
 	if err != nil {
 		return nil, err
@@ -110,7 +160,8 @@ func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out 
 	}
 	reg.UserID = user.ID
 	reg.UserPrincipal = user.UserPrincipalName
-	return &Bridge{graph: graph, readGraph: readGraph, registryPath: registryPath, reg: reg, user: user, scope: scope, machine: MachineRecordForUser(user, scope), out: out}, nil
+	httpClient := graph.httpClient()
+	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, user: user, scope: scope, machine: MachineRecordForUser(user, scope), out: out}, nil
 }
 
 func (b *Bridge) readClient() *GraphClient {
@@ -137,7 +188,7 @@ func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
 			}
 		}
 		_ = b.recordControlChatBinding(ctx, Chat{ID: b.reg.ControlChatID, Topic: b.reg.ControlChatTopic, WebURL: b.reg.ControlChatURL})
-		return Chat{ID: b.reg.ControlChatID, Topic: b.reg.ControlChatTopic, WebURL: b.reg.ControlChatURL, ChatType: "group"}, nil
+		return Chat{ID: b.reg.ControlChatID, Topic: b.reg.ControlChatTopic, WebURL: b.reg.ControlChatURL, ChatType: "meeting"}, nil
 	}
 	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()), Profile: b.scope.Profile})
 	if chat, ok := b.findExistingControlChat(ctx, topic); ok {
@@ -152,7 +203,7 @@ func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
 		}
 		return chat, nil
 	}
-	chat, err := b.graph.CreateSingleMemberGroupChat(ctx, b.user.ID, topic)
+	chat, err := b.createMeetingChat(ctx, topic)
 	if err != nil {
 		return Chat{}, err
 	}
@@ -165,6 +216,9 @@ func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
 	if err := b.Save(); err != nil {
 		return chat, err
 	}
+	if err := b.sendChatCreatedMention(ctx, "", chat.ID, "Control chat created."); err != nil {
+		return chat, err
+	}
 	err = b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:          directOutboxID(chat.ID, "control-ready", "control chat is ready"),
 		TeamsChatID: chat.ID,
@@ -172,6 +226,33 @@ func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
 		Body:        "control chat is ready.\n\n" + controlHelpText(),
 	})
 	return chat, err
+}
+
+func (b *Bridge) createMeetingChat(ctx context.Context, topic string) (Chat, error) {
+	if b == nil || b.graph == nil {
+		return Chat{}, fmt.Errorf("Teams Graph client is not configured")
+	}
+	return b.graph.CreateMeetingChat(ctx, topic)
+}
+
+func (b *Bridge) sendChatCreatedMention(ctx context.Context, sessionID string, chatID string, text string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "Teams chat created."
+	}
+	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:               directOutboxID(chatID, "chat-created", text),
+		SessionID:        sessionID,
+		TeamsChatID:      chatID,
+		Kind:             "chat-created",
+		Body:             text,
+		MentionOwner:     true,
+		NotificationKind: "chat_created",
+	})
 }
 
 func (b *Bridge) findExistingControlChat(ctx context.Context, topic string) (Chat, bool) {
@@ -187,7 +268,7 @@ func (b *Bridge) findExistingControlChat(ctx context.Context, topic string) (Cha
 		if strings.TrimSpace(chat.Topic) != topic {
 			continue
 		}
-		if chat.ChatType != "" && chat.ChatType != "group" {
+		if chat.ChatType != "" && chat.ChatType != "meeting" {
 			continue
 		}
 		members, err := b.graph.ListChatMembers(ctx, chat.ID)
@@ -257,6 +338,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	}
 	b.controlFallbackExecutor = opts.ControlFallbackExecutor
 	b.controlFallbackModel = strings.TrimSpace(opts.ControlFallbackModel)
+	b.helperRestarter = opts.HelperRestarter
+	b.helperReloader = opts.HelperReloader
+	b.asyncTurns = !opts.Once
 	b.annotateUserMessages = true
 	if b.executor == nil {
 		b.executor = CodexExecutor{}
@@ -300,7 +384,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	}
 	if b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams control chat: %s\n", chat.WebURL)
-		_, _ = fmt.Fprintln(b.out, "Listening. Send `new <task>` in the control chat, then use the session chat that is created.")
+		_, _ = fmt.Fprintln(b.out, "Listening. Send `help`, `p`, or `n <directory>` in the control chat.")
 	}
 	for {
 		if ownerHeartbeatDone != nil {
@@ -325,7 +409,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.flushPendingOutbox(ctx, "", ""); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
-		if err := b.syncLinkedTranscripts(ctx); err != nil && b.out != nil {
+		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
 		}
 		if drained, err := b.drainComplete(ctx); err != nil {
@@ -339,6 +423,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.processDeferredInbound(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams deferred input processing error: %v\n", err)
 		}
+		if err := b.processQueuedTurns(ctx); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
+		}
 		if err := b.pollOnce(ctx, opts.Top); err != nil {
 			if b.out != nil {
 				_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", err)
@@ -350,12 +437,47 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if opts.Once {
 			return nil
 		}
+		sleepInterval := b.nextPollInterval(opts.Interval, time.Now())
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(opts.Interval):
+		case <-time.After(sleepInterval):
 		}
 	}
+}
+
+func (b *Bridge) boostPolling(now time.Time) {
+	if b == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	until := now.Add(fastPollDuration)
+	b.pollMu.Lock()
+	if until.After(b.fastPollUntil) {
+		b.fastPollUntil = until
+	}
+	b.pollMu.Unlock()
+}
+
+func (b *Bridge) nextPollInterval(base time.Duration, now time.Time) time.Duration {
+	if base <= 0 {
+		base = 5 * time.Second
+	}
+	if b == nil {
+		return base
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.pollMu.Lock()
+	until := b.fastPollUntil
+	b.pollMu.Unlock()
+	if now.Before(until) && base > fastPollInterval {
+		return fastPollInterval
+	}
+	return base
 }
 
 func (b *Bridge) pollOnce(ctx context.Context, top int) error {
@@ -364,42 +486,129 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			return err
 		}
 	}
-	if err := b.pollChat(ctx, b.reg.ControlChatID, top, b.handleControlMessage); err != nil {
+	state, err := b.store.Load(ctx)
+	if err != nil {
 		return err
 	}
-	for _, session := range b.reg.ActiveSessions() {
-		s := session
-		if err := b.pollChat(ctx, s.ChatID, top, func(ctx context.Context, msg ChatMessage, text string) error {
-			return b.handleSessionMessage(ctx, s.ChatID, msg, text)
-		}); err != nil {
+	controlPoll, hasControlPoll := state.ChatPolls[b.reg.ControlChatID]
+	controlDecision := decideInboundPoll(inboundPollInput{
+		ChatID:  b.reg.ControlChatID,
+		Role:    inboundPollRoleControl,
+		Poll:    controlPoll,
+		HasPoll: hasControlPoll,
+		Now:     time.Now(),
+	})
+	if !controlDecision.Due {
+		if err := b.persistInboundPollDecision(ctx, controlDecision); err != nil {
 			return err
 		}
+	} else {
+		controlHandled, err := b.pollChatWithRoleState(ctx, b.reg.ControlChatID, top, inboundPollRoleControl, false, controlPoll, hasControlPoll, b.handleControlMessage)
+		if err != nil {
+			return err
+		}
+		if controlHandled {
+			return nil
+		}
 	}
-	return nil
+
+	state, err = b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	runningBySession := runningPollSessions(state)
+	var decisions []inboundPollDecision
+	pollsByChat := make(map[string]teamstore.ChatPollState)
+	hasPollByChat := make(map[string]bool)
+	for _, session := range b.reg.ActiveSessions() {
+		if transcriptImportIsActive(state, session.ID) {
+			continue
+		}
+		poll, hasPoll := state.ChatPolls[session.ChatID]
+		pollsByChat[session.ChatID] = poll
+		hasPollByChat[session.ChatID] = hasPoll
+		decision := decideInboundPoll(inboundPollInput{
+			ChatID:           session.ChatID,
+			Role:             inboundPollRoleWork,
+			Poll:             poll,
+			HasPoll:          hasPoll,
+			Running:          runningBySession[session.ID],
+			SessionUpdatedAt: session.UpdatedAt,
+			Now:              time.Now(),
+		})
+		if decision.ShouldPark {
+			if err := b.parkIdleWorkChat(ctx, session, decision); err != nil {
+				return err
+			}
+			continue
+		}
+		if !decision.Due {
+			if err := b.persistInboundPollDecision(ctx, decision); err != nil {
+				return err
+			}
+			continue
+		}
+		decisions = append(decisions, decision)
+	}
+	sortInboundPollDecisions(decisions)
+	if len(decisions) > maxWorkChatPollsPerCycle {
+		decisions = decisions[:maxWorkChatPollsPerCycle]
+	}
+	var firstErr error
+	for _, decision := range decisions {
+		session := b.reg.SessionByChatID(decision.ChatID)
+		if session == nil {
+			continue
+		}
+		s := session
+		if _, err := b.pollChatWithRoleState(ctx, s.ChatID, top, inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], func(ctx context.Context, msg ChatMessage, text string) error {
+			return b.handleSessionMessage(ctx, s.ChatID, msg, text)
+		}); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+	}
+	return firstErr
 }
 
-func (b *Bridge) pollChat(ctx context.Context, chatID string, top int, handle func(context.Context, ChatMessage, string) error) error {
+func (b *Bridge) pollChat(ctx context.Context, chatID string, top int, handle func(context.Context, ChatMessage, string) error) (bool, error) {
+	return b.pollChatWithRole(ctx, chatID, top, inboundPollRoleWork, false, handle)
+}
+
+func (b *Bridge) pollChatWithRole(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, handle func(context.Context, ChatMessage, string) error) (bool, error) {
 	if err := b.ensureStore(); err != nil {
-		return err
+		return false, err
 	}
 	poll, hasPoll, err := b.store.ChatPoll(ctx, chatID)
 	if err != nil {
-		return err
+		return false, err
+	}
+	return b.pollChatWithRoleState(ctx, chatID, top, role, running, poll, hasPoll, handle)
+}
+
+func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, handle func(context.Context, ChatMessage, string) error) (bool, error) {
+	if err := b.ensureStore(); err != nil {
+		return false, err
 	}
 	seeded := hasPoll && poll.Seeded
 	var modifiedAfter time.Time
 	if seeded && !poll.LastModifiedCursor.IsZero() {
 		modifiedAfter = poll.LastModifiedCursor.Add(-pollCursorOverlap)
 	}
-	var window MessageWindow
+	var (
+		window MessageWindow
+		err    error
+	)
 	if seeded && strings.TrimSpace(poll.ContinuationPath) != "" {
 		window, err = b.readClient().ListMessagesWindowFromPath(ctx, poll.ContinuationPath)
 	} else {
 		window, err = b.readClient().ListMessagesWindow(ctx, chatID, top, modifiedAfter)
 	}
 	if err != nil {
-		_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
-		return err
+		_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
+		return false, err
 	}
 	msgs := window.Messages
 	sort.Slice(msgs, func(i, j int) bool {
@@ -411,11 +620,22 @@ func (b *Bridge) pollChat(ctx context.Context, chatID string, top int, handle fu
 		for _, msg := range msgs {
 			b.reg.MarkSeen(chatID, msg.ID)
 		}
-		_, err := b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), "")
-		return err
+		updated, err := b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), "")
+		if err != nil {
+			return false, err
+		}
+		err = b.scheduleChatAfterPoll(ctx, chatID, role, running, updated, time.Time{})
+		return false, err
 	}
+	handled := false
+	var activityAt time.Time
 	for _, msg := range msgs {
-		if b.shouldIgnoreMessage(chatID, msg) {
+		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg)
+		if err != nil {
+			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+			return handled, err
+		}
+		if ignore {
 			b.reg.MarkSeen(chatID, msg.ID)
 			continue
 		}
@@ -428,21 +648,30 @@ func (b *Bridge) pollChat(ctx context.Context, chatID string, top int, handle fu
 		if b.currentLeaseGeneration() > 0 {
 			if err := b.ensureActiveControlLease(ctx); err != nil {
 				_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
-				return err
+				return handled, err
 			}
 		}
 		if err := handle(ctx, msg, text); err != nil {
 			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
-			return err
+			return handled, err
 		}
+		handled = true
+		activityAt = latestTime(activityAt, time.Now(), messageSortTime(msg))
+		b.boostPolling(time.Now())
 		b.reg.MarkSeen(chatID, msg.ID)
 	}
 	continuationPath := ""
 	if seeded && window.Truncated {
 		continuationPath = window.NextPath
 	}
-	_, err = b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), continuationPath)
-	return err
+	updated, err := b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), continuationPath)
+	if err != nil {
+		return handled, err
+	}
+	if handled && activityAt.IsZero() {
+		activityAt = time.Now()
+	}
+	return handled, b.scheduleChatAfterPoll(ctx, chatID, role, running, updated, activityAt)
 }
 
 func normalizedMessageTop(top int) int {
@@ -470,6 +699,125 @@ func maxMessageModifiedTime(messages []ChatMessage) time.Time {
 	return max
 }
 
+func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time) error {
+	now := time.Now()
+	poll.NextPollAt = time.Time{}
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:          chatID,
+		Role:            role,
+		Poll:            poll,
+		HasPoll:         true,
+		Running:         running,
+		ForceActivityAt: activityAt,
+		Now:             now,
+	})
+	next := decision.NextPollAt
+	if decision.Interval > 0 {
+		next = nextInboundPollAt(now, decision.Interval)
+	}
+	_, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:            chatID,
+		PollState:         decision.State,
+		PreviousPollState: decision.PreviousState,
+		NextPollAt:        next,
+		LastActivityAt:    activityAt,
+		ClearBlockedUntil: true,
+		ResetFailures:     true,
+	})
+	return err
+}
+
+func (b *Bridge) persistInboundPollDecision(ctx context.Context, decision inboundPollDecision) error {
+	if strings.TrimSpace(decision.ChatID) == "" || strings.TrimSpace(decision.State) == "" {
+		return nil
+	}
+	_, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:            decision.ChatID,
+		PollState:         decision.State,
+		PreviousPollState: decision.PreviousState,
+		NextPollAt:        decision.NextPollAt,
+		LastActivityAt:    decision.LastActivityAt,
+		BlockedUntil:      decision.BlockedUntil,
+		ClearBlockedUntil: decision.State != inboundPollStateBlocked,
+	})
+	return err
+}
+
+func inboundPollBlockedUntil(poll teamstore.ChatPollState, err error, now time.Time) time.Time {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var graphErr *GraphStatusError
+	if errors.As(err, &graphErr) && graphErr.StatusCode == 429 {
+		delay := graphErr.RetryAfter
+		if delay <= 0 {
+			delay = 30 * time.Second
+		}
+		return now.Add(delay)
+	}
+	failures := poll.FailureCount + 1
+	if failures < 1 {
+		failures = 1
+	}
+	if failures > 5 {
+		failures = 5
+	}
+	delay := time.Duration(1<<uint(failures-1)) * 5 * time.Second
+	if delay > 2*time.Minute {
+		delay = 2 * time.Minute
+	}
+	return now.Add(delay)
+}
+
+func runningPollSessions(state teamstore.State) map[string]bool {
+	running := make(map[string]bool)
+	for _, turn := range state.Turns {
+		switch turn.Status {
+		case teamstore.TurnStatusQueued, teamstore.TurnStatusRunning:
+			if strings.TrimSpace(turn.SessionID) != "" {
+				running[turn.SessionID] = true
+			}
+		}
+	}
+	return running
+}
+
+func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision inboundPollDecision) error {
+	if err := b.persistInboundPollDecision(ctx, decision); err != nil {
+		return err
+	}
+	if !decision.ShouldNotifyPark {
+		return nil
+	}
+	resumeCommand := "r " + resumeKeyForSession(session)
+	body := renderTeamsFreezeNoticeHTML(
+		b.reg.ControlChatURL,
+		resumeCommand,
+		"Your Codex work is safe. Paused after 48h idle.",
+	)
+	err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:park-notice:" + session.ID + ":" + resumeKeyForSession(session),
+		SessionID:   session.ID,
+		TeamsChatID: session.ChatID,
+		Kind:        "freeze-notice",
+		Body:        body,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = b.store.MarkChatPollParkNoticeSent(ctx, session.ChatID, time.Now())
+	return err
+}
+
+func resumeKeyForSession(session Session) string {
+	seed := strings.Join([]string{strings.TrimSpace(session.ID), strings.TrimSpace(session.ChatID)}, "\x00")
+	if strings.Trim(seed, "\x00") == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
 func parseGraphTime(value string) time.Time {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -482,20 +830,101 @@ func parseGraphTime(value string) time.Time {
 	return t
 }
 
-func (b *Bridge) shouldIgnoreMessage(chatID string, msg ChatMessage) bool {
+func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg ChatMessage) (bool, error) {
 	if msg.ID == "" || b.reg.HasSeen(chatID, msg.ID) || b.reg.HasSent(chatID, msg.ID) {
-		return true
+		return true, nil
 	}
 	if msg.MessageType != "" && msg.MessageType != "message" {
-		return true
+		return true, nil
 	}
 	if msg.From.User == nil {
-		return true
+		return true, nil
 	}
 	if b.user.ID != "" && msg.From.User.ID != b.user.ID {
+		return true, nil
+	}
+	if b.store != nil {
+		delivered, err := b.store.HasDeliveredOutboxMessage(ctx, chatID, msg.ID)
+		if err != nil {
+			return false, err
+		}
+		if delivered {
+			b.reg.MarkSent(chatID, msg.ID)
+			return true, nil
+		}
+		delivered, err = b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
+		if err != nil {
+			return false, err
+		}
+		if delivered {
+			b.reg.MarkSent(chatID, msg.ID)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context, chatID string, msg ChatMessage) (bool, error) {
+	incomingPlain := PlainTextFromTeamsHTML(msg.Body.Content)
+	if !looksLikeRenderedOutboxPlainText(incomingPlain) {
+		return false, nil
+	}
+	incomingKey := comparableTeamsPlainText(incomingPlain)
+	if incomingKey == "" {
+		return false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.TeamsChatID != chatID || !outboxMayHaveReachedTeams(outbox) {
+			continue
+		}
+		if comparableTeamsPlainText(PlainTextFromTeamsHTML(renderOutboxHTML(outbox))) != incomingKey {
+			continue
+		}
+		if outbox.TeamsMessageID == "" && msg.ID != "" {
+			if _, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func outboxMayHaveReachedTeams(outbox teamstore.OutboxMessage) bool {
+	switch outbox.Status {
+	case teamstore.OutboxStatusAccepted, teamstore.OutboxStatusSent:
 		return true
+	case teamstore.OutboxStatusSending:
+		return !outbox.LastSendAttempt.IsZero()
+	default:
+		return false
+	}
+}
+
+func looksLikeRenderedOutboxPlainText(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, prefix := range []string{
+		"🔧 Helper:",
+		"Helper:",
+		"🤖 ⏳ Codex status:",
+		"🤖 ✅ Codex answer:",
+		"🤖 🛠️ Codex command:",
+		"🤖 Codex progress:",
+		"🧑‍💻 User:",
+	} {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
 	}
 	return false
+}
+
+func comparableTeamsPlainText(text string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
 }
 
 func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string, msg ChatMessage) {
@@ -626,8 +1055,18 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
 			return b.sendControl(ctx, message)
+		case DashboardCommandResume:
+			message, err := b.resumeParkedWorkChat(ctx, parsed.Argument)
+			if err != nil {
+				return b.sendControl(ctx, controlCommandErrorMessage(err))
+			}
+			return b.sendControl(ctx, message)
 		case DashboardCommandStatus:
 			return b.sendControl(ctx, b.formatSessionList())
+		case DashboardCommandRestart:
+			return b.restartHelperFromControl(ctx, parsed.Argument)
+		case DashboardCommandReload:
+			return b.reloadHelperFromControl(ctx, parsed.Argument)
 		case DashboardCommandSelect:
 			message, err := b.resolveControlSelection(ctx, parsed.Target)
 			if err != nil {
@@ -652,7 +1091,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 				}
 				return b.sendControl(ctx, serviceControlBlockedMessage(control, "publishing existing sessions"))
 			}
-			message, err := b.publishCodexSession(ctx, parsed.Target)
+			message, err := b.publishCodexSessionWithProgress(ctx, parsed.Target, b.sendControl)
 			if err != nil {
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
@@ -784,17 +1223,19 @@ func (b *Bridge) controlFallbackSessionFromState(durable teamstore.SessionContex
 
 func controlHelpText() string {
 	return strings.Join([]string{
-		"🏠 Control chat",
-		"Use this chat to choose a folder, create/open 💬 Codex Work chats, and import local Codex history.",
+		"## 🏠 Control chat",
+		"Use this chat to choose a workspace and create or continue 💬 Codex Work chats.",
 		"",
 		"Start here:",
-		"`projects` - pick from recent Codex folders",
-		"`new <directory> -- <title>` - create a Work chat for a folder",
-		"`sessions` then `continue <number>` - import an existing local Codex session",
-		"`status` - show active Work chats",
+		"- `p` / `projects` - choose a workspace",
+		"- `n <directory>` / `new <directory>` - create a new Work chat for a directory",
+		"- `s` / `sessions` - show sessions in the selected workspace",
+		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
+		"- `st` / `status` - show active Work chats",
 		"",
-		"For quick helper questions, type the question here.",
-		"For project work, create/open a 💬 Work chat, then send the task there.",
+		"After `p`, reply with a number such as `1` to open that workspace. On a workspace page, send `new` to create a Work chat in that workspace.",
+		"",
+		"For quick helper questions, type the question here. For project work, use a 💬 Work chat.",
 		"",
 		"Send `help advanced` for all commands.",
 	}, "\n")
@@ -802,21 +1243,26 @@ func controlHelpText() string {
 
 func controlAdvancedHelpText() string {
 	return strings.Join([]string{
-		"🏠 Control chat advanced help",
-		"`help` or `menu` - show short help",
-		"`projects` - list directories with local Codex history",
-		"`project 1` - list local sessions for project 1 from the `projects` list",
-		"`sessions` or `history` - list local sessions in the selected directory",
-		"`new <title>` - create a work chat in the helper default directory",
-		"`new <directory> -- <title>` - create the directory if missing, then create a work chat there",
-		"`continue <number>` - import local session <number> from the latest sessions/history list into a new or existing Teams work chat",
-		"`open <number>` - show the Teams link only for a work chat that is already linked; it does not import local history",
-		"`details <number>` - show technical IDs and details",
-		"`mkdir <directory>` - create a directory only; use `new <directory> -- <title>` if you also want a work chat",
-		"`ask <question>` - ask a quick helper question in this control chat if you prefer commands",
-		"`status` - list active Teams work chats",
-		"When a list shows numbers, reply with the number or the suggested action, for example `project 1` or `continue 1`.",
-		"`!` is a short command prefix for desktop users, for example `!projects`, `!continue 1`, or `!open 1`.",
+		"## 🏠 Control chat advanced help",
+		"",
+		"Workspace flow:",
+		"- `p` / `projects` - list directories with local Codex history",
+		"- `p 1` / `project 1` / `1` - open workspace 1 from the `projects` list",
+		"- `new` / `n` - create a Work chat in the currently opened workspace",
+		"- `n <directory>` / `new <directory>` - create the directory if missing, then create a Work chat there",
+		"",
+		"History flow:",
+		"- `s` / `sessions` / `history` - list local sessions in the selected workspace",
+		"- `c 1` / `continue 1` / `1` on a sessions page - create/open a Work chat and import that session history",
+		"",
+		"Other control commands:",
+		"- `st` / `status` - list active Teams work chats",
+		"- `d <number>` / `details <number>` - show technical IDs and details",
+		"- `m <directory>` / `mkdir <directory>` - create a directory only",
+		"- `ask <question>` - ask a quick helper question in this control chat",
+		"- `h` / `help` / `menu` - show short help",
+		"- `helper restart` - show the safe restart confirmation",
+		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
 		"",
 		"work chat commands:",
 		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
@@ -824,8 +1270,9 @@ func controlAdvancedHelpText() string {
 		"If this chat stops replying for about a minute, start the helper again on the host, then send `status`.",
 		"",
 		"copy-ready examples:",
-		"`new /home/baka/project/codex-helper -- Fix Teams retry flow`",
-		"`mkdir ~/tmp/mobile-fix`",
+		"`p`",
+		"`n /home/baka/project/codex-helper`",
+		"`m ~/tmp/mobile-fix`",
 	}, "\n")
 }
 
@@ -874,12 +1321,271 @@ func unknownControlCommandMessage(text string) string {
 		return controlHelpText()
 	}
 	if isWorkOnlyHelperCommand(text) {
-		return "⚠️ Wrong chat\n\nThis is the 🏠 control chat. `helper ...` commands like `helper file`, `helper retry`, `helper close`, and `helper rename` work inside a 💬 Work chat.\n\nTo start project work, send `new <directory> -- <title>` here, then open the new Work chat and send the task there."
+		return "⚠️ Wrong chat\n\nThis is the 🏠 control chat. `helper ...` commands like `helper file`, `helper retry`, `helper close`, and `helper rename` work inside a 💬 Work chat.\n\nTo start project work, send `new <directory>` here, then open the new Work chat and send the task there."
 	}
 	if strings.Contains(name, "/") || strings.HasPrefix(name, ".") {
 		return controlPathHintMessage(text)
 	}
 	return fmt.Sprintf("unknown control command: `%s`\n\n%s", name, controlHelpText())
+}
+
+func (b *Bridge) restartHelperFromControl(ctx context.Context, arg string) error {
+	arg = strings.TrimSpace(arg)
+	if !helperRestartConfirmed(arg) {
+		return b.sendControl(ctx, strings.Join([]string{
+			"## 🔄 Helper restart",
+			"",
+			"This restarts the local Teams helper on this machine.",
+			"It will only restart when there is no active Codex work.",
+			"",
+			"To restart, send:",
+			"`helper restart now`",
+			"",
+			"If you are debugging a stuck helper and accept interrupting work, send:",
+			"`helper restart force`",
+		}, "\n"))
+	}
+	if b.helperRestarter == nil {
+		return b.sendControl(ctx, "⚠️ Helper restart is not available in this helper process. Start it with the normal Teams service command, then try again.")
+	}
+	if message, blocked, err := b.helperRestartBlockedMessage(ctx, helperRestartForce(arg)); err != nil {
+		return err
+	} else if blocked {
+		return b.sendControl(ctx, message)
+	}
+	if err := b.sendControl(ctx, strings.Join([]string{
+		"🔄 Helper restart scheduled",
+		"",
+		"I may be silent for a few seconds.",
+		"After it comes back, send `st` if you want to check status.",
+	}, "\n")); err != nil {
+		return err
+	}
+	restarter := b.helperRestarter
+	go b.runDelayedHelperRestart(restarter)
+	return nil
+}
+
+func helperRestartConfirmed(arg string) bool {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "now", "--now", "restart now", "restart --now", "force", "--force", "restart force", "restart --force":
+		return true
+	default:
+		return false
+	}
+}
+
+func helperRestartForce(arg string) bool {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "force", "--force", "restart force", "restart --force":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *Bridge) reloadHelperFromControl(ctx context.Context, arg string) error {
+	arg = strings.TrimSpace(arg)
+	if !helperReloadConfirmed(arg) {
+		return b.sendControl(ctx, strings.Join([]string{
+			"## 🔁 Helper reload",
+			"",
+			"This rebuilds the local Teams helper from the current source checkout, replaces the running helper binary, then restarts it.",
+			"It will only reload when there is no active Codex work.",
+			"",
+			"To reload, send:",
+			"`helper reload now`",
+			"",
+			"Debug only, if you accept interrupting active work:",
+			"`helper reload force`",
+		}, "\n"))
+	}
+	if b.helperReloader == nil {
+		return b.sendControl(ctx, "⚠️ Helper reload is not available in this helper process. Start it with the normal Teams service command, then try again.")
+	}
+	previous, message, blocked, err := b.beginHelperReloadDrain(ctx, helperReloadForce(arg))
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return b.sendControl(ctx, message)
+	}
+	if err := b.sendControl(ctx, strings.Join([]string{
+		"🔁 Helper reload started",
+		"",
+		"I am testing and rebuilding the helper from the current source checkout.",
+		"I may be silent for a short time.",
+	}, "\n")); err != nil {
+		_ = b.restoreHelperReloadDrain(context.Background(), previous)
+		return err
+	}
+	reloader := b.helperReloader
+	go b.runDelayedHelperReload(reloader, HelperReloadOptions{Force: helperReloadForce(arg)}, previous)
+	return nil
+}
+
+func helperReloadConfirmed(arg string) bool {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "now", "--now", "reload now", "reload --now", "force", "--force", "reload force", "reload --force":
+		return true
+	default:
+		return false
+	}
+}
+
+func helperReloadForce(arg string) bool {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "force", "--force", "reload force", "reload --force":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *Bridge) beginHelperReloadDrain(ctx context.Context, force bool) (teamstore.ServiceControl, string, bool, error) {
+	if err := b.ensureStore(); err != nil {
+		return teamstore.ServiceControl{}, "", false, err
+	}
+	now := time.Now()
+	var previous teamstore.ServiceControl
+	var blockedMessage string
+	var blocked bool
+	err := b.store.Update(ctx, func(state *teamstore.State) error {
+		previous = state.ServiceControl
+		if state.ServiceControl.Draining {
+			blocked = true
+			blockedMessage = helperDrainBlockedMessage(state.ServiceControl, "reload")
+			return nil
+		}
+		if !force && teamstore.HasUpgradeBlockingWork(*state, now) {
+			blocked = true
+			blockedMessage = strings.Join([]string{
+				"⏳ Codex work is still active.",
+				"",
+				"I will not reload while work or Teams messages are still in progress.",
+				"Wait for it to finish, then send `helper reload now`.",
+				"",
+				"Debug only: `helper reload force` may interrupt active work.",
+			}, "\n")
+			return nil
+		}
+		next := state.ServiceControl
+		next.Draining = true
+		next.Reason = teamstore.HelperReloadReason
+		next.UpdatedAt = now
+		state.ServiceControl = next
+		return nil
+	})
+	if err != nil {
+		return teamstore.ServiceControl{}, "", false, err
+	}
+	return previous, blockedMessage, blocked, nil
+}
+
+func (b *Bridge) restoreHelperReloadDrain(ctx context.Context, previous teamstore.ServiceControl) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	return b.store.Update(ctx, func(state *teamstore.State) error {
+		current := state.ServiceControl
+		if !current.Draining || current.Reason != teamstore.HelperReloadReason {
+			return nil
+		}
+		restored := previous
+		restored.UpdatedAt = time.Now()
+		state.ServiceControl = restored
+		return nil
+	})
+}
+
+func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (string, bool, error) {
+	if err := b.ensureStore(); err != nil {
+		return "", false, err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if state.ServiceControl.Draining {
+		return helperDrainBlockedMessage(state.ServiceControl, "restart"), true, nil
+	}
+	if !force && teamstore.HasUpgradeBlockingWork(state, time.Now()) {
+		return strings.Join([]string{
+			"⏳ Codex work is still active.",
+			"",
+			"I will not restart while work or Teams messages are still in progress.",
+			"Wait for it to finish, then send `helper restart now`.",
+			"",
+			"Debug only: `helper restart force` may interrupt active work.",
+		}, "\n"), true, nil
+	}
+	return "", false, nil
+}
+
+func helperDrainBlockedMessage(control teamstore.ServiceControl, action string) string {
+	switch control.Reason {
+	case teamstore.HelperUpgradeReason:
+		return strings.Join([]string{
+			"⏳ Helper upgrade is already in progress.",
+			"",
+			"I will not start another " + action + " during upgrade.",
+			"Wait for the upgrade to finish, then send `st`.",
+		}, "\n")
+	case teamstore.HelperReloadReason:
+		return strings.Join([]string{
+			"⏳ Helper reload is already in progress.",
+			"",
+			"I will not start another " + action + " during reload.",
+			"Wait for the reload to finish, then send `st`.",
+		}, "\n")
+	default:
+		if control.Reason != "" {
+			return "⏳ Helper is busy: " + control.Reason + ".\n\nWait for it to finish, then send `st`."
+		}
+		return "⏳ Helper is busy.\n\nWait for it to finish, then send `st`."
+	}
+}
+
+func (b *Bridge) runDelayedHelperRestart(restarter HelperRestarter) {
+	delay := helperRestartDelay
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := restarter(ctx); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams helper restart failed: %v\n", err)
+		}
+		_ = b.sendControl(context.Background(), "⚠️ Helper restart failed\n\n"+err.Error())
+	}
+}
+
+func (b *Bridge) runDelayedHelperReload(reloader HelperReloader, opts HelperReloadOptions, previous teamstore.ServiceControl) {
+	delay := helperRestartDelay
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	var clearOnce sync.Once
+	clearDrain := func(ctx context.Context) error {
+		var err error
+		clearOnce.Do(func() {
+			err = b.restoreHelperReloadDrain(ctx, previous)
+		})
+		return err
+	}
+	opts.BeforeRestart = clearDrain
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := reloader(ctx, opts); err != nil {
+		_ = clearDrain(context.Background())
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams helper reload failed: %v\n", err)
+		}
+		_ = b.sendControl(context.Background(), "⚠️ Helper reload failed\n\n"+err.Error())
+		return
+	}
+	_ = clearDrain(context.Background())
 }
 
 func isWorkOnlyHelperCommand(text string) bool {
@@ -913,8 +1619,7 @@ func looksLikeControlPath(text string) bool {
 func controlPathHintMessage(text string) string {
 	path := strings.TrimSpace(text)
 	quoted := quoteTeamsCommandPath(path)
-	title := suggestedTitleForPath(path)
-	return fmt.Sprintf("📁 Detected path: `%s`\n\nChoose one:\n\nRecommended: to start a 💬 Work chat there, copy and send:\n`new %s -- %s`\n\nOnly create the directory without a Teams Work chat:\n`mkdir %s`", path, quoted, title, quoted)
+	return fmt.Sprintf("📁 Detected path: `%s`\n\nChoose one:\n\n- `new %s` - create a 💬 Work chat there\n- `mkdir %s` - only create the directory", path, quoted, quoted)
 }
 
 func quoteTeamsCommandPath(path string) string {
@@ -938,20 +1643,6 @@ func unquoteTeamsCommandPath(path string) (string, bool) {
 		return "", false
 	}
 	return unquoted, true
-}
-
-func suggestedTitleForPath(path string) string {
-	cleaned := strings.TrimSpace(strings.ReplaceAll(path, "\\", "/"))
-	cleaned = strings.TrimRight(cleaned, "/")
-	base := filepath.Base(cleaned)
-	if base == "." || base == "/" || base == "" {
-		base = "Codex task"
-	}
-	title := SanitizeDashboardTitle(base)
-	if title == "" {
-		return "Codex task"
-	}
-	return title
 }
 
 func unknownWorkCommandMessage(text string) string {
@@ -985,7 +1676,7 @@ func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, 
 		TeamsChatID: session.ChatID,
 		Kind:        "ack",
 		AckKind:     "control_prompt",
-		Body:        "❓ Quick helper question\n\nI will answer here in the 🏠 control chat. For project work, send `new <directory> -- <title>`, then send the task inside the new 💬 Work chat.",
+		Body:        "❓ Quick helper question\n\nI will answer here. For project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
 	})
 	if err != nil {
 		return err
@@ -1012,7 +1703,12 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		}
 		return b.sendControl(ctx, serviceControlBlockedMessage(control, "new sessions"))
 	}
-	parsed, err := parseNewSessionRequest(request)
+	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_new"); err != nil {
+		return err
+	} else if duplicate {
+		return b.sendControl(ctx, "I already handled this `new` request. Send `st` to see current Work chats, or send a fresh `new <directory>` message to create another one.")
+	}
+	parsed, err := b.parseNewSessionRequest(ctx, request)
 	if err != nil {
 		return b.sendControl(ctx, err.Error())
 	}
@@ -1021,19 +1717,23 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 			return b.sendControl(ctx, "create workspace failed: "+err.Error())
 		}
 	}
+	now := time.Now()
 	sessionID := b.reg.NextSessionID()
+	titleTopic := ""
+	if parsed.Title != "" {
+		titleTopic = SessionTopic(now, parsed.Title)
+	}
 	topic := WorkChatTitle(ChatTitleOptions{
 		MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()),
 		Profile:      b.scope.Profile,
 		SessionID:    sessionID,
-		Topic:        SessionTopic(time.Now(), parsed.Prompt),
+		Topic:        titleTopic,
 		Cwd:          parsed.WorkDir,
 	})
-	chat, err := b.graph.CreateSingleMemberGroupChat(ctx, b.user.ID, topic)
+	chat, err := b.createMeetingChat(ctx, topic)
 	if err != nil {
 		return err
 	}
-	now := time.Now()
 	session := Session{
 		ID:        sessionID,
 		ChatID:    chat.ID,
@@ -1048,57 +1748,101 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return err
 	}
+	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+"."); err != nil {
+		return err
+	}
 	if err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:          "outbox:" + session.ID + ":anchor",
 		SessionID:   session.ID,
 		TeamsChatID: chat.ID,
 		Kind:        "anchor",
-		Body:        sessionReadyMessage(session, parsed.Prompt),
+		Body:        sessionReadyMessage(session, parsed.Title),
 	}); err != nil {
 		return err
 	}
 	return b.sendControl(ctx, fmt.Sprintf("✅ Work chat created: %s\n\nOpen this Teams link and send your task there:\n%s\n\nIf Teams does not show it right away, search for: %s", session.ID, session.ChatURL, session.ID))
 }
 
+func (b *Bridge) controlCommandAlreadyHandled(ctx context.Context, msg ChatMessage, source string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(msg.ID) == "" || strings.TrimSpace(b.reg.ControlChatID) == "" {
+		return false, nil
+	}
+	inbound, created, err := b.persistControlInboundWithStatus(ctx, msg, teamstore.InboundStatusPersisted, source)
+	if err != nil {
+		return false, err
+	}
+	if created {
+		return false, nil
+	}
+	if inbound.Status == teamstore.InboundStatusDeferred {
+		return false, nil
+	}
+	return true, nil
+}
+
 type newSessionRequest struct {
 	WorkDir string
-	Prompt  string
+	Title   string
+}
+
+func (b *Bridge) parseNewSessionRequest(ctx context.Context, raw string) (newSessionRequest, error) {
+	parsed, err := parseNewSessionRequest(raw)
+	if err != nil {
+		return newSessionRequest{}, err
+	}
+	if parsed.WorkDir == "" && strings.TrimSpace(raw) == "" {
+		if workspace, ok := b.currentControlWorkspace(ctx); ok {
+			parsed.WorkDir = workspace.Path
+		}
+	}
+	if parsed.WorkDir == "" {
+		return newSessionRequest{}, fmt.Errorf("usage: `new <directory>`; after opening a workspace from `projects`, you can also send `new`")
+	}
+	return parsed, nil
 }
 
 func parseNewSessionRequest(raw string) (newSessionRequest, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return newSessionRequest{}, fmt.Errorf("usage: `new <title>` or `new <explicit-directory> -- <title>`")
+		return newSessionRequest{}, nil
 	}
 	before, after, hasSep := strings.Cut(raw, " -- ")
 	if !hasSep {
-		return newSessionRequest{Prompt: raw}, nil
+		resolved, err := resolveUserWorkspacePath(raw)
+		if err != nil {
+			return newSessionRequest{}, err
+		}
+		return newSessionRequest{WorkDir: resolved}, nil
 	}
 	dir := strings.TrimSpace(before)
-	prompt := strings.TrimSpace(after)
-	if dir == "" || prompt == "" {
-		return newSessionRequest{}, fmt.Errorf("usage: `new <explicit-directory> -- <title>`")
-	}
-	if !looksExplicitWorkspacePath(dir) {
-		return newSessionRequest{Prompt: raw}, nil
+	title := strings.TrimSpace(after)
+	if dir == "" {
+		return newSessionRequest{}, fmt.Errorf("usage: `new <directory>`")
 	}
 	resolved, err := resolveUserWorkspacePath(dir)
 	if err != nil {
 		return newSessionRequest{}, err
 	}
-	return newSessionRequest{WorkDir: resolved, Prompt: prompt}, nil
+	return newSessionRequest{WorkDir: resolved, Title: title}, nil
 }
 
-func looksExplicitWorkspacePath(path string) bool {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return false
+func (b *Bridge) currentControlWorkspace(ctx context.Context) (teamstore.WorkspaceRecord, bool) {
+	if b == nil || b.store == nil {
+		return teamstore.WorkspaceRecord{}, false
 	}
-	return filepath.IsAbs(path) ||
-		strings.HasPrefix(path, "~") ||
-		strings.HasPrefix(path, ".") ||
-		strings.HasPrefix(path, "$") ||
-		strings.ContainsAny(path, `/\`)
+	view, ok, err := b.loadDashboardView(ctx)
+	if err != nil || !ok || strings.TrimSpace(view.WorkspaceID) == "" {
+		return teamstore.WorkspaceRecord{}, false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return teamstore.WorkspaceRecord{}, false
+	}
+	record, ok := state.Workspaces[view.WorkspaceID]
+	if !ok || strings.TrimSpace(record.Path) == "" {
+		return teamstore.WorkspaceRecord{}, false
+	}
+	return record, true
 }
 
 func resolveUserWorkspacePath(raw string) (string, error) {
@@ -1139,7 +1883,7 @@ func (b *Bridge) createWorkspaceDirectory(ctx context.Context, raw string) error
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return b.sendControl(ctx, "create workspace failed: "+err.Error())
 	}
-	return b.sendControl(ctx, "Directory is ready: "+dir+"\n\nNext: send `new "+quoteTeamsCommandPath(dir)+" -- <title>` to create a work chat for this directory.")
+	return b.sendControl(ctx, "Directory is ready: "+dir+"\n\nNext: send `new "+quoteTeamsCommandPath(dir)+"` to create a work chat for this directory.")
 }
 
 func sessionReadyMessage(session Session, prompt string) string {
@@ -1237,10 +1981,72 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	if msg.Body.Content == "" && strings.TrimSpace(text) != "" {
 		msg.Body.Content = text
 	}
+	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
+		return err
+	} else if importing {
+		return b.deferSessionMessageDuringTranscriptImport(ctx, session, msg)
+	}
 	if control, blocked, err := b.serviceControlBlocksNewWork(ctx); err != nil {
 		return err
 	} else if blocked {
 		return b.rejectSessionWork(ctx, session, msg, control)
+	}
+	if b.asyncTurns {
+		turns, err := b.sessionTurnQueueState(ctx, session.ID)
+		if err != nil {
+			return err
+		}
+		if turns.Running {
+			if err := b.ensureDurableSession(ctx, session); err != nil {
+				return err
+			}
+			inbound, created, err := b.persistInbound(ctx, session, msg)
+			if err != nil {
+				return err
+			}
+			turn, turnCreated, err := b.queueTurn(ctx, session, inbound)
+			if err != nil {
+				return err
+			}
+			if !created || !turnCreated {
+				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
+			}
+			session.UpdatedAt = time.Now()
+			if turns.Queued == 0 {
+				if err := b.queueTeamsPromptAck(ctx, session, turn, true); err != nil {
+					return err
+				}
+			}
+			b.boostPolling(time.Now())
+			return nil
+		}
+		gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		if err != nil {
+			return err
+		}
+		if gate.Block {
+			if err := b.ensureDurableSession(ctx, session); err != nil {
+				return err
+			}
+			inbound, created, err := b.persistInbound(ctx, session, msg)
+			if err != nil {
+				return err
+			}
+			turn, turnCreated, err := b.queueTurn(ctx, session, inbound)
+			if err != nil {
+				return err
+			}
+			if !created || !turnCreated {
+				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
+			}
+			if turns.Queued == 0 {
+				if err := b.queueTeamsPromptAckWithBody(ctx, session, turn, gate.AckBody); err != nil {
+					return err
+				}
+			}
+			b.boostPolling(time.Now())
+			return nil
+		}
 	}
 
 	localFiles, cleanupFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, chatID, msg)
@@ -1250,19 +2056,24 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		}
 		return err
 	}
-	defer cleanupFiles()
 	if hostedAttachmentMessage != "" {
+		cleanupFiles()
 		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, hostedAttachmentMessage)
 	}
 	referenceFiles, cleanupReferenceFiles, unsupportedAttachmentMessage, err := b.downloadReferenceFileAttachments(ctx, session, msg)
 	if err != nil {
+		cleanupFiles()
 		if message, ok := attachmentDownloadUserMessage(err); ok {
 			return b.rejectSessionAttachmentWithMessage(ctx, session, msg, message)
 		}
 		return err
 	}
-	defer cleanupReferenceFiles()
+	cleanupLocalFiles := func() {
+		cleanupFiles()
+		cleanupReferenceFiles()
+	}
 	if unsupportedAttachmentMessage != "" {
+		cleanupLocalFiles()
 		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, unsupportedAttachmentMessage)
 	}
 	localFiles = append(localFiles, referenceFiles...)
@@ -1282,9 +2093,27 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 	}
 	session.UpdatedAt = time.Now()
-	if err := b.queueTeamsPromptAck(ctx, session, turn, text); err != nil {
+	if err := b.queueTeamsPromptAck(ctx, session, turn, false); err != nil {
+		cleanupLocalFiles()
 		return err
 	}
+	if b.asyncTurns {
+		prompt := PromptWithLocalAttachments(TeamsCodexPrompt(text), localFiles)
+		started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
+			defer cleanupLocalFiles()
+			return b.runQueuedTurn(runCtx, session, claimed, chatID, prompt)
+		})
+		if err != nil {
+			cleanupLocalFiles()
+			return err
+		}
+		if !started {
+			cleanupLocalFiles()
+		}
+		b.boostPolling(time.Now())
+		return nil
+	}
+	defer cleanupLocalFiles()
 
 	return b.runQueuedTurn(ctx, session, turn, chatID, PromptWithLocalAttachments(TeamsCodexPrompt(text), localFiles))
 }
@@ -1397,7 +2226,19 @@ func turnSortTime(turn teamstore.Turn) time.Time {
 	return time.Time{}
 }
 
-func (b *Bridge) queueTeamsPromptAck(ctx context.Context, session *Session, turn teamstore.Turn, _ string) error {
+func (b *Bridge) queueTeamsPromptAck(ctx context.Context, session *Session, turn teamstore.Turn, queuedBehindActive bool) error {
+	body := "⏳ Codex is working. Request accepted."
+	if queuedBehindActive {
+		body = "⏳ Queued. Codex will respond after the current request."
+	}
+	return b.queueTeamsPromptAckWithBody(ctx, session, turn, body)
+}
+
+func (b *Bridge) queueTeamsPromptAckWithBody(ctx context.Context, session *Session, turn teamstore.Turn, body string) error {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		body = "⏳ Codex is working. Request accepted."
+	}
 	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
 		ID:          "outbox:" + turn.ID + ":ack",
 		SessionID:   session.ID,
@@ -1405,7 +2246,7 @@ func (b *Bridge) queueTeamsPromptAck(ctx context.Context, session *Session, turn
 		TeamsChatID: session.ChatID,
 		Kind:        "ack",
 		AckKind:     "teams_prompt",
-		Body:        "⏳ Codex is working. Request accepted.",
+		Body:        body,
 	})
 	if err != nil {
 		return err
@@ -1503,6 +2344,11 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			}
 			continue
 		}
+		if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
+			return err
+		} else if importing {
+			continue
+		}
 		text := strings.TrimSpace(inbound.Text)
 		if text == "" {
 			if err := b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred input text is unavailable"); err != nil {
@@ -1529,10 +2375,60 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := b.queueTeamsPromptAck(ctx, session, turn, text); err != nil {
+		if err := b.queueTeamsPromptAck(ctx, session, turn, false); err != nil {
 			return err
 		}
 		if err := b.runQueuedTurn(ctx, session, turn, session.ChatID, TeamsCodexPrompt(text)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Bridge) processQueuedTurns(ctx context.Context) error {
+	if !b.asyncTurns {
+		return nil
+	}
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	running := make(map[string]bool)
+	queued := make(map[string]bool)
+	for _, turn := range state.Turns {
+		switch turn.Status {
+		case teamstore.TurnStatusRunning:
+			running[turn.SessionID] = true
+		case teamstore.TurnStatusQueued:
+			queued[turn.SessionID] = true
+		}
+	}
+	var sessionIDs []string
+	for sessionID := range queued {
+		if transcriptImportIsActive(state, sessionID) {
+			continue
+		}
+		if !running[sessionID] {
+			sessionIDs = append(sessionIDs, sessionID)
+		}
+	}
+	sort.Strings(sessionIDs)
+	for _, sessionID := range sessionIDs {
+		session := b.sessionForIDState(state, sessionID)
+		if session == nil {
+			continue
+		}
+		gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		if err != nil {
+			return err
+		}
+		if gate.Block {
+			continue
+		}
+		if _, err := b.startQueuedTurn(ctx, session, "", nil); err != nil {
 			return err
 		}
 	}
@@ -1652,12 +2548,16 @@ func (b *Bridge) markDeferredInboundIgnored(ctx context.Context, inboundID strin
 }
 
 func (b *Bridge) sessionForTurnState(state teamstore.State, turn teamstore.Turn) *Session {
-	if session := b.reg.SessionByID(turn.SessionID); session != nil {
+	return b.sessionForIDState(state, turn.SessionID)
+}
+
+func (b *Bridge) sessionForIDState(state teamstore.State, sessionID string) *Session {
+	if session := b.reg.SessionByID(sessionID); session != nil {
 		return session
 	}
-	durable, ok := state.Sessions[turn.SessionID]
+	durable, ok := state.Sessions[sessionID]
 	if !ok || durable.TeamsChatID == "" {
-		if ok && turn.SessionID == controlFallbackSessionID && b.reg.ControlChatID != "" {
+		if ok && sessionID == controlFallbackSessionID && b.reg.ControlChatID != "" {
 			return b.controlFallbackSessionFromState(durable)
 		}
 		return nil
@@ -2143,7 +3043,7 @@ func (b *Bridge) fileWriteGraph() (*GraphClient, error) {
 	if b.fileGraph != nil {
 		return b.fileGraph, nil
 	}
-	graph, err := NewFileWriteGraphClient(b.out)
+	graph, err := NewFileWriteGraphClientWithHTTPClient(b.out, b.httpClient)
 	if err != nil {
 		return nil, err
 	}
@@ -2204,6 +3104,7 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 	}); err != nil {
 		return err
 	}
+	b.boostPolling(time.Now())
 	return b.uploadArtifactsFromResult(ctx, session, turn, result.Text)
 }
 
@@ -2255,6 +3156,112 @@ func (b *Bridge) rejectSessionAttachmentWithMessage(ctx context.Context, session
 		Kind:        "attachment",
 		Body:        message,
 	})
+}
+
+type queuedTurnRunner func(context.Context, teamstore.Turn) error
+
+type sessionTurnQueueState struct {
+	Running bool
+	Queued  int
+}
+
+func (b *Bridge) sessionTurnQueueState(ctx context.Context, sessionID string) (sessionTurnQueueState, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return sessionTurnQueueState{}, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return sessionTurnQueueState{}, err
+	}
+	var out sessionTurnQueueState
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID {
+			continue
+		}
+		switch turn.Status {
+		case teamstore.TurnStatusRunning:
+			out.Running = true
+		case teamstore.TurnStatusQueued:
+			out.Queued++
+		}
+	}
+	return out, nil
+}
+
+func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferredTurnID string, preferred queuedTurnRunner) (bool, error) {
+	if session == nil {
+		return false, nil
+	}
+	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
+		return false, err
+	} else if importing {
+		return false, nil
+	}
+	claimed, ok, err := b.store.ClaimNextQueuedTurn(ctx, session.ID)
+	if err != nil || !ok {
+		return ok, err
+	}
+	runCtx := ctx
+	go func() {
+		err := b.runClaimedQueuedTurn(runCtx, session, claimed, preferredTurnID, preferred)
+		if err != nil {
+			b.handleClaimedQueuedTurnError(context.Background(), session, claimed, err)
+		}
+		if err := b.processQueuedTurns(context.Background()); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams queued turn follow-up error: %v\n", err)
+		}
+		b.boostPolling(time.Now())
+	}()
+	return true, nil
+}
+
+func (b *Bridge) runClaimedQueuedTurn(ctx context.Context, session *Session, claimed teamstore.Turn, preferredTurnID string, preferred queuedTurnRunner) error {
+	if strings.TrimSpace(preferredTurnID) != "" && claimed.ID == preferredTurnID && preferred != nil {
+		return preferred(ctx, claimed)
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	return b.recoverQueuedTurn(ctx, session, claimed, state)
+}
+
+func (b *Bridge) handleClaimedQueuedTurnError(ctx context.Context, session *Session, turn teamstore.Turn, err error) {
+	if err == nil || b == nil || b.store == nil {
+		return
+	}
+	state, loadErr := b.store.Load(ctx)
+	if loadErr == nil {
+		if current, ok := state.Turns[turn.ID]; ok {
+			switch current.Status {
+			case teamstore.TurnStatusCompleted, teamstore.TurnStatusFailed, teamstore.TurnStatusInterrupted:
+				return
+			}
+		}
+	}
+	if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn failed before Codex completed: "+err.Error()); markErr != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams queued turn interrupt error: %v\n", markErr)
+		}
+		return
+	}
+	chatID := ""
+	if session != nil {
+		chatID = session.ChatID
+	}
+	if strings.TrimSpace(chatID) == "" {
+		return
+	}
+	if queueErr := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:" + turn.ID + ":queued-turn-error",
+		SessionID:   turn.SessionID,
+		TurnID:      turn.ID,
+		TeamsChatID: chatID,
+		Kind:        "error",
+		Body:        "Codex could not continue this queued request: " + err.Error() + "\n\nPlease resend the message if you still want to run it.",
+	}); queueErr != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams queued turn error notification failed: %v\n", queueErr)
+	}
 }
 
 func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, text string) (ExecutionResult, error) {
@@ -2343,8 +3350,26 @@ func (f *codexEventForwarder) Close(finalText string) {
 
 func (f *codexEventForwarder) run() {
 	defer close(f.done)
-	for event := range f.events {
-		f.handle(event)
+	timer := newCodexIdleStatusTimer(codexIdleStatusInitialDelay)
+	defer stopCodexIdleStatusTimer(timer)
+	var idleC <-chan time.Time
+	if timer != nil {
+		idleC = timer.C
+	}
+	for {
+		select {
+		case event, ok := <-f.events:
+			if !ok {
+				return
+			}
+			f.handle(event)
+			resetCodexIdleStatusTimer(timer, codexIdleStatusInitialDelay)
+		case <-idleC:
+			f.sendIdleStatus()
+			resetCodexIdleStatusTimer(timer, codexIdleStatusRepeatDelay)
+		case <-f.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -2357,10 +3382,8 @@ func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
 		f.pendingAgent = event.Text
 	case codexrunner.StreamEventCommandStarted:
 		f.flushPendingAgent()
-		_ = f.send("command", formatCodexCommandStarted(event))
 	case codexrunner.StreamEventCommandCompleted:
 		f.flushPendingAgent()
-		_ = f.send("command", formatCodexCommandCompleted(event))
 	case codexrunner.StreamEventTurnFailed:
 		f.flushPendingAgent()
 		if event.Failure != nil && strings.TrimSpace(event.Failure.Message) != "" {
@@ -2377,6 +3400,14 @@ func (f *codexEventForwarder) flushPendingAgent() {
 	f.pendingAgent = ""
 }
 
+func (f *codexEventForwarder) sendIdleStatus() {
+	if strings.TrimSpace(f.pendingAgent) != "" {
+		f.flushPendingAgent()
+		return
+	}
+	_ = f.send("status", codexIdleStatusMessage)
+}
+
 func (f *codexEventForwarder) send(kind string, text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" || f.bridge == nil || strings.TrimSpace(f.chatID) == "" {
@@ -2389,6 +3420,38 @@ func (f *codexEventForwarder) send(kind string, text string) error {
 		f.err = err
 	}
 	return err
+}
+
+func newCodexIdleStatusTimer(delay time.Duration) *time.Timer {
+	if delay <= 0 {
+		return nil
+	}
+	return time.NewTimer(delay)
+}
+
+func resetCodexIdleStatusTimer(timer *time.Timer, delay time.Duration) {
+	if timer == nil || delay <= 0 {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
+}
+
+func stopCodexIdleStatusTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
 }
 
 func sameCodexVisibleText(left string, right string) bool {
@@ -3104,6 +4167,17 @@ func (b *Bridge) persistInboundWithStatusAndSource(ctx context.Context, session 
 	})
 }
 
+func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, session *Session, msg ChatMessage) error {
+	if session == nil {
+		return nil
+	}
+	if err := b.ensureDurableSession(ctx, session); err != nil {
+		return err
+	}
+	_, _, err := b.persistInboundWithStatusAndSource(ctx, session, msg, teamstore.InboundStatusDeferred, "teams_session_import_deferred")
+	return err
+}
+
 func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamstore.InboundEvent) (teamstore.Turn, bool, error) {
 	leaseGeneration := b.currentLeaseGeneration()
 	return b.store.QueueTurn(ctx, teamstore.Turn{
@@ -3121,6 +4195,9 @@ func (b *Bridge) queueAndSendOutboxChunks(ctx context.Context, sessionID string,
 }
 
 func (b *Bridge) queueAndSendOutboxChunksWithOptions(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string, opts outboxQueueOptions) error {
+	if shouldSuppressCodexCommandOutbox(kind) {
+		return nil
+	}
 	renderKind := renderKindForOutbox(kind)
 	if renderKind == TeamsRenderAssistant {
 		text = StripOAIMemoryCitationBlocks(text)
@@ -3150,12 +4227,13 @@ func (b *Bridge) queueAndSendOutboxChunksWithOptions(ctx context.Context, sessio
 			LeaseGeneration: leaseGeneration,
 			Kind:            msgKind,
 			Body:            body,
+			SourceTextHash:  normalizedTextHash(text),
 			PartIndex:       chunk.PartIndex,
 			PartCount:       chunk.PartCount,
 			RenderedBytes:   chunk.ByteLength,
 		}
 		mentionThisPart := opts.MentionOwner && i == 0
-		if opts.MentionOwner && isFinalOutboxKind(kind) {
+		if opts.MentionOwner && isCompletionNotificationKind(kind, opts.NotificationKind) {
 			mentionThisPart = i == len(chunks)-1
 		}
 		if mentionThisPart {
@@ -3174,7 +4252,11 @@ func (b *Bridge) queueAndSendOutboxChunksWithOptions(ctx context.Context, sessio
 	if len(queued) == 0 {
 		return nil
 	}
-	return b.flushPendingOutboxForChat(ctx, chatID)
+	if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
+		return err
+	}
+	b.boostPolling(time.Now())
+	return nil
 }
 
 func (b *Bridge) queueAndSendOutbox(ctx context.Context, msg teamstore.OutboxMessage) error {
@@ -3271,6 +4353,10 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		if err := b.ensureActiveControlLease(ctx); err != nil {
 			return err
 		}
+	}
+	if shouldSuppressCodexCommandOutbox(outbox.Kind) {
+		_, err := b.store.MarkOutboxSent(ctx, outbox.ID, "")
+		return err
 	}
 	if outbox.Status == teamstore.OutboxStatusAccepted && outbox.TeamsMessageID != "" {
 		_, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
@@ -3433,10 +4519,64 @@ func (b *Bridge) sendLongToChat(ctx context.Context, chatID string, text string)
 	return b.sendToChat(ctx, chatID, text)
 }
 
+func (b *Bridge) discoverDashboardProjects(ctx context.Context) ([]codexhistory.Project, error) {
+	if b == nil {
+		return discoverCodexProjectsForTeams(ctx, "")
+	}
+	now := time.Now()
+	b.dashboardProjectsMu.Lock()
+	if !b.dashboardProjectsCachedAt.IsZero() && now.Sub(b.dashboardProjectsCachedAt) < dashboardProjectsCacheTTL {
+		projects := cloneCodexProjects(b.dashboardProjectsCache)
+		b.dashboardProjectsMu.Unlock()
+		return projects, nil
+	}
+	b.dashboardProjectsMu.Unlock()
+
+	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	cached := cloneCodexProjects(projects)
+	b.dashboardProjectsMu.Lock()
+	b.dashboardProjectsCache = cached
+	b.dashboardProjectsCachedAt = now
+	b.dashboardProjectsMu.Unlock()
+	return cloneCodexProjects(cached), nil
+}
+
+func cloneCodexProjects(projects []codexhistory.Project) []codexhistory.Project {
+	if len(projects) == 0 {
+		return nil
+	}
+	out := make([]codexhistory.Project, len(projects))
+	for i, project := range projects {
+		out[i] = project
+		if len(project.Sessions) > 0 {
+			out[i].Sessions = append([]codexhistory.Session(nil), project.Sessions...)
+			for j := range out[i].Sessions {
+				if len(out[i].Sessions[j].Subagents) > 0 {
+					out[i].Sessions[j].Subagents = append([]codexhistory.SubagentSession(nil), out[i].Sessions[j].Subagents...)
+				}
+			}
+		}
+	}
+	return out
+}
+
 func renderOutboxHTML(outbox teamstore.OutboxMessage) string {
-	if isFinalOutboxKind(outbox.Kind) {
+	if isChatMovedOutboxKind(outbox.Kind) {
+		rendered, _ := renderChatMovedOutboxHTML(outbox, User{}, false)
+		return rendered
+	}
+	if strings.EqualFold(strings.TrimSpace(outbox.Kind), "freeze-notice") {
+		return outbox.Body
+	}
+	if isTranscriptImportBatchOutboxKind(outbox.Kind) {
+		return outbox.Body
+	}
+	if isCompletionNotificationOutbox(outbox) && renderKindForOutbox(outbox.Kind) == TeamsRenderAssistant {
 		rendered := renderFinalOutboxBodyHTML(outbox)
-		if isFinalOutboxCompletionPart(outbox) {
+		if isCompletionNotificationPart(outbox) {
 			rendered += `<p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>`
 		}
 		return rendered
@@ -3450,14 +4590,17 @@ func renderOutboxHTML(outbox teamstore.OutboxMessage) string {
 }
 
 func renderOutboxMentionHTML(outbox teamstore.OutboxMessage, owner User) (string, []ChatMention) {
+	if isChatMovedOutboxKind(outbox.Kind) {
+		return renderChatMovedOutboxHTML(outbox, owner, true)
+	}
 	mentionText := strings.TrimSpace(firstNonEmptyString(owner.DisplayName, owner.UserPrincipalName, "owner"))
 	mention := `<at id="0">` + html.EscapeString(mentionText) + `</at>`
 	label := teamsRenderLabel(renderKindForOutbox(outbox.Kind), normalizedPartIndex(outbox), normalizedPartCount(outbox))
 	body := normalizeTeamsRenderTextForKind(renderKindForOutbox(outbox.Kind), outbox.Body)
 	rendered := renderTeamsHTMLParagraphs(label, body, mention)
-	if isFinalOutboxKind(outbox.Kind) {
+	if isCompletionNotificationOutbox(outbox) && renderKindForOutbox(outbox.Kind) == TeamsRenderAssistant {
 		rendered = renderFinalOutboxBodyHTML(outbox)
-		if isFinalOutboxCompletionPart(outbox) {
+		if isCompletionNotificationPart(outbox) {
 			rendered += `<p><strong>🔧 Helper:</strong> ✅ Codex finished responding. ` + mention + `</p>`
 		}
 	}
@@ -3466,6 +4609,68 @@ func renderOutboxMentionHTML(outbox teamstore.OutboxMessage, owner User) (string
 		Text: mentionText,
 		User: owner,
 	}}
+}
+
+func isChatMovedOutboxKind(kind string) bool {
+	return strings.EqualFold(strings.TrimSpace(kind), "chat-moved")
+}
+
+func renderChatMovedOutboxHTML(outbox teamstore.OutboxMessage, owner User, includeMention bool) (string, []ChatMention) {
+	target, href := parseChatMovedNoticeBody(outbox.Body)
+	if target == "" {
+		target = "the new chat"
+	}
+	label := teamsRenderLabel(TeamsRenderHelper, normalizedPartIndex(outbox), normalizedPartCount(outbox))
+	mentionHTML := ""
+	var mentions []ChatMention
+	if includeMention && strings.TrimSpace(owner.ID) != "" {
+		mentionText := strings.TrimSpace(firstNonEmptyString(owner.DisplayName, owner.UserPrincipalName, "owner"))
+		if mentionText == "" {
+			mentionText = "owner"
+		}
+		mentionHTML = ` <at id="0">` + html.EscapeString(mentionText) + `</at>`
+		mentions = []ChatMention{{
+			ID:   0,
+			Text: mentionText,
+			User: owner,
+		}}
+	}
+	linkText := "Open " + target
+	linkHTML := html.EscapeString(linkText)
+	if safeHref, ok := safeTeamsMarkdownURL(href); ok && teamsMarkdownURLIsHTTP(safeHref) {
+		linkHTML = `<a href="` + html.EscapeString(safeHref) + `">` + html.EscapeString(linkText) + `</a>`
+	} else if strings.TrimSpace(href) != "" {
+		linkHTML = html.EscapeString(strings.TrimSpace(href))
+	}
+	var out strings.Builder
+	out.WriteString("<p><strong>")
+	out.WriteString(html.EscapeString(label))
+	out.WriteString(":</strong>")
+	out.WriteString(mentionHTML)
+	out.WriteString(" 🔁 <strong>This chat moved</strong></p>")
+	out.WriteString("<p><strong>Open ")
+	out.WriteString(html.EscapeString(target))
+	out.WriteString(":</strong><br>")
+	out.WriteString(linkHTML)
+	out.WriteString("</p>")
+	out.WriteString("<p>Messages here may not be handled after the switch.</p>")
+	return out.String(), mentions
+}
+
+func parseChatMovedNoticeBody(body string) (target string, href string) {
+	lines := strings.Split(normalizeTeamsRenderText(body), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "open ") && strings.HasSuffix(trimmed, ":") {
+			target = strings.TrimSpace(strings.TrimSuffix(trimmed[len("Open "):], ":"))
+			continue
+		}
+		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+			href = trimmed
+		}
+	}
+	return target, href
 }
 
 func renderFinalOutboxBodyHTML(outbox teamstore.OutboxMessage) string {
@@ -3481,6 +4686,21 @@ func isFinalOutboxKind(kind string) bool {
 
 func isFinalOutboxCompletionPart(outbox teamstore.OutboxMessage) bool {
 	if !isFinalOutboxKind(outbox.Kind) {
+		return false
+	}
+	return normalizedPartIndex(outbox) >= normalizedPartCount(outbox)
+}
+
+func isCompletionNotificationOutbox(outbox teamstore.OutboxMessage) bool {
+	return isCompletionNotificationKind(outbox.Kind, outbox.NotificationKind)
+}
+
+func isCompletionNotificationKind(kind string, notificationKind string) bool {
+	return isFinalOutboxKind(kind) || strings.EqualFold(strings.TrimSpace(notificationKind), "turn_completed")
+}
+
+func isCompletionNotificationPart(outbox teamstore.OutboxMessage) bool {
+	if !isCompletionNotificationOutbox(outbox) {
 		return false
 	}
 	return normalizedPartIndex(outbox) >= normalizedPartCount(outbox)
@@ -3527,6 +4747,16 @@ func renderKindForOutbox(kind string) TeamsRenderKind {
 	default:
 		return TeamsRenderHelper
 	}
+}
+
+func isTranscriptImportBatchOutboxKind(kind string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	return strings.HasPrefix(kind, "import-batch-") || strings.HasPrefix(kind, "sync-batch-")
+}
+
+func shouldSuppressCodexCommandOutbox(kind string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	return strings.HasPrefix(kind, "codex-command-")
 }
 
 func directOutboxID(chatID string, kind string, body string) string {
@@ -3614,18 +4844,18 @@ func (b *Bridge) formatSessionList() string {
 	}
 	if len(active) == 0 {
 		if closedCount > 0 {
-			return fmt.Sprintf("Control status: no active linked work chats. %d closed work chat(s) are hidden because the helper no longer polls them.\n\nSend `new <directory> -- <title>` to create a repo-specific work chat, `new <title>` for the helper default directory, or `sessions` then `continue <number>` to import an existing local Codex session into a new work chat.", closedCount)
+			return fmt.Sprintf("Control status: no active linked work chats. %d closed work chat(s) are hidden because the helper no longer polls them.\n\nSend `projects` to choose a workspace, `new <directory>` to create a Work chat, or `sessions` then `continue <number>` to import an existing local Codex session.", closedCount)
 		}
-		return "Control status: no linked work chats yet. Send `new <directory> -- <title>` to create a repo-specific work chat, or `new <title>` for the helper default directory."
+		return "Control status: no linked work chats yet.\n\nNext: send `projects` to choose a workspace, or `new <directory>` to create a Work chat."
 	}
-	lines := []string{"Control status: active linked work chats"}
+	lines := []string{"## Active Work chats"}
 	for _, session := range active {
-		lines = append(lines, fmt.Sprintf("%s [%s] %s\n%s", session.ID, session.Status, session.Topic, session.ChatURL))
+		lines = append(lines, fmt.Sprintf("- **%s** [%s]\n  %s\n  %s", session.Topic, session.Status, session.ID, session.ChatURL))
 	}
 	if closedCount > 0 {
 		lines = append(lines, fmt.Sprintf("%d closed work chat(s) hidden. The helper no longer reads or responds in closed chats.", closedCount))
 	}
-	lines = append(lines, "Next: open one of these Teams chats to continue work, or send `new <directory> -- <title>` to create another repo-specific work chat.")
+	lines = append(lines, "Next: open one of these Teams chats to continue work, or send `new <directory>` to create another Work chat.")
 	return strings.Join(lines, "\n")
 }
 
@@ -3826,7 +5056,7 @@ func (b *Bridge) formatLocalSessionDetails(ctx context.Context, selection Dashbo
 }
 
 func (b *Bridge) dashboardSessionForSelection(ctx context.Context, selection DashboardSelection) (DashboardSession, bool) {
-	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	projects, err := b.discoverDashboardProjects(ctx)
 	if err != nil {
 		return DashboardSession{}, false
 	}
@@ -3919,7 +5149,11 @@ func containsLinePrefix(lines []string, prefix string) bool {
 }
 
 func (b *Bridge) publishCodexSession(ctx context.Context, target DashboardCommandTarget) (string, error) {
-	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	return b.publishCodexSessionWithProgress(ctx, target, nil)
+}
+
+func (b *Bridge) publishCodexSessionWithProgress(ctx context.Context, target DashboardCommandTarget, notify func(context.Context, string) error) (string, error) {
+	projects, err := b.discoverDashboardProjects(ctx)
 	if err != nil {
 		return "", fmt.Errorf("workspace discovery failed: %w", err)
 	}
@@ -3935,12 +5169,22 @@ func (b *Bridge) publishCodexSession(ctx context.Context, target DashboardComman
 		if err := b.ensureDurableSession(ctx, existing); err != nil {
 			return "", err
 		}
+		if importing, err := b.sessionTranscriptImportInProgress(ctx, existing.ID); err != nil {
+			return "", err
+		} else if importing {
+			return fmt.Sprintf("Already published as %s: %s\n\nHistory import is still running. Wait for \"Import complete\" in the Work chat before sending a new task there.", existing.ID, existing.ChatURL), nil
+		}
 		hasNew, err := b.transcriptHasNewRecords(ctx, existing.ID, local.FilePath)
 		if err != nil {
 			return "", fmt.Errorf("check history import for %s: %w", existing.ID, err)
 		}
 		importStatus := "No new local history was imported."
 		if hasNew {
+			if notify != nil {
+				if err := notify(ctx, publishHistoryPreparingMessage(existing.ID, existing.ChatURL, true)); err != nil {
+					return "", err
+				}
+			}
 			if err := b.importCodexTranscriptToTeams(ctx, *existing, local); err != nil {
 				return "", fmt.Errorf("resume history import for %s: %w", existing.ID, err)
 			}
@@ -3956,7 +5200,7 @@ func (b *Bridge) publishCodexSession(ctx context.Context, target DashboardComman
 		Topic:        local.DisplayTitle(),
 		Cwd:          firstNonEmptyString(local.ProjectPath, project.Path),
 	})
-	chat, err := b.graph.CreateSingleMemberGroupChat(ctx, b.user.ID, title)
+	chat, err := b.createMeetingChat(ctx, title)
 	if err != nil {
 		return "", err
 	}
@@ -3986,10 +5230,35 @@ func (b *Bridge) publishCodexSession(ctx context.Context, target DashboardComman
 	}); err != nil {
 		return "", err
 	}
+	if notify != nil {
+		if err := notify(ctx, publishHistoryPreparingMessage(session.ID, session.ChatURL, false)); err != nil {
+			return "", err
+		}
+	}
+	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+"."); err != nil {
+		return "", err
+	}
 	if err := b.importCodexTranscriptToTeams(ctx, session, local); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("Published local Codex session as %s: %s\n\nOpen this Teams work chat and send a message there to continue.", session.ID, session.ChatURL), nil
+}
+
+func publishHistoryPreparingMessage(sessionID string, chatURL string, existing bool) string {
+	status := "Work chat created"
+	if existing {
+		status = "Work chat reopened"
+	}
+	lines := []string{
+		fmt.Sprintf("✅ %s: %s", status, strings.TrimSpace(sessionID)),
+		"",
+		"Open Work chat:",
+		strings.TrimSpace(chatURL),
+		"",
+		"Preparing local Codex history now. Long sessions can take a few minutes.",
+		`Wait for "Import complete" in the Work chat before sending a new task there.`,
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 func (b *Bridge) resolvePublishTargetSessionID(ctx context.Context, target DashboardCommandTarget) (string, error) {
@@ -4024,6 +5293,7 @@ func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Sessi
 	}
 	title := "Imported Codex session history\n\nThe messages below came from your local Codex session. Reply in this chat to continue from here.\n\nSession: " + local.DisplayTitle()
 	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-title", title); err != nil {
+		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
 		return err
 	}
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, local.FilePath, importTurnID, "import", transcriptCheckpointID(session.ID))
@@ -4037,6 +5307,7 @@ func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Sessi
 	}
 	complete := formatTranscriptImportCompleteMessage(stats)
 	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-complete", complete); err != nil {
+		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
 		return err
 	}
 	return b.markTranscriptImportComplete(ctx, session, local.FilePath, lastRecordID, lastLine)
@@ -4088,6 +5359,7 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	}
 	stats := transcriptImportStats{Total: len(transcript.Records)}
 	dedupe := newTranscriptDedupeState()
+	batcher := newTranscriptImportBatcher(b, session, filePath, importTurnID, kindPrefix, checkpointID)
 	for i, record := range transcript.Records {
 		if strings.TrimSpace(record.Text) == "" {
 			continue
@@ -4095,38 +5367,173 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		checkpointKey := transcriptRecordCheckpointKey(record)
 		if shouldSkipImportedTranscriptRecord(record) {
 			stats.SkippedBackground++
-			if err := b.recordTranscriptCheckpointWithID(ctx, session, filePath, checkpointKey, record.SourceLine, checkpointID); err != nil {
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, record.SourceLine); err != nil {
 				return "", 0, stats, err
 			}
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
-			if err := b.recordTranscriptCheckpointWithID(ctx, session, filePath, checkpointKey, record.SourceLine, checkpointID); err != nil {
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, record.SourceLine); err != nil {
 				return "", 0, stats, err
 			}
 			continue
 		}
 		if dedupe.shouldSkip(record, body) {
-			if err := b.recordTranscriptCheckpointWithID(ctx, session, filePath, checkpointKey, record.SourceLine, checkpointID); err != nil {
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, record.SourceLine); err != nil {
 				return "", 0, stats, err
 			}
 			continue
 		}
 		kind := transcriptRecordOutboxKind(kindPrefix, record, i+1)
-		if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kind, body); err != nil {
+		if err := batcher.add(ctx, transcriptImportBatchRecord{
+			Record:        record,
+			Kind:          kind,
+			Body:          body,
+			CheckpointKey: checkpointKey,
+		}); err != nil {
 			return "", 0, stats, err
 		}
 		stats.Imported++
-		if err := b.recordTranscriptCheckpointWithID(ctx, session, filePath, checkpointKey, record.SourceLine, checkpointID); err != nil {
-			return "", 0, stats, err
-		}
+	}
+	if err := batcher.flush(ctx); err != nil {
+		return "", 0, stats, err
 	}
 	if len(transcript.Records) == 0 {
 		return "", 0, stats, nil
 	}
 	last := transcript.Records[len(transcript.Records)-1]
 	return transcriptRecordCheckpointKey(last), last.SourceLine, stats, nil
+}
+
+type transcriptImportBatchRecord struct {
+	Record        TranscriptRecord
+	Kind          string
+	Body          string
+	CheckpointKey string
+}
+
+type transcriptImportCheckpointRecord struct {
+	Key        string
+	SourceLine int
+}
+
+type transcriptImportBatcher struct {
+	bridge       *Bridge
+	session      Session
+	filePath     string
+	importTurnID string
+	kindPrefix   string
+	checkpointID string
+	records      []transcriptImportBatchRecord
+	checkpoints  []transcriptImportCheckpointRecord
+	htmlParts    []string
+	htmlBytes    int
+	batchIndex   int
+}
+
+func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, importTurnID string, kindPrefix string, checkpointID string) *transcriptImportBatcher {
+	return &transcriptImportBatcher{
+		bridge:       b,
+		session:      session,
+		filePath:     filePath,
+		importTurnID: importTurnID,
+		kindPrefix:   strings.TrimSpace(kindPrefix),
+		checkpointID: checkpointID,
+	}
+}
+
+func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImportBatchRecord) error {
+	html := renderTeamsHTMLPart(TeamsRenderInput{
+		Surface: TeamsRenderSurfaceOutbox,
+		Kind:    renderKindForOutbox(record.Kind),
+		Text:    record.Body,
+	}, 1, 1)
+	if len(html) > teamsChunkHTMLContentBytes {
+		if err := b.flush(ctx); err != nil {
+			return err
+		}
+		if err := b.bridge.queueAndSendOutboxChunks(ctx, b.session.ID, b.importTurnID, b.session.ChatID, record.Kind, record.Body); err != nil {
+			return err
+		}
+		return b.bridge.recordTranscriptCheckpointWithID(ctx, b.session, b.filePath, record.CheckpointKey, record.Record.SourceLine, b.checkpointID)
+	}
+	addedBytes := len(html)
+	if len(b.htmlParts) > 0 {
+		addedBytes += len(transcriptImportBatchSeparatorHTML)
+	}
+	if len(b.htmlParts) > 0 && b.htmlBytes+addedBytes > teamsChunkHTMLContentBytes {
+		if err := b.flush(ctx); err != nil {
+			return err
+		}
+	}
+	if len(b.htmlParts) > 0 {
+		b.htmlBytes += len(transcriptImportBatchSeparatorHTML)
+	}
+	b.records = append(b.records, record)
+	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: record.CheckpointKey, SourceLine: record.Record.SourceLine})
+	b.htmlParts = append(b.htmlParts, html)
+	b.htmlBytes += len(html)
+	return nil
+}
+
+func (b *transcriptImportBatcher) recordCheckpoint(ctx context.Context, checkpointKey string, sourceLine int) error {
+	if len(b.records) == 0 {
+		return b.bridge.recordTranscriptCheckpointWithID(ctx, b.session, b.filePath, checkpointKey, sourceLine, b.checkpointID)
+	}
+	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: checkpointKey, SourceLine: sourceLine})
+	return nil
+}
+
+func (b *transcriptImportBatcher) flush(ctx context.Context) error {
+	if len(b.records) == 0 {
+		return nil
+	}
+	b.batchIndex++
+	html := strings.Join(b.htmlParts, transcriptImportBatchSeparatorHTML)
+	first := b.records[0]
+	last := b.records[len(b.records)-1]
+	kind := transcriptImportBatchOutboxKind(b.kindPrefix, first.Record, last.Record, b.batchIndex)
+	if err := b.bridge.queueAndSendTranscriptImportBatch(ctx, b.session.ID, b.importTurnID, b.session.ChatID, kind, html); err != nil {
+		return err
+	}
+	for _, checkpoint := range b.checkpoints {
+		if err := b.bridge.recordTranscriptCheckpointWithID(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, b.checkpointID); err != nil {
+			return err
+		}
+	}
+	b.records = nil
+	b.checkpoints = nil
+	b.htmlParts = nil
+	b.htmlBytes = 0
+	return nil
+}
+
+func transcriptImportBatchOutboxKind(prefix string, first TranscriptRecord, last TranscriptRecord, index int) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "import"
+	}
+	firstKey := transcriptRecordKey(first, index)
+	lastKey := transcriptRecordKey(last, index)
+	return fmt.Sprintf("%s-batch-%04d-%s-%s", prefix, index, firstKey, lastKey)
+}
+
+func (b *Bridge) queueAndSendTranscriptImportBatch(ctx context.Context, sessionID string, turnID string, chatID string, kind string, html string) error {
+	html = strings.TrimSpace(html)
+	if html == "" {
+		return nil
+	}
+	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		SessionID:     sessionID,
+		TurnID:        turnID,
+		TeamsChatID:   chatID,
+		Kind:          kind,
+		Body:          html,
+		PartIndex:     1,
+		PartCount:     1,
+		RenderedBytes: len(html),
+	})
 }
 
 func (b *Bridge) importSubagentMarkersToTeams(ctx context.Context, session Session, local codexhistory.Session, importTurnID string) error {
@@ -4232,6 +5639,239 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, sessionID string, 
 	return false, nil
 }
 
+type localCodexBeforeTeamsGate struct {
+	Block   bool
+	AckBody string
+}
+
+type localTranscriptDeltaState struct {
+	Active                  bool
+	NeedsSync               bool
+	CheckpointBeforeActive  string
+	CheckpointBeforeLine    int
+	CheckpointStatus        string
+	CheckpointHadRecord     bool
+	HasActionableTranscript bool
+}
+
+func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *Session) (localCodexBeforeTeamsGate, error) {
+	if b == nil || session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
+		return localCodexBeforeTeamsGate{}, nil
+	}
+	if err := b.ensureDurableSession(ctx, session); err != nil {
+		return localCodexBeforeTeamsGate{}, err
+	}
+	local, ok, err := b.localCodexSessionForTeamsSession(ctx, *session)
+	if err != nil {
+		return localCodexBeforeTeamsGate{}, err
+	}
+	if !ok || strings.TrimSpace(local.FilePath) == "" {
+		return localCodexBeforeTeamsGate{}, nil
+	}
+	delta, err := b.classifyLocalTranscriptDelta(ctx, *session, local)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return localCodexBeforeTeamsGate{}, nil
+		}
+		return localCodexBeforeTeamsGate{}, err
+	}
+	switch delta.CheckpointStatus {
+	case importCheckpointStatusImporting:
+		return localCodexBeforeTeamsGate{
+			Block:   true,
+			AckBody: "⏳ Queued. I’m preparing this chat history first, then I’ll respond.",
+		}, nil
+	case importCheckpointStatusFailed:
+		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, *session, local)
+		if err != nil {
+			return localCodexBeforeTeamsGate{}, err
+		}
+		if recovered {
+			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		}
+		return localCodexBeforeTeamsGate{
+			Block:   true,
+			AckBody: "⚠️ Queued. Local Codex history sync needs attention before I continue this chat.",
+		}, nil
+	}
+	if delta.Active {
+		if !delta.CheckpointHadRecord && strings.TrimSpace(delta.CheckpointBeforeActive) != "" {
+			if err := b.recordTranscriptCheckpoint(ctx, *session, local.FilePath, delta.CheckpointBeforeActive, delta.CheckpointBeforeLine); err != nil {
+				return localCodexBeforeTeamsGate{}, err
+			}
+		}
+		return localCodexBeforeTeamsGate{
+			Block:   true,
+			AckBody: "⏳ Queued. Codex is active in the CLI for this chat; I’ll respond here after that finishes.",
+		}, nil
+	}
+	if delta.NeedsSync {
+		if err := b.syncSessionTranscript(ctx, *session, local); err != nil {
+			return localCodexBeforeTeamsGate{}, err
+		}
+		remaining, err := b.localTranscriptHasActionableDelta(ctx, *session, local)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return localCodexBeforeTeamsGate{}, nil
+			}
+			return localCodexBeforeTeamsGate{}, err
+		}
+		if remaining {
+			return localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: "⏳ Queued. I’m syncing recent Codex updates first, then I’ll respond.",
+			}, nil
+		}
+	}
+	return localCodexBeforeTeamsGate{}, nil
+}
+
+func (b *Bridge) localCodexSessionForTeamsSession(ctx context.Context, session Session) (codexhistory.Session, bool, error) {
+	if b == nil || strings.TrimSpace(session.CodexThreadID) == "" {
+		return codexhistory.Session{}, false, nil
+	}
+	if err := b.ensureStore(); err != nil {
+		return codexhistory.Session{}, false, err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return codexhistory.Session{}, false, err
+	}
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; strings.TrimSpace(checkpoint.SourcePath) != "" {
+		return codexhistory.Session{
+			SessionID:   session.CodexThreadID,
+			ProjectPath: session.Cwd,
+			FilePath:    checkpoint.SourcePath,
+		}, true, nil
+	}
+	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	if err != nil {
+		return codexhistory.Session{}, false, nil
+	}
+	for _, project := range projects {
+		for _, local := range project.Sessions {
+			if local.SessionID != session.CodexThreadID {
+				continue
+			}
+			if local.ProjectPath == "" {
+				local.ProjectPath = project.Path
+			}
+			if strings.TrimSpace(local.FilePath) == "" {
+				return codexhistory.Session{}, false, nil
+			}
+			return local, true, nil
+		}
+	}
+	return codexhistory.Session{}, false, nil
+}
+
+func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Session, local codexhistory.Session) (localTranscriptDeltaState, error) {
+	var out localTranscriptDeltaState
+	if strings.TrimSpace(local.FilePath) == "" {
+		return out, nil
+	}
+	if err := b.ensureStore(); err != nil {
+		return out, err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return out, err
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	out.CheckpointStatus = checkpoint.Status
+	out.CheckpointHadRecord = checkpoint.LastRecordID != ""
+	switch checkpoint.Status {
+	case importCheckpointStatusImporting, importCheckpointStatusFailed:
+		return out, nil
+	}
+	var transcript Transcript
+	if checkpoint.LastRecordID == "" {
+		transcript, err = ReadSessionTranscript(local.FilePath)
+	} else {
+		transcript, err = ReadSessionTranscriptSince(local.FilePath, checkpoint.LastRecordID)
+	}
+	if err != nil {
+		return out, err
+	}
+	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
+		return out, fmt.Errorf("transcript checkpoint was not found; refusing to guess a sync position")
+	}
+	if len(transcript.Records) == 0 {
+		return out, nil
+	}
+	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
+	deliveredHashes := deliveredTranscriptHashes(state, session.ID)
+	dedupe := newTranscriptDedupeState()
+	active := false
+	for i, record := range transcript.Records {
+		body := formatTranscriptRecordForTeams(record)
+		if strings.TrimSpace(body) == "" {
+			continue
+		}
+		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+			shouldSkipDeliveredTranscriptRecord(record, body, deliveredHashes) ||
+			dedupe.shouldSkip(record, body) {
+			continue
+		}
+		out.HasActionableTranscript = true
+		if shouldSkipBackgroundTranscriptRecord(record) {
+			if !active {
+				out.setCheckpointBeforeActive(transcript.Records, i)
+			}
+			active = true
+			continue
+		}
+		if transcriptRecordIsTerminal(record) {
+			active = false
+			out.NeedsSync = true
+			continue
+		}
+		switch record.Kind {
+		case TranscriptKindUser, TranscriptKindStatus, TranscriptKindArtifact, TranscriptKindUnknown:
+			if !active {
+				out.setCheckpointBeforeActive(transcript.Records, i)
+			}
+			active = true
+			out.NeedsSync = true
+		case TranscriptKindAssistant:
+			active = false
+			out.NeedsSync = true
+		}
+	}
+	out.Active = active
+	if out.Active {
+		out.NeedsSync = false
+	}
+	return out, nil
+}
+
+func (s *localTranscriptDeltaState) setCheckpointBeforeActive(records []TranscriptRecord, index int) {
+	if s == nil || s.CheckpointBeforeActive != "" || index <= 0 || index > len(records)-1 {
+		return
+	}
+	previous := records[index-1]
+	s.CheckpointBeforeActive = transcriptRecordCheckpointKey(previous)
+	s.CheckpointBeforeLine = previous.SourceLine
+}
+
+func (b *Bridge) localTranscriptHasActionableDelta(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
+	delta, err := b.classifyLocalTranscriptDelta(ctx, session, local)
+	if err != nil {
+		return false, err
+	}
+	return delta.Active || delta.NeedsSync || delta.HasActionableTranscript, nil
+}
+
+func transcriptRecordIsTerminal(record TranscriptRecord) bool {
+	source := strings.ToLower(strings.TrimSpace(record.SourceType))
+	switch source {
+	case "turn.failed", "turn/completed", "turn.completed":
+		return true
+	default:
+		return false
+	}
+}
+
 func transcriptHasDiagnostic(transcript Transcript, kind string) bool {
 	kind = strings.TrimSpace(kind)
 	for _, diagnostic := range transcript.Diagnostics {
@@ -4287,6 +5927,17 @@ func transcriptRecordCheckpointKey(record TranscriptRecord) string {
 	return firstNonEmptyString(record.ItemID, record.DedupeKey)
 }
 
+func (b *Bridge) syncLinkedTranscriptsIfDue(ctx context.Context, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !b.lastTranscriptSync.IsZero() && now.Sub(b.lastTranscriptSync) < transcriptSyncMinInterval {
+		return nil
+	}
+	b.lastTranscriptSync = now
+	return b.syncLinkedTranscripts(ctx)
+}
+
 func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 	if len(b.reg.Sessions) == 0 {
 		return nil
@@ -4332,8 +5983,25 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		return err
 	}
 	checkpoint, hasCheckpoint := state.ImportCheckpoints[checkpointID]
-	if hasCheckpoint && checkpoint.Status == importCheckpointStatusImporting {
-		return nil
+	if hasCheckpoint {
+		switch checkpoint.Status {
+		case importCheckpointStatusImporting:
+			return nil
+		case importCheckpointStatusFailed:
+			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
+			if err != nil {
+				return err
+			}
+			if !recovered {
+				return nil
+			}
+			state, err = b.store.Load(ctx)
+			if err != nil {
+				return err
+			}
+			checkpoint = state.ImportCheckpoints[checkpointID]
+			hasCheckpoint = true
+		}
 	}
 	if !hasCheckpoint || checkpoint.LastRecordID == "" {
 		transcript, err := ReadSessionTranscript(local.FilePath)
@@ -4356,10 +6024,15 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	if len(transcript.Records) == 0 {
 		return nil
 	}
+	if len(transcript.Records) > transcriptSyncMaxAutoBacklogRecords {
+		last := transcript.Records[len(transcript.Records)-1]
+		return b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(last), last.SourceLine)
+	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
-	deliveredAssistantHashes := deliveredAssistantTranscriptHashes(state, session.ID)
+	deliveredHashes := deliveredTranscriptHashes(state, session.ID)
 	dedupe := newTranscriptDedupeState()
 	syncTurnID := "sync:" + session.ID
+	sent := 0
 	for i, record := range transcript.Records {
 		if strings.TrimSpace(record.Text) == "" {
 			continue
@@ -4372,7 +6045,7 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			continue
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
-			shouldSkipDeliveredAssistantTranscriptRecord(record, body, deliveredAssistantHashes) ||
+			shouldSkipDeliveredTranscriptRecord(record, body, deliveredHashes) ||
 			shouldSkipBackgroundTranscriptRecord(record) ||
 			dedupe.shouldSkip(record, body) {
 			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
@@ -4381,14 +6054,89 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			continue
 		}
 		kind := transcriptRecordOutboxKind("sync", record, i+1)
-		if err := b.queueAndSendOutboxChunks(ctx, session.ID, syncTurnID, session.ChatID, kind, body); err != nil {
+		opts := transcriptSyncOutboxOptions(record)
+		if err := b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, syncTurnID, session.ChatID, kind, body, opts); err != nil {
 			return err
 		}
 		if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
 			return err
 		}
+		sent++
+		if sent >= transcriptSyncMaxRecordsPerSessionPerCycle {
+			return nil
+		}
 	}
 	return nil
+}
+
+func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
+	if b == nil || b.store == nil {
+		return false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.Status != importCheckpointStatusFailed {
+		return false, nil
+	}
+	sourcePath := strings.TrimSpace(firstNonEmptyString(checkpoint.SourcePath, local.FilePath))
+	if sourcePath == "" {
+		return false, nil
+	}
+	if strings.TrimSpace(checkpoint.LastRecordID) != "" {
+		transcript, err := ReadSessionTranscriptSince(sourcePath, checkpoint.LastRecordID)
+		if err != nil {
+			return false, err
+		}
+		if !transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
+			return true, b.markTranscriptImportComplete(ctx, session, sourcePath, checkpoint.LastRecordID, checkpoint.LastSourceLine)
+		}
+	}
+	if checkpoint.LastSourceLine <= 0 {
+		return false, nil
+	}
+	transcript, err := ReadSessionTranscript(sourcePath)
+	if err != nil {
+		return false, err
+	}
+	var recovered TranscriptRecord
+	for _, record := range transcript.Records {
+		if record.SourceLine <= checkpoint.LastSourceLine {
+			recovered = record
+		}
+		if strings.TrimSpace(checkpoint.LastRecordID) != "" &&
+			(record.ItemID == checkpoint.LastRecordID || record.DedupeKey == checkpoint.LastRecordID) {
+			recovered = record
+			break
+		}
+	}
+	if strings.TrimSpace(transcriptRecordCheckpointKey(recovered)) == "" {
+		return false, nil
+	}
+	return true, b.markTranscriptImportComplete(ctx, session, sourcePath, transcriptRecordCheckpointKey(recovered), recovered.SourceLine)
+}
+
+func transcriptImportIsActive(state teamstore.State, sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return false
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(sessionID)]
+	return checkpoint.Status == importCheckpointStatusImporting
+}
+
+func (b *Bridge) sessionTranscriptImportInProgress(ctx context.Context, sessionID string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" {
+		return false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	return transcriptImportIsActive(state, sessionID), nil
 }
 
 func teamsOriginTextHashes(state teamstore.State, sessionID string) map[string]bool {
@@ -4413,33 +6161,83 @@ func shouldSkipTeamsOriginTranscriptRecord(record TranscriptRecord, body string,
 	return hash != "" && hashes[hash]
 }
 
-func deliveredAssistantTranscriptHashes(state teamstore.State, sessionID string) map[string]bool {
-	hashes := make(map[string]bool)
+func deliveredTranscriptHashes(state teamstore.State, sessionID string) map[TranscriptKind]map[string]bool {
+	hashes := make(map[TranscriptKind]map[string]bool)
 	for _, outbox := range state.OutboxMessages {
 		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
 			continue
 		}
-		if !isFinalOutboxKind(outbox.Kind) {
+		if !outboxWasDelivered(outbox) {
 			continue
 		}
-		hash := normalizedTextHash(StripHelperPromptEchoes(StripArtifactManifestBlocks(outbox.Body)))
+		kind, ok := deliveredOutboxTranscriptKind(outbox.Kind)
+		if !ok {
+			continue
+		}
+		hash := normalizedTextHash(formatDeliveredOutboxBodyForTranscriptDedupe(kind, outbox.Body))
 		if hash != "" {
-			hashes[hash] = true
+			if hashes[kind] == nil {
+				hashes[kind] = make(map[string]bool)
+			}
+			hashes[kind][hash] = true
+		}
+		if outbox.SourceTextHash != "" {
+			if hashes[kind] == nil {
+				hashes[kind] = make(map[string]bool)
+			}
+			hashes[kind][outbox.SourceTextHash] = true
 		}
 	}
 	return hashes
 }
 
-func shouldSkipDeliveredAssistantTranscriptRecord(record TranscriptRecord, body string, hashes map[string]bool) bool {
-	if record.Kind != TranscriptKindAssistant {
+func outboxWasDelivered(outbox teamstore.OutboxMessage) bool {
+	if outbox.Status == teamstore.OutboxStatusSent {
+		return true
+	}
+	return outbox.Status == teamstore.OutboxStatusAccepted && strings.TrimSpace(outbox.TeamsMessageID) != ""
+}
+
+func deliveredOutboxTranscriptKind(kind string) (TranscriptKind, bool) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	switch {
+	case isFinalOutboxKind(kind) || strings.Contains(kind, "assistant"):
+		return TranscriptKindAssistant, true
+	case strings.Contains(kind, "progress") || strings.Contains(kind, "status"):
+		return TranscriptKindStatus, true
+	default:
+		return "", false
+	}
+}
+
+func formatDeliveredOutboxBodyForTranscriptDedupe(kind TranscriptKind, body string) string {
+	body = StripHelperPromptEchoes(StripArtifactManifestBlocks(body))
+	if kind == TranscriptKindAssistant {
+		body = StripOAIMemoryCitationBlocks(body)
+	}
+	return body
+}
+
+func shouldSkipDeliveredTranscriptRecord(record TranscriptRecord, body string, hashes map[TranscriptKind]map[string]bool) bool {
+	if record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus {
 		return false
 	}
 	hash := normalizedTextHash(body)
-	return hash != "" && hashes[hash]
+	return hash != "" && hashes[record.Kind][hash]
 }
 
 func shouldSkipBackgroundTranscriptRecord(record TranscriptRecord) bool {
-	return record.Kind == TranscriptKindTool || record.Kind == TranscriptKindStatus
+	return record.Kind == TranscriptKindTool
+}
+
+func transcriptSyncOutboxOptions(record TranscriptRecord) outboxQueueOptions {
+	if record.Kind != TranscriptKindAssistant {
+		return outboxQueueOptions{}
+	}
+	return outboxQueueOptions{
+		MentionOwner:     true,
+		NotificationKind: "turn_completed",
+	}
 }
 
 type transcriptDedupeState struct {
@@ -4659,7 +6457,7 @@ func (b *Bridge) markTranscriptImportFailedWithID(ctx context.Context, session S
 }
 
 func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
-	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	projects, err := b.discoverDashboardProjects(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -4672,36 +6470,61 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if len(dashboard.Workspaces) == 0 {
-		return "No local Codex workspaces found on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\nNext: send `new <directory> -- <title>` to create a repo-specific work chat, or `new <title>` for the helper default directory.", nil
+		return "## 📁 Workspaces\n\nNo local Codex workspaces found on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\nNext: send `new <directory>` to create a Work chat for a directory.", nil
 	}
-	lines := []string{"workspaces:"}
+	lines := []string{
+		"## 📁 Workspaces",
+		"",
+		"Reply with a number to open a workspace.",
+		"",
+	}
 	for _, workspace := range dashboard.Workspaces {
-		hint := dashboardPathHint(workspace.Path)
-		suffix := fmt.Sprintf("%d sessions", workspace.SessionCount)
-		if hint != "" && hint != workspace.DisplayTitle {
-			suffix = hint + ", " + suffix
+		meta := fmt.Sprintf("%d sessions", workspace.SessionCount)
+		if workspace.SessionCount == 1 {
+			meta = "1 session"
 		}
-		lines = append(lines, fmt.Sprintf("%d. %s (%s)", workspace.Number, workspace.DisplayTitle, suffix))
+		if !workspace.UpdatedAt.IsZero() {
+			meta += " - updated " + workspace.UpdatedAt.Local().Format("2006-01-02 15:04")
+		}
+		pathLine := dashboardWorkspacePathDisplay(workspace.Path)
+		lines = append(lines, fmt.Sprintf("`%d` - %s\n   %s", workspace.Number, pathLine, meta))
 	}
-	lines = append(lines, "Send a number in this control chat, or send `project <number>`, to list sessions for that directory. Numbers expire after 10 minutes; if a number looks wrong, send `projects` again.")
+	lines = append(lines, "", "Next:", "- `1` - open workspace 1", "- `n <directory>` or `new <directory>` - create a new Work chat directly")
+	lines = append(lines, "", "Numbers expire after 10 minutes. If a number looks wrong, send `projects` again.")
 	return strings.Join(lines, "\n"), nil
 }
 
-func dashboardPathHint(path string) string {
+func dashboardWorkspacePathDisplay(path string) string {
+	if abs := dashboardAbsolutePath(path); abs != "" {
+		return dashboardInlineCode(abs)
+	}
+	return "**Unknown workspace**\n   Path: not recorded by Codex"
+}
+
+func dashboardAbsolutePath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ""
 	}
 	clean := filepath.Clean(path)
-	base := filepath.Base(clean)
-	parent := filepath.Base(filepath.Dir(clean))
-	if base == "." || base == string(filepath.Separator) {
+	if filepath.IsAbs(clean) {
+		return clean
+	}
+	if abs, err := filepath.Abs(clean); err == nil {
+		return filepath.Clean(abs)
+	}
+	return clean
+}
+
+func dashboardInlineCode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return ""
 	}
-	if parent == "." || parent == string(filepath.Separator) || parent == "" {
-		return base
+	if strings.Contains(value, "`") {
+		value = strings.ReplaceAll(value, "`", "'")
 	}
-	return parent + string(filepath.Separator) + base
+	return "`" + value + "`"
 }
 
 func dashboardWorkspaceByID(workspaces []DashboardWorkspace, id string) DashboardWorkspace {
@@ -4715,7 +6538,7 @@ func dashboardWorkspaceByID(workspaces []DashboardWorkspace, id string) Dashboar
 }
 
 func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target DashboardCommandTarget) (string, error) {
-	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	projects, err := b.discoverDashboardProjects(ctx)
 	if err != nil {
 		return "", fmt.Errorf("workspace discovery failed: %w", err)
 	}
@@ -4754,44 +6577,64 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 		return "", err
 	}
 	if len(dashboard.CurrentView.Items) == 0 {
-		return "No local Codex sessions found in this workspace on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\nNext: send `new <directory> -- <title>` to create a repo-specific work chat, or `new <title>` for the helper default directory.", nil
+		selectedWorkspace := dashboardWorkspaceByID(dashboard.Workspaces, dashboard.SelectedWorkspaceID)
+		if selectedWorkspace.ID != "" {
+			return fmt.Sprintf("`new` - create a new Work chat in this workspace.\n\n## Sessions\n\nWorkspace: %s\n\nNo local Codex sessions were found in this workspace on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.", dashboardWorkspacePathDisplay(selectedWorkspace.Path)), nil
+		}
+		return "## Sessions\n\nNo local Codex sessions found on this machine.\n\nNext: send `projects` to choose a workspace, or `new <directory>` to create a Work chat.", nil
 	}
 	selectedWorkspace := dashboardWorkspaceByID(dashboard.Workspaces, dashboard.SelectedWorkspaceID)
 	sessions := make(map[string]DashboardSession, len(dashboard.Sessions))
 	for _, session := range dashboard.Sessions {
 		sessions[sessionKey(session.WorkspaceID, session.ID)] = session
 	}
-	heading := "sessions"
+	heading := "Sessions"
+	workspaceLine := ""
 	if selectedWorkspace.ID != "" {
-		hint := dashboardPathHint(selectedWorkspace.Path)
-		if hint != "" && hint != selectedWorkspace.DisplayTitle {
-			heading = fmt.Sprintf("sessions for %s - %s", selectedWorkspace.DisplayTitle, hint)
-		} else {
-			heading = fmt.Sprintf("sessions for %s", selectedWorkspace.DisplayTitle)
+		heading = "Sessions"
+		workspaceLine = "Workspace: " + dashboardWorkspacePathDisplay(selectedWorkspace.Path)
+	}
+	lines := []string{
+		"`new` - create a new Work chat in this workspace.",
+		"",
+		"## " + heading,
+		"",
+		workspaceLine,
+		"",
+		"Reply with a number to continue a session in Teams.",
+		"",
+	}
+	if strings.TrimSpace(workspaceLine) == "" {
+		lines = []string{
+			"`new` - create a new Work chat in this workspace.",
+			"",
+			"## " + heading,
+			"",
+			"Reply with a number to continue a session in Teams.",
+			"",
 		}
 	}
-	lines := []string{heading + ":"}
 	for _, item := range dashboard.CurrentView.Items {
 		session, ok := sessions[sessionKey(item.WorkspaceID, item.SessionID)]
 		if !ok {
 			continue
 		}
-		action := fmt.Sprintf("not in Teams -> `continue %d`", item.Number)
+		action := fmt.Sprintf("send `%d` or `c %d`", item.Number, item.Number)
 		if linked := b.linkedSessionForLocalSessionID(session.ID); linked != nil {
 			if isActiveSessionStatus(linked.Status) {
-				action = fmt.Sprintf("Teams ready -> `open %d`", item.Number)
+				action = fmt.Sprintf("already in Teams -> send `%d` to open/import updates", item.Number)
 			} else {
-				action = fmt.Sprintf("closed Teams chat -> `continue %d` for a new work chat", item.Number)
+				action = fmt.Sprintf("closed Teams chat -> send `%d` for a new Work chat", item.Number)
 			}
 		}
-		parts := []string{session.DisplayTitle}
+		parts := []string{"**" + session.DisplayTitle + "**"}
 		if meta := dashboardSessionListMeta(session); meta != "" {
 			parts = append(parts, meta)
 		}
 		parts = append(parts, action)
-		lines = append(lines, fmt.Sprintf("%d. %s", item.Number, strings.Join(parts, " - ")))
+		lines = append(lines, fmt.Sprintf("`%d` - %s", item.Number, strings.Join(parts, "\n   ")))
 	}
-	lines = append(lines, "Send a number in this control chat to open an active linked work chat. Use `continue <number>` to import local history into Teams; use `open <number>` only when Teams is already ready. Use `details <number>` for technical IDs. Numbers expire after 10 minutes.")
+	lines = append(lines, "", "Need debug IDs? Send `details <number>`. Numbers expire after 10 minutes.")
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -4881,6 +6724,46 @@ func (b *Bridge) formatOpenControlTarget(ctx context.Context, target DashboardCo
 	return b.formatOpenSession(target.Raw), nil
 }
 
+func (b *Bridge) resumeParkedWorkChat(ctx context.Context, arg string) (string, error) {
+	key := strings.ToLower(strings.TrimSpace(arg))
+	if key == "" {
+		return "", fmt.Errorf("usage: `r <resume-key>`")
+	}
+	var match *Session
+	for i := range b.reg.Sessions {
+		session := &b.reg.Sessions[i]
+		if !isActiveSessionStatus(session.Status) {
+			continue
+		}
+		if strings.EqualFold(session.ID, key) || strings.EqualFold(resumeKeyForSession(*session), key) {
+			match = session
+			break
+		}
+	}
+	if match == nil {
+		return "", fmt.Errorf("resume key not found: %s", key)
+	}
+	now := time.Now()
+	if _, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:            match.ChatID,
+		PollState:         inboundPollStateHot,
+		PreviousPollState: "",
+		NextPollAt:        now,
+		LastActivityAt:    now,
+		ClearBlockedUntil: true,
+		ResetFailures:     true,
+	}); err != nil {
+		return "", err
+	}
+	match.UpdatedAt = now
+	_ = b.ensureDurableSession(ctx, match)
+	b.boostPolling(now)
+	if match.ChatURL != "" {
+		return fmt.Sprintf("Resumed %s.\n\nOpen Work chat: %s\n\nMessages in that chat will be read again.", match.ID, match.ChatURL), nil
+	}
+	return fmt.Sprintf("Resumed %s.\n\nMessages in that Work chat will be read again.", match.ID), nil
+}
+
 func (b *Bridge) resolveControlSelection(ctx context.Context, target DashboardCommandTarget) (string, error) {
 	if !target.IsNumber {
 		return "", ErrDashboardNotBareNumber
@@ -4893,7 +6776,7 @@ func (b *Bridge) resolveControlSelection(ctx context.Context, target DashboardCo
 	case DashboardSelectionWorkspace:
 		return b.formatWorkspaceSessionsDashboard(ctx, DashboardCommandTarget{Number: selection.Number, IsNumber: true})
 	case DashboardSelectionSession:
-		return b.formatSessionSelection(selection), nil
+		return b.publishCodexSessionWithProgress(ctx, DashboardCommandTarget{Raw: strconvItoa(selection.Number), Number: selection.Number, IsNumber: true}, b.sendControl)
 	default:
 		return "", ErrDashboardNumberMissing
 	}
@@ -4937,7 +6820,7 @@ func (b *Bridge) localCodexSessionExists(ctx context.Context, sessionID string) 
 	if sessionID == "" {
 		return false
 	}
-	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	projects, err := b.discoverDashboardProjects(ctx)
 	if err != nil {
 		return false
 	}
@@ -4947,9 +6830,9 @@ func (b *Bridge) localCodexSessionExists(ctx context.Context, sessionID string) 
 
 func (b *Bridge) localSessionNotInTeamsMessage(number int, _ string) string {
 	if number > 0 {
-		return fmt.Sprintf("This local Codex session is not in Teams yet.\nNext: send `continue %d` to create a work chat and import its history.\nUse `details %d` to show technical IDs.", number, number)
+		return fmt.Sprintf("This local Codex session is not in Teams yet.\nNext: send `%d` or `continue %d` to create a Work chat and import its history.\nUse `details %d` to show technical IDs.", number, number, number)
 	}
-	return "This local Codex session is not in Teams yet.\nNext: send `sessions`, choose its number, then send `continue <number>` to create a work chat and import its history.\nUse `details <number>` from the sessions list to show technical IDs."
+	return "This local Codex session is not in Teams yet.\nNext: send `sessions`, then choose its number to create a Work chat and import its history.\nUse `details <number>` from the sessions list to show technical IDs."
 }
 
 func isActiveSessionStatus(status string) bool {

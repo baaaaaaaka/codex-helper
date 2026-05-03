@@ -1086,6 +1086,47 @@ func TestOutboxBlocksUpgradeStatusMatrix(t *testing.T) {
 	}
 }
 
+func TestHasDeliveredOutboxMessageStatusMatrix(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	for _, msg := range []OutboxMessage{
+		{ID: "queued", TeamsChatID: "chat-1", TeamsMessageID: "teams-queued", Status: OutboxStatusQueued},
+		{ID: "sending", TeamsChatID: "chat-1", TeamsMessageID: "teams-sending", Status: OutboxStatusSending},
+		{ID: "accepted", TeamsChatID: "chat-1", TeamsMessageID: "teams-accepted", Status: OutboxStatusAccepted},
+		{ID: "sent", TeamsChatID: "chat-1", TeamsMessageID: "teams-sent", Status: OutboxStatusSent},
+		{ID: "other-chat", TeamsChatID: "chat-2", TeamsMessageID: "teams-other", Status: OutboxStatusSent},
+	} {
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
+		}
+	}
+	tests := []struct {
+		name      string
+		chatID    string
+		messageID string
+		want      bool
+	}{
+		{name: "queued", chatID: "chat-1", messageID: "teams-queued", want: false},
+		{name: "sending", chatID: "chat-1", messageID: "teams-sending", want: false},
+		{name: "accepted", chatID: "chat-1", messageID: "teams-accepted", want: true},
+		{name: "sent", chatID: "chat-1", messageID: "teams-sent", want: true},
+		{name: "other chat", chatID: "chat-1", messageID: "teams-other", want: false},
+		{name: "missing", chatID: "chat-1", messageID: "missing", want: false},
+		{name: "empty", chatID: "", messageID: "teams-sent", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.HasDeliveredOutboxMessage(ctx, tc.chatID, tc.messageID)
+			if err != nil {
+				t.Fatalf("HasDeliveredOutboxMessage error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("HasDeliveredOutboxMessage = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHasUpgradeBlockingWorkTurnStatusMatrix(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -1219,6 +1260,44 @@ func TestRecoverInterruptsAmbiguousTurns(t *testing.T) {
 		if turn.RecoveryReason == "" {
 			t.Fatalf("turn %s recovery reason is empty", id)
 		}
+	}
+	if got := state.InboundEvents[inbound.ID].Status; got != InboundStatusIgnored {
+		t.Fatalf("interrupted turn inbound status = %q, want %q", got, InboundStatusIgnored)
+	}
+}
+
+func TestClaimNextQueuedTurnSerializesPerSession(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	first, _, err := store.QueueTurn(ctx, Turn{ID: "turn:first", SessionID: "s1", QueuedAt: time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatalf("QueueTurn first error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(ctx, Turn{ID: "turn:second", SessionID: "s1", QueuedAt: time.Date(2026, 5, 3, 1, 1, 0, 0, time.UTC)}); err != nil {
+		t.Fatalf("QueueTurn second error: %v", err)
+	}
+	claimed, ok, err := store.ClaimNextQueuedTurn(ctx, "s1")
+	if err != nil {
+		t.Fatalf("ClaimNextQueuedTurn error: %v", err)
+	}
+	if !ok || claimed.ID != first.ID || claimed.Status != TurnStatusRunning || claimed.StartedAt.IsZero() {
+		t.Fatalf("claimed first queued turn mismatch: ok=%v claimed=%#v", ok, claimed)
+	}
+	if again, ok, err := store.ClaimNextQueuedTurn(ctx, "s1"); err != nil || ok {
+		t.Fatalf("ClaimNextQueuedTurn while running = ok %v turn %#v err %v, want no claim", ok, again, err)
+	}
+	if _, err := store.MarkTurnCompleted(ctx, claimed.ID, "thread-1", "codex-turn-1"); err != nil {
+		t.Fatalf("MarkTurnCompleted error: %v", err)
+	}
+	second, ok, err := store.ClaimNextQueuedTurn(ctx, "s1")
+	if err != nil {
+		t.Fatalf("ClaimNextQueuedTurn second error: %v", err)
+	}
+	if !ok || second.ID != "turn:second" || second.Status != TurnStatusRunning {
+		t.Fatalf("claimed second queued turn mismatch: ok=%v second=%#v", ok, second)
 	}
 }
 
@@ -1432,6 +1511,89 @@ func TestPendingOutboxIncludesStaleSendingMessage(t *testing.T) {
 	}
 }
 
+func TestSavePrunesOldSentOutboxMessages(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < maxRetainedSentOutboxMessages+20; i++ {
+			id := fmt.Sprintf("outbox:sent:%03d", i)
+			state.OutboxMessages[id] = OutboxMessage{
+				ID:          id,
+				TeamsChatID: "chat-1",
+				Status:      OutboxStatusSent,
+				Kind:        "helper",
+				Body:        "sent",
+				SentAt:      now.Add(time.Duration(i) * time.Second),
+				CreatedAt:   now.Add(time.Duration(i) * time.Second),
+			}
+		}
+		state.OutboxMessages["outbox:queued"] = OutboxMessage{
+			ID:          "outbox:queued",
+			TeamsChatID: "chat-1",
+			Status:      OutboxStatusQueued,
+			Kind:        "helper",
+			Body:        "queued",
+			CreatedAt:   now,
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.OutboxMessages); got != maxRetainedSentOutboxMessages {
+		t.Fatalf("outbox len = %d, want %d", got, maxRetainedSentOutboxMessages)
+	}
+	if _, ok := state.OutboxMessages["outbox:queued"]; !ok {
+		t.Fatal("queued outbox was pruned")
+	}
+	if _, ok := state.OutboxMessages["outbox:sent:000"]; ok {
+		t.Fatal("oldest sent outbox was not pruned")
+	}
+	if _, ok := state.OutboxMessages[fmt.Sprintf("outbox:sent:%03d", maxRetainedSentOutboxMessages+19)]; !ok {
+		t.Fatal("newest sent outbox was pruned")
+	}
+}
+
+func TestSavePrunesOldTranscriptLedgerRecords(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < maxRetainedTranscriptLedgerRecords+20; i++ {
+			id := fmt.Sprintf("ledger:s1:%04d", i)
+			state.TranscriptLedger[id] = TranscriptLedgerRecord{
+				ID:             id,
+				SessionID:      "s1",
+				SourceRecordID: fmt.Sprintf("record-%04d", i),
+				UpdatedAt:      now.Add(time.Duration(i) * time.Second),
+				CreatedAt:      now.Add(time.Duration(i) * time.Second),
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.TranscriptLedger); got != maxRetainedTranscriptLedgerRecords {
+		t.Fatalf("ledger len = %d, want %d", got, maxRetainedTranscriptLedgerRecords)
+	}
+	if _, ok := state.TranscriptLedger["ledger:s1:0000"]; ok {
+		t.Fatal("oldest transcript ledger record was not pruned")
+	}
+	if _, ok := state.TranscriptLedger[fmt.Sprintf("ledger:s1:%04d", maxRetainedTranscriptLedgerRecords+19)]; !ok {
+		t.Fatal("newest transcript ledger record was pruned")
+	}
+}
+
 func TestTeamsBackgroundKeepaliveClockSkewOutboxAndRateLimitCI(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1531,14 +1693,83 @@ func TestChatPollStateTracksCursorAndErrors(t *testing.T) {
 	if len(poll.LastError) != 240 || poll.LastErrorAt.IsZero() {
 		t.Fatalf("unexpected poll error state: %#v", poll)
 	}
+	if poll.FailureCount != 1 {
+		t.Fatalf("failure count = %d, want 1", poll.FailureCount)
+	}
 
 	later := cursor.Add(time.Minute)
 	poll, err = store.RecordChatPollSuccess(ctx, "chat-1", later, false, false, 1)
 	if err != nil {
 		t.Fatalf("second RecordChatPollSuccess error: %v", err)
 	}
-	if !poll.Seeded || !poll.LastModifiedCursor.Equal(later) || poll.LastError != "" || poll.LastWindowFullMessage != "" || poll.ContinuationPath != "" {
+	if !poll.Seeded || !poll.LastModifiedCursor.Equal(later) || poll.LastError != "" || poll.LastWindowFullMessage != "" || poll.ContinuationPath != "" || poll.FailureCount != 0 {
 		t.Fatalf("unexpected recovered poll state: %#v", poll)
+	}
+}
+
+func TestChatPollScheduleStatePersistsParkAndBlock(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC().Add(time.Hour)
+
+	poll, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      "hot",
+		NextPollAt:     now.Add(time.Second),
+		LastActivityAt: now,
+		ResetFailures:  true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedule hot error: %v", err)
+	}
+	if poll.PollState != "hot" || !poll.NextPollAt.Equal(now.Add(time.Second)) || !poll.LastActivityAt.Equal(now) {
+		t.Fatalf("hot poll schedule mismatch: %#v", poll)
+	}
+
+	blockedUntil := now.Add(time.Minute)
+	if err := store.RecordChatPollErrorWithBlock(ctx, "chat-1", "429", blockedUntil); err != nil {
+		t.Fatalf("RecordChatPollErrorWithBlock error: %v", err)
+	}
+	poll, ok, err := store.ChatPoll(ctx, "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll after block ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != "blocked" || poll.PreviousPollState != "hot" || !poll.BlockedUntil.Equal(blockedUntil) || !poll.NextPollAt.Equal(blockedUntil) {
+		t.Fatalf("blocked poll schedule mismatch: %#v", poll)
+	}
+
+	poll, err = store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:            "chat-1",
+		PollState:         "parked",
+		PreviousPollState: "",
+		ClearBlockedUntil: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedule parked error: %v", err)
+	}
+	if poll.PollState != "parked" || poll.ParkedAt.IsZero() || !poll.BlockedUntil.IsZero() {
+		t.Fatalf("parked poll schedule mismatch: %#v", poll)
+	}
+	poll, err = store.MarkChatPollParkNoticeSent(ctx, "chat-1", now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("MarkChatPollParkNoticeSent error: %v", err)
+	}
+	if poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("park notice timestamp missing: %#v", poll)
+	}
+
+	poll, err = store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:            "chat-1",
+		PollState:         "hot",
+		NextPollAt:        now,
+		LastActivityAt:    now.Add(3 * time.Minute),
+		ClearBlockedUntil: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedule resume error: %v", err)
+	}
+	if poll.PollState != "hot" || !poll.ParkedAt.IsZero() || !poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("resume should clear park markers: %#v", poll)
 	}
 }
 

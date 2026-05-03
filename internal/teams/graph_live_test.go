@@ -223,19 +223,6 @@ func TestLiveTeamsFormattingRenderOptIn(t *testing.T) {
 			},
 			{
 				Surface: TeamsRenderSurfaceOutbox,
-				Kind:    TeamsRenderCommand,
-				Text: strings.Join([]string{
-					`/usr/bin/zsh -lc 'go test ./internal/teams -run TestRenderTeamsHTMLCodexMarkdown -count=1'`,
-					"",
-					"Status: completed",
-					"Exit code: 0",
-					"",
-					"Output:",
-					"ok  github.com/baaaaaaaka/codex-helper/internal/teams  0.018s",
-				}, "\n"),
-			},
-			{
-				Surface: TeamsRenderSurfaceOutbox,
 				Kind:    TeamsRenderAssistant,
 				Text: strings.Join([]string{
 					"## Summary",
@@ -315,7 +302,6 @@ func TestLiveTeamsFormattingRenderOptIn(t *testing.T) {
 	want := []string{
 		"🧑‍💻 User:\n\n检查 Teams renderer",
 		"🤖 ⏳ Codex status:\n\nReviewing internal/teams/markdown.go",
-		"🤖 🛠️ Codex command:\n\n/usr/bin/zsh -lc",
 		"🤖 ✅ Codex answer:\n\nSummary",
 		"🔧 Helper: ✅ Codex finished responding.",
 	}
@@ -367,6 +353,116 @@ func TestLiveTeamsFormattingRenderOptIn(t *testing.T) {
 		t.Fatalf("read live formatting messages failed: %v", lastErr)
 	}
 	t.Fatalf("live formatting messages were not in expected order.\nwant subsequence: %#v\ngot: %#v", want, got)
+}
+
+func TestLiveTeamsFreezeNoticeOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_FREEZE_NOTICE_TEST")) != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_FREEZE_NOTICE_TEST=1 to send a live Teams freeze notice preview")
+	}
+	if got := strings.TrimSpace(os.Getenv(liveJasonWeiSafetyAckEnv)); got != liveJasonWeiSafetyAckValue {
+		t.Fatalf("%s=%s is required before any live Teams chat read, send, mention, or file upload", liveJasonWeiSafetyAckEnv, liveJasonWeiSafetyAckValue)
+	}
+	existingChatID := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_FREEZE_NOTICE_CHAT_ID"))
+	if existingChatID == "" {
+		requireLiveWriteOnce(t, "teams-freeze-notice")
+	}
+
+	cfg, err := DefaultAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(cfg.CachePath); err != nil {
+		t.Fatalf("read Teams chat token cache %s: %v", cfg.CachePath, err)
+	}
+	readCfg, err := DefaultReadAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultReadAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(readCfg.CachePath); err != nil {
+		t.Fatalf("read Teams read token cache %s: %v", readCfg.CachePath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	graph := NewGraphClient(NewAuthManager(cfg), io.Discard)
+	readGraph := NewGraphClient(NewAuthManager(readCfg), io.Discard)
+	me, err := graph.Me(ctx)
+	if err != nil {
+		t.Fatalf("Graph /me failed: %v", err)
+	}
+	if normalizeLiveHumanName(me.DisplayName) != "jason wei" {
+		t.Fatalf("logged-in user displayName %q is not Jason Wei", me.DisplayName)
+	}
+
+	var chat Chat
+	if existingChatID != "" {
+		requireLiveJasonWeiSingleMemberChat(ctx, t, graph, existingChatID)
+		chat, err = graph.GetChat(ctx, existingChatID)
+		if err != nil {
+			t.Fatalf("get live freeze notice chat failed: %v", err)
+		}
+	} else {
+		nonce := safeLiveMarkerPart(strings.TrimSpace(os.Getenv(liveWriteOnceEnv)))
+		title := "🧊 Codex Pause Notice Preview - " + nonce
+		chat, err = graph.CreateSingleMemberGroupChat(ctx, me.ID, title)
+		if err != nil {
+			t.Fatalf("create live freeze notice chat failed: %v", err)
+		}
+		requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, chat.ID)
+	}
+	if refreshed, err := graph.GetChat(ctx, chat.ID); err == nil && strings.TrimSpace(refreshed.WebURL) != "" {
+		chat = refreshed
+	}
+	t.Logf("LIVE_FREEZE_NOTICE_CHAT_ID=%s", chat.ID)
+	t.Logf("LIVE_FREEZE_NOTICE_CHAT_URL=%s", chat.WebURL)
+	t.Logf("LIVE_FREEZE_NOTICE_CHAT_TOPIC=%s", chat.Topic)
+
+	controlLink := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_CONTROL_CHAT_URL"))
+	if controlLink == "" {
+		controlLink = "https://teams.microsoft.com/l/chat/19%3Aa3318b85cbb64529afec8fd9012ddf52%40thread.v2/conversations"
+	}
+	if _, err := graph.SendHTML(ctx, chat.ID, renderTeamsFreezeNoticeHTML(controlLink, "r 8f3c9a2d", "Your Codex work is safe. Paused after 6h idle.")); err != nil {
+		t.Fatalf("send live Teams freeze notice failed: %v", err)
+	}
+
+	want := []string{
+		"🔧 Helper:\n\n🧊 This chat is paused",
+		"⚠ Messages here will not get a reply.",
+		"Your Codex work is safe. Paused after 6h idle.",
+		"▶️ Continue chat:",
+		"Step 1: Open Control chat",
+		"Step 2: Send: r 8f3c9a2d",
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	var got []string
+	var lastErr error
+	for time.Now().Before(deadline) {
+		got, lastErr = liveRecentPlainMessagesAscending(ctx, readGraph, chat.ID, 20)
+		if lastErr == nil && containsAllLivePlainText(got, want) {
+			rawHTML, err := liveRecentHTMLMessagesAscending(ctx, readGraph, chat.ID, 20)
+			if err != nil {
+				t.Fatalf("read live freeze notice raw HTML failed: %v", err)
+			}
+			joinedHTML := strings.Join(rawHTML, "\n")
+			if strings.Contains(strings.Join(got, "\n"), "teams.microsoft.com/l/chat/") {
+				t.Fatalf("live freeze notice plain text leaked raw Teams URL: %#v", got)
+			}
+			if !strings.Contains(joinedHTML, `<a href="https://teams.microsoft.com/l/chat/`) || !strings.Contains(joinedHTML, ">Control chat</a>") {
+				t.Fatalf("live freeze notice raw HTML did not keep Control chat as a compact link:\n%s", joinedHTML)
+			}
+			for i, text := range got {
+				if strings.Contains(text, "This chat is paused") {
+					t.Logf("LIVE_FREEZE_NOTICE_RECENT[%d]=%s", i, text)
+				}
+			}
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if lastErr != nil {
+		t.Fatalf("read live freeze notice messages failed: %v", lastErr)
+	}
+	t.Fatalf("live freeze notice did not contain expected text.\nwant fragments: %#v\ngot: %#v", want, got)
 }
 
 func TestLiveTeamsOAIMemoryCitationFilterOptIn(t *testing.T) {
@@ -1206,13 +1302,13 @@ func TestLiveBridgePublishExistingTranscriptOrderOptIn(t *testing.T) {
 	}
 
 	want := []string{
-		"Helper: Imported Codex session history",
+		"Imported Codex session history",
 		"User:\nsynthetic live import test user prompt " + nonce,
 		"Codex answer:\nsynthetic live import test assistant reply " + nonce,
 		"Codex status:\nsynthetic live import test codex status " + nonce,
 		"User:\nsynthetic live import test second user prompt " + nonce,
 		"Codex answer:\nsynthetic live import test second assistant reply " + nonce,
-		"Helper: Import complete. Imported 5 visible history item(s) and skipped 1 background tool event(s)",
+		"Import complete. Imported 5 visible history item(s) and skipped 1 background tool event(s)",
 	}
 	deadline := time.Now().Add(6 * time.Minute)
 	var got []string
@@ -1565,7 +1661,7 @@ func TestLiveBridgePublishSubagentMarkerOptIn(t *testing.T) {
 	want := []string{
 		"User:\nlive parent user " + nonce,
 		"Codex answer:\nlive parent assistant " + nonce,
-		"Helper: Subagent spawned",
+		"Subagent spawned",
 		"Subagent: live subagent user " + nonce,
 	}
 	deadline := time.Now().Add(6 * time.Minute)
@@ -2098,8 +2194,9 @@ func validateLiveJasonWeiSingleMemberChat(me User, chat Chat, members []ChatMemb
 	if strings.TrimSpace(chat.ID) != strings.TrimSpace(chatID) {
 		return fmt.Errorf("chat id mismatch: got %q, want %q", chat.ID, chatID)
 	}
-	if strings.TrimSpace(chat.ChatType) != "group" {
-		return fmt.Errorf("chat %q is %q, not a single-member group chat", chatID, chat.ChatType)
+	chatType := strings.TrimSpace(chat.ChatType)
+	if chatType != "group" && chatType != "meeting" {
+		return fmt.Errorf("chat %q is %q, not a single-member group or meeting chat", chatID, chat.ChatType)
 	}
 	if len(members) != 1 {
 		return fmt.Errorf("chat %q has %d member(s), want exactly 1", chatID, len(members))

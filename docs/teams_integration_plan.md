@@ -13,7 +13,7 @@ Implementation tracker: `docs/teams_integration_execution_plan.md`.
   the active implementation path, because they would need separate app,
   permission, security, and state-mapping decisions.
 - Microsoft Graph delegated chat access is available through Teams-compatible public clients.
-- A single-member Teams group chat can be created and used as a private Codex conversation surface.
+- A single-member standalone Teams meeting chat can be created and used as a private Codex conversation surface across desktop and mobile clients after the helper sends an initial self-mention.
 - A control chat plus one on-demand Teams work chat per Codex session is the
   current best fit for thread-like session management under the observed
   permissions.
@@ -41,7 +41,7 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
   title should use an obvious presentation marker equivalent to `[control]`;
   installations may choose an emoji marker, but durable identity must come from
   stored ids, never from the title text.
-- Use one single-member Teams work chat per Codex session, created on demand
+- Use one single-member Teams meeting work chat per Codex session, created on demand
   when the user asks for Teams access to that session.
 - Session chat titles must be recognizable from Teams search and the chat list:
   include a work marker equivalent to `[work]`, the session number/id, and a
@@ -324,10 +324,49 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
 - Add a per-chat outbound rate limiter. Long message chunks, imported history,
   and artifact notifications must preserve order while respecting Teams rate
   limits and `Retry-After`.
+- Use per-chat inbound polling states instead of scanning every linked chat on
+  every loop. Default thresholds:
+  - `hot`: user just sent a message, chat just resumed/created, or helper just
+    sent a final answer; poll every `1s` for `2 min`.
+  - `running`: Codex turn is running; poll every `3s`, then return to `hot`
+    when the final answer is sent.
+  - `warm`: recent conversation; poll every `10s` until `15 min` idle.
+  - `cool`: quiet conversation; poll every `30s` until `2h` idle.
+  - `cold`: old conversation; poll every `120s` until `48h` idle.
+  - `parked`: after `48h` idle or explicit close/park; do not poll. Resume only
+    from the control chat with stable `r <hash>`.
+  - `catchup`: startup/reconnect/resume/continuation; poll budgeted ASAP with
+    larger windows, then return by latest activity.
+  - `blocked`: Graph 429/transport backoff; do not poll until `Retry-After`.
+- Do not keep a separate `deep_cold` state. The middle tier is `cool`; the
+  terminal inactive state is `parked`.
 - Every durable checkpoint update must be tied to the operation that makes it
   true. For example, history import checkpoints advance only after the
   corresponding Teams outbox item is sent; Graph ingestion checkpoints do not
   advance after a failed or throttled poll.
+- Parked or frozen work chats must use a stable resume key such as
+  `r 8f3c9a2d`, not a dashboard number such as `r 7`. Dashboard numbers are
+  only current-view shortcuts; the resume key is the durable recovery handle.
+- Freeze notices should be intentionally short and visually distinct, written
+  for a first-time Teams user who does not know or care how the helper works.
+  Avoid internal terms such as durable state, polling, checking, dashboard, or
+  resume intent. Show only that this chat will not reply anymore, that the Codex
+  work is safe, and exactly how to continue:
+
+  ```text
+  🧊 This chat is paused
+  ⚠ **Messages here will not get a reply.**
+  Your Codex work is safe. Paused after 6h idle.
+
+  ▶️ **Continue chat:**
+  Step 1: Open Control chat
+  Step 2: Send: `r 8f3c9a2d`
+  ```
+
+  Do not show raw Teams URLs in the freeze notice body. Prefer a compact
+  `Control chat` link/button only if Teams renders it without exposing the raw
+  URL; otherwise show plain `Open Control chat` plus the exact stable resume
+  command.
 
 ## Operations
 

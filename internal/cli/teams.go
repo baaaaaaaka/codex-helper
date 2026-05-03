@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,12 +30,14 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 	cmd.PersistentFlags().StringVar(&registryPath, "registry", "", "Override Teams bridge registry path")
 	cmd.AddCommand(
 		newTeamsSetupCmd(),
-		newTeamsAuthCmd(),
-		newTeamsControlCmd(&registryPath),
+		newTeamsAuthCmd(root),
+		newTeamsControlCmd(root, &registryPath),
+		newTeamsChatCmd(root, &registryPath),
+		newTeamsProbeChatCmd(root),
 		newTeamsRunCmd(root, &registryPath),
-		newTeamsSendFileCmd(&registryPath),
+		newTeamsSendFileCmd(root, &registryPath),
 		newTeamsStatusCmd(&registryPath),
-		newTeamsDoctorCmd(&registryPath),
+		newTeamsDoctorCmd(root, &registryPath),
 		newTeamsServiceCmd(root, &registryPath),
 		newTeamsPauseCmd(),
 		newTeamsResumeCmd(),
@@ -53,28 +56,34 @@ func newTeamsSetupCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintln(out, "Teams setup checklist")
-			_, _ = fmt.Fprintln(out, "1. Run `codex-proxy teams auth read` in a foreground terminal and finish Microsoft device login for low-latency polling.")
-			_, _ = fmt.Fprintln(out, "2. Run `codex-proxy teams auth` in a foreground terminal and finish Microsoft device login for chat creation and sends.")
-			_, _ = fmt.Fprintln(out, "3. Run `codex-proxy teams doctor --live` to verify Graph identity and existing chat read access for your account.")
-			_, _ = fmt.Fprintln(out, "4. Run `codex-proxy teams control` to create or show this machine's single-member control chat. This command may create a Teams chat and send a ready message.")
-			_, _ = fmt.Fprintln(out, "5. Run `codex-proxy teams service doctor` to check the no-root service backend for this platform.")
-			_, _ = fmt.Fprintln(out, "6. Start the foreground bridge with `codex-proxy teams run`, or install a user service with `codex-proxy teams service install` followed by `codex-proxy teams service enable` and `codex-proxy teams service start`.")
-			_, _ = fmt.Fprintln(out, "7. Foreground `teams run` stops when its terminal exits. Use the service path for terminal close, SSH disconnect, WSL, sleep/wake, and helper upgrade recovery.")
-			_, _ = fmt.Fprintln(out, "8. For file uploads, run `codex-proxy teams auth file-write` and keep files under the Teams outbound root shown by `helper file <relative-path>` errors.")
+			_, _ = fmt.Fprintln(out, "1. Configure your tenant and Teams Graph client IDs with `codex-proxy teams auth config --tenant-id <tenant-id> --read-client-id <read-client-id> --chat-client-id <chat-client-id>`.")
+			_, _ = fmt.Fprintln(out, "2. Run `codex-proxy teams auth read` in a foreground terminal and finish Microsoft device login for low-latency polling.")
+			_, _ = fmt.Fprintln(out, "3. Run `codex-proxy teams auth` in a foreground terminal and finish Microsoft device login for chat creation and sends.")
+			_, _ = fmt.Fprintln(out, "4. Run `codex-proxy teams doctor --live` to verify Graph identity and existing chat read access for your account.")
+			_, _ = fmt.Fprintln(out, "5. Run `codex-proxy teams control` to create or show this machine's meeting-based control chat. This command may create a Teams chat and send an @mention plus a ready message.")
+			_, _ = fmt.Fprintln(out, "6. Run `codex-proxy teams service doctor` to check the no-root service backend for this platform.")
+			_, _ = fmt.Fprintln(out, "7. Start the foreground bridge with `codex-proxy teams run`, or install a user service with `codex-proxy teams service install` followed by `codex-proxy teams service enable` and `codex-proxy teams service start`.")
+			_, _ = fmt.Fprintln(out, "8. Foreground `teams run` stops when its terminal exits. Use the service path for terminal close, SSH disconnect, WSL, sleep/wake, and helper upgrade recovery.")
+			_, _ = fmt.Fprintln(out, "9. For file uploads, run `codex-proxy teams auth file-write` and keep files under the Teams outbound root shown by `helper file <relative-path>` errors.")
 			_, _ = fmt.Fprintln(out, "Local checks: `codex-proxy teams status`, `codex-proxy teams control --print`, `codex-proxy teams doctor`, `codex-proxy teams service doctor`.")
 			return nil
 		},
 	}
 }
 
-func newTeamsAuthCmd() *cobra.Command {
+func newTeamsAuthCmd(root *rootOptions) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "auth",
 		Short: "Authenticate to Microsoft Graph for Teams chat access",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			auth, err := newTeamsAuthManager()
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
 			if err != nil {
 				return err
 			}
@@ -82,7 +91,7 @@ func newTeamsAuthCmd() *cobra.Command {
 			if _, err := auth.AccessToken(ctx, cmd.OutOrStdout(), force); err != nil {
 				return err
 			}
-			graph := teams.NewGraphClient(auth, cmd.OutOrStdout())
+			graph := teams.NewGraphClientWithHTTPClient(auth, cmd.OutOrStdout(), httpClient.Client)
 			me, err := graph.Me(ctx)
 			if err != nil {
 				return err
@@ -93,26 +102,124 @@ func newTeamsAuthCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Force a fresh device-code login")
 	cmd.AddCommand(
-		newTeamsAuthReadCmd(),
+		newTeamsAuthConfigCmd(),
+		newTeamsAuthReadCmd(root),
 		newTeamsAuthReadStatusCmd(),
 		newTeamsAuthReadLogoutCmd(),
 		newTeamsAuthStatusCmd(),
 		newTeamsLogoutCmd(),
-		newTeamsAuthFileWriteCmd(),
+		newTeamsAuthFileWriteCmd(root),
 		newTeamsAuthFileWriteStatusCmd(),
 		newTeamsAuthFileWriteLogoutCmd(),
 	)
 	return cmd
 }
 
-func newTeamsAuthReadCmd() *cobra.Command {
+func newTeamsAuthConfigCmd() *cobra.Command {
+	var tenantID string
+	var readClientID string
+	var chatClientID string
+	var fileWriteClientID string
+	var readScopes string
+	var chatScopes string
+	var fileWriteScopes string
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "Configure local Teams Graph tenant and client IDs",
+		Long:  "Configure local Teams Graph tenant and client IDs. This writes a local user config file; client IDs are not stored in the source tree.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, err := teams.DefaultTeamsAuthConfigPath()
+			if err != nil {
+				return err
+			}
+			cfg, err := teams.LoadTeamsAuthConfigFile(path)
+			if err != nil {
+				return err
+			}
+			changed := false
+			if cmd.Flags().Changed("tenant-id") {
+				cfg.TenantID = strings.TrimSpace(tenantID)
+				changed = true
+			}
+			if cmd.Flags().Changed("read-client-id") {
+				cfg.Read.ClientID = strings.TrimSpace(readClientID)
+				changed = true
+			}
+			if cmd.Flags().Changed("chat-client-id") || cmd.Flags().Changed("client-id") {
+				cfg.ChatWrite.ClientID = strings.TrimSpace(chatClientID)
+				changed = true
+			}
+			if cmd.Flags().Changed("file-write-client-id") {
+				cfg.FileWrite.ClientID = strings.TrimSpace(fileWriteClientID)
+				changed = true
+			}
+			if cmd.Flags().Changed("read-scopes") {
+				cfg.Read.Scopes = strings.TrimSpace(readScopes)
+				changed = true
+			}
+			if cmd.Flags().Changed("chat-scopes") {
+				cfg.ChatWrite.Scopes = strings.TrimSpace(chatScopes)
+				changed = true
+			}
+			if cmd.Flags().Changed("file-write-scopes") {
+				cfg.FileWrite.Scopes = strings.TrimSpace(fileWriteScopes)
+				changed = true
+			}
+			if changed {
+				if err := teams.SaveTeamsAuthConfigFile(path, cfg); err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Saved Teams auth config: %s\n", path)
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams auth config: %s\n", path)
+			}
+			printTeamsAuthConfigSummary(cmd.OutOrStdout(), cfg)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&tenantID, "tenant-id", "", "Microsoft Entra tenant id")
+	cmd.Flags().StringVar(&readClientID, "read-client-id", "", "Public client id for Teams read Graph scopes")
+	cmd.Flags().StringVar(&chatClientID, "chat-client-id", "", "Public client id for Teams chat creation/send scopes")
+	cmd.Flags().StringVar(&chatClientID, "client-id", "", "Alias for --chat-client-id")
+	cmd.Flags().StringVar(&fileWriteClientID, "file-write-client-id", "", "Public client id for Teams file upload scopes; defaults to chat client id when omitted")
+	cmd.Flags().StringVar(&readScopes, "read-scopes", "", "Override Teams read scopes")
+	cmd.Flags().StringVar(&chatScopes, "chat-scopes", "", "Override Teams chat write scopes")
+	cmd.Flags().StringVar(&fileWriteScopes, "file-write-scopes", "", "Override Teams file write scopes")
+	return cmd
+}
+
+func printTeamsAuthConfigSummary(out io.Writer, cfg teams.TeamsAuthConfigFile) {
+	_, _ = fmt.Fprintf(out, "Tenant ID: %s\n", configuredStatus(cfg.TenantID))
+	_, _ = fmt.Fprintf(out, "Read client ID: %s\n", configuredStatus(cfg.Read.ClientID))
+	_, _ = fmt.Fprintf(out, "Chat write client ID: %s\n", configuredStatus(cfg.ChatWrite.ClientID))
+	fileStatus := configuredStatus(cfg.FileWrite.ClientID)
+	if strings.TrimSpace(cfg.FileWrite.ClientID) == "" && strings.TrimSpace(cfg.ChatWrite.ClientID) != "" {
+		fileStatus = "using chat write client"
+	}
+	_, _ = fmt.Fprintf(out, "File write client ID: %s\n", fileStatus)
+}
+
+func configuredStatus(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "missing"
+	}
+	return "configured"
+}
+
+func newTeamsAuthReadCmd(root *rootOptions) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "read",
 		Short: "Authenticate to Microsoft Graph for Teams message polling",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			auth, err := newTeamsReadAuthManager()
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsReadAuthManagerWithHTTPClient(httpClient.Client)
 			if err != nil {
 				return err
 			}
@@ -120,7 +227,7 @@ func newTeamsAuthReadCmd() *cobra.Command {
 			if _, err := auth.AccessToken(ctx, cmd.OutOrStdout(), force); err != nil {
 				return err
 			}
-			graph := teams.NewGraphClient(auth, cmd.OutOrStdout())
+			graph := teams.NewGraphClientWithHTTPClient(auth, cmd.OutOrStdout(), httpClient.Client)
 			me, err := graph.Me(ctx)
 			if err != nil {
 				return err
@@ -178,31 +285,69 @@ func newTeamsAuthReadLogoutCmd() *cobra.Command {
 	}
 }
 
-func newTeamsControlCmd(registryPath *string) *cobra.Command {
+func newTeamsControlCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var noCreate bool
+	var recreate bool
+	var yes bool
+	var recreateDrainTimeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "control",
 		Short: "Show or create the Teams control chat",
-		Long:  "Show or create this machine's single-member Teams control chat. Without --no-create, this may call Microsoft Graph to create the chat, update its title, and send a ready message.",
+		Long:  "Show, create, or recreate this machine's meeting-based Teams control chat. Without --no-create, this may call Microsoft Graph to create the chat, update its title, and send an @mention plus a ready message.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if noCreate && recreate {
+				return fmt.Errorf("use only one of --no-create/--print or --recreate")
+			}
 			if noCreate {
 				return printTeamsControlChatLocal(cmd, *registryPath)
 			}
-			auth, err := newTeamsAuthManager()
+			if recreate && !yes {
+				return fmt.Errorf("recreating the control chat creates a new Teams chat and sends messages; rerun with --yes")
+			}
+			if recreate {
+				if err := drainTeamsBridgeForChatRecreate(cmd.Context(), cmd.OutOrStdout(), recreateDrainTimeout); err != nil {
+					return err
+				}
+			}
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
-			bridge, err := teams.NewBridge(cmd.Context(), auth, *registryPath, cmd.OutOrStdout())
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
 			if err != nil {
 				return err
 			}
-			chat, err := bridge.EnsureControlChat(cmd.Context())
+			bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
 			if err != nil {
 				return err
+			}
+			var chat teams.Chat
+			var old teams.Chat
+			if recreate {
+				recreated, err := bridge.RecreateControlChat(cmd.Context())
+				if err != nil {
+					return err
+				}
+				chat = recreated.NewChat
+				old = recreated.OldChat
+			} else {
+				chat, err = bridge.EnsureControlChat(cmd.Context())
+				if err != nil {
+					return err
+				}
 			}
 			if err := bridge.Save(); err != nil {
 				return err
+			}
+			if recreate {
+				printTeamsControlChatDetails(cmd.OutOrStdout(), "Teams control chat recreated", chat.ID, chat.Topic, chat.WebURL)
+				if old.ID != "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Previous Chat ID: %s\n", old.ID)
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Restart or reload the Teams helper so the running listener uses the new control chat.")
+				return nil
 			}
 			printTeamsControlChatDetails(cmd.OutOrStdout(), "Teams control chat ready", chat.ID, chat.Topic, chat.WebURL)
 			return nil
@@ -210,7 +355,149 @@ func newTeamsControlCmd(registryPath *string) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&noCreate, "no-create", false, "Only print the locally known control chat; do not call Graph or create/update/send")
 	cmd.Flags().BoolVar(&noCreate, "print", false, "Alias for --no-create")
+	cmd.Flags().BoolVar(&recreate, "recreate", false, "Create a fresh meeting-based control chat and rebind local Teams helper state; old Teams chats are not deleted")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that --recreate may create a Teams chat and send an @mention plus a ready message")
+	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", 30*time.Second, "How long to wait for the running Teams listener to drain before recreating")
 	return cmd
+}
+
+func newTeamsChatCmd(root *rootOptions, registryPath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "chat",
+		Short: "Developer maintenance for Teams work chats",
+		Long:  "Developer maintenance for Teams work chats. These commands may create Teams chats and send messages; they never delete old Teams chats.",
+	}
+	cmd.AddCommand(newTeamsChatRecreateCmd(root, registryPath))
+	return cmd
+}
+
+func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Command {
+	var yes bool
+	var recreateDrainTimeout time.Duration
+	cmd := &cobra.Command{
+		Use:   "recreate <session-id|codex-thread-id|teams-chat-id>",
+		Short: "Create a fresh Teams work chat for an existing session",
+		Long:  "Create a fresh meeting-based Teams work chat for an existing helper session and rebind local state. The old Teams chat is left untouched.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !yes {
+				return fmt.Errorf("recreating a work chat creates a new Teams chat and sends messages; rerun with --yes")
+			}
+			if err := drainTeamsBridgeForChatRecreate(cmd.Context(), cmd.OutOrStdout(), recreateDrainTimeout); err != nil {
+				return err
+			}
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
+			if err != nil {
+				return err
+			}
+			bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+			if err != nil {
+				return err
+			}
+			recreated, err := bridge.RecreateSessionChat(cmd.Context(), args[0], teams.RecreateSessionChatOptions{})
+			if err != nil {
+				return err
+			}
+			if err := bridge.Save(); err != nil {
+				return err
+			}
+			printTeamsControlChatDetails(cmd.OutOrStdout(), "Teams work chat recreated", recreated.NewChat.ID, recreated.NewChat.Topic, recreated.NewChat.WebURL)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Session: %s\n", recreated.SessionID)
+			if recreated.OldChat.ID != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Previous Chat ID: %s\n", recreated.OldChat.ID)
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Restart or reload the Teams helper so the running listener uses the new work chat.")
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that this may create a Teams chat and send an @mention plus a ready message")
+	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", 30*time.Second, "How long to wait for the running Teams listener to drain before recreating")
+	return cmd
+}
+
+func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout time.Duration) error {
+	paths, err := existingTeamsStorePaths()
+	if err != nil {
+		return err
+	}
+	type recreateStore struct {
+		Path string
+		St   *teamsstore.Store
+	}
+	var stores []recreateStore
+	for _, path := range paths {
+		st, err := teamsstore.Open(path)
+		if err != nil {
+			return err
+		}
+		state, err := st.Load(ctx)
+		if err != nil {
+			return err
+		}
+		owner, hasOwner := stateOwner(state)
+		if !hasOwner {
+			continue
+		}
+		if teamsstore.IsStale(owner, 2*time.Minute, time.Now()) {
+			return fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before recreating chats", path)
+		}
+		if _, err := st.SetDraining(ctx, "chat recreate"); err != nil {
+			return err
+		}
+		stores = append(stores, recreateStore{Path: path, St: st})
+	}
+	if len(stores) == 0 {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if out != nil {
+		_, _ = fmt.Fprintln(out, "Waiting for active Teams listener to drain before recreating chat...")
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(teamsUpgradePollInterval)
+	defer tick.Stop()
+	for {
+		drained := true
+		for _, item := range stores {
+			itemDrained, err := teamsUpgradeStateDrained(ctx, item.St)
+			if err != nil {
+				return err
+			}
+			if !itemDrained {
+				drained = false
+				break
+			}
+		}
+		if drained {
+			for _, item := range stores {
+				if _, err := item.St.ClearDrain(ctx); err != nil {
+					return err
+				}
+			}
+			if out != nil {
+				_, _ = fmt.Fprintln(out, "Teams listener drained.")
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			for _, item := range stores {
+				_, _ = item.St.ClearDrain(context.Background())
+			}
+			return fmt.Errorf("timed out waiting for Teams listener to drain before recreating chat; run `codex-proxy teams status` or `codex-proxy teams recover --force` if the owner is gone")
+		case <-tick.C:
+		}
+	}
 }
 
 func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
@@ -236,11 +523,16 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					return err
 				}
 			}
-			auth, err := newTeamsAuthManager()
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
-			bridge, err := teams.NewBridge(cmd.Context(), auth, *registryPath, cmd.OutOrStdout())
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
+			if err != nil {
+				return err
+			}
+			bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
 			if err != nil {
 				return err
 			}
@@ -261,6 +553,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				Executor:                executor,
 				ControlFallbackExecutor: controlFallbackExecutor,
 				ControlFallbackModel:    controlFallbackModel,
+				HelperRestarter:         restartTeamsHelperFromTeams,
+				HelperReloader:          reloadTeamsHelperFromTeams,
 			})
 		},
 	}
@@ -278,6 +572,17 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	return cmd
 }
 
+func restartTeamsHelperFromTeams(context.Context) error {
+	if teamsServiceGOOS() == "windows" && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+		if err := scheduleDelayedTeamsServiceStart(context.Background()); err != nil {
+			return err
+		}
+		exitFunc(0)
+		return nil
+	}
+	return restartSelf()
+}
+
 func newTeamsStatusCmd(registryPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
@@ -289,7 +594,7 @@ func newTeamsStatusCmd(registryPath *string) *cobra.Command {
 	}
 }
 
-func newTeamsSendFileCmd(registryPath *string) *cobra.Command {
+func newTeamsSendFileCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var sessionID string
 	var chatID string
 	var allowLocalPath bool
@@ -323,7 +628,12 @@ func newTeamsSendFileCmd(registryPath *string) *cobra.Command {
 				}
 				return err
 			}
-			graph, err := teams.NewFileWriteGraphClient(cmd.OutOrStdout())
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			graph, err := teams.NewFileWriteGraphClientWithHTTPClient(cmd.OutOrStdout(), httpClient.Client)
 			if err != nil {
 				return err
 			}
@@ -358,7 +668,7 @@ func newTeamsSendFileCmd(registryPath *string) *cobra.Command {
 	return cmd
 }
 
-func newTeamsDoctorCmd(registryPath *string) *cobra.Command {
+func newTeamsDoctorCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var live bool
 	var appServerProbe bool
 	var codexPath string
@@ -373,7 +683,7 @@ func newTeamsDoctorCmd(registryPath *string) *cobra.Command {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintln(out, "Teams doctor")
 			if live {
-				if err := runTeamsDoctorLiveCheck(cmd, *registryPath); err != nil {
+				if err := runTeamsDoctorLiveCheck(cmd, root, *registryPath); err != nil {
 					return err
 				}
 			} else {
@@ -585,14 +895,19 @@ func newTeamsLogoutCmd() *cobra.Command {
 	}
 }
 
-func newTeamsAuthFileWriteCmd() *cobra.Command {
+func newTeamsAuthFileWriteCmd(root *rootOptions) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "file-write",
 		Short: "Authenticate to Microsoft Graph for Teams file uploads",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			auth, err := newTeamsFileWriteAuthManager()
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsFileWriteAuthManagerWithHTTPClient(httpClient.Client)
 			if err != nil {
 				return err
 			}
@@ -600,7 +915,7 @@ func newTeamsAuthFileWriteCmd() *cobra.Command {
 			if _, err := auth.AccessToken(ctx, cmd.OutOrStdout(), force); err != nil {
 				return err
 			}
-			graph := teams.NewGraphClient(auth, cmd.OutOrStdout())
+			graph := teams.NewGraphClientWithHTTPClient(auth, cmd.OutOrStdout(), httpClient.Client)
 			me, err := graph.Me(ctx)
 			if err != nil {
 				return err
@@ -714,24 +1029,29 @@ type teamsAppServerProbeOptions struct {
 
 var runTeamsAppServerProbe = defaultRunTeamsAppServerProbe
 
-func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, registryPath string) error {
+func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, root *rootOptions, registryPath string) error {
 	out := cmd.OutOrStdout()
-	readAuth, err := newTeamsReadAuthManager()
+	httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 	if err != nil {
 		return err
 	}
-	readGraph := teams.NewGraphClient(readAuth, out)
+	defer func() { _ = httpClient.Close(context.Background()) }()
+	readAuth, err := newTeamsReadAuthManagerWithHTTPClient(httpClient.Client)
+	if err != nil {
+		return err
+	}
+	readGraph := teams.NewGraphClientWithHTTPClient(readAuth, out, httpClient.Client)
 	me, err := readGraph.Me(cmd.Context())
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "Graph read auth: failed (%v)\n", err)
 		return err
 	}
 	_, _ = fmt.Fprintf(out, "Graph read auth: ok as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
-	writeAuth, err := newTeamsAuthManager()
+	writeAuth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
 	if err != nil {
 		return err
 	}
-	writeGraph := teams.NewGraphClient(writeAuth, out)
+	writeGraph := teams.NewGraphClientWithHTTPClient(writeAuth, out, httpClient.Client)
 	if _, err := writeGraph.Me(cmd.Context()); err != nil {
 		_, _ = fmt.Fprintf(out, "Graph write auth: failed (%v)\n", err)
 		return err
@@ -835,27 +1155,39 @@ func defaultRunTeamsAppServerProbe(cmd *cobra.Command, opts teamsAppServerProbeO
 }
 
 func newTeamsAuthManager() (*teams.AuthManager, error) {
+	return newTeamsAuthManagerWithHTTPClient(nil)
+}
+
+func newTeamsAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
 	cfg, err := teams.DefaultAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	return teams.NewAuthManager(cfg), nil
+	return teams.NewAuthManagerWithHTTPClient(cfg, client), nil
 }
 
 func newTeamsReadAuthManager() (*teams.AuthManager, error) {
+	return newTeamsReadAuthManagerWithHTTPClient(nil)
+}
+
+func newTeamsReadAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
 	cfg, err := teams.DefaultReadAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	return teams.NewAuthManager(cfg), nil
+	return teams.NewAuthManagerWithHTTPClient(cfg, client), nil
 }
 
 func newTeamsFileWriteAuthManager() (*teams.AuthManager, error) {
+	return newTeamsFileWriteAuthManagerWithHTTPClient(nil)
+}
+
+func newTeamsFileWriteAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
 	cfg, err := teams.DefaultFileWriteAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	return teams.NewAuthManager(cfg), nil
+	return teams.NewAuthManagerWithHTTPClient(cfg, client), nil
 }
 
 func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
@@ -1027,7 +1359,7 @@ func printTeamsControlChatLocal(cmd *cobra.Command, registryPath string) error {
 		}
 	}
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams control chat: unavailable")
-	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Run `codex-proxy teams control` to create the single-member control chat.")
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Run `codex-proxy teams control` to create the meeting-based control chat.")
 	printTeamsControlChatExamples(cmd.OutOrStdout())
 	return nil
 }
@@ -1044,7 +1376,7 @@ func printTeamsControlChatDetails(out io.Writer, label string, chatID string, to
 
 func printTeamsControlChatExamples(out io.Writer) {
 	_, _ = fmt.Fprintln(out, "Open this Teams chat, type `help`, and send it.")
-	_, _ = fmt.Fprintln(out, "After that, try `projects` to choose a folder, `new <directory> -- <title>` to start repo work, or `status` to check the helper.")
+	_, _ = fmt.Fprintln(out, "After that, try `projects` to choose a folder, `new <directory>` to start repo work, or `status` to check the helper.")
 	_, _ = fmt.Fprintln(out, "Keep `codex-proxy teams run` or the Teams service running on this machine; Teams messages are not read after the local listener stops.")
 }
 

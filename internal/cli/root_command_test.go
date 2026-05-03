@@ -43,7 +43,7 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"auth", "control", "doctor", "drain", "pause", "recover", "resume", "run", "send-file", "service", "setup", "status"}
+	want := []string{"auth", "chat", "control", "doctor", "drain", "pause", "probe-chat", "recover", "resume", "run", "send-file", "service", "setup", "status"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected teams subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -68,8 +68,47 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 		authNames = append(authNames, sub.Name())
 	}
 	sort.Strings(authNames)
-	if want := []string{"file-write", "file-write-logout", "file-write-status", "logout", "read", "read-logout", "read-status", "status"}; !reflect.DeepEqual(authNames, want) {
+	if want := []string{"config", "file-write", "file-write-logout", "file-write-status", "logout", "read", "read-logout", "read-status", "status"}; !reflect.DeepEqual(authNames, want) {
 		t.Fatalf("unexpected teams auth subcommands\n got: %#v\nwant: %#v", authNames, want)
+	}
+}
+
+func TestRestartTeamsHelperFromTeamsWindowsServiceSchedulesTaskStart(t *testing.T) {
+	prevGOOS := teamsServiceGOOS
+	prevDetached := teamsServiceStartDetached
+	prevExit := exitFunc
+	prevPowerShell := teamsServicePowerShellExecutable
+	t.Cleanup(func() {
+		teamsServiceGOOS = prevGOOS
+		teamsServiceStartDetached = prevDetached
+		exitFunc = prevExit
+		teamsServicePowerShellExecutable = prevPowerShell
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	teamsServiceGOOS = func() string { return "windows" }
+	teamsServicePowerShellExecutable = func() string { return "powershell.exe" }
+	var gotName string
+	var gotArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return nil
+	}
+	var exitCode int
+	var exited bool
+	exitFunc = func(code int) {
+		exited = true
+		exitCode = code
+	}
+
+	if err := restartTeamsHelperFromTeams(context.Background()); err != nil {
+		t.Fatalf("restartTeamsHelperFromTeams error: %v", err)
+	}
+	if !exited || exitCode != 0 {
+		t.Fatalf("exit = %v/%d, want true/0", exited, exitCode)
+	}
+	if gotName != "powershell.exe" || !strings.Contains(strings.Join(gotArgs, " "), "Start-ScheduledTask") {
+		t.Fatalf("detached restart command = %q %#v, want scheduled task start", gotName, gotArgs)
 	}
 }
 

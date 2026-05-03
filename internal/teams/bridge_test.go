@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +53,58 @@ func (e *streamingRecordingExecutor) RunWithEventHandler(_ context.Context, _ *S
 		}
 	}
 	return e.result, e.err
+}
+
+type blockingStreamingExecutor struct {
+	started chan struct{}
+	release chan struct{}
+	result  ExecutionResult
+}
+
+func (e *blockingStreamingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunWithEventHandler(ctx, session, prompt, nil)
+}
+
+func (e *blockingStreamingExecutor) RunWithEventHandler(ctx context.Context, _ *Session, _ string, _ codexrunner.EventHandler) (ExecutionResult, error) {
+	close(e.started)
+	select {
+	case <-ctx.Done():
+		return ExecutionResult{}, ctx.Err()
+	case <-e.release:
+		return e.result, nil
+	}
+}
+
+type serialStreamingExecutor struct {
+	started chan string
+	release chan struct{}
+	mu      sync.Mutex
+	prompts []string
+}
+
+func (e *serialStreamingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunWithEventHandler(ctx, session, prompt, nil)
+}
+
+func (e *serialStreamingExecutor) RunWithEventHandler(ctx context.Context, _ *Session, prompt string, _ codexrunner.EventHandler) (ExecutionResult, error) {
+	visible := strings.TrimSpace(StripHelperPromptEchoes(prompt))
+	e.mu.Lock()
+	e.prompts = append(e.prompts, visible)
+	count := len(e.prompts)
+	e.mu.Unlock()
+	e.started <- visible
+	select {
+	case <-ctx.Done():
+		return ExecutionResult{}, ctx.Err()
+	case <-e.release:
+		return ExecutionResult{Text: fmt.Sprintf("done %d: %s", count, visible), CodexThreadID: "thread-1", CodexTurnID: fmt.Sprintf("turn-%d", count)}, nil
+	}
+}
+
+func (e *serialStreamingExecutor) promptSnapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.prompts...)
 }
 
 type blockingExecutor struct {
@@ -147,7 +201,7 @@ func TestBridgeSessionMessagePersistsTurnRunsAndSendsOutbox(t *testing.T) {
 	}
 }
 
-func TestBridgeStreamsCodexProgressAndCommandsToTeams(t *testing.T) {
+func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	exitCode := 0
@@ -174,9 +228,6 @@ func TestBridgeStreamsCodexProgressAndCommandsToTeams(t *testing.T) {
 	for _, want := range []string{
 		"Codex is working",
 		"🤖 ⏳ Codex status:\nI am checking the failing test first.",
-		"🤖 🛠️ Codex command:\nRunning command:",
-		"Status: completed",
-		"--- FAIL: TestAdd",
 		"🔧 Helper: ✅ Codex finished responding.",
 		"🤖 ✅ Codex answer:\nFINAL MARKER",
 	} {
@@ -187,8 +238,367 @@ func TestBridgeStreamsCodexProgressAndCommandsToTeams(t *testing.T) {
 	if strings.LastIndex(joined, "🔧 Helper: ✅ Codex finished responding.") < strings.LastIndex(joined, "🤖 ✅ Codex answer:\nFINAL MARKER") {
 		t.Fatalf("final helper completion should appear after the Codex reply:\n%s", joined)
 	}
+	for _, leaked := range []string{
+		"🤖 🛠️ Codex command",
+		"Running command:",
+		"Status: completed",
+		"--- FAIL: TestAdd",
+		"go test ./...",
+	} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("streamed Teams messages leaked command detail %q:\n%s", leaked, joined)
+		}
+	}
 	if strings.Count(joined, "FINAL MARKER") != 1 {
 		t.Fatalf("final agent message was duplicated in streamed transcript:\n%s", joined)
+	}
+}
+
+func TestBridgeSendsCodexIdleStatusWhenStreamIsQuiet(t *testing.T) {
+	oldInitial := codexIdleStatusInitialDelay
+	oldRepeat := codexIdleStatusRepeatDelay
+	oldMessage := codexIdleStatusMessage
+	codexIdleStatusInitialDelay = 15 * time.Millisecond
+	codexIdleStatusRepeatDelay = time.Hour
+	codexIdleStatusMessage = "Still working. No new Codex update yet."
+	defer func() {
+		codexIdleStatusInitialDelay = oldInitial
+		codexIdleStatusRepeatDelay = oldRepeat
+		codexIdleStatusMessage = oldMessage
+	}()
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingStreamingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result: ExecutionResult{
+			Text:          "done after a long quiet step",
+			CodexThreadID: "thread-1",
+			CodexTurnID:   "turn-1",
+		},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-idle-status"), "run a quiet long task")
+	}()
+
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("streaming executor did not start")
+	}
+	waitForOutboxBody(t, store, "Still working. No new Codex update yet.")
+	close(executor.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleSessionMessage error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handleSessionMessage did not finish")
+	}
+
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+	if !strings.Contains(joined, "🤖 ⏳ Codex status:\nStill working. No new Codex update yet.") {
+		t.Fatalf("idle status missing or rendered with wrong label:\n%s", joined)
+	}
+	if strings.Count(joined, "Still working. No new Codex update yet.") != 1 {
+		t.Fatalf("idle status should be sent once before repeat interval:\n%s", joined)
+	}
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\ndone after a long quiet step") {
+		t.Fatalf("final answer missing after idle status:\n%s", joined)
+	}
+}
+
+func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	first := bridgePollMessage("first", "2026-05-03T01:00:00Z", "first prompt")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", first, "first prompt"); err != nil {
+		t.Fatalf("first handleSessionMessage error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "first prompt") {
+			t.Fatalf("first started prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Codex turn did not start")
+	}
+
+	second := bridgePollMessage("second", "2026-05-03T01:00:05Z", "second prompt")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", second, "second prompt"); err != nil {
+		t.Fatalf("second handleSessionMessage error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("second Codex turn started before first finished: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	waitForOutboxBody(t, store, "Queued. Codex will respond after the current request.")
+
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "second prompt") {
+			t.Fatalf("second started prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued second Codex turn did not start after first finished")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 2)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+
+	prompts := executor.promptSnapshot()
+	if len(prompts) != 2 || !strings.Contains(prompts[0], "first prompt") || !strings.Contains(prompts[1], "second prompt") {
+		t.Fatalf("executor prompts = %#v, want first then second", prompts)
+	}
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+	for _, want := range []string{
+		"Codex is working. Request accepted.",
+		"Queued. Codex will respond after the current request.",
+		"🤖 ✅ Codex answer:\ndone 1",
+		"🤖 ✅ Codex answer:\ndone 2",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("async queue transcript missing %q in:\n%s", want, joined)
+		}
+	}
+}
+
+func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 3),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	first := bridgePollMessage("first", "2026-05-03T01:00:00Z", "first prompt")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", first, "first prompt"); err != nil {
+		t.Fatalf("first handleSessionMessage error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("first Codex turn did not start")
+	}
+
+	for _, item := range []struct {
+		id     string
+		ts     string
+		prompt string
+	}{
+		{id: "second", ts: "2026-05-03T01:00:05Z", prompt: "second prompt"},
+		{id: "third", ts: "2026-05-03T01:00:06Z", prompt: "third prompt"},
+	} {
+		msg := bridgePollMessage(item.id, item.ts, item.prompt)
+		if err := bridge.handleSessionMessage(ctx, "chat-1", msg, item.prompt); err != nil {
+			t.Fatalf("%s handleSessionMessage error: %v", item.id, err)
+		}
+		select {
+		case got := <-executor.started:
+			t.Fatalf("%s Codex turn started before first finished: %q", item.id, got)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+	if got := strings.Count(joined, "Queued. Codex will respond after the current request."); got != 1 {
+		t.Fatalf("queued notice count = %d, want 1 in:\n%s", got, joined)
+	}
+
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "second prompt") {
+			t.Fatalf("second started prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued second Codex turn did not start after first finished")
+	}
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "third prompt") {
+			t.Fatalf("third started prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued third Codex turn did not start after second finished")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 3)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+
+	prompts := executor.promptSnapshot()
+	if len(prompts) != 3 ||
+		!strings.Contains(prompts[0], "first prompt") ||
+		!strings.Contains(prompts[1], "second prompt") ||
+		!strings.Contains(prompts[2], "third prompt") {
+		t.Fatalf("executor prompts = %#v, want first, second, third", prompts)
+	}
+}
+
+func waitForNoActiveTurnsOrOutbox(t *testing.T, store *teamstore.Store, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	stable := 0
+	for {
+		state, err := store.Load(context.Background())
+		if err != nil {
+			t.Fatalf("load store while waiting for idle turn queue: %v", err)
+		}
+		active := false
+		for _, turn := range state.Turns {
+			if turn.SessionID != sessionID {
+				continue
+			}
+			if turn.Status == teamstore.TurnStatusQueued || turn.Status == teamstore.TurnStatusRunning {
+				active = true
+				break
+			}
+		}
+		if !active {
+			for _, msg := range state.OutboxMessages {
+				if msg.SessionID != sessionID {
+					continue
+				}
+				if msg.Status == teamstore.OutboxStatusQueued || msg.Status == teamstore.OutboxStatusSending || msg.Status == teamstore.OutboxStatusAccepted {
+					active = true
+					break
+				}
+			}
+		}
+		if !active {
+			stable++
+			if stable >= 3 {
+				return
+			}
+		} else {
+			stable = 0
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for idle turn queue; turns=%#v outbox=%#v", state.Turns, state.OutboxMessages)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestBridgeSuppressesQueuedCodexCommandOutbox(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox-codex-command",
+		SessionID:   "session-1",
+		TurnID:      "turn-1",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-command-001",
+		Body:        "Running command:\ngo test ./...",
+	})
+	if err != nil {
+		t.Fatalf("queueOutbox error: %v", err)
+	}
+	if queued.Status != teamstore.OutboxStatusQueued {
+		t.Fatalf("queued status = %q", queued.Status)
+	}
+	if err := bridge.flushPendingOutboxForChat(ctx, "chat-1"); err != nil {
+		t.Fatalf("flushPendingOutboxForChat error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("queued Codex command outbox should not be sent: %#v", *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if got := state.OutboxMessages["outbox-codex-command"].Status; got != teamstore.OutboxStatusSent {
+		t.Fatalf("suppressed command outbox status = %q, want sent", got)
+	}
+}
+
+func waitForOutboxBody(t *testing.T, store *teamstore.Store, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		state, err := store.Load(context.Background())
+		if err != nil {
+			t.Fatalf("load store while waiting for outbox: %v", err)
+		}
+		for _, msg := range state.OutboxMessages {
+			if strings.Contains(msg.Body, want) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for outbox body %q; outbox=%#v", want, state.OutboxMessages)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForCompletedTurnCount(t *testing.T, store *teamstore.Store, sessionID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		state, err := store.Load(context.Background())
+		if err != nil {
+			t.Fatalf("load store while waiting for completed turns: %v", err)
+		}
+		var got int
+		for _, turn := range state.Turns {
+			if turn.SessionID == sessionID && turn.Status == teamstore.TurnStatusCompleted {
+				got++
+			}
+		}
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d completed turns; got %d; turns=%#v", want, got, state.Turns)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestShouldSuppressCodexCommandOutbox(t *testing.T) {
+	for _, kind := range []string{"codex-command-001", "CODEX-COMMAND-123"} {
+		if !shouldSuppressCodexCommandOutbox(kind) {
+			t.Fatalf("should suppress %q", kind)
+		}
+	}
+	for _, kind := range []string{"command-help", "error", "sync-status-1", "teams_session_command_deferred"} {
+		if shouldSuppressCodexCommandOutbox(kind) {
+			t.Fatalf("should not suppress helper/admin kind %q", kind)
+		}
 	}
 }
 
@@ -301,6 +711,7 @@ func TestBridgeQueuesAllLongOutputPartsBeforeFirstSend(t *testing.T) {
 			Body struct {
 				Content string `json:"content"`
 			} `json:"body"`
+			Mentions []json.RawMessage `json:"mentions"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			handlerErr = err
@@ -322,7 +733,7 @@ func TestBridgeQueuesAllLongOutputPartsBeforeFirstSend(t *testing.T) {
 			}
 		}
 		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-		sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+		sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
 	}))
@@ -351,10 +762,15 @@ func TestBridgeQueuesAllLongOutputPartsBeforeFirstSend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
+	sourceHash := normalizedTextHash(text)
 	for _, msg := range state.OutboxMessages {
-		if msg.Status != teamstore.OutboxStatusSent || msg.Sequence <= 0 || msg.PartCount != expectedParts || msg.PartIndex <= 0 {
+		if msg.Status != teamstore.OutboxStatusSent || msg.Sequence <= 0 || msg.PartCount != expectedParts || msg.PartIndex <= 0 || msg.SourceTextHash != sourceHash {
 			t.Fatalf("outbox part metadata mismatch: %#v", msg)
 		}
+	}
+	hashes := deliveredTranscriptHashes(state, "s001")
+	if !shouldSkipDeliveredTranscriptRecord(TranscriptRecord{Kind: TranscriptKindAssistant}, text, hashes) {
+		t.Fatal("chunked delivered final should dedupe the later full transcript record")
 	}
 }
 
@@ -671,39 +1087,27 @@ func TestBridgeControlWorkspacesAndSessionsDoNotRunCodex(t *testing.T) {
 	if len(executor.prompts) != 0 {
 		t.Fatalf("control dashboard invoked Codex: %#v", executor.prompts)
 	}
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-3"), "1"); err != nil {
-		t.Fatalf("bare session selection error: %v", err)
-	}
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-4"), "/details 1"); err != nil {
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-3"), "/details 1"); err != nil {
 		t.Fatalf("/details session error: %v", err)
 	}
-	if len(*sent) != 4 {
-		t.Fatalf("sent count = %d, want 4", len(*sent))
+	if len(*sent) != 3 {
+		t.Fatalf("sent count = %d, want 3", len(*sent))
 	}
-	if strings.Contains((*sent)[0].Content, "/home/user/project/alpha") {
-		t.Fatalf("workspace dashboard leaked full path: %q", (*sent)[0].Content)
-	}
-	if !strings.Contains((*sent)[0].Content, "alpha") {
-		t.Fatalf("dashboard output missing workspace/session: %#v", *sent)
+	workspaceDashboard := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(workspaceDashboard, "1 - /home/user/project/alpha") {
+		t.Fatalf("dashboard output missing numbered absolute workspace path: %q", workspaceDashboard)
 	}
 	sessionDashboard := PlainTextFromTeamsHTML((*sent)[1].Content)
-	if !strings.Contains(sessionDashboard, "sessions for alpha") {
+	if !strings.Contains(sessionDashboard, "Workspace: /home/user/project/alpha") {
 		t.Fatalf("session dashboard should name selected workspace: %q", sessionDashboard)
 	}
-	if !strings.Contains(sessionDashboard, "fix alpha") || !strings.Contains(sessionDashboard, "continue 1") {
+	if !strings.Contains(sessionDashboard, "fix alpha") || !strings.Contains(sessionDashboard, "c 1") {
 		t.Fatalf("session dashboard missing title/action: %q", sessionDashboard)
 	}
 	if strings.Contains(sessionDashboard, "thread-alpha") {
 		t.Fatalf("session dashboard leaked raw session id: %q", sessionDashboard)
 	}
-	selection := PlainTextFromTeamsHTML((*sent)[2].Content)
-	if !strings.Contains(selection, "not in Teams yet") || !strings.Contains(selection, "continue 1") {
-		t.Fatalf("local session selection = %q, want publish guidance", selection)
-	}
-	if strings.Contains(selection, "thread-alpha") {
-		t.Fatalf("local session selection leaked raw session id: %q", selection)
-	}
-	details := PlainTextFromTeamsHTML((*sent)[3].Content)
+	details := PlainTextFromTeamsHTML((*sent)[2].Content)
 	if !strings.Contains(details, "Codex session ID: thread-alpha") || !strings.Contains(details, "Working directory: /home/user/project/alpha") {
 		t.Fatalf("/details should expose technical ids on demand, got %q", details)
 	}
@@ -742,7 +1146,7 @@ func TestBridgeControlOpenRawLocalSessionSuggestsPublish(t *testing.T) {
 		t.Fatalf("sent count = %d, want 1", len(*sent))
 	}
 	got := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if !strings.Contains(got, "not in Teams yet") || !strings.Contains(got, "continue <number>") {
+	if !strings.Contains(got, "not in Teams yet") || !strings.Contains(got, "choose its number") {
 		t.Fatalf("/open raw local session response = %q", got)
 	}
 	if strings.Contains(got, "thread-alpha") {
@@ -777,8 +1181,8 @@ func TestBridgeControlWorkspaceListDoesNotShowWorkspaceFingerprint(t *testing.T)
 	if strings.Contains(got, "workspace:") {
 		t.Fatalf("workspace dashboard leaked workspace fingerprint: %q", got)
 	}
-	if !strings.Contains(got, "1. workspace") {
-		t.Fatalf("workspace dashboard missing fallback title: %q", got)
+	if !strings.Contains(got, "1 - Unknown workspace") || !strings.Contains(got, "Path: not recorded by Codex") {
+		t.Fatalf("workspace dashboard missing unknown-workspace guidance: %q", got)
 	}
 }
 
@@ -809,8 +1213,8 @@ func TestBridgeControlClosedLinkedSessionIsNotPresentedAsOpenable(t *testing.T) 
 	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-workspace"), "/workspace 1"); err != nil {
 		t.Fatalf("/workspace error: %v", err)
 	}
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-select"), "1"); err != nil {
-		t.Fatalf("select closed session error: %v", err)
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-select"), "/open 1"); err != nil {
+		t.Fatalf("open closed session error: %v", err)
 	}
 	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-status"), "/status"); err != nil {
 		t.Fatalf("/status error: %v", err)
@@ -832,39 +1236,39 @@ func TestBridgeControlClosedLinkedSessionIsNotPresentedAsOpenable(t *testing.T) 
 	}
 }
 
-func TestParseNewSessionRequestRequiresExplicitDirectoryBeforeSeparator(t *testing.T) {
-	got, err := parseNewSessionRequest("investigate --help output")
-	if err != nil {
-		t.Fatalf("parse title with flag-like separator: %v", err)
-	}
-	if got.WorkDir != "" || got.Prompt != "investigate --help output" {
-		t.Fatalf("flag-like title parsed as %#v, want title only", got)
-	}
-
-	got, err = parseNewSessionRequest("investigate -- help output")
-	if err != nil {
-		t.Fatalf("parse title with plain separator: %v", err)
-	}
-	if got.WorkDir != "" || got.Prompt != "investigate -- help output" {
-		t.Fatalf("plain title parsed as %#v, want title only without directory side effect", got)
-	}
-
+func TestParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle(t *testing.T) {
 	tmp := t.TempDir()
+	got, err := parseNewSessionRequest(tmp)
+	if err != nil {
+		t.Fatalf("parse directory request: %v", err)
+	}
+	if got.WorkDir != tmp || got.Title != "" {
+		t.Fatalf("directory request parsed as %#v", got)
+	}
+
 	got, err = parseNewSessionRequest(tmp + " -- inspect build")
 	if err != nil {
-		t.Fatalf("parse explicit directory request: %v", err)
+		t.Fatalf("parse directory request with optional title: %v", err)
 	}
-	if got.WorkDir != tmp || got.Prompt != "inspect build" {
-		t.Fatalf("explicit directory request parsed as %#v", got)
+	if got.WorkDir != tmp || got.Title != "inspect build" {
+		t.Fatalf("directory request with optional title parsed as %#v", got)
 	}
 
 	quoted := strconv.Quote(filepath.Join(tmp, "dir with spaces"))
 	got, err = parseNewSessionRequest(quoted + " -- inspect quoted build")
 	if err != nil {
-		t.Fatalf("parse quoted explicit directory request: %v", err)
+		t.Fatalf("parse quoted directory request: %v", err)
 	}
-	if got.WorkDir != filepath.Join(tmp, "dir with spaces") || got.Prompt != "inspect quoted build" {
-		t.Fatalf("quoted explicit directory request parsed as %#v", got)
+	if got.WorkDir != filepath.Join(tmp, "dir with spaces") || got.Title != "inspect quoted build" {
+		t.Fatalf("quoted directory request parsed as %#v", got)
+	}
+
+	got, err = parseNewSessionRequest("")
+	if err != nil {
+		t.Fatalf("empty request should be resolved by selected workspace later: %v", err)
+	}
+	if got.WorkDir != "" || got.Title != "" {
+		t.Fatalf("empty request parsed as %#v, want empty for selected workspace fallback", got)
 	}
 }
 
@@ -914,7 +1318,7 @@ func TestBridgeControlWorkspaceSessionsOnlyShowsSelectedWorkspace(t *testing.T) 
 	if strings.Contains(sessions, "thread-alpha") || strings.Contains(sessions, "thread-beta") {
 		t.Fatalf("selected workspace sessions leaked raw ids: %q", sessions)
 	}
-	if strings.Count(sessions, "1.") != 1 {
+	if strings.Count(sessions, "1 -") != 1 {
 		t.Fatalf("session numbering should be scoped to selected workspace, got %q", sessions)
 	}
 }
@@ -956,7 +1360,7 @@ func TestBridgeDashboardNumbersSurviveViewRoundTrip(t *testing.T) {
 		t.Fatalf("sent = %#v, want 3 dashboard messages", *sent)
 	}
 	refreshed := PlainTextFromTeamsHTML((*sent)[2].Content)
-	if !strings.Contains(refreshed, "1. alpha") || !strings.Contains(refreshed, "2. beta") {
+	if !strings.Contains(refreshed, "1 - /home/user/project/alpha") || !strings.Contains(refreshed, "2 - /home/user/project/beta") {
 		t.Fatalf("workspace numbers changed after sessions view round trip: %q", refreshed)
 	}
 }
@@ -998,7 +1402,7 @@ func TestBridgeDashboardEmptyWorkspaceKeepsSessionsContext(t *testing.T) {
 		t.Fatalf("sent = %#v, want 3 dashboard messages", *sent)
 	}
 	got := PlainTextFromTeamsHTML((*sent)[2].Content)
-	if !strings.Contains(got, "No local Codex sessions found") || strings.Contains(got, "thread-beta") {
+	if !strings.Contains(got, "No local Codex sessions") || strings.Contains(got, "thread-beta") {
 		t.Fatalf("/sessions lost empty workspace context: %q", got)
 	}
 }
@@ -1104,7 +1508,7 @@ func TestBridgeControlPathTextShowsPathHint(t *testing.T) {
 				t.Fatalf("sent count = %d, want one path hint", len(*sent))
 			}
 			got := PlainTextFromTeamsHTML((*sent)[0].Content)
-			if !strings.Contains(got, "Detected path") || !strings.Contains(got, "new "+quoteTeamsCommandPath(text)+" -- ") {
+			if !strings.Contains(got, "Detected path") || !strings.Contains(got, "new "+quoteTeamsCommandPath(text)) || strings.Contains(got, " -- ") {
 				t.Fatalf("path hint = %q", got)
 			}
 		})
@@ -1179,7 +1583,7 @@ func TestBridgeControlWorkOnlyHelperCommandExplainsCorrectChat(t *testing.T) {
 		t.Fatalf("sent message count = %d, want 1", len(*sent))
 	}
 	got := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if !strings.Contains(got, "control chat") || !strings.Contains(got, "helper ...") || !strings.Contains(got, "Work chat") || !strings.Contains(got, "new <directory> -- <title>") {
+	if !strings.Contains(got, "control chat") || !strings.Contains(got, "helper ...") || !strings.Contains(got, "Work chat") || !strings.Contains(got, "new <directory>") {
 		t.Fatalf("wrong-chat helper response = %q", got)
 	}
 }
@@ -1198,8 +1602,391 @@ func TestBridgeControlHelpIsFirstClassCommand(t *testing.T) {
 		t.Fatalf("executor prompts = %#v, want none", executor.prompts)
 	}
 	helpText := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if len(*sent) != 1 || strings.Contains(helpText, "unknown control command") || !strings.Contains(helpText, "Start here") || !strings.Contains(helpText, "new <directory> -- <title>") || !strings.Contains(helpText, "continue <number>") || !strings.Contains(helpText, "help advanced") || strings.Contains(helpText, "cx ") {
+	if len(*sent) != 1 || strings.Contains(helpText, "unknown control command") || !strings.Contains(helpText, "Start here") || !strings.Contains(helpText, "new <directory>") || !strings.Contains(helpText, "continue <number>") || !strings.Contains(helpText, "help advanced") || strings.Contains(helpText, "cx ") {
 		t.Fatalf("control help response = %#v", *sent)
+	}
+}
+
+func TestBridgeControlRestartRequiresConfirmationAndRunsRestarter(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-help"), "helper restart"); err != nil {
+		t.Fatalf("handleControlMessage restart help error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("helper restart without now should not restart")
+	default:
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "helper restart now") {
+		t.Fatalf("restart confirmation response = %#v", *sent)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-now"), "helper restart now"); err != nil {
+		t.Fatalf("handleControlMessage restart now error: %v", err)
+	}
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("helper restart now did not call restarter")
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none", executor.prompts)
+	}
+	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "restart scheduled") {
+		t.Fatalf("restart scheduled response = %#v", *sent)
+	}
+}
+
+func TestBridgeControlRestartReportsUnavailableWhenNotConfigured(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-unavailable"), "helper restart now"); err != nil {
+		t.Fatalf("handleControlMessage restart unavailable error: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "not available") {
+		t.Fatalf("restart unavailable response = %#v", *sent)
+	}
+}
+
+func TestBridgeControlRestartNowDoesNotInterruptActiveWork(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn-active", SessionID: "s1", Status: teamstore.TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-active"), "helper restart now"); err != nil {
+		t.Fatalf("handleControlMessage restart active error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("helper restart now should not restart while work is active")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "Codex work is still active") || !strings.Contains(got, "helper restart force") {
+		t.Fatalf("active-work restart response = %q", got)
+	}
+}
+
+func TestBridgeControlRestartForceCanInterruptActiveWork(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn-active", SessionID: "s1", Status: teamstore.TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-force"), "helper restart force"); err != nil {
+		t.Fatalf("handleControlMessage restart force error: %v", err)
+	}
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("helper restart force did not call restarter")
+	}
+}
+
+func TestBridgeControlRestartDoesNotRunDuringHelperUpgrade(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	if _, err := store.SetDraining(context.Background(), teamstore.HelperUpgradeReason); err != nil {
+		t.Fatalf("SetDraining error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-upgrade"), "helper restart force"); err != nil {
+		t.Fatalf("handleControlMessage restart upgrade error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("helper restart must not run during helper upgrade drain")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "upgrade is already in progress") || !strings.Contains(got, "will not start another restart") {
+		t.Fatalf("upgrade restart response = %q", got)
+	}
+}
+
+func TestBridgeControlReloadRequiresConfirmationAndRunsReloader(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	reloaded := make(chan HelperReloadOptions, 1)
+	bridge.helperReloader = func(ctx context.Context, opts HelperReloadOptions) error {
+		if opts.BeforeRestart != nil {
+			if err := opts.BeforeRestart(ctx); err != nil {
+				return err
+			}
+		}
+		reloaded <- opts
+		return nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-help"), "helper reload"); err != nil {
+		t.Fatalf("handleControlMessage reload help error: %v", err)
+	}
+	select {
+	case <-reloaded:
+		t.Fatal("helper reload without now should not reload")
+	default:
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "helper reload now") {
+		t.Fatalf("reload confirmation response = %#v", *sent)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-now"), "helper reload now"); err != nil {
+		t.Fatalf("handleControlMessage reload now error: %v", err)
+	}
+	select {
+	case opts := <-reloaded:
+		if opts.Force {
+			t.Fatal("helper reload now should not set force")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("helper reload now did not call reloader")
+	}
+	waitBridgeControlNotDraining(t, store)
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none", executor.prompts)
+	}
+	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "reload started") {
+		t.Fatalf("reload started response = %#v", *sent)
+	}
+}
+
+func TestBridgeControlReloadReportsUnavailableWhenNotConfigured(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-unavailable"), "helper reload now"); err != nil {
+		t.Fatalf("handleControlMessage reload unavailable error: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "not available") {
+		t.Fatalf("reload unavailable response = %#v", *sent)
+	}
+}
+
+func TestBridgeControlReloadNowDoesNotInterruptActiveWork(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	reloaded := make(chan struct{}, 1)
+	bridge.helperReloader = func(context.Context, HelperReloadOptions) error {
+		reloaded <- struct{}{}
+		return nil
+	}
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn-active", SessionID: "s1", Status: teamstore.TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-active"), "helper reload now"); err != nil {
+		t.Fatalf("handleControlMessage reload active error: %v", err)
+	}
+	select {
+	case <-reloaded:
+		t.Fatal("helper reload now should not reload while work is active")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "Codex work is still active") || !strings.Contains(got, "helper reload force") {
+		t.Fatalf("active-work reload response = %q", got)
+	}
+}
+
+func TestBridgeControlReloadForceCanInterruptActiveWork(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	reloaded := make(chan bool, 1)
+	bridge.helperReloader = func(ctx context.Context, opts HelperReloadOptions) error {
+		if opts.BeforeRestart != nil {
+			if err := opts.BeforeRestart(ctx); err != nil {
+				return err
+			}
+		}
+		reloaded <- opts.Force
+		return nil
+	}
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn-active", SessionID: "s1", Status: teamstore.TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-force"), "helper reload force"); err != nil {
+		t.Fatalf("handleControlMessage reload force error: %v", err)
+	}
+	select {
+	case force := <-reloaded:
+		if !force {
+			t.Fatal("helper reload force did not pass force option")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("helper reload force did not call reloader")
+	}
+	waitBridgeControlNotDraining(t, store)
+}
+
+func TestBridgeControlReloadDoesNotRunDuringHelperUpgradeOrReload(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{name: "upgrade", reason: teamstore.HelperUpgradeReason, want: "upgrade is already in progress"},
+		{name: "reload", reason: teamstore.HelperReloadReason, want: "reload is already in progress"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			reloaded := make(chan struct{}, 1)
+			bridge.helperReloader = func(context.Context, HelperReloadOptions) error {
+				reloaded <- struct{}{}
+				return nil
+			}
+			if _, err := store.SetDraining(context.Background(), tc.reason); err != nil {
+				t.Fatalf("SetDraining error: %v", err)
+			}
+
+			if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-"+tc.name), "helper reload force"); err != nil {
+				t.Fatalf("handleControlMessage reload %s error: %v", tc.name, err)
+			}
+			select {
+			case <-reloaded:
+				t.Fatalf("helper reload must not run during %s drain", tc.name)
+			default:
+			}
+			if len(*sent) != 1 {
+				t.Fatalf("sent message count = %d, want 1", len(*sent))
+			}
+			if got := PlainTextFromTeamsHTML((*sent)[0].Content); !strings.Contains(got, tc.want) {
+				t.Fatalf("drain reload response = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBridgeControlReloadFailureClearsDrain(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	done := make(chan struct{}, 1)
+	bridge.helperReloader = func(context.Context, HelperReloadOptions) error {
+		done <- struct{}{}
+		return errors.New("synthetic reload failure")
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-failure"), "helper reload now"); err != nil {
+		t.Fatalf("handleControlMessage reload failure error: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("helper reload did not call failing reloader")
+	}
+	waitBridgeControlNotDraining(t, store)
+	deadline := time.Now().Add(time.Second)
+	for {
+		for _, msg := range *sent {
+			if strings.Contains(PlainTextFromTeamsHTML(msg.Content), "Helper reload failed") {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reload failure response not sent: %#v", *sent)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitBridgeControlNotDraining(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		state, err := store.Load(context.Background())
+		if err != nil {
+			t.Fatalf("Load error: %v", err)
+		}
+		if !state.ServiceControl.Draining {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("service control still draining: %#v", state.ServiceControl)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1235,7 +2022,7 @@ func TestBridgeControlNaturalCommandFlowDoesNotRequireSlash(t *testing.T) {
 		t.Fatalf("sent = %#v, want projects, sessions, details", *sent)
 	}
 	sessions := PlainTextFromTeamsHTML((*sent)[1].Content)
-	if !strings.Contains(sessions, "continue 1") || strings.Contains(sessions, "/publish") {
+	if !strings.Contains(sessions, "c 1") || strings.Contains(sessions, "/publish") {
 		t.Fatalf("natural sessions output = %q", sessions)
 	}
 	details := PlainTextFromTeamsHTML((*sent)[2].Content)
@@ -1420,20 +2207,21 @@ func TestBridgePublishImportsExistingTranscriptOnDemand(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			createdChat = true
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"Codex Work - local - thread-alpha - fix alpha","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+			writeTestOnlineMeeting(w, "work-chat", "Codex Work - local - thread-alpha - fix alpha")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
 					Content string `json:"content"`
 				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode message: %v", err)
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
 			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -1461,19 +2249,34 @@ func TestBridgePublishImportsExistingTranscriptOnDemand(t *testing.T) {
 	if createdChat {
 		t.Fatal("workspace/session listing should not create a work chat")
 	}
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-3"), "/publish 1"); err != nil {
-		t.Fatalf("/publish error: %v", err)
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-3"), "1"); err != nil {
+		t.Fatalf("bare session selection publish error: %v", err)
 	}
 	if !createdChat {
 		t.Fatal("publish did not create work chat")
 	}
+	prepIndex := -1
+	firstWorkIndex := -1
 	var imported string
-	for _, msg := range sent {
+	for i, msg := range sent {
+		plain := PlainTextFromTeamsHTML(msg.Content)
+		if msg.ChatID == "control-chat" && strings.Contains(plain, "Preparing local Codex history now") {
+			prepIndex = i
+			if !strings.Contains(plain, "Open Work chat:") || !strings.Contains(plain, "teams.microsoft.com/l/chat/") {
+				t.Fatalf("control prep message should include the work chat URL, got %q", plain)
+			}
+		}
 		if msg.ChatID == "work-chat" {
-			imported += "\n" + PlainTextFromTeamsHTML(msg.Content)
+			if firstWorkIndex < 0 {
+				firstWorkIndex = i
+			}
+			imported += "\n" + plain
 		}
 	}
-	if !strings.Contains(imported, "Imported Codex session") || !strings.Contains(imported, "User:") || !strings.Contains(imported, "hello") || !strings.Contains(imported, "Codex answer:") || !strings.Contains(imported, "hi there") {
+	if prepIndex < 0 || firstWorkIndex < 0 || prepIndex > firstWorkIndex {
+		t.Fatalf("control prep message should be sent before work-chat import messages: prep=%d firstWork=%d sent=%#v", prepIndex, firstWorkIndex, sent)
+	}
+	if !strings.Contains(imported, "Work chat created:") || !strings.Contains(imported, "Imported Codex session") || !strings.Contains(imported, "User:") || !strings.Contains(imported, "hello") || !strings.Contains(imported, "Codex answer:") || !strings.Contains(imported, "hi there") {
 		t.Fatalf("imported transcript missing expected records: %q", imported)
 	}
 	if got := bridge.reg.SessionByCodexThreadID("thread-alpha"); got == nil || got.ChatID != "work-chat" {
@@ -1505,9 +2308,9 @@ func TestBridgePublishClosedLinkedSessionCreatesNewWorkChat(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			createCalls++
-			_, _ = fmt.Fprintf(w, `{"id":"new-work-chat","topic":"%s","chatType":"group","webUrl":"https://teams.example/new-work"}`, DefaultWorkChatMarker)
+			writeTestOnlineMeeting(w, "new-work-chat", DefaultWorkChatMarker)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			_, _ = fmt.Fprint(w, `{"id":"sent-1","messageType":"message"}`)
 		default:
@@ -1584,6 +2387,51 @@ func TestBridgeImportCheckpointMismatchDoesNotMarkComplete(t *testing.T) {
 	}
 }
 
+func TestBridgePrepareRecoversFailedTranscriptCheckpointBySourceLine(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := *bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-alpha"
+	if err := bridge.ensureDurableSession(context.Background(), &session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), "s001", func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID("s001")] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID("s001"),
+			SessionID:      "s001",
+			SourcePath:     transcriptPath,
+			LastRecordID:   "stale-checkpoint-key",
+			LastSourceLine: 1,
+			Status:         importCheckpointStatusFailed,
+			UpdatedAt:      time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed checkpoint: %v", err)
+	}
+
+	gate, err := bridge.prepareLocalCodexBeforeTeamsTurn(context.Background(), &session)
+	if err != nil {
+		t.Fatalf("prepareLocalCodexBeforeTeamsTurn error: %v", err)
+	}
+	if gate.Block {
+		t.Fatalf("gate blocked after recoverable checkpoint failure: %#v", gate)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "u1" || checkpoint.LastSourceLine != 1 {
+		t.Fatalf("checkpoint was not recovered: %#v", checkpoint)
+	}
+}
+
 func TestBridgePublishImportsExistingTranscriptInExactTeamsOrder(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	longAssistant := strings.Repeat("chunk-order-", 13000)
@@ -1620,26 +2468,21 @@ func TestBridgePublishImportsExistingTranscriptInExactTeamsOrder(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
-			var body struct {
-				Topic string `json:"topic"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatalf("decode create chat: %v", err)
-			}
-			createdTopic = body.Topic
-			_, _ = fmt.Fprintf(w, `{"id":"work-chat","topic":%q,"chatType":"group","webUrl":"https://teams.example/work-chat"}`, body.Topic)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			createdTopic = decodeTestOnlineMeetingSubject(t, r)
+			writeTestOnlineMeeting(w, "work-chat", createdTopic)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
 					Content string `json:"content"`
 				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode message: %v", err)
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
 			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -1677,36 +2520,44 @@ func TestBridgePublishImportsExistingTranscriptInExactTeamsOrder(t *testing.T) {
 			work = append(work, PlainTextFromTeamsHTML(msg.Content))
 		}
 	}
-	if len(work) < 6 {
-		t.Fatalf("work import sent %d message(s), want title, user, chunked assistant, user, assistant: %#v", len(work), work)
+	if len(work) < 7 {
+		t.Fatalf("work import sent %d message(s), want create mention, title, user, chunked assistant, user, assistant: %#v", len(work), work)
 	}
-	if !strings.Contains(work[0], "Helper: Imported Codex session") {
-		t.Fatalf("first imported message = %q, want import title", work[0])
+	if !strings.Contains(work[0], "Work chat created:") {
+		t.Fatalf("first imported message = %q, want work chat creation mention", work[0])
 	}
-	if !strings.Contains(work[1], "User:\nfirst question") {
-		t.Fatalf("second imported message = %q, want first user prompt", work[1])
+	if !strings.Contains(work[1], "Imported Codex session") {
+		t.Fatalf("second imported message = %q, want import title", work[1])
 	}
-	chunkEnd := 2
+	if !strings.Contains(work[2], "User:\nfirst question") {
+		t.Fatalf("third imported message = %q, want first user prompt", work[2])
+	}
+	chunkEnd := 3
 	for chunkEnd < len(work) && strings.Contains(work[chunkEnd], "Codex answer [part ") {
 		chunkEnd++
 	}
 	if chunkEnd <= 3 {
 		t.Fatalf("long assistant was not chunked into consecutive assistant parts: %#v", work)
 	}
-	if chunkEnd+2 >= len(work) {
+	if chunkEnd >= len(work) {
 		t.Fatalf("missing records after assistant chunks: %#v", work)
 	}
 	if strings.Contains(strings.Join(work, "\n"), "Tool read file.go") {
 		t.Fatalf("historical tool records should be skipped from the Teams recall view: %#v", work)
 	}
-	if !strings.Contains(work[chunkEnd], "Codex status:\nThinking through plan") {
-		t.Fatalf("message after assistant chunks = %q, want imported status record", work[chunkEnd])
+	tail := strings.Join(work[chunkEnd:], "\n")
+	if !strings.Contains(tail, "Codex status:\nThinking through plan") {
+		t.Fatalf("messages after assistant chunks = %q, want imported status record", tail)
 	}
-	if !strings.Contains(work[chunkEnd+1], "User:\nsecond question") {
-		t.Fatalf("message after status = %q, want second user prompt", work[chunkEnd+1])
+	if !strings.Contains(tail, "User:\nsecond question") {
+		t.Fatalf("messages after status = %q, want second user prompt", tail)
 	}
-	if !strings.Contains(work[chunkEnd+2], "Codex answer:\nsecond answer") {
-		t.Fatalf("message after second user = %q, want second assistant answer", work[chunkEnd+1])
+	if !strings.Contains(tail, "Codex answer:\nsecond answer") {
+		t.Fatalf("messages after second user = %q, want second assistant answer", tail)
+	}
+	if strings.Index(tail, "Codex status:\nThinking through plan") > strings.Index(tail, "User:\nsecond question") ||
+		strings.Index(tail, "User:\nsecond question") > strings.Index(tail, "Codex answer:\nsecond answer") {
+		t.Fatalf("batched messages after assistant chunks are out of order: %q", tail)
 	}
 	if !strings.Contains(work[len(work)-1], "Imported 5 visible history item(s)") || !strings.Contains(work[len(work)-1], "skipped 1 background tool event") {
 		t.Fatalf("completion message = %q, want skipped-tool summary", work[len(work)-1])
@@ -1766,19 +2617,20 @@ func TestBridgePublishImportsCompleteLongTranscriptAndMarksAttachedSubagents(t *
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"Codex Work - qa - thread-parent","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "work-chat", "Codex Work - qa - thread-parent")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
 					Content string `json:"content"`
 				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode message: %v", err)
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
 			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -1809,10 +2661,10 @@ func TestBridgePublishImportsCompleteLongTranscriptAndMarksAttachedSubagents(t *
 		"User:\nparent user 01",
 		"User:\nparent user 55",
 		"Codex answer:\nparent final answer after tui limit",
-		"Helper: Subagent spawned",
+		"Subagent spawned",
 		"Subagent: subagent review task",
 		"The child subagent transcript is not expanded here",
-		"Helper: Import complete. This chat is ready",
+		"Import complete. This chat is ready",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("imported transcript missing %q in:\n%s", want, joined)
@@ -1824,7 +2676,7 @@ func TestBridgePublishImportsCompleteLongTranscriptAndMarksAttachedSubagents(t *
 	if strings.Index(joined, "User:\nparent user 55") > strings.Index(joined, "Codex answer:\nparent final answer after tui limit") {
 		t.Fatalf("parent transcript order is wrong:\n%s", joined)
 	}
-	if strings.Index(joined, "Codex answer:\nparent final answer after tui limit") > strings.Index(joined, "Helper: Subagent spawned") {
+	if strings.Index(joined, "Codex answer:\nparent final answer after tui limit") > strings.Index(joined, "Subagent spawned") {
 		t.Fatalf("subagent marker should follow the parent transcript:\n%s", joined)
 	}
 	state, err := store.Load(context.Background())
@@ -1997,8 +2849,8 @@ func TestBridgePublishImportsDuplicateSourceIDsWithoutDroppingRecords(t *testing
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"Codex Work - qa - thread-dup","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "work-chat", "Codex Work - qa - thread-dup")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
@@ -2100,6 +2952,280 @@ func TestBridgeImportTranscriptDedupesNonAdjacentAssistantStatusEcho(t *testing.
 	}
 }
 
+func TestBridgeImportTranscriptBatchesVisibleHistoryRecords(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	var lines []string
+	for i := 1; i <= 12; i++ {
+		lines = append(lines,
+			fmt.Sprintf(`{"id":"u-%02d","role":"user","text":"user prompt %02d"}`, i, i),
+			fmt.Sprintf(`{"type":"response_item","payload":{"id":"tool-%02d","type":"function_call","name":"shell","arguments":"{\"cmd\":\"rg query %02d\"}"}}`, i, i),
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"agent_message","id":"s-%02d","message":"status update %02d","phase":"commentary"}}`, i, i),
+			fmt.Sprintf(`{"id":"a-%02d","role":"assistant","text":"assistant answer %02d"}`, i, i),
+		)
+	}
+	lines = append(lines, "")
+	if err := os.WriteFile(transcriptPath, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+
+	lastRecordID, _, stats, err := bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import:"+session.ID, "import", transcriptCheckpointID(session.ID))
+	if err != nil {
+		t.Fatalf("import transcript records: %v", err)
+	}
+	if lastRecordID != "a-12" {
+		t.Fatalf("lastRecordID = %q, want a-12", lastRecordID)
+	}
+	if stats.Total != 48 || stats.Imported != 36 || stats.SkippedBackground != 12 {
+		t.Fatalf("stats = %#v, want total 48 imported 36 skipped 12", stats)
+	}
+	if len(*sent) >= 36 {
+		t.Fatalf("history import sent %d Teams messages, want visible records batched below 36", len(*sent))
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("small transcript should fit in one import batch, sent=%d", len(*sent))
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	for _, want := range []string{
+		"🧑‍💻 User:\nuser prompt 01",
+		"🤖 ⏳ Codex status:\nstatus update 01",
+		"🤖 ✅ Codex answer:\nassistant answer 12",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("batched import missing %q in:\n%s", want, plain)
+		}
+	}
+	if strings.Contains(plain, "🔧 Helper:\n🧑‍💻 User:") {
+		t.Fatalf("batched transcript should not be wrapped as one helper message:\n%s", plain)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	var batchOutbox teamstore.OutboxMessage
+	for _, outbox := range state.OutboxMessages {
+		if isTranscriptImportBatchOutboxKind(outbox.Kind) {
+			batchOutbox = outbox
+			break
+		}
+	}
+	if batchOutbox.ID == "" {
+		t.Fatalf("missing import batch outbox in state: %#v", state.OutboxMessages)
+	}
+	if renderOutboxHTML(batchOutbox) != batchOutbox.Body {
+		t.Fatal("import batch outbox should render its pre-rendered safe HTML body directly")
+	}
+}
+
+func TestBridgePollIgnoresImportBatchBeforeAnnotatingUserPrefix(t *testing.T) {
+	importBatch := teamstore.OutboxMessage{
+		ID:          "outbox:import-batch",
+		TeamsChatID: "chat-1",
+		Kind:        "import-batch-0001-first-last",
+		Body: strings.Join([]string{
+			renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderUser, Text: "historical user prompt"}, 1, 1),
+			transcriptImportBatchSeparatorHTML,
+			renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderAssistant, Text: "historical assistant answer"}, 1, 1),
+		}, ""),
+		Status: teamstore.OutboxStatusSent,
+	}
+	var patched bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages":
+			msg := bridgePollMessage("teams-import-batch-1", "2026-04-30T01:05:00Z", "")
+			msg.Body.Content = importBatch.Body
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{msg}}); err != nil {
+				t.Fatalf("encode poll response: %v", err)
+			}
+		case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/teams-import-batch-1":
+			patched = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), importBatch); err != nil {
+		t.Fatalf("QueueOutbox import batch error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.readGraph = graph
+	bridge.annotateUserMessages = true
+
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if patched {
+		t.Fatal("import batch was annotated with a User prefix")
+	}
+	if len(handled) != 0 {
+		t.Fatalf("import batch should not be handled as user input: %#v", handled)
+	}
+	if !bridge.reg.HasSent("chat-1", "teams-import-batch-1") {
+		t.Fatal("import batch was not marked as sent after content-match ignore")
+	}
+}
+
+func TestBridgePollSkipsWorkChatWhileTranscriptImporting(t *testing.T) {
+	var workPolls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/control-chat/messages":
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{}}); err != nil {
+				t.Fatalf("encode control response: %v", err)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages":
+			workPolls++
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{
+				bridgePollMessage("work-during-import", "2026-04-30T01:10:00Z", "do not interrupt import"),
+			}}); err != nil {
+				t.Fatalf("encode work response: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.readGraph = graph
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.markTranscriptImportStarted(context.Background(), *session, "/tmp/session.jsonl"); err != nil {
+		t.Fatalf("markTranscriptImportStarted error: %v", err)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if workPolls != 0 {
+		t.Fatalf("work chat was polled %d time(s) while transcript import was active", workPolls)
+	}
+}
+
+func TestBridgeSessionMessageDefersUntilTranscriptImportCompletes(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "deferred answer", CodexThreadID: "thread-1", CodexTurnID: "turn-deferred"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.markTranscriptImportStarted(context.Background(), *session, "/tmp/session.jsonl"); err != nil {
+		t.Fatalf("markTranscriptImportStarted error: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("during-import", "run after import"), "run after import"); err != nil {
+		t.Fatalf("handleSessionMessage during import error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	var deferred teamstore.InboundEvent
+	for _, inbound := range state.InboundEvents {
+		if inbound.TeamsMessageID == "during-import" {
+			deferred = inbound
+			break
+		}
+	}
+	if deferred.ID == "" || deferred.Status != teamstore.InboundStatusDeferred || deferred.Text != "run after import" {
+		t.Fatalf("message was not deferred cleanly during import: %#v", deferred)
+	}
+	if len(state.Turns) != 0 || len(*sent) != 0 || len(executor.prompts) != 0 {
+		t.Fatalf("deferred import message should not queue, send ack, or run Codex yet; turns=%#v sent=%#v prompts=%#v", state.Turns, *sent, executor.prompts)
+	}
+
+	if err := bridge.markTranscriptImportComplete(context.Background(), *session, "/tmp/session.jsonl", "a-final", 42); err != nil {
+		t.Fatalf("markTranscriptImportComplete error: %v", err)
+	}
+	if err := bridge.processDeferredInbound(context.Background()); err != nil {
+		t.Fatalf("processDeferredInbound error: %v", err)
+	}
+	waitForCompletedTurnCount(t, store, "s001", 1)
+	joined := sentPlainText(*sent)
+	if !strings.Contains(joined, "Codex is working. Request accepted.") || !strings.Contains(joined, "deferred answer") {
+		t.Fatalf("deferred message was not replayed after import completion, sent=\n%s", joined)
+	}
+}
+
+func TestBridgeQueuedTurnsWaitForTranscriptImport(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{result: ExecutionResult{Text: "should wait"}})
+	bridge.asyncTurns = true
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	inbound, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		SessionID:      "s001",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "queued-during-import",
+		Text:           "queued input",
+		TextHash:       normalizedTextHash("queued input"),
+		Status:         teamstore.InboundStatusPersisted,
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{SessionID: "s001", InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if err := bridge.markTranscriptImportStarted(context.Background(), *session, "/tmp/session.jsonl"); err != nil {
+		t.Fatalf("markTranscriptImportStarted error: %v", err)
+	}
+
+	started, err := bridge.startQueuedTurn(context.Background(), session, "", nil)
+	if err != nil {
+		t.Fatalf("startQueuedTurn error: %v", err)
+	}
+	if started {
+		t.Fatal("queued turn started while transcript import was active")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if got := state.Turns[turn.ID].Status; got != teamstore.TurnStatusQueued {
+		t.Fatalf("turn status = %q, want queued while import is active", got)
+	}
+}
+
 func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	transcript := strings.Join([]string{
@@ -2132,8 +3258,8 @@ func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"Codex Work - local - thread-alpha - fix alpha","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "work-chat", "Codex Work - local - thread-alpha - fix alpha")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
@@ -2227,8 +3353,8 @@ func TestBridgePublishRetryAfterTitleFailureIsNotSkippedByBackgroundSync(t *test
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"Codex Work - qa - thread-alpha","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "work-chat", "Codex Work - qa - thread-alpha")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
@@ -2312,9 +3438,9 @@ func TestBridgePublishDefersDuringHelperUpgradeDrain(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			createCalls++
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"Codex Work - local - thread-alpha - fix alpha","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+			writeTestOnlineMeeting(w, "work-chat", "Codex Work - local - thread-alpha - fix alpha")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			_, _ = fmt.Fprint(w, `{"id":"sent","messageType":"message"}`)
 		default:
@@ -2552,6 +3678,7 @@ func TestBridgeSessionHostedContentIsDownloadedForCodexTurn(t *testing.T) {
 }
 
 func TestBridgeSessionReferenceFileAttachmentIsDownloadedForCodexTurn(t *testing.T) {
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "openid profile offline_access User.Read Chat.Read Files.Read")
 	graph, sent := newBridgeReferenceFileGraph(t)
 	store := newBridgeTestStore(t)
@@ -3136,7 +4263,7 @@ func TestBridgePollSeedsThenUsesDurableModifiedCursor(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	var handled []string
 
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3153,7 +4280,7 @@ func TestBridgePollSeedsThenUsesDurableModifiedCursor(t *testing.T) {
 		t.Fatalf("missing seeded poll state: %#v ok=%v", poll, ok)
 	}
 
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3181,7 +4308,7 @@ func TestBridgePollUsesReadGraphAndSendsWithWriteGraph(t *testing.T) {
 	bridge := newBridgeTestBridge(writeGraph, store, executor)
 	bridge.readGraph = readGraph
 
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
 		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
 	}); err != nil {
 		t.Fatalf("pollChat error: %v", err)
@@ -3242,7 +4369,7 @@ func TestBridgePollAnnotatesIncomingUserMessageBestEffort(t *testing.T) {
 	bridge.user.DisplayName = "Jason Wei"
 	bridge.annotateUserMessages = true
 	var handled []string
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3277,7 +4404,7 @@ func TestBridgePollDurableCursorSurvivesEmptyRegistry(t *testing.T) {
 	bridge.reg.Chats = map[string]ChatState{}
 	var handled []string
 
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3298,7 +4425,7 @@ func TestBridgePollDoesNotDropUserPromptStartingWithCodexPrefix(t *testing.T) {
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	var handled []string
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3306,6 +4433,98 @@ func TestBridgePollDoesNotDropUserPromptStartingWithCodexPrefix(t *testing.T) {
 	}
 	if len(handled) != 1 || handled[0] != "Codex: 这个日志是什么意思" {
 		t.Fatalf("handled = %#v, want Codex-prefixed user prompt", handled)
+	}
+}
+
+func TestBridgePollIgnoresDurableDeliveredOutboxAfterRegistryLoss(t *testing.T) {
+	contentOnlyOutbox := teamstore.OutboxMessage{
+		ID:          "outbox:sent-helper-without-message-id",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-progress-003",
+		Body:        "old process sent this but crashed before storing its Teams message id",
+		Status:      teamstore.OutboxStatusSent,
+	}
+	contentOnlyMessage := bridgePollMessage("teams-helper-sent-by-content", "2026-04-30T01:05:01Z", "")
+	contentOnlyMessage.Body.Content = renderOutboxHTML(contentOnlyOutbox)
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{
+			bridgePollMessage("teams-helper-sent-1", "2026-04-30T01:05:00Z", "🔧 Helper:\nImported Codex session"),
+			contentOnlyMessage,
+		},
+	}})
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:             "outbox:sent-helper-message",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-sent-1",
+		Kind:           "helper",
+		Body:           "Imported Codex session",
+		Status:         teamstore.OutboxStatusSent,
+	}); err != nil {
+		t.Fatalf("QueueOutbox sent helper message error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, contentOnlyOutbox); err != nil {
+		t.Fatalf("QueueOutbox content-only helper message error: %v", err)
+	}
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.reg.Chats = map[string]ChatState{}
+	var handled []string
+
+	if _, err := bridge.pollChat(ctx, "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled helper-authored durable outbox as inbound prompt: %#v", handled)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none", executor.prompts)
+	}
+	if !bridge.reg.HasSent("chat-1", "teams-helper-sent-1") {
+		t.Fatal("durable sent message was not restored into registry")
+	}
+	if !bridge.reg.HasSent("chat-1", "teams-helper-sent-by-content") {
+		t.Fatal("content-matched sent message was not restored into registry")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.OutboxMessages[contentOnlyOutbox.ID].TeamsMessageID; got != "teams-helper-sent-by-content" {
+		t.Fatalf("content-matched outbox TeamsMessageID = %q, want teams-helper-sent-by-content", got)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestBridgePollDoesNotDropRenderedOutboxPrefixWithoutDurableMatch(t *testing.T) {
+	msg := bridgePollMessage("fresh-user-debug", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = "<p><strong>🤖 ⏳ Codex status:</strong><br>why did this appear?</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "why did this appear?") {
+		t.Fatalf("handled = %#v, want fresh user debug prompt", handled)
 	}
 }
 
@@ -3349,7 +4568,7 @@ func TestBridgePollRecordsWindowWarningWhenContinuationReturned(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	var handled []string
 
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3430,7 +4649,7 @@ func TestBridgePollUsesDurableContinuationAfterOnePage(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	var handled []string
 
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3447,7 +4666,7 @@ func TestBridgePollUsesDurableContinuationAfterOnePage(t *testing.T) {
 		t.Fatalf("missing continuation after page cap: %#v ok=%v", poll, ok)
 	}
 
-	if err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
 		handled = append(handled, text)
 		return nil
 	}); err != nil {
@@ -3462,6 +4681,35 @@ func TestBridgePollUsesDurableContinuationAfterOnePage(t *testing.T) {
 	}
 	if !ok || poll.ContinuationPath != "" || poll.LastWindowFullMessage != "" {
 		t.Fatalf("continuation was not cleared after final page: %#v ok=%v", poll, ok)
+	}
+}
+
+func TestBridgePollUsesConservativeCursorOverlapForDelayedMessages(t *testing.T) {
+	cursor := time.Date(2026, 4, 30, 1, 5, 0, 0, time.UTC)
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{bridgePollMessage("new-1", "2026-04-30T01:05:10Z", "after delay")},
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			want := cursor.Add(-pollCursorOverlap).Format(time.RFC3339Nano)
+			if filter := r.URL.Query().Get("$filter"); !strings.Contains(filter, want) {
+				t.Fatalf("poll filter = %q, want cursor minus conservative overlap %s", filter, want)
+			}
+		},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", cursor, true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || handled[0] != "after delay" {
+		t.Fatalf("handled messages = %#v", handled)
 	}
 }
 
@@ -3719,9 +4967,9 @@ func TestBridgeUpgradeDrainingControlNewIsDeferredAndReplayed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			createCalls++
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"deferred","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+			writeTestOnlineMeeting(w, "work-chat", "deferred")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
@@ -3780,8 +5028,8 @@ func TestBridgeUpgradeDrainingControlNewIsDeferredAndReplayed(t *testing.T) {
 	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
 		t.Fatalf("workdir was not created: info=%#v err=%v", info, err)
 	}
-	if len(sent) != 3 {
-		t.Fatalf("sent messages = %d, want upgrade notice, anchor, and control created message: %#v", len(sent), sent)
+	if len(sent) != 4 {
+		t.Fatalf("sent messages = %d, want upgrade notice, creation mention, anchor, and control ack: %#v", len(sent), sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -3930,15 +5178,90 @@ func TestBridgeControlNewCreatesDirectoryBoundSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
-			var payload struct {
-				Topic string `json:"topic"`
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			createdTopic = decodeTestOnlineMeetingSubject(t, r)
+			writeTestOnlineMeeting(w, "work-chat", createdTopic)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				t.Fatalf("decode create chat: %v", err)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode message: %v", err)
 			}
-			createdTopic = payload.Topic
-			_, _ = fmt.Fprint(w, `{"id":"work-chat","topic":"`+payload.Topic+`","chatType":"group","webUrl":"https://teams.example/work-chat"}`)
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.reg.Sessions = nil
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-new"), "/new "+workDir); err != nil {
+		t.Fatalf("/new error: %v", err)
+	}
+	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
+		t.Fatalf("workdir was not created: info=%#v err=%v", info, err)
+	}
+	if !strings.Contains(createdTopic, DefaultWorkChatMarker) || !strings.Contains(createdTopic, "s001") || !strings.Contains(createdTopic, filepath.Base(workDir)) {
+		t.Fatalf("created topic = %q, want work marker and session id", createdTopic)
+	}
+	session := bridge.reg.SessionByID("s001")
+	if session == nil || session.Cwd != workDir || session.ChatID != "work-chat" {
+		t.Fatalf("registered session mismatch: %#v", bridge.reg.Sessions)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Sessions["s001"].Cwd; got != workDir {
+		t.Fatalf("durable session cwd = %q, want %q", got, workDir)
+	}
+	if len(sent) != 3 {
+		t.Fatalf("sent messages = %d, want creation mention, anchor, and control ack", len(sent))
+	}
+	controlAck := PlainTextFromTeamsHTML(sent[2].Content)
+	if !strings.Contains(controlAck, "search for: s001") {
+		t.Fatalf("control ack should help mobile users find the new chat, got %q", controlAck)
+	}
+	createdNotice := PlainTextFromTeamsHTML(sent[0].Content)
+	if !strings.Contains(createdNotice, "Work chat created: s001") || sent[0].Mentions != 1 {
+		t.Fatalf("work chat creation mention = %#v", sent[0])
+	}
+	anchor := PlainTextFromTeamsHTML(sent[1].Content)
+	if !strings.Contains(anchor, "Codex will start automatically") ||
+		!strings.Contains(anchor, "Status: waiting for your first task") ||
+		!strings.Contains(anchor, "Project: "+filepath.Base(workDir)) ||
+		strings.Contains(anchor, "Folder: "+workDir) {
+		t.Fatalf("work chat anchor = %q", anchor)
+	}
+}
+
+func TestBridgeControlNewDuplicateMessageDoesNotCreateSecondChat(t *testing.T) {
+	parent := t.TempDir()
+	workDir := filepath.Join(parent, "dedupe-workspace")
+	var created int
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			created++
+			subject := decodeTestOnlineMeetingSubject(t, r)
+			writeTestOnlineMeeting(w, fmt.Sprintf("work-chat-%d", created), subject)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
@@ -3966,49 +5289,379 @@ func TestBridgeControlNewCreatesDirectoryBoundSession(t *testing.T) {
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
 	bridge.reg.Sessions = nil
+	msg := bridgeTestMessage("control-new-duplicate")
+	text := "new " + workDir
 
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-new"), "/new "+workDir+" -- investigate build"); err != nil {
-		t.Fatalf("/new error: %v", err)
+	if err := bridge.handleControlMessage(context.Background(), msg, text); err != nil {
+		t.Fatalf("first new error: %v", err)
 	}
-	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
-		t.Fatalf("workdir was not created: info=%#v err=%v", info, err)
+	if err := bridge.handleControlMessage(context.Background(), msg, text); err != nil {
+		t.Fatalf("duplicate new error: %v", err)
 	}
-	if !strings.Contains(createdTopic, DefaultWorkChatMarker) || !strings.Contains(createdTopic, "s001") {
-		t.Fatalf("created topic = %q, want work marker and session id", createdTopic)
+	if created != 1 {
+		t.Fatalf("created chats = %d, want 1", created)
 	}
-	session := bridge.reg.SessionByID("s001")
-	if session == nil || session.Cwd != workDir || session.ChatID != "work-chat" {
-		t.Fatalf("registered session mismatch: %#v", bridge.reg.Sessions)
+	if got := len(bridge.reg.Sessions); got != 1 {
+		t.Fatalf("registered sessions = %d, want 1", got)
 	}
-	state, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load error: %v", err)
+	var plain []string
+	for _, msg := range sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
-	if got := state.Sessions["s001"].Cwd; got != workDir {
-		t.Fatalf("durable session cwd = %q, want %q", got, workDir)
-	}
-	if len(sent) != 2 {
-		t.Fatalf("sent messages = %d, want anchor plus control ack", len(sent))
-	}
-	controlAck := PlainTextFromTeamsHTML(sent[1].Content)
-	if !strings.Contains(controlAck, "search for: s001") {
-		t.Fatalf("control ack should help mobile users find the new chat, got %q", controlAck)
-	}
-	anchor := PlainTextFromTeamsHTML(sent[0].Content)
-	if !strings.Contains(anchor, "Codex will start automatically") ||
-		!strings.Contains(anchor, "Status: waiting for your first task") ||
-		!strings.Contains(anchor, "Project: "+filepath.Base(workDir)) ||
-		strings.Contains(anchor, "Folder: "+workDir) {
-		t.Fatalf("work chat anchor = %q", anchor)
+	if !strings.Contains(strings.Join(plain, "\n---\n"), "already handled this new request") {
+		t.Fatalf("duplicate response did not explain idempotency:\n%s", strings.Join(plain, "\n---\n"))
 	}
 }
 
-func TestBridgeEnsureControlChatRebindsExistingSingleMemberChat(t *testing.T) {
+func TestBridgeControlNewUsesSelectedWorkspaceWhenNoDirectoryGiven(t *testing.T) {
+	parent := t.TempDir()
+	workDir := filepath.Join(parent, "selected-workspace")
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "selected",
+			Path: workDir,
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-selected",
+				FirstPrompt: "existing selected work",
+				ProjectPath: workDir,
+				ModifiedAt:  time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	var createdTopic string
+	graph, sent := newBridgeCreateChatGraph(t, &createdTopic)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.reg.Sessions = nil
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-workspaces"), "projects"); err != nil {
+		t.Fatalf("projects error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-select-workspace"), "1"); err != nil {
+		t.Fatalf("select workspace error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-new-selected"), "new"); err != nil {
+		t.Fatalf("new selected workspace error: %v", err)
+	}
+	session := bridge.reg.SessionByID("s001")
+	if session == nil || session.Cwd != workDir {
+		t.Fatalf("new without directory did not use selected workspace: %#v", bridge.reg.Sessions)
+	}
+	if !strings.Contains(createdTopic, filepath.Base(workDir)) {
+		t.Fatalf("created topic = %q, want selected workspace title", createdTopic)
+	}
+	if len(*sent) < 4 {
+		t.Fatalf("sent messages = %#v, want projects, sessions, anchor, control ack", *sent)
+	}
+	sessionsPage := PlainTextFromTeamsHTML((*sent)[1].Content)
+	if !strings.HasPrefix(strings.TrimPrefix(sessionsPage, "🔧 Helper:\n"), "new") {
+		t.Fatalf("sessions page should put new first, got %q", sessionsPage)
+	}
+}
+
+func TestBridgeFastPollBoostAfterActivity(t *testing.T) {
+	bridge := &Bridge{}
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	if got := bridge.nextPollInterval(5*time.Second, now); got != 5*time.Second {
+		t.Fatalf("idle poll interval = %v, want 5s", got)
+	}
+	bridge.boostPolling(now)
+	if got := bridge.nextPollInterval(5*time.Second, now.Add(time.Second)); got != fastPollInterval {
+		t.Fatalf("boosted poll interval = %v, want %v", got, fastPollInterval)
+	}
+	if got := bridge.nextPollInterval(500*time.Millisecond, now.Add(time.Second)); got != 500*time.Millisecond {
+		t.Fatalf("boost should not slow explicit fast interval, got %v", got)
+	}
+	if got := bridge.nextPollInterval(5*time.Second, now.Add(fastPollDuration+time.Second)); got != 5*time.Second {
+		t.Fatalf("expired boost interval = %v, want 5s", got)
+	}
+}
+
+func TestBridgePollOncePrioritizesControlAfterControlActivity(t *testing.T) {
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{bridgePollMessage("control-help", "2026-05-02T01:05:00Z", "help")},
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if !strings.Contains(r.URL.Path, "/chats/control-chat/messages") {
+				t.Fatalf("first poll should read control chat, got %s", r.URL.Path)
+			}
+		},
+	}})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", time.Date(2026, 5, 2, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 5, 2, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %#v, want one control help response", *sent)
+	}
+	if got := bridge.nextPollInterval(5*time.Second, time.Now()); got != fastPollInterval {
+		t.Fatalf("control activity should boost next poll interval, got %v", got)
+	}
+}
+
+func TestBridgePollOnceSkipsChatsUntilNextPollAt(t *testing.T) {
+	now := time.Now()
+	readGraph := newBridgePollGraph(t, nil)
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	for _, chatID := range []string{"control-chat", "chat-1"} {
+		if _, err := store.RecordChatPollSuccess(context.Background(), chatID, now.Add(-time.Minute), true, false, 1); err != nil {
+			t.Fatalf("seed poll %s: %v", chatID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+			ChatID:         chatID,
+			PollState:      inboundPollStateWarm,
+			NextPollAt:     now.Add(time.Hour),
+			LastActivityAt: now.Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("schedule poll %s: %v", chatID, err)
+		}
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+}
+
+func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
+	now := time.Now()
+	readGraph := newBridgePollGraph(t, nil)
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	oldActivity := now.Add(-49 * time.Hour)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateCold,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" || !strings.Contains((*sent)[0].Content, "This chat is paused") || !strings.Contains((*sent)[0].Content, "Step 2: Send: <code>r ") {
+		t.Fatalf("freeze notice sent = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() || poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("work chat was not parked with notice: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceSkipsWorkChatDuringTranscriptImport(t *testing.T) {
+	now := time.Now()
+	readGraph := newBridgePollGraph(t, nil)
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateHot,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	session := bridge.reg.Sessions[0]
+	if err := bridge.markTranscriptImportStarted(context.Background(), session, "/tmp/session.jsonl"); err != nil {
+		t.Fatalf("mark import started: %v", err)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+}
+
+func TestBridgeControlResumeKeyReactivatesParkedWorkChat(t *testing.T) {
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: time.Now().Add(-49 * time.Hour),
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+	key := resumeKeyForSession(session)
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("resume-1", "2026-05-02T01:05:00Z", "r "+key), "r "+key); err != nil {
+		t.Fatalf("resume command error: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Resumed s001") {
+		t.Fatalf("resume response = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || poll.LastActivityAt.IsZero() {
+		t.Fatalf("resume did not make chat hot and due: %#v", poll)
+	}
+}
+
+func TestBridgeResumeKeyIgnoresMutableSessionMetadata(t *testing.T) {
+	session := Session{ID: "s001", ChatID: "chat-1", Cwd: "/old", CodexThreadID: "thread-old"}
+	key := resumeKeyForSession(session)
+	session.Cwd = "/new"
+	session.CodexThreadID = "thread-new"
+	session.Topic = "new topic"
+	if got := resumeKeyForSession(session); got != key {
+		t.Fatalf("resume key changed after mutable metadata update: %q -> %q", key, got)
+	}
+}
+
+func TestBridgePollChatReadRateLimitBlocksOnlyThatChat(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/chats/chat-1/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
+	}))
+	t.Cleanup(server.Close)
+	readGraph := &GraphClient{
+		auth:    &fakeGraphAuth{token: "access"},
+		client:  server.Client(),
+		baseURL: server.URL,
+		sleep:   func(context.Context, time.Duration) error { return nil },
+		jitter:  func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+
+	if _, err := bridge.pollChatWithRole(context.Background(), "chat-1", 20, inboundPollRoleWork, false, func(context.Context, ChatMessage, string) error {
+		t.Fatal("handler should not run after Graph 429")
+		return nil
+	}); err == nil || !isGraphRateLimitError(err) {
+		t.Fatalf("pollChat error = %v, want Graph 429", err)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateBlocked || poll.BlockedUntil.Before(time.Now().Add(50*time.Second)) {
+		t.Fatalf("poll 429 did not block chat: %#v", poll)
+	}
+	if requests != defaultGraphRetries+1 {
+		t.Fatalf("requests = %d, want %d", requests, defaultGraphRetries+1)
+	}
+
+	bridge.readGraph = newBridgePollGraph(t, nil)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", time.Now().Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     time.Now().Add(time.Hour),
+		LastActivityAt: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("blocked pollOnce should skip chat-1 without reading it: %v", err)
+	}
+}
+
+func TestBridgeDashboardProjectsCacheReusesDiscoveryForFollowupSelection(t *testing.T) {
+	var calls int
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		calls++
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-alpha",
+				FirstPrompt: "fix alpha",
+				ProjectPath: "/home/user/project/alpha",
+				ModifiedAt:  time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-projects"), "p"); err != nil {
+		t.Fatalf("projects error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-select"), "1"); err != nil {
+		t.Fatalf("select workspace error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("discovery calls = %d, want cached projects reused for follow-up selection", calls)
+	}
+	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "Workspace: /home/user/project/alpha") {
+		t.Fatalf("sent = %#v, want workspace sessions from cached discovery", *sent)
+	}
+}
+
+func TestBridgeEnsureControlChatSkipsExistingSingleMemberGroupChat(t *testing.T) {
 	store := newBridgeTestStore(t)
 	t.Setenv(envTeamsMachineLabel, "qa-host")
 	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: "qa-host"})
 	var created bool
-	var readySent bool
+	var readySent int
 	var requests []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.String())
@@ -4023,12 +5676,13 @@ func TestBridgeEnsureControlChatRebindsExistingSingleMemberChat(t *testing.T) {
 			}}})
 		case r.Method == http.MethodGet && r.URL.Path == "/chats/existing-control/members":
 			_, _ = fmt.Fprint(w, `{"value":[{"id":"member-1","userId":"user-1","email":"user@example.test"}]}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			created = true
-			_, _ = fmt.Fprint(w, `{"id":"new-control","topic":"new","chatType":"group","webUrl":"https://teams.example/new-control"}`)
+			subject := decodeTestOnlineMeetingSubject(t, r)
+			writeTestOnlineMeeting(w, "new-control", subject)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
-			readySent = true
-			_, _ = fmt.Fprint(w, `{"id":"ready","messageType":"message"}`)
+			readySent++
+			_, _ = fmt.Fprintf(w, `{"id":"ready-%d","messageType":"message"}`, readySent)
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -4052,10 +5706,10 @@ func TestBridgeEnsureControlChatRebindsExistingSingleMemberChat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureControlChat error: %v", err)
 	}
-	if created || readySent {
-		t.Fatalf("existing control chat should be rebound without create or ready send: created=%v ready=%v requests=%v", created, readySent, requests)
+	if !created || readySent != 2 {
+		t.Fatalf("legacy single-member group should be skipped and replaced by meeting chat: created=%v ready=%v requests=%v", created, readySent, requests)
 	}
-	if chat.ID != "existing-control" || bridge.reg.ControlChatID != "existing-control" {
+	if chat.ID != "new-control" || bridge.reg.ControlChatID != "new-control" {
 		t.Fatalf("control chat binding = chat=%#v reg=%#v", chat, bridge.reg)
 	}
 }
@@ -4107,19 +5761,20 @@ func TestBridgeEnsureControlChatQueuesReadyMessageDurably(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/me/chats":
 			_, _ = fmt.Fprint(w, `{"value":[]}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/chats":
-			_, _ = fmt.Fprint(w, `{"id":"new-control","topic":"control","chatType":"group","webUrl":"https://teams.example/new-control"}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/chats/new-control/messages":
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "new-control", "control")
+		case r.Method == http.MethodPost && (r.URL.Path == "/chats/old-control/messages" || r.URL.Path == "/chats/new-control/messages"):
 			var body struct {
 				Body struct {
 					Content string `json:"content"`
 				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode ready message: %v", err)
 			}
-			sent = append(sent, bridgeSentMessage{ChatID: "new-control", Content: body.Body.Content})
-			_, _ = fmt.Fprint(w, `{"id":"ready-message","messageType":"message"}`)
+			sent = append(sent, bridgeSentMessage{ChatID: "new-control", Content: body.Body.Content, Mentions: len(body.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"ready-message-%d","messageType":"message"}`, len(sent))
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -4147,7 +5802,7 @@ func TestBridgeEnsureControlChatQueuesReadyMessageDurably(t *testing.T) {
 	if chat.ID != "new-control" || bridge.reg.ControlChatID != "new-control" {
 		t.Fatalf("control chat was not recorded: chat=%#v reg=%#v", chat, bridge.reg)
 	}
-	if len(sent) != 1 || !strings.Contains(sent[0].Content, "control chat is ready") {
+	if len(sent) != 2 || !strings.Contains(sent[0].Content, "Control chat created.") || sent[0].Mentions != 1 || !strings.Contains(sent[1].Content, "control chat is ready") {
 		t.Fatalf("ready message sent = %#v", sent)
 	}
 	state, err := store.Load(context.Background())
@@ -4164,8 +5819,218 @@ func TestBridgeEnsureControlChatQueuesReadyMessageDurably(t *testing.T) {
 			break
 		}
 	}
-	if ready.Status != teamstore.OutboxStatusSent || ready.TeamsMessageID != "ready-message" || ready.Sequence <= 0 {
+	if ready.Status != teamstore.OutboxStatusSent || ready.TeamsMessageID != "ready-message-2" || ready.Sequence <= 0 {
 		t.Fatalf("ready outbox was not durably sent: %#v", ready)
+	}
+}
+
+func TestBridgeRecreateControlChatCreatesFreshMeetingAndRetiresOldRouting(t *testing.T) {
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "new-control", decodeTestOnlineMeetingSubject(t, r))
+		case r.Method == http.MethodPost && (r.URL.Path == "/chats/old-control/messages" || r.URL.Path == "/chats/new-control/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode recreated control message: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"new-control-message-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	store := newBridgeTestStore(t)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		now := time.Now()
+		state.ControlChat = teamstore.ControlChatBinding{
+			TeamsChatID:    "old-control",
+			TeamsChatURL:   "https://teams.example/old-control",
+			TeamsChatTopic: "old topic",
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		state.ChatPolls["old-control"] = teamstore.ChatPollState{ChatID: "old-control", Seeded: true}
+		state.ChatSequences["old-control"] = teamstore.ChatSequenceState{ChatID: "old-control", Next: 42}
+		state.ChatRateLimits["old-control"] = teamstore.ChatRateLimitState{ChatID: "old-control", Reason: "blocked"}
+		state.DashboardViews["old-view"] = teamstore.DashboardViewRecord{ID: "old-view", ChatID: "old-control"}
+		state.DashboardNumbers["old-number"] = teamstore.DashboardNumberRecord{ID: "old-number", ChatID: "old-control"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.reg.ControlChatID = "old-control"
+	bridge.reg.ControlChatURL = "https://teams.example/old-control"
+	bridge.reg.ControlChatTopic = "old topic"
+	bridge.reg.Chats = map[string]ChatState{"old-control": {SeenMessageIDs: []string{"seen-old"}}}
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+
+	recreated, err := bridge.RecreateControlChat(context.Background())
+	if err != nil {
+		t.Fatalf("RecreateControlChat error: %v", err)
+	}
+	if recreated.OldChat.ID != "old-control" || recreated.NewChat.ID != "new-control" || bridge.reg.ControlChatID != "new-control" {
+		t.Fatalf("recreated control mismatch: recreated=%#v reg=%#v", recreated, bridge.reg)
+	}
+	if _, ok := bridge.reg.Chats["old-control"]; ok {
+		t.Fatalf("old control chat state should be retired: %#v", bridge.reg.Chats)
+	}
+	if len(sent) != 3 || sent[0].ChatID != "old-control" || sent[0].Mentions != 1 || !strings.Contains(sent[0].Content, "This chat moved") || !strings.Contains(sent[0].Content, "new-control") {
+		t.Fatalf("old control migration notice = %#v", sent)
+	}
+	if !strings.Contains(sent[0].Content, `<a href="https://teams.microsoft.com/l/chat/new-control/0">Open the new Control chat</a>`) {
+		t.Fatalf("old control migration notice did not render a clickable link: %s", sent[0].Content)
+	}
+	if strings.Contains(sent[0].Content, "🧑‍💻 User") {
+		t.Fatalf("old control migration notice was rendered as a user message: %s", sent[0].Content)
+	}
+	if sent[1].ChatID != "new-control" || sent[1].Mentions != 1 || !strings.Contains(sent[1].Content, "Control chat recreated.") || sent[2].ChatID != "new-control" || !strings.Contains(sent[2].Content, "control chat is ready") {
+		t.Fatalf("recreated control messages = %#v", sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if state.ControlChat.TeamsChatID != "new-control" {
+		t.Fatalf("control binding not updated: %#v", state.ControlChat)
+	}
+	if _, ok := state.ChatPolls["old-control"]; ok {
+		t.Fatalf("old control poll was not retired: %#v", state.ChatPolls["old-control"])
+	}
+	if _, ok := state.ChatSequences["old-control"]; ok {
+		t.Fatalf("old control sequence was not retired: %#v", state.ChatSequences["old-control"])
+	}
+	if _, ok := state.ChatRateLimits["old-control"]; ok {
+		t.Fatalf("old control rate limit was not retired: %#v", state.ChatRateLimits["old-control"])
+	}
+	if _, ok := state.DashboardViews["old-view"]; ok {
+		t.Fatalf("old control dashboard view was not retired")
+	}
+	if _, ok := state.DashboardNumbers["old-number"]; ok {
+		t.Fatalf("old control dashboard number was not retired")
+	}
+}
+
+func TestBridgeRecreateSessionChatRebindsSessionAndRetiresOldRouting(t *testing.T) {
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "new-work", decodeTestOnlineMeetingSubject(t, r))
+		case r.Method == http.MethodPost && (r.URL.Path == "/chats/chat-1/messages" || r.URL.Path == "/chats/new-work/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode recreated session message: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"new-work-message-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	store := newBridgeTestStore(t)
+	now := time.Now()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions["s001"] = teamstore.SessionContext{
+			ID:            "s001",
+			Status:        teamstore.SessionStatusActive,
+			TeamsChatID:   "chat-1",
+			TeamsChatURL:  "https://teams.example/chat-1",
+			TeamsTopic:    "topic",
+			CodexThreadID: "thread-1",
+			Cwd:           "/workspace/demo",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		state.ChatPolls["chat-1"] = teamstore.ChatPollState{ChatID: "chat-1", Seeded: true}
+		state.ChatSequences["chat-1"] = teamstore.ChatSequenceState{ChatID: "chat-1", Next: 7}
+		state.ChatRateLimits["chat-1"] = teamstore.ChatRateLimitState{ChatID: "chat-1", Reason: "blocked"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.reg.Sessions[0].CodexThreadID = "thread-1"
+	bridge.reg.Sessions[0].Cwd = "/workspace/demo"
+	bridge.reg.Chats = map[string]ChatState{"chat-1": {SeenMessageIDs: []string{"seen-old"}}}
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+
+	recreated, err := bridge.RecreateSessionChat(context.Background(), "chat-1", RecreateSessionChatOptions{})
+	if err != nil {
+		t.Fatalf("RecreateSessionChat error: %v", err)
+	}
+	if recreated.SessionID != "s001" || recreated.OldChat.ID != "chat-1" || recreated.NewChat.ID != "new-work" {
+		t.Fatalf("recreated session mismatch: %#v", recreated)
+	}
+	session := bridge.reg.SessionByID("s001")
+	if session == nil || session.ChatID != "new-work" || session.CodexThreadID != "thread-1" || session.Cwd != "/workspace/demo" {
+		t.Fatalf("registry session not rebound: %#v", bridge.reg.Sessions)
+	}
+	if _, ok := bridge.reg.Chats["chat-1"]; ok {
+		t.Fatalf("old work chat state should be retired: %#v", bridge.reg.Chats)
+	}
+	if len(sent) != 3 || sent[0].ChatID != "chat-1" || sent[0].Mentions != 1 || !strings.Contains(sent[0].Content, "This chat moved") || !strings.Contains(sent[0].Content, "new-work") {
+		t.Fatalf("old work migration notice = %#v", sent)
+	}
+	if !strings.Contains(sent[0].Content, `<a href="https://teams.microsoft.com/l/chat/new-work/0">Open the new Work chat for s001</a>`) {
+		t.Fatalf("old work migration notice did not render a clickable link: %s", sent[0].Content)
+	}
+	if strings.Contains(sent[0].Content, "🧑‍💻 User") {
+		t.Fatalf("old work migration notice was rendered as a user message: %s", sent[0].Content)
+	}
+	if sent[1].ChatID != "new-work" || sent[1].Mentions != 1 || !strings.Contains(sent[1].Content, "Work chat recreated: s001.") || sent[2].ChatID != "new-work" || !strings.Contains(PlainTextFromTeamsHTML(sent[2].Content), "ready") {
+		t.Fatalf("recreated work messages = %#v", sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	durable := state.Sessions["s001"]
+	if durable.TeamsChatID != "new-work" || durable.CodexThreadID != "thread-1" || durable.Cwd != "/workspace/demo" {
+		t.Fatalf("durable session not rebound: %#v", durable)
+	}
+	if _, ok := state.ChatPolls["chat-1"]; ok {
+		t.Fatalf("old work poll was not retired: %#v", state.ChatPolls["chat-1"])
+	}
+	if _, ok := state.ChatSequences["chat-1"]; ok {
+		t.Fatalf("old work sequence was not retired: %#v", state.ChatSequences["chat-1"])
+	}
+	if _, ok := state.ChatRateLimits["chat-1"]; ok {
+		t.Fatalf("old work rate limit was not retired: %#v", state.ChatRateLimits["chat-1"])
 	}
 }
 
@@ -4485,6 +6350,250 @@ func TestBridgeSyncLinkedTranscriptSeedsThenImportsNewRecords(t *testing.T) {
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptSkipsWhileTranscriptImporting(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("initial sync error: %v", err)
+	}
+	beforeState, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load before import error: %v", err)
+	}
+	beforeCheckpoint := beforeState.ImportCheckpoints[transcriptCheckpointID("s001")]
+	if err := bridge.markTranscriptImportStarted(context.Background(), *session, transcriptPath); err != nil {
+		t.Fatalf("mark import started: %v", err)
+	}
+	if err := os.WriteFile(transcriptPath, []byte(initial+`{"id":"a2","role":"assistant","text":"new answer during import"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync during import error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("sync during import should not send live catch-up messages, sent=%#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
+	if checkpoint.Status != importCheckpointStatusImporting || checkpoint.LastRecordID != beforeCheckpoint.LastRecordID {
+		t.Fatalf("checkpoint during import = %#v, want importing at previous record %#v", checkpoint, beforeCheckpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptMirrorsLocalCodexConversation(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("initial sync error: %v", err)
+	}
+
+	next := strings.Join([]string{
+		initial,
+		`{"type":"response_item","payload":{"id":"u2","type":"message","role":"user","content":[{"type":"input_text","text":"local cli prompt"}]}}`,
+		`{"type":"response_item","payload":{"id":"tool-1","type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"go test ./...\"}"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s2","message":"local cli visible status","phase":"commentary"}}`,
+		`{"type":"response_item","payload":{"id":"a2","type":"message","role":"assistant","content":[{"type":"output_text","text":"local cli final answer"}]}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(next), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("second sync error: %v", err)
+	}
+	if len(*sent) != 3 {
+		t.Fatalf("sent messages = %#v, want user, status, answer", *sent)
+	}
+	plain := make([]string, 0, len(*sent))
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n")
+	for _, want := range []string{
+		"🧑‍💻 User:\nlocal cli prompt",
+		"🤖 ⏳ Codex status:\nlocal cli visible status",
+		"🤖 ✅ Codex answer:\nlocal cli final answer",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("synced transcript missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "go test ./...") || strings.Contains(joined, "exec_command") {
+		t.Fatalf("synced transcript leaked command/tool output:\n%s", joined)
+	}
+	if strings.Index(joined, "local cli prompt") > strings.Index(joined, "local cli visible status") ||
+		strings.Index(joined, "local cli visible status") > strings.Index(joined, "local cli final answer") {
+		t.Fatalf("synced transcript order is wrong:\n%s", joined)
+	}
+	if (*sent)[0].Mentions != 0 || (*sent)[1].Mentions != 0 {
+		t.Fatalf("user/status sync should not mention owner: %#v", *sent)
+	}
+	if (*sent)[2].Mentions != 1 || !strings.Contains((*sent)[2].Content, `<at id="0">`) || !strings.Contains((*sent)[2].Content, "Codex finished responding") {
+		t.Fatalf("synced local final answer should mention owner at completion: %#v", (*sent)[2])
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptSkipsLargeAutomaticBacklog(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("initial sync error: %v", err)
+	}
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+5; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"a%03d","role":"assistant","text":"backlog answer %03d"}`+"\n", i, i))
+	}
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write backlog transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("backlog sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("large automatic backlog should not flood Teams, sent=%#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
+	if checkpoint.LastRecordID != fmt.Sprintf("a%03d", transcriptSyncMaxAutoBacklogRecords+4) {
+		t.Fatalf("checkpoint = %#v, want advanced to latest backlog record", checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptsIfDueThrottlesScans(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	discoverCalls := 0
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		discoverCalls++
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	now := time.Unix(1000, 0)
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now); err != nil {
+		t.Fatalf("first sync error: %v", err)
+	}
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(transcriptSyncMinInterval/2)); err != nil {
+		t.Fatalf("throttled sync error: %v", err)
+	}
+	if discoverCalls != 1 {
+		t.Fatalf("discoverCalls = %d, want one scan inside throttle interval", discoverCalls)
+	}
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(transcriptSyncMinInterval)); err != nil {
+		t.Fatalf("due sync error: %v", err)
+	}
+	if discoverCalls != 2 {
+		t.Fatalf("discoverCalls = %d, want second scan when due", discoverCalls)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptSkipsTeamsOriginUserPrompt(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -4608,11 +6717,24 @@ func TestBridgeSyncLinkedTranscriptSkipsTeamsOriginNoiseAndDeliveredFinal(t *tes
 	}); err != nil {
 		t.Fatalf("QueueOutbox final error: %v", err)
 	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:delivered-status",
+		SessionID:      "s001",
+		TurnID:         turn.ID,
+		TeamsChatID:    "chat-1",
+		Kind:           "codex-progress-001",
+		Body:           "already streamed status",
+		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-status",
+	}); err != nil {
+		t.Fatalf("QueueOutbox status error: %v", err)
+	}
 	augmentedPrompt := TeamsCodexPrompt("team prompt")
 	next := initial +
 		`{"id":"u2","role":"user","text":` + strconv.Quote(augmentedPrompt) + `}` + "\n" +
 		`{"id":"u3","role":"user","text":` + strconv.Quote(augmentedPrompt) + `}` + "\n" +
 		`{"id":"tool-1","type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"go test ./...\"}"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s2","message":"already streamed status","phase":"commentary"}}` + "\n" +
 		`{"id":"a2","role":"assistant","text":"answer from codex"}` + "\n" +
 		`{"id":"a3","role":"assistant","text":"answer from codex"}` + "\n" +
 		`{"id":"a4","role":"assistant","text":"local follow-up"}` + "\n"
@@ -4630,10 +6752,352 @@ func TestBridgeSyncLinkedTranscriptSkipsTeamsOriginNoiseAndDeliveredFinal(t *tes
 	if !strings.Contains(plain, "local follow-up") {
 		t.Fatalf("synced message = %q, want local follow-up", plain)
 	}
-	for _, leaked := range []string{"team prompt", "teams-outbound", "answer from codex", "exec_command"} {
+	for _, leaked := range []string{"team prompt", "teams-outbound", "already streamed status", "answer from codex", "exec_command"} {
 		if strings.Contains(plain, leaked) {
 			t.Fatalf("synced message leaked %q: %q", leaked, plain)
 		}
+	}
+}
+
+func TestDeliveredTranscriptHashesIncludeLiveStatusAndFinal(t *testing.T) {
+	state := teamstore.State{OutboxMessages: map[string]teamstore.OutboxMessage{
+		"status": {
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			Kind:           "codex-progress-001",
+			Body:           "already streamed status",
+			Status:         teamstore.OutboxStatusSent,
+			TeamsMessageID: "teams-status",
+		},
+		"final": {
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			Kind:           "final",
+			Body:           "already delivered answer",
+			Status:         teamstore.OutboxStatusSent,
+			TeamsMessageID: "teams-final",
+		},
+		"queued": {
+			SessionID:   "s001",
+			TeamsChatID: "chat-1",
+			Kind:        "codex-progress-002",
+			Body:        "not delivered yet",
+			Status:      teamstore.OutboxStatusQueued,
+		},
+	}}
+	hashes := deliveredTranscriptHashes(state, "s001")
+	if !shouldSkipDeliveredTranscriptRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "already streamed status", hashes) {
+		t.Fatal("delivered live status was not recognized as already sent")
+	}
+	if !shouldSkipDeliveredTranscriptRecord(TranscriptRecord{Kind: TranscriptKindAssistant}, "already delivered answer", hashes) {
+		t.Fatal("delivered final answer was not recognized as already sent")
+	}
+	if shouldSkipDeliveredTranscriptRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "not delivered yet", hashes) {
+		t.Fatal("queued unsent status should not be treated as delivered")
+	}
+}
+
+func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	beforeState, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load seeded state error: %v", err)
+	}
+	beforeCheckpoint := beforeState.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+
+	activeTranscript := initial +
+		`{"id":"u-local","role":"user","text":"local CLI prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local CLI is editing files","phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(activeTranscript), 0o600); err != nil {
+		t.Fatalf("write active transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-during-local", "2026-05-03T01:01:00Z", "teams prompt during local")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt during local"); err != nil {
+		t.Fatalf("handleSessionMessage while local active error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("Teams turn started while local CLI transcript was active: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Codex is active in the CLI") {
+		t.Fatalf("active local CLI ack = %#v, want one clear queued notice", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.LastRecordID != beforeCheckpoint.LastRecordID || checkpoint.LastSourceLine != beforeCheckpoint.LastSourceLine {
+		t.Fatalf("checkpoint advanced during active local CLI turn: %#v, before %#v", checkpoint, beforeCheckpoint)
+	}
+	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
+		t.Fatalf("queued turn count = %d, want 1", got)
+	}
+
+	completedTranscript := activeTranscript +
+		`{"id":"a-local","role":"assistant","text":"local CLI final answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(completedTranscript), 0o600); err != nil {
+		t.Fatalf("write completed transcript: %v", err)
+	}
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns after local completion error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "teams prompt during local") {
+			t.Fatalf("queued Teams prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued Teams prompt did not start after local CLI completed")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+	for _, want := range []string{
+		"Codex is active in the CLI",
+		"🧑‍💻 User:\nlocal CLI prompt",
+		"🤖 ⏳ Codex status:\nlocal CLI is editing files",
+		"🤖 ✅ Codex answer:\nlocal CLI final answer",
+		"🤖 ✅ Codex answer:\ndone 1: teams prompt during local",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("combined transcript missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Index(joined, "local CLI final answer") > strings.Index(joined, "done 1: teams prompt during local") {
+		t.Fatalf("Teams turn answer was sent before local CLI catch-up:\n%s", joined)
+	}
+}
+
+func TestBridgeSyncsCompletedLocalTranscriptBeforeStartingTeamsPrompt(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	completedTranscript := initial +
+		`{"id":"u-local","role":"user","text":"local completed prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local completed status","phase":"commentary"}}` + "\n" +
+		`{"id":"a-local","role":"assistant","text":"local completed answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(completedTranscript), 0o600); err != nil {
+		t.Fatalf("write completed transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-after-local", "2026-05-03T01:02:00Z", "teams prompt after local")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt after local"); err != nil {
+		t.Fatalf("handleSessionMessage after local completion error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "teams prompt after local") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Teams prompt did not start after completed local catch-up")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+	for _, want := range []string{
+		"🧑‍💻 User:\nlocal completed prompt",
+		"🤖 ⏳ Codex status:\nlocal completed status",
+		"🤖 ✅ Codex answer:\nlocal completed answer",
+		"Codex is working. Request accepted.",
+		"🤖 ✅ Codex answer:\ndone 1: teams prompt after local",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("transcript missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Index(joined, "local completed answer") > strings.Index(joined, "Codex is working. Request accepted.") ||
+		strings.Index(joined, "Codex is working. Request accepted.") > strings.Index(joined, "done 1: teams prompt after local") {
+		t.Fatalf("completed local catch-up should precede Teams ack and answer:\n%s", joined)
+	}
+}
+
+func TestBridgeQueuedTurnWaitsForLocalTranscriptCatchupLimit(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxRecordsPerSessionPerCycle+2; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"a-local-%02d","role":"assistant","text":"local answer %02d"}`+"\n", i, i))
+	}
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write multi-record transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-after-catchup", "2026-05-03T01:03:00Z", "teams prompt after catchup")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt after catchup"); err != nil {
+		t.Fatalf("handleSessionMessage during catch-up error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("Teams turn started before local catch-up drained: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := countSentPlainContaining(*sent, "local answer "); got != transcriptSyncMaxRecordsPerSessionPerCycle {
+		t.Fatalf("synced local answer count = %d, want first catch-up batch of %d", got, transcriptSyncMaxRecordsPerSessionPerCycle)
+	}
+	if !sentPlainContains(*sent, "syncing recent Codex updates first") {
+		t.Fatalf("catch-up queued ack missing in %#v", *sent)
+	}
+
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns while catch-up remains error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "teams prompt after catchup") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Teams prompt did not start after remaining catch-up drained")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	if !sentPlainContains(*sent, "local answer 09") {
+		t.Fatalf("remaining local catch-up was not sent before Teams answer: %#v", *sent)
+	}
+}
+
+func TestBridgeAllowsTeamsPromptAfterLocalTranscriptFailureTerminal(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	failedTranscript := initial +
+		`{"id":"u-local","role":"user","text":"local prompt before failure"}` + "\n" +
+		`{"type":"turn.failed","error":{"message":"local CLI failed cleanly"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(failedTranscript), 0o600); err != nil {
+		t.Fatalf("write failed transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-after-failed-local", "2026-05-03T01:04:00Z", "teams prompt after failed local")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt after failed local"); err != nil {
+		t.Fatalf("handleSessionMessage after failed local transcript error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "teams prompt after failed local") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Teams prompt did not start after terminal local failure")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"🧑‍💻 User:\nlocal prompt before failure",
+		"🤖 ⏳ Codex status:\nlocal CLI failed cleanly",
+		"🤖 ✅ Codex answer:\ndone 1: teams prompt after failed local",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("failed local transcript flow missing %q in:\n%s", want, joined)
+		}
+	}
+}
+
+func TestBridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	activeToolOnly := initial + `{"type":"response_item","payload":{"id":"tool-local","type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"go test ./...\"}"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(activeToolOnly), 0o600); err != nil {
+		t.Fatalf("write tool transcript: %v", err)
+	}
+	msg := bridgePollMessage("teams-during-tool", "2026-05-03T01:05:00Z", "teams prompt during tool")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt during tool"); err != nil {
+		t.Fatalf("handleSessionMessage during tool-only local activity error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("Teams turn started while local tool-only transcript was active: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Codex is active in the CLI") {
+		t.Fatalf("tool-only active ack = %#v", *sent)
 	}
 }
 
@@ -5178,8 +7642,39 @@ func TestBridgeRecoverUnfinishedRunningTurnMarksInterrupted(t *testing.T) {
 }
 
 type bridgeSentMessage struct {
-	ChatID  string
-	Content string
+	ChatID   string
+	Content  string
+	Mentions int
+}
+
+func sentPlainText(sent []bridgeSentMessage) string {
+	var parts []string
+	for _, msg := range sent {
+		parts = append(parts, PlainTextFromTeamsHTML(msg.Content))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func decodeTestOnlineMeetingSubject(t *testing.T, r *http.Request) string {
+	t.Helper()
+	var body struct {
+		Subject string `json:"subject"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode onlineMeeting: %v", err)
+	}
+	return body.Subject
+}
+
+func writeTestOnlineMeeting(w http.ResponseWriter, chatID string, subject string) {
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"id":         "meeting-" + strings.TrimPrefix(chatID, "chat-"),
+		"subject":    subject,
+		"joinWebUrl": "https://teams.example/meeting/" + url.PathEscape(chatID),
+		"chatInfo": map[string]any{
+			"threadId": chatID,
+		},
+	})
 }
 
 type bridgePollPage struct {
@@ -5245,12 +7740,13 @@ func newBridgeRetryGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]b
 				Body struct {
 					Content string `json:"content"`
 				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode Graph request: %v", err)
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
 		default:
@@ -5263,6 +7759,57 @@ func newBridgeRetryGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]b
 			t.Fatal("retry did not fetch original Teams message")
 		}
 	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
+func newBridgeAsyncQueueGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/chat-1/messages/"):
+			w.Header().Set("Content-Type", "application/json")
+			id := strings.TrimPrefix(r.URL.Path, "/chats/chat-1/messages/")
+			prompts := map[string]string{
+				"second":              "second prompt",
+				"third":               "third prompt",
+				"teams-during-local":  "teams prompt during local",
+				"teams-after-catchup": "teams prompt after catchup",
+				"teams-during-tool":   "teams prompt during tool",
+			}
+			prompt, ok := prompts[id]
+			if !ok {
+				t.Fatalf("unexpected queued message fetch: %s", r.URL.String())
+			}
+			if err := json.NewEncoder(w).Encode(bridgePollMessage(id, "2026-05-03T01:00:05Z", prompt)); err != nil {
+				t.Fatalf("encode queued message %s: %v", id, err)
+			}
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
 	return &GraphClient{
 		auth:       &fakeGraphAuth{token: "access"},
 		client:     server.Client(),
@@ -5368,6 +7915,82 @@ func bridgePollMessage(id string, timestamp string, text string) ChatMessage {
 	return msg
 }
 
+func stubDiscoverCodexSession(t *testing.T, threadID string, transcriptPath string) func() {
+	t.Helper()
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   threadID,
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	return func() {
+		discoverCodexProjectsForTeams = prevDiscover
+	}
+}
+
+func seedLinkedTranscriptForTest(t *testing.T, bridge *Bridge, transcriptPath string, threadID string) *Session {
+	t.Helper()
+	session := bridge.reg.SessionByChatID("chat-1")
+	if session == nil {
+		t.Fatal("test registry missing chat-1 session")
+	}
+	session.CodexThreadID = threadID
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("initial sync error: %v", err)
+	}
+	state, err := bridge.store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state after seed error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if strings.TrimSpace(checkpoint.SourcePath) != transcriptPath || strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		t.Fatalf("seed checkpoint = %#v, want source path %q and a last record", checkpoint, transcriptPath)
+	}
+	return session
+}
+
+func queuedTurnCountForSession(state teamstore.State, sessionID string) int {
+	count := 0
+	for _, turn := range state.Turns {
+		if turn.SessionID == sessionID && turn.Status == teamstore.TurnStatusQueued {
+			count++
+		}
+	}
+	return count
+}
+
+func sentPlainJoined(messages []bridgeSentMessage) string {
+	plain := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	return strings.Join(plain, "\n---\n")
+}
+
+func sentPlainContains(messages []bridgeSentMessage, needle string) bool {
+	return strings.Contains(sentPlainJoined(messages), needle)
+}
+
+func countSentPlainContaining(messages []bridgeSentMessage, needle string) int {
+	count := 0
+	for _, msg := range messages {
+		if strings.Contains(PlainTextFromTeamsHTML(msg.Content), needle) {
+			count++
+		}
+	}
+	return count
+}
+
 func newBridgeTestGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
 	t.Helper()
 	var sent []bridgeSentMessage
@@ -5379,14 +8002,54 @@ func newBridgeTestGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
 			Body struct {
 				Content string `json:"content"`
 			} `json:"body"`
+			Mentions []json.RawMessage `json:"mentions"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode Graph request: %v", err)
 		}
 		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-		sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+		sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+	}))
+	t.Cleanup(server.Close)
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
+func newBridgeCreateChatGraph(t *testing.T, createdTopic *string) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			subject := decodeTestOnlineMeetingSubject(t, r)
+			if createdTopic != nil {
+				*createdTopic = subject
+			}
+			writeTestOnlineMeeting(w, "work-chat", subject)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode message: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
 	}))
 	t.Cleanup(server.Close)
 	return &GraphClient{

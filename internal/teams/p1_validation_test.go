@@ -60,7 +60,7 @@ func TestP1RendererMatrixEscapesCRLFAndEmptyText(t *testing.T) {
 		{name: "user", kind: TeamsRenderUser, label: "🧑‍💻 User"},
 		{name: "assistant", kind: TeamsRenderAssistant, label: "🤖 ✅ Codex answer"},
 		{name: "helper", kind: TeamsRenderHelper, label: "🔧 Helper"},
-		{name: "status", kind: TeamsRenderStatus, label: "📌 Session status"},
+		{name: "status", kind: TeamsRenderStatus, label: "🤖 ⏳ Codex status"},
 		{name: "code", kind: TeamsRenderCode, label: "💻 Code"},
 	}
 	for _, tc := range cases {

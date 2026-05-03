@@ -140,11 +140,13 @@ P0 completed in the current implementation slice:
   self-mention, or file upload unless
   `CODEX_HELPER_TEAMS_LIVE_JASON_WEI_ONLY=jason-wei-only` is set, the signed-in
   Graph user is `Jason Wei`, and `CODEX_HELPER_TEAMS_LIVE_CHAT_ID` resolves to
-  a single-member group chat whose only member is that same AAD user.
-- Control-chat bootstrap records the durable control binding first and sends the
-  ready message through durable outbox. Pending outbox flushing keeps same-chat
-  FIFO checks enabled, so a fresh `sending` predecessor blocks later queued
-  messages after restart instead of allowing overtaking.
+  a single-member group or meeting chat whose only member is that same AAD user.
+- Control-chat bootstrap records the durable control binding first, sends an
+  initial self-mention through durable outbox so Teams clients surface the
+  meeting chat, then sends the ready message through durable outbox. Pending
+  outbox flushing keeps same-chat FIFO checks enabled, so a fresh `sending`
+  predecessor blocks later queued messages after restart instead of allowing
+  overtaking.
 - Graph status errors redact dynamic chat, message, hosted-content, share,
   drive-item, and upload-path values before they can be surfaced in local
   diagnostics or helper Teams replies.
@@ -174,6 +176,49 @@ P2 deferred:
 - Large-file upload sessions and broader local-path attachment UX.
 - Running-turn interrupt for the stable foreground `exec` runner.
 - Remote upgrade confirmation/PIN semantics.
+
+Parking/resume UX requirement:
+
+- Parked or frozen work chats must never rely on the current dashboard number
+  as the durable resume handle. Dashboard numbers are view-local and can change
+  after discovery refreshes, helper restarts, or activity on another machine.
+- Each park action must create a durable resume intent with a stable short key
+  derived from durable identity, for example `r 8f3c9a2d`. The key should be
+  long enough to avoid collisions across this helper profile and machine, but
+  short enough to type on mobile. Resolve collisions by extending the key, not
+  by falling back to numbers.
+- The control chat may still show numbered dashboard shortcuts for immediate
+  navigation, but parked-chat recovery messages must show the stable key as the
+  primary command.
+- The work chat freeze message must be written for a first-time, distracted
+  Teams user. Do not mention internal concepts such as durable state, polling,
+  checking, resume intents, registry, dashboard, or helper mechanisms. Required
+  fields: this chat will not reply anymore, Codex work is safe, the
+  plain-language reason, the exact command to copy, and where to send it.
+- Preferred freeze message shape:
+
+  ```text
+  🧊 This chat is paused
+  ⚠ **Messages here will not get a reply.**
+  Your Codex work is safe. Paused after 6h idle.
+
+  ▶️ **Continue chat:**
+  Step 1: Open Control chat
+  Step 2: Send: `r 8f3c9a2d`
+  ```
+
+- Keep the work-chat freeze notice to at most about 6 short lines on mobile.
+  Put the exact command in inline code, avoid numbered alternatives, and avoid
+  any secondary commands.
+
+- Do not show raw Teams URLs in the freeze notice body. If the helper can create
+  a control-chat resume-intent message and capture its Teams message id, the
+  freeze notice may use a compact button/card/link affordance that displays only
+  `Control chat`; otherwise show plain `Open Control chat` plus the stable
+  resume command.
+- Resume commands are idempotent. Reusing an already active key should return
+  the active work chat link instead of creating another Teams chat or rerunning
+  Codex.
 
 ## M0: Plan And Tracker
 
@@ -563,7 +608,7 @@ Suggested write scope:
 Responsibilities:
 
 - Route control chat commands.
-- Create or reuse one single-member Teams work chat for a Codex session on
+- Create or reuse one single-member Teams meeting work chat for a Codex session on
   demand when the user opens or publishes that session in Teams.
 - Treat non-slash session messages as Codex input.
 - Treat slash-prefixed commands as helper commands.
@@ -993,7 +1038,7 @@ Status:
   - bridge integration for `projects`, `project <n>`, `sessions`, bare
     control-chat number selection, and local history-backed session listing
   - dashboard commands are covered by tests and do not invoke the Codex runner
-  - `new <directory> -- <task>` creates the directory, binds the session cwd,
+  - `new <directory>` creates the directory, binds the session cwd,
     and routes Codex turns from that work chat in the selected directory
   - `mkdir <directory>` creates operator-requested work directories
   - work-chat `helper rename <title>` updates the Teams group-chat topic and durable
@@ -1246,6 +1291,27 @@ Responsibilities:
   only when durable state itself is corrupt.
 - Add a per-chat outbound scheduler that respects Teams/Graph rate limits and
   `Retry-After`.
+- Add a per-chat inbound polling scheduler. Do not scan every active chat on
+  every loop. Each chat stores durable `next_poll_at`, `last_activity_at`,
+  `state`, `blocked_until`, and continuation metadata, and the loop polls only
+  due chats within the global read budget.
+- Default inbound polling states and thresholds:
+
+  | State | Trigger | Target interval | Downgrade |
+  | --- | --- | --- | --- |
+  | `hot` | user just sent a message, work chat just resumed/created, or helper just sent a final answer | `1s`, respecting per-chat 1 rps | after `2 min` idle |
+  | `running` | Codex turn is running | `3s` | turn completion moves to `hot`; no user/helper activity for `15 min` moves to `warm` unless the turn is still running |
+  | `warm` | recent conversation, no active turn | `10s` | after `15 min` idle |
+  | `cool` | quiet but still likely to be resumed soon | `30s` | after `2h` idle |
+  | `cold` | old conversation kept as low-frequency listener | `120s` | after `48h` idle |
+  | `parked` | explicitly closed/parked or idle for `48h` | not polled | user sends stable `r <hash>` in control chat |
+  | `catchup` | startup, reconnect, resume, or continuation path exists | budgeted ASAP, top `50` | after catch-up completes, return by latest activity |
+  | `blocked` | Graph 429 or transport backoff | not polled | `blocked_until`/`Retry-After` expires, then return to prior state |
+
+- Remove the earlier `deep_cold` tier. `cool` is the middle tier between
+  `warm` and `cold`; `parked` starts at `48h` idle by default.
+- Control chat has its own schedule and never parks: `1s` for `2 min` after a
+  control message, otherwise `5s`, except when blocked by `Retry-After`.
 - Keep ordering guarantees across long chunks, imported history, artifact
   messages, ACKs, and notifications.
 - Add explicit migrations for new state fields before enabling features that

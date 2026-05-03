@@ -23,6 +23,7 @@ const (
 	DashboardCommandWorkspace  DashboardCommandName = "workspace"
 	DashboardCommandSessions   DashboardCommandName = "sessions"
 	DashboardCommandOpen       DashboardCommandName = "open"
+	DashboardCommandResume     DashboardCommandName = "resume"
 	DashboardCommandPublish    DashboardCommandName = "publish"
 	DashboardCommandNew        DashboardCommandName = "new"
 	DashboardCommandAsk        DashboardCommandName = "ask"
@@ -31,6 +32,8 @@ const (
 	DashboardCommandDetails    DashboardCommandName = "details"
 	DashboardCommandHelp       DashboardCommandName = "help"
 	DashboardCommandStatus     DashboardCommandName = "status"
+	DashboardCommandRestart    DashboardCommandName = "restart"
+	DashboardCommandReload     DashboardCommandName = "reload"
 	DashboardCommandClose      DashboardCommandName = "close"
 	DashboardCommandRetry      DashboardCommandName = "retry"
 	DashboardCommandCancel     DashboardCommandName = "cancel"
@@ -184,6 +187,9 @@ func splitNaturalControlCommand(text string) (string, string, bool) {
 }
 
 func controlDashboardCommandName(syntax dashboardCommandSyntax, name string, arg string) (DashboardCommandName, bool) {
+	if commandName, ok := controlAdminCommandName(syntax, name, arg); ok {
+		return commandName, true
+	}
 	switch syntax {
 	case dashboardCommandSyntaxSlash, dashboardCommandSyntaxBang, dashboardCommandSyntaxCX:
 		return controlLegacyCommandName(name, arg)
@@ -194,34 +200,59 @@ func controlDashboardCommandName(syntax dashboardCommandSyntax, name string, arg
 	}
 }
 
+func controlAdminCommandName(syntax dashboardCommandSyntax, name string, arg string) (DashboardCommandName, bool) {
+	if syntax != dashboardCommandSyntaxHelp {
+		return DashboardCommandNone, false
+	}
+	name = strings.ToLower(strings.TrimSpace(name))
+	argName, _ := splitDashboardCommandBody(arg)
+	argName = strings.ToLower(strings.TrimSpace(argName))
+	switch name {
+	case "restart", "reboot":
+		return DashboardCommandRestart, true
+	case "reload":
+		return DashboardCommandReload, true
+	case "service":
+		if argName == "restart" || argName == "reboot" {
+			return DashboardCommandRestart, true
+		}
+		if argName == "reload" {
+			return DashboardCommandReload, true
+		}
+	}
+	return DashboardCommandNone, false
+}
+
 func controlNaturalCommandName(name string, arg string) (DashboardCommandName, bool) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "projects", "project", "workspaces", "workdirs", "dirs":
+	case "p", "proj", "projects", "project", "workspaces", "workdirs", "dirs":
 		if strings.TrimSpace(arg) != "" && !isPluralControlListName(name) {
 			return DashboardCommandWorkspace, true
 		}
 		return DashboardCommandWorkspaces, true
-	case "workspace", "workdir", "dir":
+	case "w", "ws", "workspace", "workdir", "dir":
 		return DashboardCommandWorkspace, true
-	case "sessions", "session", "history":
+	case "s", "sessions", "session", "history":
 		return DashboardCommandSessions, true
-	case "open":
+	case "o", "open":
 		return DashboardCommandOpen, true
-	case "continue", "publish", "import":
+	case "r", "resume":
+		return DashboardCommandResume, true
+	case "c", "continue", "publish", "import":
 		return DashboardCommandPublish, true
-	case "new", "create":
+	case "n", "new", "create":
 		return DashboardCommandNew, true
-	case "ask", "question":
+	case "q", "ask", "question":
 		return DashboardCommandAsk, true
-	case "mkdir", "folder":
+	case "m", "mkdir", "folder":
 		return DashboardCommandMkdir, true
-	case "rename":
+	case "rn", "rename":
 		return DashboardCommandRename, true
-	case "details", "detail":
+	case "d", "details", "detail":
 		return DashboardCommandDetails, true
-	case "", "help", "menu", "?":
+	case "", "h", "help", "menu", "?":
 		return DashboardCommandHelp, true
-	case "status":
+	case "st", "status":
 		return DashboardCommandStatus, true
 	default:
 		return DashboardCommandNone, false
@@ -238,6 +269,9 @@ func isPluralControlListName(name string) bool {
 }
 
 func controlLegacyCommandName(name string, arg string) (DashboardCommandName, bool) {
+	if strings.EqualFold(strings.TrimSpace(name), "p") {
+		return DashboardCommandPublish, true
+	}
 	if commandName, ok := controlNaturalCommandName(name, arg); ok {
 		return commandName, true
 	}
@@ -250,6 +284,8 @@ func controlLegacyCommandName(name string, arg string) (DashboardCommandName, bo
 		return DashboardCommandSessions, true
 	case "o":
 		return DashboardCommandOpen, true
+	case "r":
+		return DashboardCommandResume, true
 	case "pub", "p":
 		return DashboardCommandPublish, true
 	case "n":

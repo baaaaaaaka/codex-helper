@@ -135,7 +135,7 @@ func TestLiveBridgeControlDashboardFallbackOptIn(t *testing.T) {
 	}
 
 	sendControl("control help", "help")
-	waitAny("control help", []string{"first-time path:", "`projects`"})
+	waitAny("control help", []string{"Start here:", "`p` / `projects`"})
 
 	mkdirTarget := filepath.Join(tmp, "mkdir-"+nonce)
 	sendControl("control mkdir", "mkdir "+mkdirTarget)
@@ -145,10 +145,10 @@ func TestLiveBridgeControlDashboardFallbackOptIn(t *testing.T) {
 	}
 
 	sendControl("control projects", "projects")
-	waitAny("control projects", []string{"workspaces:", "Send a number in this control chat"}, []string{"No local Codex workspaces found on this machine"})
+	waitAny("control projects", []string{"Workspaces", "Reply with a number"}, []string{"No local Codex workspaces found on this machine"})
 
 	sendControl("control sessions", "sessions")
-	waitAny("control sessions", []string{"sessions", "continue <number>"}, []string{"No local Codex sessions found"})
+	waitAny("control sessions", []string{"Sessions", "Reply with a number"}, []string{"No local Codex sessions found"})
 
 	sendControl("control unknown slash", "/definitely-not-a-helper-command-"+nonce)
 	waitAny("control unknown slash", []string{"unknown control command", "projects"})
