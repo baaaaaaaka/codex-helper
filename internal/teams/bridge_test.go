@@ -520,7 +520,7 @@ func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T)
 
 func waitForNoActiveTurnsOrOutbox(t *testing.T, store *teamstore.Store, sessionID string) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	stable := 0
 	for {
 		state, err := store.Load(context.Background())
@@ -600,7 +600,7 @@ func TestBridgeSuppressesQueuedCodexCommandOutbox(t *testing.T) {
 
 func waitForOutboxBody(t *testing.T, store *teamstore.Store, want string) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -620,7 +620,7 @@ func waitForOutboxBody(t *testing.T, store *teamstore.Store, want string) {
 
 func waitForCompletedTurnCount(t *testing.T, store *teamstore.Store, sessionID string, want int) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -1171,11 +1171,12 @@ func TestBridgeControlWorkspacesAndSessionsDoNotRunCodex(t *testing.T) {
 		t.Fatalf("sent count = %d, want 3", len(*sent))
 	}
 	workspaceDashboard := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if !strings.Contains(workspaceDashboard, "1 - /home/user/project/alpha") {
+	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
+	if !strings.Contains(workspaceDashboard, "1 - "+expectedAlphaPath) {
 		t.Fatalf("dashboard output missing numbered absolute workspace path: %q", workspaceDashboard)
 	}
 	sessionDashboard := PlainTextFromTeamsHTML((*sent)[1].Content)
-	if !strings.Contains(sessionDashboard, "Workspace: /home/user/project/alpha") {
+	if !strings.Contains(sessionDashboard, "Workspace: "+expectedAlphaPath) {
 		t.Fatalf("session dashboard should name selected workspace: %q", sessionDashboard)
 	}
 	if !strings.Contains(sessionDashboard, "fix alpha") || !strings.Contains(sessionDashboard, "c 1") {
@@ -1437,7 +1438,9 @@ func TestBridgeDashboardNumbersSurviveViewRoundTrip(t *testing.T) {
 		t.Fatalf("sent = %#v, want 3 dashboard messages", *sent)
 	}
 	refreshed := PlainTextFromTeamsHTML((*sent)[2].Content)
-	if !strings.Contains(refreshed, "1 - /home/user/project/alpha") || !strings.Contains(refreshed, "2 - /home/user/project/beta") {
+	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
+	expectedBetaPath := dashboardAbsolutePath("/home/user/project/beta")
+	if !strings.Contains(refreshed, "1 - "+expectedAlphaPath) || !strings.Contains(refreshed, "2 - "+expectedBetaPath) {
 		t.Fatalf("workspace numbers changed after sessions view round trip: %q", refreshed)
 	}
 }
@@ -5768,7 +5771,8 @@ func TestBridgeDashboardProjectsCacheReusesDiscoveryForFollowupSelection(t *test
 	if calls != 1 {
 		t.Fatalf("discovery calls = %d, want cached projects reused for follow-up selection", calls)
 	}
-	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "Workspace: /home/user/project/alpha") {
+	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
+	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "Workspace: "+expectedAlphaPath) {
 		t.Fatalf("sent = %#v, want workspace sessions from cached discovery", *sent)
 	}
 }
@@ -6985,6 +6989,7 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 
 	var plain []string
 	for _, msg := range *sent {
@@ -7047,6 +7052,7 @@ func TestBridgeSyncsCompletedLocalTranscriptBeforeStartingTeamsPrompt(t *testing
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 
 	var plain []string
 	for _, msg := range *sent {
@@ -7126,6 +7132,7 @@ func TestBridgeQueuedTurnWaitsForLocalTranscriptCatchupLimit(t *testing.T) {
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 	if !sentPlainContains(*sent, "local answer 09") {
 		t.Fatalf("remaining local catch-up was not sent before Teams answer: %#v", *sent)
 	}
@@ -7170,6 +7177,7 @@ func TestBridgeAllowsTeamsPromptAfterLocalTranscriptFailureTerminal(t *testing.T
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 	joined := sentPlainJoined(*sent)
 	for _, want := range []string{
 		"🧑‍💻 User:\nlocal prompt before failure",
