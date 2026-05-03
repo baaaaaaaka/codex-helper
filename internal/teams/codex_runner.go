@@ -120,9 +120,6 @@ type CodexExecutor struct {
 
 func (e CodexExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
 	timeout := e.Timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Minute
-	}
 	command := strings.TrimSpace(e.CodexPath)
 	if command == "" {
 		command = "codex"

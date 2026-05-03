@@ -34,6 +34,7 @@ func newManagedTeamsCodexExecutor(
 	if command == "" {
 		command = "codex"
 	}
+	codexArgs = teamsCodexYoloSafeArgs(codexArgs)
 	launcher := teamsCodexLauncher{root: root, log: log}
 	execRunner := &codexrunner.ExecRunner{
 		Launcher:   launcher,
@@ -123,11 +124,6 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 	if err != nil {
 		return codexrunner.LaunchResult{}, err
 	}
-	cfg, err := store.Load()
-	if err != nil {
-		return codexrunner.LaunchResult{}, err
-	}
-	useYolo := resolveYoloEnabled(cfg)
 	useProxy, _, err := ensureProxyPreferenceRunFn(ctx, store, "", log)
 	if err != nil {
 		return codexrunner.LaunchResult{}, err
@@ -141,7 +137,8 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 		Stdin:       strings.NewReader(req.Stdin),
 		Stdout:      stdoutWriter,
 		Stderr:      &stderr,
-		YoloEnabled: useYolo,
+		YoloEnabled: true,
+		RequireYolo: true,
 	}
 
 	var runErr error
@@ -194,6 +191,10 @@ func runTeamsCodexDirect(
 	opts.Stdout = stdout
 	opts.Stderr = stderr
 	return runTargetWithFallbackWithOptionsFn(ctx, resolvedCmd, "", nil, nil, opts)
+}
+
+func teamsCodexYoloSafeArgs(args []string) []string {
+	return stripYoloArgs(args)
 }
 
 func teamsStoreConfigForStatus(root *rootOptions) (*config.Store, error) {

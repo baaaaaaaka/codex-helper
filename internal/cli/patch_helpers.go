@@ -213,17 +213,23 @@ func stripYoloArgs(cmdArgs []string) []string {
 	}
 	out := make([]string, 0, len(cmdArgs))
 	for i := 0; i < len(cmdArgs); i++ {
-		switch cmdArgs[i] {
-		case "--yolo", "--dangerously-bypass-approvals-and-sandbox":
+		arg := strings.TrimSpace(cmdArgs[i])
+		switch {
+		case arg == "--yolo" || arg == "--dangerously-bypass-approvals-and-sandbox":
 			continue
-		case "--ask-for-approval", "--sandbox":
+		case arg == "--ask-for-approval" || arg == "--sandbox" || arg == "-s":
 			// Skip the flag and its value.
 			if i+1 < len(cmdArgs) {
 				i++
 			}
 			continue
+		case strings.HasPrefix(arg, "--ask-for-approval=") ||
+			strings.HasPrefix(arg, "--sandbox=") ||
+			strings.HasPrefix(arg, "-s="):
+			continue
+		default:
+			out = append(out, cmdArgs[i])
 		}
-		out = append(out, cmdArgs[i])
 	}
 	return out
 }

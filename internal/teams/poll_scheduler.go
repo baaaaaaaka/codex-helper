@@ -34,6 +34,8 @@ const (
 	maxWorkChatPollsPerCycle = 8
 )
 
+const DefaultMaxWorkChatPollsPerCycle = maxWorkChatPollsPerCycle
+
 type inboundPollRole string
 
 const (

@@ -305,6 +305,7 @@ type runTargetOptions struct {
 	// PreserveTTY keeps stdout/stderr attached to the terminal for interactive CLIs.
 	PreserveTTY    bool
 	YoloEnabled    bool
+	RequireYolo    bool
 	OnYoloFallback func() error
 	// PatchInfo, when set, records patch failure on startup crash.
 	PatchInfo *patchRunInfo
@@ -563,6 +564,9 @@ func runTargetWithFallbackWithOptions(
 		}
 		out := stdoutBuf.String() + stderrBuf.String()
 		if opts.YoloEnabled && !yoloRetried && isYoloFailure(err, out) {
+			if opts.RequireYolo {
+				return fmt.Errorf("yolo mode is required but Codex rejected yolo launch: %w", err)
+			}
 			yoloRetried = true
 			if opts.OnYoloFallback != nil {
 				_ = opts.OnYoloFallback()

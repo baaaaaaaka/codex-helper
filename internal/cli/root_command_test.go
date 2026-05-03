@@ -58,6 +58,14 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	if runCmd.Flags().Lookup("control-fallback-model") == nil {
 		t.Fatal("teams run should expose --control-fallback-model")
 	}
+	if runCmd.Flags().Lookup("owner-stale-after") == nil || runCmd.Flags().Lookup("max-work-chat-polls") == nil {
+		t.Fatal("teams run should expose Teams helper reliability tuning flags")
+	}
+	if flag := runCmd.Flags().Lookup("codex-timeout"); flag == nil {
+		t.Fatal("teams run should expose --codex-timeout")
+	} else if flag.DefValue != "0s" {
+		t.Fatalf("teams run --codex-timeout default = %q, want 0s", flag.DefValue)
+	}
 
 	authCmd, _, err := teamsCmd.Find([]string{"auth"})
 	if err != nil {

@@ -56,6 +56,7 @@ const (
 	importCheckpointStatusImporting = "importing"
 	importCheckpointStatusComplete  = "complete"
 	importCheckpointStatusFailed    = "failed"
+	importCheckpointStatusBlocked   = "blocked"
 )
 
 type outboxQueueOptions struct {
@@ -64,20 +65,21 @@ type outboxQueueOptions struct {
 }
 
 type BridgeOptions struct {
-	RegistryPath            string
-	StorePath               string
-	Store                   *teamstore.Store
-	HelperVersion           string
-	OwnerStaleAfter         time.Duration
-	Interval                time.Duration
-	Once                    bool
-	Top                     int
-	Executor                Executor
-	ControlFallbackExecutor Executor
-	ControlFallbackModel    string
-	Runner                  codexrunner.Runner
-	HelperRestarter         HelperRestarter
-	HelperReloader          HelperReloader
+	RegistryPath             string
+	StorePath                string
+	Store                    *teamstore.Store
+	HelperVersion            string
+	OwnerStaleAfter          time.Duration
+	Interval                 time.Duration
+	Once                     bool
+	Top                      int
+	MaxWorkChatPollsPerCycle int
+	Executor                 Executor
+	ControlFallbackExecutor  Executor
+	ControlFallbackModel     string
+	Runner                   codexrunner.Runner
+	HelperRestarter          HelperRestarter
+	HelperReloader           HelperReloader
 }
 
 type HelperRestarter func(context.Context) error
@@ -116,6 +118,7 @@ type Bridge struct {
 	pollMu                    sync.Mutex
 	fastPollUntil             time.Time
 	lastTranscriptSync        time.Time
+	maxWorkChatPollsPerCycle  int
 	dashboardProjectsMu       sync.Mutex
 	dashboardProjectsCache    []codexhistory.Project
 	dashboardProjectsCachedAt time.Time
@@ -302,9 +305,13 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	if b.machine.ID == "" {
 		b.machine = MachineRecordForUser(b.user, b.scope)
 	}
+	b.maxWorkChatPollsPerCycle = opts.MaxWorkChatPollsPerCycle
 	b.leaseDuration = opts.Interval * 3
 	if b.leaseDuration < 30*time.Second {
 		b.leaseDuration = 30 * time.Second
+	}
+	if b.leaseDuration < opts.OwnerStaleAfter {
+		b.leaseDuration = opts.OwnerStaleAfter
 	}
 	b.store = opts.Store
 	if b.store == nil {
@@ -551,8 +558,8 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		decisions = append(decisions, decision)
 	}
 	sortInboundPollDecisions(decisions)
-	if len(decisions) > maxWorkChatPollsPerCycle {
-		decisions = decisions[:maxWorkChatPollsPerCycle]
+	if limit := b.effectiveMaxWorkChatPollsPerCycle(); len(decisions) > limit {
+		decisions = decisions[:limit]
 	}
 	var firstErr error
 	for _, decision := range decisions {
@@ -731,6 +738,13 @@ func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role 
 	return err
 }
 
+func (b *Bridge) effectiveMaxWorkChatPollsPerCycle() int {
+	if b != nil && b.maxWorkChatPollsPerCycle > 0 {
+		return b.maxWorkChatPollsPerCycle
+	}
+	return maxWorkChatPollsPerCycle
+}
+
 func (b *Bridge) persistInboundPollDecision(ctx context.Context, decision inboundPollDecision) error {
 	if strings.TrimSpace(decision.ChatID) == "" || strings.TrimSpace(decision.State) == "" {
 		return nil
@@ -781,6 +795,16 @@ func runningPollSessions(state teamstore.State) map[string]bool {
 			if strings.TrimSpace(turn.SessionID) != "" {
 				running[turn.SessionID] = true
 			}
+		}
+	}
+	return running
+}
+
+func runningTurnSessions(state teamstore.State) map[string]bool {
+	running := make(map[string]bool)
+	for _, turn := range state.Turns {
+		if turn.Status == teamstore.TurnStatusRunning && strings.TrimSpace(turn.SessionID) != "" {
+			running[turn.SessionID] = true
 		}
 	}
 	return running
@@ -993,6 +1017,17 @@ func promptTextFromTeamsMessageHTML(content string) string {
 	return stripUserAnnotationPrefix(PlainTextFromTeamsHTML(content))
 }
 
+func promptTextFromTeamsMessageOrFallback(msg ChatMessage, fallbackText string) (string, bool) {
+	if prompt := strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content)); prompt != "" && !IsHelperText(prompt) {
+		return prompt, true
+	}
+	fallback := strings.TrimSpace(fallbackText)
+	if fallback == "" || IsHelperText(fallback) {
+		return "", false
+	}
+	return fallback, true
+}
+
 func stripUserAnnotationPrefix(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -1000,8 +1035,11 @@ func stripUserAnnotationPrefix(text string) string {
 	}
 	firstLine, rest, ok := strings.Cut(text, "\n")
 	firstLine = strings.TrimSpace(firstLine)
-	if !ok || !isUserAnnotationLabel(firstLine) {
+	if !isUserAnnotationLabel(firstLine) {
 		return text
+	}
+	if !ok {
+		return ""
 	}
 	return strings.TrimSpace(rest)
 }
@@ -2214,8 +2252,8 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 		return b.sendToChat(ctx, session.ChatID, hostedAttachmentMessage)
 	}
 	localFiles = append(localFiles, hostedFiles...)
-	prompt := promptTextFromTeamsMessageHTML(msg.Body.Content)
-	if strings.TrimSpace(prompt) == "" && len(localFiles) == 0 || IsHelperText(prompt) {
+	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, inbound.Text)
+	if !promptOK && len(localFiles) == 0 {
 		return b.sendToChat(ctx, session.ChatID, "retry cannot use an empty or helper-generated original message.")
 	}
 	retryTurn, _, err := b.store.QueueTurn(ctx, teamstore.Turn{
@@ -2676,8 +2714,8 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 		})
 	}
 	localFiles = append(localFiles, referenceFiles...)
-	prompt := promptTextFromTeamsMessageHTML(msg.Body.Content)
-	if strings.TrimSpace(prompt) == "" && len(localFiles) == 0 || IsHelperText(prompt) {
+	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, inbound.Text)
+	if !promptOK && len(localFiles) == 0 {
 		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn original prompt is empty or helper-generated"); err != nil {
 			return err
 		}
@@ -3123,22 +3161,28 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 	if result.CodexThreadID != "" {
 		session.CodexThreadID = result.CodexThreadID
 	}
-	session.UpdatedAt = time.Now()
-	if _, err := b.store.MarkTurnCompleted(ctx, turn.ID, result.CodexThreadID, result.CodexTurnID); err != nil {
-		return err
-	}
 	mentionOwner := true
 	visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
 	if visibleText == "" && len(ExtractArtifactManifestBlocks(result.Text)) > 0 {
 		visibleText = "artifact manifest received; uploading listed files."
 	}
-	if err := b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "final", visibleText, outboxQueueOptions{
+	queued, err := b.queueOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "final", visibleText, outboxQueueOptions{
 		MentionOwner:     mentionOwner,
 		NotificationKind: "turn_completed",
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
-	b.boostPolling(time.Now())
+	session.UpdatedAt = time.Now()
+	if _, err := b.store.MarkTurnCompleted(ctx, turn.ID, result.CodexThreadID, result.CodexTurnID); err != nil {
+		return err
+	}
+	if len(queued) > 0 {
+		if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
+			return err
+		}
+		b.boostPolling(time.Now())
+	}
 	return b.uploadArtifactsFromResult(ctx, session, turn, result.Text)
 }
 
@@ -4229,8 +4273,23 @@ func (b *Bridge) queueAndSendOutboxChunks(ctx context.Context, sessionID string,
 }
 
 func (b *Bridge) queueAndSendOutboxChunksWithOptions(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string, opts outboxQueueOptions) error {
-	if shouldSuppressCodexCommandOutbox(kind) {
+	queued, err := b.queueOutboxChunksWithOptions(ctx, sessionID, turnID, chatID, kind, text, opts)
+	if err != nil {
+		return err
+	}
+	if len(queued) == 0 {
 		return nil
+	}
+	if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
+		return err
+	}
+	b.boostPolling(time.Now())
+	return nil
+}
+
+func (b *Bridge) queueOutboxChunksWithOptions(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string, opts outboxQueueOptions) ([]teamstore.OutboxMessage, error) {
+	if shouldSuppressCodexCommandOutbox(kind) {
+		return nil, nil
 	}
 	renderKind := renderKindForOutbox(kind)
 	if renderKind == TeamsRenderAssistant {
@@ -4279,18 +4338,11 @@ func (b *Bridge) queueAndSendOutboxChunksWithOptions(ctx context.Context, sessio
 		}
 		queuedMsg, err := b.queueOutbox(ctx, msg)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		queued = append(queued, queuedMsg)
 	}
-	if len(queued) == 0 {
-		return nil
-	}
-	if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
-		return err
-	}
-	b.boostPolling(time.Now())
-	return nil
+	return queued, nil
 }
 
 func (b *Bridge) queueAndSendOutbox(ctx context.Context, msg teamstore.OutboxMessage) error {
@@ -5834,7 +5886,7 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 		return out, nil
 	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
-	deliveredHashes := deliveredTranscriptHashes(state, session.ID)
+	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
 	dedupe := newTranscriptDedupeState()
 	active := false
 	for i, record := range transcript.Records {
@@ -5843,7 +5895,7 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 			continue
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
-			shouldSkipDeliveredTranscriptRecord(record, body, deliveredHashes) ||
+			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			dedupe.shouldSkip(record, body) {
 			continue
 		}
@@ -5979,6 +6031,11 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	activeTeamsTurns := runningTurnSessions(state)
 	projects, err := discoverCodexProjectsForTeams(ctx, "")
 	if err != nil {
 		return nil
@@ -5999,6 +6056,9 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 		if session.CodexThreadID == "" {
 			continue
 		}
+		if activeTeamsTurns[session.ID] {
+			continue
+		}
 		local, ok := byID[session.CodexThreadID]
 		if !ok || strings.TrimSpace(local.FilePath) == "" {
 			continue
@@ -6016,10 +6076,15 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	if err != nil {
 		return err
 	}
+	if runningTurnSessions(state)[session.ID] {
+		return nil
+	}
 	checkpoint, hasCheckpoint := state.ImportCheckpoints[checkpointID]
 	if hasCheckpoint {
 		switch checkpoint.Status {
 		case importCheckpointStatusImporting:
+			return nil
+		case importCheckpointStatusBlocked:
 			return nil
 		case importCheckpointStatusFailed:
 			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
@@ -6059,11 +6124,10 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		return nil
 	}
 	if len(transcript.Records) > transcriptSyncMaxAutoBacklogRecords {
-		last := transcript.Records[len(transcript.Records)-1]
-		return b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(last), last.SourceLine)
+		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, len(transcript.Records))
 	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
-	deliveredHashes := deliveredTranscriptHashes(state, session.ID)
+	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
 	dedupe := newTranscriptDedupeState()
 	syncTurnID := "sync:" + session.ID
 	sent := 0
@@ -6079,7 +6143,7 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			continue
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
-			shouldSkipDeliveredTranscriptRecord(record, body, deliveredHashes) ||
+			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			shouldSkipBackgroundTranscriptRecord(record) ||
 			dedupe.shouldSkip(record, body) {
 			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
@@ -6153,6 +6217,28 @@ func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session 
 	return true, b.markTranscriptImportComplete(ctx, session, sourcePath, transcriptRecordCheckpointKey(recovered), recovered.SourceLine)
 }
 
+func (b *Bridge) blockAutomaticTranscriptSync(ctx context.Context, session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint, backlogRecords int) error {
+	if err := b.markTranscriptImportBlocked(ctx, session, sourcePath, checkpoint); err != nil {
+		return err
+	}
+	body := fmt.Sprintf("Local Codex history has %d new items, so I paused automatic history sync to avoid flooding this Teams chat.\n\nNo history was skipped. To import the backlog, send `helper publish-history` here.", backlogRecords)
+	idSeed := firstNonEmptyString(checkpoint.LastRecordID, fmt.Sprintf("line-%d", checkpoint.LastSourceLine), "start")
+	outboxID := "outbox:sync:" + session.ID + ":backlog-blocked:" + shortStableID(idSeed)
+	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:          outboxID,
+		SessionID:   session.ID,
+		TurnID:      "sync:" + session.ID,
+		TeamsChatID: session.ChatID,
+		Kind:        "sync-status-backlog-blocked",
+		Body:        body,
+	})
+}
+
+func shortStableID(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 func transcriptImportIsActive(state teamstore.State, sessionID string) bool {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -6195,20 +6281,20 @@ func shouldSkipTeamsOriginTranscriptRecord(record TranscriptRecord, body string,
 	return hash != "" && hashes[hash]
 }
 
-func deliveredTranscriptHashes(state teamstore.State, sessionID string) map[TranscriptKind]map[string]bool {
+func knownTranscriptOutboxHashes(state teamstore.State, sessionID string) map[TranscriptKind]map[string]bool {
 	hashes := make(map[TranscriptKind]map[string]bool)
 	for _, outbox := range state.OutboxMessages {
 		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
 			continue
 		}
-		if !outboxWasDelivered(outbox) {
+		if !outboxCanDedupeTranscript(outbox) {
 			continue
 		}
 		kind, ok := deliveredOutboxTranscriptKind(outbox.Kind)
 		if !ok {
 			continue
 		}
-		hash := normalizedTextHash(formatDeliveredOutboxBodyForTranscriptDedupe(kind, outbox.Body))
+		hash := normalizedTextHash(formatKnownOutboxBodyForTranscriptDedupe(kind, outbox.Body))
 		if hash != "" {
 			if hashes[kind] == nil {
 				hashes[kind] = make(map[string]bool)
@@ -6225,11 +6311,13 @@ func deliveredTranscriptHashes(state teamstore.State, sessionID string) map[Tran
 	return hashes
 }
 
-func outboxWasDelivered(outbox teamstore.OutboxMessage) bool {
-	if outbox.Status == teamstore.OutboxStatusSent {
+func outboxCanDedupeTranscript(outbox teamstore.OutboxMessage) bool {
+	switch outbox.Status {
+	case teamstore.OutboxStatusQueued, teamstore.OutboxStatusSending, teamstore.OutboxStatusAccepted, teamstore.OutboxStatusSent:
 		return true
+	default:
+		return false
 	}
-	return outbox.Status == teamstore.OutboxStatusAccepted && strings.TrimSpace(outbox.TeamsMessageID) != ""
 }
 
 func deliveredOutboxTranscriptKind(kind string) (TranscriptKind, bool) {
@@ -6244,7 +6332,7 @@ func deliveredOutboxTranscriptKind(kind string) (TranscriptKind, bool) {
 	}
 }
 
-func formatDeliveredOutboxBodyForTranscriptDedupe(kind TranscriptKind, body string) string {
+func formatKnownOutboxBodyForTranscriptDedupe(kind TranscriptKind, body string) string {
 	body = StripHelperPromptEchoes(StripArtifactManifestBlocks(body))
 	if kind == TranscriptKindAssistant {
 		body = StripOAIMemoryCitationBlocks(body)
@@ -6252,7 +6340,7 @@ func formatDeliveredOutboxBodyForTranscriptDedupe(kind TranscriptKind, body stri
 	return body
 }
 
-func shouldSkipDeliveredTranscriptRecord(record TranscriptRecord, body string, hashes map[TranscriptKind]map[string]bool) bool {
+func shouldSkipKnownTranscriptOutboxRecord(record TranscriptRecord, body string, hashes map[TranscriptKind]map[string]bool) bool {
 	if record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus {
 		return false
 	}
@@ -6484,6 +6572,25 @@ func (b *Bridge) markTranscriptImportFailedWithID(ctx context.Context, session S
 		checkpoint.SessionID = session.ID
 		checkpoint.SourcePath = sourcePath
 		checkpoint.Status = importCheckpointStatusFailed
+		checkpoint.UpdatedAt = now
+		state.ImportCheckpoints[id] = checkpoint
+		return nil
+	})
+}
+
+func (b *Bridge) markTranscriptImportBlocked(ctx context.Context, session Session, sourcePath string, previous teamstore.ImportCheckpoint) error {
+	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+		now := time.Now()
+		id := transcriptCheckpointID(session.ID)
+		checkpoint := state.ImportCheckpoints[id]
+		if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+			checkpoint.LastRecordID = previous.LastRecordID
+			checkpoint.LastSourceLine = previous.LastSourceLine
+		}
+		checkpoint.ID = id
+		checkpoint.SessionID = session.ID
+		checkpoint.SourcePath = sourcePath
+		checkpoint.Status = importCheckpointStatusBlocked
 		checkpoint.UpdatedAt = now
 		state.ImportCheckpoints[id] = checkpoint
 		return nil

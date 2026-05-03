@@ -19,6 +19,11 @@ import (
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
+const (
+	defaultTeamsOwnerStaleAfter       = 5 * time.Minute
+	defaultTeamsChatRecreateDrainTime = 2 * time.Minute
+)
+
 func newTeamsCmd(root *rootOptions) *cobra.Command {
 	var registryPath string
 
@@ -462,7 +467,7 @@ func newTeamsControlCmd(root *rootOptions, registryPath *string) *cobra.Command 
 	cmd.Flags().BoolVar(&noCreate, "print", false, "Alias for --no-create")
 	cmd.Flags().BoolVar(&recreate, "recreate", false, "Create a fresh meeting-based control chat and rebind local Teams helper state; old Teams chats are not deleted")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that --recreate may create a Teams chat and send an @mention plus a ready message")
-	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", 30*time.Second, "How long to wait for the running Teams listener to drain before recreating")
+	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", defaultTeamsChatRecreateDrainTime, "How long to wait for the running Teams listener to drain before recreating")
 	return cmd
 }
 
@@ -521,7 +526,7 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 		},
 	}
 	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that this may create a Teams chat and send an @mention plus a ready message")
-	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", 30*time.Second, "How long to wait for the running Teams listener to drain before recreating")
+	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", defaultTeamsChatRecreateDrainTime, "How long to wait for the running Teams listener to drain before recreating")
 	return cmd
 }
 
@@ -548,7 +553,7 @@ func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout
 		if !hasOwner {
 			continue
 		}
-		if teamsstore.IsStale(owner, 2*time.Minute, time.Now()) {
+		if teamsstore.IsStale(owner, defaultTeamsOwnerStaleAfter, time.Now()) {
 			return fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before recreating chats", path)
 		}
 		if _, err := st.SetDraining(ctx, "chat recreate"); err != nil {
@@ -560,7 +565,7 @@ func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout
 		return nil
 	}
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = defaultTeamsChatRecreateDrainTime
 	}
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "Waiting for active Teams listener to drain before recreating chat...")
@@ -616,6 +621,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var codexArgs []string
 	var controlFallbackModel string
 	var timeout time.Duration
+	var ownerStaleAfter time.Duration
+	var maxWorkChatPolls int
 	var upgradeCodex bool
 	cmd := &cobra.Command{
 		Use:     "run",
@@ -650,16 +657,18 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				return err
 			}
 			return bridge.Listen(cmd.Context(), teams.BridgeOptions{
-				RegistryPath:            *registryPath,
-				HelperVersion:           buildVersion(),
-				Interval:                interval,
-				Once:                    once,
-				Top:                     top,
-				Executor:                executor,
-				ControlFallbackExecutor: controlFallbackExecutor,
-				ControlFallbackModel:    controlFallbackModel,
-				HelperRestarter:         restartTeamsHelperFromTeams,
-				HelperReloader:          reloadTeamsHelperFromTeams,
+				RegistryPath:             *registryPath,
+				HelperVersion:            buildVersion(),
+				Interval:                 interval,
+				Once:                     once,
+				Top:                      top,
+				OwnerStaleAfter:          ownerStaleAfter,
+				MaxWorkChatPollsPerCycle: maxWorkChatPolls,
+				Executor:                 executor,
+				ControlFallbackExecutor:  controlFallbackExecutor,
+				ControlFallbackModel:     controlFallbackModel,
+				HelperRestarter:          restartTeamsHelperFromTeams,
+				HelperReloader:           reloadTeamsHelperFromTeams,
 			})
 		},
 	}
@@ -672,7 +681,9 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&workDir, "workdir", "", "Working directory for Codex sessions")
 	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra argument to pass to codex exec (repeatable)")
 	cmd.Flags().StringVar(&controlFallbackModel, "control-fallback-model", teams.DefaultControlFallbackModel, "Codex model for unrecognized control-chat requests")
-	cmd.Flags().DurationVar(&timeout, "codex-timeout", 30*time.Minute, "Timeout for each Codex turn")
+	cmd.Flags().DurationVar(&timeout, "codex-timeout", 0, "Timeout for each Codex turn; 0 disables the helper-enforced turn timeout")
+	cmd.Flags().DurationVar(&ownerStaleAfter, "owner-stale-after", defaultTeamsOwnerStaleAfter, "How long a Teams helper owner can miss heartbeats before recovery or another helper may take over")
+	cmd.Flags().IntVar(&maxWorkChatPolls, "max-work-chat-polls", teams.DefaultMaxWorkChatPollsPerCycle, "Maximum work chats to read per poll cycle")
 	cmd.Flags().BoolVar(&upgradeCodex, "upgrade-codex", false, "Upgrade Codex CLI once before starting Teams polling")
 	return cmd
 }

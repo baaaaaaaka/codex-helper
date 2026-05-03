@@ -27,7 +27,7 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false), YoloEnabled: boolPtr(true)}); err != nil {
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false), YoloEnabled: boolPtr(false)}); err != nil {
 		t.Fatalf("Save config: %v", err)
 	}
 
@@ -77,7 +77,10 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 		t.Fatal("Teams launcher must not preserve TTY")
 	}
 	if !gotOpts.YoloEnabled {
-		t.Fatal("Teams launcher should inherit yolo mode from codex-proxy config")
+		t.Fatal("Teams launcher should force yolo mode even when global config has yolo disabled")
+	}
+	if !gotOpts.RequireYolo {
+		t.Fatal("Teams launcher must not fall back to sandbox mode when yolo launch is rejected")
 	}
 	if gotOpts.Stdout == nil || gotOpts.Stderr == nil || gotOpts.Stdin == nil {
 		t.Fatalf("headless IO not configured: %#v", gotOpts)
@@ -149,9 +152,33 @@ func TestNewTeamsControlFallbackExecutorForcesSparkModel(t *testing.T) {
 	if !ok {
 		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
 	}
-	want := []string{"--sandbox", "workspace-write", "--model", teams.DefaultControlFallbackModel}
+	want := []string{"--model", teams.DefaultControlFallbackModel}
 	if !reflect.DeepEqual(runner.ExtraArgs, want) {
 		t.Fatalf("fallback extra args = %#v, want %#v", runner.ExtraArgs, want)
+	}
+}
+
+func TestNewManagedTeamsCodexExecutorStripsSandboxArgs(t *testing.T) {
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{}, "exec", "/tmp/codex", "/work", []string{
+		"--model", "gpt-test",
+		"--sandbox=workspace-write",
+		"--ask-for-approval", "on-request",
+		"-s", "read-only",
+	}, time.Minute, io.Discard)
+	if err != nil {
+		t.Fatalf("newManagedTeamsCodexExecutor error: %v", err)
+	}
+	teamsExecutor, ok := executor.(teamsCodexExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
+	}
+	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
+	if !ok {
+		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
+	}
+	want := []string{"--model", "gpt-test"}
+	if !reflect.DeepEqual(runner.ExtraArgs, want) {
+		t.Fatalf("runner extra args = %#v, want %#v", runner.ExtraArgs, want)
 	}
 }
 

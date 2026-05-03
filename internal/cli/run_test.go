@@ -219,6 +219,37 @@ func TestRunTargetWithFallbackDisablesYolo(t *testing.T) {
 	}
 }
 
+func TestRunTargetWithFallbackRequiresYolo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "yolo.sh")
+	content := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--yolo\" ]; then\n    echo \"unknown flag: --yolo\" >&2\n    exit 2\n  fi\ndone\nexit 0\n"
+	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	disabled := false
+	opts := runTargetOptions{
+		UseProxy:    false,
+		PreserveTTY: false,
+		YoloEnabled: true,
+		RequireYolo: true,
+		OnYoloFallback: func() error {
+			disabled = true
+			return nil
+		},
+	}
+	err := runTargetWithFallbackWithOptions(context.Background(), []string{script, "--yolo"}, "", nil, nil, opts)
+	if err == nil || !strings.Contains(err.Error(), "yolo mode is required") {
+		t.Fatalf("runTargetWithFallbackWithOptions error = %v, want required-yolo error", err)
+	}
+	if disabled {
+		t.Fatal("required yolo should not call fallback disable hook")
+	}
+}
+
 func TestCodexExecutionContextForRunRequiresRunnableIdentityForForeignHome(t *testing.T) {
 	lockCLITestHooks(t)
 	setEffectivePathsHooksForTest(t)

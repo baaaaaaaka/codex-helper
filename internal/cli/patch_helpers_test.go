@@ -115,6 +115,20 @@ func TestStripYoloArgs_AskForApprovalAtEnd(t *testing.T) {
 	}
 }
 
+func TestStripYoloArgs_RemovesInlineSandboxForms(t *testing.T) {
+	in := []string{"codex", "--sandbox=workspace-write", "-s=read-only", "-s", "workspace-write", "--ask-for-approval=on-request", "exec"}
+	out := stripYoloArgs(in)
+	want := []string{"codex", "exec"}
+	if len(out) != len(want) {
+		t.Fatalf("expected %v, got %v", want, out)
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, out)
+		}
+	}
+}
+
 func TestExtractVersion(t *testing.T) {
 	cases := []struct {
 		input string
