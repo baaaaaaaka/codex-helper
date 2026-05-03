@@ -27,13 +27,13 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false), YoloEnabled: boolPtr(true)}); err != nil {
 		t.Fatalf("Save config: %v", err)
 	}
 
 	binDir := t.TempDir()
 	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nexit 0\n"), 0o700); err != nil {
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
 		t.Fatalf("write codex stub: %v", err)
 	}
 
@@ -67,7 +67,7 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if !reflect.DeepEqual(gotArgs, []string{codexPath, "exec", "--json", "-"}) {
+	if !reflect.DeepEqual(gotArgs, []string{codexPath, "--dangerously-bypass-approvals-and-sandbox", "exec", "--json", "-"}) {
 		t.Fatalf("cmd args = %#v", gotArgs)
 	}
 	if gotOpts.UseProxy {
@@ -75,6 +75,9 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	}
 	if gotOpts.PreserveTTY {
 		t.Fatal("Teams launcher must not preserve TTY")
+	}
+	if !gotOpts.YoloEnabled {
+		t.Fatal("Teams launcher should inherit yolo mode from codex-proxy config")
 	}
 	if gotOpts.Stdout == nil || gotOpts.Stderr == nil || gotOpts.Stdin == nil {
 		t.Fatalf("headless IO not configured: %#v", gotOpts)

@@ -120,7 +120,7 @@ func TestRunWithExistingInstanceOptionsPreservesExplicitCodexHomeEnv(t *testing.
 		},
 	}
 
-	if err := runWithExistingInstanceOptions(context.Background(), manager.HealthClient{Timeout: time.Second}, inst, []string{"codex"}, opts); err != nil {
+	if err := runWithExistingInstanceOptions(context.Background(), nil, manager.HealthClient{Timeout: time.Second}, inst, []string{"codex"}, opts); err != nil {
 		t.Fatalf("runWithExistingInstanceOptions error: %v", err)
 	}
 
@@ -177,7 +177,7 @@ func TestRunWithExistingInstanceOptionsInstallsCodexUsingProxyEnv(t *testing.T) 
 	clearCachedCodexPath()
 
 	opts := runTargetOptions{UseProxy: false, Log: io.Discard}
-	if err := runWithExistingInstanceOptions(context.Background(), manager.HealthClient{Timeout: time.Second}, inst, []string{"codex", "--help"}, opts); err != nil {
+	if err := runWithExistingInstanceOptions(context.Background(), nil, manager.HealthClient{Timeout: time.Second}, inst, []string{"codex", "--help"}, opts); err != nil {
 		t.Fatalf("runWithExistingInstanceOptions error: %v", err)
 	}
 	if _, err := os.Stat(codexPath); err != nil {

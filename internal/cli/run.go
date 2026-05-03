@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -148,11 +149,12 @@ func selectProfile(cfg config.Config, ref string) (config.Profile, error) {
 }
 
 func runWithExistingInstance(ctx context.Context, hc manager.HealthClient, inst config.Instance, cmdArgs []string) error {
-	return runWithExistingInstanceOptions(ctx, hc, inst, cmdArgs, defaultRunTargetOptions())
+	return runWithExistingInstanceOptions(ctx, nil, hc, inst, cmdArgs, defaultRunTargetOptions())
 }
 
 func runWithExistingInstanceOptions(
 	ctx context.Context,
+	store *config.Store,
 	hc manager.HealthClient,
 	inst config.Instance,
 	cmdArgs []string,
@@ -173,6 +175,11 @@ func runWithExistingInstanceOptions(
 	if isCodexCommand(cmdArgs[0]) {
 		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 			return err
+		}
+		var cleanup func()
+		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
+		if cleanup != nil {
+			defer cleanup()
 		}
 	}
 
@@ -223,6 +230,11 @@ func runWithNewStackOptions(
 		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 			return err
 		}
+		var cleanup func()
+		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
+		if cleanup != nil {
+			defer cleanup()
+		}
 	}
 
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
@@ -251,7 +263,7 @@ func runWithProfileOptions(
 ) error {
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
 	if inst := manager.FindReusableInstance(instances, profile.ID, hc); inst != nil {
-		err := runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
+		err := runWithExistingInstanceOptions(ctx, store, hc, *inst, cmdArgs, opts)
 		if err == nil {
 			return nil
 		}
@@ -266,7 +278,7 @@ func runWithProfileOptions(
 	// processes after our initial snapshot was loaded.
 	if freshCfg, err := store.Load(); err == nil {
 		if inst := manager.FindReusableInstance(freshCfg.Instances, profile.ID, hc); inst != nil {
-			err := runWithExistingInstanceOptions(ctx, hc, *inst, cmdArgs, opts)
+			err := runWithExistingInstanceOptions(ctx, store, hc, *inst, cmdArgs, opts)
 			if err == nil {
 				return nil
 			}
@@ -360,6 +372,54 @@ type patchRunInfo struct {
 
 func defaultRunTargetOptions() runTargetOptions {
 	return runTargetOptions{UseProxy: true}
+}
+
+func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *runTargetOptions) ([]string, func()) {
+	if opts == nil || !opts.YoloEnabled || len(cmdArgs) == 0 || !isCodexCommand(cmdArgs[0]) {
+		return cmdArgs, nil
+	}
+	log := opts.Log
+	if log == nil {
+		log = io.Discard
+	}
+	var cleanup func()
+	if store != nil {
+		historyDir := filepath.Dir(store.Path())
+		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinaryForLaunch(cmdArgs[0], historyDir, opts.ExecIdentity)
+		logYoloPatchStatus(log, patchResult, skipped, patchErr)
+		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
+			cmdArgs = append([]string{}, cmdArgs...)
+			cmdArgs[0] = patchResult.PatchedBinary
+			opts.ExtraEnv = append(opts.ExtraEnv, patchEnv...)
+			opts.PatchInfo = info
+			cleanup = patchResult.Cleanup
+		}
+		if opts.OnYoloFallback == nil {
+			opts.OnYoloFallback = func() error {
+				return persistYoloEnabled(store, false)
+			}
+		}
+	}
+	if !commandArgsHaveYolo(cmdArgs[1:]) {
+		if yoloFlags := codexYoloArgs(cmdArgs[0]); len(yoloFlags) > 0 {
+			out := make([]string, 0, 1+len(yoloFlags)+len(cmdArgs[1:]))
+			out = append(out, cmdArgs[0])
+			out = append(out, yoloFlags...)
+			out = append(out, cmdArgs[1:]...)
+			cmdArgs = out
+		}
+	}
+	return cmdArgs, cleanup
+}
+
+func commandArgsHaveYolo(args []string) bool {
+	for _, arg := range args {
+		switch strings.TrimSpace(arg) {
+		case "--yolo", "--dangerously-bypass-approvals-and-sandbox":
+			return true
+		}
+	}
+	return false
 }
 
 func withProfileInstallEnv(

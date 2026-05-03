@@ -57,6 +57,32 @@ func RenderTeamsHTML(input TeamsRenderInput) string {
 	return renderTeamsHTMLPart(input, 1, 1)
 }
 
+func renderTeamsFreezeNoticeHTML(controlLink string, resumeCommand string, safeLine string) string {
+	controlLink = strings.TrimSpace(controlLink)
+	resumeCommand = strings.TrimSpace(resumeCommand)
+	if resumeCommand == "" {
+		resumeCommand = "r <resume-key>"
+	}
+	safeLine = strings.TrimSpace(safeLine)
+	if safeLine == "" {
+		safeLine = "Your Codex work is safe."
+	}
+	step1 := "Step 1: Open Control chat"
+	if href, ok := safeTeamsMarkdownURL(controlLink); ok {
+		step1 = `Step 1: Open <a href="` + html.EscapeString(href) + `">Control chat</a>`
+	}
+	return strings.Join([]string{
+		`<p><strong>🔧 Helper:</strong><br>` +
+			`🧊 This chat is paused<br>` +
+			`⚠ <strong>Messages here will not get a reply.</strong><br>` +
+			html.EscapeString(safeLine) + `</p>`,
+		`<p>&nbsp;</p>`,
+		`<p>▶️ <strong>Continue chat:</strong><br>` +
+			step1 + `<br>` +
+			`Step 2: Send: <code>` + html.EscapeString(resumeCommand) + `</code></p>`,
+	}, "")
+}
+
 func PlanTeamsHTMLChunks(input TeamsRenderInput, opts TeamsRenderOptions) []TeamsRenderedChunk {
 	_, targetLimit := normalizeTeamsRenderLimits(opts)
 	text := normalizeTeamsRenderTextForKind(input.Kind, input.Text)
@@ -360,7 +386,7 @@ func teamsRenderLabel(kind TeamsRenderKind, partIndex int, partCount int) string
 	case TeamsRenderHelper:
 		base = "🔧 Helper"
 	case TeamsRenderStatus:
-		base = "📌 Session status"
+		base = "🤖 ⏳ Codex status"
 	case TeamsRenderCode:
 		base = "💻 Code"
 	case TeamsRenderCommand:
@@ -390,7 +416,7 @@ func normalizeTeamsRenderTextForKind(kind TeamsRenderKind, text string) string {
 }
 
 func teamsRenderKindUsesCodexMarkdown(kind TeamsRenderKind) bool {
-	return kind == TeamsRenderAssistant || kind == TeamsRenderProgress || kind == TeamsRenderUser
+	return kind == TeamsRenderAssistant || kind == TeamsRenderProgress || kind == TeamsRenderUser || kind == TeamsRenderHelper || kind == TeamsRenderStatus
 }
 
 func compactTeamsRenderBlankLines(text string) string {

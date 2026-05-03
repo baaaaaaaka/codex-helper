@@ -16,11 +16,8 @@ import (
 )
 
 const (
-	defaultTenantID         = "43083d15-7273-40c1-b7db-39efd9ccc17a"
-	defaultReadClientID     = "5a4935c2-c6e9-46a4-a064-da9b18a3509b"
-	defaultClientID         = "29c0325f-4dd7-43c6-b57f-70265a6e24c5"
 	defaultReadScopes       = "openid profile offline_access User.Read Chat.Read Files.Read"
-	defaultScopes           = "openid profile offline_access User.Read Chat.ReadWrite"
+	defaultScopes           = "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite"
 	defaultFileWriteScopes  = "openid profile offline_access User.Read Chat.ReadWrite Files.ReadWrite"
 	readTokenCacheName      = "teams-read-token.json"
 	chatWriteTokenCacheName = "teams-chat-write-token.json"
@@ -32,6 +29,90 @@ type AuthConfig struct {
 	ClientID  string
 	Scopes    string
 	CachePath string
+}
+
+type TeamsAuthConfigFile struct {
+	TenantID  string                          `json:"tenant_id,omitempty"`
+	Read      TeamsAuthCredentialConfig       `json:"read,omitempty"`
+	ChatWrite TeamsAuthCredentialConfig       `json:"chat_write,omitempty"`
+	FileWrite TeamsAuthCredentialConfig       `json:"file_write,omitempty"`
+	Profiles  map[string]TeamsAuthProfileFile `json:"profiles,omitempty"`
+}
+
+type TeamsAuthProfileFile struct {
+	TenantID  string                    `json:"tenant_id,omitempty"`
+	Read      TeamsAuthCredentialConfig `json:"read,omitempty"`
+	ChatWrite TeamsAuthCredentialConfig `json:"chat_write,omitempty"`
+	FileWrite TeamsAuthCredentialConfig `json:"file_write,omitempty"`
+}
+
+type TeamsAuthCredentialConfig struct {
+	ClientID string `json:"client_id,omitempty"`
+	Scopes   string `json:"scopes,omitempty"`
+}
+
+func (c TeamsAuthConfigFile) profile(name string) TeamsAuthProfileFile {
+	name = strings.TrimSpace(name)
+	if name == "" || c.Profiles == nil {
+		return TeamsAuthProfileFile{}
+	}
+	return c.Profiles[name]
+}
+
+func DefaultTeamsAuthConfigPath() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_AUTH_CONFIG")); v != "" {
+		return expandHome(v), nil
+	}
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "codex-helper", "teams-auth.json"), nil
+}
+
+func LoadTeamsAuthConfigFile(path string) (TeamsAuthConfigFile, error) {
+	if strings.TrimSpace(path) == "" {
+		var err error
+		path, err = DefaultTeamsAuthConfigPath()
+		if err != nil {
+			return TeamsAuthConfigFile{}, err
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return TeamsAuthConfigFile{}, nil
+	}
+	if err != nil {
+		return TeamsAuthConfigFile{}, err
+	}
+	var cfg TeamsAuthConfigFile
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return TeamsAuthConfigFile{}, fmt.Errorf("read Teams auth config %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+func SaveTeamsAuthConfigFile(path string, cfg TeamsAuthConfigFile) error {
+	if strings.TrimSpace(path) == "" {
+		var err error
+		path, err = DefaultTeamsAuthConfigPath()
+		if err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 type TokenCache struct {
@@ -59,10 +140,15 @@ func DefaultReadAuthConfig() (AuthConfig, error) {
 	if err != nil {
 		return AuthConfig{}, err
 	}
+	fileCfg, err := loadDefaultTeamsAuthConfigFile()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	profileCfg := fileCfg.profile(defaultTeamsAuthProfile())
 	cfg := AuthConfig{
-		TenantID:  defaultTenantID,
-		ClientID:  defaultReadClientID,
-		Scopes:    defaultReadScopes,
+		TenantID:  firstNonEmptyString(profileCfg.TenantID, fileCfg.TenantID),
+		ClientID:  firstNonEmptyString(profileCfg.Read.ClientID, fileCfg.Read.ClientID),
+		Scopes:    firstNonEmptyString(profileCfg.Read.Scopes, fileCfg.Read.Scopes, defaultReadScopes),
 		CachePath: cachePath,
 	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_READ_TENANT_ID")); v != "" {
@@ -79,6 +165,9 @@ func DefaultReadAuthConfig() (AuthConfig, error) {
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE")); v != "" {
 		cfg.CachePath = expandHome(v)
 	}
+	if err := requireTeamsAuthIDs(cfg, "read", "CODEX_HELPER_TEAMS_READ_CLIENT_ID"); err != nil {
+		return AuthConfig{}, err
+	}
 	if !unsafeTeamsScopesAllowed() {
 		if err := validateTeamsScopes(cfg.Scopes); err != nil {
 			return AuthConfig{}, err
@@ -87,15 +176,56 @@ func DefaultReadAuthConfig() (AuthConfig, error) {
 	return cfg, nil
 }
 
+func loadDefaultTeamsAuthConfigFile() (TeamsAuthConfigFile, error) {
+	path, err := DefaultTeamsAuthConfigPath()
+	if err != nil {
+		return TeamsAuthConfigFile{}, err
+	}
+	return LoadTeamsAuthConfigFile(path)
+}
+
+func requireTeamsAuthIDs(cfg AuthConfig, label string, clientEnv string) error {
+	configPath, pathErr := DefaultTeamsAuthConfigPath()
+	if pathErr != nil {
+		configPath = "$XDG_CONFIG_HOME/codex-helper/teams-auth.json"
+	}
+	if strings.TrimSpace(cfg.TenantID) == "" {
+		return fmt.Errorf("Teams %s tenant id is not configured; set CODEX_HELPER_TEAMS_TENANT_ID or write %s with `codex-proxy teams auth config --tenant-id <tenant-id> ...`", label, configPath)
+	}
+	if strings.TrimSpace(cfg.ClientID) == "" {
+		if strings.TrimSpace(clientEnv) == "CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID" {
+			return fmt.Errorf("Teams %s client id is not configured; set %s or CODEX_HELPER_TEAMS_CLIENT_ID, or write %s with `codex-proxy teams auth config --file-write-client-id <client-id> ...`", label, clientEnv, configPath)
+		}
+		return fmt.Errorf("Teams %s client id is not configured; set %s or write %s with `codex-proxy teams auth config --%s <client-id> ...`", label, clientEnv, configPath, authConfigClientFlag(label))
+	}
+	return nil
+}
+
+func authConfigClientFlag(label string) string {
+	switch strings.TrimSpace(label) {
+	case "read":
+		return "read-client-id"
+	case "chat write":
+		return "chat-client-id"
+	default:
+		return "client-id"
+	}
+}
+
 func DefaultAuthConfig() (AuthConfig, error) {
 	cachePath, err := defaultTokenCachePath()
 	if err != nil {
 		return AuthConfig{}, err
 	}
+	fileCfg, err := loadDefaultTeamsAuthConfigFile()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	profileCfg := fileCfg.profile(defaultTeamsAuthProfile())
 	cfg := AuthConfig{
-		TenantID:  defaultTenantID,
-		ClientID:  defaultClientID,
-		Scopes:    defaultScopes,
+		TenantID:  firstNonEmptyString(profileCfg.TenantID, fileCfg.TenantID),
+		ClientID:  firstNonEmptyString(profileCfg.ChatWrite.ClientID, fileCfg.ChatWrite.ClientID),
+		Scopes:    firstNonEmptyString(profileCfg.ChatWrite.Scopes, fileCfg.ChatWrite.Scopes, defaultScopes),
 		CachePath: cachePath,
 	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_TENANT_ID")); v != "" {
@@ -110,6 +240,9 @@ func DefaultAuthConfig() (AuthConfig, error) {
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_TOKEN_CACHE")); v != "" {
 		cfg.CachePath = expandHome(v)
 	}
+	if err := requireTeamsAuthIDs(cfg, "chat write", "CODEX_HELPER_TEAMS_CLIENT_ID"); err != nil {
+		return AuthConfig{}, err
+	}
 	if !unsafeTeamsScopesAllowed() {
 		if err := validateTeamsScopes(cfg.Scopes); err != nil {
 			return AuthConfig{}, err
@@ -123,10 +256,20 @@ func DefaultFileWriteAuthConfig() (AuthConfig, error) {
 	if err != nil {
 		return AuthConfig{}, err
 	}
+	fileCfg, err := loadDefaultTeamsAuthConfigFile()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	profileCfg := fileCfg.profile(defaultTeamsAuthProfile())
 	cfg := AuthConfig{
-		TenantID:  defaultTenantID,
-		ClientID:  defaultClientID,
-		Scopes:    defaultFileWriteScopes,
+		TenantID: firstNonEmptyString(profileCfg.TenantID, fileCfg.TenantID),
+		ClientID: firstNonEmptyString(
+			profileCfg.FileWrite.ClientID,
+			fileCfg.FileWrite.ClientID,
+			profileCfg.ChatWrite.ClientID,
+			fileCfg.ChatWrite.ClientID,
+		),
+		Scopes:    firstNonEmptyString(profileCfg.FileWrite.Scopes, fileCfg.FileWrite.Scopes, defaultFileWriteScopes),
 		CachePath: cachePath,
 	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FILE_WRITE_TENANT_ID")); v != "" {
@@ -145,6 +288,9 @@ func DefaultFileWriteAuthConfig() (AuthConfig, error) {
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE")); v != "" {
 		cfg.CachePath = expandHome(v)
 	}
+	if err := requireTeamsAuthIDs(cfg, "file write", "CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID"); err != nil {
+		return AuthConfig{}, err
+	}
 	if !unsafeTeamsScopesAllowed() {
 		if err := validateTeamsScopes(cfg.Scopes); err != nil {
 			return AuthConfig{}, err
@@ -154,20 +300,38 @@ func DefaultFileWriteAuthConfig() (AuthConfig, error) {
 }
 
 func NewAuthManager(cfg AuthConfig) *AuthManager {
-	return &AuthManager{
-		cfg: cfg,
-		client: &http.Client{
+	return NewAuthManagerWithHTTPClient(cfg, nil)
+}
+
+func NewAuthManagerWithHTTPClient(cfg AuthConfig, client *http.Client) *AuthManager {
+	if client == nil {
+		client = &http.Client{
 			Timeout: 30 * time.Second,
-		},
+		}
+	}
+	return &AuthManager{
+		cfg:    cfg,
+		client: client,
 	}
 }
 
+func (a *AuthManager) TenantID() string {
+	if a == nil {
+		return ""
+	}
+	return strings.TrimSpace(a.cfg.TenantID)
+}
+
 func newNonInteractiveAuthManager(cfg AuthConfig, action string, loginCommand ...string) graphAuth {
+	return newNonInteractiveAuthManagerWithHTTPClient(cfg, nil, action, loginCommand...)
+}
+
+func newNonInteractiveAuthManagerWithHTTPClient(cfg AuthConfig, client *http.Client, action string, loginCommand ...string) graphAuth {
 	command := "codex-proxy teams auth"
 	if len(loginCommand) > 0 && strings.TrimSpace(loginCommand[0]) != "" {
 		command = strings.TrimSpace(loginCommand[0])
 	}
-	return nonInteractiveAuth{AuthManager: NewAuthManager(cfg), action: action, loginCommand: command}
+	return nonInteractiveAuth{AuthManager: NewAuthManagerWithHTTPClient(cfg, client), action: action, loginCommand: command}
 }
 
 func (a nonInteractiveAuth) AccessToken(ctx context.Context, out io.Writer, forceLogin bool) (string, error) {
@@ -459,19 +623,20 @@ func tokenFromMap(raw map[string]any) TokenCache {
 
 func validateTeamsScopes(scopes string) error {
 	allowed := map[string]bool{
-		"openid":                  true,
-		"profile":                 true,
-		"offline_access":          true,
-		"User.Read":               true,
-		"Files.Read":              true,
-		"Chat.Read":               true,
-		"Chat.ReadWrite":          true,
-		"Chat.Create":             true,
-		"ChatMessage.Send":        true,
-		"ChatMember.ReadWrite":    true,
-		"Channel.ReadBasic.All":   true,
-		"ChannelMessage.Read.All": true,
-		"Files.ReadWrite":         true,
+		"openid":                   true,
+		"profile":                  true,
+		"offline_access":           true,
+		"User.Read":                true,
+		"Files.Read":               true,
+		"Chat.Read":                true,
+		"Chat.ReadWrite":           true,
+		"Chat.Create":              true,
+		"ChatMessage.Send":         true,
+		"ChatMember.ReadWrite":     true,
+		"Channel.ReadBasic.All":    true,
+		"ChannelMessage.Read.All":  true,
+		"OnlineMeetings.ReadWrite": true,
+		"Files.ReadWrite":          true,
 	}
 	var unexpected []string
 	seen := make(map[string]bool)

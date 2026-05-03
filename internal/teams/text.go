@@ -114,5 +114,5 @@ func UnsupportedControlAttachmentMessage(attachments []MessageAttachment) string
 	if count == 0 {
 		return ""
 	}
-	return UnsupportedAttachmentMessage(attachments) + " Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like `projects`, `new <directory> -- <title>`, `continue <number>`, and `status`."
+	return UnsupportedAttachmentMessage(attachments) + " Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like `projects`, `new <directory>`, `continue <number>`, and `status`."
 }

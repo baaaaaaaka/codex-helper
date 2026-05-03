@@ -27,22 +27,39 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "/help", name: DashboardCommandHelp},
 		{text: "/status", name: DashboardCommandStatus},
 		{text: "help", name: DashboardCommandHelp},
+		{text: "h", name: DashboardCommandHelp},
 		{text: "menu", name: DashboardCommandHelp},
 		{text: "projects", name: DashboardCommandWorkspaces},
+		{text: "p", name: DashboardCommandWorkspaces},
+		{text: "p 2", name: DashboardCommandWorkspace, raw: "2", number: 2, isNumber: true},
 		{text: "project 2", name: DashboardCommandWorkspace, raw: "2", number: 2, isNumber: true},
+		{text: "s", name: DashboardCommandSessions},
 		{text: "history", name: DashboardCommandSessions},
+		{text: "c 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "continue 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "open 3", name: DashboardCommandOpen, raw: "3", number: 3, isNumber: true},
+		{text: "d 3", name: DashboardCommandDetails, raw: "3", number: 3, isNumber: true},
 		{text: "details 3", name: DashboardCommandDetails, raw: "3", number: 3, isNumber: true},
+		{text: "n /tmp/new-work", name: DashboardCommandNew, raw: "/tmp/new-work"},
 		{text: "new build the thing", name: DashboardCommandNew, raw: "build the thing"},
 		{text: "new /tmp/new-work -- build the thing", name: DashboardCommandNew, raw: "/tmp/new-work -- build the thing"},
 		{text: "ask what can this control chat do", name: DashboardCommandAsk, raw: "what can this control chat do"},
+		{text: "m /tmp/new-work", name: DashboardCommandMkdir, raw: "/tmp/new-work"},
 		{text: "mkdir /tmp/new-work", name: DashboardCommandMkdir, raw: "/tmp/new-work"},
+		{text: "st", name: DashboardCommandStatus},
 		{text: "status", name: DashboardCommandStatus},
 		{text: "!continue 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "!p 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "codex continue 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "codex help", name: DashboardCommandHelp},
+		{text: "helper restart", name: DashboardCommandRestart},
+		{text: "helper restart now", name: DashboardCommandRestart, raw: "now"},
+		{text: "helper restart force", name: DashboardCommandRestart, raw: "force"},
+		{text: "codex-helper service restart now", name: DashboardCommandRestart, raw: "restart now"},
+		{text: "helper reload", name: DashboardCommandReload},
+		{text: "helper reload now", name: DashboardCommandReload, raw: "now"},
+		{text: "helper reload force", name: DashboardCommandReload, raw: "force"},
+		{text: "codex-helper service reload now", name: DashboardCommandReload, raw: "reload now"},
 		{text: "cx p 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "cx h", name: DashboardCommandHelp},
 		{text: "4", name: DashboardCommandSelect, raw: "4", number: 4, isNumber: true},
@@ -67,8 +84,36 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 	}
 }
 
+func TestParseControlRestartRequiresHelperPrefix(t *testing.T) {
+	for _, text := range []string{"restart", "restart now", "codex restart"} {
+		t.Run(text, func(t *testing.T) {
+			cmd := ParseDashboardCommand(ChatScopeControl, text)
+			if cmd.HelperCommand || !cmd.ForwardToCodex || !cmd.RequiresCodex {
+				t.Fatalf("restart text without helper prefix should go to Codex, got %#v", cmd)
+			}
+		})
+	}
+}
+
+func TestParseControlReloadRequiresHelperPrefix(t *testing.T) {
+	for _, text := range []string{"reload", "reload now", "/reload", "codex reload"} {
+		t.Run(text, func(t *testing.T) {
+			cmd := ParseDashboardCommand(ChatScopeControl, text)
+			if strings.HasPrefix(text, "/") {
+				if !cmd.HelperCommand || cmd.Name != DashboardCommandUnknown || cmd.ForwardToCodex || cmd.RequiresCodex {
+					t.Fatalf("unknown slash reload parse mismatch: %#v", cmd)
+				}
+				return
+			}
+			if cmd.HelperCommand || !cmd.ForwardToCodex || !cmd.RequiresCodex {
+				t.Fatalf("reload text without helper prefix should go to Codex, got %#v", cmd)
+			}
+		})
+	}
+}
+
 func TestParseControlUnknownInputForwardsOnlyPlainTextToCodex(t *testing.T) {
-	for _, text := range []string{"帮我看看现在该怎么操作", "codex explain this error", "codex h", "codex p 1", "/not-a-helper-command please"} {
+	for _, text := range []string{"帮我看看现在该怎么操作", "codex explain this error", "/not-a-helper-command please"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeControl, text)
 			if strings.HasPrefix(text, "/") {

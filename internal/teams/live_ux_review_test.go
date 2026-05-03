@@ -309,7 +309,7 @@ func (uxReviewExecutor) Run(_ context.Context, session *Session, prompt string) 
 	visible := StripHelperPromptEchoes(StripArtifactManifestBlocks(prompt))
 	visible = strings.TrimSpace(visible)
 	if session != nil && session.ID == controlFallbackSessionID {
-		return ExecutionResult{Text: "quick helper answer: I received `" + visible + "`. For project work, create a 💬 Work chat with `new <directory> -- <title>`."}, nil
+		return ExecutionResult{Text: "quick helper answer: I received `" + visible + "`. For project work, create a 💬 Work chat with `new <directory>`."}, nil
 	}
 	if visible == "" {
 		visible = "the request"

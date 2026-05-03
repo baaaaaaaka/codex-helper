@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +30,7 @@ const (
 	teamsServiceWindowsTaskXMLName   = "codex-helper-teams-task.xml"
 	teamsServiceWSLTaskConfigName    = "codex-helper-teams-wsl-task.txt"
 	teamsServiceTaskRestartCount     = 999
+	teamsServiceTaskRestartInterval  = 60
 )
 
 type teamsServiceCommandRunner interface {
@@ -698,7 +701,7 @@ func (b teamsServiceWSLWindowsTaskBackend) Install(ctx context.Context, spec tea
 	arg := powershellSingleQuote(windowsCommandLine(args))
 	cmd := "$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument " + arg + "; " +
 		"$trigger = New-ScheduledTaskTrigger -AtLogOn; " +
-		"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds 10); " +
+		"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
 		"$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited; " +
 		"Register-ScheduledTask -TaskName " + task + " -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null; " +
 		"Disable-ScheduledTask -TaskName " + task + " | Out-Null"
@@ -876,10 +879,57 @@ func teamsServiceEnvironment() map[string]string {
 	}
 	for _, name := range teamsServiceEnvironmentAllowlist() {
 		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			if teamsServiceShouldDropProxyEnv(name, value) {
+				continue
+			}
 			env[name] = value
 		}
 	}
 	return env
+}
+
+func teamsServiceShouldDropProxyEnv(name string, value string) bool {
+	if !teamsServiceProxyEnvName(name) || teamsServiceKeepLocalProxyEnv() {
+		return false
+	}
+	return teamsServiceProxyIsLoopback(value)
+}
+
+func teamsServiceProxyEnvName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "http_proxy", "https_proxy", "all_proxy":
+		return true
+	default:
+		return false
+	}
+}
+
+func teamsServiceKeepLocalProxyEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_KEEP_LOCAL_PROXY"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func teamsServiceProxyIsLoopback(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	host := value
+	if parsed, err := url.Parse(value); err == nil && parsed.Host != "" {
+		host = parsed.Hostname()
+	}
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func teamsServiceEnvironmentAllowlist() []string {
@@ -1035,7 +1085,7 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n")
 	b.WriteString("    <Enabled>false</Enabled>\n")
 	b.WriteString("    <RestartOnFailure>\n")
-	b.WriteString("      <Interval>PT10S</Interval>\n")
+	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskRestartInterval) + "S</Interval>\n")
 	b.WriteString("      <Count>" + strconv.Itoa(teamsServiceTaskRestartCount) + "</Count>\n")
 	b.WriteString("    </RestartOnFailure>\n")
 	b.WriteString("  </Settings>\n")

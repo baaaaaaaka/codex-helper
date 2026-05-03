@@ -437,6 +437,7 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodGet, "/me?$select=id,displayName,userPrincipalName"},
 		{http.MethodGet, "/me/chats?$top=50"},
 		{http.MethodPost, "/chats"},
+		{http.MethodPost, "/me/onlineMeetings"},
 		{http.MethodGet, "/chats/chat-id?$select=id,topic,chatType,webUrl"},
 		{http.MethodGet, "/chats/chat-id/members"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50"},
@@ -478,6 +479,43 @@ func TestGraphListChats(t *testing.T) {
 	}
 	if len(chats) != 1 || chats[0].ID != "chat-1" || chats[0].ChatType != "group" || chats[0].WebURL == "" {
 		t.Fatalf("unexpected chats: %#v", chats)
+	}
+}
+
+func TestGraphCreateMeetingChatUsesOnlineMeetingThreadID(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var sawCreate bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || r.URL.Path != "/me/onlineMeetings" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		sawCreate = true
+		var payload struct {
+			Subject       string `json:"subject"`
+			StartDateTime string `json:"startDateTime"`
+			EndDateTime   string `json:"endDateTime"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode onlineMeeting payload: %v", err)
+		}
+		if payload.Subject != "💬 Codex Work - s001 - repo - host" || payload.StartDateTime == "" || payload.EndDateTime == "" {
+			t.Fatalf("unexpected onlineMeeting payload: %#v", payload)
+		}
+		_, _ = fmt.Fprint(w, `{"id":"meeting-1","subject":"💬 Codex Work - s001 - repo - host","joinWebUrl":"https://teams.example/join","chatInfo":{"threadId":"19:meeting_abc@thread.v2"}}`)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	chat, err := graph.CreateMeetingChat(context.Background(), "💬 Codex Work - s001 - repo - host")
+	if err != nil {
+		t.Fatalf("CreateMeetingChat error: %v", err)
+	}
+	if !sawCreate || chat.ID != "19:meeting_abc@thread.v2" || chat.ChatType != "meeting" || chat.Topic != "💬 Codex Work - s001 - repo - host" {
+		t.Fatalf("unexpected meeting chat: %#v sawCreate=%v", chat, sawCreate)
+	}
+	if !strings.Contains(chat.WebURL, "teams.microsoft.com/l/chat/19%3Ameeting_abc%40thread.v2/0") {
+		t.Fatalf("chat WebURL = %q, want Teams chat link", chat.WebURL)
 	}
 }
 
@@ -590,6 +628,10 @@ func TestLiveJasonWeiSingleMemberChatValidation(t *testing.T) {
 	if err := validateLiveJasonWeiSingleMemberChat(validUser, validChat, validMembers, "chat-1"); err != nil {
 		t.Fatalf("valid Jason Wei single-member group chat rejected: %v", err)
 	}
+	validMeetingChat := Chat{ID: "chat-1", ChatType: "meeting"}
+	if err := validateLiveJasonWeiSingleMemberChat(validUser, validMeetingChat, validMembers, "chat-1"); err != nil {
+		t.Fatalf("valid Jason Wei single-member meeting chat rejected: %v", err)
+	}
 
 	tests := []struct {
 		name    string
@@ -621,7 +663,7 @@ func TestLiveJasonWeiSingleMemberChatValidation(t *testing.T) {
 			chat:    Chat{ID: "chat-1", ChatType: "oneOnOne"},
 			members: validMembers,
 			chatID:  "chat-1",
-			want:    "not a single-member group chat",
+			want:    "not a single-member group or meeting chat",
 		},
 		{
 			name:    "extra member",

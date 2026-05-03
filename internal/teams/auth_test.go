@@ -12,6 +12,14 @@ import (
 	"time"
 )
 
+func setTeamsAuthIDsForTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
+	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "chat-client")
+	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client")
+	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID", "file-client")
+}
+
 func TestWriteTokenCacheUsesPrivatePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX permission bits are not meaningful on Windows")
@@ -299,6 +307,7 @@ func TestWriteTokenCacheDoesNotChmodExistingDirectory(t *testing.T) {
 }
 
 func TestDefaultAuthConfigRejectsUnexpectedScopes(t *testing.T) {
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "openid profile offline_access User.Read Files.Read.All")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
 
@@ -312,6 +321,7 @@ func TestDefaultAuthConfigRejectsUnexpectedScopes(t *testing.T) {
 }
 
 func TestDefaultAuthConfigAllowsDocumentedScopes(t *testing.T) {
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "openid profile offline_access User.Read Chat.ReadWrite Chat.Create")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
 
@@ -324,9 +334,70 @@ func TestDefaultAuthConfigAllowsDocumentedScopes(t *testing.T) {
 	}
 }
 
+func TestDefaultAuthConfigRequiresConfiguredTenantAndClientID(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "")
+	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "")
+	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", filepath.Join(tmp, "missing-auth.json"))
+
+	_, err := DefaultAuthConfig()
+	if err == nil {
+		t.Fatal("expected missing Teams auth config error")
+	}
+	if !strings.Contains(err.Error(), "tenant id is not configured") {
+		t.Fatalf("missing config error = %v", err)
+	}
+}
+
+func TestDefaultAuthConfigUsesLocalAuthConfigFile(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(tmp, "teams-auth.json")
+	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", configPath)
+	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "")
+	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "")
+	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "")
+	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID", "")
+	if err := SaveTeamsAuthConfigFile(configPath, TeamsAuthConfigFile{
+		TenantID: "tenant-from-file",
+		Read: TeamsAuthCredentialConfig{
+			ClientID: "read-from-file",
+		},
+		ChatWrite: TeamsAuthCredentialConfig{
+			ClientID: "chat-from-file",
+		},
+	}); err != nil {
+		t.Fatalf("SaveTeamsAuthConfigFile error: %v", err)
+	}
+
+	chatCfg, err := DefaultAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultAuthConfig error: %v", err)
+	}
+	if chatCfg.TenantID != "tenant-from-file" || chatCfg.ClientID != "chat-from-file" {
+		t.Fatalf("chat config = %#v", chatCfg)
+	}
+	readCfg, err := DefaultReadAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultReadAuthConfig error: %v", err)
+	}
+	if readCfg.TenantID != "tenant-from-file" || readCfg.ClientID != "read-from-file" {
+		t.Fatalf("read config = %#v", readCfg)
+	}
+	fileCfg, err := DefaultFileWriteAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
+	}
+	if fileCfg.TenantID != "tenant-from-file" || fileCfg.ClientID != "chat-from-file" {
+		t.Fatalf("file config should fall back to chat client id: %#v", fileCfg)
+	}
+}
+
 func TestDefaultFileWriteAuthConfigUsesSeparateCacheAndScopes(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_SCOPES", "")
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
@@ -352,7 +423,9 @@ func TestDefaultReadAuthConfigUsesReadClientCacheAndScopes(t *testing.T) {
 	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", "")
+	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client-configured")
 	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "write-client-override")
+	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "openid profile offline_access User.Read Chat.ReadWrite")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
 
@@ -360,8 +433,8 @@ func TestDefaultReadAuthConfigUsesReadClientCacheAndScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultReadAuthConfig error: %v", err)
 	}
-	if cfg.ClientID != defaultReadClientID {
-		t.Fatalf("read client id = %q, want default read client", cfg.ClientID)
+	if cfg.ClientID != "read-client-configured" {
+		t.Fatalf("read client id = %q, want configured read client", cfg.ClientID)
 	}
 	if cfg.Scopes != defaultReadScopes {
 		t.Fatalf("read scopes = %q, want %q", cfg.Scopes, defaultReadScopes)
@@ -373,6 +446,7 @@ func TestDefaultReadAuthConfigUsesReadClientCacheAndScopes(t *testing.T) {
 }
 
 func TestDefaultReadAuthConfigAllowsTeamsCLIReadScopes(t *testing.T) {
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "openid profile offline_access User.Read Chat.Read Channel.ReadBasic.All ChannelMessage.Read.All")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
 
@@ -388,6 +462,7 @@ func TestDefaultReadAuthConfigAllowsTeamsCLIReadScopes(t *testing.T) {
 func TestDefaultAuthConfigUsesProfileScopedCache(t *testing.T) {
 	tmp := t.TempDir()
 	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
@@ -405,6 +480,7 @@ func TestDefaultAuthConfigUsesProfileScopedCache(t *testing.T) {
 func TestDefaultAuthConfigKeepsExistingLegacyDefaultCache(t *testing.T) {
 	tmp := t.TempDir()
 	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
@@ -428,6 +504,7 @@ func TestDefaultAuthConfigKeepsExistingLegacyDefaultCache(t *testing.T) {
 func TestDefaultAuthConfigUsesLegacyDefaultCacheWithBroadCachedScopes(t *testing.T) {
 	tmp := t.TempDir()
 	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
@@ -452,6 +529,7 @@ func TestDefaultAuthConfigUsesLegacyDefaultCacheWithBroadCachedScopes(t *testing
 func TestDefaultAuthConfigUsesTeamsProfileForCache(t *testing.T) {
 	tmp := t.TempDir()
 	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "research/teams")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", "")
@@ -469,6 +547,7 @@ func TestDefaultAuthConfigUsesTeamsProfileForCache(t *testing.T) {
 func TestDefaultFileWriteAuthConfigUsesAuthProfileOverride(t *testing.T) {
 	tmp := t.TempDir()
 	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "teams-profile")
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_PROFILE", "auth-profile")
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", "")
@@ -484,6 +563,7 @@ func TestDefaultFileWriteAuthConfigUsesAuthProfileOverride(t *testing.T) {
 }
 
 func TestDefaultAuthConfigUnsafeScopeOverride(t *testing.T) {
+	setTeamsAuthIDsForTest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "openid profile offline_access User.Read Files.Read.All")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "1")
 

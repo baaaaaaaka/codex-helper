@@ -108,7 +108,7 @@ func TestTeamsSetupPrintsSafeChecklistWithoutState(t *testing.T) {
 		"teams auth",
 		"teams doctor --live",
 		"teams control",
-		"may create a Teams chat and send a ready message",
+		"may create a Teams chat and send an @mention plus a ready message",
 		"codex-proxy teams service enable",
 		"codex-proxy teams service start",
 	} {
@@ -118,6 +118,68 @@ func TestTeamsSetupPrintsSafeChecklistWithoutState(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(configBase, "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
 		t.Fatalf("teams setup should not create state file, stat err = %v", err)
+	}
+}
+
+func TestTeamsProbeChatHelpIsExplicitlySideEffectSafe(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+
+	out := executeRootForTeamsTest(t, "teams", "probe-chat", "--help")
+	for _, want := range []string{
+		"Probe an external Teams chat without binding helper state",
+		"--send-test",
+		"--webhook-url-file",
+		"By default it is read-only",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("probe-chat help missing %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(configBase, "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
+		t.Fatalf("teams probe-chat --help should not create state file, stat err = %v", err)
+	}
+}
+
+func TestTeamsAuthConfigWritesLocalClientIDs(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+
+	out := executeRootForTeamsTest(t,
+		"teams", "auth", "config",
+		"--tenant-id", "tenant-config",
+		"--read-client-id", "read-client-config",
+		"--chat-client-id", "chat-client-config",
+	)
+	configPath := filepath.Join(configBase, "codex-helper", "teams-auth.json")
+	for _, want := range []string{
+		"Saved Teams auth config: " + configPath,
+		"Tenant ID: configured",
+		"Read client ID: configured",
+		"Chat write client ID: configured",
+		"File write client ID: using chat write client",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("auth config output missing %q:\n%s", want, out)
+		}
+	}
+	cfg, err := teams.LoadTeamsAuthConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadTeamsAuthConfigFile error: %v", err)
+	}
+	if cfg.TenantID != "tenant-config" || cfg.Read.ClientID != "read-client-config" || cfg.ChatWrite.ClientID != "chat-client-config" {
+		t.Fatalf("saved auth config = %#v", cfg)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat auth config: %v", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("auth config permissions = %03o, want private", info.Mode().Perm())
 	}
 }
 
@@ -147,7 +209,7 @@ func TestTeamsStatusAndControlPrintShowControlChatDetails(t *testing.T) {
 	if !strings.Contains(printed, "Teams control chat: https://teams.example/control") || !strings.Contains(printed, "Title: "+controlTopic) || !strings.Contains(printed, "Chat ID: control-chat") {
 		t.Fatalf("control --print output mismatch:\n%s", printed)
 	}
-	if !strings.Contains(printed, "new <directory> -- <title>") || !strings.Contains(printed, "Teams messages are not read after the local listener stops") {
+	if !strings.Contains(printed, "new <directory>") || !strings.Contains(printed, "Teams messages are not read after the local listener stops") {
 		t.Fatalf("control --print examples are not mobile-safe:\n%s", printed)
 	}
 }
@@ -157,6 +219,7 @@ func TestTeamsAuthStatusDoesNotPrintCachedSecrets(t *testing.T) {
 
 	tmp := t.TempDir()
 	cachePath := filepath.Join(tmp, "token.json")
+	setTeamsAuthIDsForCLITest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", cachePath)
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
 	secretAccess := "access-secret-value"
@@ -248,7 +311,7 @@ func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	prevProbe := runTeamsAppServerProbe
 	liveCalled := false
 	probeCalled := false
-	runTeamsDoctorLiveCheck = func(cmd *cobra.Command, _ string) error {
+	runTeamsDoctorLiveCheck = func(cmd *cobra.Command, _ *rootOptions, _ string) error {
 		liveCalled = true
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Graph: ok as Test <test@example.com>")
 		return nil
@@ -305,6 +368,7 @@ func TestTeamsLogoutRemovesOnlyLocalAuthCache(t *testing.T) {
 
 	tmp := t.TempDir()
 	cachePath := filepath.Join(tmp, "token.json")
+	setTeamsAuthIDsForCLITest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", cachePath)
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
 	if err := os.WriteFile(cachePath, []byte(`{"access_token":"secret"}`), 0o600); err != nil {
@@ -331,6 +395,7 @@ func TestTeamsLogoutRefusesToRemoveNonTokenCacheOverride(t *testing.T) {
 
 	tmp := t.TempDir()
 	cachePath := filepath.Join(tmp, "ordinary.json")
+	setTeamsAuthIDsForCLITest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", cachePath)
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
 	if err := os.WriteFile(cachePath, []byte(`{"hello":"world"}`), 0o600); err != nil {
@@ -353,6 +418,7 @@ func TestTeamsFileWriteAuthStatusAndLogoutUseSeparateCache(t *testing.T) {
 
 	tmp := t.TempDir()
 	cachePath := filepath.Join(tmp, "file-write-token.json")
+	setTeamsAuthIDsForCLITest(t)
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", cachePath)
 	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_SCOPES", "")
 	secretAccess := "file-write-access-secret"
