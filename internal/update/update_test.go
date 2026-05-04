@@ -160,6 +160,42 @@ func TestPerformUpdateChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestPerformUpdateValidateBinaryRejectsInvalidPayload(t *testing.T) {
+	requireRuntimeAsset(t)
+	tag := "v2.1.0"
+	ver := "2.1.0"
+	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("assetName error: %v", err)
+	}
+	server := newReleaseServer(t, tag, asset, []byte("not a helper binary"))
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+
+	dest := filepath.Join(t.TempDir(), binaryName())
+	if err := os.WriteFile(dest, []byte("old"), 0o755); err != nil {
+		t.Fatalf("write dest: %v", err)
+	}
+	_, err = PerformUpdate(context.Background(), UpdateOptions{
+		Repo:           "owner/name",
+		Version:        tag,
+		InstallPath:    dest,
+		Timeout:        time.Second,
+		ValidateBinary: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "validate downloaded binary") {
+		t.Fatalf("expected validation error, got %v", err)
+	}
+	got, readErr := os.ReadFile(dest)
+	if readErr != nil {
+		t.Fatalf("read dest: %v", readErr)
+	}
+	if string(got) != "old" {
+		t.Fatalf("dest was replaced despite validation failure: %q", got)
+	}
+}
+
 func TestPerformUpdateLatest(t *testing.T) {
 	requireRuntimeAsset(t)
 	tag := "v3.1.0"

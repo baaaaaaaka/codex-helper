@@ -100,6 +100,7 @@ type State struct {
 	ChatRateLimits    map[string]ChatRateLimitState     `json:"chat_rate_limits,omitempty"`
 	ArtifactRecords   map[string]ArtifactRecord         `json:"artifact_records,omitempty"`
 	Notifications     map[string]NotificationRecord     `json:"notifications,omitempty"`
+	AutoUpdate        AutoUpdateState                   `json:"auto_update,omitempty"`
 }
 
 type ScopeIdentity struct {
@@ -343,6 +344,38 @@ type UpgradeRequest struct {
 	AbortedAt       time.Time      `json:"aborted_at,omitempty"`
 	AbortReason     string         `json:"abort_reason,omitempty"`
 	UpdatedAt       time.Time      `json:"updated_at,omitempty"`
+}
+
+type AutoUpdateState struct {
+	LastCheckAt          time.Time `json:"last_check_at,omitempty"`
+	NextCheckAt          time.Time `json:"next_check_at,omitempty"`
+	BackoffUntil         time.Time `json:"backoff_until,omitempty"`
+	LastSuccessAt        time.Time `json:"last_success_at,omitempty"`
+	LastError            string    `json:"last_error,omitempty"`
+	LastErrorAt          time.Time `json:"last_error_at,omitempty"`
+	CandidateTag         string    `json:"candidate_tag,omitempty"`
+	CandidateVersion     string    `json:"candidate_version,omitempty"`
+	CandidatePriority    string    `json:"candidate_priority,omitempty"`
+	CandidateAsset       string    `json:"candidate_asset,omitempty"`
+	CandidatePublishedAt time.Time `json:"candidate_published_at,omitempty"`
+	CandidateEligibleAt  time.Time `json:"candidate_eligible_at,omitempty"`
+	LastAttemptTag       string    `json:"last_attempt_tag,omitempty"`
+	LastAttemptAt        time.Time `json:"last_attempt_at,omitempty"`
+	LastInstalledTag     string    `json:"last_installed_tag,omitempty"`
+	LastInstalledAt      time.Time `json:"last_installed_at,omitempty"`
+}
+
+type AutoUpdateRecord struct {
+	Now                  time.Time
+	NextCheckAt          time.Time
+	BackoffUntil         time.Time
+	LastError            string
+	CandidateTag         string
+	CandidateVersion     string
+	CandidatePriority    string
+	CandidateAsset       string
+	CandidatePublishedAt time.Time
+	CandidateEligibleAt  time.Time
 }
 
 type ChatPollState struct {
@@ -901,6 +934,83 @@ func (s *Store) ReadUpgrade(ctx context.Context) (UpgradeRequest, bool, error) {
 		return UpgradeRequest{}, false, nil
 	}
 	return *state.Upgrade, true, nil
+}
+
+func (s *Store) ReadAutoUpdate(ctx context.Context) (AutoUpdateState, error) {
+	state, err := s.Load(ctx)
+	if err != nil {
+		return AutoUpdateState{}, err
+	}
+	return state.AutoUpdate, nil
+}
+
+func (s *Store) RecordAutoUpdateCheck(ctx context.Context, record AutoUpdateRecord) (AutoUpdateState, error) {
+	now := record.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var out AutoUpdateState
+	err := s.Update(ctx, func(state *State) error {
+		next := state.AutoUpdate
+		next.LastCheckAt = now
+		next.NextCheckAt = record.NextCheckAt
+		next.BackoffUntil = record.BackoffUntil
+		next.LastError = trimDiagnostic(record.LastError, 240)
+		if next.LastError != "" {
+			next.LastErrorAt = now
+		} else {
+			next.LastErrorAt = time.Time{}
+			next.LastSuccessAt = now
+		}
+		next.CandidateTag = strings.TrimSpace(record.CandidateTag)
+		next.CandidateVersion = strings.TrimSpace(record.CandidateVersion)
+		next.CandidatePriority = strings.TrimSpace(record.CandidatePriority)
+		next.CandidateAsset = strings.TrimSpace(record.CandidateAsset)
+		next.CandidatePublishedAt = record.CandidatePublishedAt
+		next.CandidateEligibleAt = record.CandidateEligibleAt
+		state.AutoUpdate = next
+		out = next
+		return nil
+	})
+	return out, err
+}
+
+func (s *Store) RecordAutoUpdateAttempt(ctx context.Context, tag string, now time.Time) (AutoUpdateState, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var out AutoUpdateState
+	err := s.Update(ctx, func(state *State) error {
+		next := state.AutoUpdate
+		next.LastAttemptTag = strings.TrimSpace(tag)
+		next.LastAttemptAt = now
+		state.AutoUpdate = next
+		out = next
+		return nil
+	})
+	return out, err
+}
+
+func (s *Store) RecordAutoUpdateInstalled(ctx context.Context, tag string, now time.Time) (AutoUpdateState, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var out AutoUpdateState
+	err := s.Update(ctx, func(state *State) error {
+		next := state.AutoUpdate
+		next.LastInstalledTag = strings.TrimSpace(tag)
+		next.LastInstalledAt = now
+		next.CandidateTag = ""
+		next.CandidateVersion = ""
+		next.CandidatePriority = ""
+		next.CandidateAsset = ""
+		next.CandidatePublishedAt = time.Time{}
+		next.CandidateEligibleAt = time.Time{}
+		state.AutoUpdate = next
+		out = next
+		return nil
+	})
+	return out, err
 }
 
 func (s *Store) MarkUpgradeReady(ctx context.Context, upgradeID string) (UpgradeRequest, error) {

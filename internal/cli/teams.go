@@ -624,6 +624,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var ownerStaleAfter time.Duration
 	var maxWorkChatPolls int
 	var upgradeCodex bool
+	var autoUpdate bool
+	var autoUpdateRepo string
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
@@ -656,6 +658,10 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var helperAutoUpdater teams.HelperAutoUpdater
+			if autoUpdate {
+				helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo)
+			}
 			return bridge.Listen(cmd.Context(), teams.BridgeOptions{
 				RegistryPath:             *registryPath,
 				HelperVersion:            buildVersion(),
@@ -669,6 +675,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				ControlFallbackModel:     controlFallbackModel,
 				HelperRestarter:          restartTeamsHelperFromTeams,
 				HelperReloader:           reloadTeamsHelperFromTeams,
+				HelperAutoUpdater:        helperAutoUpdater,
 			})
 		},
 	}
@@ -685,6 +692,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().DurationVar(&ownerStaleAfter, "owner-stale-after", defaultTeamsOwnerStaleAfter, "How long a Teams helper owner can miss heartbeats before recovery or another helper may take over")
 	cmd.Flags().IntVar(&maxWorkChatPolls, "max-work-chat-polls", teams.DefaultMaxWorkChatPollsPerCycle, "Maximum work chats to read per poll cycle")
 	cmd.Flags().BoolVar(&upgradeCodex, "upgrade-codex", false, "Upgrade Codex CLI once before starting Teams polling")
+	cmd.Flags().BoolVar(&autoUpdate, "auto-update", true, "Check codex-helper GitHub releases periodically and apply eligible p0/p1 helper updates")
+	cmd.Flags().StringVar(&autoUpdateRepo, "auto-update-repo", "", "Override GitHub repo for Teams helper auto-update checks")
 	return cmd
 }
 
@@ -1328,11 +1337,14 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	if err != nil {
 		return err
 	}
-	reg, err := teams.LoadRegistry(registryPath)
+	reg, err := loadTeamsStatusRegistry(registryPath)
 	if err != nil {
 		return err
 	}
-	active := reg.ActiveSessions()
+	statusSessions := make(map[string]string)
+	for _, session := range reg.Sessions {
+		addStatusSession(statusSessions, session.ID, session.ChatID, session.Status)
+	}
 	defaultStatePath, err := teamsStorePath()
 	if err != nil {
 		return err
@@ -1372,6 +1384,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 				continue
 			}
 			stateSessions++
+			addStatusSession(statusSessions, session.ID, session.TeamsChatID, string(session.Status))
 		}
 		for _, msg := range state.OutboxMessages {
 			if msg.Status == teamsstore.OutboxStatusQueued {
@@ -1396,7 +1409,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		if state.ControlLease.HolderMachineID != "" {
 			controlLeases = append(controlLeases, fmt.Sprintf("Control lease: holder=%s kind=%s generation=%d until=%s", state.ControlLease.HolderMachineID, state.ControlLease.HolderKind, state.ControlLease.Generation, state.ControlLease.LeaseUntil.Format(time.RFC3339)))
 		}
-		if controlChatID == "" && state.ControlChat.TeamsChatID != "" {
+		if state.ControlChat.TeamsChatID != "" && (controlChatID == "" || controlChatSource == resolvedRegistryPath) {
 			controlChatID = state.ControlChat.TeamsChatID
 			controlChatTopic = state.ControlChat.TeamsChatTopic
 			controlChatURL = state.ControlChat.TeamsChatURL
@@ -1423,7 +1436,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			_, _ = fmt.Fprintf(out, "Control chat source: %s\n", controlChatSource)
 		}
 	}
-	_, _ = fmt.Fprintf(out, "Sessions: %d total, %d active\n", len(reg.Sessions), len(active))
+	_, _ = fmt.Fprintf(out, "Sessions: %d total, %d active\n", len(statusSessions), activeStatusSessionCount(statusSessions))
 	_, _ = fmt.Fprintf(out, "State: %s\n", defaultStatePath)
 	if len(statePaths) == 0 {
 		_, _ = fmt.Fprintln(out, "Bridge: not running")
@@ -1637,6 +1650,132 @@ func teamsRegistryPath(registryPath string) (string, error) {
 		return registryPath, nil
 	}
 	return teams.DefaultRegistryPath()
+}
+
+func loadTeamsStatusRegistry(registryPath string) (teams.Registry, error) {
+	if strings.TrimSpace(registryPath) != "" {
+		return teams.LoadRegistry(registryPath)
+	}
+	paths, err := existingTeamsRegistryPaths()
+	if err != nil {
+		return teams.Registry{}, err
+	}
+	if len(paths) == 0 {
+		return teams.Registry{Version: 1}, nil
+	}
+	var merged teams.Registry
+	merged.Version = 1
+	for _, path := range paths {
+		reg, err := teams.LoadRegistry(path)
+		if err != nil {
+			return teams.Registry{}, err
+		}
+		mergeTeamsRegistryProjection(&merged, reg)
+	}
+	return merged, nil
+}
+
+func mergeTeamsRegistryProjection(dst *teams.Registry, src teams.Registry) {
+	if dst == nil {
+		return
+	}
+	if dst.Version == 0 {
+		dst.Version = 1
+	}
+	if dst.UserID == "" {
+		dst.UserID = src.UserID
+	}
+	if dst.UserPrincipal == "" {
+		dst.UserPrincipal = src.UserPrincipal
+	}
+	if src.ControlChatID != "" {
+		dst.ControlChatID = src.ControlChatID
+		dst.ControlChatURL = src.ControlChatURL
+		dst.ControlChatTopic = src.ControlChatTopic
+	}
+	for _, session := range src.Sessions {
+		if session.ID == "__control_fallback__" {
+			continue
+		}
+		if session.ID != "" && dst.SessionByID(session.ID) != nil {
+			continue
+		}
+		if session.ChatID != "" && dst.SessionByChatID(session.ChatID) != nil {
+			continue
+		}
+		dst.Sessions = append(dst.Sessions, session)
+	}
+}
+
+func addStatusSession(sessions map[string]string, sessionID string, chatID string, status string) {
+	key := strings.TrimSpace(sessionID)
+	if key == "" {
+		key = strings.TrimSpace(chatID)
+	}
+	if key == "" || key == "__control_fallback__" {
+		return
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "active"
+	}
+	if existing, ok := sessions[key]; ok && existing == "active" {
+		return
+	}
+	sessions[key] = status
+}
+
+func activeStatusSessionCount(sessions map[string]string) int {
+	active := 0
+	for _, status := range sessions {
+		if status == "active" {
+			active++
+		}
+	}
+	return active
+}
+
+func teamsRegistryPaths(registryPath string) ([]string, error) {
+	if strings.TrimSpace(registryPath) != "" {
+		return []string{registryPath}, nil
+	}
+	legacy, err := teams.DefaultRegistryPath()
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{legacy}
+	base := filepath.Dir(legacy)
+	matches, err := filepath.Glob(filepath.Join(base, "teams", "scopes", "*", "registry.json"))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	seen := map[string]struct{}{legacy: {}}
+	for _, path := range matches {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func existingTeamsRegistryPaths() ([]string, error) {
+	paths, err := teamsRegistryPaths("")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		out = append(out, path)
+	}
+	return out, nil
 }
 
 func teamsStorePath() (string, error) {

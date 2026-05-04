@@ -61,6 +61,9 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	if runCmd.Flags().Lookup("owner-stale-after") == nil || runCmd.Flags().Lookup("max-work-chat-polls") == nil {
 		t.Fatal("teams run should expose Teams helper reliability tuning flags")
 	}
+	if runCmd.Flags().Lookup("auto-update") == nil || runCmd.Flags().Lookup("auto-update-repo") == nil {
+		t.Fatal("teams run should expose Teams helper auto-update flags")
+	}
 	if flag := runCmd.Flags().Lookup("codex-timeout"); flag == nil {
 		t.Fatal("teams run should expose --codex-timeout")
 	} else if flag.DefValue != "0s" {

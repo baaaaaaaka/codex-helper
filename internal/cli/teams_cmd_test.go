@@ -97,6 +97,48 @@ func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	}
 }
 
+func TestTeamsStatusCountsScopedRegistrySessions(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	scopedRegistryPath := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", "scope-a", "registry.json")
+	if err := teams.SaveRegistry(scopedRegistryPath, teams.Registry{
+		Version:          1,
+		ControlChatID:    "scoped-control",
+		ControlChatURL:   "https://teams.example/scoped-control",
+		ControlChatTopic: "🏠 Codex Control - host",
+		Sessions: []teams.Session{{
+			ID:        "s001",
+			ChatID:    "work-chat",
+			ChatURL:   "https://teams.example/work-chat",
+			Topic:     "💬 Codex Work - s001 - host",
+			Status:    "active",
+			UpdatedAt: time.Now(),
+		}},
+	}); err != nil {
+		t.Fatalf("SaveRegistry scoped registry: %v", err)
+	}
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"teams", "status"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute teams status: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Control chat: configured, listener stopped",
+		"Control chat URL: https://teams.example/scoped-control",
+		"Sessions: 1 total, 1 active",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("teams status output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestTeamsSetupPrintsSafeChecklistWithoutState(t *testing.T) {
 	lockCLITestHooks(t)
 

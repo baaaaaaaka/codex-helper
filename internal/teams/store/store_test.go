@@ -1005,6 +1005,93 @@ func TestUpgradeAbortPreservesPreviousDrain(t *testing.T) {
 	}
 }
 
+func TestAutoUpdateLifecyclePersistsCandidateAndClearsAfterInstall(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	published := now.Add(-time.Hour)
+	eligible := published
+
+	checked, err := store.RecordAutoUpdateCheck(ctx, AutoUpdateRecord{
+		Now:                  now,
+		NextCheckAt:          now.Add(30 * time.Minute),
+		CandidateTag:         " v1.2.4 ",
+		CandidateVersion:     " 1.2.4 ",
+		CandidatePriority:    " p0 ",
+		CandidateAsset:       " codex-proxy_1.2.4_linux_amd64 ",
+		CandidatePublishedAt: published,
+		CandidateEligibleAt:  eligible,
+	})
+	if err != nil {
+		t.Fatalf("RecordAutoUpdateCheck error: %v", err)
+	}
+	if checked.CandidateTag != "v1.2.4" || checked.CandidateVersion != "1.2.4" || checked.CandidatePriority != "p0" {
+		t.Fatalf("candidate was not normalized: %#v", checked)
+	}
+	if checked.LastSuccessAt.IsZero() || !checked.LastErrorAt.IsZero() {
+		t.Fatalf("success/error timestamps mismatch after check: %#v", checked)
+	}
+	if _, err := store.RecordAutoUpdateAttempt(ctx, " v1.2.4 ", now.Add(time.Minute)); err != nil {
+		t.Fatalf("RecordAutoUpdateAttempt error: %v", err)
+	}
+	installed, err := store.RecordAutoUpdateInstalled(ctx, " v1.2.4 ", now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("RecordAutoUpdateInstalled error: %v", err)
+	}
+	if installed.LastInstalledTag != "v1.2.4" || installed.LastInstalledAt.IsZero() {
+		t.Fatalf("installed state mismatch: %#v", installed)
+	}
+	if installed.CandidateTag != "" || installed.CandidateVersion != "" || !installed.CandidatePublishedAt.IsZero() {
+		t.Fatalf("candidate should be cleared after install: %#v", installed)
+	}
+
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("Open error: %v", err)
+	}
+	read, err := reopened.ReadAutoUpdate(ctx)
+	if err != nil {
+		t.Fatalf("ReadAutoUpdate error: %v", err)
+	}
+	if read.LastInstalledTag != "v1.2.4" || read.LastAttemptTag != "v1.2.4" {
+		t.Fatalf("reopened auto-update state mismatch: %#v", read)
+	}
+}
+
+func TestAutoUpdateCheckRecordsTrimmedErrorAndBackoff(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	longErr := strings.Repeat("x", 400)
+
+	state, err := store.RecordAutoUpdateCheck(ctx, AutoUpdateRecord{
+		Now:          now,
+		NextCheckAt:  now.Add(30 * time.Minute),
+		BackoffUntil: now.Add(10 * time.Minute),
+		LastError:    longErr,
+	})
+	if err != nil {
+		t.Fatalf("RecordAutoUpdateCheck error: %v", err)
+	}
+	if state.LastError == "" || len(state.LastError) > 240 {
+		t.Fatalf("LastError was not trimmed: len=%d value=%q", len(state.LastError), state.LastError)
+	}
+	if state.LastErrorAt.IsZero() || !state.BackoffUntil.Equal(now.Add(10*time.Minute)) {
+		t.Fatalf("error/backoff timestamps mismatch: %#v", state)
+	}
+
+	cleared, err := store.RecordAutoUpdateCheck(ctx, AutoUpdateRecord{
+		Now:         now.Add(time.Hour),
+		NextCheckAt: now.Add(90 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("RecordAutoUpdateCheck clear error: %v", err)
+	}
+	if cleared.LastError != "" || !cleared.LastErrorAt.IsZero() || cleared.LastSuccessAt.IsZero() {
+		t.Fatalf("success check should clear prior error: %#v", cleared)
+	}
+}
+
 func TestDeferredInboundIsDurableAndListed(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

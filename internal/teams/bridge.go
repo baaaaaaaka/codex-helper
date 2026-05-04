@@ -49,6 +49,8 @@ var helperRestartDelay = 3 * time.Second
 var codexIdleStatusInitialDelay = 2 * time.Minute
 var codexIdleStatusRepeatDelay = 5 * time.Minute
 var codexIdleStatusMessage = "Still working. No new Codex update yet."
+var queuedTurnAttentionDelay = 10 * time.Minute
+var queuedTurnAttentionRepeatDelay = 10 * time.Minute
 
 const controlFallbackSessionID = "__control_fallback__"
 
@@ -80,15 +82,47 @@ type BridgeOptions struct {
 	Runner                   codexrunner.Runner
 	HelperRestarter          HelperRestarter
 	HelperReloader           HelperReloader
+	HelperAutoUpdater        HelperAutoUpdater
 }
 
 type HelperRestarter func(context.Context) error
 
 type HelperReloader func(context.Context, HelperReloadOptions) error
 
+type HelperAutoUpdater interface {
+	Check(context.Context, HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error)
+	Apply(context.Context, HelperAutoUpdateCandidate) (HelperAutoUpdateApplyResult, error)
+}
+
 type HelperReloadOptions struct {
 	Force         bool
 	BeforeRestart func(context.Context) error
+}
+
+type HelperAutoUpdateCheck struct {
+	InstalledVersion string
+	Now              time.Time
+}
+
+type HelperAutoUpdateDecision struct {
+	Candidate    *HelperAutoUpdateCandidate
+	NextCheckAt  time.Time
+	BackoffUntil time.Time
+	LastError    string
+}
+
+type HelperAutoUpdateCandidate struct {
+	TagName     string
+	Version     string
+	Priority    string
+	PublishedAt time.Time
+	EligibleAt  time.Time
+	Asset       string
+}
+
+type HelperAutoUpdateApplyResult struct {
+	Version         string
+	RestartRequired bool
 }
 
 type Bridge struct {
@@ -418,6 +452,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
+		}
+		if err := b.maybeRunHelperAutoUpdate(ctx, opts); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams helper auto-update error: %v\n", err)
 		}
 		if drained, err := b.drainComplete(ctx); err != nil {
 			return err
@@ -1335,7 +1372,7 @@ func controlAdvancedHelpText() string {
 		"work chat commands:",
 		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
 		"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
-		"If this chat stops replying for about a minute, start the helper again on the host, then send `status`.",
+		"If this chat stops replying for about a minute, send `helper status`. From the control chat, `helper reload now` loads the latest helper code and `helper restart now` restarts the helper.",
 		"",
 		"copy-ready examples:",
 		"`p`",
@@ -1354,6 +1391,7 @@ func sessionHelpText() string {
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`helper details` or `!details` - show debug IDs and links",
+		"`helper publish-history` - import a paused local Codex history backlog",
 		"",
 		"Send `helper help advanced` for retry, cancel, and rename commands.",
 	}, "\n")
@@ -1367,7 +1405,8 @@ func sessionAdvancedHelpText() string {
 		"`helper rename <title>` or `!rename <title>` - rename this Teams chat",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
-		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel <turn-id>` / `!cancel <turn-id>`",
+		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
+		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
 		"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
 		"Other text, including unknown slash-prefixed text, is sent to Codex.",
 	}, "\n")
@@ -1654,6 +1693,133 @@ func (b *Bridge) runDelayedHelperReload(reloader HelperReloader, opts HelperRelo
 		return
 	}
 	_ = clearDrain(context.Background())
+}
+
+func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOptions) error {
+	if opts.Once || opts.HelperAutoUpdater == nil || b.store == nil {
+		return nil
+	}
+	now := time.Now()
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	auto := state.AutoUpdate
+	if state.ServiceControl.Draining && state.ServiceControl.Reason == teamstore.HelperUpgradeReason && strings.TrimSpace(auto.CandidateTag) != "" {
+		return b.applyHelperAutoUpdateWhenDrained(ctx, opts, HelperAutoUpdateCandidate{
+			TagName:     auto.CandidateTag,
+			Version:     auto.CandidateVersion,
+			Priority:    auto.CandidatePriority,
+			PublishedAt: auto.CandidatePublishedAt,
+			EligibleAt:  auto.CandidateEligibleAt,
+			Asset:       auto.CandidateAsset,
+		})
+	}
+	if auto.BackoffUntil.After(now) {
+		return nil
+	}
+	if auto.NextCheckAt.After(now) {
+		return nil
+	}
+	decision, err := opts.HelperAutoUpdater.Check(ctx, HelperAutoUpdateCheck{
+		InstalledVersion: opts.HelperVersion,
+		Now:              now,
+	})
+	if err != nil {
+		_, recordErr := b.store.RecordAutoUpdateCheck(ctx, teamstore.AutoUpdateRecord{
+			Now:          now,
+			NextCheckAt:  now.Add(30 * time.Minute),
+			BackoffUntil: now.Add(30 * time.Minute),
+			LastError:    err.Error(),
+		})
+		if recordErr != nil {
+			return recordErr
+		}
+		return err
+	}
+	record := teamstore.AutoUpdateRecord{
+		Now:          now,
+		NextCheckAt:  decision.NextCheckAt,
+		BackoffUntil: decision.BackoffUntil,
+		LastError:    decision.LastError,
+	}
+	if decision.Candidate != nil {
+		record.CandidateTag = decision.Candidate.TagName
+		record.CandidateVersion = decision.Candidate.Version
+		record.CandidatePriority = decision.Candidate.Priority
+		record.CandidateAsset = decision.Candidate.Asset
+		record.CandidatePublishedAt = decision.Candidate.PublishedAt
+		record.CandidateEligibleAt = decision.Candidate.EligibleAt
+	}
+	if record.NextCheckAt.IsZero() {
+		record.NextCheckAt = now.Add(30 * time.Minute)
+	}
+	if _, err := b.store.RecordAutoUpdateCheck(ctx, record); err != nil {
+		return err
+	}
+	if decision.Candidate == nil {
+		return nil
+	}
+	return b.applyHelperAutoUpdateWhenDrained(ctx, opts, *decision.Candidate)
+}
+
+func (b *Bridge) applyHelperAutoUpdateWhenDrained(ctx context.Context, opts BridgeOptions, candidate HelperAutoUpdateCandidate) error {
+	if opts.HelperAutoUpdater == nil {
+		return nil
+	}
+	req, err := b.store.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, 10*time.Minute)
+	if err != nil {
+		if errors.Is(err, teamstore.ErrUpgradeInProgress) {
+			return nil
+		}
+		return err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if teamstore.HasUpgradeBlockingWork(state, time.Now()) {
+		return nil
+	}
+	if _, err := b.store.MarkUpgradeReady(ctx, req.ID); err != nil {
+		return err
+	}
+	if _, err := b.store.RecordAutoUpdateAttempt(ctx, candidate.TagName, time.Now()); err != nil {
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
+		return err
+	}
+	res, err := opts.HelperAutoUpdater.Apply(ctx, candidate)
+	if err != nil {
+		_, _ = b.store.RecordAutoUpdateCheck(context.Background(), teamstore.AutoUpdateRecord{
+			Now:                  time.Now(),
+			NextCheckAt:          time.Now().Add(30 * time.Minute),
+			BackoffUntil:         time.Now().Add(30 * time.Minute),
+			LastError:            err.Error(),
+			CandidateTag:         candidate.TagName,
+			CandidateVersion:     candidate.Version,
+			CandidatePriority:    candidate.Priority,
+			CandidateAsset:       candidate.Asset,
+			CandidatePublishedAt: candidate.PublishedAt,
+			CandidateEligibleAt:  candidate.EligibleAt,
+		})
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
+		return err
+	}
+	tag := candidate.TagName
+	if strings.TrimSpace(tag) == "" && strings.TrimSpace(res.Version) != "" {
+		tag = "v" + strings.TrimPrefix(strings.TrimSpace(res.Version), "v")
+	}
+	if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
+		return err
+	}
+	if _, err := b.store.CompleteUpgrade(ctx, req.ID); err != nil {
+		return err
+	}
+	if opts.HelperRestarter == nil {
+		return nil
+	}
+	return opts.HelperRestarter(ctx)
 }
 
 func isWorkOnlyHelperCommand(text string) bool {
@@ -2040,6 +2206,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 			return b.renameSessionChat(ctx, session, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandDetails:
 			return b.sendToChat(ctx, chatID, b.formatSessionDetails(session))
+		case DashboardCommandPublishHistory:
+			return b.publishWorkSessionHistory(ctx, session)
 		case DashboardCommandHelp:
 			if isAdvancedHelpArg(parsed.Argument) {
 				return b.sendToChat(ctx, chatID, sessionAdvancedHelpText())
@@ -2112,7 +2280,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
 			if turns.Queued == 0 {
-				if err := b.queueTeamsPromptAckWithBody(ctx, session, turn, gate.AckBody); err != nil {
+				if err := b.queueTeamsPromptBlockedAck(ctx, session, turn, gate); err != nil {
 					return err
 				}
 			}
@@ -2301,9 +2469,114 @@ func turnSortTime(turn teamstore.Turn) time.Time {
 func (b *Bridge) queueTeamsPromptAck(ctx context.Context, session *Session, turn teamstore.Turn, queuedBehindActive bool) error {
 	body := "⏳ Codex is working. Request accepted."
 	if queuedBehindActive {
-		body = "⏳ Queued. Codex will respond after the current request."
+		body = b.formatBlockedTeamsPromptAck(ctx, session, localCodexBeforeTeamsGate{
+			Block:   true,
+			AckBody: "A Codex request is already running in this Work chat.",
+		})
 	}
 	return b.queueTeamsPromptAckWithBody(ctx, session, turn, body)
+}
+
+func (b *Bridge) queueTeamsPromptBlockedAck(ctx context.Context, session *Session, turn teamstore.Turn, gate localCodexBeforeTeamsGate) error {
+	return b.queueTeamsPromptAckWithBody(ctx, session, turn, b.formatBlockedTeamsPromptAck(ctx, session, gate))
+}
+
+func (b *Bridge) formatBlockedTeamsPromptAck(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) string {
+	reason := blockedAckReason(gate)
+	ahead := b.requestAheadSummary(ctx, session, gate)
+	return strings.Join([]string{
+		"⚠️ **Your request is queued.**",
+		reason,
+		"",
+		"---",
+		"",
+		"**Request ahead of you:**",
+		ahead,
+		"",
+		"---",
+		"",
+		"**Options:**",
+		"- Run this request next: do nothing. It is already submitted.",
+		"- Need it immediately: send it in a different 💬 Work chat.",
+		"- Drop this queued request: `helper cancel last`.",
+		"- Interrupt the request ahead only if it looks stuck: open the 🏠 Control chat and send `helper restart force`.",
+	}, "\n")
+}
+
+func blockedAckReason(gate localCodexBeforeTeamsGate) string {
+	text := strings.TrimSpace(gate.AckBody)
+	switch {
+	case strings.Contains(text, "already running"):
+		return "Another Codex request is already running in this Work chat, so I will run yours after it finishes."
+	case strings.Contains(text, "active in the CLI"):
+		return "A local Codex CLI request is active for this chat, so I will run yours after that finishes."
+	case strings.Contains(text, "preparing this chat history"):
+		return "I am preparing this chat history first, so I will run your request after the import finishes."
+	case strings.Contains(text, "paused backlog"):
+		return "Local Codex history has a paused backlog, so I need that resolved before running your request."
+	case strings.Contains(text, "syncing recent Codex updates"):
+		return "I am syncing recent local Codex updates first, so I will run your request after the sync finishes."
+	case strings.Contains(text, "history sync needs attention"):
+		return "Local Codex history sync needs attention before I can run your request."
+	default:
+		return "A required Codex/helper step is ahead of your request, so I will run yours after that clears."
+	}
+}
+
+func (b *Bridge) requestAheadSummary(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) string {
+	if b != nil && b.store != nil && session != nil {
+		if state, err := b.store.Load(ctx); err == nil {
+			if turn, ok := runningTurnForSessionState(state, session.ID); ok {
+				if summary := turnPromptSummary(state, turn); summary != "" {
+					return summary
+				}
+				return "A Teams Codex request is running, but its original prompt is not available."
+			}
+		}
+	}
+	text := strings.TrimSpace(gate.AckBody)
+	switch {
+	case strings.Contains(text, "active in the CLI"):
+		return "Local Codex CLI request. The prompt is not available from Teams."
+	case strings.Contains(text, "preparing this chat history"):
+		return "Local Codex history import."
+	case strings.Contains(text, "paused backlog"):
+		return "Paused local Codex history backlog. Send `helper publish-history` when you want to import it."
+	case strings.Contains(text, "syncing recent Codex updates"):
+		return "Recent local Codex updates are being synced into this Teams chat."
+	case strings.Contains(text, "history sync needs attention"):
+		return "Local Codex history sync recovery."
+	default:
+		return "Codex/helper work already in progress."
+	}
+}
+
+func runningTurnForSessionState(state teamstore.State, sessionID string) (teamstore.Turn, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return teamstore.Turn{}, false
+	}
+	var out teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusRunning {
+			continue
+		}
+		if out.ID == "" || turnSortTime(turn).After(turnSortTime(out)) {
+			out = turn
+		}
+	}
+	return out, out.ID != ""
+}
+
+func turnPromptSummary(state teamstore.State, turn teamstore.Turn) string {
+	inbound := state.InboundEvents[turn.InboundEventID]
+	text := strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(inbound.Text)))
+	if text == "" {
+		return ""
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	text = strings.ReplaceAll(text, "`", "'")
+	return shortenTeamsLine(text, 180)
 }
 
 func (b *Bridge) queueTeamsPromptAckWithBody(ctx context.Context, session *Session, turn teamstore.Turn, body string) error {
@@ -2498,6 +2771,11 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 			return err
 		}
 		if gate.Block {
+			if turn, ok := oldestQueuedTurnForSessionState(state, sessionID); ok {
+				if err := b.sendQueuedTurnAttentionIfDue(ctx, session, turn, gate, time.Now()); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if _, err := b.startQueuedTurn(ctx, session, "", nil); err != nil {
@@ -2505,6 +2783,95 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func oldestQueuedTurnForSessionState(state teamstore.State, sessionID string) (teamstore.Turn, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return teamstore.Turn{}, false
+	}
+	var out teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusQueued {
+			continue
+		}
+		if out.ID == "" || queuedTurnAgeBaseTime(turn).Before(queuedTurnAgeBaseTime(out)) ||
+			(queuedTurnAgeBaseTime(turn).Equal(queuedTurnAgeBaseTime(out)) && turn.ID < out.ID) {
+			out = turn
+		}
+	}
+	return out, out.ID != ""
+}
+
+func queuedTurnAgeBaseTime(turn teamstore.Turn) time.Time {
+	for _, value := range []time.Time{turn.QueuedAt, turn.CreatedAt, turn.UpdatedAt, turn.StartedAt} {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
+func queuedTurnAttentionBucket(turn teamstore.Turn, now time.Time) (int64, bool) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	base := queuedTurnAgeBaseTime(turn)
+	if base.IsZero() || queuedTurnAttentionDelay <= 0 || now.Sub(base) < queuedTurnAttentionDelay {
+		return 0, false
+	}
+	repeat := queuedTurnAttentionRepeatDelay
+	if repeat <= 0 {
+		repeat = queuedTurnAttentionDelay
+	}
+	seconds := int64(repeat / time.Second)
+	if seconds <= 0 {
+		seconds = 1
+	}
+	return now.Unix() / seconds, true
+}
+
+func (b *Bridge) sendQueuedTurnAttentionIfDue(ctx context.Context, session *Session, turn teamstore.Turn, gate localCodexBeforeTeamsGate, now time.Time) error {
+	if b == nil || session == nil || strings.TrimSpace(session.ChatID) == "" {
+		return nil
+	}
+	bucket, ok := queuedTurnAttentionBucket(turn, now)
+	if !ok {
+		return nil
+	}
+	body := strings.Join([]string{
+		"⏳ Still waiting.",
+		queuedTurnBlockedReason(gate),
+		"",
+		"Your Teams message is queued and will run after this clears.",
+		"If this looks stale, send `helper status` here. To drop the queued message, send `helper cancel last`.",
+	}, "\n")
+	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:          fmt.Sprintf("outbox:%s:queued-wait:%d", turn.ID, bucket),
+		SessionID:   session.ID,
+		TurnID:      turn.ID,
+		TeamsChatID: session.ChatID,
+		Kind:        "queued-wait",
+		Body:        body,
+	})
+}
+
+func queuedTurnBlockedReason(gate localCodexBeforeTeamsGate) string {
+	text := strings.TrimSpace(gate.AckBody)
+	switch {
+	case strings.Contains(text, "active in the CLI"):
+		return "Local Codex is still active for this chat."
+	case strings.Contains(text, "preparing this chat history"):
+		return "I am still preparing local history for this chat."
+	case strings.Contains(text, "paused backlog"):
+		return "Local history import is paused until you send `helper publish-history`."
+	case strings.Contains(text, "syncing recent Codex updates"):
+		return "I am still syncing recent local Codex updates before running your Teams request."
+	case strings.Contains(text, "history sync needs attention"):
+		return "Local history sync needs attention before I can continue."
+	default:
+		return "The helper is waiting for a required local sync step."
+	}
 }
 
 func (b *Bridge) rejectDeferredSessionInboundAfterUpgrade(ctx context.Context, inbound teamstore.InboundEvent) error {
@@ -2739,7 +3106,7 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 
 func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID string) error {
 	if turnID == "" {
-		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel <turn-id>` or `!cancel <turn-id>`")
+		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel last`, `helper cancel <turn-id>`, or `!cancel <turn-id>`")
 	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
@@ -2747,6 +3114,13 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 	state, err := b.store.Load(ctx)
 	if err != nil {
 		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(turnID), "last") {
+		resolved, ok := latestCancelableTurnID(state, session.ID)
+		if !ok {
+			return b.sendToChat(ctx, session.ChatID, "no queued turn is available to cancel in this session.")
+		}
+		turnID = resolved
 	}
 	turn, ok := state.Turns[turnID]
 	if !ok || turn.SessionID != session.ID {
@@ -2770,6 +3144,22 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 	default:
 		return b.sendToChat(ctx, session.ChatID, fmt.Sprintf("turn %s is %s and cannot be canceled.", turn.ID, turn.Status))
 	}
+}
+
+func latestCancelableTurnID(state teamstore.State, sessionID string) (string, bool) {
+	var latest teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusQueued {
+			continue
+		}
+		if latest.ID == "" || turnSortTime(turn).After(turnSortTime(latest)) {
+			latest = turn
+		}
+	}
+	if latest.ID == "" {
+		return "", false
+	}
+	return latest.ID, true
 }
 
 func (b *Bridge) sendFileCommand(ctx context.Context, session *Session, relPath string) error {
@@ -5002,6 +5392,10 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 			lines = append(lines, "Latest error: "+latest.FailureMessage)
 		}
 		switch latest.Status {
+		case teamstore.TurnStatusQueued:
+			lines = append(lines, "Queued request: waiting for local Codex history or the current Codex run to clear. Send `helper cancel last` if you want to drop the queued request.")
+		case teamstore.TurnStatusRunning:
+			lines = append(lines, "Running request: Codex is currently working. If no status appears for a while, the helper will send a waiting update.")
 		case teamstore.TurnStatusFailed, teamstore.TurnStatusInterrupted:
 			lines = append(lines, "Retry: check recent messages and changed files first. `helper retry last` asks Codex to run the same Teams request again in this same session, so it may repeat file edits or terminal commands.")
 		}
@@ -5017,6 +5411,10 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 	}
 	if firstNonEmptyString(session.Status, "active") == string(teamstore.SessionStatusClosed) {
 		lines = append(lines, "Next: this chat is closed. Use the 🏠 control chat to open or create another work chat.")
+	} else if hasLatest && latest.Status == teamstore.TurnStatusQueued {
+		lines = append(lines, "Next: wait for the queued request, or send `helper cancel last` to drop it.")
+	} else if hasLatest && latest.Status == teamstore.TurnStatusRunning {
+		lines = append(lines, "Next: wait for Codex to finish. Send a new task only after the final answer if you want strict ordering.")
 	} else if hasLatest && (latest.Status == teamstore.TurnStatusFailed || latest.Status == teamstore.TurnStatusInterrupted) {
 		lines = append(lines, "Next: send a new task to start fresh, or `helper retry last` to retry the interrupted request in this session.")
 	} else {
@@ -5399,6 +5797,47 @@ func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Sessi
 	return b.markTranscriptImportComplete(ctx, session, local.FilePath, lastRecordID, lastLine)
 }
 
+func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session) error {
+	if session == nil {
+		return nil
+	}
+	if err := b.ensureDurableSession(ctx, session); err != nil {
+		return err
+	}
+	local, ok, err := b.localCodexSessionForTeamsSession(ctx, *session)
+	if err != nil {
+		return err
+	}
+	if !ok || strings.TrimSpace(local.FilePath) == "" {
+		return b.sendToChat(ctx, session.ChatID, "No local Codex history file is linked to this Work chat.")
+	}
+	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
+		return err
+	} else if importing {
+		return b.sendToChat(ctx, session.ChatID, "History import is already running. Wait for `Import complete` before sending another task.")
+	}
+	if err := b.markTranscriptImportStarted(ctx, *session, local.FilePath); err != nil {
+		return err
+	}
+	importTurnID := "publish-history:" + session.ID
+	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, *session, local.FilePath, importTurnID, "sync", transcriptCheckpointID(session.ID))
+	if err != nil {
+		_ = b.markTranscriptImportFailed(ctx, *session, local.FilePath)
+		return b.sendToChat(ctx, session.ChatID, "History import failed: "+err.Error())
+	}
+	if err := b.markTranscriptImportComplete(ctx, *session, local.FilePath, lastRecordID, lastLine); err != nil {
+		return err
+	}
+	body := formatTranscriptImportCompleteMessage(stats)
+	if stats.Imported == 0 && stats.SkippedBackground == 0 {
+		body = "No new visible local Codex history needed to be imported. This chat is ready."
+	}
+	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "sync-complete", body); err != nil {
+		return err
+	}
+	return b.processQueuedTurns(ctx)
+}
+
 type transcriptImportStats struct {
 	Total             int
 	Imported          int
@@ -5633,6 +6072,11 @@ func (b *Bridge) importSubagentMarkersToTeams(ctx context.Context, session Sessi
 	for i, subagent := range subagents {
 		key := subagentImportKey(subagent, i+1)
 		checkpointID := transcriptSubagentCheckpointID(session.ID, subagent.SessionID, key)
+		if complete, err := b.transcriptCheckpointComplete(ctx, checkpointID); err != nil {
+			return err
+		} else if complete {
+			continue
+		}
 		sourcePath := strings.TrimSpace(subagent.FilePath)
 		if err := b.markTranscriptImportStartedWithID(ctx, session, sourcePath, checkpointID); err != nil {
 			return err
@@ -5646,6 +6090,18 @@ func (b *Bridge) importSubagentMarkersToTeams(ctx context.Context, session Sessi
 		}
 	}
 	return nil
+}
+
+func (b *Bridge) transcriptCheckpointComplete(ctx context.Context, checkpointID string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(checkpointID) == "" {
+		return false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	return checkpoint.Status == importCheckpointStatusComplete && strings.TrimSpace(checkpoint.LastRecordID) != "", nil
 }
 
 func subagentImportSortTime(subagent codexhistory.SubagentSession) time.Time {
@@ -5767,6 +6223,24 @@ func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *
 			Block:   true,
 			AckBody: "⏳ Queued. I’m preparing this chat history first, then I’ll respond.",
 		}, nil
+	case importCheckpointStatusBlocked:
+		if err := b.syncSessionTranscript(ctx, *session, local); err != nil {
+			return localCodexBeforeTeamsGate{}, err
+		}
+		refreshed, err := b.classifyLocalTranscriptDelta(ctx, *session, local)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return localCodexBeforeTeamsGate{}, nil
+			}
+			return localCodexBeforeTeamsGate{}, err
+		}
+		if refreshed.CheckpointStatus != importCheckpointStatusBlocked {
+			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		}
+		return localCodexBeforeTeamsGate{
+			Block:   true,
+			AckBody: "⚠️ Queued. Local Codex history has a paused backlog. Send `helper publish-history` here; I’ll continue after the import finishes.",
+		}, nil
 	case importCheckpointStatusFailed:
 		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, *session, local)
 		if err != nil {
@@ -5867,7 +6341,7 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 	out.CheckpointStatus = checkpoint.Status
 	out.CheckpointHadRecord = checkpoint.LastRecordID != ""
 	switch checkpoint.Status {
-	case importCheckpointStatusImporting, importCheckpointStatusFailed:
+	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
 		return out, nil
 	}
 	var transcript Transcript
@@ -6084,8 +6558,6 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		switch checkpoint.Status {
 		case importCheckpointStatusImporting:
 			return nil
-		case importCheckpointStatusBlocked:
-			return nil
 		case importCheckpointStatusFailed:
 			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
 			if err != nil {
@@ -6123,11 +6595,12 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	if len(transcript.Records) == 0 {
 		return nil
 	}
-	if len(transcript.Records) > transcriptSyncMaxAutoBacklogRecords {
-		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, len(transcript.Records))
-	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
+	visibleBacklog := countVisibleTranscriptSyncRecords(transcript.Records, teamsOriginHashes, knownHashes)
+	if visibleBacklog > transcriptSyncMaxAutoBacklogRecords {
+		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, visibleBacklog)
+	}
 	dedupe := newTranscriptDedupeState()
 	syncTurnID := "sync:" + session.ID
 	sent := 0
@@ -6217,11 +6690,33 @@ func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session 
 	return true, b.markTranscriptImportComplete(ctx, session, sourcePath, transcriptRecordCheckpointKey(recovered), recovered.SourceLine)
 }
 
+func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool) int {
+	dedupe := newTranscriptDedupeState()
+	visible := 0
+	for _, record := range records {
+		if strings.TrimSpace(record.Text) == "" {
+			continue
+		}
+		body := formatTranscriptRecordForTeams(record)
+		if strings.TrimSpace(body) == "" {
+			continue
+		}
+		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
+			shouldSkipBackgroundTranscriptRecord(record) ||
+			dedupe.shouldSkip(record, body) {
+			continue
+		}
+		visible++
+	}
+	return visible
+}
+
 func (b *Bridge) blockAutomaticTranscriptSync(ctx context.Context, session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint, backlogRecords int) error {
 	if err := b.markTranscriptImportBlocked(ctx, session, sourcePath, checkpoint); err != nil {
 		return err
 	}
-	body := fmt.Sprintf("Local Codex history has %d new items, so I paused automatic history sync to avoid flooding this Teams chat.\n\nNo history was skipped. To import the backlog, send `helper publish-history` here.", backlogRecords)
+	body := fmt.Sprintf("Local Codex history has %d visible new item(s), so I paused automatic history sync to avoid flooding this Teams chat.\n\nNo history was skipped. To import the backlog, send `helper publish-history` here.", backlogRecords)
 	idSeed := firstNonEmptyString(checkpoint.LastRecordID, fmt.Sprintf("line-%d", checkpoint.LastSourceLine), "start")
 	outboxID := "outbox:sync:" + session.ID + ":backlog-blocked:" + shortStableID(idSeed)
 	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
@@ -6471,7 +6966,7 @@ func (b *Bridge) recordTranscriptCheckpointWithID(ctx context.Context, session S
 		now := time.Now()
 		id := checkpointID
 		status := state.ImportCheckpoints[id].Status
-		if status == "" {
+		if status == "" || status == importCheckpointStatusBlocked {
 			status = importCheckpointStatusComplete
 		}
 		state.ImportCheckpoints[id] = teamstore.ImportCheckpoint{

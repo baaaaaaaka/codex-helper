@@ -142,7 +142,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "/status", "/close", "/help", "/details", "!status", "!file report.txt", "helper status", "helper retry turn-1", "helper file report.txt", "codex status", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "/status", "/close", "/help", "/details", "!status", "!file report.txt", "!ph", "helper status", "helper retry turn-1", "helper file report.txt", "helper publish-history", "codex status", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {

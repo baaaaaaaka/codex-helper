@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -46,10 +47,11 @@ type CheckOptions struct {
 }
 
 type UpdateOptions struct {
-	Repo        string
-	Version     string
-	InstallPath string
-	Timeout     time.Duration
+	Repo           string
+	Version        string
+	InstallPath    string
+	Timeout        time.Duration
+	ValidateBinary bool
 }
 
 type ApplyResult struct {
@@ -208,6 +210,12 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	if opts.ValidateBinary {
+		if err := validateDownloadedBinary(ctx, tmpPath, verNoV, timeout); err != nil {
+			_ = os.Remove(tmpPath)
+			return ApplyResult{}, err
+		}
+	}
 
 	rep, err := replaceBinary(tmpPath, installPath)
 	if err != nil {
@@ -232,6 +240,9 @@ func binaryName() string {
 
 func normalizeVersion(v string) string {
 	s := strings.TrimSpace(v)
+	if fields := strings.Fields(s); len(fields) > 0 {
+		s = fields[0]
+	}
 	s = strings.TrimPrefix(s, "v")
 	if s == "" || strings.EqualFold(s, "dev") {
 		return ""
@@ -492,6 +503,41 @@ func sha256File(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func validateDownloadedBinary(ctx context.Context, path string, version string, timeout time.Duration) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("validate downloaded binary: %w", err)
+	}
+	if info.IsDir() || info.Size() == 0 {
+		return fmt.Errorf("validate downloaded binary: invalid file %s", path)
+	}
+	if runtime.GOOS != "windows" && info.Mode()&0o111 == 0 {
+		return fmt.Errorf("validate downloaded binary: file is not executable %s", path)
+	}
+	cmdCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	out, err := exec.CommandContext(cmdCtx, path, "--version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("validate downloaded binary: %w: %s", err, trimValidationOutput(string(out)))
+	}
+	if version != "" && !strings.Contains(string(out), strings.TrimPrefix(version, "v")) {
+		return fmt.Errorf("validate downloaded binary: version output %q does not contain %q", trimValidationOutput(string(out)), strings.TrimPrefix(version, "v"))
+	}
+	return nil
+}
+
+func trimValidationOutput(output string) string {
+	output = strings.TrimSpace(output)
+	if len(output) > 500 {
+		return output[:500] + "..."
+	}
+	return output
 }
 
 func isVersionNewer(remote, local string) (bool, bool) {

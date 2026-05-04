@@ -199,6 +199,24 @@ Optional flags:
 - `--version vX.Y.Z` (install a specific version)
 - `--install-path /path/to/codex-proxy` (override install path; file or directory)
 
+Teams background mode also checks `codex-helper` GitHub Releases every 30
+minutes and silently applies eligible helper updates after current Teams/Codex
+work drains:
+
+- `p0`: update as soon as the release is detected.
+- `p1`: update after the release has been published for 48 hours.
+- `p2`: never auto-update.
+
+Releases default to `p2` unless the release notes include this machine-readable
+marker:
+
+```md
+<!-- codex-helper-release: {"auto_update_priority":"p1"} -->
+```
+
+Use `p0`, `p1`, or `p2` in the marker. Teams mode ignores draft releases,
+prereleases, older versions, and releases without a matching platform asset.
+
 Upgrade Codex CLI itself (reinstall-style):
 
 ```bash

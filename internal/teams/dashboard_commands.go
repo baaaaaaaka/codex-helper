@@ -16,28 +16,29 @@ const (
 type DashboardCommandName string
 
 const (
-	DashboardCommandNone       DashboardCommandName = ""
-	DashboardCommandUnknown    DashboardCommandName = "unknown"
-	DashboardCommandSelect     DashboardCommandName = "select"
-	DashboardCommandWorkspaces DashboardCommandName = "workspaces"
-	DashboardCommandWorkspace  DashboardCommandName = "workspace"
-	DashboardCommandSessions   DashboardCommandName = "sessions"
-	DashboardCommandOpen       DashboardCommandName = "open"
-	DashboardCommandResume     DashboardCommandName = "resume"
-	DashboardCommandPublish    DashboardCommandName = "publish"
-	DashboardCommandNew        DashboardCommandName = "new"
-	DashboardCommandAsk        DashboardCommandName = "ask"
-	DashboardCommandMkdir      DashboardCommandName = "mkdir"
-	DashboardCommandRename     DashboardCommandName = "rename"
-	DashboardCommandDetails    DashboardCommandName = "details"
-	DashboardCommandHelp       DashboardCommandName = "help"
-	DashboardCommandStatus     DashboardCommandName = "status"
-	DashboardCommandRestart    DashboardCommandName = "restart"
-	DashboardCommandReload     DashboardCommandName = "reload"
-	DashboardCommandClose      DashboardCommandName = "close"
-	DashboardCommandRetry      DashboardCommandName = "retry"
-	DashboardCommandCancel     DashboardCommandName = "cancel"
-	DashboardCommandSendFile   DashboardCommandName = "send-file"
+	DashboardCommandNone           DashboardCommandName = ""
+	DashboardCommandUnknown        DashboardCommandName = "unknown"
+	DashboardCommandSelect         DashboardCommandName = "select"
+	DashboardCommandWorkspaces     DashboardCommandName = "workspaces"
+	DashboardCommandWorkspace      DashboardCommandName = "workspace"
+	DashboardCommandSessions       DashboardCommandName = "sessions"
+	DashboardCommandOpen           DashboardCommandName = "open"
+	DashboardCommandResume         DashboardCommandName = "resume"
+	DashboardCommandPublish        DashboardCommandName = "publish"
+	DashboardCommandNew            DashboardCommandName = "new"
+	DashboardCommandAsk            DashboardCommandName = "ask"
+	DashboardCommandMkdir          DashboardCommandName = "mkdir"
+	DashboardCommandRename         DashboardCommandName = "rename"
+	DashboardCommandDetails        DashboardCommandName = "details"
+	DashboardCommandHelp           DashboardCommandName = "help"
+	DashboardCommandStatus         DashboardCommandName = "status"
+	DashboardCommandRestart        DashboardCommandName = "restart"
+	DashboardCommandReload         DashboardCommandName = "reload"
+	DashboardCommandPublishHistory DashboardCommandName = "publish-history"
+	DashboardCommandClose          DashboardCommandName = "close"
+	DashboardCommandRetry          DashboardCommandName = "retry"
+	DashboardCommandCancel         DashboardCommandName = "cancel"
+	DashboardCommandSendFile       DashboardCommandName = "send-file"
 )
 
 type ParsedDashboardCommand struct {
@@ -336,6 +337,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandRename, true
 	case "details", "detail":
 		return DashboardCommandDetails, true
+	case "publish-history", "sync-history", "import-history":
+		return DashboardCommandPublishHistory, true
 	default:
 		return DashboardCommandNone, false
 	}
@@ -362,6 +365,8 @@ func workLegacyCommandName(name string, arg string) (DashboardCommandName, bool)
 		return DashboardCommandRename, true
 	case "d":
 		return DashboardCommandDetails, true
+	case "ph", "sync":
+		return DashboardCommandPublishHistory, true
 	default:
 		return DashboardCommandNone, false
 	}

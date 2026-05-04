@@ -351,7 +351,7 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 		t.Fatalf("second Codex turn started before first finished: %q", got)
 	case <-time.After(50 * time.Millisecond):
 	}
-	waitForOutboxBody(t, store, "Queued. Codex will respond after the current request.")
+	waitForOutboxBody(t, store, "⚠️ **Your request is queued.**")
 
 	executor.release <- struct{}{}
 	select {
@@ -377,7 +377,10 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 	joined := strings.Join(plain, "\n---\n")
 	for _, want := range []string{
 		"Codex is working. Request accepted.",
-		"Queued. Codex will respond after the current request.",
+		"⚠️ Your request is queued.",
+		"Request ahead of you:",
+		"first prompt",
+		"helper cancel last",
 		"🤖 ✅ Codex answer:\ndone 1",
 		"🤖 ✅ Codex answer:\ndone 2",
 	} {
@@ -432,7 +435,7 @@ func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
 		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
 	joined := strings.Join(plain, "\n---\n")
-	if got := strings.Count(joined, "Queued. Codex will respond after the current request."); got != 1 {
+	if got := strings.Count(joined, "Your request is queued."); got != 1 {
 		t.Fatalf("queued notice count = %d, want 1 in:\n%s", got, joined)
 	}
 
@@ -497,7 +500,7 @@ func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T)
 	if err := bridge.handleSessionMessage(ctx, "chat-1", card, ""); err != nil {
 		t.Fatalf("adaptive card-only handleSessionMessage error: %v", err)
 	}
-	if strings.Contains(sentPlainJoined(*sent), "Queued. Codex will respond after the current request.") {
+	if strings.Contains(sentPlainJoined(*sent), "Your request is queued.") {
 		t.Fatalf("adaptive card-only message should not send queued ack: %#v", *sent)
 	}
 	state, err := store.Load(ctx)
@@ -2766,6 +2769,22 @@ func TestBridgePublishImportsCompleteLongTranscriptAndMarksAttachedSubagents(t *
 	if state.ImportCheckpoints[subCheckpointID].LastRecordID == "" || state.ImportCheckpoints[subCheckpointID].LastRecordID == "child-a1" {
 		t.Fatalf("subagent checkpoint = %#v, want marker-only checkpoint", state.ImportCheckpoints[subCheckpointID])
 	}
+
+	followupLines := append(append([]string(nil), parentLines...),
+		`{"timestamp":"2026-05-01T01:01:00Z","type":"response_item","payload":{"id":"a-followup","type":"message","role":"assistant","content":[{"type":"output_text","text":"parent follow-up answer after subagent marker"}]}}`,
+	)
+	if err := os.WriteFile(parentPath, []byte(strings.Join(followupLines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write parent followup transcript: %v", err)
+	}
+	if _, err := bridge.publishCodexSession(context.Background(), DashboardCommandTarget{Raw: "thread-parent"}); err != nil {
+		t.Fatalf("republish existing session error: %v", err)
+	}
+	if got := countSentPlainContaining(sent, "Subagent spawned"); got != 1 {
+		t.Fatalf("subagent marker count after republish = %d, want no duplicate; messages:\n%s", got, sentPlainJoined(sent))
+	}
+	if !sentPlainContains(sent, "parent follow-up answer after subagent marker") {
+		t.Fatalf("republish did not import new parent history:\n%s", sentPlainJoined(sent))
+	}
 }
 
 func TestTranscriptDedupeSkipsAdjacentUserEventAndResponseDuplicates(t *testing.T) {
@@ -3613,6 +3632,38 @@ func TestBridgeSessionCancelQueuedTurnMarksInterrupted(t *testing.T) {
 	}
 	if !strings.Contains((*sent)[0].Content, "turn canceled") {
 		t.Fatalf("cancel response = %q", (*sent)[0].Content)
+	}
+}
+
+func TestBridgeSessionCancelLastQueuedTurnMarksInterrupted(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:queued-last", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("cancel-last-command"), "helper cancel last"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 0 {
+		t.Fatalf("executor prompts = %#v, want none", got)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns[turn.ID].Status; got != teamstore.TurnStatusInterrupted {
+		t.Fatalf("turn status = %q, want interrupted", got)
+	}
+	if got := sentPlainJoined(*sent); !strings.Contains(got, "turn canceled") || !strings.Contains(got, turn.ID) {
+		t.Fatalf("cancel last response = %q", got)
 	}
 }
 
@@ -6858,6 +6909,239 @@ func TestBridgeSyncLinkedTranscriptBlocksLargeAutomaticBacklogWithoutAdvancing(t
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptDoesNotBlockLargeBackgroundBacklog(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+20; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"tool%03d","role":"tool","text":"background tool output %03d"}`+"\n", i, i))
+	}
+	updated.WriteString(`{"id":"a2","role":"assistant","text":"visible answer after background backlog"}` + "\n")
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync background backlog error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, "paused automatic history sync") {
+		t.Fatalf("background-only backlog should not block automatic sync:\n%s", joined)
+	}
+	if strings.Contains(joined, "background tool output") {
+		t.Fatalf("background tool output leaked into Teams:\n%s", joined)
+	}
+	if !strings.Contains(joined, "visible answer after background backlog") {
+		t.Fatalf("visible answer was not synced:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a2" {
+		t.Fatalf("checkpoint = %#v, want complete at a2", checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptRecoversOldBlockedBackgroundBacklog(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load seeded state error: %v", err)
+	}
+	if err := bridge.markTranscriptImportBlocked(context.Background(), *session, transcriptPath, state.ImportCheckpoints[transcriptCheckpointID(session.ID)]); err != nil {
+		t.Fatalf("mark old blocked checkpoint error: %v", err)
+	}
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+20; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"tool%03d","role":"tool","text":"background tool output %03d"}`+"\n", i, i))
+	}
+	updated.WriteString(`{"id":"a2","role":"assistant","text":"visible answer after old blocked backlog"}` + "\n")
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync old blocked background backlog error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "visible answer after old blocked backlog") || strings.Contains(joined, "background tool output") {
+		t.Fatalf("old blocked background backlog sync mismatch:\n%s", joined)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a2" {
+		t.Fatalf("checkpoint = %#v, want recovered complete at a2", checkpoint)
+	}
+}
+
+func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+1; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"a%03d","role":"assistant","text":"blocked backlog answer %03d"}`+"\n", i, i))
+	}
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write blocked backlog transcript: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("block backlog sync error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load blocked state error: %v", err)
+	}
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusBlocked {
+		t.Fatalf("checkpoint status = %#v, want blocked", checkpoint)
+	}
+
+	inbound, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: "teams-after-catchup",
+		Text:           "teams prompt after catchup",
+		TextHash:       normalizedTextHash("teams prompt after catchup"),
+		Status:         teamstore.InboundStatusPersisted,
+		Source:         "teams",
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-history", "2026-05-03T01:06:00Z", "helper publish-history"), "helper publish-history"); err != nil {
+		t.Fatalf("helper publish-history error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "teams prompt after catchup") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("queued Teams prompt did not start after helper publish-history")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
+
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"paused automatic history sync",
+		"blocked backlog answer 000",
+		"Import complete",
+		"done 1: teams prompt after catchup",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("publish-history output missing %q in:\n%s", want, joined)
+		}
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state error: %v", err)
+	}
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint after publish-history = %#v, want complete", checkpoint)
+	}
+}
+
+func TestBridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+1; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"a%03d","role":"assistant","text":"blocked backlog answer %03d"}`+"\n", i, i))
+	}
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write blocked backlog transcript: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("block backlog sync error: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-after-catchup", "2026-05-03T01:06:00Z", "teams prompt after catchup")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt after catchup"); err != nil {
+		t.Fatalf("handleSessionMessage with blocked history error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("queued Teams prompt started before history backlog was imported: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "helper publish-history") || strings.Contains(joined, "Codex is active in the CLI") {
+		t.Fatalf("blocked backlog ack should be actionable and not claim active CLI:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state error: %v", err)
+	}
+	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
+		t.Fatalf("queued turn count = %d, want 1", got)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptsIfDueThrottlesScans(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -7152,7 +7436,8 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 		t.Fatalf("Teams turn started while local CLI transcript was active: %q", got)
 	case <-time.After(50 * time.Millisecond):
 	}
-	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Codex is active in the CLI") {
+	activeAck := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if len(*sent) != 1 || !strings.Contains(activeAck, "Your request is queued") || !strings.Contains(activeAck, "Local Codex CLI request") || strings.Contains(activeAck, "Request ahead of you:\nteams prompt during local") {
 		t.Fatalf("active local CLI ack = %#v, want one clear queued notice", *sent)
 	}
 	state, err := store.Load(context.Background())
@@ -7192,7 +7477,8 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	}
 	joined := strings.Join(plain, "\n---\n")
 	for _, want := range []string{
-		"Codex is active in the CLI",
+		"Your request is queued",
+		"Local Codex CLI request",
 		"🧑‍💻 User:\nlocal CLI prompt",
 		"🤖 ⏳ Codex status:\nlocal CLI is editing files",
 		"🤖 ✅ Codex answer:\nlocal CLI final answer",
@@ -7204,6 +7490,71 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	}
 	if strings.Index(joined, "local CLI final answer") > strings.Index(joined, "done 1: teams prompt during local") {
 		t.Fatalf("Teams turn answer was sent before local CLI catch-up:\n%s", joined)
+	}
+}
+
+func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	activeTranscript := initial +
+		`{"id":"u-local","role":"user","text":"local CLI prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local CLI is editing files","phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(activeTranscript), 0o600); err != nil {
+		t.Fatalf("write active transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-during-local", "2026-05-03T01:01:00Z", "teams prompt during local")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt during local"); err != nil {
+		t.Fatalf("handleSessionMessage while local active error: %v", err)
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		for id, turn := range state.Turns {
+			if turn.SessionID == session.ID && turn.Status == teamstore.TurnStatusQueued {
+				turn.QueuedAt = time.Now().Add(-queuedTurnAttentionDelay - time.Minute)
+				turn.CreatedAt = turn.QueuedAt
+				turn.UpdatedAt = turn.QueuedAt
+				state.Turns[id] = turn
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("age queued turn: %v", err)
+	}
+
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns reminder error: %v", err)
+	}
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("second processQueuedTurns reminder error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("Teams turn started while local CLI transcript was active: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	joined := sentPlainJoined(*sent)
+	if got := strings.Count(joined, "Still waiting"); got != 1 {
+		t.Fatalf("queued wait reminder count = %d, want one in:\n%s", got, joined)
+	}
+	for _, want := range []string{"Local Codex is still active for this chat", "helper cancel last"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("queued wait reminder missing %q in:\n%s", want, joined)
+		}
 	}
 }
 
@@ -7310,7 +7661,7 @@ func TestBridgeQueuedTurnWaitsForLocalTranscriptCatchupLimit(t *testing.T) {
 	if got := countSentPlainContaining(*sent, "local answer "); got != transcriptSyncMaxRecordsPerSessionPerCycle {
 		t.Fatalf("synced local answer count = %d, want first catch-up batch of %d", got, transcriptSyncMaxRecordsPerSessionPerCycle)
 	}
-	if !sentPlainContains(*sent, "syncing recent Codex updates first") {
+	if !sentPlainContains(*sent, "syncing recent local Codex updates first") {
 		t.Fatalf("catch-up queued ack missing in %#v", *sent)
 	}
 
@@ -7416,7 +7767,8 @@ func TestBridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity(t *testing.T) {
 		t.Fatalf("Teams turn started while local tool-only transcript was active: %q", got)
 	case <-time.After(50 * time.Millisecond):
 	}
-	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Codex is active in the CLI") {
+	toolAck := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if len(*sent) != 1 || !strings.Contains(toolAck, "Your request is queued") || !strings.Contains(toolAck, "Local Codex CLI request") || strings.Contains(toolAck, "Request ahead of you:\nteams prompt during tool") {
 		t.Fatalf("tool-only active ack = %#v", *sent)
 	}
 }
