@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,7 +13,15 @@ import (
 func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	lockCLITestHooks(t)
 	prevPerform := performUpdate
-	t.Cleanup(func() { performUpdate = prevPerform })
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+	})
+	fakeInstallPath := filepath.Join(t.TempDir(), "codex-proxy")
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) {
+		return fakeInstallPath, nil
+	}
 	var got update.UpdateOptions
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
 		got = opts
@@ -34,6 +43,12 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	}
 	if got.Version == "latest" {
 		t.Fatal("auto-updater must never pass latest to PerformUpdate")
+	}
+	if got.InstallPath != fakeInstallPath {
+		t.Fatalf("InstallPath = %q, want %q", got.InstallPath, fakeInstallPath)
+	}
+	if !got.ValidateBinary {
+		t.Fatal("auto-updater must validate the downloaded binary before restart")
 	}
 	if res.Version != "1.2.4" {
 		t.Fatalf("result version = %q, want 1.2.4", res.Version)

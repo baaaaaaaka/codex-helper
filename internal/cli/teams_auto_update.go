@@ -15,6 +15,8 @@ type teamsReleaseAutoUpdater struct {
 	repo string
 }
 
+var teamsAutoUpdateResolveInstallPath = update.ResolveInstallPath
+
 func newTeamsReleaseAutoUpdater(repo string) teams.HelperAutoUpdater {
 	return teamsReleaseAutoUpdater{repo: repo}
 }
@@ -56,7 +58,7 @@ func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAu
 }
 
 func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.HelperAutoUpdateCandidate) (teams.HelperAutoUpdateApplyResult, error) {
-	installPath, err := update.ResolveInstallPath("")
+	installPath, err := teamsAutoUpdateResolveInstallPath("")
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
