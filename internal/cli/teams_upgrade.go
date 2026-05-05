@@ -288,9 +288,15 @@ func teamsUpgradeStateDrained(ctx context.Context, st *teamsstore.Store) (bool, 
 
 func stateOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool) {
 	if state.ServiceOwner != nil {
+		if teamsstore.OwnerAppearsLocallyDead(*state.ServiceOwner) {
+			return teamsstore.OwnerMetadata{}, false
+		}
 		return *state.ServiceOwner, true
 	}
 	if state.LockOwner != nil {
+		if teamsstore.OwnerAppearsLocallyDead(*state.LockOwner) {
+			return teamsstore.OwnerMetadata{}, false
+		}
 		return *state.LockOwner, true
 	}
 	return teamsstore.OwnerMetadata{}, false

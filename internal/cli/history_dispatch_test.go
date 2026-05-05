@@ -371,8 +371,13 @@ func TestHistoryOpenReturnsSessionNotFound(t *testing.T) {
 func TestHistoryListCmdPrintsDiscoveredProjects(t *testing.T) {
 	codexDir := setupCodexHistoryDir(t)
 	sessionID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	helperSessionID := "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff"
+	tempHelperSessionID := "aaaaaaaa-bbbb-cccc-dddd-999999999999"
 	projectDir := t.TempDir()
+	tempHelperProjectDir := filepath.Join(os.TempDir(), "codex-helper-real-probe")
 	writeCodexSessionFile(t, codexDir, sessionID, projectDir, "build the release")
+	writeCodexSessionFile(t, codexDir, helperSessionID, projectDir, "[codex-helper-control] helper control prompt")
+	writeCodexSessionFile(t, codexDir, tempHelperSessionID, tempHelperProjectDir, "Reply exactly DEFAULT-PROBE-OK")
 
 	cmd := newHistoryListCmd(&rootOptions{}, &codexDir)
 	cmd.SetContext(context.Background())
@@ -400,6 +405,36 @@ func TestHistoryListCmdPrintsDiscoveredProjects(t *testing.T) {
 	wantProjectDir := canonicalPath(t, projectDir)
 	if gotProjectDir != wantProjectDir {
 		t.Fatalf("unexpected project path: got %q want %q", gotProjectDir, wantProjectDir)
+	}
+	for _, project := range payload.Projects {
+		if strings.Contains(project.Path, "codex-helper-real-probe") {
+			t.Fatalf("helper temp debug project remained visible: %+v", project)
+		}
+	}
+
+	cmd = newHistoryListCmd(&rootOptions{}, &codexDir)
+	cmd.SetContext(context.Background())
+	out.Reset()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--pretty", "--include-helper"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute history list --include-helper: %v", err)
+	}
+	payload = struct {
+		Projects []codexhistory.Project `json:"projects"`
+	}{}
+	if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+		t.Fatalf("unmarshal include-helper history list output: %v\noutput: %s", err, out.String())
+	}
+	gotSessions := map[string]bool{}
+	for _, project := range payload.Projects {
+		for _, session := range project.Sessions {
+			gotSessions[session.SessionID] = true
+		}
+	}
+	if len(payload.Projects) != 2 || len(gotSessions) != 3 ||
+		!gotSessions[sessionID] || !gotSessions[helperSessionID] || !gotSessions[tempHelperSessionID] {
+		t.Fatalf("unexpected include-helper history list payload: %+v", payload)
 	}
 }
 

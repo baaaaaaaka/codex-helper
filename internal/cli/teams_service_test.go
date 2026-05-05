@@ -703,7 +703,7 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		"--cd ",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex-home"),
-		wantExe + " teams run --registry",
+		wantExe + " teams run --auto-service=false --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
@@ -852,6 +852,11 @@ type teamsServiceTestHooks struct {
 
 func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	t.Helper()
+	t.Setenv(envTeamsCodexChild, "")
+	t.Setenv(envTeamsCodexParentPID, "")
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "")
+	t.Setenv("CODEX_HELPER_TEAMS_AUTO_SERVICE", "")
 	prevGOOS := teamsServiceGOOS
 	prevExecutable := teamsServiceExecutable
 	prevGetwd := teamsServiceGetwd

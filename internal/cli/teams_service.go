@@ -31,6 +31,8 @@ const (
 	teamsServiceWSLTaskConfigName    = "codex-helper-teams-wsl-task.txt"
 	teamsServiceTaskRestartCount     = 999
 	teamsServiceTaskRestartInterval  = 60
+	teamsServiceWatchdogMinutes      = 30
+	teamsServiceWatchdogDays         = 3650
 )
 
 type teamsServiceCommandRunner interface {
@@ -69,6 +71,7 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 	}
 	cmd.AddCommand(
 		newTeamsServiceInstallCmd(registryPath),
+		newTeamsServiceBootstrapCmd(registryPath),
 		newTeamsServiceUninstallCmd(),
 		newTeamsServiceEnableCmd(),
 		newTeamsServiceDisableCmd(),
@@ -81,12 +84,54 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 	return cmd
 }
 
+func newTeamsServiceBootstrapCmd(registryPath *string) *cobra.Command {
+	var yes bool
+	var noUAC bool
+	var fallbackOnly bool
+	cmd := &cobra.Command{
+		Use:   "bootstrap",
+		Short: "Install or repair the Teams bridge background service",
+		Long:  "Install or repair the Teams bridge background service. On WSL, this first tries a current-user Windows Scheduled Task. If Windows blocks that path, it can ask before opening a UAC prompt and then falls back to a current-user Startup watchdog.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("bootstrap the Teams service", "helper reload now"); err != nil {
+				return err
+			}
+			if err := teamsServiceAuthPreflight(); err != nil {
+				return err
+			}
+			result, err := bootstrapTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
+				AssumeYes:    yes,
+				NoUAC:        noUAC,
+				FallbackOnly: fallbackOnly,
+				In:           cmd.InOrStdin(),
+				Out:          cmd.OutOrStdout(),
+			})
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service bootstrap ready: %s\n", result.Mode)
+			if strings.TrimSpace(result.Path) != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service config: %s\n", result.Path)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Approve the Windows UAC prompt if the WSL Scheduled Task needs elevation")
+	cmd.Flags().BoolVar(&noUAC, "no-uac", false, "Do not open a Windows UAC prompt; use the current-user Startup fallback if needed")
+	cmd.Flags().BoolVar(&fallbackOnly, "fallback-only", false, "Install the current-user Startup watchdog instead of trying Windows Task Scheduler")
+	return cmd
+}
+
 func newTeamsServiceInstallCmd(registryPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "install",
 		Short: "Install the Teams bridge user service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("install the Teams service", "helper reload now"); err != nil {
+				return err
+			}
 			path, err := installTeamsService(cmd.Context(), registryPath)
 			if err != nil {
 				return err
@@ -104,6 +149,9 @@ func newTeamsServiceUninstallCmd() *cobra.Command {
 		Short: "Remove the Teams bridge user service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("uninstall the Teams service", "helper restart now"); err != nil {
+				return err
+			}
 			path, err := uninstallTeamsService(cmd.Context())
 			if err != nil {
 				return err
@@ -120,6 +168,9 @@ func newTeamsServiceEnableCmd() *cobra.Command {
 		Short: "Enable the Teams bridge user service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("enable the Teams service", "helper restart now"); err != nil {
+				return err
+			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
@@ -143,6 +194,9 @@ func newTeamsServiceDisableCmd() *cobra.Command {
 		Short: "Disable the Teams bridge user service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("disable the Teams service", "helper restart now"); err != nil {
+				return err
+			}
 			backend, err := teamsServiceBackendForCurrentPlatform()
 			if err != nil {
 				return err
@@ -177,6 +231,9 @@ func newTeamsServiceStartCmd() *cobra.Command {
 		Short: "Start the Teams bridge service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("start the Teams service", "helper restart now"); err != nil {
+				return err
+			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
@@ -199,6 +256,9 @@ func newTeamsServiceStopCmd() *cobra.Command {
 		Short: "Stop the Teams bridge service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("stop the Teams service", "helper restart now"); err != nil {
+				return err
+			}
 			backend, err := teamsServiceBackendForCurrentPlatform()
 			if err != nil {
 				return err
@@ -218,6 +278,9 @@ func newTeamsServiceRestartCmd() *cobra.Command {
 		Short: "Restart the Teams bridge service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams service", "helper restart now"); err != nil {
+				return err
+			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
@@ -293,6 +356,106 @@ func installTeamsService(ctx context.Context, registryPath *string) (string, err
 	return backend.Install(ctx, spec)
 }
 
+func repairTeamsService(ctx context.Context, registryPath *string, opts teamsServiceRepairOptions) (string, error) {
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return "", err
+	}
+	spec, err := buildTeamsServiceSpec(registryPath)
+	if err != nil {
+		return "", err
+	}
+	if repairer, ok := backend.(teamsServiceRepairBackend); ok {
+		return repairer.Repair(ctx, spec, opts)
+	}
+	path, err := backend.Install(ctx, spec)
+	if err != nil {
+		return "", err
+	}
+	if opts.Enable {
+		if err := runTeamsServiceCommand(ctx, io.Discard, backend, "enable"); err != nil {
+			return "", err
+		}
+	}
+	if opts.Start {
+		if err := runTeamsServiceCommand(ctx, io.Discard, backend, "start"); err != nil {
+			return "", err
+		}
+	}
+	return path, nil
+}
+
+type teamsServiceBootstrapOptions struct {
+	AssumeYes    bool
+	NoUAC        bool
+	FallbackOnly bool
+	In           io.Reader
+	Out          io.Writer
+}
+
+type teamsServiceBootstrapResult struct {
+	Mode string
+	Path string
+}
+
+func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teamsServiceBootstrapOptions) (teamsServiceBootstrapResult, error) {
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return teamsServiceBootstrapResult{}, err
+	}
+	spec, err := buildTeamsServiceSpec(registryPath)
+	if err != nil {
+		return teamsServiceBootstrapResult{}, err
+	}
+	if opts.FallbackOnly {
+		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+			path, err := wslBackend.InstallStartupFallback(ctx, spec, true)
+			return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, err
+		}
+		return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only is only supported by the WSL Windows service backend")
+	}
+	path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: true})
+	if err == nil {
+		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+			_ = wslBackend.RemoveStartupFallbackMarker()
+		}
+		return teamsServiceBootstrapResult{Mode: backend.ID(), Path: path}, nil
+	}
+	wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
+	if !ok {
+		return teamsServiceBootstrapResult{}, err
+	}
+	accessDenied := isTeamsServiceWindowsAccessDeniedError(err)
+	if !accessDenied && !opts.NoUAC {
+		return teamsServiceBootstrapResult{}, err
+	}
+	out := opts.Out
+	if out == nil {
+		out = io.Discard
+	}
+	if accessDenied {
+		_, _ = fmt.Fprintf(out, "Windows blocked automatic Scheduled Task setup: %v\n", err)
+	} else {
+		_, _ = fmt.Fprintf(out, "Windows Scheduled Task setup failed: %v\n", err)
+	}
+	if accessDenied && !opts.NoUAC && confirmTeamsServiceUACPrompt(opts.In, out, opts.AssumeYes) {
+		principalUser, userErr := teamsServiceCurrentWindowsUser(ctx)
+		if userErr != nil {
+			_, _ = fmt.Fprintf(out, "Could not identify the current Windows user for the elevated task: %v\n", userErr)
+		} else {
+			if path, elevateErr := wslBackend.RepairElevated(ctx, spec, teamsServiceRepairOptions{Enable: true, Start: true}, principalUser); elevateErr == nil {
+				_ = wslBackend.RemoveStartupFallbackMarker()
+				return teamsServiceBootstrapResult{Mode: "wsl-windows-task-scheduler-uac", Path: path}, nil
+			} else {
+				_, _ = fmt.Fprintf(out, "Elevated Scheduled Task setup failed: %v\n", elevateErr)
+			}
+		}
+	}
+	_, _ = fmt.Fprintln(out, "Installing the current-user Windows Startup watchdog fallback instead.")
+	path, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, true)
+	return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, fallbackErr
+}
+
 func uninstallTeamsService(ctx context.Context) (string, error) {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
@@ -317,6 +480,15 @@ type teamsServiceBackend interface {
 	Run(ctx context.Context, action string) ([]byte, error)
 	Installed() (bool, error)
 	Active(ctx context.Context) (bool, error)
+}
+
+type teamsServiceRepairOptions struct {
+	Enable bool
+	Start  bool
+}
+
+type teamsServiceRepairBackend interface {
+	Repair(ctx context.Context, spec teamsServiceSpec, opts teamsServiceRepairOptions) (string, error)
 }
 
 func teamsServiceBackendForCurrentPlatform() (teamsServiceBackend, error) {
@@ -383,6 +555,56 @@ func defaultTeamsServiceAuthPreflight() error {
 		return fmt.Errorf("Teams write auth cache is not ready for background service (%s at %s); run `%s` in a foreground terminal first", writeStatus, writeCfg.CachePath, teamsAuthCommandForCache(writeCfg.CachePath, "codex-proxy teams auth"))
 	}
 	return nil
+}
+
+func ensureTeamsServiceForRun(ctx context.Context, registryPath *string) error {
+	if runningInsideTeamsCodexChild() {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_AUTO_SERVICE")), "0") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_AUTO_SERVICE")), "false") {
+		return nil
+	}
+	if teamsServiceGOOS() != "linux" || !teamsServiceIsWSL() {
+		return nil
+	}
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return err
+	}
+	if backend.ID() != "wsl-windows-task-scheduler" {
+		return nil
+	}
+	if err := teamsServiceAuthPreflight(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+		return nil
+	}
+	if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+		if installed, err := wslBackend.StartupFallbackMarkerExists(); err == nil && installed {
+			return nil
+		}
+	}
+	start := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) == ""
+	_, err = repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: start})
+	if err != nil {
+		wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
+		if ok {
+			spec, specErr := buildTeamsServiceSpec(registryPath)
+			if specErr != nil {
+				return specErr
+			}
+			if _, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, false); fallbackErr != nil {
+				return fmt.Errorf("WSL Scheduled Task setup was blocked (%v), and Startup fallback setup failed: %w", err, fallbackErr)
+			}
+			if isTeamsServiceWindowsAccessDeniedError(err) {
+				return fmt.Errorf("WSL Scheduled Task setup was blocked by Windows policy; installed the current-user Startup watchdog fallback")
+			}
+			return fmt.Errorf("WSL Scheduled Task setup failed (%v); installed the current-user Startup watchdog fallback", err)
+		}
+	}
+	return err
 }
 
 func teamsServiceInstalled() (bool, error) {
@@ -651,11 +873,11 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 }
 
 func (b teamsServiceWindowsTaskBackend) Installed() (bool, error) {
-	xmlPath, err := b.Path()
+	_, err := teamsServiceRunPowerShell(context.Background(), "Get-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsTaskName)+" -ErrorAction Stop | Out-Null")
 	if err != nil {
-		return false, err
+		return false, nil
 	}
-	return teamsServiceFileExists(xmlPath)
+	return true, nil
 }
 
 func (b teamsServiceWindowsTaskBackend) Active(ctx context.Context) (bool, error) {
@@ -685,30 +907,112 @@ func (teamsServiceWSLWindowsTaskBackend) Path() (string, error) {
 	return filepath.Join(dir, "codex-helper-teams-wsl-task-"+teamsServiceWSLTaskIdentity().Suffix+".txt"), nil
 }
 
-func (b teamsServiceWSLWindowsTaskBackend) Install(ctx context.Context, spec teamsServiceSpec) (string, error) {
-	configPath, err := b.Path()
+func (teamsServiceWSLWindowsTaskBackend) startupFallbackMarkerPath() (string, error) {
+	dir, err := teamsServiceWindowsTaskXMLDir()
 	if err != nil {
 		return "", err
 	}
+	return filepath.Join(dir, "codex-helper-teams-wsl-startup-"+teamsServiceWSLTaskIdentity().Suffix+".txt"), nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) writeTaskConfig(spec teamsServiceSpec) (string, []string, error) {
+	configPath, err := b.Path()
+	if err != nil {
+		return "", nil, err
+	}
 	args := buildTeamsServiceWSLArguments(spec)
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := os.WriteFile(configPath, []byte(buildTeamsServiceWSLTaskConfig(b.Name(), args)), 0o600); err != nil {
+		return "", nil, err
+	}
+	return configPath, args, nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) Install(ctx context.Context, spec teamsServiceSpec) (string, error) {
+	configPath, args, err := b.writeTaskConfig(spec)
+	if err != nil {
 		return "", err
 	}
-	task := powershellSingleQuote(b.Name())
-	arg := powershellSingleQuote(windowsCommandLine(args))
-	cmd := "$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument " + arg + "; " +
-		"$trigger = New-ScheduledTaskTrigger -AtLogOn; " +
-		"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
-		"$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited; " +
-		"Register-ScheduledTask -TaskName " + task + " -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null; " +
-		"Disable-ScheduledTask -TaskName " + task + " | Out-Null"
+	cmd := buildTeamsServiceWSLRegisterCommand(b.Name(), args, teamsServiceWSLRegisterOptions{ForceDisabled: true})
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
 	}
 	return configPath, nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) Repair(ctx context.Context, spec teamsServiceSpec, opts teamsServiceRepairOptions) (string, error) {
+	configPath, args, err := b.writeTaskConfig(spec)
+	if err != nil {
+		return "", err
+	}
+	cmd := buildTeamsServiceWSLRegisterCommand(b.Name(), args, teamsServiceWSLRegisterOptions{
+		Enable:          opts.Enable,
+		Start:           opts.Start,
+		PreserveEnabled: !opts.Enable,
+		PreserveRunning: !opts.Start,
+	})
+	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
+		return "", err
+	}
+	return configPath, nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) RepairElevated(ctx context.Context, spec teamsServiceSpec, opts teamsServiceRepairOptions, principalUser string) (string, error) {
+	configPath, args, err := b.writeTaskConfig(spec)
+	if err != nil {
+		return "", err
+	}
+	cmd := buildTeamsServiceWSLRegisterCommand(b.Name(), args, teamsServiceWSLRegisterOptions{
+		Enable:          opts.Enable,
+		Start:           opts.Start,
+		PreserveEnabled: !opts.Enable,
+		PreserveRunning: !opts.Start,
+		PrincipalUser:   principalUser,
+	})
+	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLElevatedCommand(cmd)); err != nil {
+		return "", err
+	}
+	return configPath, nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) InstallStartupFallback(ctx context.Context, spec teamsServiceSpec, start bool) (string, error) {
+	markerPath, err := b.startupFallbackMarkerPath()
+	if err != nil {
+		return "", err
+	}
+	args := buildTeamsServiceWSLArguments(spec)
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		return "", err
+	}
+	command := buildTeamsServiceWSLStartupFallbackCommand(b.Name(), args, start)
+	if _, err := teamsServiceRunPowerShell(ctx, command); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(markerPath, []byte(buildTeamsServiceWSLStartupFallbackConfig(b.Name(), args)), 0o600); err != nil {
+		return "", err
+	}
+	return markerPath, nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) StartupFallbackMarkerExists() (bool, error) {
+	markerPath, err := b.startupFallbackMarkerPath()
+	if err != nil {
+		return false, err
+	}
+	return teamsServiceFileExists(markerPath)
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) RemoveStartupFallbackMarker() error {
+	markerPath, err := b.startupFallbackMarkerPath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (b teamsServiceWSLWindowsTaskBackend) Uninstall(ctx context.Context) (string, error) {
@@ -724,6 +1028,7 @@ func (b teamsServiceWSLWindowsTaskBackend) Uninstall(ctx context.Context) (strin
 	if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
+	_ = b.RemoveStartupFallbackMarker()
 	return configPath, nil
 }
 
@@ -735,7 +1040,15 @@ func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action strin
 	case "disable":
 		return teamsServiceRunPowerShell(ctx, "Disable-ScheduledTask -TaskName "+task+" | Out-Null")
 	case "status":
-		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
+		data, err := teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+" -ErrorAction Stop; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
+		if err == nil {
+			return data, nil
+		}
+		if installed, markerErr := b.StartupFallbackMarkerExists(); markerErr == nil && installed {
+			markerPath, _ := b.startupFallbackMarkerPath()
+			return []byte("Scheduled Task: not registered\nStartup watchdog fallback: installed\nStartup watchdog config: " + markerPath + "\n"), nil
+		}
+		return data, err
 	case "start":
 		return teamsServiceRunPowerShell(ctx, "Start-ScheduledTask -TaskName "+task)
 	case "stop":
@@ -797,6 +1110,64 @@ func teamsServiceRunPowerShell(ctx context.Context, command string) ([]byte, err
 		return nil, fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
 	}
 	return data, nil
+}
+
+func teamsServiceCurrentWindowsUser(ctx context.Context) (string, error) {
+	data, err := teamsServiceRunPowerShell(ctx, "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name")
+	if err != nil {
+		return "", err
+	}
+	user := strings.TrimSpace(string(data))
+	if user == "" {
+		return "", fmt.Errorf("current Windows user is empty")
+	}
+	return user, nil
+}
+
+func isTeamsServiceWindowsAccessDeniedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"access is denied",
+		"0x80070005",
+		"unauthorizedaccessexception",
+		"accessdenied",
+		"e_accessdenied",
+	} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func confirmTeamsServiceUACPrompt(in io.Reader, out io.Writer, assumeYes bool) bool {
+	if out == nil {
+		out = io.Discard
+	}
+	_, _ = fmt.Fprintln(out, "A Windows UAC prompt is about to appear to install a current-user Teams helper Scheduled Task.")
+	_, _ = fmt.Fprintln(out, "The task targets only the current Windows user and uses least privilege.")
+	if assumeYes {
+		_, _ = fmt.Fprintln(out, "UAC prompt approved by --yes.")
+		return true
+	}
+	_, _ = fmt.Fprint(out, "Show the UAC prompt now? Type yes to continue: ")
+	if in == nil {
+		in = os.Stdin
+	}
+	var answer string
+	if _, err := fmt.Fscan(in, &answer); err != nil {
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, "UAC prompt was not confirmed.")
+		return false
+	}
+	confirmed := strings.EqualFold(strings.TrimSpace(answer), "yes") || strings.EqualFold(strings.TrimSpace(answer), "y")
+	if !confirmed {
+		_, _ = fmt.Fprintln(out, "UAC prompt was not confirmed.")
+	}
+	return confirmed
 }
 
 func defaultTeamsServicePowerShellExecutable() string {
@@ -1115,15 +1486,127 @@ func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
 	for _, key := range sortedEnvironmentKeys(spec.Environment) {
 		args = append(args, key+"="+spec.Environment[key])
 	}
-	args = append(args, spec.Executable, "teams", "run")
+	args = append(args, spec.Executable, "teams", "run", "--auto-service=false")
 	if spec.RegistryPath != "" {
 		args = append(args, "--registry", spec.RegistryPath)
 	}
 	return args
 }
 
+type teamsServiceWSLRegisterOptions struct {
+	ForceDisabled   bool
+	Enable          bool
+	Start           bool
+	PreserveEnabled bool
+	PreserveRunning bool
+	PrincipalUser   string
+}
+
+func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts teamsServiceWSLRegisterOptions) string {
+	task := powershellSingleQuote(taskName)
+	arg := powershellSingleQuote(windowsCommandLine(args))
+	principalUser := "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name"
+	if strings.TrimSpace(opts.PrincipalUser) != "" {
+		principalUser = powershellSingleQuote(strings.TrimSpace(opts.PrincipalUser))
+	}
+	cmd := "$taskName = " + task + "; " +
+		"$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
+		"$wasEnabled = $false; $wasRunning = $false; " +
+		"if ($null -ne $existing) { $wasEnabled = $existing.State -ne 'Disabled'; $wasRunning = $existing.State -eq 'Running' }; " +
+		"$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument " + arg + "; " +
+		"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
+		"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWatchdogMinutes) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
+		"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
+		"$principalUser = " + principalUser + "; " +
+		"$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited; " +
+		"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force | Out-Null; "
+	switch {
+	case opts.ForceDisabled:
+		cmd += "Disable-ScheduledTask -TaskName $taskName | Out-Null; "
+	case opts.Enable:
+		cmd += "Enable-ScheduledTask -TaskName $taskName | Out-Null; "
+	case opts.PreserveEnabled:
+		cmd += "if ($wasEnabled) { Enable-ScheduledTask -TaskName $taskName | Out-Null } else { Disable-ScheduledTask -TaskName $taskName | Out-Null }; "
+	}
+	switch {
+	case opts.Start:
+		cmd += "Start-ScheduledTask -TaskName $taskName | Out-Null"
+	case opts.PreserveRunning:
+		cmd += "if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }"
+	}
+	return strings.TrimSpace(cmd)
+}
+
+func buildTeamsServiceWSLElevatedCommand(command string) string {
+	inner := "$ErrorActionPreference = 'Stop'; " + strings.TrimSpace(command)
+	args := "@('-NoProfile','-ExecutionPolicy','Bypass','-Command'," + powershellSingleQuote(inner) + ")"
+	return "$uacArgs = " + args + "; " +
+		"$p = Start-Process -FilePath 'powershell.exe' -ArgumentList $uacArgs -Verb RunAs -Wait -PassThru; " +
+		"if ($null -eq $p) { throw 'Windows UAC process did not start' }; " +
+		"if ($p.ExitCode -ne 0) { throw ('elevated Teams service bootstrap failed with exit code ' + $p.ExitCode) }"
+}
+
 func buildTeamsServiceWSLTaskConfig(taskName string, args []string) string {
 	var b strings.Builder
+	b.WriteString("TaskName=")
+	b.WriteString(taskName)
+	b.WriteString("\nCommand=wsl.exe\nArguments=")
+	b.WriteString(windowsCommandLine(args))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func buildTeamsServiceWSLStartupFallbackCommand(taskName string, args []string, start bool) string {
+	identity := teamsServiceWSLTaskIdentity()
+	scriptName := "codex-helper-teams-wsl-" + identity.Suffix + ".ps1"
+	cmdName := "codex-helper-teams-wsl-" + identity.Suffix + ".cmd"
+	script := buildTeamsServiceWSLStartupWatchdogScript(taskName, args, identity.Suffix)
+	cmdScript := "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"%LOCALAPPDATA%\\codex-helper\\teams\\" + scriptName + "\"\r\n"
+	ps := "$startup = [Environment]::GetFolderPath('Startup'); " +
+		"if ([string]::IsNullOrWhiteSpace($startup)) { throw 'Windows Startup folder is unavailable' }; " +
+		"$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
+		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
+		"$scriptPath = Join-Path $appDir " + powershellSingleQuote(scriptName) + "; " +
+		"$cmdPath = Join-Path $startup " + powershellSingleQuote(cmdName) + "; " +
+		"Set-Content -LiteralPath $scriptPath -Value " + powershellSingleQuote(script) + " -Encoding UTF8; " +
+		"Set-Content -LiteralPath $cmdPath -Value " + powershellSingleQuote(cmdScript) + " -Encoding ASCII"
+	if start {
+		ps += "; Start-Process -FilePath $cmdPath -WindowStyle Hidden | Out-Null"
+	}
+	return ps
+}
+
+func buildTeamsServiceWSLStartupWatchdogScript(taskName string, args []string, suffix string) string {
+	mutexName := "Local\\CodexHelperTeamsWSLWatchdog-" + safeWindowsTaskNamePart(suffix, 32)
+	runLogName := "codex-helper-teams-wsl-run-" + safeWindowsTaskNamePart(suffix, 32) + ".log"
+	watchdogLogName := "codex-helper-teams-wsl-watchdog-" + safeWindowsTaskNamePart(suffix, 32) + ".log"
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
+	b.WriteString("$created = $false\r\n")
+	b.WriteString("$mutex = New-Object System.Threading.Mutex($true, " + powershellSingleQuote(mutexName) + ", [ref]$created)\r\n")
+	b.WriteString("if (-not $created) { exit 0 }\r\n")
+	b.WriteString("try {\r\n")
+	b.WriteString("  $logDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'\r\n")
+	b.WriteString("  New-Item -ItemType Directory -Force -Path $logDir | Out-Null\r\n")
+	b.WriteString("  $runLog = Join-Path $logDir " + powershellSingleQuote(runLogName) + "\r\n")
+	b.WriteString("  $watchdogLog = Join-Path $logDir " + powershellSingleQuote(watchdogLogName) + "\r\n")
+	b.WriteString("  $wslArgs = " + powershellArrayLiteral(args) + "\r\n")
+	b.WriteString("  Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' starting " + strings.ReplaceAll(taskName, "'", "''") + "')\r\n")
+	b.WriteString("  while ($true) {\r\n")
+	b.WriteString("    & wsl.exe @wslArgs *>> $runLog\r\n")
+	b.WriteString("    $code = $LASTEXITCODE\r\n")
+	b.WriteString("    Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' wsl.exe exited ' + $code + '; restarting in 30s')\r\n")
+	b.WriteString("    Start-Sleep -Seconds 30\r\n")
+	b.WriteString("  }\r\n")
+	b.WriteString("} finally {\r\n")
+	b.WriteString("  if ($null -ne $mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() }\r\n")
+	b.WriteString("}\r\n")
+	return b.String()
+}
+
+func buildTeamsServiceWSLStartupFallbackConfig(taskName string, args []string) string {
+	var b strings.Builder
+	b.WriteString("Fallback=Windows Startup watchdog\n")
 	b.WriteString("TaskName=")
 	b.WriteString(taskName)
 	b.WriteString("\nCommand=wsl.exe\nArguments=")
@@ -1364,6 +1847,17 @@ func windowsCommandLine(args []string) string {
 
 func powershellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func powershellArrayLiteral(values []string) string {
+	if len(values) == 0 {
+		return "@()"
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, powershellSingleQuote(value))
+	}
+	return "@(" + strings.Join(parts, ", ") + ")"
 }
 
 func shellQuote(s string) string {

@@ -44,6 +44,7 @@ type AppServerStartRequest struct {
 	Command    string
 	Args       []string
 	WorkingDir string
+	ExtraEnv   []string
 	Timeout    time.Duration
 }
 
@@ -55,6 +56,7 @@ type AppServerRunner struct {
 	Command       string
 	AppServerArgs []string
 	ExtraArgs     []string
+	ExtraEnv      []string
 	WorkingDir    string
 	Timeout       time.Duration
 
@@ -267,6 +269,7 @@ func (r *AppServerRunner) ensureReadyLocked(ctx context.Context) error {
 			Command:    firstNonEmpty(r.Command, defaultCodexCommand),
 			Args:       append([]string{"app-server"}, r.AppServerArgs...),
 			WorkingDir: r.WorkingDir,
+			ExtraEnv:   append([]string{}, r.ExtraEnv...),
 			Timeout:    r.Timeout,
 		})
 		if err != nil {

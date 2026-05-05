@@ -37,29 +37,31 @@ type SubagentSession struct {
 }
 
 func (s Session) DisplayTitle() string {
+	kind := HelperSessionKind(s)
 	if s.Summary != "" {
-		return s.Summary
+		return displayTitleWithHelperMarker(s.Summary, kind)
 	}
 	if s.FirstPrompt != "" {
-		return s.FirstPrompt
+		return displayTitleWithHelperMarker(s.FirstPrompt, kind)
 	}
 	if s.SessionID != "" {
-		return s.SessionID
+		return displayTitleWithHelperMarker(s.SessionID, kind)
 	}
-	return "untitled"
+	return displayTitleWithHelperMarker("untitled", kind)
 }
 
 func (s SubagentSession) DisplayTitle() string {
+	kind := HelperSubagentSessionKind(s)
 	if s.Summary != "" {
-		return s.Summary
+		return displayTitleWithHelperMarker(s.Summary, kind)
 	}
 	if s.FirstPrompt != "" {
-		return s.FirstPrompt
+		return displayTitleWithHelperMarker(s.FirstPrompt, kind)
 	}
 	if s.AgentID != "" {
-		return s.AgentID
+		return displayTitleWithHelperMarker(s.AgentID, kind)
 	}
-	return "untitled"
+	return displayTitleWithHelperMarker("untitled", kind)
 }
 
 func ResolveCodexDir(override string) (string, error) {

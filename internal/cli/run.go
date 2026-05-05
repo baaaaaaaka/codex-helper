@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
@@ -383,7 +384,29 @@ func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *
 	if log == nil {
 		log = io.Discard
 	}
-	var cleanup func()
+	var cleanupFns []func()
+	addCleanup := func(fn func()) {
+		if fn != nil {
+			cleanupFns = append(cleanupFns, fn)
+		}
+	}
+	cleanup := func() {
+		for i := len(cleanupFns) - 1; i >= 0; i-- {
+			cleanupFns[i]()
+		}
+	}
+	codexHome := envValue(opts.ExtraEnv, envCodexHome)
+	if strings.TrimSpace(codexHome) == "" {
+		codexHome = envValue(opts.ExtraEnv, codexhistory.EnvCodexDir)
+	}
+	if strings.TrimSpace(codexHome) != "" {
+		authOverride, authErr := prepareYoloAuthOverride(codexHome, opts.ExecIdentity)
+		logYoloAuthStatus(log, authOverride, authErr)
+		if authOverride != nil {
+			addCleanup(authOverride.Cleanup)
+		}
+		_ = cloudgate.RemoveCloudRequirementsCache(codexHome)
+	}
 	if store != nil {
 		historyDir := filepath.Dir(store.Path())
 		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinaryForLaunch(cmdArgs[0], historyDir, opts.ExecIdentity)
@@ -393,7 +416,7 @@ func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *
 			cmdArgs[0] = patchResult.PatchedBinary
 			opts.ExtraEnv = append(opts.ExtraEnv, patchEnv...)
 			opts.PatchInfo = info
-			cleanup = patchResult.Cleanup
+			addCleanup(patchResult.Cleanup)
 		}
 		if opts.OnYoloFallback == nil {
 			opts.OnYoloFallback = func() error {
@@ -409,6 +432,9 @@ func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *
 			out = append(out, cmdArgs[1:]...)
 			cmdArgs = out
 		}
+	}
+	if len(cleanupFns) == 0 {
+		return cmdArgs, nil
 	}
 	return cmdArgs, cleanup
 }

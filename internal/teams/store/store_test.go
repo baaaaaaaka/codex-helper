@@ -972,6 +972,35 @@ func TestUpgradeLifecycleRestoresControl(t *testing.T) {
 	}
 }
 
+func TestUpgradeNotificationTargetsDeduplicate(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	req, err := store.BeginUpgrade(ctx, CodexUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	target := UpgradeNotificationTarget{SessionID: "s001", TurnID: "turn-1", TeamsChatID: "chat-1"}
+	updated, err := store.AddUpgradeNotificationTarget(ctx, req.ID, target)
+	if err != nil {
+		t.Fatalf("AddUpgradeNotificationTarget error: %v", err)
+	}
+	updated, err = store.AddUpgradeNotificationTarget(ctx, req.ID, target)
+	if err != nil {
+		t.Fatalf("duplicate AddUpgradeNotificationTarget error: %v", err)
+	}
+	updated, err = store.AddUpgradeNotificationTarget(ctx, req.ID, UpgradeNotificationTarget{SessionID: "s002", TurnID: "turn-2", TeamsChatID: "chat-2"})
+	if err != nil {
+		t.Fatalf("second AddUpgradeNotificationTarget error: %v", err)
+	}
+	if len(updated.NotificationTargets) != 2 {
+		t.Fatalf("notification targets = %#v, want two unique targets", updated.NotificationTargets)
+	}
+	if updated.NotificationTargets[0].CreatedAt.IsZero() || updated.NotificationTargets[1].CreatedAt.IsZero() {
+		t.Fatalf("notification targets missing CreatedAt: %#v", updated.NotificationTargets)
+	}
+}
+
 func TestUpgradeAbortPreservesPreviousDrain(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1502,6 +1531,34 @@ func TestInterruptedTurnCannotBeCompletedOrFailed(t *testing.T) {
 	}
 	if got := state.Turns[turn.ID].Status; got != TurnStatusInterrupted {
 		t.Fatalf("turn status = %q, want interrupted", got)
+	}
+}
+
+func TestMarkTurnFailedWithCodexIDsPersistsDiagnostics(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(ctx, Turn{ID: "turn:manual", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	failed, err := store.MarkTurnFailedWithCodexIDs(ctx, turn.ID, "model policy failed", "thread-1", "codex-turn-failed")
+	if err != nil {
+		t.Fatalf("MarkTurnFailedWithCodexIDs error: %v", err)
+	}
+	if failed.Status != TurnStatusFailed || failed.CodexThreadID != "thread-1" || failed.CodexTurnID != "codex-turn-failed" {
+		t.Fatalf("failed turn mismatch: %#v", failed)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	session := state.Sessions["s1"]
+	if session.CodexThreadID != "thread-1" || session.LatestCodexTurnID != "codex-turn-failed" || session.LatestTurnID != turn.ID {
+		t.Fatalf("session codex diagnostics mismatch: %#v", session)
 	}
 }
 
@@ -2066,6 +2123,157 @@ func TestClaimControlLeasePrimaryBeatsEphemeralAndEphemeralStaysStandby(t *testi
 	}
 }
 
+func TestClaimControlLeaseDoesNotPreemptLiveIdleOwner(t *testing.T) {
+	prevHostname := ownerHostname
+	prevAlive := ownerProcessAlive
+	t.Cleanup(func() {
+		ownerHostname = prevHostname
+		ownerProcessAlive = prevAlive
+	})
+	ownerHostname = func() (string, error) { return "host-a", nil }
+	ownerProcessAlive = func(pid int) bool { return pid == 4242 }
+
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	scope := ScopeIdentity{ID: "scope-1", AccountID: "user-1", OSUser: "alice", Profile: "default"}
+	ephemeral := MachineRecord{ID: "machine-temp", ScopeID: scope.ID, Kind: MachineKindEphemeral, Label: "temp"}
+	first, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: ephemeral, Duration: time.Minute, Now: now})
+	if err != nil {
+		t.Fatalf("ephemeral ClaimControlLease error: %v", err)
+	}
+	owner := testOwner("", "", now)
+	owner.ScopeID = scope.ID
+	owner.MachineID = ephemeral.ID
+	owner.LeaseGeneration = first.Lease.Generation
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	primary := MachineRecord{ID: "machine-primary", ScopeID: scope.ID, Kind: MachineKindPrimary, Label: "primary"}
+	blocked, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: primary, Duration: time.Minute, Now: now.Add(time.Second)})
+	if err != nil {
+		t.Fatalf("primary ClaimControlLease error: %v", err)
+	}
+	if blocked.Mode != LeaseModeStandby || blocked.Lease.HolderMachineID != ephemeral.ID {
+		t.Fatalf("primary decision = %#v, want standby behind live owner", blocked)
+	}
+
+	cleared, err := store.ClearOwnerIfSame(ctx, owner)
+	if err != nil {
+		t.Fatalf("ClearOwnerIfSame error: %v", err)
+	}
+	if !cleared {
+		t.Fatal("ClearOwnerIfSame cleared = false, want true")
+	}
+	released, err := store.ReleaseControlLeaseIfHolder(ctx, ephemeral.ID, first.Lease.Generation)
+	if err != nil {
+		t.Fatalf("ReleaseControlLeaseIfHolder error: %v", err)
+	}
+	if !released {
+		t.Fatal("ReleaseControlLeaseIfHolder released = false, want true")
+	}
+	claimed, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: primary, Duration: time.Minute, Now: now.Add(2 * time.Second)})
+	if err != nil {
+		t.Fatalf("primary ClaimControlLease after release error: %v", err)
+	}
+	if claimed.Mode != LeaseModeActive || claimed.Lease.HolderMachineID != primary.ID {
+		t.Fatalf("primary decision after release = %#v, want active", claimed)
+	}
+}
+
+func TestClaimControlLeaseSameMachineDuplicateStaysStandbyBehindLiveOwner(t *testing.T) {
+	prevHostname := ownerHostname
+	prevAlive := ownerProcessAlive
+	t.Cleanup(func() {
+		ownerHostname = prevHostname
+		ownerProcessAlive = prevAlive
+	})
+	ownerHostname = func() (string, error) { return "host-a", nil }
+	ownerProcessAlive = func(pid int) bool { return pid == 4242 }
+
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	scope := ScopeIdentity{ID: "scope-1", AccountID: "user-1", OSUser: "alice", Profile: "default"}
+	machine := MachineRecord{ID: "machine-primary", ScopeID: scope.ID, Kind: MachineKindPrimary, Label: "primary"}
+	owner := testOwner("", "", now)
+	first, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now})
+	if err != nil {
+		t.Fatalf("initial ClaimControlLease error: %v", err)
+	}
+	owner.ScopeID = scope.ID
+	owner.MachineID = machine.ID
+	owner.LeaseGeneration = first.Lease.Generation
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	duplicateOwner := owner
+	duplicateOwner.PID = 7777
+	duplicate, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: duplicateOwner, Duration: time.Minute, Now: now.Add(time.Second)})
+	if err != nil {
+		t.Fatalf("duplicate ClaimControlLease error: %v", err)
+	}
+	if duplicate.Mode != LeaseModeStandby || duplicate.Lease.HolderMachineID != machine.ID {
+		t.Fatalf("duplicate decision = %#v, want standby behind existing owner", duplicate)
+	}
+
+	refreshed, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now.Add(2 * time.Second)})
+	if err != nil {
+		t.Fatalf("same owner ClaimControlLease error: %v", err)
+	}
+	if refreshed.Mode != LeaseModeActive || refreshed.Lease.HolderMachineID != machine.ID {
+		t.Fatalf("same owner decision = %#v, want active refresh", refreshed)
+	}
+}
+
+func TestClaimControlLeaseSameMachineReloadBackupPathRefreshesActiveOwner(t *testing.T) {
+	prevHostname := ownerHostname
+	prevAlive := ownerProcessAlive
+	t.Cleanup(func() {
+		ownerHostname = prevHostname
+		ownerProcessAlive = prevAlive
+	})
+	ownerHostname = func() (string, error) { return "host-a", nil }
+	ownerProcessAlive = func(pid int) bool { return pid == 4242 }
+
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	scope := ScopeIdentity{ID: "scope-1", AccountID: "user-1", OSUser: "alice", Profile: "default"}
+	machine := MachineRecord{ID: "machine-primary", ScopeID: scope.ID, Kind: MachineKindPrimary, Label: "primary"}
+	owner := testOwner("", "", now)
+	owner.ExecutablePath = "/usr/local/bin/codex-helper.reload-backup-4242-100"
+	first, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now})
+	if err != nil {
+		t.Fatalf("initial ClaimControlLease error: %v", err)
+	}
+	owner.ScopeID = scope.ID
+	owner.MachineID = machine.ID
+	owner.LeaseGeneration = first.Lease.Generation
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	reloadedOwner := owner
+	reloadedOwner.ExecutablePath = "/usr/local/bin/codex-helper.reload-backup-4242-100.reload-backup-4242-200"
+	refreshed, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: reloadedOwner, Duration: time.Minute, Now: now.Add(time.Second)})
+	if err != nil {
+		t.Fatalf("reload-backup ClaimControlLease error: %v", err)
+	}
+	if refreshed.Mode != LeaseModeActive || refreshed.Lease.HolderMachineID != machine.ID {
+		t.Fatalf("reload-backup decision = %#v, want active refresh", refreshed)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Machines[machine.ID].Status; got != MachineStatusActive {
+		t.Fatalf("machine status = %q, want active", got)
+	}
+}
+
 func TestClaimControlLeaseDoesNotPreemptActiveTurn(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2338,6 +2546,36 @@ func TestRecordOwnerHeartbeatUpdatesExistingOwner(t *testing.T) {
 	}
 }
 
+func TestRecordOwnerHeartbeatTreatsExecRestartAsSameOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	startedAt := testOwnerStart()
+	firstHeartbeat := startedAt.Add(5 * time.Second)
+	secondHeartbeat := startedAt.Add(30 * time.Second)
+	owner := testOwner("session-old", "turn-old", startedAt)
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, firstHeartbeat); err != nil {
+		t.Fatalf("first RecordOwnerHeartbeat error: %v", err)
+	}
+
+	execOwner := owner
+	execOwner.StartedAt = startedAt.Add(20 * time.Second)
+	execOwner.ActiveSessionID = ""
+	execOwner.ActiveTurnID = ""
+	updated, err := store.RecordOwnerHeartbeat(ctx, execOwner, time.Minute, secondHeartbeat)
+	if err != nil {
+		t.Fatalf("exec restart RecordOwnerHeartbeat error: %v", err)
+	}
+	if !updated.StartedAt.Equal(startedAt) {
+		t.Fatalf("StartedAt = %s, want original %s", updated.StartedAt, startedAt)
+	}
+	if !updated.LastHeartbeat.Equal(secondHeartbeat) {
+		t.Fatalf("LastHeartbeat = %s, want %s", updated.LastHeartbeat, secondHeartbeat)
+	}
+	if updated.ActiveSessionID != "" || updated.ActiveTurnID != "" {
+		t.Fatalf("active owner fields = %q/%q, want cleared after restart", updated.ActiveSessionID, updated.ActiveTurnID)
+	}
+}
+
 func TestRecordOwnerHeartbeatRefusesLiveOwnerWithDiagnostic(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2378,6 +2616,35 @@ func TestRecordOwnerHeartbeatRefusesLiveOwnerWithDiagnostic(t *testing.T) {
 	}
 }
 
+func TestRecordOwnerHeartbeatReplacesDeadLocalOwnerBeforeStale(t *testing.T) {
+	prevHostname := ownerHostname
+	prevAlive := ownerProcessAlive
+	t.Cleanup(func() {
+		ownerHostname = prevHostname
+		ownerProcessAlive = prevAlive
+	})
+	ownerHostname = func() (string, error) { return "host-a", nil }
+	ownerProcessAlive = func(pid int) bool { return pid != 4242 }
+
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := testOwnerStart()
+	existing := testOwner("session-live", "turn-live", now)
+	if _, err := store.RecordOwnerHeartbeat(ctx, existing, time.Minute, now); err != nil {
+		t.Fatalf("existing RecordOwnerHeartbeat error: %v", err)
+	}
+
+	contender := testOwner("session-new", "turn-new", now.Add(10*time.Second))
+	contender.PID = 5252
+	recorded, err := store.RecordOwnerHeartbeat(ctx, contender, time.Minute, now.Add(15*time.Second))
+	if err != nil {
+		t.Fatalf("contender RecordOwnerHeartbeat error: %v", err)
+	}
+	if recorded.PID != contender.PID || recorded.ActiveSessionID != "session-new" || recorded.ActiveTurnID != "turn-new" {
+		t.Fatalf("dead local owner was not replaced: %#v", recorded)
+	}
+}
+
 func TestRecoverStaleOwnerReplacesStaleOwner(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2400,6 +2667,72 @@ func TestRecoverStaleOwnerReplacesStaleOwner(t *testing.T) {
 	}
 	if !recovered {
 		t.Fatal("RecoverStaleOwner recovered = false")
+	}
+	if recoveredOwner.PID != next.PID || recoveredOwner.ActiveSessionID != "session-new" || recoveredOwner.ActiveTurnID != "turn-new" {
+		t.Fatalf("recovered owner mismatch: %#v", recoveredOwner)
+	}
+}
+
+func TestRecoverStaleOwnerTreatsExecRestartAsSameOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	startedAt := testOwnerStart()
+	firstHeartbeat := startedAt.Add(5 * time.Second)
+	secondHeartbeat := startedAt.Add(30 * time.Second)
+	owner := testOwner("session-old", "turn-old", startedAt)
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, firstHeartbeat); err != nil {
+		t.Fatalf("first RecordOwnerHeartbeat error: %v", err)
+	}
+
+	execOwner := owner
+	execOwner.StartedAt = startedAt.Add(20 * time.Second)
+	execOwner.ActiveSessionID = ""
+	execOwner.ActiveTurnID = ""
+	recoveredOwner, recovered, err := store.RecoverStaleOwner(ctx, execOwner, time.Minute, secondHeartbeat)
+	if err != nil {
+		t.Fatalf("RecoverStaleOwner exec restart error: %v", err)
+	}
+	if recovered {
+		t.Fatal("RecoverStaleOwner recovered = true for same exec-restarted owner")
+	}
+	if !recoveredOwner.StartedAt.Equal(startedAt) {
+		t.Fatalf("StartedAt = %s, want original %s", recoveredOwner.StartedAt, startedAt)
+	}
+	if !recoveredOwner.LastHeartbeat.Equal(secondHeartbeat) {
+		t.Fatalf("LastHeartbeat = %s, want %s", recoveredOwner.LastHeartbeat, secondHeartbeat)
+	}
+	if recoveredOwner.ActiveSessionID != "" || recoveredOwner.ActiveTurnID != "" {
+		t.Fatalf("active owner fields = %q/%q, want cleared after restart", recoveredOwner.ActiveSessionID, recoveredOwner.ActiveTurnID)
+	}
+}
+
+func TestRecoverStaleOwnerReplacesDeadLocalOwnerBeforeStale(t *testing.T) {
+	prevHostname := ownerHostname
+	prevAlive := ownerProcessAlive
+	t.Cleanup(func() {
+		ownerHostname = prevHostname
+		ownerProcessAlive = prevAlive
+	})
+	ownerHostname = func() (string, error) { return "host-a", nil }
+	ownerProcessAlive = func(pid int) bool { return pid != 4242 }
+
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := testOwnerStart()
+	liveHeartbeat := now.Add(10 * time.Second)
+	existing := testOwner("session-live", "turn-live", now)
+	if _, err := store.RecordOwnerHeartbeat(ctx, existing, time.Minute, liveHeartbeat); err != nil {
+		t.Fatalf("existing RecordOwnerHeartbeat error: %v", err)
+	}
+
+	next := testOwner("session-new", "turn-new", now.Add(20*time.Second))
+	next.PID = 5252
+	recoveredOwner, recovered, err := store.RecoverStaleOwner(ctx, next, time.Minute, now.Add(30*time.Second))
+	if err != nil {
+		t.Fatalf("RecoverStaleOwner error: %v", err)
+	}
+	if !recovered {
+		t.Fatal("RecoverStaleOwner recovered = false for dead local owner")
 	}
 	if recoveredOwner.PID != next.PID || recoveredOwner.ActiveSessionID != "session-new" || recoveredOwner.ActiveTurnID != "turn-new" {
 		t.Fatalf("recovered owner mismatch: %#v", recoveredOwner)
@@ -2487,6 +2820,31 @@ func TestClearOwnerIfSameDoesNotClearDifferentOwner(t *testing.T) {
 		t.Fatalf("ReadOwner after same clear error: %v", err)
 	} else if ok {
 		t.Fatal("owner still present after same clear")
+	}
+}
+
+func TestClearOwnerIfSameDoesNotClearSameProcessDifferentInstance(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := testOwnerStart()
+	owner := testOwner("session-1", "turn-1", now)
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	other := owner
+	other.StartedAt = now.Add(time.Minute)
+	cleared, err := store.ClearOwnerIfSame(ctx, other)
+	if err != nil {
+		t.Fatalf("ClearOwnerIfSame different instance error: %v", err)
+	}
+	if cleared {
+		t.Fatal("ClearOwnerIfSame cleared same pid/executable with different started_at")
+	}
+	if _, ok, err := store.ReadOwner(ctx); err != nil {
+		t.Fatalf("ReadOwner after different instance clear error: %v", err)
+	} else if !ok {
+		t.Fatal("owner missing after different instance clear")
 	}
 }
 

@@ -22,6 +22,9 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 		Short: "Upgrade codex-proxy from GitHub releases",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("upgrade the Teams helper", "helper reload now"); err != nil {
+				return err
+			}
 			ctx := cmd.Context()
 
 			requested := update.ResolveVersion(versionOverride)

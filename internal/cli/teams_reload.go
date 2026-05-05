@@ -28,6 +28,9 @@ var (
 )
 
 func reloadTeamsHelperFromTeams(ctx context.Context, opts teams.HelperReloadOptions) error {
+	if err := rejectTeamsHelperSelfManagementFromChild("reload the Teams helper", "helper reload now"); err != nil {
+		return err
+	}
 	sourceDir, err := teamsReloadSourceDir()
 	if err != nil {
 		return err
@@ -142,6 +145,7 @@ func validateTeamsReloadInstallPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	abs = stableRestartExecutablePath(abs)
 	for _, part := range strings.FieldsFunc(filepath.Clean(abs), func(r rune) bool {
 		return r == filepath.Separator || r == '/' || r == '\\'
 	}) {
@@ -259,10 +263,13 @@ func teamsReloadBuildEnv() []string {
 		}
 		out = append(out, key+"="+value)
 	}
-	return out
+	return teamsReloadAugmentPath(out)
 }
 
 func runTeamsReloadCommand(ctx context.Context, dir string, env []string, name string, args ...string) (teamsReloadCommandResult, error) {
+	if resolved, ok := teamsReloadLookPath(name, env); ok {
+		name = resolved
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Env = env
@@ -274,10 +281,102 @@ func runTeamsReloadCommand(ctx context.Context, dir string, env []string, name s
 	return result, nil
 }
 
+func teamsReloadLookPath(name string, env []string) (string, bool) {
+	if strings.TrimSpace(name) == "" || strings.ContainsAny(name, `/\`) {
+		return name, false
+	}
+	path := ""
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && key == "PATH" {
+			path = value
+			break
+		}
+	}
+	if strings.TrimSpace(path) == "" {
+		path = os.Getenv("PATH")
+	}
+	for _, dir := range filepath.SplitList(path) {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() && (runtime.GOOS == "windows" || info.Mode()&0o111 != 0) {
+			return candidate, true
+		}
+	}
+	return name, false
+}
+
 func teamsReloadSafeOutput(output string) string {
 	output = strings.TrimSpace(output)
 	if len(output) > 4000 {
 		output = output[:4000] + "\n... output truncated ..."
 	}
 	return output
+}
+
+func teamsReloadAugmentPath(env []string) []string {
+	pathIndex := -1
+	pathValue := ""
+	home := ""
+	for i, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "PATH":
+			pathIndex = i
+			pathValue = value
+		case "HOME":
+			home = value
+		}
+	}
+	var candidates []string
+	if strings.TrimSpace(home) != "" {
+		candidates = append(candidates,
+			filepath.Join(home, ".local", "go", "bin"),
+			filepath.Join(home, "go", "bin"),
+			filepath.Join(home, ".local", "bin"),
+		)
+	}
+	candidates = append(candidates,
+		"/usr/local/go/bin",
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+	)
+	pathValue = appendPathEntries(pathValue, candidates...)
+	if pathIndex >= 0 {
+		env[pathIndex] = "PATH=" + pathValue
+		return env
+	}
+	if strings.TrimSpace(pathValue) != "" {
+		env = append(env, "PATH="+pathValue)
+	}
+	return env
+}
+
+func appendPathEntries(pathValue string, entries ...string) string {
+	seen := map[string]bool{}
+	var parts []string
+	for _, part := range filepath.SplitList(pathValue) {
+		part = strings.TrimSpace(part)
+		if part == "" || seen[part] {
+			continue
+		}
+		seen[part] = true
+		parts = append(parts, part)
+	}
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		parts = append(parts, entry)
+	}
+	return strings.Join(parts, string(os.PathListSeparator))
 }

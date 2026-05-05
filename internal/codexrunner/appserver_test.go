@@ -115,6 +115,27 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 	assertTextInput(t, writes[4], "continue")
 }
 
+func TestAppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-existing"}}}`,
+		`{"id":4,"error":{"code":"cloud_requirements","message":"Failed to load cloud requirements (workspace-managed policies)."}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	if !IsKind(err, ErrorCodex) {
+		t.Fatalf("ResumeThread error = %v, want codex failure", err)
+	}
+	if got.ThreadID != "thread-existing" || got.TurnID != "" || got.Status != TurnStatusUnknown {
+		t.Fatalf("unexpected result: %#v", got)
+	}
+	if !strings.Contains(err.Error(), "cloud_requirements") || !strings.Contains(err.Error(), "Failed to load cloud requirements") {
+		t.Fatalf("error did not preserve app-server code/message: %v", err)
+	}
+}
+
 func TestAppServerRunnerStreamsNotifications(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
@@ -361,6 +382,7 @@ func TestAppServerRunnerFallsBackWhenInitializationProbeFails(t *testing.T) {
 		}),
 		Fallback: fallback,
 		Command:  "/managed/codex",
+		ExtraEnv: []string{"CODEX_HELPER_TEAMS_CHILD=1"},
 		Timeout:  time.Minute,
 	}
 
@@ -376,6 +398,9 @@ func TestAppServerRunnerFallsBackWhenInitializationProbeFails(t *testing.T) {
 	}
 	if !reflect.DeepEqual(startReq.Args, []string{"app-server"}) {
 		t.Fatalf("starter args = %#v", startReq.Args)
+	}
+	if !reflect.DeepEqual(startReq.ExtraEnv, []string{"CODEX_HELPER_TEAMS_CHILD=1"}) {
+		t.Fatalf("starter extra env = %#v", startReq.ExtraEnv)
 	}
 	if !transport.closed {
 		t.Fatalf("transport was not closed after failed probe")

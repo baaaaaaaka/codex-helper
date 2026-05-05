@@ -142,7 +142,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "/status", "/close", "/help", "/details", "!status", "!file report.txt", "!ph", "helper status", "helper retry turn-1", "helper file report.txt", "helper publish-history", "codex status", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/close", "/help", "/details", "!status", "!file report.txt", "!ph", "helper status", "helper retry turn-1", "helper file report.txt", "helper publish-history", "codex status", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {
@@ -152,6 +152,9 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 				t.Fatalf("work slash command %q should not require Codex: %#v", text, cmd)
 			}
 		})
+	}
+	if cmd := ParseDashboardCommand(ChatScopeWork, "help advanced"); cmd.Name != DashboardCommandHelp || cmd.Argument != "advanced" {
+		t.Fatalf("help advanced parse = %#v, want help with advanced arg", cmd)
 	}
 }
 

@@ -94,12 +94,35 @@ func (e RunnerExecutor) RunWithEventHandler(ctx context.Context, session *Sessio
 		},
 	})
 	if err != nil {
-		out := ExecutionResult{CodexThreadID: result.ThreadID, CodexTurnID: result.TurnID}
-		if result.ThreadID != "" || result.TurnID != "" || result.Status == codexrunner.TurnStatusStarted || result.Status == codexrunner.TurnStatusInProgress {
+		out := executionResultFromCodexTurn(result)
+		if codexTurnMayStillBeRunning(result) {
 			return out, &AmbiguousExecutionError{ThreadID: result.ThreadID, TurnID: result.TurnID, Err: err}
 		}
 		return out, err
 	}
+	return successfulExecutionResultFromCodexTurn(result), nil
+}
+
+func codexTurnMayStillBeRunning(result codexrunner.TurnResult) bool {
+	switch result.Status {
+	case codexrunner.TurnStatusStarted, codexrunner.TurnStatusInProgress:
+		return true
+	case codexrunner.TurnStatusUnknown:
+		return strings.TrimSpace(result.TurnID) != ""
+	default:
+		return false
+	}
+}
+
+func executionResultFromCodexTurn(result codexrunner.TurnResult) ExecutionResult {
+	return ExecutionResult{
+		Text:          strings.TrimSpace(result.FinalAgentMessage),
+		CodexThreadID: result.ThreadID,
+		CodexTurnID:   result.TurnID,
+	}
+}
+
+func successfulExecutionResultFromCodexTurn(result codexrunner.TurnResult) ExecutionResult {
 	text := strings.TrimSpace(result.FinalAgentMessage)
 	if text == "" {
 		text = "(Codex finished without a final message.)"
@@ -108,7 +131,7 @@ func (e RunnerExecutor) RunWithEventHandler(ctx context.Context, session *Sessio
 		Text:          text,
 		CodexThreadID: result.ThreadID,
 		CodexTurnID:   result.TurnID,
-	}, nil
+	}
 }
 
 type CodexExecutor struct {

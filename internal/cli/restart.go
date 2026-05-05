@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -49,6 +51,7 @@ func restartSelf() error {
 	if err != nil {
 		return err
 	}
+	exe = stableRestartExecutablePath(exe)
 	args := append([]string{exe}, os.Args[1:]...)
 	if runtime.GOOS == "windows" {
 		if err := startSelf(exe, args[1:]); err != nil {
@@ -58,6 +61,29 @@ func restartSelf() error {
 		return nil
 	}
 	return execSelf(exe, args, os.Environ())
+}
+
+func stableRestartExecutablePath(path string) string {
+	stable := stripReloadBackupSuffix(path)
+	if stable == path {
+		return path
+	}
+	if info, err := os.Stat(stable); err == nil && !info.IsDir() {
+		return stable
+	}
+	return path
+}
+
+func stripReloadBackupSuffix(path string) string {
+	path = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))
+	if path == "" {
+		return path
+	}
+	dir, base := filepath.Split(path)
+	if idx := strings.Index(base, ".reload-backup-"); idx >= 0 {
+		return filepath.Join(dir, base[:idx])
+	}
+	return path
 }
 
 func startRestartProcess(exe string, args []string) error {

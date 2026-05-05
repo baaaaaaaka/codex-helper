@@ -46,6 +46,31 @@ func TestAppServerProcessStarterLaunchesCommandArgsAndWorkingDir(t *testing.T) {
 	}
 }
 
+func TestAppServerProcessStarterPassesExtraEnv(t *testing.T) {
+	command, args := appServerProcessHelperCommand("meta")
+
+	transport, err := (AppServerProcessStarter{}).StartAppServer(context.Background(), AppServerStartRequest{
+		Command:  command,
+		Args:     args,
+		ExtraEnv: []string{"CODEX_HELPER_TEAMS_CHILD=1", "CODEX_HELPER_TEAMS_PARENT_PID=1234"},
+	})
+	if err != nil {
+		t.Fatalf("StartAppServer error: %v", err)
+	}
+	defer transport.Close()
+
+	line := readProcessTestLine(t, transport)
+	var got struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(line, &got); err != nil {
+		t.Fatalf("metadata line is not JSON: %s: %v", string(line), err)
+	}
+	if got.Env["CODEX_HELPER_TEAMS_CHILD"] != "1" || got.Env["CODEX_HELPER_TEAMS_PARENT_PID"] != "1234" {
+		t.Fatalf("extra env not passed to app-server process: %#v", got.Env)
+	}
+}
+
 func TestAppServerProcessTransportWriteLineAndReadLine(t *testing.T) {
 	transport := startProcessHelper(t, AppServerProcessStarter{}, "echo")
 	defer transport.Close()
@@ -224,6 +249,10 @@ func runAppServerProcessHelper(args []string) int {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"cwd":  cwd,
 			"args": args,
+			"env": map[string]string{
+				"CODEX_HELPER_TEAMS_CHILD":      os.Getenv("CODEX_HELPER_TEAMS_CHILD"),
+				"CODEX_HELPER_TEAMS_PARENT_PID": os.Getenv("CODEX_HELPER_TEAMS_PARENT_PID"),
+			},
 		})
 		time.Sleep(24 * time.Hour)
 		return 0

@@ -36,6 +36,10 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
 		t.Fatalf("write codex stub: %v", err)
 	}
+	codexDir := t.TempDir()
+	t.Setenv(envCodexHome, codexDir)
+	writeFakeCache(t, codexDir)
+	originalAuth := writeTestAuthJSON(t, codexDir, true)
 
 	prevRun := runTargetWithFallbackWithOptionsFn
 	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRun })
@@ -50,6 +54,16 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 		}
 		if string(stdin) != "prompt text" {
 			t.Fatalf("stdin = %q", string(stdin))
+		}
+		if cacheExists(t, codexDir) {
+			t.Fatal("Teams yolo launch should delete cloud requirements cache before Codex starts")
+		}
+		authDuringRun, err := os.ReadFile(filepath.Join(codexDir, "auth.json"))
+		if err != nil {
+			t.Fatalf("read auth during run: %v", err)
+		}
+		if authJSONHasPlanClaim(t, authDuringRun) {
+			t.Fatal("Teams yolo launch should mask workspace plan auth before Codex starts")
 		}
 		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"thread.started","thread_id":"thread-managed"}`)
 		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
@@ -88,9 +102,32 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	if !hasExplicitCodexHomeEnv(gotOpts.ExtraEnv) {
 		t.Fatalf("expected Codex home env in launch options: %#v", gotOpts.ExtraEnv)
 	}
+	if !hasEnvValue(gotOpts.ExtraEnv, envTeamsCodexChild, "1") {
+		t.Fatalf("expected Teams child marker env in launch options: %#v", gotOpts.ExtraEnv)
+	}
+	if !hasEnvValue(gotOpts.ExtraEnv, envTeamsCodexParentPID, fmt.Sprint(os.Getpid())) {
+		t.Fatalf("expected Teams parent pid env in launch options: %#v", gotOpts.ExtraEnv)
+	}
 	if !strings.Contains(string(result.Stdout), "thread-managed") {
 		t.Fatalf("stdout was not captured: %s", string(result.Stdout))
 	}
+	authAfterRun, err := os.ReadFile(filepath.Join(codexDir, "auth.json"))
+	if err != nil {
+		t.Fatalf("read auth after run: %v", err)
+	}
+	if !reflect.DeepEqual(authAfterRun, originalAuth) {
+		t.Fatal("Teams yolo launch should restore auth after Codex exits")
+	}
+}
+
+func hasEnvValue(env []string, key string, want string) bool {
+	prefix := key + "="
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			return strings.TrimPrefix(item, prefix) == want
+		}
+	}
+	return false
 }
 
 func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
@@ -109,6 +146,66 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	}
 	if got.Text != "final" || got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-existing" {
 		t.Fatalf("unexpected result: %#v", got)
+	}
+}
+
+func TestTeamsCodexExecutorDoesNotTreatExistingThreadIDErrorAsAccepted(t *testing.T) {
+	runner := &fakeTeamsRunner{
+		result: codexrunner.TurnResult{ThreadID: "thread-existing"},
+		err:    fmt.Errorf("codex_failure: Error: Failed to load cloud requirements (workspace-managed policies)."),
+	}
+	executor := teamsCodexExecutor{runner: runner}
+	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing"}, "continue")
+	if err == nil {
+		t.Fatal("Run error = nil, want failure")
+	}
+	if teams.IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, should not be ambiguous when only the existing thread id is known", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
+func TestTeamsCodexExecutorTreatsStartedTurnErrorAsAmbiguous(t *testing.T) {
+	runner := &fakeTeamsRunner{
+		result: codexrunner.TurnResult{
+			ThreadID: "thread-existing",
+			TurnID:   "turn-started",
+			Status:   codexrunner.TurnStatusInProgress,
+		},
+		err: fmt.Errorf("stream disconnected before completion"),
+	}
+	executor := teamsCodexExecutor{runner: runner}
+	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing"}, "continue")
+	if !teams.IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, want ambiguous", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-started" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
+func TestTeamsCodexExecutorDoesNotTreatTerminalFailedTurnAsAmbiguous(t *testing.T) {
+	runner := &fakeTeamsRunner{
+		result: codexrunner.TurnResult{
+			ThreadID: "thread-existing",
+			TurnID:   "turn-failed",
+			Status:   codexrunner.TurnStatusFailed,
+			Failure:  &codexrunner.TurnFailure{Message: "model policy failed"},
+		},
+		err: fmt.Errorf("codex_failure: model policy failed"),
+	}
+	executor := teamsCodexExecutor{runner: runner}
+	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing"}, "continue")
+	if err == nil {
+		t.Fatal("Run error = nil, want failure")
+	}
+	if teams.IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, should not be ambiguous for terminal failed turn", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-failed" {
+		t.Fatalf("unexpected execution result: %#v", got)
 	}
 }
 
@@ -271,24 +368,54 @@ func TestRunTeamsUpgradeCodexOnceRejectsCodexPath(t *testing.T) {
 	}
 }
 
+func TestRunTeamsCodexUpgradeFromBridgeUsesExistingUpgradePath(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	prevUpgrade := upgradeCodexInstalledForTeamsRun
+	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
+	called := false
+	upgradeCodexInstalledForTeamsRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+		called = true
+		if !opts.upgradeCodex {
+			t.Fatal("expected upgradeCodex install option")
+		}
+		return "/managed/codex", nil
+	}
+
+	got, err := runTeamsCodexUpgradeFromBridge(context.Background(), &rootOptions{configPath: cfgPath}, io.Discard, "")
+	if err != nil {
+		t.Fatalf("runTeamsCodexUpgradeFromBridge error: %v", err)
+	}
+	if !called || got.Path != "/managed/codex" {
+		t.Fatalf("upgrade called=%v result=%#v", called, got)
+	}
+}
+
 type fakeTeamsRunner struct {
 	result   codexrunner.TurnResult
+	err      error
 	resumed  bool
 	threadID string
 }
 
 func (r *fakeTeamsRunner) StartThread(context.Context, codexrunner.TurnInput) (codexrunner.TurnResult, error) {
-	return r.result, nil
+	return r.result, r.err
 }
 
 func (r *fakeTeamsRunner) ResumeThread(_ context.Context, threadID string, _ codexrunner.TurnInput) (codexrunner.TurnResult, error) {
 	r.resumed = true
 	r.threadID = threadID
-	return r.result, nil
+	return r.result, r.err
 }
 
 func (r *fakeTeamsRunner) StartTurn(context.Context, codexrunner.StartTurnInput) (codexrunner.TurnResult, error) {
-	return r.result, nil
+	return r.result, r.err
 }
 
 func (r *fakeTeamsRunner) InterruptTurn(context.Context, codexrunner.TurnRef) error {

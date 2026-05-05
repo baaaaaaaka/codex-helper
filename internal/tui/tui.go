@@ -1026,7 +1026,8 @@ func ensurePreview(
 }
 
 func buildProjectItems(projects []codexhistory.Project, defaultCwd string) []projectItem {
-	orderedProjects := append([]codexhistory.Project(nil), projects...)
+	orderedProjects := codexhistory.FilterUserVisibleProjects(projects)
+	orderedProjects = append([]codexhistory.Project(nil), orderedProjects...)
 	sort.SliceStable(orderedProjects, func(i, j int) bool {
 		return projectLess(orderedProjects[i], orderedProjects[j])
 	})
@@ -1074,7 +1075,7 @@ func buildSessionItems(project codexhistory.Project, expanded map[string]bool) [
 		kind:          sessionItemNew,
 		alwaysVisible: true,
 	}}
-	for _, session := range project.Sessions {
+	for _, session := range codexhistory.FilterUserVisibleSessions(project.Sessions) {
 		title := session.DisplayTitle()
 		ts := "unknown"
 		if !session.ModifiedAt.IsZero() {

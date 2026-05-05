@@ -43,6 +43,9 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 	if req.WorkingDir != "" {
 		cmd.Dir = req.WorkingDir
 	}
+	if len(req.ExtraEnv) > 0 {
+		cmd.Env = append(os.Environ(), req.ExtraEnv...)
+	}
 
 	stdinRead, stdinWrite, err := os.Pipe()
 	if err != nil {

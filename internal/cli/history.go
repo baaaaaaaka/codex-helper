@@ -86,6 +86,7 @@ func newHistoryTuiCmd(root *rootOptions, codexDir *string, codexPath *string, pr
 
 func newHistoryListCmd(root *rootOptions, codexDir *string) *cobra.Command {
 	var pretty bool
+	var includeHelper bool
 
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -99,6 +100,9 @@ func newHistoryListCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			projects, err := codexhistory.DiscoverProjects(paths.CodexDir)
 			if err != nil && len(projects) == 0 {
 				return err
+			}
+			if !includeHelper {
+				projects = codexhistory.FilterUserVisibleProjects(projects)
 			}
 			payload := map[string]any{"projects": projects}
 			out, err := json.MarshalIndent(payload, "", "  ")
@@ -116,6 +120,7 @@ func newHistoryListCmd(root *rootOptions, codexDir *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&pretty, "pretty", false, "Pretty-print JSON")
+	cmd.Flags().BoolVar(&includeHelper, "include-helper", false, "Include codex-helper control/debug sessions")
 	return cmd
 }
 

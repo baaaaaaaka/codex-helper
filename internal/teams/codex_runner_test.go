@@ -1,8 +1,12 @@
 package teams
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 )
 
 func TestParseCodexJSONLExtractsThreadAndFinalAgentMessage(t *testing.T) {
@@ -27,6 +31,66 @@ func TestParseCodexJSONLExtractsThreadAndFinalAgentMessage(t *testing.T) {
 	}
 }
 
+func TestRunnerExecutorDoesNotTreatExistingThreadIDErrorAsAccepted(t *testing.T) {
+	runner := &fakeCodexRunner{
+		result: codexrunner.TurnResult{ThreadID: "thread-existing"},
+		err:    fmt.Errorf("codex_failure: Error: Failed to load cloud requirements (workspace-managed policies)."),
+	}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if err == nil {
+		t.Fatal("Run error = nil, want failure")
+	}
+	if IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, should not be ambiguous when only the existing thread id is known", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
+func TestRunnerExecutorTreatsStartedTurnErrorAsAmbiguous(t *testing.T) {
+	runner := &fakeCodexRunner{
+		result: codexrunner.TurnResult{
+			ThreadID: "thread-existing",
+			TurnID:   "turn-started",
+			Status:   codexrunner.TurnStatusInProgress,
+		},
+		err: fmt.Errorf("stream disconnected before completion"),
+	}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if !IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, want ambiguous", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-started" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
+func TestRunnerExecutorDoesNotTreatTerminalFailedTurnAsAmbiguous(t *testing.T) {
+	runner := &fakeCodexRunner{
+		result: codexrunner.TurnResult{
+			ThreadID: "thread-existing",
+			TurnID:   "turn-failed",
+			Status:   codexrunner.TurnStatusFailed,
+			Failure:  &codexrunner.TurnFailure{Message: "model policy failed"},
+		},
+		err: fmt.Errorf("codex_failure: model policy failed"),
+	}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if err == nil {
+		t.Fatal("Run error = nil, want failure")
+	}
+	if IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, should not be ambiguous for terminal failed turn", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-failed" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
 func TestSplitTextChunks(t *testing.T) {
 	got := splitTextChunks("one two three four", 8)
 	if len(got) != 3 {
@@ -35,6 +99,35 @@ func TestSplitTextChunks(t *testing.T) {
 	if strings.Join(got, " ") != "one two three four" {
 		t.Fatalf("unexpected chunks %#v", got)
 	}
+}
+
+type fakeCodexRunner struct {
+	result codexrunner.TurnResult
+	err    error
+}
+
+func (r *fakeCodexRunner) StartThread(context.Context, codexrunner.TurnInput) (codexrunner.TurnResult, error) {
+	return r.result, r.err
+}
+
+func (r *fakeCodexRunner) ResumeThread(context.Context, string, codexrunner.TurnInput) (codexrunner.TurnResult, error) {
+	return r.result, r.err
+}
+
+func (r *fakeCodexRunner) StartTurn(context.Context, codexrunner.StartTurnInput) (codexrunner.TurnResult, error) {
+	return r.result, r.err
+}
+
+func (r *fakeCodexRunner) InterruptTurn(context.Context, codexrunner.TurnRef) error {
+	return nil
+}
+
+func (r *fakeCodexRunner) ReadThread(context.Context, string) (codexrunner.Thread, error) {
+	return codexrunner.Thread{}, nil
+}
+
+func (r *fakeCodexRunner) ListThreads(context.Context, codexrunner.ListThreadsOptions) ([]codexrunner.Thread, error) {
+	return nil, nil
 }
 
 func TestSplitTextChunksForHTMLMessageUsesRenderedHTMLBytes(t *testing.T) {

@@ -203,6 +203,147 @@ func TestBridgeSessionMessagePersistsTurnRunsAndSendsOutbox(t *testing.T) {
 	}
 }
 
+func TestBridgeWorkChatBareHelpAdvancedDoesNotRunCodex(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("help-advanced", "help advanced"), "help advanced"); err != nil {
+		t.Fatalf("handleSessionMessage help advanced error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("help advanced should not be forwarded to Codex, prompts=%#v", executor.prompts)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %#v, want one advanced help response", *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(plain, "Work chat advanced help") || !strings.Contains(plain, "helper retry last") {
+		t.Fatalf("advanced help response mismatch:\n%s", plain)
+	}
+}
+
+func TestBridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{
+		err: errors.New(`codex_failure: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}`),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	upgrades := 0
+	bridge.codexUpgrader = func(context.Context) (CodexUpgradeResult, error) {
+		upgrades++
+		return CodexUpgradeResult{Path: "/managed/codex"}, nil
+	}
+
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s-other", Status: teamstore.SessionStatusActive}); err != nil {
+		t.Fatalf("CreateSession other: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{
+		ID:        "turn-other-running",
+		SessionID: "s-other",
+		Status:    teamstore.TurnStatusRunning,
+	}); err != nil {
+		t.Fatalf("QueueTurn other running: %v", err)
+	}
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("needs-upgrade", "run with new model"), "run with new model"); err != nil {
+		t.Fatalf("handleSessionMessage upgrade failure error: %v", err)
+	}
+	if upgrades != 0 {
+		t.Fatalf("upgrade should wait for active work, got %d calls", upgrades)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if state.Upgrade == nil || state.Upgrade.Reason != teamstore.CodexUpgradeReason || !state.ServiceControl.Draining {
+		t.Fatalf("expected pending Codex upgrade drain, state=%#v control=%#v", state.Upgrade, state.ServiceControl)
+	}
+	if len(state.Upgrade.NotificationTargets) != 1 || state.Upgrade.NotificationTargets[0].TeamsChatID != "chat-1" {
+		t.Fatalf("upgrade notification targets = %#v, want chat-1", state.Upgrade.NotificationTargets)
+	}
+	if len(*sent) < 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "Codex CLI needs an update") {
+		t.Fatalf("upgrade notice not sent: %#v", *sent)
+	}
+
+	if _, err := store.MarkTurnCompleted(context.Background(), "turn-other-running", "", ""); err != nil {
+		t.Fatalf("MarkTurnCompleted other running: %v", err)
+	}
+	if err := bridge.maybeRunPendingCodexUpgrade(context.Background()); err != nil {
+		t.Fatalf("maybeRunPendingCodexUpgrade: %v", err)
+	}
+	if upgrades != 1 {
+		t.Fatalf("upgrade calls = %d, want 1", upgrades)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after upgrade: %v", err)
+	}
+	if state.ServiceControl.Draining {
+		t.Fatalf("Codex upgrade should clear drain, control=%#v", state.ServiceControl)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted {
+		t.Fatalf("upgrade phase = %#v, want completed", state.Upgrade)
+	}
+	if !sentPlainContains(*sent, "Codex CLI upgraded") {
+		t.Fatalf("upgrade completion notice missing: %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "Codex CLI upgraded") != 1 {
+		t.Fatalf("control upgrade completion notice missing or duplicated: %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "chat-1", "Codex CLI upgraded") != 1 {
+		t.Fatalf("work chat upgrade completion notice missing or duplicated: %#v", *sent)
+	}
+}
+
+func TestBridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{
+		err: errors.New("codex model requires a newer version of Codex CLI"),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.codexUpgrader = func(context.Context) (CodexUpgradeResult, error) {
+		return CodexUpgradeResult{}, errors.New("synthetic upgrade failure")
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("needs-upgrade-fails", "run with new model"), "run with new model"); err != nil {
+		t.Fatalf("handleSessionMessage upgrade failure error: %v", err)
+	}
+	if err := bridge.maybeRunPendingCodexUpgrade(context.Background()); err == nil {
+		t.Fatal("maybeRunPendingCodexUpgrade error = nil, want upgrade failure")
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "Codex CLI upgrade failed") != 1 {
+		t.Fatalf("control upgrade failure notice missing or duplicated: %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "chat-1", "Codex CLI upgrade failed") != 1 {
+		t.Fatalf("work chat upgrade failure notice missing or duplicated: %#v", *sent)
+	}
+}
+
+func TestCodexErrorRequiresUpgradeHeuristics(t *testing.T) {
+	matches := []string{
+		"Codex turn failed: The 'gpt-5.5' model requires a newer version of Codex.",
+		"codex error: please upgrade to the latest app or CLI and try again",
+		"Codex model gpt-next needs an upgrade of the CLI",
+	}
+	for _, text := range matches {
+		if !codexErrorRequiresUpgrade(errors.New(text)) {
+			t.Fatalf("expected upgrade-required match for %q", text)
+		}
+	}
+	for _, text := range []string{
+		"codex_failure: Failed to load cloud requirements",
+		"network error while running codex",
+		"model was rate limited by server",
+	} {
+		if codexErrorRequiresUpgrade(errors.New(text)) {
+			t.Fatalf("unexpected upgrade-required match for %q", text)
+		}
+	}
+}
+
 func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -765,6 +906,88 @@ func TestBridgeSessionMessageAllowsEmptyCodexTurnID(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionCodexFailureWithOnlyExistingThreadIDMarksFailed(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{
+		result: ExecutionResult{CodexThreadID: "thread-existing"},
+		err:    errors.New("codex_failure: Error: Failed to load cloud requirements (workspace-managed policies)."),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.reg.Sessions[0].CodexThreadID = "thread-existing"
+
+	err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-cloud-policy-fail"), "status")
+	if err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent message count = %d, want ack plus error", len(*sent))
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[1].Content)
+	if !strings.Contains(plain, "Failed to load cloud requirements") {
+		t.Fatalf("error response missing root cause: %q", plain)
+	}
+	if strings.Contains(plain, "could not confirm whether it finished") || strings.Contains(plain, "helper retry last") {
+		t.Fatalf("error response should not use ambiguous retry guidance: %q", plain)
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var turn teamstore.Turn
+	for _, item := range state.Turns {
+		turn = item
+	}
+	if turn.Status != teamstore.TurnStatusFailed {
+		t.Fatalf("turn status = %q, want failed", turn.Status)
+	}
+	if turn.CodexThreadID != "thread-existing" || turn.CodexTurnID != "" {
+		t.Fatalf("turn codex ids = %q/%q, want existing thread and empty turn", turn.CodexThreadID, turn.CodexTurnID)
+	}
+}
+
+func TestBridgeSessionTerminalCodexFailureWithTurnIDMarksFailed(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{
+		result: ExecutionResult{CodexThreadID: "thread-existing", CodexTurnID: "turn-failed"},
+		err:    errors.New("codex_failure: model policy failed"),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.reg.Sessions[0].CodexThreadID = "thread-existing"
+
+	err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-terminal-fail"), "status")
+	if err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent message count = %d, want ack plus error", len(*sent))
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[1].Content)
+	if !strings.Contains(plain, "model policy failed") {
+		t.Fatalf("error response missing root cause: %q", plain)
+	}
+	if strings.Contains(plain, "could not confirm whether it finished") || strings.Contains(plain, "helper retry last") {
+		t.Fatalf("error response should not use ambiguous retry guidance: %q", plain)
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var turn teamstore.Turn
+	for _, item := range state.Turns {
+		turn = item
+	}
+	if turn.Status != teamstore.TurnStatusFailed {
+		t.Fatalf("turn status = %q, want failed", turn.Status)
+	}
+	if turn.CodexThreadID != "thread-existing" || turn.CodexTurnID != "turn-failed" {
+		t.Fatalf("turn codex ids = %q/%q, want thread-existing/turn-failed", turn.CodexThreadID, turn.CodexTurnID)
+	}
+}
+
 func TestBridgeQueuesAllLongOutputPartsBeforeFirstSend(t *testing.T) {
 	store := newBridgeTestStore(t)
 	ctx := context.Background()
@@ -1149,6 +1372,11 @@ func TestBridgeControlWorkspacesAndSessionsDoNotRunCodex(t *testing.T) {
 				FirstPrompt: "fix alpha",
 				ProjectPath: "/home/user/project/alpha",
 				ModifiedAt:  time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC),
+			}, {
+				SessionID:   "thread-control-helper",
+				FirstPrompt: ControlFallbackCodexPrompt("debug the control chat"),
+				ProjectPath: "/home/user/project/alpha",
+				ModifiedAt:  time.Date(2026, 4, 30, 11, 0, 0, 0, time.UTC),
 			}},
 		}}, nil
 	}
@@ -1186,6 +1414,9 @@ func TestBridgeControlWorkspacesAndSessionsDoNotRunCodex(t *testing.T) {
 	}
 	if !strings.Contains(sessionDashboard, "fix alpha") || !strings.Contains(sessionDashboard, "c 1") {
 		t.Fatalf("session dashboard missing title/action: %q", sessionDashboard)
+	}
+	if strings.Contains(sessionDashboard, "thread-control-helper") || strings.Contains(sessionDashboard, "debug the control chat") || strings.Contains(sessionDashboard, "codex-helper-control") {
+		t.Fatalf("session dashboard leaked helper control history: %q", sessionDashboard)
 	}
 	if strings.Contains(sessionDashboard, "thread-alpha") {
 		t.Fatalf("session dashboard leaked raw session id: %q", sessionDashboard)
@@ -1492,6 +1723,139 @@ func TestBridgeDashboardEmptyWorkspaceKeepsSessionsContext(t *testing.T) {
 	}
 }
 
+func TestBridgeStaleDashboardHiddenHelperSessionDoesNotLeak(t *testing.T) {
+	workspacePath := "/home/user/project/alpha"
+	workspaceID := workspaceIDForPath(workspacePath)
+	hiddenSessionID := "thread-control-helper"
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: workspacePath,
+			Sessions: []codexhistory.Session{{
+				SessionID:   hiddenSessionID,
+				FirstPrompt: ControlFallbackCodexPrompt("debug the control chat"),
+				ProjectPath: workspacePath,
+				ModifiedAt:  time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		now := time.Now()
+		state.DashboardViews["control-chat"] = teamstore.DashboardViewRecord{
+			ID:          "dashboard:control-chat",
+			ChatID:      "control-chat",
+			Kind:        string(DashboardViewSessions),
+			WorkspaceID: workspaceID,
+			Items: []teamstore.DashboardViewItem{{
+				Number:      1,
+				Kind:        string(DashboardSelectionSession),
+				WorkspaceID: workspaceID,
+				SessionID:   hiddenSessionID,
+				Label:       "old helper control",
+			}},
+			ExpiresAt: now.Add(time.Hour),
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale dashboard view: %v", err)
+	}
+
+	for i, text := range []string{"details 1", "continue 1"} {
+		if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage(fmt.Sprintf("stale-hidden-%d", i)), text); err != nil {
+			t.Fatalf("%s error: %v", text, err)
+		}
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want two sanitized errors", *sent)
+	}
+	for _, msg := range *sent {
+		got := PlainTextFromTeamsHTML(msg.Content)
+		if !strings.Contains(got, "That number is not in the current list") {
+			t.Fatalf("stale hidden selection response = %q", got)
+		}
+		if strings.Contains(got, hiddenSessionID) || strings.Contains(got, "codex-helper") || strings.Contains(got, "debug the control chat") {
+			t.Fatalf("stale hidden selection leaked helper details: %q", got)
+		}
+	}
+}
+
+func TestBridgeStaleDashboardHiddenWorkspaceDoesNotPinSessions(t *testing.T) {
+	hiddenWorkspacePath := "/home/user/project/hidden"
+	hiddenWorkspaceID := workspaceIDForPath(hiddenWorkspacePath)
+	visibleWorkspacePath := "/home/user/project/beta"
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "hidden",
+			Path: hiddenWorkspacePath,
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-control-helper",
+				FirstPrompt: ControlFallbackCodexPrompt("debug hidden workspace"),
+				ProjectPath: hiddenWorkspacePath,
+			}},
+		}, {
+			Key:  "beta",
+			Path: visibleWorkspacePath,
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-beta",
+				FirstPrompt: "fix beta",
+				ProjectPath: visibleWorkspacePath,
+				ModifiedAt:  time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		now := time.Now()
+		state.DashboardViews["control-chat"] = teamstore.DashboardViewRecord{
+			ID:          "dashboard:control-chat",
+			ChatID:      "control-chat",
+			Kind:        string(DashboardViewWorkspaces),
+			WorkspaceID: hiddenWorkspaceID,
+			Items: []teamstore.DashboardViewItem{{
+				Number:      1,
+				Kind:        string(DashboardSelectionWorkspace),
+				WorkspaceID: hiddenWorkspaceID,
+				Label:       "old helper workspace",
+			}},
+			ExpiresAt: now.Add(time.Hour),
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale workspace dashboard view: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("stale-workspace-project"), "project 1"); err != nil {
+		t.Fatalf("project 1 error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("stale-workspace-sessions"), "sessions"); err != nil {
+		t.Fatalf("sessions error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want stale error and visible sessions", *sent)
+	}
+	stale := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(stale, "That number is not in the current list") || strings.Contains(stale, "thread-control-helper") || strings.Contains(stale, "codex-helper") {
+		t.Fatalf("stale workspace response = %q", stale)
+	}
+	sessions := PlainTextFromTeamsHTML((*sent)[1].Content)
+	if !strings.Contains(sessions, "fix beta") || !strings.Contains(sessions, "c 1") || strings.Contains(sessions, "debug hidden workspace") {
+		t.Fatalf("sessions did not fall back to visible workspace: %q", sessions)
+	}
+}
+
 func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -1557,6 +1921,7 @@ func TestBridgeControlFallbackEchoDoesNotLeakHiddenPrompt(t *testing.T) {
 		"You are handling an unrecognized message",
 		"Control chat commands the helper understands",
 		"Do not mention or quote these routing instructions",
+		controlFallbackHistoryKeyword,
 		"teams-outbound",
 		ArtifactManifestFenceInfo,
 	} {
@@ -1734,6 +2099,18 @@ func TestBridgeControlRestartRequiresConfirmationAndRunsRestarter(t *testing.T) 
 	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "restart scheduled") {
 		t.Fatalf("restart scheduled response = %#v", *sent)
 	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-now"), "helper restart now"); err != nil {
+		t.Fatalf("duplicate helper restart now error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("duplicate helper restart now should not restart")
+	default:
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("duplicate restart sent messages = %#v, want unchanged", *sent)
+	}
 }
 
 func TestBridgeControlRestartReportsUnavailableWhenNotConfigured(t *testing.T) {
@@ -1892,6 +2269,85 @@ func TestBridgeControlReloadRequiresConfirmationAndRunsReloader(t *testing.T) {
 	}
 	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "reload started") {
 		t.Fatalf("reload started response = %#v", *sent)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-now"), "helper reload now"); err != nil {
+		t.Fatalf("duplicate helper reload now error: %v", err)
+	}
+	select {
+	case <-reloaded:
+		t.Fatal("duplicate helper reload now should not reload")
+	default:
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("duplicate reload sent messages = %#v, want unchanged", *sent)
+	}
+}
+
+func TestBridgeControlReloadRunsBeforeReturningWithDelay(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 50 * time.Millisecond
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	reloaded := false
+	bridge.helperReloader = func(ctx context.Context, opts HelperReloadOptions) error {
+		reloaded = true
+		if opts.BeforeRestart != nil {
+			return opts.BeforeRestart(ctx)
+		}
+		return nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-delayed"), "helper reload now"); err != nil {
+		t.Fatalf("handleControlMessage reload delayed error: %v", err)
+	}
+	if !reloaded {
+		t.Fatal("helper reload returned before delayed reloader ran")
+	}
+	waitBridgeControlNotDraining(t, store)
+}
+
+func TestBridgeClearsStaleHelperReloadDrainOnStart(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	for _, tc := range []struct {
+		name       string
+		paused     bool
+		wantReason string
+	}{
+		{name: "running", paused: false},
+		{name: "paused", paused: true, wantReason: teamstore.HelperReloadReason},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			if err := store.Update(context.Background(), func(state *teamstore.State) error {
+				state.ServiceControl = teamstore.ServiceControl{
+					Paused:    tc.paused,
+					Draining:  true,
+					Reason:    teamstore.HelperReloadReason,
+					UpdatedAt: time.Now().Add(-time.Minute),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed stale reload drain: %v", err)
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if err := bridge.clearStaleHelperReloadDrainOnStart(context.Background()); err != nil {
+				t.Fatalf("clearStaleHelperReloadDrainOnStart error: %v", err)
+			}
+			state, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatalf("Load error: %v", err)
+			}
+			if state.ServiceControl.Draining {
+				t.Fatalf("stale reload drain was not cleared: %#v", state.ServiceControl)
+			}
+			if state.ServiceControl.Paused != tc.paused || state.ServiceControl.Reason != tc.wantReason {
+				t.Fatalf("service control after stale reload clear = %#v", state.ServiceControl)
+			}
+		})
 	}
 }
 
@@ -8692,6 +9148,16 @@ func countSentPlainContaining(messages []bridgeSentMessage, needle string) int {
 	count := 0
 	for _, msg := range messages {
 		if strings.Contains(PlainTextFromTeamsHTML(msg.Content), needle) {
+			count++
+		}
+	}
+	return count
+}
+
+func countSentPlainContainingForChat(messages []bridgeSentMessage, chatID string, needle string) int {
+	count := 0
+	for _, msg := range messages {
+		if msg.ChatID == chatID && strings.Contains(PlainTextFromTeamsHTML(msg.Content), needle) {
 			count++
 		}
 	}

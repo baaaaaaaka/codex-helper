@@ -165,6 +165,8 @@ func isolateUpgradeTeamsServiceForTest(t *testing.T) *recordingTeamsServiceRunne
 
 func isolateUpgradeTeamsStateForTest(t *testing.T, tmp string) {
 	t.Helper()
+	t.Setenv(envTeamsCodexChild, "")
+	t.Setenv(envTeamsCodexParentPID, "")
 	isolateTeamsUserDirsForTest(t, tmp)
 }
 

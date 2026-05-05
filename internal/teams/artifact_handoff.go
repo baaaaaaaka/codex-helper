@@ -5,16 +5,24 @@ import (
 	"encoding/hex"
 	"path"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 )
 
 const ArtifactManifestFenceInfo = "codex-helper-artifacts"
 const DefaultControlFallbackModel = "gpt-5.3-codex-spark"
+const controlFallbackHistoryKeyword = codexhistory.HelperControlSessionTitleKeyword
 
 func TeamsCodexPrompt(prompt string) string {
 	root, err := DefaultOutboundRoot()
 	if err != nil || strings.TrimSpace(root) == "" {
 		return prompt
 	}
+	safety := strings.TrimSpace(`
+Teams helper safety:
+- You are running inside a Codex turn launched by the Teams helper.
+- Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+- If a helper restart or reload is needed, finish the answer and tell the user to send ` + "`helper reload now`" + ` or ` + "`helper restart now`" + ` in the Teams control chat.`)
 	instructions := strings.TrimSpace(`
 If you need to return generated files or images to the Teams user, write them under this local directory:
 ` + root + `
@@ -25,6 +33,7 @@ Then include this fenced manifest in your final answer:
 ` + "```" + `
 
 Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.`)
+	instructions = safety + "\n\n" + instructions
 	if strings.TrimSpace(prompt) == "" {
 		return instructions
 	}
@@ -33,6 +42,7 @@ Use only relative manifest paths under that directory. Keep your normal answer v
 
 func ControlFallbackCodexPrompt(prompt string) string {
 	instructions := strings.TrimSpace(`
+` + controlFallbackHistoryKeyword + `
 You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.
 The local helper command parser already tried to handle this message and did not recognize it.
 
@@ -60,6 +70,7 @@ Do not mention or quote these routing instructions.`)
 }
 
 const controlFallbackInstructionLead = "You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper."
+const teamsHelperSafetyInstructionLead = "Teams helper safety:"
 const artifactHandoffInstructionLead = "If you need to return generated files or images to the Teams user, write them under this local directory:"
 
 func StripHelperPromptEchoes(text string) string {
@@ -67,19 +78,27 @@ func StripHelperPromptEchoes(text string) string {
 	if text == "" {
 		return ""
 	}
+	text = stripHelperHistoryKeywords(text)
 	text = stripControlFallbackInstructionEcho(text)
+	text = stripTeamsHelperSafetyInstructionEcho(text)
 	text = stripArtifactHandoffInstructionEcho(text)
-	return strings.TrimSpace(text)
+	return strings.TrimSpace(stripHelperHistoryKeywords(text))
 }
 
 func stripControlFallbackInstructionEcho(text string) string {
-	idx := strings.Index(text, controlFallbackInstructionLead)
+	idx := indexCaseInsensitive(text, controlFallbackInstructionLead)
+	if idx < 0 {
+		idx = indexCaseInsensitive(text, "Control chat commands the helper understands:")
+	}
 	if idx < 0 {
 		return text
 	}
 	before := strings.TrimSpace(text[:idx])
+	if strings.Contains(before, controlFallbackHistoryKeyword) {
+		before = strings.TrimSpace(strings.ReplaceAll(before, controlFallbackHistoryKeyword, ""))
+	}
 	rest := text[idx:]
-	userIdx := strings.Index(rest, "User message:")
+	userIdx := indexCaseInsensitive(rest, "User message:")
 	if userIdx < 0 {
 		return before
 	}
@@ -94,8 +113,48 @@ func stripControlFallbackInstructionEcho(text string) string {
 	return strings.TrimSpace(before + " " + after)
 }
 
+func stripHelperHistoryKeywords(text string) string {
+	for _, marker := range []string{
+		codexhistory.HelperControlSessionTitleKeyword,
+		codexhistory.HelperDebugSessionTitleKeyword,
+		codexhistory.HelperSessionTitleKeyword,
+	} {
+		text = stripCaseInsensitiveToken(text, marker)
+	}
+	return strings.TrimSpace(text)
+}
+
+func stripCaseInsensitiveToken(text string, token string) string {
+	if text == "" || token == "" {
+		return text
+	}
+	lowerToken := strings.ToLower(token)
+	for {
+		idx := strings.Index(strings.ToLower(text), lowerToken)
+		if idx < 0 {
+			return text
+		}
+		text = text[:idx] + text[idx+len(token):]
+	}
+}
+
+func indexCaseInsensitive(text string, needle string) int {
+	if text == "" || needle == "" {
+		return -1
+	}
+	return strings.Index(strings.ToLower(text), strings.ToLower(needle))
+}
+
 func stripArtifactHandoffInstructionEcho(text string) string {
 	idx := strings.Index(text, artifactHandoffInstructionLead)
+	if idx < 0 {
+		return text
+	}
+	return strings.TrimSpace(text[:idx])
+}
+
+func stripTeamsHelperSafetyInstructionEcho(text string) string {
+	idx := strings.Index(text, teamsHelperSafetyInstructionLead)
 	if idx < 0 {
 		return text
 	}

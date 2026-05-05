@@ -64,6 +64,9 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	if runCmd.Flags().Lookup("auto-update") == nil || runCmd.Flags().Lookup("auto-update-repo") == nil {
 		t.Fatal("teams run should expose Teams helper auto-update flags")
 	}
+	if runCmd.Flags().Lookup("auto-service") == nil {
+		t.Fatal("teams run should expose Teams helper background service auto-ensure flag")
+	}
 	if flag := runCmd.Flags().Lookup("codex-timeout"); flag == nil {
 		t.Fatal("teams run should expose --codex-timeout")
 	} else if flag.DefValue != "0s" {
@@ -95,6 +98,8 @@ func TestRestartTeamsHelperFromTeamsWindowsServiceSchedulesTaskStart(t *testing.
 		exitFunc = prevExit
 		teamsServicePowerShellExecutable = prevPowerShell
 	})
+	t.Setenv(envTeamsCodexChild, "")
+	t.Setenv(envTeamsCodexParentPID, "")
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
 	teamsServiceGOOS = func() string { return "windows" }
 	teamsServicePowerShellExecutable = func() string { return "powershell.exe" }
@@ -120,6 +125,75 @@ func TestRestartTeamsHelperFromTeamsWindowsServiceSchedulesTaskStart(t *testing.
 	}
 	if gotName != "powershell.exe" || !strings.Contains(strings.Join(gotArgs, " "), "Start-ScheduledTask") {
 		t.Fatalf("detached restart command = %q %#v, want scheduled task start", gotName, gotArgs)
+	}
+}
+
+func TestRestartTeamsHelperFromTeamsRefusesTeamsCodexChild(t *testing.T) {
+	t.Setenv(envTeamsCodexChild, "1")
+	err := restartTeamsHelperFromTeams(context.Background())
+	if err == nil {
+		t.Fatal("restartTeamsHelperFromTeams error = nil, want refusal")
+	}
+	if !strings.Contains(err.Error(), "helper restart now") || !strings.Contains(err.Error(), "launched by Teams helper") {
+		t.Fatalf("restartTeamsHelperFromTeams error = %v, want Teams child refusal", err)
+	}
+}
+
+func TestTeamsServiceRestartRefusesTeamsCodexChild(t *testing.T) {
+	t.Setenv(envTeamsCodexChild, "1")
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"teams", "service", "restart"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("teams service restart error = nil, want refusal")
+	}
+	if !strings.Contains(err.Error(), "helper restart now") || !strings.Contains(err.Error(), "launched by Teams helper") {
+		t.Fatalf("teams service restart error = %v, want Teams child refusal", err)
+	}
+}
+
+func TestTeamsServiceStopRefusesTeamsCodexChild(t *testing.T) {
+	t.Setenv(envTeamsCodexChild, "1")
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"teams", "service", "stop"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("teams service stop error = nil, want refusal")
+	}
+	if !strings.Contains(err.Error(), "helper restart now") || !strings.Contains(err.Error(), "launched by Teams helper") {
+		t.Fatalf("teams service stop error = %v, want Teams child refusal", err)
+	}
+}
+
+func TestTeamsServiceMutationsRefuseTeamsCodexChild(t *testing.T) {
+	for _, args := range [][]string{
+		{"teams", "service", "install"},
+		{"teams", "service", "bootstrap"},
+		{"teams", "service", "enable"},
+		{"teams", "service", "start"},
+		{"upgrade"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Setenv(envTeamsCodexChild, "1")
+			cmd := newRootCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatalf("%v error = nil, want Teams child refusal", args)
+			}
+			if !strings.Contains(err.Error(), "launched by Teams helper") {
+				t.Fatalf("%v error = %v, want Teams child refusal", args, err)
+			}
+		})
 	}
 }
 

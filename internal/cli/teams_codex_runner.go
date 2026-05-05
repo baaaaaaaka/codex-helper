@@ -52,6 +52,7 @@ func newManagedTeamsCodexExecutor(
 			Fallback:   execRunner,
 			Command:    command,
 			ExtraArgs:  append([]string{}, codexArgs...),
+			ExtraEnv:   teamsCodexChildEnv(),
 			WorkingDir: strings.TrimSpace(workDir),
 			Timeout:    timeout,
 		}
@@ -84,17 +85,40 @@ func (e teamsCodexExecutor) RunWithEventHandler(ctx context.Context, session *te
 		result, err = e.runner.StartThread(ctx, input)
 	}
 	if err != nil {
-		out := teams.ExecutionResult{CodexThreadID: result.ThreadID, CodexTurnID: result.TurnID}
-		if result.ThreadID != "" || result.TurnID != "" || result.Status == codexrunner.TurnStatusStarted || result.Status == codexrunner.TurnStatusInProgress {
+		out := teamsExecutionResultFromCodexTurn(result)
+		if teamsCodexTurnMayStillBeRunning(result) {
 			return out, &teams.AmbiguousExecutionError{ThreadID: result.ThreadID, TurnID: result.TurnID, Err: err}
 		}
 		return out, err
 	}
+	return successfulTeamsExecutionResultFromCodexTurn(result), nil
+}
+
+func teamsCodexTurnMayStillBeRunning(result codexrunner.TurnResult) bool {
+	switch result.Status {
+	case codexrunner.TurnStatusStarted, codexrunner.TurnStatusInProgress:
+		return true
+	case codexrunner.TurnStatusUnknown:
+		return strings.TrimSpace(result.TurnID) != ""
+	default:
+		return false
+	}
+}
+
+func teamsExecutionResultFromCodexTurn(result codexrunner.TurnResult) teams.ExecutionResult {
+	return teams.ExecutionResult{
+		Text:          strings.TrimSpace(result.FinalAgentMessage),
+		CodexThreadID: result.ThreadID,
+		CodexTurnID:   result.TurnID,
+	}
+}
+
+func successfulTeamsExecutionResultFromCodexTurn(result codexrunner.TurnResult) teams.ExecutionResult {
 	text := strings.TrimSpace(result.FinalAgentMessage)
 	if text == "" {
 		text = "(Codex finished without a final message.)"
 	}
-	return teams.ExecutionResult{Text: text, CodexThreadID: result.ThreadID, CodexTurnID: result.TurnID}, nil
+	return teams.ExecutionResult{Text: text, CodexThreadID: result.ThreadID, CodexTurnID: result.TurnID}
 }
 
 type teamsCodexLauncher struct {
@@ -132,6 +156,7 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 	stdoutWriter := codexrunner.NewEventStreamWriter(&stdout, req.EventHandler)
 	opts := runTargetOptions{
 		Cwd:         strings.TrimSpace(req.Dir),
+		ExtraEnv:    teamsCodexChildEnv(),
 		UseProxy:    useProxy,
 		Log:         log,
 		Stdin:       strings.NewReader(req.Stdin),
@@ -242,4 +267,33 @@ func runTeamsUpgradeCodexOnce(cmd interface {
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Codex upgraded before Teams listen: %s\n", path)
 	return nil
+}
+
+func runTeamsCodexUpgradeFromBridge(ctx context.Context, root *rootOptions, out io.Writer, codexPath string) (teams.CodexUpgradeResult, error) {
+	if strings.TrimSpace(codexPath) != "" {
+		return teams.CodexUpgradeResult{}, fmt.Errorf("automatic Codex upgrade cannot be used with --codex-path")
+	}
+	store, _, err := newRootStore(root, "")
+	if err != nil {
+		return teams.CodexUpgradeResult{}, err
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return teams.CodexUpgradeResult{}, err
+	}
+	installOpts := codexInstallOptions{upgradeCodex: true}
+	if upgradeUsesProxy(cfg) {
+		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, "", true, out)
+		if err != nil {
+			return teams.CodexUpgradeResult{}, err
+		}
+		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
+			return withProfileInstallEnv(ctx, store, profile, cfgWithProfile.Instances, runInstall)
+		}
+	}
+	path, err := upgradeCodexInstalledForTeamsRun(ctx, out, installOpts)
+	if err != nil {
+		return teams.CodexUpgradeResult{}, err
+	}
+	return teams.CodexUpgradeResult{Path: path}, nil
 }

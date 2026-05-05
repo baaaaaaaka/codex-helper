@@ -301,6 +301,106 @@ func TestSessionDisplayTitle(t *testing.T) {
 	}
 }
 
+func TestHelperSessionDisplayTitleAndFiltering(t *testing.T) {
+	control := Session{
+		SessionID:   "control-1",
+		FirstPrompt: "You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.\nUser message:\nwhat can I do here",
+		Subagents: []SubagentSession{{
+			AgentID:     "agent-debug",
+			FirstPrompt: "[codex-helper-debug] inspect helper state",
+		}},
+	}
+	debug := Session{SessionID: "debug-1", FirstPrompt: "[codex-helper-debug] live helper e2e smoke"}
+	normalTeamsWork := Session{SessionID: "work-1", FirstPrompt: "Fix the failing tests\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}
+	normalCLI := Session{SessionID: "cli-1", FirstPrompt: "implement customer feature"}
+	normalMarkerMention := Session{SessionID: "marker-mention", FirstPrompt: "Investigate what [codex-helper-control] means in docs"}
+	normalDebugPath := Session{SessionID: "debug-path", FirstPrompt: "customer bug", ProjectPath: "/tmp/scn_docs_customer"}
+	normalLegacyPhrase := Session{SessionID: "legacy-phrase", FirstPrompt: "Document the phrase: unrecognized message from the user's Microsoft Teams control chat for codex-helper"}
+	helperTempDebug := Session{SessionID: "helper-temp-debug", FirstPrompt: "Reply exactly DEFAULT-PROBE-OK", ProjectPath: "/tmp/codex-helper-real-probe"}
+	normalTmpWork := Session{SessionID: "normal-tmp-work", FirstPrompt: "debug production issue in temp workspace", ProjectPath: "/tmp/customer-real-work"}
+	normalNonTempMarker := Session{SessionID: "normal-nontemp-marker", FirstPrompt: "Document why a test uses REAL-DEV-FIXED-example", ProjectPath: "/home/baka/project/customer-docs"}
+	parentWithHelperSubagent := Session{
+		SessionID:   "parent-1",
+		FirstPrompt: "real parent task",
+		Subagents: []SubagentSession{
+			{AgentID: "helper-sub", FirstPrompt: "[codex-helper-debug] inspect helper state"},
+			{AgentID: "real-sub", FirstPrompt: "review the customer patch"},
+		},
+	}
+
+	if got := control.DisplayTitle(); !strings.HasPrefix(got, HelperControlSessionTitleKeyword+" ") {
+		t.Fatalf("control DisplayTitle() = %q, want control helper prefix", got)
+	}
+	if got := debug.DisplayTitle(); !strings.HasPrefix(got, HelperDebugSessionTitleKeyword+" ") {
+		t.Fatalf("debug DisplayTitle() = %q, want debug helper prefix", got)
+	}
+	if got := normalTeamsWork.DisplayTitle(); strings.Contains(got, HelperSessionTitleKeyword) {
+		t.Fatalf("normal Teams work session was marked as helper: %q", got)
+	}
+	if IsHelperSession(normalMarkerMention) {
+		t.Fatalf("normal marker mention was marked as helper: %#v", normalMarkerMention)
+	}
+	if IsHelperSession(normalDebugPath) {
+		t.Fatalf("normal path containing debug-looking marker was marked as helper: %#v", normalDebugPath)
+	}
+	if IsHelperSession(normalLegacyPhrase) {
+		t.Fatalf("normal legacy phrase documentation was marked as helper: %#v", normalLegacyPhrase)
+	}
+	if !IsHelperSession(helperTempDebug) {
+		t.Fatalf("known helper temp debug session was not marked as helper: %#v", helperTempDebug)
+	}
+	if IsHelperSession(normalTmpWork) {
+		t.Fatalf("ordinary /tmp work was marked as helper: %#v", normalTmpWork)
+	}
+	if IsHelperSession(normalNonTempMarker) {
+		t.Fatalf("non-temp marker documentation was marked as helper: %#v", normalNonTempMarker)
+	}
+
+	projects := []Project{{
+		Key:      "p1",
+		Path:     "/repo",
+		Sessions: []Session{control, normalTeamsWork, debug, normalCLI, normalMarkerMention, normalDebugPath, normalLegacyPhrase, helperTempDebug, normalTmpWork, normalNonTempMarker, parentWithHelperSubagent},
+	}, {
+		Key:      "helper-only",
+		Path:     "/tmp/helper",
+		Sessions: []Session{control},
+	}, {
+		Key:  "helper-temp-only",
+		Path: "/tmp/TestLiveBridgeRealDeveloperTasksOptIn123/001/calc-real-dev-20260501T080000Z",
+		Sessions: []Session{{
+			SessionID:   "helper-temp-from-project",
+			FirstPrompt: "Real developer task 1. Run go test ./...",
+		}},
+	}, {
+		Key:  "normal-tmp-only",
+		Path: "/tmp/customer-real-work",
+		Sessions: []Session{{
+			SessionID:   "normal-tmp-from-project",
+			FirstPrompt: "debug production issue in temp workspace",
+		}},
+	}}
+	filtered := FilterUserVisibleProjects(projects)
+	if len(filtered) != 2 {
+		t.Fatalf("filtered projects = %#v, want two user-visible projects", filtered)
+	}
+	if got := len(filtered[0].Sessions); got != 8 {
+		t.Fatalf("filtered sessions = %#v, want eight user-visible sessions", filtered[0].Sessions)
+	}
+	for _, session := range filtered[0].Sessions {
+		if IsHelperSession(session) {
+			t.Fatalf("helper session remained visible: %#v", session)
+		}
+		if session.SessionID == "parent-1" {
+			if got := len(session.Subagents); got != 1 || session.Subagents[0].AgentID != "real-sub" {
+				t.Fatalf("helper subagent was not filtered under visible parent: %#v", session.Subagents)
+			}
+		}
+	}
+	if filtered[1].Key != "normal-tmp-only" || len(filtered[1].Sessions) != 1 {
+		t.Fatalf("normal /tmp project was not preserved: %#v", filtered[1])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ResolveCodexDir
 // ---------------------------------------------------------------------------

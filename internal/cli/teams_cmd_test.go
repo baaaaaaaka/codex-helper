@@ -97,6 +97,41 @@ func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	}
 }
 
+func TestTeamsStatusPrefersScopedDrainingServiceControl(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	legacyStatePath := filepath.Join(configBase, "codex-helper", "teams", "state.json")
+	legacyStore, err := teamsstore.Open(legacyStatePath)
+	if err != nil {
+		t.Fatalf("Open legacy store: %v", err)
+	}
+	if _, err := legacyStore.ClearDrain(context.Background()); err != nil {
+		t.Fatalf("ClearDrain legacy: %v", err)
+	}
+
+	scopedStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope-a", "state.json")
+	scopedStore, err := teamsstore.Open(scopedStatePath)
+	if err != nil {
+		t.Fatalf("Open scoped store: %v", err)
+	}
+	if _, err := scopedStore.SetDraining(context.Background(), teamsstore.HelperReloadReason); err != nil {
+		t.Fatalf("SetDraining scoped: %v", err)
+	}
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"teams", "status"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute teams status: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Service control: draining (codex-proxy reload)") {
+		t.Fatalf("teams status did not surface scoped drain:\n%s", got)
+	}
+}
+
 func TestTeamsStatusCountsScopedRegistrySessions(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -136,6 +171,60 @@ func TestTeamsStatusCountsScopedRegistrySessions(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("teams status output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestTeamsStatusTreatsDeadLocalOwnerAsStopped(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	now := time.Now()
+	owner := teamsstore.OwnerMetadata{
+		PID:            2147483647,
+		Hostname:       hostname,
+		ExecutablePath: "/missing/codex-proxy",
+		HelperVersion:  "v-test",
+		StartedAt:      now,
+		LastHeartbeat:  now,
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ControlChat = teamsstore.ControlChatBinding{
+			TeamsChatID:    "control-chat",
+			TeamsChatTopic: "🏠 Codex Control - host",
+			TeamsChatURL:   "https://teams.example/control",
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed control chat: %v", err)
+	}
+
+	got := executeRootForTeamsTest(t, "teams", "status")
+	for _, want := range []string{
+		"Control chat: configured, listener stopped",
+		"Bridge: not running",
+		"Teams listener: stopped",
+		"Owner: none",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("teams status output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Bridge: running") {
+		t.Fatalf("teams status reported dead owner as running:\n%s", got)
 	}
 }
 

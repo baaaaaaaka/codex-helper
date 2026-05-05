@@ -626,6 +626,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var upgradeCodex bool
 	var autoUpdate bool
 	var autoUpdateRepo string
+	var autoService bool
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
@@ -635,6 +636,11 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 			if upgradeCodex {
 				if err := runTeamsUpgradeCodexOnce(cmd, root, codexPath); err != nil {
 					return err
+				}
+			}
+			if autoService && !once {
+				if err := ensureTeamsServiceForRun(cmd.Context(), registryPath); err != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
 				}
 			}
 			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
@@ -676,6 +682,9 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				HelperRestarter:          restartTeamsHelperFromTeams,
 				HelperReloader:           reloadTeamsHelperFromTeams,
 				HelperAutoUpdater:        helperAutoUpdater,
+				CodexUpgrader: func(ctx context.Context) (teams.CodexUpgradeResult, error) {
+					return runTeamsCodexUpgradeFromBridge(ctx, root, cmd.ErrOrStderr(), codexPath)
+				},
 			})
 		},
 	}
@@ -694,10 +703,14 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&upgradeCodex, "upgrade-codex", false, "Upgrade Codex CLI once before starting Teams polling")
 	cmd.Flags().BoolVar(&autoUpdate, "auto-update", true, "Check codex-helper GitHub releases periodically and apply eligible p0/p1 helper updates")
 	cmd.Flags().StringVar(&autoUpdateRepo, "auto-update-repo", "", "Override GitHub repo for Teams helper auto-update checks")
+	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
 	return cmd
 }
 
 func restartTeamsHelperFromTeams(context.Context) error {
+	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
+		return err
+	}
 	if teamsServiceGOOS() == "windows" && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
 		if err := scheduleDelayedTeamsServiceStart(context.Background()); err != nil {
 			return err
@@ -1449,9 +1462,10 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	for _, lease := range controlLeases {
 		_, _ = fmt.Fprintln(out, lease)
 	}
-	if len(serviceControls) > 0 {
-		_, _ = fmt.Fprintf(out, "Service control: %s\n", formatServiceControl(serviceControls[0]))
+	if serviceControl, ok := summarizeServiceControls(serviceControls); ok {
+		_, _ = fmt.Fprintf(out, "Service control: %s\n", formatServiceControl(serviceControl))
 	}
+	_, _ = fmt.Fprintf(out, "OS service: %s\n", formatTeamsOSServiceStatus(cmd.Context()))
 	if len(owners) == 0 {
 		_, _ = fmt.Fprintln(out, "Bridge: not running")
 		_, _ = fmt.Fprintln(out, "Teams listener: stopped - Teams messages are not being read.")
@@ -1471,6 +1485,29 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		}
 	}
 	return nil
+}
+
+func formatTeamsOSServiceStatus(ctx context.Context) string {
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return "unsupported (" + err.Error() + ")"
+	}
+	name := backend.Name()
+	installed, err := backend.Installed()
+	if err != nil {
+		return fmt.Sprintf("unknown (%s: %s; %v)", backend.ID(), name, err)
+	}
+	if !installed {
+		return fmt.Sprintf("missing (%s: %s)", backend.ID(), name)
+	}
+	active, err := backend.Active(ctx)
+	if err != nil {
+		return fmt.Sprintf("installed, running unknown (%s: %s; %v)", backend.ID(), name, err)
+	}
+	if active {
+		return fmt.Sprintf("installed, running (%s: %s)", backend.ID(), name)
+	}
+	return fmt.Sprintf("installed, not running (%s: %s)", backend.ID(), name)
 }
 
 func printTeamsControlChatLocal(cmd *cobra.Command, registryPath string) error {
@@ -1636,6 +1673,35 @@ func formatServiceControl(control teamsstore.ServiceControl) string {
 		status += ", updated " + control.UpdatedAt.Format(time.RFC3339)
 	}
 	return status
+}
+
+func summarizeServiceControls(controls []teamsstore.ServiceControl) (teamsstore.ServiceControl, bool) {
+	if len(controls) == 0 {
+		return teamsstore.ServiceControl{}, false
+	}
+	best := controls[0]
+	bestRank := serviceControlRank(best)
+	for _, control := range controls[1:] {
+		rank := serviceControlRank(control)
+		if rank > bestRank || (rank == bestRank && control.UpdatedAt.After(best.UpdatedAt)) {
+			best = control
+			bestRank = rank
+		}
+	}
+	return best, true
+}
+
+func serviceControlRank(control teamsstore.ServiceControl) int {
+	switch {
+	case control.Paused && control.Draining:
+		return 3
+	case control.Draining:
+		return 2
+	case control.Paused:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func formatControlReason(control teamsstore.ServiceControl) string {

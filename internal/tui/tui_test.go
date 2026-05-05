@@ -366,6 +366,43 @@ func TestBuildSessionItemsIncludesNewAgent(t *testing.T) {
 	}
 }
 
+func TestBuildProjectAndSessionItemsHideHelperSessions(t *testing.T) {
+	helper := codexhistory.Session{
+		SessionID:   "helper-control",
+		FirstPrompt: "You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.\nUser message:\ndebug",
+	}
+	visible := codexhistory.Session{SessionID: "visible", FirstPrompt: "ship user feature"}
+	tempDebug := codexhistory.Session{SessionID: "temp-debug", FirstPrompt: "Reply exactly DEFAULT-PROBE-OK"}
+	projects := []codexhistory.Project{{
+		Key:      "p1",
+		Path:     "/repo",
+		Sessions: []codexhistory.Session{helper, visible},
+	}, {
+		Key:      "helper-only",
+		Path:     "/tmp/helper-only",
+		Sessions: []codexhistory.Session{helper},
+	}, {
+		Key:      "helper-temp-only",
+		Path:     "/tmp/codex-helper-real-probe",
+		Sessions: []codexhistory.Session{tempDebug},
+	}}
+
+	projectItems := buildProjectItems(projects, "")
+	if len(projectItems) != 1 {
+		t.Fatalf("project items = %#v, want only user-visible project", projectItems)
+	}
+	if projectItems[0].project.Path != "/repo" {
+		t.Fatalf("project path = %q, want /repo", projectItems[0].project.Path)
+	}
+	sessionItems := buildSessionItems(projectItems[0].project, nil)
+	if len(sessionItems) != 2 {
+		t.Fatalf("session items = %#v, want new agent plus visible session", sessionItems)
+	}
+	if sessionItems[1].session.SessionID != "visible" {
+		t.Fatalf("visible session mismatch: %#v", sessionItems[1].session)
+	}
+}
+
 func TestFilterSessionsKeepsNewAgent(t *testing.T) {
 	project := codexhistory.Project{Sessions: []codexhistory.Session{{SessionID: "sess-1"}}}
 	items := buildSessionItems(project, nil)
@@ -402,6 +439,26 @@ func TestBuildSessionItemsShowsSubagentMarkers(t *testing.T) {
 	}
 	if expanded[2].kind != sessionItemSubagent {
 		t.Fatalf("expected subagent row, got %#v", expanded[2])
+	}
+}
+
+func TestBuildSessionItemsFiltersHelperSubagents(t *testing.T) {
+	project := codexhistory.Project{
+		Sessions: []codexhistory.Session{{
+			SessionID:   "sess-1",
+			FirstPrompt: "normal task",
+			Subagents: []codexhistory.SubagentSession{{
+				AgentID:     "helper-sub",
+				FirstPrompt: "[codex-helper-debug] helper smoke",
+			}},
+		}},
+	}
+	items := buildSessionItems(project, map[string]bool{"sess-1": true})
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want new agent plus parent session only", items)
+	}
+	if !strings.HasPrefix(items[1].label, "   ") {
+		t.Fatalf("parent should not show expandable marker after helper subagent filtering: %q", items[1].label)
 	}
 }
 

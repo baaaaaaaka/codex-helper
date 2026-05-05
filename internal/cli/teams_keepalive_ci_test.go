@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -169,11 +171,16 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"New-ScheduledTaskAction",
 		"wsl.exe",
 		"New-ScheduledTaskTrigger -AtLogOn",
+		"RepetitionInterval (New-TimeSpan -Minutes 30)",
+		"RepetitionDuration (New-TimeSpan -Days 3650)",
 		"New-ScheduledTaskSettingsSet",
+		"MultipleInstances IgnoreNew",
 		"RestartCount 999",
 		"New-TimeSpan -Seconds 60",
+		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
 		"Interactive",
 		"RunLevel Limited",
+		"Trigger @($logon, $watchdog)",
 		"Disable-ScheduledTask",
 	} {
 		if !strings.Contains(command, want) {
@@ -208,12 +215,437 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"--cd ",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex home"),
-		wantExe + " teams run --registry",
+		wantExe + " teams run --auto-service=false --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("WSL config missing %q:\n%s", want, config)
 		}
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	if _, err := repairTeamsService(context.Background(), stringPtr("/home/alice/teams registry.json"), teamsServiceRepairOptions{Enable: true, Start: true}); err != nil {
+		t.Fatalf("repairTeamsService error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("WSL repair calls = %#v, want one Register-ScheduledTask call", runner.calls)
+	}
+	command := runner.calls[0].name + " " + strings.Join(runner.calls[0].args, " ")
+	for _, want := range []string{
+		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
+		"Register-ScheduledTask",
+		"Enable-ScheduledTask -TaskName $taskName",
+		"Start-ScheduledTask -TaskName $taskName",
+		"MultipleInstances IgnoreNew",
+		"RepetitionInterval (New-TimeSpan -Minutes 30)",
+		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("WSL repair command missing %q:\n%s", want, command)
+		}
+	}
+	if strings.Contains(command, "Disable-ScheduledTask -TaskName $taskName") {
+		t.Fatalf("WSL repair enable command should not disable task:\n%s", command)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveAutoEnsureWSLRepairsAndStartsFromForeground(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	if err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json")); err != nil {
+		t.Fatalf("ensureTeamsServiceForRun error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("auto ensure calls = %#v, want one repair call", runner.calls)
+	}
+	command := strings.Join(runner.calls[0].args, " ")
+	if !strings.Contains(command, "Enable-ScheduledTask -TaskName $taskName") || !strings.Contains(command, "Start-ScheduledTask -TaskName $taskName") {
+		t.Fatalf("auto ensure did not enable and start foreground WSL task:\n%s", command)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveAutoEnsureWSLServiceModeDoesNotRegisterItself(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+
+	if err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json")); err != nil {
+		t.Fatalf("ensureTeamsServiceForRun service mode error: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("auto ensure service mode should not re-register its own WSL supervisor task: %#v", runner.calls)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapDirectRepairSuccessCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap direct repair error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("bootstrap direct repair calls = %#v, want one", runner.calls)
+	}
+	command := strings.Join(runner.calls[0].args, " ")
+	for _, want := range []string{
+		"Register-ScheduledTask",
+		"Enable-ScheduledTask -TaskName $taskName",
+		"Start-ScheduledTask -TaskName $taskName",
+		"RunLevel Limited",
+		"--auto-service=false",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("bootstrap direct command missing %q:\n%s", want, command)
+		}
+	}
+	if got := out.String(); !strings.Contains(got, "Teams service bootstrap ready: wsl-windows-task-scheduler") {
+		t.Fatalf("bootstrap output missing success mode:\n%s", got)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			nil,
+			[]byte("NVIDIA\\jason\n"),
+			nil,
+		},
+		errs: []error{
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetIn(strings.NewReader("yes\n"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap UAC repair error: %v\noutput:\n%s", err, out.String())
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("bootstrap UAC calls = %#v, want direct, current-user query, elevated repair", runner.calls)
+	}
+	gotOut := out.String()
+	if !strings.Contains(gotOut, "A Windows UAC prompt is about to appear") || !strings.Contains(gotOut, "Type yes to continue") {
+		t.Fatalf("bootstrap did not clearly prompt before UAC:\n%s", gotOut)
+	}
+	elevated := strings.Join(runner.calls[2].args, " ")
+	for _, want := range []string{
+		"Start-Process",
+		"-Verb RunAs",
+		"-Wait",
+		"-PassThru",
+		"Register-ScheduledTask",
+		"RunLevel Limited",
+		"NVIDIA\\jason",
+	} {
+		if !strings.Contains(elevated, want) {
+			t.Fatalf("elevated command missing %q:\n%s", want, elevated)
+		}
+	}
+	for _, forbidden := range []string{"RunLevel Highest", "HighestAvailable", "NT AUTHORITY\\SYSTEM", "-UserId 'SYSTEM'", "LogonType Password"} {
+		if strings.Contains(elevated, forbidden) {
+			t.Fatalf("elevated command must stay current-user least-privilege, found %q:\n%s", forbidden, elevated)
+		}
+	}
+	if got := out.String(); !strings.Contains(got, "Teams service bootstrap ready: wsl-windows-task-scheduler-uac") {
+		t.Fatalf("bootstrap output missing UAC success mode:\n%s", got)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetIn(strings.NewReader("no\n"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap fallback error: %v\noutput:\n%s", err, out.String())
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("bootstrap fallback calls = %#v, want direct repair then Startup fallback", runner.calls)
+	}
+	fallback := strings.Join(runner.calls[1].args, " ")
+	for _, want := range []string{
+		"GetFolderPath('Startup')",
+		"codex-helper\\teams",
+		"System.Threading.Mutex",
+		"wsl.exe",
+		"--auto-service=false",
+		"Start-Process -FilePath $cmdPath -WindowStyle Hidden",
+	} {
+		if !strings.Contains(fallback, want) {
+			t.Fatalf("fallback command missing %q:\n%s", want, fallback)
+		}
+	}
+	if strings.Contains(fallback, "-Verb RunAs") || strings.Contains(fallback, "Register-ScheduledTask") {
+		t.Fatalf("Startup fallback should not use UAC or Task Scheduler:\n%s", fallback)
+	}
+	files, err := filepath.Glob(filepath.Join(tmp, "wsl-task", "codex-helper-teams-wsl-startup-*.txt"))
+	if err != nil {
+		t.Fatalf("glob Startup fallback marker: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("Startup fallback marker files = %#v, want one", files)
+	}
+	if got := out.String(); !strings.Contains(got, "UAC prompt was not confirmed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+		t.Fatalf("bootstrap fallback output missing confirmation and mode:\n%s", got)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapNoUACFallsBackOnTaskFailureCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveScheduledTaskFailureForTest{},
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap", "--no-uac"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap --no-uac fallback error: %v\noutput:\n%s", err, out.String())
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("bootstrap --no-uac calls = %#v, want direct repair then Startup fallback", runner.calls)
+	}
+	if got := out.String(); !strings.Contains(got, "Windows Scheduled Task setup failed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+		t.Fatalf("bootstrap --no-uac output missing generic failure fallback:\n%s", got)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbackOnceCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json"))
+	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") {
+		t.Fatalf("auto ensure access denied error = %v, want Startup fallback diagnostic", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("auto ensure calls = %#v, want direct repair plus fallback install", runner.calls)
+	}
+	fallback := strings.Join(runner.calls[1].args, " ")
+	if strings.Contains(fallback, "Start-Process -FilePath $cmdPath") {
+		t.Fatalf("auto ensure fallback should not start a background watchdog while foreground run is active:\n%s", fallback)
+	}
+	if !strings.Contains(fallback, "GetFolderPath('Startup')") || !strings.Contains(fallback, "--auto-service=false") {
+		t.Fatalf("auto ensure fallback command missing Startup watchdog setup:\n%s", fallback)
+	}
+
+	runner.calls = nil
+	runner.errs = nil
+	if err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json")); err != nil {
+		t.Fatalf("auto ensure with fallback marker should skip retry, got: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("auto ensure should not retry blocked Scheduled Task after fallback marker: %#v", runner.calls)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallbackOnceCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveScheduledTaskFailureForTest{},
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json"))
+	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") || !strings.Contains(err.Error(), "Scheduled Task setup failed") {
+		t.Fatalf("auto ensure task failure error = %v, want Startup fallback diagnostic", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("auto ensure calls = %#v, want direct repair plus fallback install", runner.calls)
+	}
+
+	runner.calls = nil
+	runner.errs = nil
+	if err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json")); err != nil {
+		t.Fatalf("auto ensure with fallback marker should skip retry, got: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("auto ensure should not retry failed Scheduled Task after fallback marker: %#v", runner.calls)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStatusReportsStartupFallbackCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{errTeamsKeepaliveScheduledTaskFailureForTest{}},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte("fallback"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"status"})
+	var out strings.Builder
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("service status with fallback marker error: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Startup watchdog fallback: installed") || !strings.Contains(got, markerPath) {
+		t.Fatalf("service status did not report fallback marker:\n%s", got)
 	}
 }
 
@@ -304,6 +736,196 @@ func TestTeamsBackgroundKeepaliveServiceActionsCI(t *testing.T) {
 	}
 }
 
+func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{output: []byte("ok")}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "windows-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	tests := []struct {
+		action string
+		want   string
+	}{
+		{action: "enable", want: "Enable-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+		{action: "status", want: "Get-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+		{action: "start", want: "Start-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+		{action: "stop", want: "Stop-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+		{action: "restart", want: "Stop-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+		{action: "disable", want: "Disable-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.action, func(t *testing.T) {
+			runner.calls = nil
+			cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+			cmd.SetArgs([]string{tt.action})
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("service %s error: %v", tt.action, err)
+			}
+			if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" {
+				t.Fatalf("service %s calls = %#v, want one powershell.exe call", tt.action, runner.calls)
+			}
+			if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, tt.want) {
+				t.Fatalf("service %s command missing %q:\n%s", tt.action, tt.want, joined)
+			}
+		})
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLInstalledActiveProbeUsesTaskSchedulerCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{output: []byte("ok")}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "windows-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	installed, err := teamsServiceInstalled()
+	if err != nil {
+		t.Fatalf("teamsServiceInstalled error: %v", err)
+	}
+	if !installed {
+		t.Fatal("teamsServiceInstalled = false, want true from mocked Task Scheduler")
+	}
+	active, err := teamsServiceActive(context.Background())
+	if err != nil {
+		t.Fatalf("teamsServiceActive error: %v", err)
+	}
+	if !active {
+		t.Fatal("teamsServiceActive = false, want true from mocked Task Scheduler")
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("WSL probe calls = %#v, want installed and active checks", runner.calls)
+	}
+	for _, call := range runner.calls {
+		joined := strings.Join(call.args, " ")
+		if !strings.Contains(joined, "Get-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default ") {
+			t.Fatalf("WSL probe command missing task lookup:\n%s", joined)
+		}
+		if strings.Contains(joined, "Register-ScheduledTask") || strings.Contains(joined, "systemctl") {
+			t.Fatalf("WSL probe command should be read-only Task Scheduler lookup:\n%s", joined)
+		}
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("real Windows Scheduled Task roundtrip only runs on Windows CI")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(tmp, "codex-home"))
+	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "ci-"+safeWindowsTaskNamePart(filepath.Base(tmp), 16))
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "codex-proxy"),
+		cwd:                  filepath.Join(tmp, "work"),
+		windowsTaskDir:       filepath.Join(tmp, "wsl-task"),
+		isWSL:                true,
+		wslDistro:            "CodexHelperCI",
+		wslLinuxUser:         "runner",
+		powerShellExecutable: "powershell.exe",
+		runner:               teamsServiceExecRunner{},
+	})
+
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	spec := teamsServiceSpec{
+		Executable:   "/home/runner/bin/codex-proxy",
+		WorkingDir:   "/home/runner/work",
+		RegistryPath: "/home/runner/.config/codex-helper/teams-registry.json",
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
+			"CODEX_HOME":                      "/home/runner/.codex",
+			"NO_COLOR":                        "1",
+		},
+	}
+	if _, err := backend.Install(context.Background(), spec); err != nil {
+		t.Fatalf("real WSL-shaped Scheduled Task install failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = backend.Uninstall(context.Background())
+	})
+
+	inspect := "$task = Get-ScheduledTask -TaskName " + powershellSingleQuote(backend.Name()) + "; " +
+		"$task.State; $task.Actions | Format-List Execute,Arguments"
+	data, err := teamsServiceRunPowerShell(context.Background(), inspect)
+	if err != nil {
+		t.Fatalf("inspect real WSL-shaped task: %v", err)
+	}
+	got := string(data)
+	for _, want := range []string{
+		"Disabled",
+		"wsl.exe",
+		"CodexHelperCI",
+		"runner",
+		"--auto-service=false",
+		"teams run",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("real WSL-shaped task missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := backend.Run(context.Background(), "enable"); err != nil {
+		t.Fatalf("enable real WSL-shaped task: %v", err)
+	}
+	if _, err := backend.Run(context.Background(), "disable"); err != nil {
+		t.Fatalf("disable real WSL-shaped task: %v", err)
+	}
+}
+
 type errTeamsKeepaliveAuthMissingForTest struct{}
 
 func (errTeamsKeepaliveAuthMissingForTest) Error() string { return "keepalive auth missing" }
+
+type errTeamsKeepaliveAccessDeniedForTest struct{}
+
+func (errTeamsKeepaliveAccessDeniedForTest) Error() string {
+	return "Register-ScheduledTask : Access is denied. (Exception from HRESULT: 0x80070005 (E_ACCESSDENIED))"
+}
+
+type errTeamsKeepaliveScheduledTaskFailureForTest struct{}
+
+func (errTeamsKeepaliveScheduledTaskFailureForTest) Error() string {
+	return "Register-ScheduledTask failed: exit status 1"
+}
+
+type scriptedTeamsServiceRunner struct {
+	calls   []teamsServiceCommandCall
+	outputs [][]byte
+	errs    []error
+}
+
+func (r *scriptedTeamsServiceRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	idx := len(r.calls)
+	r.calls = append(r.calls, teamsServiceCommandCall{
+		name: name,
+		args: append([]string{}, args...),
+	})
+	var out []byte
+	if idx < len(r.outputs) {
+		out = append([]byte{}, r.outputs[idx]...)
+	}
+	var err error
+	if idx < len(r.errs) {
+		err = r.errs[idx]
+	}
+	return out, err
+}

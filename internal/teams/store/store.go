@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+
+	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
 const (
@@ -71,6 +73,7 @@ const outboxSendLease = 2 * time.Minute
 const (
 	HelperUpgradeReason = "codex-proxy upgrade"
 	HelperReloadReason  = "codex-proxy reload"
+	CodexUpgradeReason  = "codex cli upgrade"
 )
 
 type State struct {
@@ -190,6 +193,7 @@ const (
 type ControlLeaseClaim struct {
 	Scope    ScopeIdentity
 	Machine  MachineRecord
+	Owner    OwnerMetadata
 	Duration time.Duration
 	Now      time.Time
 }
@@ -333,17 +337,25 @@ const (
 )
 
 type UpgradeRequest struct {
-	ID              string         `json:"id"`
-	Phase           UpgradePhase   `json:"phase"`
-	Reason          string         `json:"reason,omitempty"`
-	PreviousControl ServiceControl `json:"previous_control,omitempty"`
-	DeadlineAt      time.Time      `json:"deadline_at,omitempty"`
-	StartedAt       time.Time      `json:"started_at,omitempty"`
-	ReadyAt         time.Time      `json:"ready_at,omitempty"`
-	CompletedAt     time.Time      `json:"completed_at,omitempty"`
-	AbortedAt       time.Time      `json:"aborted_at,omitempty"`
-	AbortReason     string         `json:"abort_reason,omitempty"`
-	UpdatedAt       time.Time      `json:"updated_at,omitempty"`
+	ID                  string                      `json:"id"`
+	Phase               UpgradePhase                `json:"phase"`
+	Reason              string                      `json:"reason,omitempty"`
+	PreviousControl     ServiceControl              `json:"previous_control,omitempty"`
+	NotificationTargets []UpgradeNotificationTarget `json:"notification_targets,omitempty"`
+	DeadlineAt          time.Time                   `json:"deadline_at,omitempty"`
+	StartedAt           time.Time                   `json:"started_at,omitempty"`
+	ReadyAt             time.Time                   `json:"ready_at,omitempty"`
+	CompletedAt         time.Time                   `json:"completed_at,omitempty"`
+	AbortedAt           time.Time                   `json:"aborted_at,omitempty"`
+	AbortReason         string                      `json:"abort_reason,omitempty"`
+	UpdatedAt           time.Time                   `json:"updated_at,omitempty"`
+}
+
+type UpgradeNotificationTarget struct {
+	SessionID   string    `json:"session_id,omitempty"`
+	TurnID      string    `json:"turn_id,omitempty"`
+	TeamsChatID string    `json:"teams_chat_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at,omitempty"`
 }
 
 type AutoUpdateState struct {
@@ -531,6 +543,11 @@ type RecoveryReport struct {
 }
 
 var ErrOwnerLive = errors.New("Teams owner is active")
+
+var (
+	ownerHostname     = os.Hostname
+	ownerProcessAlive = proc.IsAlive
+)
 var ErrUnsupportedSchemaVersion = errors.New("unsupported Teams state schema version")
 var ErrControlLeaseNotHeld = errors.New("Teams control lease is not held by this machine")
 
@@ -783,15 +800,19 @@ func (s *Store) ClaimControlLease(ctx context.Context, claim ControlLeaseClaim) 
 		existing := state.ControlLease
 		existingLive := existing.HolderMachineID != "" && existing.ScopeID == claim.Scope.ID && existing.LeaseUntil.After(now)
 		sameHolder := existingLive && existing.HolderMachineID == machine.ID
+		liveLeaseOwner := false
+		sameOwner := false
 		protectedActiveTurn := false
 		if owner, ok := state.readOwner(); ok {
-			protectedActiveTurn = existingLive &&
-				machine.Priority > existing.Priority &&
+			sameOwner = sameOwnerProcess(owner, claim.Owner)
+			liveLeaseOwner = existingLive &&
 				owner.MachineID == existing.HolderMachineID &&
 				owner.LeaseGeneration == existing.Generation &&
-				owner.ActiveTurnID != ""
+				!IsStale(owner, claim.Duration, now) &&
+				!OwnerAppearsLocallyDead(owner)
+			protectedActiveTurn = liveLeaseOwner && owner.ActiveTurnID != ""
 		}
-		canClaim := !existingLive || sameHolder || machine.Priority > existing.Priority && !protectedActiveTurn
+		canClaim := !existingLive || sameHolder && (!liveLeaseOwner || sameOwner) || machine.Priority > existing.Priority && !liveLeaseOwner && !protectedActiveTurn
 		if canClaim {
 			if sameHolder {
 				if existing.Generation <= 0 {
@@ -1026,6 +1047,31 @@ func (s *Store) MarkUpgradeReady(ctx context.Context, upgradeID string) (Upgrade
 	})
 }
 
+func (s *Store) AddUpgradeNotificationTarget(ctx context.Context, upgradeID string, target UpgradeNotificationTarget) (UpgradeRequest, error) {
+	target.SessionID = strings.TrimSpace(target.SessionID)
+	target.TurnID = strings.TrimSpace(target.TurnID)
+	target.TeamsChatID = strings.TrimSpace(target.TeamsChatID)
+	if target.TeamsChatID == "" {
+		return UpgradeRequest{}, fmt.Errorf("upgrade notification target chat id is required")
+	}
+	return s.updateUpgrade(ctx, upgradeID, func(req UpgradeRequest, now time.Time) (UpgradeRequest, error) {
+		if req.Phase == UpgradePhaseCompleted || req.Phase == UpgradePhaseAborted {
+			return req, nil
+		}
+		if target.CreatedAt.IsZero() {
+			target.CreatedAt = now
+		}
+		targetKey := upgradeNotificationTargetKey(target)
+		for _, existing := range req.NotificationTargets {
+			if upgradeNotificationTargetKey(existing) == targetKey {
+				return req, nil
+			}
+		}
+		req.NotificationTargets = append(req.NotificationTargets, target)
+		return req, nil
+	})
+}
+
 func (s *Store) CompleteUpgrade(ctx context.Context, upgradeID string) (UpgradeRequest, error) {
 	return s.updateUpgrade(ctx, upgradeID, func(req UpgradeRequest, now time.Time) (UpgradeRequest, error) {
 		req.Phase = UpgradePhaseCompleted
@@ -1045,6 +1091,19 @@ func (s *Store) AbortUpgrade(ctx context.Context, upgradeID string, reason strin
 		}
 		return req, nil
 	})
+}
+
+func upgradeNotificationTargetKey(target UpgradeNotificationTarget) string {
+	chatID := strings.TrimSpace(target.TeamsChatID)
+	turnID := strings.TrimSpace(target.TurnID)
+	if turnID != "" {
+		return chatID + "\x00turn\x00" + turnID
+	}
+	sessionID := strings.TrimSpace(target.SessionID)
+	if sessionID != "" {
+		return chatID + "\x00session\x00" + sessionID
+	}
+	return chatID
 }
 
 func CurrentOwner(helperVersion string, activeSessionID string, activeTurnID string, now time.Time) (OwnerMetadata, error) {
@@ -1082,11 +1141,11 @@ func (s *Store) RecordOwnerHeartbeat(ctx context.Context, owner OwnerMetadata, s
 			return err
 		}
 		if existing, ok := state.readOwner(); ok {
-			if sameOwner(existing, next) {
+			if sameOwnerProcess(existing, next) {
 				if !existing.StartedAt.IsZero() {
 					next.StartedAt = existing.StartedAt
 				}
-			} else if !IsStale(existing, staleAfter, now) {
+			} else if !IsStale(existing, staleAfter, now) && !OwnerAppearsLocallyDead(existing) {
 				return &OwnerConflictError{
 					Existing:   existing,
 					Now:        now,
@@ -1122,7 +1181,7 @@ func (s *Store) ClearOwnerIfSame(ctx context.Context, owner OwnerMetadata) (bool
 	cleared := false
 	err := s.Update(ctx, func(state *State) error {
 		existing, ok := state.readOwner()
-		if !ok || !sameOwner(existing, owner) {
+		if !ok || !sameOwnerInstance(existing, owner) {
 			return nil
 		}
 		state.ServiceOwner = nil
@@ -1148,8 +1207,13 @@ func (s *Store) RecoverStaleOwner(ctx context.Context, owner OwnerMetadata, stal
 		switch {
 		case !ok:
 			recovered = true
-		case sameOwner(existing, next):
+		case sameOwnerProcess(existing, next):
+			if !existing.StartedAt.IsZero() {
+				next.StartedAt = existing.StartedAt
+			}
 		case IsStale(existing, staleAfter, now):
+			recovered = true
+		case OwnerAppearsLocallyDead(existing):
 			recovered = true
 		default:
 			return &OwnerConflictError{
@@ -1173,6 +1237,20 @@ func IsStale(owner OwnerMetadata, staleAfter time.Duration, now time.Time) bool 
 		now = time.Now()
 	}
 	return !owner.LastHeartbeat.After(now) && now.Sub(owner.LastHeartbeat) > staleAfter
+}
+
+func OwnerAppearsLocallyDead(owner OwnerMetadata) bool {
+	if owner.PID <= 0 || strings.TrimSpace(owner.Hostname) == "" {
+		return false
+	}
+	hostname, err := ownerHostname()
+	if err != nil || strings.TrimSpace(hostname) == "" {
+		return false
+	}
+	if owner.Hostname != hostname {
+		return false
+	}
+	return !ownerProcessAlive(owner.PID)
 }
 
 func (s *Store) UpdateSession(ctx context.Context, sessionID string, fn func(*State) error) error {
@@ -1465,13 +1543,24 @@ func (s *Store) MarkTurnCompleted(ctx context.Context, turnID string, codexThrea
 }
 
 func (s *Store) MarkTurnFailed(ctx context.Context, turnID string, message string) (Turn, error) {
-	return s.updateTurn(ctx, turnID, func(_ *State, turn Turn, now time.Time) (Turn, error) {
+	return s.MarkTurnFailedWithCodexIDs(ctx, turnID, message, "", "")
+}
+
+func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, message string, codexThreadID string, codexTurnID string) (Turn, error) {
+	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
 		if turn.Status == TurnStatusInterrupted {
 			return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be failed", turn.ID)
 		}
 		turn.Status = TurnStatusFailed
 		turn.FailedAt = now
 		turn.FailureMessage = message
+		if codexThreadID != "" {
+			turn.CodexThreadID = codexThreadID
+		}
+		if codexTurnID != "" {
+			turn.CodexTurnID = codexTurnID
+		}
+		updateSessionFromTurn(state, turn, now)
 		return turn, nil
 	})
 }
@@ -2411,8 +2500,30 @@ func (owner OwnerMetadata) withHeartbeat(now time.Time) (OwnerMetadata, error) {
 	return owner, nil
 }
 
-func sameOwner(a OwnerMetadata, b OwnerMetadata) bool {
-	if a.PID != b.PID || a.Hostname != b.Hostname || a.ExecutablePath != b.ExecutablePath {
+func sameOwnerProcess(a OwnerMetadata, b OwnerMetadata) bool {
+	if a.PID != b.PID || a.Hostname != b.Hostname {
+		return false
+	}
+	if a.ExecutablePath == b.ExecutablePath {
+		return true
+	}
+	return canonicalOwnerExecutablePath(a.ExecutablePath) == canonicalOwnerExecutablePath(b.ExecutablePath)
+}
+
+func canonicalOwnerExecutablePath(path string) string {
+	path = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))
+	if path == "" {
+		return ""
+	}
+	dir, base := filepath.Split(path)
+	if idx := strings.Index(base, ".reload-backup-"); idx >= 0 {
+		return filepath.Join(dir, base[:idx])
+	}
+	return path
+}
+
+func sameOwnerInstance(a OwnerMetadata, b OwnerMetadata) bool {
+	if !sameOwnerProcess(a, b) {
 		return false
 	}
 	if !a.StartedAt.IsZero() && !b.StartedAt.IsZero() {

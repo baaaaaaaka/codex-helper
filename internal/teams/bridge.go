@@ -83,11 +83,18 @@ type BridgeOptions struct {
 	HelperRestarter          HelperRestarter
 	HelperReloader           HelperReloader
 	HelperAutoUpdater        HelperAutoUpdater
+	CodexUpgrader            CodexUpgrader
 }
 
 type HelperRestarter func(context.Context) error
 
 type HelperReloader func(context.Context, HelperReloadOptions) error
+
+type CodexUpgrader func(context.Context) (CodexUpgradeResult, error)
+
+type CodexUpgradeResult struct {
+	Path string
+}
 
 type HelperAutoUpdater interface {
 	Check(context.Context, HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error)
@@ -143,6 +150,7 @@ type Bridge struct {
 	controlFallbackModel      string
 	helperRestarter           HelperRestarter
 	helperReloader            HelperReloader
+	codexUpgrader             CodexUpgrader
 	store                     *teamstore.Store
 	asyncTurns                bool
 	ownerMu                   sync.Mutex
@@ -381,6 +389,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	b.controlFallbackModel = strings.TrimSpace(opts.ControlFallbackModel)
 	b.helperRestarter = opts.HelperRestarter
 	b.helperReloader = opts.HelperReloader
+	b.codexUpgrader = opts.CodexUpgrader
 	b.asyncTurns = !opts.Once
 	b.annotateUserMessages = true
 	if b.executor == nil {
@@ -400,6 +409,12 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	owner.LeaseGeneration = b.currentLeaseGeneration()
 	b.setOwner(owner, opts.OwnerStaleAfter)
 	if err := b.recordOwnerHeartbeat(ctx, "", ""); err != nil {
+		if errors.Is(err, teamstore.ErrOwnerLive) && !opts.Once {
+			return b.runStandbyLoop(ctx, opts)
+		}
+		return err
+	}
+	if err := b.clearStaleHelperReloadDrainOnStart(ctx); err != nil {
 		return err
 	}
 	ownerHeartbeatCtx, cancelOwnerHeartbeat := context.WithCancel(ctx)
@@ -444,7 +459,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 			b.clearOwnerIfSame(context.Background())
 			return b.runStandbyLoop(ctx, opts)
 		}
-		if err := b.recordOwnerHeartbeat(ctx, "", ""); err != nil {
+		if err := b.recordCurrentOwnerHeartbeat(ctx); err != nil {
 			return err
 		}
 		if err := b.flushPendingOutbox(ctx, "", ""); err != nil && b.out != nil {
@@ -455,6 +470,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		if err := b.maybeRunHelperAutoUpdate(ctx, opts); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams helper auto-update error: %v\n", err)
+		}
+		if err := b.maybeRunPendingCodexUpgrade(ctx); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams Codex upgrade error: %v\n", err)
 		}
 		if drained, err := b.drainComplete(ctx); err != nil {
 			return err
@@ -1169,9 +1187,9 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		case DashboardCommandStatus:
 			return b.sendControl(ctx, b.formatSessionList())
 		case DashboardCommandRestart:
-			return b.restartHelperFromControl(ctx, parsed.Argument)
+			return b.restartHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandReload:
-			return b.reloadHelperFromControl(ctx, parsed.Argument)
+			return b.reloadHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandSelect:
 			message, err := b.resolveControlSelection(ctx, parsed.Target)
 			if err != nil {
@@ -1182,7 +1200,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			if control, blocked, err := b.serviceControlBlocksNewWork(ctx); err != nil {
 				return err
 			} else if blocked {
-				if control.Draining && control.Reason == teamstore.HelperUpgradeReason {
+				if serviceControlDefersInput(control) {
 					deferredMsg := msg
 					if resolved, err := b.resolvePublishTargetSessionID(ctx, parsed.Target); err == nil && resolved != "" {
 						deferredMsg.Body.ContentType = "html"
@@ -1233,7 +1251,7 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 	if control, blocked, err := b.serviceControlBlocksNewWork(ctx); err != nil {
 		return err
 	} else if blocked {
-		if control.Draining && control.Reason == teamstore.HelperUpgradeReason {
+		if serviceControlDefersInput(control) {
 			session, err := b.ensureControlFallbackSession(ctx)
 			if err != nil {
 				return err
@@ -1436,7 +1454,7 @@ func unknownControlCommandMessage(text string) string {
 	return fmt.Sprintf("unknown control command: `%s`\n\n%s", name, controlHelpText())
 }
 
-func (b *Bridge) restartHelperFromControl(ctx context.Context, arg string) error {
+func (b *Bridge) restartHelperFromControl(ctx context.Context, msg ChatMessage, arg string) error {
 	arg = strings.TrimSpace(arg)
 	if !helperRestartConfirmed(arg) {
 		return b.sendControl(ctx, strings.Join([]string{
@@ -1454,6 +1472,11 @@ func (b *Bridge) restartHelperFromControl(ctx context.Context, arg string) error
 	}
 	if b.helperRestarter == nil {
 		return b.sendControl(ctx, "⚠️ Helper restart is not available in this helper process. Start it with the normal Teams service command, then try again.")
+	}
+	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_restart"); err != nil {
+		return err
+	} else if duplicate {
+		return nil
 	}
 	if message, blocked, err := b.helperRestartBlockedMessage(ctx, helperRestartForce(arg)); err != nil {
 		return err
@@ -1491,7 +1514,7 @@ func helperRestartForce(arg string) bool {
 	}
 }
 
-func (b *Bridge) reloadHelperFromControl(ctx context.Context, arg string) error {
+func (b *Bridge) reloadHelperFromControl(ctx context.Context, msg ChatMessage, arg string) error {
 	arg = strings.TrimSpace(arg)
 	if !helperReloadConfirmed(arg) {
 		return b.sendControl(ctx, strings.Join([]string{
@@ -1510,6 +1533,11 @@ func (b *Bridge) reloadHelperFromControl(ctx context.Context, arg string) error 
 	if b.helperReloader == nil {
 		return b.sendControl(ctx, "⚠️ Helper reload is not available in this helper process. Start it with the normal Teams service command, then try again.")
 	}
+	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_reload"); err != nil {
+		return err
+	} else if duplicate {
+		return nil
+	}
 	previous, message, blocked, err := b.beginHelperReloadDrain(ctx, helperReloadForce(arg))
 	if err != nil {
 		return err
@@ -1527,7 +1555,7 @@ func (b *Bridge) reloadHelperFromControl(ctx context.Context, arg string) error 
 		return err
 	}
 	reloader := b.helperReloader
-	go b.runDelayedHelperReload(reloader, HelperReloadOptions{Force: helperReloadForce(arg)}, previous)
+	b.runDelayedHelperReload(reloader, HelperReloadOptions{Force: helperReloadForce(arg)}, previous)
 	return nil
 }
 
@@ -1605,6 +1633,25 @@ func (b *Bridge) restoreHelperReloadDrain(ctx context.Context, previous teamstor
 	})
 }
 
+func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	return b.store.Update(ctx, func(state *teamstore.State) error {
+		current := state.ServiceControl
+		if !current.Draining || current.Reason != teamstore.HelperReloadReason {
+			return nil
+		}
+		current.Draining = false
+		if !current.Paused {
+			current.Reason = ""
+		}
+		current.UpdatedAt = time.Now()
+		state.ServiceControl = current
+		return nil
+	})
+}
+
 func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (string, bool, error) {
 	if err := b.ensureStore(); err != nil {
 		return "", false, err
@@ -1644,6 +1691,13 @@ func helperDrainBlockedMessage(control teamstore.ServiceControl, action string) 
 			"",
 			"I will not start another " + action + " during reload.",
 			"Wait for the reload to finish, then send `st`.",
+		}, "\n")
+	case teamstore.CodexUpgradeReason:
+		return strings.Join([]string{
+			"⏳ Codex CLI upgrade is already in progress.",
+			"",
+			"I will not start another " + action + " during the Codex upgrade.",
+			"Wait for the upgrade to finish, then send `st`.",
 		}, "\n")
 	default:
 		if control.Reason != "" {
@@ -1822,6 +1876,179 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrained(ctx context.Context, opts Brid
 	return opts.HelperRestarter(ctx)
 }
 
+func (b *Bridge) requestCodexUpgradeAfterFailure(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, cause error) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	sessionID := ""
+	if session != nil {
+		sessionID = session.ID
+	}
+	notice := strings.Join([]string{
+		"⚠️ Codex CLI needs an update",
+		"",
+		"Codex rejected this request because the installed CLI is too old for the selected model.",
+		"",
+		"I will upgrade Codex after current Codex requests finish. I will not retry this request automatically.",
+		"After the upgrade finishes, send `helper retry last` here.",
+	}, "\n")
+	if b.codexUpgrader == nil {
+		notice = strings.Join([]string{
+			"⚠️ Codex CLI needs an update",
+			"",
+			"Codex rejected this request because the installed CLI is too old for the selected model.",
+			"",
+			"Automatic Codex upgrade is not available in this helper configuration. Upgrade Codex manually, then send `helper retry last` here.",
+		}, "\n")
+	}
+	noticeMsg := teamstore.OutboxMessage{
+		ID:                 "outbox:" + turn.ID + ":codex-upgrade-required",
+		SessionID:          sessionID,
+		TurnID:             turn.ID,
+		TeamsChatID:        chatID,
+		Kind:               "error",
+		Body:               notice + "\n\nOriginal error:\n" + trimTeamsCommandOutput(cause.Error(), 600),
+		UpgradeNonBlocking: true,
+	}
+	if err := b.queueAndBestEffortSendOutbox(ctx, noticeMsg); err != nil {
+		return err
+	}
+	if b.codexUpgrader == nil {
+		return nil
+	}
+	req, err := b.store.BeginUpgrade(ctx, teamstore.CodexUpgradeReason, 30*time.Minute)
+	if err != nil && !errors.Is(err, teamstore.ErrUpgradeInProgress) {
+		return err
+	}
+	if err == nil {
+		if _, targetErr := b.store.AddUpgradeNotificationTarget(ctx, req.ID, teamstore.UpgradeNotificationTarget{
+			SessionID:   sessionID,
+			TurnID:      turn.ID,
+			TeamsChatID: chatID,
+		}); targetErr != nil {
+			return targetErr
+		}
+	}
+	b.boostPolling(time.Now())
+	return nil
+}
+
+func (b *Bridge) maybeRunPendingCodexUpgrade(ctx context.Context) error {
+	if b == nil || b.store == nil || b.codexUpgrader == nil {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if state.Upgrade == nil || state.Upgrade.ID == "" || state.Upgrade.Reason != teamstore.CodexUpgradeReason {
+		return nil
+	}
+	req := *state.Upgrade
+	switch req.Phase {
+	case teamstore.UpgradePhaseCompleted, teamstore.UpgradePhaseAborted:
+		return nil
+	}
+	if teamstore.HasUpgradeBlockingWork(state, time.Now()) {
+		return nil
+	}
+	if req.Phase == teamstore.UpgradePhaseDraining {
+		updated, err := b.store.MarkUpgradeReady(ctx, req.ID)
+		if err != nil {
+			return err
+		}
+		req = updated
+	}
+	result, err := b.codexUpgrader(ctx)
+	if err != nil {
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
+		_ = b.sendControl(context.Background(), "⚠️ Codex CLI upgrade failed\n\n"+err.Error())
+		if targetErr := b.notifyCodexUpgradeTargets(context.Background(), req.NotificationTargets, false, "", err); targetErr != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams Codex upgrade target notification error: %v\n", targetErr)
+		}
+		return err
+	}
+	completed, err := b.store.CompleteUpgrade(ctx, req.ID)
+	if err != nil {
+		return err
+	}
+	body := "✅ Codex CLI upgraded."
+	if strings.TrimSpace(result.Path) != "" {
+		body += "\n\nPath: `" + strings.TrimSpace(result.Path) + "`"
+	}
+	body += "\n\nRetry the failed Work chat request with `helper retry last`."
+	controlErr := b.sendControl(ctx, body)
+	targetErr := b.notifyCodexUpgradeTargets(ctx, completed.NotificationTargets, true, result.Path, nil)
+	if controlErr != nil {
+		return controlErr
+	}
+	return targetErr
+}
+
+func (b *Bridge) notifyCodexUpgradeTargets(ctx context.Context, targets []teamstore.UpgradeNotificationTarget, succeeded bool, path string, cause error) error {
+	seen := map[string]bool{}
+	var firstErr error
+	for _, target := range targets {
+		chatID := strings.TrimSpace(target.TeamsChatID)
+		if chatID == "" || chatID == strings.TrimSpace(b.reg.ControlChatID) {
+			continue
+		}
+		key := chatID + "\x00" + strings.TrimSpace(target.TurnID)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		body := codexUpgradeTargetNoticeBody(succeeded, path, cause)
+		idSeed := firstNonEmptyString(strings.TrimSpace(target.TurnID), strings.TrimSpace(target.SessionID), chatID)
+		msg := teamstore.OutboxMessage{
+			ID:                 "outbox:codex-upgrade-target:" + shortStableID(idSeed) + ":" + fmt.Sprintf("%t", succeeded),
+			SessionID:          strings.TrimSpace(target.SessionID),
+			TurnID:             strings.TrimSpace(target.TurnID),
+			TeamsChatID:        chatID,
+			Kind:               "helper",
+			Body:               body,
+			UpgradeNonBlocking: true,
+		}
+		if err := b.queueAndBestEffortSendOutbox(ctx, msg); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func codexUpgradeTargetNoticeBody(succeeded bool, path string, cause error) string {
+	if succeeded {
+		body := "✅ Codex CLI upgraded.\n\nRetry this request with `helper retry last`."
+		if strings.TrimSpace(path) != "" {
+			body += "\n\nPath: `" + strings.TrimSpace(path) + "`"
+		}
+		return body
+	}
+	body := "⚠️ Codex CLI upgrade failed.\n\nI could not upgrade Codex automatically. Upgrade Codex manually, then retry this request with `helper retry last`."
+	if cause != nil && strings.TrimSpace(cause.Error()) != "" {
+		body += "\n\nError:\n" + trimTeamsCommandOutput(cause.Error(), 600)
+	}
+	return body
+}
+
+func codexErrorRequiresUpgrade(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if !strings.Contains(text, "codex") {
+		return false
+	}
+	if strings.Contains(text, "requires a newer version") ||
+		strings.Contains(text, "newer version of codex") ||
+		strings.Contains(text, "upgrade to the latest") ||
+		strings.Contains(text, "latest app or cli") ||
+		(strings.Contains(text, "model") && strings.Contains(text, "upgrade") && strings.Contains(text, "cli")) {
+		return true
+	}
+	return false
+}
+
 func isWorkOnlyHelperCommand(text string) bool {
 	name, _, syntax, ok := splitDashboardCommand(text)
 	if !ok || syntax != dashboardCommandSyntaxHelp {
@@ -1928,7 +2155,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	if control, blocked, err := b.serviceControlBlocksNewWork(ctx); err != nil {
 		return err
 	} else if blocked {
-		if control.Draining && control.Reason == teamstore.HelperUpgradeReason {
+		if serviceControlDefersInput(control) {
 			inbound, _, err := b.persistControlInboundWithStatus(ctx, msg, teamstore.InboundStatusDeferred, "teams_control_new")
 			if err != nil {
 				return err
@@ -3531,7 +3758,7 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 	}
 	result, err := b.runExecutorWithHeartbeat(ctx, executor, session, turn, chatID, text)
 	if err != nil {
-		if IsAmbiguousExecutionError(err) || result.CodexThreadID != "" || result.CodexTurnID != "" {
+		if IsAmbiguousExecutionError(err) {
 			if _, runningErr := b.store.MarkTurnRunning(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); runningErr != nil {
 				return runningErr
 			}
@@ -3543,8 +3770,14 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 			}
 			return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "interrupted", "Codex accepted the request, but the helper could not confirm whether it finished. I did not retry automatically because that could duplicate work.\n\nCheck recent messages and changed files first. To run the same Teams request again in this same session, send `helper retry last` here. Advanced: `helper retry "+turn.ID+"`.")
 		}
-		if _, markErr := b.store.MarkTurnFailed(ctx, turn.ID, err.Error()); markErr != nil {
+		if _, markErr := b.store.MarkTurnFailedWithCodexIDs(ctx, turn.ID, err.Error(), firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); markErr != nil {
 			return markErr
+		}
+		if codexErrorRequiresUpgrade(err) {
+			if upgradeErr := b.requestCodexUpgradeAfterFailure(ctx, session, turn, chatID, err); upgradeErr != nil {
+				return upgradeErr
+			}
+			return nil
 		}
 		return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "error", "error: "+err.Error())
 	}
@@ -4096,9 +4329,14 @@ func (b *Bridge) claimControlLease(ctx context.Context) (bool, error) {
 	if duration <= 0 {
 		duration = 30 * time.Second
 	}
+	owner, err := teamstore.CurrentOwner("", "", "", time.Now())
+	if err != nil {
+		return false, err
+	}
 	decision, err := b.store.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{
 		Scope:    b.scope,
 		Machine:  b.machine,
+		Owner:    owner,
 		Duration: duration,
 	})
 	if err != nil {
@@ -4229,7 +4467,7 @@ func (b *Bridge) sendDeferredUpgradeNotice(ctx context.Context, chatID string, i
 		TeamsChatID:        chatID,
 		Kind:               "ack",
 		AckKind:            "upgrade_deferred",
-		Body:               "upgrade in progress. I saved this message and will resume it after the helper restarts.",
+		Body:               "upgrade in progress. I saved this message and will resume it after the upgrade finishes.",
 		UpgradeNonBlocking: true,
 	})
 	if err != nil {
@@ -4255,13 +4493,25 @@ func (b *Bridge) serviceControlBlocksNewWork(ctx context.Context) (teamstore.Ser
 	return control, control.Paused || control.Draining, nil
 }
 
+func serviceControlDefersInput(control teamstore.ServiceControl) bool {
+	if !control.Draining {
+		return false
+	}
+	switch control.Reason {
+	case teamstore.HelperUpgradeReason, teamstore.CodexUpgradeReason:
+		return true
+	default:
+		return false
+	}
+}
+
 func (b *Bridge) rejectSessionWork(ctx context.Context, session *Session, msg ChatMessage, control teamstore.ServiceControl) error {
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
 	status := teamstore.InboundStatusIgnored
 	source := "teams"
-	if control.Draining && control.Reason == teamstore.HelperUpgradeReason {
+	if serviceControlDefersInput(control) {
 		status = teamstore.InboundStatusDeferred
 		text := strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content))
 		if len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 {
@@ -4746,6 +4996,20 @@ func (b *Bridge) queueAndSendOutbox(ctx context.Context, msg teamstore.OutboxMes
 	return b.flushPendingOutboxForChat(ctx, queued.TeamsChatID)
 }
 
+func (b *Bridge) queueAndBestEffortSendOutbox(ctx context.Context, msg teamstore.OutboxMessage) error {
+	queued, err := b.queueOutbox(ctx, msg)
+	if err != nil {
+		return err
+	}
+	if queued.Status == teamstore.OutboxStatusSent {
+		return nil
+	}
+	if err := b.flushPendingOutboxForChat(ctx, queued.TeamsChatID); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
+	}
+	return nil
+}
+
 func (b *Bridge) queueOutbox(ctx context.Context, msg teamstore.OutboxMessage) (teamstore.OutboxMessage, error) {
 	if err := b.ensureStore(); err != nil {
 		return teamstore.OutboxMessage{}, err
@@ -4997,7 +5261,11 @@ func (b *Bridge) sendLongToChat(ctx context.Context, chatID string, text string)
 
 func (b *Bridge) discoverDashboardProjects(ctx context.Context) ([]codexhistory.Project, error) {
 	if b == nil {
-		return discoverCodexProjectsForTeams(ctx, "")
+		projects, err := discoverCodexProjectsForTeams(ctx, "")
+		if err != nil {
+			return nil, err
+		}
+		return codexhistory.FilterUserVisibleProjects(projects), nil
 	}
 	now := time.Now()
 	b.dashboardProjectsMu.Lock()
@@ -5012,6 +5280,7 @@ func (b *Bridge) discoverDashboardProjects(ctx context.Context) ([]codexhistory.
 	if err != nil {
 		return nil, err
 	}
+	projects = codexhistory.FilterUserVisibleProjects(projects)
 	cached := cloneCodexProjects(projects)
 	b.dashboardProjectsMu.Lock()
 	b.dashboardProjectsCache = cached
@@ -5753,14 +6022,7 @@ func (b *Bridge) resolvePublishTargetSessionID(ctx context.Context, target Dashb
 		}
 		return sessionID, nil
 	}
-	view, ok, err := b.loadDashboardView(ctx)
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("run `sessions` first so the helper can resolve session number %d", target.Number)
-	}
-	selection, err := ResolveDashboardNumber(ChatScopeControl, view, target.Number, time.Now())
+	selection, err := b.resolveDashboardTarget(ctx, target.Number)
 	if err != nil {
 		return "", err
 	}
@@ -7098,6 +7360,9 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		return "", err
 	}
 	previous := b.previousControlDashboard(ctx)
+	if !dashboardWorkspaceVisibleInProjects(projects, previous.SelectedWorkspaceID) {
+		previous.SelectedWorkspaceID = ""
+	}
 	dashboard := BuildControlDashboard(previous, ControlDashboardInput{
 		Workspaces: dashboardWorkspacesFromProjects(projects),
 		ViewKind:   DashboardViewWorkspaces,
@@ -7180,14 +7445,7 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 	}
 	selectedWorkspaceID := ""
 	if target.IsNumber {
-		view, ok, err := b.loadDashboardView(ctx)
-		if err != nil {
-			return "", err
-		}
-		if !ok {
-			return "", fmt.Errorf("run `projects` first so the helper can resolve workspace number %d", target.Number)
-		}
-		selection, err := ResolveDashboardNumber(ChatScopeControl, view, target.Number, time.Now())
+		selection, err := b.resolveDashboardTarget(ctx, target.Number)
 		if err != nil {
 			return "", err
 		}
@@ -7200,10 +7458,15 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 	} else if view, ok, err := b.loadDashboardView(ctx); err != nil {
 		return "", err
 	} else if ok && view.WorkspaceID != "" {
-		selectedWorkspaceID = view.WorkspaceID
+		if dashboardWorkspaceVisibleInProjects(projects, view.WorkspaceID) {
+			selectedWorkspaceID = view.WorkspaceID
+		}
 	}
 
 	previous := b.previousControlDashboard(ctx)
+	if !dashboardWorkspaceVisibleInProjects(projects, previous.SelectedWorkspaceID) {
+		previous.SelectedWorkspaceID = ""
+	}
 	dashboard := BuildControlDashboard(previous, ControlDashboardInput{
 		Workspaces:          dashboardWorkspacesFromProjects(projects),
 		ViewKind:            DashboardViewSessions,
@@ -7426,7 +7689,52 @@ func (b *Bridge) resolveDashboardTarget(ctx context.Context, number int) (Dashbo
 	if !ok {
 		return DashboardSelection{}, ErrDashboardViewMissing
 	}
-	return ResolveDashboardNumber(ChatScopeControl, view, number, time.Now())
+	selection, err := ResolveDashboardNumber(ChatScopeControl, view, number, time.Now())
+	if err != nil {
+		return DashboardSelection{}, err
+	}
+	if !b.dashboardSelectionStillVisible(ctx, selection) {
+		return DashboardSelection{}, ErrDashboardNumberMissing
+	}
+	return selection, nil
+}
+
+func (b *Bridge) dashboardSelectionStillVisible(ctx context.Context, selection DashboardSelection) bool {
+	projects, err := b.discoverDashboardProjects(ctx)
+	if err != nil {
+		return false
+	}
+	switch selection.Kind {
+	case DashboardSelectionWorkspace:
+		return dashboardWorkspaceVisibleInProjects(projects, selection.WorkspaceID)
+	case DashboardSelectionSession:
+		for _, project := range projects {
+			if workspaceIDForPath(project.Path) != selection.WorkspaceID {
+				continue
+			}
+			for _, session := range project.Sessions {
+				if session.SessionID == selection.SessionID {
+					return true
+				}
+			}
+		}
+	default:
+		return false
+	}
+	return false
+}
+
+func dashboardWorkspaceVisibleInProjects(projects []codexhistory.Project, workspaceID string) bool {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return false
+	}
+	for _, project := range projects {
+		if workspaceIDForPath(project.Path) == workspaceID {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) formatSessionSelection(selection DashboardSelection) string {

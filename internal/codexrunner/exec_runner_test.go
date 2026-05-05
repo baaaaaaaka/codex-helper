@@ -87,6 +87,27 @@ func TestExecRunnerResumeUsesExactThreadIDAndNeverLast(t *testing.T) {
 	}
 }
 
+func TestExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly(t *testing.T) {
+	launcher := &recordingLauncher{
+		result: LaunchResult{
+			Stderr:   []byte("Error: Failed to load cloud requirements (workspace-managed policies)."),
+			ExitCode: 1,
+		},
+	}
+	runner := NewExecRunner(launcher)
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	if !IsKind(err, ErrorCodex) {
+		t.Fatalf("ResumeThread error = %v, want codex failure", err)
+	}
+	if got.ThreadID != "thread-existing" || got.TurnID != "" || got.Status != TurnStatusUnknown {
+		t.Fatalf("unexpected result: %#v", got)
+	}
+	if !strings.Contains(err.Error(), "Failed to load cloud requirements") {
+		t.Fatalf("error did not preserve stderr: %v", err)
+	}
+}
+
 func TestExecRunnerResumeTranslatesSandboxArgForCurrentCodexCLI(t *testing.T) {
 	launcher := &recordingLauncher{
 		result: LaunchResult{Stdout: []byte(strings.Join([]string{

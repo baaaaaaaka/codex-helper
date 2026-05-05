@@ -116,10 +116,11 @@ func ParseDashboardCommand(scope ChatScope, text string) ParsedDashboardCommand 
 }
 
 func parseWorkChatCommand(trimmed string) ParsedDashboardCommand {
-	if commandName, ok := workBareCommandName(trimmed); ok {
+	if commandName, arg, ok := workBareCommandName(trimmed); ok {
 		return ParsedDashboardCommand{
 			Scope:         ChatScopeWork,
 			Name:          commandName,
+			Argument:      arg,
 			HelperCommand: true,
 		}
 	}
@@ -162,17 +163,20 @@ func parseWorkChatCommand(trimmed string) ParsedDashboardCommand {
 	}
 }
 
-func workBareCommandName(text string) (DashboardCommandName, bool) {
+func workBareCommandName(text string) (DashboardCommandName, string, bool) {
 	name, arg := splitDashboardCommandBody(text)
-	if strings.TrimSpace(arg) != "" {
-		return DashboardCommandNone, false
-	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "help", "menu", "?":
-		return DashboardCommandHelp, true
+		if strings.TrimSpace(arg) == "" || isAdvancedHelpArg(arg) {
+			return DashboardCommandHelp, arg, true
+		}
+	case "h":
+		if strings.TrimSpace(arg) == "" || isAdvancedHelpArg(arg) {
+			return DashboardCommandHelp, arg, true
+		}
 	default:
-		return DashboardCommandNone, false
 	}
+	return DashboardCommandNone, "", false
 }
 
 func splitNaturalControlCommand(text string) (string, string, bool) {
