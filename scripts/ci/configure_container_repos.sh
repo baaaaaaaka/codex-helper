@@ -74,7 +74,7 @@ rewrite_ubuntu_archive_mirror() {
   fi
 
   for source_file in "${sources[@]}"; do
-    sed_in_place_ext "s|https?://archive\.ubuntu\.com/ubuntu/?|http://${replacement_host}/ubuntu/|g" "$source_file"
+    sed_in_place_ext "s#https?://(archive|security)\.ubuntu\.com/ubuntu/?#http://${replacement_host}/ubuntu/#g" "$source_file"
   done
 
   local apt_lists

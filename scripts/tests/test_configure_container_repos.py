@@ -86,14 +86,20 @@ class ConfigureContainerReposTests(unittest.TestCase):
             lists_dir.mkdir(parents=True)
             (lists_dir / "stale").write_text("stale", encoding="utf-8")
             sources = apt_dir / "sources.list"
-            sources.write_text("deb http://archive.ubuntu.com/ubuntu focal main\n", encoding="utf-8")
+            sources.write_text(
+                "deb http://archive.ubuntu.com/ubuntu focal main\n"
+                "deb http://security.ubuntu.com/ubuntu focal-security main\n",
+                encoding="utf-8",
+            )
             deb822 = sources_dir / "ubuntu.sources"
             deb822.write_text("URIs: https://archive.ubuntu.com/ubuntu/\n", encoding="utf-8")
 
             proc = self.run_script("ubuntu-azure-archive", root)
 
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("http://azure.archive.ubuntu.com/ubuntu/", sources.read_text(encoding="utf-8"))
+            sources_text = sources.read_text(encoding="utf-8")
+            self.assertIn("http://azure.archive.ubuntu.com/ubuntu/", sources_text)
+            self.assertNotIn("security.ubuntu.com", sources_text)
             self.assertIn("http://azure.archive.ubuntu.com/ubuntu/", deb822.read_text(encoding="utf-8"))
             self.assertFalse((lists_dir / "stale").exists())
 

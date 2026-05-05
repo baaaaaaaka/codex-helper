@@ -8,9 +8,10 @@ fi
 
 retry_attempts="${RETRY_ATTEMPTS:-5}"
 retry_sleep_seconds="${RETRY_SLEEP_SECONDS:-5}"
-apt_retry_attempts="${APT_RETRY_ATTEMPTS:-6}"
+apt_retry_attempts="${APT_RETRY_ATTEMPTS:-4}"
 apt_retry_sleep_seconds="${APT_RETRY_SLEEP_SECONDS:-5}"
 apt_retry_max_sleep_seconds="${APT_RETRY_MAX_SLEEP_SECONDS:-20}"
+apt_acquire_retries="${APT_ACQUIRE_RETRIES:-1}"
 ci_script_dir="${CI_SCRIPT_DIR:-/ci}"
 packages=("$@")
 
@@ -92,10 +93,13 @@ apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   mkdir -p /etc/apt/apt.conf.d
   cat > /etc/apt/apt.conf.d/80codex-ci-retries <<EOF
-Acquire::Retries "${apt_retry_attempts}";
+Acquire::Retries "${apt_acquire_retries}";
 Acquire::http::Timeout "30";
 Acquire::https::Timeout "30";
 EOF
+  if is_ubuntu; then
+    bash "$ci_script_dir/configure_container_repos.sh" ubuntu-azure-archive
+  fi
   if ! strict_apt_update; then
     if is_ubuntu; then
       bash "$ci_script_dir/configure_container_repos.sh" ubuntu-azure-archive
