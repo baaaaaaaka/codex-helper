@@ -190,6 +190,22 @@ func initialSSHProbe(
 	return ops.probe(ctx, prof, false, nil)
 }
 
+func interactiveHostKeyCheckArgs(prof config.Profile) []string {
+	dest := prof.User + "@" + prof.Host
+	args := []string{
+		"-T",
+		"-o", "ConnectTimeout=15",
+		"-o", "PreferredAuthentications=none",
+		"-o", "NumberOfPasswordPrompts=0",
+		"-o", "GSSAPIAuthentication=no",
+		"-p", strconv.Itoa(prof.Port),
+	}
+	args = append(args, prof.SSHArgs...)
+	args = append(args, dest)
+	args = append(args, "exit")
+	return args
+}
+
 func prompt(r *bufio.Reader, label, def string) string {
 	for {
 		if def != "" {
@@ -244,17 +260,8 @@ func promptYesNo(r *bufio.Reader, label string, def bool) bool {
 }
 
 func sshProbe(ctx context.Context, prof config.Profile, interactive bool, stdin io.Reader) error {
-	dest := prof.User + "@" + prof.Host
 	if interactive {
-		args := []string{
-			"-T",
-			"-p", strconv.Itoa(prof.Port),
-		}
-		args = append(args, prof.SSHArgs...)
-		args = append(args, dest)
-		args = append(args, "exit")
-
-		c := exec.CommandContext(ctx, "ssh", args...)
+		c := exec.CommandContext(ctx, "ssh", interactiveHostKeyCheckArgs(prof)...)
 		if stdin == nil {
 			stdin = os.Stdin
 		}
