@@ -134,8 +134,8 @@ func TestLiveBridgeRealCodexUserJourneyOptIn(t *testing.T) {
 	liveSendText(ctx, t, graph, controlChat.ID, "new "+workDir+" -- "+title)
 	workSession := waitForSession("control new")
 	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, workSession.ChatID)
-	if !strings.HasPrefix(workSession.Topic, "💬 ") || !strings.Contains(workSession.Topic, "Codex Work") {
-		t.Fatalf("live work title = %q, want work-chat emoji and work marker", workSession.Topic)
+	if !strings.HasPrefix(workSession.Topic, "💬 ") || strings.Contains(workSession.Topic, "Codex Work") || !strings.Contains(workSession.Topic, "New message in "+filepath.Base(workDir)) {
+		t.Fatalf("live work title = %q, want machine-first placeholder work title", workSession.Topic)
 	}
 	if _, err := store.RecordChatPollSuccess(ctx, workSession.ChatID, time.Now().UTC(), true, false, 0); err != nil {
 		t.Fatalf("seed live work poll cursor failed: %v", err)
@@ -199,8 +199,8 @@ func TestLiveBridgeRealCodexUserJourneyOptIn(t *testing.T) {
 
 	publishedSession, publishStore := publishRealCodexHistoryToLiveTeams(ctx, t, auth, readGraph, graph, tmp, controlChat, localSession, firstThreadID, controlModel, sessionExecutor)
 	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, publishedSession.ChatID)
-	if !strings.HasPrefix(publishedSession.Topic, "💬 ") || !strings.Contains(publishedSession.Topic, "Codex Work") {
-		t.Fatalf("published live work title = %q, want work-chat emoji and marker", publishedSession.Topic)
+	if !strings.HasPrefix(publishedSession.Topic, "💬 ") || strings.Contains(publishedSession.Topic, "Codex Work") {
+		t.Fatalf("published live work title = %q, want machine-first Codex title", publishedSession.Topic)
 	}
 	waitForLiveOutbox(t, ctx, publishStore, publishedSession.ChatID, nil, "published import title", 1, "Imported Codex session history")
 	waitForLiveOutboxKind(t, ctx, publishStore, publishedSession.ChatID, "import-user", "published import user", fileName)

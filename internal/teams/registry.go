@@ -28,6 +28,8 @@ type Session struct {
 	ChatID        string    `json:"chat_id"`
 	ChatURL       string    `json:"chat_url,omitempty"`
 	Topic         string    `json:"topic"`
+	UserTitle     string    `json:"user_title,omitempty"`
+	TitleSource   string    `json:"title_source,omitempty"`
 	Status        string    `json:"status"`
 	CodexThreadID string    `json:"codex_thread_id,omitempty"`
 	Cwd           string    `json:"cwd,omitempty"`

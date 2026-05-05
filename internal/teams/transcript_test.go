@@ -197,6 +197,158 @@ func TestReadSessionTranscriptSinceRefusesMissingCheckpoint(t *testing.T) {
 	}
 }
 
+func TestReadSessionTranscriptSinceMatchesFullTailForSourceCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"session-1"}}`,
+		`{"type":"response_item","payload":{"id":"first","type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}}`,
+		`{"type":"event_msg","payload":{"id":"status-1","type":"agent_message","phase":"commentary","message":"working"}}`,
+		`{"type":"response_item","payload":{"id":"second","type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}}`,
+		`{"type":"response_item","payload":{"id":"third","type":"message","role":"assistant","content":[{"type":"output_text","text":"third"}]}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	full, err := ReadSessionTranscript(path)
+	if err != nil {
+		t.Fatalf("ReadSessionTranscript error: %v", err)
+	}
+	got, err := ReadSessionTranscriptSince(path, "second")
+	if err != nil {
+		t.Fatalf("ReadSessionTranscriptSince error: %v", err)
+	}
+	if len(full.Records) != 4 || len(got.Records) != 1 {
+		t.Fatalf("records full=%#v since=%#v", full.Records, got.Records)
+	}
+	if got.Records[0] != full.Records[3] {
+		t.Fatalf("since tail = %#v, want full tail %#v", got.Records[0], full.Records[3])
+	}
+}
+
+func TestReadSessionTranscriptSinceMatchesFullTailForFallbackCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"session-1"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fallback checkpoint"}]}}`,
+		`{"type":"response_item","payload":{"id":"after","type":"message","role":"assistant","content":[{"type":"output_text","text":"after fallback"}]}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	full, err := ReadSessionTranscript(path)
+	if err != nil {
+		t.Fatalf("ReadSessionTranscript error: %v", err)
+	}
+	if len(full.Records) != 2 {
+		t.Fatalf("full records = %#v, want 2", full.Records)
+	}
+	got, err := ReadSessionTranscriptSince(path, full.Records[0].ItemID)
+	if err != nil {
+		t.Fatalf("ReadSessionTranscriptSince error: %v", err)
+	}
+	if len(got.Records) != 1 || got.Records[0] != full.Records[1] {
+		t.Fatalf("since fallback tail = %#v, want %#v", got.Records, full.Records[1:])
+	}
+}
+
+func TestReadSessionTranscriptSinceRefusesInvalidLineLikeCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"session-1"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fallback checkpoint"}]}}`,
+		`{"type":"response_item","payload":{"id":"after","type":"message","role":"assistant","content":[{"type":"output_text","text":"after fallback"}]}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadSessionTranscriptSince(path, "fallback:session:other-session:line:2:kind:user")
+	if err != nil {
+		t.Fatalf("ReadSessionTranscriptSince error: %v", err)
+	}
+	if len(got.Records) != 0 {
+		t.Fatalf("records for invalid line-like checkpoint = %#v, want none", got.Records)
+	}
+	if len(got.Diagnostics) == 0 || got.Diagnostics[len(got.Diagnostics)-1].Kind != "checkpoint_not_found" {
+		t.Fatalf("diagnostics = %#v, want checkpoint_not_found", got.Diagnostics)
+	}
+}
+
+func TestReadSessionTranscriptSinceFallsBackForPrefixDuplicateSourceIDs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"session-1"}}`,
+		`{"type":"response_item","payload":{"id":"checkpoint","type":"message","role":"user","content":[{"type":"input_text","text":"checkpoint"}]}}`,
+		`{"type":"response_item","payload":{"id":"dup","type":"message","role":"assistant","content":[{"type":"output_text","text":"before dup"}]}}`,
+		`{"type":"response_item","payload":{"id":"after","type":"message","role":"assistant","content":[{"type":"output_text","text":"after"}]}}`,
+		`{"type":"response_item","payload":{"id":"dup","type":"message","role":"assistant","content":[{"type":"output_text","text":"after dup"}]}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	full, err := ReadSessionTranscript(path)
+	if err != nil {
+		t.Fatalf("ReadSessionTranscript error: %v", err)
+	}
+	got, err := ReadSessionTranscriptSince(path, "checkpoint")
+	if err != nil {
+		t.Fatalf("ReadSessionTranscriptSince error: %v", err)
+	}
+	want := full.Records[1:]
+	if len(got.Records) != len(want) {
+		t.Fatalf("records = %#v, want %#v", got.Records, want)
+	}
+	for i := range want {
+		if got.Records[i] != want[i] {
+			t.Fatalf("record %d = %#v, want %#v", i, got.Records[i], want[i])
+		}
+	}
+}
+
+func TestReadSessionTranscriptSinceAvoidsFullParseWorkForTail(t *testing.T) {
+	path, checkpoints := writeBenchmarkTranscript(t, 800, 24)
+	afterKey := checkpoints[len(checkpoints)-20]
+
+	var fullErr error
+	var fullRecords int
+	fullAllocs := testing.AllocsPerRun(3, func() {
+		var transcript Transcript
+		transcript, fullErr = ReadSessionTranscript(path)
+		fullRecords = len(transcript.Records)
+	})
+	if fullErr != nil {
+		t.Fatalf("ReadSessionTranscript error: %v", fullErr)
+	}
+	if fullRecords == 0 {
+		t.Fatal("expected full transcript records")
+	}
+
+	var tailErr error
+	var tailRecords int
+	tailAllocs := testing.AllocsPerRun(5, func() {
+		var transcript Transcript
+		transcript, tailErr = ReadSessionTranscriptSince(path, afterKey)
+		tailRecords = len(transcript.Records)
+	})
+	if tailErr != nil {
+		t.Fatalf("ReadSessionTranscriptSince error: %v", tailErr)
+	}
+	if tailRecords == 0 || tailRecords > 40 {
+		t.Fatalf("tail records = %d, want small non-empty tail", tailRecords)
+	}
+	if tailAllocs >= fullAllocs*0.30 {
+		t.Fatalf("tail read allocations = %.0f, full read allocations = %.0f; tail path appears to be doing full-parse work", tailAllocs, fullAllocs)
+	}
+}
+
 func assertTranscriptRecord(t *testing.T, record TranscriptRecord, wantItemID string, wantDedupeKey string, wantKind TranscriptKind, wantText string, wantLine int) {
 	t.Helper()
 	if record.ItemID != wantItemID {

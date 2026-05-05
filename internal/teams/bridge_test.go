@@ -3223,7 +3223,7 @@ func TestBridgePublishImportsExistingTranscriptInExactTeamsOrder(t *testing.T) {
 	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-3"), "/publish 1"); err != nil {
 		t.Fatalf("/publish error: %v", err)
 	}
-	if !strings.HasPrefix(createdTopic, "💬 Codex Work") || !strings.Contains(createdTopic, "qa-host") {
+	if !strings.HasPrefix(createdTopic, "💬 qa-host - ") || strings.Contains(createdTopic, "Codex Work") || !strings.Contains(createdTopic, "first question") {
 		t.Fatalf("created topic = %q, want work emoji and machine label", createdTopic)
 	}
 
@@ -3579,7 +3579,7 @@ func TestBridgePublishImportsDuplicateSourceIDsWithoutDroppingRecords(t *testing
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
-			writeTestOnlineMeeting(w, "work-chat", "Codex Work - qa - thread-dup")
+			writeTestOnlineMeeting(w, "work-chat", decodeTestOnlineMeetingSubject(t, r))
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
@@ -4083,7 +4083,7 @@ func TestBridgePublishRetryAfterTitleFailureIsNotSkippedByBackgroundSync(t *test
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
-			writeTestOnlineMeeting(w, "work-chat", "Codex Work - qa - thread-alpha")
+			writeTestOnlineMeeting(w, "work-chat", decodeTestOnlineMeetingSubject(t, r))
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {
@@ -6054,8 +6054,12 @@ func TestBridgeControlNewCreatesDirectoryBoundSession(t *testing.T) {
 	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
 		t.Fatalf("workdir was not created: info=%#v err=%v", info, err)
 	}
-	if !strings.Contains(createdTopic, DefaultWorkChatMarker) || !strings.Contains(createdTopic, "s001") || !strings.Contains(createdTopic, filepath.Base(workDir)) {
-		t.Fatalf("created topic = %q, want work marker and session id", createdTopic)
+	if !strings.HasPrefix(createdTopic, DefaultWorkChatMarker+" ") ||
+		!strings.Contains(createdTopic, "New message in "+filepath.Base(workDir)) ||
+		strings.Contains(createdTopic, "Codex Work") ||
+		strings.Contains(createdTopic, "s001") ||
+		strings.Contains(createdTopic, workDir) {
+		t.Fatalf("created topic = %q, want machine-first placeholder work title", createdTopic)
 	}
 	session := bridge.reg.SessionByID("s001")
 	if session == nil || session.Cwd != workDir || session.ChatID != "work-chat" {
@@ -6067,6 +6071,9 @@ func TestBridgeControlNewCreatesDirectoryBoundSession(t *testing.T) {
 	}
 	if got := state.Sessions["s001"].Cwd; got != workDir {
 		t.Fatalf("durable session cwd = %q, want %q", got, workDir)
+	}
+	if got := state.Sessions["s001"].TitleSource; got != sessionTitleSourceAuto {
+		t.Fatalf("durable session title source = %q, want auto", got)
 	}
 	if len(sent) != 3 {
 		t.Fatalf("sent messages = %d, want creation mention, anchor, and control ack", len(sent))
@@ -6188,8 +6195,8 @@ func TestBridgeControlNewUsesSelectedWorkspaceWhenNoDirectoryGiven(t *testing.T)
 	if session == nil || session.Cwd != workDir {
 		t.Fatalf("new without directory did not use selected workspace: %#v", bridge.reg.Sessions)
 	}
-	if !strings.Contains(createdTopic, filepath.Base(workDir)) {
-		t.Fatalf("created topic = %q, want selected workspace title", createdTopic)
+	if !strings.Contains(createdTopic, "New message in "+filepath.Base(workDir)) {
+		t.Fatalf("created topic = %q, want selected workspace placeholder title", createdTopic)
 	}
 	if len(*sent) < 4 {
 		t.Fatalf("sent messages = %#v, want projects, sessions, anchor, control ack", *sent)
@@ -7419,7 +7426,7 @@ func TestBridgeSessionRenameUpdatesTeamsTopicAndDurableState(t *testing.T) {
 	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("rename"), "/rename release audit"); err != nil {
 		t.Fatalf("/rename error: %v", err)
 	}
-	if !strings.Contains(patchedTopic, "release audit") || !strings.Contains(patchedTopic, DefaultWorkChatMarker) {
+	if !strings.HasPrefix(patchedTopic, DefaultWorkChatMarker+" ") || !strings.Contains(patchedTopic, "release audit") || strings.Contains(patchedTopic, "Codex Work") {
 		t.Fatalf("patched topic = %q", patchedTopic)
 	}
 	if got := bridge.reg.SessionByChatID("chat-1").Topic; got != patchedTopic {
@@ -7431,6 +7438,12 @@ func TestBridgeSessionRenameUpdatesTeamsTopicAndDurableState(t *testing.T) {
 	}
 	if got := state.Sessions["s001"].TeamsTopic; got != patchedTopic {
 		t.Fatalf("durable topic = %q, want %q", got, patchedTopic)
+	}
+	if got := state.Sessions["s001"].TitleSource; got != sessionTitleSourceUser {
+		t.Fatalf("durable title source = %q, want user", got)
+	}
+	if got := state.Sessions["s001"].UserTitle; got != "release audit" {
+		t.Fatalf("durable user title = %q, want release audit", got)
 	}
 	if len(sent) != 1 || !strings.Contains(sent[0].Content, "renamed") {
 		t.Fatalf("rename ack = %#v", sent)
@@ -7540,6 +7553,235 @@ func TestBridgeSyncLinkedTranscriptSeedsThenImportsNewRecords(t *testing.T) {
 	}
 	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "new local answer") {
 		t.Fatalf("synced messages = %#v", *sent)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptRefreshesAutoWorkTitleFromCodexHistory(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"fix alpha bug"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				FirstPrompt: "fix alpha bug",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	var patchedTopic string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1":
+			var payload struct {
+				Topic string `json:"topic"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+			patchedTopic = payload.Topic
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.machine.Label = "qa-host"
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	session.Cwd = "/home/user/project/alpha"
+	session.Topic = WorkChatTitle(ChatTitleOptions{
+		MachineLabel: bridge.machine.Label,
+		Topic:        NewWorkChatPlaceholderTitle(session.Cwd),
+		Cwd:          session.Cwd,
+	})
+	session.TitleSource = sessionTitleSourceAuto
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+	wantTopic := "💬 qa-host - fix alpha bug"
+	if patchedTopic != wantTopic {
+		t.Fatalf("patched topic = %q, want %q", patchedTopic, wantTopic)
+	}
+	if got := bridge.reg.SessionByChatID("chat-1").Topic; got != wantTopic {
+		t.Fatalf("registry topic = %q, want %q", got, wantTopic)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if got := state.Sessions["s001"].TeamsTopic; got != wantTopic {
+		t.Fatalf("durable topic = %q, want %q", got, wantTopic)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptDoesNotOverwriteUserWorkTitle(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"real codex title"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				FirstPrompt: "real codex title",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	session.Topic = "💬 qa-host - user room"
+	session.UserTitle = "user room"
+	session.TitleSource = sessionTitleSourceUser
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+	if got := bridge.reg.SessionByChatID("chat-1").Topic; got != "💬 qa-host - user room" {
+		t.Fatalf("registry topic = %q, want manual title preserved", got)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("manual title sync should only seed checkpoint and send nothing, sent=%#v", *sent)
+	}
+}
+
+func TestBridgeRunQueuedTurnRefreshesAutoWorkTitleAfterCodexThreadKnown(t *testing.T) {
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				FirstPrompt: "implement feature",
+				ProjectPath: "/home/user/project/alpha",
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	var patchedTopic string
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1":
+			var payload struct {
+				Topic string `json:"topic"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+			patchedTopic = payload.Topic
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode message: %v", err)
+			}
+			sent = append(sent, bridgeSentMessage{ChatID: "chat-1", Content: body.Body.Content, Mentions: len(body.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "done",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.machine.Label = "qa-host"
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.Cwd = "/home/user/project/alpha"
+	session.Topic = WorkChatTitle(ChatTitleOptions{
+		MachineLabel: bridge.machine.Label,
+		Topic:        NewWorkChatPlaceholderTitle(session.Cwd),
+		Cwd:          session.Cwd,
+	})
+	session.TitleSource = sessionTitleSourceAuto
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{
+		ID:        "turn-1",
+		SessionID: session.ID,
+	})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.runQueuedTurnWithExecutor(context.Background(), executor, session, turn, session.ChatID, "implement feature"); err != nil {
+		t.Fatalf("runQueuedTurn error: %v", err)
+	}
+	wantTopic := "💬 qa-host - implement feature"
+	if patchedTopic != wantTopic {
+		t.Fatalf("patched topic = %q, want %q", patchedTopic, wantTopic)
+	}
+	if len(sent) == 0 || !strings.Contains(PlainTextFromTeamsHTML(sent[len(sent)-1].Content), "done") {
+		t.Fatalf("final response was not sent: %#v", sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if got := state.Sessions["s001"].TeamsTopic; got != wantTopic {
+		t.Fatalf("durable topic = %q, want %q", got, wantTopic)
+	}
+	if got := state.Sessions["s001"].CodexThreadID; got != "thread-1" {
+		t.Fatalf("durable codex thread id = %q, want thread-1", got)
 	}
 }
 

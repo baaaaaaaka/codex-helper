@@ -12,7 +12,7 @@ import (
 const (
 	DefaultMachineChatMarker = "Codex Machine"
 	DefaultControlChatMarker = "🏠 Codex Control"
-	DefaultWorkChatMarker    = "💬 Codex Work"
+	DefaultWorkChatMarker    = "💬"
 
 	DefaultDashboardViewTTL = 10 * time.Minute
 
@@ -71,8 +71,16 @@ func ControlChatTitle(opts ChatTitleOptions) string {
 
 func WorkChatTitle(opts ChatTitleOptions) string {
 	marker := sanitizedTitlePart(opts.Marker, DefaultWorkChatMarker)
-	sessionID := shortTitleIDPart(opts.SessionID, "session")
-	return joinTitleParts(marker, sessionID, DashboardDisplayTitle(opts.UserTitle, opts.Topic, opts.Cwd), machineTitlePart(opts.MachineLabel))
+	machine := machineTitlePart(opts.MachineLabel)
+	return joinTitleParts(strings.TrimSpace(marker+" "+machine), DashboardDisplayTitle(opts.UserTitle, opts.Topic, opts.Cwd))
+}
+
+func NewWorkChatPlaceholderTitle(cwd string) string {
+	workspace := WorkspaceDisplayTitle("", cwd)
+	if workspace == "" {
+		workspace = "workspace"
+	}
+	return "New message in " + workspace
 }
 
 func DashboardDisplayTitle(userTitle string, topic string, cwd string) string {

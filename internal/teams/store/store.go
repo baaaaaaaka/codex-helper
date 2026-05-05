@@ -442,6 +442,8 @@ type SessionContext struct {
 	TeamsChatID       string        `json:"teams_chat_id"`
 	TeamsChatURL      string        `json:"teams_chat_url,omitempty"`
 	TeamsTopic        string        `json:"teams_topic,omitempty"`
+	UserTitle         string        `json:"user_title,omitempty"`
+	TitleSource       string        `json:"title_source,omitempty"`
 	CodexThreadID     string        `json:"codex_thread_id,omitempty"`
 	LatestCodexTurnID string        `json:"latest_codex_turn_id,omitempty"`
 	LatestTurnID      string        `json:"latest_turn_id,omitempty"`

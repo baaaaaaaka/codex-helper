@@ -1706,8 +1706,8 @@ func TestLiveBridgeHelperE2EOptIn(t *testing.T) {
 	}
 	workSession := waitForSession("control new")
 	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, workSession.ChatID)
-	if !strings.HasPrefix(workSession.Topic, "💬 ") || !strings.Contains(workSession.Topic, "Codex Work") {
-		t.Fatalf("live work title = %q, want work-chat emoji and work marker", workSession.Topic)
+	if !strings.HasPrefix(workSession.Topic, "💬 ") || strings.Contains(workSession.Topic, "Codex Work") {
+		t.Fatalf("live work title = %q, want machine-first work title", workSession.Topic)
 	}
 	if _, err := store.RecordChatPollSuccess(ctx, workSession.ChatID, time.Now().UTC(), true, false, 0); err != nil {
 		t.Fatalf("seed live work poll cursor failed: %v", err)
@@ -1828,8 +1828,8 @@ func TestLiveBridgePublishExistingTranscriptOrderOptIn(t *testing.T) {
 	}
 	workSession := bridge.reg.Sessions[0]
 	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, workSession.ChatID)
-	if !strings.HasPrefix(workSession.Topic, "💬 ") || !strings.Contains(workSession.Topic, "Codex Work") {
-		t.Fatalf("live publish work title = %q, want work-chat emoji and marker", workSession.Topic)
+	if !strings.HasPrefix(workSession.Topic, "💬 ") || strings.Contains(workSession.Topic, "Codex Work") {
+		t.Fatalf("live publish work title = %q, want machine-first work title", workSession.Topic)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {

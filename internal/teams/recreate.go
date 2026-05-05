@@ -268,6 +268,8 @@ func (b *Bridge) resetRecreatedSessionChatState(ctx context.Context, oldChatID s
 		current.TeamsChatID = session.ChatID
 		current.TeamsChatURL = session.ChatURL
 		current.TeamsTopic = session.Topic
+		current.UserTitle = session.UserTitle
+		current.TitleSource = session.TitleSource
 		current.CodexThreadID = session.CodexThreadID
 		current.Cwd = session.Cwd
 		if current.CreatedAt.IsZero() {

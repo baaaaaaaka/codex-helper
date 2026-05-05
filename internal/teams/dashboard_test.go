@@ -76,8 +76,11 @@ func TestChatTitlesUseDistinctLeadingEmoji(t *testing.T) {
 		SessionID:    "s001",
 		Topic:        "inspect logs",
 	})
-	if !strings.HasPrefix(work, "💬 ") || !strings.Contains(work, "Codex Work") || !strings.Contains(work, "s001") {
-		t.Fatalf("work title = %q, want leading work-chat emoji, marker, and session id", work)
+	if work != "💬 devbox - inspect logs" {
+		t.Fatalf("work title = %q, want machine-first work title", work)
+	}
+	if strings.Contains(work, "Codex Work") || strings.Contains(work, "s001") {
+		t.Fatalf("work title = %q, should not include legacy marker or helper session id", work)
 	}
 	if control == work {
 		t.Fatalf("control and work titles should be visually distinct: %q", control)
@@ -177,6 +180,11 @@ func TestDashboardTitlesSanitizeAndHidePathDetails(t *testing.T) {
 	})
 	if !strings.Contains(renamed, "Release Room") || strings.Contains(renamed, "old prompt title") {
 		t.Fatalf("renamed work title = %q, want user title only", renamed)
+	}
+
+	placeholder := NewWorkChatPlaceholderTitle("/home/baka/private/client-alpha/secret-repo")
+	if placeholder != "New message in secret-repo" {
+		t.Fatalf("placeholder title = %q, want workspace basename only", placeholder)
 	}
 }
 

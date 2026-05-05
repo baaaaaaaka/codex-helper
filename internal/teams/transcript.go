@@ -27,7 +27,11 @@ const (
 )
 
 type TranscriptParseOptions struct {
-	SourceName string
+	SourceName       string
+	InitialSessionID string
+	InitialThreadID  string
+	InitialTurnID    string
+	InitialLineNo    int
 }
 
 type Transcript struct {
@@ -72,13 +76,18 @@ func ReadSessionTranscript(filePath string) (Transcript, error) {
 }
 
 func ReadSessionTranscriptSince(filePath string, afterKey string) (Transcript, error) {
+	afterKey = strings.TrimSpace(afterKey)
+	if afterKey == "" {
+		return ReadSessionTranscript(filePath)
+	}
+	if transcript, ok, err := readSessionTranscriptSinceFast(filePath, afterKey); err != nil {
+		return transcript, err
+	} else if ok {
+		return transcript, nil
+	}
 	transcript, err := ReadSessionTranscript(filePath)
 	if err != nil {
 		return transcript, err
-	}
-	afterKey = strings.TrimSpace(afterKey)
-	if afterKey == "" {
-		return transcript, nil
 	}
 	for i, record := range transcript.Records {
 		if record.DedupeKey == afterKey || record.ItemID == afterKey {
@@ -94,12 +103,180 @@ func ReadSessionTranscriptSince(filePath string, afterKey string) (Transcript, e
 	return transcript, nil
 }
 
-func ParseCodexTranscript(r io.Reader, opts TranscriptParseOptions) (Transcript, error) {
+func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcript, bool, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return Transcript{}, false, err
+	}
+	defer f.Close()
+
+	sourceName := filePath
+	if abs, err := filepath.Abs(filePath); err == nil {
+		sourceName = abs
+	}
+
+	reader := bufio.NewReaderSize(f, 64*1024)
 	var state transcriptParseState
+	lineNo := 0
+	var offset int64
+	var checkpointOffset int64 = -1
+	checkpointLine := 0
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNo++
+			nextOffset := offset + int64(len(line))
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
+				if checkpointLineMatches(trimmed, lineNo, afterKey, state, sourceName) {
+					advanceTranscriptScanState(trimmed, lineNo, &state)
+					checkpointOffset = nextOffset
+					checkpointLine = lineNo
+					break
+				}
+				advanceTranscriptScanState(trimmed, lineNo, &state)
+			}
+			offset = nextOffset
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return Transcript{}, false, err
+		}
+	}
+	if checkpointOffset < 0 {
+		return Transcript{}, false, nil
+	}
+	if _, err := f.Seek(checkpointOffset, io.SeekStart); err != nil {
+		return Transcript{}, false, err
+	}
+	transcript, err := ParseCodexTranscript(f, TranscriptParseOptions{
+		SourceName:       sourceName,
+		InitialSessionID: state.sessionID,
+		InitialThreadID:  state.threadID,
+		InitialTurnID:    state.turnID,
+		InitialLineNo:    checkpointLine,
+	})
+	if err != nil {
+		return transcript, false, err
+	}
+	if transcriptSuffixMayNeedPrefixSourceCounts(filePath, checkpointOffset, transcript.Records) {
+		return Transcript{}, false, nil
+	}
+	return transcript, true, nil
+}
+
+func checkpointLineMatches(line []byte, lineNo int, afterKey string, state transcriptParseState, sourceName string) bool {
+	afterKey = strings.TrimSpace(afterKey)
+	if afterKey == "" {
+		return false
+	}
+	lineKey, hasLineKey := transcriptCheckpointLineNumber(afterKey)
+	if hasLineKey && lineNo != lineKey {
+		return false
+	}
+	probeKey := strings.TrimPrefix(afterKey, "source:")
+	if probeKey == "" {
+		return false
+	}
+	if !hasLineKey && !bytes.Contains(line, []byte(afterKey)) && !bytes.Contains(line, []byte(probeKey)) {
+		return false
+	}
+	probeState := state
+	records, _ := parseTranscriptLine(line, lineNo, &probeState)
+	for _, record := range records {
+		sourceID := strings.TrimSpace(record.SourceItemID)
+		if sourceID != "" {
+			if afterKey == sourceID || afterKey == "source:"+sourceID || afterKey == sourceID+"#line:"+strconv.Itoa(record.SourceLine) {
+				return true
+			}
+		}
+		if fallbackTranscriptItemID(transcriptFileFingerprint(sourceName, state.sessionID, nil), record.SourceLine, record.Kind) == afterKey {
+			return true
+		}
+	}
+	return false
+}
+
+func transcriptCheckpointLineNumber(key string) (int, bool) {
+	key = strings.TrimSpace(key)
+	for _, marker := range []string{"#line:", ":line:"} {
+		idx := strings.Index(key, marker)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(marker)
+		end := start
+		for end < len(key) && key[end] >= '0' && key[end] <= '9' {
+			end++
+		}
+		if end == start {
+			continue
+		}
+		lineNo, err := strconv.Atoi(key[start:end])
+		if err == nil && lineNo > 0 {
+			return lineNo, true
+		}
+	}
+	return 0, false
+}
+
+func advanceTranscriptScanState(line []byte, lineNo int, state *transcriptParseState) {
+	if len(line) == 0 || state == nil {
+		return
+	}
+	if !bytes.Contains(line, []byte(`"session_meta"`)) &&
+		!bytes.Contains(line, []byte(`"thread.started"`)) &&
+		!bytes.Contains(line, []byte(`"turn.started"`)) &&
+		!bytes.Contains(line, []byte(`"turn.completed"`)) &&
+		!bytes.Contains(line, []byte(`"method"`)) {
+		return
+	}
+	_, _ = parseTranscriptLine(line, lineNo, state)
+}
+
+func transcriptSuffixMayNeedPrefixSourceCounts(filePath string, checkpointOffset int64, records []TranscriptRecord) bool {
+	sourceIDs := make(map[string]struct{})
+	for _, record := range records {
+		if sourceID := strings.TrimSpace(record.SourceItemID); sourceID != "" {
+			sourceIDs[sourceID] = struct{}{}
+		}
+	}
+	if len(sourceIDs) == 0 {
+		return false
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	reader := bufio.NewReaderSize(io.LimitReader(f, checkpointOffset), 64*1024)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			for sourceID := range sourceIDs {
+				if bytes.Contains(line, []byte(sourceID)) {
+					return true
+				}
+			}
+		}
+		if err != nil {
+			return err != io.EOF
+		}
+	}
+}
+
+func ParseCodexTranscript(r io.Reader, opts TranscriptParseOptions) (Transcript, error) {
+	state := transcriptParseState{
+		sessionID: strings.TrimSpace(opts.InitialSessionID),
+		threadID:  strings.TrimSpace(opts.InitialThreadID),
+		turnID:    strings.TrimSpace(opts.InitialTurnID),
+	}
 	transcript := Transcript{SourceName: strings.TrimSpace(opts.SourceName)}
 	reader := bufio.NewReaderSize(r, 64*1024)
 	digest := sha256.New()
-	lineNo := 0
+	lineNo := opts.InitialLineNo
 
 	for {
 		line, err := reader.ReadBytes('\n')

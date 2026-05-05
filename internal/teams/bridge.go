@@ -61,6 +61,11 @@ const (
 	importCheckpointStatusBlocked   = "blocked"
 )
 
+const (
+	sessionTitleSourceAuto = "auto"
+	sessionTitleSourceUser = "user"
+)
+
 type outboxQueueOptions struct {
 	MentionOwner     bool
 	NotificationKind string
@@ -1348,6 +1353,8 @@ func (b *Bridge) controlFallbackSessionFromState(durable teamstore.SessionContex
 		ChatID:        b.reg.ControlChatID,
 		ChatURL:       b.reg.ControlChatURL,
 		Topic:         firstNonEmptyString(b.reg.ControlChatTopic, durable.TeamsTopic),
+		UserTitle:     durable.UserTitle,
+		TitleSource:   durable.TitleSource,
 		Status:        status,
 		CodexThreadID: durable.CodexThreadID,
 		Cwd:           durable.Cwd,
@@ -1359,7 +1366,7 @@ func (b *Bridge) controlFallbackSessionFromState(durable teamstore.SessionContex
 func controlHelpText() string {
 	return strings.Join([]string{
 		"## 🏠 Control chat",
-		"Use this chat to choose a workspace and create or continue 💬 Codex Work chats.",
+		"Use this chat to choose a workspace and create or continue 💬 Work chats.",
 		"",
 		"Start here:",
 		"- `p` / `projects` - choose a workspace",
@@ -2192,15 +2199,11 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	}
 	now := time.Now()
 	sessionID := b.reg.NextSessionID()
-	titleTopic := ""
-	if parsed.Title != "" {
-		titleTopic = SessionTopic(now, parsed.Title)
-	}
 	topic := WorkChatTitle(ChatTitleOptions{
 		MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()),
 		Profile:      b.scope.Profile,
 		SessionID:    sessionID,
-		Topic:        titleTopic,
+		Topic:        NewWorkChatPlaceholderTitle(parsed.WorkDir),
 		Cwd:          parsed.WorkDir,
 	})
 	chat, err := b.createMeetingChat(ctx, topic)
@@ -2208,14 +2211,15 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		return err
 	}
 	session := Session{
-		ID:        sessionID,
-		ChatID:    chat.ID,
-		ChatURL:   chat.WebURL,
-		Topic:     chat.Topic,
-		Status:    "active",
-		Cwd:       parsed.WorkDir,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:          sessionID,
+		ChatID:      chat.ID,
+		ChatURL:     chat.WebURL,
+		Topic:       chat.Topic,
+		TitleSource: sessionTitleSourceAuto,
+		Status:      "active",
+		Cwd:         parsed.WorkDir,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
@@ -3245,6 +3249,8 @@ func (b *Bridge) sessionForIDState(state teamstore.State, sessionID string) *Ses
 		ChatID:        durable.TeamsChatID,
 		ChatURL:       durable.TeamsChatURL,
 		Topic:         durable.TeamsTopic,
+		UserTitle:     durable.UserTitle,
+		TitleSource:   durable.TitleSource,
 		Status:        string(durable.Status),
 		CodexThreadID: durable.CodexThreadID,
 		Cwd:           durable.Cwd,
@@ -3712,6 +3718,8 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 	}
 	topic = SanitizeTopic(topic)
 	session.Topic = topic
+	session.UserTitle = title
+	session.TitleSource = sessionTitleSourceUser
 	session.UpdatedAt = time.Now()
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
@@ -3719,6 +3727,8 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
 		current := state.Sessions[session.ID]
 		current.TeamsTopic = topic
+		current.UserTitle = title
+		current.TitleSource = sessionTitleSourceUser
 		current.UpdatedAt = session.UpdatedAt
 		state.Sessions[session.ID] = current
 		return nil
@@ -3726,6 +3736,99 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 		return err
 	}
 	return b.sendToChat(ctx, session.ChatID, "Work chat renamed.\n\nNew title:\n"+shortenTeamsLine(topic, 96)+"\n\nUse `helper details` to see the full Teams title and link.")
+}
+
+func (b *Bridge) refreshWorkChatTitleFromCodexHistory(ctx context.Context, session *Session) error {
+	if b == nil || session == nil || !sessionAllowsAutoTitleUpdate(*session) || strings.TrimSpace(session.CodexThreadID) == "" {
+		return nil
+	}
+	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	if err != nil {
+		return nil
+	}
+	for _, project := range projects {
+		for _, local := range project.Sessions {
+			if local.SessionID != session.CodexThreadID {
+				continue
+			}
+			if local.ProjectPath == "" {
+				local.ProjectPath = project.Path
+			}
+			return b.maybeUpdateWorkChatTitleFromLocalSession(ctx, session, local)
+		}
+	}
+	return nil
+}
+
+func (b *Bridge) maybeUpdateWorkChatTitleFromLocalSession(ctx context.Context, session *Session, local codexhistory.Session) error {
+	if b == nil || b.graph == nil || session == nil || strings.TrimSpace(session.ChatID) == "" || !sessionAllowsAutoTitleUpdate(*session) {
+		return nil
+	}
+	localTitle := localCodexTitleForWorkChat(local)
+	if localTitle == "" {
+		return nil
+	}
+	desiredTopic := SanitizeTopic(WorkChatTitle(ChatTitleOptions{
+		MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()),
+		Profile:      b.scope.Profile,
+		SessionID:    session.ID,
+		Topic:        localTitle,
+		Cwd:          firstNonEmptyString(local.ProjectPath, session.Cwd),
+	}))
+	if strings.TrimSpace(session.Topic) == desiredTopic {
+		return nil
+	}
+	if err := b.graph.UpdateChatTopic(ctx, session.ChatID, desiredTopic); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams work chat title update skipped for %s: %v\n", session.ID, err)
+		}
+		return nil
+	}
+	now := time.Now()
+	session.Topic = desiredTopic
+	session.TitleSource = sessionTitleSourceAuto
+	session.UpdatedAt = now
+	if current := b.reg.SessionByID(session.ID); current != nil {
+		current.Topic = desiredTopic
+		current.TitleSource = sessionTitleSourceAuto
+		current.UpdatedAt = now
+	}
+	if b.store != nil {
+		if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+			current := state.Sessions[session.ID]
+			if current.ID == "" {
+				return nil
+			}
+			current.TeamsTopic = desiredTopic
+			current.TitleSource = sessionTitleSourceAuto
+			current.UpdatedAt = now
+			state.Sessions[session.ID] = current
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(b.registryPath) != "" {
+		if err := b.Save(); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams registry title save skipped for %s: %v\n", session.ID, err)
+		}
+	}
+	return nil
+}
+
+func sessionAllowsAutoTitleUpdate(session Session) bool {
+	source := strings.ToLower(strings.TrimSpace(session.TitleSource))
+	if source == sessionTitleSourceUser || strings.TrimSpace(session.UserTitle) != "" {
+		return false
+	}
+	return source == sessionTitleSourceAuto
+}
+
+func localCodexTitleForWorkChat(local codexhistory.Session) string {
+	if strings.TrimSpace(local.Summary) == "" && strings.TrimSpace(local.FirstPrompt) == "" {
+		return ""
+	}
+	return strings.TrimSpace(local.DisplayTitle())
 }
 
 func shortenTeamsLine(text string, limit int) string {
@@ -3817,6 +3920,9 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 			return err
 		}
 		b.boostPolling(time.Now())
+	}
+	if err := b.refreshWorkChatTitleFromCodexHistory(ctx, session); err != nil {
+		return err
 	}
 	return b.uploadArtifactsFromResult(ctx, session, turn, result.Text)
 }
@@ -4620,6 +4726,8 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 			ChatID:        durable.TeamsChatID,
 			ChatURL:       durable.TeamsChatURL,
 			Topic:         durable.TeamsTopic,
+			UserTitle:     durable.UserTitle,
+			TitleSource:   durable.TitleSource,
 			Status:        status,
 			CodexThreadID: durable.CodexThreadID,
 			Cwd:           durable.Cwd,
@@ -4711,6 +4819,8 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				TeamsChatID:   session.ChatID,
 				TeamsChatURL:  session.ChatURL,
 				TeamsTopic:    session.Topic,
+				UserTitle:     session.UserTitle,
+				TitleSource:   session.TitleSource,
 				CodexThreadID: session.CodexThreadID,
 				Cwd:           session.Cwd,
 				CreatedAt:     created,
@@ -4836,6 +4946,8 @@ func (b *Bridge) ensureDurableSession(ctx context.Context, session *Session) err
 		TeamsChatID:   session.ChatID,
 		TeamsChatURL:  session.ChatURL,
 		TeamsTopic:    session.Topic,
+		UserTitle:     session.UserTitle,
+		TitleSource:   session.TitleSource,
 		CodexThreadID: session.CodexThreadID,
 		RunnerKind:    "executor",
 		Cwd:           session.Cwd,
@@ -5975,6 +6087,7 @@ func (b *Bridge) publishCodexSessionWithProgress(ctx context.Context, target Das
 		ChatID:        chat.ID,
 		ChatURL:       chat.WebURL,
 		Topic:         chat.Topic,
+		TitleSource:   sessionTitleSourceAuto,
 		Status:        "active",
 		CodexThreadID: local.SessionID,
 		Cwd:           firstNonEmptyString(local.ProjectPath, project.Path),
@@ -6827,6 +6940,9 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	if runningTurnSessions(state)[session.ID] {
 		return nil
 	}
+	if err := b.maybeUpdateWorkChatTitleFromLocalSession(ctx, &session, local); err != nil {
+		return err
+	}
 	checkpoint, hasCheckpoint := state.ImportCheckpoints[checkpointID]
 	if hasCheckpoint {
 		switch checkpoint.Status {
@@ -6882,6 +6998,12 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
+		if shouldSkipBackgroundTranscriptRecord(record) {
+			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
+				return err
+			}
+			continue
+		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
 			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
@@ -6891,7 +7013,6 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
-			shouldSkipBackgroundTranscriptRecord(record) ||
 			dedupe.shouldSkip(record, body) {
 			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
 				return err
@@ -6971,13 +7092,15 @@ func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHa
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
+		if shouldSkipBackgroundTranscriptRecord(record) {
+			continue
+		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
 			continue
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
-			shouldSkipBackgroundTranscriptRecord(record) ||
 			dedupe.shouldSkip(record, body) {
 			continue
 		}
