@@ -108,7 +108,6 @@ func TestInteractiveHostKeyCheckArgsDisableAuthPrompts(t *testing.T) {
 		"\x00-o\x00ConnectTimeout=15\x00",
 		"\x00-o\x00PreferredAuthentications=none\x00",
 		"\x00-o\x00NumberOfPasswordPrompts=0\x00",
-		"\x00-o\x00GSSAPIAuthentication=no\x00",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("interactive host-key args missing %q: %#v", want, args)

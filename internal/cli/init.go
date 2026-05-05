@@ -197,7 +197,6 @@ func interactiveHostKeyCheckArgs(prof config.Profile) []string {
 		"-o", "ConnectTimeout=15",
 		"-o", "PreferredAuthentications=none",
 		"-o", "NumberOfPasswordPrompts=0",
-		"-o", "GSSAPIAuthentication=no",
 		"-p", strconv.Itoa(prof.Port),
 	}
 	args = append(args, prof.SSHArgs...)
