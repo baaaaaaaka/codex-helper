@@ -97,16 +97,26 @@ func (p *HTTPProxy) Close(ctx context.Context) error {
 
 	var closeErr error
 	if ln != nil {
-		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := ln.Close(); err != nil && !isClosedNetworkError(err) {
 			closeErr = err
 		}
 	}
 	if srv != nil {
-		if err := srv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Shutdown(ctx); err != nil && !isClosedNetworkError(err) {
 			closeErr = errors.Join(closeErr, err)
 		}
 	}
 	return closeErr
+}
+
+func isClosedNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
 func (p *HTTPProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
