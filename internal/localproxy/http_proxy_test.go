@@ -326,6 +326,13 @@ func TestHTTPProxyEdgeCases(t *testing.T) {
 	})
 }
 
+func TestIsClosedNetworkErrorAcceptsWindowsCloseMessage(t *testing.T) {
+	err := &net.OpError{Op: "close", Net: "tcp", Err: errors.New("use of closed network connection")}
+	if !isClosedNetworkError(err) {
+		t.Fatalf("isClosedNetworkError(%v) = false, want true", err)
+	}
+}
+
 func startHTTPOrigin(t *testing.T) (addr string, closeFn func()) {
 	t.Helper()
 
