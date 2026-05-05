@@ -109,6 +109,50 @@ func (e *serialStreamingExecutor) promptSnapshot() []string {
 	return append([]string(nil), e.prompts...)
 }
 
+type parallelSessionStart struct {
+	SessionID string
+	Prompt    string
+}
+
+type parallelBlockingExecutor struct {
+	started chan parallelSessionStart
+	release chan struct{}
+	mu      sync.Mutex
+	prompts map[string][]string
+}
+
+func (e *parallelBlockingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunWithEventHandler(ctx, session, prompt, nil)
+}
+
+func (e *parallelBlockingExecutor) RunWithEventHandler(ctx context.Context, session *Session, prompt string, _ codexrunner.EventHandler) (ExecutionResult, error) {
+	sessionID := ""
+	if session != nil {
+		sessionID = session.ID
+	}
+	visible := strings.TrimSpace(StripHelperPromptEchoes(prompt))
+	e.mu.Lock()
+	if e.prompts == nil {
+		e.prompts = make(map[string][]string)
+	}
+	e.prompts[sessionID] = append(e.prompts[sessionID], visible)
+	count := len(e.prompts[sessionID])
+	e.mu.Unlock()
+	e.started <- parallelSessionStart{SessionID: sessionID, Prompt: visible}
+	select {
+	case <-ctx.Done():
+		return ExecutionResult{}, ctx.Err()
+	case <-e.release:
+		return ExecutionResult{Text: fmt.Sprintf("done %s %d: %s", sessionID, count, visible), CodexThreadID: "thread-" + sessionID, CodexTurnID: fmt.Sprintf("turn-%s-%d", sessionID, count)}, nil
+	}
+}
+
+func (e *parallelBlockingExecutor) promptCount(sessionID string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.prompts[sessionID])
+}
+
 type blockingExecutor struct {
 	started chan struct{}
 	release chan struct{}
@@ -493,6 +537,21 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	waitForOutboxBody(t, store, "⚠️ **Your request is queued.**")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", second, "second prompt"); err != nil {
+		t.Fatalf("duplicate second handleSessionMessage error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after duplicate second: %v", err)
+	}
+	if got := queuedTurnCountForSession(state, "s001"); got != 1 {
+		t.Fatalf("queued turns after duplicate second = %d, want 1", got)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("duplicate second started a Codex turn before first finished: %q", got)
+	default:
+	}
 
 	executor.release <- struct{}{}
 	select {
@@ -528,6 +587,85 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("async queue transcript missing %q in:\n%s", want, joined)
 		}
+	}
+}
+
+func TestBridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession(t *testing.T) {
+	graph, _ := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 10),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	now := time.Now()
+	bridge.reg.Sessions = []Session{
+		{ID: "s001", ChatID: "chat-1", ChatURL: "https://teams.example/chat-1", Topic: "one", Status: "active", CreatedAt: now, UpdatedAt: now},
+		{ID: "s002", ChatID: "chat-2", ChatURL: "https://teams.example/chat-2", Topic: "two", Status: "active", CreatedAt: now, UpdatedAt: now},
+		{ID: "s003", ChatID: "chat-3", ChatURL: "https://teams.example/chat-3", Topic: "three", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}
+	ctx := context.Background()
+
+	for _, session := range bridge.reg.Sessions {
+		prompt := "first prompt for " + session.ID
+		msg := bridgePollMessage("first-"+session.ID, "2026-05-03T01:00:00Z", prompt)
+		if err := bridge.handleSessionMessage(ctx, session.ChatID, msg, prompt); err != nil {
+			t.Fatalf("handle first %s error: %v", session.ID, err)
+		}
+	}
+	startedBySession := map[string]string{}
+	for len(startedBySession) < 3 {
+		select {
+		case got := <-executor.started:
+			startedBySession[got.SessionID] = got.Prompt
+		case <-time.After(bridgeAsyncTestTimeout):
+			t.Fatalf("timed out waiting for parallel starts; got %#v", startedBySession)
+		}
+	}
+	for _, sessionID := range []string{"s001", "s002", "s003"} {
+		if !strings.Contains(startedBySession[sessionID], "first prompt for "+sessionID) {
+			t.Fatalf("started prompt for %s = %q", sessionID, startedBySession[sessionID])
+		}
+	}
+
+	second := bridgePollMessage("second-s001", "2026-05-03T01:00:05Z", "second prompt for s001")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", second, "second prompt for s001"); err != nil {
+		t.Fatalf("handle second s001 error: %v", err)
+	}
+	if got := executor.promptCount("s001"); got != 1 {
+		t.Fatalf("s001 prompt count while first turn runs = %d, want 1", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if got := queuedTurnCountForSession(state, "s001"); got != 1 {
+		t.Fatalf("queued turns for s001 = %d, want 1 while first turn runs", got)
+	}
+	for _, sessionID := range []string{"s002", "s003"} {
+		if got := queuedTurnCountForSession(state, sessionID); got != 0 {
+			t.Fatalf("queued turns for %s = %d, want 0", sessionID, got)
+		}
+	}
+
+	close(executor.release)
+	select {
+	case got := <-executor.started:
+		if got.SessionID != "s001" || !strings.Contains(got.Prompt, "second prompt for s001") {
+			t.Fatalf("follow-up start = %#v, want serialized second s001 prompt", got)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("second s001 turn did not start after first completed")
+	}
+	waitForCompletedTurnCount(t, store, "s001", 2)
+	waitForCompletedTurnCount(t, store, "s002", 1)
+	waitForCompletedTurnCount(t, store, "s003", 1)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	waitForNoActiveTurnsOrOutbox(t, store, "s002")
+	waitForNoActiveTurnsOrOutbox(t, store, "s003")
+	if got := executor.promptCount("s001"); got != 2 {
+		t.Fatalf("s001 prompt count = %d, want 2", got)
 	}
 }
 
@@ -1217,6 +1355,25 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentOwner error: %v", err)
 	}
+	bridge.scope = ScopeIdentityForUser(bridge.user)
+	bridge.machine = MachineRecordForUser(bridge.user, bridge.scope)
+	decision, err := store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
+		Scope:    bridge.scope,
+		Machine:  bridge.machine,
+		Owner:    owner,
+		Duration: time.Minute,
+		Now:      time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("ClaimControlLease error: %v", err)
+	}
+	if decision.Mode != teamstore.LeaseModeActive {
+		t.Fatalf("ClaimControlLease mode = %q, want active", decision.Mode)
+	}
+	bridge.setControlLease(decision.Lease)
+	owner.ScopeID = bridge.scope.ID
+	owner.MachineID = bridge.machine.ID
+	owner.LeaseGeneration = decision.Lease.Generation
 	bridge.setOwner(owner, time.Minute)
 	bridge.ownerMu.Lock()
 	bridge.ownerHeartbeatInterval = 5 * time.Millisecond
@@ -1249,6 +1406,29 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 	}
 	if activeOwner.ActiveSessionID != "s001" || activeOwner.ActiveTurnID == "" {
 		t.Fatalf("owner was not marked active during turn: %#v", activeOwner)
+	}
+	if activeOwner.MachineID != bridge.machine.ID || activeOwner.LeaseGeneration != decision.Lease.Generation {
+		t.Fatalf("active owner is not tied to current control lease: %#v lease=%#v machine=%#v", activeOwner, decision.Lease, bridge.machine)
+	}
+	competingMachine := bridge.machine
+	competingMachine.ID = bridge.machine.ID + "-competitor"
+	competingMachine.Priority = bridge.machine.Priority + 100
+	competingOwner, err := teamstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("competing CurrentOwner error: %v", err)
+	}
+	competing, err := store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
+		Scope:    bridge.scope,
+		Machine:  competingMachine,
+		Owner:    competingOwner,
+		Duration: time.Minute,
+		Now:      time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("competing ClaimControlLease error: %v", err)
+	}
+	if competing.Mode != teamstore.LeaseModeStandby || competing.Lease.HolderMachineID != bridge.machine.ID {
+		t.Fatalf("active turn should keep competing machine standby: decision=%#v activeOwner=%#v", competing, activeOwner)
 	}
 	contender := activeOwner
 	contender.PID++
@@ -6038,6 +6218,67 @@ func TestBridgeFastPollBoostAfterActivity(t *testing.T) {
 	}
 }
 
+func TestBridgePollOnceBoostsAfterRealInboundAndFinalOutput(t *testing.T) {
+	now := time.Now()
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{bridgePollMessage("work-fast", "2026-05-02T01:05:00Z", "run fast path")},
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if r.URL.Path != "/chats/chat-1/messages" {
+				t.Fatalf("poll path = %s, want chat-1 messages", r.URL.Path)
+			}
+		},
+	}})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{result: ExecutionResult{
+		Text:          "fast final",
+		CodexThreadID: "thread-fast",
+		CodexTurnID:   "turn-fast",
+	}})
+	bridge.readGraph = readGraph
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if got := bridge.nextPollInterval(5*time.Second, time.Now()); got != fastPollInterval {
+		t.Fatalf("nextPollInterval after inbound/final = %v, want %v", got, fastPollInterval)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll chat-1 ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateHot || poll.LastActivityAt.IsZero() || poll.NextPollAt.After(time.Now().Add(2*time.Second)) {
+		t.Fatalf("chat-1 poll after inbound/final = %#v, want hot and due soon", poll)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Codex is working. Request accepted.") || !strings.Contains(joined, "🤖 ✅ Codex answer:\nfast final") {
+		t.Fatalf("sent output missing ack/final:\n%s", joined)
+	}
+}
+
 func TestBridgePollOncePrioritizesControlAfterControlActivity(t *testing.T) {
 	readGraph := newBridgePollGraph(t, []bridgePollPage{{
 		messages: []ChatMessage{bridgePollMessage("control-help", "2026-05-02T01:05:00Z", "help")},
@@ -6157,6 +6398,80 @@ func TestBridgePollOnceRotatesDueWorkChatsWhenPerCycleLimitIsReached(t *testing.
 	}
 }
 
+func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T) {
+	now := time.Now()
+	wantPaths := []string{
+		"/chats/chat-99/messages",
+		"/chats/chat-01/messages",
+	}
+	var pages []bridgePollPage
+	for _, wantPath := range wantPaths {
+		path := wantPath
+		pages = append(pages, bridgePollPage{assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if r.URL.Path != path {
+				t.Fatalf("poll path = %s, want %s", r.URL.Path, path)
+			}
+		}})
+	}
+	readGraph := newBridgePollGraph(t, pages)
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	sessions := []Session{
+		{ID: "s001", ChatID: "chat-01", Status: "active", UpdatedAt: now.Add(-time.Minute)},
+		{ID: "s002", ChatID: "chat-02", Status: "active", UpdatedAt: now.Add(-time.Minute)},
+		{ID: "s099", ChatID: "chat-99", Status: "active", UpdatedAt: now.Add(-time.Hour)},
+	}
+	for _, session := range sessions {
+		if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+			ID:          session.ID,
+			Status:      teamstore.SessionStatusActive,
+			TeamsChatID: session.ChatID,
+			UpdatedAt:   session.UpdatedAt,
+		}); err != nil {
+			t.Fatalf("create session %s: %v", session.ID, err)
+		}
+		if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, now.Add(-time.Minute), true, false, 1); err != nil {
+			t.Fatalf("seed poll %s: %v", session.ChatID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+			ChatID:         session.ChatID,
+			PollState:      inboundPollStateWarm,
+			NextPollAt:     now.Add(-time.Second),
+			LastActivityAt: now.Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("schedule poll %s: %v", session.ChatID, err)
+		}
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{
+		ID:        "turn-running-s099",
+		SessionID: "s099",
+		Status:    teamstore.TurnStatusRunning,
+		StartedAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("queue running turn: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions = sessions
+	bridge.maxWorkChatPollsPerCycle = 2
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+}
+
 func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
 	now := time.Now()
 	readGraph := newBridgePollGraph(t, nil)
@@ -6272,6 +6587,73 @@ func TestBridgeControlResumeKeyReactivatesParkedWorkChat(t *testing.T) {
 	}
 }
 
+func TestBridgeControlResumeKeyOnlyReactivatesMatchingParkedChat(t *testing.T) {
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	now := time.Now()
+	second := Session{ID: "s002", ChatID: "chat-2", ChatURL: "https://teams.example/chat-2", Topic: "topic two", Status: "active", CreatedAt: now, UpdatedAt: now}
+	bridge.reg.Sessions = append(bridge.reg.Sessions, second)
+	for _, session := range bridge.reg.Sessions {
+		if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+			ID:           session.ID,
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  session.ChatID,
+			TeamsChatURL: session.ChatURL,
+			TeamsTopic:   session.Topic,
+		}); err != nil {
+			t.Fatalf("CreateSession %s: %v", session.ID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+			ChatID:         session.ChatID,
+			PollState:      inboundPollStateParked,
+			LastActivityAt: now.Add(-49 * time.Hour),
+		}); err != nil {
+			t.Fatalf("park chat %s: %v", session.ChatID, err)
+		}
+	}
+	key1 := resumeKeyForSession(bridge.reg.Sessions[0])
+	key2 := resumeKeyForSession(second)
+	if key1 == key2 {
+		t.Fatalf("resume keys should be distinct: %s", key1)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("resume-wrong", "2026-05-02T01:05:00Z", "r deadbeef"), "r deadbeef"); err != nil {
+		t.Fatalf("wrong resume command error: %v", err)
+	}
+	for _, session := range bridge.reg.Sessions {
+		poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+		if err != nil || !ok {
+			t.Fatalf("ChatPoll %s ok=%v err=%v", session.ChatID, ok, err)
+		}
+		if poll.PollState != inboundPollStateParked {
+			t.Fatalf("wrong key changed %s poll to %#v", session.ChatID, poll)
+		}
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("resume-s2", "2026-05-02T01:06:00Z", "r "+key2), "r "+key2); err != nil {
+		t.Fatalf("resume s002 command error: %v", err)
+	}
+	poll1, _, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil {
+		t.Fatalf("ChatPoll chat-1: %v", err)
+	}
+	poll2, _, err := store.ChatPoll(context.Background(), "chat-2")
+	if err != nil {
+		t.Fatalf("ChatPoll chat-2: %v", err)
+	}
+	if poll1.PollState != inboundPollStateParked {
+		t.Fatalf("chat-1 poll = %#v, want still parked", poll1)
+	}
+	if poll2.PollState != inboundPollStateHot || poll2.ParkedAt.IsZero() == false || poll2.NextPollAt.After(time.Now().Add(time.Second)) {
+		t.Fatalf("chat-2 poll = %#v, want resumed hot and due", poll2)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Count(joined, "Resumed s002") != 1 || strings.Contains(joined, "Resumed s001") {
+		t.Fatalf("resume output mismatch:\n%s", joined)
+	}
+}
+
 func TestBridgeResumeKeyIgnoresMutableSessionMetadata(t *testing.T) {
 	session := Session{ID: "s001", ChatID: "chat-1", Cwd: "/old", CodexThreadID: "thread-old"}
 	key := resumeKeyForSession(session)
@@ -6337,6 +6719,97 @@ func TestBridgePollChatReadRateLimitBlocksOnlyThatChat(t *testing.T) {
 	}
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("blocked pollOnce should skip chat-1 without reading it: %v", err)
+	}
+}
+
+func TestBridgePollOnceContinuesOtherDueChatsAfterReadRateLimit(t *testing.T) {
+	now := time.Now()
+	requestsByChat := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		requestsByChat[chatID]++
+		if chatID == "chat-1" {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"value":[]}`))
+	}))
+	t.Cleanup(server.Close)
+	readGraph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	var sessions []Session
+	for i := 1; i <= 3; i++ {
+		chatID := fmt.Sprintf("chat-%d", i)
+		sessions = append(sessions, Session{ID: fmt.Sprintf("s%03d", i), ChatID: chatID, Status: "active", UpdatedAt: now.Add(-time.Minute)})
+		if _, err := store.RecordChatPollSuccess(context.Background(), chatID, now.Add(-time.Minute), true, false, 1); err != nil {
+			t.Fatalf("seed poll %s: %v", chatID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+			ChatID:         chatID,
+			PollState:      inboundPollStateWarm,
+			NextPollAt:     now.Add(-time.Second),
+			LastActivityAt: now.Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("schedule poll %s: %v", chatID, err)
+		}
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions = sessions
+	bridge.maxWorkChatPollsPerCycle = 3
+
+	err := bridge.pollOnce(context.Background(), 20)
+	if err == nil || !isGraphRateLimitError(err) {
+		t.Fatalf("pollOnce error = %v, want first chat Graph 429", err)
+	}
+	for _, chatID := range []string{"chat-1", "chat-2", "chat-3"} {
+		want := 1
+		if chatID == "chat-1" {
+			want = defaultGraphRetries + 1
+		}
+		if requestsByChat[chatID] != want {
+			t.Fatalf("requests for %s = %d, want %d; all requests=%#v", chatID, requestsByChat[chatID], want, requestsByChat)
+		}
+	}
+	blocked, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("chat-1 poll ok=%v err=%v", ok, err)
+	}
+	if blocked.PollState != inboundPollStateBlocked || !blocked.BlockedUntil.After(now) {
+		t.Fatalf("chat-1 poll = %#v, want blocked", blocked)
+	}
+	for _, chatID := range []string{"chat-2", "chat-3"} {
+		poll, ok, err := store.ChatPoll(context.Background(), chatID)
+		if err != nil || !ok {
+			t.Fatalf("%s poll ok=%v err=%v", chatID, ok, err)
+		}
+		if poll.PollState == inboundPollStateBlocked || poll.NextPollAt.IsZero() {
+			t.Fatalf("%s poll = %#v, want successful scheduled poll", chatID, poll)
+		}
 	}
 }
 
@@ -7218,6 +7691,12 @@ func TestBridgeSyncLinkedTranscriptDedupesQueuedLiveFinal(t *testing.T) {
 	if checkpoint.LastRecordID != "a2" {
 		t.Fatalf("checkpoint = %#v, want advanced past deduped live final", checkpoint)
 	}
+	if err := bridge.flushPendingOutboxForChat(context.Background(), session.ChatID); err != nil {
+		t.Fatalf("flush queued live final after transcript sync: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), answer) {
+		t.Fatalf("queued live final was not delivered exactly once after sync: %#v", *sent)
+	}
 }
 
 func TestBridgeSyncLinkedTranscriptMirrorsLocalCodexConversation(t *testing.T) {
@@ -7539,12 +8018,28 @@ func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testi
 			t.Fatalf("publish-history output missing %q in:\n%s", want, joined)
 		}
 	}
+	if got, want := strings.Count(joined, "blocked backlog answer "), transcriptSyncMaxAutoBacklogRecords+1; got != want {
+		t.Fatalf("blocked backlog answer count = %d, want %d in:\n%s", got, want, joined)
+	}
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+1; i++ {
+		want := fmt.Sprintf("blocked backlog answer %03d", i)
+		if strings.Count(joined, want) != 1 {
+			t.Fatalf("%q count = %d, want exactly once in:\n%s", want, strings.Count(joined, want), joined)
+		}
+	}
+	requirePlainTextInOrder(t, joined,
+		"paused automatic history sync",
+		"blocked backlog answer 000",
+		fmt.Sprintf("blocked backlog answer %03d", transcriptSyncMaxAutoBacklogRecords),
+		"Import complete",
+		"done 1: teams prompt after catchup",
+	)
 	state, err = store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load final state error: %v", err)
 	}
-	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusComplete {
-		t.Fatalf("checkpoint after publish-history = %#v, want complete", checkpoint)
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID == "" || !strings.Contains(checkpoint.LastRecordID, fmt.Sprintf("a%03d", transcriptSyncMaxAutoBacklogRecords)) {
+		t.Fatalf("checkpoint after publish-history = %#v, want complete at final backlog record", checkpoint)
 	}
 }
 
@@ -8229,6 +8724,36 @@ func TestBridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity(t *testing.T) {
 	if len(*sent) != 1 || !strings.Contains(toolAck, "Your request is queued") || !strings.Contains(toolAck, "Local Codex CLI request") || strings.Contains(toolAck, "Request ahead of you:\nteams prompt during tool") {
 		t.Fatalf("tool-only active ack = %#v", *sent)
 	}
+
+	finishedToolOnly := activeToolOnly +
+		`{"type":"response_item","payload":{"id":"tool-output-local","type":"function_call_output","output":"ok"}}` + "\n" +
+		`{"type":"turn.completed","message":"local CLI completed"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(finishedToolOnly), 0o600); err != nil {
+		t.Fatalf("write completed tool transcript: %v", err)
+	}
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns after tool-only completion error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "teams prompt during tool") {
+			t.Fatalf("queued Teams turn started with prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Teams turn did not start after local tool-only transcript completed")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
+	joined := sentPlainJoined(*sent)
+	for _, leaked := range []string{"exec_command", "go test ./...", "function_call_output", "Imported status update: ok"} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("tool-only transcript detail leaked after completion (%q):\n%s", leaked, joined)
+		}
+	}
+	if !strings.Contains(joined, "local CLI completed") || !strings.Contains(joined, "🤖 ✅ Codex answer:\ndone 1: teams prompt during tool") {
+		t.Fatalf("completed tool-only flow missing status/final answer:\n%s", joined)
+	}
 }
 
 func TestBridgeOutboxRateLimitBlocksOnlyFailingChat(t *testing.T) {
@@ -8442,6 +8967,80 @@ func TestBridgeOutboxRateLimitRestartReplayPreservesPerChatFIFO(t *testing.T) {
 		if got := state.OutboxMessages[id].Status; got != teamstore.OutboxStatusSent {
 			t.Fatalf("%s status = %q, want sent", id, got)
 		}
+	}
+}
+
+func TestTeamsBackgroundKeepaliveBridgeExpiredRateLimitClearsAndSendsOnceCI(t *testing.T) {
+	store := newBridgeTestStore(t)
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		var body struct {
+			Body struct {
+				Content string `json:"content"`
+			} `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode Graph request: %v", err)
+		}
+		sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		backoffMin: time.Millisecond,
+		backoffMax: time.Millisecond,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	if _, err := store.SetChatRateLimit(context.Background(), "chat-1", time.Now().Add(-time.Minute), "expired Retry-After"); err != nil {
+		t.Fatalf("SetChatRateLimit error: %v", err)
+	}
+	for _, msg := range []teamstore.OutboxMessage{
+		{ID: "outbox:expired-1", TeamsChatID: "chat-1", Kind: "helper", Body: "first after expired rate limit"},
+		{ID: "outbox:expired-2", TeamsChatID: "chat-1", Kind: "helper", Body: "second after expired rate limit"},
+	} {
+		if _, _, err := store.QueueOutbox(context.Background(), msg); err != nil {
+			t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
+		}
+	}
+
+	if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flushPendingOutbox expired rate limit error: %v", err)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("sent count after expired rate-limit flush = %d, want 2: %#v", len(sent), sent)
+	}
+	if !strings.Contains(sent[0].Content, "first after expired rate limit") || !strings.Contains(sent[1].Content, "second after expired rate limit") {
+		t.Fatalf("expired rate-limit replay order/content mismatch: %#v", sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after expired rate-limit flush error: %v", err)
+	}
+	if _, ok := state.ChatRateLimits["chat-1"]; ok {
+		t.Fatalf("expired chat rate limit should be cleared after bridge flush: %#v", state.ChatRateLimits["chat-1"])
+	}
+	for _, id := range []string{"outbox:expired-1", "outbox:expired-2"} {
+		msg := state.OutboxMessages[id]
+		if msg.Status != teamstore.OutboxStatusSent || msg.TeamsMessageID == "" {
+			t.Fatalf("%s after flush = %#v, want sent with TeamsMessageID", id, msg)
+		}
+	}
+
+	if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("second flush after sent messages error: %v", err)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("second flush resent messages: %#v", sent)
 	}
 }
 
@@ -8937,6 +9536,7 @@ func newBridgeRetryGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]b
 func newBridgeAsyncQueueGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
 	t.Helper()
 	var sent []bridgeSentMessage
+	var sentMu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/chat-1/messages/"):
@@ -8948,6 +9548,7 @@ func newBridgeAsyncQueueGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage)
 				"teams-during-local":  "teams prompt during local",
 				"teams-after-catchup": "teams prompt after catchup",
 				"teams-during-tool":   "teams prompt during tool",
+				"second-s001":         "second prompt for s001",
 			}
 			prompt, ok := prompts[id]
 			if !ok {
@@ -8967,9 +9568,12 @@ func newBridgeAsyncQueueGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage)
 				t.Fatalf("decode Graph request: %v", err)
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sentMu.Lock()
 			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			id := len(sent)
+			sentMu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, id)
 		default:
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
@@ -9140,6 +9744,18 @@ func sentPlainJoined(messages []bridgeSentMessage) string {
 		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
 	return strings.Join(plain, "\n---\n")
+}
+
+func requirePlainTextInOrder(t *testing.T, text string, wants ...string) {
+	t.Helper()
+	offset := 0
+	for _, want := range wants {
+		idx := strings.Index(text[offset:], want)
+		if idx < 0 {
+			t.Fatalf("missing %q after offset %d in:\n%s", want, offset, text)
+		}
+		offset += idx + len(want)
+	}
 }
 
 func sentPlainContains(messages []bridgeSentMessage, needle string) bool {

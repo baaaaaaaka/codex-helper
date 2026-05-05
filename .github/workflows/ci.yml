@@ -282,7 +282,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $teamsCliKeepalive = 'Test(TeamsBackgroundKeepalive|RestartSelfExecsSameBinaryWithCurrentArgs|TeamsHelperReload|TeamsService(InstallWritesSystemdUserUnitWithoutEnabling|InstallWritesMacOSLaunchAgentPlist|InstallWritesWindowsTaskXMLAndRegistersTask|InstallWritesWSLWindowsTask|DoctorReportsWSLHint|DoctorReportsWSLReadinessFailure|ActiveQueriesSupervisorWithoutGeneratedConfig)|ScheduleDelayedTeamsServiceStartUses(WSLWindowsTask|ConfiguredPowerShell)|UpgradeCmd(StopsAndRestartsActiveTeamsServiceAroundUpdate|DelaysTeamsServiceRestartWhenUpdateNeedsProcessExit|RestoresTeamsDrainOnTimeout|TimesOutBeforeUpdatingWhenTeamsOwnerStaysLive))'
+          $teamsCliKeepalive = 'Test(TeamsBackgroundKeepalive|RestartSelfExecsSameBinaryWithCurrentArgs|TeamsHelperReload|TeamsService(InstallWritesSystemdUserUnitWithoutEnabling|InstallWritesMacOSLaunchAgentPlist|InstallWritesWindowsTaskXMLAndRegistersTask|InstallWritesWSLWindowsTask|DoctorReportsWSLHint|DoctorReportsWSLReadinessFailure|ActiveQueriesSupervisorWithoutGeneratedConfig)|ScheduleDelayedTeamsServiceStartUses(WSLWindowsTask|ConfiguredPowerShell)|UpgradeCmd(StopsAndRestartsActiveTeamsServiceAroundUpdate|DelaysTeamsServiceRestartWhenUpdateNeedsProcessExit|DoesNotUpdateWhenTeamsServiceStopFails|RestartsTeamsServiceAfterUpdateFailure|ReturnsDelayedTeamsRestartFailure|RestoresTeamsDrainOnTimeout|TimesOutBeforeUpdatingWhenTeamsOwnerStaysLive))'
           $teamsRuntimeKeepalive = 'Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           go test ./internal/cli -count=1 -run $teamsCliKeepalive -v
           go test ./internal/teams ./internal/teams/store -count=1 -run $teamsRuntimeKeepalive -v
@@ -293,11 +293,20 @@ jobs:
           set -euo pipefail
           adapter_pattern='Test(TeamsCodexExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|RunnerExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|BridgeSession(CodexFailureWithOnlyExistingThreadIDMarksFailed|TerminalCodexFailureWithTurnIDMarksFailed))$'
           runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly)$'
-          upgrade_pattern='Test(BridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork|BridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat|CodexErrorRequiresUpgradeHeuristics|UpgradeNotificationTargetsDeduplicate)$'
+          helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater(CheckSelectionAndBackoff|ApplyUsesExplicitSelectedTag)|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState))$'
+          upgrade_pattern='Test(BridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork|BridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat|CodexErrorRequiresUpgradeHeuristics|UpgradeNotificationTargetsDeduplicate|RunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner)$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestMarkTurnFailedWithCodexIDsPersistsDiagnostics$' -v
           go test ./internal/cli ./internal/teams -count=1 -run "$adapter_pattern" -v
+          go test ./internal/cli ./internal/teams -count=1 -run "$helper_auto_update_pattern" -v
           go test ./internal/teams ./internal/teams/store -count=1 -run "$upgrade_pattern" -v
+
+      - name: Teams bridge scheduling and history sync regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          bridge_pattern='Test(BridgeAsync(QueuedTurnsRunAcrossSessionsButSerializeEachSession|TurnsQueuesTeamsInputWhileCodexIsRunning)|BridgePollOnce(BoostsAfterRealInboundAndFinalOutput|PrioritizesRunningWorkChatUnderPerCycleLimit|ContinuesOtherDueChatsAfterReadRateLimit)|BridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn|BridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity|BridgeControlResumeKeyOnlyReactivatesMatchingParkedChat|BridgeSyncLinkedTranscriptDedupesQueuedLiveFinal|StoreConcurrentDistinctSessionWritersDoNotCrossMutate|InboundPollDecision(Thresholds|FutureActivityStaysHot)|SortInboundPollDecisionsPrioritizesRunningUnderCycleCap)$'
+          go test ./internal/teams ./internal/teams/store -count=1 -run "$bridge_pattern" -v
 
       - name: Teams background keepalive race regressions (Linux only)
         if: runner.os == 'Linux'
@@ -308,7 +317,7 @@ jobs:
           CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-file-token.json
         run: |
           set -euo pipefail
-          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
+          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter)|BridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession)'
           go test -race ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
 
       - name: Teams supervisor smoke (Linux/macOS)
@@ -691,7 +700,7 @@ jobs:
               -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
               -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
               -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestTeamsBackgroundKeepalive'
+              /dist/codex_teams_store_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
             echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
             docker run --rm --user 1000:1000 \
               -e HOME=/tmp/codex-home \

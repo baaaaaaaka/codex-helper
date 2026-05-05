@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,6 +22,7 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 type fakeGraphAuth struct {
+	mu             sync.Mutex
 	token          string
 	refreshedToken string
 	accessCalls    int
@@ -29,17 +31,23 @@ type fakeGraphAuth struct {
 }
 
 func (a *fakeGraphAuth) AccessToken(context.Context, io.Writer, bool) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.accessCalls++
 	return a.token, nil
 }
 
 func (a *fakeGraphAuth) RefreshAccessToken(context.Context) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.refreshCalls++
 	a.token = a.refreshedToken
 	return a.token, nil
 }
 
 func (a *fakeGraphAuth) TenantID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.tenantID
 }
 

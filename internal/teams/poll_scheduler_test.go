@@ -18,10 +18,19 @@ func TestInboundPollDecisionThresholds(t *testing.T) {
 		parked   bool
 	}{
 		{name: "hot", idle: time.Minute, want: inboundPollStateHot, interval: inboundPollHotInterval},
+		{name: "hot just before boundary", idle: 2*time.Minute - time.Nanosecond, want: inboundPollStateHot, interval: inboundPollHotInterval},
+		{name: "warm at hot boundary", idle: 2 * time.Minute, want: inboundPollStateWarm, interval: inboundPollWarmInterval},
+		{name: "warm just after hot boundary", idle: 2*time.Minute + time.Nanosecond, want: inboundPollStateWarm, interval: inboundPollWarmInterval},
 		{name: "warm", idle: 10 * time.Minute, want: inboundPollStateWarm, interval: inboundPollWarmInterval},
+		{name: "warm just before cool boundary", idle: 15*time.Minute - time.Nanosecond, want: inboundPollStateWarm, interval: inboundPollWarmInterval},
+		{name: "cool at warm boundary", idle: 15 * time.Minute, want: inboundPollStateCool, interval: inboundPollCoolInterval},
 		{name: "cool", idle: time.Hour, want: inboundPollStateCool, interval: inboundPollCoolInterval},
 		{name: "cool below extended threshold", idle: 3 * time.Hour, want: inboundPollStateCool, interval: inboundPollCoolInterval},
+		{name: "cool just before cold boundary", idle: 4*time.Hour - time.Nanosecond, want: inboundPollStateCool, interval: inboundPollCoolInterval},
+		{name: "cold at cool boundary", idle: 4 * time.Hour, want: inboundPollStateCold, interval: inboundPollColdInterval},
 		{name: "cold", idle: 5 * time.Hour, want: inboundPollStateCold, interval: inboundPollColdInterval},
+		{name: "cold just before park boundary", idle: 48*time.Hour - time.Nanosecond, want: inboundPollStateCold, interval: inboundPollColdInterval},
+		{name: "parked at boundary", idle: 48 * time.Hour, want: inboundPollStateParked, parked: true},
 		{name: "parked", idle: 49 * time.Hour, want: inboundPollStateParked, parked: true},
 		{name: "running overrides idle", idle: 49 * time.Hour, running: true, want: inboundPollStateRunning, interval: inboundPollRunningInterval},
 	}
@@ -44,6 +53,42 @@ func TestInboundPollDecisionThresholds(t *testing.T) {
 				t.Fatalf("decision = %#v, want state=%s interval=%v parked=%v", decision, tc.want, tc.interval, tc.parked)
 			}
 		})
+	}
+}
+
+func TestInboundPollDecisionFutureActivityStaysHot(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-1",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:         "chat-1",
+			Seeded:         true,
+			LastActivityAt: now.Add(5 * time.Minute),
+			NextPollAt:     now,
+		},
+		Now: now,
+	})
+	if decision.State != inboundPollStateHot || decision.Interval != inboundPollHotInterval || decision.ShouldPark {
+		t.Fatalf("future activity decision = %#v, want hot non-parked", decision)
+	}
+}
+
+func TestSortInboundPollDecisionsPrioritizesRunningUnderCycleCap(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	decisions := []inboundPollDecision{
+		{ChatID: "chat-01", State: inboundPollStateWarm, Due: true, NextPollAt: now},
+		{ChatID: "chat-99", State: inboundPollStateRunning, Due: true, NextPollAt: now},
+		{ChatID: "chat-02", State: inboundPollStateHot, Due: true, NextPollAt: now},
+	}
+	sortInboundPollDecisions(decisions)
+	got := []string{decisions[0].ChatID, decisions[1].ChatID, decisions[2].ChatID}
+	want := []string{"chat-99", "chat-02", "chat-01"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sorted decisions = %#v, want %#v", got, want)
+		}
 	}
 }
 

@@ -10,6 +10,18 @@ import (
 	"testing"
 )
 
+func requireSubstringsInOrder(t *testing.T, text string, wants ...string) {
+	t.Helper()
+	offset := 0
+	for _, want := range wants {
+		idx := strings.Index(text[offset:], want)
+		if idx < 0 {
+			t.Fatalf("missing %q after offset %d:\n%s", want, offset, text)
+		}
+		offset += idx + len(want)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveBackendSelectionCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -84,6 +96,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"Type=simple",
 		"WorkingDirectory=" + strconv.Quote(spec.WorkingDir),
 		"ExecStart=" + spec.Executable + " teams run --registry " + strconv.Quote(spec.RegistryPath),
+		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
+		"Environment=CODEX_HELPER_TEAMS_SERVICE_MODE=background",
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"WantedBy=default.target",
@@ -92,7 +106,19 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 			t.Fatalf("systemd unit missing %q:\n%s", want, unit)
 		}
 	}
-	for _, forbidden := range []string{"Restart=always", "User=root", "sudo", "StartLimitBurst=0"} {
+	for _, forbidden := range []string{
+		"Restart=always",
+		"User=root",
+		"sudo",
+		"StartLimitBurst=0",
+		"StandardInput=tty",
+		"TTYPath=",
+		"PAMName=",
+		"BindsTo=",
+		"PartOf=",
+		"Requires=graphical-session.target",
+		"After=graphical-session.target",
+	} {
 		if strings.Contains(unit, forbidden) {
 			t.Fatalf("systemd unit should not contain %q:\n%s", forbidden, unit)
 		}
@@ -100,18 +126,43 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 
 	plist := buildTeamsServiceLaunchAgentPlist(spec)
 	for _, want := range []string{
+		"<key>Disabled</key>",
 		"<key>RunAtLoad</key>",
 		"<true/>",
 		"<key>KeepAlive</key>",
 		"<key>SuccessfulExit</key>",
 		"<false/>",
+		"<string>" + spec.Executable + "</string>",
+		"<string>teams</string>",
+		"<string>run</string>",
+		"<string>--registry</string>",
+		"<string>" + spec.RegistryPath + "</string>",
 		"<key>WorkingDirectory</key>",
 		"<string>" + spec.WorkingDir + "</string>",
+		"<key>CODEX_HELPER_TEAMS_SERVICE</key>",
+		"<string>1</string>",
 		"<key>CODEX_HELPER_TEAMS_SERVICE_MODE</key>",
 		"<string>background</string>",
 	} {
 		if !strings.Contains(plist, want) {
 			t.Fatalf("LaunchAgent plist missing %q:\n%s", want, plist)
+		}
+	}
+	if !strings.Contains(plist, "<key>Disabled</key>\n\t<true/>") {
+		t.Fatalf("LaunchAgent should install disabled until explicitly started:\n%s", plist)
+	}
+	requireSubstringsInOrder(t, plist,
+		"<key>RunAtLoad</key>",
+		"<true/>",
+		"<key>KeepAlive</key>",
+		"<dict>",
+		"<key>SuccessfulExit</key>",
+		"<false/>",
+		"</dict>",
+	)
+	for _, forbidden := range []string{"LimitLoadToSessionType", "Aqua", "StandardInPath"} {
+		if strings.Contains(plist, forbidden) {
+			t.Fatalf("LaunchAgent plist should not contain %q:\n%s", forbidden, plist)
 		}
 	}
 
@@ -121,23 +172,160 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<LogonType>InteractiveToken</LogonType>",
 		"<RunLevel>LeastPrivilege</RunLevel>",
 		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+		"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+		"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
 		"<StartWhenAvailable>true</StartWhenAvailable>",
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
 		"<Interval>PT60S</Interval>",
 		"<Count>999</Count>",
+		"CODEX_HELPER_TEAMS_SERVICE",
+		"CODEX_HELPER_TEAMS_SERVICE_MODE",
+		spec.Executable,
+		"teams",
+		"run",
+		"--registry",
 		"<WorkingDirectory>" + spec.WorkingDir + "</WorkingDirectory>",
 	} {
 		if !strings.Contains(taskXML, want) {
 			t.Fatalf("Windows task XML missing %q:\n%s", want, taskXML)
 		}
 	}
-	for _, forbidden := range []string{"HighestAvailable", "RunLevel>Highest", "S4U"} {
+	for _, forbidden := range []string{"HighestAvailable", "RunLevel>Highest", "S4U", "RunOnlyIfIdle", "IdleSettings"} {
 		if strings.Contains(taskXML, forbidden) {
 			t.Fatalf("Windows task XML should not contain %q:\n%s", forbidden, taskXML)
 		}
 	}
+	requireSubstringsInOrder(t, taskXML,
+		"<LogonTrigger>",
+		"<Enabled>true</Enabled>",
+		"</LogonTrigger>",
+		"<Principals>",
+		"<LogonType>InteractiveToken</LogonType>",
+		"<RunLevel>LeastPrivilege</RunLevel>",
+		"</Principals>",
+		"<Settings>",
+		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+		"<Enabled>false</Enabled>",
+		"<RestartOnFailure>",
+	)
+}
+
+func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *testing.T) {
+	args := []string{
+		"-d", "Ubuntu",
+		"-u", "alice",
+		"--",
+		"env",
+		"CODEX_HELPER_TEAMS_SERVICE=1",
+		"CODEX_HELPER_TEAMS_SERVICE_MODE=background",
+		"/home/alice/bin/codex-proxy",
+		"teams",
+		"run",
+		"--auto-service=false",
+		"--registry",
+		"/home/alice/.config/codex-helper/teams registry.json",
+	}
+	script := buildTeamsServiceWSLStartupWatchdogScript("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, "abc")
+	for _, want := range []string{
+		"System.Threading.Mutex",
+		"if (-not $created) { exit 0 }",
+		"while ($true)",
+		"& wsl.exe @wslArgs",
+		"wsl.exe exited",
+		"restarting in 30s",
+		"Start-Sleep -Seconds 30",
+		"$mutex.ReleaseMutex(); $mutex.Dispose()",
+		"'-d'",
+		"'Ubuntu'",
+		"'/home/alice/bin/codex-proxy'",
+		"'--auto-service=false'",
+		"'/home/alice/.config/codex-helper/teams registry.json'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("WSL Startup watchdog script missing %q:\n%s", want, script)
+		}
+	}
+
+	startCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, true)
+	for _, want := range []string{
+		"[Environment]::GetFolderPath('Startup')",
+		"codex-helper\\teams",
+		".cmd",
+		".ps1",
+		"$cmdPath = Join-Path $startup",
+		"Set-Content -LiteralPath $scriptPath",
+		"Set-Content -LiteralPath $cmdPath",
+		"WindowStyle Hidden",
+		"Start-Process -FilePath $cmdPath -WindowStyle Hidden",
+	} {
+		if !strings.Contains(startCommand, want) {
+			t.Fatalf("WSL Startup fallback command missing %q:\n%s", want, startCommand)
+		}
+	}
+
+	installOnlyCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, false)
+	if strings.Contains(installOnlyCommand, "Start-Process -FilePath $cmdPath") {
+		t.Fatalf("install-only WSL Startup fallback should not start watchdog immediately:\n%s", installOnlyCommand)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWindowsTaskXMLLogonAndSelfRecoveryCI(t *testing.T) {
+	spec := teamsServiceSpec{
+		Executable:   `C:\Users\alice\AppData\Local\codex-helper\codex-proxy.exe`,
+		WorkingDir:   `C:\Users\alice\work dir`,
+		RegistryPath: `C:\Users\alice\AppData\Roaming\codex-helper\teams registry.json`,
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
+		},
+	}
+
+	taskXML := buildTeamsServiceWindowsTaskXML(spec)
+	for _, want := range []string{
+		"<LogonTrigger>",
+		"<Enabled>true</Enabled>",
+		"<LogonType>InteractiveToken</LogonType>",
+		"<RunLevel>LeastPrivilege</RunLevel>",
+		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+		"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+		"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+		"<StartWhenAvailable>true</StartWhenAvailable>",
+		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
+		"<Enabled>false</Enabled>",
+		"<RestartOnFailure>",
+		"<Interval>PT60S</Interval>",
+		"<Count>999</Count>",
+		"<Command>powershell.exe</Command>",
+		"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command",
+		"CODEX_HELPER_TEAMS_SERVICE",
+		"CODEX_HELPER_TEAMS_SERVICE_MODE",
+		"teams",
+		"run",
+		"--registry",
+	} {
+		if !strings.Contains(taskXML, want) {
+			t.Fatalf("Windows task XML missing %q:\n%s", want, taskXML)
+		}
+	}
+	for _, forbidden := range []string{"S4U", "Password", "RunLevel>Highest", "HighestAvailable", "IdleSettings", "RunOnlyIfIdle"} {
+		if strings.Contains(taskXML, forbidden) {
+			t.Fatalf("Windows task XML should not contain %q:\n%s", forbidden, taskXML)
+		}
+	}
+	requireSubstringsInOrder(t, taskXML,
+		"<LogonTrigger>",
+		"<Enabled>true</Enabled>",
+		"</LogonTrigger>",
+		"<Principals>",
+		"<LogonType>InteractiveToken</LogonType>",
+		"<RunLevel>LeastPrivilege</RunLevel>",
+		"</Principals>",
+		"<Settings>",
+		"<Enabled>false</Enabled>",
+		"<RestartOnFailure>",
+	)
 }
 
 func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
@@ -167,9 +355,15 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		t.Fatalf("WSL install calls = %#v, want one Register-ScheduledTask call", runner.calls)
 	}
 	command := runner.calls[0].name + " " + strings.Join(runner.calls[0].args, " ")
+	spec, err := buildTeamsServiceSpec(stringPtr("/home/alice/teams registry.json"))
+	if err != nil {
+		t.Fatalf("buildTeamsServiceSpec error: %v", err)
+	}
+	wantTaskArgument := "-Argument " + powershellSingleQuote(windowsCommandLine(buildTeamsServiceWSLArguments(spec)))
 	for _, want := range []string{
 		"New-ScheduledTaskAction",
 		"wsl.exe",
+		wantTaskArgument,
 		"New-ScheduledTaskTrigger -AtLogOn",
 		"RepetitionInterval (New-TimeSpan -Minutes 30)",
 		"RepetitionDuration (New-TimeSpan -Days 3650)",
@@ -247,8 +441,15 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 		t.Fatalf("WSL repair calls = %#v, want one Register-ScheduledTask call", runner.calls)
 	}
 	command := runner.calls[0].name + " " + strings.Join(runner.calls[0].args, " ")
+	spec, err := buildTeamsServiceSpec(stringPtr("/home/alice/teams registry.json"))
+	if err != nil {
+		t.Fatalf("buildTeamsServiceSpec error: %v", err)
+	}
+	wantTaskArgument := "-Argument " + powershellSingleQuote(windowsCommandLine(buildTeamsServiceWSLArguments(spec)))
 	for _, want := range []string{
 		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
+		"New-ScheduledTaskAction -Execute 'wsl.exe'",
+		wantTaskArgument,
 		"Register-ScheduledTask",
 		"Enable-ScheduledTask -TaskName $taskName",
 		"Start-ScheduledTask -TaskName $taskName",
@@ -404,12 +605,22 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		t.Fatalf("bootstrap did not clearly prompt before UAC:\n%s", gotOut)
 	}
 	elevated := strings.Join(runner.calls[2].args, " ")
+	spec, err := buildTeamsServiceSpec(stringPtr("/home/alice/teams registry.json"))
+	if err != nil {
+		t.Fatalf("buildTeamsServiceSpec error: %v", err)
+	}
 	for _, want := range []string{
 		"Start-Process",
 		"-Verb RunAs",
 		"-Wait",
 		"-PassThru",
+		"New-ScheduledTaskAction",
+		"wsl.exe",
+		windowsCommandLine(buildTeamsServiceWSLArguments(spec)),
 		"Register-ScheduledTask",
+		"Enable-ScheduledTask",
+		"Start-ScheduledTask",
+		"--auto-service=false",
 		"RunLevel Limited",
 		"NVIDIA\\jason",
 	} {
@@ -775,6 +986,12 @@ func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
 			}
 			if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, tt.want) {
 				t.Fatalf("service %s command missing %q:\n%s", tt.action, tt.want, joined)
+			} else if tt.action == "restart" {
+				requireSubstringsInOrder(t, joined,
+					"Stop-ScheduledTask -TaskName",
+					"-ErrorAction SilentlyContinue",
+					"Start-ScheduledTask -TaskName",
+				)
 			}
 		})
 	}
@@ -813,7 +1030,7 @@ func TestTeamsBackgroundKeepaliveWSLInstalledActiveProbeUsesTaskSchedulerCI(t *t
 	if len(runner.calls) != 2 {
 		t.Fatalf("WSL probe calls = %#v, want installed and active checks", runner.calls)
 	}
-	for _, call := range runner.calls {
+	for i, call := range runner.calls {
 		joined := strings.Join(call.args, " ")
 		if !strings.Contains(joined, "Get-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default ") {
 			t.Fatalf("WSL probe command missing task lookup:\n%s", joined)
@@ -821,6 +1038,23 @@ func TestTeamsBackgroundKeepaliveWSLInstalledActiveProbeUsesTaskSchedulerCI(t *t
 		if strings.Contains(joined, "Register-ScheduledTask") || strings.Contains(joined, "systemctl") {
 			t.Fatalf("WSL probe command should be read-only Task Scheduler lookup:\n%s", joined)
 		}
+		if i == 1 {
+			requireSubstringsInOrder(t, joined,
+				"Get-ScheduledTask -TaskName",
+				"$task.State -ne 'Running'",
+				"exit 3",
+			)
+		}
+	}
+
+	runner.calls = nil
+	runner.err = errTeamsKeepaliveScheduledTaskFailureForTest{}
+	active, err = teamsServiceActive(context.Background())
+	if err != nil {
+		t.Fatalf("teamsServiceActive stopped-task error: %v", err)
+	}
+	if active {
+		t.Fatal("teamsServiceActive = true when Task Scheduler reports non-running task")
 	}
 }
 

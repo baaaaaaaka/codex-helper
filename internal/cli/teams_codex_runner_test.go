@@ -14,6 +14,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
@@ -357,6 +358,75 @@ func TestRunTeamsUpgradeCodexOnceRejectsLiveTeamsOwnerBeforeUpgrade(t *testing.T
 	err := runTeamsUpgradeCodexOnce(cmd, &rootOptions{}, "")
 	if err == nil || !strings.Contains(err.Error(), "Teams bridge is already running") {
 		t.Fatalf("expected live owner error, got %v", err)
+	}
+}
+
+func TestRunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cases := []struct {
+		name string
+		seed func(t *testing.T, st *teamstore.Store)
+	}{
+		{
+			name: "queued turn",
+			seed: func(t *testing.T, st *teamstore.Store) {
+				t.Helper()
+				if _, _, err := st.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+					t.Fatalf("CreateSession: %v", err)
+				}
+				if _, _, err := st.QueueTurn(context.Background(), teamstore.Turn{ID: "turn-queued", SessionID: "s1", Status: teamstore.TurnStatusQueued}); err != nil {
+					t.Fatalf("QueueTurn: %v", err)
+				}
+			},
+		},
+		{
+			name: "running turn",
+			seed: func(t *testing.T, st *teamstore.Store) {
+				t.Helper()
+				if _, _, err := st.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+					t.Fatalf("CreateSession: %v", err)
+				}
+				if _, _, err := st.QueueTurn(context.Background(), teamstore.Turn{ID: "turn-running", SessionID: "s1", Status: teamstore.TurnStatusRunning}); err != nil {
+					t.Fatalf("QueueTurn: %v", err)
+				}
+			},
+		},
+		{
+			name: "blocking outbox",
+			seed: func(t *testing.T, st *teamstore.Store) {
+				t.Helper()
+				if _, _, err := st.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+					t.Fatalf("CreateSession: %v", err)
+				}
+				if _, _, err := st.QueueOutbox(context.Background(), teamstore.OutboxMessage{ID: "outbox-1", SessionID: "s1", TeamsChatID: "chat-1", Body: "pending"}); err != nil {
+					t.Fatalf("QueueOutbox: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			prevUpgrade := upgradeCodexInstalledForTeamsRun
+			t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
+			upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+				t.Fatal("upgrade should not run while Teams work is unfinished")
+				return "", nil
+			}
+			st, err := openTeamsStore()
+			if err != nil {
+				t.Fatalf("openTeamsStore: %v", err)
+			}
+			tc.seed(t, st)
+
+			cmd := newRootCmd()
+			err = runTeamsUpgradeCodexOnce(cmd, &rootOptions{}, "")
+			if err == nil || !strings.Contains(err.Error(), "unfinished turns") {
+				t.Fatalf("expected unfinished work error, got %v", err)
+			}
+		})
 	}
 }
 

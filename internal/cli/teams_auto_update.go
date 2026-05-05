@@ -16,6 +16,7 @@ type teamsReleaseAutoUpdater struct {
 }
 
 var teamsAutoUpdateResolveInstallPath = update.ResolveInstallPath
+var teamsAutoUpdateListReleases = update.ListReleases
 
 func newTeamsReleaseAutoUpdater(repo string) teams.HelperAutoUpdater {
 	return teamsReleaseAutoUpdater{repo: repo}
@@ -26,7 +27,7 @@ func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAu
 	if now.IsZero() {
 		now = time.Now()
 	}
-	releases, err := update.ListReleases(ctx, update.ReleaseListOptions{
+	releases, err := teamsAutoUpdateListReleases(ctx, update.ReleaseListOptions{
 		Repo:    u.repo,
 		Timeout: 8 * time.Second,
 	})

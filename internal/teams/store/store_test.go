@@ -639,6 +639,134 @@ func TestStoreConcurrentSessionAndOutboxWritersPreserveState(t *testing.T) {
 	}
 }
 
+func TestStoreConcurrentDistinctSessionWritersDoNotCrossMutate(t *testing.T) {
+	store := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const sessions = 5
+	const perSession = 16
+	for i := 1; i <= sessions; i++ {
+		sessionID := fmt.Sprintf("s%03d", i)
+		if _, _, err := store.CreateSession(ctx, SessionContext{
+			ID:          sessionID,
+			Status:      SessionStatusActive,
+			TeamsChatID: fmt.Sprintf("chat-%d", i),
+		}); err != nil {
+			t.Fatalf("CreateSession %s error: %v", sessionID, err)
+		}
+	}
+
+	errCh := make(chan error, sessions)
+	var wg sync.WaitGroup
+	for i := 1; i <= sessions; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			workerStore, err := Open(store.Path())
+			if err != nil {
+				errCh <- fmt.Errorf("open worker store %d: %w", i, err)
+				return
+			}
+			sessionID := fmt.Sprintf("s%03d", i)
+			chatID := fmt.Sprintf("chat-%d", i)
+			for j := 0; j < perSession; j++ {
+				inboundID := fmt.Sprintf("inbound:%s:%02d", sessionID, j)
+				inbound, created, err := workerStore.PersistInbound(ctx, InboundEvent{
+					ID:             inboundID,
+					SessionID:      sessionID,
+					TeamsChatID:    chatID,
+					TeamsMessageID: fmt.Sprintf("teams-%s-%02d", sessionID, j),
+					Text:           fmt.Sprintf("prompt %s %02d", sessionID, j),
+					Source:         "teams",
+				})
+				if err != nil {
+					errCh <- fmt.Errorf("persist inbound %s: %w", inboundID, err)
+					return
+				}
+				if !created {
+					errCh <- fmt.Errorf("inbound %s unexpectedly deduplicated", inboundID)
+					return
+				}
+				turn, created, err := workerStore.QueueTurn(ctx, Turn{
+					SessionID:      sessionID,
+					InboundEventID: inbound.ID,
+				})
+				if err != nil {
+					errCh <- fmt.Errorf("queue turn %s: %w", inboundID, err)
+					return
+				}
+				if !created {
+					errCh <- fmt.Errorf("turn for %s unexpectedly deduplicated", inboundID)
+					return
+				}
+				if _, err := workerStore.MarkTurnCompleted(ctx, turn.ID, "thread-"+sessionID, fmt.Sprintf("codex-%s-%02d", sessionID, j)); err != nil {
+					errCh <- fmt.Errorf("complete turn %s: %w", turn.ID, err)
+					return
+				}
+				if _, _, err := workerStore.QueueOutbox(ctx, OutboxMessage{
+					ID:          fmt.Sprintf("outbox:%s:%02d", sessionID, j),
+					SessionID:   sessionID,
+					TurnID:      turn.ID,
+					TeamsChatID: chatID,
+					Kind:        "final",
+					Body:        fmt.Sprintf("answer %s %02d", sessionID, j),
+				}); err != nil {
+					errCh <- fmt.Errorf("queue outbox %s: %w", turn.ID, err)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	for i := 1; i <= sessions; i++ {
+		sessionID := fmt.Sprintf("s%03d", i)
+		chatID := fmt.Sprintf("chat-%d", i)
+		session := state.Sessions[sessionID]
+		if session.LatestTurnID == "" || !strings.Contains(session.LatestTurnID, sessionID) {
+			t.Fatalf("session %s LatestTurnID = %q, want own latest turn", sessionID, session.LatestTurnID)
+		}
+		var turns, outbox int
+		sequences := map[int64]bool{}
+		for _, turn := range state.Turns {
+			if turn.SessionID == sessionID {
+				turns++
+			}
+		}
+		for _, msg := range state.OutboxMessages {
+			if msg.SessionID == sessionID {
+				outbox++
+				if msg.TeamsChatID != chatID {
+					t.Fatalf("session %s outbox %s chat = %q, want %q", sessionID, msg.ID, msg.TeamsChatID, chatID)
+				}
+				if sequences[msg.Sequence] {
+					t.Fatalf("session %s duplicate sequence %d", sessionID, msg.Sequence)
+				}
+				sequences[msg.Sequence] = true
+			}
+		}
+		if turns != perSession || outbox != perSession {
+			t.Fatalf("session %s turns/outbox = %d/%d, want %d/%d", sessionID, turns, outbox, perSession, perSession)
+		}
+		for seq := int64(1); seq <= perSession; seq++ {
+			if !sequences[seq] {
+				t.Fatalf("session %s missing chat sequence %d in %#v", sessionID, seq, sequences)
+			}
+		}
+	}
+}
+
 func TestStoreConcurrentInboundTurnDedupAcrossHandles(t *testing.T) {
 	store := newTestStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1887,6 +2015,124 @@ func TestTeamsBackgroundKeepaliveClockSkewOutboxAndRateLimitCI(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("rate-limited outbox should return after Retry-After expires: %#v", pending)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveLogoutResumePreservesQueuedOutboxCI(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	startedAt := testOwnerStart()
+	heartbeatAt := startedAt.Add(10 * time.Second)
+
+	staleOwner := testOwner("session-old", "turn-old", startedAt)
+	if _, err := store.RecordOwnerHeartbeat(ctx, staleOwner, time.Minute, heartbeatAt); err != nil {
+		t.Fatalf("stale RecordOwnerHeartbeat error: %v", err)
+	}
+	msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:queued-during-logout",
+		SessionID:   "session-old",
+		TurnID:      "turn-old",
+		TeamsChatID: "chat-1",
+		Kind:        "answer",
+		Body:        "queued before helper takeover",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	if _, err := store.MarkOutboxSendAttempt(ctx, msg.ID); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt error: %v", err)
+	}
+
+	blockedUntil := heartbeatAt.Add(4 * time.Minute)
+	if _, err := store.SetChatRateLimit(ctx, "chat-1", blockedUntil, "429 while old helper was disconnecting"); err != nil {
+		t.Fatalf("SetChatRateLimit error: %v", err)
+	}
+	if err := store.UpdateSession(ctx, "model logout-equivalent send lease", func(state *State) error {
+		queued := state.OutboxMessages[msg.ID]
+		queued.LastSendAttempt = heartbeatAt.Add(15 * time.Second)
+		state.OutboxMessages[msg.ID] = queued
+		return nil
+	}); err != nil {
+		t.Fatalf("rewrite send attempt time: %v", err)
+	}
+
+	recoveryAt := heartbeatAt.Add(2 * time.Minute)
+	nextOwner := testOwner("session-new", "turn-new", recoveryAt)
+	nextOwner.PID = 5252
+	recoveredOwner, recovered, err := store.RecoverStaleOwner(ctx, nextOwner, time.Minute, recoveryAt)
+	if err != nil {
+		t.Fatalf("RecoverStaleOwner error: %v", err)
+	}
+	if !recovered {
+		t.Fatal("RecoverStaleOwner recovered = false")
+	}
+	if recoveredOwner.ActiveSessionID != "session-new" || recoveredOwner.ActiveTurnID != "turn-new" {
+		t.Fatalf("recovered owner active fields = %q/%q, want new turn", recoveredOwner.ActiveSessionID, recoveredOwner.ActiveTurnID)
+	}
+
+	pending, err := store.PendingOutboxAt(ctx, blockedUntil.Add(-time.Nanosecond))
+	if err != nil {
+		t.Fatalf("PendingOutboxAt before Retry-After error: %v", err)
+	}
+	for _, candidate := range pending {
+		if candidate.ID == msg.ID {
+			t.Fatalf("outbox should stay suppressed until Retry-After even after helper takeover: %#v", pending)
+		}
+	}
+
+	pending, err = store.PendingOutboxAt(ctx, blockedUntil.Add(time.Nanosecond))
+	if err != nil {
+		t.Fatalf("PendingOutboxAt after Retry-After error: %v", err)
+	}
+	var found *OutboxMessage
+	for i := range pending {
+		if pending[i].ID == msg.ID {
+			found = &pending[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("outbox queued by stale owner should still be sendable after takeover and Retry-After: %#v", pending)
+	}
+	if found.Body != "queued before helper takeover" || found.SessionID != "session-old" || found.TurnID != "turn-old" {
+		t.Fatalf("queued outbox mutated during recovery: %#v", *found)
+	}
+
+	duplicate, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          msg.ID,
+		SessionID:   "session-old",
+		TurnID:      "turn-old",
+		TeamsChatID: "chat-1",
+		Kind:        "answer",
+		Body:        "duplicate after takeover should not replace original",
+	})
+	if err != nil {
+		t.Fatalf("duplicate QueueOutbox error: %v", err)
+	}
+	if created {
+		t.Fatal("duplicate QueueOutbox created = true after takeover")
+	}
+	if duplicate.Body != "queued before helper takeover" {
+		t.Fatalf("duplicate QueueOutbox replaced original body: %#v", duplicate)
+	}
+
+	later, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:later-after-takeover",
+		SessionID:   "session-new",
+		TurnID:      "turn-new",
+		TeamsChatID: "chat-1",
+		Kind:        "answer",
+		Body:        "later answer after helper takeover",
+	})
+	if err != nil {
+		t.Fatalf("later QueueOutbox error: %v", err)
+	}
+	earlier, ok, err := store.EarlierUnsentOutbox(ctx, later)
+	if err != nil {
+		t.Fatalf("EarlierUnsentOutbox error: %v", err)
+	}
+	if !ok || earlier.ID != msg.ID {
+		t.Fatalf("later outbox should be blocked behind unsent pre-takeover outbox; earlier=%#v ok=%v", earlier, ok)
 	}
 }
 

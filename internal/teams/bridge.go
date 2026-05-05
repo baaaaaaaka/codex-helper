@@ -139,6 +139,7 @@ type Bridge struct {
 	httpClient                *http.Client
 	registryPath              string
 	reg                       Registry
+	regMu                     sync.Mutex
 	user                      User
 	scope                     teamstore.ScopeIdentity
 	machine                   teamstore.MachineRecord
@@ -328,7 +329,18 @@ func (b *Bridge) findExistingControlChat(ctx context.Context, topic string) (Cha
 }
 
 func (b *Bridge) Save() error {
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
 	return SaveRegistry(b.registryPath, b.reg)
+}
+
+func (b *Bridge) markRegistrySent(chatID string, messageID string) {
+	if b == nil {
+		return
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	b.reg.MarkSent(chatID, messageID)
 }
 
 func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
@@ -932,7 +944,7 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			return false, err
 		}
 		if delivered {
-			b.reg.MarkSent(chatID, msg.ID)
+			b.markRegistrySent(chatID, msg.ID)
 			return true, nil
 		}
 		delivered, err = b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
@@ -940,7 +952,7 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			return false, err
 		}
 		if delivered {
-			b.reg.MarkSent(chatID, msg.ID)
+			b.markRegistrySent(chatID, msg.ID)
 			return true, nil
 		}
 	}
@@ -4624,7 +4636,7 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 	}
 	for _, outbox := range state.OutboxMessages {
 		if outbox.TeamsChatID != "" && outbox.TeamsMessageID != "" && outbox.Status == teamstore.OutboxStatusSent && !b.reg.HasSent(outbox.TeamsChatID, outbox.TeamsMessageID) {
-			b.reg.MarkSent(outbox.TeamsChatID, outbox.TeamsMessageID)
+			b.markRegistrySent(outbox.TeamsChatID, outbox.TeamsMessageID)
 			changed = true
 		}
 	}
@@ -5145,7 +5157,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 		return err
 	}
-	b.reg.MarkSent(outbox.TeamsChatID, msg.ID)
+	b.markRegistrySent(outbox.TeamsChatID, msg.ID)
 	if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, msg.ID); err != nil {
 		return err
 	}

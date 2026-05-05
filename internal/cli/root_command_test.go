@@ -176,7 +176,9 @@ func TestTeamsServiceMutationsRefuseTeamsCodexChild(t *testing.T) {
 		{"teams", "service", "install"},
 		{"teams", "service", "bootstrap"},
 		{"teams", "service", "enable"},
+		{"teams", "service", "disable"},
 		{"teams", "service", "start"},
+		{"teams", "service", "uninstall"},
 		{"upgrade"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {

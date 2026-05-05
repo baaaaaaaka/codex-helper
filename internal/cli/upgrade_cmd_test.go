@@ -490,6 +490,170 @@ func TestUpgradeCmdDelaysTeamsServiceRestartWhenUpdateNeedsProcessExit(t *testin
 	}
 }
 
+func TestUpgradeCmdDoesNotUpdateWhenTeamsServiceStopFails(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatalf("mkdir unit dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte("unit"), 0o600); err != nil {
+		t.Fatalf("write unit file: %v", err)
+	}
+	runner := &scriptedTeamsServiceRunner{errs: []error{nil, errors.New("stop failed")}}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("performUpdate should not run if Teams service stop fails")
+		return update.ApplyResult{}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "stop failed") {
+		t.Fatalf("execute upgrade error = %v, want stop failed\n%s", err, out.String())
+	}
+	if !teamsServiceCallSeen(runner.calls, "is-active") || !teamsServiceCallSeen(runner.calls, "stop") {
+		t.Fatalf("expected is-active and stop calls, got %#v", runner.calls)
+	}
+	if teamsServiceCallSeen(runner.calls, "start") {
+		t.Fatalf("service should not be restarted after stop failure, calls=%#v", runner.calls)
+	}
+}
+
+func TestUpgradeCmdRestartsTeamsServiceAfterUpdateFailure(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatalf("mkdir unit dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte("unit"), 0o600); err != nil {
+		t.Fatalf("write unit file: %v", err)
+	}
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		if !teamsServiceCallSeen(runner.calls, "stop") {
+			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
+		}
+		return update.ApplyResult{}, errors.New("download failed")
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "download failed") {
+		t.Fatalf("execute upgrade error = %v, want download failed\n%s", err, out.String())
+	}
+	if !teamsServiceCallSeen(runner.calls, "is-active") || !teamsServiceCallSeen(runner.calls, "stop") || !teamsServiceCallSeen(runner.calls, "start") {
+		t.Fatalf("expected is-active, stop, and restart after failed update, got %#v", runner.calls)
+	}
+}
+
+func TestUpgradeCmdReturnsDelayedTeamsRestartFailure(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatalf("mkdir unit dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte("unit"), 0o600); err != nil {
+		t.Fatalf("write unit file: %v", err)
+	}
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+		teamsServiceStartDetached = prevDetached
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		if !teamsServiceCallSeen(runner.calls, "stop") {
+			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
+		}
+		return update.ApplyResult{Version: "1.2.3", RestartRequired: true}, nil
+	}
+	var detachedCalled bool
+	teamsServiceStartDetached = func(context.Context, string, ...string) error {
+		detachedCalled = true
+		return errors.New("detached restart failed")
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "detached restart failed") {
+		t.Fatalf("execute upgrade error = %v, want detached restart failed\n%s", err, out.String())
+	}
+	if !detachedCalled {
+		t.Fatal("delayed restart launcher was not called")
+	}
+	if teamsServiceCallSeen(runner.calls, "start") {
+		t.Fatalf("restart-required upgrade must not immediately start service, calls=%#v", runner.calls)
+	}
+}
+
 func TestScheduleDelayedTeamsServiceStartUsesWSLWindowsTask(t *testing.T) {
 	lockCLITestHooks(t)
 

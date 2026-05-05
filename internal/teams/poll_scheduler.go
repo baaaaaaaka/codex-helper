@@ -174,11 +174,33 @@ func sortInboundPollDecisions(decisions []inboundPollDecision) {
 		if decisions[i].NextPollAt.IsZero() != decisions[j].NextPollAt.IsZero() {
 			return decisions[i].NextPollAt.IsZero()
 		}
+		if inboundPollSortPriority(decisions[i].State) != inboundPollSortPriority(decisions[j].State) {
+			return inboundPollSortPriority(decisions[i].State) < inboundPollSortPriority(decisions[j].State)
+		}
 		if !decisions[i].NextPollAt.Equal(decisions[j].NextPollAt) {
 			return decisions[i].NextPollAt.Before(decisions[j].NextPollAt)
 		}
 		return decisions[i].ChatID < decisions[j].ChatID
 	})
+}
+
+func inboundPollSortPriority(state string) int {
+	switch state {
+	case inboundPollStateRunning:
+		return 0
+	case inboundPollStateHot:
+		return 1
+	case inboundPollStateCatchup:
+		return 2
+	case inboundPollStateWarm:
+		return 3
+	case inboundPollStateCool:
+		return 4
+	case inboundPollStateCold:
+		return 5
+	default:
+		return 6
+	}
 }
 
 func latestTime(values ...time.Time) time.Time {

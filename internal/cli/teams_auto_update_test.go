@@ -2,13 +2,134 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
+
+func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
+	lockCLITestHooks(t)
+	prevListReleases := teamsAutoUpdateListReleases
+	t.Cleanup(func() { teamsAutoUpdateListReleases = prevListReleases })
+
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	release := func(tag string, priority update.AutoUpdatePriority, published time.Time) update.GitHubRelease {
+		version := strings.TrimPrefix(tag, "v")
+		asset := fmt.Sprintf("codex-proxy_%s_%s_%s", version, runtime.GOOS, runtime.GOARCH)
+		if runtime.GOOS == "windows" {
+			asset += ".exe"
+		}
+		return update.GitHubRelease{
+			TagName:     tag,
+			Body:        update.BuildReleasePriorityMarker(priority),
+			PublishedAt: published,
+			Assets: []struct {
+				Name string `json:"name"`
+			}{{Name: asset}},
+		}
+	}
+
+	cases := []struct {
+		name        string
+		releases    []update.GitHubRelease
+		listErr     error
+		wantTag     string
+		wantVersion string
+		wantNext    time.Time
+		wantBackoff bool
+	}{
+		{
+			name:        "p0 immediate",
+			releases:    []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP0, now.Add(-time.Minute))},
+			wantTag:     "v1.2.4",
+			wantVersion: "1.2.4",
+			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+		{
+			name:     "p1 waits until eligible",
+			releases: []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP1, now.Add(-47*time.Hour-45*time.Minute))},
+			wantNext: now.Add(15 * time.Minute),
+		},
+		{
+			name:     "p2 skipped",
+			releases: []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour))},
+			wantNext: now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+		{
+			name:     "missing asset skipped",
+			releases: []update.GitHubRelease{{TagName: "v1.2.4", Body: update.BuildReleasePriorityMarker(update.AutoUpdatePriorityP0), PublishedAt: now.Add(-time.Hour)}},
+			wantNext: now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+		{
+			name:        "list failure backs off",
+			listErr:     errors.New("github unavailable"),
+			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
+			wantBackoff: true,
+		},
+		{
+			name:        "installed version accepts v prefix and metadata",
+			releases:    []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP0, now.Add(-time.Hour))},
+			wantTag:     "v1.2.4",
+			wantVersion: "1.2.4",
+			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			teamsAutoUpdateListReleases = func(_ context.Context, opts update.ReleaseListOptions) ([]update.GitHubRelease, error) {
+				if opts.Repo != "owner/name" {
+					t.Fatalf("repo = %q, want owner/name", opts.Repo)
+				}
+				if opts.Timeout != 8*time.Second {
+					t.Fatalf("timeout = %s, want 8s", opts.Timeout)
+				}
+				if tc.listErr != nil {
+					return nil, tc.listErr
+				}
+				return tc.releases, nil
+			}
+			updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+			installed := "v1.2.3"
+			if strings.Contains(tc.name, "metadata") {
+				installed = "v1.2.3+local"
+			}
+			got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+				InstalledVersion: installed,
+				Now:              now,
+			})
+			if tc.listErr != nil {
+				if err == nil || !strings.Contains(err.Error(), "github unavailable") {
+					t.Fatalf("Check error = %v, want github unavailable", err)
+				}
+			} else if err != nil {
+				t.Fatalf("Check error: %v", err)
+			}
+			if tc.wantTag == "" {
+				if got.Candidate != nil {
+					t.Fatalf("candidate = %#v, want nil", got.Candidate)
+				}
+			} else if got.Candidate == nil || got.Candidate.TagName != tc.wantTag || got.Candidate.Version != tc.wantVersion {
+				t.Fatalf("candidate = %#v, want %s/%s", got.Candidate, tc.wantTag, tc.wantVersion)
+			}
+			if !got.NextCheckAt.Equal(tc.wantNext) {
+				t.Fatalf("NextCheckAt = %s, want %s", got.NextCheckAt, tc.wantNext)
+			}
+			if tc.wantBackoff && !got.BackoffUntil.Equal(tc.wantNext) {
+				t.Fatalf("BackoffUntil = %s, want %s", got.BackoffUntil, tc.wantNext)
+			}
+			if tc.wantBackoff && !strings.Contains(got.LastError, "github unavailable") {
+				t.Fatalf("LastError = %q, want github unavailable", got.LastError)
+			}
+		})
+	}
+}
 
 func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	lockCLITestHooks(t)

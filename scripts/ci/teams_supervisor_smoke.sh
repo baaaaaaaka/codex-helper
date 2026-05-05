@@ -54,7 +54,6 @@ write_probe_loop() {
 #!/usr/bin/env bash
 set -euo pipefail
 heartbeat="$1"
-trap '' HUP
 while :; do
   printf '%s pid=%s\n' "$(date +%s)" "$$" >>"$heartbeat"
   sleep 1
@@ -64,13 +63,13 @@ EOS
 }
 
 terminal_detach_smoke() {
-  log "terminal detach smoke: child should survive parent shell exit and SIGHUP"
+  log "terminal detach smoke: externally detached child should survive parent shell exit and SIGHUP"
   local probe="$root/probe-loop.sh"
   local heartbeat="$root/terminal-heartbeat.log"
   local pidfile="$root/terminal.pid"
   write_probe_loop "$probe"
   (
-    "$probe" "$heartbeat" >/dev/null 2>&1 &
+    nohup "$probe" "$heartbeat" >/dev/null 2>&1 &
     echo "$!" >"$pidfile"
   )
   local pid

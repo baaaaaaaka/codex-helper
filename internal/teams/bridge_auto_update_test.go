@@ -2,6 +2,8 @@ package teams
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,16 +14,20 @@ type fakeHelperAutoUpdater struct {
 	decision   HelperAutoUpdateDecision
 	applyCalls int
 	applied    []HelperAutoUpdateCandidate
-	err        error
+	checkErr   error
+	applyErr   error
 }
 
 func (f *fakeHelperAutoUpdater) Check(context.Context, HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error) {
-	return f.decision, f.err
+	return f.decision, f.checkErr
 }
 
 func (f *fakeHelperAutoUpdater) Apply(_ context.Context, candidate HelperAutoUpdateCandidate) (HelperAutoUpdateApplyResult, error) {
 	f.applyCalls++
 	f.applied = append(f.applied, candidate)
+	if f.applyErr != nil {
+		return HelperAutoUpdateApplyResult{}, f.applyErr
+	}
 	return HelperAutoUpdateApplyResult{Version: candidate.Version}, nil
 }
 
@@ -154,6 +160,101 @@ func TestBridgeHelperAutoUpdateRecordsCheckWithoutCandidate(t *testing.T) {
 	}
 	if state.AutoUpdate.CandidateTag != "" {
 		t.Fatalf("CandidateTag = %q, want empty", state.AutoUpdate.CandidateTag)
+	}
+}
+
+func TestBridgeHelperAutoUpdateApplyFailureBacksOffAndAbortsDrain(t *testing.T) {
+	st, bridge := newBridgeAutoUpdateTest(t)
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	if _, err := st.SetDraining(context.Background(), "maintenance"); err != nil {
+		t.Fatalf("seed existing drain: %v", err)
+	}
+	updater := &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			NextCheckAt: now.Add(30 * time.Minute),
+			Candidate: &HelperAutoUpdateCandidate{
+				TagName:     "v1.2.4",
+				Version:     "1.2.4",
+				Priority:    "p0",
+				PublishedAt: now.Add(-time.Minute),
+				EligibleAt:  now.Add(-time.Minute),
+				Asset:       "codex-proxy_1.2.4_linux_amd64",
+			},
+		},
+		applyErr: errors.New("download failed"),
+	}
+	var restartCalls int
+	err := bridge.maybeRunHelperAutoUpdate(context.Background(), BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+		HelperRestarter: func(context.Context) error {
+			restartCalls++
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "download failed") {
+		t.Fatalf("maybeRunHelperAutoUpdate error = %v, want download failure", err)
+	}
+	if updater.applyCalls != 1 || restartCalls != 0 {
+		t.Fatalf("applyCalls=%d restartCalls=%d, want apply once and no restart", updater.applyCalls, restartCalls)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.AutoUpdate.LastError != "download failed" || !state.AutoUpdate.BackoffUntil.After(time.Now()) {
+		t.Fatalf("auto-update failure state = %#v, want error and backoff", state.AutoUpdate)
+	}
+	if state.AutoUpdate.CandidateTag != "v1.2.4" || state.AutoUpdate.CandidateVersion != "1.2.4" {
+		t.Fatalf("candidate context was not retained after failure: %#v", state.AutoUpdate)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, "download failed") {
+		t.Fatalf("upgrade = %#v, want aborted download failure", state.Upgrade)
+	}
+	if !state.ServiceControl.Draining || state.ServiceControl.Reason != "maintenance" {
+		t.Fatalf("previous drain was not restored after failed auto-update: %#v", state.ServiceControl)
+	}
+	if state.AutoUpdate.LastInstalledTag != "" {
+		t.Fatalf("LastInstalledTag = %q, want empty after failed apply", state.AutoUpdate.LastInstalledTag)
+	}
+}
+
+func TestBridgeHelperAutoUpdateRestarterFailureKeepsInstalledState(t *testing.T) {
+	st, bridge := newBridgeAutoUpdateTest(t)
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	updater := &fakeHelperAutoUpdater{decision: HelperAutoUpdateDecision{
+		NextCheckAt: now.Add(30 * time.Minute),
+		Candidate: &HelperAutoUpdateCandidate{
+			TagName:     "v1.2.4",
+			Version:     "1.2.4",
+			Priority:    "p0",
+			PublishedAt: now.Add(-time.Minute),
+			EligibleAt:  now.Add(-time.Minute),
+			Asset:       "codex-proxy_1.2.4_linux_amd64",
+		},
+	}}
+	err := bridge.maybeRunHelperAutoUpdate(context.Background(), BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+		HelperRestarter: func(context.Context) error {
+			return errors.New("restart failed")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "restart failed") {
+		t.Fatalf("maybeRunHelperAutoUpdate error = %v, want restart failure", err)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
+		t.Fatalf("LastInstalledTag = %q, want v1.2.4", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted {
+		t.Fatalf("upgrade = %#v, want completed before restart failure is reported", state.Upgrade)
+	}
+	if state.ServiceControl.Draining {
+		t.Fatalf("ServiceControl still draining after completed install: %#v", state.ServiceControl)
 	}
 }
 

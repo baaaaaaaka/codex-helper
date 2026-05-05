@@ -330,6 +330,9 @@ func parseComparableVersion(v string) ([]int, bool, bool) {
 		s = base
 		prerelease = strings.TrimSpace(suffix) != ""
 	}
+	if base, _, ok := strings.Cut(s, "+"); ok {
+		s = base
+	}
 	parts := strings.Split(s, ".")
 	out := make([]int, 0, len(parts))
 	for _, p := range parts {
