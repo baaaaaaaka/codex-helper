@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,6 +83,129 @@ func TestHTTPProxy_ForwardsPlainHTTP(t *testing.T) {
 
 	if !rec.SawAddr(originAddr) {
 		t.Fatalf("expected dialer to see origin addr %q, got %#v", originAddr, rec.Addrs())
+	}
+}
+
+func TestHTTPProxyRejectsSelfLoopTargets(t *testing.T) {
+	var called atomic.Bool
+	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+		called.Store(true)
+		return nil, errors.New("dialer should not be called for self-loop target")
+	}), Options{InstanceID: "self-loop"})
+
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	_, port, err := net.SplitHostPort(httpAddr)
+	if err != nil {
+		t.Fatalf("split http addr: %v", err)
+	}
+	targets := []string{
+		httpAddr,
+		net.JoinHostPort("localhost", port),
+	}
+
+	for _, target := range targets {
+		t.Run("http_"+target, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://"+target+"/loop", nil)
+			p.handleHTTP(rec, req)
+			if rec.Code != http.StatusLoopDetected {
+				t.Fatalf("expected 508 for self-loop target %s, got %d", target, rec.Code)
+			}
+		})
+
+		t.Run("connect_"+target, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodConnect, "http://"+target, nil)
+			req.Host = target
+			p.handleConnect(rec, req)
+			if rec.Code != http.StatusLoopDetected {
+				t.Fatalf("expected 508 for self-loop CONNECT target %s, got %d", target, rec.Code)
+			}
+		})
+	}
+
+	if called.Load() {
+		t.Fatal("dialer was called for a self-loop target")
+	}
+}
+
+func TestHTTPProxyServeHTTPRejectsSelfLoopTargets(t *testing.T) {
+	var called atomic.Bool
+	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+		called.Store(true)
+		return nil, errors.New("dialer should not be called for self-loop target")
+	}), Options{InstanceID: "self-loop-server"})
+
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	_, port, err := net.SplitHostPort(httpAddr)
+	if err != nil {
+		t.Fatalf("split http addr: %v", err)
+	}
+	targets := []string{
+		httpAddr,
+		net.JoinHostPort("localhost", port),
+	}
+
+	proxyURL, _ := url.Parse("http://" + httpAddr)
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	for _, target := range targets {
+		resp, err := client.Get("http://" + target + "/loop")
+		if err != nil {
+			t.Fatalf("GET self-loop target %s: %v", target, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusLoopDetected {
+			t.Fatalf("expected 508 for self-loop target %s, got %d", target, resp.StatusCode)
+		}
+	}
+
+	if called.Load() {
+		t.Fatal("dialer was called for a self-loop target")
+	}
+}
+
+func TestHTTPProxySelfTargetDetection(t *testing.T) {
+	p := &HTTPProxy{addr: "127.0.0.1:4751"}
+
+	tests := []struct {
+		name string
+		addr string
+		want bool
+	}{
+		{name: "ipv4 loopback", addr: "127.0.0.1:4751", want: true},
+		{name: "localhost", addr: "localhost:4751", want: true},
+		{name: "localhost trailing dot", addr: "localhost.:4751", want: true},
+		{name: "ipv6 loopback", addr: "[::1]:4751", want: true},
+		{name: "different loopback port", addr: "127.0.0.1:4752", want: false},
+		{name: "non loopback same port", addr: "192.0.2.10:4751", want: false},
+		{name: "hostname same port", addr: "example.com:4751", want: false},
+		{name: "missing port", addr: "127.0.0.1", want: false},
+		{name: "malformed", addr: "not a host:port", want: false},
+		{name: "empty", addr: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := p.isSelfTarget(tt.addr); got != tt.want {
+				t.Fatalf("isSelfTarget(%q) = %v, want %v", tt.addr, got, tt.want)
+			}
+		})
 	}
 }
 
