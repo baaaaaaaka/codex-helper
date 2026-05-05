@@ -801,3 +801,60 @@ func TestCodexYoloArgsOnlyDangerouslyBypass(t *testing.T) {
 		t.Fatalf("codexYoloArgs = %v, want %v", got, want)
 	}
 }
+
+func TestCodexYoloLaunchArgsAddsWindowsSandboxOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	withCodexYoloRuntimeGOOS(t, "windows")
+	dir := t.TempDir()
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --dangerously-bypass-approvals-and-sandbox'\n")
+
+	got := codexYoloLaunchArgs(script)
+	want := []string{"-c", windowsYoloSandboxConfigArg, "--dangerously-bypass-approvals-and-sandbox"}
+	requireStringSlice(t, got, want)
+}
+
+func TestCodexYoloLaunchArgsKeepsNonWindowsArgsUnchanged(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	withCodexYoloRuntimeGOOS(t, "linux")
+	dir := t.TempDir()
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --dangerously-bypass-approvals-and-sandbox'\n")
+
+	got := codexYoloLaunchArgs(script)
+	want := []string{"--dangerously-bypass-approvals-and-sandbox"}
+	requireStringSlice(t, got, want)
+}
+
+func TestCodexYoloLaunchArgsDoesNotInjectWithoutYoloSupport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	withCodexYoloRuntimeGOOS(t, "windows")
+	dir := t.TempDir()
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex [options] [prompt]'\n")
+
+	got := codexYoloLaunchArgs(script)
+	if got != nil {
+		t.Fatalf("codexYoloLaunchArgs = %v, want nil", got)
+	}
+}
+
+func TestStripYoloArgsRemovesWindowsSandboxOverride(t *testing.T) {
+	in := []string{"codex", "-c", windowsYoloSandboxConfigArg, "--dangerously-bypass-approvals-and-sandbox", "resume", "abc"}
+	got := stripYoloArgs(in)
+	want := []string{"codex", "resume", "abc"}
+	requireStringSlice(t, got, want)
+}
+
+func TestStripYoloArgsPreservesUnrelatedConfigOverride(t *testing.T) {
+	in := []string{"codex", "-c", `model="gpt-5.5"`, "--dangerously-bypass-approvals-and-sandbox", "resume", "abc"}
+	got := stripYoloArgs(in)
+	want := []string{"codex", "-c", `model="gpt-5.5"`, "resume", "abc"}
+	requireStringSlice(t, got, want)
+}

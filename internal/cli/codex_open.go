@@ -81,7 +81,7 @@ func buildCodexResumeCommand(
 
 	args := []string{"resume", session.SessionID}
 	if yolo {
-		if yoloFlags := codexYoloArgs(path); len(yoloFlags) > 0 {
+		if yoloFlags := codexYoloLaunchArgs(path); len(yoloFlags) > 0 {
 			args = append(yoloFlags, args...)
 		}
 	}
@@ -273,7 +273,7 @@ func runCodexNewSession(
 
 	cmdArgs := []string{codexPath}
 	if useYolo {
-		if yoloFlags := codexYoloArgs(codexPath); len(yoloFlags) > 0 {
+		if yoloFlags := codexYoloLaunchArgs(codexPath); len(yoloFlags) > 0 {
 			cmdArgs = append(cmdArgs, yoloFlags...)
 		}
 	}

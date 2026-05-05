@@ -201,6 +201,28 @@ func TestBuildCodexResumeCommandPrefersDangerouslyBypass(t *testing.T) {
 	}
 }
 
+func TestBuildCodexResumeCommandAddsWindowsYoloSandboxOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	withCodexYoloRuntimeGOOS(t, "windows")
+	dir := t.TempDir()
+	session := codexhistory.Session{SessionID: "abc"}
+	project := codexhistory.Project{Path: dir}
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\necho 'usage codex --dangerously-bypass-approvals-and-sandbox'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	_, args, _, err := buildCodexResumeCommand(scriptPath, session, project, true)
+	if err != nil {
+		t.Fatalf("buildCodexResumeCommand error: %v", err)
+	}
+	want := []string{"-c", windowsYoloSandboxConfigArg, "--dangerously-bypass-approvals-and-sandbox", "resume", "abc"}
+	requireStringSlice(t, args, want)
+}
+
 func TestBuildCodexResumeCommandRejectsMissingSession(t *testing.T) {
 	dir := t.TempDir()
 	session := codexhistory.Session{}
@@ -545,6 +567,52 @@ func TestRunCodexNewSessionPrefersDangerouslyBypass(t *testing.T) {
 	if len(lines) < 1 || lines[0] != "--dangerously-bypass-approvals-and-sandbox" {
 		t.Fatalf("expected yolo args [--dangerously-bypass-approvals-and-sandbox ...], got %v", lines)
 	}
+}
+
+func TestRunCodexNewSessionAddsWindowsYoloSandboxOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	withCodexYoloRuntimeGOOS(t, "windows")
+	dir := t.TempDir()
+	outFile := filepath.Join(t.TempDir(), "args.txt")
+	scriptPath := filepath.Join(t.TempDir(), "codex")
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) printf '%%s\\n' \"$@\" > %q ;; esac\n", outFile)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	err = runCodexNewSession(
+		context.Background(),
+		&rootOptions{},
+		store,
+		nil,
+		nil,
+		dir,
+		scriptPath,
+		"",
+		false,
+		true,
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("runCodexNewSession error: %v", err)
+	}
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
+	want := []string{"-c", windowsYoloSandboxConfigArg, "--dangerously-bypass-approvals-and-sandbox"}
+	if len(lines) < len(want) {
+		t.Fatalf("expected args prefix %v, got %v", want, lines)
+	}
+	requireStringSlice(t, lines[:len(want)], want)
 }
 
 func TestRunCodexNewSessionRejectsProxyWithoutProfile(t *testing.T) {
