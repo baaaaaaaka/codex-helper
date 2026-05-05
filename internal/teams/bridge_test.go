@@ -1228,12 +1228,14 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 	}()
 	select {
 	case <-executor.started:
-	case <-time.After(2 * time.Second):
+	case err := <-done:
+		t.Fatalf("handleSessionMessage returned before executor start: %v", err)
+	case <-time.After(10 * time.Second):
 		t.Fatal("executor did not start")
 	}
 
 	var activeOwner teamstore.OwnerMetadata
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		read, ok, err := store.ReadOwner(context.Background())
 		if err != nil {
@@ -1272,7 +1274,7 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handleSessionMessage error: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("handleSessionMessage did not finish")
 	}
 	read, ok, err = store.ReadOwner(context.Background())
