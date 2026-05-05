@@ -228,7 +228,7 @@ func TestTeamsHelperReloadBuildEnvDropsTeamsSecretsAndProxies(t *testing.T) {
 		t.Fatalf("reload build env did not preserve required HOME/PATH: %#v", env)
 	}
 	path := teamsReloadEnvValue(env, "PATH")
-	for _, want := range []string{"/home/alice/.local/go/bin", "/usr/local/go/bin", "/usr/bin"} {
+	for _, want := range []string{filepath.Join("/home/alice", ".local", "go", "bin"), "/usr/local/go/bin", "/usr/bin"} {
 		if !pathContains(path, want) {
 			t.Fatalf("reload build PATH = %q, want %q", path, want)
 		}
