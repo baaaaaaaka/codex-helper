@@ -289,6 +289,8 @@ func TestSessionDisplayTitle(t *testing.T) {
 	}{
 		{"summary priority", Session{Summary: "sum", FirstPrompt: "fp", SessionID: "id"}, "sum"},
 		{"first prompt fallback", Session{FirstPrompt: "fp", SessionID: "id"}, "fp"},
+		{"teams helper safety stripped", Session{FirstPrompt: "fix the title\n\nTeams helper safety:\n- do not restart helper"}, "fix the title"},
+		{"teams artifact instructions stripped", Session{FirstPrompt: "make artifact\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}, "make artifact"},
 		{"session id fallback", Session{SessionID: "id"}, "id"},
 		{"untitled", Session{}, "untitled"},
 	}
@@ -963,6 +965,24 @@ func TestLoadHistoryIndex_SkipsSystemInjected(t *testing.T) {
 	}
 }
 
+func TestLoadHistoryIndex_StripsTeamsHelperSuffixFromFirstPrompt(t *testing.T) {
+	dir := t.TempDir()
+	entries := []string{
+		`{"session_id":"s1","ts":1770777540,"text":"fix current bug\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}`,
+	}
+	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte(strings.Join(entries, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx := loadHistoryIndex(dir)
+	info, ok := idx.lookup("s1")
+	if !ok {
+		t.Fatal("s1 not found")
+	}
+	if info.FirstPrompt != "fix current bug" {
+		t.Errorf("FirstPrompt = %q, want %q", info.FirstPrompt, "fix current bug")
+	}
+}
+
 func TestLoadHistoryIndex_InvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	content := "{broken json\n" + `{"session_id":"s1","ts":1770777540,"text":"valid"}` + "\n"
@@ -1611,6 +1631,35 @@ func TestProcessMetaLine_SecondUserKeepsFirstPrompt(t *testing.T) {
 	}
 	if meta.MessageCount != 2 {
 		t.Errorf("MessageCount = %d, want 2", meta.MessageCount)
+	}
+}
+
+func TestProcessMetaLine_StripsTeamsHelperSuffixFromFirstPrompt(t *testing.T) {
+	var meta sessionFileMeta
+	processMetaLine([]byte(`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"review the title sync\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}]}}`), &meta)
+	if meta.FirstPrompt != "review the title sync" {
+		t.Errorf("FirstPrompt = %q, want review the title sync", meta.FirstPrompt)
+	}
+	if meta.MessageCount != 1 {
+		t.Errorf("MessageCount = %d, want 1", meta.MessageCount)
+	}
+}
+
+func TestProcessMetaLine_SkipsTeamsHelperOnlyPrompt(t *testing.T) {
+	var meta sessionFileMeta
+	processMetaLine([]byte(`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Teams helper safety:\n- do not restart helper"}]}}`), &meta)
+	if meta.FirstPrompt != "" {
+		t.Errorf("FirstPrompt = %q, want empty", meta.FirstPrompt)
+	}
+	if meta.MessageCount != 0 {
+		t.Errorf("MessageCount = %d, want 0 for helper-only prompt", meta.MessageCount)
+	}
+	processMetaLine([]byte(`{"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real user prompt"}]}}`), &meta)
+	if meta.FirstPrompt != "real user prompt" {
+		t.Errorf("FirstPrompt = %q, want real user prompt", meta.FirstPrompt)
+	}
+	if meta.MessageCount != 1 {
+		t.Errorf("MessageCount = %d, want 1", meta.MessageCount)
 	}
 }
 

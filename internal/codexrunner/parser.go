@@ -33,20 +33,36 @@ func ParseJSONL(r io.Reader) (TurnResult, error) {
 }
 
 type codexEvent struct {
-	Type     string          `json:"type"`
-	ThreadID string          `json:"thread_id"`
-	TurnID   string          `json:"turn_id"`
-	Turn     codexTurn       `json:"turn"`
-	Item     codexItem       `json:"item"`
-	Usage    codexUsage      `json:"usage"`
-	Error    codexEventError `json:"error"`
-	Message  string          `json:"message"`
-	Code     string          `json:"code"`
-	Raw      json.RawMessage `json:"-"`
+	Type          string          `json:"type"`
+	ThreadID      string          `json:"thread_id"`
+	ThreadIDCamel string          `json:"threadId"`
+	ThreadName    string          `json:"thread_name"`
+	ThreadName2   string          `json:"threadName"`
+	Name          string          `json:"name"`
+	Title         string          `json:"title"`
+	TurnID        string          `json:"turn_id"`
+	Turn          codexTurn       `json:"turn"`
+	Thread        codexThread     `json:"thread"`
+	Item          codexItem       `json:"item"`
+	Usage         codexUsage      `json:"usage"`
+	Error         codexEventError `json:"error"`
+	Message       string          `json:"message"`
+	Code          string          `json:"code"`
+	Raw           json.RawMessage `json:"-"`
 }
 
 type codexTurn struct {
 	ID string `json:"id"`
+}
+
+type codexThread struct {
+	ID            string `json:"id"`
+	ThreadID      string `json:"thread_id"`
+	ThreadIDCamel string `json:"threadId"`
+	Name          string `json:"name"`
+	ThreadName    string `json:"thread_name"`
+	ThreadName2   string `json:"threadName"`
+	Title         string `json:"title"`
 }
 
 type codexItem struct {
@@ -93,9 +109,15 @@ type codexEventError struct {
 func applyEvent(result *TurnResult, event codexEvent, raw []byte) {
 	switch event.Type {
 	case "thread.started", "thread/started":
-		if strings.TrimSpace(event.ThreadID) != "" {
-			result.ThreadID = event.ThreadID
+		if id := firstNonEmpty(event.ThreadIDCamel, event.ThreadID, event.Thread.ThreadIDCamel, event.Thread.ThreadID, event.Thread.ID); id != "" {
+			result.ThreadID = id
 		}
+		setThreadName(result, event)
+	case "thread.name.updated", "thread/name/updated":
+		if id := firstNonEmpty(event.ThreadIDCamel, event.ThreadID, event.Thread.ThreadIDCamel, event.Thread.ThreadID, event.Thread.ID); id != "" {
+			result.ThreadID = id
+		}
+		setThreadName(result, event)
 	case "turn.started", "turn/started":
 		result.Status = TurnStatusStarted
 		setTurnID(result, event)
@@ -117,6 +139,12 @@ func applyEvent(result *TurnResult, event codexEvent, raw []byte) {
 		result.Failure = failureFromEvent(event)
 	default:
 		mergeUsage(&result.Usage, event.Usage)
+	}
+}
+
+func setThreadName(result *TurnResult, event codexEvent) {
+	if name := firstNonEmpty(event.Thread.Name, event.Thread.ThreadName2, event.Thread.ThreadName, event.Thread.Title, event.ThreadName2, event.ThreadName, event.Name, event.Title); name != "" {
+		result.ThreadName = strings.TrimSpace(name)
 	}
 }
 

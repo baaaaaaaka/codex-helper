@@ -60,6 +60,26 @@ func TestParseJSONLAllowsOfficialExecEventsWithoutTurnID(t *testing.T) {
 	}
 }
 
+func TestParseJSONLExtractsThreadNameUpdates(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"thread.started","thread":{"id":"thread-123","name":"Initial title"}}`,
+		`{"type":"thread.name.updated","threadId":"thread-123","threadName":"Generated title"}`,
+		`{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"done"}}`,
+		`{"type":"turn.completed"}`,
+	}, "\n")
+
+	got, err := ParseJSONL(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseJSONL error: %v", err)
+	}
+	if got.ThreadID != "thread-123" {
+		t.Fatalf("thread id = %q", got.ThreadID)
+	}
+	if got.ThreadName != "Generated title" {
+		t.Fatalf("thread name = %q, want Generated title", got.ThreadName)
+	}
+}
+
 func TestParseJSONLReturnsParseFailureForInvalidJSONEvent(t *testing.T) {
 	_, err := ParseJSONL(strings.NewReader("{bad json}\n"))
 	if !IsKind(err, ErrorParse) {

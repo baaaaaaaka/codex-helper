@@ -125,6 +125,57 @@ func TestBareNumberResolvesCurrentControlViewOnly(t *testing.T) {
 	}
 }
 
+func TestControlDashboardOrdersWorkspacesAndSessionsByRecentActivity(t *testing.T) {
+	now := time.Date(2026, 5, 5, 10, 0, 0, 0, time.UTC)
+	dashboard := BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{
+		ViewKind: DashboardViewWorkspaces,
+		Workspaces: []DashboardWorkspaceInput{{
+			ID:        "workspace-old",
+			Path:      "/home/baka/projects/old",
+			UpdatedAt: now.Add(-4 * time.Hour),
+			Sessions: []DashboardSessionInput{{
+				ID:        "session-old",
+				Topic:     "old session",
+				UpdatedAt: now.Add(-4 * time.Hour),
+			}},
+		}, {
+			ID:        "workspace-new",
+			Path:      "/home/baka/projects/new",
+			UpdatedAt: now.Add(-10 * time.Minute),
+			Sessions: []DashboardSessionInput{{
+				ID:        "session-new",
+				Topic:     "new session",
+				UpdatedAt: now.Add(-10 * time.Minute),
+			}},
+		}},
+	}, now)
+	if len(dashboard.Workspaces) != 2 || dashboard.Workspaces[0].ID != "workspace-new" || dashboard.CurrentView.Items[0].WorkspaceID != "workspace-new" {
+		t.Fatalf("workspace recency order = %#v, view = %#v", dashboard.Workspaces, dashboard.CurrentView.Items)
+	}
+
+	dashboard = BuildControlDashboard(dashboard, ControlDashboardInput{
+		ViewKind:            DashboardViewSessions,
+		SelectedWorkspaceID: "workspace-new",
+		Workspaces: []DashboardWorkspaceInput{{
+			ID:        "workspace-new",
+			Path:      "/home/baka/projects/new",
+			UpdatedAt: now,
+			Sessions: []DashboardSessionInput{{
+				ID:        "session-older",
+				Topic:     "older",
+				UpdatedAt: now.Add(-2 * time.Hour),
+			}, {
+				ID:        "session-newer",
+				Topic:     "newer",
+				UpdatedAt: now.Add(-5 * time.Minute),
+			}},
+		}},
+	}, now.Add(time.Minute))
+	if len(dashboard.CurrentView.Items) != 2 || dashboard.CurrentView.Items[0].SessionID != "session-newer" {
+		t.Fatalf("session recency order = %#v", dashboard.CurrentView.Items)
+	}
+}
+
 func TestExpiredDashboardViewDoesNotGuess(t *testing.T) {
 	now := time.Date(2026, 4, 30, 10, 0, 0, 0, time.UTC)
 	dashboard := BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{

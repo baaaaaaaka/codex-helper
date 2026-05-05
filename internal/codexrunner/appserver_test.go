@@ -53,6 +53,7 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 		`{"id":3,"result":{"thread":{"id":"thread-new"}}}`,
 		`{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}`,
 		`{"method":"turn/started","params":{"threadId":"thread-new","turn":{"id":"turn-1"}}}`,
+		`{"method":"thread/name/updated","params":{"threadId":"thread-new","threadName":"Generated helper title"}}`,
 		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-new","turnId":"turn-1","itemId":"item-1","delta":"do"}}`,
 		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-new","turnId":"turn-1","itemId":"item-1","delta":"ne"}}`,
 		`{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-new","turnId":"turn-1","tokenUsage":{"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":20,"outputTokens":20,"reasoningOutputTokens":0},"last":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":7,"outputTokens":10,"reasoningOutputTokens":0}}}}`,
@@ -74,6 +75,9 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	}
 	if got.FinalAgentMessage != "done" || got.Usage.CachedInputTokens != 7 {
 		t.Fatalf("notification result not parsed: %#v", got)
+	}
+	if got.ThreadName != "Generated helper title" {
+		t.Fatalf("thread name = %q, want generated title", got.ThreadName)
 	}
 
 	writes := transport.decodedWrites(t)
@@ -300,7 +304,7 @@ func TestAppServerRunnerReadThreadUsesIncludeTurns(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
-		`{"id":3,"result":{"thread":{"id":"thread-read","turns":[{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"done"}]}]}}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-read","name":"Read thread title","turns":[{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"done"}]}]}}}`,
 	)
 	runner := NewAppServerRunner(transport)
 
@@ -310,6 +314,9 @@ func TestAppServerRunnerReadThreadUsesIncludeTurns(t *testing.T) {
 	}
 	if got.ID != "thread-read" {
 		t.Fatalf("thread id = %q", got.ID)
+	}
+	if got.Name != "Read thread title" {
+		t.Fatalf("thread name = %q", got.Name)
 	}
 
 	writes := transport.decodedWrites(t)
@@ -341,6 +348,36 @@ func TestAppServerRunnerBackfillsCompletedTurnItems(t *testing.T) {
 	writes := transport.decodedWrites(t)
 	assertMethod(t, writes[5], "thread/read")
 	assertParamBool(t, writes[5], "includeTurns", true)
+}
+
+func TestAppServerRunnerBackfillsThreadNameAfterCompletedTurn(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-new"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}`,
+		`{"method":"turn/started","params":{"threadId":"thread-new","turn":{"id":"turn-1"}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage","text":"done"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-new","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
+		`{"id":5,"result":{"thread":{"id":"thread-new","name":"Backfilled generated title","turns":[{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"done"}]}]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	runner.BackfillThreadName = true
+
+	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatalf("StartThread error: %v", err)
+	}
+	if got.FinalAgentMessage != "done" {
+		t.Fatalf("final message = %q, want done", got.FinalAgentMessage)
+	}
+	if got.ThreadName != "Backfilled generated title" {
+		t.Fatalf("thread name = %q, want backfilled generated title", got.ThreadName)
+	}
+
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[5], "thread/read")
+	assertParamAbsent(t, writes[5], "includeTurns")
 }
 
 func TestAppServerRunnerFallsBackWhenExtraArgsCannotBeTranslated(t *testing.T) {

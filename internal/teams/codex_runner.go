@@ -18,9 +18,10 @@ type StreamingExecutor interface {
 }
 
 type ExecutionResult struct {
-	Text          string
-	CodexThreadID string
-	CodexTurnID   string
+	Text             string
+	CodexThreadID    string
+	CodexThreadTitle string
+	CodexTurnID      string
 }
 
 type AmbiguousExecutionError struct {
@@ -116,9 +117,10 @@ func codexTurnMayStillBeRunning(result codexrunner.TurnResult) bool {
 
 func executionResultFromCodexTurn(result codexrunner.TurnResult) ExecutionResult {
 	return ExecutionResult{
-		Text:          strings.TrimSpace(result.FinalAgentMessage),
-		CodexThreadID: result.ThreadID,
-		CodexTurnID:   result.TurnID,
+		Text:             strings.TrimSpace(result.FinalAgentMessage),
+		CodexThreadID:    result.ThreadID,
+		CodexThreadTitle: strings.TrimSpace(result.ThreadName),
+		CodexTurnID:      result.TurnID,
 	}
 }
 
@@ -128,9 +130,10 @@ func successfulExecutionResultFromCodexTurn(result codexrunner.TurnResult) Execu
 		text = "(Codex finished without a final message.)"
 	}
 	return ExecutionResult{
-		Text:          text,
-		CodexThreadID: result.ThreadID,
-		CodexTurnID:   result.TurnID,
+		Text:             text,
+		CodexThreadID:    result.ThreadID,
+		CodexThreadTitle: strings.TrimSpace(result.ThreadName),
+		CodexTurnID:      result.TurnID,
 	}
 }
 
@@ -171,8 +174,9 @@ func parseCodexJSONL(output string) ExecutionResult {
 		return ExecutionResult{}
 	}
 	return ExecutionResult{
-		Text:          turn.FinalAgentMessage,
-		CodexThreadID: turn.ThreadID,
-		CodexTurnID:   turn.TurnID,
+		Text:             turn.FinalAgentMessage,
+		CodexThreadID:    turn.ThreadID,
+		CodexThreadTitle: strings.TrimSpace(turn.ThreadName),
+		CodexTurnID:      turn.TurnID,
 	}
 }

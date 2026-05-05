@@ -106,6 +106,98 @@ func setReadSharedHistoryIndexCacheFileForTest(t *testing.T, fn func(path string
 	t.Cleanup(func() { readSharedHistoryIndexCacheFile = prev })
 }
 
+func TestPersistentSessionMetaCacheVersionInvalidatesPromptFiltering(t *testing.T) {
+	setTestUserCacheDir(t)
+	resetSessionFileCache()
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "rollout-2026-01-01T00-00-00-019d0000-0000-7000-8000-000000000001.jsonl")
+	writeSessionMetaFile(t, filePath, "019d0000-0000-7000-8000-000000000001", dir, "real task\\n\\nTeams helper safety:\\n- do not restart helper")
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat session file: %v", err)
+	}
+	cachePath, err := sessionMetaCacheFile()
+	if err != nil {
+		t.Fatalf("sessionMetaCacheFile: %v", err)
+	}
+	stale := persistentSessionMetaCache{
+		Version: 2,
+		Entries: map[string]persistentSessionMetaEntry{
+			filepath.Clean(filePath): {
+				FileCacheKey: newFileCacheKey(filePath, info),
+				Meta:         sessionFileMeta{SessionID: "019d0000-0000-7000-8000-000000000001", ProjectPath: dir, FirstPrompt: "stale unfiltered Teams helper safety"},
+			},
+		},
+	}
+	data, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatalf("marshal stale cache: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+	if err := os.WriteFile(cachePath, data, 0o644); err != nil {
+		t.Fatalf("write stale cache: %v", err)
+	}
+
+	meta, err := readSessionFileMetaCached(filePath)
+	if err != nil {
+		t.Fatalf("readSessionFileMetaCached: %v", err)
+	}
+	if meta.FirstPrompt != "real task" {
+		t.Fatalf("FirstPrompt = %q, want real task", meta.FirstPrompt)
+	}
+}
+
+func TestPersistentHistoryIndexCacheVersionInvalidatesPromptFiltering(t *testing.T) {
+	setTestUserCacheDir(t)
+
+	dir := t.TempDir()
+	historyPath := filepath.Join(dir, "history.jsonl")
+	if err := os.WriteFile(historyPath, []byte(`{"session_id":"s1","ts":1770777540,"text":"real task\n\nTeams helper safety:\n- do not restart helper"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+	info, err := os.Stat(historyPath)
+	if err != nil {
+		t.Fatalf("stat history: %v", err)
+	}
+	cachePath, err := historyIndexCacheFile()
+	if err != nil {
+		t.Fatalf("historyIndexCacheFile: %v", err)
+	}
+	stale := persistentHistoryIndexCache{
+		Version: 2,
+		Entries: map[string]persistentHistoryIndexEntry{
+			filepath.Clean(historyPath): {
+				FileCacheKey: newFileCacheKey(historyPath, info),
+				Sessions: map[string]*historySessionInfo{
+					"s1": {FirstPrompt: "stale unfiltered Teams helper safety", FirstPromptTime: time.Unix(1770777540, 0)},
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatalf("marshal stale cache: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+	if err := os.WriteFile(cachePath, data, 0o644); err != nil {
+		t.Fatalf("write stale cache: %v", err)
+	}
+
+	idx := loadHistoryIndex(dir)
+	infoOut, ok := idx.lookup("s1")
+	if !ok {
+		t.Fatal("s1 not found")
+	}
+	if infoOut.FirstPrompt != "real task" {
+		t.Fatalf("FirstPrompt = %q, want real task", infoOut.FirstPrompt)
+	}
+}
+
 func writeSessionMetaFile(t *testing.T, path, sessionID, cwd, prompt string) {
 	t.Helper()
 

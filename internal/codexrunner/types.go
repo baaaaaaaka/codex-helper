@@ -17,11 +17,12 @@ type Runner interface {
 }
 
 type TurnInput struct {
-	Prompt       string
-	WorkingDir   string
-	ExtraArgs    []string
-	Timeout      time.Duration
-	EventHandler EventHandler
+	Prompt             string
+	WorkingDir         string
+	ExtraArgs          []string
+	Timeout            time.Duration
+	EventHandler       EventHandler
+	BackfillThreadName bool
 }
 
 type StartTurnInput struct {
@@ -35,7 +36,8 @@ type TurnRef struct {
 }
 
 type Thread struct {
-	ID string
+	ID   string
+	Name string
 }
 
 type ListThreadsOptions struct {
@@ -56,6 +58,7 @@ const (
 
 type TurnResult struct {
 	ThreadID            string
+	ThreadName          string
 	TurnID              string
 	Status              TurnStatus
 	FinalAgentMessage   string

@@ -222,6 +222,10 @@ func processMetaLine(line []byte, meta *sessionFileMeta) {
 			if shouldSkipFirstPrompt(text) {
 				return // system-injected user message, skip entirely
 			}
+			text = firstPromptTitleText(text)
+			if text == "" {
+				return // Teams-helper-only injected prompt, skip entirely.
+			}
 			meta.MessageCount++
 			if meta.FirstPrompt == "" {
 				meta.FirstPrompt = text

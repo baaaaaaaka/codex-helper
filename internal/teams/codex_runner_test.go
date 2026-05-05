@@ -52,9 +52,10 @@ func TestRunnerExecutorDoesNotTreatExistingThreadIDErrorAsAccepted(t *testing.T)
 func TestRunnerExecutorTreatsStartedTurnErrorAsAmbiguous(t *testing.T) {
 	runner := &fakeCodexRunner{
 		result: codexrunner.TurnResult{
-			ThreadID: "thread-existing",
-			TurnID:   "turn-started",
-			Status:   codexrunner.TurnStatusInProgress,
+			ThreadID:   "thread-existing",
+			ThreadName: "Existing thread title",
+			TurnID:     "turn-started",
+			Status:     codexrunner.TurnStatusInProgress,
 		},
 		err: fmt.Errorf("stream disconnected before completion"),
 	}
@@ -65,6 +66,9 @@ func TestRunnerExecutorTreatsStartedTurnErrorAsAmbiguous(t *testing.T) {
 	}
 	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-started" {
 		t.Fatalf("unexpected execution result: %#v", got)
+	}
+	if got.CodexThreadTitle != "Existing thread title" {
+		t.Fatalf("thread title = %q", got.CodexThreadTitle)
 	}
 }
 

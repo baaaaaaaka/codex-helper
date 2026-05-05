@@ -14,7 +14,7 @@ import (
 	"github.com/gofrs/flock"
 )
 
-const persistentCacheVersion = 2
+const persistentCacheVersion = 3
 
 type fileCacheKey struct {
 	Size          int64  `json:"size"`

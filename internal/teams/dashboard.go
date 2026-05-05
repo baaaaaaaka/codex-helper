@@ -282,6 +282,7 @@ func ResolveDashboardNumber(scope ChatScope, view DashboardView, number int, now
 }
 
 func buildDashboardWorkspaces(previous []DashboardWorkspace, inputs []DashboardWorkspaceInput) []DashboardWorkspace {
+	inputs = sortDashboardWorkspaceInputs(inputs)
 	ids := make([]string, 0, len(inputs))
 	for _, input := range inputs {
 		id := dashboardWorkspaceID(input)
@@ -307,9 +308,7 @@ func buildDashboardWorkspaces(previous []DashboardWorkspace, inputs []DashboardW
 			UpdatedAt:    input.UpdatedAt,
 		})
 	}
-	sort.SliceStable(workspaces, func(i, j int) bool {
-		return workspaces[i].Number < workspaces[j].Number
-	})
+	sort.SliceStable(workspaces, func(i, j int) bool { return dashboardWorkspaceLess(workspaces[i], workspaces[j]) })
 	return workspaces
 }
 
@@ -345,6 +344,9 @@ func buildDashboardSessions(previous []DashboardSession, workspaceInputs []Dashb
 
 	numbers := map[string]int{}
 	for workspaceID, keys := range groupedKeys {
+		sort.SliceStable(keys, func(i, j int) bool {
+			return dashboardSessionInputLess(sessionInputs[keys[i]], sessionInputs[keys[j]])
+		})
 		prev := map[string]int{}
 		for key, number := range previousNumbers {
 			if strings.HasPrefix(key, workspaceID+"\x00") {
@@ -381,9 +383,117 @@ func buildDashboardSessions(previous []DashboardSession, workspaceInputs []Dashb
 		if sessions[i].WorkspaceID != sessions[j].WorkspaceID {
 			return sessions[i].WorkspaceID < sessions[j].WorkspaceID
 		}
-		return sessions[i].Number < sessions[j].Number
+		return dashboardSessionLess(sessions[i], sessions[j])
 	})
 	return sessions
+}
+
+func sortDashboardWorkspaceInputs(inputs []DashboardWorkspaceInput) []DashboardWorkspaceInput {
+	if len(inputs) <= 1 {
+		return inputs
+	}
+	out := append([]DashboardWorkspaceInput(nil), inputs...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return dashboardWorkspaceInputLess(out[i], out[j])
+	})
+	return out
+}
+
+func dashboardWorkspaceInputLess(a, b DashboardWorkspaceInput) bool {
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		if a.UpdatedAt.IsZero() {
+			return false
+		}
+		if b.UpdatedAt.IsZero() {
+			return true
+		}
+		return a.UpdatedAt.After(b.UpdatedAt)
+	}
+	aTitle := WorkspaceDisplayTitle(a.UserTitle, a.Path)
+	bTitle := WorkspaceDisplayTitle(b.UserTitle, b.Path)
+	if aTitle != bTitle {
+		return aTitle < bTitle
+	}
+	aPath := strings.TrimSpace(a.Path)
+	bPath := strings.TrimSpace(b.Path)
+	if aPath != bPath {
+		return aPath < bPath
+	}
+	return dashboardWorkspaceID(a) < dashboardWorkspaceID(b)
+}
+
+func dashboardWorkspaceLess(a, b DashboardWorkspace) bool {
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		if a.UpdatedAt.IsZero() {
+			return false
+		}
+		if b.UpdatedAt.IsZero() {
+			return true
+		}
+		return a.UpdatedAt.After(b.UpdatedAt)
+	}
+	if a.DisplayTitle != b.DisplayTitle {
+		return a.DisplayTitle < b.DisplayTitle
+	}
+	if a.Path != b.Path {
+		return a.Path < b.Path
+	}
+	return a.ID < b.ID
+}
+
+func dashboardSessionInputLess(a, b DashboardSessionInput) bool {
+	aTime := dashboardSessionInputRecency(a)
+	bTime := dashboardSessionInputRecency(b)
+	if !aTime.Equal(bTime) {
+		if aTime.IsZero() {
+			return false
+		}
+		if bTime.IsZero() {
+			return true
+		}
+		return aTime.After(bTime)
+	}
+	aTitle := DashboardDisplayTitle(a.UserTitle, a.Topic, a.Cwd)
+	bTitle := DashboardDisplayTitle(b.UserTitle, b.Topic, b.Cwd)
+	if aTitle != bTitle {
+		return aTitle < bTitle
+	}
+	return strings.TrimSpace(a.ID) < strings.TrimSpace(b.ID)
+}
+
+func dashboardSessionLess(a, b DashboardSession) bool {
+	aTime := dashboardSessionRecency(a)
+	bTime := dashboardSessionRecency(b)
+	if !aTime.Equal(bTime) {
+		if aTime.IsZero() {
+			return false
+		}
+		if bTime.IsZero() {
+			return true
+		}
+		return aTime.After(bTime)
+	}
+	if a.DisplayTitle != b.DisplayTitle {
+		return a.DisplayTitle < b.DisplayTitle
+	}
+	if a.ID != b.ID {
+		return a.ID < b.ID
+	}
+	return a.Number < b.Number
+}
+
+func dashboardSessionInputRecency(session DashboardSessionInput) time.Time {
+	if !session.UpdatedAt.IsZero() {
+		return session.UpdatedAt
+	}
+	return session.CreatedAt
+}
+
+func dashboardSessionRecency(session DashboardSession) time.Time {
+	if !session.UpdatedAt.IsZero() {
+		return session.UpdatedAt
+	}
+	return session.CreatedAt
 }
 
 func buildDashboardView(kind DashboardViewKind, selectedWorkspaceID string, workspaces []DashboardWorkspace, sessions []DashboardSession, now time.Time, ttl time.Duration) DashboardView {

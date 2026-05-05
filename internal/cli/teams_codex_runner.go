@@ -77,6 +77,9 @@ func (e teamsCodexExecutor) RunWithEventHandler(ctx context.Context, session *te
 		Timeout:      e.timeout,
 		EventHandler: handler,
 	}
+	if session != nil && teams.SessionAllowsAutoTitleUpdate(*session) {
+		input.BackfillThreadName = true
+	}
 	var result codexrunner.TurnResult
 	var err error
 	if session != nil && strings.TrimSpace(session.CodexThreadID) != "" {
@@ -107,9 +110,10 @@ func teamsCodexTurnMayStillBeRunning(result codexrunner.TurnResult) bool {
 
 func teamsExecutionResultFromCodexTurn(result codexrunner.TurnResult) teams.ExecutionResult {
 	return teams.ExecutionResult{
-		Text:          strings.TrimSpace(result.FinalAgentMessage),
-		CodexThreadID: result.ThreadID,
-		CodexTurnID:   result.TurnID,
+		Text:             strings.TrimSpace(result.FinalAgentMessage),
+		CodexThreadID:    result.ThreadID,
+		CodexThreadTitle: strings.TrimSpace(result.ThreadName),
+		CodexTurnID:      result.TurnID,
 	}
 }
 
@@ -118,7 +122,7 @@ func successfulTeamsExecutionResultFromCodexTurn(result codexrunner.TurnResult) 
 	if text == "" {
 		text = "(Codex finished without a final message.)"
 	}
-	return teams.ExecutionResult{Text: text, CodexThreadID: result.ThreadID, CodexTurnID: result.TurnID}
+	return teams.ExecutionResult{Text: text, CodexThreadID: result.ThreadID, CodexThreadTitle: strings.TrimSpace(result.ThreadName), CodexTurnID: result.TurnID}
 }
 
 type teamsCodexLauncher struct {

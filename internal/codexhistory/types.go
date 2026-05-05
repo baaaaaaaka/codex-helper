@@ -41,8 +41,8 @@ func (s Session) DisplayTitle() string {
 	if s.Summary != "" {
 		return displayTitleWithHelperMarker(s.Summary, kind)
 	}
-	if s.FirstPrompt != "" {
-		return displayTitleWithHelperMarker(s.FirstPrompt, kind)
+	if title := firstPromptTitleText(s.FirstPrompt); title != "" {
+		return displayTitleWithHelperMarker(title, kind)
 	}
 	if s.SessionID != "" {
 		return displayTitleWithHelperMarker(s.SessionID, kind)
@@ -55,8 +55,8 @@ func (s SubagentSession) DisplayTitle() string {
 	if s.Summary != "" {
 		return displayTitleWithHelperMarker(s.Summary, kind)
 	}
-	if s.FirstPrompt != "" {
-		return displayTitleWithHelperMarker(s.FirstPrompt, kind)
+	if title := firstPromptTitleText(s.FirstPrompt); title != "" {
+		return displayTitleWithHelperMarker(title, kind)
 	}
 	if s.AgentID != "" {
 		return displayTitleWithHelperMarker(s.AgentID, kind)

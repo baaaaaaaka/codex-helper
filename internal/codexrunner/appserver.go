@@ -59,6 +59,9 @@ type AppServerRunner struct {
 	ExtraEnv      []string
 	WorkingDir    string
 	Timeout       time.Duration
+	// BackfillThreadName reads thread metadata after completed turns when the
+	// completion stream did not carry a thread/name/updated notification.
+	BackfillThreadName bool
 
 	mu          sync.Mutex
 	nextID      int64
@@ -370,7 +373,9 @@ func (r *AppServerRunner) startTurnLocked(ctx context.Context, input StartTurnIn
 			return result, err
 		}
 	}
-	if result.Status == TurnStatusCompleted && strings.TrimSpace(result.FinalAgentMessage) == "" {
+	needsBackfillMessage := strings.TrimSpace(result.FinalAgentMessage) == ""
+	needsBackfillName := (r.BackfillThreadName || input.BackfillThreadName) && strings.TrimSpace(result.ThreadName) == ""
+	if result.Status == TurnStatusCompleted && (needsBackfillMessage || needsBackfillName) {
 		if err := r.backfillTurnResultLocked(ctx, &result); err != nil {
 			return result, err
 		}
@@ -393,15 +398,22 @@ func (r *AppServerRunner) backfillTurnResultLocked(ctx context.Context, result *
 	if threadID == "" {
 		return nil
 	}
-	raw, err := r.requestLocked(ctx, appServerMethodThreadRead, map[string]any{
-		"threadId":     threadID,
-		"includeTurns": true,
-	}, nil)
+	includeTurns := strings.TrimSpace(result.FinalAgentMessage) == ""
+	params := map[string]any{"threadId": threadID}
+	if includeTurns {
+		params["includeTurns"] = true
+	}
+	raw, err := r.requestLocked(ctx, appServerMethodThreadRead, params, nil)
 	if err != nil {
 		return err
 	}
-	if message := finalAgentMessageForTurn(raw, result.TurnID); strings.TrimSpace(message) != "" {
-		result.FinalAgentMessage = message
+	if thread, ok := decodeThread(raw); ok && strings.TrimSpace(result.ThreadName) == "" {
+		result.ThreadName = thread.Name
+	}
+	if includeTurns {
+		if message := finalAgentMessageForTurn(raw, result.TurnID); strings.TrimSpace(message) != "" {
+			result.FinalAgentMessage = message
+		}
 	}
 	return nil
 }
@@ -684,10 +696,18 @@ func decodeThread(raw json.RawMessage) (Thread, bool) {
 		ID            string `json:"id"`
 		ThreadID      string `json:"thread_id"`
 		ThreadIDCamel string `json:"threadId"`
+		Name          string `json:"name"`
+		ThreadName    string `json:"thread_name"`
+		ThreadName2   string `json:"threadName"`
+		Title         string `json:"title"`
 		Thread        struct {
 			ID            string `json:"id"`
 			ThreadID      string `json:"thread_id"`
 			ThreadIDCamel string `json:"threadId"`
+			Name          string `json:"name"`
+			ThreadName    string `json:"thread_name"`
+			ThreadName2   string `json:"threadName"`
+			Title         string `json:"title"`
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
@@ -697,7 +717,8 @@ func decodeThread(raw json.RawMessage) (Thread, bool) {
 	if id == "" {
 		return Thread{}, false
 	}
-	return Thread{ID: id}, true
+	name := firstNonEmpty(envelope.Thread.Name, envelope.Thread.ThreadName2, envelope.Thread.ThreadName, envelope.Thread.Title, envelope.Name, envelope.ThreadName2, envelope.ThreadName, envelope.Title)
+	return Thread{ID: id, Name: strings.TrimSpace(name)}, true
 }
 
 func decodeThreads(raw json.RawMessage) ([]Thread, error) {
@@ -935,9 +956,20 @@ func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {
 	var envelope struct {
 		ThreadID      string `json:"thread_id"`
 		ThreadIDCamel string `json:"threadId"`
+		ThreadName    string `json:"thread_name"`
+		ThreadName2   string `json:"threadName"`
+		Name          string `json:"name"`
+		Title         string `json:"title"`
 		TurnID        string `json:"turn_id"`
 		TurnIDCamel   string `json:"turnId"`
-		Turn          struct {
+		Thread        struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			ThreadName  string `json:"thread_name"`
+			ThreadName2 string `json:"threadName"`
+			Title       string `json:"title"`
+		} `json:"thread"`
+		Turn struct {
 			ID     string       `json:"id"`
 			Status TurnStatus   `json:"status"`
 			Items  []codexItem  `json:"items"`
@@ -953,6 +985,12 @@ func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {
 	}
 	if firstNonEmpty(envelope.ThreadIDCamel, envelope.ThreadID) != "" {
 		result.ThreadID = firstNonEmpty(envelope.ThreadIDCamel, envelope.ThreadID)
+	}
+	if envelope.Thread.ID != "" && result.ThreadID == "" {
+		result.ThreadID = envelope.Thread.ID
+	}
+	if name := firstNonEmpty(envelope.Thread.Name, envelope.Thread.ThreadName2, envelope.Thread.ThreadName, envelope.Thread.Title, envelope.ThreadName2, envelope.ThreadName, envelope.Name, envelope.Title); name != "" {
+		result.ThreadName = strings.TrimSpace(name)
 	}
 	if firstNonEmpty(envelope.TurnIDCamel, envelope.TurnID, envelope.Turn.ID) != "" {
 		result.TurnID = firstNonEmpty(envelope.TurnIDCamel, envelope.TurnID, envelope.Turn.ID)
@@ -1017,14 +1055,48 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 		var params struct {
 			ThreadID string `json:"threadId"`
 			Thread   struct {
-				ID string `json:"id"`
+				ID          string `json:"id"`
+				Name        string `json:"name"`
+				ThreadName  string `json:"thread_name"`
+				ThreadName2 string `json:"threadName"`
+				Title       string `json:"title"`
 			} `json:"thread"`
 		}
 		if json.Unmarshal(msg.Params, &params) == nil {
 			if id := firstNonEmpty(params.ThreadID, params.Thread.ID); id != "" {
 				result.ThreadID = id
-				return true
 			}
+			if name := firstNonEmpty(params.Thread.Name, params.Thread.ThreadName2, params.Thread.ThreadName, params.Thread.Title); name != "" {
+				result.ThreadName = strings.TrimSpace(name)
+			}
+			return result.ThreadID != "" || result.ThreadName != ""
+		}
+	case "thread/name/updated":
+		var params struct {
+			ThreadID    string `json:"threadId"`
+			ThreadID2   string `json:"thread_id"`
+			ThreadName  string `json:"threadName"`
+			ThreadName2 string `json:"thread_name"`
+			Name        string `json:"name"`
+			Title       string `json:"title"`
+			Thread      struct {
+				ID          string `json:"id"`
+				ThreadID    string `json:"thread_id"`
+				ThreadID2   string `json:"threadId"`
+				Name        string `json:"name"`
+				ThreadName  string `json:"thread_name"`
+				ThreadName2 string `json:"threadName"`
+				Title       string `json:"title"`
+			} `json:"thread"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			if id := firstNonEmpty(params.ThreadID, params.ThreadID2, params.Thread.ThreadID2, params.Thread.ThreadID, params.Thread.ID); id != "" {
+				result.ThreadID = id
+			}
+			if name := firstNonEmpty(params.ThreadName, params.ThreadName2, params.Name, params.Title, params.Thread.Name, params.Thread.ThreadName2, params.Thread.ThreadName, params.Thread.Title); name != "" {
+				result.ThreadName = strings.TrimSpace(name)
+			}
+			return result.ThreadID != "" || result.ThreadName != ""
 		}
 	case "turn/started":
 		var params struct {

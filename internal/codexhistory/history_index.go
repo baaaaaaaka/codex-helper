@@ -86,6 +86,10 @@ func loadHistoryIndexContext(ctx context.Context, root string) (historyIndex, er
 				}
 				text := strings.TrimSpace(entry.Text)
 				if text != "" && !shouldSkipFirstPrompt(text) {
+					text = firstPromptTitleText(text)
+					if text == "" {
+						continue
+					}
 					ts := time.Unix(entry.Ts, 0)
 					if info.FirstPrompt == "" || (!ts.IsZero() && (info.FirstPromptTime.IsZero() || ts.Before(info.FirstPromptTime))) {
 						info.FirstPrompt = text

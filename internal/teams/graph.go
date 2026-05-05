@@ -81,8 +81,11 @@ type ChatMember struct {
 
 type ChatMessage struct {
 	ID                   string `json:"id"`
+	ChatID               string `json:"chatId,omitempty"`
+	WebURL               string `json:"webUrl,omitempty"`
 	CreatedDateTime      string `json:"createdDateTime"`
 	LastModifiedDateTime string `json:"lastModifiedDateTime"`
+	DeletedDateTime      string `json:"deletedDateTime,omitempty"`
 	MessageType          string `json:"messageType"`
 	From                 struct {
 		User *struct {
@@ -101,6 +104,7 @@ type MessageAttachment struct {
 	ID          string `json:"id,omitempty"`
 	ContentType string `json:"contentType,omitempty"`
 	ContentURL  string `json:"contentUrl,omitempty"`
+	Content     string `json:"content,omitempty"`
 	Name        string `json:"name,omitempty"`
 }
 

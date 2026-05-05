@@ -134,6 +134,7 @@ func hasEnvValue(env []string, key string, want string) bool {
 func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
 		ThreadID:          "thread-existing",
+		ThreadName:        "Existing thread title",
 		TurnID:            "turn-existing",
 		FinalAgentMessage: "final",
 	}}
@@ -145,8 +146,34 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	if !runner.resumed || runner.threadID != "thread-existing" {
 		t.Fatalf("expected resume with exact thread id, runner=%#v", runner)
 	}
+	if !runner.input.BackfillThreadName {
+		t.Fatal("auto-title session should request thread name backfill")
+	}
 	if got.Text != "final" || got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-existing" {
 		t.Fatalf("unexpected result: %#v", got)
+	}
+	if got.CodexThreadTitle != "Existing thread title" {
+		t.Fatalf("thread title = %q", got.CodexThreadTitle)
+	}
+}
+
+func TestTeamsCodexExecutorSkipsThreadNameBackfillForUserTitle(t *testing.T) {
+	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
+		ThreadID:          "thread-existing",
+		TurnID:            "turn-existing",
+		FinalAgentMessage: "final",
+	}}
+	executor := teamsCodexExecutor{runner: runner}
+	_, err := executor.Run(context.Background(), &teams.Session{
+		CodexThreadID: "thread-existing",
+		UserTitle:     "manual room",
+		TitleSource:   "user",
+	}, "continue")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if runner.input.BackfillThreadName {
+		t.Fatal("user-titled session should not request thread name backfill")
 	}
 }
 
@@ -234,6 +261,9 @@ func TestNewManagedTeamsCodexExecutorCanUseExperimentalAppServerRunner(t *testin
 	}
 	if len(runner.AppServerArgs) != 0 {
 		t.Fatalf("appserver process args should be separate from turn args: %#v", runner.AppServerArgs)
+	}
+	if runner.BackfillThreadName {
+		t.Fatal("Teams appserver runner should request thread name backfill per turn, not globally")
 	}
 }
 
@@ -472,15 +502,18 @@ type fakeTeamsRunner struct {
 	err      error
 	resumed  bool
 	threadID string
+	input    codexrunner.TurnInput
 }
 
-func (r *fakeTeamsRunner) StartThread(context.Context, codexrunner.TurnInput) (codexrunner.TurnResult, error) {
+func (r *fakeTeamsRunner) StartThread(_ context.Context, input codexrunner.TurnInput) (codexrunner.TurnResult, error) {
+	r.input = input
 	return r.result, r.err
 }
 
-func (r *fakeTeamsRunner) ResumeThread(_ context.Context, threadID string, _ codexrunner.TurnInput) (codexrunner.TurnResult, error) {
+func (r *fakeTeamsRunner) ResumeThread(_ context.Context, threadID string, input codexrunner.TurnInput) (codexrunner.TurnResult, error) {
 	r.resumed = true
 	r.threadID = threadID
+	r.input = input
 	return r.result, r.err
 }
 

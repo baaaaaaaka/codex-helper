@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -59,6 +60,19 @@ const (
 	importCheckpointStatusComplete  = "complete"
 	importCheckpointStatusFailed    = "failed"
 	importCheckpointStatusBlocked   = "blocked"
+)
+
+type helperRestartNotice struct {
+	Version          int       `json:"version"`
+	Action           string    `json:"action,omitempty"`
+	ControlChatID    string    `json:"control_chat_id,omitempty"`
+	CommandMessageID string    `json:"command_message_id,omitempty"`
+	RequestedAt      time.Time `json:"requested_at,omitempty"`
+}
+
+const (
+	helperRestartNoticeActionRestart = "restart"
+	helperRestartNoticeActionReload  = "reload"
 )
 
 const (
@@ -454,6 +468,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	chat, err := b.EnsureControlChat(ctx)
 	if err != nil {
 		return err
+	}
+	if err := b.queuePendingHelperRestartNotice(ctx); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams helper restart notice error: %v\n", err)
 	}
 	if b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams control chat: %s\n", chat.WebURL)
@@ -1502,12 +1519,16 @@ func (b *Bridge) restartHelperFromControl(ctx context.Context, msg ChatMessage, 
 	} else if blocked {
 		return b.sendControl(ctx, message)
 	}
+	if err := b.writePendingHelperRestartNotice(msg); err != nil {
+		return b.sendControl(ctx, "⚠️ Helper restart was not started because I could not record the post-restart confirmation.\n\n"+err.Error())
+	}
 	if err := b.sendControl(ctx, strings.Join([]string{
 		"🔄 Helper restart scheduled",
 		"",
 		"I may be silent for a few seconds.",
 		"After it comes back, send `st` if you want to check status.",
 	}, "\n")); err != nil {
+		_ = b.clearPendingHelperRestartNotice()
 		return err
 	}
 	restarter := b.helperRestarter
@@ -1574,7 +1595,7 @@ func (b *Bridge) reloadHelperFromControl(ctx context.Context, msg ChatMessage, a
 		return err
 	}
 	reloader := b.helperReloader
-	b.runDelayedHelperReload(reloader, HelperReloadOptions{Force: helperReloadForce(arg)}, previous)
+	b.runDelayedHelperReload(reloader, HelperReloadOptions{Force: helperReloadForce(arg)}, previous, msg)
 	return nil
 }
 
@@ -1671,6 +1692,126 @@ func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
 	})
 }
 
+func (b *Bridge) pendingHelperRestartNoticePath() (string, error) {
+	if err := b.ensureStore(); err != nil {
+		return "", err
+	}
+	storePath := strings.TrimSpace(b.store.Path())
+	if storePath == "" {
+		return "", fmt.Errorf("Teams store path is empty")
+	}
+	return filepath.Join(filepath.Dir(storePath), "helper-restart-pending.json"), nil
+}
+
+func (b *Bridge) writePendingHelperRestartNotice(msg ChatMessage) error {
+	return b.writePendingHelperLifecycleNotice(msg, helperRestartNoticeActionRestart)
+}
+
+func (b *Bridge) writePendingHelperReloadNotice(msg ChatMessage) error {
+	return b.writePendingHelperLifecycleNotice(msg, helperRestartNoticeActionReload)
+}
+
+func (b *Bridge) writePendingHelperLifecycleNotice(msg ChatMessage, action string) error {
+	path, err := b.pendingHelperRestartNoticePath()
+	if err != nil {
+		return err
+	}
+	chatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, msg.ChatID))
+	if chatID == "" {
+		return fmt.Errorf("control chat is not bound")
+	}
+	notice := helperRestartNotice{
+		Version:          1,
+		Action:           normalizedHelperRestartNoticeAction(action),
+		ControlChatID:    chatID,
+		CommandMessageID: strings.TrimSpace(msg.ID),
+		RequestedAt:      time.Now(),
+	}
+	data, err := json.MarshalIndent(notice, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func normalizedHelperRestartNoticeAction(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case helperRestartNoticeActionReload:
+		return helperRestartNoticeActionReload
+	default:
+		return helperRestartNoticeActionRestart
+	}
+}
+
+func (b *Bridge) clearPendingHelperRestartNotice() error {
+	path, err := b.pendingHelperRestartNoticePath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
+	path, err := b.pendingHelperRestartNoticePath()
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var notice helperRestartNotice
+	if err := json.Unmarshal(data, &notice); err != nil {
+		return err
+	}
+	chatID := strings.TrimSpace(firstNonEmptyString(notice.ControlChatID, b.reg.ControlChatID))
+	if chatID == "" {
+		return fmt.Errorf("pending helper restart notice has no control chat")
+	}
+	action := normalizedHelperRestartNoticeAction(notice.Action)
+	seed := firstNonEmptyString(notice.CommandMessageID, notice.RequestedAt.Format(time.RFC3339Nano), chatID)
+	kind := "control-" + action + "-complete"
+	body := helperLifecycleCompletedNoticeBody(action)
+	if _, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:control:helper-" + action + "-complete:" + shortStableID(seed),
+		TeamsChatID: chatID,
+		Kind:        kind,
+		Body:        body,
+	}); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func helperLifecycleCompletedNoticeBody(action string) string {
+	switch normalizedHelperRestartNoticeAction(action) {
+	case helperRestartNoticeActionReload:
+		return "✅ Helper reload completed\n\nThe Teams helper is back online and running the reloaded code. Send `st` to check status."
+	default:
+		return "✅ Helper restart completed\n\nThe Teams helper is back online. Send `st` to check status."
+	}
+}
+
 func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (string, bool, error) {
 	if err := b.ensureStore(); err != nil {
 		return "", false, err
@@ -1734,6 +1875,7 @@ func (b *Bridge) runDelayedHelperRestart(restarter HelperRestarter) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := restarter(ctx); err != nil {
+		_ = b.clearPendingHelperRestartNotice()
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams helper restart failed: %v\n", err)
 		}
@@ -1741,31 +1883,45 @@ func (b *Bridge) runDelayedHelperRestart(restarter HelperRestarter) {
 	}
 }
 
-func (b *Bridge) runDelayedHelperReload(reloader HelperReloader, opts HelperReloadOptions, previous teamstore.ServiceControl) {
+func (b *Bridge) runDelayedHelperReload(reloader HelperReloader, opts HelperReloadOptions, previous teamstore.ServiceControl, msg ChatMessage) {
 	delay := helperRestartDelay
 	if delay > 0 {
 		time.Sleep(delay)
 	}
-	var clearOnce sync.Once
-	clearDrain := func(ctx context.Context) error {
+	var beforeRestartOnce sync.Once
+	var markerWritten bool
+	beforeRestart := func(ctx context.Context) error {
 		var err error
-		clearOnce.Do(func() {
+		beforeRestartOnce.Do(func() {
+			if writeErr := b.writePendingHelperReloadNotice(msg); writeErr != nil {
+				err = writeErr
+				return
+			}
+			markerWritten = true
 			err = b.restoreHelperReloadDrain(ctx, previous)
 		})
 		return err
 	}
-	opts.BeforeRestart = clearDrain
+	restoreDrainWithoutNotice := func(ctx context.Context) {
+		_ = b.restoreHelperReloadDrain(ctx, previous)
+	}
+	opts.BeforeRestart = beforeRestart
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := reloader(ctx, opts); err != nil {
-		_ = clearDrain(context.Background())
+		if markerWritten {
+			_ = b.clearPendingHelperRestartNotice()
+		}
+		restoreDrainWithoutNotice(context.Background())
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams helper reload failed: %v\n", err)
 		}
 		_ = b.sendControl(context.Background(), "⚠️ Helper reload failed\n\n"+err.Error())
 		return
 	}
-	_ = clearDrain(context.Background())
+	if !markerWritten {
+		restoreDrainWithoutNotice(context.Background())
+	}
 }
 
 func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOptions) error {
@@ -2560,6 +2716,15 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, unsupportedAttachmentMessage)
 	}
 	localFiles = append(localFiles, referenceFiles...)
+	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, chatID, msg)
+	if err != nil {
+		cleanupLocalFiles()
+		return err
+	}
+	if referencedMessageWarning != "" {
+		cleanupLocalFiles()
+		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, referencedMessageWarning)
+	}
 
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
@@ -2580,8 +2745,9 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		cleanupLocalFiles()
 		return err
 	}
+	promptText := PromptWithReferencedMessages(text, referencedMessages)
 	if b.asyncTurns {
-		prompt := PromptWithLocalAttachments(TeamsCodexPrompt(text), localFiles)
+		prompt := PromptWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles)
 		started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
 			defer cleanupLocalFiles()
 			return b.runQueuedTurn(runCtx, session, claimed, chatID, prompt)
@@ -2598,7 +2764,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	}
 	defer cleanupLocalFiles()
 
-	return b.runQueuedTurn(ctx, session, turn, chatID, PromptWithLocalAttachments(TeamsCodexPrompt(text), localFiles))
+	return b.runQueuedTurn(ctx, session, turn, chatID, PromptWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles))
 }
 
 func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID string) error {
@@ -2663,8 +2829,15 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 		return b.sendToChat(ctx, session.ChatID, hostedAttachmentMessage)
 	}
 	localFiles = append(localFiles, hostedFiles...)
+	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, session.ChatID, msg)
+	if err != nil {
+		return err
+	}
+	if referencedMessageWarning != "" {
+		return b.sendToChat(ctx, session.ChatID, referencedMessageWarning)
+	}
 	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, inbound.Text)
-	if !promptOK && len(localFiles) == 0 {
+	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
 		return b.sendToChat(ctx, session.ChatID, "retry cannot use an empty or helper-generated original message.")
 	}
 	retryTurn, _, err := b.store.QueueTurn(ctx, teamstore.Turn{
@@ -2676,7 +2849,7 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 	if err != nil {
 		return err
 	}
-	return b.runQueuedTurn(ctx, session, retryTurn, session.ChatID, PromptWithLocalAttachments(TeamsCodexPrompt(prompt), localFiles))
+	return b.runQueuedTurn(ctx, session, retryTurn, session.ChatID, PromptWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles))
 }
 
 func latestRetryableTurnID(state teamstore.State, sessionID string) (string, bool) {
@@ -2938,7 +3111,36 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			continue
 		}
 		text := strings.TrimSpace(inbound.Text)
-		if text == "" {
+		runPrompt := ""
+		cleanupPrompt := func() {}
+		if inbound.Source == "teams_session_import_deferred_attachment" && strings.TrimSpace(inbound.TeamsChatID) != "" && strings.TrimSpace(inbound.TeamsMessageID) != "" {
+			if msg, err := b.readClient().GetMessage(ctx, inbound.TeamsChatID, inbound.TeamsMessageID); err == nil {
+				prepared, cleanup, warning, err := b.prepareSessionPromptFromTeamsMessage(ctx, session, inbound.TeamsChatID, msg, text)
+				if err != nil {
+					cleanup()
+					return err
+				}
+				if warning != "" {
+					cleanup()
+					if err := b.markDeferredInboundIgnored(ctx, inbound.ID, warning); err != nil {
+						return err
+					}
+					if err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+						ID:          "outbox:" + inbound.ID + ":deferred-rejected",
+						SessionID:   session.ID,
+						TeamsChatID: session.ChatID,
+						Kind:        "error",
+						Body:        warning,
+					}); err != nil {
+						return err
+					}
+					continue
+				}
+				runPrompt = prepared
+				cleanupPrompt = cleanup
+			}
+		}
+		if runPrompt == "" && text == "" {
 			if err := b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred input text is unavailable"); err != nil {
 				return err
 			}
@@ -2953,22 +3155,30 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			}
 			continue
 		}
+		if runPrompt == "" {
+			runPrompt = TeamsCodexPrompt(text)
+		}
 		turn, turnCreated, err := b.queueTurn(ctx, session, inbound)
 		if err != nil {
+			cleanupPrompt()
 			return err
 		}
 		if !turnCreated {
+			cleanupPrompt()
 			if err := b.flushPendingOutbox(ctx, session.ID, turn.ID); err != nil {
 				return err
 			}
 			continue
 		}
 		if err := b.queueTeamsPromptAck(ctx, session, turn, false); err != nil {
+			cleanupPrompt()
 			return err
 		}
-		if err := b.runQueuedTurn(ctx, session, turn, session.ChatID, TeamsCodexPrompt(text)); err != nil {
+		if err := b.runQueuedTurn(ctx, session, turn, session.ChatID, runPrompt); err != nil {
+			cleanupPrompt()
 			return err
 		}
+		cleanupPrompt()
 	}
 	return nil
 }
@@ -3326,8 +3536,25 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 		})
 	}
 	localFiles = append(localFiles, referenceFiles...)
+	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, session.ChatID, msg)
+	if err != nil {
+		return err
+	}
+	if referencedMessageWarning != "" {
+		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn has too many message references"); err != nil {
+			return err
+		}
+		return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+			ID:          "outbox:" + turn.ID + ":recovery-message-reference-limit",
+			SessionID:   session.ID,
+			TurnID:      turn.ID,
+			TeamsChatID: session.ChatID,
+			Kind:        "interrupted",
+			Body:        referencedMessageWarning,
+		})
+	}
 	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, inbound.Text)
-	if !promptOK && len(localFiles) == 0 {
+	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
 		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn original prompt is empty or helper-generated"); err != nil {
 			return err
 		}
@@ -3340,6 +3567,7 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 			Body:        "queued turn could not be recovered because the original prompt is empty: " + turn.ID,
 		})
 	}
+	prompt = PromptWithReferencedMessages(prompt, referencedMessages)
 	basePrompt := TeamsCodexPrompt(prompt)
 	executor := b.executor
 	if session.ID == controlFallbackSessionID {
@@ -3347,6 +3575,50 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 		executor = b.effectiveControlFallbackExecutor()
 	}
 	return b.runQueuedTurnWithExecutor(ctx, executor, session, turn, session.ChatID, PromptWithLocalAttachments(basePrompt, localFiles))
+}
+
+func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, session *Session, chatID string, msg ChatMessage, fallbackText string) (string, func(), string, error) {
+	cleanupHosted := func() {}
+	cleanupReference := func() {}
+	cleanupAll := func() {
+		cleanupHosted()
+		cleanupReference()
+	}
+	localFiles, cleanupHostedFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, chatID, msg)
+	cleanupHosted = cleanupHostedFiles
+	if err != nil {
+		if message, ok := attachmentDownloadUserMessage(err); ok {
+			return "", cleanupAll, message, nil
+		}
+		return "", cleanupAll, "", err
+	}
+	if hostedAttachmentMessage != "" {
+		return "", cleanupAll, hostedAttachmentMessage, nil
+	}
+	referenceFiles, cleanupReferenceFiles, unsupportedAttachmentMessage, err := b.downloadReferenceFileAttachments(ctx, session, msg)
+	cleanupReference = cleanupReferenceFiles
+	if err != nil {
+		if message, ok := attachmentDownloadUserMessage(err); ok {
+			return "", cleanupAll, message, nil
+		}
+		return "", cleanupAll, "", err
+	}
+	if unsupportedAttachmentMessage != "" {
+		return "", cleanupAll, unsupportedAttachmentMessage, nil
+	}
+	localFiles = append(localFiles, referenceFiles...)
+	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, chatID, msg)
+	if err != nil {
+		return "", cleanupAll, "", err
+	}
+	if referencedMessageWarning != "" {
+		return "", cleanupAll, referencedMessageWarning, nil
+	}
+	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, fallbackText)
+	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
+		return "", cleanupAll, "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it.", nil
+	}
+	return PromptWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles), cleanupAll, "", nil
 }
 
 func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID string) error {
@@ -3760,6 +4032,19 @@ func (b *Bridge) refreshWorkChatTitleFromCodexHistory(ctx context.Context, sessi
 	return nil
 }
 
+func (b *Bridge) refreshWorkChatTitleFromExecutionResult(ctx context.Context, session *Session, result ExecutionResult) (bool, error) {
+	title := strings.TrimSpace(result.CodexThreadTitle)
+	if b == nil || session == nil || title == "" {
+		return false, nil
+	}
+	local := codexhistory.Session{
+		SessionID:   firstNonEmptyString(result.CodexThreadID, session.CodexThreadID),
+		Summary:     title,
+		ProjectPath: session.Cwd,
+	}
+	return true, b.maybeUpdateWorkChatTitleFromLocalSession(ctx, session, local)
+}
+
 func (b *Bridge) maybeUpdateWorkChatTitleFromLocalSession(ctx context.Context, session *Session, local codexhistory.Session) error {
 	if b == nil || b.graph == nil || session == nil || strings.TrimSpace(session.ChatID) == "" || !sessionAllowsAutoTitleUpdate(*session) {
 		return nil
@@ -3821,7 +4106,28 @@ func sessionAllowsAutoTitleUpdate(session Session) bool {
 	if source == sessionTitleSourceUser || strings.TrimSpace(session.UserTitle) != "" {
 		return false
 	}
-	return source == sessionTitleSourceAuto
+	if source == sessionTitleSourceAuto {
+		return true
+	}
+	if source != "" {
+		return false
+	}
+	return legacySessionAllowsAutoTitleUpdate(session)
+}
+
+func SessionAllowsAutoTitleUpdate(session Session) bool {
+	return sessionAllowsAutoTitleUpdate(session)
+}
+
+func legacySessionAllowsAutoTitleUpdate(session Session) bool {
+	topic := strings.TrimSpace(session.Topic)
+	if topic == "" {
+		return true
+	}
+	if strings.Contains(topic, "New message in ") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(topic), "codex work")
 }
 
 func localCodexTitleForWorkChat(local codexhistory.Session) string {
@@ -3921,8 +4227,20 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 		}
 		b.boostPolling(time.Now())
 	}
-	if err := b.refreshWorkChatTitleFromCodexHistory(ctx, session); err != nil {
+	updatedTitle, err := b.refreshWorkChatTitleFromExecutionResult(ctx, session, result)
+	if err != nil {
 		return err
+	}
+	if !updatedTitle {
+		queueState, err := b.sessionTurnQueueState(ctx, session.ID)
+		if err != nil {
+			return err
+		}
+		if queueState.Queued == 0 {
+			if err := b.refreshWorkChatTitleFromCodexHistory(ctx, session); err != nil {
+				return err
+			}
+		}
 	}
 	return b.uploadArtifactsFromResult(ctx, session, turn, result.Text)
 }
@@ -5016,7 +5334,11 @@ func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, 
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
-	_, _, err := b.persistInboundWithStatusAndSource(ctx, session, msg, teamstore.InboundStatusDeferred, "teams_session_import_deferred")
+	source := "teams_session_import_deferred"
+	if len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 {
+		source = "teams_session_import_deferred_attachment"
+	}
+	_, _, err := b.persistInboundWithStatusAndSource(ctx, session, msg, teamstore.InboundStatusDeferred, source)
 	return err
 }
 
@@ -7515,19 +7837,48 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		"",
 	}
 	for _, workspace := range dashboard.Workspaces {
-		meta := fmt.Sprintf("%d sessions", workspace.SessionCount)
-		if workspace.SessionCount == 1 {
-			meta = "1 session"
+		parts := []string{
+			"**" + dashboardWorkspaceListTitle(workspace) + "**",
+			dashboardWorkspaceListPathLine(workspace),
+			dashboardWorkspaceListMeta(workspace),
 		}
-		if !workspace.UpdatedAt.IsZero() {
-			meta += " - updated " + workspace.UpdatedAt.Local().Format("2006-01-02 15:04")
+		if dashboardAbsolutePath(workspace.Path) == "" {
+			parts = append(parts, "Older Codex records without a working directory are grouped here.")
 		}
-		pathLine := dashboardWorkspacePathDisplay(workspace.Path)
-		lines = append(lines, fmt.Sprintf("`%d` - %s\n   %s", workspace.Number, pathLine, meta))
+		parts = append(parts, fmt.Sprintf("send `%d` or `p %d`", workspace.Number, workspace.Number))
+		lines = append(lines, fmt.Sprintf("`%d` - %s", workspace.Number, strings.Join(parts, "\n   ")))
 	}
-	lines = append(lines, "", "Next:", "- `1` - open workspace 1", "- `n <directory>` or `new <directory>` - create a new Work chat directly")
+	lines = append(lines, "", "Next:", "- Send a workspace number, for example `1`, to open it.", "- `n <directory>` or `new <directory>` - create a new Work chat directly.")
 	lines = append(lines, "", "Numbers expire after 10 minutes. If a number looks wrong, send `projects` again.")
 	return strings.Join(lines, "\n"), nil
+}
+
+func dashboardWorkspaceListTitle(workspace DashboardWorkspace) string {
+	if dashboardAbsolutePath(workspace.Path) == "" {
+		return "Unknown workspace"
+	}
+	if title := strings.TrimSpace(workspace.DisplayTitle); title != "" {
+		return title
+	}
+	return WorkspaceDisplayTitle("", workspace.Path)
+}
+
+func dashboardWorkspaceListPathLine(workspace DashboardWorkspace) string {
+	if abs := dashboardAbsolutePath(workspace.Path); abs != "" {
+		return "Path: " + dashboardInlineCode(abs)
+	}
+	return "Path: not recorded by Codex"
+}
+
+func dashboardWorkspaceListMeta(workspace DashboardWorkspace) string {
+	meta := fmt.Sprintf("%d sessions", workspace.SessionCount)
+	if workspace.SessionCount == 1 {
+		meta = "1 session"
+	}
+	if !workspace.UpdatedAt.IsZero() {
+		meta += " - updated " + workspace.UpdatedAt.Local().Format("2006-01-02 15:04")
+	}
+	return meta
 }
 
 func dashboardWorkspacePathDisplay(path string) string {
@@ -7844,11 +8195,8 @@ func (b *Bridge) dashboardSelectionStillVisible(ctx context.Context, selection D
 		return dashboardWorkspaceVisibleInProjects(projects, selection.WorkspaceID)
 	case DashboardSelectionSession:
 		for _, project := range projects {
-			if workspaceIDForPath(project.Path) != selection.WorkspaceID {
-				continue
-			}
 			for _, session := range project.Sessions {
-				if session.SessionID == selection.SessionID {
+				if workspaceIDForPath(dashboardSessionWorkspacePath(project, session)) == selection.WorkspaceID && session.SessionID == selection.SessionID {
 					return true
 				}
 			}
@@ -7864,8 +8212,8 @@ func dashboardWorkspaceVisibleInProjects(projects []codexhistory.Project, worksp
 	if workspaceID == "" {
 		return false
 	}
-	for _, project := range projects {
-		if workspaceIDForPath(project.Path) == workspaceID {
+	for _, workspace := range dashboardWorkspacesFromProjects(projects) {
+		if dashboardWorkspaceID(workspace) == workspaceID {
 			return true
 		}
 	}
@@ -8047,30 +8395,70 @@ func dashboardViewFromRecord(record teamstore.DashboardViewRecord) (DashboardVie
 	}, true
 }
 
+type dashboardWorkspaceProjectAccumulator struct {
+	input       DashboardWorkspaceInput
+	seenSession map[string]bool
+}
+
 func dashboardWorkspacesFromProjects(projects []codexhistory.Project) []DashboardWorkspaceInput {
-	workspaces := make([]DashboardWorkspaceInput, 0, len(projects))
+	accumulators := map[string]*dashboardWorkspaceProjectAccumulator{}
+	order := make([]string, 0, len(projects))
+	workspaceForPath := func(path string) *dashboardWorkspaceProjectAccumulator {
+		path = strings.TrimSpace(path)
+		id := workspaceIDForPath(path)
+		acc := accumulators[id]
+		if acc != nil {
+			if acc.input.Path == "" && path != "" {
+				acc.input.Path = path
+			}
+			return acc
+		}
+		acc = &dashboardWorkspaceProjectAccumulator{
+			input: DashboardWorkspaceInput{
+				ID:   id,
+				Path: path,
+			},
+			seenSession: map[string]bool{},
+		}
+		accumulators[id] = acc
+		order = append(order, id)
+		return acc
+	}
+
 	for _, project := range projects {
-		sessions := make([]DashboardSessionInput, 0, len(project.Sessions))
+		if len(project.Sessions) == 0 {
+			_ = workspaceForPath(project.Path)
+			continue
+		}
 		for _, session := range project.Sessions {
-			sessions = append(sessions, DashboardSessionInput{
+			workspacePath := dashboardSessionWorkspacePath(project, session)
+			acc := workspaceForPath(workspacePath)
+			if acc.seenSession[session.SessionID] {
+				continue
+			}
+			acc.seenSession[session.SessionID] = true
+			acc.input.Sessions = append(acc.input.Sessions, DashboardSessionInput{
 				ID:            session.SessionID,
-				WorkspaceID:   workspaceIDForPath(project.Path),
-				Cwd:           firstNonEmptyString(session.ProjectPath, project.Path),
+				WorkspaceID:   acc.input.ID,
+				Cwd:           workspacePath,
 				Topic:         session.DisplayTitle(),
 				Status:        "local",
 				CodexThreadID: session.SessionID,
 				CreatedAt:     session.CreatedAt,
 				UpdatedAt:     session.ModifiedAt,
 			})
+			acc.input.UpdatedAt = laterDashboardTime(acc.input.UpdatedAt, session.ModifiedAt)
 		}
-		workspaces = append(workspaces, DashboardWorkspaceInput{
-			ID:        workspaceIDForPath(project.Path),
-			Path:      project.Path,
-			UpdatedAt: latestProjectModified(project),
-			Sessions:  sessions,
-		})
+	}
+	workspaces := make([]DashboardWorkspaceInput, 0, len(accumulators))
+	for _, id := range order {
+		workspaces = append(workspaces, accumulators[id].input)
 	}
 	return workspaces
+}
+
+func dashboardSessionWorkspacePath(project codexhistory.Project, session codexhistory.Session) string {
+	return firstNonEmptyString(session.ProjectPath, project.Path)
 }
 
 func findCodexSession(projects []codexhistory.Project, sessionID string) (codexhistory.Session, codexhistory.Project, bool) {
@@ -8091,11 +8479,16 @@ func findCodexSession(projects []codexhistory.Project, sessionID string) (codexh
 func latestProjectModified(project codexhistory.Project) time.Time {
 	var latest time.Time
 	for _, session := range project.Sessions {
-		if session.ModifiedAt.After(latest) {
-			latest = session.ModifiedAt
-		}
+		latest = laterDashboardTime(latest, session.ModifiedAt)
 	}
 	return latest
+}
+
+func laterDashboardTime(current time.Time, candidate time.Time) time.Time {
+	if candidate.After(current) {
+		return candidate
+	}
+	return current
 }
 
 func workspaceIDForPath(path string) string {
