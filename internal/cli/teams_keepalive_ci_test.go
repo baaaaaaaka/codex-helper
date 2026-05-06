@@ -730,6 +730,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		t.Fatalf("bootstrap did not clearly prompt before UAC:\n%s", gotOut)
 	}
 	elevated := strings.Join(runner.calls[2].args, " ")
+	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
 	for _, want := range []string{
 		"Start-Process",
 		"-Verb RunAs",
@@ -742,8 +744,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		"wslArgs",
 		"Ubuntu",
 		"alice",
-		"/home/alice/work dir",
-		"/home/alice/bin/codex-proxy",
+		wantCWD,
+		wantExe,
 		"Register-ScheduledTask",
 		"Enable-ScheduledTask",
 		"Start-ScheduledTask",
@@ -1241,12 +1243,12 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 		"CodexHelperCI",
 		"runner",
 		"--auto-service=false",
-		"teams run",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("real WSL-shaped task missing %q:\n%s", want, got)
 		}
 	}
+	requireSubstringsInOrder(t, got, "'teams'", "'run'", "'--auto-service=false'")
 	if _, err := backend.Run(context.Background(), "enable"); err != nil {
 		t.Fatalf("enable real WSL-shaped task: %v", err)
 	}
