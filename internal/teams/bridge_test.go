@@ -661,6 +661,11 @@ func TestBridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession(t *testi
 	waitForCompletedTurnCount(t, store, "s001", 2)
 	waitForCompletedTurnCount(t, store, "s002", 1)
 	waitForCompletedTurnCount(t, store, "s003", 1)
+	for _, session := range bridge.reg.Sessions {
+		if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
+			t.Fatalf("flush pending outbox for %s: %v", session.ID, err)
+		}
+	}
 	waitForNoActiveTurnsOrOutbox(t, store, "s001")
 	waitForNoActiveTurnsOrOutbox(t, store, "s002")
 	waitForNoActiveTurnsOrOutbox(t, store, "s003")
