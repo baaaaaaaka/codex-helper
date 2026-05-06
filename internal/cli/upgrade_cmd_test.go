@@ -94,6 +94,44 @@ func TestUpgradeCmdExplicitVersionCallsPerformUpdate(t *testing.T) {
 	}
 }
 
+func TestUpgradeCmdLatestCanIncludePrerelease(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+
+	checkForUpdate = func(_ context.Context, opts update.CheckOptions) update.Status {
+		if !opts.IncludePrerelease {
+			t.Fatalf("CheckForUpdate IncludePrerelease = false, want true")
+		}
+		return update.Status{Supported: true, UpdateAvailable: true}
+	}
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		return update.ApplyResult{Version: "1.2.4-rc.1"}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--repo", "owner/name", "--include-prerelease"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v", err)
+	}
+	if got.Repo != "owner/name" || got.Version != "" || !got.IncludePrerelease {
+		t.Fatalf("PerformUpdate options = %#v, want latest prerelease lookup", got)
+	}
+	if !strings.Contains(out.String(), "Updated to v1.2.4-rc.1.") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
 func TestUpgradeCmdRestartRequiredMessage(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)

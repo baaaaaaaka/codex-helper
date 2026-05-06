@@ -16,6 +16,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 	var versionOverride string
 	var installPath string
 	var teamsDrainTimeout time.Duration
+	var includePrerelease bool
 
 	cmd := &cobra.Command{
 		Use:   "upgrade",
@@ -30,9 +31,10 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 			requested := update.ResolveVersion(versionOverride)
 			if strings.EqualFold(requested, "latest") {
 				status := checkForUpdate(ctx, update.CheckOptions{
-					Repo:             repo,
-					InstalledVersion: version,
-					Timeout:          8 * time.Second,
+					Repo:              repo,
+					InstalledVersion:  version,
+					Timeout:           8 * time.Second,
+					IncludePrerelease: includePrerelease,
 				})
 				if status.Supported && !status.UpdateAvailable {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Already up to date.")
@@ -45,10 +47,11 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				return err
 			}
 			res, err := performUpdate(ctx, update.UpdateOptions{
-				Repo:        repo,
-				Version:     versionOverride,
-				InstallPath: installPath,
-				Timeout:     120 * time.Second,
+				Repo:              repo,
+				Version:           versionOverride,
+				InstallPath:       installPath,
+				Timeout:           120 * time.Second,
+				IncludePrerelease: includePrerelease,
 			})
 			if finishTeams != nil {
 				updateSucceeded := err == nil
@@ -78,6 +81,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 
 	cmd.Flags().StringVar(&repo, "repo", "", "Override GitHub repo (owner/name)")
 	cmd.Flags().StringVar(&versionOverride, "version", "", "Install a specific version (default: latest)")
+	cmd.Flags().BoolVar(&includePrerelease, "include-prerelease", false, "Allow latest to resolve to the newest GitHub prerelease")
 	cmd.Flags().StringVar(&installPath, "install-path", "", "Override install path (file or directory)")
 	cmd.Flags().DurationVar(&teamsDrainTimeout, "teams-drain-timeout", 2*time.Minute, "How long to wait for an active Teams bridge to drain before upgrading")
 

@@ -14,11 +14,13 @@ type fakeHelperAutoUpdater struct {
 	decision   HelperAutoUpdateDecision
 	applyCalls int
 	applied    []HelperAutoUpdateCandidate
+	checks     []HelperAutoUpdateCheck
 	checkErr   error
 	applyErr   error
 }
 
-func (f *fakeHelperAutoUpdater) Check(context.Context, HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error) {
+func (f *fakeHelperAutoUpdater) Check(_ context.Context, check HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error) {
+	f.checks = append(f.checks, check)
 	return f.decision, f.checkErr
 }
 
@@ -160,6 +162,115 @@ func TestBridgeHelperAutoUpdateRecordsCheckWithoutCandidate(t *testing.T) {
 	}
 	if state.AutoUpdate.CandidateTag != "" {
 		t.Fatalf("CandidateTag = %q, want empty", state.AutoUpdate.CandidateTag)
+	}
+}
+
+func TestBridgeHelperAutoUpdatePassesPrereleaseOptIn(t *testing.T) {
+	_, bridge := newBridgeAutoUpdateTest(t)
+	next := time.Date(2026, 5, 4, 0, 30, 0, 0, time.UTC)
+	updater := &fakeHelperAutoUpdater{decision: HelperAutoUpdateDecision{NextCheckAt: next}}
+	if err := bridge.maybeRunHelperAutoUpdate(context.Background(), BridgeOptions{
+		HelperVersion:              "v1.2.3",
+		HelperAutoUpdater:          updater,
+		HelperAutoUpdatePrerelease: true,
+	}); err != nil {
+		t.Fatalf("maybeRunHelperAutoUpdate error: %v", err)
+	}
+	if len(updater.checks) != 1 || !updater.checks[0].IncludePrerelease || updater.checks[0].Manual {
+		t.Fatalf("auto-update check = %#v, want prerelease opt-in and not manual", updater.checks)
+	}
+}
+
+func TestBridgeControlHelperUpdatePrereleaseRunsManualUpdate(t *testing.T) {
+	st, bridge := newBridgeAutoUpdateTest(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge.graph = graph
+	bridge.reg.ControlChatID = "control-chat"
+	bridge.helperVersion = "v1.2.3"
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	updater := &fakeHelperAutoUpdater{decision: HelperAutoUpdateDecision{
+		NextCheckAt: now.Add(30 * time.Minute),
+		Candidate: &HelperAutoUpdateCandidate{
+			TagName:     "v1.2.4-rc.1",
+			Version:     "1.2.4-rc.1",
+			Priority:    "p2",
+			PublishedAt: now.Add(-time.Hour),
+			EligibleAt:  now.Add(-time.Hour),
+			Asset:       "codex-proxy_1.2.4-rc.1_linux_amd64",
+		},
+	}}
+	bridge.helperAutoUpdater = updater
+	restarted := false
+	bridge.helperRestarter = func(context.Context) error {
+		restarted = true
+		return nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-update-pre"), "helper update prerelease"); err != nil {
+		t.Fatalf("handleControlMessage update prerelease error: %v", err)
+	}
+	if len(updater.checks) != 1 || !updater.checks[0].IncludePrerelease || !updater.checks[0].Manual {
+		t.Fatalf("manual update check = %#v, want prerelease manual", updater.checks)
+	}
+	if updater.applyCalls != 1 || !restarted {
+		t.Fatalf("applyCalls=%d restarted=%v, want update apply and restart", updater.applyCalls, restarted)
+	}
+	if !sentPlainContains(*sent, "Helper update scheduled") || !sentPlainContains(*sent, "v1.2.4-rc.1") {
+		t.Fatalf("update response missing target: %#v", *sent)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4-rc.1" {
+		t.Fatalf("LastInstalledTag = %q, want v1.2.4-rc.1", state.AutoUpdate.LastInstalledTag)
+	}
+}
+
+func TestBridgeControlHelperUpdateWaitsForActiveWork(t *testing.T) {
+	st, bridge := newBridgeAutoUpdateTest(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge.graph = graph
+	bridge.reg.ControlChatID = "control-chat"
+	bridge.helperVersion = "v1.2.3"
+	if err := st.Update(context.Background(), func(state *teamstore.State) error {
+		state.Turns["turn-running"] = teamstore.Turn{ID: "turn-running", SessionID: "session-1", Status: teamstore.TurnStatusRunning, StartedAt: time.Now()}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed running turn: %v", err)
+	}
+	updater := &fakeHelperAutoUpdater{decision: HelperAutoUpdateDecision{
+		NextCheckAt: time.Now().Add(30 * time.Minute),
+		Candidate: &HelperAutoUpdateCandidate{
+			TagName: "v1.2.4",
+			Version: "1.2.4",
+		},
+	}}
+	bridge.helperAutoUpdater = updater
+	restarted := false
+	bridge.helperRestarter = func(context.Context) error {
+		restarted = true
+		return nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-update-active"), "helper update now"); err != nil {
+		t.Fatalf("handleControlMessage update now error: %v", err)
+	}
+	if updater.applyCalls != 0 || restarted {
+		t.Fatalf("applyCalls=%d restarted=%v, want no apply/restart while active work drains", updater.applyCalls, restarted)
+	}
+	if !sentPlainContains(*sent, "Helper update scheduled") {
+		t.Fatalf("update scheduled response missing: %#v", *sent)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if !state.ServiceControl.Draining || state.ServiceControl.Reason != teamstore.HelperUpgradeReason {
+		t.Fatalf("ServiceControl = %#v, want helper upgrade drain", state.ServiceControl)
+	}
+	if state.AutoUpdate.CandidateTag != "v1.2.4" {
+		t.Fatalf("CandidateTag = %q, want v1.2.4", state.AutoUpdate.CandidateTag)
 	}
 }
 

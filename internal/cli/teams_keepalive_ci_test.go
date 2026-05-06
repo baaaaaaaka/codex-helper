@@ -3,11 +3,13 @@ package cli
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func requireSubstringsInOrder(t *testing.T, text string, wants ...string) {
@@ -167,6 +169,9 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 	}
 
 	taskXML := buildTeamsServiceWindowsTaskXML(spec)
+	if strings.Contains(taskXML, "<?xml") || strings.Contains(strings.ToLower(taskXML), "encoding=") {
+		t.Fatalf("Windows Task Scheduler XML is passed through Register-ScheduledTask -Xml and must not declare a conflicting encoding:\n%s", taskXML)
+	}
 	for _, want := range []string{
 		"<LogonTrigger>",
 		"<LogonType>InteractiveToken</LogonType>",
@@ -210,6 +215,120 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
 	)
+}
+
+func TestTeamsServiceSystemdUnitVerifiesWithSystemdAnalyzeCI(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd-analyze verification is Linux-only")
+	}
+	if os.Getenv("CODEX_HELPER_SYSTEMD_ANALYZE_TEST") != "1" {
+		t.Skip("set CODEX_HELPER_SYSTEMD_ANALYZE_TEST=1 to run native systemd unit verification")
+	}
+	if _, err := exec.LookPath("systemd-analyze"); err != nil {
+		t.Skipf("systemd-analyze not available: %v", err)
+	}
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake executable: %v", err)
+	}
+	spec := teamsServiceSpec{
+		Executable:   exe,
+		WorkingDir:   tmp,
+		RegistryPath: filepath.Join(tmp, "teams registry.json"),
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
+		},
+	}
+	unitPath := filepath.Join(tmp, "codex-helper-teams.service")
+	if err := os.WriteFile(unitPath, []byte(buildTeamsServiceUnit(spec)), 0o600); err != nil {
+		t.Fatalf("write systemd unit: %v", err)
+	}
+	cmd := exec.Command("systemd-analyze", "verify", unitPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("systemd-analyze verify failed: %v\n%s", err, out)
+	}
+}
+
+func TestTeamsServiceLaunchAgentPlistLintsWithPlutilCI(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("plutil LaunchAgent verification is macOS-only")
+	}
+	if os.Getenv("CODEX_HELPER_PLUTIL_TEST") != "1" {
+		t.Skip("set CODEX_HELPER_PLUTIL_TEST=1 to run native LaunchAgent plist verification")
+	}
+	if _, err := exec.LookPath("plutil"); err != nil {
+		t.Skipf("plutil not available: %v", err)
+	}
+	tmp := t.TempDir()
+	spec := teamsServiceSpec{
+		Executable:   filepath.Join(tmp, "codex-proxy"),
+		WorkingDir:   tmp,
+		RegistryPath: filepath.Join(tmp, "teams registry.json"),
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
+		},
+	}
+	plistPath := filepath.Join(tmp, "com.codex-helper.teams.plist")
+	if err := os.WriteFile(plistPath, []byte(buildTeamsServiceLaunchAgentPlist(spec)), 0o600); err != nil {
+		t.Fatalf("write LaunchAgent plist: %v", err)
+	}
+	cmd := exec.Command("plutil", "-lint", plistPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("plutil lint failed: %v\n%s", err, out)
+	}
+}
+
+func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Task Scheduler registration is Windows-only")
+	}
+	if os.Getenv("CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST") != "1" {
+		t.Skip("set CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST=1 to run native Task Scheduler registration")
+	}
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	if err := os.WriteFile(exe, []byte{}, 0o755); err != nil {
+		t.Fatalf("write fake executable: %v", err)
+	}
+	spec := teamsServiceSpec{
+		Executable:   exe,
+		WorkingDir:   tmp,
+		RegistryPath: filepath.Join(tmp, "teams registry.json"),
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
+		},
+	}
+	xml := buildTeamsServiceWindowsTaskXML(spec)
+	if strings.Contains(xml, "<?xml") || strings.Contains(strings.ToLower(xml), "encoding=") {
+		t.Fatalf("Windows Task Scheduler XML is passed as a PowerShell string and must not declare an encoding:\n%s", xml)
+	}
+	xmlPath := filepath.Join(tmp, "codex-helper-teams-task.xml")
+	if err := os.WriteFile(xmlPath, []byte(xml), 0o600); err != nil {
+		t.Fatalf("write Windows task XML: %v", err)
+	}
+	taskName := "Codex Helper Teams Bridge CI " + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	script := "$ErrorActionPreference = 'Stop'; " +
+		"$task = " + powershellSingleQuote(taskName) + "; " +
+		"$xmlPath = " + powershellSingleQuote(xmlPath) + "; " +
+		"try { " +
+		"$xml = Get-Content -LiteralPath $xmlPath -Raw; " +
+		"Register-ScheduledTask -TaskName $task -Xml $xml -Force -ErrorAction Stop | Out-Null; " +
+		"$registered = Get-ScheduledTask -TaskName $task -ErrorAction Stop; " +
+		"if ($registered.TaskName -ne $task) { throw 'registered task name mismatch' } " +
+		"} finally { " +
+		"Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue | Out-Null " +
+		"}"
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Register-ScheduledTask smoke failed: %v\n%s", err, out)
+	}
 }
 
 func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *testing.T) {

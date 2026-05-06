@@ -148,6 +148,78 @@ func TestSelectAutoUpdateCandidateSkipsPrereleaseTagEvenWhenReleaseFlagIsWrong(t
 	}
 }
 
+func TestSelectAutoUpdateCandidateCanOptIntoLatestPrerelease(t *testing.T) {
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	releases := []GitHubRelease{
+		releaseForAutoTest("v1.2.4-rc.2", AutoUpdatePriorityP0, now.Add(-time.Hour), true),
+		releaseForAutoTest("v1.2.4-rc.10", AutoUpdatePriorityP0, now.Add(-time.Hour), true),
+		releaseForAutoTest("v1.2.3", AutoUpdatePriorityP0, now.Add(-time.Hour), false),
+	}
+	got := SelectAutoUpdateCandidate(releases, AutoUpdateSelectionOptions{
+		InstalledVersion:  "1.2.3",
+		Now:               now,
+		GOOS:              "linux",
+		GOARCH:            "amd64",
+		IncludePrerelease: true,
+	})
+	if got.Candidate == nil {
+		t.Fatal("Candidate is nil")
+	}
+	if got.Candidate.TagName != "v1.2.4-rc.10" {
+		t.Fatalf("candidate tag = %q, want v1.2.4-rc.10", got.Candidate.TagName)
+	}
+}
+
+func TestSelectAutoUpdateCandidateStableBeatsSameVersionPrerelease(t *testing.T) {
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	releases := []GitHubRelease{
+		releaseForAutoTest("v1.2.4-rc.10", AutoUpdatePriorityP0, now.Add(-time.Hour), true),
+		releaseForAutoTest("v1.2.4", AutoUpdatePriorityP0, now.Add(-30*time.Minute), false),
+	}
+	got := SelectAutoUpdateCandidate(releases, AutoUpdateSelectionOptions{
+		InstalledVersion:  "1.2.3",
+		Now:               now,
+		GOOS:              "linux",
+		GOARCH:            "amd64",
+		IncludePrerelease: true,
+	})
+	if got.Candidate == nil {
+		t.Fatal("Candidate is nil")
+	}
+	if got.Candidate.TagName != "v1.2.4" {
+		t.Fatalf("candidate tag = %q, want v1.2.4", got.Candidate.TagName)
+	}
+}
+
+func TestSelectAutoUpdateCandidateManualIgnoresPriorityButStillNeedsOptInForPrerelease(t *testing.T) {
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	releases := []GitHubRelease{
+		releaseForAutoTest("v1.2.5-rc.1", AutoUpdatePriorityP2, now.Add(-time.Hour), true),
+		releaseForAutoTest("v1.2.4", AutoUpdatePriorityP2, now.Add(-time.Hour), false),
+	}
+	stableOnly := SelectAutoUpdateCandidate(releases, AutoUpdateSelectionOptions{
+		InstalledVersion: "1.2.3",
+		Now:              now,
+		GOOS:             "linux",
+		GOARCH:           "amd64",
+		IgnorePriority:   true,
+	})
+	if stableOnly.Candidate == nil || stableOnly.Candidate.TagName != "v1.2.4" {
+		t.Fatalf("stable-only manual candidate = %#v, want v1.2.4", stableOnly.Candidate)
+	}
+	withPrerelease := SelectAutoUpdateCandidate(releases, AutoUpdateSelectionOptions{
+		InstalledVersion:  "1.2.3",
+		Now:               now,
+		GOOS:              "linux",
+		GOARCH:            "amd64",
+		IncludePrerelease: true,
+		IgnorePriority:    true,
+	})
+	if withPrerelease.Candidate == nil || withPrerelease.Candidate.TagName != "v1.2.5-rc.1" {
+		t.Fatalf("prerelease manual candidate = %#v, want v1.2.5-rc.1", withPrerelease.Candidate)
+	}
+}
+
 func TestSelectAutoUpdateCandidateUnknownInstalledVersionFailsClosed(t *testing.T) {
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	got := SelectAutoUpdateCandidate([]GitHubRelease{

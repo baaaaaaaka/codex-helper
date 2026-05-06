@@ -287,13 +287,36 @@ jobs:
           go test ./internal/cli -count=1 -run $teamsCliKeepalive -v
           go test ./internal/teams ./internal/teams/store -count=1 -run $teamsRuntimeKeepalive -v
 
+      - name: Teams native supervisor validation (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env "PATH=$PATH" CODEX_HELPER_SYSTEMD_ANALYZE_TEST=1 go test ./internal/cli -count=1 -run 'TestTeamsServiceSystemdUnitVerifiesWithSystemdAnalyzeCI$' -v
+
+      - name: Teams native supervisor validation (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODEX_HELPER_PLUTIL_TEST=1 go test ./internal/cli -count=1 -run 'TestTeamsServiceLaunchAgentPlistLintsWithPlutilCI$' -v
+
+      - name: Teams native supervisor validation (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST = "1"
+          go test ./internal/cli -count=1 -run 'TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI$' -v
+
       - name: Teams Codex runner classification regressions
         shell: bash
         run: |
           set -euo pipefail
           adapter_pattern='Test(TeamsCodexExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|RunnerExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|BridgeSession(CodexFailureWithOnlyExistingThreadIDMarksFailed|TerminalCodexFailureWithTurnIDMarksFailed))$'
           runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly)$'
-          helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater(CheckSelectionAndBackoff|ApplyUsesExplicitSelectedTag)|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState))$'
+          helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater(CheckSelectionAndBackoff|ApplyUsesExplicitSelectedTag)|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|PassesPrereleaseOptIn|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState)|BridgeControlHelperUpdate(PrereleaseRunsManualUpdate|WaitsForActiveWork))$'
           upgrade_pattern='Test(BridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork|BridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat|CodexErrorRequiresUpgradeHeuristics|UpgradeNotificationTargetsDeduplicate|RunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner)$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestMarkTurnFailedWithCodexIDsPersistsDiagnostics$' -v
@@ -307,7 +330,7 @@ jobs:
           set -euo pipefail
           bridge_pattern='Test(BridgeAsync(QueuedTurnsRunAcrossSessionsButSerializeEachSession|TurnsQueuesTeamsInputWhileCodexIsRunning)|BridgeSessionCancel(LastRunningTurnCancelsExecutor|RunningTurnWithoutLiveHandleExplainsLimit)|LatestCancelableTurnIDPrefersRunningOverQueued|BridgePollOnce(BoostsAfterRealInboundAndFinalOutput|PrioritizesRunningWorkChatUnderPerCycleLimit|ContinuesOtherDueChatsAfterReadRateLimit)|BridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn|BridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity|BridgeControlResumeKeyOnlyReactivatesMatchingParkedChat|BridgeSyncLinkedTranscriptDedupesQueuedLiveFinal|StoreConcurrentDistinctSessionWritersDoNotCrossMutate|InboundPollDecision(Thresholds|FutureActivityStaysHot)|SortInboundPollDecisionsPrioritizesRunningUnderCycleCap)$'
           transcript_pattern='TestReadSessionTranscriptSince(RefusesMissingCheckpoint|MatchesFullTailForSourceCheckpoint|MatchesFullTailForFallbackCheckpoint|RefusesInvalidLineLikeCheckpoint|FallsBackForPrefixDuplicateSourceIDs|AvoidsFullParseWorkForTail)$'
-          workflow_pattern='Test(WorkflowNotificationsDisabledByDefault|WorkflowNotification(SendsAfterDurableOutboxSent|FallsBackToSidecarConfigWhenOldHelperErasesState|FailureRetriesWithBackoff|SuppressesAfterControlChatRebind|SkipsHistoryAndNonFinalParts|SupportsRecreatedChatMovedNotice)|QueueOutbox(SuppressesOwnerMentionWhenWorkflowNotificationEnabled|KeepsOwnerMentionWhenWorkflowNotificationDisabled)|WorkflowWebhookURLFileSafety|PostWorkflowWebhook(SendsAdaptiveCard|RejectsUnsafeActionURL|RejectsNonAbsoluteWebhookURL|RejectsOversizedPayload|RetriesTooManyRequests))$'
+          workflow_pattern='Test(WorkflowNotificationsDisabledByDefault|WorkflowNotification(SendsAfterDurableOutboxSent|FallsBackToSidecarConfigWhenOldHelperErasesState|DoesNotDuplicateAfterAmbiguousFailure|RetriesOnlyRetryableFailuresWithBackoff|SuppressesAfterControlChatRebind|SkipsHistoryAndNonFinalParts|SupportsRecreatedChatMovedNotice)|QueueOutbox(SuppressesOwnerMentionWhenWorkflowNotificationEnabled|KeepsOwnerMentionWhenWorkflowNotificationDisabled)|WorkflowWebhookURLFileSafety|PostWorkflowWebhook(SendsAdaptiveCard|RejectsUnsafeActionURL|RejectsNonAbsoluteWebhookURL|RejectsOversizedPayload|RetriesTooManyRequests|ClassifiesServerErrorAsDeliveryUncertain|ClassifiesTransportErrorAsDeliveryUncertain|ClassifiesInterruptedRateLimitWaitAsRetryable))$'
           workflow_cli_pattern='TestTeamsWorkflowStatus(RedactsWebhookURL|ReadsSidecarConfig)$'
           go test ./internal/teams ./internal/teams/store -count=1 -run "$bridge_pattern" -v
           go test ./internal/teams -count=1 -run "$transcript_pattern" -v

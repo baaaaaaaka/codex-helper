@@ -41,17 +41,19 @@ type Status struct {
 }
 
 type CheckOptions struct {
-	Repo             string
-	InstalledVersion string
-	Timeout          time.Duration
+	Repo              string
+	InstalledVersion  string
+	Timeout           time.Duration
+	IncludePrerelease bool
 }
 
 type UpdateOptions struct {
-	Repo           string
-	Version        string
-	InstallPath    string
-	Timeout        time.Duration
-	ValidateBinary bool
+	Repo              string
+	Version           string
+	InstallPath       string
+	Timeout           time.Duration
+	ValidateBinary    bool
+	IncludePrerelease bool
 }
 
 type ApplyResult struct {
@@ -128,13 +130,38 @@ func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	_, remote, err := fetchLatestRelease(ctx, repo, timeout)
-	if err != nil {
-		return Status{
-			Supported:        false,
-			Repo:             repo,
-			InstalledVersion: local,
-			Error:            err.Error(),
+	var remote string
+	var err error
+	if opts.IncludePrerelease {
+		releases, err := ListReleases(ctx, ReleaseListOptions{Repo: repo, Timeout: timeout})
+		if err != nil {
+			return Status{
+				Supported:        false,
+				Repo:             repo,
+				InstalledVersion: local,
+				Error:            err.Error(),
+			}
+		}
+		selected := SelectAutoUpdateCandidate(releases, AutoUpdateSelectionOptions{
+			InstalledVersion:  local,
+			Now:               time.Now(),
+			IncludePrerelease: true,
+			IgnorePriority:    true,
+		})
+		if selected.Candidate != nil {
+			remote = selected.Candidate.Version
+		} else {
+			remote = local
+		}
+	} else {
+		_, remote, err = fetchLatestRelease(ctx, repo, timeout)
+		if err != nil {
+			return Status{
+				Supported:        false,
+				Repo:             repo,
+				InstalledVersion: local,
+				Error:            err.Error(),
+			}
 		}
 	}
 
@@ -149,7 +176,7 @@ func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
 		}
 	}
 
-	newer, ok := isVersionNewer(remote, local)
+	newer, ok := compareVersionNewer(remote, local)
 	if !ok {
 		return Status{
 			Supported:        false,
@@ -188,7 +215,11 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 	verNoV := strings.TrimPrefix(version, "v")
 	if strings.EqualFold(version, "latest") {
 		var err error
-		tag, verNoV, err = fetchLatestRelease(ctx, repo, timeout)
+		if opts.IncludePrerelease {
+			tag, verNoV, err = fetchLatestSelectableRelease(ctx, repo, timeout, true)
+		} else {
+			tag, verNoV, err = fetchLatestRelease(ctx, repo, timeout)
+		}
 		if err != nil {
 			return ApplyResult{}, err
 		}
@@ -229,6 +260,23 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		InstallPath:     installPath,
 		RestartRequired: rep.restartRequired,
 	}, nil
+}
+
+func fetchLatestSelectableRelease(ctx context.Context, repo string, timeout time.Duration, includePrerelease bool) (string, string, error) {
+	releases, err := ListReleases(ctx, ReleaseListOptions{Repo: repo, Timeout: timeout})
+	if err != nil {
+		return "", "", err
+	}
+	selected := SelectAutoUpdateCandidate(releases, AutoUpdateSelectionOptions{
+		InstalledVersion:  "0.0.0",
+		Now:               time.Now(),
+		IncludePrerelease: includePrerelease,
+		IgnorePriority:    true,
+	})
+	if selected.Candidate == nil {
+		return "", "", fmt.Errorf("no compatible release found")
+	}
+	return selected.Candidate.TagName, selected.Candidate.Version, nil
 }
 
 func binaryName() string {

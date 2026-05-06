@@ -34,6 +34,7 @@ const (
 	DashboardCommandStatus         DashboardCommandName = "status"
 	DashboardCommandRestart        DashboardCommandName = "restart"
 	DashboardCommandReload         DashboardCommandName = "reload"
+	DashboardCommandUpdate         DashboardCommandName = "update"
 	DashboardCommandPublishHistory DashboardCommandName = "publish-history"
 	DashboardCommandClose          DashboardCommandName = "close"
 	DashboardCommandRetry          DashboardCommandName = "retry"
@@ -217,12 +218,17 @@ func controlAdminCommandName(syntax dashboardCommandSyntax, name string, arg str
 		return DashboardCommandRestart, true
 	case "reload":
 		return DashboardCommandReload, true
+	case "update", "upgrade":
+		return DashboardCommandUpdate, true
 	case "service":
 		if argName == "restart" || argName == "reboot" {
 			return DashboardCommandRestart, true
 		}
 		if argName == "reload" {
 			return DashboardCommandReload, true
+		}
+		if argName == "update" || argName == "upgrade" {
+			return DashboardCommandUpdate, true
 		}
 	}
 	return DashboardCommandNone, false

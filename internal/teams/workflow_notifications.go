@@ -290,20 +290,26 @@ func (b *Bridge) queueWorkflowNotification(ctx context.Context, event WorkflowNo
 		if state.Notifications == nil {
 			state.Notifications = make(map[string]teamstore.NotificationRecord)
 		}
-		if existing, ok := state.Notifications[event.ID]; ok && existing.Status == teamstore.NotificationStatusSent {
-			return nil
+		if existing, ok := state.Notifications[event.ID]; ok {
+			switch existing.Status {
+			case teamstore.NotificationStatusSent, teamstore.NotificationStatusUnknown:
+				return nil
+			}
 		}
 		now := time.Now()
 		rec := state.Notifications[event.ID]
 		if rec.ID == "" {
 			rec.ID = event.ID
 			rec.CreatedAt = now
+			rec.Status = teamstore.NotificationStatusQueued
+		}
+		if rec.Status == "" {
+			rec.Status = teamstore.NotificationStatusQueued
 		}
 		rec.SessionID = strings.TrimSpace(event.SessionID)
 		rec.TurnID = strings.TrimSpace(event.TurnID)
 		rec.OutboxID = strings.TrimSpace(event.OutboxID)
 		rec.Kind = strings.TrimSpace(event.Kind)
-		rec.Status = teamstore.NotificationStatusQueued
 		rec.Title = workflowLimitRunes(event.Title, workflowNotificationMaxTitleRunes)
 		rec.ChatTitle = workflowLimitRunes(event.ChatTitle, workflowNotificationMaxTitleRunes)
 		rec.RequestSummary = workflowLimitRunes(event.RequestSummary, workflowNotificationMaxSummaryRunes)
@@ -342,7 +348,7 @@ func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
 	now := time.Now()
 	var firstErr error
 	for _, rec := range state.Notifications {
-		if rec.Status == teamstore.NotificationStatusSent {
+		if rec.Status == teamstore.NotificationStatusSent || rec.Status == teamstore.NotificationStatusUnknown {
 			continue
 		}
 		if rec.Status != "" && rec.Status != teamstore.NotificationStatusQueued && rec.Status != teamstore.NotificationStatusFailed {
@@ -367,6 +373,9 @@ func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
 func workflowNotificationRetryDue(rec teamstore.NotificationRecord, now time.Time) bool {
 	if rec.Status != teamstore.NotificationStatusFailed || rec.LastAttemptAt.IsZero() {
 		return true
+	}
+	if !rec.LastErrorRetryable {
+		return false
 	}
 	delay := time.Duration(rec.Attempts) * 30 * time.Second
 	if delay < 30*time.Second {
@@ -401,10 +410,17 @@ func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL 
 		}},
 	})
 	if err != nil {
+		retryable := workflowWebhookRetryable(err)
+		uncertain := workflowWebhookDeliveryUncertain(err)
 		_ = b.store.Update(context.Background(), func(state *teamstore.State) error {
 			current := state.Notifications[rec.ID]
 			current.Status = teamstore.NotificationStatusFailed
+			if uncertain {
+				current.Status = teamstore.NotificationStatusUnknown
+			}
 			current.LastError = redactWorkflowNotificationError(err)
+			current.LastErrorRetryable = retryable
+			current.DeliveryUncertain = uncertain
 			current.UpdatedAt = time.Now()
 			state.Notifications[rec.ID] = current
 			return nil
@@ -415,6 +431,8 @@ func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL 
 		current := state.Notifications[rec.ID]
 		current.Status = teamstore.NotificationStatusSent
 		current.LastError = ""
+		current.LastErrorRetryable = false
+		current.DeliveryUncertain = false
 		current.SentAt = time.Now()
 		current.UpdatedAt = current.SentAt
 		state.Notifications[rec.ID] = current

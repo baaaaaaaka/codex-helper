@@ -86,23 +86,24 @@ type outboxQueueOptions struct {
 }
 
 type BridgeOptions struct {
-	RegistryPath             string
-	StorePath                string
-	Store                    *teamstore.Store
-	HelperVersion            string
-	OwnerStaleAfter          time.Duration
-	Interval                 time.Duration
-	Once                     bool
-	Top                      int
-	MaxWorkChatPollsPerCycle int
-	Executor                 Executor
-	ControlFallbackExecutor  Executor
-	ControlFallbackModel     string
-	Runner                   codexrunner.Runner
-	HelperRestarter          HelperRestarter
-	HelperReloader           HelperReloader
-	HelperAutoUpdater        HelperAutoUpdater
-	CodexUpgrader            CodexUpgrader
+	RegistryPath               string
+	StorePath                  string
+	Store                      *teamstore.Store
+	HelperVersion              string
+	OwnerStaleAfter            time.Duration
+	Interval                   time.Duration
+	Once                       bool
+	Top                        int
+	MaxWorkChatPollsPerCycle   int
+	Executor                   Executor
+	ControlFallbackExecutor    Executor
+	ControlFallbackModel       string
+	Runner                     codexrunner.Runner
+	HelperRestarter            HelperRestarter
+	HelperReloader             HelperReloader
+	HelperAutoUpdater          HelperAutoUpdater
+	HelperAutoUpdatePrerelease bool
+	CodexUpgrader              CodexUpgrader
 }
 
 type HelperRestarter func(context.Context) error
@@ -126,8 +127,10 @@ type HelperReloadOptions struct {
 }
 
 type HelperAutoUpdateCheck struct {
-	InstalledVersion string
-	Now              time.Time
+	InstalledVersion  string
+	Now               time.Time
+	IncludePrerelease bool
+	Manual            bool
 }
 
 type HelperAutoUpdateDecision struct {
@@ -152,43 +155,46 @@ type HelperAutoUpdateApplyResult struct {
 }
 
 type Bridge struct {
-	graph                     *GraphClient
-	readGraph                 *GraphClient
-	fileGraph                 *GraphClient
-	httpClient                *http.Client
-	registryPath              string
-	reg                       Registry
-	regMu                     sync.Mutex
-	user                      User
-	scope                     teamstore.ScopeIdentity
-	machine                   teamstore.MachineRecord
-	lease                     teamstore.ControlLease
-	leaseDuration             time.Duration
-	out                       io.Writer
-	executor                  Executor
-	controlFallbackExecutor   Executor
-	controlFallbackModel      string
-	helperRestarter           HelperRestarter
-	helperReloader            HelperReloader
-	codexUpgrader             CodexUpgrader
-	store                     *teamstore.Store
-	asyncTurns                bool
-	ownerMu                   sync.Mutex
-	owner                     teamstore.OwnerMetadata
-	ownerStaleAfter           time.Duration
-	ownerHeartbeatInterval    time.Duration
-	pollMu                    sync.Mutex
-	fastPollUntil             time.Time
-	lastTranscriptSync        time.Time
-	maxWorkChatPollsPerCycle  int
-	dashboardProjectsMu       sync.Mutex
-	dashboardProjectsCache    []codexhistory.Project
-	dashboardProjectsCachedAt time.Time
-	annotateUserMessages      bool
-	annotationDisabled        bool
-	annotationWarned          bool
-	runningTurnMu             sync.Mutex
-	runningTurnCancels        map[string]*runningTurnCancel
+	graph                      *GraphClient
+	readGraph                  *GraphClient
+	fileGraph                  *GraphClient
+	httpClient                 *http.Client
+	registryPath               string
+	reg                        Registry
+	regMu                      sync.Mutex
+	user                       User
+	scope                      teamstore.ScopeIdentity
+	machine                    teamstore.MachineRecord
+	lease                      teamstore.ControlLease
+	leaseDuration              time.Duration
+	out                        io.Writer
+	executor                   Executor
+	controlFallbackExecutor    Executor
+	controlFallbackModel       string
+	helperRestarter            HelperRestarter
+	helperReloader             HelperReloader
+	helperAutoUpdater          HelperAutoUpdater
+	helperVersion              string
+	helperAutoUpdatePrerelease bool
+	codexUpgrader              CodexUpgrader
+	store                      *teamstore.Store
+	asyncTurns                 bool
+	ownerMu                    sync.Mutex
+	owner                      teamstore.OwnerMetadata
+	ownerStaleAfter            time.Duration
+	ownerHeartbeatInterval     time.Duration
+	pollMu                     sync.Mutex
+	fastPollUntil              time.Time
+	lastTranscriptSync         time.Time
+	maxWorkChatPollsPerCycle   int
+	dashboardProjectsMu        sync.Mutex
+	dashboardProjectsCache     []codexhistory.Project
+	dashboardProjectsCachedAt  time.Time
+	annotateUserMessages       bool
+	annotationDisabled         bool
+	annotationWarned           bool
+	runningTurnMu              sync.Mutex
+	runningTurnCancels         map[string]*runningTurnCancel
 }
 
 type runningTurnCancel struct {
@@ -427,6 +433,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	b.controlFallbackModel = strings.TrimSpace(opts.ControlFallbackModel)
 	b.helperRestarter = opts.HelperRestarter
 	b.helperReloader = opts.HelperReloader
+	b.helperAutoUpdater = opts.HelperAutoUpdater
+	b.helperVersion = strings.TrimSpace(opts.HelperVersion)
+	b.helperAutoUpdatePrerelease = opts.HelperAutoUpdatePrerelease
 	b.codexUpgrader = opts.CodexUpgrader
 	b.asyncTurns = !opts.Once
 	b.annotateUserMessages = true
@@ -1246,6 +1255,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.restartHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandReload:
 			return b.reloadHelperFromControl(ctx, msg, parsed.Argument)
+		case DashboardCommandUpdate:
+			return b.updateHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandSelect:
 			message, err := b.resolveControlSelection(ctx, parsed.Target)
 			if err != nil {
@@ -1453,6 +1464,8 @@ func controlAdvancedHelpText() string {
 		"- `h` / `help` / `menu` - show short help",
 		"- `helper restart` - show the safe restart confirmation",
 		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
+		"- `helper update now` - update to the latest stable helper release",
+		"- `helper update prerelease` - update to the newest helper release or pre-release",
 		"",
 		"work chat commands:",
 		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
@@ -1628,6 +1641,147 @@ func (b *Bridge) reloadHelperFromControl(ctx context.Context, msg ChatMessage, a
 	reloader := b.helperReloader
 	b.runDelayedHelperReload(reloader, HelperReloadOptions{Force: helperReloadForce(arg)}, previous, msg)
 	return nil
+}
+
+func (b *Bridge) updateHelperFromControl(ctx context.Context, msg ChatMessage, arg string) error {
+	req, ok := parseHelperUpdateRequest(arg)
+	if !ok {
+		return b.sendControl(ctx, helperUpdateHelpText(b.helperAutoUpdatePrerelease))
+	}
+	if b.helperAutoUpdater == nil {
+		return b.sendControl(ctx, "⚠️ Helper update is not available in this helper process. Start it with the normal Teams service command, then try again.")
+	}
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_update"); err != nil {
+		return err
+	} else if duplicate {
+		return nil
+	}
+	now := time.Now()
+	decision, err := b.helperAutoUpdater.Check(ctx, HelperAutoUpdateCheck{
+		InstalledVersion:  b.helperVersion,
+		Now:               now,
+		IncludePrerelease: req.IncludePrerelease,
+		Manual:            true,
+	})
+	if err != nil {
+		_, _ = b.store.RecordAutoUpdateCheck(context.Background(), teamstore.AutoUpdateRecord{
+			Now:          now,
+			NextCheckAt:  now.Add(30 * time.Minute),
+			BackoffUntil: now.Add(30 * time.Minute),
+			LastError:    err.Error(),
+		})
+		return b.sendControl(ctx, "⚠️ Helper update check failed\n\n"+err.Error())
+	}
+	record := teamstore.AutoUpdateRecord{
+		Now:          now,
+		NextCheckAt:  decision.NextCheckAt,
+		BackoffUntil: decision.BackoffUntil,
+		LastError:    decision.LastError,
+	}
+	if record.NextCheckAt.IsZero() {
+		record.NextCheckAt = now.Add(30 * time.Minute)
+	}
+	if decision.Candidate != nil {
+		record.CandidateTag = decision.Candidate.TagName
+		record.CandidateVersion = decision.Candidate.Version
+		record.CandidatePriority = decision.Candidate.Priority
+		record.CandidateAsset = decision.Candidate.Asset
+		record.CandidatePublishedAt = decision.Candidate.PublishedAt
+		record.CandidateEligibleAt = decision.Candidate.EligibleAt
+	}
+	if _, err := b.store.RecordAutoUpdateCheck(ctx, record); err != nil {
+		return err
+	}
+	if decision.Candidate == nil {
+		if req.IncludePrerelease {
+			return b.sendControl(ctx, "✅ Helper is already on the latest available release or pre-release for this machine.")
+		}
+		return b.sendControl(ctx, "✅ Helper is already on the latest stable release for this machine.")
+	}
+	if err := b.sendControl(ctx, helperUpdateScheduledMessage(*decision.Candidate, req.IncludePrerelease)); err != nil {
+		return err
+	}
+	if err := b.applyHelperAutoUpdateWhenDrained(ctx, BridgeOptions{
+		HelperAutoUpdater: b.helperAutoUpdater,
+		HelperRestarter:   b.helperRestarter,
+	}, *decision.Candidate); err != nil {
+		return b.sendControl(ctx, "⚠️ Helper update failed\n\n"+err.Error())
+	}
+	return nil
+}
+
+type helperUpdateRequest struct {
+	IncludePrerelease bool
+}
+
+func parseHelperUpdateRequest(arg string) (helperUpdateRequest, bool) {
+	tokens := strings.Fields(strings.ToLower(strings.TrimSpace(arg)))
+	if len(tokens) == 0 {
+		return helperUpdateRequest{}, false
+	}
+	filtered := tokens[:0]
+	for _, token := range tokens {
+		switch token {
+		case "update", "upgrade":
+			continue
+		default:
+			filtered = append(filtered, token)
+		}
+	}
+	if len(filtered) == 0 {
+		return helperUpdateRequest{}, false
+	}
+	req := helperUpdateRequest{}
+	recognized := false
+	for _, token := range filtered {
+		switch token {
+		case "now", "--now", "latest", "release", "stable":
+			recognized = true
+		case "prerelease", "pre-release", "pre", "rc", "--pre", "--prerelease", "--include-prerelease":
+			req.IncludePrerelease = true
+			recognized = true
+		default:
+			return helperUpdateRequest{}, false
+		}
+	}
+	return req, recognized
+}
+
+func helperUpdateHelpText(autoPrerelease bool) string {
+	mode := "stable releases only"
+	if autoPrerelease {
+		mode = "stable releases plus eligible pre-releases"
+	}
+	return strings.Join([]string{
+		"## ⬇️ Helper update",
+		"",
+		"This updates the local Teams helper from GitHub releases.",
+		"It waits until active Codex work is idle before replacing the helper.",
+		"",
+		"Commands:",
+		"- `helper update now` - update to the latest stable release",
+		"- `helper update prerelease` - update to the newest release or pre-release",
+		"",
+		"Automatic updates currently check: " + mode + ".",
+	}, "\n")
+}
+
+func helperUpdateScheduledMessage(candidate HelperAutoUpdateCandidate, includePrerelease bool) string {
+	channel := "stable release"
+	if includePrerelease {
+		channel = "release/pre-release"
+	}
+	return strings.Join([]string{
+		"⬇️ Helper update scheduled",
+		"",
+		"Target: `" + firstNonEmptyString(candidate.TagName, "v"+strings.TrimPrefix(candidate.Version, "v")) + "`",
+		"Channel: " + channel,
+		"",
+		"I will install it when active Codex work is idle, then restart the helper.",
+	}, "\n")
 }
 
 func helperReloadConfirmed(arg string) bool {
@@ -1982,8 +2136,9 @@ func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOption
 		return nil
 	}
 	decision, err := opts.HelperAutoUpdater.Check(ctx, HelperAutoUpdateCheck{
-		InstalledVersion: opts.HelperVersion,
-		Now:              now,
+		InstalledVersion:  opts.HelperVersion,
+		Now:               now,
+		IncludePrerelease: opts.HelperAutoUpdatePrerelease,
 	})
 	if err != nil {
 		_, recordErr := b.store.RecordAutoUpdateCheck(ctx, teamstore.AutoUpdateRecord{

@@ -1431,7 +1431,9 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 		arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " + windowsQuoteArg(buildTeamsServiceWindowsPowerShell(spec, args))
 	}
 	var b strings.Builder
-	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
+	// Register-ScheduledTask -Xml receives this as a PowerShell/.NET string.
+	// An explicit encoding declaration makes Task Scheduler try to switch away
+	// from that string encoding and fail with "unable to switch the encoding".
 	b.WriteString(`<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` + "\n")
 	b.WriteString("  <RegistrationInfo>\n")
 	b.WriteString("    <Description>Codex Helper Teams bridge</Description>\n")

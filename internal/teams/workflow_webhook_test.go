@@ -116,3 +116,57 @@ func TestPostWorkflowWebhookRetriesTooManyRequests(t *testing.T) {
 		t.Fatalf("Retry-After was not honored")
 	}
 }
+
+func TestPostWorkflowWebhookClassifiesServerErrorAsDeliveryUncertain(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Status:     "502 Bad Gateway",
+			Body:       io.NopCloser(strings.NewReader("maybe delivered")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	_, err := PostWorkflowWebhook(context.Background(), client, "https://workflow.example.test/hook", WorkflowWebhookMessage{Text: "maybe"})
+	if err == nil {
+		t.Fatalf("expected server error")
+	}
+	if !workflowWebhookDeliveryUncertain(err) || workflowWebhookRetryable(err) {
+		t.Fatalf("error classification = deliveryUncertain:%v retryable:%v, want delivery-uncertain only", workflowWebhookDeliveryUncertain(err), workflowWebhookRetryable(err))
+	}
+}
+
+func TestPostWorkflowWebhookClassifiesTransportErrorAsDeliveryUncertain(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, io.ErrUnexpectedEOF
+	})}
+
+	_, err := PostWorkflowWebhook(context.Background(), client, "https://workflow.example.test/hook", WorkflowWebhookMessage{Text: "maybe"})
+	if err == nil {
+		t.Fatalf("expected transport error")
+	}
+	if !workflowWebhookDeliveryUncertain(err) || workflowWebhookRetryable(err) {
+		t.Fatalf("error classification = deliveryUncertain:%v retryable:%v, want delivery-uncertain only", workflowWebhookDeliveryUncertain(err), workflowWebhookRetryable(err))
+	}
+}
+
+func TestPostWorkflowWebhookClassifiesInterruptedRateLimitWaitAsRetryable(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{"Retry-After": []string{"1"}},
+			Body:       io.NopCloser(strings.NewReader("slow")),
+		}, nil
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	_, err := PostWorkflowWebhook(ctx, client, "https://workflow.example.test/hook", WorkflowWebhookMessage{Text: "retry later"})
+	if err == nil {
+		t.Fatalf("expected interrupted rate-limit wait error")
+	}
+	if !workflowWebhookRetryable(err) || workflowWebhookDeliveryUncertain(err) {
+		t.Fatalf("error classification = retryable:%v deliveryUncertain:%v, want retryable only", workflowWebhookRetryable(err), workflowWebhookDeliveryUncertain(err))
+	}
+}

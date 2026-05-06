@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -12,14 +13,15 @@ import (
 )
 
 type teamsReleaseAutoUpdater struct {
-	repo string
+	repo              string
+	includePrerelease bool
 }
 
 var teamsAutoUpdateResolveInstallPath = update.ResolveInstallPath
 var teamsAutoUpdateListReleases = update.ListReleases
 
-func newTeamsReleaseAutoUpdater(repo string) teams.HelperAutoUpdater {
-	return teamsReleaseAutoUpdater{repo: repo}
+func newTeamsReleaseAutoUpdater(repo string, includePrerelease bool) teams.HelperAutoUpdater {
+	return teamsReleaseAutoUpdater{repo: repo, includePrerelease: includePrerelease}
 }
 
 func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAutoUpdateCheck) (teams.HelperAutoUpdateDecision, error) {
@@ -38,9 +40,15 @@ func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAu
 			LastError:    err.Error(),
 		}, err
 	}
+	installedVersion := check.InstalledVersion
+	if check.Manual && (strings.TrimSpace(installedVersion) == "" || strings.EqualFold(strings.TrimSpace(installedVersion), "dev")) {
+		installedVersion = "0.0.0"
+	}
 	selected := update.SelectAutoUpdateCandidate(releases, update.AutoUpdateSelectionOptions{
-		InstalledVersion: check.InstalledVersion,
-		Now:              now,
+		InstalledVersion:  installedVersion,
+		Now:               now,
+		IncludePrerelease: u.includePrerelease || check.IncludePrerelease,
+		IgnorePriority:    check.Manual,
 	})
 	decision := teams.HelperAutoUpdateDecision{
 		NextCheckAt: selected.NextCheckAt,

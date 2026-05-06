@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,27 @@ type WorkflowWebhookResult struct {
 	Body       string
 }
 
+type WorkflowWebhookError struct {
+	Result            WorkflowWebhookResult
+	Retryable         bool
+	DeliveryUncertain bool
+	Message           string
+}
+
+func (e WorkflowWebhookError) Error() string {
+	return e.Message
+}
+
+func workflowWebhookRetryable(err error) bool {
+	var webhookErr WorkflowWebhookError
+	return errors.As(err, &webhookErr) && webhookErr.Retryable
+}
+
+func workflowWebhookDeliveryUncertain(err error) bool {
+	var webhookErr WorkflowWebhookError
+	return errors.As(err, &webhookErr) && webhookErr.DeliveryUncertain
+}
+
 func PostWorkflowWebhook(ctx context.Context, client *http.Client, webhookURL string, msg WorkflowWebhookMessage) (WorkflowWebhookResult, error) {
 	webhookURL = strings.TrimSpace(webhookURL)
 	if webhookURL == "" {
@@ -58,7 +80,10 @@ func PostWorkflowWebhook(ctx context.Context, client *http.Client, webhookURL st
 		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
-			return WorkflowWebhookResult{}, fmt.Errorf("Teams workflow webhook request failed")
+			return WorkflowWebhookResult{}, WorkflowWebhookError{
+				Message:           "Teams workflow webhook request failed",
+				DeliveryUncertain: true,
+			}
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
@@ -67,13 +92,24 @@ func PostWorkflowWebhook(ctx context.Context, client *http.Client, webhookURL st
 			return last, nil
 		}
 		if resp.StatusCode != http.StatusTooManyRequests || attempt == workflowWebhookRetries-1 {
-			return last, fmt.Errorf("Teams workflow webhook failed: HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+			retryable := resp.StatusCode == http.StatusTooManyRequests
+			uncertain := resp.StatusCode >= 500 && resp.StatusCode <= 599
+			return last, WorkflowWebhookError{
+				Result:            last,
+				Retryable:         retryable,
+				DeliveryUncertain: uncertain,
+				Message:           fmt.Sprintf("Teams workflow webhook failed: HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode)),
+			}
 		}
 		if err := sleepContext(ctx, workflowWebhookRetryDelay(resp, attempt)); err != nil {
-			return last, err
+			return last, WorkflowWebhookError{
+				Result:    last,
+				Retryable: true,
+				Message:   fmt.Sprintf("Teams workflow webhook retry delayed by HTTP %d was interrupted", resp.StatusCode),
+			}
 		}
 	}
-	return last, fmt.Errorf("Teams workflow webhook failed after retries")
+	return last, WorkflowWebhookError{Result: last, Retryable: true, Message: "Teams workflow webhook failed after retries"}
 }
 
 func safeWorkflowWebhookURL(raw string) bool {

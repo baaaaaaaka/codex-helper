@@ -62,10 +62,12 @@ type AutoUpdateSelection struct {
 }
 
 type AutoUpdateSelectionOptions struct {
-	InstalledVersion string
-	Now              time.Time
-	GOOS             string
-	GOARCH           string
+	InstalledVersion  string
+	Now               time.Time
+	GOOS              string
+	GOARCH            string
+	IncludePrerelease bool
+	IgnorePriority    bool
 }
 
 func ListReleases(ctx context.Context, opts ReleaseListOptions) ([]GitHubRelease, error) {
@@ -165,7 +167,7 @@ func SelectAutoUpdateCandidate(releases []GitHubRelease, opts AutoUpdateSelectio
 	}
 	var candidates []AutoUpdateCandidate
 	for _, rel := range releases {
-		if rel.Draft || rel.Prerelease {
+		if rel.Draft {
 			continue
 		}
 		tag := strings.TrimSpace(rel.TagName)
@@ -173,7 +175,7 @@ func SelectAutoUpdateCandidate(releases []GitHubRelease, opts AutoUpdateSelectio
 		if tag == "" || version == "" {
 			continue
 		}
-		if isAutoUpdatePrereleaseVersion(version) {
+		if releaseIsPrerelease(rel, version) && !opts.IncludePrerelease {
 			continue
 		}
 		newer, ok := compareVersionNewer(version, local)
@@ -185,7 +187,7 @@ func SelectAutoUpdateCandidate(releases []GitHubRelease, opts AutoUpdateSelectio
 			continue
 		}
 		priority := ParseAutoUpdatePriority(rel.Body)
-		eligibleAt, ok := autoUpdateEligibleAt(priority, rel.PublishedAt)
+		eligibleAt, ok := autoUpdateEligibleAt(priority, rel.PublishedAt, opts.IgnorePriority)
 		if !ok {
 			continue
 		}
@@ -248,9 +250,12 @@ func ParseAutoUpdatePriority(body string) AutoUpdatePriority {
 	}
 }
 
-func autoUpdateEligibleAt(priority AutoUpdatePriority, publishedAt time.Time) (time.Time, bool) {
+func autoUpdateEligibleAt(priority AutoUpdatePriority, publishedAt time.Time, ignorePriority bool) (time.Time, bool) {
 	if publishedAt.IsZero() {
 		return time.Time{}, false
+	}
+	if ignorePriority {
+		return publishedAt, true
 	}
 	switch priority {
 	case AutoUpdatePriorityP0:
@@ -263,8 +268,12 @@ func autoUpdateEligibleAt(priority AutoUpdatePriority, publishedAt time.Time) (t
 }
 
 func isAutoUpdatePrereleaseVersion(version string) bool {
-	_, prerelease, ok := parseComparableVersion(version)
-	return ok && prerelease
+	parsed, ok := parseComparableVersion(version)
+	return ok && parsed.prerelease != ""
+}
+
+func releaseIsPrerelease(rel GitHubRelease, version string) bool {
+	return rel.Prerelease || isAutoUpdatePrereleaseVersion(version)
 }
 
 func releaseHasAsset(rel GitHubRelease, asset string) bool {
@@ -287,71 +296,149 @@ func compareVersionNewer(remote, local string) (bool, bool) {
 const versionCompareInvalid = -2
 
 func compareVersion(left, right string) int {
-	lv, lpre, lok := parseComparableVersion(left)
-	rv, rpre, rok := parseComparableVersion(right)
+	lv, lok := parseComparableVersion(left)
+	rv, rok := parseComparableVersion(right)
 	if !lok || !rok {
 		return versionCompareInvalid
 	}
-	n := len(lv)
-	if len(rv) > n {
-		n = len(rv)
+	n := len(lv.parts)
+	if len(rv.parts) > n {
+		n = len(rv.parts)
 	}
-	for len(lv) < n {
-		lv = append(lv, 0)
+	for len(lv.parts) < n {
+		lv.parts = append(lv.parts, 0)
 	}
-	for len(rv) < n {
-		rv = append(rv, 0)
+	for len(rv.parts) < n {
+		rv.parts = append(rv.parts, 0)
 	}
 	for i := 0; i < n; i++ {
-		if lv[i] > rv[i] {
+		if lv.parts[i] > rv.parts[i] {
 			return 1
 		}
-		if lv[i] < rv[i] {
+		if lv.parts[i] < rv.parts[i] {
 			return -1
 		}
 	}
-	if lpre != rpre {
-		if lpre {
+	if lv.prerelease != rv.prerelease {
+		if lv.prerelease == "" {
+			return 1
+		}
+		if rv.prerelease == "" {
 			return -1
 		}
-		return 1
+		return comparePrerelease(lv.prerelease, rv.prerelease)
 	}
 	return 0
 }
 
-func parseComparableVersion(v string) ([]int, bool, bool) {
+type comparableVersion struct {
+	parts      []int
+	prerelease string
+}
+
+func parseComparableVersion(v string) (comparableVersion, bool) {
 	s := strings.TrimSpace(v)
 	s = strings.TrimPrefix(s, "v")
 	if s == "" {
-		return nil, false, false
+		return comparableVersion{}, false
 	}
-	prerelease := false
 	if base, suffix, ok := strings.Cut(s, "-"); ok {
 		s = base
-		prerelease = strings.TrimSpace(suffix) != ""
+		suffix = strings.TrimSpace(suffix)
+		if buildBase, _, ok := strings.Cut(suffix, "+"); ok {
+			suffix = strings.TrimSpace(buildBase)
+		}
+		return parseComparableVersionBase(s, suffix)
 	}
 	if base, _, ok := strings.Cut(s, "+"); ok {
 		s = base
 	}
-	parts := strings.Split(s, ".")
+	return parseComparableVersionBase(s, "")
+}
+
+func parseComparableVersionBase(base string, prerelease string) (comparableVersion, bool) {
+	parts := strings.Split(base, ".")
 	out := make([]int, 0, len(parts))
 	for _, p := range parts {
 		if p == "" {
-			return nil, false, false
+			return comparableVersion{}, false
 		}
 		n := 0
 		for _, ch := range p {
 			if ch < '0' || ch > '9' {
-				return nil, false, false
+				return comparableVersion{}, false
 			}
 			n = n*10 + int(ch-'0')
 		}
 		out = append(out, n)
 	}
 	if len(out) == 0 {
-		return nil, false, false
+		return comparableVersion{}, false
 	}
-	return out, prerelease, true
+	return comparableVersion{parts: out, prerelease: prerelease}, true
+}
+
+func comparePrerelease(left string, right string) int {
+	leftIDs := prereleaseIdentifiers(left)
+	rightIDs := prereleaseIdentifiers(right)
+	n := len(leftIDs)
+	if len(rightIDs) > n {
+		n = len(rightIDs)
+	}
+	for i := 0; i < n; i++ {
+		if i >= len(leftIDs) {
+			return -1
+		}
+		if i >= len(rightIDs) {
+			return 1
+		}
+		cmp := comparePrereleaseIdentifier(leftIDs[i], rightIDs[i])
+		if cmp != 0 {
+			return cmp
+		}
+	}
+	return 0
+}
+
+func prereleaseIdentifiers(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool {
+		return r == '.' || r == '-'
+	})
+}
+
+func comparePrereleaseIdentifier(left string, right string) int {
+	leftNum, leftNumeric := prereleaseIdentifierNumber(left)
+	rightNum, rightNumeric := prereleaseIdentifierNumber(right)
+	if leftNumeric && rightNumeric {
+		if leftNum > rightNum {
+			return 1
+		}
+		if leftNum < rightNum {
+			return -1
+		}
+		return 0
+	}
+	if leftNumeric != rightNumeric {
+		if leftNumeric {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(left, right)
+}
+
+func prereleaseIdentifierNumber(value string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	out := 0
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+		out = out*10 + int(ch-'0')
+	}
+	return out, true
 }
 
 func BuildReleasePriorityMarker(priority AutoUpdatePriority) string {

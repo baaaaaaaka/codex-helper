@@ -44,6 +44,9 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 		wantVersion string
 		wantNext    time.Time
 		wantBackoff bool
+		includePre  bool
+		manual      bool
+		installed   string
 	}{
 		{
 			name:        "p0 immediate",
@@ -61,6 +64,44 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 			name:     "p2 skipped",
 			releases: []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour))},
 			wantNext: now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+		{
+			name: "prerelease skipped by default",
+			releases: []update.GitHubRelease{func() update.GitHubRelease {
+				r := release("v1.2.4-rc.1", update.AutoUpdatePriorityP0, now.Add(-time.Hour))
+				r.Prerelease = true
+				return r
+			}()},
+			wantNext: now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+		{
+			name: "prerelease selected when enabled",
+			releases: []update.GitHubRelease{func() update.GitHubRelease {
+				r := release("v1.2.4-rc.1", update.AutoUpdatePriorityP0, now.Add(-time.Hour))
+				r.Prerelease = true
+				return r
+			}()},
+			includePre:  true,
+			wantTag:     "v1.2.4-rc.1",
+			wantVersion: "1.2.4-rc.1",
+			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+		{
+			name:        "manual ignores p2 priority",
+			releases:    []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour))},
+			manual:      true,
+			wantTag:     "v1.2.4",
+			wantVersion: "1.2.4",
+			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
+		},
+		{
+			name:        "manual can update unknown local version",
+			releases:    []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour))},
+			manual:      true,
+			installed:   "dev",
+			wantTag:     "v1.2.4",
+			wantVersion: "1.2.4",
+			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
 		},
 		{
 			name:     "missing asset skipped",
@@ -95,14 +136,18 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 				}
 				return tc.releases, nil
 			}
-			updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+			updater := teamsReleaseAutoUpdater{repo: "owner/name", includePrerelease: tc.includePre}
 			installed := "v1.2.3"
 			if strings.Contains(tc.name, "metadata") {
 				installed = "v1.2.3+local"
 			}
+			if tc.installed != "" {
+				installed = tc.installed
+			}
 			got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
 				InstalledVersion: installed,
 				Now:              now,
+				Manual:           tc.manual,
 			})
 			if tc.listErr != nil {
 				if err == nil || !strings.Contains(err.Error(), "github unavailable") {

@@ -61,7 +61,7 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	if runCmd.Flags().Lookup("owner-stale-after") == nil || runCmd.Flags().Lookup("max-work-chat-polls") == nil {
 		t.Fatal("teams run should expose Teams helper reliability tuning flags")
 	}
-	if runCmd.Flags().Lookup("auto-update") == nil || runCmd.Flags().Lookup("auto-update-repo") == nil {
+	if runCmd.Flags().Lookup("auto-update") == nil || runCmd.Flags().Lookup("auto-update-repo") == nil || runCmd.Flags().Lookup("auto-update-prerelease") == nil {
 		t.Fatal("teams run should expose Teams helper auto-update flags")
 	}
 	if runCmd.Flags().Lookup("auto-service") == nil {

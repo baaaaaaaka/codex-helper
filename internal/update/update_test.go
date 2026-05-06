@@ -72,6 +72,34 @@ func TestCheckForUpdateFallbackRedirect(t *testing.T) {
 	}
 }
 
+func TestCheckForUpdateIncludePrereleaseTreatsStableSameVersionAsNewer(t *testing.T) {
+	requireRuntimeAsset(t)
+	tag := "v1.2.4"
+	ver := "1.2.4"
+	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("assetName error: %v", err)
+	}
+	payload := []byte("stable-binary")
+	server := newReleaseListServer(t, []testReleaseAsset{{Tag: tag, Asset: asset, Payload: payload, Prerelease: false}})
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+
+	st := CheckForUpdate(context.Background(), CheckOptions{
+		Repo:              "owner/name",
+		InstalledVersion:  "1.2.4-rc.1",
+		Timeout:           time.Second,
+		IncludePrerelease: true,
+	})
+	if !st.Supported {
+		t.Fatalf("expected supported update check, got error=%q", st.Error)
+	}
+	if !st.UpdateAvailable || st.RemoteVersion != "1.2.4" {
+		t.Fatalf("status = %#v, want stable 1.2.4 newer than 1.2.4-rc.1", st)
+	}
+}
+
 func TestCheckForUpdateRejectsDev(t *testing.T) {
 	st := CheckForUpdate(context.Background(), CheckOptions{InstalledVersion: "dev"})
 	if st.Supported {
@@ -224,6 +252,51 @@ func TestPerformUpdateLatest(t *testing.T) {
 	}
 }
 
+func TestPerformUpdateLatestIncludePrerelease(t *testing.T) {
+	requireRuntimeAsset(t)
+	stableVer := "3.1.0"
+	stableAsset, err := assetName(stableVer, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("assetName stable error: %v", err)
+	}
+	preTag := "v3.2.0-rc.10"
+	preVer := "3.2.0-rc.10"
+	preAsset, err := assetName(preVer, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("assetName prerelease error: %v", err)
+	}
+	payload := []byte("latest-prerelease-binary")
+	server := newReleaseListServer(t, []testReleaseAsset{
+		{Tag: "v" + stableVer, Asset: stableAsset, Payload: []byte("stable-binary"), Prerelease: false},
+		{Tag: preTag, Asset: preAsset, Payload: payload, Prerelease: true},
+	})
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+
+	dest := filepath.Join(t.TempDir(), "codex-proxy")
+	res, err := PerformUpdate(context.Background(), UpdateOptions{
+		Repo:              "owner/name",
+		Version:           "latest",
+		InstallPath:       dest,
+		Timeout:           time.Second,
+		IncludePrerelease: true,
+	})
+	if err != nil {
+		t.Fatalf("PerformUpdate latest prerelease error: %v", err)
+	}
+	if res.Version != preVer {
+		t.Fatalf("result version = %q, want %s", res.Version, preVer)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read dest: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("installed payload = %q, want prerelease payload", got)
+	}
+}
+
 func TestPerformUpdateInvalidVersion(t *testing.T) {
 	_, err := PerformUpdate(context.Background(), UpdateOptions{
 		Version: "v",
@@ -305,6 +378,53 @@ func newReleaseServerWithChecksum(t *testing.T, tag, asset string, payload []byt
 			w.Header().Set("Content-Type", "application/octet-stream")
 			_, _ = w.Write(payload)
 		default:
+			http.NotFound(w, r)
+		}
+	}
+	return httptest.NewServer(http.HandlerFunc(handler))
+}
+
+type testReleaseAsset struct {
+	Tag        string
+	Asset      string
+	Payload    []byte
+	Prerelease bool
+}
+
+func newReleaseListServer(t *testing.T, releases []testReleaseAsset) *httptest.Server {
+	t.Helper()
+	payloadByAsset := make(map[string][]byte)
+	checksumByAsset := make(map[string]string)
+	for _, rel := range releases {
+		payloadByAsset[rel.Asset] = rel.Payload
+		sum := sha256.Sum256(rel.Payload)
+		checksumByAsset[rel.Asset] = hex.EncodeToString(sum[:])
+	}
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/repos/") && strings.Contains(r.URL.Path, "/releases"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `[`)
+			for i, rel := range releases {
+				if i > 0 {
+					_, _ = fmt.Fprint(w, `,`)
+				}
+				_, _ = fmt.Fprintf(w, `{"tag_name":%q,"prerelease":%t,"published_at":"2026-05-04T00:00:00Z","assets":[{"name":%q}]}`, rel.Tag, rel.Prerelease, rel.Asset)
+			}
+			_, _ = fmt.Fprint(w, `]`)
+		case strings.Contains(r.URL.Path, "/checksums.txt"):
+			w.Header().Set("Content-Type", "text/plain")
+			for _, rel := range releases {
+				_, _ = fmt.Fprintf(w, "%s  %s\n", checksumByAsset[rel.Asset], rel.Asset)
+			}
+		default:
+			for asset, payload := range payloadByAsset {
+				if strings.HasSuffix(r.URL.Path, "/"+asset) || strings.Contains(r.URL.Path, "/"+asset) {
+					w.Header().Set("Content-Type", "application/octet-stream")
+					_, _ = w.Write(payload)
+					return
+				}
+			}
 			http.NotFound(w, r)
 		}
 	}

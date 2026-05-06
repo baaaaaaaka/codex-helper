@@ -111,19 +111,57 @@ func TestWorkflowNotificationFallsBackToSidecarConfigWhenOldHelperErasesState(t 
 	}
 }
 
-func TestWorkflowNotificationFailureRetriesWithBackoff(t *testing.T) {
+func TestWorkflowNotificationDoesNotDuplicateAfterAmbiguousFailure(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	graph, _ := newBridgeTestGraph(t)
 	bridge := newWorkflowNotificationTestBridge(t, graph, store)
-	seedWorkflowNotificationState(t, store, "Retry this request")
+	seedWorkflowNotificationState(t, store, "Avoid duplicate cards after an ambiguous webhook result")
 
 	var calls int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&calls, 1) == 1 {
-			http.Error(w, "temporary", http.StatusInternalServerError)
-			return
-		}
+		atomic.AddInt32(&calls, 1)
+		http.Error(w, "temporary", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	outbox := workflowNotificationTestOutbox("outbox-ambiguous", "final", "turn_completed")
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("webhook calls after failure = %d, want 1", got)
+	}
+	if err := bridge.flushPendingWorkflowNotifications(ctx); err != nil {
+		t.Fatalf("flush should skip delivery-uncertain records, got %v", err)
+	}
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("webhook calls after requeue = %d, want 1", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
+	if rec.Status != teamstore.NotificationStatusUnknown || rec.Attempts != 1 || !rec.DeliveryUncertain || rec.LastErrorRetryable {
+		t.Fatalf("notification record after ambiguous failure = %#v, want unknown delivery with one attempt", rec)
+	}
+}
+
+func TestWorkflowNotificationRetriesOnlyRetryableFailuresWithBackoff(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Retry only explicit retryable webhook failures")
+
+	var calls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
@@ -133,22 +171,43 @@ func TestWorkflowNotificationFailureRetriesWithBackoff(t *testing.T) {
 		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
 	}
 
-	outbox := workflowNotificationTestOutbox("outbox-retry", "final", "turn_completed")
-	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("webhook calls after failure = %d, want 1", got)
-	}
-	if err := bridge.flushPendingWorkflowNotifications(ctx); err != nil {
-		t.Fatalf("immediate flush should skip backoff and not fail, got %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("webhook calls during backoff = %d, want 1", got)
+	outbox := workflowNotificationTestOutbox("outbox-retryable", "final", "turn_completed")
+	if err := bridge.queueWorkflowNotification(ctx, WorkflowNotificationEvent{
+		ID:             "workflow:" + shortStableID(outbox.ID),
+		SessionID:      outbox.SessionID,
+		TurnID:         outbox.TurnID,
+		OutboxID:       outbox.ID,
+		Kind:           "turn_completed",
+		Title:          "✅ Codex finished",
+		ChatTitle:      "💬 test-host - Fix installer",
+		RequestSummary: "Retry only after explicit backoff",
+		ButtonTitle:    "Open answer",
+		ButtonURL:      TeamsChatURL("chat-1", "tenant-1"),
+	}); err != nil {
+		t.Fatalf("queueWorkflowNotification: %v", err)
 	}
 	if err := store.Update(ctx, func(state *teamstore.State) error {
-		for id, rec := range state.Notifications {
-			rec.LastAttemptAt = time.Now().Add(-10 * time.Minute)
-			state.Notifications[id] = rec
-		}
+		rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
+		rec.Status = teamstore.NotificationStatusFailed
+		rec.Attempts = 1
+		rec.LastError = "Teams workflow webhook failed: HTTP 429 Too Many Requests"
+		rec.LastErrorRetryable = true
+		rec.LastAttemptAt = time.Now()
+		state.Notifications[rec.ID] = rec
+		return nil
+	}); err != nil {
+		t.Fatalf("seed retryable failure: %v", err)
+	}
+	if err := bridge.flushPendingWorkflowNotifications(ctx); err != nil {
+		t.Fatalf("immediate flush should skip retry backoff, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("webhook calls during backoff = %d, want 0", got)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
+		rec.LastAttemptAt = time.Now().Add(-10 * time.Minute)
+		state.Notifications[rec.ID] = rec
 		return nil
 	}); err != nil {
 		t.Fatalf("age notification retry: %v", err)
@@ -156,15 +215,15 @@ func TestWorkflowNotificationFailureRetriesWithBackoff(t *testing.T) {
 	if err := bridge.flushPendingWorkflowNotifications(ctx); err != nil {
 		t.Fatalf("retry flush: %v", err)
 	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("webhook calls after retry = %d, want 2", got)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("webhook calls after retry = %d, want 1", got)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
 	rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
-	if rec.Status != teamstore.NotificationStatusSent || rec.Attempts != 2 || rec.LastError != "" {
+	if rec.Status != teamstore.NotificationStatusSent || rec.Attempts != 2 || rec.LastError != "" || rec.LastErrorRetryable || rec.DeliveryUncertain {
 		t.Fatalf("notification record after retry = %#v, want sent with two attempts", rec)
 	}
 }

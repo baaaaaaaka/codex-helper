@@ -627,6 +627,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var upgradeCodex bool
 	var autoUpdate bool
 	var autoUpdateRepo string
+	var autoUpdatePrerelease bool
 	var autoService bool
 	cmd := &cobra.Command{
 		Use:     "run",
@@ -667,22 +668,23 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 			}
 			var helperAutoUpdater teams.HelperAutoUpdater
 			if autoUpdate {
-				helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo)
+				helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo, autoUpdatePrerelease)
 			}
 			return bridge.Listen(cmd.Context(), teams.BridgeOptions{
-				RegistryPath:             *registryPath,
-				HelperVersion:            buildVersion(),
-				Interval:                 interval,
-				Once:                     once,
-				Top:                      top,
-				OwnerStaleAfter:          ownerStaleAfter,
-				MaxWorkChatPollsPerCycle: maxWorkChatPolls,
-				Executor:                 executor,
-				ControlFallbackExecutor:  controlFallbackExecutor,
-				ControlFallbackModel:     controlFallbackModel,
-				HelperRestarter:          restartTeamsHelperFromTeams,
-				HelperReloader:           reloadTeamsHelperFromTeams,
-				HelperAutoUpdater:        helperAutoUpdater,
+				RegistryPath:               *registryPath,
+				HelperVersion:              buildVersion(),
+				Interval:                   interval,
+				Once:                       once,
+				Top:                        top,
+				OwnerStaleAfter:            ownerStaleAfter,
+				MaxWorkChatPollsPerCycle:   maxWorkChatPolls,
+				Executor:                   executor,
+				ControlFallbackExecutor:    controlFallbackExecutor,
+				ControlFallbackModel:       controlFallbackModel,
+				HelperRestarter:            restartTeamsHelperFromTeams,
+				HelperReloader:             reloadTeamsHelperFromTeams,
+				HelperAutoUpdater:          helperAutoUpdater,
+				HelperAutoUpdatePrerelease: autoUpdatePrerelease,
 				CodexUpgrader: func(ctx context.Context) (teams.CodexUpgradeResult, error) {
 					return runTeamsCodexUpgradeFromBridge(ctx, root, cmd.ErrOrStderr(), codexPath)
 				},
@@ -704,6 +706,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&upgradeCodex, "upgrade-codex", false, "Upgrade Codex CLI once before starting Teams polling")
 	cmd.Flags().BoolVar(&autoUpdate, "auto-update", true, "Check codex-helper GitHub releases periodically and apply eligible p0/p1 helper updates")
 	cmd.Flags().StringVar(&autoUpdateRepo, "auto-update-repo", "", "Override GitHub repo for Teams helper auto-update checks")
+	cmd.Flags().BoolVar(&autoUpdatePrerelease, "auto-update-prerelease", false, "Allow Teams helper auto-update checks to select eligible GitHub prereleases")
 	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
 	return cmd
 }
