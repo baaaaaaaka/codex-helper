@@ -1190,8 +1190,9 @@ func teamsServiceRunPowerShell(ctx context.Context, command string) ([]byte, err
 	name := teamsServicePowerShellExecutable()
 	data, err := teamsServiceRunCommandDirect(ctx, name, args...)
 	if err != nil {
-		if len(data) > 0 {
-			return data, fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
+		detail := strings.TrimSpace(string(data))
+		if detail != "" {
+			return data, fmt.Errorf("%s %s failed: %w\n%s", name, strings.Join(args, " "), err, detail)
 		}
 		return nil, fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
 	}

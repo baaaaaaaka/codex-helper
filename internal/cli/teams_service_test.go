@@ -759,6 +759,32 @@ func TestTeamsServiceDoctorReportsWSLHint(t *testing.T) {
 	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Register-ScheduledTask", "Start-ScheduledTask", "Enable-ScheduledTask", "Disable-ScheduledTask")
 }
 
+func TestTeamsServiceRunPowerShellIncludesCombinedOutputOnFailure(t *testing.T) {
+	lockCLITestHooks(t)
+
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:  "linux",
+		exe:   "/tmp/codex-proxy",
+		cwd:   "/tmp",
+		isWSL: true,
+		runner: &recordingTeamsServiceRunner{
+			output: []byte("Register-ScheduledTask : Access is denied.\n"),
+			err:    errors.New("exit status 1"),
+		},
+	})
+
+	_, err := teamsServiceRunPowerShell(context.Background(), "Register-ScheduledTask -TaskName 'Codex Helper Teams Bridge'")
+	if err == nil {
+		t.Fatal("teamsServiceRunPowerShell error = nil, want failure")
+	}
+	if !strings.Contains(err.Error(), "exit status 1") || !strings.Contains(err.Error(), "Access is denied") {
+		t.Fatalf("PowerShell error did not preserve combined output:\n%v", err)
+	}
+	if !isTeamsServiceWindowsAccessDeniedError(err) {
+		t.Fatalf("PowerShell access denied output should be classified as access denied:\n%v", err)
+	}
+}
+
 func TestTeamsServiceDoctorReportsWSLReadinessFailure(t *testing.T) {
 	lockCLITestHooks(t)
 

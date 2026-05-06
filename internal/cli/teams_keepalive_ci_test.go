@@ -863,6 +863,53 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapNoUACFallsBackOnTaskFailureCI(t *te
 	}
 }
 
+func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			[]byte("Register-ScheduledTask : Access is denied.\n"),
+			nil,
+		},
+		errs: []error{
+			errTeamsKeepaliveScheduledTaskFailureForTest{},
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap", "--no-uac"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap fallback error: %v\noutput:\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "Windows blocked automatic Scheduled Task setup") || !strings.Contains(got, "Access is denied") {
+		t.Fatalf("bootstrap did not classify access denied PowerShell output:\n%s", got)
+	}
+	if !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+		t.Fatalf("bootstrap output missing fallback mode:\n%s", got)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("bootstrap calls = %#v, want direct repair then Startup fallback", runner.calls)
+	}
+	if joined := strings.Join(runner.calls[1].args, " "); !strings.Contains(joined, "Start-Process -FilePath $cmdPath -WindowStyle Hidden") || strings.Contains(joined, "Register-ScheduledTask") {
+		t.Fatalf("fallback call should use Startup watchdog without re-registering task:\n%s", joined)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbackOnceCI(t *testing.T) {
 	lockCLITestHooks(t)
 
