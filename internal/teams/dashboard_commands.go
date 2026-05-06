@@ -35,6 +35,7 @@ const (
 	DashboardCommandRestart        DashboardCommandName = "restart"
 	DashboardCommandReload         DashboardCommandName = "reload"
 	DashboardCommandUpdate         DashboardCommandName = "update"
+	DashboardCommandWebhook        DashboardCommandName = "webhook"
 	DashboardCommandPublishHistory DashboardCommandName = "publish-history"
 	DashboardCommandClose          DashboardCommandName = "close"
 	DashboardCommandRetry          DashboardCommandName = "retry"
@@ -220,6 +221,8 @@ func controlAdminCommandName(syntax dashboardCommandSyntax, name string, arg str
 		return DashboardCommandReload, true
 	case "update", "upgrade":
 		return DashboardCommandUpdate, true
+	case "webhook", "workflow":
+		return DashboardCommandWebhook, true
 	case "service":
 		if argName == "restart" || argName == "reboot" {
 			return DashboardCommandRestart, true

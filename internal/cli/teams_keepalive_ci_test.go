@@ -417,7 +417,7 @@ func TestTeamsBackgroundKeepaliveWindowsTaskXMLLogonAndSelfRecoveryCI(t *testing
 		"<Interval>PT60S</Interval>",
 		"<Count>999</Count>",
 		"<Command>powershell.exe</Command>",
-		"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command",
+		"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command",
 		"CODEX_HELPER_TEAMS_SERVICE",
 		"CODEX_HELPER_TEAMS_SERVICE_MODE",
 		"teams",
@@ -478,11 +478,14 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildTeamsServiceSpec error: %v", err)
 	}
-	wantTaskArgument := "-Argument " + powershellSingleQuote(windowsCommandLine(buildTeamsServiceWSLArguments(spec)))
+	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(buildTeamsServiceWSLArguments(spec))
+	wantTaskArgument := "-Argument " + powershellSingleQuote(actionArgument)
 	for _, want := range []string{
 		"New-ScheduledTaskAction",
-		"wsl.exe",
+		"-Execute " + powershellSingleQuote(actionExecute),
 		wantTaskArgument,
+		"-WindowStyle Hidden",
+		"& wsl.exe @wslArgs",
 		"New-ScheduledTaskTrigger -AtLogOn",
 		"RepetitionInterval (New-TimeSpan -Minutes 30)",
 		"RepetitionDuration (New-TimeSpan -Days 3650)",
@@ -564,11 +567,14 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 	if err != nil {
 		t.Fatalf("buildTeamsServiceSpec error: %v", err)
 	}
-	wantTaskArgument := "-Argument " + powershellSingleQuote(windowsCommandLine(buildTeamsServiceWSLArguments(spec)))
+	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(buildTeamsServiceWSLArguments(spec))
+	wantTaskArgument := "-Argument " + powershellSingleQuote(actionArgument)
 	for _, want := range []string{
 		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
-		"New-ScheduledTaskAction -Execute 'wsl.exe'",
+		"New-ScheduledTaskAction -Execute " + powershellSingleQuote(actionExecute),
 		wantTaskArgument,
+		"-WindowStyle Hidden",
+		"& wsl.exe @wslArgs",
 		"Register-ScheduledTask",
 		"Enable-ScheduledTask -TaskName $taskName",
 		"Start-ScheduledTask -TaskName $taskName",
@@ -724,18 +730,20 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		t.Fatalf("bootstrap did not clearly prompt before UAC:\n%s", gotOut)
 	}
 	elevated := strings.Join(runner.calls[2].args, " ")
-	spec, err := buildTeamsServiceSpec(stringPtr("/home/alice/teams registry.json"))
-	if err != nil {
-		t.Fatalf("buildTeamsServiceSpec error: %v", err)
-	}
 	for _, want := range []string{
 		"Start-Process",
 		"-Verb RunAs",
 		"-Wait",
 		"-PassThru",
 		"New-ScheduledTaskAction",
+		"-Execute ''powershell.exe''",
+		"-WindowStyle Hidden",
 		"wsl.exe",
-		windowsCommandLine(buildTeamsServiceWSLArguments(spec)),
+		"wslArgs",
+		"Ubuntu",
+		"alice",
+		"/home/alice/work dir",
+		"/home/alice/bin/codex-proxy",
 		"Register-ScheduledTask",
 		"Enable-ScheduledTask",
 		"Start-ScheduledTask",
@@ -1226,7 +1234,10 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 	got := string(data)
 	for _, want := range []string{
 		"Disabled",
+		"powershell.exe",
+		"-WindowStyle Hidden",
 		"wsl.exe",
+		"wslArgs",
 		"CodexHelperCI",
 		"runner",
 		"--auto-service=false",

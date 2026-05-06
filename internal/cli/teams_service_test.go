@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -538,6 +539,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<RunLevel>LeastPrivilege</RunLevel>",
 		"<Enabled>false</Enabled>",
 		"<Command>powershell.exe</Command>",
+		"-WindowStyle Hidden",
 		"<WorkingDirectory>" + cwd + "</WorkingDirectory>",
 		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;run&apos; &apos;--registry&apos; &apos;` + registryPath + `&apos;`,
 		`$env:CODEX_HELPER_TEAMS_SERVICE = &apos;1&apos;`,
@@ -561,6 +563,157 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 	}
 	if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" || !strings.Contains(strings.Join(runner.calls[0].args, " "), "Enable-ScheduledTask") {
 		t.Fatalf("enable should call powershell scheduled task command, calls=%#v", runner.calls)
+	}
+}
+
+func TestTeamsServiceBootstrapShowsControlChatInForeground(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	var openValues []bool
+	registryPath := "/home/alice/teams registry.json"
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+		bootstrapControlChat: func(_ context.Context, _ *rootOptions, gotRegistry *string, openControl bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+			openValues = append(openValues, openControl)
+			if gotRegistry == nil || *gotRegistry != registryPath {
+				t.Fatalf("registry path = %v, want %q", gotRegistry, registryPath)
+			}
+			return teamsServiceBootstrapControlChatResult{
+				URL:    "https://teams.microsoft.com/l/chat/control",
+				Topic:  "🏠 Codex Control - workstation",
+				ChatID: "control-chat",
+				Opened: openControl,
+			}, nil
+		},
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap error: %v\noutput:\n%s", err, out.String())
+	}
+	if len(openValues) != 1 || !openValues[0] {
+		t.Fatalf("bootstrap control open values = %#v, want one true", openValues)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"ACTION REQUIRED: open the Teams control chat",
+		"Open this link to finish setup:",
+		"https://teams.microsoft.com/l/chat/control",
+		"Title: 🏠 Codex Control - workstation",
+		"I also tried to open it automatically.",
+		"After it opens, send `help`",
+		"Teams service bootstrap ready: wsl-windows-task-scheduler",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("bootstrap output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestTeamsServiceBootstrapCanSkipAutomaticControlChatOpen(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	var openValues []bool
+	registryPath := "/home/alice/teams registry.json"
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+		bootstrapControlChat: func(_ context.Context, _ *rootOptions, _ *string, openControl bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+			openValues = append(openValues, openControl)
+			return teamsServiceBootstrapControlChatResult{URL: "https://teams.microsoft.com/l/chat/control"}, nil
+		},
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap", "--no-open-control"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap error: %v\noutput:\n%s", err, out.String())
+	}
+	if len(openValues) != 1 || openValues[0] {
+		t.Fatalf("bootstrap control open values = %#v, want one false", openValues)
+	}
+	if got := out.String(); !strings.Contains(got, "Copy and paste the link above") || strings.Contains(got, "I also tried to open it automatically") {
+		t.Fatalf("bootstrap --no-open-control output is wrong:\n%s", got)
+	}
+}
+
+func TestTeamsServiceOpenURLCommandMatrix(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tests := []struct {
+		name       string
+		goos       string
+		isWSL      bool
+		wantExe    string
+		wantArg    string
+		wantErr    string
+		wantCmdExe bool
+	}{
+		{name: "windows", goos: "windows", wantExe: "rundll32.exe", wantArg: "url.dll,FileProtocolHandler"},
+		{name: "macos", goos: "darwin", wantExe: "open"},
+		{name: "linux desktop", goos: "linux", wantExe: "xdg-open"},
+		{name: "wsl", goos: "linux", isWSL: true, wantCmdExe: true, wantArg: "start"},
+		{name: "unsupported", goos: "freebsd", wantErr: "not supported"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+				goos:      tc.goos,
+				exe:       "/tmp/codex-proxy",
+				cwd:       "/tmp",
+				isWSL:     tc.isWSL,
+				runner:    &recordingTeamsServiceRunner{},
+				unitDir:   filepath.Join(t.TempDir(), "systemd"),
+				userID:    "501",
+				wslDistro: "Ubuntu",
+			})
+			name, args, err := teamsServiceOpenURLCommand("https://teams.microsoft.com/l/chat/control")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("open URL error = %v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("open URL command error: %v", err)
+			}
+			if tc.wantCmdExe {
+				if filepath.Base(name) != "cmd.exe" {
+					t.Fatalf("WSL opener = %q, want cmd.exe or absolute cmd.exe", name)
+				}
+			} else if name != tc.wantExe {
+				t.Fatalf("opener = %q, want %q", name, tc.wantExe)
+			}
+			joined := strings.Join(args, " ")
+			if !strings.Contains(joined, "https://teams.microsoft.com/l/chat/control") {
+				t.Fatalf("opener args missing URL: %#v", args)
+			}
+			if tc.wantArg != "" && !strings.Contains(joined, tc.wantArg) {
+				t.Fatalf("opener args missing %q: %#v", tc.wantArg, args)
+			}
+		})
 	}
 }
 
@@ -710,13 +863,20 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 			t.Fatalf("WSL config missing %q:\n%s", want, config)
 		}
 	}
-	if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" || !strings.Contains(strings.Join(runner.calls[0].args, " "), "Register-ScheduledTask") || !strings.Contains(strings.Join(runner.calls[0].args, " "), "wsl.exe") {
+	if len(runner.calls) != 1 {
 		t.Fatalf("install should register WSL scheduled task, calls=%#v", runner.calls)
 	}
-	if !strings.Contains(strings.Join(runner.calls[0].args, " "), "RestartCount 999") {
+	call := strings.Join(runner.calls[0].args, " ")
+	if runner.calls[0].name != "powershell.exe" || !strings.Contains(call, "Register-ScheduledTask") || !strings.Contains(call, "wsl.exe") {
+		t.Fatalf("install should register WSL scheduled task, calls=%#v", runner.calls)
+	}
+	if !strings.Contains(call, "-WindowStyle Hidden") || !strings.Contains(call, "& wsl.exe @wslArgs") {
+		t.Fatalf("WSL scheduled task should run through hidden PowerShell while preserving wsl.exe lifetime, calls=%#v", runner.calls)
+	}
+	if !strings.Contains(call, "RestartCount 999") {
 		t.Fatalf("WSL task should use high restart count for background keepalive, calls=%#v", runner.calls)
 	}
-	if !strings.Contains(strings.Join(runner.calls[0].args, " "), "Disable-ScheduledTask") {
+	if !strings.Contains(call, "Disable-ScheduledTask") {
 		t.Fatalf("install should leave WSL task disabled, calls=%#v", runner.calls)
 	}
 	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Start-ScheduledTask", "Enable-ScheduledTask")
@@ -848,6 +1008,7 @@ type teamsServiceTestHooks struct {
 	wslLinuxUser         string
 	powerShellExecutable string
 	runner               teamsServiceCommandRunner
+	bootstrapControlChat func(context.Context, *rootOptions, *string, bool, io.Writer) (teamsServiceBootstrapControlChatResult, error)
 }
 
 func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
@@ -870,6 +1031,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevPowerShellExecutable := teamsServicePowerShellExecutable
 	prevSystemctl := teamsServiceSystemctl
 	prevAuthPreflight := teamsServiceAuthPreflight
+	prevBootstrapControlChat := teamsServiceBootstrapControlChat
 	teamsServiceGOOS = func() string { return hooks.goos }
 	teamsServiceExecutable = func() (string, error) { return hooks.exe, nil }
 	teamsServiceGetwd = func() (string, error) { return hooks.cwd, nil }
@@ -888,6 +1050,12 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	}
 	teamsServiceSystemctl = hooks.runner
 	teamsServiceAuthPreflight = func() error { return nil }
+	teamsServiceBootstrapControlChat = func(ctx context.Context, root *rootOptions, registryPath *string, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+		if hooks.bootstrapControlChat != nil {
+			return hooks.bootstrapControlChat(ctx, root, registryPath, openControl, errOut)
+		}
+		return teamsServiceBootstrapControlChatResult{}, nil
+	}
 	t.Cleanup(func() {
 		teamsServiceGOOS = prevGOOS
 		teamsServiceExecutable = prevExecutable
@@ -902,6 +1070,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServicePowerShellExecutable = prevPowerShellExecutable
 		teamsServiceSystemctl = prevSystemctl
 		teamsServiceAuthPreflight = prevAuthPreflight
+		teamsServiceBootstrapControlChat = prevBootstrapControlChat
 	})
 }
 

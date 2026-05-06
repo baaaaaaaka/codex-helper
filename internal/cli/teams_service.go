@@ -60,10 +60,11 @@ var (
 	teamsServicePowerShellExecutable                           = defaultTeamsServicePowerShellExecutable
 	teamsServiceSystemctl            teamsServiceCommandRunner = teamsServiceExecRunner{}
 	teamsServiceAuthPreflight                                  = defaultTeamsServiceAuthPreflight
+	teamsServiceBootstrapControlChat                           = defaultTeamsServiceBootstrapControlChat
+	teamsServiceOpenURL                                        = defaultTeamsServiceOpenURL
 )
 
 func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command {
-	_ = root
 	cmd := &cobra.Command{
 		Use:   "service",
 		Short: "Manage the Teams bridge background service",
@@ -71,7 +72,7 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 	}
 	cmd.AddCommand(
 		newTeamsServiceInstallCmd(registryPath),
-		newTeamsServiceBootstrapCmd(registryPath),
+		newTeamsServiceBootstrapCmd(root, registryPath),
 		newTeamsServiceUninstallCmd(),
 		newTeamsServiceEnableCmd(),
 		newTeamsServiceDisableCmd(),
@@ -84,14 +85,15 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 	return cmd
 }
 
-func newTeamsServiceBootstrapCmd(registryPath *string) *cobra.Command {
+func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var yes bool
 	var noUAC bool
 	var fallbackOnly bool
+	var noOpenControl bool
 	cmd := &cobra.Command{
 		Use:   "bootstrap",
 		Short: "Install or repair the Teams bridge background service",
-		Long:  "Install or repair the Teams bridge background service. On WSL, this first tries a current-user Windows Scheduled Task. If Windows blocks that path, it can ask before opening a UAC prompt and then falls back to a current-user Startup watchdog.",
+		Long:  "Install or repair the Teams bridge background service. Bootstrap prepares the Teams control chat, prints the link in this terminal, and tries to open it automatically. On WSL, this first tries a current-user Windows Scheduled Task. If Windows blocks that path, it can ask before opening a UAC prompt and then falls back to a current-user Startup watchdog.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := rejectTeamsHelperSelfManagementFromChild("bootstrap the Teams service", "helper reload now"); err != nil {
@@ -99,6 +101,13 @@ func newTeamsServiceBootstrapCmd(registryPath *string) *cobra.Command {
 			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
+			}
+			control, controlErr := teamsServiceBootstrapControlChat(cmd.Context(), root, registryPath, !noOpenControl, cmd.ErrOrStderr())
+			if controlErr != nil {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams control chat link is not ready yet: %v\n", controlErr)
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "The service will still be repaired. After it starts, run `codex-proxy teams control` in a foreground terminal to print the link.")
+			} else {
+				printTeamsServiceBootstrapControlChat(cmd.OutOrStdout(), control)
 			}
 			result, err := bootstrapTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
 				AssumeYes:    yes,
@@ -120,6 +129,7 @@ func newTeamsServiceBootstrapCmd(registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&yes, "yes", false, "Approve the Windows UAC prompt if the WSL Scheduled Task needs elevation")
 	cmd.Flags().BoolVar(&noUAC, "no-uac", false, "Do not open a Windows UAC prompt; use the current-user Startup fallback if needed")
 	cmd.Flags().BoolVar(&fallbackOnly, "fallback-only", false, "Install the current-user Startup watchdog instead of trying Windows Task Scheduler")
+	cmd.Flags().BoolVar(&noOpenControl, "no-open-control", false, "Do not try to open the Teams control chat link automatically")
 	return cmd
 }
 
@@ -396,6 +406,82 @@ type teamsServiceBootstrapOptions struct {
 type teamsServiceBootstrapResult struct {
 	Mode string
 	Path string
+}
+
+type teamsServiceBootstrapControlChatResult struct {
+	URL     string
+	Topic   string
+	ChatID  string
+	Opened  bool
+	OpenErr error
+}
+
+func defaultTeamsServiceBootstrapControlChat(ctx context.Context, root *rootOptions, registryPath *string, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+	httpClient, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
+	if err != nil {
+		return teamsServiceBootstrapControlChatResult{}, err
+	}
+	defer func() { _ = httpClient.Close(context.Background()) }()
+	auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
+	if err != nil {
+		return teamsServiceBootstrapControlChatResult{}, err
+	}
+	var registry string
+	if registryPath != nil {
+		registry = *registryPath
+	}
+	bridge, err := teams.NewBridgeWithHTTPClient(ctx, auth, registry, io.Discard, httpClient.Client)
+	if err != nil {
+		return teamsServiceBootstrapControlChatResult{}, err
+	}
+	chat, err := bridge.EnsureControlChat(ctx)
+	if err != nil {
+		return teamsServiceBootstrapControlChatResult{}, err
+	}
+	if err := bridge.Save(); err != nil {
+		return teamsServiceBootstrapControlChatResult{}, err
+	}
+	result := teamsServiceBootstrapControlChatResult{
+		URL:    strings.TrimSpace(chat.WebURL),
+		Topic:  strings.TrimSpace(chat.Topic),
+		ChatID: strings.TrimSpace(chat.ID),
+	}
+	if openControl && result.URL != "" {
+		if err := teamsServiceOpenURL(ctx, result.URL); err != nil {
+			result.OpenErr = err
+		} else {
+			result.Opened = true
+		}
+	}
+	return result, nil
+}
+
+func printTeamsServiceBootstrapControlChat(out io.Writer, result teamsServiceBootstrapControlChatResult) {
+	if out == nil || strings.TrimSpace(firstNonEmptyCLI(result.URL, result.ChatID)) == "" {
+		return
+	}
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, "ACTION REQUIRED: open the Teams control chat")
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "Open this link to finish setup:")
+	_, _ = fmt.Fprintln(out, firstNonEmptyCLI(result.URL, result.ChatID))
+	if result.Topic != "" {
+		_, _ = fmt.Fprintf(out, "Title: %s\n", result.Topic)
+	}
+	_, _ = fmt.Fprintln(out)
+	switch {
+	case result.Opened:
+		_, _ = fmt.Fprintln(out, "I also tried to open it automatically. If Teams did not appear, copy and paste the link above.")
+	case result.OpenErr != nil:
+		_, _ = fmt.Fprintf(out, "I could not open it automatically: %v\n", result.OpenErr)
+		_, _ = fmt.Fprintln(out, "Copy and paste the link above into your browser or Teams.")
+	default:
+		_, _ = fmt.Fprintln(out, "Copy and paste the link above into your browser or Teams.")
+	}
+	_, _ = fmt.Fprintln(out, "After it opens, send `help` in that Teams chat.")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out)
 }
 
 func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teamsServiceBootstrapOptions) (teamsServiceBootstrapResult, error) {
@@ -1183,6 +1269,46 @@ func defaultTeamsServicePowerShellExecutable() string {
 	return "powershell.exe"
 }
 
+func defaultTeamsServiceOpenURL(ctx context.Context, rawURL string) error {
+	name, args, err := teamsServiceOpenURLCommand(rawURL)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if cmd.Process != nil {
+		if err := cmd.Process.Release(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func teamsServiceOpenURLCommand(rawURL string) (string, []string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", nil, fmt.Errorf("Teams control chat URL is empty")
+	}
+	switch teamsServiceGOOS() {
+	case "windows":
+		return "rundll32.exe", []string{"url.dll,FileProtocolHandler", rawURL}, nil
+	case "darwin":
+		return "open", []string{rawURL}, nil
+	case "linux":
+		if teamsServiceIsWSL() {
+			if _, err := os.Stat("/mnt/c/Windows/System32/cmd.exe"); err == nil {
+				return "/mnt/c/Windows/System32/cmd.exe", []string{"/C", "start", "", rawURL}, nil
+			}
+			return "cmd.exe", []string{"/C", "start", "", rawURL}, nil
+		}
+		return "xdg-open", []string{rawURL}, nil
+	default:
+		return "", nil, fmt.Errorf("automatic URL opening is not supported on %s", teamsServiceGOOS())
+	}
+}
+
 func teamsServiceRunCommandDirect(ctx context.Context, name string, args ...string) ([]byte, error) {
 	runner := teamsServiceSystemctl
 	if runner == nil {
@@ -1428,7 +1554,7 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 	arguments := windowsCommandLine(args)
 	if len(spec.Environment) > 0 {
 		command = "powershell.exe"
-		arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " + windowsQuoteArg(buildTeamsServiceWindowsPowerShell(spec, args))
+		arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command " + windowsQuoteArg(buildTeamsServiceWindowsPowerShell(spec, args))
 	}
 	var b strings.Builder
 	// Register-ScheduledTask -Xml receives this as a PowerShell/.NET string.
@@ -1506,7 +1632,7 @@ type teamsServiceWSLRegisterOptions struct {
 
 func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts teamsServiceWSLRegisterOptions) string {
 	task := powershellSingleQuote(taskName)
-	arg := powershellSingleQuote(windowsCommandLine(args))
+	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(args)
 	principalUser := "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name"
 	if strings.TrimSpace(opts.PrincipalUser) != "" {
 		principalUser = powershellSingleQuote(strings.TrimSpace(opts.PrincipalUser))
@@ -1515,7 +1641,7 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 		"$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
 		"$wasEnabled = $false; $wasRunning = $false; " +
 		"if ($null -ne $existing) { $wasEnabled = $existing.State -ne 'Disabled'; $wasRunning = $existing.State -eq 'Running' }; " +
-		"$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument " + arg + "; " +
+		"$action = New-ScheduledTaskAction -Execute " + powershellSingleQuote(actionExecute) + " -Argument " + powershellSingleQuote(actionArgument) + "; " +
 		"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
 		"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWatchdogMinutes) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
 		"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
@@ -1537,6 +1663,21 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 		cmd += "if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }"
 	}
 	return strings.TrimSpace(cmd)
+}
+
+func buildTeamsServiceWSLTaskAction(args []string) (string, string) {
+	command := "$wslArgs = " + powershellArrayLiteral(args) + "; & wsl.exe @wslArgs; exit $LASTEXITCODE"
+	arguments := windowsCommandLine([]string{
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-WindowStyle",
+		"Hidden",
+		"-Command",
+		command,
+	})
+	return "powershell.exe", arguments
 }
 
 func buildTeamsServiceWSLElevatedCommand(command string) string {

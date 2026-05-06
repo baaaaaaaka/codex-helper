@@ -2430,6 +2430,78 @@ func TestBridgeControlWorkOnlyHelperCommandExplainsCorrectChat(t *testing.T) {
 	}
 }
 
+func TestBridgeControlWebhookCommandConfiguresWorkflowWithoutRunningCodex(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+
+	rawURL := "https://workflow.example.test/secret-token"
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessageWithText("control-webhook", "helper webhook "+rawURL), "helper webhook "+rawURL); err != nil {
+		t.Fatalf("handleControlMessage webhook error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("webhook command should not be forwarded to Codex: %#v", executor.prompts)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %#v, want one control response", *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(plain, "Workflow webhook enabled") || !strings.Contains(plain, "private secret file") {
+		t.Fatalf("webhook response mismatch:\n%s", plain)
+	}
+	if strings.Contains(plain, rawURL) {
+		t.Fatalf("webhook response leaked raw URL:\n%s", plain)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	cfg := state.Workflow
+	if !cfg.Enabled || cfg.ControlWebhookURLFile == "" || cfg.ControlChatID != "control-chat" {
+		t.Fatalf("workflow config = %#v, want enabled and bound to control chat", cfg)
+	}
+	storedURL, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
+	if err != nil {
+		t.Fatalf("read webhook URL secret file: %v", err)
+	}
+	if storedURL != rawURL {
+		t.Fatalf("stored webhook URL = %q, want raw URL", storedURL)
+	}
+}
+
+func TestBridgeControlWebhookRejectsInvalidURLWithoutRunningCodex(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessageWithText("control-webhook-bad", "helper webhook http://workflow.example.test/hook"), "helper webhook http://workflow.example.test/hook"); err != nil {
+		t.Fatalf("handleControlMessage bad webhook error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("bad webhook command should not be forwarded to Codex: %#v", executor.prompts)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %#v, want one control response", *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(plain, "was not saved") || !strings.Contains(plain, "https://") {
+		t.Fatalf("bad webhook response mismatch:\n%s", plain)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if state.Workflow.Enabled || state.Workflow.ControlWebhookURLFile != "" {
+		t.Fatalf("bad webhook should not enable workflow config: %#v", state.Workflow)
+	}
+}
+
 func TestBridgeControlHelpIsFirstClassCommand(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)

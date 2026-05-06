@@ -18,6 +18,7 @@ const (
 	workflowNotificationMaxTitleRunes   = 96
 	workflowNotificationSendTimeout     = 8 * time.Second
 	workflowNotificationConfigFileName  = "workflow-notifications.json"
+	workflowWebhookURLFileName          = "workflow-webhook-url"
 )
 
 type WorkflowNotificationEvent struct {
@@ -83,6 +84,21 @@ func (b *Bridge) SendWorkflowNotificationTest(ctx context.Context) error {
 func ValidateWorkflowWebhookURLFile(path string) error {
 	_, err := readWorkflowWebhookURLFile(path)
 	return err
+}
+
+func (b *Bridge) ConfigureWorkflowNotificationsFromWebhookURL(ctx context.Context, webhookURL string) (teamstore.WorkflowNotificationConfig, error) {
+	webhookURL = strings.TrimSpace(webhookURL)
+	if !safeWorkflowWebhookURL(webhookURL) {
+		return teamstore.WorkflowNotificationConfig{}, fmt.Errorf("workflow webhook URL must be an absolute https URL")
+	}
+	path, err := b.workflowWebhookURLFilePath()
+	if err != nil {
+		return teamstore.WorkflowNotificationConfig{}, err
+	}
+	if err := writeWorkflowWebhookURLSecretFile(path, webhookURL); err != nil {
+		return teamstore.WorkflowNotificationConfig{}, err
+	}
+	return b.ConfigureWorkflowNotifications(ctx, path, true)
 }
 
 func (b *Bridge) ConfigureWorkflowNotifications(ctx context.Context, webhookURLFile string, enabled bool) (teamstore.WorkflowNotificationConfig, error) {
@@ -477,6 +493,51 @@ func readWorkflowWebhookURLFile(path string) (string, error) {
 	return webhookURL, nil
 }
 
+func writeWorkflowWebhookURLSecretFile(path string, webhookURL string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("workflow webhook URL file is required")
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("workflow webhook URL file must be an absolute path")
+	}
+	webhookURL = strings.TrimSpace(webhookURL)
+	if !safeWorkflowWebhookURL(webhookURL) {
+		return fmt.Errorf("workflow webhook URL must be an absolute https URL")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		if err := validateWorkflowWebhookURLFileParents(path); err != nil {
+			return err
+		}
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("workflow webhook URL file must not be a symlink")
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	tmp := path + ".tmp"
+	_ = os.Remove(tmp)
+	if err := os.WriteFile(tmp, []byte(webhookURL+"\n"), 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if _, err := readWorkflowWebhookURLFile(path); err != nil {
+		return err
+	}
+	return nil
+}
+
 func validateWorkflowWebhookURLFileParents(path string) error {
 	dir := filepath.Dir(path)
 	for {
@@ -520,6 +581,14 @@ func (b *Bridge) workflowNotificationConfigFilePath() (string, error) {
 		b.scope = ScopeIdentityForUser(b.user)
 	}
 	return WorkflowNotificationConfigFilePathForScope(b.scope.ID)
+}
+
+func (b *Bridge) workflowWebhookURLFilePath() (string, error) {
+	configPath, err := b.workflowNotificationConfigFilePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(configPath), workflowWebhookURLFileName), nil
 }
 
 func (b *Bridge) saveWorkflowNotificationConfigFile(cfg teamstore.WorkflowNotificationConfig) error {

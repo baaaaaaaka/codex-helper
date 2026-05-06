@@ -448,6 +448,41 @@ func TestWorkflowWebhookURLFileSafety(t *testing.T) {
 	}
 }
 
+func TestConfigureWorkflowNotificationsFromWebhookURLWritesPrivateSecret(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+
+	cfg, err := bridge.ConfigureWorkflowNotificationsFromWebhookURL(ctx, "https://workflow.example.test/secret-token")
+	if err != nil {
+		t.Fatalf("ConfigureWorkflowNotificationsFromWebhookURL error: %v", err)
+	}
+	if !cfg.Enabled || cfg.ControlWebhookURLFile == "" || cfg.ControlChatID != "control-chat" {
+		t.Fatalf("workflow config = %#v, want enabled and bound to control chat", cfg)
+	}
+	if filepath.Base(cfg.ControlWebhookURLFile) != workflowWebhookURLFileName {
+		t.Fatalf("webhook URL file = %q, want basename %q", cfg.ControlWebhookURLFile, workflowWebhookURLFileName)
+	}
+	info, err := os.Lstat(cfg.ControlWebhookURLFile)
+	if err != nil {
+		t.Fatalf("stat webhook URL file: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("webhook URL file must not be a symlink")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("webhook URL file permissions = %v, want private", info.Mode().Perm())
+	}
+	got, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
+	if err != nil {
+		t.Fatalf("read stored webhook URL file: %v", err)
+	}
+	if got != "https://workflow.example.test/secret-token" {
+		t.Fatalf("stored webhook URL = %q", got)
+	}
+}
+
 func seedWorkflowNotificationState(t *testing.T, store *teamstore.Store, request string) {
 	t.Helper()
 	now := time.Now()

@@ -64,6 +64,8 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "helper update prerelease", name: DashboardCommandUpdate, raw: "prerelease"},
 		{text: "helper upgrade pre", name: DashboardCommandUpdate, raw: "pre"},
 		{text: "codex-helper service update now", name: DashboardCommandUpdate, raw: "update now"},
+		{text: "helper webhook https://workflow.example.test/hook", name: DashboardCommandWebhook, raw: "https://workflow.example.test/hook"},
+		{text: "helper workflow off", name: DashboardCommandWebhook, raw: "off"},
 		{text: "cx p 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "cx h", name: DashboardCommandHelp},
 		{text: "4", name: DashboardCommandSelect, raw: "4", number: 4, isNumber: true},

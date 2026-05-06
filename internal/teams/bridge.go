@@ -1257,6 +1257,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.reloadHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandUpdate:
 			return b.updateHelperFromControl(ctx, msg, parsed.Argument)
+		case DashboardCommandWebhook:
+			return b.workflowWebhookFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandSelect:
 			message, err := b.resolveControlSelection(ctx, parsed.Target)
 			if err != nil {
@@ -1466,6 +1468,8 @@ func controlAdvancedHelpText() string {
 		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
 		"- `helper update now` - update to the latest stable helper release",
 		"- `helper update prerelease` - update to the newest helper release or pre-release",
+		"- `helper webhook <url>` - enable Workflow notification cards with a Teams Workflow webhook URL",
+		"- `helper webhook off` - disable Workflow notification cards",
 		"",
 		"work chat commands:",
 		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
@@ -1711,6 +1715,111 @@ func (b *Bridge) updateHelperFromControl(ctx context.Context, msg ChatMessage, a
 		return b.sendControl(ctx, "⚠️ Helper update failed\n\n"+err.Error())
 	}
 	return nil
+}
+
+func (b *Bridge) workflowWebhookFromControl(ctx context.Context, msg ChatMessage, arg string) error {
+	arg = strings.TrimSpace(arg)
+	name, rest := splitDashboardCommandBody(arg)
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	switch lowerName {
+	case "", "help", "?":
+		return b.sendControl(ctx, workflowWebhookControlHelpText())
+	case "status", "st":
+		return b.sendControl(ctx, b.workflowWebhookControlStatus(ctx))
+	case "off", "disable", "disabled":
+		if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_webhook_disable"); err != nil {
+			return err
+		} else if duplicate {
+			return nil
+		}
+		if _, err := b.ConfigureWorkflowNotifications(ctx, "", false); err != nil {
+			return b.sendControl(ctx, "⚠️ Workflow webhook was not disabled.\n\n"+err.Error())
+		}
+		return b.sendControl(ctx, "🔕 Workflow webhook disabled.\n\nThe helper will stop sending Workflow notification cards.")
+	case "test":
+		if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_webhook_test"); err != nil {
+			return err
+		} else if duplicate {
+			return nil
+		}
+		if err := b.SendWorkflowNotificationTest(ctx); err != nil {
+			return b.sendControl(ctx, "⚠️ Workflow webhook test failed.\n\n"+err.Error())
+		}
+		return b.sendControl(ctx, "✅ Workflow webhook test card queued.")
+	case "set", "url", "enable":
+		arg = strings.TrimSpace(rest)
+	}
+	if arg == "" {
+		return b.sendControl(ctx, workflowWebhookControlHelpText())
+	}
+	if !safeWorkflowWebhookURL(arg) {
+		return b.sendControl(ctx, "⚠️ Workflow webhook URL was not saved.\n\nSend an absolute `https://...` Teams Workflow webhook URL, for example:\n`helper webhook https://...`")
+	}
+	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_webhook_configure"); err != nil {
+		return err
+	} else if duplicate {
+		return nil
+	}
+	cfg, err := b.ConfigureWorkflowNotificationsFromWebhookURL(ctx, arg)
+	if err != nil {
+		return b.sendControl(ctx, "⚠️ Workflow webhook was not saved.\n\n"+err.Error())
+	}
+	lines := []string{
+		"✅ Workflow webhook enabled.",
+		"",
+		"Notification cards will be sent for important helper events.",
+		"Webhook URL: saved locally as a private secret file; I will not echo it back.",
+	}
+	if cfg.ControlChatID != "" {
+		lines = append(lines, "Bound control chat: `"+cfg.ControlChatID+"`")
+	}
+	lines = append(lines, "", "Send `helper webhook test` to send a test card.")
+	return b.sendControl(ctx, strings.Join(lines, "\n"))
+}
+
+func workflowWebhookControlHelpText() string {
+	return strings.Join([]string{
+		"## 🔔 Workflow webhook",
+		"",
+		"Use this to send Teams Workflow notification cards for important helper events.",
+		"",
+		"Commands:",
+		"- `helper webhook <https-url>` - save and enable the webhook",
+		"- `helper webhook test` - send one test card",
+		"- `helper webhook status` - show whether it is enabled",
+		"- `helper webhook off` - disable cards",
+		"",
+		"The webhook URL is stored locally as a private secret file and is not echoed back.",
+	}, "\n")
+}
+
+func (b *Bridge) workflowWebhookControlStatus(ctx context.Context) string {
+	if err := b.ensureStore(); err != nil {
+		return "⚠️ Workflow webhook status failed.\n\n" + err.Error()
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return "⚠️ Workflow webhook status failed.\n\n" + err.Error()
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err != nil {
+		return "⚠️ Workflow webhook status failed.\n\n" + err.Error()
+	}
+	if !cfg.Enabled {
+		return "🔕 Workflow webhook disabled.\n\nSend `helper webhook <https-url>` to enable Workflow notification cards."
+	}
+	lines := []string{
+		"🔔 Workflow webhook enabled.",
+		"",
+		"Webhook URL: configured as a local private secret file.",
+	}
+	if cfg.ControlChatID != "" {
+		lines = append(lines, "Bound control chat: `"+cfg.ControlChatID+"`")
+	}
+	if !cfg.UpdatedAt.IsZero() {
+		lines = append(lines, "Updated: "+cfg.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
+	}
+	return strings.Join(lines, "\n")
 }
 
 type helperUpdateRequest struct {
