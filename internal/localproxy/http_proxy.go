@@ -25,6 +25,7 @@ type HTTPProxy struct {
 	mu       sync.Mutex
 	listener net.Listener
 	server   *http.Server
+	addr     string
 }
 
 type Options struct {
@@ -79,6 +80,7 @@ func (p *HTTPProxy) Start(listenAddr string) (actualAddr string, err error) {
 
 	p.listener = ln
 	p.server = srv
+	p.addr = ln.Addr().String()
 
 	go func() {
 		_ = srv.Serve(ln)
@@ -93,6 +95,7 @@ func (p *HTTPProxy) Close(ctx context.Context) error {
 	ln := p.listener
 	p.server = nil
 	p.listener = nil
+	p.addr = ""
 	p.mu.Unlock()
 
 	var closeErr error
@@ -144,6 +147,10 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing host", http.StatusBadRequest)
 		return
 	}
+	if p.isSelfTarget(dest) {
+		http.Error(w, "refusing to proxy request back to this codex-proxy listener", http.StatusLoopDetected)
+		return
+	}
 
 	upstream, err := p.dialer.Dial("tcp", dest)
 	if err != nil {
@@ -180,6 +187,14 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
 	outReq.Header.Del("Proxy-Connection")
+	dest := outReq.URL.Host
+	if dest == "" {
+		dest = outReq.Host
+	}
+	if p.isSelfTarget(dest) {
+		http.Error(w, "refusing to proxy request back to this codex-proxy listener", http.StatusLoopDetected)
+		return
+	}
 
 	tr := &http.Transport{
 		Proxy:                 nil,
@@ -200,6 +215,43 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (p *HTTPProxy) isSelfTarget(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return false
+	}
+
+	p.mu.Lock()
+	listenAddr := p.addr
+	p.mu.Unlock()
+	if listenAddr == "" {
+		return false
+	}
+
+	_, listenPort, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return false
+	}
+	targetHost, targetPort, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if targetPort != listenPort {
+		return false
+	}
+	return isLoopbackHost(targetHost)
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	host = strings.TrimSuffix(host, ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func copyHeader(dst, src http.Header) {

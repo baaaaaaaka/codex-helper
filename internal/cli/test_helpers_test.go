@@ -41,6 +41,27 @@ func writeStub(t *testing.T, dir, name, unix, win string) {
 	}
 }
 
+func withCodexYoloRuntimeGOOS(t *testing.T, goos string) {
+	t.Helper()
+	previous := codexYoloRuntimeGOOS
+	codexYoloRuntimeGOOS = goos
+	t.Cleanup(func() {
+		codexYoloRuntimeGOOS = previous
+	})
+}
+
+func requireStringSlice(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
 func canonicalPath(t *testing.T, path string) string {
 	t.Helper()
 	if path == "" {

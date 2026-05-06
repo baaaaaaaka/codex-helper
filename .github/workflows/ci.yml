@@ -78,6 +78,12 @@ jobs:
             exit 1
           fi
 
+      - name: Local proxy self-loop regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/localproxy -count=1 -run 'TestHTTPProxy(RejectsSelfLoopTargets|ServeHTTPRejectsSelfLoopTargets|SelfTargetDetection)$' -v
+
       - name: Cross-compile check (Linux only)
         if: runner.os == 'Linux'
         shell: bash

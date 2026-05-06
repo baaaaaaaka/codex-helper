@@ -11,9 +11,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
+
+const windowsYoloSandboxConfigArg = `windows.sandbox="unelevated"`
+
+var codexYoloRuntimeGOOS = runtime.GOOS
 
 func currentProxyVersion() string {
 	v := strings.TrimSpace(version)
@@ -83,6 +88,16 @@ func codexYoloArgs(path string) []string {
 		return args
 	}
 	return nil
+}
+
+func codexYoloLaunchArgs(path string) []string {
+	args := codexYoloArgs(path)
+	if !strings.EqualFold(codexYoloRuntimeGOOS, "windows") || len(args) == 0 {
+		return args
+	}
+	out := []string{"-c", windowsYoloSandboxConfigArg}
+	out = append(out, args...)
+	return out
 }
 
 func runCodexProbe(path string, arg string) (string, error) {
@@ -216,6 +231,9 @@ func stripYoloArgs(cmdArgs []string) []string {
 		arg := strings.TrimSpace(cmdArgs[i])
 		switch {
 		case arg == "--yolo" || arg == "--dangerously-bypass-approvals-and-sandbox":
+			continue
+		case (arg == "-c" || arg == "--config") && i+1 < len(cmdArgs) && strings.TrimSpace(cmdArgs[i+1]) == windowsYoloSandboxConfigArg:
+			i++
 			continue
 		case arg == "--ask-for-approval" || arg == "--sandbox" || arg == "-s":
 			// Skip the flag and its value.

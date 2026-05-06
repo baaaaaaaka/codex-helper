@@ -94,6 +94,37 @@ func TestInitProfileInteractiveWithDepsDirectSSHSuccess(t *testing.T) {
 	}
 }
 
+func TestInteractiveHostKeyCheckArgsDisableAuthPrompts(t *testing.T) {
+	prof := config.Profile{
+		Host:    "host.example",
+		Port:    2319,
+		User:    "erin",
+		SSHArgs: []string{"-i", "/tmp/key"},
+	}
+
+	args := interactiveHostKeyCheckArgs(prof)
+	joined := "\x00" + strings.Join(args, "\x00") + "\x00"
+	for _, want := range []string{
+		"\x00-o\x00ConnectTimeout=15\x00",
+		"\x00-o\x00PreferredAuthentications=none\x00",
+		"\x00-o\x00NumberOfPasswordPrompts=0\x00",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("interactive host-key args missing %q: %#v", want, args)
+		}
+	}
+	if strings.Contains(joined, "\x00-o\x00BatchMode=yes\x00") {
+		t.Fatalf("BatchMode would suppress the host-key prompt: %#v", args)
+	}
+	if got := args[len(args)-2:]; got[0] != "erin@host.example" || got[1] != "exit" {
+		t.Fatalf("destination/command tail = %#v", got)
+	}
+	destIndex := len(args) - 2
+	if destIndex < 2 || args[destIndex-2] != "-i" || args[destIndex-1] != "/tmp/key" {
+		t.Fatalf("profile SSHArgs should be kept immediately before destination: %#v", args)
+	}
+}
+
 func TestInitProfileInteractiveWithDepsFallsBackToManagedKey(t *testing.T) {
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("host.example\n22\ncarol\n"))
