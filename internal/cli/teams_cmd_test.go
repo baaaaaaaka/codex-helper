@@ -97,6 +97,99 @@ func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	}
 }
 
+func TestTeamsWorkflowStatusRedactsWebhookURL(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	secretURL := "https://workflow.example.test/secret-token"
+	secretPath := filepath.Join(tmp, "workflow-url")
+	if err := os.WriteFile(secretPath, []byte(secretURL), 0o600); err != nil {
+		t.Fatalf("write secret URL file: %v", err)
+	}
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Workflow = teamsstore.WorkflowNotificationConfig{
+			Enabled:               true,
+			ControlWebhookURLFile: secretPath,
+			ControlChatID:         "control-chat",
+			UpdatedAt:             time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed workflow state: %v", err)
+	}
+
+	got := executeRootForTeamsTest(t, "teams", "workflow", "status")
+	for _, want := range []string{
+		"Teams workflow notifications: enabled",
+		"Bound control chat ID: control-chat",
+		"Webhook URL file: configured (ok)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("teams workflow status missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, secretURL) {
+		t.Fatalf("teams workflow status leaked raw webhook URL:\n%s", got)
+	}
+}
+
+func TestTeamsWorkflowStatusReadsSidecarConfig(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	scopeID := "scope-workflow-sidecar"
+	statePath, err := teams.DefaultStorePathForScope(scopeID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	st, err := teamsstore.Open(statePath)
+	if err != nil {
+		t.Fatalf("Open scoped store: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Scope = teamsstore.ScopeIdentity{ID: scopeID}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed scoped state: %v", err)
+	}
+	secretURL := "https://workflow.example.test/sidecar-token"
+	secretPath := filepath.Join(tmp, "workflow-sidecar-url")
+	if err := os.WriteFile(secretPath, []byte(secretURL), 0o600); err != nil {
+		t.Fatalf("write secret URL file: %v", err)
+	}
+	sidecarPath, err := teams.WorkflowNotificationConfigFilePathForScope(scopeID)
+	if err != nil {
+		t.Fatalf("WorkflowNotificationConfigFilePathForScope: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(sidecarPath), 0o700); err != nil {
+		t.Fatalf("mkdir sidecar dir: %v", err)
+	}
+	sidecar := fmt.Sprintf(`{"version":1,"workflow":{"enabled":true,"control_webhook_url_file":%q,"control_chat_id":"control-sidecar"}}`, secretPath)
+	if err := os.WriteFile(sidecarPath, []byte(sidecar), 0o600); err != nil {
+		t.Fatalf("write sidecar config: %v", err)
+	}
+
+	got := executeRootForTeamsTest(t, "teams", "workflow", "status")
+	for _, want := range []string{
+		"Teams workflow notifications: enabled",
+		"Bound control chat ID: control-sidecar",
+		"Webhook URL file: configured (ok)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("teams workflow sidecar status missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, secretURL) {
+		t.Fatalf("teams workflow sidecar status leaked raw webhook URL:\n%s", got)
+	}
+}
+
 func TestTeamsStatusPrefersScopedDrainingServiceControl(t *testing.T) {
 	lockCLITestHooks(t)
 

@@ -187,6 +187,13 @@ type Bridge struct {
 	annotateUserMessages      bool
 	annotationDisabled        bool
 	annotationWarned          bool
+	runningTurnMu             sync.Mutex
+	runningTurnCancels        map[string]*runningTurnCancel
+}
+
+type runningTurnCancel struct {
+	cancel    context.CancelFunc
+	requested bool
 }
 
 func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer) (*Bridge, error) {
@@ -462,15 +469,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		b.clearOwnerIfSame(context.Background())
 		_, _ = b.store.ReleaseControlLeaseIfHolder(context.Background(), b.machine.ID, b.currentLeaseGeneration())
 	}()
-	if err := b.recoverUnfinishedTurns(ctx); err != nil {
-		return err
-	}
-	chat, err := b.EnsureControlChat(ctx)
+	chat, err := b.initializeControlChatAndRecovery(ctx)
 	if err != nil {
 		return err
-	}
-	if err := b.queuePendingHelperRestartNotice(ctx); err != nil && b.out != nil {
-		_, _ = fmt.Fprintf(b.out, "Teams helper restart notice error: %v\n", err)
 	}
 	if b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams control chat: %s\n", chat.WebURL)
@@ -499,6 +500,14 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.flushPendingOutbox(ctx, "", ""); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
+		if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow notification flush error: %v\n", err)
+		}
+		if err := b.pollOnce(ctx, opts.Top); err != nil {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", err)
+			}
+		}
 		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
 		}
@@ -522,11 +531,6 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.processQueuedTurns(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
 		}
-		if err := b.pollOnce(ctx, opts.Top); err != nil {
-			if b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", err)
-			}
-		}
 		if err := b.Save(); err != nil {
 			return err
 		}
@@ -540,6 +544,24 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		case <-time.After(sleepInterval):
 		}
 	}
+}
+
+func (b *Bridge) initializeControlChatAndRecovery(ctx context.Context) (Chat, error) {
+	chat, err := b.EnsureControlChat(ctx)
+	if err != nil {
+		return Chat{}, err
+	}
+	if err := b.queuePendingHelperRestartNotice(ctx); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams helper restart notice error: %v\n", err)
+		}
+	} else if err := b.flushPendingOutboxForChat(ctx, chat.ID); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams control outbox flush error: %v\n", err)
+	}
+	if err := b.recoverUnfinishedTurns(ctx); err != nil {
+		return Chat{}, err
+	}
+	return chat, nil
 }
 
 func (b *Bridge) boostPolling(now time.Time) {
@@ -1316,6 +1338,15 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 	session.UpdatedAt = time.Now()
 	if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 		return err
+	}
+	if b.asyncTurns {
+		if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
+			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, ControlFallbackCodexPrompt(text))
+		}); err != nil {
+			return err
+		}
+		b.boostPolling(time.Now())
+		return nil
 	}
 	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, ControlFallbackCodexPrompt(text))
 }
@@ -3045,6 +3076,9 @@ func (b *Bridge) recoverUnfinishedTurns(ctx context.Context) error {
 		}
 		switch turn.Status {
 		case teamstore.TurnStatusQueued:
+			if b.asyncTurns {
+				continue
+			}
 			if err := b.recoverQueuedTurn(ctx, session, turn, state); err != nil {
 				return err
 			}
@@ -3173,6 +3207,21 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 		if err := b.queueTeamsPromptAck(ctx, session, turn, false); err != nil {
 			cleanupPrompt()
 			return err
+		}
+		if b.asyncTurns {
+			started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
+				defer cleanupPrompt()
+				return b.runQueuedTurn(runCtx, session, claimed, session.ChatID, runPrompt)
+			})
+			if err != nil {
+				cleanupPrompt()
+				return err
+			}
+			if !started {
+				cleanupPrompt()
+			}
+			b.boostPolling(time.Now())
+			continue
 		}
 		if err := b.runQueuedTurn(ctx, session, turn, session.ChatID, runPrompt); err != nil {
 			cleanupPrompt()
@@ -3405,6 +3454,15 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 		if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 			return err
 		}
+		if b.asyncTurns {
+			if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
+				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, ControlFallbackCodexPrompt(text))
+			}); err != nil {
+				return err
+			}
+			b.boostPolling(time.Now())
+			return nil
+		}
 		return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, ControlFallbackCodexPrompt(text))
 	default:
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "unsupported deferred control input")
@@ -3635,7 +3693,7 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 	if strings.EqualFold(strings.TrimSpace(turnID), "last") {
 		resolved, ok := latestCancelableTurnID(state, session.ID)
 		if !ok {
-			return b.sendToChat(ctx, session.ChatID, "no queued turn is available to cancel in this session.")
+			return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this session.")
 		}
 		turnID = resolved
 	}
@@ -3657,7 +3715,10 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 			Body:        "turn canceled: " + turn.ID,
 		})
 	case teamstore.TurnStatusRunning:
-		return b.sendToChat(ctx, session.ChatID, "running turn cancellation is not available in this foreground runner yet. Stop the service and use `codex-proxy teams recover` if the turn is stuck.")
+		if !b.requestRunningTurnCancel(turn.ID) {
+			return b.sendToChat(ctx, session.ChatID, "This Codex request is running, but this helper process does not own its live cancel handle. It may have started before the latest helper loaded or before a restart. Wait for it to finish, or use `helper status` to decide whether recovery is needed.")
+		}
+		return b.sendToChat(ctx, session.ChatID, "cancel requested for running turn: "+turn.ID)
 	default:
 		return b.sendToChat(ctx, session.ChatID, fmt.Sprintf("turn %s is %s and cannot be canceled.", turn.ID, turn.Status))
 	}
@@ -3665,12 +3726,23 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 
 func latestCancelableTurnID(state teamstore.State, sessionID string) (string, bool) {
 	var latest teamstore.Turn
+	latestRank := 0
 	for _, turn := range state.Turns {
-		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusQueued {
+		if turn.SessionID != sessionID {
 			continue
 		}
-		if latest.ID == "" || turnSortTime(turn).After(turnSortTime(latest)) {
+		rank := 0
+		switch turn.Status {
+		case teamstore.TurnStatusRunning:
+			rank = 2
+		case teamstore.TurnStatusQueued:
+			rank = 1
+		default:
+			continue
+		}
+		if latest.ID == "" || rank > latestRank || (rank == latestRank && turnSortTime(turn).After(turnSortTime(latest))) {
 			latest = turn
+			latestRank = rank
 		}
 	}
 	if latest.ID == "" {
@@ -4161,6 +4233,50 @@ func (b *Bridge) fileWriteGraph() (*GraphClient, error) {
 	return graph, nil
 }
 
+func (b *Bridge) registerRunningTurnCancel(turnID string, cancel context.CancelFunc) func() {
+	if b == nil || strings.TrimSpace(turnID) == "" || cancel == nil {
+		return func() {}
+	}
+	b.runningTurnMu.Lock()
+	if b.runningTurnCancels == nil {
+		b.runningTurnCancels = make(map[string]*runningTurnCancel)
+	}
+	b.runningTurnCancels[turnID] = &runningTurnCancel{cancel: cancel}
+	b.runningTurnMu.Unlock()
+	return func() {
+		b.runningTurnMu.Lock()
+		delete(b.runningTurnCancels, turnID)
+		b.runningTurnMu.Unlock()
+	}
+}
+
+func (b *Bridge) requestRunningTurnCancel(turnID string) bool {
+	if b == nil || strings.TrimSpace(turnID) == "" {
+		return false
+	}
+	b.runningTurnMu.Lock()
+	running := b.runningTurnCancels[turnID]
+	if running == nil {
+		b.runningTurnMu.Unlock()
+		return false
+	}
+	running.requested = true
+	cancel := running.cancel
+	b.runningTurnMu.Unlock()
+	cancel()
+	return true
+}
+
+func (b *Bridge) runningTurnCancelRequested(turnID string) bool {
+	if b == nil || strings.TrimSpace(turnID) == "" {
+		return false
+	}
+	b.runningTurnMu.Lock()
+	defer b.runningTurnMu.Unlock()
+	running := b.runningTurnCancels[turnID]
+	return running != nil && running.requested
+}
+
 func (b *Bridge) runQueuedTurn(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, text string) error {
 	return b.runQueuedTurnWithExecutor(ctx, b.executor, session, turn, chatID, text)
 }
@@ -4177,8 +4293,19 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 	if executor == nil {
 		executor = CodexExecutor{}
 	}
-	result, err := b.runExecutorWithHeartbeat(ctx, executor, session, turn, chatID, text)
+	execCtx, cancelExec := context.WithCancel(ctx)
+	unregisterCancel := b.registerRunningTurnCancel(turn.ID, cancelExec)
+	result, err := b.runExecutorWithHeartbeat(execCtx, executor, session, turn, chatID, text)
+	cancelRequested := b.runningTurnCancelRequested(turn.ID)
+	unregisterCancel()
+	cancelExec()
 	if err != nil {
+		if cancelRequested && isCanceledExecutionError(err) {
+			if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); markErr != nil {
+				return markErr
+			}
+			return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "canceled", "Codex request canceled.")
+		}
 		if IsAmbiguousExecutionError(err) {
 			if _, runningErr := b.store.MarkTurnRunning(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); runningErr != nil {
 				return runningErr
@@ -5469,11 +5596,59 @@ func (b *Bridge) queueOutbox(ctx context.Context, msg teamstore.OutboxMessage) (
 	if msg.LeaseGeneration == 0 {
 		msg.LeaseGeneration = b.currentLeaseGeneration()
 	}
+	if b.shouldSuppressOwnerMentionForWorkflow(ctx, msg) {
+		msg.MentionOwner = false
+	}
 	queued, _, err := b.store.QueueOutbox(ctx, msg)
 	if err != nil {
 		return teamstore.OutboxMessage{}, err
 	}
 	return queued, nil
+}
+
+func (b *Bridge) shouldSuppressOwnerMentionForWorkflow(ctx context.Context, msg teamstore.OutboxMessage) bool {
+	if b == nil || b.store == nil || !msg.MentionOwner || !outboxHasWorkflowNotificationCandidate(msg) {
+		return false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	if !workflowNotificationConfigPresent(state.Workflow) && strings.TrimSpace(b.scope.ID) == "" {
+		return false
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err != nil {
+		return false
+	}
+	return cfg.Enabled
+}
+
+func workflowNotificationConfigPresent(cfg teamstore.WorkflowNotificationConfig) bool {
+	return cfg.Enabled || strings.TrimSpace(cfg.ControlWebhookURLFile) != "" || strings.TrimSpace(cfg.ControlChatID) != ""
+}
+
+func outboxHasWorkflowNotificationCandidate(outbox teamstore.OutboxMessage) bool {
+	kind := strings.ToLower(strings.TrimSpace(outbox.Kind))
+	notificationKind := strings.ToLower(strings.TrimSpace(outbox.NotificationKind))
+	switch {
+	case notificationKind == "chat_created" || kind == "chat-created":
+		return true
+	case notificationKind == "chat_recreated" || kind == "chat-moved":
+		return true
+	case notificationKind == "turn_completed":
+		return true
+	case strings.Contains(kind, "reload-complete"):
+		return true
+	case strings.Contains(kind, "restart-complete"):
+		return true
+	case strings.HasPrefix(outbox.ID, "outbox:codex-upgrade-target:"):
+		return true
+	case workflowOutboxNeedsAttention(kind):
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Bridge) flushPendingOutbox(ctx context.Context, sessionID string, turnID string) error {
@@ -5545,7 +5720,10 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return err
 	}
 	if outbox.Status == teamstore.OutboxStatusAccepted && outbox.TeamsMessageID != "" {
-		_, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
+		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
+		if err == nil {
+			b.queueWorkflowNotificationForSentOutbox(ctx, sent)
+		}
 		return err
 	}
 	if opts.RespectRateLimitBlock {
@@ -5595,7 +5773,10 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, msg.ID); err != nil {
 		return err
 	}
-	_, err = b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
+	sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
+	if err == nil {
+		b.queueWorkflowNotificationForSentOutbox(ctx, sent)
+	}
 	return err
 }
 

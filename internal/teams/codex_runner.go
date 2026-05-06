@@ -49,6 +49,10 @@ func IsAmbiguousExecutionError(err error) bool {
 	return errors.As(err, &ambiguous)
 }
 
+func isCanceledExecutionError(err error) bool {
+	return errors.Is(err, context.Canceled) || codexrunner.IsKind(err, codexrunner.ErrorCanceled)
+}
+
 type EchoExecutor struct{}
 
 func (EchoExecutor) Run(_ context.Context, _ *Session, prompt string) (ExecutionResult, error) {

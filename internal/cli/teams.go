@@ -38,6 +38,7 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 		newTeamsAuthCmd(root),
 		newTeamsControlCmd(root, &registryPath),
 		newTeamsChatCmd(root, &registryPath),
+		newTeamsWorkflowCmd(root, &registryPath),
 		newTeamsProbeChatCmd(root),
 		newTeamsRunCmd(root, &registryPath),
 		newTeamsSendFileCmd(root, &registryPath),

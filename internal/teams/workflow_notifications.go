@@ -1,0 +1,705 @@
+package teams
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+)
+
+const (
+	workflowNotificationMaxSummaryRunes = 120
+	workflowNotificationMaxTitleRunes   = 96
+	workflowNotificationSendTimeout     = 8 * time.Second
+	workflowNotificationConfigFileName  = "workflow-notifications.json"
+)
+
+type WorkflowNotificationEvent struct {
+	ID             string
+	SessionID      string
+	TurnID         string
+	OutboxID       string
+	Kind           string
+	Title          string
+	ChatTitle      string
+	RequestSummary string
+	Hint           string
+	ButtonTitle    string
+	ButtonURL      string
+}
+
+type workflowNotificationConfigFile struct {
+	Version  int                                  `json:"version"`
+	Workflow teamstore.WorkflowNotificationConfig `json:"workflow"`
+}
+
+func (b *Bridge) SendWorkflowNotificationTest(ctx context.Context) error {
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err != nil {
+		return err
+	}
+	if !cfg.Enabled {
+		return fmt.Errorf("Teams workflow notifications are disabled")
+	}
+	controlURL := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatURL, state.ControlChat.TeamsChatURL))
+	if !safeTeamsOpenURL(controlURL) {
+		tenantID := ""
+		if b.graph != nil {
+			tenantID = b.graph.tenantID()
+		}
+		controlURL = TeamsChatURL(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID), tenantID)
+	}
+	if controlURL == "" {
+		return fmt.Errorf("Teams control chat is not configured")
+	}
+	event := WorkflowNotificationEvent{
+		ID:          "workflow:test:" + shortStableID(time.Now().Format(time.RFC3339Nano)+controlURL),
+		Kind:        "test",
+		Title:       "✅ Codex helper notification test",
+		ChatTitle:   workflowControlChatTitle(b, state),
+		Hint:        "Workflow card delivery is configured for this control chat.",
+		ButtonTitle: "Open Control",
+		ButtonURL:   controlURL,
+	}
+	if err := b.queueWorkflowNotification(ctx, event); err != nil {
+		return err
+	}
+	return b.flushPendingWorkflowNotifications(ctx)
+}
+
+func ValidateWorkflowWebhookURLFile(path string) error {
+	_, err := readWorkflowWebhookURLFile(path)
+	return err
+}
+
+func (b *Bridge) ConfigureWorkflowNotifications(ctx context.Context, webhookURLFile string, enabled bool) (teamstore.WorkflowNotificationConfig, error) {
+	if err := b.ensureStore(); err != nil {
+		return teamstore.WorkflowNotificationConfig{}, err
+	}
+	webhookURLFile = strings.TrimSpace(webhookURLFile)
+	if enabled {
+		if webhookURLFile == "" {
+			return teamstore.WorkflowNotificationConfig{}, fmt.Errorf("workflow webhook URL file is required")
+		}
+		if !filepath.IsAbs(webhookURLFile) {
+			return teamstore.WorkflowNotificationConfig{}, fmt.Errorf("workflow webhook URL file must be an absolute path")
+		}
+		if _, err := readWorkflowWebhookURLFile(webhookURLFile); err != nil {
+			return teamstore.WorkflowNotificationConfig{}, err
+		}
+	}
+	var out teamstore.WorkflowNotificationConfig
+	err := b.store.Update(ctx, func(state *teamstore.State) error {
+		next := teamstore.WorkflowNotificationConfig{UpdatedAt: time.Now()}
+		if enabled {
+			controlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+			if controlChatID == "" {
+				return fmt.Errorf("Teams control chat must be configured before enabling workflow notifications")
+			}
+			next = state.Workflow
+			next.Enabled = true
+			next.ControlWebhookURLFile = webhookURLFile
+			next.ControlChatID = controlChatID
+			next.UpdatedAt = time.Now()
+		}
+		state.Workflow = next
+		out = next
+		return nil
+	})
+	if err != nil {
+		return out, err
+	}
+	if err := b.saveWorkflowNotificationConfigFile(out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, outbox teamstore.OutboxMessage) {
+	if b == nil || b.store == nil {
+		return
+	}
+	event, ok, err := b.workflowNotificationEventForOutbox(ctx, outbox)
+	if err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow notification planning error: %v\n", err)
+		}
+		return
+	}
+	if !ok {
+		return
+	}
+	if err := b.queueWorkflowNotification(ctx, event); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
+		}
+		return
+	}
+	if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams workflow notification send error: %v\n", err)
+	}
+}
+
+func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox teamstore.OutboxMessage) (WorkflowNotificationEvent, bool, error) {
+	if outbox.ID == "" || outbox.TeamsChatID == "" {
+		return WorkflowNotificationEvent{}, false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return WorkflowNotificationEvent{}, false, err
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err != nil {
+		return WorkflowNotificationEvent{}, false, err
+	}
+	if !cfg.Enabled {
+		return WorkflowNotificationEvent{}, false, nil
+	}
+	if shouldSkipWorkflowNotificationOutbox(outbox) {
+		return WorkflowNotificationEvent{}, false, nil
+	}
+	session := workflowSessionForOutbox(b, state, outbox)
+	chatTitle := workflowNotificationChatTitle(b, session, outbox)
+	requestSummary := workflowNotificationRequestSummary(state, outbox, session)
+	buttonURL := workflowNotificationButtonURL(b, session, outbox)
+	if buttonURL == "" {
+		return WorkflowNotificationEvent{}, false, nil
+	}
+	event := WorkflowNotificationEvent{
+		ID:             "workflow:" + shortStableID(outbox.ID),
+		SessionID:      outbox.SessionID,
+		TurnID:         outbox.TurnID,
+		OutboxID:       outbox.ID,
+		Kind:           "workflow",
+		ChatTitle:      chatTitle,
+		RequestSummary: requestSummary,
+		ButtonURL:      buttonURL,
+	}
+	kind := strings.ToLower(strings.TrimSpace(outbox.Kind))
+	notificationKind := strings.ToLower(strings.TrimSpace(outbox.NotificationKind))
+	switch {
+	case notificationKind == "chat_created" || kind == "chat-created":
+		event.Kind = "chat_ready"
+		event.Title = "💬 Codex chat ready"
+		event.Hint = "Open this chat to start or continue the task."
+		event.ButtonTitle = "Open chat"
+		if event.RequestSummary == "" {
+			event.RequestSummary = workflowFallbackRequestForSession(session)
+		}
+	case notificationKind == "chat_recreated" || kind == "chat-moved":
+		event.Kind = "chat_moved"
+		event.Title = "🔁 Codex chat moved"
+		event.Hint = "Open the new chat to continue."
+		event.ButtonTitle = "Open new chat"
+		if event.RequestSummary == "" {
+			event.RequestSummary = workflowFallbackRequestForSession(session)
+		}
+	case notificationKind == "turn_completed":
+		event.Kind = "turn_completed"
+		event.Title = "✅ Codex finished"
+		event.Hint = "The answer is ready in the work chat."
+		event.ButtonTitle = "Open answer"
+	case strings.Contains(kind, "reload-complete"):
+		event.Kind = "helper_reload_completed"
+		event.Title = "✅ Helper reload completed"
+		event.ChatTitle = workflowControlChatTitle(b, state)
+		event.RequestSummary = ""
+		event.Hint = workflowMachineLabel(b) + " is back online and running the reloaded code."
+		event.ButtonTitle = "Open Control"
+	case strings.Contains(kind, "restart-complete"):
+		event.Kind = "helper_restart_completed"
+		event.Title = "✅ Helper restart completed"
+		event.ChatTitle = workflowControlChatTitle(b, state)
+		event.RequestSummary = ""
+		event.Hint = workflowMachineLabel(b) + " is back online after restart."
+		event.ButtonTitle = "Open Control"
+	case strings.HasPrefix(outbox.ID, "outbox:codex-upgrade-target:"):
+		event.Kind = "codex_upgrade"
+		if strings.Contains(strings.ToLower(outbox.Body), "failed") {
+			event.Title = "⚠️ Codex upgrade failed"
+			event.Hint = "Open the work chat to check the upgrade error."
+		} else {
+			event.Title = "⬆️ Codex upgraded"
+			event.Hint = "Open the work chat and retry the request when ready."
+		}
+		event.ButtonTitle = "Open chat"
+	case workflowOutboxNeedsAttention(kind):
+		event.Kind = "needs_attention"
+		event.Title = "⚠️ Codex needs attention"
+		event.Hint = "Open the work chat to retry or check what happened."
+		event.ButtonTitle = "Open chat"
+	default:
+		return WorkflowNotificationEvent{}, false, nil
+	}
+	if strings.TrimSpace(event.ChatTitle) == "" {
+		event.ChatTitle = workflowNotificationChatTitle(b, session, outbox)
+	}
+	if strings.TrimSpace(event.ChatTitle) == "" {
+		event.ChatTitle = workflowMachineLabel(b)
+	}
+	return event, true, nil
+}
+
+func shouldSkipWorkflowNotificationOutbox(outbox teamstore.OutboxMessage) bool {
+	kind := strings.ToLower(strings.TrimSpace(outbox.Kind))
+	if kind == "" {
+		return true
+	}
+	if strings.HasPrefix(kind, "import-") || strings.HasPrefix(kind, "sync-") || isTranscriptImportBatchOutboxKind(kind) {
+		return true
+	}
+	if strings.HasPrefix(kind, "final-") && strings.TrimSpace(outbox.NotificationKind) == "" {
+		return true
+	}
+	return false
+}
+
+func workflowOutboxNeedsAttention(kind string) bool {
+	switch {
+	case kind == "error", kind == "interrupted":
+		return true
+	case strings.Contains(kind, "queued-turn-error"):
+		return true
+	case strings.Contains(kind, "recovery-missing-message"):
+		return true
+	case strings.Contains(kind, "attachment-download"):
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *Bridge) queueWorkflowNotification(ctx context.Context, event WorkflowNotificationEvent) error {
+	if strings.TrimSpace(event.ID) == "" {
+		return fmt.Errorf("workflow notification event id is required")
+	}
+	return b.store.Update(ctx, func(state *teamstore.State) error {
+		if state.Notifications == nil {
+			state.Notifications = make(map[string]teamstore.NotificationRecord)
+		}
+		if existing, ok := state.Notifications[event.ID]; ok && existing.Status == teamstore.NotificationStatusSent {
+			return nil
+		}
+		now := time.Now()
+		rec := state.Notifications[event.ID]
+		if rec.ID == "" {
+			rec.ID = event.ID
+			rec.CreatedAt = now
+		}
+		rec.SessionID = strings.TrimSpace(event.SessionID)
+		rec.TurnID = strings.TrimSpace(event.TurnID)
+		rec.OutboxID = strings.TrimSpace(event.OutboxID)
+		rec.Kind = strings.TrimSpace(event.Kind)
+		rec.Status = teamstore.NotificationStatusQueued
+		rec.Title = workflowLimitRunes(event.Title, workflowNotificationMaxTitleRunes)
+		rec.ChatTitle = workflowLimitRunes(event.ChatTitle, workflowNotificationMaxTitleRunes)
+		rec.RequestSummary = workflowLimitRunes(event.RequestSummary, workflowNotificationMaxSummaryRunes)
+		rec.Hint = workflowLimitRunes(event.Hint, workflowNotificationMaxSummaryRunes)
+		rec.ButtonTitle = workflowLimitRunes(event.ButtonTitle, 32)
+		rec.ButtonURL = strings.TrimSpace(event.ButtonURL)
+		rec.UpdatedAt = now
+		state.Notifications[event.ID] = rec
+		return nil
+	})
+}
+
+func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err != nil {
+		return err
+	}
+	if !cfg.Enabled {
+		return nil
+	}
+	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	if strings.TrimSpace(cfg.ControlChatID) != "" && currentControlChatID != "" && strings.TrimSpace(cfg.ControlChatID) != currentControlChatID {
+		return nil
+	}
+	webhookURL, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	var firstErr error
+	for _, rec := range state.Notifications {
+		if rec.Status == teamstore.NotificationStatusSent {
+			continue
+		}
+		if rec.Status != "" && rec.Status != teamstore.NotificationStatusQueued && rec.Status != teamstore.NotificationStatusFailed {
+			continue
+		}
+		if !workflowNotificationRetryDue(rec, now) {
+			continue
+		}
+		if strings.TrimSpace(rec.Title) == "" || strings.TrimSpace(rec.ButtonURL) == "" {
+			continue
+		}
+		if err := b.sendWorkflowNotificationRecord(ctx, webhookURL, rec); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+	}
+	return firstErr
+}
+
+func workflowNotificationRetryDue(rec teamstore.NotificationRecord, now time.Time) bool {
+	if rec.Status != teamstore.NotificationStatusFailed || rec.LastAttemptAt.IsZero() {
+		return true
+	}
+	delay := time.Duration(rec.Attempts) * 30 * time.Second
+	if delay < 30*time.Second {
+		delay = 30 * time.Second
+	}
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	return !now.Before(rec.LastAttemptAt.Add(delay))
+}
+
+func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL string, rec teamstore.NotificationRecord) error {
+	now := time.Now()
+	_ = b.store.Update(ctx, func(state *teamstore.State) error {
+		current := state.Notifications[rec.ID]
+		current.Attempts++
+		current.LastAttemptAt = now
+		current.UpdatedAt = now
+		state.Notifications[rec.ID] = current
+		return nil
+	})
+	sendCtx, cancel := context.WithTimeout(ctx, workflowNotificationSendTimeout)
+	defer cancel()
+	_, err := PostWorkflowWebhook(sendCtx, b.httpClient, webhookURL, WorkflowWebhookMessage{
+		Title:          rec.Title,
+		ChatTitle:      rec.ChatTitle,
+		RequestSummary: rec.RequestSummary,
+		Hint:           rec.Hint,
+		Actions: []OpenURLCardAction{{
+			Title: firstNonEmptyString(strings.TrimSpace(rec.ButtonTitle), "Open chat"),
+			URL:   rec.ButtonURL,
+		}},
+	})
+	if err != nil {
+		_ = b.store.Update(context.Background(), func(state *teamstore.State) error {
+			current := state.Notifications[rec.ID]
+			current.Status = teamstore.NotificationStatusFailed
+			current.LastError = redactWorkflowNotificationError(err)
+			current.UpdatedAt = time.Now()
+			state.Notifications[rec.ID] = current
+			return nil
+		})
+		return err
+	}
+	return b.store.Update(ctx, func(state *teamstore.State) error {
+		current := state.Notifications[rec.ID]
+		current.Status = teamstore.NotificationStatusSent
+		current.LastError = ""
+		current.SentAt = time.Now()
+		current.UpdatedAt = current.SentAt
+		state.Notifications[rec.ID] = current
+		return nil
+	})
+}
+
+func readWorkflowWebhookURLFile(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("workflow webhook URL file is not configured")
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("workflow webhook URL file must be an absolute path")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("workflow webhook URL file must not be a symlink")
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("workflow webhook URL file must be a file")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("workflow webhook URL file permissions must be 0600 or stricter")
+	}
+	if runtime.GOOS != "windows" {
+		if err := validateWorkflowWebhookURLFileParents(path); err != nil {
+			return "", err
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	webhookURL := strings.TrimSpace(string(raw))
+	if !safeWorkflowWebhookURL(webhookURL) {
+		return "", fmt.Errorf("workflow webhook URL must be an absolute https URL")
+	}
+	return webhookURL, nil
+}
+
+func validateWorkflowWebhookURLFileParents(path string) error {
+	dir := filepath.Dir(path)
+	for {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("workflow webhook URL file parent directories must not be symlinks")
+		}
+		if info.Mode().Perm()&0o022 != 0 {
+			return fmt.Errorf("workflow webhook URL file parent directories must not be group/world-writable")
+		}
+		if info.Mode().Perm()&0o077 == 0 {
+			return nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		dir = parent
+	}
+}
+
+func (b *Bridge) effectiveWorkflowNotificationConfig(state teamstore.State) (teamstore.WorkflowNotificationConfig, error) {
+	if state.Workflow.Enabled || strings.TrimSpace(state.Workflow.ControlWebhookURLFile) != "" || strings.TrimSpace(state.Workflow.ControlChatID) != "" {
+		return state.Workflow, nil
+	}
+	cfg, ok, err := b.loadWorkflowNotificationConfigFile()
+	if err != nil {
+		return teamstore.WorkflowNotificationConfig{}, err
+	}
+	if ok {
+		return cfg, nil
+	}
+	return teamstore.WorkflowNotificationConfig{}, nil
+}
+
+func (b *Bridge) workflowNotificationConfigFilePath() (string, error) {
+	if b.scope.ID == "" {
+		b.scope = ScopeIdentityForUser(b.user)
+	}
+	return WorkflowNotificationConfigFilePathForScope(b.scope.ID)
+}
+
+func (b *Bridge) saveWorkflowNotificationConfigFile(cfg teamstore.WorkflowNotificationConfig) error {
+	path, err := b.workflowNotificationConfigFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(workflowNotificationConfigFile{Version: 1, Workflow: cfg}, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func (b *Bridge) loadWorkflowNotificationConfigFile() (teamstore.WorkflowNotificationConfig, bool, error) {
+	if b.scope.ID == "" {
+		b.scope = ScopeIdentityForUser(b.user)
+	}
+	return LoadWorkflowNotificationConfigFileForScope(b.scope.ID)
+}
+
+func WorkflowNotificationConfigFilePathForScope(scopeID string) (string, error) {
+	storePath, err := DefaultStorePathForScope(scopeID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(storePath), workflowNotificationConfigFileName), nil
+}
+
+func LoadWorkflowNotificationConfigFileForScope(scopeID string) (teamstore.WorkflowNotificationConfig, bool, error) {
+	path, err := WorkflowNotificationConfigFilePathForScope(scopeID)
+	if err != nil {
+		return teamstore.WorkflowNotificationConfig{}, false, err
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return teamstore.WorkflowNotificationConfig{}, false, nil
+	}
+	if err != nil {
+		return teamstore.WorkflowNotificationConfig{}, false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return teamstore.WorkflowNotificationConfig{}, false, fmt.Errorf("workflow notification config file must not be a symlink")
+	}
+	if info.IsDir() {
+		return teamstore.WorkflowNotificationConfig{}, false, fmt.Errorf("workflow notification config file must be a file")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return teamstore.WorkflowNotificationConfig{}, false, fmt.Errorf("workflow notification config file permissions must be 0600 or stricter")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return teamstore.WorkflowNotificationConfig{}, false, err
+	}
+	var file workflowNotificationConfigFile
+	if err := json.Unmarshal(raw, &file); err != nil {
+		return teamstore.WorkflowNotificationConfig{}, false, err
+	}
+	return file.Workflow, true, nil
+}
+
+func workflowSessionForOutbox(b *Bridge, state teamstore.State, outbox teamstore.OutboxMessage) *Session {
+	if b == nil {
+		return nil
+	}
+	if session := b.sessionForIDState(state, outbox.SessionID); session != nil {
+		return session
+	}
+	for _, session := range b.reg.Sessions {
+		if strings.TrimSpace(session.ChatID) == strings.TrimSpace(outbox.TeamsChatID) {
+			copy := session
+			return &copy
+		}
+	}
+	return nil
+}
+
+func workflowNotificationChatTitle(b *Bridge, session *Session, outbox teamstore.OutboxMessage) string {
+	if session == nil {
+		return workflowLimitRunes(strings.TrimSpace(outbox.TeamsChatID), workflowNotificationMaxTitleRunes)
+	}
+	title := WorkChatTitle(ChatTitleOptions{
+		MachineLabel: workflowMachineLabel(b),
+		SessionID:    session.ID,
+		UserTitle:    session.UserTitle,
+		Topic:        session.Topic,
+		Cwd:          session.Cwd,
+	})
+	if title == "" {
+		title = session.ID
+	}
+	return workflowLimitRunes(title, workflowNotificationMaxTitleRunes)
+}
+
+func workflowControlChatTitle(b *Bridge, state teamstore.State) string {
+	title := strings.TrimSpace(firstNonEmptyString(state.ControlChat.TeamsChatTopic, b.reg.ControlChatTopic))
+	if title != "" {
+		return workflowLimitRunes(title, workflowNotificationMaxTitleRunes)
+	}
+	return workflowLimitRunes(ControlChatTitle(ChatTitleOptions{MachineLabel: workflowMachineLabel(b)}), workflowNotificationMaxTitleRunes)
+}
+
+func workflowNotificationButtonURL(b *Bridge, session *Session, outbox teamstore.OutboxMessage) string {
+	if session != nil && safeTeamsOpenURL(session.ChatURL) {
+		return strings.TrimSpace(session.ChatURL)
+	}
+	if b != nil && strings.TrimSpace(outbox.TeamsChatID) == strings.TrimSpace(b.reg.ControlChatID) && safeTeamsOpenURL(b.reg.ControlChatURL) {
+		return strings.TrimSpace(b.reg.ControlChatURL)
+	}
+	tenantID := ""
+	if b != nil && b.graph != nil {
+		tenantID = b.graph.tenantID()
+	}
+	return TeamsChatURL(outbox.TeamsChatID, tenantID)
+}
+
+func workflowNotificationRequestSummary(state teamstore.State, outbox teamstore.OutboxMessage, session *Session) string {
+	if turn, ok := state.Turns[outbox.TurnID]; ok {
+		if inbound, ok := state.InboundEvents[turn.InboundEventID]; ok {
+			if summary := workflowRequestSummary(inbound.Text); summary != "" {
+				return summary
+			}
+		}
+	}
+	return workflowFallbackRequestForSession(session)
+}
+
+func workflowFallbackRequestForSession(session *Session) string {
+	if session == nil {
+		return ""
+	}
+	if strings.TrimSpace(session.UserTitle) != "" {
+		return workflowRequestSummary(session.UserTitle)
+	}
+	if strings.TrimSpace(session.Topic) != "" {
+		return workflowRequestSummary(session.Topic)
+	}
+	if strings.TrimSpace(session.Cwd) != "" {
+		return "Workspace: " + filepath.Base(strings.TrimSpace(session.Cwd))
+	}
+	return ""
+}
+
+func workflowRequestSummary(text string) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	return workflowLimitRunes(text, workflowNotificationMaxSummaryRunes)
+}
+
+func workflowLimitRunes(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit == 1 {
+		return "…"
+	}
+	return strings.TrimSpace(string(runes[:limit-1])) + "…"
+}
+
+func workflowMachineLabel(b *Bridge) string {
+	if b != nil {
+		if strings.TrimSpace(b.machine.Label) != "" {
+			return strings.TrimSpace(b.machine.Label)
+		}
+	}
+	return machineLabel()
+}
+
+func redactWorkflowNotificationError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if strings.Contains(strings.ToLower(text), "https://") {
+		text = "Teams workflow webhook request failed"
+	}
+	if len(text) > 240 {
+		text = text[:240] + "…"
+	}
+	return text
+}

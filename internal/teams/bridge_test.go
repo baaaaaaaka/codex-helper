@@ -669,6 +669,185 @@ func TestBridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession(t *testi
 	}
 }
 
+func TestBridgeStartupRecoveryFlushesControlNoticeBeforeQueuedWork(t *testing.T) {
+	graph, sent := newBridgeRetryGraph(t, bridgePollMessage("original-1", "2026-04-30T01:00:00Z", "queued prompt"))
+	store := newBridgeTestStore(t)
+	executor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "recovered answer", CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	bridge.reg.ControlChatTopic = ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(bridge.machine.Label, machineLabel()), Profile: bridge.scope.Profile})
+	if err := bridge.writePendingHelperRestartNotice(bridgeTestMessage("control-restart-now")); err != nil {
+		t.Fatalf("writePendingHelperRestartNotice error: %v", err)
+	}
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	inbound, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: "original-1",
+		Status:         teamstore.InboundStatusPersisted,
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := bridge.initializeControlChatAndRecovery(context.Background())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("initializeControlChatAndRecovery error: %v", err)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("startup recovery blocked on the queued Codex turn")
+	}
+	if len(*sent) != 1 || (*sent)[0].ChatID != "control-chat" || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Helper restart completed") {
+		t.Fatalf("first startup message = %#v, want restart completion in control chat", *sent)
+	}
+	select {
+	case <-executor.started:
+		close(executor.release)
+		t.Fatal("startup recovery started queued work before the first control poll")
+	default:
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		close(executor.release)
+		t.Fatalf("Load after startup recovery error: %v", err)
+	}
+	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
+		t.Fatalf("queued turns after startup recovery = %d, want 1 waiting for the main loop", got)
+	}
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		close(executor.release)
+		t.Fatalf("processQueuedTurns error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("recovered queued turn did not start asynchronously")
+	}
+	close(executor.release)
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
+}
+
+func TestBridgeProcessDeferredInboundAsyncRunsAcrossSessions(t *testing.T) {
+	graph, _ := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 10),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	now := time.Now()
+	bridge.reg.Sessions = []Session{
+		{ID: "s001", ChatID: "chat-1", ChatURL: "https://teams.example/chat-1", Topic: "one", Status: "active", CreatedAt: now, UpdatedAt: now},
+		{ID: "s002", ChatID: "chat-2", ChatURL: "https://teams.example/chat-2", Topic: "two", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}
+	for _, session := range bridge.reg.Sessions {
+		if err := bridge.ensureDurableSession(context.Background(), &session); err != nil {
+			t.Fatalf("ensureDurableSession %s error: %v", session.ID, err)
+		}
+		if _, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+			SessionID:      session.ID,
+			TeamsChatID:    session.ChatID,
+			TeamsMessageID: "deferred-" + session.ID,
+			Text:           "deferred prompt for " + session.ID,
+			Status:         teamstore.InboundStatusDeferred,
+			Source:         "teams_session_import_deferred",
+		}); err != nil {
+			t.Fatalf("PersistInbound %s error: %v", session.ID, err)
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.processDeferredInbound(context.Background())
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("processDeferredInbound error: %v", err)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("processDeferredInbound blocked on a Codex turn")
+	}
+	startedBySession := map[string]string{}
+	for len(startedBySession) < 2 {
+		select {
+		case got := <-executor.started:
+			startedBySession[got.SessionID] = got.Prompt
+		case <-time.After(bridgeAsyncTestTimeout):
+			close(executor.release)
+			t.Fatalf("timed out waiting for deferred turns to start; got %#v", startedBySession)
+		}
+	}
+	for _, sessionID := range []string{"s001", "s002"} {
+		if !strings.Contains(startedBySession[sessionID], "deferred prompt for "+sessionID) {
+			t.Fatalf("started prompt for %s = %q", sessionID, startedBySession[sessionID])
+		}
+	}
+	close(executor.release)
+	waitForCompletedTurnCount(t, store, "s001", 1)
+	waitForCompletedTurnCount(t, store, "s002", 1)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	waitForNoActiveTurnsOrOutbox(t, store, "s002")
+}
+
+func TestBridgeControlFallbackAsyncDoesNotBlockControlLoop(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "control fallback answer", CodexThreadID: "thread-control", CodexTurnID: "turn-control"},
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.controlFallbackExecutor = executor
+	bridge.asyncTurns = true
+
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.handleControlMessage(context.Background(), bridgeTestMessageWithText("control-fallback-async", "summarize current helper state"), "summarize current helper state")
+	}()
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("control fallback did not start")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			close(executor.release)
+			t.Fatalf("handleControlMessage error: %v", err)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("control fallback blocked the control handler")
+	}
+	close(executor.release)
+	waitForCompletedTurnCount(t, store, controlFallbackSessionID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, controlFallbackSessionID)
+}
+
 func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
 	graph, sent := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
@@ -4468,6 +4647,118 @@ func TestBridgeSessionCancelLastQueuedTurnMarksInterrupted(t *testing.T) {
 	}
 	if got := sentPlainJoined(*sent); !strings.Contains(got, "turn canceled") || !strings.Contains(got, turn.ID) {
 		t.Fatalf("cancel last response = %q", got)
+	}
+}
+
+func TestBridgeSessionCancelLastRunningTurnCancelsExecutor(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "should not finish"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("running-1", "2026-05-03T01:00:00Z", "long task"), "long task"); err != nil {
+		t.Fatalf("handle running message error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("running Codex turn did not start")
+	}
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("cancel-running", "2026-05-03T01:00:05Z", "helper cancel last"), "helper cancel last"); err != nil {
+		t.Fatalf("cancel running turn error: %v", err)
+	}
+
+	var canceledTurn teamstore.Turn
+	deadline := time.Now().Add(bridgeAsyncTestTimeout)
+	for {
+		state, err := store.Load(ctx)
+		if err != nil {
+			t.Fatalf("Load after cancel running error: %v", err)
+		}
+		for _, turn := range state.Turns {
+			if turn.SessionID == "s001" && turn.Status == teamstore.TurnStatusInterrupted {
+				canceledTurn = turn
+				break
+			}
+		}
+		if canceledTurn.ID != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for running turn cancel; turns=%#v", state.Turns)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if strings.TrimSpace(canceledTurn.RecoveryReason) != "canceled by user" {
+		t.Fatalf("canceled turn reason = %q, want canceled by user", canceledTurn.RecoveryReason)
+	}
+	if err := bridge.flushPendingOutboxForChat(ctx, "chat-1"); err != nil {
+		t.Fatalf("flush canceled outbox: %v", err)
+	}
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"cancel requested for running turn", "Codex request canceled."} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("cancel transcript missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "error: context canceled") {
+		t.Fatalf("user cancel should not be reported as execution error:\n%s", joined)
+	}
+}
+
+func TestBridgeSessionCancelRunningTurnWithoutLiveHandleExplainsLimit(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:running-old", SessionID: session.ID, Status: teamstore.TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn running error: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("cancel-old-running"), "helper cancel last"); err != nil {
+		t.Fatalf("cancel old running turn error: %v", err)
+	}
+	if got := sentPlainJoined(*sent); !strings.Contains(got, "does not own its live cancel handle") {
+		t.Fatalf("cancel old running response = %q", got)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns["turn:running-old"].Status; got != teamstore.TurnStatusRunning {
+		t.Fatalf("old running turn status = %q, want still running", got)
+	}
+}
+
+func TestLatestCancelableTurnIDPrefersRunningOverQueued(t *testing.T) {
+	now := time.Now()
+	state := teamstore.State{Turns: map[string]teamstore.Turn{
+		"turn:queued-newer": {
+			ID:        "turn:queued-newer",
+			SessionID: "s001",
+			Status:    teamstore.TurnStatusQueued,
+			CreatedAt: now.Add(time.Minute),
+		},
+		"turn:running-older": {
+			ID:        "turn:running-older",
+			SessionID: "s001",
+			Status:    teamstore.TurnStatusRunning,
+			CreatedAt: now,
+		},
+	}}
+	got, ok := latestCancelableTurnID(state, "s001")
+	if !ok || got != "turn:running-older" {
+		t.Fatalf("latestCancelableTurnID = %q,%v; want running turn", got, ok)
 	}
 }
 
@@ -10650,9 +10941,17 @@ func newBridgeTestStore(t *testing.T) *teamstore.Store {
 
 func newBridgeTestBridge(graph *GraphClient, store *teamstore.Store, executor Executor) *Bridge {
 	now := time.Now()
+	user := User{ID: "user-1", UserPrincipalName: "user@example.test"}
+	scope := ScopeIdentityForUser(user)
+	if store != nil {
+		scope.ID = "test-scope:" + shortStableID(store.Path())
+	}
+	machine := MachineRecordForUser(user, scope)
 	return &Bridge{
-		graph: graph,
-		user:  User{ID: "user-1", UserPrincipalName: "user@example.test"},
+		graph:   graph,
+		user:    user,
+		scope:   scope,
+		machine: machine,
 		reg: Registry{
 			Version:       1,
 			UserID:        "user-1",

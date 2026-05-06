@@ -103,6 +103,7 @@ type State struct {
 	ChatRateLimits    map[string]ChatRateLimitState     `json:"chat_rate_limits,omitempty"`
 	ArtifactRecords   map[string]ArtifactRecord         `json:"artifact_records,omitempty"`
 	Notifications     map[string]NotificationRecord     `json:"notifications,omitempty"`
+	Workflow          WorkflowNotificationConfig        `json:"workflow,omitempty"`
 	AutoUpdate        AutoUpdateState                   `json:"auto_update,omitempty"`
 }
 
@@ -310,15 +311,38 @@ type ArtifactRecord struct {
 }
 
 type NotificationRecord struct {
-	ID        string    `json:"id"`
-	SessionID string    `json:"session_id,omitempty"`
-	TurnID    string    `json:"turn_id,omitempty"`
-	Kind      string    `json:"kind,omitempty"`
-	OutboxID  string    `json:"outbox_id,omitempty"`
-	SentAt    time.Time `json:"sent_at,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	ID             string    `json:"id"`
+	SessionID      string    `json:"session_id,omitempty"`
+	TurnID         string    `json:"turn_id,omitempty"`
+	Kind           string    `json:"kind,omitempty"`
+	OutboxID       string    `json:"outbox_id,omitempty"`
+	Status         string    `json:"status,omitempty"`
+	Title          string    `json:"title,omitempty"`
+	ChatTitle      string    `json:"chat_title,omitempty"`
+	RequestSummary string    `json:"request_summary,omitempty"`
+	Hint           string    `json:"hint,omitempty"`
+	ButtonTitle    string    `json:"button_title,omitempty"`
+	ButtonURL      string    `json:"button_url,omitempty"`
+	Attempts       int       `json:"attempts,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
+	LastAttemptAt  time.Time `json:"last_attempt_at,omitempty"`
+	SentAt         time.Time `json:"sent_at,omitempty"`
+	CreatedAt      time.Time `json:"created_at,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
+
+type WorkflowNotificationConfig struct {
+	Enabled               bool      `json:"enabled,omitempty"`
+	ControlWebhookURLFile string    `json:"control_webhook_url_file,omitempty"`
+	ControlChatID         string    `json:"control_chat_id,omitempty"`
+	UpdatedAt             time.Time `json:"updated_at,omitempty"`
+}
+
+const (
+	NotificationStatusQueued = "queued"
+	NotificationStatusSent   = "sent"
+	NotificationStatusFailed = "failed"
+)
 
 type ServiceControl struct {
 	Paused    bool      `json:"paused,omitempty"`

@@ -305,10 +305,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bridge_pattern='Test(BridgeAsync(QueuedTurnsRunAcrossSessionsButSerializeEachSession|TurnsQueuesTeamsInputWhileCodexIsRunning)|BridgePollOnce(BoostsAfterRealInboundAndFinalOutput|PrioritizesRunningWorkChatUnderPerCycleLimit|ContinuesOtherDueChatsAfterReadRateLimit)|BridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn|BridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity|BridgeControlResumeKeyOnlyReactivatesMatchingParkedChat|BridgeSyncLinkedTranscriptDedupesQueuedLiveFinal|StoreConcurrentDistinctSessionWritersDoNotCrossMutate|InboundPollDecision(Thresholds|FutureActivityStaysHot)|SortInboundPollDecisionsPrioritizesRunningUnderCycleCap)$'
+          bridge_pattern='Test(BridgeAsync(QueuedTurnsRunAcrossSessionsButSerializeEachSession|TurnsQueuesTeamsInputWhileCodexIsRunning)|BridgeSessionCancel(LastRunningTurnCancelsExecutor|RunningTurnWithoutLiveHandleExplainsLimit)|LatestCancelableTurnIDPrefersRunningOverQueued|BridgePollOnce(BoostsAfterRealInboundAndFinalOutput|PrioritizesRunningWorkChatUnderPerCycleLimit|ContinuesOtherDueChatsAfterReadRateLimit)|BridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn|BridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity|BridgeControlResumeKeyOnlyReactivatesMatchingParkedChat|BridgeSyncLinkedTranscriptDedupesQueuedLiveFinal|StoreConcurrentDistinctSessionWritersDoNotCrossMutate|InboundPollDecision(Thresholds|FutureActivityStaysHot)|SortInboundPollDecisionsPrioritizesRunningUnderCycleCap)$'
           transcript_pattern='TestReadSessionTranscriptSince(RefusesMissingCheckpoint|MatchesFullTailForSourceCheckpoint|MatchesFullTailForFallbackCheckpoint|RefusesInvalidLineLikeCheckpoint|FallsBackForPrefixDuplicateSourceIDs|AvoidsFullParseWorkForTail)$'
+          workflow_pattern='Test(WorkflowNotificationsDisabledByDefault|WorkflowNotification(SendsAfterDurableOutboxSent|FallsBackToSidecarConfigWhenOldHelperErasesState|FailureRetriesWithBackoff|SuppressesAfterControlChatRebind|SkipsHistoryAndNonFinalParts|SupportsRecreatedChatMovedNotice)|QueueOutbox(SuppressesOwnerMentionWhenWorkflowNotificationEnabled|KeepsOwnerMentionWhenWorkflowNotificationDisabled)|WorkflowWebhookURLFileSafety|PostWorkflowWebhook(SendsAdaptiveCard|RejectsUnsafeActionURL|RejectsNonAbsoluteWebhookURL|RejectsOversizedPayload|RetriesTooManyRequests))$'
+          workflow_cli_pattern='TestTeamsWorkflowStatus(RedactsWebhookURL|ReadsSidecarConfig)$'
           go test ./internal/teams ./internal/teams/store -count=1 -run "$bridge_pattern" -v
           go test ./internal/teams -count=1 -run "$transcript_pattern" -v
+          go test ./internal/teams -count=1 -run "$workflow_pattern" -v
+          go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
 
       - name: Teams background keepalive race regressions (Linux only)
         if: runner.os == 'Linux'

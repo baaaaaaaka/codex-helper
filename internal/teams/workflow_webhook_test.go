@@ -35,8 +35,11 @@ func TestPostWorkflowWebhookSendsAdaptiveCard(t *testing.T) {
 	})}
 
 	result, err := PostWorkflowWebhook(context.Background(), client, "https://workflow.example.test/hook", WorkflowWebhookMessage{
-		Title: "Probe",
-		Text:  "Hello from test",
+		Title:          "✅ Codex finished",
+		ChatTitle:      "💬 test-host - Fix installer",
+		RequestSummary: "Fix the installer regression",
+		Hint:           "The answer is ready in the work chat.",
+		Actions:        []OpenURLCardAction{{Title: "Open answer", URL: "https://teams.microsoft.com/l/chat/19%3Atest%40thread.v2/0"}},
 	})
 	if err != nil {
 		t.Fatalf("PostWorkflowWebhook error: %v", err)
@@ -48,10 +51,27 @@ func TestPostWorkflowWebhookSendsAdaptiveCard(t *testing.T) {
 		t.Fatalf("payload type = %#v", seen["type"])
 	}
 	raw, _ := json.Marshal(seen)
-	for _, want := range []string{"application/vnd.microsoft.card.adaptive", "Probe", "Hello from test"} {
+	for _, want := range []string{"application/vnd.microsoft.card.adaptive", "✅ Codex finished", "Chat", "💬 test-host - Fix installer", "Request", "Fix the installer regression", "Open answer"} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("payload missing %q: %s", want, raw)
 		}
+	}
+}
+
+func TestPostWorkflowWebhookRejectsUnsafeActionURL(t *testing.T) {
+	_, err := PostWorkflowWebhook(context.Background(), nil, "https://example.test/webhook", WorkflowWebhookMessage{
+		Text:    "unsafe",
+		Actions: []OpenURLCardAction{{Title: "Open", URL: "https://example.com/not-teams"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe") {
+		t.Fatalf("expected unsafe URL error, got %v", err)
+	}
+}
+
+func TestPostWorkflowWebhookRejectsNonAbsoluteWebhookURL(t *testing.T) {
+	_, err := PostWorkflowWebhook(context.Background(), nil, "https:///missing-host", WorkflowWebhookMessage{Text: "bad"})
+	if err == nil || !strings.Contains(err.Error(), "absolute https URL") {
+		t.Fatalf("expected absolute https URL error, got %v", err)
 	}
 }
 
