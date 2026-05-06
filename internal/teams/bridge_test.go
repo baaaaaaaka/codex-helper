@@ -853,7 +853,7 @@ func TestBridgeControlFallbackAsyncDoesNotBlockControlLoop(t *testing.T) {
 	waitForNoActiveTurnsOrOutbox(t, store, controlFallbackSessionID)
 }
 
-func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
+func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T) {
 	graph, sent := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
 	executor := &serialStreamingExecutor{
@@ -892,14 +892,18 @@ func TestBridgeAsyncTurnsSendsSingleQueuedNoticeForBacklog(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+	duplicateThird := bridgePollMessage("third", "2026-05-03T01:00:06Z", "third prompt")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", duplicateThird, "third prompt"); err != nil {
+		t.Fatalf("duplicate third handleSessionMessage error: %v", err)
+	}
 
 	var plain []string
 	for _, msg := range *sent {
 		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
 	joined := strings.Join(plain, "\n---\n")
-	if got := strings.Count(joined, "Your request is queued."); got != 1 {
-		t.Fatalf("queued notice count = %d, want 1 in:\n%s", got, joined)
+	if got := strings.Count(joined, "Your request is queued."); got != 2 {
+		t.Fatalf("queued notice count = %d, want 2 for two distinct queued Teams messages in:\n%s", got, joined)
 	}
 
 	executor.release <- struct{}{}
@@ -9501,6 +9505,13 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	if len(*sent) != 1 || !strings.Contains(activeAck, "Your request is queued") || !strings.Contains(activeAck, "Local Codex CLI request") || strings.Contains(activeAck, "Request ahead of you:\nteams prompt during local") {
 		t.Fatalf("active local CLI ack = %#v, want one clear queued notice", *sent)
 	}
+	secondMsg := bridgePollMessage("teams-during-local-second", "2026-05-03T01:01:05Z", "second teams prompt during local")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, secondMsg, "second teams prompt during local"); err != nil {
+		t.Fatalf("second handleSessionMessage while local active error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("queued local-active prompts sent %d ack messages, want 2", len(*sent))
+	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load state error: %v", err)
@@ -9508,8 +9519,8 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.LastRecordID != beforeCheckpoint.LastRecordID || checkpoint.LastSourceLine != beforeCheckpoint.LastSourceLine {
 		t.Fatalf("checkpoint advanced during active local CLI turn: %#v, before %#v", checkpoint, beforeCheckpoint)
 	}
-	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
-		t.Fatalf("queued turn count = %d, want 1", got)
+	if got := queuedTurnCountForSession(state, session.ID); got != 2 {
+		t.Fatalf("queued turn count = %d, want 2", got)
 	}
 
 	completedTranscript := activeTranscript +
@@ -9529,7 +9540,16 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 		t.Fatal("queued Teams prompt did not start after local CLI completed")
 	}
 	executor.release <- struct{}{}
-	waitForCompletedTurnCount(t, store, session.ID, 1)
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "second teams prompt during local") {
+			t.Fatalf("second queued Teams prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("second queued Teams prompt did not start after first Teams prompt completed")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 2)
 	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 
 	var plain []string
@@ -9537,6 +9557,9 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
 	joined := strings.Join(plain, "\n---\n")
+	if got := strings.Count(joined, "Your request is queued"); got != 2 {
+		t.Fatalf("local-active queued notice count = %d, want 2 in:\n%s", got, joined)
+	}
 	for _, want := range []string{
 		"Your request is queued",
 		"Local Codex CLI request",
@@ -9544,6 +9567,7 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 		"🤖 ⏳ Codex status:\nlocal CLI is editing files",
 		"🤖 ✅ Codex answer:\nlocal CLI final answer",
 		"🤖 ✅ Codex answer:\ndone 1: teams prompt during local",
+		"🤖 ✅ Codex answer:\ndone 2: second teams prompt during local",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("combined transcript missing %q in:\n%s", want, joined)
@@ -10651,12 +10675,13 @@ func newBridgeAsyncQueueGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage)
 			w.Header().Set("Content-Type", "application/json")
 			id := strings.TrimPrefix(r.URL.Path, "/chats/chat-1/messages/")
 			prompts := map[string]string{
-				"second":              "second prompt",
-				"third":               "third prompt",
-				"teams-during-local":  "teams prompt during local",
-				"teams-after-catchup": "teams prompt after catchup",
-				"teams-during-tool":   "teams prompt during tool",
-				"second-s001":         "second prompt for s001",
+				"second":                    "second prompt",
+				"third":                     "third prompt",
+				"teams-during-local":        "teams prompt during local",
+				"teams-during-local-second": "second teams prompt during local",
+				"teams-after-catchup":       "teams prompt after catchup",
+				"teams-during-tool":         "teams prompt during tool",
+				"second-s001":               "second prompt for s001",
 			}
 			prompt, ok := prompts[id]
 			if !ok {

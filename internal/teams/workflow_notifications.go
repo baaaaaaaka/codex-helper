@@ -17,6 +17,7 @@ const (
 	workflowNotificationMaxSummaryRunes = 120
 	workflowNotificationMaxTitleRunes   = 96
 	workflowNotificationSendTimeout     = 8 * time.Second
+	workflowNotificationSendLease       = 2 * time.Minute
 	workflowNotificationConfigFileName  = "workflow-notifications.json"
 	workflowWebhookURLFileName          = "workflow-webhook-url"
 )
@@ -308,7 +309,7 @@ func (b *Bridge) queueWorkflowNotification(ctx context.Context, event WorkflowNo
 		}
 		if existing, ok := state.Notifications[event.ID]; ok {
 			switch existing.Status {
-			case teamstore.NotificationStatusSent, teamstore.NotificationStatusUnknown:
+			case teamstore.NotificationStatusSending, teamstore.NotificationStatusSent, teamstore.NotificationStatusUnknown:
 				return nil
 			}
 		}
@@ -367,6 +368,12 @@ func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
 		if rec.Status == teamstore.NotificationStatusSent || rec.Status == teamstore.NotificationStatusUnknown {
 			continue
 		}
+		if rec.Status == teamstore.NotificationStatusSending {
+			if err := b.markStaleWorkflowNotificationUnknown(ctx, rec, now); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		if rec.Status != "" && rec.Status != teamstore.NotificationStatusQueued && rec.Status != teamstore.NotificationStatusFailed {
 			continue
 		}
@@ -376,7 +383,17 @@ func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
 		if strings.TrimSpace(rec.Title) == "" || strings.TrimSpace(rec.ButtonURL) == "" {
 			continue
 		}
-		if err := b.sendWorkflowNotificationRecord(ctx, webhookURL, rec); err != nil {
+		claimed, ok, err := b.claimWorkflowNotificationForSend(ctx, rec.ID, now)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if err := b.sendWorkflowNotificationRecord(ctx, webhookURL, claimed); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -403,16 +420,72 @@ func workflowNotificationRetryDue(rec teamstore.NotificationRecord, now time.Tim
 	return !now.Before(rec.LastAttemptAt.Add(delay))
 }
 
-func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL string, rec teamstore.NotificationRecord) error {
-	now := time.Now()
-	_ = b.store.Update(ctx, func(state *teamstore.State) error {
-		current := state.Notifications[rec.ID]
-		current.Attempts++
-		current.LastAttemptAt = now
-		current.UpdatedAt = now
-		state.Notifications[rec.ID] = current
+func (b *Bridge) claimWorkflowNotificationForSend(ctx context.Context, id string, now time.Time) (teamstore.NotificationRecord, bool, error) {
+	var out teamstore.NotificationRecord
+	claimed := false
+	if now.IsZero() {
+		now = time.Now()
+	}
+	err := b.store.Update(ctx, func(state *teamstore.State) error {
+		rec, ok := state.Notifications[id]
+		if !ok {
+			return nil
+		}
+		switch rec.Status {
+		case teamstore.NotificationStatusSent, teamstore.NotificationStatusUnknown:
+			return nil
+		case teamstore.NotificationStatusSending:
+			return markStaleWorkflowNotificationUnknownState(state, rec, now)
+		case teamstore.NotificationStatusFailed:
+			if !workflowNotificationRetryDue(rec, now) {
+				return nil
+			}
+		case "", teamstore.NotificationStatusQueued:
+		default:
+			return nil
+		}
+		if strings.TrimSpace(rec.Title) == "" || strings.TrimSpace(rec.ButtonURL) == "" {
+			return nil
+		}
+		rec.Status = teamstore.NotificationStatusSending
+		rec.Attempts++
+		rec.LastAttemptAt = now
+		rec.LastError = ""
+		rec.LastErrorRetryable = false
+		rec.DeliveryUncertain = false
+		rec.UpdatedAt = now
+		state.Notifications[rec.ID] = rec
+		out = rec
+		claimed = true
 		return nil
 	})
+	return out, claimed, err
+}
+
+func (b *Bridge) markStaleWorkflowNotificationUnknown(ctx context.Context, rec teamstore.NotificationRecord, now time.Time) error {
+	return b.store.Update(ctx, func(state *teamstore.State) error {
+		current, ok := state.Notifications[rec.ID]
+		if !ok || current.Status != teamstore.NotificationStatusSending {
+			return nil
+		}
+		return markStaleWorkflowNotificationUnknownState(state, current, now)
+	})
+}
+
+func markStaleWorkflowNotificationUnknownState(state *teamstore.State, rec teamstore.NotificationRecord, now time.Time) error {
+	if rec.LastAttemptAt.IsZero() || now.Sub(rec.LastAttemptAt) <= workflowNotificationSendLease {
+		return nil
+	}
+	rec.Status = teamstore.NotificationStatusUnknown
+	rec.DeliveryUncertain = true
+	rec.LastErrorRetryable = false
+	rec.LastError = "previous Teams workflow webhook attempt did not finish; delivery is uncertain"
+	rec.UpdatedAt = now
+	state.Notifications[rec.ID] = rec
+	return nil
+}
+
+func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL string, rec teamstore.NotificationRecord) error {
 	sendCtx, cancel := context.WithTimeout(ctx, workflowNotificationSendTimeout)
 	defer cancel()
 	_, err := PostWorkflowWebhook(sendCtx, b.httpClient, webhookURL, WorkflowWebhookMessage{

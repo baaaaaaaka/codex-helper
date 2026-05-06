@@ -342,6 +342,7 @@ type WorkflowNotificationConfig struct {
 
 const (
 	NotificationStatusQueued  = "queued"
+	NotificationStatusSending = "sending"
 	NotificationStatusSent    = "sent"
 	NotificationStatusFailed  = "failed"
 	NotificationStatusUnknown = "unknown"

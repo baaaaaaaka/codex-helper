@@ -2946,10 +2946,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
 			session.UpdatedAt = time.Now()
-			if turns.Queued == 0 {
-				if err := b.queueTeamsPromptAck(ctx, session, turn, true); err != nil {
-					return err
-				}
+			if err := b.queueTeamsPromptAck(ctx, session, turn, true); err != nil {
+				return err
 			}
 			b.boostPolling(time.Now())
 			return nil
@@ -2973,10 +2971,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 			if !created || !turnCreated {
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
-			if turns.Queued == 0 {
-				if err := b.queueTeamsPromptBlockedAck(ctx, session, turn, gate); err != nil {
-					return err
-				}
+			if err := b.queueTeamsPromptBlockedAck(ctx, session, turn, gate); err != nil {
+				return err
 			}
 			b.boostPolling(time.Now())
 			return nil

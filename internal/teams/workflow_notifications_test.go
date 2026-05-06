@@ -152,6 +152,136 @@ func TestWorkflowNotificationDoesNotDuplicateAfterAmbiguousFailure(t *testing.T)
 	}
 }
 
+func TestWorkflowNotificationConcurrentFlushClaimsOnce(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Avoid duplicate cards from concurrent flush")
+
+	var calls int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+	outbox := workflowNotificationTestOutbox("outbox-concurrent", "final", "turn_completed")
+	if err := bridge.queueWorkflowNotification(ctx, WorkflowNotificationEvent{
+		ID:             "workflow:" + shortStableID(outbox.ID),
+		SessionID:      outbox.SessionID,
+		TurnID:         outbox.TurnID,
+		OutboxID:       outbox.ID,
+		Kind:           "turn_completed",
+		Title:          "✅ Codex finished",
+		ChatTitle:      "💬 test-host - Fix installer",
+		RequestSummary: "Avoid duplicate cards from concurrent flush",
+		ButtonTitle:    "Open answer",
+		ButtonURL:      TeamsChatURL("chat-1", "tenant-1"),
+	}); err != nil {
+		t.Fatalf("queueWorkflowNotification: %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- bridge.flushPendingWorkflowNotifications(ctx)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(release)
+		t.Fatal("first webhook request did not start")
+	}
+	if err := bridge.flushPendingWorkflowNotifications(ctx); err != nil {
+		close(release)
+		t.Fatalf("second concurrent flush error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		close(release)
+		t.Fatalf("webhook calls while first send in flight = %d, want 1", got)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first flush error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
+	if rec.Status != teamstore.NotificationStatusSent || rec.Attempts != 1 {
+		t.Fatalf("notification record = %#v, want sent with one attempt", rec)
+	}
+}
+
+func TestWorkflowNotificationStaleSendingBecomesUnknown(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Do not duplicate ambiguous stale sends")
+
+	var calls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+	outbox := workflowNotificationTestOutbox("outbox-stale-sending", "final", "turn_completed")
+	if err := bridge.queueWorkflowNotification(ctx, WorkflowNotificationEvent{
+		ID:             "workflow:" + shortStableID(outbox.ID),
+		SessionID:      outbox.SessionID,
+		TurnID:         outbox.TurnID,
+		OutboxID:       outbox.ID,
+		Kind:           "turn_completed",
+		Title:          "✅ Codex finished",
+		ChatTitle:      "💬 test-host - Fix installer",
+		RequestSummary: "Do not duplicate ambiguous stale sends",
+		ButtonTitle:    "Open answer",
+		ButtonURL:      TeamsChatURL("chat-1", "tenant-1"),
+	}); err != nil {
+		t.Fatalf("queueWorkflowNotification: %v", err)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
+		rec.Status = teamstore.NotificationStatusSending
+		rec.Attempts = 1
+		rec.LastAttemptAt = time.Now().Add(-workflowNotificationSendLease - time.Minute)
+		state.Notifications[rec.ID] = rec
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale sending notification: %v", err)
+	}
+
+	if err := bridge.flushPendingWorkflowNotifications(ctx); err != nil {
+		t.Fatalf("flush stale sending notification: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("webhook calls for stale ambiguous notification = %d, want 0", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
+	if rec.Status != teamstore.NotificationStatusUnknown || !rec.DeliveryUncertain || rec.LastError == "" {
+		t.Fatalf("stale sending notification = %#v, want unknown delivery", rec)
+	}
+}
+
 func TestWorkflowNotificationRetriesOnlyRetryableFailuresWithBackoff(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
