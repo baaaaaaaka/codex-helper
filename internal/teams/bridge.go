@@ -200,8 +200,11 @@ type Bridge struct {
 }
 
 type runningTurnCancel struct {
+	sessionID string
 	cancel    context.CancelFunc
 	requested bool
+	reason    string
+	silent    bool
 }
 
 func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer) (*Bridge, error) {
@@ -4608,7 +4611,7 @@ func (b *Bridge) fileWriteGraph() (*GraphClient, error) {
 	return graph, nil
 }
 
-func (b *Bridge) registerRunningTurnCancel(turnID string, cancel context.CancelFunc) func() {
+func (b *Bridge) registerRunningTurnCancel(sessionID string, turnID string, cancel context.CancelFunc) func() {
 	if b == nil || strings.TrimSpace(turnID) == "" || cancel == nil {
 		return func() {}
 	}
@@ -4616,7 +4619,7 @@ func (b *Bridge) registerRunningTurnCancel(turnID string, cancel context.CancelF
 	if b.runningTurnCancels == nil {
 		b.runningTurnCancels = make(map[string]*runningTurnCancel)
 	}
-	b.runningTurnCancels[turnID] = &runningTurnCancel{cancel: cancel}
+	b.runningTurnCancels[turnID] = &runningTurnCancel{sessionID: strings.TrimSpace(sessionID), cancel: cancel}
 	b.runningTurnMu.Unlock()
 	return func() {
 		b.runningTurnMu.Lock()
@@ -4626,6 +4629,10 @@ func (b *Bridge) registerRunningTurnCancel(turnID string, cancel context.CancelF
 }
 
 func (b *Bridge) requestRunningTurnCancel(turnID string) bool {
+	return b.requestRunningTurnCancelWithOptions(turnID, "canceled by user", false)
+}
+
+func (b *Bridge) requestRunningTurnCancelWithOptions(turnID string, reason string, silent bool) bool {
 	if b == nil || strings.TrimSpace(turnID) == "" {
 		return false
 	}
@@ -4636,20 +4643,62 @@ func (b *Bridge) requestRunningTurnCancel(turnID string) bool {
 		return false
 	}
 	running.requested = true
+	running.reason = strings.TrimSpace(reason)
+	running.silent = silent
 	cancel := running.cancel
 	b.runningTurnMu.Unlock()
 	cancel()
 	return true
 }
 
-func (b *Bridge) runningTurnCancelRequested(turnID string) bool {
+func (b *Bridge) runningTurnCancelState(turnID string) (bool, string, bool) {
 	if b == nil || strings.TrimSpace(turnID) == "" {
-		return false
+		return false, "", false
 	}
 	b.runningTurnMu.Lock()
 	defer b.runningTurnMu.Unlock()
 	running := b.runningTurnCancels[turnID]
-	return running != nil && running.requested
+	if running == nil || !running.requested {
+		return false, "", false
+	}
+	return true, firstNonEmptyString(running.reason, "canceled by user"), running.silent
+}
+
+func (b *Bridge) cancelSupersededRunningTurnsForSession(sessionID string, activeTurnID string) []string {
+	if b == nil {
+		return nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	activeTurnID = strings.TrimSpace(activeTurnID)
+	if sessionID == "" || activeTurnID == "" {
+		return nil
+	}
+	type cancelTarget struct {
+		turnID string
+		cancel context.CancelFunc
+	}
+	var targets []cancelTarget
+	b.runningTurnMu.Lock()
+	for turnID, running := range b.runningTurnCancels {
+		if running == nil || turnID == activeTurnID || strings.TrimSpace(running.sessionID) != sessionID {
+			continue
+		}
+		running.requested = true
+		running.reason = "superseded by a newer Teams request after recovery"
+		running.silent = true
+		if running.cancel != nil {
+			targets = append(targets, cancelTarget{turnID: turnID, cancel: running.cancel})
+		}
+	}
+	b.runningTurnMu.Unlock()
+	for _, target := range targets {
+		target.cancel()
+	}
+	out := make([]string, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, target.turnID)
+	}
+	return out
 }
 
 func (b *Bridge) runQueuedTurn(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, text string) error {
@@ -4662,6 +4711,11 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 			return err
 		}
 	}
+	sessionID := ""
+	if session != nil {
+		sessionID = session.ID
+	}
+	b.cancelSupersededRunningTurnsForSession(sessionID, turn.ID)
 	if _, err := b.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, ""); err != nil {
 		return err
 	}
@@ -4669,15 +4723,18 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 		executor = CodexExecutor{}
 	}
 	execCtx, cancelExec := context.WithCancel(ctx)
-	unregisterCancel := b.registerRunningTurnCancel(turn.ID, cancelExec)
+	unregisterCancel := b.registerRunningTurnCancel(sessionID, turn.ID, cancelExec)
 	result, err := b.runExecutorWithHeartbeat(execCtx, executor, session, turn, chatID, text)
-	cancelRequested := b.runningTurnCancelRequested(turn.ID)
+	cancelRequested, cancelReason, cancelSilent := b.runningTurnCancelState(turn.ID)
 	unregisterCancel()
 	cancelExec()
 	if err != nil {
 		if cancelRequested && isCanceledExecutionError(err) {
-			if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); markErr != nil {
+			if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, firstNonEmptyString(cancelReason, "canceled by user")); markErr != nil {
 				return markErr
+			}
+			if cancelSilent {
+				return nil
 			}
 			return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "canceled", "Codex request canceled.")
 		}
@@ -4703,6 +4760,20 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 			return nil
 		}
 		return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "error", "error: "+err.Error())
+	}
+	if cancelRequested {
+		if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, firstNonEmptyString(cancelReason, "canceled by user")); markErr != nil {
+			return markErr
+		}
+		if cancelSilent {
+			return nil
+		}
+		return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "canceled", "Codex request canceled.")
+	}
+	if interrupted, interruptErr := b.turnInterrupted(ctx, turn.ID); interruptErr != nil {
+		return interruptErr
+	} else if interrupted {
+		return nil
 	}
 	if result.CodexThreadID != "" {
 		session.CodexThreadID = result.CodexThreadID
@@ -4745,6 +4816,18 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 		}
 	}
 	return b.uploadArtifactsFromResult(ctx, session, turn, result.Text)
+}
+
+func (b *Bridge) turnInterrupted(ctx context.Context, turnID string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(turnID) == "" {
+		return false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	turn, ok := state.Turns[turnID]
+	return ok && turn.Status == teamstore.TurnStatusInterrupted, nil
 }
 
 func retryTurnID(turnID string) string {

@@ -4909,6 +4909,133 @@ func TestBridgeSessionCancelLastRunningTurnCancelsExecutor(t *testing.T) {
 	}
 }
 
+func TestBridgeStartingNewTurnStopsSupersededRunningHandleForSameSession(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	oldExecutor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "old should not finish"},
+	}
+	oldTurn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:old-stale", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn old error: %v", err)
+	}
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- bridge.runQueuedTurnWithExecutor(context.Background(), oldExecutor, session, oldTurn, session.ChatID, "old task")
+	}()
+	select {
+	case <-oldExecutor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("old Codex turn did not start")
+	}
+	if _, err := store.MarkTurnInterrupted(context.Background(), oldTurn.ID, "ambiguous after restart"); err != nil {
+		t.Fatalf("MarkTurnInterrupted old error: %v", err)
+	}
+
+	newExecutor := &recordingExecutor{result: ExecutionResult{Text: "new completed", CodexThreadID: "thread-1", CodexTurnID: "codex-new"}}
+	newTurn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:new", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn new error: %v", err)
+	}
+	if err := bridge.runQueuedTurnWithExecutor(context.Background(), newExecutor, session, newTurn, session.ChatID, "new task"); err != nil {
+		t.Fatalf("run new turn error: %v", err)
+	}
+	select {
+	case err := <-oldDone:
+		if err != nil {
+			t.Fatalf("old stale turn returned error: %v", err)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("old stale turn was not canceled")
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns[oldTurn.ID].Status; got != teamstore.TurnStatusInterrupted {
+		t.Fatalf("old turn status = %q, want interrupted", got)
+	}
+	if got := state.Turns[oldTurn.ID].RecoveryReason; !strings.Contains(got, "superseded") {
+		t.Fatalf("old turn recovery reason = %q, want superseded", got)
+	}
+	if got := state.Turns[newTurn.ID].Status; got != teamstore.TurnStatusCompleted {
+		t.Fatalf("new turn status = %q, want completed", got)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, "Codex request canceled.") {
+		t.Fatalf("superseded stale cleanup should be silent, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "new completed") {
+		t.Fatalf("new turn final response missing:\n%s", joined)
+	}
+}
+
+func TestBridgeInterruptedTurnReturningSuccessDoesNotQueueFinal(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	executor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "stale final must not be queued", CodexThreadID: "thread-old", CodexTurnID: "codex-old"},
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:interrupted-success", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.runQueuedTurnWithExecutor(context.Background(), executor, session, turn, session.ChatID, "old task")
+	}()
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Codex turn did not start")
+	}
+	if _, err := store.MarkTurnInterrupted(context.Background(), turn.ID, "ambiguous after restart"); err != nil {
+		t.Fatalf("MarkTurnInterrupted error: %v", err)
+	}
+	close(executor.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("interrupted turn returned error: %v", err)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("interrupted turn did not return")
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns[turn.ID].Status; got != teamstore.TurnStatusInterrupted {
+		t.Fatalf("turn status = %q, want interrupted", got)
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.Contains(PlainTextFromTeamsHTML(msg.Body), "stale final must not be queued") {
+			t.Fatalf("interrupted turn queued stale final: %#v", msg)
+		}
+	}
+	if got := sentPlainJoined(*sent); strings.Contains(got, "stale final must not be queued") {
+		t.Fatalf("interrupted turn sent stale final:\n%s", got)
+	}
+}
+
 func TestBridgeSessionCancelRunningTurnWithoutLiveHandleExplainsLimit(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
