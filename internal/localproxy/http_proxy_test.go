@@ -1,6 +1,7 @@
 package localproxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,103 @@ func TestHTTPProxy_HealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestHTTPProxyDefaultTimeoutsBoundIdleConnections(t *testing.T) {
+	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+		return nil, io.EOF
+	}), Options{})
+	if p.idle != defaultHTTPProxyIdleTimeout {
+		t.Fatalf("idle timeout = %s, want %s", p.idle, defaultHTTPProxyIdleTimeout)
+	}
+	if p.tunnelIdle != defaultHTTPProxyTunnelIdleTimeout {
+		t.Fatalf("tunnel idle timeout = %s, want %s", p.tunnelIdle, defaultHTTPProxyTunnelIdleTimeout)
+	}
+	if _, err := p.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+	if p.server == nil || p.server.IdleTimeout != defaultHTTPProxyIdleTimeout {
+		t.Fatalf("server idle timeout = %v, want %v", p.server, defaultHTTPProxyIdleTimeout)
+	}
+}
+
+func TestHTTPProxyConnectIdleTunnelClosesBothSides(t *testing.T) {
+	upstreamCh := make(chan net.Conn, 1)
+	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+		clientSide, upstreamSide := net.Pipe()
+		upstreamCh <- upstreamSide
+		return clientSide, nil
+	}), Options{TunnelIdleTimeout: 20 * time.Millisecond})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	conn, err := net.DialTimeout("tcp", httpAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	_ = openConnectTunnel(t, conn)
+	upstream := <-upstreamCh
+	defer upstream.Close()
+
+	assertConnClosesSoon(t, conn, "client tunnel")
+	assertConnClosesSoon(t, upstream, "upstream tunnel")
+}
+
+func TestHTTPProxyConnectTunnelStaysOpenWithOneWayActivity(t *testing.T) {
+	upstreamCh := make(chan net.Conn, 1)
+	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+		clientSide, upstreamSide := net.Pipe()
+		upstreamCh <- upstreamSide
+		return clientSide, nil
+	}), Options{TunnelIdleTimeout: 40 * time.Millisecond})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	conn, err := net.DialTimeout("tcp", httpAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	br := openConnectTunnel(t, conn)
+	upstream := <-upstreamCh
+	defer upstream.Close()
+
+	payload := []byte("abcdef")
+	writeErr := make(chan error, 1)
+	go func() {
+		for _, b := range payload {
+			time.Sleep(15 * time.Millisecond)
+			if _, err := upstream.Write([]byte{b}); err != nil {
+				writeErr <- err
+				return
+			}
+		}
+		writeErr <- nil
+	}()
+
+	got := make([]byte, len(payload))
+	for i := range got {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		b, err := br.ReadByte()
+		if err != nil {
+			t.Fatalf("read one-way tunnel byte %d: %v; got %q", i, err, string(got[:i]))
+		}
+		got[i] = b
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write one-way tunnel payload: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("one-way tunnel payload = %q, want %q", string(got), string(payload))
+	}
+}
+
 func TestHTTPProxy_ForwardsPlainHTTP(t *testing.T) {
 	originAddr, closeOrigin := startHTTPOrigin(t)
 	defer closeOrigin()
@@ -83,6 +181,49 @@ func TestHTTPProxy_ForwardsPlainHTTP(t *testing.T) {
 
 	if !rec.SawAddr(originAddr) {
 		t.Fatalf("expected dialer to see origin addr %q, got %#v", originAddr, rec.Addrs())
+	}
+}
+
+func TestHTTPProxyPlainHTTPUsesOneShotOriginConnection(t *testing.T) {
+	originAddr, requestCloseCh, originClosedCh, closeOrigin := startTrackingHTTPOrigin(t)
+	defer closeOrigin()
+
+	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+		return net.DialTimeout(network, addr, 2*time.Second)
+	}), Options{InstanceID: "plain-http-one-shot"})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	proxyURL, _ := url.Parse("http://" + httpAddr)
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	resp, err := client.Get("http://" + originAddr + "/hello")
+	if err != nil {
+		t.Fatalf("GET via proxy: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	select {
+	case got := <-requestCloseCh:
+		if !got {
+			t.Fatalf("proxy origin request did not ask the origin server to close the connection")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("origin request was not observed")
+	}
+
+	select {
+	case <-originClosedCh:
+	case <-time.After(time.Second):
+		t.Fatalf("proxied plain HTTP origin connection remained open after response")
 	}
 }
 
@@ -353,6 +494,88 @@ func startHTTPOrigin(t *testing.T) (addr string, closeFn func()) {
 		_ = srv.Shutdown(context.Background())
 		_ = ln.Close()
 	}
+}
+
+func startTrackingHTTPOrigin(t *testing.T) (addr string, requestCloseCh <-chan bool, closedCh <-chan struct{}, closeFn func()) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen origin: %v", err)
+	}
+
+	requestClose := make(chan bool, 1)
+	closed := make(chan struct{}, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		requestClose <- r.Close
+		_, _ = w.Write([]byte("hello"))
+	})
+
+	srv := &http.Server{
+		Handler: mux,
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				select {
+				case closed <- struct{}{}:
+				default:
+				}
+			}
+		},
+	}
+	go func() { _ = srv.Serve(ln) }()
+
+	return ln.Addr().String(), requestClose, closed, func() {
+		_ = srv.Shutdown(context.Background())
+		_ = ln.Close()
+	}
+}
+
+func openConnectTunnel(t *testing.T, conn net.Conn) *bufio.Reader {
+	t.Helper()
+	if _, err := io.WriteString(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read CONNECT status: %v", err)
+	}
+	if !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT status = %q, want 200", status)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read CONNECT headers: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	return br
+}
+
+func assertConnClosesSoon(t *testing.T, conn net.Conn, label string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	buf := make([]byte, 1)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		n, err := conn.Read(buf)
+		if n > 0 {
+			t.Fatalf("%s unexpectedly produced data while waiting for idle close", label)
+		}
+		if err == nil {
+			continue
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			continue
+		}
+		return
+	}
+	t.Fatalf("%s did not close after tunnel idle timeout", label)
 }
 
 type recordingDialer struct {

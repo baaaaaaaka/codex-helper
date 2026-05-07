@@ -27,14 +27,18 @@ func (c HealthClient) CheckHTTPProxy(port int, expectedInstanceID string) error 
 		timeout = 1 * time.Second
 	}
 
+	tr := &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout: timeout,
+		}).DialContext,
+		DisableKeepAlives: true,
+	}
+	defer tr.CloseIdleConnections()
+
 	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy: nil,
-			DialContext: (&net.Dialer{
-				Timeout: timeout,
-			}).DialContext,
-		},
+		Timeout:   timeout,
+		Transport: tr,
 	}
 
 	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/_codex_proxy/health", port))

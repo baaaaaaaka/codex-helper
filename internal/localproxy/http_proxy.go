@@ -21,6 +21,8 @@ type Dialer interface {
 type HTTPProxy struct {
 	instanceID string
 	dialer     Dialer
+	idle       time.Duration
+	tunnelIdle time.Duration
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -29,13 +31,30 @@ type HTTPProxy struct {
 }
 
 type Options struct {
-	InstanceID string
+	InstanceID        string
+	IdleTimeout       time.Duration
+	TunnelIdleTimeout time.Duration
 }
 
+const (
+	defaultHTTPProxyIdleTimeout       = 2 * time.Minute
+	defaultHTTPProxyTunnelIdleTimeout = 30 * time.Minute
+)
+
 func NewHTTPProxy(d Dialer, opts Options) *HTTPProxy {
+	idle := opts.IdleTimeout
+	if idle == 0 {
+		idle = defaultHTTPProxyIdleTimeout
+	}
+	tunnelIdle := opts.TunnelIdleTimeout
+	if tunnelIdle == 0 {
+		tunnelIdle = defaultHTTPProxyTunnelIdleTimeout
+	}
 	return &HTTPProxy{
 		instanceID: opts.InstanceID,
 		dialer:     d,
+		idle:       idle,
+		tunnelIdle: tunnelIdle,
 	}
 }
 
@@ -76,6 +95,7 @@ func (p *HTTPProxy) Start(listenAddr string) (actualAddr string, err error) {
 	srv := &http.Server{
 		Handler:           http.HandlerFunc(p.serveHTTP),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       p.idle,
 	}
 
 	p.listener = ln
@@ -172,15 +192,59 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	go func() {
-		_, _ = io.Copy(upstream, clientConn)
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		_ = clientConn.Close()
 		_ = upstream.Close()
-	}()
+		return
+	}
 
-	_, _ = io.Copy(clientConn, upstream)
-	_ = clientConn.Close()
+	p.copyTunnel(clientConn, upstream)
+}
+
+func (p *HTTPProxy) copyTunnel(clientConn net.Conn, upstream net.Conn) {
+	var once sync.Once
+	closeBoth := func() {
+		_ = clientConn.Close()
+		_ = upstream.Close()
+	}
+	resetDeadline := func() {
+		if p.tunnelIdle <= 0 {
+			return
+		}
+		deadline := time.Now().Add(p.tunnelIdle)
+		_ = clientConn.SetReadDeadline(deadline)
+		_ = upstream.SetReadDeadline(deadline)
+	}
+	resetDeadline()
+	done := make(chan struct{}, 2)
+	go func() {
+		copyTunnelDirection(upstream, clientConn, resetDeadline)
+		once.Do(closeBoth)
+		done <- struct{}{}
+	}()
+	go func() {
+		copyTunnelDirection(clientConn, upstream, resetDeadline)
+		once.Do(closeBoth)
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+}
+
+func copyTunnelDirection(dst net.Conn, src net.Conn, markActive func()) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			markActive()
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
 
 func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -198,12 +262,14 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	tr := &http.Transport{
 		Proxy:                 nil,
+		DisableKeepAlives:     true,
 		ForceAttemptHTTP2:     false,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return p.dialer.Dial(network, addr)
 		},
 	}
+	defer tr.CloseIdleConnections()
 
 	resp, err := tr.RoundTrip(outReq)
 	if err != nil {
