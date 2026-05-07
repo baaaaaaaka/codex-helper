@@ -89,6 +89,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 			"CODEX_HELPER_TEAMS_SERVICE":      "1",
 			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
 			"CODEX_HOME":                      "/home/alice/.codex",
+			"HTTP_PROXY":                      "http://127.0.0.1:38471",
 			"NO_COLOR":                        "1",
 		},
 	}
@@ -100,6 +101,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"ExecStart=" + spec.Executable + " teams run --registry " + strconv.Quote(spec.RegistryPath),
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"Environment=CODEX_HELPER_TEAMS_SERVICE_MODE=background",
+		"Environment=HTTP_PROXY=http://127.0.0.1:38471",
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"WantedBy=default.target",
@@ -145,6 +147,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<string>1</string>",
 		"<key>CODEX_HELPER_TEAMS_SERVICE_MODE</key>",
 		"<string>background</string>",
+		"<key>HTTP_PROXY</key>",
+		"<string>http://127.0.0.1:38471</string>",
 	} {
 		if !strings.Contains(plist, want) {
 			t.Fatalf("LaunchAgent plist missing %q:\n%s", want, plist)
@@ -187,6 +191,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<Count>999</Count>",
 		"CODEX_HELPER_TEAMS_SERVICE",
 		"CODEX_HELPER_TEAMS_SERVICE_MODE",
+		"HTTP_PROXY",
+		"http://127.0.0.1:38471",
 		spec.Executable,
 		"teams",
 		"run",
@@ -571,6 +577,8 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 	wantTaskArgument := "-Argument " + powershellSingleQuote(actionArgument)
 	for _, want := range []string{
 		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
+		"$legacyPrefix",
+		"Unregister-ScheduledTask -TaskName $_.TaskName",
 		"New-ScheduledTaskAction -Execute " + powershellSingleQuote(actionExecute),
 		wantTaskArgument,
 		"-WindowStyle Hidden",
@@ -1050,7 +1058,7 @@ func TestTeamsBackgroundKeepaliveDelayedRestartCommandsCI(t *testing.T) {
 		{name: "linux systemd", goos: "linux", wantName: "sh", wantSnippet: "systemctl --user start '" + teamsServiceUnitName + "'"},
 		{name: "macos launchagent", goos: "darwin", wantName: "sh", wantSnippet: "launchctl kickstart -k 'gui/501/" + teamsServiceLaunchAgentLabel + "'"},
 		{name: "windows task", goos: "windows", wantName: "powershell.exe", wantSnippet: "Start-ScheduledTask -TaskName '" + teamsServiceWindowsTaskName + "'"},
-		{name: "wsl windows task", goos: "linux", isWSL: true, powerShell: "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", wantName: "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", wantSnippet: "Start-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+		{name: "wsl windows task", goos: "linux", isWSL: true, powerShell: "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", wantName: "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", wantSnippet: "Start-ScheduledTask -TaskName $taskName"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1142,12 +1150,12 @@ func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
 		action string
 		want   string
 	}{
-		{action: "enable", want: "Enable-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
-		{action: "status", want: "Get-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
-		{action: "start", want: "Start-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
-		{action: "stop", want: "Stop-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
-		{action: "restart", want: "Stop-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
-		{action: "disable", want: "Disable-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default "},
+		{action: "enable", want: "Enable-ScheduledTask -TaskName $taskName"},
+		{action: "status", want: "ResolvedLegacyTaskName"},
+		{action: "start", want: "Start-ScheduledTask -TaskName $taskName"},
+		{action: "stop", want: "Stop-ScheduledTask -TaskName $taskName"},
+		{action: "restart", want: "Stop-ScheduledTask -TaskName $taskName"},
+		{action: "disable", want: "Disable-ScheduledTask -TaskName $taskName"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.action, func(t *testing.T) {
@@ -1160,13 +1168,13 @@ func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
 			if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" {
 				t.Fatalf("service %s calls = %#v, want one powershell.exe call", tt.action, runner.calls)
 			}
-			if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, tt.want) {
+			if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, tt.want) || !strings.Contains(joined, "$legacyPrefix") {
 				t.Fatalf("service %s command missing %q:\n%s", tt.action, tt.want, joined)
 			} else if tt.action == "restart" {
 				requireSubstringsInOrder(t, joined,
-					"Stop-ScheduledTask -TaskName",
+					"Stop-ScheduledTask -TaskName $taskName",
 					"-ErrorAction SilentlyContinue",
-					"Start-ScheduledTask -TaskName",
+					"Start-ScheduledTask -TaskName $taskName",
 				)
 			}
 		})
@@ -1208,7 +1216,7 @@ func TestTeamsBackgroundKeepaliveWSLInstalledActiveProbeUsesTaskSchedulerCI(t *t
 	}
 	for i, call := range runner.calls {
 		joined := strings.Join(call.args, " ")
-		if !strings.Contains(joined, "Get-ScheduledTask -TaskName 'Codex Helper Teams Bridge (WSL Ubuntu alice default ") {
+		if !strings.Contains(joined, "Get-ScheduledTask -TaskName $taskName") || !strings.Contains(joined, "$legacyPrefix") {
 			t.Fatalf("WSL probe command missing task lookup:\n%s", joined)
 		}
 		if strings.Contains(joined, "Register-ScheduledTask") || strings.Contains(joined, "systemctl") {

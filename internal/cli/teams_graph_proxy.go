@@ -45,23 +45,13 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	if err != nil {
 		return teamsGraphHTTPClientLease{}, fmt.Errorf("Teams Graph proxy is enabled but no unambiguous proxy profile is configured: %w", err)
 	}
-	hc := manager.HealthClient{Timeout: time.Second}
-	if inst := manager.FindReusableInstance(cfg.Instances, profile.ID, hc); inst != nil {
-		proxyURL := fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)
-		client, err := newTeamsProxyHTTPClient(proxyURL)
-		if err != nil {
-			return teamsGraphHTTPClientLease{}, err
-		}
-		return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-reuse"}, nil
+	hc := manager.HealthClient{Timeout: 3 * time.Second}
+	if lease, ok, err := reusableTeamsGraphProxyLease(cfg, profile.ID, hc); ok || err != nil {
+		return lease, err
 	}
 	if fresh, err := store.Load(); err == nil {
-		if inst := manager.FindReusableInstance(fresh.Instances, profile.ID, hc); inst != nil {
-			proxyURL := fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)
-			client, err := newTeamsProxyHTTPClient(proxyURL)
-			if err != nil {
-				return teamsGraphHTTPClientLease{}, err
-			}
-			return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-reuse"}, nil
+		if lease, ok, err := reusableTeamsGraphProxyLease(fresh, profile.ID, hc); ok || err != nil {
+			return lease, err
 		}
 	}
 	instanceID, err := ids.New()
@@ -70,6 +60,14 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	}
 	st, err := stackStart(profile, instanceID, stack.Options{})
 	if err != nil {
+		// A reusable proxy can become healthy while we are trying to start a
+		// fallback stack, especially on loaded machines. Re-check once before
+		// surfacing the fallback start error.
+		if fresh, loadErr := store.Load(); loadErr == nil {
+			if lease, ok, leaseErr := reusableTeamsGraphProxyLease(fresh, profile.ID, hc); ok || leaseErr != nil {
+				return lease, leaseErr
+			}
+		}
 		return teamsGraphHTTPClientLease{}, fmt.Errorf("start Teams Graph proxy stack: %w", err)
 	}
 	proxyURL := st.HTTPProxyURL()
@@ -84,6 +82,19 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-stack", close: st.Close}, nil
 }
 
+func reusableTeamsGraphProxyLease(cfg config.Config, profileID string, hc manager.HealthClient) (teamsGraphHTTPClientLease, bool, error) {
+	inst := manager.FindReusableInstance(cfg.Instances, profileID, hc)
+	if inst == nil {
+		return teamsGraphHTTPClientLease{}, false, nil
+	}
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)
+	client, err := newTeamsProxyHTTPClient(proxyURL)
+	if err != nil {
+		return teamsGraphHTTPClientLease{}, false, err
+	}
+	return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-reuse"}, true, nil
+}
+
 func teamsGraphProxyEnabled(cfg config.Config) bool {
 	if cfg.ProxyEnabled != nil {
 		return *cfg.ProxyEnabled
@@ -93,16 +104,8 @@ func teamsGraphProxyEnabled(cfg config.Config) bool {
 
 func newTeamsDirectHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			Proxy: nil,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
-		},
+		Timeout:   30 * time.Second,
+		Transport: newTeamsHTTPTransport(nil),
 	}
 }
 
@@ -112,15 +115,23 @@ func newTeamsProxyHTTPClient(proxyURL string) (*http.Client, error) {
 		return nil, err
 	}
 	return &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(parsed),
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
-		},
+		Timeout:   30 * time.Second,
+		Transport: newTeamsHTTPTransport(http.ProxyURL(parsed)),
 	}, nil
+}
+
+func newTeamsHTTPTransport(proxy func(*http.Request) (*url.URL, error)) *http.Transport {
+	return &http.Transport{
+		Proxy: proxy,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -525,7 +526,7 @@ func (a nonInteractiveAuth) AccessToken(ctx context.Context, out io.Writer, forc
 	}
 	refreshed, err := a.refreshCachedToken(ctx, tok)
 	if err != nil {
-		return "", fmt.Errorf("%s token refresh failed: %w; run `%s` locally", a.displayAction(), err, a.loginInstruction())
+		return "", a.tokenRefreshError(err)
 	}
 	return refreshed.AccessToken, nil
 }
@@ -543,9 +544,20 @@ func (a nonInteractiveAuth) RefreshAccessToken(ctx context.Context) (string, err
 	}
 	refreshed, err := a.refreshCachedToken(ctx, tok)
 	if err != nil {
-		return "", fmt.Errorf("%s token refresh failed: %w; run `%s` locally", a.displayAction(), err, a.loginInstruction())
+		return "", a.tokenRefreshError(err)
 	}
 	return refreshed.AccessToken, nil
+}
+
+func (a nonInteractiveAuth) tokenRefreshError(err error) error {
+	if isTemporaryOAuthError(err) {
+		return &TemporaryAuthError{
+			Action:       a.displayAction(),
+			Err:          err,
+			LoginCommand: a.loginInstruction(),
+		}
+	}
+	return fmt.Errorf("%s token refresh failed: %w; run `%s` locally", a.displayAction(), err, a.loginInstruction())
 }
 
 func (a nonInteractiveAuth) reauthRequiredError(reason string) error {
@@ -606,6 +618,13 @@ func (a *AuthManager) AccessToken(ctx context.Context, out io.Writer, forceLogin
 				return "", err
 			}
 			if refreshFailed != nil {
+				if isTemporaryOAuthError(refreshFailed) {
+					return "", &TemporaryAuthError{
+						Action:       "Teams chat access",
+						Err:          refreshFailed,
+						LoginCommand: loginCommand,
+					}
+				}
 				return "", fmt.Errorf("Teams chat access token refresh failed: %w; run `%s` in a foreground terminal", refreshFailed, loginCommand)
 			}
 			return "", fmt.Errorf("Teams chat access auth cache is expired and has no refresh token; run `%s` in a foreground terminal before starting the service", loginCommand)
@@ -744,6 +763,94 @@ func (e oauthError) Error() string {
 	return e.Code
 }
 
+type oauthHTTPStatusError struct {
+	Endpoint   string
+	StatusCode int
+	Status     string
+}
+
+func (e oauthHTTPStatusError) Error() string {
+	status := strings.TrimSpace(e.Status)
+	if status == "" {
+		status = http.StatusText(e.StatusCode)
+	}
+	if status == "" {
+		status = fmt.Sprintf("HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("oauth %s failed: %s", e.Endpoint, status)
+}
+
+// TemporaryAuthError marks auth refresh failures that are normally caused by
+// transient network/proxy/identity-provider availability. These should not
+// tell a background service user to re-auth immediately; the bridge can retry.
+type TemporaryAuthError struct {
+	Action       string
+	Err          error
+	LoginCommand string
+}
+
+func (e *TemporaryAuthError) Error() string {
+	action := strings.TrimSpace(e.Action)
+	if action == "" {
+		action = "Teams auth"
+	}
+	return fmt.Sprintf("%s token refresh temporarily failed: %v; will retry automatically; check network/proxy if this persists", action, e.Err)
+}
+
+func (e *TemporaryAuthError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func IsTemporaryAuthError(err error) bool {
+	var temporary *TemporaryAuthError
+	return errors.As(err, &temporary)
+}
+
+func isTemporaryOAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var status oauthHTTPStatusError
+	if errors.As(err, &status) {
+		switch status.StatusCode {
+		case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	for _, token := range []string{
+		"bad gateway",
+		"gateway timeout",
+		"service unavailable",
+		"too many requests",
+		"timeout",
+		"connection refused",
+		"connection reset",
+		"network is unreachable",
+		"no such host",
+		"proxyconnect",
+		"tls handshake timeout",
+		"unexpected eof",
+	} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *AuthManager) form(ctx context.Context, endpoint string, values url.Values, out any) error {
 	body := strings.NewReader(values.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.authorityURL(endpoint), body)
@@ -768,7 +875,7 @@ func (a *AuthManager) form(ctx context.Context, endpoint string, values url.Valu
 		if json.Unmarshal(data, &payload) == nil && payload.Error != "" {
 			return oauthError{Code: payload.Error, Description: payload.ErrorDescription}
 		}
-		return fmt.Errorf("oauth %s failed: HTTP %d", endpoint, resp.StatusCode)
+		return oauthHTTPStatusError{Endpoint: endpoint, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return err

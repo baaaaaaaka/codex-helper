@@ -1038,6 +1038,7 @@ func (b teamsServiceWSLWindowsTaskBackend) Repair(ctx context.Context, spec team
 		Start:           opts.Start,
 		PreserveEnabled: !opts.Enable,
 		PreserveRunning: !opts.Start,
+		CleanLegacy:     true,
 	})
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
@@ -1056,6 +1057,7 @@ func (b teamsServiceWSLWindowsTaskBackend) RepairElevated(ctx context.Context, s
 		PreserveEnabled: !opts.Enable,
 		PreserveRunning: !opts.Start,
 		PrincipalUser:   principalUser,
+		CleanLegacy:     true,
 	})
 	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLElevatedCommand(cmd)); err != nil {
 		return "", err
@@ -1119,14 +1121,14 @@ func (b teamsServiceWSLWindowsTaskBackend) Uninstall(ctx context.Context) (strin
 }
 
 func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action string) ([]byte, error) {
-	task := powershellSingleQuote(b.Name())
+	resolve := teamsServiceWSLResolveTaskPowerShell(b.Name())
 	switch action {
 	case "enable":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolve+"Enable-ScheduledTask -TaskName $taskName | Out-Null")
 	case "disable":
-		return teamsServiceRunPowerShell(ctx, "Disable-ScheduledTask -TaskName "+task+" | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolve+"Disable-ScheduledTask -TaskName $taskName | Out-Null")
 	case "status":
-		data, err := teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+" -ErrorAction Stop; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
+		data, err := teamsServiceRunPowerShell(ctx, resolve+"$info = Get-ScheduledTaskInfo -TaskName $taskName; if ($task.TaskName -ne "+powershellSingleQuote(b.Name())+") { 'ResolvedLegacyTaskName : ' + $task.TaskName }; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
 		if err == nil {
 			return data, nil
 		}
@@ -1136,18 +1138,18 @@ func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action strin
 		}
 		return data, err
 	case "start":
-		return teamsServiceRunPowerShell(ctx, "Start-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, resolve+"Start-ScheduledTask -TaskName $taskName")
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName")
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName $taskName")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for WSL Task Scheduler: %s", action)
 	}
 }
 
 func (b teamsServiceWSLWindowsTaskBackend) Installed() (bool, error) {
-	_, err := teamsServiceRunPowerShell(context.Background(), "Get-ScheduledTask -TaskName "+powershellSingleQuote(b.Name())+" -ErrorAction Stop | Out-Null")
+	_, err := teamsServiceRunPowerShell(context.Background(), teamsServiceWSLResolveTaskPowerShell(b.Name())+"$task | Out-Null")
 	if err != nil {
 		return false, nil
 	}
@@ -1155,7 +1157,7 @@ func (b teamsServiceWSLWindowsTaskBackend) Installed() (bool, error) {
 }
 
 func (b teamsServiceWSLWindowsTaskBackend) Active(ctx context.Context) (bool, error) {
-	_, err := teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+powershellSingleQuote(b.Name())+"; if ($task.State -ne 'Running') { exit 3 }")
+	_, err := teamsServiceRunPowerShell(ctx, teamsServiceWSLResolveTaskPowerShell(b.Name())+"if ($task.State -ne 'Running') { exit 3 }")
 	if err != nil {
 		return false, nil
 	}
@@ -1387,7 +1389,7 @@ func teamsServiceEnvironment() map[string]string {
 }
 
 func teamsServiceShouldDropProxyEnv(name string, value string) bool {
-	if !teamsServiceProxyEnvName(name) || teamsServiceKeepLocalProxyEnv() {
+	if !teamsServiceProxyEnvName(name) || !teamsServiceDropLocalProxyEnv() {
 		return false
 	}
 	return teamsServiceProxyIsLoopback(value)
@@ -1403,7 +1405,15 @@ func teamsServiceProxyEnvName(name string) bool {
 }
 
 func teamsServiceKeepLocalProxyEnv() bool {
+	return !teamsServiceDropLocalProxyEnv()
+}
+
+func teamsServiceDropLocalProxyEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_KEEP_LOCAL_PROXY"))) {
+	case "1", "true", "yes", "on":
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_DROP_LOCAL_PROXY"))) {
 	case "1", "true", "yes", "on":
 		return true
 	default:
@@ -1629,6 +1639,7 @@ type teamsServiceWSLRegisterOptions struct {
 	PreserveEnabled bool
 	PreserveRunning bool
 	PrincipalUser   string
+	CleanLegacy     bool
 }
 
 func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts teamsServiceWSLRegisterOptions) string {
@@ -1638,17 +1649,23 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 	if strings.TrimSpace(opts.PrincipalUser) != "" {
 		principalUser = powershellSingleQuote(strings.TrimSpace(opts.PrincipalUser))
 	}
-	cmd := "$taskName = " + task + "; " +
+	cmd := "$taskName = " + task + "; "
+	if opts.CleanLegacy {
+		prefix := teamsServiceWSLTaskNamePrefix(taskName)
+		cmd += "$legacyPrefix = " + powershellSingleQuote(prefix) + "; " +
+			"Get-ScheduledTask | Where-Object { $_.TaskName -like ($legacyPrefix + '*') -and $_.TaskName -ne $taskName } | ForEach-Object { Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue }; "
+	}
+	cmd +=
 		"$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
-		"$wasEnabled = $false; $wasRunning = $false; " +
-		"if ($null -ne $existing) { $wasEnabled = $existing.State -ne 'Disabled'; $wasRunning = $existing.State -eq 'Running' }; " +
-		"$action = New-ScheduledTaskAction -Execute " + powershellSingleQuote(actionExecute) + " -Argument " + powershellSingleQuote(actionArgument) + "; " +
-		"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
-		"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWatchdogMinutes) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
-		"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
-		"$principalUser = " + principalUser + "; " +
-		"$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited; " +
-		"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force | Out-Null; "
+			"$wasEnabled = $false; $wasRunning = $false; " +
+			"if ($null -ne $existing) { $wasEnabled = $existing.State -ne 'Disabled'; $wasRunning = $existing.State -eq 'Running' }; " +
+			"$action = New-ScheduledTaskAction -Execute " + powershellSingleQuote(actionExecute) + " -Argument " + powershellSingleQuote(actionArgument) + "; " +
+			"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
+			"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWatchdogMinutes) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
+			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
+			"$principalUser = " + principalUser + "; " +
+			"$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited; " +
+			"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force | Out-Null; "
 	switch {
 	case opts.ForceDisabled:
 		cmd += "Disable-ScheduledTask -TaskName $taskName | Out-Null; "
@@ -1679,6 +1696,31 @@ func buildTeamsServiceWSLTaskAction(args []string) (string, string) {
 		command,
 	})
 	return "powershell.exe", arguments
+}
+
+func teamsServiceWSLTaskNamePrefix(taskName string) string {
+	taskName = strings.TrimSpace(taskName)
+	idx := strings.LastIndex(taskName, " ")
+	if idx < 0 {
+		return taskName
+	}
+	return taskName[:idx+1]
+}
+
+func teamsServiceWSLResolveTaskPowerShell(taskName string) string {
+	prefix := teamsServiceWSLTaskNamePrefix(taskName)
+	return "$taskName = " + powershellSingleQuote(taskName) + "; " +
+		"$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
+		"if ($null -eq $task) { " +
+		"$legacyPrefix = " + powershellSingleQuote(prefix) + "; " +
+		"$matches = @(Get-ScheduledTask | Where-Object { $_.TaskName -like ($legacyPrefix + '*') } | Sort-Object TaskName); " +
+		"if ($matches.Count -gt 0) { " +
+		"$running = @($matches | Where-Object { $_.State -eq 'Running' }); " +
+		"if ($running.Count -gt 0) { $task = $running[0] } else { $task = $matches[0] }; " +
+		"$taskName = $task.TaskName " +
+		"} " +
+		"}; " +
+		"if ($null -eq $task) { throw ('Teams WSL Scheduled Task not found: ' + $taskName) }; "
 }
 
 func buildTeamsServiceWSLElevatedCommand(command string) string {
@@ -1841,9 +1883,7 @@ func teamsServiceWSLTaskIdentity() teamsServiceWSLTaskIdentityInfo {
 		profile = "default"
 	}
 	machineID := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_MACHINE_ID"))
-	configPath := strings.TrimSpace(os.Getenv("CODEX_HELPER_CONFIG"))
-	codexHome := strings.TrimSpace(firstNonEmptyTeamsServiceString(os.Getenv("CODEX_HOME"), os.Getenv("CODEX_DIR")))
-	raw := strings.Join([]string{distro, linuxUser, profile, machineID, configPath, codexHome}, "\x00")
+	raw := strings.Join([]string{distro, linuxUser, profile, machineID}, "\x00")
 	sum := sha256.Sum256([]byte(raw))
 	displayParts := []string{
 		safeWindowsTaskNamePart(distro, 28),

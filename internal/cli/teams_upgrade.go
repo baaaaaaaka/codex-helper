@@ -60,7 +60,7 @@ func ensureTeamsIdleBeforeCodexUpgrade(ctx context.Context) error {
 	return nil
 }
 
-func prepareTeamsForHelperUpgrade(ctx context.Context, out io.Writer, timeout time.Duration) (teamsUpgradeFinalizer, error) {
+func prepareTeamsForHelperUpgrade(ctx context.Context, out io.Writer, timeout time.Duration, registryPath *string) (teamsUpgradeFinalizer, error) {
 	paths, err := existingTeamsStorePaths()
 	if err != nil {
 		return nil, err
@@ -71,7 +71,7 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, out io.Writer, timeout ti
 	}
 	if len(paths) == 0 {
 		if serviceWasActive {
-			return stopTeamsServiceForHelperUpgrade(ctx, out, nil)
+			return stopTeamsServiceForHelperUpgrade(ctx, out, nil, registryPath)
 		}
 		return nil, nil
 	}
@@ -108,7 +108,7 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, out io.Writer, timeout ti
 	}
 	if len(stores) == 0 {
 		if serviceWasActive {
-			return stopTeamsServiceForHelperUpgrade(ctx, out, nil)
+			return stopTeamsServiceForHelperUpgrade(ctx, out, nil, registryPath)
 		}
 		return nil, nil
 	}
@@ -160,7 +160,7 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, out io.Writer, timeout ti
 				}
 			}
 			if serviceWasActive {
-				restart, err := stopTeamsServiceForHelperUpgrade(ctx, out, finish)
+				restart, err := stopTeamsServiceForHelperUpgrade(ctx, out, finish, registryPath)
 				if err != nil {
 					_ = finish(context.Background(), false)
 					return nil, err
@@ -183,7 +183,7 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, out io.Writer, timeout ti
 	}
 }
 
-func stopTeamsServiceForHelperUpgrade(ctx context.Context, out io.Writer, beforeRestart func(context.Context, bool) error) (teamsUpgradeFinalizer, error) {
+func stopTeamsServiceForHelperUpgrade(ctx context.Context, out io.Writer, beforeRestart func(context.Context, bool) error, registryPath *string) (teamsUpgradeFinalizer, error) {
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "Stopping Teams service before upgrade...")
 	}
@@ -198,6 +198,14 @@ func stopTeamsServiceForHelperUpgrade(ctx context.Context, out io.Writer, before
 		}
 		if opts.ServiceRestart == teamsUpgradeRestartNone {
 			return nil
+		}
+		if opts.Success {
+			if out != nil {
+				_, _ = fmt.Fprintln(out, "Refreshing Teams service config before restart...")
+			}
+			if _, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false}); err != nil {
+				return err
+			}
 		}
 		if opts.ServiceRestart == teamsUpgradeRestartDelayed {
 			if out != nil {
@@ -231,7 +239,7 @@ func defaultTeamsServiceStartDetached(_ context.Context, name string, args ...st
 
 func delayedTeamsServiceStartCommand(backend teamsServiceBackend) (string, []string, error) {
 	if backend.ID() == "wsl-windows-task-scheduler" {
-		command := "Start-Sleep -Seconds 3; Start-ScheduledTask -TaskName " + powershellSingleQuote(backend.Name())
+		command := "Start-Sleep -Seconds 3; " + teamsServiceWSLResolveTaskPowerShell(backend.Name()) + "Start-ScheduledTask -TaskName $taskName"
 		return teamsServicePowerShellExecutable(), []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}, nil
 	}
 	switch teamsServiceGOOS() {

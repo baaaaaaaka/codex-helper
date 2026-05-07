@@ -22,6 +22,67 @@ func TestHealthClient_CheckHTTPProxy(t *testing.T) {
 	}
 }
 
+func TestHealthClient_CheckHTTPProxyUsesOneShotConnection(t *testing.T) {
+	closeCh := make(chan struct{}, 1)
+	requestCloseCh := make(chan bool, 1)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_codex_proxy/health", func(w http.ResponseWriter, r *http.Request) {
+		requestCloseCh <- r.Close
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":         true,
+			"instanceId": "inst-one-shot",
+		})
+	})
+	srv := &http.Server{
+		Handler: mux,
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				select {
+				case closeCh <- struct{}{}:
+				default:
+				}
+			}
+		},
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() {
+		_ = srv.Shutdown(context.Background())
+		_ = ln.Close()
+	}()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	tcp, err := net.ResolveTCPAddr("tcp", "127.0.0.1:"+portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	hc := HealthClient{Timeout: 1 * time.Second}
+	if err := hc.CheckHTTPProxy(tcp.Port, "inst-one-shot"); err != nil {
+		t.Fatalf("CheckHTTPProxy: %v", err)
+	}
+
+	select {
+	case got := <-requestCloseCh:
+		if !got {
+			t.Fatalf("health request did not ask the proxy server to close the connection")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("health request was not observed")
+	}
+
+	select {
+	case <-closeCh:
+	case <-time.After(time.Second):
+		t.Fatalf("health check connection remained open after the one-shot probe")
+	}
+}
+
 func startHealthOnlyServer(t *testing.T, instanceID string) (port int, closeFn func()) {
 	t.Helper()
 

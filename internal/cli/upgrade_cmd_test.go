@@ -394,6 +394,7 @@ func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) 
 		unitDir: unitDir,
 		runner:  runner,
 	})
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:38471")
 
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
@@ -438,8 +439,17 @@ func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) 
 	if !teamsServiceCallSeen(runner.calls, "is-active") || !teamsServiceCallSeen(runner.calls, "stop") || !teamsServiceCallSeen(runner.calls, "start") {
 		t.Fatalf("expected is-active, stop, and start calls, got %#v", runner.calls)
 	}
-	if !strings.Contains(out.String(), "Stopping Teams service before upgrade") || !strings.Contains(out.String(), "Restarting Teams service after upgrade") {
+	if !strings.Contains(out.String(), "Stopping Teams service before upgrade") ||
+		!strings.Contains(out.String(), "Refreshing Teams service config before restart") ||
+		!strings.Contains(out.String(), "Restarting Teams service after upgrade") {
 		t.Fatalf("upgrade output missing service restart messages:\n%s", out.String())
+	}
+	unit, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read refreshed unit: %v", err)
+	}
+	if !strings.Contains(string(unit), "Environment=HTTP_PROXY=http://127.0.0.1:38471") {
+		t.Fatalf("upgrade should refresh Teams service env with current proxy, unit:\n%s", string(unit))
 	}
 }
 

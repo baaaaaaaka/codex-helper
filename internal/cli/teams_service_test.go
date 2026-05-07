@@ -299,7 +299,29 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceEnvironmentDropsLoopbackProxyByDefault(t *testing.T) {
+func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:38471")
+	t.Setenv("HTTPS_PROXY", "http://localhost:38471")
+	t.Setenv("ALL_PROXY", "socks5://[::1]:38471")
+	t.Setenv("http_proxy", "http://127.0.0.1:38471")
+	t.Setenv("https_proxy", "http://localhost:38471")
+	t.Setenv("all_proxy", "socks5://[::1]:38471")
+	t.Setenv("NO_PROXY", "localhost,127.0.0.1,::1")
+	t.Setenv("no_proxy", "localhost,127.0.0.1,::1")
+
+	env := teamsServiceEnvironment()
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		if value := env[name]; value == "" {
+			t.Fatalf("%s should be preserved for the background service, got %#v", name, env)
+		}
+	}
+	if env["NO_PROXY"] == "" || env["no_proxy"] == "" {
+		t.Fatalf("NO_PROXY values should be preserved, got %#v", env)
+	}
+}
+
+func TestTeamsServiceEnvironmentCanDropLoopbackProxyWhenExplicit(t *testing.T) {
+	t.Setenv("CODEX_HELPER_TEAMS_DROP_LOCAL_PROXY", "1")
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:38471")
 	t.Setenv("HTTPS_PROXY", "http://localhost:38471")
 	t.Setenv("ALL_PROXY", "socks5://[::1]:38471")
@@ -321,12 +343,48 @@ func TestTeamsServiceEnvironmentDropsLoopbackProxyByDefault(t *testing.T) {
 }
 
 func TestTeamsServiceEnvironmentCanKeepLoopbackProxyWhenExplicit(t *testing.T) {
+	t.Setenv("CODEX_HELPER_TEAMS_DROP_LOCAL_PROXY", "1")
 	t.Setenv("CODEX_HELPER_TEAMS_KEEP_LOCAL_PROXY", "1")
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:38471")
 
 	env := teamsServiceEnvironment()
 	if got := env["HTTPS_PROXY"]; got != "http://127.0.0.1:38471" {
 		t.Fatalf("HTTPS_PROXY = %q, want explicit loopback proxy preserved", got)
+	}
+}
+
+func TestTeamsServiceWSLTaskIdentityStableAcrossWorkingConfigAndCodexHome(t *testing.T) {
+	lockCLITestHooks(t)
+
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:         "linux",
+		isWSL:        true,
+		wslDistro:    "Debian",
+		wslLinuxUser: "baka",
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "default")
+	t.Setenv("CODEX_HELPER_TEAMS_MACHINE_ID", "")
+	t.Setenv("CODEX_HELPER_CONFIG", "/home/baka/project/a/config.json")
+	t.Setenv("CODEX_HOME", "/home/baka/project/a/.codex")
+	first := teamsServiceWSLTaskIdentity()
+
+	t.Setenv("CODEX_HELPER_CONFIG", "/home/baka/project/b/config.json")
+	t.Setenv("CODEX_HOME", "/home/baka/project/b/.codex")
+	second := teamsServiceWSLTaskIdentity()
+
+	if first.Suffix != second.Suffix || first.Display != second.Display {
+		t.Fatalf("WSL task identity changed across cwd/config/codex home: first=%#v second=%#v", first, second)
+	}
+	if !strings.Contains(first.Display, "Debian baka default") {
+		t.Fatalf("display = %q, want distro/user/profile", first.Display)
+	}
+}
+
+func TestTeamsServiceWSLTaskNamePrefixIncludesTrailingSpaceBeforeSuffix(t *testing.T) {
+	got := teamsServiceWSLTaskNamePrefix("Codex Helper Teams Bridge (WSL Debian baka default bd54a914bb9b)")
+	want := "Codex Helper Teams Bridge (WSL Debian baka default "
+	if got != want {
+		t.Fatalf("prefix = %q, want %q", got, want)
 	}
 }
 

@@ -42,7 +42,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				}
 			}
 
-			finishTeams, err := prepareTeamsForHelperUpgrade(ctx, cmd.OutOrStdout(), teamsDrainTimeout)
+			finishTeams, err := prepareTeamsForHelperUpgrade(ctx, cmd.OutOrStdout(), teamsDrainTimeout, nil)
 			if err != nil {
 				return err
 			}

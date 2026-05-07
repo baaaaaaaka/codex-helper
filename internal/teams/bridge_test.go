@@ -7688,6 +7688,33 @@ func TestBridgePollChatReadRateLimitBlocksOnlyThatChat(t *testing.T) {
 	}
 }
 
+func TestBridgeTemporaryAuthPollErrorUsesLongerBackoffAndLogThrottle(t *testing.T) {
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	err := &TemporaryAuthError{
+		Action:       "Teams message read",
+		Err:          fmt.Errorf("Post token: Bad Gateway"),
+		LoginCommand: "codex-proxy teams auth full",
+	}
+	blocked := inboundPollBlockedUntil(teamstore.ChatPollState{FailureCount: 4}, err, now)
+	if blocked.Before(now.Add(2*time.Minute)) || blocked.After(now.Add(5*time.Minute)) {
+		t.Fatalf("temporary auth blocked until = %s, want between 2m and 5m after %s", blocked, now)
+	}
+
+	bridge := &Bridge{}
+	if !bridge.shouldLogPollError(err, now) {
+		t.Fatal("first temporary auth error should be logged")
+	}
+	if bridge.shouldLogPollError(err, now.Add(5*time.Minute)) {
+		t.Fatal("repeated temporary auth error should be throttled")
+	}
+	if !bridge.shouldLogPollError(err, now.Add(31*time.Minute)) {
+		t.Fatal("repeated temporary auth error should log after throttle window")
+	}
+	if !bridge.shouldLogPollError(fmt.Errorf("different poll error"), now.Add(32*time.Minute)) {
+		t.Fatal("different poll error should log immediately")
+	}
+}
+
 func TestBridgePollOnceContinuesOtherDueChatsAfterReadRateLimit(t *testing.T) {
 	now := time.Now()
 	requestsByChat := map[string]int{}

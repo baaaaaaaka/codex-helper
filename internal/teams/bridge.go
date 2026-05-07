@@ -185,6 +185,8 @@ type Bridge struct {
 	ownerHeartbeatInterval     time.Duration
 	pollMu                     sync.Mutex
 	fastPollUntil              time.Time
+	lastPollErrorLog           string
+	lastPollErrorLogAt         time.Time
 	lastTranscriptSync         time.Time
 	maxWorkChatPollsPerCycle   int
 	dashboardProjectsMu        sync.Mutex
@@ -514,7 +516,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		if err := b.pollOnce(ctx, opts.Top); err != nil {
 			if b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", err)
+				if b.shouldLogPollError(err, time.Now()) {
+					_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", err)
+				}
 			}
 		}
 		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
@@ -901,10 +905,42 @@ func inboundPollBlockedUntil(poll teamstore.ChatPollState, err error, now time.T
 		failures = 5
 	}
 	delay := time.Duration(1<<uint(failures-1)) * 5 * time.Second
+	if IsTemporaryAuthError(err) {
+		delay = time.Duration(1<<uint(failures-1)) * 15 * time.Second
+		if delay > 5*time.Minute {
+			delay = 5 * time.Minute
+		}
+		return now.Add(delay)
+	}
 	if delay > 2*time.Minute {
 		delay = 2 * time.Minute
 	}
 	return now.Add(delay)
+}
+
+func (b *Bridge) shouldLogPollError(err error, now time.Time) bool {
+	if err == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	text := strings.TrimSpace(err.Error())
+	if text == "" {
+		return false
+	}
+	minInterval := 5 * time.Minute
+	if IsTemporaryAuthError(err) {
+		minInterval = 30 * time.Minute
+	}
+	b.pollMu.Lock()
+	defer b.pollMu.Unlock()
+	if text == b.lastPollErrorLog && now.Sub(b.lastPollErrorLogAt) < minInterval {
+		return false
+	}
+	b.lastPollErrorLog = text
+	b.lastPollErrorLogAt = now
+	return true
 }
 
 func runningPollSessions(state teamstore.State) map[string]bool {

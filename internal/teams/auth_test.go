@@ -252,6 +252,76 @@ func TestNonInteractiveAuthRejectsExpiredAccessTokenWithoutRefresh(t *testing.T)
 	}
 }
 
+func TestNonInteractiveAuthTreatsRefreshBadGatewayAsTemporary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "teams-full-token.json")
+	if err := writeTokenCache(path, TokenCache{
+		AccessToken:  "expired-access",
+		RefreshToken: "refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("write token cache: %v", err)
+	}
+	auth := nonInteractiveAuth{
+		AuthManager: NewAuthManager(AuthConfig{
+			TenantID:  "tenant",
+			ClientID:  "client",
+			Scopes:    defaultFullScopes,
+			CachePath: path,
+		}),
+		action:       "Teams message read",
+		loginCommand: "codex-proxy teams auth full",
+	}
+	auth.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusBadGateway, `Bad Gateway`), nil
+	})}
+
+	_, err := auth.AccessToken(context.Background(), nil, false)
+	if err == nil {
+		t.Fatal("expected temporary refresh error")
+	}
+	if !IsTemporaryAuthError(err) {
+		t.Fatalf("expected temporary auth error, got %T %v", err, err)
+	}
+	if strings.Contains(err.Error(), "run `codex-proxy teams auth full` locally") {
+		t.Fatalf("temporary network/proxy errors should not ask for immediate reauth: %v", err)
+	}
+	if !strings.Contains(err.Error(), "will retry automatically") {
+		t.Fatalf("temporary error should describe automatic retry: %v", err)
+	}
+}
+
+func TestServiceAuthTreatsRefreshBadGatewayAsTemporary(t *testing.T) {
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	path := filepath.Join(t.TempDir(), "teams-full-token.json")
+	if err := writeTokenCache(path, TokenCache{
+		AccessToken:  "expired-access",
+		RefreshToken: "refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("write token cache: %v", err)
+	}
+	auth := NewAuthManager(AuthConfig{
+		TenantID:  "tenant",
+		ClientID:  "client",
+		Scopes:    defaultFullScopes,
+		CachePath: path,
+	})
+	auth.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusBadGateway, `Bad Gateway`), nil
+	})}
+
+	_, err := auth.AccessToken(context.Background(), nil, false)
+	if err == nil {
+		t.Fatal("expected temporary refresh error")
+	}
+	if !IsTemporaryAuthError(err) {
+		t.Fatalf("expected temporary auth error, got %T %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "will retry automatically") {
+		t.Fatalf("temporary error should describe automatic retry: %v", err)
+	}
+}
+
 func TestNonInteractiveAuthUsesValidCachedAccessToken(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "teams-token.json")
 	if err := writeTokenCache(path, TokenCache{
