@@ -215,6 +215,9 @@ func runTeamsCodexDirect(
 		if cleanup != nil {
 			defer cleanup()
 		}
+		if err := requireYoloLaunchArgs(resolvedCmd, opts); err != nil {
+			return err
+		}
 	}
 	opts.UseProxy = false
 	opts.Stdout = stdout

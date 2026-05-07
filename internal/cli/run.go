@@ -29,6 +29,7 @@ var stackStart = stack.Start
 
 var (
 	runWithProfileFn                   = runWithProfile
+	runWithProfileOptionsFn            = runWithProfileOptions
 	runTargetWithFallbackWithOptionsFn = runTargetWithFallbackWithOptions
 	runTargetCommand                   = exec.Command
 	ensureProxyPreferenceRunFn         = ensureProxyPreference
@@ -46,6 +47,7 @@ func newRunCmd(root *rootOptions) *cobra.Command {
 			return runLike(cmd, root, true)
 		},
 	}
+	cmd.Flags().Bool("yolo", false, "Launch Codex with helper-managed yolo mode")
 	return cmd
 }
 
@@ -70,6 +72,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	if len(after) == 0 {
 		after = []string{"codex"}
 	}
+	runOpts := runTargetOptionsFromRunFlags(cmd)
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -91,6 +94,10 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			}
 			cfg.ProxyEnabled = &enabled
 		}
+		if runOpts.YoloEnabled {
+			runOpts.Log = cmd.ErrOrStderr()
+			return runWithProfileOptionsFn(ctx, store, profile, cfg.Instances, after, runOpts)
+		}
 		return runWithProfileFn(ctx, store, profile, cfg.Instances, after)
 	}
 
@@ -110,6 +117,10 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			}
 			cfgWithProfile.ProxyEnabled = &enabled
 		}
+		if runOpts.YoloEnabled {
+			runOpts.Log = cmd.ErrOrStderr()
+			return runWithProfileOptionsFn(ctx, store, profile, cfgWithProfile.Instances, after, runOpts)
+		}
 		return runWithProfileFn(ctx, store, profile, cfgWithProfile.Instances, after)
 	}
 
@@ -119,7 +130,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		return err
 	}
 
-	opts := defaultRunTargetOptions()
+	opts := runOpts
 	opts.UseProxy = false
 	opts.Log = log
 	if isCodexCommand(resolvedCmd[0]) {
@@ -129,8 +140,29 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		}
 		opts.ExtraEnv = append(opts.ExtraEnv, extraEnv...)
 		opts.ExecIdentity = execIdentity
+		var cleanup func()
+		resolvedCmd, cleanup = prepareYoloCodexCommandForRun(store, resolvedCmd, &opts)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if err := requireYoloLaunchArgs(resolvedCmd, opts); err != nil {
+			return err
+		}
 	}
 	return runTargetWithFallbackWithOptionsFn(ctx, resolvedCmd, "", nil, nil, opts)
+}
+
+func runTargetOptionsFromRunFlags(cmd *cobra.Command) runTargetOptions {
+	opts := defaultRunTargetOptions()
+	if cmd == nil {
+		return opts
+	}
+	yolo, err := cmd.Flags().GetBool("yolo")
+	if err == nil && yolo {
+		opts.YoloEnabled = true
+		opts.RequireYolo = true
+	}
+	return opts
 }
 
 func selectProfile(cfg config.Config, ref string) (config.Profile, error) {
@@ -181,6 +213,9 @@ func runWithExistingInstanceOptions(
 		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
 		if cleanup != nil {
 			defer cleanup()
+		}
+		if err := requireYoloLaunchArgs(cmdArgs, opts); err != nil {
+			return err
 		}
 	}
 
@@ -235,6 +270,9 @@ func runWithNewStackOptions(
 		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
 		if cleanup != nil {
 			defer cleanup()
+		}
+		if err := requireYoloLaunchArgs(cmdArgs, opts); err != nil {
+			return err
 		}
 	}
 
@@ -440,13 +478,31 @@ func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *
 }
 
 func commandArgsHaveYolo(args []string) bool {
-	for _, arg := range args {
+	for i, arg := range args {
 		switch strings.TrimSpace(arg) {
 		case "--yolo", "--dangerously-bypass-approvals-and-sandbox":
 			return true
+		case "--ask-for-approval":
+			if i+1 < len(args) && strings.TrimSpace(args[i+1]) == "never" {
+				return true
+			}
+		default:
+			if strings.TrimSpace(arg) == "--ask-for-approval=never" {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func requireYoloLaunchArgs(cmdArgs []string, opts runTargetOptions) error {
+	if !opts.YoloEnabled || !opts.RequireYolo {
+		return nil
+	}
+	if len(cmdArgs) < 2 || !commandArgsHaveYolo(cmdArgs[1:]) {
+		return fmt.Errorf("yolo mode is required but no supported Codex yolo launch flag was detected")
+	}
+	return nil
 }
 
 func withProfileInstallEnv(
