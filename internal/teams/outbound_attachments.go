@@ -339,6 +339,8 @@ func outboundContentType(ext string) string {
 	switch strings.ToLower(ext) {
 	case ".md", ".log", ".patch", ".diff":
 		return "text/plain"
+	case ".zip":
+		return "application/zip"
 	}
 	if ctype := mime.TypeByExtension(ext); ctype != "" {
 		return ctype
