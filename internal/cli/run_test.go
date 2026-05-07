@@ -456,6 +456,173 @@ func TestRunLikeUsesDefaultCodexCommandInDirectMode(t *testing.T) {
 	}
 }
 
+func TestRunLikeYoloFlagEnablesManagedYoloInDirectMode(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	codexPath := filepath.Join(codexDir, "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; --version) echo 'codex 0.0.0' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", codexDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CODEX_HOME", t.TempDir())
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("runWithProfile should not be called when proxy preference is disabled")
+		return nil
+	}
+
+	var gotCmdArgs []string
+	var gotOpts runTargetOptions
+	runTargetWithFallbackWithOptionsFn = func(ctx context.Context, cmdArgs []string, proxyURL string, healthCheck func() error, fatalCh <-chan error, opts runTargetOptions) error {
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		gotOpts = opts
+		return nil
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--yolo"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+	if !gotOpts.YoloEnabled || !gotOpts.RequireYolo {
+		t.Fatalf("expected explicit run --yolo to require yolo, got opts=%+v", gotOpts)
+	}
+	if gotOpts.UseProxy {
+		t.Fatal("expected direct yolo run to keep proxy disabled")
+	}
+	if !slices.Contains(gotCmdArgs, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Fatalf("expected managed yolo launch arg in %v", gotCmdArgs)
+	}
+}
+
+func TestRunLikeYoloFlagFailsWhenCodexHasNoYoloLaunchFlag(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	codexDir := t.TempDir()
+	codexPath := filepath.Join(codexDir, "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex' ;; --version) echo 'codex 0.0.0' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", codexDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CODEX_HOME", t.TempDir())
+
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRunTarget })
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("run target should not start when explicit --yolo cannot be satisfied")
+		return nil
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--yolo"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "no supported Codex yolo launch flag") {
+		t.Fatalf("run command error = %v, want missing yolo flag", err)
+	}
+}
+
+func TestRunLikeYoloFlagPassesOptionsThroughProxyMode(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	prevRunWithProfile := runWithProfileFn
+	prevRunWithProfileOptions := runWithProfileOptionsFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	prevEnsureProxy := ensureProxyPreferenceRunFn
+	prevEnsureProfile := ensureProfileRunFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runWithProfileOptionsFn = prevRunWithProfileOptions
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+		ensureProxyPreferenceRunFn = prevEnsureProxy
+		ensureProfileRunFn = prevEnsureProfile
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("runWithProfile should not be used for explicit run --yolo")
+		return nil
+	}
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("direct runner should not be used when proxy preference is enabled")
+		return nil
+	}
+	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		return true, config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(true)}, nil
+	}
+	profile := config.Profile{ID: "p1", Name: "primary"}
+	ensureProfileRunFn = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
+		return profile, config.Config{
+			Version:      config.CurrentVersion,
+			ProxyEnabled: boolPtr(true),
+			Profiles:     []config.Profile{profile},
+		}, nil
+	}
+
+	var gotCmdArgs []string
+	var gotOpts runTargetOptions
+	runWithProfileOptionsFn = func(ctx context.Context, store *config.Store, prof config.Profile, instances []config.Instance, cmdArgs []string, opts runTargetOptions) error {
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		gotOpts = opts
+		return nil
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--yolo", "--", "codex", "exec", "-"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+	if !reflect.DeepEqual(gotCmdArgs, []string{"codex", "exec", "-"}) {
+		t.Fatalf("cmd args = %v, want codex exec -", gotCmdArgs)
+	}
+	if !gotOpts.YoloEnabled || !gotOpts.RequireYolo {
+		t.Fatalf("expected proxy run --yolo to pass required yolo opts, got %+v", gotOpts)
+	}
+	if !gotOpts.UseProxy {
+		t.Fatal("expected proxy run to keep proxy enabled")
+	}
+}
+
 func TestRunLikePropagatesCodexHomeEnv(t *testing.T) {
 	lockCLITestHooks(t)
 
