@@ -516,8 +516,9 @@ Responsibilities:
 - Split outbound chat messages by final rendered Teams HTML byte length.
   Live testing on 2026-04-30 found the delegated Graph chat send path accepts
   `102,289` bytes of HTML `body.content` and rejects `102,290` bytes with
-  `HTTP 400 BadRequest`; production sends should target about `72 KiB` and
-  keep each final HTML body below an `80 KiB` safety line.
+  `HTTP 400 BadRequest`; production sends should target about `24 KiB` and
+  keep each final HTML body below a `32 KiB` safety line so Teams clients do
+  not stall on very large messages.
 - Provide a per-chat send scheduler/rate limiter that respects `Retry-After`
   and preserves order for long-message chunks, imported history, ACKs, and
   notifications.
@@ -587,8 +588,8 @@ Status:
   replaying the same first ten pages forever.
 - Completed live message-size probe: in a dedicated probe chat, `102,289`
   bytes of HTML `body.content` succeeded and `102,290` bytes failed. Current
-  implementation splits by rendered HTML byte length with a `72 KiB` chunk
-  target and an `80 KiB` safety line, and labels multi-part messages.
+  implementation splits by rendered HTML byte length with a `24 KiB` chunk
+  target and a `32 KiB` safety line, and labels multi-part messages.
 - Completed live self-mention probe: Graph accepted a message containing a
   `mentions` payload for the authenticated user, and the Teams client notified
   the user. Product implementation still needs a durable outbox-level

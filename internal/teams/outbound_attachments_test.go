@@ -66,6 +66,23 @@ func TestPrepareOutboundAttachmentRejectsSymlinkAndDisallowedExtension(t *testin
 	}
 }
 
+func TestPrepareOutboundAttachmentAllowsZip(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "bundle.zip"), []byte("zip bytes"), 0o600); err != nil {
+		t.Fatalf("write zip fixture: %v", err)
+	}
+	file, err := PrepareOutboundAttachment("bundle.zip", OutboundAttachmentOptions{
+		Root:          root,
+		GeneratedName: "upload.zip",
+	})
+	if err != nil {
+		t.Fatalf("PrepareOutboundAttachment zip error: %v", err)
+	}
+	if file.Name != "bundle.zip" || file.UploadName != "upload.zip" || file.ContentType != "application/zip" {
+		t.Fatalf("unexpected zip attachment: %#v", file)
+	}
+}
+
 func TestPrepareOutboundAttachmentRejectsSymlinkDirectoryEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

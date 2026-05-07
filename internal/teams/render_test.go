@@ -205,6 +205,36 @@ func TestPlanTeamsHTMLChunksStaysUnderHardLimitAndOrdersParts(t *testing.T) {
 	}
 }
 
+func TestDefaultTeamsChunkLimitsAreClientConservative(t *testing.T) {
+	if TeamsRenderHardLimitBytes != 32*1024 {
+		t.Fatalf("TeamsRenderHardLimitBytes = %d, want %d", TeamsRenderHardLimitBytes, 32*1024)
+	}
+	if teamsRenderTargetLimitBytes != 24*1024 {
+		t.Fatalf("teamsRenderTargetLimitBytes = %d, want %d", teamsRenderTargetLimitBytes, 24*1024)
+	}
+	if safeTeamsHTMLContentBytes != TeamsRenderHardLimitBytes {
+		t.Fatalf("safeTeamsHTMLContentBytes = %d, want renderer hard limit %d", safeTeamsHTMLContentBytes, TeamsRenderHardLimitBytes)
+	}
+	if teamsChunkHTMLContentBytes != teamsRenderTargetLimitBytes {
+		t.Fatalf("teamsChunkHTMLContentBytes = %d, want renderer target limit %d", teamsChunkHTMLContentBytes, teamsRenderTargetLimitBytes)
+	}
+
+	text := strings.Repeat("mobile-client-chunk ", 2600)
+	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
+		Surface: TeamsRenderSurfaceOutbox,
+		Kind:    TeamsRenderAssistant,
+		Text:    text,
+	}, TeamsRenderOptions{})
+	if len(chunks) < 2 {
+		t.Fatalf("expected default limits to split long mobile-sized output, got %d chunk", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if chunk.ByteLength > TeamsRenderHardLimitBytes {
+			t.Fatalf("chunk %d rendered to %d bytes, want <= %d", i, chunk.ByteLength, TeamsRenderHardLimitBytes)
+		}
+	}
+}
+
 func TestPlanTeamsHTMLChunksUsesRenderedByteSize(t *testing.T) {
 	text := strings.Repeat("<&>", 100)
 	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{Kind: TeamsRenderHelper, Text: text}, TeamsRenderOptions{

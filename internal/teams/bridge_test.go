@@ -6325,6 +6325,32 @@ func TestBridgePollDropsRenderedHelperOrCodexOutputWithoutDurableMatch(t *testin
 	}
 }
 
+func TestBridgePollAllowsOwnerMessageStartingWithHelperPrefix(t *testing.T) {
+	msg := bridgePollMessage("owner-helper-prefixed-question", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = "<p><strong>🔧 Helper:</strong><br>artifact manifest rejected; what should I do?</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "artifact manifest rejected") {
+		t.Fatalf("handled = %#v, want helper-prefixed owner prompt", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "owner-helper-prefixed-question") {
+		t.Fatal("owner helper-prefixed prompt should not be marked as sent helper output")
+	}
+}
+
 func TestBridgePollRecordsWindowWarningWhenContinuationReturned(t *testing.T) {
 	requests := 0
 	var server *httptest.Server

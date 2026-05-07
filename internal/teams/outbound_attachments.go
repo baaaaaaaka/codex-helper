@@ -331,6 +331,7 @@ func defaultOutboundExtensions() map[string]bool {
 		".gif":   true,
 		".webp":  true,
 		".pdf":   true,
+		".zip":   true,
 	}
 }
 

@@ -4,11 +4,12 @@ import (
 	"html"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	TeamsRenderHardLimitBytes    = 80 * 1024
-	teamsRenderTargetLimitBytes  = 72 * 1024
+	TeamsRenderHardLimitBytes    = 32 * 1024
+	teamsRenderTargetLimitBytes  = 24 * 1024
 	defaultOwnerMentionThreshold = 60 * time.Second
 )
 
@@ -179,25 +180,37 @@ func splitTeamsRenderTextGeneric(input TeamsRenderInput, text string, limitBytes
 		if plannedCount < 2 {
 			plannedCount = 1
 		}
-		remaining := string(runes)
 		partInput := input
-		partInput.Text = remaining
-		if len(renderTeamsHTMLPart(partInput, partIndex, plannedCount)) <= limitBytes {
-			chunks = append(chunks, remaining)
-			break
+		if teamsRenderTextLikelyFits(input, runes, partIndex, plannedCount, limitBytes) {
+			remaining := string(runes)
+			partInput.Text = remaining
+			if len(renderTeamsHTMLPart(partInput, partIndex, plannedCount)) <= limitBytes {
+				chunks = append(chunks, remaining)
+				break
+			}
 		}
 
-		best := 0
-		low, high := 1, len(runes)
-		for low <= high {
-			mid := low + (high-low)/2
-			candidate := string(runes[:mid])
-			partInput.Text = candidate
-			if len(renderTeamsHTMLPart(partInput, partIndex, plannedCount)) <= limitBytes {
-				best = mid
-				low = mid + 1
-			} else {
-				high = mid - 1
+		best := estimatedTeamsRenderCut(input, runes, partIndex, plannedCount, limitBytes)
+		if best > len(runes) {
+			best = len(runes)
+		}
+		if best > 0 {
+			partInput.Text = string(runes[:best])
+			if len(renderTeamsHTMLPart(partInput, partIndex, plannedCount)) > limitBytes {
+				estimatedBest := best
+				best = 0
+				low, high := 1, estimatedBest-1
+				for low <= high {
+					mid := low + (high-low)/2
+					candidate := string(runes[:mid])
+					partInput.Text = candidate
+					if len(renderTeamsHTMLPart(partInput, partIndex, plannedCount)) <= limitBytes {
+						best = mid
+						low = mid + 1
+					} else {
+						high = mid - 1
+					}
+				}
 			}
 		}
 		if best <= 0 {
@@ -229,6 +242,63 @@ func splitTeamsRenderTextGeneric(input TeamsRenderInput, text string, limitBytes
 		runes = runes[cut:]
 	}
 	return chunks
+}
+
+func teamsRenderTextLikelyFits(input TeamsRenderInput, runes []rune, partIndex int, plannedCount int, limitBytes int) bool {
+	partInput := input
+	partInput.Text = ""
+	overhead := len(renderTeamsHTMLPart(partInput, partIndex, plannedCount))
+	return overhead+estimatedTeamsRenderEscapedBytes(runes) <= limitBytes
+}
+
+func estimatedTeamsRenderCut(input TeamsRenderInput, runes []rune, partIndex int, plannedCount int, limitBytes int) int {
+	partInput := input
+	partInput.Text = ""
+	overhead := len(renderTeamsHTMLPart(partInput, partIndex, plannedCount))
+	budget := limitBytes - overhead - 512
+	if budget < 1 {
+		budget = 1
+	}
+	total := 0
+	best := 0
+	for i, r := range runes {
+		total += estimatedTeamsRenderEscapedRuneBytes(r)
+		if total > budget {
+			break
+		}
+		best = i + 1
+	}
+	if best <= 0 {
+		return 1
+	}
+	return best
+}
+
+func estimatedTeamsRenderEscapedBytes(runes []rune) int {
+	total := 0
+	for _, r := range runes {
+		total += estimatedTeamsRenderEscapedRuneBytes(r)
+	}
+	return total
+}
+
+func estimatedTeamsRenderEscapedRuneBytes(r rune) int {
+	switch r {
+	case '<', '>':
+		return 4
+	case '&', '\'', '"':
+		return 5
+	case '\n':
+		return 4
+	default:
+		if r < utf8.RuneSelf {
+			return 1
+		}
+		if n := utf8.RuneLen(r); n > 0 {
+			return n
+		}
+		return len(string(r))
+	}
 }
 
 func splitTeamsRenderMarkdownTables(input TeamsRenderInput, text string, limitBytes int, plannedCount int) ([]string, bool) {

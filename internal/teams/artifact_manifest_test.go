@@ -100,6 +100,29 @@ func TestParseArtifactManifestPreservesValidFileOrdering(t *testing.T) {
 	}
 }
 
+func TestParseArtifactManifestAllowsZipArtifacts(t *testing.T) {
+	root := t.TempDir()
+	plan, err := ParseArtifactManifest(testArtifactManifest(t, []ArtifactManifestEntry{
+		{Path: "archives/results.zip", Name: "results bundle.zip"},
+	}), ArtifactManifestOptions{
+		OutboundRoot: root,
+		SessionID:    "s001",
+		TurnID:       "turn-zip",
+		ValidateFile: func(req ArtifactManifestValidationRequest) (ArtifactManifestFileInfo, error) {
+			if req.CleanPath != "archives/results.zip" {
+				t.Fatalf("CleanPath = %q, want archives/results.zip", req.CleanPath)
+			}
+			return ArtifactManifestFileInfo{Size: 128}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ParseArtifactManifest zip error: %v", err)
+	}
+	if len(plan.Files) != 1 || plan.Files[0].Name != "results_bundle.zip" || !strings.HasSuffix(plan.Files[0].UploadNameSeed, "results_bundle.zip") {
+		t.Fatalf("unexpected zip plan: %#v", plan.Files)
+	}
+}
+
 func TestCleanArtifactManifestPath(t *testing.T) {
 	got, err := CleanArtifactManifestPath(`reports\final.txt`)
 	if err != nil {

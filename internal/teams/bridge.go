@@ -38,10 +38,10 @@ const (
 	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
-	// body content. Split well below that to leave room for Teams-side changes,
-	// part labels, and encoding surprises.
-	safeTeamsHTMLContentBytes  = 80 * 1024
-	teamsChunkHTMLContentBytes = 72 * 1024
+	// body content. Split far below that to reduce Teams client rendering
+	// stalls while still leaving room for part labels and encoding surprises.
+	safeTeamsHTMLContentBytes  = 32 * 1024
+	teamsChunkHTMLContentBytes = 24 * 1024
 )
 
 var ownerMentionLongTurnThreshold = time.Minute
@@ -1114,8 +1114,6 @@ func looksLikeRenderedOutboxPlainText(text string) bool {
 func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
 	text = strings.TrimSpace(text)
 	for _, prefix := range []string{
-		"🔧 Helper:",
-		"Helper:",
 		"🤖 ⏳ Codex status:",
 		"🤖 ✅ Codex answer:",
 		"🤖 🛠️ Codex command:",

@@ -197,9 +197,10 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
   succeeds with `102,289` bytes of HTML `body.content` and fails at
   `102,290` bytes with `HTTP 400 BadRequest`.
 - Split outbound text by final rendered Teams HTML byte length, not raw rune
-  count. Use a conservative chunk target around `72 KiB` and keep each final
-  message below an `80 KiB` safety line so HTML escaping, part labels, and
-  tenant/client behavior changes do not make sends fail.
+  count. Use a client-friendly chunk target around `24 KiB` and keep each
+  final message below a `32 KiB` safety line so Teams clients stay responsive
+  while HTML escaping, part labels, and tenant/client behavior changes still
+  cannot make sends exceed the transport boundary.
 - Label multi-message output as `part i/n` and preserve outbox ordering so a
   retry or restart cannot reorder a long Codex answer.
 - Apply per-chat rate limiting. A long `Retry-After` for one chat must not
