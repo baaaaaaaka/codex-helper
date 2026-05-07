@@ -8,61 +8,64 @@ import (
 	"time"
 )
 
-func TestControlDashboardStableNumbersAcrossRefresh(t *testing.T) {
+func TestControlDashboardRenumbersByCurrentRecencyAcrossRefresh(t *testing.T) {
 	now := time.Date(2026, 4, 30, 10, 0, 0, 0, time.UTC)
 	first := BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{
 		ViewKind:            DashboardViewSessions,
 		SelectedWorkspaceID: "workspace-a",
 		Workspaces: []DashboardWorkspaceInput{
 			{
-				ID:   "workspace-a",
-				Path: "/home/baka/projects/a",
+				ID:        "workspace-a",
+				Path:      "/home/baka/projects/a",
+				UpdatedAt: now.Add(-time.Hour),
 				Sessions: []DashboardSessionInput{
-					{ID: "session-a1", Topic: "first"},
-					{ID: "session-a2", Topic: "second"},
+					{ID: "session-a1", Topic: "first", UpdatedAt: now.Add(-10 * time.Minute)},
+					{ID: "session-a2", Topic: "second", UpdatedAt: now.Add(-20 * time.Minute)},
 				},
 			},
-			{ID: "workspace-b", Path: "/home/baka/projects/b"},
+			{ID: "workspace-b", Path: "/home/baka/projects/b", UpdatedAt: now.Add(-2 * time.Hour)},
 		},
 	}, now)
 
-	workspaceANumber := dashboardWorkspaceNumber(t, first, "workspace-a")
-	workspaceBNumber := dashboardWorkspaceNumber(t, first, "workspace-b")
-	sessionA1Number := dashboardSessionNumber(t, first, "workspace-a", "session-a1")
-	sessionA2Number := dashboardSessionNumber(t, first, "workspace-a", "session-a2")
+	if got := dashboardWorkspaceNumber(t, first, "workspace-a"); got != 1 {
+		t.Fatalf("workspace-a initial number = %d, want 1", got)
+	}
+	if got := dashboardSessionNumber(t, first, "workspace-a", "session-a1"); got != 1 {
+		t.Fatalf("session-a1 initial number = %d, want 1", got)
+	}
 
 	second := BuildControlDashboard(first, ControlDashboardInput{
 		ViewKind:            DashboardViewSessions,
 		SelectedWorkspaceID: "workspace-a",
 		Workspaces: []DashboardWorkspaceInput{
-			{ID: "workspace-b", Path: "/home/baka/projects/b"},
+			{ID: "workspace-b", Path: "/home/baka/projects/b", UpdatedAt: now.Add(time.Hour)},
 			{
-				ID:   "workspace-a",
-				Path: "/home/baka/projects/a",
+				ID:        "workspace-a",
+				Path:      "/home/baka/projects/a",
+				UpdatedAt: now.Add(-time.Hour),
 				Sessions: []DashboardSessionInput{
-					{ID: "session-a2", Topic: "second renamed order"},
-					{ID: "session-a3", Topic: "third"},
-					{ID: "session-a1", Topic: "first renamed order"},
+					{ID: "session-a2", Topic: "second renamed order", UpdatedAt: now.Add(30 * time.Minute)},
+					{ID: "session-a3", Topic: "third", UpdatedAt: now.Add(20 * time.Minute)},
+					{ID: "session-a1", Topic: "first renamed order", UpdatedAt: now.Add(-30 * time.Minute)},
 				},
 			},
 		},
 	}, now.Add(time.Minute))
 
-	if got := dashboardWorkspaceNumber(t, second, "workspace-a"); got != workspaceANumber {
-		t.Fatalf("workspace-a number = %d, want stable %d", got, workspaceANumber)
+	if got := dashboardWorkspaceNumber(t, second, "workspace-b"); got != 1 {
+		t.Fatalf("workspace-b number after refresh = %d, want current first row number 1", got)
 	}
-	if got := dashboardWorkspaceNumber(t, second, "workspace-b"); got != workspaceBNumber {
-		t.Fatalf("workspace-b number = %d, want stable %d", got, workspaceBNumber)
+	if got := dashboardWorkspaceNumber(t, second, "workspace-a"); got != 2 {
+		t.Fatalf("workspace-a number after refresh = %d, want current second row number 2", got)
 	}
-	if got := dashboardSessionNumber(t, second, "workspace-a", "session-a1"); got != sessionA1Number {
-		t.Fatalf("session-a1 number = %d, want stable %d", got, sessionA1Number)
+	if got := dashboardSessionNumber(t, second, "workspace-a", "session-a2"); got != 1 {
+		t.Fatalf("session-a2 number after refresh = %d, want newest session number 1", got)
 	}
-	if got := dashboardSessionNumber(t, second, "workspace-a", "session-a2"); got != sessionA2Number {
-		t.Fatalf("session-a2 number = %d, want stable %d", got, sessionA2Number)
+	if got := dashboardSessionNumber(t, second, "workspace-a", "session-a3"); got != 2 {
+		t.Fatalf("session-a3 number after refresh = %d, want second newest session number 2", got)
 	}
-	newNumber := dashboardSessionNumber(t, second, "workspace-a", "session-a3")
-	if newNumber == sessionA1Number || newNumber == sessionA2Number {
-		t.Fatalf("new session number = %d, reused existing number", newNumber)
+	if got := dashboardSessionNumber(t, second, "workspace-a", "session-a1"); got != 3 {
+		t.Fatalf("session-a1 number after refresh = %d, want oldest session number 3", got)
 	}
 }
 
@@ -152,6 +155,9 @@ func TestControlDashboardOrdersWorkspacesAndSessionsByRecentActivity(t *testing.
 	if len(dashboard.Workspaces) != 2 || dashboard.Workspaces[0].ID != "workspace-new" || dashboard.CurrentView.Items[0].WorkspaceID != "workspace-new" {
 		t.Fatalf("workspace recency order = %#v, view = %#v", dashboard.Workspaces, dashboard.CurrentView.Items)
 	}
+	if dashboard.Workspaces[0].Number != 1 || dashboard.Workspaces[1].Number != 2 {
+		t.Fatalf("workspace numbers should follow display order: %#v", dashboard.Workspaces)
+	}
 
 	dashboard = BuildControlDashboard(dashboard, ControlDashboardInput{
 		ViewKind:            DashboardViewSessions,
@@ -173,6 +179,9 @@ func TestControlDashboardOrdersWorkspacesAndSessionsByRecentActivity(t *testing.
 	}, now.Add(time.Minute))
 	if len(dashboard.CurrentView.Items) != 2 || dashboard.CurrentView.Items[0].SessionID != "session-newer" {
 		t.Fatalf("session recency order = %#v", dashboard.CurrentView.Items)
+	}
+	if dashboard.CurrentView.Items[0].Number != 1 || dashboard.CurrentView.Items[1].Number != 2 {
+		t.Fatalf("session numbers should follow display order: %#v", dashboard.CurrentView.Items)
 	}
 }
 
@@ -239,7 +248,7 @@ func TestDashboardTitlesSanitizeAndHidePathDetails(t *testing.T) {
 	}
 }
 
-func TestControlDashboardLargeCorpusStressKeepsStablePrivateNumbers(t *testing.T) {
+func TestControlDashboardLargeCorpusStressKeepsCurrentViewSequentialPrivateNumbers(t *testing.T) {
 	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
 	workspaces := makeDashboardStressInputs(120, 12, now)
 	first := BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{
@@ -254,9 +263,8 @@ func TestControlDashboardLargeCorpusStressKeepsStablePrivateNumbers(t *testing.T
 		t.Fatalf("session count = %d, want %d", got, 120*12)
 	}
 	assertDashboardViewNumbersUnique(t, first.CurrentView)
+	assertDashboardViewNumbersSequential(t, first.CurrentView)
 	assertDashboardTitlesDoNotLeakPrivatePaths(t, first)
-	workspaceNumber := dashboardWorkspaceNumber(t, first, "workspace-042")
-	sessionNumber := dashboardSessionNumber(t, first, "workspace-042", "session-042-007")
 
 	for i, j := 0, len(workspaces)-1; i < j; i, j = i+1, j-1 {
 		workspaces[i], workspaces[j] = workspaces[j], workspaces[i]
@@ -271,8 +279,8 @@ func TestControlDashboardLargeCorpusStressKeepsStablePrivateNumbers(t *testing.T
 				Topic:     "new session after rediscovery",
 				Cwd:       "/home/baka/private/customer-042/repo-042",
 				Status:    "active",
-				CreatedAt: now.Add(time.Minute),
-				UpdatedAt: now.Add(time.Minute),
+				CreatedAt: now.Add(24 * time.Hour),
+				UpdatedAt: now.Add(24 * time.Hour),
 			})
 			break
 		}
@@ -282,22 +290,19 @@ func TestControlDashboardLargeCorpusStressKeepsStablePrivateNumbers(t *testing.T
 		SelectedWorkspaceID: "workspace-042",
 		Workspaces:          workspaces,
 	}, now.Add(time.Minute))
-	if got := dashboardWorkspaceNumber(t, second, "workspace-042"); got != workspaceNumber {
-		t.Fatalf("workspace-042 number = %d, want stable %d", got, workspaceNumber)
+	if got := dashboardWorkspaceNumber(t, second, "workspace-119"); got != 1 {
+		t.Fatalf("newest workspace number = %d, want current first row number 1", got)
 	}
-	if got := dashboardSessionNumber(t, second, "workspace-042", "session-042-007"); got != sessionNumber {
-		t.Fatalf("session-042-007 number = %d, want stable %d", got, sessionNumber)
-	}
-	newNumber := dashboardSessionNumber(t, second, "workspace-042", "session-042-new")
-	if newNumber == sessionNumber {
-		t.Fatalf("new session reused existing number %d", newNumber)
+	if got := dashboardSessionNumber(t, second, "workspace-042", "session-042-new"); got != 1 {
+		t.Fatalf("newest session number = %d, want current first row number 1", got)
 	}
 	assertDashboardViewNumbersUnique(t, second.CurrentView)
+	assertDashboardViewNumbersSequential(t, second.CurrentView)
 	assertDashboardTitlesDoNotLeakPrivatePaths(t, second)
-	if _, err := ResolveDashboardNumber(ChatScopeControl, second.CurrentView, sessionNumber, now.Add(2*time.Minute)); err != nil {
-		t.Fatalf("stable session number should resolve before expiry: %v", err)
+	if _, err := ResolveDashboardNumber(ChatScopeControl, second.CurrentView, 1, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("current first session number should resolve before expiry: %v", err)
 	}
-	if _, err := ResolveDashboardNumber(ChatScopeControl, second.CurrentView, sessionNumber, now.Add(20*time.Minute)); !errors.Is(err, ErrDashboardViewExpired) {
+	if _, err := ResolveDashboardNumber(ChatScopeControl, second.CurrentView, 1, now.Add(20*time.Minute)); !errors.Is(err, ErrDashboardViewExpired) {
 		t.Fatalf("expired large dashboard view error = %v, want ErrDashboardViewExpired", err)
 	}
 }
@@ -361,6 +366,15 @@ func assertDashboardViewNumbersUnique(t *testing.T, view DashboardView) {
 			t.Fatalf("duplicate dashboard view number %d: %#v and %#v", item.Number, previous, item)
 		}
 		seen[item.Number] = item
+	}
+}
+
+func assertDashboardViewNumbersSequential(t *testing.T, view DashboardView) {
+	t.Helper()
+	for i, item := range view.Items {
+		if want := i + 1; item.Number != want {
+			t.Fatalf("dashboard view item %d has number %d, want %d in %#v", i, item.Number, want, view.Items)
+		}
 	}
 }
 

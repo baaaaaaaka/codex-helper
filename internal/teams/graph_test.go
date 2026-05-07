@@ -811,6 +811,9 @@ func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 			if len(payload.Attachments) != 1 || payload.Attachments[0].ContentType != "reference" || payload.Attachments[0].Name != "file.txt" || payload.Attachments[0].ContentURL == "" {
 				t.Fatalf("unexpected attachments: %#v", payload.Attachments)
 			}
+			if payload.Attachments[0].ID != "1176c944-0cb9-4304-974c-5837185efd6a" {
+				t.Fatalf("attachment id = %q, want drive item eTag GUID", payload.Attachments[0].ID)
+			}
 			_, _ = fmt.Fprint(w, `{"id":"message-1","messageType":"message","attachments":[{"id":"1176c944-0cb9-4304-974c-5837185efd6a","contentType":"reference","name":"file.txt","contentUrl":"https://contoso.sharepoint.com/file.txt"}]}`)
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -836,6 +839,22 @@ func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 	}
 	if !sawUpload || !sawMetadata || !sawMessage {
 		t.Fatalf("missing request(s): upload=%v metadata=%v message=%v", sawUpload, sawMetadata, sawMessage)
+	}
+}
+
+func TestGraphSendDriveItemAttachmentRejectsMissingETagGUID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("missing eTag should fail before Graph request, got %s %s", r.Method, r.URL.String())
+	}))
+	defer server.Close()
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	_, err := graph.SendDriveItemAttachment(context.Background(), "chat-1", DriveItem{
+		ID:        "item-1",
+		Name:      "file.txt",
+		WebDavURL: "https://contoso.sharepoint.com/file.txt",
+	}, "attached")
+	if err == nil || !strings.Contains(err.Error(), "no eTag GUID") {
+		t.Fatalf("SendDriveItemAttachment error = %v, want missing eTag GUID", err)
 	}
 }
 

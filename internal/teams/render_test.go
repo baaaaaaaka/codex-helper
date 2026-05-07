@@ -86,6 +86,23 @@ func TestRenderTeamsHTMLAssistantBreaksAfterAnswerLabel(t *testing.T) {
 	}
 }
 
+func TestRenderTeamsHTMLCodexMarkdownKeepsLabelSeparateFromBody(t *testing.T) {
+	got := RenderTeamsHTML(TeamsRenderInput{
+		Kind: TeamsRenderAssistant,
+		Text: "final answer",
+	})
+	want := `<p><strong>🤖 ✅ Codex answer:</strong></p><p>final answer</p>`
+	if got != want {
+		t.Fatalf("assistant render HTML = %q, want %q", got, want)
+	}
+	if strings.Contains(got, `<strong>🤖 ✅ Codex answer:</strong><br>`) {
+		t.Fatalf("assistant label and body should not share one paragraph with br: %s", got)
+	}
+	if plain := PlainTextFromTeamsHTML(got); plain != "🤖 ✅ Codex answer:\nfinal answer" {
+		t.Fatalf("assistant plain text = %q", plain)
+	}
+}
+
 func TestRenderTeamsHTMLUserBreaksAfterLabel(t *testing.T) {
 	got := PlainTextFromTeamsHTML(RenderTeamsHTML(TeamsRenderInput{
 		Kind: TeamsRenderUser,
@@ -115,7 +132,7 @@ func TestRenderTeamsHTMLCodexMarkdownSubset(t *testing.T) {
 		}, "\n"),
 	})
 	for _, want := range []string{
-		`<strong>🤖 ✅ Codex answer:</strong><br><strong>Summary</strong>`,
+		`<p><strong>🤖 ✅ Codex answer:</strong></p><p><strong>Summary</strong></p>`,
 		`<ul><li><strong>fixed</strong>`,
 		`<em>rendering</em>`,
 		`<code>safe &lt;tag&gt;</code>`,
@@ -223,7 +240,7 @@ func TestRenderTeamsHTMLUsesParagraphsForBlankLines(t *testing.T) {
 	if strings.Contains(got, "<br><br>") {
 		t.Fatalf("blank lines should become paragraphs, not repeated br tags: %s", got)
 	}
-	if !strings.Contains(got, `<p><strong>🔧 Helper:</strong><br>first</p><p>second<br>third</p>`) {
+	if !strings.Contains(got, `<p><strong>🔧 Helper:</strong></p><p>first</p><p>second<br>third</p>`) {
 		t.Fatalf("unexpected paragraph rendering: %s", got)
 	}
 	plain := PlainTextFromTeamsHTML(got)

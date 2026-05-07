@@ -1009,6 +1009,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			return true, nil
 		}
 	}
+	if looksLikeRenderedHelperOrCodexOutputPlainText(PlainTextFromTeamsHTML(msg.Body.Content)) {
+		b.markRegistrySent(chatID, msg.ID)
+		return true, nil
+	}
 	return false, nil
 }
 
@@ -1063,6 +1067,24 @@ func looksLikeRenderedOutboxPlainText(text string) bool {
 		"🤖 🛠️ Codex command:",
 		"🤖 Codex progress:",
 		"🧑‍💻 User:",
+	} {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, prefix := range []string{
+		"🔧 Helper:",
+		"Helper:",
+		"🤖 ⏳ Codex status:",
+		"🤖 ✅ Codex answer:",
+		"🤖 🛠️ Codex command:",
+		"🤖 Codex progress:",
+		"💻 Code:",
 	} {
 		if strings.HasPrefix(text, prefix) {
 			return true
@@ -1206,7 +1228,11 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 	if len(msg.Attachments) > 0 {
 		return b.sendControl(ctx, UnsupportedControlAttachmentMessage(msg.Attachments))
 	}
-	if parsed := ParseDashboardCommand(ChatScopeControl, text); parsed.HelperCommand {
+	parsed := ParseDashboardCommand(ChatScopeControl, text)
+	if controlCommandConsumesDashboardView(parsed) {
+		defer func() { _ = b.clearControlDashboardView(context.Background()) }()
+	}
+	if parsed.HelperCommand {
 		switch parsed.Name {
 		case DashboardCommandNew:
 			return b.createSession(ctx, msg, parsed.Argument)
@@ -1222,18 +1248,21 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		case DashboardCommandWorkspaces:
 			message, err := b.formatWorkspaceDashboard(ctx)
 			if err != nil {
+				_ = b.clearControlDashboardView(context.Background())
 				return b.sendControl(ctx, "workspace discovery failed: "+err.Error())
 			}
 			return b.sendControl(ctx, message)
 		case DashboardCommandWorkspace:
 			message, err := b.formatWorkspaceSessionsDashboard(ctx, parsed.Target)
 			if err != nil {
+				_ = b.clearControlDashboardView(context.Background())
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
 			return b.sendControl(ctx, message)
 		case DashboardCommandSessions:
 			message, err := b.formatWorkspaceSessionsDashboard(ctx, DashboardCommandTarget{})
 			if err != nil {
+				_ = b.clearControlDashboardView(context.Background())
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
 			return b.sendControl(ctx, message)
@@ -1311,6 +1340,18 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		return b.sendControl(ctx, controlPathHintMessage(text))
 	}
 	return b.runControlFallback(ctx, msg, text)
+}
+
+func controlCommandConsumesDashboardView(parsed ParsedDashboardCommand) bool {
+	if !parsed.HelperCommand {
+		return true
+	}
+	switch parsed.Name {
+	case DashboardCommandWorkspaces, DashboardCommandWorkspace, DashboardCommandSessions, DashboardCommandSelect:
+		return false
+	default:
+		return true
+	}
 }
 
 func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text string) error {
@@ -1468,6 +1509,7 @@ func controlAdvancedHelpText() string {
 		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
 		"- `helper update now` - update to the latest stable helper release",
 		"- `helper update prerelease` - update to the newest helper release or pre-release",
+		"- `helper webhook setup` - show a guided Workflow webhook setup flow",
 		"- `helper webhook <url>` - enable Workflow notification cards with a Teams Workflow webhook URL",
 		"- `helper webhook off` - disable Workflow notification cards",
 		"",
@@ -1724,6 +1766,8 @@ func (b *Bridge) workflowWebhookFromControl(ctx context.Context, msg ChatMessage
 	switch lowerName {
 	case "", "help", "?":
 		return b.sendControl(ctx, workflowWebhookControlHelpText())
+	case "setup", "guide", "start":
+		return b.sendControl(ctx, b.workflowWebhookControlSetupText())
 	case "status", "st":
 		return b.sendControl(ctx, b.workflowWebhookControlStatus(ctx))
 	case "off", "disable", "disabled":
@@ -1784,12 +1828,47 @@ func workflowWebhookControlHelpText() string {
 		"Use this to send Teams Workflow notification cards for important helper events.",
 		"",
 		"Commands:",
+		"- `helper webhook setup` - show the setup steps",
 		"- `helper webhook <https-url>` - save and enable the webhook",
 		"- `helper webhook test` - send one test card",
 		"- `helper webhook status` - show whether it is enabled",
 		"- `helper webhook off` - disable cards",
 		"",
 		"The webhook URL is stored locally as a private secret file and is not echoed back.",
+	}, "\n")
+}
+
+func (b *Bridge) workflowWebhookControlSetupText() string {
+	controlTitle := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatTopic, workflowControlChatTitle(b, teamstore.State{}), b.reg.ControlChatID))
+	if controlTitle == "" {
+		controlTitle = "this Control chat"
+	}
+	controlHint := controlTitle
+	if b.reg.ControlChatID != "" {
+		controlHint += "\nChat ID: `" + b.reg.ControlChatID + "`"
+	}
+	powerAutomateURL := "https://make.powerautomate.com/"
+	guideURL := "https://support.microsoft.com/en-us/office/send-messages-in-teams-using-incoming-webhooks-323660ec-12ca-40b1-a1d3-a3df47e808c4"
+	return strings.Join([]string{
+		"## 🔔 Workflow webhook setup",
+		"",
+		"Use this to send notification cards when Codex finishes, reloads, restarts, or needs your attention.",
+		"",
+		"Step 1: Open [Power Automate](" + powerAutomateURL + ")",
+		"Create a Teams Workflow for incoming webhook alerts.",
+		"",
+		"Step 2: Choose the target chat",
+		controlHint,
+		"",
+		"Step 3: Save the workflow",
+		"After saving, Power Automate will show a webhook URL. Copy it.",
+		"",
+		"Step 4: Send this here",
+		"`helper webhook <paste-url>`",
+		"",
+		"Need the Microsoft walkthrough? Open [Teams webhook setup guide](" + guideURL + ").",
+		"",
+		"Note: Microsoft does not provide a reliable one-click link that pre-fills every workflow field and returns the generated webhook URL.",
 	}, "\n")
 }
 
@@ -4224,6 +4303,7 @@ func (b *Bridge) queueAndSendAttachmentOutbox(ctx context.Context, sessionID str
 		Body:            strings.TrimSpace(message),
 		DriveItemID:     strings.TrimSpace(item.ID),
 		DriveItemName:   strings.TrimSpace(item.Name),
+		DriveItemETag:   strings.TrimSpace(item.ETag),
 		DriveItemWebURL: strings.TrimSpace(item.WebURL),
 		DriveItemWebDav: strings.TrimSpace(item.WebDavURL),
 	})
@@ -4266,6 +4346,7 @@ func driveItemFromOutbox(outbox teamstore.OutboxMessage) DriveItem {
 	return DriveItem{
 		ID:        strings.TrimSpace(outbox.DriveItemID),
 		Name:      strings.TrimSpace(outbox.DriveItemName),
+		ETag:      strings.TrimSpace(outbox.DriveItemETag),
 		WebURL:    strings.TrimSpace(outbox.DriveItemWebURL),
 		WebDavURL: strings.TrimSpace(outbox.DriveItemWebDav),
 	}
@@ -6007,7 +6088,18 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
 			return err
 		}
-		outbox, err = b.store.MarkOutboxDriveItem(ctx, outbox.ID, item.ID, item.Name, item.WebURL, item.WebDavURL)
+		outbox, err = b.store.MarkOutboxDriveItem(ctx, outbox.ID, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
+		if err != nil {
+			return err
+		}
+	}
+	if outbox.DriveItemID != "" && driveItemAttachmentID(driveItemFromOutbox(outbox)) == "" {
+		item, err := b.refreshOutboxDriveItemMetadata(ctx, outbox)
+		if err != nil {
+			_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
+			return err
+		}
+		outbox, err = b.store.MarkOutboxDriveItem(ctx, outbox.ID, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
 		if err != nil {
 			return err
 		}
@@ -6050,6 +6142,21 @@ func (b *Bridge) uploadQueuedOutboxAttachment(ctx context.Context, outbox teamst
 		return DriveItem{}, err
 	}
 	return UploadOutboundAttachment(ctx, graph, file, opts)
+}
+
+func (b *Bridge) refreshOutboxDriveItemMetadata(ctx context.Context, outbox teamstore.OutboxMessage) (DriveItem, error) {
+	graph, err := b.fileWriteGraph()
+	if err != nil {
+		return DriveItem{}, fmt.Errorf("Teams file attachment metadata refresh failed: %w", err)
+	}
+	item, err := graph.GetDriveItemMetadata(ctx, strings.TrimSpace(outbox.DriveItemID))
+	if err != nil {
+		return DriveItem{}, fmt.Errorf("Teams file attachment metadata refresh failed: %w", err)
+	}
+	if driveItemAttachmentID(item) == "" {
+		return DriveItem{}, fmt.Errorf("Teams file attachment metadata refresh did not return an eTag GUID for drive item %q", strings.TrimSpace(outbox.DriveItemID))
+	}
+	return item, nil
 }
 
 func outboundAttachmentFileFromOutbox(outbox teamstore.OutboxMessage) (OutboundAttachmentFile, OutboundAttachmentOptions, error) {
@@ -8290,7 +8397,7 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		lines = append(lines, fmt.Sprintf("`%d` - %s", workspace.Number, strings.Join(parts, "\n   ")))
 	}
 	lines = append(lines, "", "Next:", "- Send a workspace number, for example `1`, to open it.", "- `n <directory>` or `new <directory>` - create a new Work chat directly.")
-	lines = append(lines, "", "Numbers expire after 10 minutes. If a number looks wrong, send `projects` again.")
+	lines = append(lines, "", "Numbers apply to your next reply and expire after 10 minutes. If a number looks wrong, send `projects` again.")
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -8405,9 +8512,9 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 	if len(dashboard.CurrentView.Items) == 0 {
 		selectedWorkspace := dashboardWorkspaceByID(dashboard.Workspaces, dashboard.SelectedWorkspaceID)
 		if selectedWorkspace.ID != "" {
-			return fmt.Sprintf("`new` - create a new Work chat in this workspace.\n\n## Sessions\n\nWorkspace: %s\n\nNo local Codex sessions were found in this workspace on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.", dashboardWorkspacePathDisplay(selectedWorkspace.Path)), nil
+			return fmt.Sprintf("`new` - create a new Work chat in this workspace.\n\n## Sessions\n\nWorkspace: %s\n\nNo local Codex sessions were found in this workspace on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\nTip: send `new` to create a new Work chat in this workspace.", dashboardWorkspacePathDisplay(selectedWorkspace.Path)), nil
 		}
-		return "## Sessions\n\nNo local Codex sessions found on this machine.\n\nNext: send `projects` to choose a workspace, or `new <directory>` to create a Work chat.", nil
+		return "## Sessions\n\nNo local Codex sessions found on this machine.\n\nNext: send `projects` to choose a workspace.\n\nTip: send `new <directory>` to create a new Work chat.", nil
 	}
 	selectedWorkspace := dashboardWorkspaceByID(dashboard.Workspaces, dashboard.SelectedWorkspaceID)
 	sessions := make(map[string]DashboardSession, len(dashboard.Sessions))
@@ -8460,7 +8567,7 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 		parts = append(parts, action)
 		lines = append(lines, fmt.Sprintf("`%d` - %s", item.Number, strings.Join(parts, "\n   ")))
 	}
-	lines = append(lines, "", "Need debug IDs? Send `details <number>`. Numbers expire after 10 minutes.")
+	lines = append(lines, "", "Need debug IDs? Send `details <number>`. Numbers expire after one reply.", "Tip: send `new` to create a new Work chat in this workspace.")
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -8596,14 +8703,18 @@ func (b *Bridge) resolveControlSelection(ctx context.Context, target DashboardCo
 	}
 	selection, err := b.resolveDashboardTarget(ctx, target.Number)
 	if err != nil {
+		_ = b.clearControlDashboardView(context.Background())
 		return "", err
 	}
 	switch selection.Kind {
 	case DashboardSelectionWorkspace:
 		return b.formatWorkspaceSessionsDashboard(ctx, DashboardCommandTarget{Number: selection.Number, IsNumber: true})
 	case DashboardSelectionSession:
-		return b.publishCodexSessionWithProgress(ctx, DashboardCommandTarget{Raw: strconvItoa(selection.Number), Number: selection.Number, IsNumber: true}, b.sendControl)
+		message, err := b.publishCodexSessionWithProgress(ctx, DashboardCommandTarget{Raw: strconvItoa(selection.Number), Number: selection.Number, IsNumber: true}, b.sendControl)
+		_ = b.clearControlDashboardView(context.Background())
+		return message, err
 	default:
+		_ = b.clearControlDashboardView(context.Background())
 		return "", ErrDashboardNumberMissing
 	}
 }
@@ -8780,6 +8891,20 @@ func (b *Bridge) persistControlDashboard(ctx context.Context, dashboard ControlD
 				UpdatedAt:   now,
 			}
 		}
+		return nil
+	})
+}
+
+func (b *Bridge) clearControlDashboardView(ctx context.Context) error {
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	chatID := strings.TrimSpace(b.reg.ControlChatID)
+	if chatID == "" {
+		return nil
+	}
+	return b.store.Update(ctx, func(state *teamstore.State) error {
+		delete(state.DashboardViews, chatID)
 		return nil
 	})
 }

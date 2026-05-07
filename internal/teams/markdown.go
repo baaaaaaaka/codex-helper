@@ -52,30 +52,13 @@ func renderTeamsHTMLCodexMarkdownAfterLabelBreak(label string, text string) stri
 	}
 
 	var out strings.Builder
-	labelWritten := false
+	out.WriteString("<p>")
+	out.WriteString(labelHTML)
+	out.WriteString("</p>")
 	for _, block := range blocks {
-		if !labelWritten && teamsMarkdownBlockCanShareLabel(block) {
-			out.WriteString("<p>")
-			out.WriteString(labelHTML)
-			out.WriteString("<br>")
-			out.WriteString(renderTeamsMarkdownBlockBodyHTML(block))
-			out.WriteString("</p>")
-			labelWritten = true
-			continue
-		}
-		if !labelWritten {
-			out.WriteString("<p>")
-			out.WriteString(labelHTML)
-			out.WriteString("</p>")
-			labelWritten = true
-		}
 		out.WriteString(renderTeamsMarkdownBlockHTML(block))
 	}
 	return out.String()
-}
-
-func teamsMarkdownBlockCanShareLabel(block teamsMarkdownBlock) bool {
-	return block.kind != teamsMarkdownCodeBlock && block.kind != teamsMarkdownList && block.kind != teamsMarkdownTable
 }
 
 func renderTeamsMarkdownBlockHTML(block teamsMarkdownBlock) string {

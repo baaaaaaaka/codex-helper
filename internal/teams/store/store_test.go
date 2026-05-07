@@ -941,12 +941,13 @@ func TestMarkOutboxDriveItemPersistsUploadMetadataAndClearsError(t *testing.T) {
 		t.Fatalf("QueueOutbox error: %v", err)
 	}
 
-	updated, err := store.MarkOutboxDriveItem(ctx, msg.ID, " drive-item-1 ", " report.txt ", " https://sharepoint.example/report.txt ", " dav://report ")
+	updated, err := store.MarkOutboxDriveItem(ctx, msg.ID, " drive-item-1 ", " report.txt ", " \"{1176C944-0CB9-4304-974C-5837185EFD6A},1\" ", " https://sharepoint.example/report.txt ", " dav://report ")
 	if err != nil {
 		t.Fatalf("MarkOutboxDriveItem error: %v", err)
 	}
 	if updated.DriveItemID != "drive-item-1" ||
 		updated.DriveItemName != "report.txt" ||
+		updated.DriveItemETag != "\"{1176C944-0CB9-4304-974C-5837185EFD6A},1\"" ||
 		updated.DriveItemWebURL != "https://sharepoint.example/report.txt" ||
 		updated.DriveItemWebDav != "dav://report" ||
 		updated.LastSendError != "" {
@@ -956,7 +957,7 @@ func TestMarkOutboxDriveItemPersistsUploadMetadataAndClearsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if got := reloaded.OutboxMessages[msg.ID]; got.DriveItemID != "drive-item-1" || got.LastSendError != "" {
+	if got := reloaded.OutboxMessages[msg.ID]; got.DriveItemID != "drive-item-1" || got.DriveItemETag == "" || got.LastSendError != "" {
 		t.Fatalf("DriveItem metadata was not durable: %#v", got)
 	}
 }

@@ -487,6 +487,9 @@ func (g *GraphClient) SendDriveItemAttachment(ctx context.Context, chatID string
 		name = "attachment"
 	}
 	attachmentID := driveItemAttachmentID(item)
+	if attachmentID == "" {
+		return ChatMessage{}, fmt.Errorf("drive item %q has no eTag GUID for Teams attachment id", strings.TrimSpace(item.ID))
+	}
 	bodyText := html.EscapeString(helperAttachmentMessage(message))
 	if bodyText != "" {
 		bodyText += " "
@@ -1471,18 +1474,5 @@ func driveItemAttachmentID(item DriveItem) string {
 	if match := guidPattern.FindString(item.ETag); match != "" {
 		return strings.ToLower(match)
 	}
-	if id := randomAttachmentID(); id != "" {
-		return id
-	}
-	return "attachment-" + safePathPart(firstNonEmptyString(item.ID, item.Name, "file"))
-}
-
-func randomAttachmentID() string {
-	var b [16]byte
-	if _, err := cryptorand.Read(b[:]); err != nil {
-		return ""
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	return ""
 }

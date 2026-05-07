@@ -43,7 +43,7 @@ func TestRenderTeamsHTMLCodexMarkdownStressCorpus(t *testing.T) {
 				"| <x> | **y** |",
 			}, "\n"),
 			wantHTML: []string{
-				`<strong>🤖 ✅ Codex answer:</strong><br><strong>Result</strong>`,
+				`<p><strong>🤖 ✅ Codex answer:</strong></p><p><strong>Result</strong></p>`,
 				`&gt; quoted &lt;b&gt;html&lt;/b&gt;`,
 				`<ul><li>first item<br><ul><li>nested item with <strong>bold</strong> and <code>x &lt; y</code></li></ul></li></ul>`,
 				`<ol><li>ordered<br><ol><li>nested ordered</li></ol></li></ol>`,
@@ -800,7 +800,7 @@ func TestRenderFinalOutboxCodexMarkdownStress(t *testing.T) {
 	got := renderOutboxHTML(outbox)
 	assertTeamsRenderedHTMLSafe(t, got)
 	for _, want := range []string{
-		`<strong>🤖 ✅ Codex answer:</strong><br>Done with <strong>bold</strong>.`,
+		`<p><strong>🤖 ✅ Codex answer:</strong></p><p>Done with <strong>bold</strong>.</p>`,
 		`<pre><code>{&#34;ok&#34;:&#34;&lt;yes&gt;&#34;}</code></pre>`,
 		`<p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>`,
 	} {
@@ -892,7 +892,7 @@ func TestRenderTeamsHTMLUserMessagesUseSafeMarkdown(t *testing.T) {
 	})
 	assertTeamsRenderedHTMLSafe(t, got)
 	for _, want := range []string{
-		`<strong>🧑‍💻 User:</strong><br>Use this:`,
+		`<p><strong>🧑‍💻 User:</strong></p><p>Use this:`,
 		`<pre><code>new fix windows installer`,
 		`resume 3`,
 		`<ol><li>checks:<br><ul><li>topic 清洗</li><li>registry 映射</li><li>message 去重</li></ul></li></ol>`,

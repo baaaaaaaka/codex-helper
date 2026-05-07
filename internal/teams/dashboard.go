@@ -283,14 +283,6 @@ func ResolveDashboardNumber(scope ChatScope, view DashboardView, number int, now
 
 func buildDashboardWorkspaces(previous []DashboardWorkspace, inputs []DashboardWorkspaceInput) []DashboardWorkspace {
 	inputs = sortDashboardWorkspaceInputs(inputs)
-	ids := make([]string, 0, len(inputs))
-	for _, input := range inputs {
-		id := dashboardWorkspaceID(input)
-		if id != "" {
-			ids = append(ids, id)
-		}
-	}
-	numbers := stableNumbers(previousWorkspaceNumbers(previous), ids)
 	workspaces := make([]DashboardWorkspace, 0, len(inputs))
 	seen := map[string]bool{}
 	for _, input := range inputs {
@@ -300,7 +292,6 @@ func buildDashboardWorkspaces(previous []DashboardWorkspace, inputs []DashboardW
 		}
 		seen[id] = true
 		workspaces = append(workspaces, DashboardWorkspace{
-			Number:       numbers[id],
 			ID:           id,
 			Path:         strings.TrimSpace(input.Path),
 			DisplayTitle: WorkspaceDisplayTitle(input.UserTitle, input.Path),
@@ -309,12 +300,13 @@ func buildDashboardWorkspaces(previous []DashboardWorkspace, inputs []DashboardW
 		})
 	}
 	sort.SliceStable(workspaces, func(i, j int) bool { return dashboardWorkspaceLess(workspaces[i], workspaces[j]) })
+	for i := range workspaces {
+		workspaces[i].Number = i + 1
+	}
 	return workspaces
 }
 
 func buildDashboardSessions(previous []DashboardSession, workspaceInputs []DashboardWorkspaceInput, selectedWorkspaceID string) []DashboardSession {
-	previousNumbers := previousSessionNumbers(previous)
-	groupedKeys := map[string][]string{}
 	sessionInputs := map[string]DashboardSessionInput{}
 	for _, workspace := range workspaceInputs {
 		workspaceID := dashboardWorkspaceID(workspace)
@@ -337,36 +329,18 @@ func buildDashboardSessions(previous []DashboardSession, workspaceInputs []Dashb
 			if _, exists := sessionInputs[key]; exists {
 				continue
 			}
-			groupedKeys[workspaceID] = append(groupedKeys[workspaceID], key)
 			sessionInputs[key] = session
 		}
 	}
 
-	numbers := map[string]int{}
-	for workspaceID, keys := range groupedKeys {
-		sort.SliceStable(keys, func(i, j int) bool {
-			return dashboardSessionInputLess(sessionInputs[keys[i]], sessionInputs[keys[j]])
-		})
-		prev := map[string]int{}
-		for key, number := range previousNumbers {
-			if strings.HasPrefix(key, workspaceID+"\x00") {
-				prev[key] = number
-			}
-		}
-		for key, number := range stableNumbers(prev, keys) {
-			numbers[key] = number
-		}
-	}
-
 	var sessions []DashboardSession
-	for key, input := range sessionInputs {
+	for _, input := range sessionInputs {
 		sessionID := strings.TrimSpace(input.ID)
 		workspaceID := strings.TrimSpace(input.WorkspaceID)
 		if workspaceID == "" {
 			workspaceID = selectedWorkspaceID
 		}
 		sessions = append(sessions, DashboardSession{
-			Number:        numbers[key],
 			ID:            sessionID,
 			WorkspaceID:   workspaceID,
 			Cwd:           strings.TrimSpace(input.Cwd),
@@ -385,6 +359,11 @@ func buildDashboardSessions(previous []DashboardSession, workspaceInputs []Dashb
 		}
 		return dashboardSessionLess(sessions[i], sessions[j])
 	})
+	nextByWorkspace := map[string]int{}
+	for i := range sessions {
+		nextByWorkspace[sessions[i].WorkspaceID]++
+		sessions[i].Number = nextByWorkspace[sessions[i].WorkspaceID]
+	}
 	return sessions
 }
 

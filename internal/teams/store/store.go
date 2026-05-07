@@ -552,6 +552,7 @@ type OutboxMessage struct {
 	AttachmentHash         string       `json:"attachment_hash,omitempty"`
 	DriveItemID            string       `json:"drive_item_id,omitempty"`
 	DriveItemName          string       `json:"drive_item_name,omitempty"`
+	DriveItemETag          string       `json:"drive_item_etag,omitempty"`
 	DriveItemWebURL        string       `json:"drive_item_web_url,omitempty"`
 	DriveItemWebDav        string       `json:"drive_item_web_dav,omitempty"`
 	AckKind                string       `json:"ack_kind,omitempty"`
@@ -1711,10 +1712,11 @@ func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, messag
 	})
 }
 
-func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, webURL string, webDavURL string) (OutboxMessage, error) {
+func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
 	return s.updateOutbox(ctx, outboxID, func(msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
+		msg.DriveItemETag = strings.TrimSpace(eTag)
 		msg.DriveItemWebURL = strings.TrimSpace(webURL)
 		msg.DriveItemWebDav = strings.TrimSpace(webDavURL)
 		msg.LastSendError = ""
