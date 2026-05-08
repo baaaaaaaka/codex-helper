@@ -3,13 +3,17 @@ package stack
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,6 +62,33 @@ func TestStackHelpers(t *testing.T) {
 	case <-s.stopCh:
 	default:
 		t.Fatalf("expected stopCh to be closed")
+	}
+}
+
+func TestStackCloseIsConcurrentSafe(t *testing.T) {
+	var closeHooks atomic.Int32
+	s := NewStackForTestWithCloseHook(1234, 2345, func() {
+		closeHooks.Add(1)
+		time.Sleep(10 * time.Millisecond)
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.Close(context.Background()); err != nil {
+				t.Errorf("Close error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := closeHooks.Load(); got != 1 {
+		t.Fatalf("close hook calls = %d, want 1", got)
+	}
+	select {
+	case <-s.stopCh:
+	default:
+		t.Fatal("stopCh was not closed")
 	}
 }
 
@@ -402,5 +433,73 @@ func TestMonitorReportsFatalOnImmediateExit(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timeout waiting for fatal error")
+	}
+}
+
+func TestMonitorDoesNotRestartTunnelAfterCloseDuringBackoff(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	counterFile := filepath.Join(dir, "counter")
+	script := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(script, []byte(fakeFailingSSHScript(counterFile)), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	t.Setenv("PATH", dir)
+
+	tun, err := ssh.NewTunnel(ssh.TunnelConfig{
+		Host:      "example.com",
+		Port:      22,
+		User:      "alice",
+		SocksPort: 12345,
+	})
+	if err != nil {
+		t.Fatalf("NewTunnel error: %v", err)
+	}
+	if err := tun.Start(); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+
+	s := &Stack{
+		Profile:   config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		SocksPort: 12345,
+		tunnel:    tun,
+		fatalCh:   make(chan error, 1),
+		stopCh:    make(chan struct{}),
+	}
+
+	go s.monitor(Options{MaxRestarts: 10, RestartBackoff: 200 * time.Millisecond})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, _ := os.ReadFile(counterFile)
+		if strings.Count(string(data), "x") == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial fake ssh invocation was not recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := s.Close(context.Background()); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			err = nil
+		}
+		if err != nil {
+			t.Fatalf("Close error: %v", err)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	data, _ := os.ReadFile(counterFile)
+	if got := strings.Count(string(data), "x"); got != 1 {
+		t.Fatalf("monitor restarted tunnel after Close: invocation count=%d", got)
+	}
+	select {
+	case err := <-s.fatalCh:
+		t.Fatalf("unexpected fatal after Close: %v", err)
+	default:
 	}
 }

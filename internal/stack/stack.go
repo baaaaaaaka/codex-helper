@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -35,8 +36,17 @@ type Stack struct {
 	proxy  *localproxy.HTTPProxy
 	tunnel *ssh.Tunnel
 
+	tunnelMu sync.Mutex
+
 	fatalCh chan error
 	stopCh  chan struct{}
+
+	closeMu   sync.Mutex
+	closing   bool
+	closeDone chan struct{}
+	closeErr  error
+
+	closeHook func()
 }
 
 // proxySetup holds the local HTTP proxy components created by setupHTTPProxy.
@@ -216,16 +226,44 @@ func (s *Stack) HTTPProxyURL() string {
 func (s *Stack) Fatal() <-chan error { return s.fatalCh }
 
 func (s *Stack) Close(ctx context.Context) error {
+	s.closeMu.Lock()
+	if s.closeDone == nil {
+		s.closeDone = make(chan struct{})
+	}
+	if s.closing {
+		done := s.closeDone
+		s.closeMu.Unlock()
+		<-done
+		s.closeMu.Lock()
+		err := s.closeErr
+		s.closeMu.Unlock()
+		return err
+	}
+	s.closing = true
+	done := s.closeDone
+	s.closeMu.Unlock()
+
+	defer func() {
+		s.closeMu.Lock()
+		close(done)
+		s.closeMu.Unlock()
+	}()
+
 	select {
 	case <-s.stopCh:
 		// already closed
 	default:
 		close(s.stopCh)
 	}
+	defer func() {
+		if s.closeHook != nil {
+			s.closeHook()
+		}
+	}()
 
 	var firstErr error
-	if s.tunnel != nil {
-		if err := s.tunnel.Stop(2 * time.Second); err != nil && firstErr == nil {
+	if tun := s.currentTunnel(); tun != nil {
+		if err := tun.Stop(2 * time.Second); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -234,27 +272,37 @@ func (s *Stack) Close(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	s.closeMu.Lock()
+	s.closeErr = firstErr
+	s.closeMu.Unlock()
 	return firstErr
 }
 
 func (s *Stack) monitor(opts Options) {
 	restarts := 0
 	for {
-		err := s.tunnel.Wait()
-
-		select {
-		case <-s.stopCh:
+		tun := s.currentTunnel()
+		if tun == nil {
+			if !s.stopped() {
+				s.fatalCh <- errors.New("ssh tunnel missing")
+			}
 			return
-		default:
+		}
+		err := tun.Wait()
+
+		if s.stopped() {
+			return
 		}
 
 		restarts++
 		if restarts > opts.MaxRestarts {
-			s.fatalCh <- fmt.Errorf("ssh tunnel exited too many times: %w", err)
+			s.reportFatal(fmt.Errorf("ssh tunnel exited too many times: %w", err))
 			return
 		}
 
-		time.Sleep(opts.RestartBackoff)
+		if s.waitStopped(opts.RestartBackoff) {
+			return
+		}
 
 		// Reconnect using the same SOCKS port. If the port is now occupied
 		// by another process the tunnel will fail and we report fatal rather
@@ -264,21 +312,70 @@ func (s *Stack) monitor(opts Options) {
 		// entire stack.
 		tun, terr := newTunnel(s.Profile, s.SocksPort)
 		if terr != nil {
-			s.fatalCh <- terr
+			s.reportFatal(terr)
 			return
 		}
 		if terr := tun.Start(); terr != nil {
-			s.fatalCh <- terr
+			s.reportFatal(terr)
+			return
+		}
+		s.setTunnel(tun)
+		if s.stopped() {
+			_ = tun.Stop(opts.TunnelStopGrace)
 			return
 		}
 		if terr := waitForTCPTunnel(fmt.Sprintf("127.0.0.1:%d", s.SocksPort), opts.SocksReadyTimeout, tun); terr != nil {
 			_ = tun.Stop(opts.TunnelStopGrace)
-			s.fatalCh <- terr
+			s.reportFatal(terr)
 			return
 		}
 
-		s.tunnel = tun
 		restarts = 0
+	}
+}
+
+func (s *Stack) currentTunnel() *ssh.Tunnel {
+	s.tunnelMu.Lock()
+	defer s.tunnelMu.Unlock()
+	return s.tunnel
+}
+
+func (s *Stack) setTunnel(tun *ssh.Tunnel) {
+	s.tunnelMu.Lock()
+	s.tunnel = tun
+	s.tunnelMu.Unlock()
+}
+
+func (s *Stack) stopped() bool {
+	select {
+	case <-s.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Stack) waitStopped(delay time.Duration) bool {
+	if delay <= 0 {
+		return s.stopped()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-s.stopCh:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *Stack) reportFatal(err error) {
+	if err == nil || s.stopped() {
+		return
+	}
+	select {
+	case s.fatalCh <- err:
+	case <-s.stopCh:
 	}
 }
 

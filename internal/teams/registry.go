@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -93,6 +94,9 @@ func SaveRegistry(path string, reg Registry) error {
 	data, err := json.MarshalIndent(reg, "", "  ")
 	if err != nil {
 		return err
+	}
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(bytes.TrimSpace(existing), bytes.TrimSpace(data)) {
+		return nil
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {

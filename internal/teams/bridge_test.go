@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -6452,6 +6453,78 @@ func TestBridgePollDropsRenderedHelperOrCodexOutputWithoutDurableMatch(t *testin
 	}
 }
 
+func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
+	msg := bridgePollMessage("stale-helper-artifact", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p>Codex: artifact attached: stage5_small_error_report.md <attachment id="artifact-1"></attachment></p>`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "artifact-1",
+		ContentType: "reference",
+		Name:        "stage5_small_error_report.md",
+	}}
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled helper attachment echo as inbound prompt: %#v", handled)
+	}
+	if !bridge.reg.HasSent("chat-1", "stale-helper-artifact") {
+		t.Fatal("ignored helper attachment echo was not marked sent")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+	if _, ok := userAnnotatedMessageHTML(msg, User{}); ok {
+		t.Fatal("helper attachment echo should not be annotated as a user message")
+	}
+}
+
+func TestBridgePollAllowsCodexPrefixedUserMessageWithAttachment(t *testing.T) {
+	msg := bridgePollMessage("owner-codex-attachment", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p>Codex: please inspect this file <attachment id="file-1"></attachment></p>`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "file-1",
+		ContentType: "reference",
+		Name:        "input.txt",
+	}}
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || handled[0] != "Codex: please inspect this file" {
+		t.Fatalf("handled = %#v, want Codex-prefixed user attachment prompt", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "owner-codex-attachment") {
+		t.Fatal("owner Codex-prefixed attachment prompt should not be marked as sent helper output")
+	}
+}
+
 func TestBridgePollAllowsOwnerMessageStartingWithHelperPrefix(t *testing.T) {
 	msg := bridgePollMessage("owner-helper-prefixed-question", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = "<p><strong>🔧 Helper:</strong><br>artifact manifest rejected; what should I do?</p>"
@@ -7453,6 +7526,92 @@ func TestBridgePollOnceSkipsChatsUntilNextPollAt(t *testing.T) {
 
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
+	}
+}
+
+func TestBridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls(t *testing.T) {
+	now := time.Now()
+	activity := now.Add(-10 * time.Minute)
+	readGraph := newBridgePollGraph(t, nil)
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	for _, chatID := range []string{"control-chat", "chat-1"} {
+		if _, err := store.RecordChatPollSuccess(context.Background(), chatID, activity, true, false, 1); err != nil {
+			t.Fatalf("seed poll %s: %v", chatID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+			ChatID:         chatID,
+			PollState:      inboundPollStateWarm,
+			NextPollAt:     now.Add(time.Hour),
+			LastActivityAt: activity,
+		}); err != nil {
+			t.Fatalf("schedule poll %s: %v", chatID, err)
+		}
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store before pollOnce: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions[0].UpdatedAt = activity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after pollOnce: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("pollOnce rewrote state even though no chat was due and schedules were unchanged")
+	}
+}
+
+func TestInboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch(t *testing.T) {
+	next := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	activity := next.Add(-time.Minute)
+	blockedUntil := next.Add(5 * time.Minute)
+	basePoll := teamstore.ChatPollState{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     next,
+		LastActivityAt: activity,
+	}
+	baseDecision := inboundPollDecision{
+		ChatID:         "chat-1",
+		State:          inboundPollStateWarm,
+		NextPollAt:     next,
+		LastActivityAt: activity,
+	}
+
+	if !inboundPollDecisionAlreadyPersisted(basePoll, true, baseDecision) {
+		t.Fatal("matching warm decision should be treated as already persisted")
+	}
+
+	blockedPoll := basePoll
+	blockedPoll.BlockedUntil = blockedUntil
+	if inboundPollDecisionAlreadyPersisted(blockedPoll, true, baseDecision) {
+		t.Fatal("non-blocked decision with stale BlockedUntil must not be treated as already persisted")
+	}
+
+	blockedDecision := baseDecision
+	blockedDecision.State = inboundPollStateBlocked
+	blockedDecision.BlockedUntil = blockedUntil
+	blockedPoll.PollState = inboundPollStateBlocked
+	if !inboundPollDecisionAlreadyPersisted(blockedPoll, true, blockedDecision) {
+		t.Fatal("matching blocked decision should be treated as already persisted")
+	}
+
+	blockedDecision.BlockedUntil = blockedUntil.Add(time.Minute)
+	if inboundPollDecisionAlreadyPersisted(blockedPoll, true, blockedDecision) {
+		t.Fatal("blocked decision with a different retry time must be persisted")
+	}
+
+	newerActivityDecision := baseDecision
+	newerActivityDecision.LastActivityAt = activity.Add(time.Second)
+	if inboundPollDecisionAlreadyPersisted(basePoll, true, newerActivityDecision) {
+		t.Fatal("decision with newer activity must be persisted")
 	}
 }
 

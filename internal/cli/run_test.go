@@ -14,12 +14,14 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/proc"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 	"github.com/spf13/cobra"
 )
@@ -187,6 +189,72 @@ func TestTerminateProcess(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected process to exit")
 	}
+}
+
+func TestRunTargetCancelTerminatesChildProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip process group signal test on windows")
+	}
+	dir := t.TempDir()
+	childFile := filepath.Join(dir, "child.pid")
+	script := filepath.Join(dir, "spawn-child.sh")
+	content := "#!/bin/sh\n" +
+		"sleep 30 &\n" +
+		"echo $! > \"$CHILD_FILE\"\n" +
+		"wait\n"
+	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runTargetOnceWithOptions(ctx, []string{script}, "", nil, nil, &bytes.Buffer{}, &bytes.Buffer{}, runTargetOptions{
+			UseProxy: false,
+			ExtraEnv: []string{"CHILD_FILE=" + childFile},
+		})
+	}()
+
+	var childPID int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, err := os.ReadFile(childFile); err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if parseErr != nil {
+				t.Fatalf("parse child pid: %v", parseErr)
+			}
+			childPID = pid
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		cancel()
+		t.Fatal("child pid was not written")
+	}
+	if !proc.IsAlive(childPID) {
+		cancel()
+		t.Fatalf("child process %d exited before cancellation", childPID)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runTargetOnceWithOptions error = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runTargetOnceWithOptions did not return after cancellation")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !proc.IsAlive(childPID) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("child process %d survived target cancellation", childPID)
 }
 
 func TestRunTargetWithFallbackDisablesYolo(t *testing.T) {

@@ -633,8 +633,10 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		Now:     time.Now(),
 	})
 	if !controlDecision.Due {
-		if err := b.persistInboundPollDecision(ctx, controlDecision); err != nil {
-			return err
+		if !inboundPollDecisionAlreadyPersisted(controlPoll, hasControlPoll, controlDecision) {
+			if err := b.persistInboundPollDecision(ctx, controlDecision); err != nil {
+				return err
+			}
 		}
 	} else {
 		controlHandled, err := b.pollChatWithRoleState(ctx, b.reg.ControlChatID, top, inboundPollRoleControl, false, controlPoll, hasControlPoll, b.handleControlMessage)
@@ -677,8 +679,10 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			continue
 		}
 		if !decision.Due {
-			if err := b.persistInboundPollDecision(ctx, decision); err != nil {
-				return err
+			if !inboundPollDecisionAlreadyPersisted(poll, hasPoll, decision) {
+				if err := b.persistInboundPollDecision(ctx, decision); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -888,6 +892,31 @@ func (b *Bridge) persistInboundPollDecision(ctx context.Context, decision inboun
 	return err
 }
 
+func inboundPollDecisionAlreadyPersisted(poll teamstore.ChatPollState, hasPoll bool, decision inboundPollDecision) bool {
+	if !hasPoll {
+		return false
+	}
+	if strings.TrimSpace(poll.ChatID) != strings.TrimSpace(decision.ChatID) {
+		return false
+	}
+	if strings.TrimSpace(poll.PollState) != strings.TrimSpace(decision.State) {
+		return false
+	}
+	if strings.TrimSpace(poll.PreviousPollState) != strings.TrimSpace(decision.PreviousState) {
+		return false
+	}
+	if !poll.NextPollAt.Equal(decision.NextPollAt) {
+		return false
+	}
+	if decision.LastActivityAt.After(poll.LastActivityAt) {
+		return false
+	}
+	if strings.TrimSpace(decision.State) == inboundPollStateBlocked {
+		return poll.BlockedUntil.Equal(decision.BlockedUntil)
+	}
+	return poll.BlockedUntil.IsZero()
+}
+
 func inboundPollBlockedUntil(poll teamstore.ChatPollState, err error, now time.Time) time.Time {
 	if now.IsZero() {
 		now = time.Now()
@@ -1048,6 +1077,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			return true, nil
 		}
 	}
+	if isHelperAttachmentEchoMessage(msg) {
+		b.markRegistrySent(chatID, msg.ID)
+		return true, nil
+	}
 	if looksLikeRenderedHelperOrCodexOutputPlainText(PlainTextFromTeamsHTML(msg.Body.Content)) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
@@ -1138,7 +1171,7 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	if !b.annotateUserMessages || b.annotationDisabled || b.graph == nil {
 		return
 	}
-	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" || isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
+	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
 		return
 	}
 	annotated, ok := userAnnotatedMessageHTML(msg, b.user)
@@ -1171,7 +1204,7 @@ func shouldDisableUserMessageAnnotation(err error) bool {
 
 func userAnnotatedMessageHTML(msg ChatMessage, _ User) (string, bool) {
 	content := strings.TrimSpace(msg.Body.Content)
-	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
+	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
 		return "", false
 	}
 	label := incomingUserLabel()
@@ -1256,6 +1289,27 @@ func hasAdaptiveCardAttachment(attachments []MessageAttachment) bool {
 
 func hasTeamsAttachmentPlaceholder(content string) bool {
 	return strings.Contains(strings.ToLower(content), "<attachment")
+}
+
+func isHelperAttachmentEchoMessage(msg ChatMessage) bool {
+	if len(msg.Attachments) == 0 && len(HostedContentIDsFromHTML(msg.Body.Content)) == 0 && !hasTeamsAttachmentPlaceholder(msg.Body.Content) {
+		return false
+	}
+	text := strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content))
+	if text == "" {
+		return false
+	}
+	prefix, rest, ok := strings.Cut(text, ":")
+	if !ok || !strings.EqualFold(strings.TrimSpace(prefix), "codex") {
+		return false
+	}
+	rest = strings.ToLower(strings.TrimSpace(rest))
+	for _, marker := range []string{"file attached", "artifact attached"} {
+		if rest == marker || strings.HasPrefix(rest, marker+":") {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text string) error {

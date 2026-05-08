@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -2250,6 +2251,43 @@ func TestChatPollScheduleStatePersistsParkAndBlock(t *testing.T) {
 	}
 	if poll.PollState != "hot" || !poll.ParkedAt.IsZero() || !poll.ParkNoticeSentAt.IsZero() {
 		t.Fatalf("resume should clear park markers: %#v", poll)
+	}
+}
+
+func TestChatPollScheduleNoopDoesNotRewriteState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	update := ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      "warm",
+		NextPollAt:     now.Add(time.Minute),
+		LastActivityAt: now.Add(-10 * time.Minute),
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, update); err != nil {
+		t.Fatalf("initial UpdateChatPollSchedule error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before noop: %v", err)
+	}
+	pollBefore, ok, err := store.ChatPoll(ctx, "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll before noop ok=%v err=%v", ok, err)
+	}
+	pollAfter, err := store.UpdateChatPollSchedule(ctx, update)
+	if err != nil {
+		t.Fatalf("noop UpdateChatPollSchedule error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after noop: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("noop UpdateChatPollSchedule rewrote state file")
+	}
+	if !pollAfter.UpdatedAt.Equal(pollBefore.UpdatedAt) {
+		t.Fatalf("noop UpdateChatPollSchedule changed UpdatedAt: before=%s after=%s", pollBefore.UpdatedAt, pollAfter.UpdatedAt)
 	}
 }
 

@@ -68,6 +68,8 @@ const (
 var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
 var ErrUpgradeInProgress = errors.New("Teams upgrade already in progress")
 
+var errStoreNoChange = errors.New("teams store no change")
+
 const outboxSendLease = 2 * time.Minute
 
 const (
@@ -674,6 +676,9 @@ func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
 			return err
 		}
 		if err := fn(&state); err != nil {
+			if errors.Is(err, errStoreNoChange) {
+				return nil
+			}
 			return err
 		}
 		state.ensure(time.Now())
@@ -1935,37 +1940,70 @@ func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollSched
 	err := s.Update(ctx, func(state *State) error {
 		now := time.Now()
 		poll := state.ChatPolls[chatID]
-		poll.ChatID = chatID
+		changed := false
+		if poll.ChatID != chatID {
+			poll.ChatID = chatID
+			changed = true
+		}
 		if update.PollState != "" {
-			if update.PollState == "blocked" {
-				previous := strings.TrimSpace(update.PreviousPollState)
-				if previous == "" && poll.PollState != "" && poll.PollState != "blocked" {
-					previous = poll.PollState
+			nextState := strings.TrimSpace(update.PollState)
+			nextPrevious := strings.TrimSpace(update.PreviousPollState)
+			if nextState == "blocked" {
+				if nextPrevious == "" && poll.PollState != "" && poll.PollState != "blocked" {
+					nextPrevious = poll.PollState
 				}
-				poll.PreviousPollState = previous
-			} else {
-				poll.PreviousPollState = strings.TrimSpace(update.PreviousPollState)
 			}
-			poll.PollState = strings.TrimSpace(update.PollState)
+			if poll.PreviousPollState != nextPrevious {
+				poll.PreviousPollState = nextPrevious
+				changed = true
+			}
+			if poll.PollState != nextState {
+				poll.PollState = nextState
+				changed = true
+			}
 			if poll.PollState == "parked" && poll.ParkedAt.IsZero() {
 				poll.ParkedAt = now
+				changed = true
 			}
 			if poll.PollState != "parked" {
-				poll.ParkedAt = time.Time{}
-				poll.ParkNoticeSentAt = time.Time{}
+				if !poll.ParkedAt.IsZero() {
+					poll.ParkedAt = time.Time{}
+					changed = true
+				}
+				if !poll.ParkNoticeSentAt.IsZero() {
+					poll.ParkNoticeSentAt = time.Time{}
+					changed = true
+				}
 			}
 		}
-		poll.NextPollAt = update.NextPollAt
+		if !poll.NextPollAt.Equal(update.NextPollAt) {
+			poll.NextPollAt = update.NextPollAt
+			changed = true
+		}
 		if update.LastActivityAt.After(poll.LastActivityAt) {
 			poll.LastActivityAt = update.LastActivityAt
+			changed = true
 		}
 		if update.ClearBlockedUntil {
-			poll.BlockedUntil = time.Time{}
+			if !poll.BlockedUntil.IsZero() {
+				poll.BlockedUntil = time.Time{}
+				changed = true
+			}
 		} else if !update.BlockedUntil.IsZero() {
-			poll.BlockedUntil = update.BlockedUntil
+			if !poll.BlockedUntil.Equal(update.BlockedUntil) {
+				poll.BlockedUntil = update.BlockedUntil
+				changed = true
+			}
 		}
 		if update.ResetFailures {
-			poll.FailureCount = 0
+			if poll.FailureCount != 0 {
+				poll.FailureCount = 0
+				changed = true
+			}
+		}
+		if !changed {
+			out = poll
+			return errStoreNoChange
 		}
 		poll.UpdatedAt = now
 		state.ChatPolls[chatID] = poll

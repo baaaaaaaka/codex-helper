@@ -493,6 +493,38 @@ func TestRunWithNewStackOptionsSuccess(t *testing.T) {
 	}
 }
 
+func TestCloseStackWhenContextDoneClosesStackBeforeCallerReturns(t *testing.T) {
+	closed := make(chan struct{})
+	st := stack.NewStackForTestWithCloseHook(12345, 23456, func() {
+		close(closed)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := closeStackWhenContextDone(ctx, st)
+	defer stop()
+	cancel()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stack was not closed after context cancellation")
+	}
+}
+
+func TestCloseStackWhenContextDoneStopPreventsLateClose(t *testing.T) {
+	closed := make(chan struct{})
+	st := stack.NewStackForTestWithCloseHook(12345, 23456, func() {
+		close(closed)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := closeStackWhenContextDone(ctx, st)
+	stop()
+	cancel()
+	select {
+	case <-closed:
+		t.Fatal("stack closed after context watcher was stopped")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestRunWithNewStackOptionsPreservesExplicitCodexHomeEnv(t *testing.T) {
 	lockCLITestHooks(t)
 	if runtime.GOOS == "windows" {

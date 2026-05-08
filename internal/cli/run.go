@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -244,7 +245,9 @@ func runWithNewStackOptions(
 	if err != nil {
 		return err
 	}
+	stopContextClose := closeStackWhenContextDone(ctx, st)
 	defer func() { _ = st.Close(context.Background()) }()
+	defer stopContextClose()
 
 	proxyURL := st.HTTPProxyURL()
 
@@ -280,6 +283,29 @@ func runWithNewStackOptions(
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
 		return hc.CheckHTTPProxy(st.HTTPPort, instanceID)
 	}, st.Fatal(), opts)
+}
+
+func closeStackWhenContextDone(ctx context.Context, st *stack.Stack) func() {
+	if ctx == nil || st == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		defer close(exited)
+		select {
+		case <-ctx.Done():
+			_ = st.Close(context.Background())
+		case <-done:
+		}
+	}()
+	return func() {
+		stopOnce.Do(func() {
+			close(done)
+		})
+		<-exited
+	}
 }
 
 func runWithProfile(
@@ -548,7 +574,9 @@ func withProfileInstallEnv(
 		}
 		return err
 	}
+	stopContextClose := closeStackWhenContextDone(ctx, st)
 	defer func() { _ = st.Close(context.Background()) }()
+	defer stopContextClose()
 	if err := installViaProxy(st.HTTPProxyURL()); err != nil {
 		if reuseErr != nil {
 			return fmt.Errorf("reusable proxy install failed (%v) and fallback stack install failed: %w", reuseErr, err)
@@ -723,6 +751,7 @@ func runTargetOnceWithOptions(
 		return identityErr
 	}
 	cmd.Env = updatedEnv
+	configureTargetProcessGroup(cmd)
 	if opts.Stdin != nil {
 		cmd.Stdin = opts.Stdin
 	} else {
@@ -783,11 +812,11 @@ func runTargetOnceWithOptions(
 		case err := <-done:
 			return err
 		case err := <-fatalCh:
-			_ = terminateProcess(cmd.Process, 2*time.Second)
+			_ = terminateTargetCommand(cmd, 2*time.Second)
 			<-done
 			return fmt.Errorf("proxy stack failed; terminated target: %w", err)
 		case <-ctx.Done():
-			_ = terminateProcess(cmd.Process, 2*time.Second)
+			_ = terminateTargetCommand(cmd, 2*time.Second)
 			<-done
 			return ctx.Err()
 		case <-ticker.C:
@@ -797,7 +826,7 @@ func runTargetOnceWithOptions(
 			if err := healthCheck(); err != nil {
 				failures++
 				if failures >= 3 {
-					_ = terminateProcess(cmd.Process, 2*time.Second)
+					_ = terminateTargetCommand(cmd, 2*time.Second)
 					<-done
 					return fmt.Errorf("proxy unhealthy; terminated target: %w", err)
 				}
