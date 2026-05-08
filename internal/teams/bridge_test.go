@@ -560,7 +560,7 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 		if !strings.Contains(got, "second prompt") {
 			t.Fatalf("second started prompt = %q", got)
 		}
-	case <-time.After(bridgeAsyncTestTimeout):
+	case <-time.After(20 * time.Second):
 		t.Fatal("queued second Codex turn did not start after first finished")
 	}
 	executor.release <- struct{}{}
@@ -2752,6 +2752,7 @@ func TestBridgeControlRestartFailureDoesNotSendCompletedNotice(t *testing.T) {
 		t.Fatal("helper restart did not call failing restarter")
 	}
 	waitForOutboxBody(t, store, "Helper restart failed")
+	waitForNoActiveTurnsOrOutbox(t, store, "")
 
 	restartedBridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	if err := restartedBridge.queuePendingHelperRestartNotice(context.Background()); err != nil {
