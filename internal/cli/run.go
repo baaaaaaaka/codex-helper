@@ -36,6 +36,7 @@ var (
 	ensureProxyPreferenceRunFn         = ensureProxyPreference
 	ensureProfileRunFn                 = ensureProfile
 	persistProxyPreferenceRunFn        = persistProxyPreference
+	runTargetHealthCheckInterval       = 5 * time.Second
 )
 
 func newRunCmd(root *rootOptions) *cobra.Command {
@@ -803,7 +804,7 @@ func runTargetOnceWithOptions(
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(runTargetHealthCheckInterval)
 	defer ticker.Stop()
 
 	failures := 0

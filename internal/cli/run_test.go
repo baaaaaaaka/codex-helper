@@ -257,6 +257,108 @@ func TestRunTargetCancelTerminatesChildProcessGroup(t *testing.T) {
 	t.Fatalf("child process %d survived target cancellation", childPID)
 }
 
+func TestRunTargetHealthFailureTerminatesChildProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip process group signal test on windows")
+	}
+	oldInterval := runTargetHealthCheckInterval
+	runTargetHealthCheckInterval = 20 * time.Millisecond
+	t.Cleanup(func() { runTargetHealthCheckInterval = oldInterval })
+
+	dir := t.TempDir()
+	childFile := filepath.Join(dir, "child.pid")
+	script := filepath.Join(dir, "spawn-child.sh")
+	content := "#!/bin/sh\n" +
+		"sleep 30 &\n" +
+		"echo $! > \"$CHILD_FILE\"\n" +
+		"wait\n"
+	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runTargetOnceWithOptions(context.Background(), []string{script}, "", func() error {
+			return errors.New("synthetic health failure")
+		}, nil, &bytes.Buffer{}, &bytes.Buffer{}, runTargetOptions{
+			UseProxy: false,
+			ExtraEnv: []string{"CHILD_FILE=" + childFile},
+		})
+	}()
+
+	var childPID int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, err := os.ReadFile(childFile); err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if parseErr != nil {
+				t.Fatalf("parse child pid: %v", parseErr)
+			}
+			childPID = pid
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child pid was not written")
+	}
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "proxy unhealthy") {
+			t.Fatalf("runTargetOnceWithOptions error = %v, want proxy unhealthy", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runTargetOnceWithOptions did not return after repeated health failures")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !proc.IsAlive(childPID) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("child process %d survived health-failure target termination", childPID)
+}
+
+func TestRunTargetHealthSuccessResetsFailureCount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based signal test on windows")
+	}
+	oldInterval := runTargetHealthCheckInterval
+	runTargetHealthCheckInterval = 20 * time.Millisecond
+	t.Cleanup(func() { runTargetHealthCheckInterval = oldInterval })
+
+	script := filepath.Join(t.TempDir(), "long-running.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 30\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	checks := 0
+	healthCheck := func() error {
+		checks++
+		if checks >= 5 {
+			cancel()
+		}
+		switch checks {
+		case 1, 2, 4, 5:
+			return errors.New("synthetic intermittent health failure")
+		default:
+			return nil
+		}
+	}
+
+	err := runTargetOnceWithOptions(ctx, []string{script}, "", healthCheck, nil, &bytes.Buffer{}, &bytes.Buffer{}, runTargetOptions{
+		UseProxy: false,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runTargetOnceWithOptions error = %v, want context.Canceled after health reset", err)
+	}
+}
+
 func TestRunTargetWithFallbackDisablesYolo(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")

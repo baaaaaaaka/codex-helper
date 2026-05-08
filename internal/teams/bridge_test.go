@@ -6495,6 +6495,71 @@ func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 	}
 }
 
+func TestIsHelperAttachmentEchoMessageVariants(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		attachments []MessageAttachment
+		want        bool
+	}{
+		{
+			name:    "artifact echo with Teams reference attachment",
+			content: `<p>Codex: artifact attached: report.md <attachment id="a1"></attachment></p>`,
+			attachments: []MessageAttachment{{
+				ID:          "a1",
+				ContentType: "reference",
+				Name:        "report.md",
+			}},
+			want: true,
+		},
+		{
+			name:    "file echo with hosted content only",
+			content: `<p>Codex: file attached: image.png <img src="../hostedContents/h1/$value"></p>`,
+			want:    true,
+		},
+		{
+			name:    "file echo with attachment placeholder only",
+			content: `<p>Codex: file attached <attachment id="a1"></attachment></p>`,
+			want:    true,
+		},
+		{
+			name:    "Codex-prefixed user attachment prompt is not an echo",
+			content: `<p>Codex: please inspect this file <attachment id="a1"></attachment></p>`,
+			attachments: []MessageAttachment{{
+				ID:          "a1",
+				ContentType: "reference",
+				Name:        "input.txt",
+			}},
+			want: false,
+		},
+		{
+			name:    "echo-shaped plain text without attachment indicator is not ignored",
+			content: `<p>Codex: artifact attached: report.md</p>`,
+			want:    false,
+		},
+		{
+			name:    "helper-looking unrelated attachment is not ignored",
+			content: `<p>Codex: artifact manifest rejected <attachment id="a1"></attachment></p>`,
+			attachments: []MessageAttachment{{
+				ID:          "a1",
+				ContentType: "reference",
+				Name:        "input.txt",
+			}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := bridgeTestMessageWithText("helper-echo-variant", tt.content)
+			msg.Attachments = tt.attachments
+			if got := isHelperAttachmentEchoMessage(msg); got != tt.want {
+				t.Fatalf("isHelperAttachmentEchoMessage() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBridgePollAllowsCodexPrefixedUserMessageWithAttachment(t *testing.T) {
 	msg := bridgePollMessage("owner-codex-attachment", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = `<p>Codex: please inspect this file <attachment id="file-1"></attachment></p>`

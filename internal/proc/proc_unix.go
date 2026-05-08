@@ -25,10 +25,14 @@ func isLinuxZombie(pid int) bool {
 	if err != nil {
 		return false
 	}
-	text := string(raw)
+	state, ok := linuxProcStateFromStat(string(raw))
+	return ok && state == 'Z'
+}
+
+func linuxProcStateFromStat(text string) (byte, bool) {
 	end := strings.LastIndex(text, ")")
 	if end < 0 || end+2 >= len(text) {
-		return false
+		return 0, false
 	}
-	return text[end+2] == 'Z'
+	return text[end+2], true
 }

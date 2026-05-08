@@ -35,3 +35,33 @@ func TestSaveRegistryNoopDoesNotRewriteFile(t *testing.T) {
 		t.Fatalf("SaveRegistry rewrote unchanged file: modtime=%s want %s", info.ModTime(), oldTime)
 	}
 }
+
+func TestSaveRegistryWritesChangedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	reg := Registry{
+		Version:       1,
+		UserID:        "user-1",
+		ControlChatID: "control-chat",
+		Chats: map[string]ChatState{
+			"control-chat": {SeenMessageIDs: []string{"m1"}},
+		},
+	}
+	if err := SaveRegistry(path, reg); err != nil {
+		t.Fatalf("initial SaveRegistry error: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read registry before change: %v", err)
+	}
+	reg.Chats["control-chat"] = ChatState{SeenMessageIDs: []string{"m1", "m2"}}
+	if err := SaveRegistry(path, reg); err != nil {
+		t.Fatalf("changed SaveRegistry error: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read registry after change: %v", err)
+	}
+	if string(before) == string(after) {
+		t.Fatal("SaveRegistry did not write changed registry contents")
+	}
+}

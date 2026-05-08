@@ -1949,6 +1949,9 @@ func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollSched
 			nextState := strings.TrimSpace(update.PollState)
 			nextPrevious := strings.TrimSpace(update.PreviousPollState)
 			if nextState == "blocked" {
+				if nextPrevious == "" && poll.PollState == "blocked" && poll.PreviousPollState != "" {
+					nextPrevious = poll.PreviousPollState
+				}
 				if nextPrevious == "" && poll.PollState != "" && poll.PollState != "blocked" {
 					nextPrevious = poll.PollState
 				}
