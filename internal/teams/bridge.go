@@ -50,6 +50,7 @@ var helperRestartDelay = 3 * time.Second
 var codexIdleStatusInitialDelay = 2 * time.Minute
 var codexIdleStatusRepeatDelay = 5 * time.Minute
 var codexIdleStatusMessage = "Still working. No new Codex update yet."
+var codexStreamRetryStatusRepeatDelay = 5 * time.Minute
 var queuedTurnAttentionDelay = 10 * time.Minute
 var queuedTurnAttentionRepeatDelay = 10 * time.Minute
 
@@ -2695,7 +2696,7 @@ func isWorkOnlyHelperCommand(text string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "file", "image", "send-file", "send-image", "retry", "cancel", "close", "rename":
+	case "file", "image", "send-file", "send-image", "retry", "cancel", "close", "rename", "publish-history", "sync-history", "import-history":
 		return true
 	default:
 		return false
@@ -5073,16 +5074,17 @@ func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor
 const maxTeamsCommandOutputRunes = 6000
 
 type codexEventForwarder struct {
-	ctx          context.Context
-	bridge       *Bridge
-	sessionID    string
-	turnID       string
-	chatID       string
-	events       chan codexrunner.StreamEvent
-	done         chan struct{}
-	pendingAgent string
-	seq          int
-	err          error
+	ctx                     context.Context
+	bridge                  *Bridge
+	sessionID               string
+	turnID                  string
+	chatID                  string
+	events                  chan codexrunner.StreamEvent
+	done                    chan struct{}
+	pendingAgent            string
+	lastStreamRetryStatusAt time.Time
+	seq                     int
+	err                     error
 }
 
 func (b *Bridge) startCodexEventForwarder(ctx context.Context, session *Session, turn teamstore.Turn, chatID string) *codexEventForwarder {
@@ -5160,6 +5162,9 @@ func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
 		f.flushPendingAgent()
 	case codexrunner.StreamEventCommandCompleted:
 		f.flushPendingAgent()
+	case codexrunner.StreamEventStreamRetry:
+		f.flushPendingAgent()
+		f.sendStreamRetryStatus(event)
 	case codexrunner.StreamEventTurnFailed:
 		f.flushPendingAgent()
 		if event.Failure != nil && strings.TrimSpace(event.Failure.Message) != "" {
@@ -5182,6 +5187,38 @@ func (f *codexEventForwarder) sendIdleStatus() {
 		return
 	}
 	_ = f.send("status", codexIdleStatusMessage)
+}
+
+func (f *codexEventForwarder) sendStreamRetryStatus(event codexrunner.StreamEvent) {
+	if f == nil {
+		return
+	}
+	now := time.Now()
+	if !f.lastStreamRetryStatusAt.IsZero() && now.Sub(f.lastStreamRetryStatusAt) < codexStreamRetryStatusRepeatDelay {
+		return
+	}
+	f.lastStreamRetryStatusAt = now
+	_ = f.send("status", formatCodexStreamRetryStatus(event))
+}
+
+func formatCodexStreamRetryStatus(event codexrunner.StreamEvent) string {
+	message := ""
+	code := ""
+	if event.Failure != nil {
+		message = strings.TrimSpace(event.Failure.Message)
+		code = strings.TrimSpace(event.Failure.Code)
+	}
+	if message == "" {
+		message = "Reconnecting..."
+	}
+	lines := []string{"Connection dropped. Codex is reconnecting."}
+	if !strings.EqualFold(strings.TrimSpace(message), strings.TrimSpace(lines[0])) {
+		lines = append(lines, "", message)
+	}
+	if code != "" {
+		lines = append(lines, "Reason: "+code)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (f *codexEventForwarder) send(kind string, text string) error {

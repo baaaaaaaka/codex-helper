@@ -17,7 +17,20 @@ import (
 func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 	lockCLITestHooks(t)
 	prevListReleases := teamsAutoUpdateListReleases
-	t.Cleanup(func() { teamsAutoUpdateListReleases = prevListReleases })
+	prevFetchReleaseIndex := teamsAutoUpdateFetchReleaseIndex
+	prevCheckForUpdate := checkForUpdate
+	t.Cleanup(func() {
+		teamsAutoUpdateListReleases = prevListReleases
+		teamsAutoUpdateFetchReleaseIndex = prevFetchReleaseIndex
+		checkForUpdate = prevCheckForUpdate
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not be used by release-list auto-update checks")
+		return update.Status{}
+	}
+	teamsAutoUpdateFetchReleaseIndex = func(context.Context, update.ReleaseIndexOptions) ([]update.GitHubRelease, error) {
+		return nil, errors.New("update index missing")
+	}
 
 	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
 	release := func(tag string, priority update.AutoUpdatePriority, published time.Time) update.GitHubRelease {
@@ -45,6 +58,7 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 		wantNext    time.Time
 		wantBackoff bool
 		includePre  bool
+		checkPre    bool
 		manual      bool
 		installed   string
 	}{
@@ -87,17 +101,19 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
 		},
 		{
-			name:        "manual ignores p2 priority",
+			name:        "manual prerelease path ignores p2 priority",
 			releases:    []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour))},
 			manual:      true,
+			checkPre:    true,
 			wantTag:     "v1.2.4",
 			wantVersion: "1.2.4",
 			wantNext:    now.Add(update.DefaultAutoUpdateCheckInterval),
 		},
 		{
-			name:        "manual can update unknown local version",
+			name:        "manual prerelease path can update unknown local version",
 			releases:    []update.GitHubRelease{release("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour))},
 			manual:      true,
+			checkPre:    true,
 			installed:   "dev",
 			wantTag:     "v1.2.4",
 			wantVersion: "1.2.4",
@@ -145,9 +161,10 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 				installed = tc.installed
 			}
 			got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
-				InstalledVersion: installed,
-				Now:              now,
-				Manual:           tc.manual,
+				InstalledVersion:  installed,
+				Now:               now,
+				IncludePrerelease: tc.checkPre,
+				Manual:            tc.manual,
 			})
 			if tc.listErr != nil {
 				if err == nil || !strings.Contains(err.Error(), "github unavailable") {
@@ -173,6 +190,283 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 				t.Fatalf("LastError = %q, want github unavailable", got.LastError)
 			}
 		})
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterPrefersReleaseIndexOverListAPI(t *testing.T) {
+	lockCLITestHooks(t)
+	prevListReleases := teamsAutoUpdateListReleases
+	prevFetchReleaseIndex := teamsAutoUpdateFetchReleaseIndex
+	prevCheckForUpdate := checkForUpdate
+	t.Cleanup(func() {
+		teamsAutoUpdateListReleases = prevListReleases
+		teamsAutoUpdateFetchReleaseIndex = prevFetchReleaseIndex
+		checkForUpdate = prevCheckForUpdate
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not be used by release-index auto-update checks")
+		return update.Status{}
+	}
+	teamsAutoUpdateListReleases = func(context.Context, update.ReleaseListOptions) ([]update.GitHubRelease, error) {
+		t.Fatal("release index success should not fall back to GitHub release list")
+		return nil, nil
+	}
+
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	var gotIndexOpts update.ReleaseIndexOptions
+	teamsAutoUpdateFetchReleaseIndex = func(_ context.Context, opts update.ReleaseIndexOptions) ([]update.GitHubRelease, error) {
+		gotIndexOpts = opts
+		return []update.GitHubRelease{
+			teamsAutoUpdateReleaseForTest("v1.2.4", update.AutoUpdatePriorityP0, now.Add(-time.Minute), false),
+		}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+		InstalledVersion: "1.2.3",
+		Now:              now,
+	})
+	if err != nil {
+		t.Fatalf("Check error: %v", err)
+	}
+	if gotIndexOpts.Repo != "owner/name" || gotIndexOpts.Timeout != 8*time.Second {
+		t.Fatalf("release index options = %#v, want repo and timeout", gotIndexOpts)
+	}
+	if got.Candidate == nil || got.Candidate.TagName != "v1.2.4" || got.Candidate.Priority != "p0" {
+		t.Fatalf("candidate = %#v, want indexed p0 v1.2.4", got.Candidate)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterReleaseIndexNoCandidateDoesNotFallBackToListAPI(t *testing.T) {
+	lockCLITestHooks(t)
+	prevListReleases := teamsAutoUpdateListReleases
+	prevFetchReleaseIndex := teamsAutoUpdateFetchReleaseIndex
+	t.Cleanup(func() {
+		teamsAutoUpdateListReleases = prevListReleases
+		teamsAutoUpdateFetchReleaseIndex = prevFetchReleaseIndex
+	})
+	teamsAutoUpdateListReleases = func(context.Context, update.ReleaseListOptions) ([]update.GitHubRelease, error) {
+		t.Fatal("release index success with no candidate should not call GitHub release list")
+		return nil, nil
+	}
+
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	teamsAutoUpdateFetchReleaseIndex = func(context.Context, update.ReleaseIndexOptions) ([]update.GitHubRelease, error) {
+		return []update.GitHubRelease{
+			teamsAutoUpdateReleaseForTest("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour), false),
+		}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+		InstalledVersion: "1.2.3",
+		Now:              now,
+	})
+	if err != nil {
+		t.Fatalf("Check error: %v", err)
+	}
+	if got.Candidate != nil {
+		t.Fatalf("candidate = %#v, want nil for indexed p2", got.Candidate)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterReleaseIndexFailureFallsBackToListAPI(t *testing.T) {
+	lockCLITestHooks(t)
+	prevListReleases := teamsAutoUpdateListReleases
+	prevFetchReleaseIndex := teamsAutoUpdateFetchReleaseIndex
+	t.Cleanup(func() {
+		teamsAutoUpdateListReleases = prevListReleases
+		teamsAutoUpdateFetchReleaseIndex = prevFetchReleaseIndex
+	})
+
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	teamsAutoUpdateFetchReleaseIndex = func(context.Context, update.ReleaseIndexOptions) ([]update.GitHubRelease, error) {
+		return nil, errors.New("index 404")
+	}
+	teamsAutoUpdateListReleases = func(context.Context, update.ReleaseListOptions) ([]update.GitHubRelease, error) {
+		return []update.GitHubRelease{
+			teamsAutoUpdateReleaseForTest("v1.2.4", update.AutoUpdatePriorityP0, now.Add(-time.Minute), false),
+		}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+		InstalledVersion: "1.2.3",
+		Now:              now,
+	})
+	if err != nil {
+		t.Fatalf("Check error: %v", err)
+	}
+	if got.Candidate == nil || got.Candidate.TagName != "v1.2.4" {
+		t.Fatalf("candidate = %#v, want release-list fallback v1.2.4", got.Candidate)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterManualStablePrefersReleaseIndex(t *testing.T) {
+	lockCLITestHooks(t)
+	prevListReleases := teamsAutoUpdateListReleases
+	prevFetchReleaseIndex := teamsAutoUpdateFetchReleaseIndex
+	prevCheckForUpdate := checkForUpdate
+	t.Cleanup(func() {
+		teamsAutoUpdateListReleases = prevListReleases
+		teamsAutoUpdateFetchReleaseIndex = prevFetchReleaseIndex
+		checkForUpdate = prevCheckForUpdate
+	})
+	teamsAutoUpdateListReleases = func(context.Context, update.ReleaseListOptions) ([]update.GitHubRelease, error) {
+		t.Fatal("manual stable helper update should not list GitHub releases")
+		return nil, nil
+	}
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("manual stable helper update should not call GitHub latest when release index succeeds")
+		return update.Status{}
+	}
+
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	var gotIndexOpts update.ReleaseIndexOptions
+	teamsAutoUpdateFetchReleaseIndex = func(_ context.Context, opts update.ReleaseIndexOptions) ([]update.GitHubRelease, error) {
+		gotIndexOpts = opts
+		return []update.GitHubRelease{
+			teamsAutoUpdateReleaseForTest("v1.2.5-rc.1", update.AutoUpdatePriorityP0, now.Add(-time.Minute), true),
+			teamsAutoUpdateReleaseForTest("v1.2.4", update.AutoUpdatePriorityP2, now.Add(-time.Hour), false),
+		}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name", includePrerelease: true}
+	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+		InstalledVersion:  "v1.2.3",
+		Now:               now,
+		Manual:            true,
+		IncludePrerelease: false,
+	})
+	if err != nil {
+		t.Fatalf("Check error: %v", err)
+	}
+	if gotIndexOpts.Repo != "owner/name" || gotIndexOpts.Timeout != 8*time.Second {
+		t.Fatalf("release index options = %#v, want repo and timeout", gotIndexOpts)
+	}
+	if got.Candidate == nil || got.Candidate.TagName != "v1.2.4" || got.Candidate.Version != "1.2.4" {
+		t.Fatalf("candidate = %#v, want v1.2.4", got.Candidate)
+	}
+	if got.Candidate.Priority != "manual" {
+		t.Fatalf("candidate priority = %q, want manual", got.Candidate.Priority)
+	}
+	if !got.NextCheckAt.Equal(now.Add(update.DefaultAutoUpdateCheckInterval)) {
+		t.Fatalf("NextCheckAt = %s, want %s", got.NextCheckAt, now.Add(update.DefaultAutoUpdateCheckInterval))
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterManualStableFallsBackToLatestCheckWhenIndexFails(t *testing.T) {
+	lockCLITestHooks(t)
+	prevListReleases := teamsAutoUpdateListReleases
+	prevFetchReleaseIndex := teamsAutoUpdateFetchReleaseIndex
+	prevCheckForUpdate := checkForUpdate
+	t.Cleanup(func() {
+		teamsAutoUpdateListReleases = prevListReleases
+		teamsAutoUpdateFetchReleaseIndex = prevFetchReleaseIndex
+		checkForUpdate = prevCheckForUpdate
+	})
+	teamsAutoUpdateListReleases = func(context.Context, update.ReleaseListOptions) ([]update.GitHubRelease, error) {
+		t.Fatal("manual stable helper update should not list GitHub releases")
+		return nil, nil
+	}
+	teamsAutoUpdateFetchReleaseIndex = func(context.Context, update.ReleaseIndexOptions) ([]update.GitHubRelease, error) {
+		return nil, errors.New("index 404")
+	}
+
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	var gotOpts update.CheckOptions
+	checkForUpdate = func(_ context.Context, opts update.CheckOptions) update.Status {
+		gotOpts = opts
+		if opts.InstalledVersion != "0.0.0" {
+			t.Fatalf("InstalledVersion = %q, want dev fallback 0.0.0", opts.InstalledVersion)
+		}
+		return update.Status{
+			Supported:        true,
+			Repo:             opts.Repo,
+			InstalledVersion: "0.0.0",
+			RemoteTag:        "v1.2.4",
+			RemoteVersion:    "1.2.4",
+			Asset:            "codex-proxy_1.2.4_linux_amd64",
+			UpdateAvailable:  true,
+		}
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+		InstalledVersion: "dev",
+		Now:              now,
+		Manual:           true,
+	})
+	if err != nil {
+		t.Fatalf("Check error: %v", err)
+	}
+	if gotOpts.Repo != "owner/name" || gotOpts.Timeout != 8*time.Second || gotOpts.IncludePrerelease {
+		t.Fatalf("CheckForUpdate options = %#v, want stable latest lookup", gotOpts)
+	}
+	if got.Candidate == nil || got.Candidate.TagName != "v1.2.4" || got.Candidate.Priority != "manual" {
+		t.Fatalf("candidate = %#v, want manual latest fallback v1.2.4", got.Candidate)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterManualStableBacksOffWhenIndexAndLatestFail(t *testing.T) {
+	lockCLITestHooks(t)
+	prevListReleases := teamsAutoUpdateListReleases
+	prevFetchReleaseIndex := teamsAutoUpdateFetchReleaseIndex
+	prevCheckForUpdate := checkForUpdate
+	t.Cleanup(func() {
+		teamsAutoUpdateListReleases = prevListReleases
+		teamsAutoUpdateFetchReleaseIndex = prevFetchReleaseIndex
+		checkForUpdate = prevCheckForUpdate
+	})
+	teamsAutoUpdateListReleases = func(context.Context, update.ReleaseListOptions) ([]update.GitHubRelease, error) {
+		t.Fatal("manual stable helper update should not list GitHub releases")
+		return nil, nil
+	}
+	teamsAutoUpdateFetchReleaseIndex = func(context.Context, update.ReleaseIndexOptions) ([]update.GitHubRelease, error) {
+		return nil, errors.New("index 404")
+	}
+
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	checkForUpdate = func(_ context.Context, opts update.CheckOptions) update.Status {
+		if opts.InstalledVersion != "0.0.0" {
+			t.Fatalf("InstalledVersion = %q, want dev fallback 0.0.0", opts.InstalledVersion)
+		}
+		return update.Status{
+			Supported: false,
+			Repo:      opts.Repo,
+			Error:     "release lookup failed: 403 Forbidden",
+		}
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+		InstalledVersion: "dev",
+		Now:              now,
+		Manual:           true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "index 404") || !strings.Contains(err.Error(), "403 Forbidden") {
+		t.Fatalf("Check error = %v, want index and latest failures", err)
+	}
+	want := now.Add(update.DefaultAutoUpdateCheckInterval)
+	if !got.NextCheckAt.Equal(want) || !got.BackoffUntil.Equal(want) || !strings.Contains(got.LastError, "403 Forbidden") {
+		t.Fatalf("decision = %#v, want 30m backoff with error", got)
+	}
+}
+
+func teamsAutoUpdateReleaseForTest(tag string, priority update.AutoUpdatePriority, published time.Time, prerelease bool) update.GitHubRelease {
+	version := strings.TrimPrefix(tag, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_%s_%s", version, runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		asset += ".exe"
+	}
+	return update.GitHubRelease{
+		TagName:     tag,
+		Priority:    string(priority),
+		Prerelease:  prerelease,
+		PublishedAt: published,
+		Assets: []struct {
+			Name string `json:"name"`
+		}{{Name: asset}},
 	}
 }
 

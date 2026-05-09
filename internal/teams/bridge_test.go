@@ -504,6 +504,70 @@ func TestBridgeSendsCodexIdleStatusWhenStreamIsQuiet(t *testing.T) {
 	}
 }
 
+func TestBridgeSendsCodexStreamRetryStatusWithoutSpamming(t *testing.T) {
+	oldRepeat := codexStreamRetryStatusRepeatDelay
+	codexStreamRetryStatusRepeatDelay = time.Hour
+	defer func() {
+		codexStreamRetryStatusRepeatDelay = oldRepeat
+	}()
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &streamingRecordingExecutor{
+		events: []codexrunner.StreamEvent{
+			{
+				Kind:      codexrunner.StreamEventStreamRetry,
+				ThreadID:  "thread-1",
+				TurnID:    "turn-1",
+				WillRetry: true,
+				Failure: &codexrunner.TurnFailure{
+					Code:    "responseStreamDisconnected",
+					Message: "Reconnecting... 1/3",
+				},
+			},
+			{
+				Kind:      codexrunner.StreamEventStreamRetry,
+				ThreadID:  "thread-1",
+				TurnID:    "turn-1",
+				WillRetry: true,
+				Failure: &codexrunner.TurnFailure{
+					Code:    "responseStreamDisconnected",
+					Message: "Reconnecting... 2/3",
+				},
+			},
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "done after reconnect"},
+		},
+		result: ExecutionResult{
+			Text:          "done after reconnect",
+			CodexThreadID: "thread-1",
+			CodexTurnID:   "turn-1",
+		},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-stream-retry"), "run through a dropped stream"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"🤖 ⏳ Codex status:\nConnection dropped. Codex is reconnecting.",
+		"Reconnecting... 1/3",
+		"Reason: responseStreamDisconnected",
+		"🤖 ✅ Codex answer:\ndone after reconnect",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("stream retry transcript missing %q:\n%s", want, joined)
+		}
+	}
+	if count := strings.Count(joined, "Connection dropped. Codex is reconnecting."); count != 1 {
+		t.Fatalf("stream retry status count = %d, want 1:\n%s", count, joined)
+	}
+	if strings.Contains(joined, "Reconnecting... 2/3") {
+		t.Fatalf("stream retry status was not throttled:\n%s", joined)
+	}
+}
+
 func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 	graph, sent := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
@@ -2370,6 +2434,30 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	}
 }
 
+func TestBridgeControlHelperUpdateQuestionFallsBackToCodex(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "upgrade explanation",
+		CodexThreadID: "control-thread-1",
+		CodexTurnID:   "control-turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+
+	text := "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗"
+	msg := bridgePollMessage("control-helper-upgrade-question", "2026-04-30T01:00:00Z", text)
+	if err := bridge.handleControlMessage(context.Background(), msg, text); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "User message:\n"+text) {
+		t.Fatalf("executor prompts = %#v, want control fallback prompt", got)
+	}
+	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Quick helper question") || !strings.Contains((*sent)[1].Content, "upgrade explanation") {
+		t.Fatalf("sent = %#v, want fallback ack and answer", *sent)
+	}
+}
+
 func TestBridgeControlFallbackEchoDoesNotLeakHiddenPrompt(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -3253,6 +3341,28 @@ func TestBridgeWorkHelperCommandPrefixDoesNotRunCodex(t *testing.T) {
 	}
 	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "STATUS: Work chat") {
 		t.Fatalf("helper status response = %#v", *sent)
+	}
+}
+
+func TestBridgeWorkHelperUpdateQuestionRunsCodex(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "work answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	text := "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗"
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("helper-upgrade-question", text), text); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], text) {
+		t.Fatalf("executor prompts = %#v, want natural prompt", got)
+	}
+	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Codex is working") || !strings.Contains((*sent)[1].Content, "work answer") {
+		t.Fatalf("sent = %#v, want ack and final answer", *sent)
 	}
 }
 

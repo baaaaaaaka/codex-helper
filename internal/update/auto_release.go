@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"runtime"
 	"sort"
@@ -22,7 +23,10 @@ const (
 	AutoUpdateP1Delay              = 48 * time.Hour
 )
 
-var releaseMetadataRE = regexp.MustCompile(`(?s)<!--\s*codex-helper-release:\s*(\{.*?\})\s*-->`)
+var (
+	releaseMetadataRE      = regexp.MustCompile(`(?s)<!--\s*codex-helper-release:\s*(\{.*?\})\s*-->`)
+	releasePriorityAssetRE = regexp.MustCompile(`^codex-helper-auto-update-(p[012])(?:\.(?:txt|json))?$`)
+)
 
 type AutoUpdatePriority string
 
@@ -37,12 +41,41 @@ type GitHubRelease struct {
 	TagName     string    `json:"tag_name"`
 	Name        string    `json:"name"`
 	Body        string    `json:"body"`
+	Priority    string    `json:"priority,omitempty"`
 	Draft       bool      `json:"draft"`
 	Prerelease  bool      `json:"prerelease"`
 	PublishedAt time.Time `json:"published_at"`
 	Assets      []struct {
 		Name string `json:"name"`
 	} `json:"assets"`
+}
+
+type ReleaseIndexOptions struct {
+	Repo    string
+	URL     string
+	Timeout time.Duration
+}
+
+type ReleaseIndex struct {
+	Version     int                   `json:"version"`
+	Repo        string                `json:"repo,omitempty"`
+	GeneratedAt time.Time             `json:"generated_at,omitempty"`
+	Releases    []ReleaseIndexRelease `json:"releases"`
+}
+
+type ReleaseIndexRelease struct {
+	TagName     string              `json:"tag_name"`
+	Name        string              `json:"name,omitempty"`
+	Body        string              `json:"body,omitempty"`
+	Priority    string              `json:"priority,omitempty"`
+	Draft       bool                `json:"draft,omitempty"`
+	Prerelease  bool                `json:"prerelease,omitempty"`
+	PublishedAt time.Time           `json:"published_at"`
+	Assets      []ReleaseIndexAsset `json:"assets"`
+}
+
+type ReleaseIndexAsset struct {
+	Name string `json:"name"`
 }
 
 type AutoUpdateCandidate struct {
@@ -118,6 +151,107 @@ func ListReleases(ctx context.Context, opts ReleaseListOptions) ([]GitHubRelease
 	return out, nil
 }
 
+func FetchReleaseIndex(ctx context.Context, opts ReleaseIndexOptions) ([]GitHubRelease, error) {
+	repo := ResolveRepo(opts.Repo)
+	url := ResolveReleaseIndexURL(repo, opts.URL)
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "codex-proxy")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, releaseIndexStatusError(resp, body)
+	}
+	var idx ReleaseIndex
+	if err := json.Unmarshal(body, &idx); err != nil {
+		return nil, fmt.Errorf("update index parse failed: %w", err)
+	}
+	if idx.Version != 1 {
+		return nil, fmt.Errorf("update index unsupported version %d", idx.Version)
+	}
+	if strings.TrimSpace(idx.Repo) != "" && !strings.EqualFold(strings.TrimSpace(idx.Repo), repo) {
+		return nil, fmt.Errorf("update index repo mismatch: %s", idx.Repo)
+	}
+	out := make([]GitHubRelease, 0, len(idx.Releases))
+	for _, rel := range idx.Releases {
+		out = append(out, GitHubRelease{
+			TagName:     rel.TagName,
+			Name:        rel.Name,
+			Body:        rel.Body,
+			Priority:    rel.Priority,
+			Draft:       rel.Draft,
+			Prerelease:  rel.Prerelease,
+			PublishedAt: rel.PublishedAt,
+			Assets:      releaseAssetsFromNames(releaseIndexAssetNames(rel.Assets)...),
+		})
+	}
+	return out, nil
+}
+
+func ResolveReleaseIndexURL(repo string, explicit string) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvUpdateIndexURL)); v != "" {
+		return v
+	}
+	return fmt.Sprintf("%s/%s/auto-update-index/update-index.json", strings.TrimRight(githubRawBase, "/"), ResolveRepo(repo))
+}
+
+func releaseIndexStatusError(resp *http.Response, body []byte) error {
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > 300 {
+		msg = msg[:300] + "..."
+	}
+	if msg == "" {
+		return fmt.Errorf("update index lookup failed: %s", resp.Status)
+	}
+	return fmt.Errorf("update index lookup failed: %s: %s", resp.Status, msg)
+}
+
+func releaseIndexAssetNames(assets []ReleaseIndexAsset) []string {
+	out := make([]string, 0, len(assets))
+	for _, asset := range assets {
+		if name := strings.TrimSpace(asset.Name); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func releaseAssetsFromNames(names ...string) []struct {
+	Name string `json:"name"`
+} {
+	out := make([]struct {
+		Name string `json:"name"`
+	}, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			out = append(out, struct {
+				Name string `json:"name"`
+			}{Name: name})
+		}
+	}
+	return out
+}
+
 func githubReleaseListStatusError(resp *http.Response, body []byte) error {
 	msg := strings.TrimSpace(string(body))
 	if len(msg) > 300 {
@@ -186,7 +320,7 @@ func SelectAutoUpdateCandidate(releases []GitHubRelease, opts AutoUpdateSelectio
 		if err != nil || !releaseHasAsset(rel, asset) {
 			continue
 		}
-		priority := ParseAutoUpdatePriority(rel.Body)
+		priority := ReleaseAutoUpdatePriority(rel)
 		eligibleAt, ok := autoUpdateEligibleAt(priority, rel.PublishedAt, opts.IgnorePriority)
 		if !ok {
 			continue
@@ -247,6 +381,81 @@ func ParseAutoUpdatePriority(body string) AutoUpdatePriority {
 		return AutoUpdatePriorityP2
 	default:
 		return AutoUpdatePriorityP2
+	}
+}
+
+func ReleaseAutoUpdatePriority(rel GitHubRelease) AutoUpdatePriority {
+	var values []AutoUpdatePriority
+	if priority, ok := parseAutoUpdatePriorityValue(rel.Priority); ok {
+		values = append(values, priority)
+	}
+	if priority, ok := parseAutoUpdatePriorityAsset(rel.Assets); ok {
+		values = append(values, priority)
+	}
+	if priority, ok := parseAutoUpdatePriorityBody(rel.Body); ok {
+		values = append(values, priority)
+	}
+	if len(values) == 0 {
+		return AutoUpdatePriorityP2
+	}
+	first := values[0]
+	for _, value := range values[1:] {
+		if value != first {
+			return AutoUpdatePriorityP2
+		}
+	}
+	return first
+}
+
+func parseAutoUpdatePriorityBody(body string) (AutoUpdatePriority, bool) {
+	matches := releaseMetadataRE.FindAllStringSubmatch(body, -1)
+	if len(matches) != 1 {
+		return "", false
+	}
+	var payload struct {
+		AutoUpdatePriority string `json:"auto_update_priority"`
+		Priority           string `json:"priority"`
+	}
+	if err := json.Unmarshal([]byte(matches[0][1]), &payload); err != nil {
+		return "", false
+	}
+	value := strings.TrimSpace(payload.AutoUpdatePriority)
+	if value == "" {
+		value = strings.TrimSpace(payload.Priority)
+	}
+	return parseAutoUpdatePriorityValue(value)
+}
+
+func parseAutoUpdatePriorityAsset(assets []struct {
+	Name string `json:"name"`
+}) (AutoUpdatePriority, bool) {
+	var values []AutoUpdatePriority
+	for _, asset := range assets {
+		matches := releasePriorityAssetRE.FindStringSubmatch(strings.TrimSpace(asset.Name))
+		if len(matches) != 2 {
+			continue
+		}
+		priority, ok := parseAutoUpdatePriorityValue(matches[1])
+		if ok {
+			values = append(values, priority)
+		}
+	}
+	if len(values) != 1 {
+		return "", false
+	}
+	return values[0], true
+}
+
+func parseAutoUpdatePriorityValue(value string) (AutoUpdatePriority, bool) {
+	switch AutoUpdatePriority(strings.ToLower(strings.TrimSpace(value))) {
+	case AutoUpdatePriorityP0:
+		return AutoUpdatePriorityP0, true
+	case AutoUpdatePriorityP1:
+		return AutoUpdatePriorityP1, true
+	case AutoUpdatePriorityP2:
+		return AutoUpdatePriorityP2, true
+	default:
+		return "", false
 	}
 }
 

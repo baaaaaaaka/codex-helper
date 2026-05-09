@@ -924,22 +924,42 @@ func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {
 			Code      string `json:"code"`
 			WillRetry bool   `json:"willRetry"`
 			Error     struct {
-				Message string `json:"message"`
-				Code    string `json:"code"`
+				Message           string          `json:"message"`
+				Code              string          `json:"code"`
+				AdditionalDetails string          `json:"additionalDetails"`
+				CodexErrorInfo    json.RawMessage `json:"codexErrorInfo"`
 			} `json:"error"`
 		}
-		if json.Unmarshal(msg.Params, &params) != nil || params.WillRetry {
+		if json.Unmarshal(msg.Params, &params) != nil {
 			return StreamEvent{}, false
+		}
+		failure := &TurnFailure{
+			Code:    firstNonEmpty(params.Error.Code, params.Code, codexErrorInfoCode(params.Error.CodexErrorInfo)),
+			Message: firstNonEmpty(params.Error.Message, params.Message, params.Error.AdditionalDetails),
+		}
+		if failure.Message == "" {
+			if params.WillRetry {
+				failure.Message = "Codex stream disconnected; reconnecting"
+			} else {
+				failure.Message = "Codex turn failed"
+			}
+		}
+		if params.WillRetry {
+			return StreamEvent{
+				Kind:      StreamEventStreamRetry,
+				ThreadID:  params.ThreadID,
+				TurnID:    params.TurnID,
+				Failure:   failure,
+				WillRetry: true,
+				Raw:       append([]byte(nil), bytes.TrimSpace(line)...),
+			}, true
 		}
 		return StreamEvent{
 			Kind:     StreamEventTurnFailed,
 			ThreadID: params.ThreadID,
 			TurnID:   params.TurnID,
-			Failure: &TurnFailure{
-				Code:    firstNonEmpty(params.Error.Code, params.Code),
-				Message: firstNonEmpty(params.Error.Message, params.Message, "Codex turn failed"),
-			},
-			Raw: append([]byte(nil), bytes.TrimSpace(line)...),
+			Failure:  failure,
+			Raw:      append([]byte(nil), bytes.TrimSpace(line)...),
 		}, true
 	default:
 		return StreamEvent{}, false

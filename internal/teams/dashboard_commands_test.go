@@ -66,6 +66,8 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "codex-helper service update now", name: DashboardCommandUpdate, raw: "update now"},
 		{text: "helper webhook https://workflow.example.test/hook", name: DashboardCommandWebhook, raw: "https://workflow.example.test/hook"},
 		{text: "helper workflow off", name: DashboardCommandWebhook, raw: "off"},
+		{text: "helper status", name: DashboardCommandStatus},
+		{text: "helper help advanced", name: DashboardCommandHelp, raw: "advanced"},
 		{text: "cx p 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "cx h", name: DashboardCommandHelp},
 		{text: "4", name: DashboardCommandSelect, raw: "4", number: 4, isNumber: true},
@@ -112,6 +114,27 @@ func TestParseControlUpdateRequiresHelperPrefix(t *testing.T) {
 	}
 }
 
+func TestParseControlHelperAdminNaturalLanguageFallsBackToCodex(t *testing.T) {
+	for _, text := range []string{
+		"helper upgrade 能够更新成避免 api 访问过于频繁的报错吗",
+		"helper update can this avoid GitHub API rate limits",
+		"helper restart 为什么会卡住",
+		"helper reload should we use the newest code",
+		"helper webhook 能不能一键配置",
+		"helper status 为什么没有更新",
+		"helper help 怎么用",
+		"helper sessions 为什么这么慢",
+		"codex-helper service update 这个机制安全吗",
+	} {
+		t.Run(text, func(t *testing.T) {
+			cmd := ParseDashboardCommand(ChatScopeControl, text)
+			if cmd.HelperCommand || !cmd.ForwardToCodex || !cmd.RequiresCodex {
+				t.Fatalf("natural helper-prefixed text should go to Codex, got %#v", cmd)
+			}
+		})
+	}
+}
+
 func TestParseControlReloadRequiresHelperPrefix(t *testing.T) {
 	for _, text := range []string{"reload", "reload now", "/reload", "codex reload"} {
 		t.Run(text, func(t *testing.T) {
@@ -147,7 +170,7 @@ func TestParseControlUnknownInputForwardsOnlyPlainTextToCodex(t *testing.T) {
 }
 
 func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
-	for _, text := range []string{"1", "status", "details", "close", "rename this chat", "retry the failed test"} {
+	for _, text := range []string{"1", "status", "details", "close", "rename this chat", "retry the failed test", "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗", "helper webhook 能不能一键配置"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if cmd.HelperCommand {

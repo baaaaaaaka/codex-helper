@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	EnvRepo       = "CODEX_PROXY_REPO"
-	EnvVersion    = "CODEX_PROXY_VERSION"
-	EnvInstallDir = "CODEX_PROXY_INSTALL_DIR"
+	EnvRepo           = "CODEX_PROXY_REPO"
+	EnvVersion        = "CODEX_PROXY_VERSION"
+	EnvInstallDir     = "CODEX_PROXY_INSTALL_DIR"
+	EnvUpdateIndexURL = "CODEX_PROXY_UPDATE_INDEX_URL"
 
 	DefaultRepo = "baaaaaaaka/codex-helper"
 )
@@ -28,12 +29,14 @@ const (
 var (
 	githubAPIBase     = "https://api.github.com"
 	githubReleaseBase = "https://github.com"
+	githubRawBase     = "https://raw.githubusercontent.com"
 )
 
 type Status struct {
 	Supported        bool
 	Repo             string
 	InstalledVersion string
+	RemoteTag        string
 	RemoteVersion    string
 	Asset            string
 	UpdateAvailable  bool
@@ -131,6 +134,7 @@ func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
 		timeout = 2 * time.Second
 	}
 	var remote string
+	var remoteTag string
 	var err error
 	if opts.IncludePrerelease {
 		releases, err := ListReleases(ctx, ReleaseListOptions{Repo: repo, Timeout: timeout})
@@ -149,12 +153,13 @@ func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
 			IgnorePriority:    true,
 		})
 		if selected.Candidate != nil {
+			remoteTag = selected.Candidate.TagName
 			remote = selected.Candidate.Version
 		} else {
 			remote = local
 		}
 	} else {
-		_, remote, err = fetchLatestRelease(ctx, repo, timeout)
+		remoteTag, remote, err = fetchLatestRelease(ctx, repo, timeout)
 		if err != nil {
 			return Status{
 				Supported:        false,
@@ -171,6 +176,7 @@ func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
 			Supported:        false,
 			Repo:             repo,
 			InstalledVersion: local,
+			RemoteTag:        remoteTag,
 			RemoteVersion:    remote,
 			Error:            err.Error(),
 		}
@@ -182,6 +188,7 @@ func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
 			Supported:        false,
 			Repo:             repo,
 			InstalledVersion: local,
+			RemoteTag:        remoteTag,
 			RemoteVersion:    remote,
 			Asset:            asset,
 			Error:            fmt.Sprintf("unsupported version format (local=%s, remote=%s)", local, remote),
@@ -192,6 +199,7 @@ func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
 		Supported:        true,
 		Repo:             repo,
 		InstalledVersion: local,
+		RemoteTag:        remoteTag,
 		RemoteVersion:    remote,
 		Asset:            asset,
 		UpdateAvailable:  newer,

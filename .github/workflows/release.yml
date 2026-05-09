@@ -30,6 +30,65 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  publish-update-index:
+    name: Publish static update index
+    runs-on: ubuntu-latest
+    needs: [goreleaser, install-smoke]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update index branch
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/release.json"
+          existing_index="$RUNNER_TEMP/existing-update-index.json"
+          output_index="$RUNNER_TEMP/update-index.json"
+          empty_index="$RUNNER_TEMP/empty-update-index.json"
+
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,isDraft,isPrerelease,publishedAt,assets \
+            > "$release_json"
+
+          printf '{"version":1,"repo":"%s","releases":[]}\n' "$GITHUB_REPOSITORY" > "$empty_index"
+          index_branch_exists=0
+          if git ls-remote --exit-code origin refs/heads/auto-update-index >/dev/null 2>&1; then
+            git fetch origin auto-update-index
+            git show origin/auto-update-index:update-index.json > "$existing_index" 2>/dev/null || cp "$empty_index" "$existing_index"
+            index_branch_exists=1
+          else
+            cp "$empty_index" "$existing_index"
+          fi
+
+          python3 scripts/release_update_index.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --release-json "$release_json" \
+            --existing-index "$existing_index" \
+            --output "$output_index"
+
+          if [[ "$index_branch_exists" == "1" ]]; then
+            git checkout -B auto-update-index origin/auto-update-index
+          else
+            git checkout --orphan auto-update-index
+          fi
+          git rm -rf . >/dev/null 2>&1 || true
+          cp "$output_index" update-index.json
+          git add update-index.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "update-index.json already current"
+            exit 0
+          fi
+          git commit -m "chore: update helper update index for ${GITHUB_REF_NAME}"
+          git push origin auto-update-index
+
   install-smoke:
     name: Install smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

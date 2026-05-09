@@ -20,6 +20,7 @@ const (
 	StreamEventAgentMessage     StreamEventKind = "agent_message"
 	StreamEventCommandStarted   StreamEventKind = "command_started"
 	StreamEventCommandCompleted StreamEventKind = "command_completed"
+	StreamEventStreamRetry      StreamEventKind = "stream_retry"
 	StreamEventUsage            StreamEventKind = "usage"
 )
 
@@ -35,6 +36,7 @@ type StreamEvent struct {
 	Status           string
 	ExitCode         *int
 	Failure          *TurnFailure
+	WillRetry        bool
 	Usage            Usage
 	Raw              []byte
 }
@@ -49,7 +51,7 @@ func ParseStreamEventJSONL(line []byte) (StreamEvent, bool, error) {
 		return StreamEvent{}, false, err
 	}
 	out := StreamEvent{
-		ThreadID: event.ThreadID,
+		ThreadID: firstNonEmpty(event.ThreadIDCamel, event.ThreadID),
 		TurnID:   firstNonEmpty(event.TurnID, event.Turn.ID),
 		Raw:      append([]byte(nil), line...),
 	}
@@ -65,6 +67,14 @@ func ParseStreamEventJSONL(line []byte) (StreamEvent, bool, error) {
 		out.Kind = StreamEventTurnFailed
 		out.Usage = usageFromEvent(event)
 		out.Failure = failureFromEvent(event)
+	case "error":
+		out.Failure = failureFromEvent(event)
+		out.WillRetry = event.WillRetry
+		if event.WillRetry {
+			out.Kind = StreamEventStreamRetry
+		} else {
+			out.Kind = StreamEventTurnFailed
+		}
 	case "item.started", "item/started", "item.completed", "item/completed":
 		out.ItemID = event.Item.ID
 		out.ItemType = event.Item.Type

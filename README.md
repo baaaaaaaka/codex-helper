@@ -214,8 +214,14 @@ marker:
 <!-- codex-helper-release: {"auto_update_priority":"p1"} -->
 ```
 
-Use `p0`, `p1`, or `p2` in the marker. Teams mode ignores draft releases,
-prereleases, older versions, and releases without a matching platform asset.
+Use `p0`, `p1`, or `p2` in the marker. A release asset named
+`codex-helper-auto-update-p0`, `codex-helper-auto-update-p1`, or
+`codex-helper-auto-update-p2` is also accepted; conflicting markers fail closed
+to `p2`. Release publishing updates a static `auto-update-index` branch, so
+Teams helper checks normally fetch one small JSON file instead of listing GitHub
+Releases. If the index is unavailable, the helper falls back to the GitHub
+Release API. Teams mode ignores draft releases, prereleases, older versions,
+and releases without a matching platform asset.
 
 Upgrade Codex CLI itself (reinstall-style):
 

@@ -48,6 +48,7 @@ type codexEvent struct {
 	Error         codexEventError `json:"error"`
 	Message       string          `json:"message"`
 	Code          string          `json:"code"`
+	WillRetry     bool            `json:"willRetry"`
 	Raw           json.RawMessage `json:"-"`
 }
 
@@ -102,8 +103,10 @@ type codexPromptTokenDetails struct {
 }
 
 type codexEventError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code              string          `json:"code"`
+	Message           string          `json:"message"`
+	AdditionalDetails string          `json:"additionalDetails"`
+	CodexErrorInfo    json.RawMessage `json:"codexErrorInfo"`
 }
 
 func applyEvent(result *TurnResult, event codexEvent, raw []byte) {
@@ -208,13 +211,36 @@ func mergeUsage(dst *Usage, src codexUsage) {
 
 func failureFromEvent(event codexEvent) *TurnFailure {
 	failure := &TurnFailure{
-		Code:    firstNonEmpty(event.Error.Code, event.Code),
-		Message: firstNonEmpty(event.Error.Message, event.Message),
+		Code:    firstNonEmpty(event.Error.Code, event.Code, codexErrorInfoCode(event.Error.CodexErrorInfo)),
+		Message: firstNonEmpty(event.Error.Message, event.Message, event.Error.AdditionalDetails),
 	}
 	if failure.Message == "" {
-		failure.Message = "Codex turn failed"
+		if event.WillRetry {
+			failure.Message = "Codex stream disconnected; reconnecting"
+		} else {
+			failure.Message = "Codex turn failed"
+		}
 	}
 	return failure
+}
+
+func codexErrorInfoCode(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var name string
+	if err := json.Unmarshal(raw, &name); err == nil {
+		return name
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return ""
+	}
+	for key := range object {
+		return key
+	}
+	return ""
 }
 
 func firstNonEmpty(values ...string) string {

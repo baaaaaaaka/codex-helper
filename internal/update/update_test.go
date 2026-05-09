@@ -45,6 +45,9 @@ func TestCheckForUpdateAvailable(t *testing.T) {
 	if st.RemoteVersion != ver {
 		t.Fatalf("expected remote version %s, got %s", ver, st.RemoteVersion)
 	}
+	if st.RemoteTag != tag {
+		t.Fatalf("expected remote tag %s, got %s", tag, st.RemoteTag)
+	}
 }
 
 func TestCheckForUpdateFallbackRedirect(t *testing.T) {
@@ -69,6 +72,9 @@ func TestCheckForUpdateFallbackRedirect(t *testing.T) {
 	}
 	if st.RemoteVersion != ver {
 		t.Fatalf("expected remote version %s, got %s", ver, st.RemoteVersion)
+	}
+	if st.RemoteTag != tag {
+		t.Fatalf("expected remote tag %s, got %s", tag, st.RemoteTag)
 	}
 }
 

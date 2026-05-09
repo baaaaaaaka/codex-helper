@@ -191,6 +191,44 @@ func TestAppServerRunnerStreamsNotifications(t *testing.T) {
 	}
 }
 
+func TestAppServerRunnerStreamsRetryableStreamErrorNotification(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-new"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}`,
+		`{"method":"turn/started","params":{"threadId":"thread-new","turnId":"turn-1"}}`,
+		`{"method":"error","params":{"threadId":"thread-new","turnId":"turn-1","willRetry":true,"error":{"message":"Reconnecting... 1/3","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before completion"}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage","text":"done after reconnect"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-new","turnId":"turn-1","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	var events []StreamEvent
+
+	got, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt: "hello",
+		EventHandler: func(event StreamEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartThread error: %v", err)
+	}
+	if got.FinalAgentMessage != "done after reconnect" {
+		t.Fatalf("final message = %q", got.FinalAgentMessage)
+	}
+	if len(events) != 4 {
+		t.Fatalf("events len = %d, want 4: %#v", len(events), events)
+	}
+	retry := events[1]
+	if retry.Kind != StreamEventStreamRetry || !retry.WillRetry {
+		t.Fatalf("retry event = %#v", retry)
+	}
+	if retry.Failure == nil || retry.Failure.Message != "Reconnecting... 1/3" || retry.Failure.Code != "responseStreamDisconnected" {
+		t.Fatalf("retry failure = %#v", retry.Failure)
+	}
+}
+
 func TestAppServerRunnerStartTurnReturnsStructuredServerError(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,

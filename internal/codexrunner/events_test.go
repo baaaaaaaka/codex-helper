@@ -25,6 +25,26 @@ func TestParseStreamEventJSONLCommandExecution(t *testing.T) {
 	}
 }
 
+func TestParseStreamEventJSONLRetryableStreamError(t *testing.T) {
+	line := []byte(`{"type":"error","threadId":"thread-1","turn_id":"turn-1","willRetry":true,"error":{"message":"Reconnecting... 2/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}}}}`)
+	event, ok, err := ParseStreamEventJSONL(line)
+	if err != nil {
+		t.Fatalf("ParseStreamEventJSONL error: %v", err)
+	}
+	if !ok {
+		t.Fatal("event was not recognized")
+	}
+	if event.Kind != StreamEventStreamRetry || !event.WillRetry {
+		t.Fatalf("event kind/retry = %q/%v, want %q/true", event.Kind, event.WillRetry, StreamEventStreamRetry)
+	}
+	if event.ThreadID != "thread-1" || event.TurnID != "turn-1" {
+		t.Fatalf("event ids = %q/%q", event.ThreadID, event.TurnID)
+	}
+	if event.Failure == nil || event.Failure.Code != "responseStreamDisconnected" || event.Failure.Message != "Reconnecting... 2/5" {
+		t.Fatalf("failure = %#v", event.Failure)
+	}
+}
+
 func TestEventStreamWriterEmitsJSONEventsAcrossWrites(t *testing.T) {
 	var dst bytes.Buffer
 	var events []StreamEvent

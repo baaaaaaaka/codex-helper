@@ -19,6 +19,7 @@ type teamsReleaseAutoUpdater struct {
 
 var teamsAutoUpdateResolveInstallPath = update.ResolveInstallPath
 var teamsAutoUpdateListReleases = update.ListReleases
+var teamsAutoUpdateFetchReleaseIndex = update.FetchReleaseIndex
 
 func newTeamsReleaseAutoUpdater(repo string, includePrerelease bool) teams.HelperAutoUpdater {
 	return teamsReleaseAutoUpdater{repo: repo, includePrerelease: includePrerelease}
@@ -29,10 +30,10 @@ func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAu
 	if now.IsZero() {
 		now = time.Now()
 	}
-	releases, err := teamsAutoUpdateListReleases(ctx, update.ReleaseListOptions{
-		Repo:    u.repo,
-		Timeout: 8 * time.Second,
-	})
+	if check.Manual && !check.IncludePrerelease {
+		return u.checkManualStable(ctx, check, now)
+	}
+	releases, err := u.indexedOrListedReleases(ctx)
 	if err != nil {
 		return teams.HelperAutoUpdateDecision{
 			NextCheckAt:  now.Add(update.DefaultAutoUpdateCheckInterval),
@@ -62,6 +63,87 @@ func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAu
 			EligibleAt:  selected.Candidate.EligibleAt,
 			Asset:       selected.Candidate.Asset,
 		}
+	}
+	return decision, nil
+}
+
+func (u teamsReleaseAutoUpdater) indexedOrListedReleases(ctx context.Context) ([]update.GitHubRelease, error) {
+	indexReleases, indexErr := teamsAutoUpdateFetchReleaseIndex(ctx, update.ReleaseIndexOptions{
+		Repo:    u.repo,
+		Timeout: 8 * time.Second,
+	})
+	if indexErr == nil {
+		return indexReleases, nil
+	}
+	releases, listErr := teamsAutoUpdateListReleases(ctx, update.ReleaseListOptions{
+		Repo:    u.repo,
+		Timeout: 8 * time.Second,
+	})
+	if listErr != nil {
+		return nil, fmt.Errorf("release index failed: %v; release list failed: %w", indexErr, listErr)
+	}
+	return releases, nil
+}
+
+func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check teams.HelperAutoUpdateCheck, now time.Time) (teams.HelperAutoUpdateDecision, error) {
+	installedVersion := check.InstalledVersion
+	if strings.TrimSpace(installedVersion) == "" || strings.EqualFold(strings.TrimSpace(installedVersion), "dev") {
+		installedVersion = "0.0.0"
+	}
+	next := now.Add(update.DefaultAutoUpdateCheckInterval)
+	indexReleases, indexErr := teamsAutoUpdateFetchReleaseIndex(ctx, update.ReleaseIndexOptions{
+		Repo:    u.repo,
+		Timeout: 8 * time.Second,
+	})
+	if indexErr == nil {
+		selected := update.SelectAutoUpdateCandidate(indexReleases, update.AutoUpdateSelectionOptions{
+			InstalledVersion: installedVersion,
+			Now:              now,
+			IgnorePriority:   true,
+		})
+		decision := teams.HelperAutoUpdateDecision{NextCheckAt: selected.NextCheckAt}
+		if selected.Candidate != nil {
+			decision.Candidate = &teams.HelperAutoUpdateCandidate{
+				TagName:     selected.Candidate.TagName,
+				Version:     selected.Candidate.Version,
+				Priority:    "manual",
+				PublishedAt: selected.Candidate.PublishedAt,
+				EligibleAt:  selected.Candidate.EligibleAt,
+				Asset:       selected.Candidate.Asset,
+			}
+		}
+		return decision, nil
+	}
+	status := checkForUpdate(ctx, update.CheckOptions{
+		Repo:             u.repo,
+		InstalledVersion: installedVersion,
+		Timeout:          8 * time.Second,
+	})
+	if !status.Supported {
+		err := fmt.Errorf("helper update check failed: %s", strings.TrimSpace(status.Error))
+		if strings.TrimSpace(status.Error) == "" {
+			err = fmt.Errorf("helper update check failed")
+		}
+		err = fmt.Errorf("release index failed: %v; %w", indexErr, err)
+		return teams.HelperAutoUpdateDecision{
+			NextCheckAt:  next,
+			BackoffUntil: next,
+			LastError:    err.Error(),
+		}, err
+	}
+	decision := teams.HelperAutoUpdateDecision{NextCheckAt: next}
+	if !status.UpdateAvailable {
+		return decision, nil
+	}
+	tag := strings.TrimSpace(status.RemoteTag)
+	if tag == "" {
+		tag = "v" + strings.TrimPrefix(strings.TrimSpace(status.RemoteVersion), "v")
+	}
+	decision.Candidate = &teams.HelperAutoUpdateCandidate{
+		TagName:  tag,
+		Version:  strings.TrimPrefix(strings.TrimSpace(status.RemoteVersion), "v"),
+		Priority: "manual",
+		Asset:    status.Asset,
 	}
 	return decision, nil
 }

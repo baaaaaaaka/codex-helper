@@ -95,7 +95,9 @@ func ParseDashboardCommand(scope ChatScope, text string) ParsedDashboardCommand 
 	}
 	commandName, ok := controlDashboardCommandName(syntax, name, arg)
 	if !ok {
-		if syntax == dashboardCommandSyntaxCodex {
+		if syntax == dashboardCommandSyntaxHelp && helperPrefixedControlTextShouldStayHelperUnknown(name, arg) {
+			commandName = DashboardCommandUnknown
+		} else if syntax == dashboardCommandSyntaxCodex || syntax == dashboardCommandSyntaxHelp {
 			return ParsedDashboardCommand{
 				Scope:          ChatScopeControl,
 				Argument:       strings.TrimSpace(trimmed),
@@ -103,8 +105,9 @@ func ParseDashboardCommand(scope ChatScope, text string) ParsedDashboardCommand 
 				ForwardToCodex: true,
 				RequiresCodex:  true,
 			}
+		} else {
+			commandName = DashboardCommandUnknown
 		}
-		commandName = DashboardCommandUnknown
 	}
 	return ParsedDashboardCommand{
 		Scope:          ChatScopeControl,
@@ -114,6 +117,22 @@ func ParseDashboardCommand(scope ChatScope, text string) ParsedDashboardCommand 
 		HelperCommand:  true,
 		ForwardToCodex: false,
 		RequiresCodex:  false,
+	}
+}
+
+func helperPrefixedControlTextShouldStayHelperUnknown(name string, arg string) bool {
+	if helperPrefixedControlNameIsWorkOnly(name) {
+		return true
+	}
+	return false
+}
+
+func helperPrefixedControlNameIsWorkOnly(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "close", "retry", "cancel", "stop", "send-file", "send-image", "file", "image", "publish-history", "sync-history", "import-history":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -136,7 +155,7 @@ func parseWorkChatCommand(trimmed string) ParsedDashboardCommand {
 	}
 	commandName, ok := workChatCommandName(syntax, name, arg)
 	if !ok {
-		if syntax == dashboardCommandSyntaxSlash || syntax == dashboardCommandSyntaxCodex {
+		if syntax == dashboardCommandSyntaxSlash || syntax == dashboardCommandSyntaxCodex || syntax == dashboardCommandSyntaxHelp {
 			return ParsedDashboardCommand{
 				Scope:          ChatScopeWork,
 				Name:           DashboardCommandUnknown,
@@ -201,7 +220,7 @@ func controlDashboardCommandName(syntax dashboardCommandSyntax, name string, arg
 	case dashboardCommandSyntaxSlash, dashboardCommandSyntaxBang, dashboardCommandSyntaxCX:
 		return controlLegacyCommandName(name, arg)
 	case dashboardCommandSyntaxCodex, dashboardCommandSyntaxHelp:
-		return controlNaturalCommandName(name, arg)
+		return prefixedControlNaturalCommandName(name, arg)
 	default:
 		return DashboardCommandNone, false
 	}
@@ -212,29 +231,91 @@ func controlAdminCommandName(syntax dashboardCommandSyntax, name string, arg str
 		return DashboardCommandNone, false
 	}
 	name = strings.ToLower(strings.TrimSpace(name))
-	argName, _ := splitDashboardCommandBody(arg)
+	argName, argRest := splitDashboardCommandBody(arg)
 	argName = strings.ToLower(strings.TrimSpace(argName))
+	arg = strings.TrimSpace(arg)
 	switch name {
 	case "restart", "reboot":
-		return DashboardCommandRestart, true
-	case "reload":
-		return DashboardCommandReload, true
-	case "update", "upgrade":
-		return DashboardCommandUpdate, true
-	case "webhook", "workflow":
-		return DashboardCommandWebhook, true
-	case "service":
-		if argName == "restart" || argName == "reboot" {
+		if arg == "" || helperRestartConfirmed(arg) {
 			return DashboardCommandRestart, true
 		}
-		if argName == "reload" {
+	case "reload":
+		if arg == "" || helperReloadConfirmed(arg) {
 			return DashboardCommandReload, true
 		}
-		if argName == "update" || argName == "upgrade" {
+	case "update", "upgrade":
+		if arg == "" {
 			return DashboardCommandUpdate, true
+		}
+		if _, ok := parseHelperUpdateRequest(arg); ok {
+			return DashboardCommandUpdate, true
+		}
+	case "webhook", "workflow":
+		if helperWebhookCommandArgLooksExplicit(arg) {
+			return DashboardCommandWebhook, true
+		}
+	case "service":
+		if argName == "restart" || argName == "reboot" {
+			if strings.TrimSpace(argRest) == "" || helperRestartConfirmed(arg) {
+				return DashboardCommandRestart, true
+			}
+		}
+		if argName == "reload" {
+			if strings.TrimSpace(argRest) == "" || helperReloadConfirmed(arg) {
+				return DashboardCommandReload, true
+			}
+		}
+		if argName == "update" || argName == "upgrade" {
+			if strings.TrimSpace(argRest) == "" {
+				return DashboardCommandUpdate, true
+			}
+			if _, ok := parseHelperUpdateRequest(arg); ok {
+				return DashboardCommandUpdate, true
+			}
 		}
 	}
 	return DashboardCommandNone, false
+}
+
+func helperWebhookCommandArgLooksExplicit(arg string) bool {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return true
+	}
+	name, rest := splitDashboardCommandBody(arg)
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "help", "?", "setup", "guide", "start", "status", "st", "off", "disable", "disabled", "test":
+		return strings.TrimSpace(rest) == ""
+	case "set", "url", "enable":
+		return strings.Contains(strings.TrimSpace(rest), "://")
+	default:
+		return strings.Contains(arg, "://")
+	}
+}
+
+func prefixedControlNaturalCommandName(name string, arg string) (DashboardCommandName, bool) {
+	commandName, ok := controlNaturalCommandName(name, arg)
+	if !ok {
+		return DashboardCommandNone, false
+	}
+	if prefixedControlCommandArgLooksExplicit(commandName, arg) {
+		return commandName, true
+	}
+	return DashboardCommandNone, false
+}
+
+func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, arg string) bool {
+	arg = strings.TrimSpace(arg)
+	switch commandName {
+	case DashboardCommandHelp:
+		return arg == "" || isAdvancedHelpArg(arg)
+	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
+		return arg == ""
+	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
+		return true
+	default:
+		return arg == ""
+	}
 }
 
 func controlNaturalCommandName(name string, arg string) (DashboardCommandName, bool) {

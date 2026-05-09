@@ -32,6 +32,70 @@ func TestParseAutoUpdatePriority(t *testing.T) {
 	}
 }
 
+func TestReleaseAutoUpdatePrioritySourcesAndConflicts(t *testing.T) {
+	cases := []struct {
+		name string
+		rel  GitHubRelease
+		want AutoUpdatePriority
+	}{
+		{
+			name: "explicit index priority",
+			rel:  GitHubRelease{Priority: "p0"},
+			want: AutoUpdatePriorityP0,
+		},
+		{
+			name: "release asset priority marker",
+			rel: GitHubRelease{Assets: []struct {
+				Name string `json:"name"`
+			}{{Name: "codex-helper-auto-update-p1.txt"}}},
+			want: AutoUpdatePriorityP1,
+		},
+		{
+			name: "release body priority marker",
+			rel:  GitHubRelease{Body: BuildReleasePriorityMarker(AutoUpdatePriorityP0)},
+			want: AutoUpdatePriorityP0,
+		},
+		{
+			name: "matching sources accepted",
+			rel: GitHubRelease{
+				Priority: "p1",
+				Body:     BuildReleasePriorityMarker(AutoUpdatePriorityP1),
+				Assets: []struct {
+					Name string `json:"name"`
+				}{{Name: "codex-helper-auto-update-p1"}},
+			},
+			want: AutoUpdatePriorityP1,
+		},
+		{
+			name: "conflicting sources fail closed",
+			rel: GitHubRelease{
+				Priority: "p0",
+				Body:     BuildReleasePriorityMarker(AutoUpdatePriorityP1),
+			},
+			want: AutoUpdatePriorityP2,
+		},
+		{
+			name: "duplicate asset markers fail closed",
+			rel: GitHubRelease{Assets: []struct {
+				Name string `json:"name"`
+			}{{Name: "codex-helper-auto-update-p0"}, {Name: "codex-helper-auto-update-p1"}}},
+			want: AutoUpdatePriorityP2,
+		},
+		{
+			name: "missing priority defaults p2",
+			rel:  GitHubRelease{},
+			want: AutoUpdatePriorityP2,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ReleaseAutoUpdatePriority(tt.rel); got != tt.want {
+				t.Fatalf("ReleaseAutoUpdatePriority() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSelectAutoUpdateCandidateMixedReleaseWindow(t *testing.T) {
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	releases := []GitHubRelease{
@@ -55,6 +119,58 @@ func TestSelectAutoUpdateCandidateMixedReleaseWindow(t *testing.T) {
 	}
 	if got.Candidate.Priority != AutoUpdatePriorityP1 {
 		t.Fatalf("candidate priority = %q, want p1", got.Candidate.Priority)
+	}
+}
+
+func TestFetchReleaseIndexConvertsStaticIndexToGitHubReleases(t *testing.T) {
+	published := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/owner/name/auto-update-index/update-index.json" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		writeJSON(t, w, ReleaseIndex{
+			Version: 1,
+			Repo:    "owner/name",
+			Releases: []ReleaseIndexRelease{{
+				TagName:     "v1.2.4",
+				Priority:    "p0",
+				PublishedAt: published,
+				Assets:      []ReleaseIndexAsset{{Name: "codex-proxy_1.2.4_linux_amd64"}},
+			}},
+		})
+	}))
+	defer server.Close()
+	prev := githubRawBase
+	githubRawBase = server.URL
+	t.Cleanup(func() { githubRawBase = prev })
+
+	got, err := FetchReleaseIndex(context.Background(), ReleaseIndexOptions{Repo: "owner/name"})
+	if err != nil {
+		t.Fatalf("FetchReleaseIndex error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("release count = %d, want 1", len(got))
+	}
+	if got[0].TagName != "v1.2.4" || got[0].Priority != "p0" || !got[0].PublishedAt.Equal(published) {
+		t.Fatalf("release = %#v, want indexed v1.2.4 p0", got[0])
+	}
+	if !releaseHasAsset(got[0], "codex-proxy_1.2.4_linux_amd64") {
+		t.Fatalf("indexed release assets = %#v, want linux asset", got[0].Assets)
+	}
+}
+
+func TestFetchReleaseIndexRejectsWrongRepo(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, ReleaseIndex{Version: 1, Repo: "other/repo"})
+	}))
+	defer server.Close()
+
+	_, err := FetchReleaseIndex(context.Background(), ReleaseIndexOptions{
+		Repo: "owner/name",
+		URL:  server.URL + "/update-index.json",
+	})
+	if err == nil {
+		t.Fatal("FetchReleaseIndex error = nil, want repo mismatch")
 	}
 }
 
