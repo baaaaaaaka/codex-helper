@@ -63,6 +63,11 @@ const (
 	importCheckpointStatusBlocked   = "blocked"
 )
 
+const (
+	envTeamsStartupFallbackStopFile      = "CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE"
+	envTeamsStartupFallbackExitOnStandby = "CODEX_HELPER_TEAMS_EXIT_ON_STANDBY"
+)
+
 type helperRestartNotice struct {
 	Version          int       `json:"version"`
 	Action           string    `json:"action,omitempty"`
@@ -493,6 +498,12 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		_, _ = fmt.Fprintln(b.out, "Listening. Send `help`, `p`, or `n <directory>` in the control chat.")
 	}
 	for {
+		if teamsStartupFallbackStopRequested() {
+			if b.out != nil {
+				_, _ = fmt.Fprintln(b.out, "Teams Startup fallback retire signal detected; exiting.")
+			}
+			return nil
+		}
 		if ownerHeartbeatDone != nil {
 			select {
 			case err := <-ownerHeartbeatDone:
@@ -5404,6 +5415,12 @@ func (b *Bridge) runStandbyLoop(ctx context.Context, opts BridgeOptions) error {
 		_, _ = fmt.Fprintf(b.out, "Teams bridge standby; control lease is held by %s. This process will keep running and retry.\n", holder)
 	}
 	for {
+		if teamsStartupFallbackStopRequested() {
+			if b.out != nil {
+				_, _ = fmt.Fprintln(b.out, "Teams Startup fallback retire signal detected while standby; exiting.")
+			}
+			return nil
+		}
 		if active, err := b.claimControlLease(ctx); err != nil {
 			return err
 		} else if active {
@@ -5411,6 +5428,12 @@ func (b *Bridge) runStandbyLoop(ctx context.Context, opts BridgeOptions) error {
 				_, _ = fmt.Fprintln(b.out, "Teams bridge acquired control lease; becoming active.")
 			}
 			return b.Listen(ctx, opts)
+		}
+		if teamsStartupFallbackExitOnStandby() {
+			if b.out != nil {
+				_, _ = fmt.Fprintln(b.out, "Teams Startup fallback is not the active owner; exiting for low-cost retry.")
+			}
+			return nil
 		}
 		if opts.Once {
 			return nil
@@ -5424,6 +5447,24 @@ func (b *Bridge) runStandbyLoop(ctx context.Context, opts BridgeOptions) error {
 			return ctx.Err()
 		case <-time.After(interval):
 		}
+	}
+}
+
+func teamsStartupFallbackStopRequested() bool {
+	path := strings.TrimSpace(os.Getenv(envTeamsStartupFallbackStopFile))
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func teamsStartupFallbackExitOnStandby() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envTeamsStartupFallbackExitOnStandby))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
@@ -368,7 +369,7 @@ type runTargetOptions struct {
 	Stdin        io.Reader
 	Stdout       io.Writer
 	Stderr       io.Writer
-	// PreserveTTY keeps stdout/stderr attached to the terminal for interactive CLIs.
+	// PreserveTTY keeps the target in the foreground terminal process group for interactive CLIs.
 	PreserveTTY    bool
 	YoloEnabled    bool
 	RequireYolo    bool
@@ -752,25 +753,37 @@ func runTargetOnceWithOptions(
 		return identityErr
 	}
 	cmd.Env = updatedEnv
-	configureTargetProcessGroup(cmd)
+	preserveTTY := shouldPreserveTargetTTY(opts)
+	useProcessGroup := !preserveTTY
+	if useProcessGroup {
+		configureTargetProcessGroup(cmd)
+	}
+	terminateTarget := func() {
+		if useProcessGroup {
+			_ = terminateTargetCommand(cmd, 2*time.Second)
+			return
+		}
+		_ = terminateProcess(cmd.Process, 2*time.Second)
+	}
 	if opts.Stdin != nil {
 		cmd.Stdin = opts.Stdin
 	} else {
 		cmd.Stdin = os.Stdin
 	}
-	if opts.PreserveTTY {
+	if preserveTTY {
 		stdout := os.Stdout
 		if opts.Stdout != nil {
 			cmd.Stdout = opts.Stdout
 		} else {
 			cmd.Stdout = stdout
 		}
-		// Always tee stderr to the capture buffer so that isYoloFailure
-		// can detect approval_policy errors even in TTY mode.
 		stderr := io.Writer(os.Stderr)
 		if opts.Stderr != nil {
 			stderr = opts.Stderr
 		}
+		// Keep stderr capture in interactive mode so yolo fallback and startup
+		// failure classification still see early Codex errors. The TUI itself
+		// requires stdin/stdout to be terminals; stderr is only mirrored.
 		if stderrBuf != nil {
 			cmd.Stderr = io.MultiWriter(stderr, stderrBuf)
 		} else {
@@ -813,11 +826,11 @@ func runTargetOnceWithOptions(
 		case err := <-done:
 			return err
 		case err := <-fatalCh:
-			_ = terminateTargetCommand(cmd, 2*time.Second)
+			terminateTarget()
 			<-done
 			return fmt.Errorf("proxy stack failed; terminated target: %w", err)
 		case <-ctx.Done():
-			_ = terminateTargetCommand(cmd, 2*time.Second)
+			terminateTarget()
 			<-done
 			return ctx.Err()
 		case <-ticker.C:
@@ -827,7 +840,7 @@ func runTargetOnceWithOptions(
 			if err := healthCheck(); err != nil {
 				failures++
 				if failures >= 3 {
-					_ = terminateTargetCommand(cmd, 2*time.Second)
+					terminateTarget()
 					<-done
 					return fmt.Errorf("proxy unhealthy; terminated target: %w", err)
 				}
@@ -836,6 +849,23 @@ func runTargetOnceWithOptions(
 			failures = 0
 		}
 	}
+}
+
+func shouldPreserveTargetTTY(opts runTargetOptions) bool {
+	if opts.PreserveTTY {
+		return true
+	}
+	if opts.Stdin != nil || opts.Stdout != nil || opts.Stderr != nil {
+		return false
+	}
+	return isTerminalFile(os.Stdin) && isTerminalFile(os.Stdout) && isTerminalFile(os.Stderr)
+}
+
+func isTerminalFile(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	return term.IsTerminal(int(f.Fd()))
 }
 
 // recordPatchFailure persists a failure entry in the patch history store so

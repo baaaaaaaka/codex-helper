@@ -341,7 +341,7 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 	args := []string{
 		"-d", "Ubuntu",
 		"-u", "alice",
-		"--",
+		"--exec",
 		"env",
 		"CODEX_HELPER_TEAMS_SERVICE=1",
 		"CODEX_HELPER_TEAMS_SERVICE_MODE=background",
@@ -357,6 +357,9 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 		"System.Threading.Mutex",
 		"if (-not $created) { exit 0 }",
 		"while ($true)",
+		"codex-helper-teams-wsl-stop-abc.signal",
+		"Test-Path -LiteralPath $stopPath",
+		"stop requested",
 		"& wsl.exe @wslArgs",
 		"wsl.exe exited",
 		"restarting in 30s",
@@ -380,6 +383,8 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 		".cmd",
 		".ps1",
 		"$cmdPath = Join-Path $startup",
+		"$stopPath = Join-Path $appDir",
+		"Remove-Item -LiteralPath $stopPath",
 		"Set-Content -LiteralPath $scriptPath",
 		"Set-Content -LiteralPath $cmdPath",
 		"WindowStyle Hidden",
@@ -484,13 +489,18 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildTeamsServiceSpec error: %v", err)
 	}
-	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(buildTeamsServiceWSLArguments(spec))
-	wantTaskArgument := "-Argument " + powershellSingleQuote(actionArgument)
+	taskName := teamsServiceWSLWindowsTaskBackend{}.Name()
+	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, buildTeamsServiceWSLArguments(spec))
+	runLogName := teamsServiceWSLTaskRunLogName(taskName)
 	for _, want := range []string{
 		"New-ScheduledTaskAction",
-		"-Execute " + powershellSingleQuote(actionExecute),
-		wantTaskArgument,
+		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
+		"$expectedActionArgument = " + powershellSingleQuote(actionArgument),
+		"New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument",
 		"-WindowStyle Hidden",
+		runLogName,
+		"Add-Content -LiteralPath $runLog",
+		"*>> $runLog",
 		"& wsl.exe @wslArgs",
 		"New-ScheduledTaskTrigger -AtLogOn",
 		"RepetitionInterval (New-TimeSpan -Minutes 30)",
@@ -535,6 +545,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"-d Ubuntu/Dev",
 		"-u alice",
 		"--cd ",
+		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex home"),
 		wantExe + " teams run --auto-service=false --registry",
@@ -573,19 +584,28 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 	if err != nil {
 		t.Fatalf("buildTeamsServiceSpec error: %v", err)
 	}
-	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(buildTeamsServiceWSLArguments(spec))
-	wantTaskArgument := "-Argument " + powershellSingleQuote(actionArgument)
+	taskName := teamsServiceWSLWindowsTaskBackend{}.Name()
+	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, buildTeamsServiceWSLArguments(spec))
+	runLogName := teamsServiceWSLTaskRunLogName(taskName)
 	for _, want := range []string{
 		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
 		"$legacyPrefix",
 		"Unregister-ScheduledTask -TaskName $_.TaskName",
-		"New-ScheduledTaskAction -Execute " + powershellSingleQuote(actionExecute),
-		wantTaskArgument,
+		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
+		"$expectedActionArgument = " + powershellSingleQuote(actionArgument),
+		"New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument",
+		"$actionMatches = ($null -ne $actualAction",
+		"Teams WSL Scheduled Task action did not refresh; access is denied or task is protected",
 		"-WindowStyle Hidden",
+		runLogName,
+		"exited",
+		"$LASTEXITCODE",
 		"& wsl.exe @wslArgs",
 		"Register-ScheduledTask",
 		"Enable-ScheduledTask -TaskName $taskName",
 		"Start-ScheduledTask -TaskName $taskName",
+		"Teams WSL Scheduled Task did not stay running after start",
+		"Get-ScheduledTaskInfo -TaskName $taskName",
 		"MultipleInstances IgnoreNew",
 		"RepetitionInterval (New-TimeSpan -Minutes 30)",
 		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
@@ -596,6 +616,84 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 	}
 	if strings.Contains(command, "Disable-ScheduledTask -TaskName $taskName") {
 		t.Fatalf("WSL repair enable command should not disable task:\n%s", command)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLRepairReplacesStaleRegisteredActionCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	taskName := "Codex Helper Teams Bridge (WSL Ubuntu alice abc)"
+	args := []string{
+		"-d", "Ubuntu",
+		"-u", "alice",
+		"--cd", "/home/alice",
+		"--exec", "env",
+		"CODEX_HELPER_TEAMS_SERVICE=1",
+		"/home/alice/bin/codex-proxy",
+		"teams", "run", "--auto-service=false",
+	}
+	command := buildTeamsServiceWSLRegisterCommand(taskName, args, teamsServiceWSLRegisterOptions{
+		Enable:      true,
+		Start:       true,
+		CleanLegacy: true,
+	})
+
+	firstRegister := strings.Index(command, "Register-ScheduledTask -TaskName $taskName")
+	reRegister := strings.LastIndex(command, "Register-ScheduledTask -TaskName $taskName")
+	if firstRegister < 0 || reRegister <= firstRegister {
+		t.Fatalf("WSL repair command should register once, verify, then re-register after stale action mismatch:\n%s", command)
+	}
+	for _, want := range []string{
+		"$actualAction.Execute -eq $expectedActionExecute",
+		"$actualAction.Arguments -eq $expectedActionArgument",
+		"if (-not $actionMatches) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue; Register-ScheduledTask -TaskName $taskName",
+		"if (-not $actionMatches) { throw 'Teams WSL Scheduled Task action did not refresh; access is denied or task is protected' }",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("WSL repair stale-action hardening missing %q:\n%s", want, command)
+		}
+	}
+	if enableIdx := strings.Index(command, "Enable-ScheduledTask -TaskName $taskName"); enableIdx < 0 || enableIdx < reRegister {
+		t.Fatalf("WSL repair should only enable after stale-action verification/re-register:\n%s", command)
+	}
+	if startIdx := strings.Index(command, "Start-ScheduledTask -TaskName $taskName"); startIdx < 0 || startIdx < reRegister {
+		t.Fatalf("WSL repair should only start after stale-action verification/re-register:\n%s", command)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStatusPrintsTaskRunLogPathCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	if _, err := backend.Run(context.Background(), "status"); err != nil {
+		t.Fatalf("WSL status command error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("WSL status calls = %#v, want one PowerShell call", runner.calls)
+	}
+	command := strings.Join(runner.calls[0].args, " ")
+	for _, want := range []string{
+		"Get-ScheduledTaskInfo -TaskName $taskName",
+		"[Environment]::GetFolderPath('LocalApplicationData')",
+		"RunLog : ",
+		teamsServiceWSLTaskRunLogName(backend.Name()),
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("WSL status command missing %q:\n%s", want, command)
+		}
 	}
 }
 
@@ -667,6 +765,17 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDirectRepairSuccessCI(t *testing.T)
 		wslLinuxUser:   "alice",
 		runner:         runner,
 	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	taskConfigPath, err := backend.Path()
+	if err != nil {
+		t.Fatalf("task config path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(taskConfigPath), 0o700); err != nil {
+		t.Fatalf("mkdir task config dir: %v", err)
+	}
+	if err := os.WriteFile(taskConfigPath, []byte("stale scheduled task config"), 0o600); err != nil {
+		t.Fatalf("write stale task config: %v", err)
+	}
 
 	var out strings.Builder
 	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
@@ -692,6 +801,91 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDirectRepairSuccessCI(t *testing.T)
 	}
 	if got := out.String(); !strings.Contains(got, "Teams service bootstrap ready: wsl-windows-task-scheduler") {
 		t.Fatalf("bootstrap output missing success mode:\n%s", got)
+	}
+	configData, err := os.ReadFile(taskConfigPath)
+	if err != nil {
+		t.Fatalf("read refreshed task config: %v", err)
+	}
+	if config := string(configData); strings.Contains(config, "stale scheduled task config") || !strings.Contains(config, "--exec env") {
+		t.Fatalf("direct repair should refresh stale task config, got:\n%s", config)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapSuccessCleansStartupFallbackCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte("legacy fallback"), 0o600); err != nil {
+		t.Fatalf("write fallback marker: %v", err)
+	}
+	legacyMarkerPath := filepath.Join(filepath.Dir(markerPath), "codex-helper-teams-wsl-startup-legacy123.txt")
+	legacyTaskName := teamsServiceWSLTaskNamePrefix(backend.Name()) + "legacy123)"
+	if err := os.WriteFile(legacyMarkerPath, []byte("TaskName="+legacyTaskName+"\n"), 0o600); err != nil {
+		t.Fatalf("write legacy fallback marker: %v", err)
+	}
+	otherMarkerPath := filepath.Join(filepath.Dir(markerPath), "codex-helper-teams-wsl-startup-other999.txt")
+	if err := os.WriteFile(otherMarkerPath, []byte("TaskName=Codex Helper Teams Bridge (WSL Other user default other999)\n"), 0o600); err != nil {
+		t.Fatalf("write unrelated fallback marker: %v", err)
+	}
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap direct repair error: %v", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("bootstrap with fallback cleanup calls = %#v, want repair plus cleanup", runner.calls)
+	}
+	cleanup := strings.Join(runner.calls[1].args, " ")
+	for _, want := range []string{
+		"GetFolderPath('Startup')",
+		"Remove-Item",
+		"codex-helper-teams-wsl-",
+		".cmd",
+		".ps1",
+		"legacy123",
+		"Set-Content -LiteralPath $stopPath",
+		"$content.Contains('starting ' + $legacyPrefix)",
+	} {
+		if !strings.Contains(cleanup, want) {
+			t.Fatalf("startup fallback cleanup command missing %q:\n%s", want, cleanup)
+		}
+	}
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("startup fallback marker was not removed, err=%v", err)
+	}
+	if _, err := os.Stat(legacyMarkerPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy startup fallback marker was not removed, err=%v", err)
+	}
+	if _, err := os.Stat(teamsServiceWSLStartupFallbackStopPath(markerPath)); err != nil {
+		t.Fatalf("startup fallback stop file was not written: %v", err)
+	}
+	if _, err := os.Stat(teamsServiceWSLStartupFallbackStopPath(legacyMarkerPath)); err != nil {
+		t.Fatalf("legacy startup fallback stop file was not written: %v", err)
+	}
+	if _, err := os.Stat(otherMarkerPath); err != nil {
+		t.Fatalf("unrelated startup fallback marker should remain: %v", err)
 	}
 }
 
@@ -721,6 +915,17 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		wslLinuxUser:   "alice",
 		runner:         runner,
 	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	taskConfigPath, err := backend.Path()
+	if err != nil {
+		t.Fatalf("task config path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(taskConfigPath), 0o700); err != nil {
+		t.Fatalf("mkdir task config dir: %v", err)
+	}
+	if err := os.WriteFile(taskConfigPath, []byte("stale scheduled task config"), 0o600); err != nil {
+		t.Fatalf("write stale task config: %v", err)
+	}
 
 	var out strings.Builder
 	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
@@ -746,7 +951,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		"-Wait",
 		"-PassThru",
 		"New-ScheduledTaskAction",
-		"-Execute ''powershell.exe''",
+		"$expectedActionExecute = ''powershell.exe''",
 		"-WindowStyle Hidden",
 		"wsl.exe",
 		"wslArgs",
@@ -773,6 +978,13 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 	if got := out.String(); !strings.Contains(got, "Teams service bootstrap ready: wsl-windows-task-scheduler-uac") {
 		t.Fatalf("bootstrap output missing UAC success mode:\n%s", got)
 	}
+	configData, err := os.ReadFile(taskConfigPath)
+	if err != nil {
+		t.Fatalf("read refreshed task config: %v", err)
+	}
+	if config := string(configData); strings.Contains(config, "stale scheduled task config") || !strings.Contains(config, "--exec env") {
+		t.Fatalf("UAC repair should refresh stale task config, got:\n%s", config)
+	}
 }
 
 func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI(t *testing.T) {
@@ -795,6 +1007,17 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 		wslLinuxUser:   "alice",
 		runner:         runner,
 	})
+	fallbackBackend := teamsServiceWSLWindowsTaskBackend{}
+	fallbackTaskConfigPath, err := fallbackBackend.Path()
+	if err != nil {
+		t.Fatalf("fallback task config path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(fallbackTaskConfigPath), 0o700); err != nil {
+		t.Fatalf("mkdir fallback task config dir: %v", err)
+	}
+	if err := os.WriteFile(fallbackTaskConfigPath, []byte("stale scheduled task config"), 0o600); err != nil {
+		t.Fatalf("write stale fallback task config: %v", err)
+	}
 
 	var out strings.Builder
 	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
@@ -814,6 +1037,9 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 		"System.Threading.Mutex",
 		"wsl.exe",
 		"--auto-service=false",
+		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE=",
+		"CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1",
+		"Remove-Item -LiteralPath $stopPath",
 		"Start-Process -FilePath $cmdPath -WindowStyle Hidden",
 	} {
 		if !strings.Contains(fallback, want) {
@@ -830,8 +1056,102 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 	if len(files) != 1 {
 		t.Fatalf("Startup fallback marker files = %#v, want one", files)
 	}
+	if _, err := os.Stat(fallbackTaskConfigPath); !os.IsNotExist(err) {
+		t.Fatalf("stale Scheduled Task config should be removed after fallback install, err=%v", err)
+	}
 	if got := out.String(); !strings.Contains(got, "UAC prompt was not confirmed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
 		t.Fatalf("bootstrap fallback output missing confirmation and mode:\n%s", got)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapPreservesTaskConfigWhenFallbackFailsCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveScheduledTaskFailureForTest{},
+			errTeamsKeepaliveScheduledTaskFailureForTest{},
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	taskConfigPath, err := backend.Path()
+	if err != nil {
+		t.Fatalf("task config path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(taskConfigPath), 0o700); err != nil {
+		t.Fatalf("mkdir task config dir: %v", err)
+	}
+	if err := os.WriteFile(taskConfigPath, []byte("stale scheduled task config"), 0o600); err != nil {
+		t.Fatalf("write stale task config: %v", err)
+	}
+
+	var out strings.Builder
+	var errOut strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"bootstrap", "--no-uac"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("bootstrap should fail when both Scheduled Task and Startup fallback fail")
+	}
+	configData, err := os.ReadFile(taskConfigPath)
+	if err != nil {
+		t.Fatalf("stale Scheduled Task config should be preserved when fallback fails: %v", err)
+	}
+	if string(configData) != "stale scheduled task config" {
+		t.Fatalf("fallback failure should not rewrite stale task config, got:\n%s", configData)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackStopFileRetiresMarkerCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         &recordingTeamsServiceRunner{},
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte("Fallback=Windows Startup watchdog\n"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	installed, err := backend.StartupFallbackMarkerExists()
+	if err != nil || !installed {
+		t.Fatalf("fresh Startup fallback marker should be active, installed=%v err=%v", installed, err)
+	}
+	if err := os.WriteFile(teamsServiceWSLStartupFallbackStopPath(markerPath), []byte("stop\n"), 0o600); err != nil {
+		t.Fatalf("write stop file: %v", err)
+	}
+	installed, err = backend.StartupFallbackMarkerExists()
+	if err != nil {
+		t.Fatalf("stopped Startup fallback marker check error: %v", err)
+	}
+	if installed {
+		t.Fatalf("Startup fallback marker with a stop file should not block Scheduled Task repair")
 	}
 }
 
@@ -866,8 +1186,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapNoUACFallsBackOnTaskFailureCI(t *te
 	if len(runner.calls) != 2 {
 		t.Fatalf("bootstrap --no-uac calls = %#v, want direct repair then Startup fallback", runner.calls)
 	}
-	if got := out.String(); !strings.Contains(got, "Windows Scheduled Task setup failed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
-		t.Fatalf("bootstrap --no-uac output missing generic failure fallback:\n%s", got)
+	if got := out.String(); !strings.Contains(got, "Windows blocked automatic Scheduled Task setup") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+		t.Fatalf("bootstrap --no-uac output missing protected-task fallback:\n%s", got)
 	}
 }
 
@@ -986,8 +1306,8 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallback
 	})
 
 	err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json"))
-	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") || !strings.Contains(err.Error(), "Scheduled Task setup failed") {
-		t.Fatalf("auto ensure task failure error = %v, want Startup fallback diagnostic", err)
+	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") || !strings.Contains(err.Error(), "blocked by Windows policy") {
+		t.Fatalf("auto ensure task failure error = %v, want protected-task Startup fallback diagnostic", err)
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("auto ensure calls = %#v, want direct repair plus fallback install", runner.calls)
@@ -1175,6 +1495,13 @@ func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
 					"Stop-ScheduledTask -TaskName $taskName",
 					"-ErrorAction SilentlyContinue",
 					"Start-ScheduledTask -TaskName $taskName",
+					"Teams WSL Scheduled Task did not stay running after start",
+				)
+			} else if tt.action == "start" {
+				requireSubstringsInOrder(t, joined,
+					"Start-ScheduledTask -TaskName $taskName",
+					"Start-Sleep -Seconds 2",
+					"Teams WSL Scheduled Task did not stay running after start",
 				)
 			}
 		})

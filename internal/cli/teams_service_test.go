@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -350,6 +351,34 @@ func TestTeamsServiceEnvironmentCanKeepLoopbackProxyWhenExplicit(t *testing.T) {
 	env := teamsServiceEnvironment()
 	if got := env["HTTPS_PROXY"]; got != "http://127.0.0.1:38471" {
 		t.Fatalf("HTTPS_PROXY = %q, want explicit loopback proxy preserved", got)
+	}
+}
+
+func TestTeamsServiceWSLArgumentsUseExecToBypassLoginShell(t *testing.T) {
+	lockCLITestHooks(t)
+
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		wslDistro:    "Debian",
+		wslLinuxUser: "baka",
+	})
+	spec := teamsServiceSpec{
+		Executable: "/home/baka/.local/bin/codex-proxy",
+		WorkingDir: "/home/baka",
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE": "1",
+			"NO_PROXY":                   "*.nvidia.com,nvidia.com,<local>",
+		},
+	}
+	args := buildTeamsServiceWSLArguments(spec)
+	joined := strings.Join(args, "\x00")
+	if strings.Contains(joined, "\x00--\x00env\x00") {
+		t.Fatalf("WSL service args should not route env through the login shell: %#v", args)
+	}
+	if !strings.Contains(joined, "\x00--exec\x00env\x00") {
+		t.Fatalf("WSL service args should use --exec env to preserve glob proxy values: %#v", args)
+	}
+	if !slices.Contains(args, "NO_PROXY=*.nvidia.com,nvidia.com,<local>") {
+		t.Fatalf("WSL service args should preserve raw NO_PROXY value for env: %#v", args)
 	}
 }
 
@@ -938,6 +967,7 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		"-d Ubuntu-22.04",
 		"-u alice",
 		"--cd ",
+		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex-home"),
 		wantExe + " teams run --auto-service=false --registry",

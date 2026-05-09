@@ -389,6 +389,38 @@ func TestRunTargetWithFallbackDisablesYolo(t *testing.T) {
 	}
 }
 
+func TestRunTargetWithFallbackPreserveTTYStillCapturesYoloError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "yolo.sh")
+	content := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--yolo\" ]; then\n    echo \"unknown flag: --yolo\" >&2\n    exit 2\n  fi\ndone\nexit 0\n"
+	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	disabled := false
+	opts := runTargetOptions{
+		UseProxy:    false,
+		PreserveTTY: true,
+		YoloEnabled: true,
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+		OnYoloFallback: func() error {
+			disabled = true
+			return nil
+		},
+	}
+	cmdArgs := []string{script, "--yolo"}
+	if err := runTargetWithFallbackWithOptions(context.Background(), cmdArgs, "", nil, nil, opts); err != nil {
+		t.Fatalf("runTargetWithFallbackWithOptions error: %v", err)
+	}
+	if !disabled {
+		t.Fatalf("expected yolo to be disabled on PreserveTTY stderr failure")
+	}
+}
+
 func TestRunTargetWithFallbackRequiresYolo(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
@@ -417,6 +449,17 @@ func TestRunTargetWithFallbackRequiresYolo(t *testing.T) {
 	}
 	if disabled {
 		t.Fatal("required yolo should not call fallback disable hook")
+	}
+}
+
+func TestIsTerminalFileRejectsCharacterDeviceThatIsNotTTY(t *testing.T) {
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	defer f.Close()
+	if isTerminalFile(f) {
+		t.Fatalf("%s is a character device but should not be treated as a TTY", os.DevNull)
 	}
 }
 

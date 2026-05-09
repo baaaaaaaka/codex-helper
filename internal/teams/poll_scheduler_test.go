@@ -75,6 +75,82 @@ func TestInboundPollDecisionFutureActivityStaysHot(t *testing.T) {
 	}
 }
 
+func TestInboundPollUnrecoveredErrorPreventsWorkChatParking(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-1",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:               "chat-1",
+			Seeded:               true,
+			PollState:            inboundPollStateParked,
+			LastActivityAt:       now.Add(-72 * time.Hour),
+			NextPollAt:           now,
+			LastSuccessfulPollAt: now.Add(-71 * time.Hour),
+			LastError:            "Teams message read token refresh failed: Bad Gateway",
+			LastErrorAt:          now.Add(-time.Hour),
+			FailureCount:         1731,
+			ParkedAt:             now.Add(-30 * time.Minute),
+			ParkNoticeSentAt:     now.Add(-30 * time.Minute),
+			LastModifiedCursor:   now.Add(-71 * time.Hour),
+		},
+		Now: now,
+	})
+	if decision.ShouldPark || decision.State != inboundPollStateCold || decision.Interval != inboundPollColdInterval {
+		t.Fatalf("unrecovered poll error should keep work chat cold instead of parked: %#v", decision)
+	}
+	if !decision.Due || !decision.NextPollAt.Equal(now) {
+		t.Fatalf("unrecovered poll error should be due at existing cold schedule: %#v", decision)
+	}
+}
+
+func TestInboundPollRecoveredErrorCanParkWorkChat(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-1",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:               "chat-1",
+			Seeded:               true,
+			LastActivityAt:       now.Add(-72 * time.Hour),
+			LastError:            "old temporary auth error",
+			LastErrorAt:          now.Add(-2 * time.Hour),
+			LastSuccessfulPollAt: now.Add(-time.Hour),
+			FailureCount:         1,
+			NextPollAt:           now,
+		},
+		Now: now,
+	})
+	if !decision.ShouldPark || decision.State != inboundPollStateParked {
+		t.Fatalf("recovered old poll error should not keep an idle work chat polling: %#v", decision)
+	}
+}
+
+func TestInboundPollUnrecoveredPermanentErrorCanParkWorkChat(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-1",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:               "chat-1",
+			Seeded:               true,
+			LastActivityAt:       now.Add(-72 * time.Hour),
+			LastSuccessfulPollAt: now.Add(-71 * time.Hour),
+			LastError:            "Teams message read token refresh failed: invalid_grant",
+			LastErrorAt:          now.Add(-time.Hour),
+			FailureCount:         10,
+			NextPollAt:           now,
+		},
+		Now: now,
+	})
+	if !decision.ShouldPark || decision.State != inboundPollStateParked {
+		t.Fatalf("unrecovered permanent poll error should still allow idle parking: %#v", decision)
+	}
+}
+
 func TestSortInboundPollDecisionsPrioritizesRunningUnderCycleCap(t *testing.T) {
 	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
 	decisions := []inboundPollDecision{

@@ -110,6 +110,11 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		return decision
 	}
 	state, interval, parked := classifyInboundPollState(input.Role, input.Running, lastActivity, now)
+	if parked && input.Role == inboundPollRoleWork && chatPollHasUnrecoveredRetryableError(poll) {
+		state = inboundPollStateCold
+		interval = inboundPollColdInterval
+		parked = false
+	}
 	decision.State = state
 	decision.Interval = interval
 	decision.ShouldPark = parked
@@ -154,6 +159,49 @@ func classifyInboundPollState(role inboundPollRole, running bool, lastActivity t
 	default:
 		return inboundPollStateParked, 0, true
 	}
+}
+
+func chatPollHasUnrecoveredRetryableError(poll teamstore.ChatPollState) bool {
+	if poll.FailureCount <= 0 || strings.TrimSpace(poll.LastError) == "" || poll.LastErrorAt.IsZero() {
+		return false
+	}
+	if !isRetryableChatPollErrorMessage(poll.LastError) {
+		return false
+	}
+	return poll.LastSuccessfulPollAt.IsZero() || poll.LastErrorAt.After(poll.LastSuccessfulPollAt)
+}
+
+func isRetryableChatPollErrorMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	for _, token := range []string{
+		"temporarily failed",
+		"bad gateway",
+		"gateway timeout",
+		"service unavailable",
+		"too many requests",
+		"internal server error",
+		"http 429",
+		"http 500",
+		"http 502",
+		"http 503",
+		"http 504",
+		"timeout",
+		"connection refused",
+		"connection reset",
+		"network is unreachable",
+		"no such host",
+		"proxyconnect",
+		"tls handshake timeout",
+		"unexpected eof",
+	} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func nextInboundPollAt(now time.Time, interval time.Duration) time.Time {
