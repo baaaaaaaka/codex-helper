@@ -91,11 +91,25 @@ func codexYoloArgs(path string) []string {
 }
 
 func codexYoloLaunchArgs(path string) []string {
+	return codexYoloLaunchArgsWithOptions(path, yoloLaunchOptions{})
+}
+
+type yoloLaunchOptions struct {
+	ForceFileAuthStore bool
+}
+
+func codexYoloLaunchArgsWithOptions(path string, opts yoloLaunchOptions) []string {
 	args := codexYoloArgs(path)
-	if !strings.EqualFold(codexYoloRuntimeGOOS, "windows") || len(args) == 0 {
+	if len(args) == 0 {
 		return args
 	}
-	out := []string{"-c", windowsYoloSandboxConfigArg}
+	out := make([]string, 0, len(args)+4)
+	if opts.ForceFileAuthStore {
+		out = append(out, "-c", `cli_auth_credentials_store="file"`)
+	}
+	if strings.EqualFold(codexYoloRuntimeGOOS, "windows") {
+		out = append(out, "-c", windowsYoloSandboxConfigArg)
+	}
 	out = append(out, args...)
 	return out
 }
@@ -233,6 +247,9 @@ func stripYoloArgs(cmdArgs []string) []string {
 		case arg == "--yolo" || arg == "--dangerously-bypass-approvals-and-sandbox":
 			continue
 		case (arg == "-c" || arg == "--config") && i+1 < len(cmdArgs) && strings.TrimSpace(cmdArgs[i+1]) == windowsYoloSandboxConfigArg:
+			i++
+			continue
+		case (arg == "-c" || arg == "--config") && i+1 < len(cmdArgs) && strings.TrimSpace(cmdArgs[i+1]) == `cli_auth_credentials_store="file"`:
 			i++
 			continue
 		case arg == "--ask-for-approval" || arg == "--sandbox" || arg == "-s":

@@ -160,7 +160,7 @@ func runCodexSession(
 		}
 	}
 
-	path, args, _, err = buildCodexResumeCommand(codexPath, session, project, useYolo)
+	path, args, _, err = buildCodexResumeCommand(codexPath, session, project, false)
 	if err != nil {
 		return err
 	}
@@ -168,19 +168,32 @@ func runCodexSession(
 	effectiveCodexHome = codexHome
 	extraEnv = append(extraEnv, codexHomeEnv(effectiveCodexHome)...)
 
+	var authOverride *yoloAuthOverride
+	forceFileAuthStore := false
 	if useYolo {
-		authOverride, authErr := prepareYoloAuthOverride(codexHome, paths.ExecIdentity)
+		var authErr error
+		authOverride, authErr = prepareYoloAuthOverride(codexHome, paths.ExecIdentity)
 		logYoloAuthStatus(log, authOverride, authErr)
 		if authOverride != nil {
+			forceFileAuthStore = true
 			defer authOverride.Cleanup()
 		}
-		// Always delete the cloud requirements cache when yolo is
-		// requested, even if patching was skipped or failed. The cached
-		// cloud requirements would otherwise override yolo flags.
-		_ = cloudgate.RemoveCloudRequirementsCache(codexHome)
+		if cacheBypass, err := cloudgate.InstallYoloCloudRequirementsBypass(codexHome, path); err != nil && log != nil {
+			_, _ = fmt.Fprintf(log, "yolo cloud requirements bypass warning: %v\n", err)
+		} else if cacheBypass.Installed {
+			forceFileAuthStore = true
+			defer cloudgate.RemoveCloudRequirementsCache(codexHome)
+		}
 	}
 
 	cmdArgs := append([]string{path}, args...)
+	if useYolo {
+		if yoloFlags := codexYoloLaunchArgsWithOptions(path, yoloLaunchOptions{ForceFileAuthStore: forceFileAuthStore}); len(yoloFlags) > 0 {
+			cmdArgs = []string{path}
+			cmdArgs = append(cmdArgs, yoloFlags...)
+			cmdArgs = append(cmdArgs, args...)
+		}
+	}
 
 	opts := runTargetOptions{
 		Cwd:          cwd,
@@ -259,21 +272,27 @@ func runCodexNewSession(
 	effectiveCodexHome = codexHome
 	extraEnv = append(extraEnv, codexHomeEnv(effectiveCodexHome)...)
 
+	var authOverride *yoloAuthOverride
+	forceFileAuthStore := false
 	if useYolo {
-		authOverride, authErr := prepareYoloAuthOverride(codexHome, paths.ExecIdentity)
+		var authErr error
+		authOverride, authErr = prepareYoloAuthOverride(codexHome, paths.ExecIdentity)
 		logYoloAuthStatus(log, authOverride, authErr)
 		if authOverride != nil {
+			forceFileAuthStore = true
 			defer authOverride.Cleanup()
 		}
-		// Always delete the cloud requirements cache when yolo is
-		// requested, even if patching was skipped or failed. The cached
-		// cloud requirements would otherwise override yolo flags.
-		_ = cloudgate.RemoveCloudRequirementsCache(codexHome)
+		if cacheBypass, err := cloudgate.InstallYoloCloudRequirementsBypass(codexHome, codexPath); err != nil && log != nil {
+			_, _ = fmt.Fprintf(log, "yolo cloud requirements bypass warning: %v\n", err)
+		} else if cacheBypass.Installed {
+			forceFileAuthStore = true
+			defer cloudgate.RemoveCloudRequirementsCache(codexHome)
+		}
 	}
 
 	cmdArgs := []string{codexPath}
 	if useYolo {
-		if yoloFlags := codexYoloLaunchArgs(codexPath); len(yoloFlags) > 0 {
+		if yoloFlags := codexYoloLaunchArgsWithOptions(codexPath, yoloLaunchOptions{ForceFileAuthStore: forceFileAuthStore}); len(yoloFlags) > 0 {
 			cmdArgs = append(cmdArgs, yoloFlags...)
 		}
 	}

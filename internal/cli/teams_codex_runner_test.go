@@ -56,8 +56,18 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 		if string(stdin) != "prompt text" {
 			t.Fatalf("stdin = %q", string(stdin))
 		}
-		if cacheExists(t, codexDir) {
-			t.Fatal("Teams yolo launch should delete cloud requirements cache before Codex starts")
+		if !cacheExists(t, codexDir) {
+			t.Fatal("Teams yolo launch should install a cloud requirements bypass cache before Codex starts")
+		}
+		cache := readTestCloudRequirementsCache(t, codexDir)
+		if cache.Signature == "" {
+			t.Fatal("Teams yolo launch should sign the cloud requirements bypass cache")
+		}
+		if cache.SignedPayload.ChatGPTUserID != "user_test" || cache.SignedPayload.AccountID != "org_test" {
+			t.Fatalf("cache identity = %#v", cache.SignedPayload)
+		}
+		if cache.SignedPayload.Contents != nil {
+			t.Fatalf("cache contents = %#v, want nil", *cache.SignedPayload.Contents)
 		}
 		authDuringRun, err := os.ReadFile(filepath.Join(codexDir, "auth.json"))
 		if err != nil {
@@ -82,7 +92,7 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if !reflect.DeepEqual(gotArgs, []string{codexPath, "--dangerously-bypass-approvals-and-sandbox", "exec", "--json", "-"}) {
+	if !reflect.DeepEqual(gotArgs, []string{codexPath, "-c", `cli_auth_credentials_store="file"`, "--dangerously-bypass-approvals-and-sandbox", "exec", "--json", "-"}) {
 		t.Fatalf("cmd args = %#v", gotArgs)
 	}
 	if gotOpts.UseProxy {
@@ -118,6 +128,9 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	}
 	if !reflect.DeepEqual(authAfterRun, originalAuth) {
 		t.Fatal("Teams yolo launch should restore auth after Codex exits")
+	}
+	if cacheExists(t, codexDir) {
+		t.Fatal("Teams yolo launch should remove the bypass cache after Codex exits")
 	}
 }
 
