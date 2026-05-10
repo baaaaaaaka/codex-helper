@@ -1385,20 +1385,30 @@ func (b teamsServiceWSLWindowsTaskBackend) RepairElevated(ctx context.Context, s
 	return b.writeTaskConfig(args)
 }
 
+func (b teamsServiceWSLWindowsTaskBackend) TaskConfigMatches(ctx context.Context, spec teamsServiceSpec) (bool, error) {
+	args := buildTeamsServiceWSLArguments(spec)
+	watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
+	cmd := teamsServiceWSLTaskConfigMatchHelpersPowerShell() +
+		"$allMatched = $true; " +
+		buildTeamsServiceWSLTaskConfigMatchesCommand(b.Name(), args, teamsServiceWSLTaskConfigMatchOptions{}) + "; " +
+		buildTeamsServiceWSLTaskConfigMatchesCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLTaskConfigMatchOptions{WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes}) + "; " +
+		"if (-not $allMatched) { exit 3 }"
+	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
 func (b teamsServiceWSLWindowsTaskBackend) InstallStartupFallback(ctx context.Context, spec teamsServiceSpec, start bool) (string, error) {
 	markerPath, err := b.startupFallbackMarkerPath()
 	if err != nil {
 		return "", err
 	}
 	stopPath := teamsServiceWSLStartupFallbackStopPath(markerPath)
-	fallbackSpec := spec
-	fallbackSpec.Environment = make(map[string]string, len(spec.Environment)+3)
-	for key, value := range spec.Environment {
-		fallbackSpec.Environment[key] = value
-	}
-	fallbackSpec.Environment["CODEX_HELPER_TEAMS_STARTUP_FALLBACK"] = "1"
-	fallbackSpec.Environment["CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE"] = stopPath
-	fallbackSpec.Environment["CODEX_HELPER_TEAMS_EXIT_ON_STANDBY"] = "1"
+	fallbackSpec := buildTeamsServiceWSLStartupFallbackSpec(spec, stopPath)
 	args := buildTeamsServiceWSLArguments(fallbackSpec)
 	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
 		return "", err
@@ -1414,6 +1424,18 @@ func (b teamsServiceWSLWindowsTaskBackend) InstallStartupFallback(ctx context.Co
 		return "", err
 	}
 	return markerPath, nil
+}
+
+func buildTeamsServiceWSLStartupFallbackSpec(spec teamsServiceSpec, stopPath string) teamsServiceSpec {
+	fallbackSpec := spec
+	fallbackSpec.Environment = make(map[string]string, len(spec.Environment)+3)
+	for key, value := range spec.Environment {
+		fallbackSpec.Environment[key] = value
+	}
+	fallbackSpec.Environment["CODEX_HELPER_TEAMS_STARTUP_FALLBACK"] = "1"
+	fallbackSpec.Environment["CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE"] = stopPath
+	fallbackSpec.Environment["CODEX_HELPER_TEAMS_EXIT_ON_STANDBY"] = "1"
+	return fallbackSpec
 }
 
 func (b teamsServiceWSLWindowsTaskBackend) StartupFallbackMarkerExists() (bool, error) {
@@ -2322,6 +2344,51 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 		cmd += "if ($wasRunning) { " + teamsServiceWSLStartTaskAndVerifyPowerShell() + " }"
 	}
 	return strings.TrimSpace(cmd)
+}
+
+type teamsServiceWSLTaskConfigMatchOptions struct {
+	WatchdogIntervalMinutes int
+}
+
+func teamsServiceWSLTaskConfigMatchHelpersPowerShell() string {
+	return "function Test-CodexHelperTaskDurationMinutes { param($value, [double]$expectedMinutes) " +
+		"if ($null -eq $value) { return $false }; " +
+		"try { if ($value -is [TimeSpan]) { return [Math]::Abs($value.TotalMinutes - $expectedMinutes) -lt 0.01 } } catch { }; " +
+		"$text = [string]$value; " +
+		"if ([string]::IsNullOrWhiteSpace($text)) { return $false }; " +
+		"if ($text -match '^PT(?<minutes>[0-9]+(?:\\.[0-9]+)?)M$') { return [Math]::Abs(([double]$Matches['minutes']) - $expectedMinutes) -lt 0.01 }; " +
+		"if ($text -match '^PT(?<seconds>[0-9]+(?:\\.[0-9]+)?)S$') { return [Math]::Abs((([double]$Matches['seconds']) / 60.0) - $expectedMinutes) -lt 0.01 }; " +
+		"try { $duration = [TimeSpan]::Parse($text); return [Math]::Abs($duration.TotalMinutes - $expectedMinutes) -lt 0.01 } catch { return $false } " +
+		"}; "
+}
+
+func buildTeamsServiceWSLTaskConfigMatchesCommand(taskName string, args []string, opts teamsServiceWSLTaskConfigMatchOptions) string {
+	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, args)
+	watchdogIntervalMinutes := teamsServiceWSLRegisterWatchdogIntervalMinutes(teamsServiceWSLRegisterOptions{WatchdogIntervalMinutes: opts.WatchdogIntervalMinutes})
+	return "$taskName = " + powershellSingleQuote(taskName) + "; " +
+		"$expectedPrincipalUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; " +
+		"$tasks = @(Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue); " +
+		"$task = if ($tasks.Count -gt 0) { $tasks[0] } else { $null }; " +
+		"if ($null -eq $task) { $allMatched = $false } else { " +
+		"$actions = @($task.Actions); " +
+		"$action = if ($actions.Count -gt 0) { $actions[0] } else { $null }; " +
+		"if ($null -eq $action -or $action.Execute -ne " + powershellSingleQuote(actionExecute) +
+		" -or $action.Arguments -ne " + powershellSingleQuote(actionArgument) +
+		" -or $task.State -eq 'Disabled') { $allMatched = $false }; " +
+		"if ($null -eq $task.Principal -or $task.Principal.UserId -ne $expectedPrincipalUser -or $task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Limited') { $allMatched = $false }; " +
+		"$settings = $task.Settings; " +
+		"if ($null -eq $settings -or $settings.MultipleInstances -ne 'IgnoreNew' -or $settings.RestartCount -ne " + strconv.Itoa(teamsServiceTaskRestartCount) +
+		" -or -not (Test-CodexHelperTaskDurationMinutes $settings.RestartInterval " + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + ")" +
+		" -or -not (Test-CodexHelperTaskDurationMinutes $settings.ExecutionTimeLimit 0)) { $allMatched = $false }; " +
+		"$hasLogonTrigger = $false; $hasWatchdogTrigger = $false; " +
+		"foreach ($trigger in @($task.Triggers)) { " +
+		"$className = ''; if ($null -ne $trigger.CimClass) { $className = [string]$trigger.CimClass.CimClassName }; " +
+		"if ($trigger.Enabled -ne $false -and $className -like '*LogonTrigger*') { $hasLogonTrigger = $true }; " +
+		"$repetition = $trigger.Repetition; " +
+		"if ($trigger.Enabled -ne $false -and $null -ne $repetition -and (Test-CodexHelperTaskDurationMinutes $repetition.Interval " + strconv.Itoa(watchdogIntervalMinutes) + ")) { $hasWatchdogTrigger = $true } " +
+		"}; " +
+		"if (-not $hasLogonTrigger -or -not $hasWatchdogTrigger) { $allMatched = $false } " +
+		"}"
 }
 
 func teamsServiceWSLRegisterWatchdogIntervalMinutes(opts teamsServiceWSLRegisterOptions) int {

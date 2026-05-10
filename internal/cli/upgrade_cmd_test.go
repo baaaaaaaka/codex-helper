@@ -208,6 +208,14 @@ func isolateUpgradeTeamsStateForTest(t *testing.T, tmp string) {
 	isolateTeamsUserDirsForTest(t, tmp)
 }
 
+func teamsServiceJoinedCalls(calls []teamsServiceCommandCall) string {
+	var parts []string
+	for _, call := range calls {
+		parts = append(parts, call.name+" "+strings.Join(call.args, " "))
+	}
+	return strings.Join(parts, "\n")
+}
+
 func TestUpgradeCmdDrainsLiveTeamsOwnerBeforeUpdate(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)
@@ -448,6 +456,296 @@ func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) 
 	}
 	if !strings.Contains(string(unit), "Environment=HTTP_PROXY=http://127.0.0.1:38471") {
 		t.Fatalf("upgrade should refresh Teams service env with current proxy, unit:\n%s", string(unit))
+	}
+}
+
+func TestUpgradeCmdWSLAccessDeniedRefreshUsesUACRepair(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			nil,
+			nil,
+			nil,
+			nil,
+			[]byte("DESKTOP\\alice\n"),
+			nil,
+			nil,
+		},
+		errs: []error{
+			nil,
+			nil,
+			errors.New("task config mismatch"),
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+			nil,
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		if !strings.Contains(teamsServiceJoinedCalls(runner.calls), "Stop-ScheduledTask -TaskName $taskName") {
+			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
+		}
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetIn(strings.NewReader("yes\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") ||
+		!strings.Contains(out.String(), "Restarting Teams service after upgrade") {
+		t.Fatalf("upgrade output missing UAC and restart messages:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "Register-ScheduledTask") {
+		t.Fatalf("upgrade output should not include noisy PowerShell registration details:\n%s", out.String())
+	}
+	joined := teamsServiceJoinedCalls(runner.calls)
+	if !strings.Contains(joined, "Start-Process -FilePath 'powershell.exe'") {
+		t.Fatalf("expected elevated repair command, calls=%#v", runner.calls)
+	}
+	lastCall := runner.calls[len(runner.calls)-1]
+	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
+	if !strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") || strings.Contains(lastJoined, "Register-ScheduledTask") {
+		t.Fatalf("expected normal Scheduled Task start after elevated repair, last call=%#v all calls=%#v", lastCall, runner.calls)
+	}
+}
+
+func TestUpgradeCmdWSLMatchingTaskRefreshSkipsRepairAndUAC(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	runner := &scriptedTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		if !strings.Contains(teamsServiceJoinedCalls(runner.calls), "Stop-ScheduledTask -TaskName $taskName") {
+			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
+		}
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") ||
+		strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") {
+		t.Fatalf("matching task refresh should be quiet, got output:\n%s", out.String())
+	}
+	joined := teamsServiceJoinedCalls(runner.calls)
+	if strings.Contains(joined, "Register-ScheduledTask") {
+		t.Fatalf("matching task refresh should not re-register Scheduled Tasks, calls=%#v", runner.calls)
+	}
+	if !strings.Contains(joined, "$allMatched = $true") {
+		t.Fatalf("expected read-only task match probe before repair, calls=%#v", runner.calls)
+	}
+	for _, want := range []string{
+		"Test-CodexHelperTaskDurationMinutes",
+		"$task.Principal.UserId -ne $expectedPrincipalUser",
+		"$task.Principal.LogonType -ne 'Interactive'",
+		"$task.Principal.RunLevel -ne 'Limited'",
+		"$settings.MultipleInstances -ne 'IgnoreNew'",
+		"$settings.RestartCount -ne 999",
+		"$settings.RestartInterval 1",
+		"$settings.ExecutionTimeLimit 0",
+		"$hasLogonTrigger",
+		"$hasWatchdogTrigger",
+		"$repetition.Interval 1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("matching probe should verify %q before skipping repair, calls=%#v", want, runner.calls)
+		}
+	}
+	lastCall := runner.calls[len(runner.calls)-1]
+	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
+	if !strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
+		t.Fatalf("expected normal Scheduled Task start, last call=%#v all calls=%#v", lastCall, runner.calls)
+	}
+}
+
+func TestUpgradeCmdWSLMismatchRefreshRepairsWithoutUACWhenAllowed(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			nil,
+			nil,
+			errors.New("task config mismatch"),
+			nil,
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		if !strings.Contains(teamsServiceJoinedCalls(runner.calls), "Stop-ScheduledTask -TaskName $taskName") {
+			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
+		}
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetIn(strings.NewReader("yes\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") ||
+		strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") {
+		t.Fatalf("repairable mismatch should not ask for UAC or fallback:\n%s", out.String())
+	}
+	joined := teamsServiceJoinedCalls(runner.calls)
+	if !strings.Contains(joined, "Register-ScheduledTask -TaskName $taskName") {
+		t.Fatalf("mismatched task should be repaired with normal registration, calls=%#v", runner.calls)
+	}
+	if strings.Contains(joined, "Start-Process -FilePath 'powershell.exe'") {
+		t.Fatalf("normal registration success should not use elevated repair, calls=%#v", runner.calls)
+	}
+}
+
+func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWhenUACDeclined(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			nil,
+			nil,
+			errors.New("task config mismatch"),
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		if !strings.Contains(teamsServiceJoinedCalls(runner.calls), "Stop-ScheduledTask -TaskName $taskName") {
+			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
+		}
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetIn(strings.NewReader("no\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") ||
+		!strings.Contains(out.String(), "Restarting Teams service after upgrade") {
+		t.Fatalf("upgrade output missing fallback and restart messages:\n%s", out.String())
+	}
+	lastCall := runner.calls[len(runner.calls)-1]
+	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
+	if strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
+		t.Fatalf("fallback start should not call Scheduled Task start after access denied, last call=%#v all calls=%#v", lastCall, runner.calls)
+	}
+	if !strings.Contains(lastJoined, "Start-Process -FilePath $cmdPath -WindowStyle Hidden") {
+		t.Fatalf("expected Startup fallback start command, last call=%#v all calls=%#v", lastCall, runner.calls)
+	}
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	if installed, err := backend.StartupFallbackMarkerExists(); err != nil || !installed {
+		t.Fatalf("Startup fallback marker installed=%v err=%v", installed, err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "wsl-task", "codex-helper-teams-wsl-task-"+teamsServiceWSLTaskIdentity().Suffix+".txt")); !os.IsNotExist(err) {
+		t.Fatalf("stale Scheduled Task config should be removed after fallback, err=%v", err)
 	}
 }
 
@@ -769,6 +1067,41 @@ func TestScheduleDelayedTeamsServiceStartUsesConfiguredPowerShell(t *testing.T) 
 	}
 	if detachedName != configuredPowerShell || !strings.Contains(strings.Join(detachedArgs, " "), "Start-ScheduledTask") {
 		t.Fatalf("unexpected delayed restart command: name=%q args=%#v", detachedName, detachedArgs)
+	}
+}
+
+func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+	})
+	prevDetached := teamsServiceStartDetached
+	var detachedName string
+	var detachedArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		detachedName = name
+		detachedArgs = append([]string{}, args...)
+		return nil
+	}
+	t.Cleanup(func() { teamsServiceStartDetached = prevDetached })
+
+	if err := scheduleDelayedTeamsStartupFallbackStart(context.Background(), nil); err != nil {
+		t.Fatalf("scheduleDelayedTeamsStartupFallbackStart error: %v", err)
+	}
+	joined := strings.Join(detachedArgs, " ")
+	if detachedName != "powershell.exe" ||
+		!strings.Contains(joined, "Start-Sleep -Seconds 3") ||
+		!strings.Contains(joined, "Start-Process -FilePath $cmdPath -WindowStyle Hidden") ||
+		strings.Contains(joined, "Start-ScheduledTask") {
+		t.Fatalf("unexpected delayed Startup fallback command: name=%q args=%#v", detachedName, detachedArgs)
 	}
 }
 

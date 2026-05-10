@@ -801,6 +801,57 @@ func TestTeamsBackgroundKeepaliveWSLRepairReplacesStaleRegisteredActionCI(t *tes
 	}
 }
 
+func TestTeamsBackgroundKeepaliveWSLTaskConfigMatchChecksFullTaskShapeCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	taskName := "Codex Helper Teams Bridge (WSL Ubuntu alice abc)"
+	args := []string{
+		"-d", "Ubuntu",
+		"-u", "alice",
+		"--cd", "/home/alice",
+		"--exec", "env",
+		"CODEX_HELPER_TEAMS_SERVICE=1",
+		"/home/alice/bin/codex-proxy",
+		"teams", "run", "--auto-service=false",
+	}
+	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, args)
+	command := teamsServiceWSLTaskConfigMatchHelpersPowerShell() +
+		buildTeamsServiceWSLTaskConfigMatchesCommand(taskName, args, teamsServiceWSLTaskConfigMatchOptions{})
+	for _, want := range []string{
+		"Test-CodexHelperTaskDurationMinutes",
+		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
+		powershellSingleQuote(actionExecute),
+		powershellSingleQuote(actionArgument),
+		"$task.State -eq 'Disabled'",
+		"$expectedPrincipalUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
+		"$task.Principal.UserId -ne $expectedPrincipalUser",
+		"$task.Principal.LogonType -ne 'Interactive'",
+		"$task.Principal.RunLevel -ne 'Limited'",
+		"$settings.MultipleInstances -ne 'IgnoreNew'",
+		"$settings.RestartCount -ne 999",
+		"$settings.RestartInterval 1",
+		"$settings.ExecutionTimeLimit 0",
+		"$hasLogonTrigger",
+		"$className -like '*LogonTrigger*'",
+		"$hasWatchdogTrigger",
+		"$repetition.Interval 1",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("WSL task match probe missing %q:\n%s", want, command)
+		}
+	}
+	for _, forbidden := range []string{
+		"Register-ScheduledTask",
+		"Start-ScheduledTask",
+		"Stop-ScheduledTask",
+		"Unregister-ScheduledTask",
+	} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("WSL task match probe should be read-only and not contain %q:\n%s", forbidden, command)
+		}
+	}
+}
+
 func TestTeamsBackgroundKeepaliveWSLStatusPrintsTaskRunLogPathCI(t *testing.T) {
 	lockCLITestHooks(t)
 
