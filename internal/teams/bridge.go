@@ -790,7 +790,8 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		window MessageWindow
 		err    error
 	)
-	if seeded && strings.TrimSpace(poll.ContinuationPath) != "" {
+	useContinuation := seeded && role != inboundPollRoleControl && strings.TrimSpace(poll.ContinuationPath) != ""
+	if useContinuation {
 		window, err = b.readClient().ListMessagesWindowFromPath(ctx, poll.ContinuationPath)
 	} else {
 		window, err = b.readClient().ListMessagesWindow(ctx, chatID, top, modifiedAfter)
@@ -822,7 +823,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 	handled := false
 	var activityAt time.Time
 	for _, msg := range msgs {
-		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg)
+		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role)
 		if err != nil {
 			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 			return handled, err
@@ -857,7 +858,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		b.reg.MarkSeen(chatID, msg.ID)
 	}
 	continuationPath := ""
-	if seeded && window.Truncated {
+	if seeded && role != inboundPollRoleControl && window.Truncated {
 		continuationPath = window.NextPath
 	}
 	updated, err := b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), continuationPath)
@@ -1200,7 +1201,7 @@ func parseGraphTime(value string) time.Time {
 	return t
 }
 
-func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg ChatMessage) (bool, error) {
+func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg ChatMessage, role inboundPollRole) (bool, error) {
 	if msg.ID == "" || b.reg.HasSeen(chatID, msg.ID) || b.reg.HasSent(chatID, msg.ID) {
 		return true, nil
 	}
@@ -1232,6 +1233,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		}
 	}
 	if isHelperAttachmentEchoMessage(msg) {
+		b.markRegistrySent(chatID, msg.ID)
+		return true, nil
+	}
+	if role == inboundPollRoleControl && looksLikeRenderedHelperOutputPlainText(PlainTextFromTeamsHTML(msg.Body.Content)) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
@@ -1299,6 +1304,11 @@ func looksLikeRenderedOutboxPlainText(text string) bool {
 		}
 	}
 	return false
+}
+
+func looksLikeRenderedHelperOutputPlainText(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.HasPrefix(text, "🔧 Helper:") || strings.HasPrefix(text, "Helper:")
 }
 
 func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
@@ -7680,7 +7690,7 @@ func (b *Bridge) resolvePublishTargetSessionID(ctx context.Context, target Dashb
 
 func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Session, local codexhistory.Session) error {
 	importTurnID := "import:" + session.ID
-	if err := b.markTranscriptImportStarted(ctx, session, local.FilePath); err != nil {
+	if err := b.markTranscriptImportStartedForRun(ctx, session, local.FilePath, transcriptCheckpointID(session.ID), importTurnID, "import"); err != nil {
 		return err
 	}
 	title := "Imported Codex session history\n\nThe messages below came from your local Codex session. Reply in this chat to continue from here.\n\nSession: " + local.DisplayTitle()
@@ -7724,10 +7734,10 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 	} else if importing {
 		return b.sendToChat(ctx, session.ChatID, "History import is already running. Wait for `Import complete` before sending another task.")
 	}
-	if err := b.markTranscriptImportStarted(ctx, *session, local.FilePath); err != nil {
+	importTurnID := "publish-history:" + session.ID
+	if err := b.markTranscriptImportStartedForRun(ctx, *session, local.FilePath, transcriptCheckpointID(session.ID), importTurnID, "sync"); err != nil {
 		return err
 	}
-	importTurnID := "publish-history:" + session.ID
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, *session, local.FilePath, importTurnID, "sync", transcriptCheckpointID(session.ID))
 	if err != nil {
 		_ = b.markTranscriptImportFailed(ctx, *session, local.FilePath)
@@ -8100,6 +8110,7 @@ type localTranscriptDeltaState struct {
 	CheckpointBeforeActive  string
 	CheckpointBeforeLine    int
 	CheckpointStatus        string
+	CheckpointOrphaned      bool
 	CheckpointHadRecord     bool
 	HasActionableTranscript bool
 }
@@ -8127,6 +8138,12 @@ func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *
 	}
 	switch delta.CheckpointStatus {
 	case importCheckpointStatusImporting:
+		if delta.CheckpointOrphaned {
+			if err := b.syncSessionTranscript(ctx, *session, local); err != nil {
+				return localCodexBeforeTeamsGate{}, err
+			}
+			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		}
 		return localCodexBeforeTeamsGate{
 			Block:   true,
 			AckBody: "⏳ Queued. I’m preparing this chat history first, then I’ll respond.",
@@ -8247,6 +8264,7 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
 	out.CheckpointStatus = checkpoint.Status
+	out.CheckpointOrphaned = transcriptImportCheckpointIsOrphaned(state, checkpoint)
 	out.CheckpointHadRecord = checkpoint.LastRecordID != ""
 	switch checkpoint.Status {
 	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
@@ -8468,6 +8486,9 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	if hasCheckpoint {
 		switch checkpoint.Status {
 		case importCheckpointStatusImporting:
+			if transcriptImportCheckpointIsOrphaned(state, checkpoint) {
+				return b.resumeInterruptedTranscriptImport(ctx, session, local, checkpoint)
+			}
 			return nil
 		case importCheckpointStatusFailed:
 			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
@@ -8554,6 +8575,41 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		}
 	}
 	return nil
+}
+
+func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
+	sourcePath := strings.TrimSpace(firstNonEmptyString(checkpoint.SourcePath, local.FilePath))
+	if sourcePath == "" {
+		return b.markTranscriptImportFailed(ctx, session, local.FilePath)
+	}
+	importTurnID := strings.TrimSpace(firstNonEmptyString(checkpoint.ImportTurnID, "import:"+session.ID))
+	kindPrefix := strings.TrimSpace(firstNonEmptyString(checkpoint.KindPrefix, "import"))
+	checkpointID := strings.TrimSpace(firstNonEmptyString(checkpoint.ID, transcriptCheckpointID(session.ID)))
+	if err := b.markTranscriptImportStartedForRun(ctx, session, sourcePath, checkpointID, importTurnID, kindPrefix); err != nil {
+		return err
+	}
+	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID)
+	if err != nil {
+		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+		return err
+	}
+	if checkpointID == transcriptCheckpointID(session.ID) {
+		resumedLocal := local
+		resumedLocal.FilePath = sourcePath
+		if err := b.importSubagentMarkersToTeams(ctx, session, resumedLocal, importTurnID); err != nil {
+			_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+			return err
+		}
+	}
+	complete := formatTranscriptImportCompleteMessage(stats)
+	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", complete); err != nil {
+		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+		return err
+	}
+	if err := b.markTranscriptImportCompleteWithID(ctx, session, sourcePath, lastRecordID, lastLine, checkpointID); err != nil {
+		return err
+	}
+	return b.processQueuedTurns(ctx)
 }
 
 func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
@@ -8658,7 +8714,24 @@ func transcriptImportIsActive(state teamstore.State, sessionID string) bool {
 		return false
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(sessionID)]
-	return checkpoint.Status == importCheckpointStatusImporting
+	return transcriptImportCheckpointIsActive(state, checkpoint)
+}
+
+func transcriptImportCheckpointIsActive(state teamstore.State, checkpoint teamstore.ImportCheckpoint) bool {
+	return checkpoint.Status == importCheckpointStatusImporting && !transcriptImportCheckpointIsOrphaned(state, checkpoint)
+}
+
+func transcriptImportCheckpointIsOrphaned(state teamstore.State, checkpoint teamstore.ImportCheckpoint) bool {
+	if checkpoint.Status != importCheckpointStatusImporting {
+		return false
+	}
+	if state.ServiceOwner == nil || state.ServiceOwner.StartedAt.IsZero() {
+		return false
+	}
+	if checkpoint.UpdatedAt.IsZero() {
+		return true
+	}
+	return state.ServiceOwner.StartedAt.After(checkpoint.UpdatedAt)
 }
 
 func (b *Bridge) sessionTranscriptImportInProgress(ctx context.Context, sessionID string) (bool, error) {
@@ -8883,7 +8956,8 @@ func (b *Bridge) recordTranscriptCheckpointWithID(ctx context.Context, session S
 	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
 		now := time.Now()
 		id := checkpointID
-		status := state.ImportCheckpoints[id].Status
+		previous := state.ImportCheckpoints[id]
+		status := previous.Status
 		if status == "" || status == importCheckpointStatusBlocked {
 			status = importCheckpointStatusComplete
 		}
@@ -8893,6 +8967,8 @@ func (b *Bridge) recordTranscriptCheckpointWithID(ctx context.Context, session S
 			SourcePath:     sourcePath,
 			LastRecordID:   lastRecordID,
 			LastSourceLine: lastLine,
+			ImportTurnID:   previous.ImportTurnID,
+			KindPrefix:     previous.KindPrefix,
 			Status:         status,
 			UpdatedAt:      now,
 		}
@@ -8926,6 +9002,10 @@ func (b *Bridge) markTranscriptImportStarted(ctx context.Context, session Sessio
 }
 
 func (b *Bridge) markTranscriptImportStartedWithID(ctx context.Context, session Session, sourcePath string, checkpointID string) error {
+	return b.markTranscriptImportStartedForRun(ctx, session, sourcePath, checkpointID, "", "")
+}
+
+func (b *Bridge) markTranscriptImportStartedForRun(ctx context.Context, session Session, sourcePath string, checkpointID string, importTurnID string, kindPrefix string) error {
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
@@ -8936,6 +9016,12 @@ func (b *Bridge) markTranscriptImportStartedWithID(ctx context.Context, session 
 		checkpoint.ID = id
 		checkpoint.SessionID = session.ID
 		checkpoint.SourcePath = sourcePath
+		if strings.TrimSpace(importTurnID) != "" {
+			checkpoint.ImportTurnID = strings.TrimSpace(importTurnID)
+		}
+		if strings.TrimSpace(kindPrefix) != "" {
+			checkpoint.KindPrefix = strings.TrimSpace(kindPrefix)
+		}
 		checkpoint.Status = importCheckpointStatusImporting
 		checkpoint.UpdatedAt = now
 		state.ImportCheckpoints[id] = checkpoint

@@ -90,7 +90,7 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		decision.NextPollAt = poll.BlockedUntil
 		return decision
 	}
-	if strings.TrimSpace(poll.ContinuationPath) != "" {
+	if input.Role != inboundPollRoleControl && strings.TrimSpace(poll.ContinuationPath) != "" {
 		decision.State = inboundPollStateCatchup
 		decision.Interval = inboundPollCatchupInterval
 		if poll.NextPollAt.IsZero() {

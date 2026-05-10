@@ -220,6 +220,27 @@ func TestInboundPollDecisionCatchupAndBlocked(t *testing.T) {
 	}
 }
 
+func TestInboundPollDecisionIgnoresControlContinuation(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "control-chat",
+		Role:    inboundPollRoleControl,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:             "control-chat",
+			Seeded:             true,
+			ContinuationPath:   "/chats/control-chat/messages?$skiptoken=old-history",
+			LastActivityAt:     now.Add(-time.Hour),
+			LastModifiedCursor: now.Add(-time.Minute),
+			NextPollAt:         now.Add(time.Hour),
+		},
+		Now: now,
+	})
+	if decision.State == inboundPollStateCatchup || decision.Due {
+		t.Fatalf("control continuation should not force catchup polling: %#v", decision)
+	}
+}
+
 func TestInboundPollSuccessTimeDoesNotCountAsActivity(t *testing.T) {
 	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
 	decision := decideInboundPoll(inboundPollInput{

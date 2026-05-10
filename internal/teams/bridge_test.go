@@ -6811,6 +6811,74 @@ func TestBridgePollDropsRenderedHelperOrCodexOutputWithoutDurableMatch(t *testin
 	}
 }
 
+func TestBridgeControlPollIgnoresHistoricalHelperOutputAndClearsContinuation(t *testing.T) {
+	requests := 0
+	helperMsg := bridgePollMessage("old-helper-card", "2026-04-30T01:05:00Z", "")
+	helperMsg.Body.Content = "<p><strong>🔧 Helper:</strong></p><p>Active Work chats</p><p>s001</p>"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/control-chat/messages" {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		requests++
+		if got := r.URL.Query().Get("$skiptoken"); got != "" {
+			t.Fatalf("control poll followed historical continuation skiptoken %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"value":           []ChatMessage{helperMsg},
+			"@odata.nextLink": server.URL + "/chats/control-chat/messages?$skiptoken=older-control-history",
+		}); err != nil {
+			t.Fatalf("encode poll response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "control-chat", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, true, 20, "/chats/control-chat/messages?$skiptoken=old-history"); err != nil {
+		t.Fatalf("RecordChatPollSuccessWithContinuation error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.reg.ControlChatID = "control-chat"
+	var handled []string
+	if _, err := bridge.pollChatWithRole(context.Background(), "control-chat", 50, inboundPollRoleControl, false, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("control poll error: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("historical helper output was handled as control input: %#v", handled)
+	}
+	if !bridge.reg.HasSent("control-chat", "old-helper-card") {
+		t.Fatal("ignored helper output was not marked sent")
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "control-chat")
+	if err != nil {
+		t.Fatalf("ChatPoll error: %v", err)
+	}
+	if !ok || poll.ContinuationPath != "" {
+		t.Fatalf("control continuation was not cleared: %#v ok=%v", poll, ok)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	if len(state.InboundEvents) != 0 || len(state.Turns) != 0 {
+		t.Fatalf("helper history should not create control fallback work: inbound=%#v turns=%#v", state.InboundEvents, state.Turns)
+	}
+}
+
 func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 	msg := bridgePollMessage("stale-helper-artifact", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = `<p>Codex: artifact attached: stage5_small_error_report.md <attachment id="artifact-1"></attachment></p>`
@@ -9832,6 +9900,19 @@ func TestBridgeSyncLinkedTranscriptSkipsWhileTranscriptImporting(t *testing.T) {
 	if err := bridge.markTranscriptImportStarted(context.Background(), *session, transcriptPath); err != nil {
 		t.Fatalf("mark import started: %v", err)
 	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		state.ServiceOwner = &teamstore.OwnerMetadata{
+			PID:            12345,
+			Hostname:       "test-host",
+			ExecutablePath: "/tmp/codex-proxy",
+			StartedAt:      checkpoint.UpdatedAt.Add(-time.Minute),
+			LastHeartbeat:  checkpoint.UpdatedAt,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed current owner state: %v", err)
+	}
 	if err := os.WriteFile(transcriptPath, []byte(initial+`{"id":"a2","role":"assistant","text":"new answer during import"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write updated transcript: %v", err)
 	}
@@ -9849,6 +9930,66 @@ func TestBridgeSyncLinkedTranscriptSkipsWhileTranscriptImporting(t *testing.T) {
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
 	if checkpoint.Status != importCheckpointStatusImporting || checkpoint.LastRecordID != beforeCheckpoint.LastRecordID {
 		t.Fatalf("checkpoint during import = %#v, want importing at previous record %#v", checkpoint, beforeCheckpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptResumesInterruptedImportAfterOwnerRestart(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	if err := os.WriteFile(transcriptPath, []byte(initial+
+		`{"id":"a2","role":"assistant","text":"resumed answer one"}`+"\n"+
+		`{"id":"a3","role":"assistant","text":"resumed answer two"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	oldImportTime := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
+	checkpointID := transcriptCheckpointID(session.ID)
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[checkpointID]
+		checkpoint.Status = importCheckpointStatusImporting
+		checkpoint.ImportTurnID = "import:" + session.ID
+		checkpoint.KindPrefix = "import"
+		checkpoint.UpdatedAt = oldImportTime
+		state.ImportCheckpoints[checkpointID] = checkpoint
+		state.ServiceOwner = &teamstore.OwnerMetadata{
+			PID:            12345,
+			Hostname:       "test-host",
+			ExecutablePath: "/tmp/codex-proxy",
+			StartedAt:      oldImportTime.Add(time.Minute),
+			LastHeartbeat:  oldImportTime.Add(time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed interrupted import state: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("resume interrupted import error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"resumed answer one", "resumed answer two", "Import complete"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("resumed import output missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Count(joined, "old answer") != 0 {
+		t.Fatalf("resumed import duplicated already-checkpointed history:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a3" {
+		t.Fatalf("checkpoint after resumed import = %#v, want complete at a3", checkpoint)
 	}
 }
 

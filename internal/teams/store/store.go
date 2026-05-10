@@ -281,6 +281,8 @@ type ImportCheckpoint struct {
 	SourcePath     string    `json:"source_path,omitempty"`
 	LastRecordID   string    `json:"last_record_id,omitempty"`
 	LastSourceLine int       `json:"last_source_line,omitempty"`
+	ImportTurnID   string    `json:"import_turn_id,omitempty"`
+	KindPrefix     string    `json:"kind_prefix,omitempty"`
 	Status         string    `json:"status,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
