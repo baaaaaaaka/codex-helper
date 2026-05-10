@@ -236,7 +236,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
-		"<Interval>PT10S</Interval>",
+		"<Interval>PT1M</Interval>",
 		"<Count>999</Count>",
 		"CODEX_HELPER_TEAMS_SERVICE",
 		"CODEX_HELPER_TEAMS_SERVICE_MODE",
@@ -253,6 +253,9 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		if !strings.Contains(taskXML, want) {
 			t.Fatalf("Windows task XML missing %q:\n%s", want, taskXML)
 		}
+	}
+	if strings.Contains(taskXML, "PT10S") {
+		t.Fatalf("Windows task XML must not use Task Scheduler sub-minute restart intervals:\n%s", taskXML)
 	}
 	for _, forbidden := range []string{"HighestAvailable", "RunLevel>Highest", "S4U", "RunOnlyIfIdle", "IdleSettings"} {
 		if strings.Contains(taskXML, forbidden) {
@@ -279,7 +282,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<Interval>PT1M</Interval>",
 		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
 		"<RestartOnFailure>",
-		"<Interval>PT10S</Interval>",
+		"<Interval>PT1M</Interval>",
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		spec.Executable,
 		"teams",
@@ -293,6 +296,9 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		if !strings.Contains(watchdogTaskXML, want) {
 			t.Fatalf("Windows watchdog task XML missing %q:\n%s", want, watchdogTaskXML)
 		}
+	}
+	if strings.Contains(watchdogTaskXML, "PT10S") {
+		t.Fatalf("Windows watchdog task XML must not use Task Scheduler sub-minute restart intervals:\n%s", watchdogTaskXML)
 	}
 	requireSubstringsInOrder(t, watchdogTaskXML,
 		"<CalendarTrigger>",
@@ -537,7 +543,7 @@ func TestTeamsBackgroundKeepaliveWindowsTaskXMLLogonAndSelfRecoveryCI(t *testing
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
-		"<Interval>PT10S</Interval>",
+		"<Interval>PT1M</Interval>",
 		"<Count>999</Count>",
 		"<Command>powershell.exe</Command>",
 		"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command",
@@ -629,7 +635,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"MultipleInstances IgnoreNew",
 		"ExecutionTimeLimit (New-TimeSpan -Seconds 0)",
 		"RestartCount 999",
-		"New-TimeSpan -Seconds 10",
+		"RestartInterval (New-TimeSpan -Minutes 1)",
 		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
 		"Interactive",
 		"RunLevel Limited",
@@ -639,6 +645,9 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		if !strings.Contains(command, want) {
 			t.Fatalf("WSL scheduled task command missing %q:\n%s", want, command)
 		}
+	}
+	if strings.Contains(command, "RestartInterval (New-TimeSpan -Seconds 10)") {
+		t.Fatalf("WSL scheduled task command must not use Task Scheduler sub-minute restart intervals:\n%s", command)
 	}
 	for _, forbidden := range []string{"Start-ScheduledTask", "Enable-ScheduledTask", "RunLevel Highest"} {
 		if strings.Contains(command, forbidden) {

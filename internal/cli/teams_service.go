@@ -38,6 +38,7 @@ const (
 	teamsServiceWSLTaskConfigName            = "codex-helper-teams-wsl-task.txt"
 	teamsServiceTaskRestartCount             = 999
 	teamsServiceTaskRestartInterval          = 10
+	teamsServiceTaskSchedulerRestartMinutes  = 1
 	teamsServiceWatchdogMinutes              = 1
 	teamsServiceWatchdogDays                 = 3650
 	teamsServiceRunOwnerStaleAfter           = 18 * time.Second
@@ -2140,7 +2141,7 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n")
 	b.WriteString("    <Enabled>false</Enabled>\n")
 	b.WriteString("    <RestartOnFailure>\n")
-	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskRestartInterval) + "S</Interval>\n")
+	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "M</Interval>\n")
 	b.WriteString("      <Count>" + strconv.Itoa(teamsServiceTaskRestartCount) + "</Count>\n")
 	b.WriteString("    </RestartOnFailure>\n")
 	b.WriteString("  </Settings>\n")
@@ -2201,7 +2202,7 @@ func buildTeamsServiceWindowsWatchdogTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n")
 	b.WriteString("    <Enabled>false</Enabled>\n")
 	b.WriteString("    <RestartOnFailure>\n")
-	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskRestartInterval) + "S</Interval>\n")
+	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "M</Interval>\n")
 	b.WriteString("      <Count>" + strconv.Itoa(teamsServiceTaskRestartCount) + "</Count>\n")
 	b.WriteString("    </RestartOnFailure>\n")
 	b.WriteString("  </Settings>\n")
@@ -2297,7 +2298,7 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 			"$action = New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument; " +
 			"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
 			"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWSLRegisterWatchdogIntervalMinutes(opts)) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
-			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
+			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "); " +
 			"$principalUser = " + principalUser + "; " +
 			"$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited; " +
 			"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force | Out-Null; " +

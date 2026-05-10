@@ -685,7 +685,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<CalendarTrigger>",
 		"<Interval>PT1M</Interval>",
 		"<RestartOnFailure>",
-		"<Interval>PT10S</Interval>",
+		"<Interval>PT1M</Interval>",
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<Command>powershell.exe</Command>",
 		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;service&apos; &apos;watchdog&apos; &apos;--loop&apos; &apos;--interval&apos; &apos;10s&apos; &apos;--quiet&apos;`,
