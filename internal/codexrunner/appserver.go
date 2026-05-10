@@ -343,10 +343,7 @@ func (r *AppServerRunner) startTurnLocked(ctx context.Context, input StartTurnIn
 	}
 	params := map[string]any{
 		"threadId": threadID,
-		"input": []map[string]string{{
-			"type": "text",
-			"text": input.Prompt,
-		}},
+		"input":    appServerTurnInput(input.TurnInput),
 	}
 	if workingDir := firstNonEmpty(input.WorkingDir, r.WorkingDir); workingDir != "" {
 		params["cwd"] = workingDir
@@ -384,6 +381,25 @@ func (r *AppServerRunner) startTurnLocked(ctx context.Context, input StartTurnIn
 		return result, turnResultError(result)
 	}
 	return result, nil
+}
+
+func appServerTurnInput(input TurnInput) []map[string]string {
+	items := make([]map[string]string, 0, len(input.ImagePaths)+1)
+	for _, path := range input.ImagePaths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		items = append(items, map[string]string{
+			"type": "localImage",
+			"path": path,
+		})
+	}
+	items = append(items, map[string]string{
+		"type": "text",
+		"text": input.Prompt,
+	})
+	return items
 }
 
 func (r *AppServerRunner) validateAppServerArgs(inputArgs []string) error {

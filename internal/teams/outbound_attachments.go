@@ -109,14 +109,14 @@ func PrepareOutboundAttachment(path string, opts OutboundAttachmentOptions) (Out
 		return OutboundAttachmentFile{}, err
 	}
 	name := safeAttachmentName(filepath.Base(resolved))
-	if name == "" || strings.HasPrefix(name, ".") {
+	if name == "" {
 		return OutboundAttachmentFile{}, fmt.Errorf("unsafe upload file name")
 	}
-	ext := strings.ToLower(filepath.Ext(name))
-	if !allowedOutboundExtension(ext, opts.AllowedExts) {
+	if !allowedOutboundFileName(name, opts.AllowedExts) {
+		ext := strings.ToLower(filepath.Ext(name))
 		return OutboundAttachmentFile{}, fmt.Errorf("file extension %q is not allowed for Teams upload", ext)
 	}
-	contentType := outboundContentType(ext)
+	contentType := outboundContentTypeForName(name)
 	uploadName := strings.TrimSpace(opts.GeneratedName)
 	if uploadName == "" {
 		uploadName = outboundUploadName(name, time.Now())
@@ -309,38 +309,140 @@ func outboundPathError(action string, err error) error {
 	return fmt.Errorf("%s: %v", action, err)
 }
 
+func allowedOutboundFileName(name string, allowed map[string]bool) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	ext := strings.ToLower(filepath.Ext(name))
+	if len(allowed) == 0 {
+		return defaultOutboundExtensions()[ext] || defaultOutboundBaseNames()[name]
+	}
+	return allowed[strings.ToLower(ext)]
+}
+
 func allowedOutboundExtension(ext string, allowed map[string]bool) bool {
 	if len(allowed) == 0 {
-		allowed = defaultOutboundExtensions()
+		return defaultOutboundExtensions()[strings.ToLower(ext)]
 	}
 	return allowed[strings.ToLower(ext)]
 }
 
 func defaultOutboundExtensions() map[string]bool {
+	allowed := map[string]bool{}
+	addOutboundExtensions(allowed,
+		// Text, docs, and structured data.
+		".txt", ".md", ".markdown", ".rst", ".adoc", ".log",
+		".json", ".jsonl", ".ndjson", ".csv", ".tsv", ".xml",
+		".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties",
+		".env", ".envrc", ".lock", ".mod", ".sum",
+		// Source code, scripts, build files, and developer config.
+		".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".bat", ".cmd",
+		".py", ".pyw", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh",
+		".java", ".kt", ".kts", ".swift", ".m", ".mm", ".cs", ".fs", ".fsx", ".vb",
+		".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte", ".astro",
+		".css", ".scss", ".sass", ".less", ".html", ".htm",
+		".php", ".rb", ".pl", ".pm", ".lua", ".r", ".jl", ".scala", ".sc",
+		".clj", ".cljs", ".ex", ".exs", ".erl", ".hrl", ".hs", ".ml", ".mli",
+		".dart", ".sql", ".graphql", ".gql", ".proto", ".thrift", ".sol",
+		".zig", ".nim", ".v", ".sv", ".svh", ".asm", ".s", ".cmake", ".gradle",
+		".dockerfile", ".hcl", ".tf", ".tfvars", ".rego", ".cue",
+		".editorconfig", ".gitignore", ".gitattributes", ".dockerignore", ".npmrc",
+		".yarnrc", ".prettierrc", ".eslintrc", ".babelrc", ".clang-format", ".clang-tidy",
+		".patch", ".diff",
+		// Images, notebooks, databases, and common generated artifacts.
+		".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+		".pdf", ".ipynb", ".sqlite", ".sqlite3", ".db", ".parquet",
+		// Archives and package formats commonly used to exchange build artifacts.
+		".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".tbz2", ".xz", ".txz",
+		".zst", ".tzst", ".br", ".7z", ".rar",
+		".jar", ".war", ".ear", ".whl", ".nupkg", ".crate", ".gem", ".deb", ".rpm",
+		".apk", ".ipa", ".vsix",
+	)
+	return allowed
+}
+
+func defaultOutboundBaseNames() map[string]bool {
 	return map[string]bool{
-		".txt":   true,
-		".md":    true,
-		".log":   true,
-		".json":  true,
-		".csv":   true,
-		".patch": true,
-		".diff":  true,
-		".png":   true,
-		".jpg":   true,
-		".jpeg":  true,
-		".gif":   true,
-		".webp":  true,
-		".pdf":   true,
-		".zip":   true,
+		"dockerfile":        true,
+		"makefile":          true,
+		"justfile":          true,
+		"taskfile":          true,
+		"procfile":          true,
+		"brewfile":          true,
+		"gemfile":           true,
+		"rakefile":          true,
+		"license":           true,
+		"notice":            true,
+		"readme":            true,
+		"changelog":         true,
+		"contributing":      true,
+		"authors":           true,
+		"codeowners":        true,
+		"owners":            true,
+		"requirements":      true,
+		"cmakelists.txt":    true,
+		"package-lock.json": true,
 	}
 }
 
-func outboundContentType(ext string) string {
-	switch strings.ToLower(ext) {
-	case ".md", ".log", ".patch", ".diff":
+func defaultOutboundTextExtensions() map[string]bool {
+	text := map[string]bool{}
+	addOutboundExtensions(text,
+		".txt", ".md", ".markdown", ".rst", ".adoc", ".log",
+		".jsonl", ".ndjson", ".tsv",
+		".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties",
+		".env", ".envrc", ".lock", ".mod", ".sum",
+		".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".bat", ".cmd",
+		".py", ".pyw", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh",
+		".java", ".kt", ".kts", ".swift", ".m", ".mm", ".cs", ".fs", ".fsx", ".vb",
+		".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte", ".astro",
+		".css", ".scss", ".sass", ".less", ".html", ".htm",
+		".php", ".rb", ".pl", ".pm", ".lua", ".r", ".jl", ".scala", ".sc",
+		".clj", ".cljs", ".ex", ".exs", ".erl", ".hrl", ".hs", ".ml", ".mli",
+		".dart", ".sql", ".graphql", ".gql", ".proto", ".thrift", ".sol",
+		".zig", ".nim", ".v", ".sv", ".svh", ".asm", ".s", ".cmake", ".gradle",
+		".dockerfile", ".hcl", ".tf", ".tfvars", ".rego", ".cue",
+		".editorconfig", ".gitignore", ".gitattributes", ".dockerignore", ".npmrc",
+		".yarnrc", ".prettierrc", ".eslintrc", ".babelrc", ".clang-format", ".clang-tidy",
+		".patch", ".diff",
+	)
+	return text
+}
+
+func addOutboundExtensions(dst map[string]bool, exts ...string) {
+	for _, ext := range exts {
+		dst[strings.ToLower(ext)] = true
+	}
+}
+
+func outboundContentTypeForName(name string) string {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	if defaultOutboundBaseNames()[lowerName] {
 		return "text/plain"
+	}
+	return outboundContentType(filepath.Ext(name))
+}
+
+func outboundContentType(ext string) string {
+	ext = strings.ToLower(ext)
+	if defaultOutboundTextExtensions()[ext] {
+		return "text/plain"
+	}
+	switch ext {
 	case ".zip":
 		return "application/zip"
+	case ".tar":
+		return "application/x-tar"
+	case ".gz", ".tgz":
+		return "application/gzip"
+	case ".bz2", ".tbz", ".tbz2":
+		return "application/x-bzip2"
+	case ".xz", ".txz":
+		return "application/x-xz"
+	case ".zst", ".tzst":
+		return "application/zstd"
+	case ".7z":
+		return "application/x-7z-compressed"
+	case ".rar":
+		return "application/vnd.rar"
 	}
 	if ctype := mime.TypeByExtension(ext); ctype != "" {
 		return ctype

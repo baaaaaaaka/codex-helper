@@ -533,6 +533,44 @@ func PromptWithLocalAttachments(text string, files []LocalAttachment) string {
 	return strings.TrimSpace(b.String())
 }
 
+func ExecutionInputWithLocalAttachments(text string, files []LocalAttachment) ExecutionInput {
+	return ExecutionInput{
+		Prompt:     PromptWithLocalAttachments(text, files),
+		ImagePaths: codexImageAttachmentPaths(files),
+	}
+}
+
+func codexImageAttachmentPaths(files []LocalAttachment) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, file := range files {
+		path := strings.TrimSpace(file.Path)
+		if path == "" || seen[path] || !isCodexImageAttachment(file) {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out
+}
+
+func isCodexImageAttachment(file LocalAttachment) bool {
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(file.ContentType, ";")[0]))
+	switch contentType {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		return true
+	case "", "application/octet-stream", "binary/octet-stream":
+	default:
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(file.Path)) {
+	case ".png", ".jpg", ".jpeg", ".jpe", ".gif", ".webp":
+		return true
+	default:
+		return false
+	}
+}
+
 func safePathPart(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {

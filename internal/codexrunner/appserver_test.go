@@ -119,6 +119,34 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 	assertTextInput(t, writes[4], "continue")
 }
 
+func TestAppServerRunnerEncodesLocalImageInputs(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-new"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage","text":"done"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-new","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	_, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt:     "inspect",
+		ImagePaths: []string{"/tmp/a.png", "", "/tmp/b.webp"},
+	})
+	if err != nil {
+		t.Fatalf("StartThread error: %v", err)
+	}
+
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[4], "turn/start")
+	assertInputItems(t, writes[4], []map[string]string{
+		{"type": "localImage", "path": "/tmp/a.png"},
+		{"type": "localImage", "path": "/tmp/b.webp"},
+		{"type": "text", "text": "inspect"},
+	})
+}
+
 func TestAppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
@@ -720,6 +748,26 @@ func assertTextInput(tb testing.TB, got map[string]any, want string) {
 	}
 	if input["type"] != "text" || input["text"] != want {
 		tb.Fatalf("input[0] = %#v, want text %q", input, want)
+	}
+}
+
+func assertInputItems(tb testing.TB, got map[string]any, want []map[string]string) {
+	tb.Helper()
+	params := paramsMap(tb, got)
+	raw, ok := params["input"].([]any)
+	if !ok || len(raw) != len(want) {
+		tb.Fatalf("input = %#v, want %d item(s) in %#v", params["input"], len(want), got)
+	}
+	for i, wantItem := range want {
+		item, ok := raw[i].(map[string]any)
+		if !ok {
+			tb.Fatalf("input[%d] = %#v, want object", i, raw[i])
+		}
+		for key, value := range wantItem {
+			if item[key] != value {
+				tb.Fatalf("input[%d][%s] = %#v, want %q in %#v", i, key, item[key], value, item)
+			}
+		}
 	}
 }
 

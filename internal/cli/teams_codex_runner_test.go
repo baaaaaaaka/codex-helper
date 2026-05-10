@@ -237,6 +237,34 @@ func TestTeamsCodexExecutorDoesNotTreatTerminalFailedTurnAsAmbiguous(t *testing.
 	}
 }
 
+func TestTeamsCodexExecutorPassesImageInputToRunner(t *testing.T) {
+	runner := &fakeTeamsRunner{
+		result: codexrunner.TurnResult{
+			ThreadID:          "thread-new",
+			TurnID:            "turn-1",
+			Status:            codexrunner.TurnStatusCompleted,
+			FinalAgentMessage: "saw image",
+		},
+	}
+	executor := teamsCodexExecutor{runner: runner, workDir: "/work"}
+	got, err := executor.RunInput(context.Background(), &teams.Session{}, teams.ExecutionInput{
+		Prompt:     "inspect",
+		ImagePaths: []string{"/tmp/a.png", "/tmp/b.jpg"},
+	})
+	if err != nil {
+		t.Fatalf("RunInput error: %v", err)
+	}
+	if got.Text != "saw image" {
+		t.Fatalf("result = %#v", got)
+	}
+	if runner.input.Prompt != "inspect" || strings.Join(runner.input.ImagePaths, ",") != "/tmp/a.png,/tmp/b.jpg" {
+		t.Fatalf("runner input = %#v", runner.input)
+	}
+	if runner.input.WorkingDir != "/work" {
+		t.Fatalf("working dir = %q", runner.input.WorkingDir)
+	}
+}
+
 func TestNewManagedTeamsCodexExecutorCanUseExperimentalAppServerRunner(t *testing.T) {
 	executor, err := newManagedTeamsCodexExecutor(&rootOptions{}, "appserver", "/tmp/codex", "/work", []string{"--model", "gpt-test"}, time.Minute, io.Discard)
 	if err != nil {

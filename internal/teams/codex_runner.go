@@ -17,6 +17,19 @@ type StreamingExecutor interface {
 	RunWithEventHandler(ctx context.Context, session *Session, prompt string, handler codexrunner.EventHandler) (ExecutionResult, error)
 }
 
+type ExecutionInput struct {
+	Prompt     string
+	ImagePaths []string
+}
+
+type InputExecutor interface {
+	RunInput(ctx context.Context, session *Session, input ExecutionInput) (ExecutionResult, error)
+}
+
+type StreamingInputExecutor interface {
+	RunInputWithEventHandler(ctx context.Context, session *Session, input ExecutionInput, handler codexrunner.EventHandler) (ExecutionResult, error)
+}
+
 type ExecutionResult struct {
 	Text             string
 	CodexThreadID    string
@@ -71,6 +84,14 @@ func (e RunnerExecutor) Run(ctx context.Context, session *Session, prompt string
 }
 
 func (e RunnerExecutor) RunWithEventHandler(ctx context.Context, session *Session, prompt string, handler codexrunner.EventHandler) (ExecutionResult, error) {
+	return e.RunInputWithEventHandler(ctx, session, ExecutionInput{Prompt: prompt}, handler)
+}
+
+func (e RunnerExecutor) RunInput(ctx context.Context, session *Session, input ExecutionInput) (ExecutionResult, error) {
+	return e.RunInputWithEventHandler(ctx, session, input, nil)
+}
+
+func (e RunnerExecutor) RunInputWithEventHandler(ctx context.Context, session *Session, input ExecutionInput, handler codexrunner.EventHandler) (ExecutionResult, error) {
 	runner := e.Runner
 	workDir := strings.TrimSpace(e.WorkDir)
 	if session != nil && strings.TrimSpace(session.Cwd) != "" {
@@ -91,7 +112,8 @@ func (e RunnerExecutor) RunWithEventHandler(ctx context.Context, session *Sessio
 	result, err := runner.StartTurn(ctx, codexrunner.StartTurnInput{
 		ThreadID: threadID,
 		TurnInput: codexrunner.TurnInput{
-			Prompt:       prompt,
+			Prompt:       input.Prompt,
+			ImagePaths:   append([]string{}, input.ImagePaths...),
 			WorkingDir:   workDir,
 			ExtraArgs:    e.ExtraArgs,
 			Timeout:      e.Timeout,
@@ -149,6 +171,10 @@ type CodexExecutor struct {
 }
 
 func (e CodexExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunInput(ctx, session, ExecutionInput{Prompt: prompt})
+}
+
+func (e CodexExecutor) RunInput(ctx context.Context, session *Session, input ExecutionInput) (ExecutionResult, error) {
 	timeout := e.Timeout
 	command := strings.TrimSpace(e.CodexPath)
 	if command == "" {
@@ -169,7 +195,7 @@ func (e CodexExecutor) Run(ctx context.Context, session *Session, prompt string)
 		WorkDir:   workDir,
 		ExtraArgs: e.ExtraArgs,
 		Timeout:   timeout,
-	}.Run(ctx, session, prompt)
+	}.RunInput(ctx, session, input)
 }
 
 func parseCodexJSONL(output string) ExecutionResult {

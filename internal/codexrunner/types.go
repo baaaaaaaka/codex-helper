@@ -18,6 +18,7 @@ type Runner interface {
 
 type TurnInput struct {
 	Prompt             string
+	ImagePaths         []string
 	WorkingDir         string
 	ExtraArgs          []string
 	Timeout            time.Duration

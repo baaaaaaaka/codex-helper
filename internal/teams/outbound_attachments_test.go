@@ -46,12 +46,12 @@ func TestPrepareOutboundAttachmentRestrictsToRootAndAllowedFiles(t *testing.T) {
 	}
 }
 
-func TestPrepareOutboundAttachmentRejectsSymlinkAndDisallowedExtension(t *testing.T) {
+func TestPrepareOutboundAttachmentRejectsSymlinkAndDisallowedExecutable(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "secret.sh"), []byte("no"), 0o600); err != nil {
-		t.Fatalf("write script fixture: %v", err)
+	if err := os.WriteFile(filepath.Join(root, "malware.exe"), []byte("no"), 0o600); err != nil {
+		t.Fatalf("write executable fixture: %v", err)
 	}
-	if _, err := PrepareOutboundAttachment("secret.sh", OutboundAttachmentOptions{Root: root}); err == nil || !strings.Contains(err.Error(), "not allowed") {
+	if _, err := PrepareOutboundAttachment("malware.exe", OutboundAttachmentOptions{Root: root}); err == nil || !strings.Contains(err.Error(), "not allowed") {
 		t.Fatalf("expected disallowed extension error, got %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "target.txt"), []byte("ok"), 0o600); err != nil {
@@ -63,6 +63,78 @@ func TestPrepareOutboundAttachmentRejectsSymlinkAndDisallowedExtension(t *testin
 	}
 	if _, err := PrepareOutboundAttachment("link.txt", OutboundAttachmentOptions{Root: root}); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("expected symlink rejection, got %v", err)
+	}
+}
+
+func TestPrepareOutboundAttachmentAllowsCommonDeveloperFormats(t *testing.T) {
+	root := t.TempDir()
+	fixtures := []string{
+		"scripts/run.sh",
+		"scripts/build.ps1",
+		"src/main.go",
+		"src/component.tsx",
+		"src/schema.proto",
+		"config/app.yaml",
+		"config/.gitignore",
+		"notebooks/analysis.ipynb",
+		"images/diagram.svg",
+		"archives/source.tar.gz",
+		"archives/release.tgz",
+		"archives/cache.7z",
+		"packages/tool.whl",
+		"packages/app.apk",
+		"Dockerfile",
+		"Makefile",
+	}
+	for _, rel := range fixtures {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir fixture %s: %v", rel, err)
+		}
+		if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+			t.Fatalf("write fixture %s: %v", rel, err)
+		}
+	}
+
+	for _, rel := range fixtures {
+		t.Run(rel, func(t *testing.T) {
+			file, err := PrepareOutboundAttachment(filepath.FromSlash(rel), OutboundAttachmentOptions{Root: root})
+			if err != nil {
+				t.Fatalf("PrepareOutboundAttachment(%s) error: %v", rel, err)
+			}
+			if file.Name == "" || file.UploadName == "" || len(file.Bytes) == 0 {
+				t.Fatalf("unexpected prepared file for %s: %#v", rel, file)
+			}
+		})
+	}
+}
+
+func TestPrepareOutboundAttachmentUsesTextContentTypeForCodeAndExtensionlessBuildFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"run.sh", "Dockerfile"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("ok"), 0o600); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
+		}
+		file, err := PrepareOutboundAttachment(name, OutboundAttachmentOptions{Root: root})
+		if err != nil {
+			t.Fatalf("PrepareOutboundAttachment(%s) error: %v", name, err)
+		}
+		if file.ContentType != "text/plain" {
+			t.Fatalf("%s content type = %q, want text/plain", name, file.ContentType)
+		}
+	}
+}
+
+func TestPrepareOutboundAttachmentCustomAllowedExtsRemainRestrictive(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main"), 0o600); err != nil {
+		t.Fatalf("write go fixture: %v", err)
+	}
+	if _, err := PrepareOutboundAttachment("main.go", OutboundAttachmentOptions{
+		Root:        root,
+		AllowedExts: map[string]bool{".txt": true},
+	}); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("expected custom allowlist to reject .go, got %v", err)
 	}
 }
 

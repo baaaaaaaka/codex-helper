@@ -87,6 +87,48 @@ func TestExecRunnerResumeUsesExactThreadIDAndNeverLast(t *testing.T) {
 	}
 }
 
+func TestExecRunnerAttachesImagesToStartAndResume(t *testing.T) {
+	launcher := &recordingLauncher{
+		result: LaunchResult{Stdout: []byte(strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-new"}`,
+			`{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`,
+			`{"type":"turn.completed"}`,
+		}, "\n"))},
+	}
+	runner := NewExecRunner(launcher)
+
+	_, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt:     "inspect these",
+		ImagePaths: []string{"/tmp/a.png", "  ", "/tmp/b.jpg"},
+	})
+	if err != nil {
+		t.Fatalf("StartThread error: %v", err)
+	}
+	wantStartArgs := []string{"exec", "--json", "--image", "/tmp/a.png", "--image", "/tmp/b.jpg", "-"}
+	if !reflect.DeepEqual(launcher.req.Args, wantStartArgs) {
+		t.Fatalf("start args = %#v, want %#v", launcher.req.Args, wantStartArgs)
+	}
+	if launcher.req.Stdin != "inspect these" {
+		t.Fatalf("start stdin = %q", launcher.req.Stdin)
+	}
+
+	launcher.result = LaunchResult{Stdout: []byte(strings.Join([]string{
+		`{"type":"item.completed","item":{"type":"agent_message","text":"resumed"}}`,
+		`{"type":"turn.completed"}`,
+	}, "\n"))}
+	_, err = runner.ResumeThread(context.Background(), "thread-existing", TurnInput{
+		Prompt:     "continue",
+		ImagePaths: []string{"/tmp/c.webp"},
+	})
+	if err != nil {
+		t.Fatalf("ResumeThread error: %v", err)
+	}
+	wantResumeArgs := []string{"exec", "resume", "--json", "--image", "/tmp/c.webp", "thread-existing", "-"}
+	if !reflect.DeepEqual(launcher.req.Args, wantResumeArgs) {
+		t.Fatalf("resume args = %#v, want %#v", launcher.req.Args, wantResumeArgs)
+	}
+}
+
 func TestExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly(t *testing.T) {
 	launcher := &recordingLauncher{
 		result: LaunchResult{

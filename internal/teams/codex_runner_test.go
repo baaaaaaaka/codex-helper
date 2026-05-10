@@ -95,6 +95,31 @@ func TestRunnerExecutorDoesNotTreatTerminalFailedTurnAsAmbiguous(t *testing.T) {
 	}
 }
 
+func TestRunnerExecutorPassesImageInputToCodexRunner(t *testing.T) {
+	runner := &fakeCodexRunner{
+		result: codexrunner.TurnResult{
+			ThreadID:          "thread-new",
+			TurnID:            "turn-1",
+			Status:            codexrunner.TurnStatusCompleted,
+			FinalAgentMessage: "saw image",
+		},
+	}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.RunInput(context.Background(), &Session{}, ExecutionInput{
+		Prompt:     "inspect",
+		ImagePaths: []string{"/tmp/a.png", "/tmp/b.webp"},
+	})
+	if err != nil {
+		t.Fatalf("RunInput error: %v", err)
+	}
+	if got.Text != "saw image" {
+		t.Fatalf("result = %#v", got)
+	}
+	if runner.input.Prompt != "inspect" || strings.Join(runner.input.ImagePaths, ",") != "/tmp/a.png,/tmp/b.webp" {
+		t.Fatalf("runner input = %#v", runner.input)
+	}
+}
+
 func TestSplitTextChunks(t *testing.T) {
 	got := splitTextChunks("one two three four", 8)
 	if len(got) != 3 {
@@ -108,6 +133,7 @@ func TestSplitTextChunks(t *testing.T) {
 type fakeCodexRunner struct {
 	result codexrunner.TurnResult
 	err    error
+	input  codexrunner.StartTurnInput
 }
 
 func (r *fakeCodexRunner) StartThread(context.Context, codexrunner.TurnInput) (codexrunner.TurnResult, error) {
@@ -118,7 +144,8 @@ func (r *fakeCodexRunner) ResumeThread(context.Context, string, codexrunner.Turn
 	return r.result, r.err
 }
 
-func (r *fakeCodexRunner) StartTurn(context.Context, codexrunner.StartTurnInput) (codexrunner.TurnResult, error) {
+func (r *fakeCodexRunner) StartTurn(_ context.Context, input codexrunner.StartTurnInput) (codexrunner.TurnResult, error) {
+	r.input = input
 	return r.result, r.err
 }
 

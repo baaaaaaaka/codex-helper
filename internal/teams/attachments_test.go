@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,24 @@ func TestPromptWithLocalAttachmentsPrefersAlias(t *testing.T) {
 	}})
 	if strings.Contains(prompt, "/tmp/private") || !strings.Contains(prompt, ".codex-helper/teams-attachments/message/image.png") {
 		t.Fatalf("prompt should use alias instead of private temp path:\n%s", prompt)
+	}
+}
+
+func TestExecutionInputWithLocalAttachmentsAddsOnlySupportedImages(t *testing.T) {
+	input := ExecutionInputWithLocalAttachments("look", []LocalAttachment{
+		{Path: "/tmp/a.png", PromptPath: ".codex-helper/a.png", ContentType: "image/png"},
+		{Path: "/tmp/a.png", PromptPath: ".codex-helper/a-duplicate.png", ContentType: "image/png"},
+		{Path: "/tmp/b.txt", PromptPath: ".codex-helper/b.txt", ContentType: "text/plain"},
+		{Path: "/tmp/c.svg", PromptPath: ".codex-helper/c.svg", ContentType: "image/svg+xml"},
+		{Path: "/tmp/d.jpe", PromptPath: ".codex-helper/d.jpe", ContentType: ""},
+		{Path: "/tmp/e.jpg", PromptPath: ".codex-helper/e.jpg", ContentType: "text/plain"},
+	})
+	if !strings.Contains(input.Prompt, ".codex-helper/b.txt") || !strings.Contains(input.Prompt, ".codex-helper/c.svg") {
+		t.Fatalf("prompt should still list every local attachment:\n%s", input.Prompt)
+	}
+	want := []string{"/tmp/a.png", "/tmp/d.jpe"}
+	if !reflect.DeepEqual(input.ImagePaths, want) {
+		t.Fatalf("image paths = %#v, want %#v", input.ImagePaths, want)
 	}
 }
 

@@ -49,7 +49,9 @@ var discoverCodexProjectsForTeams = codexhistory.DiscoverProjectsContext
 var helperRestartDelay = 3 * time.Second
 var codexIdleStatusInitialDelay = 2 * time.Minute
 var codexIdleStatusRepeatDelay = 5 * time.Minute
+var codexIdleStatusCancelHintAfter = 7 * time.Minute
 var codexIdleStatusMessage = "Still working. No new Codex update yet."
+var codexIdleStatusCancelHint = "This is taking longer than usual. To stop the current request, send `helper cancel last` in this chat."
 var codexStreamRetryStatusRepeatDelay = 5 * time.Minute
 var queuedTurnAttentionDelay = 10 * time.Minute
 var queuedTurnAttentionRepeatDelay = 10 * time.Minute
@@ -3220,10 +3222,10 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	}
 	promptText := PromptWithReferencedMessages(text, referencedMessages)
 	if b.asyncTurns {
-		prompt := PromptWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles)
+		input := ExecutionInputWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles)
 		started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
 			defer cleanupLocalFiles()
-			return b.runQueuedTurn(runCtx, session, claimed, chatID, prompt)
+			return b.runQueuedTurnInput(runCtx, session, claimed, chatID, input)
 		})
 		if err != nil {
 			cleanupLocalFiles()
@@ -3237,7 +3239,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	}
 	defer cleanupLocalFiles()
 
-	return b.runQueuedTurn(ctx, session, turn, chatID, PromptWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles))
+	return b.runQueuedTurnInput(ctx, session, turn, chatID, ExecutionInputWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles))
 }
 
 func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID string) error {
@@ -3322,7 +3324,7 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 	if err != nil {
 		return err
 	}
-	return b.runQueuedTurn(ctx, session, retryTurn, session.ChatID, PromptWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles))
+	return b.runQueuedTurnInput(ctx, session, retryTurn, session.ChatID, ExecutionInputWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles))
 }
 
 func latestRetryableTurnID(state teamstore.State, sessionID string) (string, bool) {
@@ -3587,7 +3589,7 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			continue
 		}
 		text := strings.TrimSpace(inbound.Text)
-		runPrompt := ""
+		runInput := ExecutionInput{}
 		cleanupPrompt := func() {}
 		if inbound.Source == "teams_session_import_deferred_attachment" && strings.TrimSpace(inbound.TeamsChatID) != "" && strings.TrimSpace(inbound.TeamsMessageID) != "" {
 			if msg, err := b.readClient().GetMessage(ctx, inbound.TeamsChatID, inbound.TeamsMessageID); err == nil {
@@ -3612,11 +3614,11 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 					}
 					continue
 				}
-				runPrompt = prepared
+				runInput = prepared
 				cleanupPrompt = cleanup
 			}
 		}
-		if runPrompt == "" && text == "" {
+		if runInput.Prompt == "" && text == "" {
 			if err := b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred input text is unavailable"); err != nil {
 				return err
 			}
@@ -3631,8 +3633,8 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			}
 			continue
 		}
-		if runPrompt == "" {
-			runPrompt = TeamsCodexPrompt(text)
+		if runInput.Prompt == "" {
+			runInput = ExecutionInput{Prompt: TeamsCodexPrompt(text)}
 		}
 		turn, turnCreated, err := b.queueTurn(ctx, session, inbound)
 		if err != nil {
@@ -3653,7 +3655,7 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 		if b.asyncTurns {
 			started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
 				defer cleanupPrompt()
-				return b.runQueuedTurn(runCtx, session, claimed, session.ChatID, runPrompt)
+				return b.runQueuedTurnInput(runCtx, session, claimed, session.ChatID, runInput)
 			})
 			if err != nil {
 				cleanupPrompt()
@@ -3665,7 +3667,7 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			b.boostPolling(time.Now())
 			continue
 		}
-		if err := b.runQueuedTurn(ctx, session, turn, session.ChatID, runPrompt); err != nil {
+		if err := b.runQueuedTurnInput(ctx, session, turn, session.ChatID, runInput); err != nil {
 			cleanupPrompt()
 			return err
 		}
@@ -4074,10 +4076,10 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 		basePrompt = ControlFallbackCodexPrompt(prompt)
 		executor = b.effectiveControlFallbackExecutor()
 	}
-	return b.runQueuedTurnWithExecutor(ctx, executor, session, turn, session.ChatID, PromptWithLocalAttachments(basePrompt, localFiles))
+	return b.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, session.ChatID, ExecutionInputWithLocalAttachments(basePrompt, localFiles))
 }
 
-func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, session *Session, chatID string, msg ChatMessage, fallbackText string) (string, func(), string, error) {
+func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, session *Session, chatID string, msg ChatMessage, fallbackText string) (ExecutionInput, func(), string, error) {
 	cleanupHosted := func() {}
 	cleanupReference := func() {}
 	cleanupAll := func() {
@@ -4088,37 +4090,37 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 	cleanupHosted = cleanupHostedFiles
 	if err != nil {
 		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return "", cleanupAll, message, nil
+			return ExecutionInput{}, cleanupAll, message, nil
 		}
-		return "", cleanupAll, "", err
+		return ExecutionInput{}, cleanupAll, "", err
 	}
 	if hostedAttachmentMessage != "" {
-		return "", cleanupAll, hostedAttachmentMessage, nil
+		return ExecutionInput{}, cleanupAll, hostedAttachmentMessage, nil
 	}
 	referenceFiles, cleanupReferenceFiles, unsupportedAttachmentMessage, err := b.downloadReferenceFileAttachments(ctx, session, msg)
 	cleanupReference = cleanupReferenceFiles
 	if err != nil {
 		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return "", cleanupAll, message, nil
+			return ExecutionInput{}, cleanupAll, message, nil
 		}
-		return "", cleanupAll, "", err
+		return ExecutionInput{}, cleanupAll, "", err
 	}
 	if unsupportedAttachmentMessage != "" {
-		return "", cleanupAll, unsupportedAttachmentMessage, nil
+		return ExecutionInput{}, cleanupAll, unsupportedAttachmentMessage, nil
 	}
 	localFiles = append(localFiles, referenceFiles...)
 	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, chatID, msg)
 	if err != nil {
-		return "", cleanupAll, "", err
+		return ExecutionInput{}, cleanupAll, "", err
 	}
 	if referencedMessageWarning != "" {
-		return "", cleanupAll, referencedMessageWarning, nil
+		return ExecutionInput{}, cleanupAll, referencedMessageWarning, nil
 	}
 	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, fallbackText)
 	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
-		return "", cleanupAll, "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it.", nil
+		return ExecutionInput{}, cleanupAll, "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it.", nil
 	}
-	return PromptWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles), cleanupAll, "", nil
+	return ExecutionInputWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles), cleanupAll, "", nil
 }
 
 func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID string) error {
@@ -4768,10 +4770,18 @@ func (b *Bridge) cancelSupersededRunningTurnsForSession(sessionID string, active
 }
 
 func (b *Bridge) runQueuedTurn(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, text string) error {
-	return b.runQueuedTurnWithExecutor(ctx, b.executor, session, turn, chatID, text)
+	return b.runQueuedTurnInput(ctx, session, turn, chatID, ExecutionInput{Prompt: text})
 }
 
 func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, text string) error {
+	return b.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, chatID, ExecutionInput{Prompt: text})
+}
+
+func (b *Bridge) runQueuedTurnInput(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, input ExecutionInput) error {
+	return b.runQueuedTurnInputWithExecutor(ctx, b.executor, session, turn, chatID, input)
+}
+
+func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, input ExecutionInput) error {
 	if b.currentLeaseGeneration() > 0 {
 		if err := b.ensureActiveControlLease(ctx); err != nil {
 			return err
@@ -4790,7 +4800,7 @@ func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executo
 	}
 	execCtx, cancelExec := context.WithCancel(ctx)
 	unregisterCancel := b.registerRunningTurnCancel(sessionID, turn.ID, cancelExec)
-	result, err := b.runExecutorWithHeartbeat(execCtx, executor, session, turn, chatID, text)
+	result, err := b.runExecutorWithHeartbeat(execCtx, executor, session, turn, chatID, input)
 	cancelRequested, cancelReason, cancelSilent := b.runningTurnCancelState(turn.ID)
 	unregisterCancel()
 	cancelExec()
@@ -5052,7 +5062,7 @@ func (b *Bridge) handleClaimedQueuedTurnError(ctx context.Context, session *Sess
 	}
 }
 
-func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, text string) (ExecutionResult, error) {
+func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, input ExecutionInput) (ExecutionResult, error) {
 	if err := b.recordOwnerHeartbeat(ctx, session.ID, turn.ID); err != nil {
 		return ExecutionResult{}, err
 	}
@@ -5060,12 +5070,18 @@ func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor
 	heartbeatDone := b.startActiveOwnerHeartbeat(heartbeatCtx, session.ID, turn.ID)
 	var result ExecutionResult
 	var runErr error
-	if streaming, ok := executor.(StreamingExecutor); ok {
+	if streaming, ok := executor.(StreamingInputExecutor); ok {
 		forwarder := b.startCodexEventForwarder(ctx, session, turn, chatID)
-		result, runErr = streaming.RunWithEventHandler(ctx, session, text, forwarder.Handle)
+		result, runErr = streaming.RunInputWithEventHandler(ctx, session, input, forwarder.Handle)
 		forwarder.Close(result.Text)
+	} else if streaming, ok := executor.(StreamingExecutor); ok {
+		forwarder := b.startCodexEventForwarder(ctx, session, turn, chatID)
+		result, runErr = streaming.RunWithEventHandler(ctx, session, input.Prompt, forwarder.Handle)
+		forwarder.Close(result.Text)
+	} else if inputExecutor, ok := executor.(InputExecutor); ok {
+		result, runErr = inputExecutor.RunInput(ctx, session, input)
 	} else {
-		result, runErr = executor.Run(ctx, session, text)
+		result, runErr = executor.Run(ctx, session, input.Prompt)
 	}
 	cancelHeartbeat()
 	heartbeatErr := <-heartbeatDone
@@ -5141,6 +5157,7 @@ func (f *codexEventForwarder) run() {
 	defer close(f.done)
 	timer := newCodexIdleStatusTimer(codexIdleStatusInitialDelay)
 	defer stopCodexIdleStatusTimer(timer)
+	quietSince := time.Now()
 	var idleC <-chan time.Time
 	if timer != nil {
 		idleC = timer.C
@@ -5152,9 +5169,10 @@ func (f *codexEventForwarder) run() {
 				return
 			}
 			f.handle(event)
+			quietSince = time.Now()
 			resetCodexIdleStatusTimer(timer, codexIdleStatusInitialDelay)
 		case <-idleC:
-			f.sendIdleStatus()
+			f.sendIdleStatus(time.Since(quietSince))
 			resetCodexIdleStatusTimer(timer, codexIdleStatusRepeatDelay)
 		case <-f.ctx.Done():
 			return
@@ -5192,12 +5210,16 @@ func (f *codexEventForwarder) flushPendingAgent() {
 	f.pendingAgent = ""
 }
 
-func (f *codexEventForwarder) sendIdleStatus() {
+func (f *codexEventForwarder) sendIdleStatus(quietFor time.Duration) {
 	if strings.TrimSpace(f.pendingAgent) != "" {
 		f.flushPendingAgent()
 		return
 	}
-	_ = f.send("status", codexIdleStatusMessage)
+	message := codexIdleStatusMessage
+	if quietFor >= codexIdleStatusCancelHintAfter && strings.TrimSpace(codexIdleStatusCancelHint) != "" {
+		message += "\n\n" + codexIdleStatusCancelHint
+	}
+	_ = f.send("status", message)
 }
 
 func (f *codexEventForwarder) sendStreamRetryStatus(event codexrunner.StreamEvent) {

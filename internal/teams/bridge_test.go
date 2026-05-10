@@ -189,6 +189,27 @@ func (e *attachmentReadingExecutor) Run(_ context.Context, _ *Session, prompt st
 	return ExecutionResult{Text: "saw attachment", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}, nil
 }
 
+type imageInputRecordingExecutor struct {
+	input      ExecutionInput
+	imageRead  []byte
+	imageError error
+}
+
+func (e *imageInputRecordingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunInput(ctx, session, ExecutionInput{Prompt: prompt})
+}
+
+func (e *imageInputRecordingExecutor) RunInput(_ context.Context, _ *Session, input ExecutionInput) (ExecutionResult, error) {
+	e.input = input
+	if len(input.ImagePaths) > 0 {
+		e.imageRead, e.imageError = os.ReadFile(input.ImagePaths[0])
+		if e.imageError != nil {
+			return ExecutionResult{}, e.imageError
+		}
+	}
+	return ExecutionResult{Text: "saw image input", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}, nil
+}
+
 func TestBridgeSessionMessagePersistsTurnRunsAndSendsOutbox(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -445,13 +466,16 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 func TestBridgeSendsCodexIdleStatusWhenStreamIsQuiet(t *testing.T) {
 	oldInitial := codexIdleStatusInitialDelay
 	oldRepeat := codexIdleStatusRepeatDelay
+	oldCancelHintAfter := codexIdleStatusCancelHintAfter
 	oldMessage := codexIdleStatusMessage
 	codexIdleStatusInitialDelay = 15 * time.Millisecond
 	codexIdleStatusRepeatDelay = time.Hour
+	codexIdleStatusCancelHintAfter = time.Hour
 	codexIdleStatusMessage = "Still working. No new Codex update yet."
 	defer func() {
 		codexIdleStatusInitialDelay = oldInitial
 		codexIdleStatusRepeatDelay = oldRepeat
+		codexIdleStatusCancelHintAfter = oldCancelHintAfter
 		codexIdleStatusMessage = oldMessage
 	}()
 
@@ -501,6 +525,71 @@ func TestBridgeSendsCodexIdleStatusWhenStreamIsQuiet(t *testing.T) {
 	}
 	if !strings.Contains(joined, "🤖 ✅ Codex answer:\ndone after a long quiet step") {
 		t.Fatalf("final answer missing after idle status:\n%s", joined)
+	}
+}
+
+func TestBridgeAddsCancelHintAfterLongCodexIdleStatus(t *testing.T) {
+	oldInitial := codexIdleStatusInitialDelay
+	oldRepeat := codexIdleStatusRepeatDelay
+	oldCancelHintAfter := codexIdleStatusCancelHintAfter
+	oldMessage := codexIdleStatusMessage
+	oldHint := codexIdleStatusCancelHint
+	codexIdleStatusInitialDelay = 10 * time.Millisecond
+	codexIdleStatusRepeatDelay = 10 * time.Millisecond
+	codexIdleStatusCancelHintAfter = 15 * time.Millisecond
+	codexIdleStatusMessage = "Still working. No new Codex update yet."
+	codexIdleStatusCancelHint = "This is taking longer than usual. To stop the current request, send `helper cancel last` in this chat."
+	defer func() {
+		codexIdleStatusInitialDelay = oldInitial
+		codexIdleStatusRepeatDelay = oldRepeat
+		codexIdleStatusCancelHintAfter = oldCancelHintAfter
+		codexIdleStatusMessage = oldMessage
+		codexIdleStatusCancelHint = oldHint
+	}()
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingStreamingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result: ExecutionResult{
+			Text:          "done after cancel hint",
+			CodexThreadID: "thread-1",
+			CodexTurnID:   "turn-1",
+		},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-long-idle-status"), "run a quiet long task")
+	}()
+
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("streaming executor did not start")
+	}
+	waitForOutboxBody(t, store, "helper cancel last")
+	close(executor.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleSessionMessage error: %v", err)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("handleSessionMessage did not finish")
+	}
+
+	var joined strings.Builder
+	for _, msg := range *sent {
+		joined.WriteString(PlainTextFromTeamsHTML(msg.Content))
+		joined.WriteString("\n")
+	}
+	if !strings.Contains(joined.String(), "Still working. No new Codex update yet.") || !strings.Contains(joined.String(), "helper cancel last") {
+		t.Fatalf("long idle status missing cancel hint:\n%s", joined.String())
+	}
+	if !strings.Contains(joined.String(), "done after cancel hint") {
+		t.Fatalf("final answer missing after long idle status:\n%s", joined.String())
 	}
 }
 
@@ -5364,6 +5453,33 @@ func TestBridgeSessionHostedContentIsDownloadedForCodexTurn(t *testing.T) {
 	}
 	if !strings.Contains((*sent)[0].Content, "Codex is working") || !strings.Contains((*sent)[1].Content, "saw attachment") {
 		t.Fatalf("hosted content response = %#v", *sent)
+	}
+}
+
+func TestBridgeSessionHostedContentIsPassedAsCodexImageInput(t *testing.T) {
+	graph, sent := newBridgeHostedContentGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &imageInputRecordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	msg := bridgeTestMessage("message-hosted")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = `<p>inspect this <img src="https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-hosted/hostedContents/content-1/$value"></p>`
+
+	err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "inspect this")
+	if err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(executor.input.ImagePaths) != 1 || !strings.Contains(executor.input.ImagePaths[0], "attachment-001") {
+		t.Fatalf("image paths = %#v, want hosted image path", executor.input.ImagePaths)
+	}
+	if string(executor.imageRead) != "image-bytes" {
+		t.Fatalf("image bytes = %q, want hosted bytes", string(executor.imageRead))
+	}
+	if !strings.Contains(executor.input.Prompt, "Attached files saved locally") {
+		t.Fatalf("prompt should still include attachment path context:\n%s", executor.input.Prompt)
+	}
+	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "saw image input") {
+		t.Fatalf("sent messages = %#v, want ack plus final image response", *sent)
 	}
 }
 

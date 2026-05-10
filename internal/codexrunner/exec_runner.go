@@ -151,6 +151,7 @@ func (r *ExecRunner) startArgs(input TurnInput) ([]string, error) {
 	if workingDir != "" {
 		args = append(args, "-C", workingDir)
 	}
+	args = appendImageArgs(args, input.ImagePaths)
 	args = append(args, "-")
 	return args, nil
 }
@@ -164,6 +165,7 @@ func (r *ExecRunner) resumeArgs(threadID string, input TurnInput) ([]string, err
 	extraArgs = translateResumeArgs(extraArgs)
 	args := []string{"exec", "resume", "--json"}
 	args = append(args, extraArgs...)
+	args = appendImageArgs(args, input.ImagePaths)
 	args = append(args, threadID, "-")
 	return args, nil
 }
@@ -177,6 +179,17 @@ func (r *ExecRunner) baseArgs(extra []string) ([]string, error) {
 	args := []string{"exec", "--json"}
 	args = append(args, merged...)
 	return args, nil
+}
+
+func appendImageArgs(args []string, paths []string) []string {
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		args = append(args, "--image", path)
+	}
+	return args
 }
 
 func translateResumeArgs(args []string) []string {

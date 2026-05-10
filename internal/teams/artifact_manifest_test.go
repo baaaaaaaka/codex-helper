@@ -51,7 +51,7 @@ func TestParseArtifactManifestRejectsDirectoryOversizeSymlinkAndDisallowedExtens
 		})
 	}
 
-	_, err := ParseArtifactManifest(testArtifactManifest(t, []ArtifactManifestEntry{{Path: "run.sh"}}), ArtifactManifestOptions{
+	_, err := ParseArtifactManifest(testArtifactManifest(t, []ArtifactManifestEntry{{Path: "run.exe"}}), ArtifactManifestOptions{
 		OutboundRoot: t.TempDir(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "not allowed") {
@@ -97,6 +97,44 @@ func TestParseArtifactManifestPreservesValidFileOrdering(t *testing.T) {
 	}
 	if plan.Files[0].Size != int64(len("reports/b.txt")) {
 		t.Fatalf("size not copied from validation hook: %#v", plan.Files[0])
+	}
+}
+
+func TestParseArtifactManifestAllowsCommonDeveloperFormats(t *testing.T) {
+	root := t.TempDir()
+	entries := []ArtifactManifestEntry{
+		{Path: "scripts/run.sh"},
+		{Path: "src/main.go"},
+		{Path: "src/component.tsx"},
+		{Path: "config/app.toml"},
+		{Path: "archives/source.tar.gz", Name: "source bundle.tar.gz"},
+		{Path: "packages/tool.whl"},
+		{Path: "Dockerfile"},
+		{Path: ".gitignore"},
+	}
+	seen := map[string]bool{}
+	plan, err := ParseArtifactManifest(testArtifactManifest(t, entries), ArtifactManifestOptions{
+		OutboundRoot: root,
+		SessionID:    "s001",
+		TurnID:       "turn-dev",
+		ValidateFile: func(req ArtifactManifestValidationRequest) (ArtifactManifestFileInfo, error) {
+			seen[req.CleanPath] = true
+			return ArtifactManifestFileInfo{Size: int64(len(req.CleanPath))}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ParseArtifactManifest developer formats error: %v", err)
+	}
+	if len(plan.Files) != len(entries) {
+		t.Fatalf("expected %d files, got %#v", len(entries), plan.Files)
+	}
+	for _, entry := range entries {
+		if !seen[entry.Path] {
+			t.Fatalf("validation did not see %s; seen=%v", entry.Path, seen)
+		}
+	}
+	if got := plan.Files[4].Name; got != "source_bundle.tar.gz" {
+		t.Fatalf("sanitized archive display name = %q", got)
 	}
 }
 

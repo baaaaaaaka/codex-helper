@@ -104,8 +104,8 @@ func ParseArtifactManifest(data []byte, opts ArtifactManifestOptions) (ArtifactM
 		if err != nil {
 			return ArtifactManifestPlan{}, fmt.Errorf("artifact file %d: %w", i+1, err)
 		}
-		ext := strings.ToLower(path.Ext(cleanPath))
-		if !allowedOutboundExtension(ext, opts.AllowedExts) {
+		if !allowedOutboundFileName(path.Base(cleanPath), opts.AllowedExts) {
+			ext := strings.ToLower(path.Ext(cleanPath))
 			return ArtifactManifestPlan{}, fmt.Errorf("artifact file %d: file extension %q is not allowed for Teams upload", i+1, ext)
 		}
 
@@ -121,7 +121,7 @@ func ParseArtifactManifest(data []byte, opts ArtifactManifestOptions) (ArtifactM
 			name = path.Base(cleanPath)
 		}
 		name = safeAttachmentName(name)
-		if name == "" || strings.HasPrefix(name, ".") {
+		if name == "" {
 			return ArtifactManifestPlan{}, fmt.Errorf("artifact file %d: unsafe upload file name", i+1)
 		}
 

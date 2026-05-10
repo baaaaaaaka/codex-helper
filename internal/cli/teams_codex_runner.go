@@ -71,21 +71,30 @@ func (e teamsCodexExecutor) Run(ctx context.Context, session *teams.Session, pro
 }
 
 func (e teamsCodexExecutor) RunWithEventHandler(ctx context.Context, session *teams.Session, prompt string, handler codexrunner.EventHandler) (teams.ExecutionResult, error) {
-	input := codexrunner.TurnInput{
-		Prompt:       prompt,
+	return e.RunInputWithEventHandler(ctx, session, teams.ExecutionInput{Prompt: prompt}, handler)
+}
+
+func (e teamsCodexExecutor) RunInput(ctx context.Context, session *teams.Session, input teams.ExecutionInput) (teams.ExecutionResult, error) {
+	return e.RunInputWithEventHandler(ctx, session, input, nil)
+}
+
+func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, session *teams.Session, input teams.ExecutionInput, handler codexrunner.EventHandler) (teams.ExecutionResult, error) {
+	turnInput := codexrunner.TurnInput{
+		Prompt:       input.Prompt,
+		ImagePaths:   append([]string{}, input.ImagePaths...),
 		WorkingDir:   e.workDir,
 		Timeout:      e.timeout,
 		EventHandler: handler,
 	}
 	if session != nil && teams.SessionAllowsAutoTitleUpdate(*session) {
-		input.BackfillThreadName = true
+		turnInput.BackfillThreadName = true
 	}
 	var result codexrunner.TurnResult
 	var err error
 	if session != nil && strings.TrimSpace(session.CodexThreadID) != "" {
-		result, err = e.runner.ResumeThread(ctx, session.CodexThreadID, input)
+		result, err = e.runner.ResumeThread(ctx, session.CodexThreadID, turnInput)
 	} else {
-		result, err = e.runner.StartThread(ctx, input)
+		result, err = e.runner.StartThread(ctx, turnInput)
 	}
 	if err != nil {
 		out := teamsExecutionResultFromCodexTurn(result)
