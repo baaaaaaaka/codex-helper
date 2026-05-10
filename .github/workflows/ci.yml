@@ -644,10 +644,9 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
-  linux-distro-smoke:
-    name: Linux distro smoke (CentOS7/Rocky8/Ubuntu20.04)
+  linux-distro-smoke-build:
+    name: Linux distro smoke build
     runs-on: ubuntu-latest
-    needs: [test]
 
     steps:
       - name: Checkout
@@ -666,22 +665,6 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/codex-proxy ./cmd/codex-proxy
           chmod +x dist/codex-proxy
 
-      - name: Smoke test in containers (doctor)
-        shell: bash
-        run: |
-          set -euo pipefail
-          for img in centos:7 rockylinux:8 ubuntu:20.04; do
-            echo "==> $img"
-            if [ "$img" = "centos:7" ]; then
-              docker run --rm -v "$PWD/dist:/dist:ro" "$img" bash -c '
-                sed -i "s/^mirrorlist=/#mirrorlist=/g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
-                sed -i "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
-                /dist/codex-proxy proxy doctor'
-            else
-              docker run --rm -v "$PWD/dist:/dist:ro" "$img" /dist/codex-proxy proxy doctor
-            fi
-          done
-
       - name: Build CLI test binary
         shell: bash
         run: |
@@ -692,120 +675,172 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams/store -c -o dist/codex_teams_store_test
           chmod +x dist/codex_cli_test dist/codex_cloudgate_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
 
+      - name: Upload Linux distro smoke binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-distro-smoke-dist
+          path: dist/
+          if-no-files-found: error
+
+  linux-distro-smoke:
+    name: Linux distro smoke (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    needs: [linux-distro-smoke-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: CentOS7
+            image: centos:7
+            package_args: ca-certificates curl xz tar
+          - label: Rocky8
+            image: rockylinux:8
+            package_args: ca-certificates curl xz tar
+          - label: Ubuntu20.04
+            image: ubuntu:20.04
+            package_args: ca-certificates curl xz-utils tar
+    env:
+      DISTRO_IMAGE: ${{ matrix.image }}
+      DISTRO_PACKAGE_ARGS: ${{ matrix.package_args }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux distro smoke binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-distro-smoke-dist
+          path: dist
+
+      - name: Restore executable bits
+        shell: bash
+        run: chmod +x dist/codex-proxy dist/codex_cli_test dist/codex_cloudgate_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
+
+      - name: Smoke test in container (doctor)
+        shell: bash
+        run: |
+          set -euo pipefail
+          img="$DISTRO_IMAGE"
+          echo "==> $img"
+          if [ "$img" = "centos:7" ]; then
+            docker run --rm -v "$PWD/dist:/dist:ro" "$img" bash -c '
+              sed -i "s/^mirrorlist=/#mirrorlist=/g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
+              sed -i "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
+              /dist/codex-proxy proxy doctor'
+          else
+            docker run --rm -v "$PWD/dist:/dist:ro" "$img" /dist/codex-proxy proxy doctor
+          fi
+
       - name: Run tests in containers
         shell: bash
         run: |
           set -euo pipefail
-          for img in centos:7 rockylinux:8 ubuntu:20.04; do
-            echo "==> $img (cloudgate tests)"
-            docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_cloudgate_test -test.v -test.count=1
-            echo "==> $img (cli tests)"
-            docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_cli_test -test.v -test.count=1 -test.run='Test[^I]'
-            echo "==> $img (proc zombie/parser tests)"
-            docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_proc_test -test.v -test.count=1 -test.run='Test(IsAliveTreatsLinuxZombieAsDead|LinuxProcStateFromStatParsesLastParen)$'
-            echo "==> $img (Teams resource cleanup tests)"
-            docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_teams_test -test.v -test.count=1 -test.run='Test(BridgePollDropsHelperAttachmentEchoWithoutDurableMatch|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch)$'
-            docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestChatPollSchedule(NoopDoesNotRewriteState|BlockedNoopPreservesPreviousState|ParkedNoopPreservesParkedAt)$'
-          done
+          img="$DISTRO_IMAGE"
+          echo "==> $img (cloudgate tests)"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_cloudgate_test -test.v -test.count=1
+          echo "==> $img (cli tests)"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_cli_test -test.v -test.count=1 -test.run='Test[^I]'
+          echo "==> $img (proc zombie/parser tests)"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_proc_test -test.v -test.count=1 -test.run='Test(IsAliveTreatsLinuxZombieAsDead|LinuxProcStateFromStatParsesLastParen)$'
+          echo "==> $img (Teams resource cleanup tests)"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_test -test.v -test.count=1 -test.run='Test(BridgePollDropsHelperAttachmentEchoWithoutDurableMatch|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch)$'
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestChatPollSchedule(NoopDoesNotRewriteState|BlockedNoopPreservesPreviousState|ParkedNoopPreservesParkedAt)$'
 
       - name: Teams background keepalive tests in containers (non-root)
         shell: bash
         run: |
           set -euo pipefail
           teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
-          for img in centos:7 rockylinux:8 ubuntu:20.04; do
-            echo "==> $img (Teams keepalive tests as non-root uid 1000)"
-            docker run --rm --user 1000:1000 \
-              -e HOME=/tmp/codex-home \
-              -e XDG_CONFIG_HOME=/tmp/codex-config \
-              -e XDG_CACHE_HOME=/tmp/codex-cache \
-              -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-              -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-              -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
-              -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_cli_test -test.v -test.count=1 -test.run='TestTeamsBackgroundKeepalive'
-            docker run --rm --user 1000:1000 \
-              -e HOME=/tmp/codex-home \
-              -e XDG_CONFIG_HOME=/tmp/codex-config \
-              -e XDG_CACHE_HOME=/tmp/codex-cache \
-              -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-              -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-              -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
-              -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
-            docker run --rm --user 1000:1000 \
-              -e HOME=/tmp/codex-home \
-              -e XDG_CONFIG_HOME=/tmp/codex-config \
-              -e XDG_CACHE_HOME=/tmp/codex-cache \
-              -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-              -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-              -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
-              -v "$PWD/dist:/dist:ro" "$img" \
-              /dist/codex_teams_store_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
-            echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
-            docker run --rm --user 1000:1000 \
-              -e HOME=/tmp/codex-home \
-              -e RUNNER_TEMP=/tmp/codex-runner-temp \
-              -v "$PWD/scripts/ci:/ci:ro" "$img" \
-              bash /ci/teams_supervisor_smoke.sh
-          done
+          img="$DISTRO_IMAGE"
+          echo "==> $img (Teams keepalive tests as non-root uid 1000)"
+          docker run --rm --user 1000:1000 \
+            -e HOME=/tmp/codex-home \
+            -e XDG_CONFIG_HOME=/tmp/codex-config \
+            -e XDG_CACHE_HOME=/tmp/codex-cache \
+            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+            -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_cli_test -test.v -test.count=1 -test.run='TestTeamsBackgroundKeepalive'
+          docker run --rm --user 1000:1000 \
+            -e HOME=/tmp/codex-home \
+            -e XDG_CONFIG_HOME=/tmp/codex-config \
+            -e XDG_CACHE_HOME=/tmp/codex-cache \
+            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+            -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
+          docker run --rm --user 1000:1000 \
+            -e HOME=/tmp/codex-home \
+            -e XDG_CONFIG_HOME=/tmp/codex-config \
+            -e XDG_CACHE_HOME=/tmp/codex-cache \
+            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+            -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_store_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
+          echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
+          docker run --rm --user 1000:1000 \
+            -e HOME=/tmp/codex-home \
+            -e RUNNER_TEMP=/tmp/codex-runner-temp \
+            -v "$PWD/scripts/ci:/ci:ro" "$img" \
+            bash /ci/teams_supervisor_smoke.sh
 
       - name: Codex upgrade smoke in Linux containers (system/local)
         shell: bash
         run: |
           set -euo pipefail
-          for img in centos:7 rockylinux:8 ubuntu:20.04; do
-            echo "==> $img (codex upgrade command)"
-            docker run --rm \
-              -v "$PWD/dist:/dist:ro" \
-              -v "$PWD/scripts/ci:/ci:ro" \
-              "$img" bash -lc '
-                set -euo pipefail
-                if command -v apt-get >/dev/null 2>&1; then
-                  bash /ci/install_container_packages.sh ca-certificates curl xz-utils tar
-                elif command -v dnf >/dev/null 2>&1; then
-                  bash /ci/install_container_packages.sh ca-certificates curl xz tar
-                elif command -v yum >/dev/null 2>&1; then
-                  bash /ci/install_container_packages.sh ca-certificates curl xz tar
-                else
-                  echo "unsupported package manager for codex upgrade smoke"
+          img="$DISTRO_IMAGE"
+          echo "==> $img (codex upgrade command)"
+          docker run --rm \
+            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS" \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/scripts/ci:/ci:ro" \
+            "$img" bash -lc '
+              set -euo pipefail
+              if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                # shellcheck disable=SC2086
+                bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
+              else
+                echo "unsupported package manager for codex upgrade smoke"
+                exit 1
+              fi
+
+              NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR="$(bash /ci/install_node_local.sh)"
+              export PATH="$NODE_BIN_DIR:$PATH"
+
+              bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex
+              system_prefix="$(npm prefix -g)"
+              /dist/codex-proxy --config /tmp/codex-upgrade-system.json --upgrade-codex
+              codex --version >/dev/null
+              system_path="$(command -v codex)"
+              case "$system_path" in
+                "$system_prefix"/*) ;;
+                *)
+                  echo "expected system codex under $system_prefix, got $system_path"
                   exit 1
-                fi
+                  ;;
+              esac
 
-                NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR="$(bash /ci/install_node_local.sh)"
-                export PATH="$NODE_BIN_DIR:$PATH"
-
-                bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex
-                system_prefix="$(npm prefix -g)"
-                /dist/codex-proxy --config /tmp/codex-upgrade-system.json --upgrade-codex
-                codex --version >/dev/null
-                system_path="$(command -v codex)"
-                case "$system_path" in
-                  "$system_prefix"/*) ;;
-                  *)
-                    echo "expected system codex under $system_prefix, got $system_path"
-                    exit 1
-                    ;;
-                esac
-
-                local_prefix="/tmp/codex-local-prefix"
-                bash /ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" --include=optional @openai/codex
-                export CODEX_NPM_PREFIX="$local_prefix"
-                export PATH="$local_prefix/bin:$local_prefix:$PATH"
-                /dist/codex-proxy --config /tmp/codex-upgrade-local.json --upgrade-codex
-                codex --version >/dev/null
-                local_path="$(command -v codex)"
-                case "$local_path" in
-                  "$local_prefix"/*) ;;
-                  *)
-                    echo "expected local codex under $local_prefix, got $local_path"
-                    exit 1
-                    ;;
-                esac
-              '
-          done
+              local_prefix="/tmp/codex-local-prefix"
+              bash /ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" --include=optional @openai/codex
+              export CODEX_NPM_PREFIX="$local_prefix"
+              export PATH="$local_prefix/bin:$local_prefix:$PATH"
+              /dist/codex-proxy --config /tmp/codex-upgrade-local.json --upgrade-codex
+              codex --version >/dev/null
+              local_path="$(command -v codex)"
+              case "$local_path" in
+                "$local_prefix"/*) ;;
+                *)
+                  echo "expected local codex under $local_prefix, got $local_path"
+                  exit 1
+                  ;;
+              esac
+            '

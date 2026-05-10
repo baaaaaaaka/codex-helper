@@ -176,7 +176,12 @@ func TestRenderTeamsHTMLCodexMarkdownKeepsIndentedNestedListsReadable(t *testing
 }
 
 func TestPlanTeamsHTMLChunksStaysUnderHardLimitAndOrdersParts(t *testing.T) {
-	text := strings.Repeat("<&>", 30000)
+	escapedUnitLen := len("&lt;&amp;&gt;")
+	repeat := TeamsRenderHardLimitBytes/escapedUnitLen + 1000
+	text := strings.Repeat("<&>", repeat)
+	if repeat*escapedUnitLen <= TeamsRenderHardLimitBytes {
+		t.Fatalf("test payload should exceed hard limit after HTML escaping")
+	}
 	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
 		Surface: TeamsRenderSurfaceOutbox,
 		Kind:    TeamsRenderAssistant,
