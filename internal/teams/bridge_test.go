@@ -1089,6 +1089,24 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 		!strings.Contains(prompts[2], "third prompt") {
 		t.Fatalf("executor prompts = %#v, want first, second, third", prompts)
 	}
+	joined = sentPlainJoined(*sent)
+	if got := strings.Count(joined, "Codex is starting this queued request."); got != 2 {
+		t.Fatalf("queued start notice count = %d, want 2 for second and third only:\n%s", got, joined)
+	}
+	requirePlainTextInOrder(t, joined,
+		"Codex is starting this queued request.",
+		"Now running:",
+		"second prompt",
+		"Still queued:",
+		"third prompt",
+		"done 2",
+		"Codex is starting this queued request.",
+		"Now running:",
+		"third prompt",
+		"Still queued:",
+		"No other queued requests.",
+		"done 3",
+	)
 }
 
 func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T) {
@@ -1603,6 +1621,69 @@ func TestBridgeOutboxMentionOwnerUsesGraphMentionPayload(t *testing.T) {
 	}
 	if !sawMention {
 		t.Fatal("expected Graph mention payload")
+	}
+}
+
+func TestBridgeQueuedTurnErrorMentionsOwnerWhenWorkflowDisabled(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	session := (&Registry{
+		Sessions: []Session{{
+			ID:     "s001",
+			ChatID: "chat-1",
+			Status: "active",
+		}},
+	}).SessionByChatID("chat-1")
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{err: errors.New("simulated codex failure")})
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:error", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.runQueuedTurn(context.Background(), session, turn, session.ChatID, "fail please"); err != nil {
+		t.Fatalf("runQueuedTurn error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent count = %d, want 1: %#v", len(*sent), *sent)
+	}
+	if (*sent)[0].Mentions != 1 {
+		t.Fatalf("error message mentions = %d, want 1", (*sent)[0].Mentions)
+	}
+	if got := PlainTextFromTeamsHTML((*sent)[0].Content); !strings.Contains(got, "error: simulated codex failure") {
+		t.Fatalf("error message = %q", got)
+	}
+}
+
+func TestBridgeChunkedNeedsAttentionMentionsOwnerOnlyOnLastPart(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	text := strings.Repeat("error detail that should be split into multiple Teams messages\n", 1200)
+
+	queued, err := bridge.queueOutboxChunksWithOptions(context.Background(), "s001", "turn:error-chunked", "chat-1", "error", text, outboxQueueOptions{
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("queueOutboxChunksWithOptions error: %v", err)
+	}
+	if len(queued) < 2 {
+		t.Fatalf("queued chunks = %d, want split error", len(queued))
+	}
+	for i, msg := range queued {
+		wantMention := i == len(queued)-1
+		if msg.MentionOwner != wantMention {
+			t.Fatalf("chunk %d MentionOwner = %v, want %v; queued=%#v", i+1, msg.MentionOwner, wantMention, queued)
+		}
+		if wantMention && msg.NotificationKind != "needs_attention" {
+			t.Fatalf("last chunk NotificationKind = %q, want needs_attention", msg.NotificationKind)
+		}
+		if !wantMention && msg.NotificationKind != "" {
+			t.Fatalf("chunk %d NotificationKind = %q, want empty before last chunk", i+1, msg.NotificationKind)
+		}
 	}
 }
 
@@ -11372,6 +11453,70 @@ func TestBridgeRecoverUnfinishedRunningTurnMarksInterrupted(t *testing.T) {
 	}
 	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "helper retry "+turn.ID) {
 		t.Fatalf("interruption notification = %#v", *sent)
+	}
+}
+
+func TestBridgeRecoverUnfinishedRunningTurnDelaysNoticeUntilQueueIdle(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.asyncTurns = true
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	running, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:running-before-restart", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn running error: %v", err)
+	}
+	if _, err := store.MarkTurnRunning(context.Background(), running.ID, "thread-1", "codex-turn-1"); err != nil {
+		t.Fatalf("MarkTurnRunning error: %v", err)
+	}
+	queued, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:queued-after-restart", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn queued error: %v", err)
+	}
+
+	if err := bridge.recoverUnfinishedTurns(context.Background()); err != nil {
+		t.Fatalf("recoverUnfinishedTurns error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("interruption notice should wait behind queued work, sent = %#v", *sent)
+	}
+	if _, err := store.MarkTurnCompleted(context.Background(), queued.ID, "", ""); err != nil {
+		t.Fatalf("MarkTurnCompleted queued error: %v", err)
+	}
+	if err := bridge.sendDeferredInterruptedTurnNotices(context.Background()); err != nil {
+		t.Fatalf("sendDeferredInterruptedTurnNotices error: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "helper retry "+running.ID) {
+		t.Fatalf("delayed interruption notification = %#v", *sent)
+	}
+	if (*sent)[0].Mentions != 1 {
+		t.Fatalf("interruption notice mentions = %d, want 1 without workflow card", (*sent)[0].Mentions)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	outbox := state.OutboxMessages[interruptedAfterRestartOutboxID(running.ID)]
+	if !outbox.MentionOwner || outbox.NotificationKind != "needs_attention" {
+		t.Fatalf("delayed interruption outbox = %#v, want attention mention metadata", outbox)
+	}
+	if got := state.Turns[running.ID].RecoveryReason; got != recoveryReasonAmbiguousAfterHelperRestartNoticeSent {
+		t.Fatalf("recovery reason after notice = %q, want notice sent marker", got)
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		delete(state.OutboxMessages, interruptedAfterRestartOutboxID(running.ID))
+		return nil
+	}); err != nil {
+		t.Fatalf("delete sent outbox: %v", err)
+	}
+	if err := bridge.sendDeferredInterruptedTurnNotices(context.Background()); err != nil {
+		t.Fatalf("second sendDeferredInterruptedTurnNotices error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("notice was resent after sent outbox pruning: %#v", *sent)
 	}
 }
 

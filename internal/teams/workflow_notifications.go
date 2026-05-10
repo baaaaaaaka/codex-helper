@@ -286,7 +286,11 @@ func shouldSkipWorkflowNotificationOutbox(outbox teamstore.OutboxMessage) bool {
 
 func workflowOutboxNeedsAttention(kind string) bool {
 	switch {
-	case kind == "error", kind == "interrupted":
+	case kind == "error" || strings.HasPrefix(kind, "error-"):
+		return true
+	case kind == "interrupted" || strings.HasPrefix(kind, "interrupted-"):
+		return true
+	case kind == "failed" || strings.HasPrefix(kind, "failed-"):
 		return true
 	case strings.Contains(kind, "queued-turn-error"):
 		return true

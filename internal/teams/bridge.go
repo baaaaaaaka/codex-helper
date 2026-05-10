@@ -88,6 +88,11 @@ const (
 	sessionTitleSourceUser = "user"
 )
 
+const (
+	recoveryReasonAmbiguousAfterHelperRestart           = "ambiguous after helper restart"
+	recoveryReasonAmbiguousAfterHelperRestartNoticeSent = "ambiguous after helper restart; notice sent"
+)
+
 type outboxQueueOptions struct {
 	MentionOwner     bool
 	NotificationKind string
@@ -560,6 +565,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		if err := b.processQueuedTurns(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
+		}
+		if err := b.sendDeferredInterruptedTurnNotices(ctx); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams interrupted turn notice error: %v\n", err)
 		}
 		if err := b.Save(); err != nil {
 			return err
@@ -3463,6 +3471,22 @@ func runningTurnForSessionState(state teamstore.State, sessionID string) (teamst
 	return out, out.ID != ""
 }
 
+func sessionHasQueuedOrRunningTurnState(state teamstore.State, sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return false
+	}
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID {
+			continue
+		}
+		if turn.Status == teamstore.TurnStatusQueued || turn.Status == teamstore.TurnStatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
 func turnPromptSummary(state teamstore.State, turn teamstore.Turn) string {
 	inbound := state.InboundEvents[turn.InboundEventID]
 	text := strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(inbound.Text)))
@@ -3531,22 +3555,82 @@ func (b *Bridge) recoverUnfinishedTurns(ctx context.Context) error {
 				return err
 			}
 		case teamstore.TurnStatusRunning:
-			if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "ambiguous after helper restart"); err != nil {
-				return err
-			}
-			if err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-				ID:          "outbox:" + turn.ID + ":interrupted-after-restart",
-				SessionID:   session.ID,
-				TurnID:      turn.ID,
-				TeamsChatID: session.ChatID,
-				Kind:        "interrupted-after-restart",
-				Body:        "turn was interrupted after helper restart: " + turn.ID + "\nUse `helper retry " + turn.ID + "` if you want to run it again.",
-			}); err != nil {
+			if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, recoveryReasonAmbiguousAfterHelperRestart); err != nil {
 				return err
 			}
 		}
 	}
+	return b.sendDeferredInterruptedTurnNotices(ctx)
+}
+
+func interruptedAfterRestartOutboxID(turnID string) string {
+	return "outbox:" + strings.TrimSpace(turnID) + ":interrupted-after-restart"
+}
+
+func (b *Bridge) sendDeferredInterruptedTurnNotices(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	var turns []teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.Status != teamstore.TurnStatusInterrupted || strings.TrimSpace(turn.RecoveryReason) != recoveryReasonAmbiguousAfterHelperRestart {
+			continue
+		}
+		if sessionHasQueuedOrRunningTurnState(state, turn.SessionID) {
+			continue
+		}
+		turns = append(turns, turn)
+	}
+	sort.Slice(turns, func(i, j int) bool {
+		left := turnSortTime(turns[i])
+		right := turnSortTime(turns[j])
+		if !left.Equal(right) {
+			return left.Before(right)
+		}
+		return turns[i].ID < turns[j].ID
+	})
+	for _, turn := range turns {
+		session := b.sessionForTurnState(state, turn)
+		if session == nil || strings.TrimSpace(session.ChatID) == "" {
+			continue
+		}
+		if err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+			ID:               interruptedAfterRestartOutboxID(turn.ID),
+			SessionID:        session.ID,
+			TurnID:           turn.ID,
+			TeamsChatID:      session.ChatID,
+			Kind:             "interrupted-after-restart",
+			Body:             "turn was interrupted after helper restart: " + turn.ID + "\n\nUse `helper retry " + turn.ID + "` if you want to run it again.",
+			MentionOwner:     true,
+			NotificationKind: "needs_attention",
+		}); err != nil {
+			return err
+		}
+		if err := b.markInterruptedAfterRestartNoticeSent(ctx, turn); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (b *Bridge) markInterruptedAfterRestartNoticeSent(ctx context.Context, turn teamstore.Turn) error {
+	if b == nil || b.store == nil || strings.TrimSpace(turn.ID) == "" || strings.TrimSpace(turn.SessionID) == "" {
+		return nil
+	}
+	return b.store.UpdateSession(ctx, turn.SessionID, func(state *teamstore.State) error {
+		current, ok := state.Turns[turn.ID]
+		if !ok || current.Status != teamstore.TurnStatusInterrupted || strings.TrimSpace(current.RecoveryReason) != recoveryReasonAmbiguousAfterHelperRestart {
+			return nil
+		}
+		current.RecoveryReason = recoveryReasonAmbiguousAfterHelperRestartNoticeSent
+		current.UpdatedAt = time.Now()
+		state.Turns[current.ID] = current
+		return nil
+	})
 }
 
 func (b *Bridge) processDeferredInbound(ctx context.Context) error {
@@ -4828,7 +4912,10 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, "ambiguous Codex execution: "+err.Error()); markErr != nil {
 				return markErr
 			}
-			return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "interrupted", "Codex accepted the request, but the helper could not confirm whether it finished. I did not retry automatically because that could duplicate work.\n\nCheck recent messages and changed files first. To run the same Teams request again in this same session, send `helper retry last` here. Advanced: `helper retry "+turn.ID+"`.")
+			return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "interrupted", "Codex accepted the request, but the helper could not confirm whether it finished. I did not retry automatically because that could duplicate work.\n\nCheck recent messages and changed files first. To run the same Teams request again in this same session, send `helper retry last` here. Advanced: `helper retry "+turn.ID+"`.", outboxQueueOptions{
+				MentionOwner:     true,
+				NotificationKind: "needs_attention",
+			})
 		}
 		if _, markErr := b.store.MarkTurnFailedWithCodexIDs(ctx, turn.ID, err.Error(), firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); markErr != nil {
 			return markErr
@@ -4839,7 +4926,10 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			}
 			return nil
 		}
-		return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "error", "error: "+err.Error())
+		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", "error: "+err.Error(), outboxQueueOptions{
+			MentionOwner:     true,
+			NotificationKind: "needs_attention",
+		})
 	}
 	if cancelRequested {
 		if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, firstNonEmptyString(cancelReason, "canceled by user")); markErr != nil {
@@ -4934,12 +5024,14 @@ func (b *Bridge) interruptTurnForAttachmentMessage(ctx context.Context, session 
 		return err
 	}
 	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-		ID:          "outbox:" + turn.ID + ":attachment-download",
-		SessionID:   session.ID,
-		TurnID:      turn.ID,
-		TeamsChatID: session.ChatID,
-		Kind:        "interrupted",
-		Body:        message,
+		ID:               "outbox:" + turn.ID + ":attachment-download",
+		SessionID:        session.ID,
+		TurnID:           turn.ID,
+		TeamsChatID:      session.ChatID,
+		Kind:             "interrupted",
+		Body:             message,
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
 	})
 }
 
@@ -5003,6 +5095,11 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 	if err != nil || !ok {
 		return ok, err
 	}
+	if strings.TrimSpace(preferredTurnID) == "" || claimed.ID != preferredTurnID {
+		if err := b.queueAndBestEffortQueuedTurnStartNotice(ctx, session, claimed); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice error: %v\n", err)
+		}
+	}
 	runCtx := ctx
 	go func() {
 		err := b.runClaimedQueuedTurn(runCtx, session, claimed, preferredTurnID, preferred)
@@ -5012,9 +5109,94 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		if err := b.processQueuedTurns(context.Background()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams queued turn follow-up error: %v\n", err)
 		}
+		if err := b.sendDeferredInterruptedTurnNotices(context.Background()); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams interrupted turn notice error: %v\n", err)
+		}
 		b.boostPolling(time.Now())
 	}()
 	return true, nil
+}
+
+func queuedTurnStartOutboxID(turnID string) string {
+	return "outbox:" + strings.TrimSpace(turnID) + ":queued-start"
+}
+
+func (b *Bridge) queueAndBestEffortQueuedTurnStartNotice(ctx context.Context, session *Session, claimed teamstore.Turn) error {
+	if b == nil || b.store == nil || session == nil || strings.TrimSpace(session.ChatID) == "" {
+		return nil
+	}
+	body, ok, err := b.formatQueuedTurnStartNotice(ctx, session.ID, claimed)
+	if err != nil || !ok {
+		return err
+	}
+	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:          queuedTurnStartOutboxID(claimed.ID),
+		SessionID:   session.ID,
+		TurnID:      claimed.ID,
+		TeamsChatID: session.ChatID,
+		Kind:        "queued-status",
+		Body:        body,
+	})
+}
+
+func (b *Bridge) formatQueuedTurnStartNotice(ctx context.Context, sessionID string, claimed teamstore.Turn) (string, bool, error) {
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	current := turnPromptSummary(state, claimed)
+	if current == "" {
+		current = "Queued request `" + shortenTeamsLine(claimed.ID, 80) + "`"
+	}
+	remaining := remainingQueuedTurnSummariesForSessionState(state, sessionID)
+	lines := []string{
+		"▶️ **Codex is starting this queued request.**",
+		"",
+		"**Now running:**",
+		current,
+		"",
+		"---",
+		"",
+		"**Still queued:**",
+	}
+	if len(remaining) == 0 {
+		lines = append(lines, "No other queued requests.")
+	} else {
+		for _, summary := range remaining {
+			lines = append(lines, "- "+summary)
+		}
+	}
+	return strings.Join(lines, "\n"), true, nil
+}
+
+func remainingQueuedTurnSummariesForSessionState(state teamstore.State, sessionID string) []string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	var turns []teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID == sessionID && turn.Status == teamstore.TurnStatusQueued {
+			turns = append(turns, turn)
+		}
+	}
+	sort.Slice(turns, func(i, j int) bool {
+		left := queuedTurnAgeBaseTime(turns[i])
+		right := queuedTurnAgeBaseTime(turns[j])
+		if !left.Equal(right) {
+			return left.Before(right)
+		}
+		return turns[i].ID < turns[j].ID
+	})
+	out := make([]string, 0, len(turns))
+	for _, turn := range turns {
+		summary := turnPromptSummary(state, turn)
+		if summary == "" {
+			summary = "Queued request `" + shortenTeamsLine(turn.ID, 80) + "`"
+		}
+		out = append(out, summary)
+	}
+	return out
 }
 
 func (b *Bridge) runClaimedQueuedTurn(ctx context.Context, session *Session, claimed teamstore.Turn, preferredTurnID string, preferred queuedTurnRunner) error {
@@ -5055,12 +5237,14 @@ func (b *Bridge) handleClaimedQueuedTurnError(ctx context.Context, session *Sess
 		return
 	}
 	if queueErr := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-		ID:          "outbox:" + turn.ID + ":queued-turn-error",
-		SessionID:   turn.SessionID,
-		TurnID:      turn.ID,
-		TeamsChatID: chatID,
-		Kind:        "error",
-		Body:        "Codex could not continue this queued request: " + err.Error() + "\n\nPlease resend the message if you still want to run it.",
+		ID:               "outbox:" + turn.ID + ":queued-turn-error",
+		SessionID:        turn.SessionID,
+		TurnID:           turn.ID,
+		TeamsChatID:      chatID,
+		Kind:             "error",
+		Body:             "Codex could not continue this queued request: " + err.Error() + "\n\nPlease resend the message if you still want to run it.",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
 	}); queueErr != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams queued turn error notification failed: %v\n", queueErr)
 	}
@@ -6155,7 +6339,7 @@ func (b *Bridge) queueOutboxChunksWithOptions(ctx context.Context, sessionID str
 			RenderedBytes:   chunk.ByteLength,
 		}
 		mentionThisPart := opts.MentionOwner && i == 0
-		if opts.MentionOwner && isCompletionNotificationKind(kind, opts.NotificationKind) {
+		if opts.MentionOwner && shouldMentionOwnerOnLastOutboxPart(kind, opts.NotificationKind) {
 			mentionThisPart = i == len(chunks)-1
 		}
 		if mentionThisPart {
@@ -6711,6 +6895,16 @@ func isCompletionNotificationOutbox(outbox teamstore.OutboxMessage) bool {
 
 func isCompletionNotificationKind(kind string, notificationKind string) bool {
 	return isFinalOutboxKind(kind) || strings.EqualFold(strings.TrimSpace(notificationKind), "turn_completed")
+}
+
+func shouldMentionOwnerOnLastOutboxPart(kind string, notificationKind string) bool {
+	if isCompletionNotificationKind(kind, notificationKind) {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(notificationKind), "needs_attention") {
+		return true
+	}
+	return workflowOutboxNeedsAttention(strings.ToLower(strings.TrimSpace(kind)))
 }
 
 func isCompletionNotificationPart(outbox teamstore.OutboxMessage) bool {

@@ -427,6 +427,41 @@ func TestWorkflowNotificationSkipsHistoryAndNonFinalParts(t *testing.T) {
 	}
 }
 
+func TestWorkflowNotificationSendsInterruptedAfterRestartNeedsAttention(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Resume after helper restart")
+
+	var seen map[string]any
+	var calls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-interrupted-after-restart", "interrupted-after-restart", "needs_attention"))
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("webhook calls = %d, want 1", got)
+	}
+	raw, _ := json.Marshal(seen)
+	for _, want := range []string{"⚠️ Codex needs attention", "Open chat", "Resume after helper restart"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("workflow payload missing %q: %s", want, raw)
+		}
+	}
+}
+
 func TestWorkflowNotificationSupportsRecreatedChatMovedNotice(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
@@ -501,6 +536,38 @@ func TestQueueOutboxSuppressesOwnerMentionWhenWorkflowNotificationEnabled(t *tes
 	}
 	if moved.MentionOwner {
 		t.Fatalf("chat moved MentionOwner = true, want false when workflow card is enabled: %#v", moved)
+	}
+	interrupted, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:interrupted-after-restart",
+		SessionID:        "s001",
+		TurnID:           "turn-interrupted",
+		TeamsChatID:      "chat-1",
+		Kind:             "interrupted-after-restart",
+		Body:             "turn was interrupted after helper restart",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("queue interrupted outbox: %v", err)
+	}
+	if interrupted.MentionOwner {
+		t.Fatalf("interrupted MentionOwner = true, want false when workflow card is enabled: %#v", interrupted)
+	}
+	chunkedError, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:error-001",
+		SessionID:        "s001",
+		TurnID:           "turn-error",
+		TeamsChatID:      "chat-1",
+		Kind:             "error-001",
+		Body:             "chunked error",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("queue chunked error outbox: %v", err)
+	}
+	if chunkedError.MentionOwner {
+		t.Fatalf("chunked error MentionOwner = true, want false when workflow card is enabled: %#v", chunkedError)
 	}
 }
 
