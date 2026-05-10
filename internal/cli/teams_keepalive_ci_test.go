@@ -939,8 +939,14 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		t.Fatalf("bootstrap UAC calls = %#v, want direct, current-user query, elevated repair", runner.calls)
 	}
 	gotOut := out.String()
-	if !strings.Contains(gotOut, "A Windows UAC prompt is about to appear") || !strings.Contains(gotOut, "Type yes to continue") {
+	if !strings.Contains(gotOut, "NEXT STEP: TYPE yes TO CONTINUE") || !strings.Contains(gotOut, "Type yes and press Enter") {
 		t.Fatalf("bootstrap did not clearly prompt before UAC:\n%s", gotOut)
+	}
+	if strings.Contains(gotOut, "Show the UAC prompt now?") {
+		t.Fatalf("bootstrap UAC prompt should be concise and action-only:\n%s", gotOut)
+	}
+	if strings.Contains(gotOut, "Windows blocked automatic Scheduled Task setup") || strings.Contains(gotOut, "Register-ScheduledTask failed") {
+		t.Fatalf("bootstrap should not print raw access-denied repair errors before UAC:\n%s", gotOut)
 	}
 	elevated := strings.Join(runner.calls[2].args, " ")
 	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
@@ -1059,7 +1065,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 	if _, err := os.Stat(fallbackTaskConfigPath); !os.IsNotExist(err) {
 		t.Fatalf("stale Scheduled Task config should be removed after fallback install, err=%v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "UAC prompt was not confirmed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+	if got := out.String(); !strings.Contains(got, "UAC prompt was not confirmed") || !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
 		t.Fatalf("bootstrap fallback output missing confirmation and mode:\n%s", got)
 	}
 }
@@ -1186,7 +1192,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapNoUACFallsBackOnTaskFailureCI(t *te
 	if len(runner.calls) != 2 {
 		t.Fatalf("bootstrap --no-uac calls = %#v, want direct repair then Startup fallback", runner.calls)
 	}
-	if got := out.String(); !strings.Contains(got, "Windows blocked automatic Scheduled Task setup") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+	if got := out.String(); !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Windows Scheduled Task setup could not be completed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
 		t.Fatalf("bootstrap --no-uac output missing protected-task fallback:\n%s", got)
 	}
 }
@@ -1224,8 +1230,11 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *t
 		t.Fatalf("bootstrap fallback error: %v\noutput:\n%s", err, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "Windows blocked automatic Scheduled Task setup") || !strings.Contains(got, "Access is denied") {
+	if !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Windows Scheduled Task setup could not be completed") || !strings.Contains(got, "Windows denied permission") {
 		t.Fatalf("bootstrap did not classify access denied PowerShell output:\n%s", got)
+	}
+	if strings.Contains(got, "Register-ScheduledTask : Access is denied") {
+		t.Fatalf("bootstrap should summarize access denied output instead of printing raw PowerShell noise:\n%s", got)
 	}
 	if !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
 		t.Fatalf("bootstrap output missing fallback mode:\n%s", got)

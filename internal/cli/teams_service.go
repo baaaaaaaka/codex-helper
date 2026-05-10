@@ -102,13 +102,7 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
-			control, controlErr := teamsServiceBootstrapControlChat(cmd.Context(), root, registryPath, !noOpenControl, cmd.ErrOrStderr())
-			if controlErr != nil {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams control chat link is not ready yet: %v\n", controlErr)
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "The service will still be repaired. After it starts, run `codex-proxy teams control` in a foreground terminal to print the link.")
-			} else {
-				printTeamsServiceBootstrapControlChat(cmd.OutOrStdout(), control)
-			}
+			control, controlErr := teamsServiceBootstrapControlChat(cmd.Context(), root, registryPath, !noOpenControl, io.Discard)
 			result, err := bootstrapTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
 				AssumeYes:    yes,
 				NoUAC:        noUAC,
@@ -119,9 +113,11 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service bootstrap ready: %s\n", result.Mode)
-			if strings.TrimSpace(result.Path) != "" {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service config: %s\n", result.Path)
+			printTeamsServiceBootstrapReady(cmd.OutOrStdout(), result)
+			if controlErr != nil {
+				printTeamsServiceBootstrapControlChatUnavailable(cmd.OutOrStdout(), controlErr)
+			} else {
+				printTeamsServiceBootstrapControlChat(cmd.OutOrStdout(), control)
 			}
 			return nil
 		},
@@ -462,24 +458,50 @@ func printTeamsServiceBootstrapControlChat(out io.Writer, result teamsServiceBoo
 	}
 	_, _ = fmt.Fprintln(out)
 	_, _ = fmt.Fprintln(out, "============================================================")
-	_, _ = fmt.Fprintln(out, "ACTION REQUIRED: open the Teams control chat")
+	_, _ = fmt.Fprintln(out, "NEXT STEP: OPEN THE TEAMS CONTROL CHAT")
+	_, _ = fmt.Fprintln(out, "============================================================")
 	_, _ = fmt.Fprintln(out)
-	_, _ = fmt.Fprintln(out, "Open this link to finish setup:")
+	_, _ = fmt.Fprintln(out, "Open:")
 	_, _ = fmt.Fprintln(out, firstNonEmptyCLI(result.URL, result.ChatID))
-	if result.Topic != "" {
-		_, _ = fmt.Fprintf(out, "Title: %s\n", result.Topic)
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "Then send:")
+	_, _ = fmt.Fprintln(out, "help")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out)
+}
+
+func printTeamsServiceBootstrapControlChatUnavailable(out io.Writer, err error) {
+	if out == nil {
+		return
 	}
 	_, _ = fmt.Fprintln(out)
-	switch {
-	case result.Opened:
-		_, _ = fmt.Fprintln(out, "I also tried to open it automatically. If Teams did not appear, copy and paste the link above.")
-	case result.OpenErr != nil:
-		_, _ = fmt.Fprintf(out, "I could not open it automatically: %v\n", result.OpenErr)
-		_, _ = fmt.Fprintln(out, "Copy and paste the link above into your browser or Teams.")
-	default:
-		_, _ = fmt.Fprintln(out, "Copy and paste the link above into your browser or Teams.")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, "NEXT STEP: PRINT THE TEAMS CONTROL CHAT LINK")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, "The service was repaired, but the control chat link was not ready.")
+	_, _ = fmt.Fprintln(out, "Reason: "+teamsServiceBootstrapErrorSummary(err))
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "Run:")
+	_, _ = fmt.Fprintln(out, "codex-proxy teams control")
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "Then open the printed link and send:")
+	_, _ = fmt.Fprintln(out, "help")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out)
+}
+
+func printTeamsServiceBootstrapReady(out io.Writer, result teamsServiceBootstrapResult) {
+	if out == nil {
+		return
 	}
-	_, _ = fmt.Fprintln(out, "After it opens, send `help` in that Teams chat.")
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, "BOOTSTRAP COMPLETE")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintf(out, "Teams service bootstrap ready: %s\n", result.Mode)
+	if strings.TrimSpace(result.Path) != "" {
+		_, _ = fmt.Fprintf(out, "Teams service config: %s\n", result.Path)
+	}
 	_, _ = fmt.Fprintln(out, "============================================================")
 	_, _ = fmt.Fprintln(out)
 }
@@ -513,36 +535,39 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	}
 	accessDenied := isTeamsServiceWindowsAccessDeniedError(err)
 	if !accessDenied && !opts.NoUAC {
-		return teamsServiceBootstrapResult{}, err
+		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Scheduled Task setup failed: %s", teamsServiceBootstrapErrorSummary(err))
 	}
 	out := opts.Out
 	if out == nil {
 		out = io.Discard
 	}
-	if accessDenied {
-		_, _ = fmt.Fprintf(out, "Windows blocked automatic Scheduled Task setup: %v\n", err)
-	} else {
-		_, _ = fmt.Fprintf(out, "Windows Scheduled Task setup failed: %v\n", err)
-	}
 	if accessDenied && !opts.NoUAC && confirmTeamsServiceUACPrompt(opts.In, out, opts.AssumeYes) {
 		principalUser, userErr := teamsServiceCurrentWindowsUser(ctx)
 		if userErr != nil {
-			_, _ = fmt.Fprintf(out, "Could not identify the current Windows user for the elevated task: %v\n", userErr)
+			printTeamsServiceBootstrapTaskFallback(out, "Could not identify the current Windows user for UAC setup: "+teamsServiceBootstrapErrorSummary(userErr))
 		} else {
 			if path, elevateErr := wslBackend.RepairElevated(ctx, spec, teamsServiceRepairOptions{Enable: true, Start: true}, principalUser); elevateErr == nil {
 				_ = wslBackend.RemoveStartupFallbackMarker()
 				return teamsServiceBootstrapResult{Mode: "wsl-windows-task-scheduler-uac", Path: path}, nil
 			} else {
-				_, _ = fmt.Fprintf(out, "Elevated Scheduled Task setup failed: %v\n", elevateErr)
+				printTeamsServiceBootstrapTaskFallback(out, "UAC Scheduled Task setup failed: "+teamsServiceBootstrapErrorSummary(elevateErr))
 			}
 		}
+	} else {
+		reason := "Windows Scheduled Task setup could not be completed: " + teamsServiceBootstrapErrorSummary(err)
+		if accessDenied && opts.NoUAC {
+			reason = "Windows Scheduled Task setup could not be completed: Windows denied permission to create or repair the Scheduled Task, and UAC is disabled by --no-uac."
+		}
+		printTeamsServiceBootstrapTaskFallback(out, reason)
 	}
-	_, _ = fmt.Fprintln(out, "Installing the current-user Windows Startup watchdog fallback instead.")
 	path, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, true)
 	if fallbackErr == nil {
 		_ = wslBackend.removeTaskConfig()
 	}
-	return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, fallbackErr
+	if fallbackErr != nil {
+		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback failed after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(fallbackErr))
+	}
+	return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, nil
 }
 
 func uninstallTeamsService(ctx context.Context) (string, error) {
@@ -1346,17 +1371,61 @@ func isTeamsServiceWindowsAccessDeniedError(err error) bool {
 	return false
 }
 
+func teamsServiceBootstrapErrorSummary(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	if isTeamsServiceWindowsAccessDeniedError(err) {
+		return "Windows denied permission to create or repair the current-user Scheduled Task."
+	}
+	summary := strings.TrimSpace(err.Error())
+	summary = strings.Join(strings.Fields(summary), " ")
+	if summary == "" {
+		return "unknown error"
+	}
+	const maxLen = 320
+	if len(summary) <= maxLen {
+		return summary
+	}
+	return strings.TrimSpace(summary[:maxLen]) + "..."
+}
+
+func printTeamsServiceBootstrapTaskFallback(out io.Writer, reason string) {
+	if out == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "Windows Scheduled Task setup could not be completed."
+	}
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, "NOTICE: USING STARTUP WATCHDOG FALLBACK")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, reason)
+	_, _ = fmt.Fprintln(out, "Installing the current-user Windows Startup watchdog fallback instead.")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out)
+}
+
 func confirmTeamsServiceUACPrompt(in io.Reader, out io.Writer, assumeYes bool) bool {
 	if out == nil {
 		out = io.Discard
 	}
-	_, _ = fmt.Fprintln(out, "A Windows UAC prompt is about to appear to install a current-user Teams helper Scheduled Task.")
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, "NEXT STEP: TYPE yes TO CONTINUE")
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out, "Windows needs permission to create or repair the current-user Scheduled Task.")
 	_, _ = fmt.Fprintln(out, "The task targets only the current Windows user and uses least privilege.")
 	if assumeYes {
 		_, _ = fmt.Fprintln(out, "UAC prompt approved by --yes.")
+		_, _ = fmt.Fprintln(out, "============================================================")
+		_, _ = fmt.Fprintln(out)
 		return true
 	}
-	_, _ = fmt.Fprint(out, "Show the UAC prompt now? Type yes to continue: ")
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprint(out, "Type yes and press Enter: ")
 	if in == nil {
 		in = os.Stdin
 	}
@@ -1364,12 +1433,17 @@ func confirmTeamsServiceUACPrompt(in io.Reader, out io.Writer, assumeYes bool) b
 	if _, err := fmt.Fscan(in, &answer); err != nil {
 		_, _ = fmt.Fprintln(out)
 		_, _ = fmt.Fprintln(out, "UAC prompt was not confirmed.")
+		_, _ = fmt.Fprintln(out, "============================================================")
+		_, _ = fmt.Fprintln(out)
 		return false
 	}
+	_, _ = fmt.Fprintln(out)
 	confirmed := strings.EqualFold(strings.TrimSpace(answer), "yes") || strings.EqualFold(strings.TrimSpace(answer), "y")
 	if !confirmed {
 		_, _ = fmt.Fprintln(out, "UAC prompt was not confirmed.")
 	}
+	_, _ = fmt.Fprintln(out, "============================================================")
+	_, _ = fmt.Fprintln(out)
 	return confirmed
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -695,17 +696,141 @@ func TestTeamsServiceBootstrapShowsControlChatInForeground(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"ACTION REQUIRED: open the Teams control chat",
-		"Open this link to finish setup:",
-		"https://teams.microsoft.com/l/chat/control",
-		"Title: 🏠 Codex Control - workstation",
-		"I also tried to open it automatically.",
-		"After it opens, send `help`",
+		"BOOTSTRAP COMPLETE",
 		"Teams service bootstrap ready: wsl-windows-task-scheduler",
+		"NEXT STEP: OPEN THE TEAMS CONTROL CHAT",
+		"Open:",
+		"https://teams.microsoft.com/l/chat/control",
+		"Then send:",
+		"help",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("bootstrap output missing %q:\n%s", want, got)
 		}
+	}
+	completeIdx := strings.Index(got, "BOOTSTRAP COMPLETE")
+	nextIdx := strings.Index(got, "NEXT STEP: OPEN THE TEAMS CONTROL CHAT")
+	if completeIdx < 0 || nextIdx < 0 || completeIdx > nextIdx {
+		t.Fatalf("bootstrap should put the user's next step last:\n%s", got)
+	}
+	for _, unwanted := range []string{
+		"Title: 🏠 Codex Control - workstation",
+		"I also tried to open it automatically.",
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("bootstrap next-step output should not mix in secondary info %q:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestTeamsServiceBootstrapSuppressesControlChatDiagnosticOutput(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	var sawDiscardedDiagnostic bool
+	registryPath := "/home/alice/teams registry.json"
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+		bootstrapControlChat: func(ctx context.Context, root *rootOptions, gotRegistryPath *string, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+			_, _ = fmt.Fprintln(errOut, "Teams Graph proxy: using http://127.0.0.1:44438")
+			sawDiscardedDiagnostic = true
+			return teamsServiceBootstrapControlChatResult{
+				URL:    "https://teams.microsoft.com/l/chat/control",
+				Topic:  "🏠 Codex Control - workstation",
+				ChatID: "control-chat",
+				Opened: true,
+			}, nil
+		},
+	})
+
+	var out strings.Builder
+	var errOut strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap error: %v\noutput:\n%s\nstderr:\n%s", err, out.String(), errOut.String())
+	}
+	if !sawDiscardedDiagnostic {
+		t.Fatal("bootstrap control chat hook was not called")
+	}
+	if got := out.String() + errOut.String(); strings.Contains(got, "Teams Graph proxy: using") {
+		t.Fatalf("bootstrap should suppress control chat diagnostics, got:\n%s", got)
+	}
+}
+
+func TestTeamsServiceBootstrapPrintsControlChatRecoveryAsFinalStep(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	registryPath := "/home/alice/teams registry.json"
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+		bootstrapControlChat: func(ctx context.Context, root *rootOptions, gotRegistryPath *string, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+			return teamsServiceBootstrapControlChatResult{}, errors.New("Teams Graph proxy is enabled but no unambiguous proxy profile is configured")
+		},
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap error: %v\noutput:\n%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"BOOTSTRAP COMPLETE",
+		"NEXT STEP: PRINT THE TEAMS CONTROL CHAT LINK",
+		"Reason: Teams Graph proxy is enabled",
+		"codex-proxy teams control",
+		"Then open the printed link and send:",
+		"help",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("bootstrap output missing %q:\n%s", want, got)
+		}
+	}
+	completeIdx := strings.Index(got, "BOOTSTRAP COMPLETE")
+	nextIdx := strings.Index(got, "NEXT STEP: PRINT THE TEAMS CONTROL CHAT LINK")
+	if completeIdx < 0 || nextIdx < 0 || completeIdx > nextIdx {
+		t.Fatalf("control chat recovery should be the final next-step block:\n%s", got)
+	}
+}
+
+func TestTeamsServiceBootstrapErrorSummaryKeepsFailuresReadable(t *testing.T) {
+	longPowerShellError := strings.Repeat("Register-ScheduledTask failed with noisy diagnostic details. ", 20)
+	got := teamsServiceBootstrapErrorSummary(errors.New(longPowerShellError))
+	if strings.Contains(got, "\n") {
+		t.Fatalf("summary should be single-line, got %q", got)
+	}
+	if len(got) > 323 {
+		t.Fatalf("summary should be bounded, got len=%d text=%q", len(got), got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("long summary should be truncated, got %q", got)
+	}
+
+	accessDenied := teamsServiceBootstrapErrorSummary(errors.New("Register-ScheduledTask : Access is denied.\nAt line:1 char:1\nlarge command"))
+	if strings.Contains(accessDenied, "Register-ScheduledTask") || !strings.Contains(accessDenied, "Windows denied permission") {
+		t.Fatalf("access denied should be summarized without raw PowerShell noise, got %q", accessDenied)
 	}
 }
 
@@ -741,7 +866,7 @@ func TestTeamsServiceBootstrapCanSkipAutomaticControlChatOpen(t *testing.T) {
 	if len(openValues) != 1 || openValues[0] {
 		t.Fatalf("bootstrap control open values = %#v, want one false", openValues)
 	}
-	if got := out.String(); !strings.Contains(got, "Copy and paste the link above") || strings.Contains(got, "I also tried to open it automatically") {
+	if got := out.String(); !strings.Contains(got, "NEXT STEP: OPEN THE TEAMS CONTROL CHAT") || !strings.Contains(got, "https://teams.microsoft.com/l/chat/control") || strings.Contains(got, "I also tried to open it automatically") {
 		t.Fatalf("bootstrap --no-open-control output is wrong:\n%s", got)
 	}
 }
