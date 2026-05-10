@@ -191,10 +191,9 @@ func (e CodexExecutor) RunInput(ctx context.Context, session *Session, input Exe
 		Timeout:    timeout,
 	}
 	return RunnerExecutor{
-		Runner:    runner,
-		WorkDir:   workDir,
-		ExtraArgs: e.ExtraArgs,
-		Timeout:   timeout,
+		Runner:  runner,
+		WorkDir: workDir,
+		Timeout: timeout,
 	}.RunInput(ctx, session, input)
 }
 

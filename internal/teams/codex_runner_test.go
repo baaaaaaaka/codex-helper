@@ -3,6 +3,8 @@ package teams
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,6 +30,43 @@ func TestParseCodexJSONLExtractsThreadAndFinalAgentMessage(t *testing.T) {
 	}
 	if got.CodexTurnID != "" {
 		t.Fatalf("unexpected turn id %q for official exec JSON", got.CodexTurnID)
+	}
+}
+
+func TestCodexExecutorDoesNotDuplicateExtraArgs(t *testing.T) {
+	if os.PathSeparator != '/' {
+		t.Skip("shell stub test uses POSIX script")
+	}
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$@" > %q
+cat >/dev/null
+printf '%%s\n' '{"type":"thread.started","thread_id":"thread-new"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}' '{"type":"turn.completed"}'
+`, argsFile)
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+
+	reasoningArg := CodexReasoningEffortConfigArg(DefaultControlFallbackReasoningEffort)
+	executor := CodexExecutor{
+		CodexPath: codexPath,
+		WorkDir:   t.TempDir(),
+		ExtraArgs: []string{"-c", reasoningArg},
+	}
+	got, err := executor.RunInput(context.Background(), &Session{}, ExecutionInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatalf("RunInput error: %v", err)
+	}
+	if got.Text != "done" {
+		t.Fatalf("result text = %q", got.Text)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if count := strings.Count(string(args), reasoningArg); count != 1 {
+		t.Fatalf("reasoning arg count = %d, want 1; args:\n%s", count, string(args))
 	}
 }
 

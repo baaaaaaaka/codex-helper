@@ -699,7 +699,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Override Codex CLI path")
 	cmd.Flags().StringVar(&workDir, "workdir", "", "Working directory for Codex sessions")
 	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra argument to pass to codex exec (repeatable)")
-	cmd.Flags().StringVar(&controlFallbackModel, "control-fallback-model", teams.DefaultControlFallbackModel, "Codex model for unrecognized control-chat requests")
+	cmd.Flags().StringVar(&controlFallbackModel, "control-fallback-model", teams.DefaultControlFallbackModel, "Optional Codex model override for unrecognized control-chat requests; empty uses Codex default")
 	cmd.Flags().DurationVar(&timeout, "codex-timeout", 0, "Timeout for each Codex turn; 0 disables the helper-enforced turn timeout")
 	cmd.Flags().DurationVar(&ownerStaleAfter, "owner-stale-after", defaultTeamsOwnerStaleAfter, "How long a Teams helper owner can miss heartbeats before recovery or another helper may take over")
 	cmd.Flags().IntVar(&maxWorkChatPolls, "max-work-chat-polls", teams.DefaultMaxWorkChatPollsPerCycle, "Maximum work chats to read per poll cycle")
@@ -1118,7 +1118,8 @@ func newTeamsAuthFileWriteLogoutCmd() *cobra.Command {
 func newTeamsExecutor(root *rootOptions, name string, runnerName string, codexPath string, workDir string, codexArgs []string, timeout time.Duration, log io.Writer) (teams.Executor, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "codex":
-		return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, codexArgs, timeout, log)
+		args := codexArgsWithDefaultReasoningEffort(codexArgs, teams.DefaultSessionReasoningEffort)
+		return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, timeout, log)
 	case "echo":
 		return teams.EchoExecutor{}, nil
 	default:
@@ -1128,10 +1129,92 @@ func newTeamsExecutor(root *rootOptions, name string, runnerName string, codexPa
 
 func newTeamsControlFallbackExecutor(root *rootOptions, runnerName string, codexPath string, workDir string, codexArgs []string, model string, timeout time.Duration, log io.Writer) (teams.Executor, error) {
 	model = strings.TrimSpace(model)
-	if model == "" {
-		model = teams.DefaultControlFallbackModel
+	args := codexArgsWithModel(codexArgs, model)
+	args = codexArgsWithReasoningEffort(args, teams.DefaultControlFallbackReasoningEffort)
+	return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, timeout, log)
+}
+
+func codexArgsWithDefaultReasoningEffort(args []string, effort string) []string {
+	if codexArgsHasConfigOverride(args, teams.CodexReasoningEffortConfigKey) {
+		return append([]string{}, args...)
 	}
-	return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, codexArgsWithModel(codexArgs, model), timeout, log)
+	return codexArgsWithReasoningEffort(args, effort)
+}
+
+func codexArgsWithReasoningEffort(args []string, effort string) []string {
+	return codexArgsWithConfigOverride(args, teams.CodexReasoningEffortConfigKey, strings.TrimSpace(effort))
+}
+
+func codexArgsWithConfigOverride(args []string, key string, value string) []string {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	out := codexArgsWithoutConfigOverride(args, key)
+	if key != "" && value != "" {
+		out = append(out, "-c", teams.CodexReasoningEffortConfigArg(value))
+	}
+	return out
+}
+
+func codexArgsHasConfigOverride(args []string, key string) bool {
+	key = strings.TrimSpace(key)
+	for i := 0; i < len(args); i++ {
+		trimmed := strings.TrimSpace(args[i])
+		switch {
+		case trimmed == "-c" || trimmed == "--config":
+			if i+1 < len(args) && codexConfigOverrideMatchesKey(args[i+1], key) {
+				return true
+			}
+			i++
+		case strings.HasPrefix(trimmed, "-c="):
+			if codexConfigOverrideMatchesKey(strings.TrimPrefix(trimmed, "-c="), key) {
+				return true
+			}
+		case strings.HasPrefix(trimmed, "--config="):
+			if codexConfigOverrideMatchesKey(strings.TrimPrefix(trimmed, "--config="), key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func codexArgsWithoutConfigOverride(args []string, key string) []string {
+	key = strings.TrimSpace(key)
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		trimmed := strings.TrimSpace(arg)
+		switch {
+		case trimmed == "-c" || trimmed == "--config":
+			if i+1 < len(args) && codexConfigOverrideMatchesKey(args[i+1], key) {
+				i++
+				continue
+			}
+			out = append(out, arg)
+			if i+1 < len(args) {
+				i++
+				out = append(out, args[i])
+			}
+		case strings.HasPrefix(trimmed, "-c="):
+			if codexConfigOverrideMatchesKey(strings.TrimPrefix(trimmed, "-c="), key) {
+				continue
+			}
+			out = append(out, arg)
+		case strings.HasPrefix(trimmed, "--config="):
+			if codexConfigOverrideMatchesKey(strings.TrimPrefix(trimmed, "--config="), key) {
+				continue
+			}
+			out = append(out, arg)
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out
+}
+
+func codexConfigOverrideMatchesKey(raw string, key string) bool {
+	rawKey, _, ok := strings.Cut(strings.TrimSpace(raw), "=")
+	return ok && strings.TrimSpace(rawKey) == strings.TrimSpace(key)
 }
 
 func codexArgsWithModel(args []string, model string) []string {

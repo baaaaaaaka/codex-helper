@@ -83,6 +83,12 @@ func writeTestAuthJSON(t *testing.T, codexDir string, includePlan bool) []byte {
 	return writeTestAuthJSONWithPlans(t, codexDir, includePlan, includePlan)
 }
 
+func setTestCodexHomeEnv(t *testing.T, codexDir string) {
+	t.Helper()
+	t.Setenv(codexhistory.EnvCodexDir, codexDir)
+	t.Setenv(envCodexHome, codexDir)
+}
+
 func rewriteAuthToken(t *testing.T, authPath string, tokenKey string, tokenValue string) []byte {
 	t.Helper()
 

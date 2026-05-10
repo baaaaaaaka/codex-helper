@@ -806,7 +806,7 @@ func TestRunLikeYoloFlagInstallsCloudRequirementsBypassInDirectMode(t *testing.T
 	t.Setenv("PATH", codexBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	codexHome := t.TempDir()
-	t.Setenv("CODEX_HOME", codexHome)
+	setTestCodexHomeEnv(t, codexHome)
 	writeFakeCache(t, codexHome)
 	originalAuth := writeTestAuthJSON(t, codexHome, true)
 

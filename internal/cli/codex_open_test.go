@@ -479,6 +479,7 @@ func TestRunCodexNewSessionAddsYoloArgs(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
 	}
+	setTestCodexHomeEnv(t, t.TempDir())
 	dir := t.TempDir()
 	outFile := filepath.Join(t.TempDir(), "args.txt")
 	scriptPath := filepath.Join(t.TempDir(), "codex")
@@ -527,6 +528,7 @@ func TestRunCodexNewSessionPrefersDangerouslyBypass(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
 	}
+	setTestCodexHomeEnv(t, t.TempDir())
 	dir := t.TempDir()
 	outFile := filepath.Join(t.TempDir(), "args.txt")
 	scriptPath := filepath.Join(t.TempDir(), "codex")
@@ -574,6 +576,7 @@ func TestRunCodexNewSessionAddsWindowsYoloSandboxOverride(t *testing.T) {
 		t.Skip("skip shell script test on windows")
 	}
 	withCodexYoloRuntimeGOOS(t, "windows")
+	setTestCodexHomeEnv(t, t.TempDir())
 	dir := t.TempDir()
 	outFile := filepath.Join(t.TempDir(), "args.txt")
 	scriptPath := filepath.Join(t.TempDir(), "codex")

@@ -4,14 +4,22 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 )
 
 const ArtifactManifestFenceInfo = "codex-helper-artifacts"
-const DefaultControlFallbackModel = "gpt-5.3-codex-spark"
+const CodexReasoningEffortConfigKey = "model_reasoning_effort"
+const DefaultSessionReasoningEffort = "xhigh"
+const DefaultControlFallbackReasoningEffort = "low"
+const DefaultControlFallbackModel = ""
 const controlFallbackHistoryKeyword = codexhistory.HelperControlSessionTitleKeyword
+
+func CodexReasoningEffortConfigArg(effort string) string {
+	return CodexReasoningEffortConfigKey + "=" + strconv.Quote(strings.TrimSpace(effort))
+}
 
 func TeamsCodexPrompt(prompt string) string {
 	root, err := DefaultOutboundRoot()

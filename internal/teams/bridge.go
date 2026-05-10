@@ -2773,7 +2773,11 @@ func (b *Bridge) effectiveControlFallbackExecutor() Executor {
 	if b.controlFallbackExecutor != nil {
 		return b.controlFallbackExecutor
 	}
-	return CodexExecutor{ExtraArgs: []string{"--model", b.effectiveControlFallbackModel()}}
+	args := []string{"-c", CodexReasoningEffortConfigArg(DefaultControlFallbackReasoningEffort)}
+	if model := b.effectiveControlFallbackModel(); model != "" {
+		args = append(args, "--model", model)
+	}
+	return CodexExecutor{ExtraArgs: args}
 }
 
 func (b *Bridge) effectiveControlFallbackModel() string {

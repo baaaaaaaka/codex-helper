@@ -38,7 +38,7 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 		t.Fatalf("write codex stub: %v", err)
 	}
 	codexDir := t.TempDir()
-	t.Setenv(envCodexHome, codexDir)
+	setTestCodexHomeEnv(t, codexDir)
 	writeFakeCache(t, codexDir)
 	originalAuth := writeTestAuthJSON(t, codexDir, true)
 
@@ -308,8 +308,72 @@ func TestNewManagedTeamsCodexExecutorCanUseExperimentalAppServerRunner(t *testin
 	}
 }
 
-func TestNewTeamsControlFallbackExecutorForcesSparkModel(t *testing.T) {
-	executor, err := newTeamsControlFallbackExecutor(&rootOptions{}, "exec", "/tmp/codex", "/work", []string{"--model", "gpt-5", "--sandbox", "workspace-write"}, "", time.Minute, io.Discard)
+func TestNewTeamsExecutorDefaultsSessionReasoningEffortToXHigh(t *testing.T) {
+	executor, err := newTeamsExecutor(&rootOptions{}, "codex", "exec", "/tmp/codex", "/work", []string{"--model", "gpt-5", "--sandbox", "workspace-write"}, time.Minute, io.Discard)
+	if err != nil {
+		t.Fatalf("newTeamsExecutor error: %v", err)
+	}
+	teamsExecutor, ok := executor.(teamsCodexExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
+	}
+	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
+	if !ok {
+		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
+	}
+	want := []string{"--model", "gpt-5", "-c", teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}
+	if !reflect.DeepEqual(runner.ExtraArgs, want) {
+		t.Fatalf("session extra args = %#v, want %#v", runner.ExtraArgs, want)
+	}
+}
+
+func TestNewTeamsExecutorDefaultsSessionReasoningEffortToXHighForAppServer(t *testing.T) {
+	executor, err := newTeamsExecutor(&rootOptions{}, "codex", "appserver", "/tmp/codex", "/work", nil, time.Minute, io.Discard)
+	if err != nil {
+		t.Fatalf("newTeamsExecutor error: %v", err)
+	}
+	teamsExecutor, ok := executor.(teamsCodexExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
+	}
+	runner, ok := teamsExecutor.runner.(*codexrunner.AppServerRunner)
+	if !ok {
+		t.Fatalf("runner type = %T, want AppServerRunner", teamsExecutor.runner)
+	}
+	want := []string{"-c", teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}
+	if !reflect.DeepEqual(runner.ExtraArgs, want) {
+		t.Fatalf("appserver session extra args = %#v, want %#v", runner.ExtraArgs, want)
+	}
+	fallback, ok := runner.Fallback.(*codexrunner.ExecRunner)
+	if !ok {
+		t.Fatalf("fallback type = %T, want ExecRunner", runner.Fallback)
+	}
+	if !reflect.DeepEqual(fallback.ExtraArgs, want) {
+		t.Fatalf("appserver fallback extra args = %#v, want %#v", fallback.ExtraArgs, want)
+	}
+}
+
+func TestNewTeamsExecutorPreservesExplicitSessionReasoningEffort(t *testing.T) {
+	executor, err := newTeamsExecutor(&rootOptions{}, "codex", "exec", "/tmp/codex", "/work", []string{"-c", `model_reasoning_effort="medium"`}, time.Minute, io.Discard)
+	if err != nil {
+		t.Fatalf("newTeamsExecutor error: %v", err)
+	}
+	teamsExecutor, ok := executor.(teamsCodexExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
+	}
+	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
+	if !ok {
+		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
+	}
+	want := []string{"-c", `model_reasoning_effort="medium"`}
+	if !reflect.DeepEqual(runner.ExtraArgs, want) {
+		t.Fatalf("session extra args = %#v, want %#v", runner.ExtraArgs, want)
+	}
+}
+
+func TestNewTeamsControlFallbackExecutorUsesLowEffortWithoutDefaultModel(t *testing.T) {
+	executor, err := newTeamsControlFallbackExecutor(&rootOptions{}, "exec", "/tmp/codex", "/work", []string{"--model", "gpt-5", "--sandbox", "workspace-write", "-c", `model_reasoning_effort="xhigh"`}, "", time.Minute, io.Discard)
 	if err != nil {
 		t.Fatalf("newTeamsControlFallbackExecutor error: %v", err)
 	}
@@ -321,7 +385,52 @@ func TestNewTeamsControlFallbackExecutorForcesSparkModel(t *testing.T) {
 	if !ok {
 		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
 	}
-	want := []string{"--model", teams.DefaultControlFallbackModel}
+	want := []string{"-c", teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}
+	if !reflect.DeepEqual(runner.ExtraArgs, want) {
+		t.Fatalf("fallback extra args = %#v, want %#v", runner.ExtraArgs, want)
+	}
+}
+
+func TestNewTeamsControlFallbackExecutorUsesLowEffortForAppServer(t *testing.T) {
+	executor, err := newTeamsControlFallbackExecutor(&rootOptions{}, "appserver", "/tmp/codex", "/work", []string{"--model", "gpt-5", "-c", `model_reasoning_effort="xhigh"`}, "", time.Minute, io.Discard)
+	if err != nil {
+		t.Fatalf("newTeamsControlFallbackExecutor error: %v", err)
+	}
+	teamsExecutor, ok := executor.(teamsCodexExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
+	}
+	runner, ok := teamsExecutor.runner.(*codexrunner.AppServerRunner)
+	if !ok {
+		t.Fatalf("runner type = %T, want AppServerRunner", teamsExecutor.runner)
+	}
+	want := []string{"-c", teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}
+	if !reflect.DeepEqual(runner.ExtraArgs, want) {
+		t.Fatalf("appserver control fallback extra args = %#v, want %#v", runner.ExtraArgs, want)
+	}
+	fallback, ok := runner.Fallback.(*codexrunner.ExecRunner)
+	if !ok {
+		t.Fatalf("fallback type = %T, want ExecRunner", runner.Fallback)
+	}
+	if !reflect.DeepEqual(fallback.ExtraArgs, want) {
+		t.Fatalf("appserver fallback extra args = %#v, want %#v", fallback.ExtraArgs, want)
+	}
+}
+
+func TestNewTeamsControlFallbackExecutorHonorsExplicitFallbackModel(t *testing.T) {
+	executor, err := newTeamsControlFallbackExecutor(&rootOptions{}, "exec", "/tmp/codex", "/work", nil, "gpt-control", time.Minute, io.Discard)
+	if err != nil {
+		t.Fatalf("newTeamsControlFallbackExecutor error: %v", err)
+	}
+	teamsExecutor, ok := executor.(teamsCodexExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
+	}
+	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
+	if !ok {
+		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
+	}
+	want := []string{"--model", "gpt-control", "-c", teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}
 	if !reflect.DeepEqual(runner.ExtraArgs, want) {
 		t.Fatalf("fallback extra args = %#v, want %#v", runner.ExtraArgs, want)
 	}
@@ -356,6 +465,24 @@ func TestCodexArgsWithModelReplacesExistingModelForms(t *testing.T) {
 	want := []string{"--sandbox", "read-only", "--model", "spark"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("codexArgsWithModel = %#v, want %#v", got, want)
+	}
+}
+
+func TestCodexArgsWithReasoningEffortReplacesExistingConfigForms(t *testing.T) {
+	got := codexArgsWithReasoningEffort([]string{
+		"-c", `model_reasoning_effort="medium"`,
+		"--config", `sandbox_mode="read-only"`,
+		"--config=model_reasoning_effort=\"high\"",
+		"-c=model_reasoning_effort=\"xhigh\"",
+		"--model", "gpt-5",
+	}, "low")
+	want := []string{
+		"--config", `sandbox_mode="read-only"`,
+		"--model", "gpt-5",
+		"-c", teams.CodexReasoningEffortConfigArg("low"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("codexArgsWithReasoningEffort = %#v, want %#v", got, want)
 	}
 }
 
