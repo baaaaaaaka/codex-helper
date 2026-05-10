@@ -103,6 +103,7 @@ func newTeamsAuthCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(ctx, cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
 			return nil
 		},
@@ -259,6 +260,7 @@ func newTeamsAuthFullCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(ctx, cmd.ErrOrStderr())
 			cfg, _ := teams.DefaultFullAuthConfig()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated Teams full access as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Full token cache: %s\n", cfg.CachePath)
@@ -344,6 +346,7 @@ func newTeamsAuthReadCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(ctx, cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated Teams read access as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Read token cache: %s\n", cfg.CachePath)
 			return nil
@@ -434,6 +437,7 @@ func newTeamsControlCmd(root *rootOptions, registryPath *string) *cobra.Command 
 			if err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 			var chat teams.Chat
 			var old teams.Chat
 			if recreate {
@@ -510,6 +514,7 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 			if err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 			recreated, err := bridge.RecreateSessionChat(cmd.Context(), args[0], teams.RecreateSessionChatOptions{})
 			if err != nil {
 				return err
@@ -640,55 +645,62 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					return err
 				}
 			}
-			if autoService && !once {
-				if err := ensureTeamsServiceForRun(cmd.Context(), registryPath); err != nil {
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
+			runOnce := func() error {
+				if autoService && !once {
+					if err := ensureTeamsServiceForRun(cmd.Context(), registryPath); err != nil {
+						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
+					}
 				}
+				httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+				if err != nil {
+					return err
+				}
+				defer func() { _ = httpClient.Close(context.Background()) }()
+				auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
+				if err != nil {
+					return err
+				}
+				bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+				if err != nil {
+					return err
+				}
+				httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
+				executor, err := newTeamsExecutor(root, executorName, runnerName, codexPath, workDir, codexArgs, timeout, cmd.ErrOrStderr())
+				if err != nil {
+					return err
+				}
+				controlFallbackExecutor, err := newTeamsControlFallbackExecutor(root, runnerName, codexPath, workDir, codexArgs, controlFallbackModel, timeout, cmd.ErrOrStderr())
+				if err != nil {
+					return err
+				}
+				var helperAutoUpdater teams.HelperAutoUpdater
+				if autoUpdate {
+					helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo, autoUpdatePrerelease)
+				}
+				return bridge.Listen(cmd.Context(), teams.BridgeOptions{
+					RegistryPath:               *registryPath,
+					HelperVersion:              buildVersion(),
+					Interval:                   interval,
+					Once:                       once,
+					Top:                        top,
+					OwnerStaleAfter:            ownerStaleAfter,
+					MaxWorkChatPollsPerCycle:   maxWorkChatPolls,
+					Executor:                   executor,
+					ControlFallbackExecutor:    controlFallbackExecutor,
+					ControlFallbackModel:       controlFallbackModel,
+					HelperRestarter:            restartTeamsHelperFromTeams,
+					HelperReloader:             reloadTeamsHelperFromTeams,
+					HelperAutoUpdater:          helperAutoUpdater,
+					HelperAutoUpdatePrerelease: autoUpdatePrerelease,
+					CodexUpgrader: func(ctx context.Context) (teams.CodexUpgradeResult, error) {
+						return runTeamsCodexUpgradeFromBridge(ctx, root, cmd.ErrOrStderr(), codexPath)
+					},
+				})
 			}
-			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
-			if err != nil {
-				return err
+			if teamsRunShouldRetryInProcess(once) {
+				return runTeamsServiceRetryLoop(cmd.Context(), cmd.ErrOrStderr(), runOnce)
 			}
-			defer func() { _ = httpClient.Close(context.Background()) }()
-			auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
-			if err != nil {
-				return err
-			}
-			bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
-			if err != nil {
-				return err
-			}
-			executor, err := newTeamsExecutor(root, executorName, runnerName, codexPath, workDir, codexArgs, timeout, cmd.ErrOrStderr())
-			if err != nil {
-				return err
-			}
-			controlFallbackExecutor, err := newTeamsControlFallbackExecutor(root, runnerName, codexPath, workDir, codexArgs, controlFallbackModel, timeout, cmd.ErrOrStderr())
-			if err != nil {
-				return err
-			}
-			var helperAutoUpdater teams.HelperAutoUpdater
-			if autoUpdate {
-				helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo, autoUpdatePrerelease)
-			}
-			return bridge.Listen(cmd.Context(), teams.BridgeOptions{
-				RegistryPath:               *registryPath,
-				HelperVersion:              buildVersion(),
-				Interval:                   interval,
-				Once:                       once,
-				Top:                        top,
-				OwnerStaleAfter:            ownerStaleAfter,
-				MaxWorkChatPollsPerCycle:   maxWorkChatPolls,
-				Executor:                   executor,
-				ControlFallbackExecutor:    controlFallbackExecutor,
-				ControlFallbackModel:       controlFallbackModel,
-				HelperRestarter:            restartTeamsHelperFromTeams,
-				HelperReloader:             reloadTeamsHelperFromTeams,
-				HelperAutoUpdater:          helperAutoUpdater,
-				HelperAutoUpdatePrerelease: autoUpdatePrerelease,
-				CodexUpgrader: func(ctx context.Context) (teams.CodexUpgradeResult, error) {
-					return runTeamsCodexUpgradeFromBridge(ctx, root, cmd.ErrOrStderr(), codexPath)
-				},
-			})
+			return runOnce()
 		},
 	}
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "Polling interval")
@@ -709,6 +721,59 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&autoUpdatePrerelease, "auto-update-prerelease", false, "Allow Teams helper auto-update checks to select eligible GitHub prereleases")
 	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
 	return cmd
+}
+
+var (
+	teamsRunServiceRetryDelay = 30 * time.Second
+	teamsRunServiceSleep      = sleepContext
+)
+
+func teamsRunShouldRetryInProcess(once bool) bool {
+	return !once && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != ""
+}
+
+func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce func() error) error {
+	for {
+		err := runOnce()
+		if err == nil || !isRecoverableTeamsRunError(err) {
+			return err
+		}
+		delay := teamsRunServiceRetryDelay
+		if delay <= 0 {
+			delay = 30 * time.Second
+		}
+		if errOut != nil {
+			_, _ = fmt.Fprintf(errOut, "Teams service recoverable error: %v; retrying in %s\n", err, delay)
+		}
+		if sleepErr := teamsRunServiceSleep(ctx, delay); sleepErr != nil {
+			return sleepErr
+		}
+	}
+}
+
+func isRecoverableTeamsRunError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var persistent *teams.PersistentPollFailureError
+	if errors.As(err, &persistent) {
+		return true
+	}
+	return teams.IsRecoverablePollFailure(err)
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func restartTeamsHelperFromTeams(context.Context) error {
@@ -786,6 +851,7 @@ func newTeamsSendFileCmd(root *rootOptions, registryPath *string) *cobra.Command
 			if err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Sent Teams file attachment: %s\n", result.Item.Name)
 			if strings.TrimSpace(sessionID) != "" {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Target session: %s\n", strings.TrimSpace(sessionID))
@@ -1063,6 +1129,7 @@ func newTeamsAuthFileWriteCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(ctx, cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated Teams file upload as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "File-write token cache: %s\n", cfg.CachePath)
 			return nil
@@ -1271,6 +1338,7 @@ func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, root *rootOptions, regis
 		_, _ = fmt.Fprintf(out, "Graph read auth: failed (%v)\n", err)
 		return err
 	}
+	httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 	_, _ = fmt.Fprintf(out, "Graph read auth: ok as %s <%s>\n", me.DisplayName, me.UserPrincipalName)
 	writeAuth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
 	if err != nil {

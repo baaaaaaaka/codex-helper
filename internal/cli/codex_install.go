@@ -1329,8 +1329,6 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 }
 
 func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts codexInstallOptions) (string, error) {
-	ensureManagedNodeOnPath()
-
 	var upgradedPath string
 	if err := withCodexInstallLock(ctx, out, func() error {
 		source, err := detectCodexUpgradeSource(ctx, opts.installerEnv)
@@ -1595,8 +1593,14 @@ func resolveUpgradedCodexPath(ctx context.Context, preferred string) (string, er
 }
 
 func findInstalledCodexWithoutProbe() (string, error) {
-	ensureManagedNodeOnPath()
+	if path, err := exec.LookPath("codex"); err == nil {
+		path = normalizeExecutablePath(path)
+		if executableExists(path) {
+			return path, nil
+		}
+	}
 
+	ensureManagedNodeOnPath()
 	if path, err := exec.LookPath("codex"); err == nil {
 		path = normalizeExecutablePath(path)
 		if executableExists(path) {

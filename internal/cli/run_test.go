@@ -279,6 +279,9 @@ func TestRunTargetHealthFailureTerminatesChildProcessGroup(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- runTargetOnceWithOptions(context.Background(), []string{script}, "", func() error {
+			if _, err := os.Stat(childFile); err != nil {
+				return nil
+			}
 			return errors.New("synthetic health failure")
 		}, nil, &bytes.Buffer{}, &bytes.Buffer{}, runTargetOptions{
 			UseProxy: false,

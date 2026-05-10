@@ -41,6 +41,7 @@ func newTeamsProbeChatCmd(root *rootOptions) *cobra.Command {
 			if err := probeTeamsChatReadOnly(cmd.Context(), cmd.OutOrStdout(), httpClient.Client, chatID, top); err != nil {
 				return err
 			}
+			httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 			if !sendTest {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Webhook send: skipped (use --send-test with --webhook-url-file or --webhook-url-env)")
 				return nil

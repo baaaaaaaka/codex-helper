@@ -158,6 +158,7 @@ func newTeamsWorkflowBridge(ctx context.Context, root *rootOptions, registryPath
 		closeBridge()
 		return nil, func() {}, err
 	}
+	httpClient.RetireSuspects(ctx, errOut)
 	return bridge, closeBridge, nil
 }
 

@@ -83,6 +83,64 @@ func TestHealthClient_CheckHTTPProxyUsesOneShotConnection(t *testing.T) {
 	}
 }
 
+func TestHealthClient_CheckHTTPProxyCONNECT(t *testing.T) {
+	port, closeFn := startConnectProxyServer(t, http.StatusOK)
+	defer closeFn()
+
+	hc := HealthClient{Timeout: time.Second}
+	if err := hc.CheckHTTPProxyCONNECT(port, "graph.example.test:443"); err != nil {
+		t.Fatalf("CheckHTTPProxyCONNECT: %v", err)
+	}
+}
+
+func TestHealthClient_CheckHTTPProxyCONNECTErrors(t *testing.T) {
+	hc := HealthClient{Timeout: 200 * time.Millisecond}
+
+	t.Run("invalid target", func(t *testing.T) {
+		if err := hc.CheckHTTPProxyCONNECT(1, "graph.example.test"); err == nil {
+			t.Fatalf("expected invalid target error")
+		}
+	})
+
+	t.Run("non-200 connect", func(t *testing.T) {
+		port, closeFn := startConnectProxyServer(t, http.StatusBadGateway)
+		defer closeFn()
+		if err := hc.CheckHTTPProxyCONNECT(port, "graph.example.test:443"); err == nil {
+			t.Fatalf("expected CONNECT status error")
+		}
+	})
+}
+
+func startConnectProxyServer(t *testing.T, connectStatus int) (port int, closeFn func()) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+		w.WriteHeader(connectStatus)
+	})
+
+	srv := &http.Server{Handler: handler}
+	go func() { _ = srv.Serve(ln) }()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	tcp, err := net.ResolveTCPAddr("tcp", "127.0.0.1:"+portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	return tcp.Port, func() {
+		_ = srv.Shutdown(context.Background())
+		_ = ln.Close()
+	}
+}
+
 func startHealthOnlyServer(t *testing.T, instanceID string) (port int, closeFn func()) {
 	t.Helper()
 

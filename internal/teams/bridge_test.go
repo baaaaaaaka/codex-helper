@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	stdhtml "html"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1545,7 +1547,7 @@ func TestBridgeQueuesAllLongOutputPartsBeforeFirstSend(t *testing.T) {
 		auth:       &fakeGraphAuth{token: "access"},
 		client:     server.Client(),
 		baseURL:    server.URL,
-		maxRetries: 0,
+		maxRetries: 1,
 		backoffMin: time.Millisecond,
 		backoffMax: time.Millisecond,
 		sleep:      func(context.Context, time.Duration) error { return nil },
@@ -1602,7 +1604,7 @@ func TestBridgeOutboxMentionOwnerUsesGraphMentionPayload(t *testing.T) {
 		auth:       &fakeGraphAuth{token: "access"},
 		client:     server.Client(),
 		baseURL:    server.URL,
-		maxRetries: 0,
+		maxRetries: 1,
 		backoffMin: time.Millisecond,
 		backoffMax: time.Millisecond,
 		sleep:      func(context.Context, time.Duration) error { return nil },
@@ -2805,6 +2807,41 @@ func TestBridgeControlWebhookCommandConfiguresWorkflowWithoutRunningCodex(t *tes
 	}
 }
 
+func TestBridgeControlWebhookCommandUsesTeamsHyperlinkHref(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+
+	rawURL := "https://workflow.example.test/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sig=secret-token-that-teams-hides"
+	displayURL := "https://workflow.example.test/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sig=secret-..."
+	msg := bridgeTestMessage("control-webhook-href")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = `<p>helper webhook <a href="` + stdhtml.EscapeString(rawURL) + `">` + stdhtml.EscapeString(displayURL) + `</a></p>`
+	if err := bridge.handleControlMessage(context.Background(), msg, "helper webhook "+displayURL); err != nil {
+		t.Fatalf("handleControlMessage webhook href error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("webhook command should not be forwarded to Codex: %#v", executor.prompts)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %#v, want one control response", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	storedURL, err := readWorkflowWebhookURLFile(state.Workflow.ControlWebhookURLFile)
+	if err != nil {
+		t.Fatalf("read webhook URL secret file: %v", err)
+	}
+	if storedURL != rawURL {
+		t.Fatalf("stored webhook URL = %q, want href URL %q", storedURL, rawURL)
+	}
+}
+
 func TestBridgeControlWebhookSetupShowsGuideWithoutRunningCodex(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -2826,19 +2863,32 @@ func TestBridgeControlWebhookSetupShowsGuideWithoutRunningCodex(t *testing.T) {
 	plain := PlainTextFromTeamsHTML(html)
 	for _, want := range []string{
 		"Workflow webhook setup",
-		"Open Power Automate",
-		"Choose the target chat",
+		"click the + button at the lower right",
+		"choose Workflow",
+		"Pick exactly this Workflow template",
+		"Send webhook alerts to a chat",
 		"🏠 Codex Control - test-machine",
 		"helper webhook <paste-url>",
+		"actual hyperlink target",
 		"Microsoft does not provide a reliable one-click link",
 	} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("setup guide missing %q:\n%s", want, plain)
 		}
 	}
+	for _, unwanted := range []string{
+		"Do not choose",
+		"Send webhook alerts to a channel",
+		"from specific people",
+		"from people in an org",
+		"Post to a chat when a webhook request is received",
+	} {
+		if strings.Contains(plain, unwanted) {
+			t.Fatalf("setup guide should only show the correct Workflow option, found %q:\n%s", unwanted, plain)
+		}
+	}
 	for _, want := range []string{
-		`href="https://make.powerautomate.com/"`,
-		`href="https://support.microsoft.com/en-us/office/send-messages-in-teams-using-incoming-webhooks-323660ec-12ca-40b1-a1d3-a3df47e808c4"`,
+		`href="https://support.microsoft.com/en-us/office/create-incoming-webhooks-with-workflows-for-microsoft-teams-8ae491c7-0394-4861-ba59-055e33f75498"`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("setup guide html missing %q:\n%s", want, html)
@@ -8397,6 +8447,173 @@ func TestBridgeTemporaryAuthPollErrorUsesLongerBackoffAndLogThrottle(t *testing.
 	}
 	if !bridge.shouldLogPollError(fmt.Errorf("different poll error"), now.Add(32*time.Minute)) {
 		t.Fatal("different poll error should log immediately")
+	}
+}
+
+func TestBridgePersistentPollFailureRequestsSupervisorRestart(t *testing.T) {
+	now := time.Date(2026, 5, 10, 9, 0, 0, 0, time.UTC)
+	bridge := &Bridge{}
+	err := fmt.Errorf("proxyconnect tcp: i/o timeout")
+	if restart := bridge.notePollFailure(err, now); restart != nil {
+		t.Fatalf("first transient failure restart = %v, want nil", restart)
+	}
+	if restart := bridge.notePollFailure(err, now.Add(5*time.Minute)); restart != nil {
+		t.Fatalf("short transient failure window restart = %v, want nil", restart)
+	}
+	restart := bridge.notePollFailure(err, now.Add(persistentPollFailureRestartAfter+time.Second))
+	if restart == nil {
+		t.Fatal("persistent transient failures should request supervisor restart")
+	}
+	if !strings.Contains(restart.Error(), "requesting Teams listener restart") || !errors.Is(restart, err) {
+		t.Fatalf("restart error = %v, want wrapped listener restart diagnostic", restart)
+	}
+
+	bridge.notePollSuccess(now.Add(persistentPollFailureRestartAfter + 2*time.Second))
+	if restart := bridge.notePollFailure(err, now.Add(persistentPollFailureRestartAfter+3*time.Second)); restart != nil {
+		t.Fatalf("successful poll should reset persistent failure watchdog, got %v", restart)
+	}
+
+	if restart := bridge.notePollFailure(err, now.Add(persistentPollFailureRestartAfter+4*time.Second)); restart != nil {
+		t.Fatalf("second transient failure after reset restart = %v, want nil", restart)
+	}
+	if restart := bridge.notePollFailure(fmt.Errorf("Graph GET failed: HTTP 403 Forbidden"), now.Add(persistentPollFailureRestartAfter+5*time.Second)); restart != nil {
+		t.Fatalf("non-restartable poll failure restart = %v, want nil", restart)
+	}
+	if restart := bridge.notePollFailure(err, now.Add(2*persistentPollFailureRestartAfter)); restart != nil {
+		t.Fatalf("non-restartable failure should reset watchdog, got %v", restart)
+	}
+}
+
+func TestBridgeListenReturnsPersistentPollFailureForRestart(t *testing.T) {
+	var pollRequests int
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/control-chat/messages") {
+				pollRequests++
+				http.Error(w, `{"error":{"code":"BadGateway","message":"upstream proxy timed out"}}`, http.StatusBadGateway)
+				return w.Result(), nil
+			}
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			return nil, nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 1,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.reg.ControlChatTopic = ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(bridge.machine.Label, machineLabel()), Profile: bridge.scope.Profile})
+	bridge.persistentPollFailureFirstAt = time.Now().Add(-persistentPollFailureRestartAfter - time.Second)
+	bridge.persistentPollFailureCount = persistentPollFailureRestartMinCount - 1
+
+	err := bridge.Listen(context.Background(), BridgeOptions{
+		Store:           store,
+		Once:            true,
+		Interval:        time.Millisecond,
+		OwnerStaleAfter: time.Minute,
+	})
+	var persistent *PersistentPollFailureError
+	if !errors.As(err, &persistent) {
+		t.Fatalf("Listen error = %T %v, want PersistentPollFailureError", err, err)
+	}
+	if persistent.Count != persistentPollFailureRestartMinCount {
+		t.Fatalf("persistent count = %d, want %d", persistent.Count, persistentPollFailureRestartMinCount)
+	}
+	if pollRequests != 2 {
+		t.Fatalf("pollRequests = %d, want 2", pollRequests)
+	}
+}
+
+func TestBridgePollFailureWatchdogIgnoresRateLimit(t *testing.T) {
+	now := time.Date(2026, 5, 10, 9, 0, 0, 0, time.UTC)
+	bridge := &Bridge{}
+	err := &GraphStatusError{Method: http.MethodGet, Path: "/chats/chat-1/messages", StatusCode: http.StatusTooManyRequests}
+	if restart := bridge.notePollFailure(err, now); restart != nil {
+		t.Fatalf("rate limit restart = %v, want nil", restart)
+	}
+	if restart := bridge.notePollFailure(err, now.Add(persistentPollFailureRestartAfter+time.Minute)); restart != nil {
+		t.Fatalf("persistent rate limit restart = %v, want nil", restart)
+	}
+	if bridge.persistentPollFailureCount != 0 {
+		t.Fatalf("rate limit should not advance persistent failure count, got %d", bridge.persistentPollFailureCount)
+	}
+}
+
+func TestBridgeRecoverablePollFailureClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "temporary auth", err: &TemporaryAuthError{Action: "Teams auth", Err: context.DeadlineExceeded}, want: true},
+		{name: "graph 408", err: &GraphStatusError{StatusCode: http.StatusRequestTimeout}, want: true},
+		{name: "graph 500", err: &GraphStatusError{StatusCode: http.StatusInternalServerError}, want: true},
+		{name: "graph 502", err: &GraphStatusError{StatusCode: http.StatusBadGateway}, want: true},
+		{name: "graph 503", err: &GraphStatusError{StatusCode: http.StatusServiceUnavailable}, want: true},
+		{name: "graph 504", err: &GraphStatusError{StatusCode: http.StatusGatewayTimeout}, want: true},
+		{name: "graph 429", err: &GraphStatusError{StatusCode: http.StatusTooManyRequests}, want: false},
+		{name: "graph 403", err: &GraphStatusError{StatusCode: http.StatusForbidden}, want: false},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, want: true},
+		{name: "context canceled", err: context.Canceled, want: false},
+		{name: "net dns timeout", err: &net.DNSError{IsTimeout: true, Err: "lookup timed out"}, want: true},
+		{name: "proxyconnect timeout", err: fmt.Errorf("proxyconnect tcp: dial tcp: i/o timeout"), want: true},
+		{name: "bad gateway text", err: fmt.Errorf("Graph GET failed: HTTP 502 Bad Gateway: dial upstream failed"), want: true},
+		{name: "business timeout text", err: fmt.Errorf("invalid timeout configuration"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsRecoverablePollFailure(tt.err); got != tt.want {
+				t.Fatalf("IsRecoverablePollFailure(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBridgeOnlyControlPollSuccessResetsFailureWatchdog(t *testing.T) {
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.Contains(r.URL.Path, "/messages") {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"value":[]}`))
+				return w.Result(), nil
+			}
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			return nil, nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 1,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	now := time.Date(2026, 5, 10, 9, 0, 0, 0, time.UTC)
+	pollErr := fmt.Errorf("proxyconnect tcp: i/o timeout")
+	if restart := bridge.notePollFailure(pollErr, now); restart != nil {
+		t.Fatalf("first poll failure restart = %v, want nil", restart)
+	}
+
+	if _, err := bridge.pollChatWithRoleState(context.Background(), "chat-1", 20, inboundPollRoleWork, false, teamstore.ChatPollState{}, false, func(context.Context, ChatMessage, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("work poll success error: %v", err)
+	}
+	if bridge.persistentPollFailureCount != 1 {
+		t.Fatalf("work poll success reset failure count to %d, want 1", bridge.persistentPollFailureCount)
+	}
+
+	if _, err := bridge.pollChatWithRoleState(context.Background(), "control-chat", 20, inboundPollRoleControl, false, teamstore.ChatPollState{}, false, func(context.Context, ChatMessage, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("control poll success error: %v", err)
+	}
+	if bridge.persistentPollFailureCount != 0 || !bridge.persistentPollFailureFirstAt.IsZero() {
+		t.Fatalf("control poll success did not reset watchdog: count=%d first=%s", bridge.persistentPollFailureCount, bridge.persistentPollFailureFirstAt)
 	}
 }
 

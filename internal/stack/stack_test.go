@@ -1,6 +1,7 @@
 package stack
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -76,11 +77,17 @@ func TestWaitForTCPTunnel_ReturnsWhenTunnelExits(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
+	port, err := pickFreePort()
+	if err != nil {
+		t.Fatalf("pickFreePort: %v", err)
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
 	tun, err := ssh.NewTunnel(ssh.TunnelConfig{
 		Host:      "example.com",
 		Port:      22,
 		User:      "alice",
-		SocksPort: 12345,
+		SocksPort: port,
 	})
 	if err != nil {
 		t.Fatalf("NewTunnel error: %v", err)
@@ -89,7 +96,7 @@ func TestWaitForTCPTunnel_ReturnsWhenTunnelExits(t *testing.T) {
 		t.Fatalf("Start error: %v", err)
 	}
 
-	err = waitForTCPTunnel("127.0.0.1:12345", 500*time.Millisecond, tun)
+	err = waitForTCPTunnel(addr, 500*time.Millisecond, tun)
 	if err == nil {
 		t.Fatalf("expected early tunnel exit error")
 	}

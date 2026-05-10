@@ -98,7 +98,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 	for _, want := range []string{
 		"Type=simple",
 		"WorkingDirectory=" + strconv.Quote(spec.WorkingDir),
-		"ExecStart=" + spec.Executable + " teams run --registry " + strconv.Quote(spec.RegistryPath),
+		"ExecStart=" + spec.Executable + " teams run --owner-stale-after 18s --registry " + strconv.Quote(spec.RegistryPath),
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"Environment=CODEX_HELPER_TEAMS_SERVICE_MODE=background",
 		"Environment=HTTP_PROXY=http://127.0.0.1:38471",
@@ -127,6 +127,32 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 			t.Fatalf("systemd unit should not contain %q:\n%s", forbidden, unit)
 		}
 	}
+	watchdogUnit := buildTeamsServiceWatchdogUnit(spec)
+	for _, want := range []string{
+		"Type=simple",
+		"WorkingDirectory=" + strconv.Quote(spec.WorkingDir),
+		"ExecStart=" + spec.Executable + " teams service watchdog --loop --interval 10s --quiet",
+		"Restart=on-failure",
+		"RestartSec=10s",
+		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
+		"WantedBy=default.target",
+	} {
+		if !strings.Contains(watchdogUnit, want) {
+			t.Fatalf("systemd watchdog unit missing %q:\n%s", want, watchdogUnit)
+		}
+	}
+	watchdogTimer := buildTeamsServiceWatchdogTimer()
+	for _, want := range []string{
+		"OnBootSec=30s",
+		"OnUnitActiveSec=1min",
+		"AccuracySec=30s",
+		"Unit=" + teamsServiceWatchdogUnitName,
+		"WantedBy=timers.target",
+	} {
+		if !strings.Contains(watchdogTimer, want) {
+			t.Fatalf("systemd watchdog timer missing %q:\n%s", want, watchdogTimer)
+		}
+	}
 
 	plist := buildTeamsServiceLaunchAgentPlist(spec)
 	for _, want := range []string{
@@ -139,6 +165,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<string>" + spec.Executable + "</string>",
 		"<string>teams</string>",
 		"<string>run</string>",
+		"<string>--owner-stale-after</string>",
+		"<string>18s</string>",
 		"<string>--registry</string>",
 		"<string>" + spec.RegistryPath + "</string>",
 		"<key>WorkingDirectory</key>",
@@ -171,6 +199,26 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 			t.Fatalf("LaunchAgent plist should not contain %q:\n%s", forbidden, plist)
 		}
 	}
+	watchdogPlist := buildTeamsServiceWatchdogLaunchAgentPlist(spec)
+	for _, want := range []string{
+		"<string>" + teamsServiceLaunchAgentWatchdogLabel + "</string>",
+		"<string>" + spec.Executable + "</string>",
+		"<string>teams</string>",
+		"<string>service</string>",
+		"<string>watchdog</string>",
+		"<string>--loop</string>",
+		"<string>--interval</string>",
+		"<string>10s</string>",
+		"<string>--quiet</string>",
+		"<key>KeepAlive</key>",
+		"<key>SuccessfulExit</key>",
+		"<false/>",
+		"<key>CODEX_HELPER_TEAMS_SERVICE</key>",
+	} {
+		if !strings.Contains(watchdogPlist, want) {
+			t.Fatalf("LaunchAgent watchdog plist missing %q:\n%s", want, watchdogPlist)
+		}
+	}
 
 	taskXML := buildTeamsServiceWindowsTaskXML(spec)
 	if strings.Contains(taskXML, "<?xml") || strings.Contains(strings.ToLower(taskXML), "encoding=") {
@@ -183,11 +231,12 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
 		"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
 		"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<StartWhenAvailable>true</StartWhenAvailable>",
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
-		"<Interval>PT60S</Interval>",
+		"<Interval>PT10S</Interval>",
 		"<Count>999</Count>",
 		"CODEX_HELPER_TEAMS_SERVICE",
 		"CODEX_HELPER_TEAMS_SERVICE_MODE",
@@ -196,6 +245,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		spec.Executable,
 		"teams",
 		"run",
+		"--owner-stale-after",
+		"18s",
 		"--registry",
 		"<WorkingDirectory>" + spec.WorkingDir + "</WorkingDirectory>",
 	} {
@@ -220,6 +271,38 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
+	)
+	watchdogTaskXML := buildTeamsServiceWindowsWatchdogTaskXML(spec)
+	for _, want := range []string{
+		"<Description>Codex Helper Teams service watchdog</Description>",
+		"<CalendarTrigger>",
+		"<Interval>PT1M</Interval>",
+		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+		"<RestartOnFailure>",
+		"<Interval>PT10S</Interval>",
+		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+		spec.Executable,
+		"teams",
+		"service",
+		"watchdog",
+		"--loop",
+		"--interval",
+		"10s",
+		"--quiet",
+	} {
+		if !strings.Contains(watchdogTaskXML, want) {
+			t.Fatalf("Windows watchdog task XML missing %q:\n%s", want, watchdogTaskXML)
+		}
+	}
+	requireSubstringsInOrder(t, watchdogTaskXML,
+		"<CalendarTrigger>",
+		"<Repetition>",
+		"<Interval>PT1M</Interval>",
+		"</Repetition>",
+		"<StartBoundary>",
+		"<Enabled>true</Enabled>",
+		"<ScheduleByDay>",
+		"</CalendarTrigger>",
 	)
 }
 
@@ -251,7 +334,15 @@ func TestTeamsServiceSystemdUnitVerifiesWithSystemdAnalyzeCI(t *testing.T) {
 	if err := os.WriteFile(unitPath, []byte(buildTeamsServiceUnit(spec)), 0o600); err != nil {
 		t.Fatalf("write systemd unit: %v", err)
 	}
-	cmd := exec.Command("systemd-analyze", "verify", unitPath)
+	watchdogUnitPath := filepath.Join(tmp, "codex-helper-teams-watchdog.service")
+	if err := os.WriteFile(watchdogUnitPath, []byte(buildTeamsServiceWatchdogUnit(spec)), 0o600); err != nil {
+		t.Fatalf("write systemd watchdog unit: %v", err)
+	}
+	watchdogTimerPath := filepath.Join(tmp, "codex-helper-teams-watchdog.timer")
+	if err := os.WriteFile(watchdogTimerPath, []byte(buildTeamsServiceWatchdogTimer()), 0o600); err != nil {
+		t.Fatalf("write systemd watchdog timer: %v", err)
+	}
+	cmd := exec.Command("systemd-analyze", "verify", unitPath, watchdogUnitPath, watchdogTimerPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("systemd-analyze verify failed: %v\n%s", err, out)
@@ -282,7 +373,11 @@ func TestTeamsServiceLaunchAgentPlistLintsWithPlutilCI(t *testing.T) {
 	if err := os.WriteFile(plistPath, []byte(buildTeamsServiceLaunchAgentPlist(spec)), 0o600); err != nil {
 		t.Fatalf("write LaunchAgent plist: %v", err)
 	}
-	cmd := exec.Command("plutil", "-lint", plistPath)
+	watchdogPlistPath := filepath.Join(tmp, "com.codex-helper.teams.watchdog.plist")
+	if err := os.WriteFile(watchdogPlistPath, []byte(buildTeamsServiceWatchdogLaunchAgentPlist(spec)), 0o600); err != nil {
+		t.Fatalf("write LaunchAgent watchdog plist: %v", err)
+	}
+	cmd := exec.Command("plutil", "-lint", plistPath, watchdogPlistPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("plutil lint failed: %v\n%s", err, out)
@@ -314,20 +409,36 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 	if strings.Contains(xml, "<?xml") || strings.Contains(strings.ToLower(xml), "encoding=") {
 		t.Fatalf("Windows Task Scheduler XML is passed as a PowerShell string and must not declare an encoding:\n%s", xml)
 	}
+	watchdogXML := buildTeamsServiceWindowsWatchdogTaskXML(spec)
+	if strings.Contains(watchdogXML, "<?xml") || strings.Contains(strings.ToLower(watchdogXML), "encoding=") {
+		t.Fatalf("Windows watchdog Task Scheduler XML is passed as a PowerShell string and must not declare an encoding:\n%s", watchdogXML)
+	}
 	xmlPath := filepath.Join(tmp, "codex-helper-teams-task.xml")
 	if err := os.WriteFile(xmlPath, []byte(xml), 0o600); err != nil {
 		t.Fatalf("write Windows task XML: %v", err)
 	}
+	watchdogXMLPath := filepath.Join(tmp, "codex-helper-teams-watchdog-task.xml")
+	if err := os.WriteFile(watchdogXMLPath, []byte(watchdogXML), 0o600); err != nil {
+		t.Fatalf("write Windows watchdog task XML: %v", err)
+	}
 	taskName := "Codex Helper Teams Bridge CI " + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	watchdogTaskName := "Codex Helper Teams Watchdog CI " + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	script := "$ErrorActionPreference = 'Stop'; " +
 		"$task = " + powershellSingleQuote(taskName) + "; " +
+		"$watchdogTask = " + powershellSingleQuote(watchdogTaskName) + "; " +
 		"$xmlPath = " + powershellSingleQuote(xmlPath) + "; " +
+		"$watchdogXmlPath = " + powershellSingleQuote(watchdogXMLPath) + "; " +
 		"try { " +
 		"$xml = Get-Content -LiteralPath $xmlPath -Raw; " +
 		"Register-ScheduledTask -TaskName $task -Xml $xml -Force -ErrorAction Stop | Out-Null; " +
+		"$watchdogXml = Get-Content -LiteralPath $watchdogXmlPath -Raw; " +
+		"Register-ScheduledTask -TaskName $watchdogTask -Xml $watchdogXml -Force -ErrorAction Stop | Out-Null; " +
 		"$registered = Get-ScheduledTask -TaskName $task -ErrorAction Stop; " +
-		"if ($registered.TaskName -ne $task) { throw 'registered task name mismatch' } " +
+		"$registeredWatchdog = Get-ScheduledTask -TaskName $watchdogTask -ErrorAction Stop; " +
+		"if ($registered.TaskName -ne $task) { throw 'registered task name mismatch' }; " +
+		"if ($registeredWatchdog.TaskName -ne $watchdogTask) { throw 'registered watchdog task name mismatch' } " +
 		"} finally { " +
+		"Unregister-ScheduledTask -TaskName $watchdogTask -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; " +
 		"Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue | Out-Null " +
 		"}"
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
@@ -362,8 +473,8 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 		"stop requested",
 		"& wsl.exe @wslArgs",
 		"wsl.exe exited",
-		"restarting in 30s",
-		"Start-Sleep -Seconds 30",
+		"restarting in 10s",
+		"Start-Sleep -Seconds 10",
 		"$mutex.ReleaseMutex(); $mutex.Dispose()",
 		"'-d'",
 		"'Ubuntu'",
@@ -421,16 +532,19 @@ func TestTeamsBackgroundKeepaliveWindowsTaskXMLLogonAndSelfRecoveryCI(t *testing
 		"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
 		"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
 		"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<StartWhenAvailable>true</StartWhenAvailable>",
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
-		"<Interval>PT60S</Interval>",
+		"<Interval>PT10S</Interval>",
 		"<Count>999</Count>",
 		"<Command>powershell.exe</Command>",
 		"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command",
 		"CODEX_HELPER_TEAMS_SERVICE",
 		"CODEX_HELPER_TEAMS_SERVICE_MODE",
+		"$code = $LASTEXITCODE",
+		"exit $code",
 		"teams",
 		"run",
 		"--registry",
@@ -491,24 +605,31 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 	}
 	taskName := teamsServiceWSLWindowsTaskBackend{}.Name()
 	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, buildTeamsServiceWSLArguments(spec))
+	watchdogTaskName := teamsServiceWSLWindowsTaskBackend{}.watchdogName()
+	watchdogExecute, watchdogArgument := buildTeamsServiceWSLTaskAction(watchdogTaskName, buildTeamsServiceWSLWatchdogArguments(spec))
 	runLogName := teamsServiceWSLTaskRunLogName(taskName)
+	watchdogRunLogName := teamsServiceWSLTaskRunLogName(watchdogTaskName)
 	for _, want := range []string{
 		"New-ScheduledTaskAction",
 		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
 		"$expectedActionArgument = " + powershellSingleQuote(actionArgument),
+		"$expectedActionExecute = " + powershellSingleQuote(watchdogExecute),
+		"$expectedActionArgument = " + powershellSingleQuote(watchdogArgument),
 		"New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument",
 		"-WindowStyle Hidden",
 		runLogName,
+		watchdogRunLogName,
 		"Add-Content -LiteralPath $runLog",
 		"*>> $runLog",
 		"& wsl.exe @wslArgs",
 		"New-ScheduledTaskTrigger -AtLogOn",
-		"RepetitionInterval (New-TimeSpan -Minutes 30)",
+		"RepetitionInterval (New-TimeSpan -Minutes 1)",
 		"RepetitionDuration (New-TimeSpan -Days 3650)",
 		"New-ScheduledTaskSettingsSet",
 		"MultipleInstances IgnoreNew",
+		"ExecutionTimeLimit (New-TimeSpan -Seconds 0)",
 		"RestartCount 999",
-		"New-TimeSpan -Seconds 60",
+		"New-TimeSpan -Seconds 10",
 		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
 		"Interactive",
 		"RunLevel Limited",
@@ -548,7 +669,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex home"),
-		wantExe + " teams run --auto-service=false --registry",
+		wantExe + " teams run --owner-stale-after 18s --auto-service=false --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
@@ -586,18 +707,24 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 	}
 	taskName := teamsServiceWSLWindowsTaskBackend{}.Name()
 	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, buildTeamsServiceWSLArguments(spec))
+	watchdogTaskName := teamsServiceWSLWindowsTaskBackend{}.watchdogName()
+	watchdogExecute, watchdogArgument := buildTeamsServiceWSLTaskAction(watchdogTaskName, buildTeamsServiceWSLWatchdogArguments(spec))
 	runLogName := teamsServiceWSLTaskRunLogName(taskName)
+	watchdogRunLogName := teamsServiceWSLTaskRunLogName(watchdogTaskName)
 	for _, want := range []string{
 		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
 		"$legacyPrefix",
 		"Unregister-ScheduledTask -TaskName $_.TaskName",
 		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
 		"$expectedActionArgument = " + powershellSingleQuote(actionArgument),
+		"$expectedActionExecute = " + powershellSingleQuote(watchdogExecute),
+		"$expectedActionArgument = " + powershellSingleQuote(watchdogArgument),
 		"New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument",
 		"$actionMatches = ($null -ne $actualAction",
 		"Teams WSL Scheduled Task action did not refresh; access is denied or task is protected",
 		"-WindowStyle Hidden",
 		runLogName,
+		watchdogRunLogName,
 		"exited",
 		"$LASTEXITCODE",
 		"& wsl.exe @wslArgs",
@@ -607,7 +734,8 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 		"Teams WSL Scheduled Task did not stay running after start",
 		"Get-ScheduledTaskInfo -TaskName $taskName",
 		"MultipleInstances IgnoreNew",
-		"RepetitionInterval (New-TimeSpan -Minutes 30)",
+		"ExecutionTimeLimit (New-TimeSpan -Seconds 0)",
+		"RepetitionInterval (New-TimeSpan -Minutes 1)",
 		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
 	} {
 		if !strings.Contains(command, want) {
@@ -616,6 +744,9 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 	}
 	if strings.Contains(command, "Disable-ScheduledTask -TaskName $taskName") {
 		t.Fatalf("WSL repair enable command should not disable task:\n%s", command)
+	}
+	if got := strings.Count(command, "Teams WSL Scheduled Task did not stay running after start"); got != 1 {
+		t.Fatalf("WSL repair should verify only the long-running bridge task, got %d verifications:\n%s", got, command)
 	}
 }
 
@@ -1443,8 +1574,13 @@ func TestTeamsBackgroundKeepaliveServiceActionsCI(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("service %s error: %v", action, err)
 		}
-		if len(runner.calls) != 1 || runner.calls[0].name != "systemctl" || runner.calls[0].args[0] != "--user" {
-			t.Fatalf("service %s calls = %#v, want one systemctl --user call", action, runner.calls)
+		if len(runner.calls) == 0 {
+			t.Fatalf("service %s made no systemctl calls", action)
+		}
+		for _, call := range runner.calls {
+			if call.name != "systemctl" || len(call.args) == 0 || call.args[0] != "--user" {
+				t.Fatalf("service %s calls = %#v, want systemctl --user calls", action, runner.calls)
+			}
 		}
 	}
 

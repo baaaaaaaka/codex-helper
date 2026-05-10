@@ -46,14 +46,15 @@ var (
 			close:     st.Close,
 		}, nil
 	}
-	proxyRecordInstance = manager.RecordInstance
-	proxyRemoveInstance = manager.RemoveInstance
-	proxyHeartbeat      = manager.Heartbeat
-	proxyProcessAlive   = proc.IsAlive
-	proxyFindProcess    = os.FindProcess
-	proxyTerminate      = terminateProcess
-	proxyLookPath       = exec.LookPath
-	proxyCheckHTTPProxy = func(hc manager.HealthClient, port int, expectedInstanceID string) error {
+	proxyRecordInstance       = manager.RecordInstance
+	proxyRemoveInstance       = manager.RemoveInstance
+	proxyHeartbeat            = manager.Heartbeat
+	proxyProcessAlive         = proc.IsAlive
+	proxyLooksLikeProxyDaemon = proc.LooksLikeProxyDaemon
+	proxyFindProcess          = os.FindProcess
+	proxyTerminate            = terminateProcess
+	proxyLookPath             = exec.LookPath
+	proxyCheckHTTPProxy       = func(hc manager.HealthClient, port int, expectedInstanceID string) error {
 		return hc.CheckHTTPProxy(port, expectedInstanceID)
 	}
 	proxyExecutable    = os.Executable

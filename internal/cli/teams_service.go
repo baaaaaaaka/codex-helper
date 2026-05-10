@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -23,16 +24,27 @@ import (
 )
 
 const (
-	teamsServiceUnitName             = "codex-helper-teams.service"
-	teamsServiceLaunchAgentLabel     = "com.codex-helper.teams"
-	teamsServiceLaunchAgentPlistName = teamsServiceLaunchAgentLabel + ".plist"
-	teamsServiceWindowsTaskName      = "Codex Helper Teams Bridge"
-	teamsServiceWindowsTaskXMLName   = "codex-helper-teams-task.xml"
-	teamsServiceWSLTaskConfigName    = "codex-helper-teams-wsl-task.txt"
-	teamsServiceTaskRestartCount     = 999
-	teamsServiceTaskRestartInterval  = 60
-	teamsServiceWatchdogMinutes      = 30
-	teamsServiceWatchdogDays         = 3650
+	teamsServiceUnitName                     = "codex-helper-teams.service"
+	teamsServiceWatchdogUnitName             = "codex-helper-teams-watchdog.service"
+	teamsServiceWatchdogTimerName            = "codex-helper-teams-watchdog.timer"
+	teamsServiceLaunchAgentLabel             = "com.codex-helper.teams"
+	teamsServiceLaunchAgentPlistName         = teamsServiceLaunchAgentLabel + ".plist"
+	teamsServiceLaunchAgentWatchdogLabel     = teamsServiceLaunchAgentLabel + ".watchdog"
+	teamsServiceLaunchAgentWatchdogPlistName = teamsServiceLaunchAgentWatchdogLabel + ".plist"
+	teamsServiceWindowsTaskName              = "Codex Helper Teams Bridge"
+	teamsServiceWindowsWatchdogTaskName      = "Codex Helper Teams Watchdog"
+	teamsServiceWindowsTaskXMLName           = "codex-helper-teams-task.xml"
+	teamsServiceWindowsWatchdogTaskXMLName   = "codex-helper-teams-watchdog-task.xml"
+	teamsServiceWSLTaskConfigName            = "codex-helper-teams-wsl-task.txt"
+	teamsServiceTaskRestartCount             = 999
+	teamsServiceTaskRestartInterval          = 10
+	teamsServiceWatchdogMinutes              = 1
+	teamsServiceWatchdogDays                 = 3650
+	teamsServiceRunOwnerStaleAfter           = 18 * time.Second
+	teamsServiceExternalWatchdogInterval     = 10 * time.Second
+	teamsServiceExternalWatchdogCheckTimeout = 20 * time.Second
+	teamsServiceExternalWatchdogSeconds      = int(teamsServiceExternalWatchdogInterval / time.Second)
+	teamsServiceExternalWatchdogMinutes      = 1
 )
 
 type teamsServiceCommandRunner interface {
@@ -80,6 +92,7 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 		newTeamsServiceStartCmd(),
 		newTeamsServiceStopCmd(),
 		newTeamsServiceRestartCmd(),
+		newTeamsServiceWatchdogCmd(),
 		newTeamsServiceDoctorCmd(),
 	)
 	return cmd
@@ -430,6 +443,7 @@ func defaultTeamsServiceBootstrapControlChat(ctx context.Context, root *rootOpti
 	if err != nil {
 		return teamsServiceBootstrapControlChatResult{}, err
 	}
+	httpClient.RetireSuspects(ctx, errOut)
 	chat, err := bridge.EnsureControlChat(ctx)
 	if err != nil {
 		return teamsServiceBootstrapControlChatResult{}, err
@@ -758,6 +772,26 @@ func startTeamsService(ctx context.Context, restart bool) error {
 	return runTeamsServiceCommand(ctx, io.Discard, backend, action)
 }
 
+type teamsServicePrimaryRunner interface {
+	RunPrimary(ctx context.Context, action string) ([]byte, error)
+}
+
+func startTeamsPrimaryService(ctx context.Context, restart bool) error {
+	action := "start"
+	if restart {
+		action = "restart"
+	}
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return err
+	}
+	if primary, ok := backend.(teamsServicePrimaryRunner); ok {
+		_, err := primary.RunPrimary(ctx, action)
+		return err
+	}
+	return runTeamsServiceCommand(ctx, io.Discard, backend, action)
+}
+
 type teamsServiceSystemdBackend struct{}
 
 func (teamsServiceSystemdBackend) ID() string {
@@ -784,6 +818,20 @@ func (b teamsServiceSystemdBackend) Install(ctx context.Context, spec teamsServi
 	if err := os.WriteFile(unitPath, []byte(unit), 0o600); err != nil {
 		return "", err
 	}
+	watchdogUnitPath, err := teamsServiceWatchdogUnitPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(watchdogUnitPath, []byte(buildTeamsServiceWatchdogUnit(spec)), 0o600); err != nil {
+		return "", err
+	}
+	watchdogTimerPath, err := teamsServiceWatchdogTimerPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(watchdogTimerPath, []byte(buildTeamsServiceWatchdogTimer()), 0o600); err != nil {
+		return "", err
+	}
 	if _, err := teamsServiceRunSystemctl(ctx, "daemon-reload"); err != nil {
 		return "", err
 	}
@@ -798,6 +846,16 @@ func (b teamsServiceSystemdBackend) Uninstall(ctx context.Context) (string, erro
 	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
+	if watchdogUnitPath, err := teamsServiceWatchdogUnitPath(); err == nil {
+		if err := os.Remove(watchdogUnitPath); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	if watchdogTimerPath, err := teamsServiceWatchdogTimerPath(); err == nil {
+		if err := os.Remove(watchdogTimerPath); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+	}
 	if _, err := teamsServiceRunSystemctl(ctx, "daemon-reload"); err != nil {
 		return "", err
 	}
@@ -805,11 +863,43 @@ func (b teamsServiceSystemdBackend) Uninstall(ctx context.Context) (string, erro
 }
 
 func (teamsServiceSystemdBackend) Run(ctx context.Context, action string) ([]byte, error) {
-	args := []string{action, teamsServiceUnitName}
-	if action == "status" {
-		args = []string{"status", "--no-pager", teamsServiceUnitName}
+	switch action {
+	case "enable", "disable", "start", "stop", "restart":
+		return teamsServiceRunSystemctl(ctx, action, teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName)
+	case "status":
+		main, err := teamsServiceRunSystemctl(ctx, "status", "--no-pager", teamsServiceUnitName)
+		watchdog, watchdogErr := teamsServiceRunSystemctl(ctx, "status", "--no-pager", teamsServiceWatchdogUnitName)
+		timer, timerErr := teamsServiceRunSystemctl(ctx, "status", "--no-pager", teamsServiceWatchdogTimerName)
+		out := append([]byte{}, main...)
+		if len(out) > 0 && !bytes.HasSuffix(out, []byte("\n")) {
+			out = append(out, '\n')
+		}
+		out = append(out, watchdog...)
+		if len(out) > 0 && !bytes.HasSuffix(out, []byte("\n")) {
+			out = append(out, '\n')
+		}
+		out = append(out, timer...)
+		if err != nil {
+			return out, err
+		}
+		if watchdogErr != nil {
+			return out, watchdogErr
+		}
+		return out, timerErr
+	default:
+		return nil, fmt.Errorf("unsupported Teams service action for systemd: %s", action)
 	}
-	return teamsServiceRunSystemctl(ctx, args...)
+}
+
+func (teamsServiceSystemdBackend) RunPrimary(ctx context.Context, action string) ([]byte, error) {
+	switch action {
+	case "start", "restart", "stop", "enable", "disable":
+		return teamsServiceRunSystemctl(ctx, action, teamsServiceUnitName)
+	case "status":
+		return teamsServiceRunSystemctl(ctx, "status", "--no-pager", teamsServiceUnitName)
+	default:
+		return nil, fmt.Errorf("unsupported primary Teams service action for systemd: %s", action)
+	}
 }
 
 func (b teamsServiceSystemdBackend) Installed() (bool, error) {
@@ -861,6 +951,13 @@ func (b teamsServiceLaunchAgentBackend) Install(_ context.Context, spec teamsSer
 	if err := os.WriteFile(plistPath, []byte(buildTeamsServiceLaunchAgentPlist(spec)), 0o600); err != nil {
 		return "", err
 	}
+	watchdogPath, err := teamsServiceLaunchAgentWatchdogPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(watchdogPath, []byte(buildTeamsServiceWatchdogLaunchAgentPlist(spec)), 0o600); err != nil {
+		return "", err
+	}
 	return plistPath, nil
 }
 
@@ -870,8 +967,14 @@ func (b teamsServiceLaunchAgentBackend) Uninstall(ctx context.Context) (string, 
 		return "", err
 	}
 	_, _ = teamsServiceRunLaunchctl(ctx, "bootout", teamsServiceLaunchctlServiceTarget())
+	_, _ = teamsServiceRunLaunchctl(ctx, "bootout", teamsServiceLaunchctlWatchdogTarget())
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
 		return "", err
+	}
+	if watchdogPath, err := teamsServiceLaunchAgentWatchdogPath(); err == nil {
+		if err := os.Remove(watchdogPath); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
 	}
 	return plistPath, nil
 }
@@ -879,21 +982,57 @@ func (b teamsServiceLaunchAgentBackend) Uninstall(ctx context.Context) (string, 
 func (b teamsServiceLaunchAgentBackend) Run(ctx context.Context, action string) ([]byte, error) {
 	switch action {
 	case "enable":
-		return teamsServiceRunLaunchctl(ctx, "enable", teamsServiceLaunchctlServiceTarget())
+		main, err := teamsServiceRunLaunchctl(ctx, "enable", teamsServiceLaunchctlServiceTarget())
+		watchdog, watchdogErr := teamsServiceRunLaunchctl(ctx, "enable", teamsServiceLaunchctlWatchdogTarget())
+		if watchdogErr != nil {
+			watchdog = nil
+		}
+		return appendLaunchctlOutput(main, watchdog), err
 	case "disable":
-		return teamsServiceRunLaunchctl(ctx, "disable", teamsServiceLaunchctlServiceTarget())
+		watchdog, watchdogErr := teamsServiceRunLaunchctl(ctx, "disable", teamsServiceLaunchctlWatchdogTarget())
+		if watchdogErr != nil {
+			watchdog = nil
+		}
+		main, err := teamsServiceRunLaunchctl(ctx, "disable", teamsServiceLaunchctlServiceTarget())
+		return appendLaunchctlOutput(watchdog, main), err
 	case "status":
-		return teamsServiceRunLaunchctl(ctx, "print", teamsServiceLaunchctlServiceTarget())
+		main, err := teamsServiceRunLaunchctl(ctx, "print", teamsServiceLaunchctlServiceTarget())
+		watchdog, watchdogErr := teamsServiceRunLaunchctl(ctx, "print", teamsServiceLaunchctlWatchdogTarget())
+		if watchdogErr != nil {
+			watchdog = nil
+		}
+		return appendLaunchctlOutput(main, watchdog), err
 	case "start":
 		path, err := b.Path()
 		if err != nil {
 			return nil, err
 		}
-		return teamsServiceRunLaunchctl(ctx, "bootstrap", teamsServiceLaunchctlUserTarget(), path)
+		main, err := teamsServiceRunLaunchctl(ctx, "bootstrap", teamsServiceLaunchctlUserTarget(), path)
+		watchdogPath, pathErr := teamsServiceLaunchAgentWatchdogPath()
+		if pathErr == nil {
+			if exists, existsErr := teamsServiceFileExists(watchdogPath); existsErr == nil && exists {
+				watchdog, watchdogErr := teamsServiceRunLaunchctl(ctx, "bootstrap", teamsServiceLaunchctlUserTarget(), watchdogPath)
+				if watchdogErr != nil {
+					watchdog = nil
+				}
+				return appendLaunchctlOutput(main, watchdog), err
+			}
+		}
+		return main, err
 	case "stop":
-		return teamsServiceRunLaunchctl(ctx, "bootout", teamsServiceLaunchctlServiceTarget())
+		watchdog, watchdogErr := teamsServiceRunLaunchctl(ctx, "bootout", teamsServiceLaunchctlWatchdogTarget())
+		if watchdogErr != nil {
+			watchdog = nil
+		}
+		main, err := teamsServiceRunLaunchctl(ctx, "bootout", teamsServiceLaunchctlServiceTarget())
+		return appendLaunchctlOutput(watchdog, main), err
 	case "restart":
-		return teamsServiceRunLaunchctl(ctx, "kickstart", "-k", teamsServiceLaunchctlServiceTarget())
+		main, err := teamsServiceRunLaunchctl(ctx, "kickstart", "-k", teamsServiceLaunchctlServiceTarget())
+		watchdog, watchdogErr := teamsServiceRunLaunchctl(ctx, "kickstart", "-k", teamsServiceLaunchctlWatchdogTarget())
+		if watchdogErr != nil {
+			watchdog = nil
+		}
+		return appendLaunchctlOutput(main, watchdog), err
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for LaunchAgent: %s", action)
 	}
@@ -915,6 +1054,29 @@ func (b teamsServiceLaunchAgentBackend) Active(ctx context.Context) (bool, error
 	return true, nil
 }
 
+func (b teamsServiceLaunchAgentBackend) RunPrimary(ctx context.Context, action string) ([]byte, error) {
+	switch action {
+	case "enable":
+		return teamsServiceRunLaunchctl(ctx, "enable", teamsServiceLaunchctlServiceTarget())
+	case "disable":
+		return teamsServiceRunLaunchctl(ctx, "disable", teamsServiceLaunchctlServiceTarget())
+	case "status":
+		return teamsServiceRunLaunchctl(ctx, "print", teamsServiceLaunchctlServiceTarget())
+	case "start":
+		path, err := b.Path()
+		if err != nil {
+			return nil, err
+		}
+		return teamsServiceRunLaunchctl(ctx, "bootstrap", teamsServiceLaunchctlUserTarget(), path)
+	case "stop":
+		return teamsServiceRunLaunchctl(ctx, "bootout", teamsServiceLaunchctlServiceTarget())
+	case "restart":
+		return teamsServiceRunLaunchctl(ctx, "kickstart", "-k", teamsServiceLaunchctlServiceTarget())
+	default:
+		return nil, fmt.Errorf("unsupported primary Teams service action for LaunchAgent: %s", action)
+	}
+}
+
 type teamsServiceWindowsTaskBackend struct{}
 
 func (teamsServiceWindowsTaskBackend) ID() string {
@@ -933,6 +1095,14 @@ func (teamsServiceWindowsTaskBackend) Path() (string, error) {
 	return filepath.Join(dir, teamsServiceWindowsTaskXMLName), nil
 }
 
+func teamsServiceWindowsWatchdogTaskXMLPath() (string, error) {
+	dir, err := teamsServiceWindowsTaskXMLDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, teamsServiceWindowsWatchdogTaskXMLName), nil
+}
+
 func (b teamsServiceWindowsTaskBackend) Install(ctx context.Context, spec teamsServiceSpec) (string, error) {
 	xmlPath, err := b.Path()
 	if err != nil {
@@ -944,7 +1114,15 @@ func (b teamsServiceWindowsTaskBackend) Install(ctx context.Context, spec teamsS
 	if err := os.WriteFile(xmlPath, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
 		return "", err
 	}
+	watchdogXMLPath, err := teamsServiceWindowsWatchdogTaskXMLPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(watchdogXMLPath, []byte(buildTeamsServiceWindowsWatchdogTaskXML(spec)), 0o600); err != nil {
+		return "", err
+	}
 	cmd := "$xml = Get-Content -LiteralPath " + powershellSingleQuote(xmlPath) + " -Raw; Register-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsTaskName) + " -Xml $xml -Force | Out-Null"
+	cmd += "; $watchdogXml = Get-Content -LiteralPath " + powershellSingleQuote(watchdogXMLPath) + " -Raw; Register-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + " -Xml $watchdogXml -Force | Out-Null"
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
 	}
@@ -957,17 +1135,45 @@ func (b teamsServiceWindowsTaskBackend) Uninstall(ctx context.Context) (string, 
 		return "", err
 	}
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
-	cmd := "if (Get-ScheduledTask -TaskName " + task + " -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName " + task + " -Confirm:$false }"
+	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
+	cmd := "if (Get-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName " + watchdogTask + " -Confirm:$false }; "
+	cmd += "if (Get-ScheduledTask -TaskName " + task + " -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName " + task + " -Confirm:$false }"
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
 	}
 	if err := os.Remove(xmlPath); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
+	if watchdogXMLPath, err := teamsServiceWindowsWatchdogTaskXMLPath(); err == nil {
+		if err := os.Remove(watchdogXMLPath); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+	}
 	return xmlPath, nil
 }
 
 func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([]byte, error) {
+	task := powershellSingleQuote(teamsServiceWindowsTaskName)
+	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
+	switch action {
+	case "enable":
+		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null")
+	case "disable":
+		return teamsServiceRunPowerShell(ctx, "Disable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null; Disable-ScheduledTask -TaskName "+task+" | Out-Null")
+	case "status":
+		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; $watchdog = Get-ScheduledTask -TaskName "+watchdogTask+"; $watchdogInfo = Get-ScheduledTaskInfo -TaskName "+watchdogTask+"; $watchdog | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime")
+	case "start":
+		return teamsServiceRunPowerShell(ctx, "Start-ScheduledTask -TaskName "+task+"; Start-ScheduledTask -TaskName "+watchdogTask)
+	case "stop":
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction SilentlyContinue; Stop-ScheduledTask -TaskName "+task)
+	case "restart":
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName "+task+"; Start-ScheduledTask -TaskName "+watchdogTask)
+	default:
+		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
+	}
+}
+
+func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action string) ([]byte, error) {
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
 	switch action {
 	case "enable":
@@ -983,7 +1189,7 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 	case "restart":
 		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName "+task)
 	default:
-		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
+		return nil, fmt.Errorf("unsupported primary Teams service action for Task Scheduler: %s", action)
 	}
 }
 
@@ -1012,6 +1218,11 @@ func (teamsServiceWSLWindowsTaskBackend) ID() string {
 func (b teamsServiceWSLWindowsTaskBackend) Name() string {
 	identity := teamsServiceWSLTaskIdentity()
 	return "Codex Helper Teams Bridge (WSL " + identity.Display + " " + identity.Suffix + ")"
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) watchdogName() string {
+	identity := teamsServiceWSLTaskIdentity()
+	return "Codex Helper Teams Watchdog (WSL " + identity.Display + " " + identity.Suffix + ")"
 }
 
 func (teamsServiceWSLWindowsTaskBackend) Path() (string, error) {
@@ -1121,6 +1332,8 @@ func (b teamsServiceWSLWindowsTaskBackend) removeTaskConfig() error {
 func (b teamsServiceWSLWindowsTaskBackend) Install(ctx context.Context, spec teamsServiceSpec) (string, error) {
 	args := buildTeamsServiceWSLArguments(spec)
 	cmd := buildTeamsServiceWSLRegisterCommand(b.Name(), args, teamsServiceWSLRegisterOptions{ForceDisabled: true})
+	watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
+	cmd += "; " + buildTeamsServiceWSLRegisterCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLRegisterOptions{ForceDisabled: true, WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes})
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
 	}
@@ -1135,6 +1348,12 @@ func (b teamsServiceWSLWindowsTaskBackend) Repair(ctx context.Context, spec team
 		PreserveEnabled: !opts.Enable,
 		PreserveRunning: !opts.Start,
 		CleanLegacy:     true,
+	})
+	watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
+	cmd += "; " + buildTeamsServiceWSLRegisterCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLRegisterOptions{
+		Enable:                  opts.Enable,
+		PreserveEnabled:         !opts.Enable,
+		WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes,
 	})
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
@@ -1151,6 +1370,13 @@ func (b teamsServiceWSLWindowsTaskBackend) RepairElevated(ctx context.Context, s
 		PreserveRunning: !opts.Start,
 		PrincipalUser:   principalUser,
 		CleanLegacy:     true,
+	})
+	watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
+	cmd += "; " + buildTeamsServiceWSLRegisterCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLRegisterOptions{
+		Enable:                  opts.Enable,
+		PreserveEnabled:         !opts.Enable,
+		PrincipalUser:           principalUser,
+		WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes,
 	})
 	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLElevatedCommand(cmd)); err != nil {
 		return "", err
@@ -1247,7 +1473,9 @@ func (b teamsServiceWSLWindowsTaskBackend) Uninstall(ctx context.Context) (strin
 		return "", err
 	}
 	task := powershellSingleQuote(b.Name())
-	cmd := "if (Get-ScheduledTask -TaskName " + task + " -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName " + task + " -Confirm:$false }"
+	watchdogTask := powershellSingleQuote(b.watchdogName())
+	cmd := "if (Get-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName " + watchdogTask + " -Confirm:$false }; "
+	cmd += "if (Get-ScheduledTask -TaskName " + task + " -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName " + task + " -Confirm:$false }"
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
 	}
@@ -1260,14 +1488,16 @@ func (b teamsServiceWSLWindowsTaskBackend) Uninstall(ctx context.Context) (strin
 
 func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action string) ([]byte, error) {
 	resolve := teamsServiceWSLResolveTaskPowerShell(b.Name())
+	resolveWatchdog := teamsServiceWSLResolveTaskPowerShell(b.watchdogName())
 	switch action {
 	case "enable":
-		return teamsServiceRunPowerShell(ctx, resolve+"Enable-ScheduledTask -TaskName $taskName | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolve+"Enable-ScheduledTask -TaskName $taskName | Out-Null; "+resolveWatchdog+"Enable-ScheduledTask -TaskName $taskName | Out-Null")
 	case "disable":
-		return teamsServiceRunPowerShell(ctx, resolve+"Disable-ScheduledTask -TaskName $taskName | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"Disable-ScheduledTask -TaskName $taskName | Out-Null; "+resolve+"Disable-ScheduledTask -TaskName $taskName | Out-Null")
 	case "status":
 		runLogChild := powershellSingleQuote("codex-helper\\teams\\" + teamsServiceWSLTaskRunLogName(b.Name()))
-		data, err := teamsServiceRunPowerShell(ctx, resolve+"$info = Get-ScheduledTaskInfo -TaskName $taskName; $runLog = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+runLogChild+"; if ($task.TaskName -ne "+powershellSingleQuote(b.Name())+") { 'ResolvedLegacyTaskName : ' + $task.TaskName }; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; 'RunLog : ' + $runLog")
+		watchdogLogChild := powershellSingleQuote("codex-helper\\teams\\" + teamsServiceWSLTaskRunLogName(b.watchdogName()))
+		data, err := teamsServiceRunPowerShell(ctx, resolve+"$info = Get-ScheduledTaskInfo -TaskName $taskName; $runLog = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+runLogChild+"; if ($task.TaskName -ne "+powershellSingleQuote(b.Name())+") { 'ResolvedLegacyTaskName : ' + $task.TaskName }; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; 'RunLog : ' + $runLog; "+resolveWatchdog+"$watchdogInfo = Get-ScheduledTaskInfo -TaskName $taskName; $watchdogRunLog = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+watchdogLogChild+"; $task | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime; 'WatchdogRunLog : ' + $watchdogRunLog")
 		if err == nil {
 			return data, nil
 		}
@@ -1277,11 +1507,11 @@ func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action strin
 		}
 		return data, err
 	case "start":
-		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell())
+		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"Start-ScheduledTask -TaskName $taskName | Out-Null")
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName")
+		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+resolve+"Stop-ScheduledTask -TaskName $taskName")
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell())
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"Start-ScheduledTask -TaskName $taskName | Out-Null")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for WSL Task Scheduler: %s", action)
 	}
@@ -1301,6 +1531,26 @@ func (b teamsServiceWSLWindowsTaskBackend) Active(ctx context.Context) (bool, er
 		return false, nil
 	}
 	return true, nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) RunPrimary(ctx context.Context, action string) ([]byte, error) {
+	resolve := teamsServiceWSLResolveTaskPowerShell(b.Name())
+	switch action {
+	case "enable":
+		return teamsServiceRunPowerShell(ctx, resolve+"Enable-ScheduledTask -TaskName $taskName | Out-Null")
+	case "disable":
+		return teamsServiceRunPowerShell(ctx, resolve+"Disable-ScheduledTask -TaskName $taskName | Out-Null")
+	case "status":
+		return teamsServiceRunPowerShell(ctx, resolve+"$info = Get-ScheduledTaskInfo -TaskName $taskName; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
+	case "start":
+		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell())
+	case "stop":
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName")
+	case "restart":
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell())
+	default:
+		return nil, fmt.Errorf("unsupported primary Teams service action for WSL Task Scheduler: %s", action)
+	}
 }
 
 func teamsServiceRunSystemctl(ctx context.Context, args ...string) ([]byte, error) {
@@ -1324,6 +1574,20 @@ func teamsServiceRunLaunchctl(ctx context.Context, args ...string) ([]byte, erro
 		return nil, fmt.Errorf("launchctl %s failed: %w", strings.Join(args, " "), err)
 	}
 	return data, nil
+}
+
+func appendLaunchctlOutput(chunks ...[]byte) []byte {
+	var out []byte
+	for _, data := range chunks {
+		if len(data) == 0 {
+			continue
+		}
+		out = append(out, data...)
+		if !bytes.HasSuffix(out, []byte("\n")) {
+			out = append(out, '\n')
+		}
+	}
+	return out
 }
 
 func teamsServiceRunPowerShell(ctx context.Context, command string) ([]byte, error) {
@@ -1676,14 +1940,35 @@ func sortedEnvironmentKeys(env map[string]string) []string {
 	return keys
 }
 
-func buildTeamsServiceUnit(spec teamsServiceSpec) string {
+func buildTeamsServiceRunArgs(spec teamsServiceSpec) []string {
 	args := []string{
-		systemdQuoteArg(spec.Executable),
 		"teams",
 		"run",
+		"--owner-stale-after",
+		teamsServiceRunOwnerStaleAfter.String(),
 	}
 	if spec.RegistryPath != "" {
-		args = append(args, "--registry", systemdQuoteArg(spec.RegistryPath))
+		args = append(args, "--registry", spec.RegistryPath)
+	}
+	return args
+}
+
+func buildTeamsServiceWatchdogArgs() []string {
+	return []string{
+		"teams",
+		"service",
+		"watchdog",
+		"--loop",
+		"--interval",
+		teamsServiceExternalWatchdogInterval.String(),
+		"--quiet",
+	}
+}
+
+func buildTeamsServiceUnit(spec teamsServiceSpec) string {
+	args := []string{systemdQuoteArg(spec.Executable)}
+	for _, arg := range buildTeamsServiceRunArgs(spec) {
+		args = append(args, systemdQuoteArg(arg))
 	}
 	execStart := strings.Join(args, " ")
 
@@ -1712,11 +1997,56 @@ func buildTeamsServiceUnit(spec teamsServiceSpec) string {
 	return b.String()
 }
 
-func buildTeamsServiceLaunchAgentPlist(spec teamsServiceSpec) string {
-	args := []string{spec.Executable, "teams", "run"}
-	if spec.RegistryPath != "" {
-		args = append(args, "--registry", spec.RegistryPath)
+func buildTeamsServiceWatchdogUnit(spec teamsServiceSpec) string {
+	args := []string{systemdQuoteArg(spec.Executable)}
+	for _, arg := range buildTeamsServiceWatchdogArgs() {
+		args = append(args, systemdQuoteArg(arg))
 	}
+	execStart := strings.Join(args, " ")
+	var b strings.Builder
+	b.WriteString("[Unit]\n")
+	b.WriteString("Description=Codex Helper Teams service watchdog\n")
+	b.WriteString("\n")
+	b.WriteString("[Service]\n")
+	b.WriteString("Type=simple\n")
+	b.WriteString("WorkingDirectory=")
+	b.WriteString(systemdQuoteArg(spec.WorkingDir))
+	b.WriteString("\n")
+	b.WriteString("ExecStart=")
+	b.WriteString(execStart)
+	b.WriteString("\n")
+	b.WriteString("Restart=on-failure\n")
+	b.WriteString("RestartSec=10s\n")
+	for _, key := range sortedEnvironmentKeys(spec.Environment) {
+		b.WriteString("Environment=")
+		b.WriteString(systemdQuoteArg(key + "=" + spec.Environment[key]))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	b.WriteString("[Install]\n")
+	b.WriteString("WantedBy=default.target\n")
+	return b.String()
+}
+
+func buildTeamsServiceWatchdogTimer() string {
+	var b strings.Builder
+	b.WriteString("[Unit]\n")
+	b.WriteString("Description=Codex Helper Teams service watchdog timer\n")
+	b.WriteString("\n")
+	b.WriteString("[Timer]\n")
+	b.WriteString("OnBootSec=30s\n")
+	b.WriteString("OnUnitActiveSec=1min\n")
+	b.WriteString("AccuracySec=30s\n")
+	b.WriteString("Persistent=true\n")
+	b.WriteString("Unit=" + teamsServiceWatchdogUnitName + "\n")
+	b.WriteString("\n")
+	b.WriteString("[Install]\n")
+	b.WriteString("WantedBy=timers.target\n")
+	return b.String()
+}
+
+func buildTeamsServiceLaunchAgentPlist(spec teamsServiceSpec) string {
+	args := append([]string{spec.Executable}, buildTeamsServiceRunArgs(spec)...)
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	b.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
@@ -1744,11 +2074,37 @@ func buildTeamsServiceLaunchAgentPlist(spec teamsServiceSpec) string {
 	return b.String()
 }
 
-func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
-	args := []string{"teams", "run"}
-	if spec.RegistryPath != "" {
-		args = append(args, "--registry", spec.RegistryPath)
+func buildTeamsServiceWatchdogLaunchAgentPlist(spec teamsServiceSpec) string {
+	args := append([]string{spec.Executable}, buildTeamsServiceWatchdogArgs()...)
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
+	b.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
+	b.WriteString(`<plist version="1.0">` + "\n")
+	b.WriteString("<dict>\n")
+	b.WriteString("\t<key>Label</key>\n\t<string>" + xmlEscape(teamsServiceLaunchAgentWatchdogLabel) + "</string>\n")
+	b.WriteString("\t<key>Disabled</key>\n\t<true/>\n")
+	b.WriteString("\t<key>ProgramArguments</key>\n\t<array>\n")
+	for _, arg := range args {
+		b.WriteString("\t\t<string>" + xmlEscape(arg) + "</string>\n")
 	}
+	b.WriteString("\t</array>\n")
+	b.WriteString("\t<key>WorkingDirectory</key>\n\t<string>" + xmlEscape(spec.WorkingDir) + "</string>\n")
+	b.WriteString("\t<key>RunAtLoad</key>\n\t<true/>\n")
+	b.WriteString("\t<key>KeepAlive</key>\n\t<dict>\n")
+	b.WriteString("\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n")
+	b.WriteString("\t</dict>\n")
+	b.WriteString("\t<key>EnvironmentVariables</key>\n\t<dict>\n")
+	for _, key := range sortedEnvironmentKeys(spec.Environment) {
+		b.WriteString("\t\t<key>" + xmlEscape(key) + "</key>\n\t\t<string>" + xmlEscape(spec.Environment[key]) + "</string>\n")
+	}
+	b.WriteString("\t</dict>\n")
+	b.WriteString("</dict>\n")
+	b.WriteString("</plist>\n")
+	return b.String()
+}
+
+func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
+	args := buildTeamsServiceRunArgs(spec)
 	command := spec.Executable
 	arguments := windowsCommandLine(args)
 	if len(spec.Environment) > 0 {
@@ -1779,6 +2135,68 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n")
 	b.WriteString("    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n")
 	b.WriteString("    <AllowHardTerminate>true</AllowHardTerminate>\n")
+	b.WriteString("    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n")
+	b.WriteString("    <StartWhenAvailable>true</StartWhenAvailable>\n")
+	b.WriteString("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n")
+	b.WriteString("    <Enabled>false</Enabled>\n")
+	b.WriteString("    <RestartOnFailure>\n")
+	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskRestartInterval) + "S</Interval>\n")
+	b.WriteString("      <Count>" + strconv.Itoa(teamsServiceTaskRestartCount) + "</Count>\n")
+	b.WriteString("    </RestartOnFailure>\n")
+	b.WriteString("  </Settings>\n")
+	b.WriteString("  <Actions Context=\"Author\">\n")
+	b.WriteString("    <Exec>\n")
+	b.WriteString("      <Command>" + xmlEscape(command) + "</Command>\n")
+	b.WriteString("      <Arguments>" + xmlEscape(arguments) + "</Arguments>\n")
+	b.WriteString("      <WorkingDirectory>" + xmlEscape(spec.WorkingDir) + "</WorkingDirectory>\n")
+	b.WriteString("    </Exec>\n")
+	b.WriteString("  </Actions>\n")
+	b.WriteString("</Task>\n")
+	return b.String()
+}
+
+func buildTeamsServiceWindowsWatchdogTaskXML(spec teamsServiceSpec) string {
+	args := buildTeamsServiceWatchdogArgs()
+	command := spec.Executable
+	arguments := windowsCommandLine(args)
+	if len(spec.Environment) > 0 {
+		command = "powershell.exe"
+		arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command " + windowsQuoteArg(buildTeamsServiceWindowsPowerShell(spec, args))
+	}
+	var b strings.Builder
+	b.WriteString(`<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` + "\n")
+	b.WriteString("  <RegistrationInfo>\n")
+	b.WriteString("    <Description>Codex Helper Teams service watchdog</Description>\n")
+	b.WriteString("  </RegistrationInfo>\n")
+	b.WriteString("  <Triggers>\n")
+	b.WriteString("    <LogonTrigger>\n")
+	b.WriteString("      <Enabled>true</Enabled>\n")
+	b.WriteString("    </LogonTrigger>\n")
+	b.WriteString("    <CalendarTrigger>\n")
+	b.WriteString("      <Repetition>\n")
+	b.WriteString("        <Interval>PT" + strconv.Itoa(teamsServiceExternalWatchdogMinutes) + "M</Interval>\n")
+	b.WriteString("        <Duration>P" + strconv.Itoa(teamsServiceWatchdogDays) + "D</Duration>\n")
+	b.WriteString("        <StopAtDurationEnd>false</StopAtDurationEnd>\n")
+	b.WriteString("      </Repetition>\n")
+	b.WriteString("      <StartBoundary>2026-01-01T00:00:00</StartBoundary>\n")
+	b.WriteString("      <Enabled>true</Enabled>\n")
+	b.WriteString("      <ScheduleByDay>\n")
+	b.WriteString("        <DaysInterval>1</DaysInterval>\n")
+	b.WriteString("      </ScheduleByDay>\n")
+	b.WriteString("    </CalendarTrigger>\n")
+	b.WriteString("  </Triggers>\n")
+	b.WriteString("  <Principals>\n")
+	b.WriteString("    <Principal id=\"Author\">\n")
+	b.WriteString("      <LogonType>InteractiveToken</LogonType>\n")
+	b.WriteString("      <RunLevel>LeastPrivilege</RunLevel>\n")
+	b.WriteString("    </Principal>\n")
+	b.WriteString("  </Principals>\n")
+	b.WriteString("  <Settings>\n")
+	b.WriteString("    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n")
+	b.WriteString("    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n")
+	b.WriteString("    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n")
+	b.WriteString("    <AllowHardTerminate>true</AllowHardTerminate>\n")
+	b.WriteString("    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n")
 	b.WriteString("    <StartWhenAvailable>true</StartWhenAvailable>\n")
 	b.WriteString("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n")
 	b.WriteString("    <Enabled>false</Enabled>\n")
@@ -1816,21 +2234,37 @@ func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
 	for _, key := range sortedEnvironmentKeys(spec.Environment) {
 		args = append(args, key+"="+spec.Environment[key])
 	}
-	args = append(args, spec.Executable, "teams", "run", "--auto-service=false")
+	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false")
 	if spec.RegistryPath != "" {
 		args = append(args, "--registry", spec.RegistryPath)
 	}
 	return args
 }
 
+func buildTeamsServiceWSLWatchdogArguments(spec teamsServiceSpec) []string {
+	args := buildTeamsServiceWSLArguments(spec)
+	for i := 0; i+2 < len(args); i++ {
+		if args[i] == spec.Executable && args[i+1] == "teams" && args[i+2] == "run" {
+			out := append([]string{}, args[:i]...)
+			out = append(out, spec.Executable)
+			out = append(out, buildTeamsServiceWatchdogArgs()...)
+			return out
+		}
+	}
+	out := append([]string{}, args...)
+	out = append(out, buildTeamsServiceWatchdogArgs()...)
+	return out
+}
+
 type teamsServiceWSLRegisterOptions struct {
-	ForceDisabled   bool
-	Enable          bool
-	Start           bool
-	PreserveEnabled bool
-	PreserveRunning bool
-	PrincipalUser   string
-	CleanLegacy     bool
+	ForceDisabled           bool
+	Enable                  bool
+	Start                   bool
+	PreserveEnabled         bool
+	PreserveRunning         bool
+	PrincipalUser           string
+	CleanLegacy             bool
+	WatchdogIntervalMinutes int
 }
 
 func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts teamsServiceWSLRegisterOptions) string {
@@ -1862,8 +2296,8 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 			"$expectedActionArgument = " + expectedActionArgument + "; " +
 			"$action = New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument; " +
 			"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
-			"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWatchdogMinutes) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
-			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
+			"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWSLRegisterWatchdogIntervalMinutes(opts)) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
+			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "); " +
 			"$principalUser = " + principalUser + "; " +
 			"$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited; " +
 			"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force | Out-Null; " +
@@ -1887,6 +2321,13 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 		cmd += "if ($wasRunning) { " + teamsServiceWSLStartTaskAndVerifyPowerShell() + " }"
 	}
 	return strings.TrimSpace(cmd)
+}
+
+func teamsServiceWSLRegisterWatchdogIntervalMinutes(opts teamsServiceWSLRegisterOptions) int {
+	if opts.WatchdogIntervalMinutes > 0 {
+		return opts.WatchdogIntervalMinutes
+	}
+	return teamsServiceWatchdogMinutes
 }
 
 func teamsServiceWSLStartTaskAndVerifyPowerShell() string {
@@ -2051,8 +2492,8 @@ func buildTeamsServiceWSLStartupWatchdogScript(taskName string, args []string, s
 	b.WriteString("    & wsl.exe @wslArgs *>> $runLog\r\n")
 	b.WriteString("    $code = $LASTEXITCODE\r\n")
 	b.WriteString("    if (Test-Path -LiteralPath $stopPath) { Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' stop requested after wsl.exe exited ' + $code); break }\r\n")
-	b.WriteString("    Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' wsl.exe exited ' + $code + '; restarting in 30s')\r\n")
-	b.WriteString("    Start-Sleep -Seconds 30\r\n")
+	b.WriteString("    Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' wsl.exe exited ' + $code + '; restarting in " + strconv.Itoa(teamsServiceTaskRestartInterval) + "s')\r\n")
+	b.WriteString("    Start-Sleep -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "\r\n")
 	b.WriteString("  }\r\n")
 	b.WriteString("} finally {\r\n")
 	b.WriteString("  if ($null -ne $mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() }\r\n")
@@ -2081,6 +2522,9 @@ func buildTeamsServiceWindowsPowerShell(spec teamsServiceSpec, args []string) st
 		call += " " + powershellSingleQuote(arg)
 	}
 	parts = append(parts, call)
+	parts = append(parts, "$code = $LASTEXITCODE")
+	parts = append(parts, "if ($null -eq $code) { $code = 1 }")
+	parts = append(parts, "exit $code")
 	return strings.Join(parts, "; ")
 }
 
@@ -2090,6 +2534,22 @@ func teamsServiceUnitPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, teamsServiceUnitName), nil
+}
+
+func teamsServiceWatchdogUnitPath() (string, error) {
+	dir, err := teamsServiceSystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, teamsServiceWatchdogUnitName), nil
+}
+
+func teamsServiceWatchdogTimerPath() (string, error) {
+	dir, err := teamsServiceSystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, teamsServiceWatchdogTimerName), nil
 }
 
 func defaultTeamsServiceSystemdUserDir() (string, error) {
@@ -2106,6 +2566,14 @@ func defaultTeamsServiceLaunchAgentDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, "Library", "LaunchAgents"), nil
+}
+
+func teamsServiceLaunchAgentWatchdogPath() (string, error) {
+	dir, err := teamsServiceLaunchAgentDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, teamsServiceLaunchAgentWatchdogPlistName), nil
 }
 
 func defaultTeamsServiceWindowsTaskXMLDir() (string, error) {
@@ -2227,6 +2695,10 @@ func teamsServiceLaunchctlUserTarget() string {
 
 func teamsServiceLaunchctlServiceTarget() string {
 	return teamsServiceLaunchctlUserTarget() + "/" + teamsServiceLaunchAgentLabel
+}
+
+func teamsServiceLaunchctlWatchdogTarget() string {
+	return teamsServiceLaunchctlUserTarget() + "/" + teamsServiceLaunchAgentWatchdogLabel
 }
 
 func defaultTeamsServiceIsWSL() bool {

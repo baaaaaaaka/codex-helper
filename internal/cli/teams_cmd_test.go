@@ -52,6 +52,85 @@ func TestTeamsStatusReportsLocalStateWithoutCreatingDefaultState(t *testing.T) {
 	}
 }
 
+func TestRunTeamsServiceRetryLoopRetriesRecoverableErrors(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevDelay := teamsRunServiceRetryDelay
+	prevSleep := teamsRunServiceSleep
+	t.Cleanup(func() {
+		teamsRunServiceRetryDelay = prevDelay
+		teamsRunServiceSleep = prevSleep
+	})
+	teamsRunServiceRetryDelay = 123 * time.Millisecond
+	var sleeps []time.Duration
+	teamsRunServiceSleep = func(_ context.Context, delay time.Duration) error {
+		sleeps = append(sleeps, delay)
+		return nil
+	}
+
+	attempts := 0
+	var errOut bytes.Buffer
+	err := runTeamsServiceRetryLoop(context.Background(), &errOut, func() error {
+		attempts++
+		if attempts == 1 {
+			return &teams.GraphStatusError{Method: "GET", Path: "/me", StatusCode: 502}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runTeamsServiceRetryLoop error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if len(sleeps) != 1 || sleeps[0] != 123*time.Millisecond {
+		t.Fatalf("sleeps = %v, want one 123ms sleep", sleeps)
+	}
+	if !strings.Contains(errOut.String(), "recoverable error") || !strings.Contains(errOut.String(), "retrying in 123ms") {
+		t.Fatalf("retry output mismatch:\n%s", errOut.String())
+	}
+}
+
+func TestRunTeamsServiceRetryLoopDoesNotRetryPermanentErrors(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevSleep := teamsRunServiceSleep
+	t.Cleanup(func() { teamsRunServiceSleep = prevSleep })
+	teamsRunServiceSleep = func(context.Context, time.Duration) error {
+		t.Fatal("permanent errors should not sleep or retry")
+		return nil
+	}
+
+	attempts := 0
+	permanent := fmt.Errorf("invalid Teams configuration")
+	err := runTeamsServiceRetryLoop(context.Background(), nil, func() error {
+		attempts++
+		return permanent
+	})
+	if err != permanent {
+		t.Fatalf("error = %v, want permanent error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestTeamsRunShouldRetryInProcessOnlyForServiceMode(t *testing.T) {
+	lockCLITestHooks(t)
+
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+	if teamsRunShouldRetryInProcess(false) {
+		t.Fatal("foreground teams run should not retry internally")
+	}
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	if !teamsRunShouldRetryInProcess(false) {
+		t.Fatal("background service teams run should retry recoverable errors internally")
+	}
+	if teamsRunShouldRetryInProcess(true) {
+		t.Fatal("teams run --once should not enter service retry loop")
+	}
+}
+
 func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	lockCLITestHooks(t)
 

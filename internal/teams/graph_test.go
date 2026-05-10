@@ -123,6 +123,44 @@ func TestGraphRetriesTooManyRequestsAfterRetryAfter(t *testing.T) {
 	}
 }
 
+func TestGraphStatusErrorIncludesSafeMessage(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Error(w, `{"error":{"code":"BadGateway","message":"upstream proxy timed out"}}`, http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	_, err := graph.Me(context.Background())
+	var graphErr *GraphStatusError
+	if !errors.As(err, &graphErr) {
+		t.Fatalf("Graph error = %T %v, want GraphStatusError", err, err)
+	}
+	if graphErr.Code != "BadGateway" || graphErr.Message != "upstream proxy timed out" {
+		t.Fatalf("GraphStatusError = %#v, want safe code and message", graphErr)
+	}
+	if !strings.Contains(err.Error(), "upstream proxy timed out") {
+		t.Fatalf("error string should include safe message, got %v", err)
+	}
+}
+
+func TestGraphStatusErrorDropsSensitiveMessage(t *testing.T) {
+	err := graphStatusError(http.MethodGet, "/me", &http.Response{StatusCode: http.StatusServiceUnavailable}, []byte(`{"error":{"code":"ServiceUnavailable","message":"secret bearer raw-token should not be shown"}}`))
+	var graphErr *GraphStatusError
+	if !errors.As(err, &graphErr) {
+		t.Fatalf("Graph error = %T %v, want GraphStatusError", err, err)
+	}
+	if graphErr.Code != "ServiceUnavailable" {
+		t.Fatalf("GraphStatusError code = %q, want ServiceUnavailable", graphErr.Code)
+	}
+	if graphErr.Message != "" {
+		t.Fatalf("GraphStatusError message = %q, want redacted", graphErr.Message)
+	}
+	if got := err.Error(); strings.Contains(got, "secret") || strings.Contains(got, "raw-token") || strings.Contains(got, "bearer") {
+		t.Fatalf("Graph error leaked sensitive message: %s", got)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveGraphNetworkDisconnectThenNextCallRecoversCI(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	var attempts int

@@ -9,10 +9,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/manager"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 )
 
@@ -61,7 +63,13 @@ func TestTeamsGraphHTTPClientUsesConfiguredReusableProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen reusable proxy health server: %v", err)
 	}
+	var connectSeen atomic.Bool
 	proxyServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			connectSeen.Store(true)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path != "/_codex_proxy/health" {
 			t.Fatalf("unexpected proxy probe path %s", r.URL.Path)
 		}
@@ -128,7 +136,278 @@ func TestTeamsGraphHTTPClientUsesConfiguredReusableProxy(t *testing.T) {
 	if gotURL == nil || gotURL.String() != lease.ProxyURL {
 		t.Fatalf("proxy URL = %v, want %s", gotURL, lease.ProxyURL)
 	}
+	if !connectSeen.Load() {
+		t.Fatal("reusable proxy must pass a CONNECT probe before use")
+	}
 	assertTeamsGraphTransportBounds(t, tr)
+}
+
+func TestTeamsGraphHTTPClientSkipsReusableProxyWhenConnectProbeFails(t *testing.T) {
+	lockCLITestHooks(t)
+
+	instanceID := "inst-half-broken"
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen reusable proxy health server: %v", err)
+	}
+	proxyServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			http.Error(w, "socks tunnel is unavailable", http.StatusBadGateway)
+			return
+		}
+		if r.URL.Path != "/_codex_proxy/health" {
+			t.Fatalf("unexpected proxy probe path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "instanceId": instanceID})
+	}))
+	proxyServer.Listener = ln
+	proxyServer.Start()
+	defer proxyServer.Close()
+	_, portText, err := net.SplitHostPort(proxyServer.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split proxy server addr: %v", err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatalf("parse proxy port: %v", err)
+	}
+
+	store := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles: []config.Profile{{
+			ID:        "p1",
+			Name:      "profile",
+			Host:      "example.com",
+			Port:      22,
+			User:      "alice",
+			CreatedAt: time.Now(),
+		}},
+		Instances: []config.Instance{{
+			ID:         instanceID,
+			ProfileID:  "p1",
+			Kind:       config.InstanceKindDaemon,
+			HTTPPort:   port,
+			DaemonPID:  os.Getpid(),
+			StartedAt:  time.Now(),
+			LastSeenAt: time.Now(),
+		}},
+	})
+	origTarget := teamsGraphProxyCONNECTTarget
+	t.Cleanup(func() { teamsGraphProxyCONNECTTarget = origTarget })
+	teamsGraphProxyCONNECTTarget = "graph.example.test:443"
+	origStackStart := stackStart
+	t.Cleanup(func() { stackStart = origStackStart })
+	sentinel := errors.New("fresh proxy stack requested")
+	stackStart = func(config.Profile, string, stack.Options) (*stack.Stack, error) {
+		return nil, sentinel
+	}
+
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	_, suspect, ok, err := reusableTeamsGraphProxyLease(cfg, "p1", manager.HealthClient{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("reusableTeamsGraphProxyLease: %v", err)
+	}
+	if ok {
+		t.Fatal("CONNECT-broken reusable proxy must not be reused")
+	}
+	if suspect == nil || suspect.ID != instanceID {
+		t.Fatalf("suspect = %+v, want %s", suspect, instanceID)
+	}
+
+	_, err = newTeamsGraphHTTPClientLease(context.Background(), &rootOptions{configPath: store.Path()}, nil)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("newTeamsGraphHTTPClientLease error = %v, want fresh stack sentinel", err)
+	}
+}
+
+func TestRetireTeamsGraphProxySuspectTerminatesVerifiedDaemon(t *testing.T) {
+	lockCLITestHooks(t)
+
+	inst := config.Instance{
+		ID:        "inst-stale",
+		ProfileID: "p1",
+		Kind:      config.InstanceKindDaemon,
+		HTTPPort:  18080,
+		DaemonPID: 4242,
+	}
+	store := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:   config.CurrentVersion,
+		Instances: []config.Instance{inst},
+	})
+
+	prevAlive := proxyProcessAlive
+	prevLooksLike := proxyLooksLikeProxyDaemon
+	prevCheckHTTPProxy := proxyCheckHTTPProxy
+	prevFindProcess := proxyFindProcess
+	prevTerminate := proxyTerminate
+	t.Cleanup(func() {
+		proxyProcessAlive = prevAlive
+		proxyLooksLikeProxyDaemon = prevLooksLike
+		proxyCheckHTTPProxy = prevCheckHTTPProxy
+		proxyFindProcess = prevFindProcess
+		proxyTerminate = prevTerminate
+	})
+
+	proxyProcessAlive = func(pid int) bool { return pid == inst.DaemonPID }
+	proxyLooksLikeProxyDaemon = func(pid int) (bool, error) {
+		if pid != inst.DaemonPID {
+			t.Fatalf("looks-like pid = %d, want %d", pid, inst.DaemonPID)
+		}
+		return true, nil
+	}
+	var checkedPort int
+	var checkedID string
+	proxyCheckHTTPProxy = func(_ manager.HealthClient, port int, expectedInstanceID string) error {
+		checkedPort = port
+		checkedID = expectedInstanceID
+		return nil
+	}
+	proxyFindProcess = func(pid int) (*os.Process, error) {
+		if pid != inst.DaemonPID {
+			t.Fatalf("find pid = %d, want %d", pid, inst.DaemonPID)
+		}
+		return &os.Process{Pid: pid}, nil
+	}
+	terminatedPID := 0
+	proxyTerminate = func(p *os.Process, grace time.Duration) error {
+		if p == nil {
+			t.Fatal("expected process")
+		}
+		if grace != teamsGraphProxyRetireGrace {
+			t.Fatalf("grace = %v, want %v", grace, teamsGraphProxyRetireGrace)
+		}
+		terminatedPID = p.Pid
+		return nil
+	}
+
+	if err := retireTeamsGraphProxySuspect(context.Background(), store, inst, manager.HealthClient{Timeout: time.Second}, nil); err != nil {
+		t.Fatalf("retireTeamsGraphProxySuspect: %v", err)
+	}
+	if checkedPort != inst.HTTPPort || checkedID != inst.ID {
+		t.Fatalf("health recheck = port %d id %q, want port %d id %q", checkedPort, checkedID, inst.HTTPPort, inst.ID)
+	}
+	if terminatedPID != inst.DaemonPID {
+		t.Fatalf("terminated pid = %d, want %d", terminatedPID, inst.DaemonPID)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 0 {
+		t.Fatalf("stale instance still registered: %+v", cfg.Instances)
+	}
+}
+
+func TestTeamsGraphHTTPClientLeaseRetireSuspectsDeduplicates(t *testing.T) {
+	lockCLITestHooks(t)
+
+	inst := config.Instance{
+		ID:        "inst-duplicate",
+		ProfileID: "p1",
+		Kind:      config.InstanceKindDaemon,
+		HTTPPort:  18080,
+		DaemonPID: 4242,
+	}
+	store := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:   config.CurrentVersion,
+		Instances: []config.Instance{inst},
+	})
+
+	prevAlive := proxyProcessAlive
+	prevLooksLike := proxyLooksLikeProxyDaemon
+	prevCheckHTTPProxy := proxyCheckHTTPProxy
+	prevFindProcess := proxyFindProcess
+	prevTerminate := proxyTerminate
+	t.Cleanup(func() {
+		proxyProcessAlive = prevAlive
+		proxyLooksLikeProxyDaemon = prevLooksLike
+		proxyCheckHTTPProxy = prevCheckHTTPProxy
+		proxyFindProcess = prevFindProcess
+		proxyTerminate = prevTerminate
+	})
+
+	proxyProcessAlive = func(pid int) bool { return pid == inst.DaemonPID }
+	proxyLooksLikeProxyDaemon = func(pid int) (bool, error) { return pid == inst.DaemonPID, nil }
+	proxyCheckHTTPProxy = func(manager.HealthClient, int, string) error { return nil }
+	proxyFindProcess = func(pid int) (*os.Process, error) { return &os.Process{Pid: pid}, nil }
+	terminates := 0
+	proxyTerminate = func(*os.Process, time.Duration) error {
+		terminates++
+		return nil
+	}
+
+	lease := teamsGraphHTTPClientLease{
+		store:                  store,
+		suspectReusableProxies: []config.Instance{inst, {ID: ""}, inst},
+	}
+	lease.RetireSuspects(context.Background(), nil)
+	if terminates != 1 {
+		t.Fatalf("terminates = %d, want 1", terminates)
+	}
+}
+
+func TestRetireTeamsGraphProxySuspectDoesNotTerminateUnverifiedProcess(t *testing.T) {
+	lockCLITestHooks(t)
+
+	inst := config.Instance{
+		ID:        "inst-unverified",
+		ProfileID: "p1",
+		Kind:      config.InstanceKindDaemon,
+		HTTPPort:  18080,
+		DaemonPID: 4242,
+	}
+	store := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:   config.CurrentVersion,
+		Instances: []config.Instance{inst},
+	})
+
+	prevAlive := proxyProcessAlive
+	prevLooksLike := proxyLooksLikeProxyDaemon
+	prevCheckHTTPProxy := proxyCheckHTTPProxy
+	prevFindProcess := proxyFindProcess
+	prevTerminate := proxyTerminate
+	t.Cleanup(func() {
+		proxyProcessAlive = prevAlive
+		proxyLooksLikeProxyDaemon = prevLooksLike
+		proxyCheckHTTPProxy = prevCheckHTTPProxy
+		proxyFindProcess = prevFindProcess
+		proxyTerminate = prevTerminate
+	})
+
+	proxyProcessAlive = func(pid int) bool { return pid == inst.DaemonPID }
+	proxyLooksLikeProxyDaemon = func(pid int) (bool, error) {
+		if pid != inst.DaemonPID {
+			t.Fatalf("looks-like pid = %d, want %d", pid, inst.DaemonPID)
+		}
+		return false, nil
+	}
+	proxyCheckHTTPProxy = func(manager.HealthClient, int, string) error {
+		t.Fatal("health recheck must not run for an unverified process")
+		return nil
+	}
+	proxyFindProcess = func(int) (*os.Process, error) {
+		t.Fatal("find process must not run for an unverified process")
+		return nil, nil
+	}
+	proxyTerminate = func(*os.Process, time.Duration) error {
+		t.Fatal("terminate must not run for an unverified process")
+		return nil
+	}
+
+	if err := retireTeamsGraphProxySuspect(context.Background(), store, inst, manager.HealthClient{Timeout: time.Second}, nil); err != nil {
+		t.Fatalf("retireTeamsGraphProxySuspect: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 0 {
+		t.Fatalf("unverified stale instance should be unregistered: %+v", cfg.Instances)
+	}
 }
 
 func TestTeamsGraphHTTPClientTransportBoundsIdleConnections(t *testing.T) {

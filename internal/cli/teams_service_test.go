@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -98,7 +100,7 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		"[Unit]",
 		"Description=Codex Helper Teams bridge",
 		"WorkingDirectory=" + strconv.Quote(cwd),
-		"ExecStart=" + strconv.Quote(exePath) + " teams run --registry " + strconv.Quote(registryPath),
+		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 18s --registry " + strconv.Quote(registryPath),
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"Environment=NO_COLOR=1",
@@ -432,15 +434,19 @@ func TestTeamsServiceSystemctlSubcommandsUseUserService(t *testing.T) {
 	})
 
 	for _, tc := range []struct {
-		name string
-		args []string
+		name      string
+		wantCalls []teamsServiceCommandCall
 	}{
-		{name: "enable", args: []string{"--user", "enable", teamsServiceUnitName}},
-		{name: "disable", args: []string{"--user", "disable", teamsServiceUnitName}},
-		{name: "status", args: []string{"--user", "status", "--no-pager", teamsServiceUnitName}},
-		{name: "start", args: []string{"--user", "start", teamsServiceUnitName}},
-		{name: "stop", args: []string{"--user", "stop", teamsServiceUnitName}},
-		{name: "restart", args: []string{"--user", "restart", teamsServiceUnitName}},
+		{name: "enable", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "enable", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
+		{name: "disable", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "disable", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
+		{name: "status", wantCalls: []teamsServiceCommandCall{
+			{name: "systemctl", args: []string{"--user", "status", "--no-pager", teamsServiceUnitName}},
+			{name: "systemctl", args: []string{"--user", "status", "--no-pager", teamsServiceWatchdogUnitName}},
+			{name: "systemctl", args: []string{"--user", "status", "--no-pager", teamsServiceWatchdogTimerName}},
+		}},
+		{name: "start", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "start", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
+		{name: "stop", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "stop", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
+		{name: "restart", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "restart", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
 	} {
 		runner.calls = nil
 		cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
@@ -450,9 +456,8 @@ func TestTeamsServiceSystemctlSubcommandsUseUserService(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("execute service %s: %v", tc.name, err)
 		}
-		wantCalls := []teamsServiceCommandCall{{name: "systemctl", args: tc.args}}
-		if !reflect.DeepEqual(runner.calls, wantCalls) {
-			t.Fatalf("%s calls = %#v, want %#v", tc.name, runner.calls, wantCalls)
+		if !reflect.DeepEqual(runner.calls, tc.wantCalls) {
+			t.Fatalf("%s calls = %#v, want %#v", tc.name, runner.calls, tc.wantCalls)
 		}
 		if tc.name == "status" && !strings.Contains(out.String(), "active") {
 			t.Fatalf("status should print systemctl output:\n%s", out.String())
@@ -563,6 +568,8 @@ func TestTeamsServiceInstallWritesMacOSLaunchAgentPlist(t *testing.T) {
 		"<string>" + exePath + "</string>",
 		"<string>teams</string>",
 		"<string>run</string>",
+		"<string>--owner-stale-after</string>",
+		"<string>18s</string>",
 		"<string>--registry</string>",
 		"<string>" + registryPath + "</string>",
 		"<key>KeepAlive</key>",
@@ -577,6 +584,29 @@ func TestTeamsServiceInstallWritesMacOSLaunchAgentPlist(t *testing.T) {
 	if len(runner.calls) != 0 {
 		t.Fatalf("install should only write plist, calls=%#v", runner.calls)
 	}
+	watchdogPlistPath := filepath.Join(agentDir, teamsServiceLaunchAgentWatchdogPlistName)
+	watchdogData, err := os.ReadFile(watchdogPlistPath)
+	if err != nil {
+		t.Fatalf("read watchdog plist: %v", err)
+	}
+	watchdogPlist := string(watchdogData)
+	for _, want := range []string{
+		"<string>" + teamsServiceLaunchAgentWatchdogLabel + "</string>",
+		"<string>teams</string>",
+		"<string>service</string>",
+		"<string>watchdog</string>",
+		"<string>--loop</string>",
+		"<string>--interval</string>",
+		"<string>10s</string>",
+		"<string>--quiet</string>",
+		"<key>KeepAlive</key>",
+		"<key>SuccessfulExit</key>",
+		"<false/>",
+	} {
+		if !strings.Contains(watchdogPlist, want) {
+			t.Fatalf("watchdog plist missing %q:\n%s", want, watchdogPlist)
+		}
+	}
 
 	runner.calls = nil
 	cmd = newTeamsServiceCmd(&rootOptions{}, &registryPath)
@@ -587,6 +617,9 @@ func TestTeamsServiceInstallWritesMacOSLaunchAgentPlist(t *testing.T) {
 	wantCalls := []teamsServiceCommandCall{{
 		name: "launchctl",
 		args: []string{"bootstrap", "gui/501", plistPath},
+	}, {
+		name: "launchctl",
+		args: []string{"bootstrap", "gui/501", watchdogPlistPath},
 	}}
 	if !reflect.DeepEqual(runner.calls, wantCalls) {
 		t.Fatalf("launchctl start calls = %#v, want %#v", runner.calls, wantCalls)
@@ -626,10 +659,13 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<LogonType>InteractiveToken</LogonType>",
 		"<RunLevel>LeastPrivilege</RunLevel>",
 		"<Enabled>false</Enabled>",
+		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<Command>powershell.exe</Command>",
 		"-WindowStyle Hidden",
 		"<WorkingDirectory>" + cwd + "</WorkingDirectory>",
-		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;run&apos; &apos;--registry&apos; &apos;` + registryPath + `&apos;`,
+		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;run&apos; &apos;--owner-stale-after&apos; &apos;18s&apos; &apos;--registry&apos; &apos;` + registryPath + `&apos;`,
+		`$code = $LASTEXITCODE`,
+		`exit $code`,
 		`$env:CODEX_HELPER_TEAMS_SERVICE = &apos;1&apos;`,
 		"<RestartOnFailure>",
 		"<Count>999</Count>",
@@ -638,8 +674,32 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 			t.Fatalf("task xml missing %q:\n%s", want, taskXML)
 		}
 	}
+	watchdogXMLPath := filepath.Join(xmlDir, teamsServiceWindowsWatchdogTaskXMLName)
+	watchdogData, err := os.ReadFile(watchdogXMLPath)
+	if err != nil {
+		t.Fatalf("read watchdog task xml: %v", err)
+	}
+	watchdogXML := string(watchdogData)
+	for _, want := range []string{
+		"<Description>Codex Helper Teams service watchdog</Description>",
+		"<CalendarTrigger>",
+		"<Interval>PT1M</Interval>",
+		"<RestartOnFailure>",
+		"<Interval>PT10S</Interval>",
+		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+		"<Command>powershell.exe</Command>",
+		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;service&apos; &apos;watchdog&apos; &apos;--loop&apos; &apos;--interval&apos; &apos;10s&apos; &apos;--quiet&apos;`,
+		`$env:CODEX_HELPER_TEAMS_SERVICE = &apos;1&apos;`,
+	} {
+		if !strings.Contains(watchdogXML, want) {
+			t.Fatalf("watchdog task xml missing %q:\n%s", want, watchdogXML)
+		}
+	}
 	if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" || !strings.Contains(strings.Join(runner.calls[0].args, " "), "Register-ScheduledTask") {
 		t.Fatalf("install should register task with powershell, calls=%#v", runner.calls)
+	}
+	if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, teamsServiceWindowsWatchdogTaskName) {
+		t.Fatalf("install should register watchdog task too, call=%s", joined)
 	}
 	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Start-ScheduledTask", "Enable-ScheduledTask")
 
@@ -651,6 +711,45 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 	}
 	if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" || !strings.Contains(strings.Join(runner.calls[0].args, " "), "Enable-ScheduledTask") {
 		t.Fatalf("enable should call powershell scheduled task command, calls=%#v", runner.calls)
+	}
+	if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, teamsServiceWindowsTaskName) || !strings.Contains(joined, teamsServiceWindowsWatchdogTaskName) {
+		t.Fatalf("enable should include main and watchdog tasks, call=%s", joined)
+	}
+}
+
+func TestTeamsServiceWindowsPowerShellPropagatesChildExitCodeCI(t *testing.T) {
+	shell, err := exec.LookPath("pwsh")
+	if err != nil {
+		shell, err = exec.LookPath("powershell.exe")
+	}
+	if err != nil {
+		t.Skip("PowerShell is not available")
+	}
+
+	tmp := t.TempDir()
+	child := filepath.Join(tmp, "exit-37")
+	if runtime.GOOS == "windows" {
+		child += ".cmd"
+		if err := os.WriteFile(child, []byte("@exit /b 37\r\n"), 0o700); err != nil {
+			t.Fatalf("write child command: %v", err)
+		}
+	} else {
+		if err := os.WriteFile(child, []byte("#!/bin/sh\nexit 37\n"), 0o700); err != nil {
+			t.Fatalf("write child command: %v", err)
+		}
+	}
+	script := buildTeamsServiceWindowsPowerShell(teamsServiceSpec{
+		Executable:  child,
+		Environment: map[string]string{"CODEX_HELPER_TEAMS_SERVICE": "1"},
+	}, []string{"teams", "run"})
+	cmd := exec.Command(shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	err = cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("PowerShell error = %T %v, want exit error", err, err)
+	}
+	if got := exitErr.ExitCode(); got != 37 {
+		t.Fatalf("PowerShell exit code = %d, want child exit code 37", got)
 	}
 }
 
@@ -1095,7 +1194,7 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex-home"),
-		wantExe + " teams run --auto-service=false --registry",
+		wantExe + " teams run --owner-stale-after 18s --auto-service=false --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {

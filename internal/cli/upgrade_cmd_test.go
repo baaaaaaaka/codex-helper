@@ -210,9 +210,8 @@ func isolateUpgradeTeamsStateForTest(t *testing.T, tmp string) {
 
 func TestUpgradeCmdDrainsLiveTeamsOwnerBeforeUpdate(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
 
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval
@@ -279,9 +278,8 @@ func TestUpgradeCmdDrainsLiveTeamsOwnerBeforeUpdate(t *testing.T) {
 
 func TestUpgradeCmdDrainsScopedTeamsStateBeforeUpdate(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
 
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval

@@ -148,7 +148,10 @@ func TestSupportedReferenceAttachmentHonorsConfiguredSharePointAllowlist(t *test
 }
 
 func TestDownloadReferenceFileAttachmentsRequiresFileScope(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "openid profile offline_access User.Read Chat.Read")
+	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", filepath.Join(tmp, "read-token.json"))
 	bridge := &Bridge{}
 	files, cleanup, message, err := bridge.downloadReferenceFileAttachments(context.Background(), &Session{ID: "s001"}, ChatMessage{
 		Attachments: []MessageAttachment{{

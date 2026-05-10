@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,14 +22,17 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	xhtml "golang.org/x/net/html"
 )
 
 const (
-	pollCursorOverlap         = 2 * time.Minute
-	fastPollInterval          = time.Second
-	fastPollDuration          = 90 * time.Second
-	transcriptSyncMinInterval = 30 * time.Second
-	dashboardProjectsCacheTTL = 30 * time.Second
+	pollCursorOverlap                    = 2 * time.Minute
+	fastPollInterval                     = time.Second
+	fastPollDuration                     = 90 * time.Second
+	transcriptSyncMinInterval            = 30 * time.Second
+	dashboardProjectsCacheTTL            = 30 * time.Second
+	persistentPollFailureRestartAfter    = 10 * time.Minute
+	persistentPollFailureRestartMinCount = 3
 
 	// Automatic transcript sync is for small local Codex CLI catch-up. Large
 	// history import must stay explicit, otherwise helper startup can flood a
@@ -167,49 +171,71 @@ type HelperAutoUpdateApplyResult struct {
 	RestartRequired bool
 }
 
+type PersistentPollFailureError struct {
+	Since time.Time
+	Count int
+	Err   error
+}
+
+func (e *PersistentPollFailureError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("persistent Teams poll failure since %s (%d consecutive network/proxy failures); requesting Teams listener restart: %v", e.Since.Format(time.RFC3339), e.Count, e.Err)
+}
+
+func (e *PersistentPollFailureError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type Bridge struct {
-	graph                      *GraphClient
-	readGraph                  *GraphClient
-	fileGraph                  *GraphClient
-	httpClient                 *http.Client
-	registryPath               string
-	reg                        Registry
-	regMu                      sync.Mutex
-	user                       User
-	scope                      teamstore.ScopeIdentity
-	machine                    teamstore.MachineRecord
-	lease                      teamstore.ControlLease
-	leaseDuration              time.Duration
-	out                        io.Writer
-	executor                   Executor
-	controlFallbackExecutor    Executor
-	controlFallbackModel       string
-	helperRestarter            HelperRestarter
-	helperReloader             HelperReloader
-	helperAutoUpdater          HelperAutoUpdater
-	helperVersion              string
-	helperAutoUpdatePrerelease bool
-	codexUpgrader              CodexUpgrader
-	store                      *teamstore.Store
-	asyncTurns                 bool
-	ownerMu                    sync.Mutex
-	owner                      teamstore.OwnerMetadata
-	ownerStaleAfter            time.Duration
-	ownerHeartbeatInterval     time.Duration
-	pollMu                     sync.Mutex
-	fastPollUntil              time.Time
-	lastPollErrorLog           string
-	lastPollErrorLogAt         time.Time
-	lastTranscriptSync         time.Time
-	maxWorkChatPollsPerCycle   int
-	dashboardProjectsMu        sync.Mutex
-	dashboardProjectsCache     []codexhistory.Project
-	dashboardProjectsCachedAt  time.Time
-	annotateUserMessages       bool
-	annotationDisabled         bool
-	annotationWarned           bool
-	runningTurnMu              sync.Mutex
-	runningTurnCancels         map[string]*runningTurnCancel
+	graph                        *GraphClient
+	readGraph                    *GraphClient
+	fileGraph                    *GraphClient
+	httpClient                   *http.Client
+	registryPath                 string
+	reg                          Registry
+	regMu                        sync.Mutex
+	user                         User
+	scope                        teamstore.ScopeIdentity
+	machine                      teamstore.MachineRecord
+	lease                        teamstore.ControlLease
+	leaseDuration                time.Duration
+	out                          io.Writer
+	executor                     Executor
+	controlFallbackExecutor      Executor
+	controlFallbackModel         string
+	helperRestarter              HelperRestarter
+	helperReloader               HelperReloader
+	helperAutoUpdater            HelperAutoUpdater
+	helperVersion                string
+	helperAutoUpdatePrerelease   bool
+	codexUpgrader                CodexUpgrader
+	store                        *teamstore.Store
+	asyncTurns                   bool
+	ownerMu                      sync.Mutex
+	owner                        teamstore.OwnerMetadata
+	ownerStaleAfter              time.Duration
+	ownerHeartbeatInterval       time.Duration
+	pollMu                       sync.Mutex
+	fastPollUntil                time.Time
+	lastPollErrorLog             string
+	lastPollErrorLogAt           time.Time
+	persistentPollFailureFirstAt time.Time
+	persistentPollFailureCount   int
+	lastTranscriptSync           time.Time
+	maxWorkChatPollsPerCycle     int
+	dashboardProjectsMu          sync.Mutex
+	dashboardProjectsCache       []codexhistory.Project
+	dashboardProjectsCachedAt    time.Time
+	annotateUserMessages         bool
+	annotationDisabled           bool
+	annotationWarned             bool
+	runningTurnMu                sync.Mutex
+	runningTurnCancels           map[string]*runningTurnCancel
 }
 
 type runningTurnCancel struct {
@@ -542,6 +568,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 					_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", err)
 				}
 			}
+			if restartErr := b.notePollFailure(err, time.Now()); restartErr != nil {
+				return restartErr
+			}
 		}
 		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
@@ -784,6 +813,9 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		if err != nil {
 			return false, err
 		}
+		if role == inboundPollRoleControl {
+			b.notePollSuccess(time.Now())
+		}
 		err = b.scheduleChatAfterPoll(ctx, chatID, role, running, updated, time.Time{})
 		return false, err
 	}
@@ -831,6 +863,9 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 	updated, err := b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), continuationPath)
 	if err != nil {
 		return handled, err
+	}
+	if role == inboundPollRoleControl {
+		b.notePollSuccess(time.Now())
 	}
 	if handled && activityAt.IsZero() {
 		activityAt = time.Now()
@@ -995,6 +1030,103 @@ func (b *Bridge) shouldLogPollError(err error, now time.Time) bool {
 	b.lastPollErrorLog = text
 	b.lastPollErrorLogAt = now
 	return true
+}
+
+func (b *Bridge) notePollSuccess(now time.Time) {
+	if b == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.pollMu.Lock()
+	b.persistentPollFailureFirstAt = time.Time{}
+	b.persistentPollFailureCount = 0
+	b.pollMu.Unlock()
+}
+
+func (b *Bridge) notePollFailure(err error, now time.Time) error {
+	if b == nil || err == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !isPersistentPollFailureCandidate(err) {
+		b.notePollSuccess(now)
+		return nil
+	}
+	b.pollMu.Lock()
+	defer b.pollMu.Unlock()
+	if b.persistentPollFailureFirstAt.IsZero() {
+		b.persistentPollFailureFirstAt = now
+	}
+	b.persistentPollFailureCount++
+	if b.persistentPollFailureCount < persistentPollFailureRestartMinCount {
+		return nil
+	}
+	if now.Sub(b.persistentPollFailureFirstAt) < persistentPollFailureRestartAfter {
+		return nil
+	}
+	return &PersistentPollFailureError{
+		Since: b.persistentPollFailureFirstAt,
+		Count: b.persistentPollFailureCount,
+		Err:   err,
+	}
+}
+
+func IsRecoverablePollFailure(err error) bool {
+	return isPersistentPollFailureCandidate(err)
+}
+
+func isPersistentPollFailureCandidate(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsTemporaryAuthError(err) {
+		return true
+	}
+	var graphErr *GraphStatusError
+	if errors.As(err, &graphErr) {
+		switch graphErr.StatusCode {
+		case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	if lower == "" {
+		return false
+	}
+	for _, token := range []string{
+		"bad gateway",
+		"client.timeout exceeded",
+		"connection refused",
+		"connection reset",
+		"connection reset by peer",
+		"gateway timeout",
+		"i/o timeout",
+		"network is unreachable",
+		"no such host",
+		"proxyconnect",
+		"socks connect",
+		"temporary failure",
+		"tls handshake timeout",
+		"unexpected eof",
+	} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func runningPollSessions(state teamstore.State) map[string]bool {
@@ -1909,6 +2041,7 @@ func (b *Bridge) workflowWebhookFromControl(ctx context.Context, msg ChatMessage
 	if arg == "" {
 		return b.sendControl(ctx, workflowWebhookControlHelpText())
 	}
+	arg = workflowWebhookURLFromControlMessage(msg, arg)
 	if !safeWorkflowWebhookURL(arg) {
 		return b.sendControl(ctx, "⚠️ Workflow webhook URL was not saved.\n\nSend an absolute `https://...` Teams Workflow webhook URL, for example:\n`helper webhook https://...`")
 	}
@@ -1960,29 +2093,78 @@ func (b *Bridge) workflowWebhookControlSetupText() string {
 	if b.reg.ControlChatID != "" {
 		controlHint += "\nChat ID: `" + b.reg.ControlChatID + "`"
 	}
-	powerAutomateURL := "https://make.powerautomate.com/"
-	guideURL := "https://support.microsoft.com/en-us/office/send-messages-in-teams-using-incoming-webhooks-323660ec-12ca-40b1-a1d3-a3df47e808c4"
+	guideURL := "https://support.microsoft.com/en-us/office/create-incoming-webhooks-with-workflows-for-microsoft-teams-8ae491c7-0394-4861-ba59-055e33f75498"
 	return strings.Join([]string{
 		"## 🔔 Workflow webhook setup",
 		"",
 		"Use this to send notification cards when Codex finishes, reloads, restarts, or needs your attention.",
 		"",
-		"Step 1: Open [Power Automate](" + powerAutomateURL + ")",
-		"Create a Teams Workflow for incoming webhook alerts.",
+		"Step 1: Open Workflows here",
+		"In this Control chat, click the `+` button at the lower right of the message box, then choose `Workflow`.",
 		"",
-		"Step 2: Choose the target chat",
+		"Step 2: Pick exactly this Workflow template",
+		"Search `webhook`, then choose exactly: **Send webhook alerts to a chat**",
+		"",
+		"Step 3: Confirm the target chat",
+		"Keep the target set to this Control chat:",
 		controlHint,
 		"",
-		"Step 3: Save the workflow",
-		"After saving, Power Automate will show a webhook URL. Copy it.",
+		"Step 4: Create the Workflow and copy the URL",
+		"Click `Next` / `Add workflow`. Teams will show a webhook URL; copy it.",
 		"",
-		"Step 4: Send this here",
+		"Step 5: Send this here",
 		"`helper webhook <paste-url>`",
+		"If Teams turns the pasted URL into a shortened hyperlink, the helper will read the actual hyperlink target.",
 		"",
 		"Need the Microsoft walkthrough? Open [Teams webhook setup guide](" + guideURL + ").",
 		"",
 		"Note: Microsoft does not provide a reliable one-click link that pre-fills every workflow field and returns the generated webhook URL.",
 	}, "\n")
+}
+
+func workflowWebhookURLFromControlMessage(msg ChatMessage, arg string) string {
+	arg = strings.TrimSpace(arg)
+	if !strings.Contains(strings.ToLower(arg), "http") {
+		return arg
+	}
+	for _, href := range safeWorkflowWebhookHrefsFromTeamsHTML(msg.Body.Content) {
+		return href
+	}
+	return arg
+}
+
+func safeWorkflowWebhookHrefsFromTeamsHTML(content string) []string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	root, err := xhtml.Parse(strings.NewReader("<html><body>" + content + "</body></html>"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.EqualFold(n.Data, "a") {
+			for _, attr := range n.Attr {
+				if strings.EqualFold(attr.Key, "href") {
+					href := strings.TrimSpace(attr.Val)
+					if safeWorkflowWebhookURL(href) {
+						out = append(out, href)
+					}
+					break
+				}
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return out
 }
 
 func (b *Bridge) workflowWebhookControlStatus(ctx context.Context) string {

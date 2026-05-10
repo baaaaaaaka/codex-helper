@@ -1147,6 +1147,7 @@ func graphStatusError(method string, path string, resp *http.Response, raw []byt
 		Path:       path,
 		StatusCode: resp.StatusCode,
 		Code:       safeGraphErrorCode(raw),
+		Message:    safeGraphErrorMessage(raw),
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		err.RetryAfter = retryAfter(resp.Header.Get("Retry-After"))
@@ -1188,12 +1189,34 @@ func safeGraphErrorMessage(raw []byte) string {
 	if message == "" || len(message) > 240 {
 		return ""
 	}
+	if graphErrorMessageLooksSensitive(message) {
+		return ""
+	}
 	for _, r := range message {
 		if r < 0x20 || r == '<' || r == '>' {
 			return ""
 		}
 	}
 	return message
+}
+
+func graphErrorMessageLooksSensitive(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{
+		"authorization",
+		"bearer",
+		"client_secret",
+		"cookie",
+		"password",
+		"raw-token",
+		"secret",
+		"token",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func allowedGraphQuery(path string) (url.Values, bool) {
