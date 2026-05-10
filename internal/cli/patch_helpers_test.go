@@ -830,6 +830,20 @@ func TestCodexYoloLaunchArgsKeepsNonWindowsArgsUnchanged(t *testing.T) {
 	requireStringSlice(t, got, want)
 }
 
+func TestCodexYoloLaunchArgsCanForceFileAuthStore(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	withCodexYoloRuntimeGOOS(t, "linux")
+	dir := t.TempDir()
+	script := writeProbeScript(t, dir, "codex",
+		"#!/bin/sh\necho 'usage codex --dangerously-bypass-approvals-and-sandbox'\n")
+
+	got := codexYoloLaunchArgsWithOptions(script, yoloLaunchOptions{ForceFileAuthStore: true})
+	want := []string{"-c", `cli_auth_credentials_store="file"`, "--dangerously-bypass-approvals-and-sandbox"}
+	requireStringSlice(t, got, want)
+}
+
 func TestCodexYoloLaunchArgsDoesNotInjectWithoutYoloSupport(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
@@ -847,6 +861,13 @@ func TestCodexYoloLaunchArgsDoesNotInjectWithoutYoloSupport(t *testing.T) {
 
 func TestStripYoloArgsRemovesWindowsSandboxOverride(t *testing.T) {
 	in := []string{"codex", "-c", windowsYoloSandboxConfigArg, "--dangerously-bypass-approvals-and-sandbox", "resume", "abc"}
+	got := stripYoloArgs(in)
+	want := []string{"codex", "resume", "abc"}
+	requireStringSlice(t, got, want)
+}
+
+func TestStripYoloArgsRemovesFileAuthStoreOverride(t *testing.T) {
+	in := []string{"codex", "-c", `cli_auth_credentials_store="file"`, "--dangerously-bypass-approvals-and-sandbox", "resume", "abc"}
 	got := stripYoloArgs(in)
 	want := []string{"codex", "resume", "abc"}
 	requireStringSlice(t, got, want)

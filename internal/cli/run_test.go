@@ -517,6 +517,156 @@ func TestRunLikeYoloFlagEnablesManagedYoloInDirectMode(t *testing.T) {
 	}
 }
 
+type testCloudRequirementsCacheFile struct {
+	Signature     string `json:"signature"`
+	SignedPayload struct {
+		ChatGPTUserID string  `json:"chatgpt_user_id"`
+		AccountID     string  `json:"account_id"`
+		Contents      *string `json:"contents"`
+	} `json:"signed_payload"`
+}
+
+func readTestCloudRequirementsCache(t *testing.T, codexDir string) testCloudRequirementsCacheFile {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(codexDir, "cloud-requirements-cache.json"))
+	if err != nil {
+		t.Fatalf("read cloud requirements cache: %v", err)
+	}
+	var cache testCloudRequirementsCacheFile
+	if err := json.Unmarshal(data, &cache); err != nil {
+		t.Fatalf("parse cloud requirements cache: %v", err)
+	}
+	return cache
+}
+
+func TestRunLikeYoloFlagInstallsCloudRequirementsBypassInDirectMode(t *testing.T) {
+	lockCLITestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	codexBinDir := t.TempDir()
+	codexPath := filepath.Join(codexBinDir, "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; --version) echo 'codex 0.0.0' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", codexBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	writeFakeCache(t, codexHome)
+	originalAuth := writeTestAuthJSON(t, codexHome, true)
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("runWithProfile should not be called when proxy preference is disabled")
+		return nil
+	}
+
+	var gotCmdArgs []string
+	runTargetWithFallbackWithOptionsFn = func(ctx context.Context, cmdArgs []string, proxyURL string, healthCheck func() error, fatalCh <-chan error, opts runTargetOptions) error {
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		if opts.UseProxy {
+			t.Fatal("expected direct yolo run to keep proxy disabled")
+		}
+		if !cacheExists(t, codexHome) {
+			t.Fatal("cloud requirements bypass cache should exist while Codex starts")
+		}
+		cache := readTestCloudRequirementsCache(t, codexHome)
+		if cache.Signature == "" {
+			t.Fatal("cloud requirements bypass cache should be signed")
+		}
+		if cache.SignedPayload.ChatGPTUserID != "user_test" || cache.SignedPayload.AccountID != "org_test" {
+			t.Fatalf("cache identity = %#v", cache.SignedPayload)
+		}
+		if cache.SignedPayload.Contents != nil {
+			t.Fatalf("cache contents = %#v, want nil", *cache.SignedPayload.Contents)
+		}
+		authDuringRun, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+		if err != nil {
+			t.Fatalf("read auth during run: %v", err)
+		}
+		if authJSONHasPlanClaim(t, authDuringRun) {
+			t.Fatal("yolo run should mask workspace plan auth before Codex starts")
+		}
+		return nil
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--yolo"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+	if !reflect.DeepEqual(gotCmdArgs, []string{codexPath, "-c", `cli_auth_credentials_store="file"`, "--dangerously-bypass-approvals-and-sandbox"}) {
+		t.Fatalf("cmd args = %#v", gotCmdArgs)
+	}
+	if cacheExists(t, codexHome) {
+		t.Fatal("cloud requirements bypass cache should be removed after Codex exits")
+	}
+	authAfterRun, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("read auth after run: %v", err)
+	}
+	if !reflect.DeepEqual(authAfterRun, originalAuth) {
+		t.Fatal("yolo run should restore auth after Codex exits")
+	}
+}
+
+func TestPrepareYoloCodexCommandForRunAddsFileAuthWhenYoloAlreadyPresent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+
+	store := newTempStore(t)
+	codexBinDir := t.TempDir()
+	codexPath := filepath.Join(codexBinDir, "codex")
+	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; --version) echo 'codex 0.0.0' ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	codexHome := t.TempDir()
+	writeTestAuthJSON(t, codexHome, true)
+
+	opts := runTargetOptions{
+		YoloEnabled: true,
+		ExtraEnv:    []string{envCodexHome + "=" + codexHome},
+		Log:         io.Discard,
+	}
+	cmdArgs, cleanup := prepareYoloCodexCommandForRun(store, []string{codexPath, "--dangerously-bypass-approvals-and-sandbox", "exec", "-"}, &opts)
+	if cleanup == nil {
+		t.Fatal("expected cleanup for yolo auth/cache overrides")
+	}
+	defer cleanup()
+
+	wantPrefix := []string{codexPath, "-c", `cli_auth_credentials_store="file"`, "--dangerously-bypass-approvals-and-sandbox", "exec", "-"}
+	if !reflect.DeepEqual(cmdArgs, wantPrefix) {
+		t.Fatalf("cmd args = %#v, want %#v", cmdArgs, wantPrefix)
+	}
+	if !cacheExists(t, codexHome) {
+		t.Fatal("cloud requirements bypass cache should be installed")
+	}
+}
+
 func TestRunLikeYoloFlagFailsWhenCodexHasNoYoloLaunchFlag(t *testing.T) {
 	lockCLITestHooks(t)
 

@@ -434,13 +434,20 @@ func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *
 	if strings.TrimSpace(codexHome) == "" {
 		codexHome = envValue(opts.ExtraEnv, codexhistory.EnvCodexDir)
 	}
+	forceFileAuthStore := false
 	if strings.TrimSpace(codexHome) != "" {
 		authOverride, authErr := prepareYoloAuthOverride(codexHome, opts.ExecIdentity)
 		logYoloAuthStatus(log, authOverride, authErr)
 		if authOverride != nil {
+			forceFileAuthStore = true
 			addCleanup(authOverride.Cleanup)
 		}
-		_ = cloudgate.RemoveCloudRequirementsCache(codexHome)
+		if cacheBypass, err := cloudgate.InstallYoloCloudRequirementsBypass(codexHome, cmdArgs[0]); err != nil {
+			_, _ = fmt.Fprintf(log, "yolo cloud requirements bypass warning: %v\n", err)
+		} else if cacheBypass.Installed {
+			forceFileAuthStore = true
+			addCleanup(func() { _ = cloudgate.RemoveCloudRequirementsCache(codexHome) })
+		}
 	}
 	if store != nil {
 		historyDir := filepath.Dir(store.Path())
@@ -460,18 +467,33 @@ func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *
 		}
 	}
 	if !commandArgsHaveYolo(cmdArgs[1:]) {
-		if yoloFlags := codexYoloArgs(cmdArgs[0]); len(yoloFlags) > 0 {
+		if yoloFlags := codexYoloLaunchArgsWithOptions(cmdArgs[0], yoloLaunchOptions{ForceFileAuthStore: forceFileAuthStore}); len(yoloFlags) > 0 {
 			out := make([]string, 0, 1+len(yoloFlags)+len(cmdArgs[1:]))
 			out = append(out, cmdArgs[0])
 			out = append(out, yoloFlags...)
 			out = append(out, cmdArgs[1:]...)
 			cmdArgs = out
 		}
+	} else if forceFileAuthStore && !commandArgsHaveFileAuthStoreConfig(cmdArgs[1:]) {
+		out := make([]string, 0, len(cmdArgs)+2)
+		out = append(out, cmdArgs[0], "-c", `cli_auth_credentials_store="file"`)
+		out = append(out, cmdArgs[1:]...)
+		cmdArgs = out
 	}
 	if len(cleanupFns) == 0 {
 		return cmdArgs, nil
 	}
 	return cmdArgs, cleanup
+}
+
+func commandArgsHaveFileAuthStoreConfig(args []string) bool {
+	for i, arg := range args {
+		trimmed := strings.TrimSpace(arg)
+		if (trimmed == "-c" || trimmed == "--config") && i+1 < len(args) && strings.TrimSpace(args[i+1]) == `cli_auth_credentials_store="file"` {
+			return true
+		}
+	}
+	return false
 }
 
 func commandArgsHaveYolo(args []string) bool {
