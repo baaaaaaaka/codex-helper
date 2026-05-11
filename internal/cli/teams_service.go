@@ -1334,7 +1334,7 @@ func (b teamsServiceWSLWindowsTaskBackend) Install(ctx context.Context, spec tea
 	args := buildTeamsServiceWSLArguments(spec)
 	cmd := buildTeamsServiceWSLRegisterCommand(b.Name(), args, teamsServiceWSLRegisterOptions{ForceDisabled: true})
 	watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
-	cmd += "; " + buildTeamsServiceWSLRegisterCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLRegisterOptions{ForceDisabled: true, WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes})
+	cmd += "; " + buildTeamsServiceWSLRegisterCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLRegisterOptions{ForceDisabled: true})
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
 	}
@@ -1352,9 +1352,11 @@ func (b teamsServiceWSLWindowsTaskBackend) Repair(ctx context.Context, spec team
 	})
 	watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
 	cmd += "; " + buildTeamsServiceWSLRegisterCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLRegisterOptions{
-		Enable:                  opts.Enable,
-		PreserveEnabled:         !opts.Enable,
-		WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes,
+		Enable:          opts.Enable,
+		Start:           opts.Start,
+		PreserveEnabled: !opts.Enable,
+		PreserveRunning: !opts.Start,
+		CleanLegacy:     true,
 	})
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
@@ -1374,10 +1376,12 @@ func (b teamsServiceWSLWindowsTaskBackend) RepairElevated(ctx context.Context, s
 	})
 	watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
 	cmd += "; " + buildTeamsServiceWSLRegisterCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLRegisterOptions{
-		Enable:                  opts.Enable,
-		PreserveEnabled:         !opts.Enable,
-		PrincipalUser:           principalUser,
-		WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes,
+		Enable:          opts.Enable,
+		Start:           opts.Start,
+		PreserveEnabled: !opts.Enable,
+		PreserveRunning: !opts.Start,
+		PrincipalUser:   principalUser,
+		CleanLegacy:     true,
 	})
 	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLElevatedCommand(cmd)); err != nil {
 		return "", err
@@ -1391,7 +1395,7 @@ func (b teamsServiceWSLWindowsTaskBackend) TaskConfigMatches(ctx context.Context
 	cmd := teamsServiceWSLTaskConfigMatchHelpersPowerShell() +
 		"$allMatched = $true; " +
 		buildTeamsServiceWSLTaskConfigMatchesCommand(b.Name(), args, teamsServiceWSLTaskConfigMatchOptions{}) + "; " +
-		buildTeamsServiceWSLTaskConfigMatchesCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLTaskConfigMatchOptions{WatchdogIntervalMinutes: teamsServiceExternalWatchdogMinutes}) + "; " +
+		buildTeamsServiceWSLTaskConfigMatchesCommand(b.watchdogName(), watchdogArgs, teamsServiceWSLTaskConfigMatchOptions{}) + "; " +
 		"if (-not $allMatched) { exit 3 }"
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		if ctx.Err() != nil {
@@ -1530,11 +1534,11 @@ func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action strin
 		}
 		return data, err
 	case "start":
-		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { Start-ScheduledTask -TaskName $taskName | Out-Null }")
+		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell()+" }")
 	case "stop":
 		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $task) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }; "+resolve+"Stop-ScheduledTask -TaskName $taskName")
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { Start-ScheduledTask -TaskName $taskName | Out-Null }")
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell()+" }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for WSL Task Scheduler: %s", action)
 	}
@@ -2304,21 +2308,17 @@ func buildTeamsServiceWSLWatchdogArguments(spec teamsServiceSpec) []string {
 }
 
 type teamsServiceWSLRegisterOptions struct {
-	ForceDisabled           bool
-	Enable                  bool
-	Start                   bool
-	PreserveEnabled         bool
-	PreserveRunning         bool
-	PrincipalUser           string
-	CleanLegacy             bool
-	WatchdogIntervalMinutes int
+	ForceDisabled   bool
+	Enable          bool
+	Start           bool
+	PreserveEnabled bool
+	PreserveRunning bool
+	PrincipalUser   string
+	CleanLegacy     bool
 }
 
 func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts teamsServiceWSLRegisterOptions) string {
 	task := powershellSingleQuote(taskName)
-	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, args)
-	expectedActionExecute := powershellSingleQuote(actionExecute)
-	expectedActionArgument := powershellSingleQuote(actionArgument)
 	principalUser := "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name"
 	if strings.TrimSpace(opts.PrincipalUser) != "" {
 		principalUser = powershellSingleQuote(strings.TrimSpace(opts.PrincipalUser))
@@ -2339,17 +2339,15 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 		"$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
 			"$wasEnabled = $false; $wasRunning = $false; " +
 			"if ($null -ne $existing) { $wasEnabled = $existing.State -ne 'Disabled'; $wasRunning = $existing.State -eq 'Running' }; " +
-			"$expectedActionExecute = " + expectedActionExecute + "; " +
-			"$expectedActionArgument = " + expectedActionArgument + "; " +
+			buildTeamsServiceWSLTaskLauncherSetupPowerShell(taskName, args) +
 			"$action = New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument; " +
 			"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
-			"$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceWSLRegisterWatchdogIntervalMinutes(opts)) + ") -RepetitionDuration (New-TimeSpan -Days " + strconv.Itoa(teamsServiceWatchdogDays) + "); " +
 			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "); " +
 			"$principalUser = " + principalUser + "; " +
 			"$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited; " +
-			"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force | Out-Null; " +
+			"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $logon -Settings $settings -Principal $principal -Force | Out-Null; " +
 			verifyAction +
-			"if (-not $actionMatches) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue; Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force | Out-Null; " +
+			"if (-not $actionMatches) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue; Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $logon -Settings $settings -Principal $principal -Force | Out-Null; " +
 			verifyAction +
 			"}; " +
 			"if (-not $actionMatches) { throw 'Teams WSL Scheduled Task action did not refresh; access is denied or task is protected' }; "
@@ -2370,9 +2368,7 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 	return strings.TrimSpace(cmd)
 }
 
-type teamsServiceWSLTaskConfigMatchOptions struct {
-	WatchdogIntervalMinutes int
-}
+type teamsServiceWSLTaskConfigMatchOptions struct{}
 
 func teamsServiceWSLTaskConfigMatchHelpersPowerShell() string {
 	return "function Test-CodexHelperTaskDurationMinutes { param($value, [double]$expectedMinutes) " +
@@ -2387,43 +2383,44 @@ func teamsServiceWSLTaskConfigMatchHelpersPowerShell() string {
 }
 
 func buildTeamsServiceWSLTaskConfigMatchesCommand(taskName string, args []string, opts teamsServiceWSLTaskConfigMatchOptions) string {
-	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, args)
-	watchdogIntervalMinutes := teamsServiceWSLRegisterWatchdogIntervalMinutes(teamsServiceWSLRegisterOptions{WatchdogIntervalMinutes: opts.WatchdogIntervalMinutes})
 	return "$taskName = " + powershellSingleQuote(taskName) + "; " +
+		buildTeamsServiceWSLTaskLauncherExpectedPowerShell(taskName, args) +
 		"$expectedPrincipalUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; " +
 		"$tasks = @(Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue); " +
 		"$task = if ($tasks.Count -gt 0) { $tasks[0] } else { $null }; " +
 		"if ($null -eq $task) { $allMatched = $false } else { " +
+		"$launcherPowerShellMatches = $false; " +
+		"if (Test-Path -LiteralPath $launcherPowerShellPath) { $launcherPowerShellMatches = ((Get-Content -LiteralPath $launcherPowerShellPath -Raw) -eq $expectedLauncherPowerShell) }; " +
+		"$launcherVbsMatches = $false; " +
+		"if (Test-Path -LiteralPath $launcherVbsPath) { $launcherVbsMatches = ((Get-Content -LiteralPath $launcherVbsPath -Raw) -eq $expectedLauncherVbs) }; " +
+		"if (-not $launcherPowerShellMatches -or -not $launcherVbsMatches) { $allMatched = $false }; " +
 		"$actions = @($task.Actions); " +
 		"$action = if ($actions.Count -gt 0) { $actions[0] } else { $null }; " +
-		"if ($null -eq $action -or $action.Execute -ne " + powershellSingleQuote(actionExecute) +
-		" -or $action.Arguments -ne " + powershellSingleQuote(actionArgument) +
+		"if ($null -eq $action -or $action.Execute -ne $expectedActionExecute" +
+		" -or $action.Arguments -ne $expectedActionArgument" +
 		" -or $task.State -eq 'Disabled') { $allMatched = $false }; " +
 		"if ($null -eq $task.Principal -or $task.Principal.UserId -ne $expectedPrincipalUser -or $task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Limited') { $allMatched = $false }; " +
 		"$settings = $task.Settings; " +
 		"if ($null -eq $settings -or $settings.MultipleInstances -ne 'IgnoreNew' -or $settings.RestartCount -ne " + strconv.Itoa(teamsServiceTaskRestartCount) +
 		" -or -not (Test-CodexHelperTaskDurationMinutes $settings.RestartInterval " + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + ")" +
 		" -or -not (Test-CodexHelperTaskDurationMinutes $settings.ExecutionTimeLimit 0)) { $allMatched = $false }; " +
-		"$hasLogonTrigger = $false; $hasWatchdogTrigger = $false; " +
+		"$hasLogonTrigger = $false; $hasRepeatingTrigger = $false; " +
 		"foreach ($trigger in @($task.Triggers)) { " +
 		"$className = ''; if ($null -ne $trigger.CimClass) { $className = [string]$trigger.CimClass.CimClassName }; " +
 		"if ($trigger.Enabled -ne $false -and $className -like '*LogonTrigger*') { $hasLogonTrigger = $true }; " +
 		"$repetition = $trigger.Repetition; " +
-		"if ($trigger.Enabled -ne $false -and $null -ne $repetition -and (Test-CodexHelperTaskDurationMinutes $repetition.Interval " + strconv.Itoa(watchdogIntervalMinutes) + ")) { $hasWatchdogTrigger = $true } " +
+		"if ($trigger.Enabled -ne $false -and $null -ne $repetition -and -not [string]::IsNullOrWhiteSpace([string]$repetition.Interval)) { $hasRepeatingTrigger = $true } " +
 		"}; " +
-		"if (-not $hasLogonTrigger -or -not $hasWatchdogTrigger) { $allMatched = $false } " +
+		"if (-not $hasLogonTrigger -or $hasRepeatingTrigger) { $allMatched = $false } " +
 		"}"
-}
-
-func teamsServiceWSLRegisterWatchdogIntervalMinutes(opts teamsServiceWSLRegisterOptions) int {
-	if opts.WatchdogIntervalMinutes > 0 {
-		return opts.WatchdogIntervalMinutes
-	}
-	return teamsServiceWatchdogMinutes
 }
 
 func teamsServiceWSLStartTaskAndVerifyPowerShell() string {
 	return "Start-ScheduledTask -TaskName $taskName | Out-Null; " + teamsServiceWSLVerifyTaskRunningPowerShell()
+}
+
+func teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell() string {
+	return "if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName | Out-Null }; " + teamsServiceWSLVerifyTaskRunningPowerShell()
 }
 
 func teamsServiceWSLVerifyTaskRunningPowerShell() string {
@@ -2441,35 +2438,77 @@ func teamsServiceWSLTaskRunLogName(taskName string) string {
 	return "codex-helper-teams-wsl-task-" + safeWindowsTaskNamePart(taskName, 56) + "-" + hex.EncodeToString(sum[:])[:12] + ".log"
 }
 
-func buildTeamsServiceWSLTaskAction(taskName string, args []string) (string, string) {
+func teamsServiceWSLTaskLauncherStem(taskName string, args []string) string {
+	var b strings.Builder
+	b.WriteString(taskName)
+	for _, arg := range args {
+		b.WriteByte(0)
+		b.WriteString(arg)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return "codex-helper-teams-wsl-task-" + safeWindowsTaskNamePart(taskName, 48) + "-" + hex.EncodeToString(sum[:])[:12]
+}
+
+func buildTeamsServiceWSLTaskPowerShellScript(taskName string, args []string) string {
 	runLogName := teamsServiceWSLTaskRunLogName(taskName)
 	wslArgumentLine := windowsCommandLine(args)
-	command := "$ErrorActionPreference = 'Continue'; " +
-		"$logDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
-		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null; " +
-		"$runLog = Join-Path $logDir " + powershellSingleQuote(runLogName) + "; " +
-		"$stdoutLog = $runLog + '.stdout.log'; " +
-		"$stderrLog = $runLog + '.stderr.log'; " +
-		"$wslArgumentLine = " + powershellSingleQuote(wslArgumentLine) + "; " +
-		"Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' starting ' + " + powershellSingleQuote(taskName) + "); " +
-		"Add-Content -LiteralPath $runLog -Value ('stdout ' + $stdoutLog + ' stderr ' + $stderrLog); " +
-		"Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue; " +
-		"$p = Start-Process -FilePath 'wsl.exe' -ArgumentList $wslArgumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog; " +
-		"$code = if ($null -ne $p) { $p.ExitCode } else { 1 }; " +
-		"if ($null -eq $code) { $code = 1 }; " +
-		"Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' exited ' + $code); " +
-		"exit $code"
-	arguments := windowsCommandLine([]string{
-		"-NoProfile",
-		"-NonInteractive",
-		"-ExecutionPolicy",
-		"Bypass",
-		"-WindowStyle",
-		"Hidden",
-		"-Command",
-		command,
-	})
-	return "powershell.exe", arguments
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
+	b.WriteString("$logDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'\r\n")
+	b.WriteString("New-Item -ItemType Directory -Force -Path $logDir | Out-Null\r\n")
+	b.WriteString("$runLog = Join-Path $logDir " + powershellSingleQuote(runLogName) + "\r\n")
+	b.WriteString("$stdoutLog = $runLog + '.stdout.log'\r\n")
+	b.WriteString("$stderrLog = $runLog + '.stderr.log'\r\n")
+	b.WriteString("$wslArgumentLine = " + powershellSingleQuote(wslArgumentLine) + "\r\n")
+	b.WriteString("Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' starting ' + " + powershellSingleQuote(taskName) + ")\r\n")
+	b.WriteString("Add-Content -LiteralPath $runLog -Value ('stdout ' + $stdoutLog + ' stderr ' + $stderrLog)\r\n")
+	b.WriteString("Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue\r\n")
+	b.WriteString("$p = Start-Process -FilePath 'wsl.exe' -ArgumentList $wslArgumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog\r\n")
+	b.WriteString("$code = if ($null -ne $p) { $p.ExitCode } else { 1 }\r\n")
+	b.WriteString("if ($null -eq $code) { $code = 1 }\r\n")
+	b.WriteString("Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' exited ' + $code)\r\n")
+	b.WriteString("exit $code\r\n")
+	return b.String()
+}
+
+func buildTeamsServiceWSLTaskLauncherSetupPowerShell(taskName string, args []string) string {
+	return buildTeamsServiceWSLTaskLauncherPowerShell(taskName, args, true)
+}
+
+func buildTeamsServiceWSLTaskLauncherExpectedPowerShell(taskName string, args []string) string {
+	return buildTeamsServiceWSLTaskLauncherPowerShell(taskName, args, false)
+}
+
+func buildTeamsServiceWSLTaskLauncherPowerShell(taskName string, args []string, writeFiles bool) string {
+	stem := teamsServiceWSLTaskLauncherStem(taskName, args)
+	psName := stem + ".ps1"
+	vbsName := stem + ".vbs"
+	psScript := buildTeamsServiceWSLTaskPowerShellScript(taskName, args)
+	cmd := "$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
+		"$launcherPowerShellPath = Join-Path $appDir " + powershellSingleQuote(psName) + "; " +
+		"$launcherVbsPath = Join-Path $appDir " + powershellSingleQuote(vbsName) + "; " +
+		"$expectedLauncherPowerShell = " + powershellSingleQuote(psScript) + "; " +
+		"$launcherPowerShellExe = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; " +
+		"$launcherPowerShellExeVbs = $launcherPowerShellExe.Replace('\"', '\"\"'); " +
+		"$launcherPowerShellPathVbs = $launcherPowerShellPath.Replace('\"', '\"\"'); " +
+		"$expectedLauncherVbs = @(" +
+		powershellSingleQuote("Function Q(s)") + ", " +
+		powershellSingleQuote("  Q = Chr(34) & s & Chr(34)") + ", " +
+		powershellSingleQuote("End Function") + ", " +
+		powershellSingleQuote("Set shell = CreateObject(\"WScript.Shell\")") + ", " +
+		"('cmd = Q(\"' + $launcherPowerShellExeVbs + '\") & \" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \" & Q(\"' + $launcherPowerShellPathVbs + '\")'), " +
+		powershellSingleQuote("code = shell.Run(cmd, 0, True)") + ", " +
+		powershellSingleQuote("WScript.Quit code") +
+		") -join \"`r`n\"; "
+	if writeFiles {
+		cmd +=
+			"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
+				"Set-Content -LiteralPath $launcherPowerShellPath -Value $expectedLauncherPowerShell -Encoding UTF8 -NoNewline; " +
+				"Set-Content -LiteralPath $launcherVbsPath -Value $expectedLauncherVbs -Encoding ASCII -NoNewline; "
+	}
+	cmd += "$expectedActionExecute = 'wscript.exe'; " +
+		"$expectedActionArgument = '//B //Nologo \"' + $launcherVbsPath + '\"'; "
+	return cmd
 }
 
 func teamsServiceWSLTaskNamePrefix(taskName string) string {
@@ -2530,22 +2569,33 @@ func buildTeamsServiceWSLTaskConfig(taskName string, args []string) string {
 func buildTeamsServiceWSLStartupFallbackCommand(taskName string, args []string, start bool) string {
 	identity := teamsServiceWSLTaskIdentity()
 	scriptName := "codex-helper-teams-wsl-" + identity.Suffix + ".ps1"
-	cmdName := "codex-helper-teams-wsl-" + identity.Suffix + ".cmd"
+	launcherName := "codex-helper-teams-wsl-" + identity.Suffix + ".vbs"
 	stopName := "codex-helper-teams-wsl-stop-" + identity.Suffix + ".signal"
 	script := buildTeamsServiceWSLStartupWatchdogScript(taskName, args, identity.Suffix)
-	cmdScript := "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"%LOCALAPPDATA%\\codex-helper\\teams\\" + scriptName + "\"\r\n"
 	ps := "$startup = [Environment]::GetFolderPath('Startup'); " +
 		"if ([string]::IsNullOrWhiteSpace($startup)) { throw 'Windows Startup folder is unavailable' }; " +
 		"$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
 		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
 		"$scriptPath = Join-Path $appDir " + powershellSingleQuote(scriptName) + "; " +
-		"$cmdPath = Join-Path $startup " + powershellSingleQuote(cmdName) + "; " +
+		"$launcherPath = Join-Path $startup " + powershellSingleQuote(launcherName) + "; " +
 		"$stopPath = Join-Path $appDir " + powershellSingleQuote(stopName) + "; " +
 		"Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue; " +
 		"Set-Content -LiteralPath $scriptPath -Value " + powershellSingleQuote(script) + " -Encoding UTF8; " +
-		"Set-Content -LiteralPath $cmdPath -Value " + powershellSingleQuote(cmdScript) + " -Encoding ASCII"
+		"$launcherPowerShellExe = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; " +
+		"$launcherPowerShellExeVbs = $launcherPowerShellExe.Replace('\"', '\"\"'); " +
+		"$scriptPathVbs = $scriptPath.Replace('\"', '\"\"'); " +
+		"$launcherVbs = @(" +
+		powershellSingleQuote("Function Q(s)") + ", " +
+		powershellSingleQuote("  Q = Chr(34) & s & Chr(34)") + ", " +
+		powershellSingleQuote("End Function") + ", " +
+		powershellSingleQuote("Set shell = CreateObject(\"WScript.Shell\")") + ", " +
+		"('cmd = Q(\"' + $launcherPowerShellExeVbs + '\") & \" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \" & Q(\"' + $scriptPathVbs + '\")'), " +
+		powershellSingleQuote("code = shell.Run(cmd, 0, True)") + ", " +
+		powershellSingleQuote("WScript.Quit code") +
+		") -join \"`r`n\"; " +
+		"Set-Content -LiteralPath $launcherPath -Value $launcherVbs -Encoding ASCII"
 	if start {
-		ps += "; Start-Process -FilePath $cmdPath -WindowStyle Hidden | Out-Null"
+		ps += "; Start-Process -FilePath 'wscript.exe' -ArgumentList ('//B //Nologo \"' + $launcherPath + '\"') -WindowStyle Hidden | Out-Null"
 	}
 	return ps
 }
@@ -2571,8 +2621,9 @@ func buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName string, suffixes 
 		"$stopPath = Join-Path $appDir ('codex-helper-teams-wsl-stop-' + $suffix + '.signal'); " +
 		"Set-Content -LiteralPath $stopPath -Value 'stop' -Encoding ASCII; " +
 		"$paths = @(); " +
-		"if (-not [string]::IsNullOrWhiteSpace($startup)) { $paths += (Join-Path $startup ($scriptPrefix + $suffix + '.cmd')) }; " +
+		"if (-not [string]::IsNullOrWhiteSpace($startup)) { $paths += (Join-Path $startup ($scriptPrefix + $suffix + '.cmd')); $paths += (Join-Path $startup ($scriptPrefix + $suffix + '.vbs')) }; " +
 		"$paths += (Join-Path $appDir ($scriptPrefix + $suffix + '.ps1')); " +
+		"$paths += (Join-Path $appDir ($scriptPrefix + $suffix + '.vbs')); " +
 		"foreach ($path in $paths) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } " +
 		"}"
 }

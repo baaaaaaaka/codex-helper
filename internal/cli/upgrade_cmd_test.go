@@ -606,9 +606,15 @@ func TestUpgradeCmdWSLMatchingTaskRefreshSkipsRepairAndUAC(t *testing.T) {
 		"$settings.RestartCount -ne 999",
 		"$settings.RestartInterval 1",
 		"$settings.ExecutionTimeLimit 0",
+		"$expectedActionExecute = 'wscript.exe'",
+		"Test-Path -LiteralPath $launcherPowerShellPath",
+		"Test-Path -LiteralPath $launcherVbsPath",
+		"Get-Content -LiteralPath $launcherPowerShellPath -Raw",
+		"Get-Content -LiteralPath $launcherVbsPath -Raw",
+		"$expectedLauncherPowerShell",
+		"$expectedLauncherVbs",
 		"$hasLogonTrigger",
-		"$hasWatchdogTrigger",
-		"$repetition.Interval 1",
+		"$hasRepeatingTrigger",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("matching probe should verify %q before skipping repair, calls=%#v", want, runner.calls)
@@ -744,7 +750,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWhenUACDeclined(t *testing.T) 
 	if strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
 		t.Fatalf("fallback start should not call Scheduled Task start after access denied, last call=%#v all calls=%#v", lastCall, runner.calls)
 	}
-	if !strings.Contains(lastJoined, "Start-Process -FilePath $cmdPath -WindowStyle Hidden") {
+	if !strings.Contains(lastJoined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(lastJoined, "WScript.Shell") || strings.Contains(lastJoined, ".cmd") {
 		t.Fatalf("expected Startup fallback start command, last call=%#v all calls=%#v", lastCall, runner.calls)
 	}
 	backend := teamsServiceWSLWindowsTaskBackend{}
@@ -1037,7 +1043,9 @@ func TestScheduleDelayedTeamsServiceStartUsesWSLWindowsTask(t *testing.T) {
 	joined := strings.Join(detachedArgs, " ")
 	if detachedName != "powershell.exe" ||
 		!strings.Contains(joined, "Start-ScheduledTask") ||
-		!strings.Contains(joined, "Codex Helper Teams Bridge (WSL Ubuntu-22.04 alice work ") {
+		!strings.Contains(joined, "Codex Helper Teams Bridge (WSL Ubuntu-22.04 alice work ") ||
+		!strings.Contains(joined, "Codex Helper Teams Watchdog (WSL Ubuntu-22.04 alice work ") ||
+		!strings.Contains(joined, "$task.State -ne 'Running'") {
 		t.Fatalf("unexpected WSL delayed restart: name=%q args=%#v", detachedName, detachedArgs)
 	}
 }
@@ -1106,7 +1114,7 @@ func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testin
 	joined := strings.Join(detachedArgs, " ")
 	if detachedName != "powershell.exe" ||
 		!strings.Contains(joined, "Start-Sleep -Seconds 3") ||
-		!strings.Contains(joined, "Start-Process -FilePath $cmdPath -WindowStyle Hidden") ||
+		!strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") ||
 		strings.Contains(joined, "Start-ScheduledTask") {
 		t.Fatalf("unexpected delayed Startup fallback command: name=%q args=%#v", detachedName, detachedArgs)
 	}

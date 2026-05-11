@@ -1335,9 +1335,14 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		t.Fatalf("install should register WSL scheduled task, calls=%#v", runner.calls)
 	}
 	for _, want := range []string{
+		"$expectedActionExecute = 'wscript.exe'",
+		"$expectedActionArgument = '//B //Nologo",
+		"WScript.Shell",
+		"shell.Run(cmd, 0, True)",
+		"WScript.Quit code",
 		"-WindowStyle Hidden",
 		"$wslArgumentLine",
-		"Start-Process -FilePath",
+		"Start-Process -FilePath ''wsl.exe''",
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
 	} {
@@ -1347,6 +1352,9 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 	}
 	if strings.Contains(call, "& wsl.exe @wslArgs") {
 		t.Fatalf("WSL scheduled task should not launch wsl.exe directly in a visible console path, calls=%#v", runner.calls)
+	}
+	if strings.Contains(call, "RepetitionInterval") || strings.Contains(call, "Trigger @($logon, $watchdog)") {
+		t.Fatalf("WSL scheduled task should not use repeated Task Scheduler triggers, calls=%#v", runner.calls)
 	}
 	if !strings.Contains(call, "RestartCount 999") {
 		t.Fatalf("WSL task should use high restart count for background keepalive, calls=%#v", runner.calls)

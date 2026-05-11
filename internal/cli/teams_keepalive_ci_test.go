@@ -503,23 +503,30 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 	for _, want := range []string{
 		"[Environment]::GetFolderPath('Startup')",
 		"codex-helper\\teams",
-		".cmd",
+		".vbs",
 		".ps1",
-		"$cmdPath = Join-Path $startup",
+		"$launcherPath = Join-Path $startup",
 		"$stopPath = Join-Path $appDir",
 		"Remove-Item -LiteralPath $stopPath",
 		"Set-Content -LiteralPath $scriptPath",
-		"Set-Content -LiteralPath $cmdPath",
+		"Set-Content -LiteralPath $launcherPath",
+		"WScript.Shell",
+		"shell.Run(cmd, 0, True)",
+		"WScript.Quit code",
 		"WindowStyle Hidden",
-		"Start-Process -FilePath $cmdPath -WindowStyle Hidden",
+		"Start-Process -FilePath 'wscript.exe'",
+		"//B //Nologo",
 	} {
 		if !strings.Contains(startCommand, want) {
 			t.Fatalf("WSL Startup fallback command missing %q:\n%s", want, startCommand)
 		}
 	}
+	if strings.Contains(startCommand, ".cmd") {
+		t.Fatalf("WSL Startup fallback must not use a console .cmd launcher:\n%s", startCommand)
+	}
 
 	installOnlyCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, false)
-	if strings.Contains(installOnlyCommand, "Start-Process -FilePath $cmdPath") {
+	if strings.Contains(installOnlyCommand, "Start-Process -FilePath 'wscript.exe'") {
 		t.Fatalf("install-only WSL Startup fallback should not start watchdog immediately:\n%s", installOnlyCommand)
 	}
 }
@@ -616,30 +623,39 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		t.Fatalf("buildTeamsServiceSpec error: %v", err)
 	}
 	taskName := teamsServiceWSLWindowsTaskBackend{}.Name()
-	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, buildTeamsServiceWSLArguments(spec))
+	actionExecute := "wscript.exe"
 	watchdogTaskName := teamsServiceWSLWindowsTaskBackend{}.watchdogName()
-	watchdogExecute, watchdogArgument := buildTeamsServiceWSLTaskAction(watchdogTaskName, buildTeamsServiceWSLWatchdogArguments(spec))
+	watchdogExecute := "wscript.exe"
 	runLogName := teamsServiceWSLTaskRunLogName(taskName)
 	watchdogRunLogName := teamsServiceWSLTaskRunLogName(watchdogTaskName)
+	launcherStem := teamsServiceWSLTaskLauncherStem(taskName, buildTeamsServiceWSLArguments(spec))
+	watchdogLauncherStem := teamsServiceWSLTaskLauncherStem(watchdogTaskName, buildTeamsServiceWSLWatchdogArguments(spec))
 	for _, want := range []string{
 		"New-ScheduledTaskAction",
 		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
-		"$expectedActionArgument = " + powershellSingleQuote(actionArgument),
 		"$expectedActionExecute = " + powershellSingleQuote(watchdogExecute),
-		"$expectedActionArgument = " + powershellSingleQuote(watchdogArgument),
 		"New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument",
-		"-WindowStyle Hidden",
+		"$expectedActionArgument = '//B //Nologo",
+		"wscript.exe",
+		launcherStem + ".ps1",
+		launcherStem + ".vbs",
+		watchdogLauncherStem + ".ps1",
+		watchdogLauncherStem + ".vbs",
+		"$expectedLauncherPowerShell",
+		"$expectedLauncherVbs",
+		"-NoNewline",
+		"WScript.Shell",
+		"shell.Run(cmd, 0, True)",
+		"WScript.Quit code",
 		runLogName,
 		watchdogRunLogName,
 		"Add-Content -LiteralPath $runLog",
 		"$wslArgumentLine",
-		"Start-Process -FilePath",
+		"Start-Process -FilePath ''wsl.exe''",
 		"-WindowStyle Hidden",
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
 		"New-ScheduledTaskTrigger -AtLogOn",
-		"RepetitionInterval (New-TimeSpan -Minutes 1)",
-		"RepetitionDuration (New-TimeSpan -Days 3650)",
 		"New-ScheduledTaskSettingsSet",
 		"MultipleInstances IgnoreNew",
 		"ExecutionTimeLimit (New-TimeSpan -Seconds 0)",
@@ -648,11 +664,21 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
 		"Interactive",
 		"RunLevel Limited",
-		"Trigger @($logon, $watchdog)",
+		"Trigger $logon",
 		"Disable-ScheduledTask",
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("WSL scheduled task command missing %q:\n%s", want, command)
+		}
+	}
+	for _, forbidden := range []string{
+		"RepetitionInterval",
+		"RepetitionDuration",
+		"Trigger @($logon, $watchdog)",
+		"$watchdog = New-ScheduledTaskTrigger",
+	} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("WSL scheduled task command must not contain repeating triggers %q:\n%s", forbidden, command)
 		}
 	}
 	if strings.Contains(command, "& wsl.exe @wslArgs") {
@@ -727,28 +753,38 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 		t.Fatalf("buildTeamsServiceSpec error: %v", err)
 	}
 	taskName := teamsServiceWSLWindowsTaskBackend{}.Name()
-	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, buildTeamsServiceWSLArguments(spec))
+	actionExecute := "wscript.exe"
 	watchdogTaskName := teamsServiceWSLWindowsTaskBackend{}.watchdogName()
-	watchdogExecute, watchdogArgument := buildTeamsServiceWSLTaskAction(watchdogTaskName, buildTeamsServiceWSLWatchdogArguments(spec))
+	watchdogExecute := "wscript.exe"
 	runLogName := teamsServiceWSLTaskRunLogName(taskName)
 	watchdogRunLogName := teamsServiceWSLTaskRunLogName(watchdogTaskName)
+	launcherStem := teamsServiceWSLTaskLauncherStem(taskName, buildTeamsServiceWSLArguments(spec))
+	watchdogLauncherStem := teamsServiceWSLTaskLauncherStem(watchdogTaskName, buildTeamsServiceWSLWatchdogArguments(spec))
 	for _, want := range []string{
 		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
 		"$legacyPrefix",
 		"Unregister-ScheduledTask -TaskName $_.TaskName",
 		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
-		"$expectedActionArgument = " + powershellSingleQuote(actionArgument),
 		"$expectedActionExecute = " + powershellSingleQuote(watchdogExecute),
-		"$expectedActionArgument = " + powershellSingleQuote(watchdogArgument),
 		"New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument",
+		"$expectedActionArgument = '//B //Nologo",
+		launcherStem + ".ps1",
+		launcherStem + ".vbs",
+		watchdogLauncherStem + ".ps1",
+		watchdogLauncherStem + ".vbs",
+		"$expectedLauncherPowerShell",
+		"$expectedLauncherVbs",
+		"-NoNewline",
+		"WScript.Shell",
+		"shell.Run(cmd, 0, True)",
+		"WScript.Quit code",
 		"$actionMatches = ($null -ne $actualAction",
 		"Teams WSL Scheduled Task action did not refresh; access is denied or task is protected",
-		"-WindowStyle Hidden",
 		runLogName,
 		watchdogRunLogName,
 		"exited",
 		"$wslArgumentLine",
-		"Start-Process -FilePath",
+		"Start-Process -FilePath ''wsl.exe''",
 		"-WindowStyle Hidden",
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
@@ -759,11 +795,20 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 		"Get-ScheduledTaskInfo -TaskName $taskName",
 		"MultipleInstances IgnoreNew",
 		"ExecutionTimeLimit (New-TimeSpan -Seconds 0)",
-		"RepetitionInterval (New-TimeSpan -Minutes 1)",
 		"[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("WSL repair command missing %q:\n%s", want, command)
+		}
+	}
+	for _, forbidden := range []string{
+		"RepetitionInterval",
+		"RepetitionDuration",
+		"Trigger @($logon, $watchdog)",
+		"$watchdog = New-ScheduledTaskTrigger",
+	} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("WSL repair command must not contain repeating triggers %q:\n%s", forbidden, command)
 		}
 	}
 	if strings.Contains(command, "& wsl.exe @wslArgs") {
@@ -772,8 +817,8 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 	if strings.Contains(command, "Disable-ScheduledTask -TaskName $taskName") {
 		t.Fatalf("WSL repair enable command should not disable task:\n%s", command)
 	}
-	if got := strings.Count(command, "Teams WSL Scheduled Task did not stay running after start"); got != 1 {
-		t.Fatalf("WSL repair should verify only the long-running bridge task, got %d verifications:\n%s", got, command)
+	if got := strings.Count(command, "Teams WSL Scheduled Task did not stay running after start"); got != 2 {
+		t.Fatalf("WSL repair should verify both bridge and watchdog tasks, got %d verifications:\n%s", got, command)
 	}
 }
 
@@ -832,14 +877,24 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigMatchChecksFullTaskShapeCI(t *test
 		"/home/alice/bin/codex-proxy",
 		"teams", "run", "--auto-service=false",
 	}
-	actionExecute, actionArgument := buildTeamsServiceWSLTaskAction(taskName, args)
+	actionExecute := "wscript.exe"
+	launcherStem := teamsServiceWSLTaskLauncherStem(taskName, args)
 	command := teamsServiceWSLTaskConfigMatchHelpersPowerShell() +
 		buildTeamsServiceWSLTaskConfigMatchesCommand(taskName, args, teamsServiceWSLTaskConfigMatchOptions{})
 	for _, want := range []string{
 		"Test-CodexHelperTaskDurationMinutes",
+		"Test-Path -LiteralPath $launcherPowerShellPath",
+		"Get-Content -LiteralPath $launcherPowerShellPath -Raw",
+		"Get-Content -LiteralPath $launcherVbsPath -Raw",
+		"$expectedLauncherPowerShell",
+		"$expectedLauncherVbs",
+		"$launcherPowerShellMatches",
+		"$launcherVbsMatches",
+		launcherStem + ".ps1",
+		launcherStem + ".vbs",
 		"Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
-		powershellSingleQuote(actionExecute),
-		powershellSingleQuote(actionArgument),
+		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
+		"$expectedActionArgument = '//B //Nologo",
 		"$task.State -eq 'Disabled'",
 		"$expectedPrincipalUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
 		"$task.Principal.UserId -ne $expectedPrincipalUser",
@@ -851,8 +906,8 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigMatchChecksFullTaskShapeCI(t *test
 		"$settings.ExecutionTimeLimit 0",
 		"$hasLogonTrigger",
 		"$className -like '*LogonTrigger*'",
-		"$hasWatchdogTrigger",
-		"$repetition.Interval 1",
+		"$hasRepeatingTrigger",
+		"$hasRepeatingTrigger) { $allMatched = $false",
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("WSL task match probe missing %q:\n%s", want, command)
@@ -863,6 +918,8 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigMatchChecksFullTaskShapeCI(t *test
 		"Start-ScheduledTask",
 		"Stop-ScheduledTask",
 		"Unregister-ScheduledTask",
+		"Set-Content",
+		"New-ScheduledTaskTrigger -Once",
 	} {
 		if strings.Contains(command, forbidden) {
 			t.Fatalf("WSL task match probe should be read-only and not contain %q:\n%s", forbidden, command)
@@ -1072,6 +1129,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapSuccessCleansStartupFallbackCI(t *t
 		"Remove-Item",
 		"codex-helper-teams-wsl-",
 		".cmd",
+		".vbs",
 		".ps1",
 		"legacy123",
 		"Set-Content -LiteralPath $stopPath",
@@ -1166,7 +1224,9 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		"-Wait",
 		"-PassThru",
 		"New-ScheduledTaskAction",
-		"$expectedActionExecute = ''powershell.exe''",
+		"$expectedActionExecute = ''wscript.exe''",
+		"$expectedActionArgument = ''//B //Nologo",
+		"WScript.Shell",
 		"-WindowStyle Hidden",
 		"wsl.exe",
 		"wslArgumentLine",
@@ -1255,11 +1315,19 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE=",
 		"CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1",
 		"Remove-Item -LiteralPath $stopPath",
-		"Start-Process -FilePath $cmdPath -WindowStyle Hidden",
+		"$launcherPath = Join-Path $startup",
+		"Set-Content -LiteralPath $launcherPath",
+		"WScript.Shell",
+		"shell.Run(cmd, 0, True)",
+		"Start-Process -FilePath 'wscript.exe'",
+		"//B //Nologo",
 	} {
 		if !strings.Contains(fallback, want) {
 			t.Fatalf("fallback command missing %q:\n%s", want, fallback)
 		}
+	}
+	if strings.Contains(fallback, ".cmd") {
+		t.Fatalf("Startup fallback should not create a console .cmd launcher:\n%s", fallback)
 	}
 	if strings.Contains(fallback, "-Verb RunAs") || strings.Contains(fallback, "Register-ScheduledTask") {
 		t.Fatalf("Startup fallback should not use UAC or Task Scheduler:\n%s", fallback)
@@ -1451,7 +1519,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *t
 	if len(runner.calls) != 2 {
 		t.Fatalf("bootstrap calls = %#v, want direct repair then Startup fallback", runner.calls)
 	}
-	if joined := strings.Join(runner.calls[1].args, " "); !strings.Contains(joined, "Start-Process -FilePath $cmdPath -WindowStyle Hidden") || strings.Contains(joined, "Register-ScheduledTask") {
+	if joined := strings.Join(runner.calls[1].args, " "); !strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(joined, "WScript.Shell") || strings.Contains(joined, "Register-ScheduledTask") {
 		t.Fatalf("fallback call should use Startup watchdog without re-registering task:\n%s", joined)
 	}
 }
@@ -1626,8 +1694,15 @@ func TestTeamsBackgroundKeepaliveDelayedRestartCommandsCI(t *testing.T) {
 			if name != tc.wantName {
 				t.Fatalf("restart command name = %q, want %q", name, tc.wantName)
 			}
-			if joined := strings.Join(args, " "); !strings.Contains(joined, tc.wantSnippet) {
+			joined := strings.Join(args, " ")
+			if !strings.Contains(joined, tc.wantSnippet) {
 				t.Fatalf("restart command args missing %q:\n%#v", tc.wantSnippet, args)
+			}
+			if tc.isWSL && !strings.Contains(joined, "Codex Helper Teams Watchdog (WSL Ubuntu alice default ") {
+				t.Fatalf("WSL delayed restart should start watchdog too:\n%s", joined)
+			}
+			if tc.isWSL && !strings.Contains(joined, "$task.State -ne 'Running'") {
+				t.Fatalf("WSL delayed restart should avoid re-starting an already running watchdog task:\n%s", joined)
 			}
 		})
 	}
@@ -1720,12 +1795,24 @@ func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
 					"Start-ScheduledTask -TaskName $taskName",
 					"Teams WSL Scheduled Task did not stay running after start",
 				)
+				if strings.Count(joined, "Teams WSL Scheduled Task did not stay running after start") != 2 {
+					t.Fatalf("service restart should verify both bridge and watchdog tasks:\n%s", joined)
+				}
+				if !strings.Contains(joined, "if ($null -ne $task) { if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName") {
+					t.Fatalf("service restart should avoid re-starting an already running watchdog task:\n%s", joined)
+				}
 			} else if tt.action == "start" {
 				requireSubstringsInOrder(t, joined,
 					"Start-ScheduledTask -TaskName $taskName",
 					"Start-Sleep -Seconds 2",
 					"Teams WSL Scheduled Task did not stay running after start",
 				)
+				if strings.Count(joined, "Teams WSL Scheduled Task did not stay running after start") != 2 {
+					t.Fatalf("service start should verify both bridge and watchdog tasks:\n%s", joined)
+				}
+				if !strings.Contains(joined, "if ($null -ne $task) { if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName") {
+					t.Fatalf("service start should avoid re-starting an already running watchdog task:\n%s", joined)
+				}
 			}
 		})
 	}
@@ -1874,7 +1961,9 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 	})
 
 	inspect := "$task = Get-ScheduledTask -TaskName " + powershellSingleQuote(backend.Name()) + "; " +
-		"$task.State; $task.Actions | Format-List Execute,Arguments"
+		"$watchdog = Get-ScheduledTask -TaskName " + powershellSingleQuote(backend.watchdogName()) + "; " +
+		"'bridge'; $task.State; $task.Actions | Format-List Execute,Arguments; $task.Triggers | ForEach-Object { $_.CimClass.CimClassName + ' ' + [string]$_.Repetition.Interval }; " +
+		"'watchdog'; $watchdog.State; $watchdog.Actions | Format-List Execute,Arguments; $watchdog.Triggers | ForEach-Object { $_.CimClass.CimClassName + ' ' + [string]$_.Repetition.Interval }"
 	data, err := teamsServiceRunPowerShell(context.Background(), inspect)
 	if err != nil {
 		t.Fatalf("inspect real WSL-shaped task: %v", err)
@@ -1882,23 +1971,26 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 	got := string(data)
 	for _, want := range []string{
 		"Disabled",
-		"powershell.exe",
-		"-WindowStyle Hidden",
-		"wsl.exe",
-		"wslArgumentLine",
-		"Start-Process -FilePath",
-		"-ArgumentList $wslArgumentLine",
-		"-RedirectStandardOutput $stdoutLog",
-		"-RedirectStandardError $stderrLog",
-		"CodexHelperCI",
-		"runner",
-		"--auto-service=false",
+		"wscript.exe",
+		"//B //Nologo",
+		".vbs",
+		"MSFT_TaskLogonTrigger",
+		"bridge",
+		"watchdog",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("real WSL-shaped task missing %q:\n%s", want, got)
 		}
 	}
-	requireSubstringsInOrder(t, got, "teams", "run", "--auto-service=false")
+	for _, forbidden := range []string{
+		"powershell.exe",
+		"PT1M",
+		"MSFT_TaskTimeTrigger",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("real WSL-shaped task should not contain %q:\n%s", forbidden, got)
+		}
+	}
 	if _, err := backend.Run(context.Background(), "enable"); err != nil {
 		t.Fatalf("enable real WSL-shaped task: %v", err)
 	}

@@ -368,7 +368,13 @@ func defaultTeamsServiceStartDetached(_ context.Context, name string, args ...st
 
 func delayedTeamsServiceStartCommand(backend teamsServiceBackend) (string, []string, error) {
 	if backend.ID() == "wsl-windows-task-scheduler" {
-		command := "Start-Sleep -Seconds 3; " + teamsServiceWSLResolveTaskPowerShell(backend.Name()) + "Start-ScheduledTask -TaskName $taskName"
+		wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
+		if !ok {
+			return "", nil, fmt.Errorf("WSL Teams service backend has unexpected type %T", backend)
+		}
+		command := "Start-Sleep -Seconds 3; " +
+			teamsServiceWSLResolveTaskPowerShell(wslBackend.Name()) + "Start-ScheduledTask -TaskName $taskName; " +
+			teamsServiceWSLResolveOptionalTaskPowerShell(wslBackend.watchdogName()) + "if ($null -ne $task -and $task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName }"
 		return teamsServicePowerShellExecutable(), []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}, nil
 	}
 	switch teamsServiceGOOS() {
