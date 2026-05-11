@@ -1,6 +1,41 @@
 {
-  "generated_at": "2026-05-11T13:05:33Z",
+  "generated_at": "2026-05-11T13:21:21Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.52_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.52_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.52_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.52_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.0-rc.52",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-05-11T13:20:35Z",
+      "tag_name": "v0.1.0-rc.52",
+      "version": "0.1.0-rc.52"
+    },
     {
       "assets": [
         {
