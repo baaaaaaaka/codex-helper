@@ -477,6 +477,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshUsesUACRepair(t *testing.T) {
 			nil,
 			nil,
 			nil,
+			nil,
 			[]byte("DESKTOP\\alice\n"),
 			nil,
 			nil,
@@ -485,6 +486,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshUsesUACRepair(t *testing.T) {
 			nil,
 			nil,
 			errors.New("task config mismatch"),
+			errTeamsKeepaliveAccessDeniedForTest{},
 			errTeamsKeepaliveAccessDeniedForTest{},
 			nil,
 			nil,
@@ -690,7 +692,7 @@ func TestUpgradeCmdWSLMismatchRefreshRepairsWithoutUACWhenAllowed(t *testing.T) 
 	}
 }
 
-func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWhenUACDeclined(t *testing.T) {
+func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWithoutUACWhenCleanupIsAllowed(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
@@ -735,7 +737,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWhenUACDeclined(t *testing.T) 
 
 	cmd := newUpgradeCmd(&rootOptions{})
 	cmd.SetArgs([]string{"--version", "v1.2.3"})
-	cmd.SetIn(strings.NewReader("no\n"))
+	cmd.SetIn(strings.NewReader(""))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -745,12 +747,23 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWhenUACDeclined(t *testing.T) 
 		!strings.Contains(out.String(), "Restarting Teams service after upgrade") {
 		t.Fatalf("upgrade output missing fallback and restart messages:\n%s", out.String())
 	}
+	if strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") ||
+		strings.Contains(out.String(), "UAC prompt") {
+		t.Fatalf("upgrade should use quiet fallback without asking for UAC when old tasks can be retired normally:\n%s", out.String())
+	}
 	lastCall := runner.calls[len(runner.calls)-1]
 	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
+	if !strings.Contains(teamsServiceJoinedCalls(runner.calls), "Disable-ScheduledTask") {
+		t.Fatalf("fallback should retire old WSL Scheduled Tasks before installing Startup fallback, calls=%#v", runner.calls)
+	}
 	if strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
 		t.Fatalf("fallback start should not call Scheduled Task start after access denied, last call=%#v all calls=%#v", lastCall, runner.calls)
 	}
-	if !strings.Contains(lastJoined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(lastJoined, "WScript.Shell") || strings.Contains(lastJoined, ".cmd") {
+	if strings.Contains(teamsServiceJoinedCalls(runner.calls), "-Verb RunAs") {
+		t.Fatalf("quiet fallback must not use elevated PowerShell, calls=%#v", runner.calls)
+	}
+	if !strings.Contains(lastJoined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(lastJoined, "WScript.Shell") ||
+		strings.Contains(lastJoined, "Set-Content -LiteralPath $legacyCmdLauncherPath") || strings.Contains(lastJoined, "Start-Process -FilePath 'cmd.exe'") {
 		t.Fatalf("expected Startup fallback start command, last call=%#v all calls=%#v", lastCall, runner.calls)
 	}
 	backend := teamsServiceWSLWindowsTaskBackend{}
@@ -759,6 +772,109 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWhenUACDeclined(t *testing.T) 
 	}
 	if _, err := os.Stat(filepath.Join(tmp, "wsl-task", "codex-helper-teams-wsl-task-"+teamsServiceWSLTaskIdentity().Suffix+".txt")); !os.IsNotExist(err) {
 		t.Fatalf("stale Scheduled Task config should be removed after fallback, err=%v", err)
+	}
+}
+
+func TestUpgradeCmdWSLAccessDeniedRefreshUsesElevatedRetireBeforeFallback(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			nil,
+			[]byte("NVIDIA\\jason\n"),
+			nil,
+			nil,
+			nil,
+		},
+		errs: []error{
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out bytes.Buffer
+	refresh, err := recoverWSLTeamsServiceRefreshAccessDenied(context.Background(), nil, strings.NewReader("yes\n"), &out, errTeamsKeepaliveAccessDeniedForTest{})
+	if err != nil {
+		t.Fatalf("recover refresh access denied: %v\n%s", err, out.String())
+	}
+	if !refresh.StartupFallback {
+		t.Fatalf("refresh should install Startup fallback when elevated repair is denied")
+	}
+	if len(runner.calls) != 5 {
+		t.Fatalf("refresh calls=%#v, want normal retire, user query, elevated repair, elevated retire, fallback", runner.calls)
+	}
+	elevatedRetire := strings.Join(runner.calls[3].args, " ")
+	for _, want := range []string{
+		"Start-Process",
+		"-Verb RunAs",
+		"Disable-ScheduledTask",
+		"Codex Helper Teams Bridge",
+		"Codex Helper Teams Watchdog",
+	} {
+		if !strings.Contains(elevatedRetire, want) {
+			t.Fatalf("elevated retire command missing %q:\n%s", want, elevatedRetire)
+		}
+	}
+	if strings.Contains(elevatedRetire, "Register-ScheduledTask") {
+		t.Fatalf("elevated retire must not try to create or repair tasks:\n%s", elevatedRetire)
+	}
+	if !strings.Contains(out.String(), "Old WSL Scheduled Tasks were disabled using Windows permission") {
+		t.Fatalf("upgrade fallback output missing elevated cleanup explanation:\n%s", out.String())
+	}
+}
+
+func TestUpgradeCmdWSLAccessDeniedRefreshFailsWhenCleanupNeedsUACAndUACDeclined(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveAccessDeniedForTest{},
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out bytes.Buffer
+	refresh, err := recoverWSLTeamsServiceRefreshAccessDenied(context.Background(), nil, strings.NewReader("no\n"), &out, errTeamsKeepaliveAccessDeniedForTest{})
+	if err == nil {
+		t.Fatalf("recover refresh should fail when normal cleanup needs UAC and UAC is declined")
+	}
+	if refresh.StartupFallback {
+		t.Fatalf("refresh must not install Startup fallback when old Scheduled Tasks remain active")
+	}
+	if !strings.Contains(err.Error(), "UAC was not confirmed") {
+		t.Fatalf("error should explain that UAC was needed and declined, got %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("refresh calls=%#v, want only normal retire before declined UAC", runner.calls)
+	}
+	if !strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") {
+		t.Fatalf("cleanup failure should ask for UAC before failing:\n%s", out.String())
 	}
 }
 

@@ -507,8 +507,14 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 		".vbs",
 		".ps1",
 		"$launcherPath = Join-Path $startup",
+		"$legacyCmdLauncherPath = Join-Path $startup",
+		".cmd",
+		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.cmd'",
+		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.vbs'",
+		"$content.Contains($legacyPrefix)",
 		"$stopPath = Join-Path $appDir",
 		"Remove-Item -LiteralPath $stopPath",
+		"Remove-Item -LiteralPath $legacyCmdLauncherPath",
 		"Set-Content -LiteralPath $scriptPath",
 		"Set-Content -LiteralPath $launcherPath",
 		"WScript.Shell",
@@ -522,8 +528,14 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 			t.Fatalf("WSL Startup fallback command missing %q:\n%s", want, startCommand)
 		}
 	}
-	if strings.Contains(startCommand, ".cmd") {
-		t.Fatalf("WSL Startup fallback must not use a console .cmd launcher:\n%s", startCommand)
+	for _, forbidden := range []string{
+		"Set-Content -LiteralPath $legacyCmdLauncherPath",
+		"Start-Process -FilePath 'cmd.exe'",
+		"cmd.exe /",
+	} {
+		if strings.Contains(startCommand, forbidden) {
+			t.Fatalf("WSL Startup fallback must not create or start a console .cmd launcher, found %q:\n%s", forbidden, startCommand)
+		}
 	}
 
 	installOnlyCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, false)
@@ -1139,6 +1151,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapSuccessCleansStartupFallbackCI(t *t
 		"legacy123",
 		"Set-Content -LiteralPath $stopPath",
 		"$content.Contains('starting ' + $legacyPrefix)",
+		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.cmd'",
+		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.vbs'",
 	} {
 		if !strings.Contains(cleanup, want) {
 			t.Fatalf("startup fallback cleanup command missing %q:\n%s", want, cleanup)
@@ -1325,6 +1339,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE=",
 		"CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1",
 		"Remove-Item -LiteralPath $stopPath",
+		"Remove-Item -LiteralPath $legacyCmdLauncherPath",
 		"$launcherPath = Join-Path $startup",
 		"Set-Content -LiteralPath $launcherPath",
 		"WScript.Shell",
@@ -1336,8 +1351,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 			t.Fatalf("fallback command missing %q:\n%s", want, fallback)
 		}
 	}
-	if strings.Contains(fallback, ".cmd") {
-		t.Fatalf("Startup fallback should not create a console .cmd launcher:\n%s", fallback)
+	if strings.Contains(fallback, "Set-Content -LiteralPath $legacyCmdLauncherPath") || strings.Contains(fallback, "Start-Process -FilePath 'cmd.exe'") {
+		t.Fatalf("Startup fallback should not create or start a console .cmd launcher:\n%s", fallback)
 	}
 	if strings.Contains(fallback, "-Verb RunAs") || strings.Contains(fallback, "Register-ScheduledTask") {
 		t.Fatalf("Startup fallback should not use UAC or Task Scheduler:\n%s", fallback)
@@ -1452,6 +1467,75 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapRefusesFallbackWhenStaleTasksCannot
 	}
 	if strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") {
 		t.Fatalf("bootstrap should not announce Startup fallback before stale tasks are safely disabled:\n%s", out.String())
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapUsesElevatedRetireBeforeFallbackCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			nil,
+			[]byte("NVIDIA\\jason\n"),
+			nil,
+			nil,
+			nil,
+			nil,
+		},
+		errs: []error{
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+			errTeamsKeepaliveAccessDeniedForTest{},
+			errTeamsKeepaliveAccessDeniedForTest{},
+			nil,
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetIn(strings.NewReader("yes\n"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap fallback with elevated retire error: %v\noutput:\n%s", err, out.String())
+	}
+	if len(runner.calls) != 6 {
+		t.Fatalf("bootstrap calls = %#v, want direct repair, user query, elevated repair, normal retire, elevated retire, fallback", runner.calls)
+	}
+	elevatedRetire := strings.Join(runner.calls[4].args, " ")
+	for _, want := range []string{
+		"Start-Process",
+		"-Verb RunAs",
+		"Disable-ScheduledTask",
+		"Codex Helper Teams Bridge",
+		"Codex Helper Teams Watchdog",
+	} {
+		if !strings.Contains(elevatedRetire, want) {
+			t.Fatalf("elevated retire command missing %q:\n%s", want, elevatedRetire)
+		}
+	}
+	if strings.Contains(elevatedRetire, "Register-ScheduledTask") {
+		t.Fatalf("elevated retire must not try to create or repair tasks:\n%s", elevatedRetire)
+	}
+	fallback := strings.Join(runner.calls[5].args, " ")
+	if !strings.Contains(fallback, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(fallback, "Remove-Item -LiteralPath $legacyCmdLauncherPath") {
+		t.Fatalf("fallback install should use hidden wscript launcher and remove old .cmd launcher:\n%s", fallback)
+	}
+	got := out.String()
+	if !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Old WSL Scheduled Tasks were disabled using Windows permission") {
+		t.Fatalf("bootstrap output missing elevated cleanup fallback explanation:\n%s", got)
 	}
 }
 

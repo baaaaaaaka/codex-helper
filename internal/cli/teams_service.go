@@ -530,6 +530,11 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	if err != nil {
 		return teamsServiceBootstrapResult{}, err
 	}
+	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+		if _, err := teamsServiceRetireLocalDuplicateProcesses(ctx, spec); err != nil {
+			return teamsServiceBootstrapResult{}, fmt.Errorf("could not stop old local Teams helper process(es) before bootstrap: %w", err)
+		}
+	}
 	if opts.FallbackOnly {
 		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
 			if err := wslBackend.RetireScheduledTasks(ctx); err != nil {
@@ -565,7 +570,9 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		out = io.Discard
 	}
 	fallbackReason := ""
+	uacConfirmed := false
 	if accessDenied && !opts.NoUAC && confirmTeamsServiceUACPrompt(opts.In, out, opts.AssumeYes) {
+		uacConfirmed = true
 		principalUser, userErr := teamsServiceCurrentWindowsUser(ctx)
 		if userErr != nil {
 			fallbackReason = "Could not identify the current Windows user for UAC setup: " + teamsServiceBootstrapErrorSummary(userErr)
@@ -586,7 +593,16 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		}
 	}
 	if retireErr := wslBackend.RetireScheduledTasks(ctx); retireErr != nil {
-		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr))
+		if uacConfirmed {
+			if elevatedRetireErr := wslBackend.RetireScheduledTasksElevated(ctx); elevatedRetireErr != nil {
+				return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): normal cleanup failed: %s; elevated cleanup failed: %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr), teamsServiceBootstrapErrorSummary(elevatedRetireErr))
+			}
+			if strings.TrimSpace(fallbackReason) != "" {
+				fallbackReason += " Old WSL Scheduled Tasks were disabled using Windows permission before installing the fallback."
+			}
+		} else {
+			return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr))
+		}
 	}
 	printTeamsServiceBootstrapTaskFallback(out, fallbackReason)
 	path, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, true)
@@ -1443,6 +1459,12 @@ func (b teamsServiceWSLWindowsTaskBackend) VerifyAndCleanAfterRepair(ctx context
 func (b teamsServiceWSLWindowsTaskBackend) RetireScheduledTasks(ctx context.Context) error {
 	cmd := buildTeamsServiceWSLRetireTaskCommand(b.Name(), true) + "; " + buildTeamsServiceWSLRetireTaskCommand(b.watchdogName(), true)
 	_, err := teamsServiceRunPowerShell(ctx, cmd)
+	return err
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) RetireScheduledTasksElevated(ctx context.Context) error {
+	cmd := buildTeamsServiceWSLRetireTaskCommand(b.Name(), true) + "; " + buildTeamsServiceWSLRetireTaskCommand(b.watchdogName(), true)
+	_, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLElevatedCommand(cmd))
 	return err
 }
 
@@ -2630,16 +2652,21 @@ func buildTeamsServiceWSLStartupFallbackCommand(taskName string, args []string, 
 	identity := teamsServiceWSLTaskIdentity()
 	scriptName := "codex-helper-teams-wsl-" + identity.Suffix + ".ps1"
 	launcherName := "codex-helper-teams-wsl-" + identity.Suffix + ".vbs"
+	legacyCmdLauncherName := "codex-helper-teams-wsl-" + identity.Suffix + ".cmd"
 	stopName := "codex-helper-teams-wsl-stop-" + identity.Suffix + ".signal"
 	script := buildTeamsServiceWSLStartupWatchdogScript(taskName, args, identity.Suffix)
-	ps := "$startup = [Environment]::GetFolderPath('Startup'); " +
+	cleanup := buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName, []string{identity.Suffix})
+	ps := cleanup + "; " +
+		"$startup = [Environment]::GetFolderPath('Startup'); " +
 		"if ([string]::IsNullOrWhiteSpace($startup)) { throw 'Windows Startup folder is unavailable' }; " +
 		"$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
 		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
 		"$scriptPath = Join-Path $appDir " + powershellSingleQuote(scriptName) + "; " +
 		"$launcherPath = Join-Path $startup " + powershellSingleQuote(launcherName) + "; " +
+		"$legacyCmdLauncherPath = Join-Path $startup " + powershellSingleQuote(legacyCmdLauncherName) + "; " +
 		"$stopPath = Join-Path $appDir " + powershellSingleQuote(stopName) + "; " +
 		"Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue; " +
+		"Remove-Item -LiteralPath $legacyCmdLauncherPath -Force -ErrorAction SilentlyContinue; " +
 		"Set-Content -LiteralPath $scriptPath -Value " + powershellSingleQuote(script) + " -Encoding UTF8; " +
 		"$launcherPowerShellExe = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; " +
 		"$launcherPowerShellExeVbs = $launcherPowerShellExe.Replace('\"', '\"\"'); " +
@@ -2677,6 +2704,21 @@ func buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName string, suffixes 
 		"$suffix = $_.BaseName -replace '^codex-helper-teams-wsl-', ''; " +
 		"if (-not [string]::IsNullOrWhiteSpace($suffix) -and -not $allSuffixes.Contains($suffix)) { $allSuffixes.Add($suffix) } " +
 		"} } }; " +
+		"if (-not [string]::IsNullOrWhiteSpace($startup) -and (Test-Path -LiteralPath $startup)) { " +
+		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.cmd' -File -ErrorAction SilentlyContinue | ForEach-Object { " +
+		"$suffix = $_.BaseName -replace '^codex-helper-teams-wsl-', ''; " +
+		"$content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue; " +
+		"$scriptPath = Join-Path $appDir ($scriptPrefix + $suffix + '.ps1'); " +
+		"$scriptContent = if (Test-Path -LiteralPath $scriptPath) { Get-Content -LiteralPath $scriptPath -Raw -ErrorAction SilentlyContinue } else { $null }; " +
+		"if (-not [string]::IsNullOrWhiteSpace($suffix) -and -not $allSuffixes.Contains($suffix) -and (($null -ne $content -and $content.Contains($legacyPrefix)) -or ($null -ne $scriptContent -and ($scriptContent.Contains('starting ' + $legacyPrefix) -or $scriptContent.Contains($legacyPrefix))))) { $allSuffixes.Add($suffix) } " +
+		"}; " +
+		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.vbs' -File -ErrorAction SilentlyContinue | ForEach-Object { " +
+		"$suffix = $_.BaseName -replace '^codex-helper-teams-wsl-', ''; " +
+		"$content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue; " +
+		"$scriptPath = Join-Path $appDir ($scriptPrefix + $suffix + '.ps1'); " +
+		"$scriptContent = if (Test-Path -LiteralPath $scriptPath) { Get-Content -LiteralPath $scriptPath -Raw -ErrorAction SilentlyContinue } else { $null }; " +
+		"if (-not [string]::IsNullOrWhiteSpace($suffix) -and -not $allSuffixes.Contains($suffix) -and (($null -ne $content -and $content.Contains($legacyPrefix)) -or ($null -ne $scriptContent -and ($scriptContent.Contains('starting ' + $legacyPrefix) -or $scriptContent.Contains($legacyPrefix))))) { $allSuffixes.Add($suffix) } " +
+		"} }; " +
 		"foreach ($suffix in $allSuffixes) { " +
 		"$stopPath = Join-Path $appDir ('codex-helper-teams-wsl-stop-' + $suffix + '.signal'); " +
 		"Set-Content -LiteralPath $stopPath -Value 'stop' -Encoding ASCII; " +

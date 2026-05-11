@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
@@ -1515,6 +1516,9 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevSystemctl := teamsServiceSystemctl
 	prevAuthPreflight := teamsServiceAuthPreflight
 	prevBootstrapControlChat := teamsServiceBootstrapControlChat
+	prevListLocalProcesses := teamsServiceListLocalProcesses
+	prevTerminateLocalProcess := teamsServiceTerminateLocalProcess
+	prevLocalProcessGraceDelay := teamsServiceLocalProcessGraceDelay
 	teamsServiceGOOS = func() string { return hooks.goos }
 	teamsServiceExecutable = func() (string, error) { return hooks.exe, nil }
 	teamsServiceGetwd = func() (string, error) { return hooks.cwd, nil }
@@ -1533,6 +1537,9 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	}
 	teamsServiceSystemctl = hooks.runner
 	teamsServiceAuthPreflight = func() error { return nil }
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) { return nil, nil }
+	teamsServiceTerminateLocalProcess = func(int, time.Duration) error { return nil }
+	teamsServiceLocalProcessGraceDelay = 0
 	teamsServiceBootstrapControlChat = func(ctx context.Context, root *rootOptions, registryPath *string, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
 		if hooks.bootstrapControlChat != nil {
 			return hooks.bootstrapControlChat(ctx, root, registryPath, openControl, errOut)
@@ -1554,6 +1561,9 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServiceSystemctl = prevSystemctl
 		teamsServiceAuthPreflight = prevAuthPreflight
 		teamsServiceBootstrapControlChat = prevBootstrapControlChat
+		teamsServiceListLocalProcesses = prevListLocalProcesses
+		teamsServiceTerminateLocalProcess = prevTerminateLocalProcess
+		teamsServiceLocalProcessGraceDelay = prevLocalProcessGraceDelay
 	})
 }
 
