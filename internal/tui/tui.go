@@ -1010,15 +1010,12 @@ func ensurePreview(
 	state.previewLoading[cacheKey] = true
 
 	maxMessages := opts.PreviewMessages
-	if maxMessages <= 0 {
-		maxMessages = 20
-	}
 
 	go func(key string, path string, maxMsgs int) {
 		msgs, err := codexhistory.ReadSessionMessages(path, maxMsgs)
 		text := ""
 		if err == nil {
-			text = codexhistory.FormatMessages(msgs, 400)
+			text = codexhistory.FormatMessages(msgs, 0)
 		}
 		previewCh <- previewEvent{cacheKey: key, text: text, err: err}
 		screen.PostEvent(&uiEvent{when: time.Now(), kind: "preview"})

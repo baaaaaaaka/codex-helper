@@ -382,24 +382,75 @@ func TestHelperSessionDisplayTitleAndFiltering(t *testing.T) {
 		}},
 	}}
 	filtered := FilterUserVisibleProjects(projects)
-	if len(filtered) != 2 {
-		t.Fatalf("filtered projects = %#v, want two user-visible projects", filtered)
+	if len(filtered) != 4 {
+		t.Fatalf("filtered projects = %#v, want four user-visible workspace projects", filtered)
 	}
-	if got := len(filtered[0].Sessions); got != 8 {
-		t.Fatalf("filtered sessions = %#v, want eight user-visible sessions", filtered[0].Sessions)
-	}
-	for _, session := range filtered[0].Sessions {
-		if IsHelperSession(session) {
-			t.Fatalf("helper session remained visible: %#v", session)
-		}
-		if session.SessionID == "parent-1" {
-			if got := len(session.Subagents); got != 1 || session.Subagents[0].AgentID != "real-sub" {
-				t.Fatalf("helper subagent was not filtered under visible parent: %#v", session.Subagents)
+	byPath := map[string]Project{}
+	for _, project := range filtered {
+		byPath[project.Path] = project
+		for _, session := range project.Sessions {
+			if IsHelperSession(session) {
+				t.Fatalf("helper session remained visible: %#v", session)
+			}
+			if session.SessionID == "parent-1" {
+				if got := len(session.Subagents); got != 1 || session.Subagents[0].AgentID != "real-sub" {
+					t.Fatalf("helper subagent was not filtered under visible parent: %#v", session.Subagents)
+				}
 			}
 		}
 	}
-	if filtered[1].Key != "normal-tmp-only" || len(filtered[1].Sessions) != 1 {
-		t.Fatalf("normal /tmp project was not preserved: %#v", filtered[1])
+	if got := len(byPath["/repo"].Sessions); got != 5 {
+		t.Fatalf("/repo sessions = %#v, want five user-visible sessions", byPath["/repo"].Sessions)
+	}
+	if got := len(byPath["/tmp/scn_docs_customer"].Sessions); got != 1 {
+		t.Fatalf("/tmp/scn_docs_customer sessions = %#v, want one", byPath["/tmp/scn_docs_customer"].Sessions)
+	}
+	if got := len(byPath["/tmp/customer-real-work"].Sessions); got != 2 {
+		t.Fatalf("/tmp/customer-real-work sessions = %#v, want two grouped sessions", byPath["/tmp/customer-real-work"].Sessions)
+	}
+	if got := len(byPath["/home/baka/project/customer-docs"].Sessions); got != 1 {
+		t.Fatalf("/home/baka/project/customer-docs sessions = %#v, want one", byPath["/home/baka/project/customer-docs"].Sessions)
+	}
+}
+
+func TestFilterUserVisibleProjectsGroupsBySessionWorkspace(t *testing.T) {
+	projects := []Project{{
+		Key:  "stale-discovery-record",
+		Path: "/tmp/codex-json-stale",
+		Sessions: []Session{{
+			SessionID:   "session-1",
+			ProjectPath: "/work/repo",
+			FilePath:    "/history/session-1.jsonl",
+			FirstPrompt: "real user work",
+		}},
+	}, {
+		Key:  "repo",
+		Path: "/work/repo",
+		Sessions: []Session{{
+			SessionID:   "session-1",
+			ProjectPath: "/work/repo",
+			FilePath:    "/history/session-1.jsonl",
+			FirstPrompt: "duplicate discovery entry",
+		}, {
+			SessionID:   "session-2",
+			ProjectPath: "/work/repo",
+			FilePath:    "/history/session-2.jsonl",
+			FirstPrompt: "second session",
+		}},
+	}}
+
+	filtered := FilterUserVisibleProjects(projects)
+	if len(filtered) != 1 {
+		t.Fatalf("filtered projects = %#v, want one workspace project", filtered)
+	}
+	if filtered[0].Path != "/work/repo" {
+		t.Fatalf("project path = %q, want session workspace path", filtered[0].Path)
+	}
+	if len(filtered[0].Sessions) != 2 {
+		t.Fatalf("sessions = %#v, want duplicate session removed", filtered[0].Sessions)
+	}
+	if filtered[0].Sessions[0].SessionID != "session-1" || filtered[0].Sessions[1].SessionID != "session-2" {
+		t.Fatalf("session order = %#v", filtered[0].Sessions)
 	}
 }
 

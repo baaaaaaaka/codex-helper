@@ -14,6 +14,7 @@ type Message struct {
 	Role      string
 	Content   string
 	Timestamp time.Time
+	sourceID  string
 }
 
 func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
@@ -25,6 +26,7 @@ func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
 
 	var ring []Message
 	reader := bufio.NewReaderSize(f, 64*1024)
+	seenSourceIDs := map[string]bool{}
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil && err != io.EOF {
@@ -33,6 +35,12 @@ func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
 		line = bytes.TrimSpace(line)
 		if len(line) > 0 {
 			for _, msg := range parseLineMessages(line) {
+				if msg.sourceID != "" {
+					if seenSourceIDs[msg.sourceID] {
+						continue
+					}
+					seenSourceIDs[msg.sourceID] = true
+				}
 				appendMessage(&ring, msg, maxMessages)
 			}
 		}
@@ -63,6 +71,16 @@ func parseLineMessages(line []byte) []Message {
 		return parseResponseItem(env.Payload, ts)
 	case "event_msg":
 		return parseEventMsg(env.Payload, ts)
+	case "item.completed":
+		return parseItemCompletedLine(line, ts)
+	case "turn.completed":
+		return parseTurnCompletedLine(line, ts)
+	}
+	switch env.Method {
+	case "item/completed":
+		return parseItemCompletedRaw(env.Params, ts)
+	case "turn/completed":
+		return parseTurnCompletedRaw(env.Params, ts)
 	}
 	return nil
 }
@@ -83,6 +101,12 @@ func parseResponseItem(raw json.RawMessage, ts time.Time) []Message {
 			return nil
 		}
 		return parseMessagePayload(payload, ts)
+	case "agent_message", "assistant_message":
+		var payload codexResponsePayload
+		if json.Unmarshal(raw, &payload) != nil {
+			return nil
+		}
+		return parseAgentMessagePayload(payload, ts)
 	case "function_call":
 		return parseFunctionCall(raw, ts)
 	case "function_call_output":
@@ -103,6 +127,19 @@ func parseResponseItem(raw json.RawMessage, ts time.Time) []Message {
 		return parseReasoning(raw, ts)
 	}
 	return nil
+}
+
+func parseAgentMessagePayload(payload codexResponsePayload, ts time.Time) []Message {
+	text := firstNonEmptyString(payload.Message, payload.Text, extractContentText(payload.Content))
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	role := "assistant"
+	if strings.ToLower(payload.Phase) == "commentary" {
+		role = "assistant_commentary"
+	}
+	return []Message{{Role: role, Content: text, Timestamp: ts, sourceID: messageSourceID(payload.Type, payload.ID)}}
 }
 
 func parseMessagePayload(payload codexResponsePayload, ts time.Time) []Message {
@@ -132,11 +169,13 @@ func parseMessagePayload(payload codexResponsePayload, ts time.Time) []Message {
 		}
 	}
 
-	return []Message{{Role: displayRole, Content: text, Timestamp: ts}}
+	return []Message{{Role: displayRole, Content: text, Timestamp: ts, sourceID: messageSourceID(payload.Type, payload.ID)}}
 }
 
 func parseFunctionCall(raw json.RawMessage, ts time.Time) []Message {
 	var fc struct {
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}
@@ -162,11 +201,13 @@ func parseFunctionCall(raw json.RawMessage, ts time.Time) []Message {
 		}
 	}
 
-	return []Message{{Role: "tool", Content: label, Timestamp: ts}}
+	return []Message{{Role: "tool", Content: label, Timestamp: ts, sourceID: messageSourceID("function_call", firstNonEmptyString(fc.ID, fc.CallID))}}
 }
 
 func parseFunctionCallOutput(raw json.RawMessage, ts time.Time) []Message {
 	var fco struct {
+		ID     string `json:"id"`
+		CallID string `json:"call_id"`
 		Output string `json:"output"`
 	}
 	if json.Unmarshal(raw, &fco) != nil {
@@ -176,7 +217,7 @@ func parseFunctionCallOutput(raw json.RawMessage, ts time.Time) []Message {
 	if text == "" {
 		return nil
 	}
-	return []Message{{Role: "tool_result", Content: text, Timestamp: ts}}
+	return []Message{{Role: "tool_result", Content: text, Timestamp: ts, sourceID: messageSourceID("function_call_output", firstNonEmptyString(fco.ID, fco.CallID))}}
 }
 
 func parseCustomToolCall(payload codexResponsePayload, ts time.Time) []Message {
@@ -189,7 +230,7 @@ func parseCustomToolCall(payload codexResponsePayload, ts time.Time) []Message {
 	if text != "" {
 		label += "\n" + strings.TrimSpace(text)
 	}
-	return []Message{{Role: "tool", Content: label, Timestamp: ts}}
+	return []Message{{Role: "tool", Content: label, Timestamp: ts, sourceID: messageSourceID(payload.Type, payload.ID)}}
 }
 
 func parseCustomToolCallOutput(payload codexResponsePayload, ts time.Time) []Message {
@@ -198,11 +239,12 @@ func parseCustomToolCallOutput(payload codexResponsePayload, ts time.Time) []Mes
 	if text == "" {
 		return nil
 	}
-	return []Message{{Role: "tool_result", Content: text, Timestamp: ts}}
+	return []Message{{Role: "tool_result", Content: text, Timestamp: ts, sourceID: messageSourceID(payload.Type, payload.ID)}}
 }
 
 func parseReasoning(raw json.RawMessage, ts time.Time) []Message {
 	var reasoning struct {
+		ID      string `json:"id"`
 		Type    string `json:"type"`
 		Summary []struct {
 			Type string `json:"type"`
@@ -221,12 +263,18 @@ func parseReasoning(raw json.RawMessage, ts time.Time) []Message {
 	if len(parts) == 0 {
 		return nil
 	}
-	return []Message{{Role: "thinking", Content: strings.Join(parts, "\n"), Timestamp: ts}}
+	return []Message{{Role: "thinking", Content: strings.Join(parts, "\n"), Timestamp: ts, sourceID: messageSourceID(reasoning.Type, reasoning.ID)}}
 }
 
 func parseEventMsg(raw json.RawMessage, ts time.Time) []Message {
 	var event struct {
-		Type string `json:"type"`
+		ID      string          `json:"id"`
+		Type    string          `json:"type"`
+		Phase   string          `json:"phase"`
+		Content json.RawMessage `json:"content"`
+		Message json.RawMessage `json:"message"`
+		Text    json.RawMessage `json:"text"`
+		Payload json.RawMessage `json:"payload"`
 	}
 	if json.Unmarshal(raw, &event) != nil {
 		return nil
@@ -234,15 +282,144 @@ func parseEventMsg(raw json.RawMessage, ts time.Time) []Message {
 
 	// Only extract user_message as a fallback for sessions without response_item/user
 	if event.Type == "user_message" {
-		var userMsg struct {
-			Content string `json:"content"`
-		}
-		if json.Unmarshal(raw, &userMsg) == nil {
-			text := strings.TrimSpace(userMsg.Content)
-			if text != "" {
-				return []Message{{Role: "user", Content: text, Timestamp: ts}}
-			}
+		text := strings.TrimSpace(firstNonEmptyString(
+			extractContentText(event.Content),
+			extractContentText(event.Message),
+			extractContentText(event.Text),
+		))
+		if text != "" {
+			return []Message{{Role: "user", Content: text, Timestamp: ts, sourceID: messageSourceID(event.Type, event.ID)}}
 		}
 	}
+	if event.Type == "agent_message" || event.Type == "assistant_message" {
+		text := firstNonEmptyString(
+			extractContentText(event.Message),
+			extractContentText(event.Text),
+			extractContentText(event.Content),
+			extractContentText(event.Payload),
+		)
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return nil
+		}
+		role := "assistant"
+		if strings.ToLower(event.Phase) == "commentary" {
+			role = "assistant_commentary"
+		}
+		return []Message{{Role: role, Content: text, Timestamp: ts, sourceID: messageSourceID(event.Type, event.ID)}}
+	}
 	return nil
+}
+
+func parseItemCompletedLine(line []byte, ts time.Time) []Message {
+	var env struct {
+		Item    json.RawMessage `json:"item"`
+		Payload json.RawMessage `json:"payload"`
+		Params  json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(line, &env) != nil {
+		return nil
+	}
+	if len(bytes.TrimSpace(env.Item)) > 0 {
+		return parseCompletedItem(env.Item, ts)
+	}
+	if len(bytes.TrimSpace(env.Payload)) > 0 {
+		return parseItemCompletedRaw(env.Payload, ts)
+	}
+	if len(bytes.TrimSpace(env.Params)) > 0 {
+		return parseItemCompletedRaw(env.Params, ts)
+	}
+	return nil
+}
+
+func parseItemCompletedRaw(raw json.RawMessage, ts time.Time) []Message {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	var payload struct {
+		Item json.RawMessage `json:"item"`
+	}
+	if json.Unmarshal(raw, &payload) == nil && len(bytes.TrimSpace(payload.Item)) > 0 {
+		return parseCompletedItem(payload.Item, ts)
+	}
+	return parseCompletedItem(raw, ts)
+}
+
+func parseCompletedItem(raw json.RawMessage, ts time.Time) []Message {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	return parseResponseItem(raw, ts)
+}
+
+func parseTurnCompletedLine(line []byte, ts time.Time) []Message {
+	var env struct {
+		Payload json.RawMessage `json:"payload"`
+		Params  json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(line, &env) != nil {
+		return nil
+	}
+	if len(bytes.TrimSpace(env.Payload)) > 0 {
+		if msgs := parseTurnCompletedRaw(env.Payload, ts); len(msgs) > 0 {
+			return msgs
+		}
+	}
+	if len(bytes.TrimSpace(env.Params)) > 0 {
+		if msgs := parseTurnCompletedRaw(env.Params, ts); len(msgs) > 0 {
+			return msgs
+		}
+	}
+	return parseTurnCompletedRaw(json.RawMessage(line), ts)
+}
+
+func parseTurnCompletedRaw(raw json.RawMessage, ts time.Time) []Message {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	var payload struct {
+		Turn struct {
+			Items []json.RawMessage `json:"items"`
+		} `json:"turn"`
+		Items []json.RawMessage `json:"items"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return nil
+	}
+	items := payload.Turn.Items
+	if len(items) == 0 {
+		items = payload.Items
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	var out []Message
+	for _, item := range items {
+		out = append(out, parseCompletedItem(item, ts)...)
+	}
+	return out
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func messageSourceID(kind string, id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "item"
+	}
+	return kind + ":" + id
 }

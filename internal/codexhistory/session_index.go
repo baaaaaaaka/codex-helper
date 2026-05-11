@@ -29,7 +29,9 @@ type sessionFileMeta struct {
 type codexEnvelope struct {
 	Timestamp string          `json:"timestamp"`
 	Type      string          `json:"type"`
+	Method    string          `json:"method"`
 	Payload   json.RawMessage `json:"payload"`
+	Params    json.RawMessage `json:"params"`
 }
 
 type codexSessionMetaPayload struct {
@@ -41,10 +43,13 @@ type codexSessionMetaPayload struct {
 // codexResponsePayload is a unified struct for response_item payloads.
 // Different fields are populated depending on the Type.
 type codexResponsePayload struct {
+	ID      string          `json:"id"`
 	Type    string          `json:"type"`
 	Role    string          `json:"role"`
 	Phase   string          `json:"phase"`
 	Name    string          `json:"name"`
+	Text    string          `json:"text"`
+	Message string          `json:"message"`
 	Content json.RawMessage `json:"content"`
 }
 

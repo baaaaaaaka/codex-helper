@@ -573,6 +573,35 @@ func TestParseEventMsg_WhitespaceContent(t *testing.T) {
 	}
 }
 
+func TestParseEventMsg_AgentMessagePhases(t *testing.T) {
+	commentary := `{"type":"agent_message","phase":"commentary","message":"working"}`
+	msgs := parseEventMsg([]byte(commentary), fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("commentary messages = %#v, want 1", msgs)
+	}
+	if msgs[0].Role != "assistant_commentary" || msgs[0].Content != "working" {
+		t.Fatalf("commentary msg = %#v", msgs[0])
+	}
+
+	final := `{"type":"agent_message","phase":"final_answer","message":"done"}`
+	msgs = parseEventMsg([]byte(final), fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("final messages = %#v, want 1", msgs)
+	}
+	if msgs[0].Role != "assistant" || msgs[0].Content != "done" {
+		t.Fatalf("final msg = %#v", msgs[0])
+	}
+
+	arrayContent := `{"type":"agent_message","phase":"final_answer","content":[{"type":"output_text","text":"array done"}]}`
+	msgs = parseEventMsg([]byte(arrayContent), fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("array content messages = %#v, want 1", msgs)
+	}
+	if msgs[0].Role != "assistant" || msgs[0].Content != "array done" {
+		t.Fatalf("array content msg = %#v", msgs[0])
+	}
+}
+
 func TestParseEventMsg_InvalidJSON(t *testing.T) {
 	msgs := parseEventMsg([]byte(`{broken`), fixedTime())
 	if msgs != nil {
@@ -659,6 +688,27 @@ func TestReadSessionMessages_MaxMessagesRingBuffer(t *testing.T) {
 	}
 }
 
+func TestReadSessionMessages_DoesNotDedupeDifferentItemTypesWithSameCallID(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"read","arguments":"{}"}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"file data"}}`,
+	}
+	f := filepath.Join(t.TempDir(), "tool.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := ReadSessionMessages(f, 0)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want tool call and tool result", msgs)
+	}
+	if msgs[0].Role != "tool" || msgs[1].Role != "tool_result" {
+		t.Fatalf("roles = %q/%q, want tool/tool_result", msgs[0].Role, msgs[1].Role)
+	}
+}
+
 func TestReadSessionMessages_SystemInjectedSkipped(t *testing.T) {
 	lines := []string{
 		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md\nskill stuff"}]}}`,
@@ -719,5 +769,42 @@ func TestReadSessionMessages_CustomToolCalls(t *testing.T) {
 	}
 	if msgs[1].Role != "tool_result" {
 		t.Errorf("msgs[1].Role = %q", msgs[1].Role)
+	}
+}
+
+func TestReadSessionMessages_CompletedEventShapes(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"working"}}`,
+		`{"timestamp":"2026-01-01T00:01:00Z","type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"item done"}}`,
+		`{"timestamp":"2026-01-01T00:02:00Z","method":"item/completed","params":{"item":{"id":"item-2","type":"message","role":"assistant","content":[{"type":"output_text","text":"method item done"}]}}}`,
+		`{"timestamp":"2026-01-01T00:02:30Z","type":"response_item","payload":{"id":"user-1","type":"message","role":"user","content":[{"type":"input_text","text":"question"}]}}`,
+		`{"timestamp":"2026-01-01T00:02:31Z","type":"response_item","payload":{"id":"assistant-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}`,
+		`{"timestamp":"2026-01-01T00:03:00Z","method":"turn/completed","params":{"turn":{"items":[{"id":"sys","type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md\nskip me"}]},{"id":"user-1","type":"message","role":"user","content":[{"type":"input_text","text":"question"}]},{"id":"assistant-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}}}`,
+	}
+	f := filepath.Join(t.TempDir(), "completed.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := ReadSessionMessages(f, 0)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %#v, want 5", msgs)
+	}
+	want := []struct {
+		role string
+		text string
+	}{
+		{"assistant_commentary", "working"},
+		{"assistant", "item done"},
+		{"assistant", "method item done"},
+		{"user", "question"},
+		{"assistant", "answer"},
+	}
+	for i, item := range want {
+		if msgs[i].Role != item.role || msgs[i].Content != item.text {
+			t.Fatalf("msgs[%d] = %#v, want role=%q text=%q", i, msgs[i], item.role, item.text)
+		}
 	}
 }

@@ -59,20 +59,90 @@ func FilterUserVisibleProjects(projects []Project) []Project {
 	if len(projects) == 0 {
 		return nil
 	}
-	out := make([]Project, 0, len(projects))
+
+	type projectAccumulator struct {
+		project     Project
+		seenSession map[string]bool
+	}
+
+	accumulators := map[string]*projectAccumulator{}
+	order := make([]string, 0, len(projects))
+	workspaceForProject := func(project Project, path string) *projectAccumulator {
+		path = strings.TrimSpace(path)
+		key := userVisibleProjectWorkspaceKey(project, path)
+		acc := accumulators[key]
+		if acc != nil {
+			if acc.project.Path == "" && path != "" {
+				acc.project.Path = path
+			}
+			if acc.project.Key == "" {
+				acc.project.Key = strings.TrimSpace(project.Key)
+			}
+			return acc
+		}
+		acc = &projectAccumulator{
+			project: Project{
+				Key:  strings.TrimSpace(project.Key),
+				Path: path,
+			},
+			seenSession: map[string]bool{},
+		}
+		accumulators[key] = acc
+		order = append(order, key)
+		return acc
+	}
+
 	for _, project := range projects {
 		if len(project.Sessions) == 0 {
-			out = append(out, project)
+			_ = workspaceForProject(project, project.Path)
 			continue
 		}
 		sessions := filterUserVisibleSessions(project.Path, project.Sessions)
 		if len(sessions) == 0 {
 			continue
 		}
-		project.Sessions = sessions
-		out = append(out, project)
+		for _, session := range sessions {
+			workspacePath := strings.TrimSpace(session.ProjectPath)
+			if workspacePath == "" {
+				workspacePath = strings.TrimSpace(project.Path)
+				session.ProjectPath = workspacePath
+			}
+			acc := workspaceForProject(project, workspacePath)
+			if key := userVisibleSessionKey(session); key != "" {
+				if acc.seenSession[key] {
+					continue
+				}
+				acc.seenSession[key] = true
+			}
+			acc.project.Sessions = append(acc.project.Sessions, session)
+		}
+	}
+	out := make([]Project, 0, len(order))
+	for _, key := range order {
+		out = append(out, accumulators[key].project)
 	}
 	return out
+}
+
+func userVisibleProjectWorkspaceKey(project Project, path string) string {
+	path = strings.TrimSpace(path)
+	if path != "" {
+		return "path:" + normalizeHelperSessionPath(path)
+	}
+	if key := strings.TrimSpace(project.Key); key != "" {
+		return "key:" + key
+	}
+	return "unknown"
+}
+
+func userVisibleSessionKey(session Session) string {
+	if id := strings.TrimSpace(session.SessionID); id != "" {
+		return "id:" + id
+	}
+	if filePath := strings.TrimSpace(session.FilePath); filePath != "" {
+		return "file:" + normalizeHelperSessionPath(filePath)
+	}
+	return ""
 }
 
 func FilterUserVisibleSessions(sessions []Session) []Session {

@@ -403,6 +403,48 @@ func TestBuildProjectAndSessionItemsHideHelperSessions(t *testing.T) {
 	}
 }
 
+func TestBuildProjectItemsUsesSessionWorkspacePath(t *testing.T) {
+	projects := []codexhistory.Project{{
+		Key:  "stale-helper-discovery-record",
+		Path: "/tmp/codex-json-stale",
+		Sessions: []codexhistory.Session{{
+			SessionID:   "sess-1",
+			ProjectPath: "/repo/current",
+			FilePath:    "/history/sess-1.jsonl",
+			FirstPrompt: "real user session",
+		}},
+	}, {
+		Key:  "current",
+		Path: "/repo/current",
+		Sessions: []codexhistory.Session{{
+			SessionID:   "sess-1",
+			ProjectPath: "/repo/current",
+			FilePath:    "/history/sess-1.jsonl",
+			FirstPrompt: "duplicate session",
+		}, {
+			SessionID:   "sess-2",
+			ProjectPath: "/repo/current",
+			FilePath:    "/history/sess-2.jsonl",
+			FirstPrompt: "second session",
+		}},
+	}}
+
+	projectItems := buildProjectItems(projects, "")
+	if len(projectItems) != 1 {
+		t.Fatalf("project items = %#v, want one grouped workspace", projectItems)
+	}
+	if projectItems[0].project.Path != "/repo/current" {
+		t.Fatalf("project path = %q, want /repo/current", projectItems[0].project.Path)
+	}
+	if got := len(projectItems[0].project.Sessions); got != 2 {
+		t.Fatalf("session count = %d, want grouped and deduped count 2", got)
+	}
+	sessionItems := buildSessionItems(projectItems[0].project, nil)
+	if len(sessionItems) != 3 {
+		t.Fatalf("session items = %#v, want new agent plus two sessions", sessionItems)
+	}
+}
+
 func TestFilterSessionsKeepsNewAgent(t *testing.T) {
 	project := codexhistory.Project{Sessions: []codexhistory.Session{{SessionID: "sess-1"}}}
 	items := buildSessionItems(project, nil)
@@ -1100,8 +1142,15 @@ func TestApplyPreviewNavigation(t *testing.T) {
 func TestEnsurePreview(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
-	content := `{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-01-01T00:00:00Z"}`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	longAnswer := strings.Repeat("long-answer-", 45) + "tail-marker"
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"oldest prompt"}]}}`,
+	}
+	for i := 0; i < 24; i++ {
+		lines = append(lines, `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"middle update"}]}}`)
+	}
+	lines = append(lines, `{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"`+longAnswer+`"}}`)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatalf("write session: %v", err)
 	}
 
@@ -1110,7 +1159,7 @@ func TestEnsurePreview(t *testing.T) {
 	session := &codexhistory.Session{FilePath: path}
 	previewCh := make(chan previewEvent, 1)
 
-	ensurePreview(screen, state, Options{PreviewMessages: 1}, session, nil, previewCh)
+	ensurePreview(screen, state, Options{}, session, nil, previewCh)
 	cacheKey := previewCacheKey(session, nil)
 	if !state.previewLoading[cacheKey] {
 		t.Fatalf("expected preview loading to be set")
@@ -1123,8 +1172,12 @@ func TestEnsurePreview(t *testing.T) {
 		if ev.err != nil {
 			t.Fatalf("unexpected preview error: %v", ev.err)
 		}
-		// NOTE: codexhistory.ReadSessionMessages is stubbed (Phase 2),
-		// so the preview text will be empty. Just verify no error.
+		if !strings.Contains(ev.text, "oldest prompt") {
+			t.Fatalf("preview did not include oldest message: %q", ev.text)
+		}
+		if !strings.Contains(ev.text, "tail-marker") {
+			t.Fatalf("preview truncated long final answer: %q", ev.text)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timeout waiting for preview event")
 	}
@@ -1133,6 +1186,39 @@ func TestEnsurePreview(t *testing.T) {
 	ensurePreview(screen, state, Options{}, session, nil, previewCh)
 	if !state.previewLoading[cacheKey] {
 		t.Fatalf("expected preview loading to remain set")
+	}
+}
+
+func TestEnsurePreviewHonorsExplicitMessageLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sess.jsonl")
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"last answer"}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	screen := newTestScreen(t, 80, 24)
+	state := newTestState(nil)
+	session := &codexhistory.Session{FilePath: path}
+	previewCh := make(chan previewEvent, 1)
+
+	ensurePreview(screen, state, Options{PreviewMessages: 1}, session, nil, previewCh)
+	select {
+	case ev := <-previewCh:
+		if ev.err != nil {
+			t.Fatalf("unexpected preview error: %v", ev.err)
+		}
+		if strings.Contains(ev.text, "first prompt") {
+			t.Fatalf("preview ignored explicit message limit: %q", ev.text)
+		}
+		if !strings.Contains(ev.text, "last answer") {
+			t.Fatalf("preview missing last answer: %q", ev.text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for preview event")
 	}
 }
 
