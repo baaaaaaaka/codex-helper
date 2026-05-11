@@ -120,7 +120,7 @@ func TestLiveBridgeRealCodexUserJourneyOptIn(t *testing.T) {
 
 	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_REAL_CODEX_INCLUDE_CONTROL_FALLBACK")) == "1" {
 		liveSendText(ctx, t, graph, controlChat.ID, "Reply exactly CONTROL-FALLBACK-"+nonce)
-		waitForOutbox("control fallback ack", controlChat.ID, "quick helper question")
+		waitForOutbox("control fallback ack", controlChat.ID, "Codex received your control-chat question")
 		waitForOutbox("control fallback final", controlChat.ID, "CONTROL-FALLBACK-"+nonce)
 	} else {
 		t.Logf("skipping live control fallback Codex turn; set CODEX_HELPER_TEAMS_LIVE_REAL_CODEX_INCLUDE_CONTROL_FALLBACK=1 to exercise %s", controlModel)

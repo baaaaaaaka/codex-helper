@@ -155,7 +155,7 @@ func TestLiveBridgeControlDashboardFallbackOptIn(t *testing.T) {
 
 	fallbackPrompt := "live control fallback " + nonce
 	sendControl("control fallback", fallbackPrompt)
-	waitAny("control fallback ack", []string{"quick helper question"})
+	waitAny("control fallback ack", []string{"Codex received your control-chat question"})
 	waitAny("control fallback final", []string{"echo:", fallbackPrompt})
 }
 

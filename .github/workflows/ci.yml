@@ -351,6 +351,13 @@ jobs:
           go test ./internal/teams -count=1 -run "$workflow_pattern" -v
           go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
 
+      - name: Teams control dashboard formatting regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='TestBridge(Control(DashboardReadableWorkspaceAndSessionFormatting|WorkspacesAndSessionsDoNotRunCodex|WorkspaceListDoesNotShowWorkspaceFingerprint|WorkspaceListUsesSessionProjectPathWhenProjectPathMissing|WorkspaceSessionsOnlyShowsSelectedWorkspace|NewUsesSelectedWorkspaceWhenNoDirectoryGiven|UnknownTextFallsBackToCodex|HelperUpdateQuestionFallsBackToCodex|AskUsesExplicitFallbackText)|UpgradeDrainDefersAndReplaysControlFallbackOnce)$'
+          go test ./internal/teams -count=1 -run "$pattern" -v
+
       - name: Teams background keepalive race regressions (Linux only)
         if: runner.os == 'Linux'
         shell: bash

@@ -3019,7 +3019,7 @@ func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, 
 		TeamsChatID: session.ChatID,
 		Kind:        "ack",
 		AckKind:     "control_prompt",
-		Body:        "❓ Quick helper question\n\nI will answer here. For project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
+		Body:        "❓ **Codex received your control-chat question.**\n\nThis message is not a helper command, so **Codex will answer it here**. The request has already been submitted to Codex.\n\nFor project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
 	})
 	if err != nil {
 		return err
@@ -9305,7 +9305,7 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if len(dashboard.Workspaces) == 0 {
-		return "## 📁 Workspaces\n\nNo local Codex workspaces found on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\nNext: send `new <directory>` to create a Work chat for a directory.", nil
+		return "## 📁 Workspaces\n\nNo local Codex workspaces found on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\n**Next:** send `new <directory>` to create a Work chat for a directory.", nil
 	}
 	lines := []string{
 		"## 📁 Workspaces",
@@ -9313,19 +9313,24 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		"Reply with a number to open a workspace.",
 		"",
 	}
-	for _, workspace := range dashboard.Workspaces {
-		parts := []string{
-			"**" + dashboardWorkspaceListTitle(workspace) + "**",
+	for i, workspace := range dashboard.Workspaces {
+		if i > 0 {
+			lines = append(lines, "", "---", "")
+		}
+		lines = append(lines,
+			fmt.Sprintf("**%d. %s**", workspace.Number, dashboardWorkspaceListTitle(workspace)),
 			dashboardWorkspaceListPathLine(workspace),
 			dashboardWorkspaceListMeta(workspace),
-		}
+		)
 		if dashboardAbsolutePath(workspace.Path) == "" {
-			parts = append(parts, "Older Codex records without a working directory are grouped here.")
+			lines = append(lines, "Older Codex records without a working directory are grouped here.")
 		}
-		parts = append(parts, fmt.Sprintf("send `%d` or `p %d`", workspace.Number, workspace.Number))
-		lines = append(lines, fmt.Sprintf("`%d` - %s", workspace.Number, strings.Join(parts, "\n   ")))
+		lines = append(lines,
+			"",
+			fmt.Sprintf("**Next:** send `%d` or `p %d` to open this workspace", workspace.Number, workspace.Number),
+		)
 	}
-	lines = append(lines, "", "Next:", "- Send a workspace number, for example `1`, to open it.", "- `n <directory>` or `new <directory>` - create a new Work chat directly.")
+	lines = append(lines, "", "**Other options:**", "- Send a workspace number, for example `1`, to open it.", "- `n <directory>` or `new <directory>` - create a new Work chat directly.")
 	lines = append(lines, "", "Numbers apply to your next reply and expire after 10 minutes. If a number looks wrong, send `projects` again.")
 	return strings.Join(lines, "\n"), nil
 }
@@ -9342,9 +9347,9 @@ func dashboardWorkspaceListTitle(workspace DashboardWorkspace) string {
 
 func dashboardWorkspaceListPathLine(workspace DashboardWorkspace) string {
 	if abs := dashboardAbsolutePath(workspace.Path); abs != "" {
-		return "Path: " + dashboardInlineCode(abs)
+		return dashboardInlineCode(abs)
 	}
-	return "Path: not recorded by Codex"
+	return "Path not recorded by Codex"
 }
 
 func dashboardWorkspaceListMeta(workspace DashboardWorkspace) string {
@@ -9353,9 +9358,9 @@ func dashboardWorkspaceListMeta(workspace DashboardWorkspace) string {
 		meta = "1 session"
 	}
 	if !workspace.UpdatedAt.IsZero() {
-		meta += " - updated " + workspace.UpdatedAt.Local().Format("2006-01-02 15:04")
+		meta += ", latest " + dashboardInlineCode(workspace.UpdatedAt.Local().Format("2006-01-02 15:04"))
 	}
-	return meta
+	return "Sessions: " + meta
 }
 
 func dashboardWorkspacePathDisplay(path string) string {
@@ -9441,9 +9446,9 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 	if len(dashboard.CurrentView.Items) == 0 {
 		selectedWorkspace := dashboardWorkspaceByID(dashboard.Workspaces, dashboard.SelectedWorkspaceID)
 		if selectedWorkspace.ID != "" {
-			return fmt.Sprintf("`new` - create a new Work chat in this workspace.\n\n## Sessions\n\nWorkspace: %s\n\nNo local Codex sessions were found in this workspace on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\nTip: send `new` to create a new Work chat in this workspace.", dashboardWorkspacePathDisplay(selectedWorkspace.Path)), nil
+			return fmt.Sprintf("## Sessions\n\nWorkspace: %s\n\nNo local Codex sessions were found in this workspace on this machine.\n\nCodex history is stored locally. If you used Codex on another computer, run this helper there too.\n\n**Next:** send `new` to create a new Work chat in this workspace.", dashboardWorkspacePathDisplay(selectedWorkspace.Path)), nil
 		}
-		return "## Sessions\n\nNo local Codex sessions found on this machine.\n\nNext: send `projects` to choose a workspace.\n\nTip: send `new <directory>` to create a new Work chat.", nil
+		return "## Sessions\n\nNo local Codex sessions found on this machine.\n\n**Next:** send `projects` to choose a workspace.\n\nTip: send `new <directory>` to create a new Work chat.", nil
 	}
 	selectedWorkspace := dashboardWorkspaceByID(dashboard.Workspaces, dashboard.SelectedWorkspaceID)
 	sessions := make(map[string]DashboardSession, len(dashboard.Sessions))
@@ -9457,8 +9462,6 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 		workspaceLine = "Workspace: " + dashboardWorkspacePathDisplay(selectedWorkspace.Path)
 	}
 	lines := []string{
-		"`new` - create a new Work chat in this workspace.",
-		"",
 		"## " + heading,
 		"",
 		workspaceLine,
@@ -9468,43 +9471,56 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 	}
 	if strings.TrimSpace(workspaceLine) == "" {
 		lines = []string{
-			"`new` - create a new Work chat in this workspace.",
-			"",
 			"## " + heading,
 			"",
 			"Reply with a number to continue a session in Teams.",
 			"",
 		}
 	}
+	workspaceByID := make(map[string]DashboardWorkspace, len(dashboard.Workspaces))
+	for _, workspace := range dashboard.Workspaces {
+		workspaceByID[workspace.ID] = workspace
+	}
+	displayed := 0
 	for _, item := range dashboard.CurrentView.Items {
 		session, ok := sessions[sessionKey(item.WorkspaceID, item.SessionID)]
 		if !ok {
 			continue
 		}
-		action := fmt.Sprintf("send `%d` or `c %d`", item.Number, item.Number)
+		if displayed > 0 {
+			lines = append(lines, "", "---", "")
+		}
+		action := fmt.Sprintf("send `%d` or `c %d` to continue this session in Teams", item.Number, item.Number)
 		if linked := b.linkedSessionForLocalSessionID(session.ID); linked != nil {
 			if isActiveSessionStatus(linked.Status) {
-				action = fmt.Sprintf("already in Teams -> send `%d` to open/import updates", item.Number)
+				action = fmt.Sprintf("send `%d` to open this Teams chat or import updates", item.Number)
 			} else {
-				action = fmt.Sprintf("closed Teams chat -> send `%d` for a new Work chat", item.Number)
+				action = fmt.Sprintf("send `%d` to create a new Work chat from this closed Teams chat", item.Number)
 			}
 		}
-		parts := []string{"**" + session.DisplayTitle + "**"}
-		if meta := dashboardSessionListMeta(session); meta != "" {
-			parts = append(parts, meta)
+		lines = append(lines, fmt.Sprintf("**%d. %s**", item.Number, session.DisplayTitle))
+		pathLine := "Path not recorded by Codex"
+		if workspace, ok := workspaceByID[item.WorkspaceID]; ok {
+			pathLine = dashboardWorkspaceListPathLine(workspace)
+		} else if selectedWorkspace.ID != "" {
+			pathLine = dashboardWorkspaceListPathLine(selectedWorkspace)
 		}
-		parts = append(parts, action)
-		lines = append(lines, fmt.Sprintf("`%d` - %s", item.Number, strings.Join(parts, "\n   ")))
+		lines = append(lines, pathLine)
+		if meta := dashboardSessionListMeta(session); meta != "" {
+			lines = append(lines, meta)
+		}
+		lines = append(lines, "", "**Next:** "+action)
+		displayed++
 	}
-	lines = append(lines, "", "Need debug IDs? Send `details <number>`. Numbers expire after one reply.", "Tip: send `new` to create a new Work chat in this workspace.")
+	lines = append(lines, "", "Need debug IDs? Send `details <number>`. Numbers expire after one reply.", "", "**Next:** send `new` to create a new Work chat in this workspace.")
 	return strings.Join(lines, "\n"), nil
 }
 
 func dashboardSessionListMeta(session DashboardSession) string {
 	if session.UpdatedAt.IsZero() {
-		return ""
+		return "Session: update time not recorded"
 	}
-	return "updated " + session.UpdatedAt.Local().Format("2006-01-02 15:04")
+	return "Session: updated " + dashboardInlineCode(session.UpdatedAt.Local().Format("2006-01-02 15:04"))
 }
 
 func (b *Bridge) previousControlDashboard(ctx context.Context) ControlDashboard {

@@ -2019,14 +2019,14 @@ func TestBridgeControlWorkspacesAndSessionsDoNotRunCodex(t *testing.T) {
 	}
 	workspaceDashboard := PlainTextFromTeamsHTML((*sent)[0].Content)
 	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
-	if !strings.Contains(workspaceDashboard, "1 - alpha") || !strings.Contains(workspaceDashboard, "Path: "+expectedAlphaPath) {
+	if !strings.Contains(workspaceDashboard, "1. alpha") || !strings.Contains(workspaceDashboard, expectedAlphaPath) || !strings.Contains(workspaceDashboard, "Sessions: 1 session") || !strings.Contains(workspaceDashboard, "Next: send 1 or p 1") {
 		t.Fatalf("dashboard output missing readable workspace title/path: %q", workspaceDashboard)
 	}
 	sessionDashboard := PlainTextFromTeamsHTML((*sent)[1].Content)
 	if !strings.Contains(sessionDashboard, "Workspace: "+expectedAlphaPath) {
 		t.Fatalf("session dashboard should name selected workspace: %q", sessionDashboard)
 	}
-	if !strings.Contains(sessionDashboard, "fix alpha") || !strings.Contains(sessionDashboard, "c 1") {
+	if !strings.Contains(sessionDashboard, "1. fix alpha") || !strings.Contains(sessionDashboard, expectedAlphaPath) || !strings.Contains(sessionDashboard, "Session: updated") || !strings.Contains(sessionDashboard, "Next: send 1 or c 1") {
 		t.Fatalf("session dashboard missing title/action: %q", sessionDashboard)
 	}
 	sessionLines := strings.Split(strings.TrimSpace(sessionDashboard), "\n")
@@ -2049,6 +2049,66 @@ func TestBridgeControlWorkspacesAndSessionsDoNotRunCodex(t *testing.T) {
 	}
 	if _, ok := state.DashboardViews["control-chat"]; ok {
 		t.Fatalf("dashboard view should be consumed after details command: %#v", state.DashboardViews)
+	}
+}
+
+func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.T) {
+	alphaUpdated := time.Date(2026, 4, 30, 12, 0, 0, 0, time.Local)
+	betaUpdated := time.Date(2026, 4, 30, 13, 0, 0, 0, time.Local)
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "alpha",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-alpha",
+				FirstPrompt: "fix alpha",
+				ProjectPath: "/home/user/project/alpha",
+				ModifiedAt:  alphaUpdated,
+			}},
+		}, {
+			Key:  "beta",
+			Path: "/home/user/project/beta",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-beta",
+				FirstPrompt: "fix beta",
+				ProjectPath: "/home/user/project/beta",
+				ModifiedAt:  betaUpdated,
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+
+	workspaces, err := bridge.formatWorkspaceDashboard(context.Background())
+	if err != nil {
+		t.Fatalf("formatWorkspaceDashboard error: %v", err)
+	}
+	for _, want := range []string{
+		"**1. beta**\n`/home/user/project/beta`\nSessions: 1 session, latest `2026-04-30 13:00`\n\n**Next:** send `1` or `p 1` to open this workspace",
+		"\n\n---\n\n",
+		"**2. alpha**\n`/home/user/project/alpha`\nSessions: 1 session, latest `2026-04-30 12:00`\n\n**Next:** send `2` or `p 2` to open this workspace",
+	} {
+		if !strings.Contains(workspaces, want) {
+			t.Fatalf("workspace dashboard missing %q in:\n%s", want, workspaces)
+		}
+	}
+	if strings.Contains(workspaces, "Sessions: **") || strings.Contains(workspaces, "Sessions: 1 session, latest **") {
+		t.Fatalf("workspace session metadata should not be bolded:\n%s", workspaces)
+	}
+
+	sessions, err := bridge.formatWorkspaceSessionsDashboard(context.Background(), DashboardCommandTarget{Raw: "/home/user/project/alpha"})
+	if err != nil {
+		t.Fatalf("formatWorkspaceSessionsDashboard error: %v", err)
+	}
+	wantSession := "**1. fix alpha**\n`/home/user/project/alpha`\nSession: updated `2026-04-30 12:00`\n\n**Next:** send `1` or `c 1` to continue this session in Teams"
+	if !strings.Contains(sessions, wantSession) {
+		t.Fatalf("session dashboard missing readable block %q in:\n%s", wantSession, sessions)
+	}
+	if strings.Contains(sessions, "Session: **") || strings.Contains(sessions, "Session: updated **") {
+		t.Fatalf("session metadata should not be bolded:\n%s", sessions)
 	}
 }
 
@@ -2113,7 +2173,7 @@ func TestBridgeControlWorkspaceListDoesNotShowWorkspaceFingerprint(t *testing.T)
 	if strings.Contains(got, "workspace:") {
 		t.Fatalf("workspace dashboard leaked workspace fingerprint: %q", got)
 	}
-	if !strings.Contains(got, "1 - Unknown workspace") || !strings.Contains(got, "Path: not recorded by Codex") || !strings.Contains(got, "Older Codex records without a working directory") {
+	if !strings.Contains(got, "1. Unknown workspace") || !strings.Contains(got, "Path not recorded by Codex") || !strings.Contains(got, "Older Codex records without a working directory") || !strings.Contains(got, "Next: send 1 or p 1") {
 		t.Fatalf("workspace dashboard missing unknown-workspace guidance: %q", got)
 	}
 }
@@ -2144,7 +2204,7 @@ func TestBridgeControlWorkspaceListUsesSessionProjectPathWhenProjectPathMissing(
 	}
 	got := PlainTextFromTeamsHTML((*sent)[0].Content)
 	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
-	if strings.Contains(got, "Unknown workspace") || !strings.Contains(got, "1 - alpha") || !strings.Contains(got, "Path: "+expectedAlphaPath) {
+	if strings.Contains(got, "Unknown workspace") || !strings.Contains(got, "1. alpha") || !strings.Contains(got, expectedAlphaPath) || !strings.Contains(got, "Next: send 1 or p 1") {
 		t.Fatalf("workspace dashboard should use session ProjectPath instead of unknown grouping: %q", got)
 	}
 }
@@ -2281,7 +2341,7 @@ func TestBridgeControlWorkspaceSessionsOnlyShowsSelectedWorkspace(t *testing.T) 
 	if strings.Contains(sessions, "thread-alpha") || strings.Contains(sessions, "thread-beta") {
 		t.Fatalf("selected workspace sessions leaked raw ids: %q", sessions)
 	}
-	if strings.Count(sessions, "1 -") != 1 {
+	if strings.Count(sessions, "1. ") != 1 {
 		t.Fatalf("session numbering should be scoped to selected workspace, got %q", sessions)
 	}
 }
@@ -2325,7 +2385,7 @@ func TestBridgeDashboardNumbersFollowCurrentViewOrderAfterRoundTrip(t *testing.T
 	refreshed := PlainTextFromTeamsHTML((*sent)[2].Content)
 	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
 	expectedBetaPath := dashboardAbsolutePath("/home/user/project/beta")
-	if !strings.Contains(refreshed, "1 - beta") || !strings.Contains(refreshed, "Path: "+expectedBetaPath) || !strings.Contains(refreshed, "2 - alpha") || !strings.Contains(refreshed, "Path: "+expectedAlphaPath) {
+	if !strings.Contains(refreshed, "1. beta") || !strings.Contains(refreshed, expectedBetaPath) || !strings.Contains(refreshed, "2. alpha") || !strings.Contains(refreshed, expectedAlphaPath) {
 		t.Fatalf("workspace numbers should follow current recency order after sessions view round trip: %q", refreshed)
 	}
 }
@@ -2583,7 +2643,7 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	if got := len(*sent); got != 2 {
 		t.Fatalf("sent message count = %d, want ack plus final", got)
 	}
-	if !strings.Contains((*sent)[0].Content, "Quick helper question") || !strings.Contains((*sent)[1].Content, "fallback answer") {
+	if !strings.Contains((*sent)[0].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[0].Content, "Codex will answer it here") || !strings.Contains((*sent)[1].Content, "fallback answer") {
 		t.Fatalf("sent content did not include control ack and executor output: %#v", *sent)
 	}
 	if strings.Contains((*sent)[1].Content, "Control chat commands") || strings.Contains((*sent)[1].Content, "User message:") {
@@ -2625,7 +2685,7 @@ func TestBridgeControlHelperUpdateQuestionFallsBackToCodex(t *testing.T) {
 	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "User message:\n"+text) {
 		t.Fatalf("executor prompts = %#v, want control fallback prompt", got)
 	}
-	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Quick helper question") || !strings.Contains((*sent)[1].Content, "upgrade explanation") {
+	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[0].Content, "request has already been submitted to Codex") || !strings.Contains((*sent)[1].Content, "upgrade explanation") {
 		t.Fatalf("sent = %#v, want fallback ack and answer", *sent)
 	}
 }
@@ -2709,7 +2769,7 @@ func TestBridgeControlAskUsesExplicitFallbackText(t *testing.T) {
 	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "User message:\nwhat should I do") || strings.Contains(got[0], "/ask what should I do") {
 		t.Fatalf("executor prompts = %#v, want explicit /ask argument only", got)
 	}
-	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Quick helper question") || !strings.Contains((*sent)[1].Content, "ask answer") {
+	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[1].Content, "ask answer") {
 		t.Fatalf("sent content did not include explicit ask ACK and answer: %#v", *sent)
 	}
 	state, err := store.Load(context.Background())
@@ -3670,7 +3730,7 @@ func TestBridgeUpgradeDrainDefersAndReplaysControlFallbackOnce(t *testing.T) {
 	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "User message:\n自然语言请求") {
 		t.Fatalf("executor prompts after drain = %#v, want replayed control fallback", got)
 	}
-	if len(*sent) != 3 || !strings.Contains((*sent)[1].Content, "Quick helper question") || !strings.Contains((*sent)[2].Content, "replayed fallback answer") {
+	if len(*sent) != 3 || !strings.Contains((*sent)[1].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[2].Content, "replayed fallback answer") {
 		t.Fatalf("sent after replay = %#v, want control ACK then fallback answer", *sent)
 	}
 	if bridge.reg.SessionByID(controlFallbackSessionID) != nil || bridge.reg.SessionByChatID("control-chat") != nil {
@@ -7878,8 +7938,9 @@ func TestBridgeControlNewUsesSelectedWorkspaceWhenNoDirectoryGiven(t *testing.T)
 		t.Fatalf("sent messages = %#v, want projects, sessions, anchor, control ack", *sent)
 	}
 	sessionsPage := PlainTextFromTeamsHTML((*sent)[1].Content)
-	if !strings.HasPrefix(strings.TrimPrefix(sessionsPage, "🔧 Helper:\n"), "new") {
-		t.Fatalf("sessions page should put new first, got %q", sessionsPage)
+	sessionLines := strings.Split(strings.TrimSpace(sessionsPage), "\n")
+	if last := sessionLines[len(sessionLines)-1]; !strings.Contains(last, "Next: send new") || !strings.Contains(last, "create a new Work chat") {
+		t.Fatalf("sessions page should keep the new command as the final next step, got %q", sessionsPage)
 	}
 }
 

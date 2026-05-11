@@ -186,7 +186,7 @@ func TestLiveBridgeUXReviewRoundOptIn(t *testing.T) {
 		sendHTML("control path hint", controlChat.ID, "./tmp/live ux "+nonce)
 		waitForOutbox("control path hint", controlChat.ID, "Detected path", "copy and send")
 		sendHTML("control fallback", controlChat.ID, "live ux quick question "+nonce)
-		waitForOutbox("control fallback ack", controlChat.ID, "Quick helper question")
+		waitForOutbox("control fallback ack", controlChat.ID, "Codex received your control-chat question")
 		waitForOutbox("control fallback final", controlChat.ID, "quick helper answer", "live ux quick question "+nonce)
 		dumpTranscript("control", controlChat.ID, 16)
 	case "work":
