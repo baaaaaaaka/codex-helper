@@ -32,6 +32,7 @@ type TranscriptParseOptions struct {
 	InitialThreadID  string
 	InitialTurnID    string
 	InitialLineNo    int
+	InitialOffset    int64
 }
 
 type Transcript struct {
@@ -43,16 +44,18 @@ type Transcript struct {
 }
 
 type TranscriptRecord struct {
-	ItemID       string
-	SourceItemID string
-	DedupeKey    string
-	ThreadID     string
-	TurnID       string
-	Kind         TranscriptKind
-	Text         string
-	CreatedAt    time.Time
-	SourceLine   int
-	SourceType   string
+	ItemID            string
+	SourceItemID      string
+	DedupeKey         string
+	ThreadID          string
+	TurnID            string
+	Kind              TranscriptKind
+	Text              string
+	CreatedAt         time.Time
+	SourceLine        int
+	SourceStartOffset int64
+	SourceOffset      int64
+	SourceType        string
 }
 
 type TranscriptDiagnostic struct {
@@ -157,6 +160,7 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 		InitialThreadID:  state.threadID,
 		InitialTurnID:    state.turnID,
 		InitialLineNo:    checkpointLine,
+		InitialOffset:    checkpointOffset,
 	})
 	if err != nil {
 		return transcript, false, err
@@ -277,15 +281,22 @@ func ParseCodexTranscript(r io.Reader, opts TranscriptParseOptions) (Transcript,
 	reader := bufio.NewReaderSize(r, 64*1024)
 	digest := sha256.New()
 	lineNo := opts.InitialLineNo
+	offset := opts.InitialOffset
 
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			lineStartOffset := offset
 			lineNo++
+			offset += int64(len(line))
 			_, _ = digest.Write(line)
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) > 0 {
 				records, diagnostics := parseTranscriptLine(trimmed, lineNo, &state)
+				for i := range records {
+					records[i].SourceStartOffset = lineStartOffset
+					records[i].SourceOffset = offset
+				}
 				transcript.Records = append(transcript.Records, records...)
 				transcript.Diagnostics = append(transcript.Diagnostics, diagnostics...)
 			}
@@ -517,7 +528,17 @@ func completedItemTranscriptRecord(obj map[string]json.RawMessage, lineNo int, c
 
 	sourceID := jsonStringField(item, "id", "item_id", "itemId", "call_id", "callId")
 	itemType := jsonStringField(item, "type")
-	kind := kindFromType(itemType)
+	role := strings.ToLower(strings.TrimSpace(jsonStringField(item, "role")))
+	if role == "system" || role == "developer" {
+		return pendingTranscriptRecord{}, false
+	}
+	kind := kindFromRole(role)
+	if kind == TranscriptKindUnknown {
+		kind = kindFromType(itemType)
+	}
+	if kind == TranscriptKindAssistant && strings.EqualFold(jsonStringField(item, "phase"), "commentary") {
+		kind = TranscriptKindStatus
+	}
 	text := firstNonEmptyString(
 		jsonStringField(item, "text", "content", "message", "output"),
 		textFromJSONRaw(item["content"]),

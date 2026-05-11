@@ -212,7 +212,7 @@ func TestLoadMigratesV1StateToV2SemanticBackbone(t *testing.T) {
 	if state.ChatSequences["chat-1"].Next != 3 {
 		t.Fatalf("chat sequence next = %d, want 3", state.ChatSequences["chat-1"].Next)
 	}
-	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.TranscriptLedger == nil || state.ImportCheckpoints == nil || state.ChatRateLimits == nil || state.ArtifactRecords == nil || state.Notifications == nil {
+	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.TranscriptLedger == nil || state.ImportCheckpoints == nil || state.HistoryWatch == nil || state.ChatRateLimits == nil || state.ArtifactRecords == nil || state.Notifications == nil {
 		t.Fatalf("semantic v2 maps were not initialized: %#v", state)
 	}
 	if state.ServiceOwner == nil || state.ServiceOwner.ActiveTurnID != "turn:legacy" {
@@ -307,7 +307,7 @@ func TestLoadMigratesLocalPOCV1StateShape(t *testing.T) {
 	if got := state.Turns["turn:inbound:19:work-chat@thread.v2:2"].Status; got != TurnStatusCompleted {
 		t.Fatalf("latest turn status = %q, want completed", got)
 	}
-	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.ChatSequences == nil || state.ChatRateLimits == nil || state.Notifications == nil {
+	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.ChatSequences == nil || state.HistoryWatch == nil || state.ChatRateLimits == nil || state.Notifications == nil {
 		t.Fatalf("semantic maps were not initialized for local poc shape: %#v", state)
 	}
 	if state.ServiceControl.UpdatedAt.IsZero() {

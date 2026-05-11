@@ -303,6 +303,85 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceInstallDefaultsCodexHomeForScope(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	prevUserHome := effectivePathsUserHomeDir
+	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { effectivePathsUserHomeDir = prevUserHome })
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_DIR", "")
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exePath,
+		cwd:     filepath.Join(tmp, "work"),
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	want := filepath.Join(home, ".codex")
+	unit := string(data)
+	for _, envLine := range []string{
+		"Environment=" + systemdQuoteArg("CODEX_HOME="+want),
+		"Environment=" + systemdQuoteArg("CODEX_DIR="+want),
+	} {
+		if !strings.Contains(unit, envLine) {
+			t.Fatalf("unit missing default Codex home env %q:\n%s", envLine, unit)
+		}
+	}
+}
+
+func TestTeamsServiceInstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	prevUserHome := effectivePathsUserHomeDir
+	effectivePathsUserHomeDir = func() (string, error) { return "", errors.New("home unavailable") }
+	t.Cleanup(func() { effectivePathsUserHomeDir = prevUserHome })
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_DIR", "")
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exePath,
+		cwd:     filepath.Join(tmp, "work"),
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("service install should not fail only because default Codex home cannot be derived: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	if strings.Contains(unit, "CODEX_HOME=") || strings.Contains(unit, "CODEX_DIR=") {
+		t.Fatalf("unit should omit default Codex home env when it cannot be derived:\n%s", unit)
+	}
+	if !strings.Contains(unit, "CODEX_HELPER_TEAMS_SERVICE=1") {
+		t.Fatalf("unit missing required helper service env:\n%s", unit)
+	}
+}
+
 func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:38471")
 	t.Setenv("HTTPS_PROXY", "http://localhost:38471")
@@ -321,6 +400,53 @@ func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
 	}
 	if env["NO_PROXY"] == "" || env["no_proxy"] == "" {
 		t.Fatalf("NO_PROXY values should be preserved, got %#v", env)
+	}
+}
+
+func TestTeamsServiceEnvironmentMirrorsSingleCodexHomeEnv(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(tmp, "codex home"))
+	t.Setenv("CODEX_DIR", "")
+
+	env, err := teamsServiceEnvironmentForWorkingDir(tmp)
+	if err != nil {
+		t.Fatalf("teamsServiceEnvironmentForWorkingDir: %v", err)
+	}
+	want := filepath.Join(tmp, "codex home")
+	if env["CODEX_HOME"] != want || env["CODEX_DIR"] != want {
+		t.Fatalf("Codex home env = CODEX_HOME:%q CODEX_DIR:%q, want both %q", env["CODEX_HOME"], env["CODEX_DIR"], want)
+	}
+}
+
+func TestTeamsServiceEnvironmentResolvesRelativeCodexDirEnv(t *testing.T) {
+	tmp := t.TempDir()
+	work := filepath.Join(tmp, "work")
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_DIR", "relative-codex")
+
+	env, err := teamsServiceEnvironmentForWorkingDir(work)
+	if err != nil {
+		t.Fatalf("teamsServiceEnvironmentForWorkingDir: %v", err)
+	}
+	want := filepath.Join(work, "relative-codex")
+	if env["CODEX_HOME"] != want || env["CODEX_DIR"] != want {
+		t.Fatalf("Codex home env = CODEX_HOME:%q CODEX_DIR:%q, want both %q", env["CODEX_HOME"], env["CODEX_DIR"], want)
+	}
+}
+
+func TestTeamsServiceEnvironmentPreservesConflictingExplicitCodexHomes(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "codex-home")
+	dir := filepath.Join(tmp, "codex-dir")
+	t.Setenv("CODEX_HOME", home)
+	t.Setenv("CODEX_DIR", dir)
+
+	env, err := teamsServiceEnvironmentForWorkingDir(tmp)
+	if err != nil {
+		t.Fatalf("teamsServiceEnvironmentForWorkingDir: %v", err)
+	}
+	if env["CODEX_HOME"] != home || env["CODEX_DIR"] != dir {
+		t.Fatalf("explicit Codex env should be preserved, got CODEX_HOME:%q CODEX_DIR:%q", env["CODEX_HOME"], env["CODEX_DIR"])
 	}
 }
 
@@ -1208,8 +1334,19 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 	if runner.calls[0].name != "powershell.exe" || !strings.Contains(call, "Register-ScheduledTask") || !strings.Contains(call, "wsl.exe") {
 		t.Fatalf("install should register WSL scheduled task, calls=%#v", runner.calls)
 	}
-	if !strings.Contains(call, "-WindowStyle Hidden") || !strings.Contains(call, "& wsl.exe @wslArgs") {
-		t.Fatalf("WSL scheduled task should run through hidden PowerShell while preserving wsl.exe lifetime, calls=%#v", runner.calls)
+	for _, want := range []string{
+		"-WindowStyle Hidden",
+		"$wslArgumentLine",
+		"Start-Process -FilePath",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
+	} {
+		if !strings.Contains(call, want) {
+			t.Fatalf("WSL scheduled task should run wsl.exe through a hidden child process while preserving task lifetime; missing %q, calls=%#v", want, runner.calls)
+		}
+	}
+	if strings.Contains(call, "& wsl.exe @wslArgs") {
+		t.Fatalf("WSL scheduled task should not launch wsl.exe directly in a visible console path, calls=%#v", runner.calls)
 	}
 	if !strings.Contains(call, "RestartCount 999") {
 		t.Fatalf("WSL task should use high restart count for background keepalive, calls=%#v", runner.calls)

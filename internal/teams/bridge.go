@@ -29,7 +29,11 @@ const (
 	pollCursorOverlap                    = 2 * time.Minute
 	fastPollInterval                     = time.Second
 	fastPollDuration                     = 90 * time.Second
-	transcriptSyncMinInterval            = 30 * time.Second
+	transcriptSyncMinInterval            = 10 * time.Second
+	historyWatchSyncMinInterval          = 10 * time.Second
+	historyWatchReconcileInterval        = 5 * time.Minute
+	historyWatchRecentDays               = 3
+	historyTieredMaxTailBytes            = 512 * 1024
 	dashboardProjectsCacheTTL            = 30 * time.Second
 	persistentPollFailureRestartAfter    = 10 * time.Minute
 	persistentPollFailureRestartMinCount = 3
@@ -227,6 +231,8 @@ type Bridge struct {
 	persistentPollFailureFirstAt time.Time
 	persistentPollFailureCount   int
 	lastTranscriptSync           time.Time
+	lastHistoryWatchSync         time.Time
+	lastHistoryWatchReconcile    time.Time
 	maxWorkChatPollsPerCycle     int
 	dashboardProjectsMu          sync.Mutex
 	dashboardProjectsCache       []codexhistory.Project
@@ -574,6 +580,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
+		}
+		if err := b.syncCodexHistoryFinalsIfDue(ctx, time.Now()); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams history watch error: %v\n", err)
 		}
 		if err := b.maybeRunHelperAutoUpdate(ctx, opts); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams helper auto-update error: %v\n", err)
@@ -7573,6 +7582,10 @@ func (b *Bridge) publishCodexSessionWithProgress(ctx context.Context, target Das
 	if !ok {
 		return "", fmt.Errorf("Codex session not found: %s", sessionID)
 	}
+	return b.publishCodexSessionLocal(ctx, local, project, notify)
+}
+
+func (b *Bridge) publishCodexSessionLocal(ctx context.Context, local codexhistory.Session, project codexhistory.Project, notify func(context.Context, string) error) (string, error) {
 	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
 		if err := b.ensureDurableSession(ctx, existing); err != nil {
 			return "", err
@@ -7712,7 +7725,7 @@ func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Sessi
 		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
 		return err
 	}
-	return b.markTranscriptImportComplete(ctx, session, local.FilePath, lastRecordID, lastLine)
+	return b.markTranscriptImportCompleteAtEOF(ctx, session, local.FilePath, lastRecordID, lastLine)
 }
 
 func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session) error {
@@ -7743,7 +7756,7 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 		_ = b.markTranscriptImportFailed(ctx, *session, local.FilePath)
 		return b.sendToChat(ctx, session.ChatID, "History import failed: "+err.Error())
 	}
-	if err := b.markTranscriptImportComplete(ctx, *session, local.FilePath, lastRecordID, lastLine); err != nil {
+	if err := b.markTranscriptImportCompleteAtEOF(ctx, *session, local.FilePath, lastRecordID, lastLine); err != nil {
 		return err
 	}
 	body := formatTranscriptImportCompleteMessage(stats)
@@ -7804,30 +7817,33 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	dedupe := newTranscriptDedupeState()
 	batcher := newTranscriptImportBatcher(b, session, filePath, importTurnID, kindPrefix, checkpointID)
 	for i, record := range transcript.Records {
+		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
 		checkpointKey := transcriptRecordCheckpointKey(record)
 		if shouldSkipImportedTranscriptRecord(record) {
 			stats.SkippedBackground++
-			if err := batcher.recordCheckpoint(ctx, checkpointKey, record.SourceLine); err != nil {
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
 				return "", 0, stats, err
 			}
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
-			if err := batcher.recordCheckpoint(ctx, checkpointKey, record.SourceLine); err != nil {
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
 				return "", 0, stats, err
 			}
 			continue
 		}
 		if dedupe.shouldSkip(record, body) {
-			if err := batcher.recordCheckpoint(ctx, checkpointKey, record.SourceLine); err != nil {
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
 				return "", 0, stats, err
 			}
 			continue
 		}
+		record.SourceLine = checkpointLine
+		record.SourceOffset = checkpointOffset
 		kind := transcriptRecordOutboxKind(kindPrefix, record, i+1)
 		if err := batcher.add(ctx, transcriptImportBatchRecord{
 			Record:        record,
@@ -7857,8 +7873,9 @@ type transcriptImportBatchRecord struct {
 }
 
 type transcriptImportCheckpointRecord struct {
-	Key        string
-	SourceLine int
+	Key          string
+	SourceLine   int
+	SourceOffset int64
 }
 
 type transcriptImportBatcher struct {
@@ -7899,7 +7916,7 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 		if err := b.bridge.queueAndSendOutboxChunks(ctx, b.session.ID, b.importTurnID, b.session.ChatID, record.Kind, record.Body); err != nil {
 			return err
 		}
-		return b.bridge.recordTranscriptCheckpointWithID(ctx, b.session, b.filePath, record.CheckpointKey, record.Record.SourceLine, b.checkpointID)
+		return b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, record.CheckpointKey, record.Record.SourceLine, record.Record.SourceOffset, b.checkpointID)
 	}
 	addedBytes := len(html)
 	if len(b.htmlParts) > 0 {
@@ -7914,17 +7931,17 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 		b.htmlBytes += len(transcriptImportBatchSeparatorHTML)
 	}
 	b.records = append(b.records, record)
-	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: record.CheckpointKey, SourceLine: record.Record.SourceLine})
+	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: record.CheckpointKey, SourceLine: record.Record.SourceLine, SourceOffset: record.Record.SourceOffset})
 	b.htmlParts = append(b.htmlParts, html)
 	b.htmlBytes += len(html)
 	return nil
 }
 
-func (b *transcriptImportBatcher) recordCheckpoint(ctx context.Context, checkpointKey string, sourceLine int) error {
+func (b *transcriptImportBatcher) recordCheckpoint(ctx context.Context, checkpointKey string, sourceLine int, sourceOffset int64) error {
 	if len(b.records) == 0 {
-		return b.bridge.recordTranscriptCheckpointWithID(ctx, b.session, b.filePath, checkpointKey, sourceLine, b.checkpointID)
+		return b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, checkpointKey, sourceLine, sourceOffset, b.checkpointID)
 	}
-	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: checkpointKey, SourceLine: sourceLine})
+	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: checkpointKey, SourceLine: sourceLine, SourceOffset: sourceOffset})
 	return nil
 }
 
@@ -7941,7 +7958,7 @@ func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 		return err
 	}
 	for _, checkpoint := range b.checkpoints {
-		if err := b.bridge.recordTranscriptCheckpointWithID(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, b.checkpointID); err != nil {
+		if err := b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, b.checkpointID); err != nil {
 			return err
 		}
 	}
@@ -8274,7 +8291,7 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 	if checkpoint.LastRecordID == "" {
 		transcript, err = ReadSessionTranscript(local.FilePath)
 	} else {
-		transcript, err = ReadSessionTranscriptSince(local.FilePath, checkpoint.LastRecordID)
+		transcript, err = b.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
 	}
 	if err != nil {
 		return out, err
@@ -8436,6 +8453,25 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 		return err
 	}
 	activeTeamsTurns := runningTurnSessions(state)
+	var needsDiscovery []Session
+	for _, session := range b.reg.ActiveSessions() {
+		if session.CodexThreadID == "" {
+			continue
+		}
+		if activeTeamsTurns[session.ID] {
+			continue
+		}
+		if local, ok := linkedTranscriptLocalFromCheckpoint(session, state.ImportCheckpoints[transcriptCheckpointID(session.ID)]); ok {
+			if err := b.syncSessionTranscript(ctx, session, local); err != nil {
+				return err
+			}
+			continue
+		}
+		needsDiscovery = append(needsDiscovery, session)
+	}
+	if len(needsDiscovery) == 0 {
+		return nil
+	}
 	projects, err := discoverCodexProjectsForTeams(ctx, "")
 	if err != nil {
 		return nil
@@ -8452,15 +8488,12 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 			byID[session.SessionID] = session
 		}
 	}
-	for _, session := range b.reg.ActiveSessions() {
-		if session.CodexThreadID == "" {
-			continue
-		}
-		if activeTeamsTurns[session.ID] {
-			continue
-		}
+	for _, session := range needsDiscovery {
 		local, ok := byID[session.CodexThreadID]
 		if !ok || strings.TrimSpace(local.FilePath) == "" {
+			continue
+		}
+		if info, err := os.Stat(local.FilePath); err != nil || info.IsDir() {
 			continue
 		}
 		if err := b.syncSessionTranscript(ctx, session, local); err != nil {
@@ -8468,6 +8501,23 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func linkedTranscriptLocalFromCheckpoint(session Session, checkpoint teamstore.ImportCheckpoint) (codexhistory.Session, bool) {
+	sourcePath := strings.TrimSpace(checkpoint.SourcePath)
+	if sourcePath == "" {
+		return codexhistory.Session{}, false
+	}
+	info, err := os.Stat(sourcePath)
+	if err != nil || info.IsDir() {
+		return codexhistory.Session{}, false
+	}
+	return codexhistory.Session{
+		SessionID:   strings.TrimSpace(session.CodexThreadID),
+		ProjectPath: strings.TrimSpace(session.Cwd),
+		FilePath:    sourcePath,
+		ModifiedAt:  info.ModTime(),
+	}, true
 }
 
 func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, local codexhistory.Session) error {
@@ -8515,9 +8565,9 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			return nil
 		}
 		last := transcript.Records[len(transcript.Records)-1]
-		return b.recordTranscriptCheckpoint(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine)
+		return b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset)
 	}
-	transcript, err := ReadSessionTranscriptSince(local.FilePath, checkpoint.LastRecordID)
+	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, local.SessionID, session.CodexThreadID)
 	if err != nil {
 		return err
 	}
@@ -8537,18 +8587,19 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	syncTurnID := "sync:" + session.ID
 	sent := 0
 	for i, record := range transcript.Records {
+		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
 		if shouldSkipBackgroundTranscriptRecord(record) {
-			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
+			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
 				return err
 			}
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
-			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
+			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
 				return err
 			}
 			continue
@@ -8556,7 +8607,7 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			dedupe.shouldSkip(record, body) {
-			if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
+			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
 				return err
 			}
 			continue
@@ -8566,7 +8617,7 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		if err := b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, syncTurnID, session.ChatID, kind, body, opts); err != nil {
 			return err
 		}
-		if err := b.recordTranscriptCheckpoint(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), record.SourceLine); err != nil {
+		if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
 			return err
 		}
 		sent++
@@ -8575,6 +8626,81 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		}
 	}
 	return nil
+}
+
+func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore.ImportCheckpoint, sessionID string, threadID string) (Transcript, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return Transcript{}, nil
+	}
+	if linkedCheckpointFileUnchanged(filePath, checkpoint) {
+		return Transcript{SourceName: filePath}, nil
+	}
+	if checkpoint.LastOffset > 0 && strings.TrimSpace(checkpoint.SourcePath) == strings.TrimSpace(filePath) {
+		result, err := historyTieredScanTail(filePath, historyTieredFileState{
+			Path:        filePath,
+			Size:        checkpoint.SourceSize,
+			ModTime:     checkpoint.SourceModTime,
+			Offset:      checkpoint.LastOffset,
+			Line:        checkpoint.LastSourceLine,
+			SessionID:   strings.TrimSpace(sessionID),
+			ThreadID:    strings.TrimSpace(threadID),
+			LastFinalID: strings.TrimSpace(checkpoint.LastRecordID),
+		}, historyTieredMaxTailBytes)
+		if err != nil {
+			return Transcript{}, err
+		}
+		if !result.TooLarge && !result.Truncated {
+			return Transcript{SourceName: filePath, Records: filterTranscriptRecordsAfterCheckpoint(result.Records, checkpoint.LastRecordID)}, nil
+		}
+	}
+	return ReadSessionTranscriptSince(filePath, checkpoint.LastRecordID)
+}
+
+func filterTranscriptRecordsAfterCheckpoint(records []TranscriptRecord, afterKey string) []TranscriptRecord {
+	afterKey = strings.TrimSpace(afterKey)
+	if afterKey == "" || len(records) == 0 {
+		return records
+	}
+	for i, record := range records {
+		if record.DedupeKey == afterKey || record.ItemID == afterKey {
+			return append([]TranscriptRecord(nil), records[i+1:]...)
+		}
+	}
+	return records
+}
+
+func transcriptCheckpointPositionForRecord(records []TranscriptRecord, index int) (int, int64) {
+	if index < 0 || index >= len(records) {
+		return 0, 0
+	}
+	record := records[index]
+	for i := index + 1; i < len(records); i++ {
+		if records[i].SourceLine != record.SourceLine {
+			break
+		}
+		if strings.TrimSpace(transcriptRecordCheckpointKey(records[i])) != "" {
+			line := record.SourceLine
+			if line > 0 {
+				line--
+			}
+			return line, record.SourceStartOffset
+		}
+	}
+	return record.SourceLine, record.SourceOffset
+}
+
+func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportCheckpoint) bool {
+	if checkpoint.SourceSize <= 0 || checkpoint.SourceModTime.IsZero() || checkpoint.LastOffset <= 0 {
+		return false
+	}
+	if checkpoint.LastOffset != checkpoint.SourceSize {
+		return false
+	}
+	info, err := os.Stat(filePath)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return info.Size() == checkpoint.SourceSize && info.ModTime().Equal(checkpoint.SourceModTime)
 }
 
 func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
@@ -8606,7 +8732,7 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
 		return err
 	}
-	if err := b.markTranscriptImportCompleteWithID(ctx, session, sourcePath, lastRecordID, lastLine, checkpointID); err != nil {
+	if err := b.markTranscriptImportCompleteAtEOFWithID(ctx, session, sourcePath, lastRecordID, lastLine, checkpointID); err != nil {
 		return err
 	}
 	return b.processQueuedTurns(ctx)
@@ -8947,12 +9073,21 @@ func (b *Bridge) recordTranscriptCheckpoint(ctx context.Context, session Session
 }
 
 func (b *Bridge) recordTranscriptCheckpointWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, checkpointID string) error {
+	return b.recordTranscriptCheckpointDetailedWithID(ctx, session, sourcePath, lastRecordID, lastLine, 0, checkpointID)
+}
+
+func (b *Bridge) recordTranscriptCheckpointDetailed(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64) error {
+	return b.recordTranscriptCheckpointDetailedWithID(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, transcriptCheckpointID(session.ID))
+}
+
+func (b *Bridge) recordTranscriptCheckpointDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string) error {
 	if strings.TrimSpace(lastRecordID) == "" {
 		return nil
 	}
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
+	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
 	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
 		now := time.Now()
 		id := checkpointID
@@ -8967,6 +9102,9 @@ func (b *Bridge) recordTranscriptCheckpointWithID(ctx context.Context, session S
 			SourcePath:     sourcePath,
 			LastRecordID:   lastRecordID,
 			LastSourceLine: lastLine,
+			LastOffset:     firstNonZeroInt64(lastOffset, previous.LastOffset),
+			SourceSize:     sourceSize,
+			SourceModTime:  sourceModTime,
 			ImportTurnID:   previous.ImportTurnID,
 			KindPrefix:     previous.KindPrefix,
 			Status:         status,
@@ -8986,6 +9124,27 @@ func (b *Bridge) recordTranscriptCheckpointWithID(ctx context.Context, session S
 		}
 		return nil
 	})
+}
+
+func transcriptSourceFileState(sourcePath string) (int64, time.Time) {
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath == "" {
+		return 0, time.Time{}
+	}
+	info, err := os.Stat(sourcePath)
+	if err != nil || info.IsDir() {
+		return 0, time.Time{}
+	}
+	return info.Size(), info.ModTime()
+}
+
+func firstNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func transcriptLedgerID(sessionID string, checkpointID string, recordID string) string {
@@ -9033,10 +9192,23 @@ func (b *Bridge) markTranscriptImportComplete(ctx context.Context, session Sessi
 	return b.markTranscriptImportCompleteWithID(ctx, session, sourcePath, lastRecordID, lastLine, transcriptCheckpointID(session.ID))
 }
 
+func (b *Bridge) markTranscriptImportCompleteAtEOF(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int) error {
+	return b.markTranscriptImportCompleteAtEOFWithID(ctx, session, sourcePath, lastRecordID, lastLine, transcriptCheckpointID(session.ID))
+}
+
 func (b *Bridge) markTranscriptImportCompleteWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, checkpointID string) error {
+	return b.markTranscriptImportCompleteDetailedWithID(ctx, session, sourcePath, lastRecordID, lastLine, checkpointID, false)
+}
+
+func (b *Bridge) markTranscriptImportCompleteAtEOFWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, checkpointID string) error {
+	return b.markTranscriptImportCompleteDetailedWithID(ctx, session, sourcePath, lastRecordID, lastLine, checkpointID, true)
+}
+
+func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, checkpointID string, completeEOF bool) error {
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
+	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
 	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
 		now := time.Now()
 		id := checkpointID
@@ -9047,6 +9219,11 @@ func (b *Bridge) markTranscriptImportCompleteWithID(ctx context.Context, session
 		if strings.TrimSpace(lastRecordID) != "" {
 			checkpoint.LastRecordID = lastRecordID
 			checkpoint.LastSourceLine = lastLine
+		}
+		checkpoint.SourceSize = sourceSize
+		checkpoint.SourceModTime = sourceModTime
+		if completeEOF && sourceSize > 0 {
+			checkpoint.LastOffset = sourceSize
 		}
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now

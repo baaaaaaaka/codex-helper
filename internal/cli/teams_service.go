@@ -1822,11 +1822,15 @@ func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
 			resolvedRegistryPath = filepath.Join(cwd, resolvedRegistryPath)
 		}
 	}
+	env, err := teamsServiceEnvironmentForWorkingDir(cwd)
+	if err != nil {
+		return teamsServiceSpec{}, err
+	}
 	return teamsServiceSpec{
 		Executable:   exe,
 		WorkingDir:   cwd,
 		RegistryPath: resolvedRegistryPath,
-		Environment:  teamsServiceEnvironment(),
+		Environment:  env,
 	}, nil
 }
 
@@ -1847,6 +1851,18 @@ func validateTeamsServiceExecutable(exe string) error {
 }
 
 func teamsServiceEnvironment() map[string]string {
+	env, err := teamsServiceEnvironmentForWorkingDir("")
+	if err != nil {
+		return map[string]string{
+			"NO_COLOR":                        "1",
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
+		}
+	}
+	return env
+}
+
+func teamsServiceEnvironmentForWorkingDir(workingDir string) (map[string]string, error) {
 	env := map[string]string{
 		"NO_COLOR":                        "1",
 		"CODEX_HELPER_TEAMS_SERVICE":      "1",
@@ -1860,7 +1876,15 @@ func teamsServiceEnvironment() map[string]string {
 			env[name] = value
 		}
 	}
-	return env
+	if strings.TrimSpace(env[envCodexHome]) == "" || strings.TrimSpace(env["CODEX_DIR"]) == "" {
+		codexHome, err := resolveCodexHome("", workingDir)
+		if err == nil && strings.TrimSpace(codexHome) != "" {
+			codexHome = strings.TrimSpace(codexHome)
+			env[envCodexHome] = codexHome
+			env["CODEX_DIR"] = codexHome
+		}
+	}
+	return env, nil
 }
 
 func teamsServiceShouldDropProxyEnv(name string, value string) bool {
@@ -2419,14 +2443,19 @@ func teamsServiceWSLTaskRunLogName(taskName string) string {
 
 func buildTeamsServiceWSLTaskAction(taskName string, args []string) (string, string) {
 	runLogName := teamsServiceWSLTaskRunLogName(taskName)
+	wslArgumentLine := windowsCommandLine(args)
 	command := "$ErrorActionPreference = 'Continue'; " +
 		"$logDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
 		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null; " +
 		"$runLog = Join-Path $logDir " + powershellSingleQuote(runLogName) + "; " +
-		"$wslArgs = " + powershellArrayLiteral(args) + "; " +
+		"$stdoutLog = $runLog + '.stdout.log'; " +
+		"$stderrLog = $runLog + '.stderr.log'; " +
+		"$wslArgumentLine = " + powershellSingleQuote(wslArgumentLine) + "; " +
 		"Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' starting ' + " + powershellSingleQuote(taskName) + "); " +
-		"& wsl.exe @wslArgs *>> $runLog; " +
-		"$code = $LASTEXITCODE; " +
+		"Add-Content -LiteralPath $runLog -Value ('stdout ' + $stdoutLog + ' stderr ' + $stderrLog); " +
+		"Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue; " +
+		"$p = Start-Process -FilePath 'wsl.exe' -ArgumentList $wslArgumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog; " +
+		"$code = if ($null -ne $p) { $p.ExitCode } else { 1 }; " +
 		"if ($null -eq $code) { $code = 1 }; " +
 		"Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' exited ' + $code); " +
 		"exit $code"
@@ -2553,6 +2582,7 @@ func buildTeamsServiceWSLStartupWatchdogScript(taskName string, args []string, s
 	runLogName := "codex-helper-teams-wsl-run-" + safeWindowsTaskNamePart(suffix, 32) + ".log"
 	watchdogLogName := "codex-helper-teams-wsl-watchdog-" + safeWindowsTaskNamePart(suffix, 32) + ".log"
 	stopName := "codex-helper-teams-wsl-stop-" + safeWindowsTaskNamePart(suffix, 32) + ".signal"
+	wslArgumentLine := windowsCommandLine(args)
 	var b strings.Builder
 	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
 	b.WriteString("$created = $false\r\n")
@@ -2564,12 +2594,16 @@ func buildTeamsServiceWSLStartupWatchdogScript(taskName string, args []string, s
 	b.WriteString("  $runLog = Join-Path $logDir " + powershellSingleQuote(runLogName) + "\r\n")
 	b.WriteString("  $watchdogLog = Join-Path $logDir " + powershellSingleQuote(watchdogLogName) + "\r\n")
 	b.WriteString("  $stopPath = Join-Path $logDir " + powershellSingleQuote(stopName) + "\r\n")
-	b.WriteString("  $wslArgs = " + powershellArrayLiteral(args) + "\r\n")
+	b.WriteString("  $stdoutLog = $runLog + '.stdout.log'\r\n")
+	b.WriteString("  $stderrLog = $runLog + '.stderr.log'\r\n")
+	b.WriteString("  $wslArgumentLine = " + powershellSingleQuote(wslArgumentLine) + "\r\n")
 	b.WriteString("  Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' starting " + strings.ReplaceAll(taskName, "'", "''") + "')\r\n")
 	b.WriteString("  while ($true) {\r\n")
 	b.WriteString("    if (Test-Path -LiteralPath $stopPath) { Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' stop requested; exiting'); break }\r\n")
-	b.WriteString("    & wsl.exe @wslArgs *>> $runLog\r\n")
-	b.WriteString("    $code = $LASTEXITCODE\r\n")
+	b.WriteString("    Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' starting hidden wsl.exe; stdout ' + $stdoutLog + ' stderr ' + $stderrLog)\r\n")
+	b.WriteString("    Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue\r\n")
+	b.WriteString("    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $wslArgumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog\r\n")
+	b.WriteString("    $code = if ($null -ne $p) { $p.ExitCode } else { 1 }\r\n")
 	b.WriteString("    if (Test-Path -LiteralPath $stopPath) { Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' stop requested after wsl.exe exited ' + $code); break }\r\n")
 	b.WriteString("    Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' wsl.exe exited ' + $code + '; restarting in " + strconv.Itoa(teamsServiceTaskRestartInterval) + "s')\r\n")
 	b.WriteString("    Start-Sleep -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "\r\n")

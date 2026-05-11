@@ -101,6 +101,8 @@ type State struct {
 	DashboardNumbers  map[string]DashboardNumberRecord  `json:"dashboard_numbers,omitempty"`
 	TranscriptLedger  map[string]TranscriptLedgerRecord `json:"transcript_ledger,omitempty"`
 	ImportCheckpoints map[string]ImportCheckpoint       `json:"import_checkpoints,omitempty"`
+	HistoryWatch      map[string]HistoryWatchCheckpoint `json:"history_watch,omitempty"`
+	HistoryWatchReady time.Time                         `json:"history_watch_ready,omitempty"`
 	ChatSequences     map[string]ChatSequenceState      `json:"chat_sequences,omitempty"`
 	ChatRateLimits    map[string]ChatRateLimitState     `json:"chat_rate_limits,omitempty"`
 	ArtifactRecords   map[string]ArtifactRecord         `json:"artifact_records,omitempty"`
@@ -281,6 +283,9 @@ type ImportCheckpoint struct {
 	SourcePath     string    `json:"source_path,omitempty"`
 	LastRecordID   string    `json:"last_record_id,omitempty"`
 	LastSourceLine int       `json:"last_source_line,omitempty"`
+	LastOffset     int64     `json:"last_offset,omitempty"`
+	SourceSize     int64     `json:"source_size,omitempty"`
+	SourceModTime  time.Time `json:"source_mod_time,omitempty"`
 	ImportTurnID   string    `json:"import_turn_id,omitempty"`
 	KindPrefix     string    `json:"kind_prefix,omitempty"`
 	Status         string    `json:"status,omitempty"`
@@ -299,6 +304,29 @@ type ChatRateLimitState struct {
 	Reason         string    `json:"reason,omitempty"`
 	PoisonOutboxID string    `json:"poison_outbox_id,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
+}
+
+type HistoryWatchCheckpoint struct {
+	ID                          string    `json:"id,omitempty"`
+	Path                        string    `json:"path,omitempty"`
+	Size                        int64     `json:"size,omitempty"`
+	ModTime                     time.Time `json:"mod_time,omitempty"`
+	Offset                      int64     `json:"offset,omitempty"`
+	Line                        int       `json:"line,omitempty"`
+	SessionID                   string    `json:"session_id,omitempty"`
+	ThreadID                    string    `json:"thread_id,omitempty"`
+	TurnID                      string    `json:"turn_id,omitempty"`
+	LastFinalID                 string    `json:"last_final_id,omitempty"`
+	PendingAssistantSourceID    string    `json:"pending_assistant_source_id,omitempty"`
+	PendingAssistantThreadID    string    `json:"pending_assistant_thread_id,omitempty"`
+	PendingAssistantTurnID      string    `json:"pending_assistant_turn_id,omitempty"`
+	PendingAssistantText        string    `json:"pending_assistant_text,omitempty"`
+	PendingAssistantCreatedAt   time.Time `json:"pending_assistant_created_at,omitempty"`
+	PendingAssistantSourceLine  int       `json:"pending_assistant_source_line,omitempty"`
+	PendingAssistantStartOffset int64     `json:"pending_assistant_start_offset,omitempty"`
+	PendingAssistantOffset      int64     `json:"pending_assistant_offset,omitempty"`
+	PendingAssistantSourceType  string    `json:"pending_assistant_source_type,omitempty"`
+	UpdatedAt                   time.Time `json:"updated_at,omitempty"`
 }
 
 type ArtifactRecord struct {
@@ -2352,6 +2380,7 @@ func newState() State {
 		DashboardNumbers:  make(map[string]DashboardNumberRecord),
 		TranscriptLedger:  make(map[string]TranscriptLedgerRecord),
 		ImportCheckpoints: make(map[string]ImportCheckpoint),
+		HistoryWatch:      make(map[string]HistoryWatchCheckpoint),
 		ChatSequences:     make(map[string]ChatSequenceState),
 		ChatRateLimits:    make(map[string]ChatRateLimitState),
 		ArtifactRecords:   make(map[string]ArtifactRecord),
@@ -2405,6 +2434,9 @@ func (s *State) ensure(now time.Time) {
 	}
 	if s.ImportCheckpoints == nil {
 		s.ImportCheckpoints = make(map[string]ImportCheckpoint)
+	}
+	if s.HistoryWatch == nil {
+		s.HistoryWatch = make(map[string]HistoryWatchCheckpoint)
 	}
 	if s.ChatSequences == nil {
 		s.ChatSequences = make(map[string]ChatSequenceState)

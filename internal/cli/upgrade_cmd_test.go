@@ -342,6 +342,13 @@ func TestUpgradeCmdAllowsDeferredTeamsInboundWithoutOwner(t *testing.T) {
 
 	tmp := t.TempDir()
 	isolateUpgradeTeamsStateForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	t.Cleanup(func() {
@@ -1160,6 +1167,13 @@ func TestUpgradeCmdPreservesExistingTeamsDrain(t *testing.T) {
 
 	tmp := t.TempDir()
 	isolateUpgradeTeamsStateForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
 	prevPoll := teamsUpgradePollInterval

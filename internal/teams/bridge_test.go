@@ -10169,6 +10169,125 @@ func TestBridgeSyncLinkedTranscriptMirrorsLocalCodexConversation(t *testing.T) {
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptRetriesRemainingRecordsFromSameLine(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-1"}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"old","type":"message","role":"assistant","content":[{"type":"output_text","text":"old answer"}]}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-1",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  time.Now(),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("initial sync error: %v", err)
+	}
+
+	oneLineUpdate := initial +
+		`{"method":"turn/completed","params":{"turnId":"turn-2","turn":{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"same-line prompt"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same-line answer"}]}]}}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(oneLineUpdate), 0o600); err != nil {
+		t.Fatalf("write one-line update: %v", err)
+	}
+
+	var firstRunSent []bridgeSentMessage
+	var sendAttempt int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		sendAttempt++
+		var body struct {
+			Body struct {
+				Content string `json:"content"`
+			} `json:"body"`
+			Mentions []json.RawMessage `json:"mentions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode Graph request: %v", err)
+		}
+		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		firstRunSent = append(firstRunSent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+		if sendAttempt == 2 {
+			http.Error(w, "fail second same-line record", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, sendAttempt)
+	}))
+	defer server.Close()
+	bridge.graph = &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err == nil {
+		t.Fatal("sync with second same-line record failure returned nil")
+	}
+	if len(firstRunSent) != 2 || !strings.Contains(PlainTextFromTeamsHTML(firstRunSent[0].Content), "same-line prompt") {
+		t.Fatalf("first run sent = %#v, want prompt sent then answer failure", firstRunSent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load checkpoint state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if !strings.Contains(checkpoint.LastRecordID, "line:3:kind:user") {
+		t.Fatalf("checkpoint record = %q, want fallback user key for line 3", checkpoint.LastRecordID)
+	}
+	if checkpoint.LastSourceLine != 2 {
+		t.Fatalf("checkpoint source line = %d, want previous line before re-scanning same-line tail", checkpoint.LastSourceLine)
+	}
+	if checkpoint.LastOffset <= 0 || checkpoint.LastOffset >= checkpoint.SourceSize {
+		t.Fatalf("checkpoint offset = %d source size = %d, want line-start offset before same-line answer", checkpoint.LastOffset, checkpoint.SourceSize)
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		for id, outbox := range state.OutboxMessages {
+			if outbox.Status != teamstore.OutboxStatusSent && strings.Contains(outbox.Body, "same-line answer") {
+				delete(state.OutboxMessages, id)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("remove failed same-line answer outbox: %v", err)
+	}
+
+	successGraph, retrySent := newBridgeTestGraph(t)
+	bridge.graph = successGraph
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("retry sync error: %v", err)
+	}
+	if len(*retrySent) != 1 {
+		t.Fatalf("retry sent = %#v, want only remaining same-line answer", *retrySent)
+	}
+	plain := PlainTextFromTeamsHTML((*retrySent)[0].Content)
+	if !strings.Contains(plain, "same-line answer") || strings.Contains(plain, "same-line prompt") {
+		t.Fatalf("retry message = %q, want only same-line answer", plain)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptBlocksLargeAutomaticBacklogWithoutAdvancing(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -10530,8 +10649,529 @@ func TestBridgeSyncLinkedTranscriptsIfDueThrottlesScans(t *testing.T) {
 	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(transcriptSyncMinInterval)); err != nil {
 		t.Fatalf("due sync error: %v", err)
 	}
+	if discoverCalls != 1 {
+		t.Fatalf("discoverCalls = %d, want due scan to reuse checkpoint source path without discovery", discoverCalls)
+	}
+	if err := os.Remove(transcriptPath); err != nil {
+		t.Fatalf("remove transcript: %v", err)
+	}
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(2*transcriptSyncMinInterval)); err != nil {
+		t.Fatalf("missing-path fallback sync error: %v", err)
+	}
 	if discoverCalls != 2 {
-		t.Fatalf("discoverCalls = %d, want second scan when due", discoverCalls)
+		t.Fatalf("discoverCalls = %d, want discovery fallback when checkpoint source path is missing", discoverCalls)
+	}
+}
+
+func TestLinkedCheckpointFileUnchangedRequiresFullyProcessedOffset(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := `{"id":"old","role":"assistant","text":"old answer"}` + "\n" +
+		`{"id":"a2","role":"assistant","text":"second answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	checkpoint := teamstore.ImportCheckpoint{
+		SourcePath:    transcriptPath,
+		SourceSize:    info.Size(),
+		SourceModTime: info.ModTime(),
+		LastOffset:    int64(strings.Index(body, "\n") + 1),
+	}
+	if linkedCheckpointFileUnchanged(transcriptPath, checkpoint) {
+		t.Fatal("checkpoint with unprocessed tail bytes was treated as unchanged")
+	}
+	checkpoint.LastOffset = info.Size()
+	if !linkedCheckpointFileUnchanged(transcriptPath, checkpoint) {
+		t.Fatal("checkpoint at EOF with unchanged stat was not treated as unchanged")
+	}
+}
+
+func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-watch.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	initial := `{"type":"session_meta","payload":{"id":"thread-watch"}}` + "\n" +
+		`{"thread_id":"thread-watch","turn_id":"turn-old","id":"a-old","role":"assistant","text":"old answer"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-watch","turn_id":"turn-old"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-watch", transcriptPath)
+	defer restoreDiscover()
+	var createdTopic string
+	graph, sent := newBridgeCreateChatGraph(t, &createdTopic)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("initial history watch sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("initial watch baseline sent messages: %#v", *sent)
+	}
+
+	appended := initial +
+		`{"thread_id":"thread-watch","turn_id":"turn-new","id":"u-new","role":"user","text":"new prompt"}` + "\n" +
+		`{"thread_id":"thread-watch","turn_id":"turn-new","id":"a-new","role":"assistant","text":"new final answer"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-watch","turn_id":"turn-new"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(appended), 0o600); err != nil {
+		t.Fatalf("append transcript: %v", err)
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("second history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-watch") == nil {
+		t.Fatal("history watch final did not publish a linked Teams session")
+	}
+	if createdTopic == "" {
+		t.Fatal("history watch final did not create a Teams work chat")
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Work chat created", "Imported Codex session history", "old answer", "new final answer"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("published history missing %q in:\n%s", want, joined)
+		}
+	}
+	published := bridge.reg.SessionByCodexThreadID("thread-watch")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(published.ID)]
+	if checkpoint.LastOffset != info.Size() || checkpoint.SourceSize != info.Size() {
+		t.Fatalf("import checkpoint offset/size = %d/%d, want EOF %d", checkpoint.LastOffset, checkpoint.SourceSize, info.Size())
+	}
+	sentCount := len(*sent)
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(20*time.Second), false); err != nil {
+		t.Fatalf("repeat history watch sync error: %v", err)
+	}
+	if len(*sent) != sentCount {
+		t.Fatalf("repeat watch sync sent duplicate messages: before=%d after=%d", sentCount, len(*sent))
+	}
+}
+
+func TestBridgeHistoryWatchDiscoversNewRecentFileWithoutFullReconcile(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-01-thread-new.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-new", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("initial empty history watch sync error: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-new"}}` + "\n" +
+		`{"thread_id":"thread-new","turn_id":"turn-1","id":"a1","role":"assistant","text":"new file final"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-new","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("recent-file history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-new") == nil {
+		t.Fatal("history watch did not publish a new recent transcript without full reconcile")
+	}
+	if !sentPlainContains(*sent, "new file final") {
+		t.Fatalf("published history missing new final in %#v", *sent)
+	}
+}
+
+func TestBridgeHistoryWatchPersistsPendingAssistantAcrossPolls(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-02-thread-pending.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-pending", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("initial empty history watch sync error: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-pending"}}` + "\n" +
+		`{"type":"item.completed","thread_id":"thread-pending","turn_id":"turn-1","item":{"id":"a1","type":"message","role":"assistant","content":[{"type":"output_text","text":"pending final answer"}]}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write pending transcript: %v", err)
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("pending-only history watch sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("pending assistant without terminal should not publish yet: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load pending state: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.PendingAssistantText != "pending final answer" {
+			t.Fatalf("pending assistant text = %q, want persisted final answer", checkpoint.PendingAssistantText)
+		}
+	}
+
+	appendLine(t, transcriptPath, `{"type":"turn.completed","thread_id":"thread-pending","turn_id":"turn-1"}`)
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(20*time.Second), false); err != nil {
+		t.Fatalf("terminal history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-pending") == nil {
+		t.Fatal("history watch did not publish final after terminal arrived in a later poll")
+	}
+	if !sentPlainContains(*sent, "pending final answer") {
+		t.Fatalf("published history missing pending final in %#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state: %v", err)
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.PendingAssistantText != "" {
+			t.Fatalf("pending assistant was not cleared after final: %#v", checkpoint)
+		}
+	}
+}
+
+func TestBridgeHistoryWatchPublishLookupUsesScopedCodexHome(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-03-thread-scoped.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	var roots []string
+	discoverCodexProjectsForTeams = func(_ context.Context, root string) ([]codexhistory.Project, error) {
+		roots = append(roots, root)
+		if root != codexRoot {
+			return nil, nil
+		}
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/scoped",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-scoped",
+				ProjectPath: "/home/user/project/scoped",
+				FilePath:    transcriptPath,
+				ModifiedAt:  now,
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("initial scoped history watch sync error: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-scoped"}}` + "\n" +
+		`{"thread_id":"thread-scoped","turn_id":"turn-1","id":"a1","role":"assistant","text":"scoped final"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-scoped","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write scoped transcript: %v", err)
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("scoped history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-scoped") == nil {
+		t.Fatalf("history watch did not publish scoped Codex home session; discover roots=%#v", roots)
+	}
+	if !sentPlainContains(*sent, "scoped final") {
+		t.Fatalf("published history missing scoped final in %#v", *sent)
+	}
+	for _, root := range roots {
+		if root != codexRoot {
+			t.Fatalf("discover called with root %q, want scoped Codex home %q (all roots %#v)", root, codexRoot, roots)
+		}
+	}
+}
+
+func TestBridgeHistoryWatchFallsBackForLargeTail(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-04-thread-large-tail.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-large-tail", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("initial empty history watch sync error: %v", err)
+	}
+	var body strings.Builder
+	body.WriteString(`{"type":"session_meta","payload":{"id":"thread-large-tail"}}` + "\n")
+	body.WriteString(`{"type":"event_msg","payload":{"id":"status-big","type":"agent_message","phase":"commentary","message":"`)
+	body.WriteString(strings.Repeat("x", historyTieredMaxTailBytes+1024))
+	body.WriteString(`"}}` + "\n")
+	body.WriteString(`{"thread_id":"thread-large-tail","turn_id":"turn-1","id":"a1","role":"assistant","text":"large tail final"}` + "\n")
+	body.WriteString(`{"type":"turn.completed","thread_id":"thread-large-tail","turn_id":"turn-1"}` + "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body.String()), 0o600); err != nil {
+		t.Fatalf("write large-tail transcript: %v", err)
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("large-tail history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-large-tail") == nil {
+		t.Fatal("history watch did not publish final after large tail fallback")
+	}
+	if !sentPlainContains(*sent, "large tail final") {
+		t.Fatalf("published history missing large tail final in %#v", *sent)
+	}
+}
+
+func TestBridgeHistoryWatchDoesNotMarkReadyWhenInitialReconcileFails(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	oldPath := filepath.Join(codexRoot, "sessions", "2026", "04", "01", "rollout-2026-04-01T09-00-00-thread-old.jsonl")
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0o700); err != nil {
+		t.Fatalf("mkdir old transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-old"}}` + "\n" +
+		`{"thread_id":"thread-old","turn_id":"turn-1","id":"a1","role":"assistant","text":"old final that must be baselined"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-old","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(oldPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write old transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return nil, errors.New("temporary discover failure")
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err == nil {
+		t.Fatal("initial reconcile failure returned nil")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load failed-init state: %v", err)
+	}
+	if !state.HistoryWatchReady.IsZero() {
+		t.Fatalf("history watch marked ready after failed initial reconcile: %s", state.HistoryWatchReady)
+	}
+
+	discoverCodexProjectsForTeams = func(_ context.Context, root string) ([]codexhistory.Project, error) {
+		if root != codexRoot {
+			return nil, nil
+		}
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/old",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-old",
+				ProjectPath: "/home/user/project/old",
+				FilePath:    oldPath,
+				ModifiedAt:  now,
+			}},
+		}}, nil
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), true); err != nil {
+		t.Fatalf("retry initial reconcile sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("existing old history should be baselined after initial reconcile recovery, sent=%#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load recovered-init state: %v", err)
+	}
+	if state.HistoryWatchReady.IsZero() || len(state.HistoryWatch) != 1 {
+		t.Fatalf("history watch was not baselined after reconcile recovery: ready=%s checkpoints=%#v", state.HistoryWatchReady, state.HistoryWatch)
+	}
+}
+
+func TestBridgeHistoryWatchDoesNotAdvanceWhenPublishTargetIsTemporarilyMissing(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-01-thread-late.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-late"}}` + "\n" +
+		`{"thread_id":"thread-late","turn_id":"turn-1","id":"a1","role":"assistant","text":"late final"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-late","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, false); err != nil {
+		t.Fatalf("history watch sync with missing publish target error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	if len(state.HistoryWatch) != 0 {
+		t.Fatalf("history watch checkpoint advanced before publish target existed: %#v", state.HistoryWatch)
+	}
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-late",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    transcriptPath,
+				ModifiedAt:  now,
+			}},
+		}}, nil
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("history watch retry sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-late") == nil {
+		t.Fatal("history watch final was not retried after publish target became available")
+	}
+	if !sentPlainContains(*sent, "late final") {
+		t.Fatalf("published history missing late final in %#v", *sent)
+	}
+}
+
+func TestBridgeHistoryWatchSkipsAlreadyLinkedSession(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-linked.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-linked"}}` + "\n" +
+		`{"thread_id":"thread-linked","turn_id":"turn-1","id":"a1","role":"assistant","text":"linked final answer"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-linked","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-linked", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-linked"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("history watch sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("history watch should leave linked session to linked transcript sync, sent=%#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+}
+
+func TestBridgeHistoryWatchPublishesSubagentFinal(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	childPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-child.jsonl")
+	if err := os.MkdirAll(filepath.Dir(childPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-child"}}` + "\n" +
+		`{"thread_id":"thread-child","turn_id":"turn-1","id":"a1","role":"assistant","text":"child final answer"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-child","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(childPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-parent",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    filepath.Join(filepath.Dir(childPath), "missing-parent.jsonl"),
+				Subagents: []codexhistory.SubagentSession{{
+					ParentSessionID: "thread-parent",
+					SessionID:       "thread-child",
+					FirstPrompt:     "child prompt",
+					FilePath:        childPath,
+					ModifiedAt:      now,
+				}},
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-child") == nil {
+		t.Fatal("history watch did not publish subagent final as its own Work chat")
+	}
+	if !sentPlainContains(*sent, "child final answer") {
+		t.Fatalf("published subagent history missing final in %#v", *sent)
 	}
 }
 

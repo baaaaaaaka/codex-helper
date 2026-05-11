@@ -477,20 +477,26 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 		"codex-helper-teams-wsl-stop-abc.signal",
 		"Test-Path -LiteralPath $stopPath",
 		"stop requested",
-		"& wsl.exe @wslArgs",
+		"$wslArgumentLine",
+		"Start-Process -FilePath",
+		"-WindowStyle Hidden",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
 		"wsl.exe exited",
 		"restarting in 10s",
 		"Start-Sleep -Seconds 10",
 		"$mutex.ReleaseMutex(); $mutex.Dispose()",
-		"'-d'",
-		"'Ubuntu'",
-		"'/home/alice/bin/codex-proxy'",
-		"'--auto-service=false'",
-		"'/home/alice/.config/codex-helper/teams registry.json'",
+		"-d Ubuntu",
+		"/home/alice/bin/codex-proxy",
+		"--auto-service=false",
+		`"/home/alice/.config/codex-helper/teams registry.json"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("WSL Startup watchdog script missing %q:\n%s", want, script)
 		}
+	}
+	if strings.Contains(script, "& wsl.exe @wslArgs") {
+		t.Fatalf("WSL Startup watchdog script must not launch wsl.exe directly in a visible console path:\n%s", script)
 	}
 
 	startCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, true)
@@ -626,8 +632,11 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		runLogName,
 		watchdogRunLogName,
 		"Add-Content -LiteralPath $runLog",
-		"*>> $runLog",
-		"& wsl.exe @wslArgs",
+		"$wslArgumentLine",
+		"Start-Process -FilePath",
+		"-WindowStyle Hidden",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
 		"New-ScheduledTaskTrigger -AtLogOn",
 		"RepetitionInterval (New-TimeSpan -Minutes 1)",
 		"RepetitionDuration (New-TimeSpan -Days 3650)",
@@ -645,6 +654,9 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		if !strings.Contains(command, want) {
 			t.Fatalf("WSL scheduled task command missing %q:\n%s", want, command)
 		}
+	}
+	if strings.Contains(command, "& wsl.exe @wslArgs") {
+		t.Fatalf("WSL scheduled task command must not launch wsl.exe directly in a visible console path:\n%s", command)
 	}
 	if strings.Contains(command, "RestartInterval (New-TimeSpan -Seconds 10)") {
 		t.Fatalf("WSL scheduled task command must not use Task Scheduler sub-minute restart intervals:\n%s", command)
@@ -735,8 +747,11 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 		runLogName,
 		watchdogRunLogName,
 		"exited",
-		"$LASTEXITCODE",
-		"& wsl.exe @wslArgs",
+		"$wslArgumentLine",
+		"Start-Process -FilePath",
+		"-WindowStyle Hidden",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
 		"Register-ScheduledTask",
 		"Enable-ScheduledTask -TaskName $taskName",
 		"Start-ScheduledTask -TaskName $taskName",
@@ -750,6 +765,9 @@ func TestTeamsBackgroundKeepaliveWSLRepairEnablesStartsAndPreservesTask(t *testi
 		if !strings.Contains(command, want) {
 			t.Fatalf("WSL repair command missing %q:\n%s", want, command)
 		}
+	}
+	if strings.Contains(command, "& wsl.exe @wslArgs") {
+		t.Fatalf("WSL repair command must not launch wsl.exe directly in a visible console path:\n%s", command)
 	}
 	if strings.Contains(command, "Disable-ScheduledTask -TaskName $taskName") {
 		t.Fatalf("WSL repair enable command should not disable task:\n%s", command)
@@ -1151,7 +1169,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		"$expectedActionExecute = ''powershell.exe''",
 		"-WindowStyle Hidden",
 		"wsl.exe",
-		"wslArgs",
+		"wslArgumentLine",
 		"Ubuntu",
 		"alice",
 		wantCWD,
@@ -1867,7 +1885,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 		"powershell.exe",
 		"-WindowStyle Hidden",
 		"wsl.exe",
-		"wslArgs",
+		"wslArgumentLine",
 		"CodexHelperCI",
 		"runner",
 		"--auto-service=false",
