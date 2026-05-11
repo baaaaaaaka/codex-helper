@@ -1886,6 +1886,10 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 		"-WindowStyle Hidden",
 		"wsl.exe",
 		"wslArgumentLine",
+		"Start-Process -FilePath",
+		"-ArgumentList $wslArgumentLine",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
 		"CodexHelperCI",
 		"runner",
 		"--auto-service=false",
@@ -1894,7 +1898,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 			t.Fatalf("real WSL-shaped task missing %q:\n%s", want, got)
 		}
 	}
-	requireSubstringsInOrder(t, got, "'teams'", "'run'", "'--auto-service=false'")
+	requireSubstringsInOrder(t, got, "teams", "run", "--auto-service=false")
 	if _, err := backend.Run(context.Background(), "enable"); err != nil {
 		t.Fatalf("enable real WSL-shaped task: %v", err)
 	}
