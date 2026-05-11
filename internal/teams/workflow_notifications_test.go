@@ -392,7 +392,7 @@ func TestWorkflowNotificationSuppressesAfterControlChatRebind(t *testing.T) {
 	}
 }
 
-func TestWorkflowNotificationSkipsHistoryAndNonFinalParts(t *testing.T) {
+func TestWorkflowNotificationSkipsHistoricalImportsAndNotifiesDetectedSyncFinals(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	graph, _ := newBridgeTestGraph(t)
@@ -412,18 +412,75 @@ func TestWorkflowNotificationSkipsHistoryAndNonFinalParts(t *testing.T) {
 	}
 
 	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-import", "import-history", ""))
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-sync-status", "sync-status-001", ""))
 	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-part-1", "final-001", ""))
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-sync-final", "sync-assistant-001", "turn_completed"))
 	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-part-2", "final-002", "turn_completed"))
 
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("webhook calls = %d, want 1", got)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("webhook calls = %d, want 2", got)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	if len(state.Notifications) != 1 {
-		t.Fatalf("notifications = %#v, want only final completion notification", state.Notifications)
+	if len(state.Notifications) != 2 {
+		t.Fatalf("notifications = %#v, want live final and detected sync final notifications", state.Notifications)
+	}
+	if _, ok := state.Notifications["workflow:"+shortStableID("outbox-sync-final")]; !ok {
+		t.Fatalf("sync assistant final notification missing: %#v", state.Notifications)
+	}
+	if _, ok := state.Notifications["workflow:"+shortStableID("outbox-part-2")]; !ok {
+		t.Fatalf("live final notification missing: %#v", state.Notifications)
+	}
+}
+
+func TestWorkflowNotificationSendsDetectedCodexAnswerOnce(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Detected answer should notify once")
+
+	var seen map[string]any
+	var calls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("test session missing")
+	}
+
+	bridge.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, "codex-final-key")
+	bridge.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, "codex-final-key")
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("webhook calls = %d, want 1", got)
+	}
+	raw, _ := json.Marshal(seen)
+	for _, want := range []string{"✅ Codex finished", "Open answer", "teams.microsoft.com"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("workflow payload missing %q: %s", want, raw)
+		}
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	key := "workflow:detected-codex-answer:" + shortStableID(session.ID+":codex-final-key")
+	if rec := state.Notifications[key]; rec.Status != teamstore.NotificationStatusSent || rec.Attempts != 1 {
+		t.Fatalf("detected answer notification = %#v, want sent once", rec)
 	}
 }
 

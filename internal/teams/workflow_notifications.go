@@ -170,6 +170,46 @@ func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, out
 	}
 }
 
+func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswer(ctx context.Context, session *Session, sourceKey string) {
+	if b == nil || b.store == nil || session == nil {
+		return
+	}
+	sourceKey = strings.TrimSpace(sourceKey)
+	if sourceKey == "" || strings.TrimSpace(session.ChatID) == "" {
+		return
+	}
+	outboxID := "detected-codex-answer:" + shortStableID(session.ID+":"+sourceKey)
+	event, ok, err := b.workflowNotificationEventForOutbox(ctx, teamstore.OutboxMessage{
+		ID:               outboxID,
+		SessionID:        session.ID,
+		TurnID:           sourceKey,
+		TeamsChatID:      session.ChatID,
+		Kind:             "detected-codex-answer",
+		NotificationKind: "turn_completed",
+	})
+	if err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow notification planning error: %v\n", err)
+		}
+		return
+	}
+	if !ok {
+		return
+	}
+	event.ID = "workflow:detected-codex-answer:" + shortStableID(session.ID+":"+sourceKey)
+	event.OutboxID = ""
+	event.TurnID = ""
+	if err := b.queueWorkflowNotification(ctx, event); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
+		}
+		return
+	}
+	if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams workflow notification send error: %v\n", err)
+	}
+}
+
 func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox teamstore.OutboxMessage) (WorkflowNotificationEvent, bool, error) {
 	if outbox.ID == "" || outbox.TeamsChatID == "" {
 		return WorkflowNotificationEvent{}, false, nil
@@ -270,10 +310,29 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 	return event, true, nil
 }
 
+func (b *Bridge) workflowNotificationsEnabled(ctx context.Context) bool {
+	if b == nil || b.store == nil {
+		return false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err != nil {
+		return false
+	}
+	return cfg.Enabled
+}
+
 func shouldSkipWorkflowNotificationOutbox(outbox teamstore.OutboxMessage) bool {
 	kind := strings.ToLower(strings.TrimSpace(outbox.Kind))
 	if kind == "" {
 		return true
+	}
+	notificationKind := strings.ToLower(strings.TrimSpace(outbox.NotificationKind))
+	if notificationKind == "turn_completed" {
+		return false
 	}
 	if strings.HasPrefix(kind, "import-") || strings.HasPrefix(kind, "sync-") || isTranscriptImportBatchOutboxKind(kind) {
 		return true

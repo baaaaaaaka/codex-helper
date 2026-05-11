@@ -11219,6 +11219,16 @@ func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) 
 			t.Fatalf("published history missing %q in:\n%s", want, joined)
 		}
 	}
+	var chatCreatedMentions int
+	for _, msg := range *sent {
+		if strings.Contains(PlainTextFromTeamsHTML(msg.Content), "Work chat created") {
+			chatCreatedMentions = msg.Mentions
+			break
+		}
+	}
+	if chatCreatedMentions == 0 {
+		t.Fatalf("history watch without workflow notifications should preserve the chat-created mention, sent=%#v", *sent)
+	}
 	published := bridge.reg.SessionByCodexThreadID("thread-watch")
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -11238,6 +11248,82 @@ func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) 
 	}
 	if len(*sent) != sentCount {
 		t.Fatalf("repeat watch sync sent duplicate messages: before=%d after=%d", sentCount, len(*sent))
+	}
+}
+
+func TestBridgeHistoryWatchSendsWorkflowCardForDetectedFinal(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-watch-card.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-watch-card", transcriptPath)
+	defer restoreDiscover()
+	var seenMu sync.Mutex
+	var seen []map[string]any
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode workflow request: %v", err)
+		}
+		seenMu.Lock()
+		seen = append(seen, body)
+		seenMu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(context.Background(), urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("initial empty history watch sync error: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-watch-card"}}` + "\n" +
+		`{"thread_id":"thread-watch-card","turn_id":"turn-1","id":"a1","role":"assistant","text":"detected final answer"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-watch-card","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("history watch sync error: %v", err)
+	}
+	seenMu.Lock()
+	seenCount := len(seen)
+	var firstSeen map[string]any
+	if seenCount > 0 {
+		firstSeen = seen[0]
+	}
+	seenMu.Unlock()
+	if seenCount != 1 {
+		t.Fatalf("workflow webhook calls = %d, want exactly one detected-answer card: %#v", seenCount, seen)
+	}
+	for _, msg := range *sent {
+		if strings.Contains(PlainTextFromTeamsHTML(msg.Content), "Work chat created") && msg.Mentions != 0 {
+			t.Fatalf("history watch with workflow notifications should not also mention the owner in chat-created notice: %#v", *sent)
+		}
+	}
+	raw, _ := json.Marshal(firstSeen)
+	for _, want := range []string{"✅ Codex finished", "Open answer", "teams.microsoft.com"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("workflow payload missing %q: %s", want, raw)
+		}
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(20*time.Second), false); err != nil {
+		t.Fatalf("repeat history watch sync error: %v", err)
+	}
+	seenMu.Lock()
+	seenCount = len(seen)
+	seenMu.Unlock()
+	if seenCount != 1 {
+		t.Fatalf("repeat watch sync sent duplicate workflow cards: %#v", seen)
 	}
 }
 
@@ -11600,14 +11686,14 @@ func TestBridgeHistoryWatchSkipsAlreadyLinkedSession(t *testing.T) {
 	}
 }
 
-func TestBridgeHistoryWatchPublishesSubagentFinal(t *testing.T) {
+func TestBridgeHistoryWatchSkipsSubagentFinal(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
 	codexRoot := t.TempDir()
 	childPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-child.jsonl")
 	if err := os.MkdirAll(filepath.Dir(childPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
 	}
-	body := `{"type":"session_meta","payload":{"id":"thread-child"}}` + "\n" +
+	body := `{"type":"session_meta","payload":{"id":"thread-child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"thread-parent","depth":1}}}}}` + "\n" +
 		`{"thread_id":"thread-child","turn_id":"turn-1","id":"a1","role":"assistant","text":"child final answer"}` + "\n" +
 		`{"type":"turn.completed","thread_id":"thread-child","turn_id":"turn-1"}` + "\n"
 	if err := os.WriteFile(childPath, []byte(body), 0o600); err != nil {
@@ -11633,10 +11719,24 @@ func TestBridgeHistoryWatchPublishesSubagentFinal(t *testing.T) {
 		}}, nil
 	}
 	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	var workflowMu sync.Mutex
+	var workflowCalls int
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		workflowMu.Lock()
+		workflowCalls++
+		workflowMu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
 	graph, sent := newBridgeCreateChatGraph(t, nil)
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	bridge.scope.CodexHome = codexRoot
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(context.Background(), urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
 		state.HistoryWatchReady = now.Add(-time.Minute)
 		return nil
@@ -11647,11 +11747,62 @@ func TestBridgeHistoryWatchPublishesSubagentFinal(t *testing.T) {
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
 		t.Fatalf("history watch sync error: %v", err)
 	}
-	if bridge.reg.SessionByCodexThreadID("thread-child") == nil {
-		t.Fatal("history watch did not publish subagent final as its own Work chat")
+	if bridge.reg.SessionByCodexThreadID("thread-child") != nil {
+		t.Fatal("history watch published subagent final as its own Work chat")
 	}
-	if !sentPlainContains(*sent, "child final answer") {
-		t.Fatalf("published subagent history missing final in %#v", *sent)
+	if sentPlainContains(*sent, "child final answer") {
+		t.Fatalf("history watch should not publish subagent final, sent=%#v", *sent)
+	}
+	workflowMu.Lock()
+	gotWorkflowCalls := workflowCalls
+	workflowMu.Unlock()
+	if gotWorkflowCalls != 0 {
+		t.Fatalf("subagent final sent %d workflow notification(s), want 0", gotWorkflowCalls)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.Offset == 0 || checkpoint.Size == 0 {
+			t.Fatalf("subagent checkpoint was not advanced to avoid repeated scans: %#v", checkpoint)
+		}
+	}
+}
+
+func TestBridgeHistoryWatchReconcilePathsSkipSubagents(t *testing.T) {
+	parentPath := filepath.Join(t.TempDir(), "parent.jsonl")
+	childPath := filepath.Join(filepath.Dir(parentPath), "child.jsonl")
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-parent",
+				ProjectPath: "/home/user/project/alpha",
+				FilePath:    parentPath,
+				Subagents: []codexhistory.SubagentSession{{
+					ParentSessionID: "thread-parent",
+					SessionID:       "thread-child",
+					FilePath:        childPath,
+				}},
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, newBridgeTestStore(t), &recordingExecutor{})
+
+	paths, err := bridge.historyWatchReconcilePaths(context.Background())
+	if err != nil {
+		t.Fatalf("historyWatchReconcilePaths error: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != parentPath {
+		t.Fatalf("reconcile paths = %#v, want only parent path", paths)
 	}
 }
 
@@ -13473,12 +13624,13 @@ func newBridgeCreateChatGraph(t *testing.T, createdTopic *string) (*GraphClient,
 				Body struct {
 					Content string `json:"content"`
 				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode message: %v", err)
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
 			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
 		default:
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())

@@ -92,3 +92,11 @@ func readSessionFileMetaCachedContext(ctx context.Context, filePath string) (ses
 	}
 	return meta, nil
 }
+
+func SessionFileIsSubagentContext(ctx context.Context, filePath string) (bool, error) {
+	meta, err := readSessionFileMetaCachedContext(ctx, filePath)
+	if err != nil {
+		return false, err
+	}
+	return meta.IsSubagent, nil
+}

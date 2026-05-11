@@ -369,6 +369,10 @@ func (b *Bridge) createMeetingChat(ctx context.Context, topic string) (Chat, err
 }
 
 func (b *Bridge) sendChatCreatedMention(ctx context.Context, sessionID string, chatID string, text string) error {
+	return b.sendChatCreatedNotice(ctx, sessionID, chatID, text, true)
+}
+
+func (b *Bridge) sendChatCreatedNotice(ctx context.Context, sessionID string, chatID string, text string, notify bool) error {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return nil
@@ -377,14 +381,20 @@ func (b *Bridge) sendChatCreatedMention(ctx context.Context, sessionID string, c
 	if text == "" {
 		text = "Teams chat created."
 	}
+	kind := "chat-created"
+	notificationKind := "chat_created"
+	if !notify {
+		kind = "chat-created-silent"
+		notificationKind = ""
+	}
 	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:               directOutboxID(chatID, "chat-created", text),
 		SessionID:        sessionID,
 		TeamsChatID:      chatID,
-		Kind:             "chat-created",
+		Kind:             kind,
 		Body:             text,
-		MentionOwner:     true,
-		NotificationKind: "chat_created",
+		MentionOwner:     notify,
+		NotificationKind: notificationKind,
 	})
 }
 
@@ -7885,6 +7895,18 @@ func (b *Bridge) publishCodexSessionWithProgress(ctx context.Context, target Das
 }
 
 func (b *Bridge) publishCodexSessionLocal(ctx context.Context, local codexhistory.Session, project codexhistory.Project, notify func(context.Context, string) error) (string, error) {
+	return b.publishCodexSessionLocalWithOptions(ctx, local, project, publishCodexSessionOptions{
+		Notify:                  notify,
+		ChatCreatedNotification: true,
+	})
+}
+
+type publishCodexSessionOptions struct {
+	Notify                  func(context.Context, string) error
+	ChatCreatedNotification bool
+}
+
+func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local codexhistory.Session, project codexhistory.Project, opts publishCodexSessionOptions) (string, error) {
 	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
 		if err := b.ensureDurableSession(ctx, existing); err != nil {
 			return "", err
@@ -7900,8 +7922,8 @@ func (b *Bridge) publishCodexSessionLocal(ctx context.Context, local codexhistor
 		}
 		importStatus := "No new local history was imported."
 		if hasNew {
-			if notify != nil {
-				if err := notify(ctx, publishHistoryPreparingMessage(existing.ID, existing.ChatURL, true)); err != nil {
+			if opts.Notify != nil {
+				if err := opts.Notify(ctx, publishHistoryPreparingMessage(existing.ID, existing.ChatURL, true)); err != nil {
 					return "", err
 				}
 			}
@@ -7951,12 +7973,12 @@ func (b *Bridge) publishCodexSessionLocal(ctx context.Context, local codexhistor
 	}); err != nil {
 		return "", err
 	}
-	if notify != nil {
-		if err := notify(ctx, publishHistoryPreparingMessage(session.ID, session.ChatURL, false)); err != nil {
+	if opts.Notify != nil {
+		if err := opts.Notify(ctx, publishHistoryPreparingMessage(session.ID, session.ChatURL, false)); err != nil {
 			return "", err
 		}
 	}
-	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+"."); err != nil {
+	if err := b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification); err != nil {
 		return "", err
 	}
 	if err := b.importCodexTranscriptToTeams(ctx, session, local); err != nil {

@@ -91,11 +91,6 @@ func (b *Bridge) historyWatchReconcilePaths(ctx context.Context) ([]string, erro
 			if strings.TrimSpace(session.FilePath) != "" {
 				paths = append(paths, session.FilePath)
 			}
-			for _, subagent := range session.Subagents {
-				if strings.TrimSpace(subagent.FilePath) != "" {
-					paths = append(paths, subagent.FilePath)
-				}
-			}
 		}
 	}
 	return paths, nil
@@ -295,6 +290,11 @@ func (b *Bridge) removeHistoryWatchCheckpoint(ctx context.Context, id string) er
 }
 
 func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, final historyTieredFinal) (bool, error) {
+	if isSubagent, err := codexhistory.SessionFileIsSubagentContext(ctx, path); err == nil && isSubagent {
+		return true, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
 	threadID := strings.TrimSpace(final.Record.ThreadID)
 	local, project, ok, err := b.findHistoryWatchCodexSession(ctx, path, threadID)
 	if err != nil || !ok {
@@ -303,8 +303,19 @@ func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, fina
 	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
 		return true, nil
 	}
-	_, err = b.publishCodexSessionLocal(ctx, local, project, nil)
-	return err == nil, err
+	workflowNotificationsEnabled := b.workflowNotificationsEnabled(ctx)
+	_, err = b.publishCodexSessionLocalWithOptions(ctx, local, project, publishCodexSessionOptions{
+		ChatCreatedNotification: !workflowNotificationsEnabled,
+	})
+	if err != nil {
+		return false, err
+	}
+	if workflowNotificationsEnabled {
+		if session := b.reg.SessionByCodexThreadID(local.SessionID); session != nil {
+			b.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, final.Key)
+		}
+	}
+	return true, nil
 }
 
 func (b *Bridge) findHistoryWatchCodexSession(ctx context.Context, path string, threadID string) (codexhistory.Session, codexhistory.Project, bool, error) {
@@ -325,20 +336,6 @@ func (b *Bridge) findHistoryWatchCodexSession(ctx context.Context, path string, 
 			}
 			if cleanPath != "" && cleanComparablePath(local.FilePath) == cleanPath {
 				return local, project, true, nil
-			}
-			for _, subagent := range local.Subagents {
-				if (threadID != "" && subagent.SessionID == threadID) ||
-					(cleanPath != "" && cleanComparablePath(subagent.FilePath) == cleanPath) {
-					return codexhistory.Session{
-						SessionID:    subagent.SessionID,
-						FirstPrompt:  subagent.FirstPrompt,
-						MessageCount: subagent.MessageCount,
-						CreatedAt:    subagent.CreatedAt,
-						ModifiedAt:   subagent.ModifiedAt,
-						ProjectPath:  firstNonEmptyString(local.ProjectPath, project.Path),
-						FilePath:     subagent.FilePath,
-					}, project, true, nil
-				}
 			}
 		}
 	}

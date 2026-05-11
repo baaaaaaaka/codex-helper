@@ -1,6 +1,7 @@
 package codexhistory
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -364,6 +365,22 @@ func TestReadSessionFileMeta_SubagentFile(t *testing.T) {
 	}
 	if meta.MessageCount != 1 {
 		t.Errorf("MessageCount = %d, want 1", meta.MessageCount)
+	}
+}
+
+func TestSessionFileIsSubagentContext(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "sub.jsonl")
+	content := `{"timestamp":"2026-03-01T12:00:00Z","type":"session_meta","payload":{"id":"file-sub-1","source":{"subagent":"review"}}}
+`
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	isSubagent, err := SessionFileIsSubagentContext(context.Background(), tmpFile)
+	if err != nil {
+		t.Fatalf("SessionFileIsSubagentContext error: %v", err)
+	}
+	if !isSubagent {
+		t.Fatal("SessionFileIsSubagentContext = false, want true")
 	}
 }
 
