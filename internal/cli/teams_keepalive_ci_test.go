@@ -1713,6 +1713,47 @@ func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
 	}
 }
 
+func TestTeamsBackgroundKeepaliveWSLStopSkipsMissingWatchdogTaskCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{output: []byte("ok")}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "windows-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	if _, err := backend.Run(context.Background(), "stop"); err != nil {
+		t.Fatalf("WSL stop error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("WSL stop calls = %#v, want one PowerShell call", runner.calls)
+	}
+	command := strings.Join(runner.calls[0].args, " ")
+	watchdogIdx := strings.Index(command, "Codex Helper Teams Watchdog")
+	bridgeIdx := strings.Index(command, "Codex Helper Teams Bridge")
+	if watchdogIdx < 0 || bridgeIdx < 0 || bridgeIdx <= watchdogIdx {
+		t.Fatalf("WSL stop should resolve optional watchdog before required bridge:\n%s", command)
+	}
+	watchdogSegment := command[watchdogIdx:bridgeIdx]
+	if strings.Contains(watchdogSegment, "Teams WSL Scheduled Task not found") {
+		t.Fatalf("missing WSL watchdog task must not fail stop:\n%s", command)
+	}
+	if !strings.Contains(watchdogSegment, "if ($null -ne $task) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }") {
+		t.Fatalf("WSL stop should stop watchdog only when it exists:\n%s", command)
+	}
+	if !strings.Contains(command[bridgeIdx:], "Teams WSL Scheduled Task not found") {
+		t.Fatalf("WSL stop should still require the primary bridge task:\n%s", command)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveWSLInstalledActiveProbeUsesTaskSchedulerCI(t *testing.T) {
 	lockCLITestHooks(t)
 

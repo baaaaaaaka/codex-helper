@@ -1511,16 +1511,16 @@ func (b teamsServiceWSLWindowsTaskBackend) Uninstall(ctx context.Context) (strin
 
 func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action string) ([]byte, error) {
 	resolve := teamsServiceWSLResolveTaskPowerShell(b.Name())
-	resolveWatchdog := teamsServiceWSLResolveTaskPowerShell(b.watchdogName())
+	resolveWatchdog := teamsServiceWSLResolveOptionalTaskPowerShell(b.watchdogName())
 	switch action {
 	case "enable":
-		return teamsServiceRunPowerShell(ctx, resolve+"Enable-ScheduledTask -TaskName $taskName | Out-Null; "+resolveWatchdog+"Enable-ScheduledTask -TaskName $taskName | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolve+"Enable-ScheduledTask -TaskName $taskName | Out-Null; "+resolveWatchdog+"if ($null -ne $task) { Enable-ScheduledTask -TaskName $taskName | Out-Null }")
 	case "disable":
-		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"Disable-ScheduledTask -TaskName $taskName | Out-Null; "+resolve+"Disable-ScheduledTask -TaskName $taskName | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $task) { Disable-ScheduledTask -TaskName $taskName | Out-Null }; "+resolve+"Disable-ScheduledTask -TaskName $taskName | Out-Null")
 	case "status":
 		runLogChild := powershellSingleQuote("codex-helper\\teams\\" + teamsServiceWSLTaskRunLogName(b.Name()))
 		watchdogLogChild := powershellSingleQuote("codex-helper\\teams\\" + teamsServiceWSLTaskRunLogName(b.watchdogName()))
-		data, err := teamsServiceRunPowerShell(ctx, resolve+"$info = Get-ScheduledTaskInfo -TaskName $taskName; $runLog = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+runLogChild+"; if ($task.TaskName -ne "+powershellSingleQuote(b.Name())+") { 'ResolvedLegacyTaskName : ' + $task.TaskName }; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; 'RunLog : ' + $runLog; "+resolveWatchdog+"$watchdogInfo = Get-ScheduledTaskInfo -TaskName $taskName; $watchdogRunLog = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+watchdogLogChild+"; $task | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime; 'WatchdogRunLog : ' + $watchdogRunLog")
+		data, err := teamsServiceRunPowerShell(ctx, resolve+"$info = Get-ScheduledTaskInfo -TaskName $taskName; $runLog = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+runLogChild+"; if ($task.TaskName -ne "+powershellSingleQuote(b.Name())+") { 'ResolvedLegacyTaskName : ' + $task.TaskName }; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; 'RunLog : ' + $runLog; "+resolveWatchdog+"if ($null -ne $task) { $watchdogInfo = Get-ScheduledTaskInfo -TaskName $taskName; $watchdogRunLog = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+watchdogLogChild+"; $task | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime; 'WatchdogRunLog : ' + $watchdogRunLog } else { 'WatchdogScheduledTask : not registered' }")
 		if err == nil {
 			return data, nil
 		}
@@ -1530,11 +1530,11 @@ func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action strin
 		}
 		return data, err
 	case "start":
-		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"Start-ScheduledTask -TaskName $taskName | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { Start-ScheduledTask -TaskName $taskName | Out-Null }")
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+resolve+"Stop-ScheduledTask -TaskName $taskName")
+		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $task) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }; "+resolve+"Stop-ScheduledTask -TaskName $taskName")
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"Start-ScheduledTask -TaskName $taskName | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { Start-ScheduledTask -TaskName $taskName | Out-Null }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for WSL Task Scheduler: %s", action)
 	}
@@ -2453,8 +2453,16 @@ func teamsServiceWSLTaskNamePrefix(taskName string) string {
 }
 
 func teamsServiceWSLResolveTaskPowerShell(taskName string) string {
+	return teamsServiceWSLResolveTaskPowerShellRequired(taskName, true)
+}
+
+func teamsServiceWSLResolveOptionalTaskPowerShell(taskName string) string {
+	return teamsServiceWSLResolveTaskPowerShellRequired(taskName, false)
+}
+
+func teamsServiceWSLResolveTaskPowerShellRequired(taskName string, required bool) string {
 	prefix := teamsServiceWSLTaskNamePrefix(taskName)
-	return "$taskName = " + powershellSingleQuote(taskName) + "; " +
+	cmd := "$taskName = " + powershellSingleQuote(taskName) + "; " +
 		"$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
 		"if ($null -eq $task) { " +
 		"$legacyPrefix = " + powershellSingleQuote(prefix) + "; " +
@@ -2464,8 +2472,11 @@ func teamsServiceWSLResolveTaskPowerShell(taskName string) string {
 		"if ($running.Count -gt 0) { $task = $running[0] } else { $task = $matches[0] }; " +
 		"$taskName = $task.TaskName " +
 		"} " +
-		"}; " +
-		"if ($null -eq $task) { throw ('Teams WSL Scheduled Task not found: ' + $taskName) }; "
+		"}; "
+	if required {
+		cmd += "if ($null -eq $task) { throw ('Teams WSL Scheduled Task not found: ' + $taskName) }; "
+	}
+	return cmd
 }
 
 func buildTeamsServiceWSLElevatedCommand(command string) string {
