@@ -128,6 +128,29 @@ func TestAppServerProcessTransportReadFailureIncludesLimitedStderr(t *testing.T)
 	}
 }
 
+func TestAppServerProcessDiagnosticWaitsForStderrDrainAfterExit(t *testing.T) {
+	transport := &appServerProcessTransport{
+		stderrBuffer: newLimitedStderrBuffer(1024),
+		stderrDone:   make(chan struct{}),
+		waitDone:     make(chan struct{}),
+	}
+	close(transport.waitDone)
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		_, _ = transport.stderrBuffer.Write([]byte("delayed-stderr-marker"))
+		close(transport.stderrDone)
+	}()
+
+	err := transport.diagnosticError(errors.New("stdout closed"), "read app-server stdout")
+	if err == nil {
+		t.Fatal("diagnosticError unexpectedly returned nil")
+	}
+	if !strings.Contains(err.Error(), "delayed-stderr-marker") {
+		t.Fatalf("stderr diagnostic did not wait for drain: %v", err)
+	}
+}
+
 func TestAppServerProcessTransportWriteFailureIncludesStderr(t *testing.T) {
 	transport := startProcessHelper(t, AppServerProcessStarter{}, "close-stdin")
 	defer transport.Close()

@@ -327,7 +327,7 @@ jobs:
         run: |
           set -euo pipefail
           adapter_pattern='Test(TeamsCodexExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|RunnerExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|BridgeSession(CodexFailureWithOnlyExistingThreadIDMarksFailed|TerminalCodexFailureWithTurnIDMarksFailed))$'
-          runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly)$'
+          runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerProcess(TransportReadFailureIncludesLimitedStderr|DiagnosticWaitsForStderrDrainAfterExit))$'
           helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater.*|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|PassesPrereleaseOptIn|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState)|BridgeControlHelperUpdate(PrereleaseRunsManualUpdate|WaitsForActiveWork))$'
           upgrade_pattern='Test(BridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork|BridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat|CodexErrorRequiresUpgradeHeuristics|UpgradeNotificationTargetsDeduplicate|RunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner)$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v

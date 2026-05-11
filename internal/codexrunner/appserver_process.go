@@ -97,6 +97,7 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 		stderrBuffer:  newLimitedStderrBuffer(s.StderrLimit),
 		lines:         make(chan appServerProcessLine, 16),
 		done:          make(chan struct{}),
+		stderrDone:    make(chan struct{}),
 		waitDone:      make(chan struct{}),
 	}
 	transport.wg.Add(2)
@@ -119,9 +120,10 @@ type appServerProcessTransport struct {
 	stderr        *os.File
 	stderrBuffer  *limitedStderrBuffer
 
-	lines    chan appServerProcessLine
-	done     chan struct{}
-	waitDone chan struct{}
+	lines      chan appServerProcessLine
+	done       chan struct{}
+	stderrDone chan struct{}
+	waitDone   chan struct{}
 
 	writeMu   sync.Mutex
 	closeOnce sync.Once
@@ -234,6 +236,7 @@ func (p *appServerProcessTransport) readStdout() {
 
 func (p *appServerProcessTransport) readStderr() {
 	defer p.wg.Done()
+	defer close(p.stderrDone)
 	_, _ = io.Copy(p.stderrBuffer, p.stderr)
 }
 
@@ -258,12 +261,25 @@ func (p *appServerProcessTransport) waitError() error {
 	return p.waitErr
 }
 
-func (p *appServerProcessTransport) waitForExit(timeout time.Duration) {
+func (p *appServerProcessTransport) waitForExit(timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-p.waitDone:
+		return true
 	case <-timer.C:
+		return false
+	}
+}
+
+func (p *appServerProcessTransport) waitForStderr(timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-p.stderrDone:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -271,7 +287,9 @@ func (p *appServerProcessTransport) diagnosticError(err error, action string) er
 	if err == nil {
 		return nil
 	}
-	p.waitForExit(50 * time.Millisecond)
+	if p.waitForExit(50 * time.Millisecond) {
+		p.waitForStderr(50 * time.Millisecond)
+	}
 	if stderr := p.stderrBuffer.String(); stderr != "" {
 		return fmt.Errorf("%s: %w; stderr: %s", action, err, stderr)
 	}
