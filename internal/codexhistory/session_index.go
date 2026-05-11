@@ -48,8 +48,8 @@ type codexResponsePayload struct {
 	Role    string          `json:"role"`
 	Phase   string          `json:"phase"`
 	Name    string          `json:"name"`
-	Text    string          `json:"text"`
-	Message string          `json:"message"`
+	Text    json.RawMessage `json:"text"`
+	Message json.RawMessage `json:"message"`
 	Content json.RawMessage `json:"content"`
 }
 

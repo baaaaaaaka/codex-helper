@@ -141,6 +141,20 @@ func TestParseResponseItem_FunctionCallOutput(t *testing.T) {
 	}
 }
 
+func TestParseResponseItem_AgentMessageTextContentArray(t *testing.T) {
+	raw := `{"id":"agent-raw-1","type":"agent_message","text":[{"type":"output_text","text":"raw array answer"}]}`
+	msgs := parseResponseItem([]byte(raw), fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1, got %d", len(msgs))
+	}
+	if msgs[0].Role != "assistant" || msgs[0].Content != "raw array answer" {
+		t.Fatalf("msg = %#v", msgs[0])
+	}
+	if msgs[0].sourceID != "agent_message:agent-raw-1" {
+		t.Fatalf("sourceID = %q", msgs[0].sourceID)
+	}
+}
+
 func TestParseResponseItem_CustomToolCall(t *testing.T) {
 	raw := `{"type":"custom_tool_call","name":"my_tool","content":[{"type":"input_text","text":"arg data"}]}`
 	msgs := parseResponseItem([]byte(raw), fixedTime())
@@ -313,6 +327,57 @@ func TestParseMessagePayload_WhitespaceContent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// parseAgentMessagePayload
+// ---------------------------------------------------------------------------
+
+func TestParseAgentMessagePayload_TextContentArray(t *testing.T) {
+	p := codexResponsePayload{
+		ID:   "agent-1",
+		Type: "agent_message",
+		Text: []byte(`[{"type":"output_text","text":"array final answer"}]`),
+	}
+	msgs := parseAgentMessagePayload(p, fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1, got %d", len(msgs))
+	}
+	if msgs[0].Role != "assistant" || msgs[0].Content != "array final answer" {
+		t.Fatalf("msg = %#v", msgs[0])
+	}
+	if msgs[0].sourceID != "agent_message:agent-1" {
+		t.Fatalf("sourceID = %q", msgs[0].sourceID)
+	}
+}
+
+func TestParseAgentMessagePayload_MessageString(t *testing.T) {
+	p := codexResponsePayload{
+		Type:    "agent_message",
+		Message: []byte(`"string final answer"`),
+	}
+	msgs := parseAgentMessagePayload(p, fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1, got %d", len(msgs))
+	}
+	if msgs[0].Content != "string final answer" {
+		t.Fatalf("content = %q", msgs[0].Content)
+	}
+}
+
+func TestParseAgentMessagePayload_CommentaryPhase(t *testing.T) {
+	p := codexResponsePayload{
+		Type:    "agent_message",
+		Phase:   "commentary",
+		Content: []byte(`[{"type":"output_text","text":"working"}]`),
+	}
+	msgs := parseAgentMessagePayload(p, fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1, got %d", len(msgs))
+	}
+	if msgs[0].Role != "assistant_commentary" {
+		t.Fatalf("role = %q", msgs[0].Role)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // parseFunctionCall
 // ---------------------------------------------------------------------------
 
@@ -328,6 +393,17 @@ func TestParseFunctionCall_ValidJSONArgs(t *testing.T) {
 	// JSON should be pretty-printed
 	if !strings.Contains(msgs[0].Content, "\"path\"") {
 		t.Errorf("expected formatted JSON in content: %q", msgs[0].Content)
+	}
+}
+
+func TestParseFunctionCall_ObjectArgs(t *testing.T) {
+	raw := `{"type":"function_call","name":"write_file","arguments":{"path":"/tmp/x","content":"data"}}`
+	msgs := parseFunctionCall([]byte(raw), fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1, got %d", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Content, `"path"`) || !strings.Contains(msgs[0].Content, `/tmp/x`) {
+		t.Fatalf("object arguments were not rendered: %q", msgs[0].Content)
 	}
 }
 
@@ -383,6 +459,17 @@ func TestParseFunctionCallOutput_Normal(t *testing.T) {
 	}
 	if msgs[0].Role != "tool_result" || msgs[0].Content != "result text" {
 		t.Errorf("msg = %+v", msgs[0])
+	}
+}
+
+func TestParseFunctionCallOutput_ObjectOutput(t *testing.T) {
+	raw := `{"type":"function_call_output","output":{"stdout":"ok","exit_code":0}}`
+	msgs := parseFunctionCallOutput([]byte(raw), fixedTime())
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1, got %d", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Content, `"stdout"`) || !strings.Contains(msgs[0].Content, `"ok"`) {
+		t.Fatalf("object output was not rendered: %q", msgs[0].Content)
 	}
 }
 

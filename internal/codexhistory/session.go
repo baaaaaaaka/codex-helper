@@ -130,7 +130,11 @@ func parseResponseItem(raw json.RawMessage, ts time.Time) []Message {
 }
 
 func parseAgentMessagePayload(payload codexResponsePayload, ts time.Time) []Message {
-	text := firstNonEmptyString(payload.Message, payload.Text, extractContentText(payload.Content))
+	text := firstNonEmptyString(
+		extractContentText(payload.Message),
+		extractContentText(payload.Text),
+		extractContentText(payload.Content),
+	)
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil
@@ -174,10 +178,10 @@ func parseMessagePayload(payload codexResponsePayload, ts time.Time) []Message {
 
 func parseFunctionCall(raw json.RawMessage, ts time.Time) []Message {
 	var fc struct {
-		ID        string `json:"id"`
-		CallID    string `json:"call_id"`
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		ID        string          `json:"id"`
+		CallID    string          `json:"call_id"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
 	}
 	if json.Unmarshal(raw, &fc) != nil {
 		return nil
@@ -188,17 +192,8 @@ func parseFunctionCall(raw json.RawMessage, ts time.Time) []Message {
 	}
 
 	label := "Tool: " + name
-	if fc.Arguments != "" {
-		var parsed any
-		if json.Unmarshal([]byte(fc.Arguments), &parsed) == nil {
-			if formatted, err := json.MarshalIndent(parsed, "", "  "); err == nil {
-				label += "\n" + string(formatted)
-			} else {
-				label += "\n" + fc.Arguments
-			}
-		} else {
-			label += "\n" + fc.Arguments
-		}
+	if args := formatJSONFieldText(fc.Arguments); args != "" {
+		label += "\n" + args
 	}
 
 	return []Message{{Role: "tool", Content: label, Timestamp: ts, sourceID: messageSourceID("function_call", firstNonEmptyString(fc.ID, fc.CallID))}}
@@ -206,14 +201,14 @@ func parseFunctionCall(raw json.RawMessage, ts time.Time) []Message {
 
 func parseFunctionCallOutput(raw json.RawMessage, ts time.Time) []Message {
 	var fco struct {
-		ID     string `json:"id"`
-		CallID string `json:"call_id"`
-		Output string `json:"output"`
+		ID     string          `json:"id"`
+		CallID string          `json:"call_id"`
+		Output json.RawMessage `json:"output"`
 	}
 	if json.Unmarshal(raw, &fco) != nil {
 		return nil
 	}
-	text := strings.TrimSpace(fco.Output)
+	text := strings.TrimSpace(formatJSONFieldText(fco.Output))
 	if text == "" {
 		return nil
 	}
@@ -422,4 +417,39 @@ func messageSourceID(kind string, id string) string {
 		kind = "item"
 	}
 	return kind + ":" + id
+}
+
+func formatJSONFieldText(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return ""
+		}
+		return formatMaybeJSONText(s)
+	}
+	var parsed any
+	if json.Unmarshal(raw, &parsed) == nil {
+		if formatted, err := json.MarshalIndent(parsed, "", "  "); err == nil {
+			return string(formatted)
+		}
+	}
+	return string(raw)
+}
+
+func formatMaybeJSONText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	var parsed any
+	if json.Unmarshal([]byte(text), &parsed) == nil {
+		if formatted, err := json.MarshalIndent(parsed, "", "  "); err == nil {
+			return string(formatted)
+		}
+	}
+	return text
 }
