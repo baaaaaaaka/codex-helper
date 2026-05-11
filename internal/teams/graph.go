@@ -458,6 +458,30 @@ func (g *GraphClient) UnhideChatForUser(ctx context.Context, chatID string, user
 	return g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/unhideForUser", body, nil)
 }
 
+func (g *GraphClient) MarkChatUnreadForUser(ctx context.Context, chatID string, user User, lastMessageReadDateTime time.Time) error {
+	chatID = strings.TrimSpace(chatID)
+	userID := strings.TrimSpace(user.ID)
+	if chatID == "" {
+		return fmt.Errorf("chat id is required")
+	}
+	if userID == "" {
+		return fmt.Errorf("user id is required")
+	}
+	userBody := map[string]any{
+		"id": userID,
+	}
+	if tenantID := strings.TrimSpace(g.tenantID()); tenantID != "" {
+		userBody["tenantId"] = tenantID
+	}
+	body := map[string]any{
+		"user": userBody,
+	}
+	if !lastMessageReadDateTime.IsZero() {
+		body["lastMessageReadDateTime"] = lastMessageReadDateTime.UTC().Format(time.RFC3339Nano)
+	}
+	return g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/markChatUnreadForUser", body, nil)
+}
+
 func HTMLMessageMentioningOwner(prefix string, text string, owner User) (string, []ChatMention) {
 	mentionText := strings.TrimSpace(firstNonEmptyString(owner.DisplayName, owner.UserPrincipalName, "owner"))
 	mention := `<at id="0">` + html.EscapeString(mentionText) + `</at>`
@@ -913,6 +937,10 @@ func isAllowedGraphRequest(method string, path string) bool {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
 	}
+	if method == http.MethodPost && isChatMarkUnreadForUserPath(clean) {
+		q, ok := allowedGraphQuery(path)
+		return ok && len(q) == 0
+	}
 	if method == http.MethodPatch && isChatMessagePath(clean) {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
@@ -1347,6 +1375,14 @@ func isChatMembersPath(path string) bool {
 func isChatUnhideForUserPath(path string) bool {
 	parts := strings.Split(path, "/")
 	if len(parts) != 4 || parts[0] != "" || parts[1] != "chats" || parts[2] == "" || parts[3] != "unhideForUser" {
+		return false
+	}
+	return safeGraphDynamicID(parts[2])
+}
+
+func isChatMarkUnreadForUserPath(path string) bool {
+	parts := strings.Split(path, "/")
+	if len(parts) != 4 || parts[0] != "" || parts[1] != "chats" || parts[2] == "" || parts[3] != "markChatUnreadForUser" {
 		return false
 	}
 	return safeGraphDynamicID(parts[2])

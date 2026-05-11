@@ -459,7 +459,9 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodGet, "/chats/a/messages/message-id/hostedContents/../$value"},
 		{http.MethodGet, "/chats/a/messages/message-id/hostedContents/content-id/$value?$top=1"},
 		{http.MethodPost, "/chats/a/unhideForUser?$top=1"},
+		{http.MethodPost, "/chats/a/markChatUnreadForUser?$top=1"},
 		{http.MethodPost, "/chats/a/../unhideForUser"},
+		{http.MethodPost, "/chats/a/../markChatUnreadForUser"},
 		{http.MethodPost, "/me/onlineMeetings/createOrGet?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content/extra"},
@@ -499,6 +501,7 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodGet, "/chats/chat-id/messages/message-id"},
 		{http.MethodPatch, "/chats/chat-id/messages/message-id"},
 		{http.MethodPost, "/chats/chat-id/unhideForUser"},
+		{http.MethodPost, "/chats/chat-id/markChatUnreadForUser"},
 		{http.MethodGet, "/chats/chat-id/messages/message-id/hostedContents/content-id/$value"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content"},
 		{http.MethodPut, "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/file.txt:/content"},
@@ -1081,6 +1084,47 @@ func TestGraphUnhideChatForUser(t *testing.T) {
 	}
 	if !sawUnhide {
 		t.Fatal("missing unhide request")
+	}
+}
+
+func TestGraphMarkChatUnreadForUser(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access", tenantID: "tenant-1"}
+	readAt := time.Date(2026, 5, 11, 12, 34, 56, 789000000, time.FixedZone("offset", 8*60*60))
+	var sawMarkUnread bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/markChatUnreadForUser" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		if r.URL.RawQuery != "" {
+			t.Fatalf("unexpected query: %q", r.URL.RawQuery)
+		}
+		sawMarkUnread = true
+		var payload struct {
+			User struct {
+				ID       string `json:"id"`
+				TenantID string `json:"tenantId"`
+			} `json:"user"`
+			LastMessageReadDateTime string `json:"lastMessageReadDateTime"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode mark unread payload: %v", err)
+		}
+		if payload.User.ID != "user-1" || payload.User.TenantID != "tenant-1" {
+			t.Fatalf("unexpected mark unread payload: %#v", payload)
+		}
+		if want := readAt.UTC().Format(time.RFC3339Nano); payload.LastMessageReadDateTime != want {
+			t.Fatalf("lastMessageReadDateTime = %q, want %q", payload.LastMessageReadDateTime, want)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	if err := graph.MarkChatUnreadForUser(context.Background(), "chat-1", User{ID: "user-1"}, readAt); err != nil {
+		t.Fatalf("MarkChatUnreadForUser error: %v", err)
+	}
+	if !sawMarkUnread {
+		t.Fatal("missing mark unread request")
 	}
 }
 

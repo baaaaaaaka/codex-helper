@@ -37,6 +37,7 @@ const (
 	dashboardProjectsCacheTTL            = 30 * time.Second
 	persistentPollFailureRestartAfter    = 10 * time.Minute
 	persistentPollFailureRestartMinCount = 3
+	recentDuplicateSessionPromptWindow   = 3 * time.Minute
 
 	// Automatic transcript sync is for small local Codex CLI catch-up. Large
 	// history import must stay explicit, otherwise helper startup can flood a
@@ -240,6 +241,8 @@ type Bridge struct {
 	annotateUserMessages         bool
 	annotationDisabled           bool
 	annotationWarned             bool
+	markAnswerChatsUnread        bool
+	markAnswerUnreadWarned       bool
 	runningTurnMu                sync.Mutex
 	runningTurnCancels           map[string]*runningTurnCancel
 }
@@ -289,7 +292,7 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 	reg.UserID = user.ID
 	reg.UserPrincipal = user.UserPrincipalName
 	httpClient := graph.httpClient()
-	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, user: user, scope: scope, machine: MachineRecordForUser(user, scope), out: out}, nil
+	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, user: user, scope: scope, machine: MachineRecordForUser(user, scope), out: out, markAnswerChatsUnread: true}, nil
 }
 
 func (b *Bridge) readClient() *GraphClient {
@@ -859,7 +862,6 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 			b.reg.MarkSeen(chatID, msg.ID)
 			continue
 		}
-		b.annotateIncomingUserMessage(ctx, chatID, msg)
 		if b.currentLeaseGeneration() > 0 {
 			if err := b.ensureActiveControlLease(ctx); err != nil {
 				releaseGlobalInbound(ctx, globalClaim)
@@ -877,6 +879,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 			return handled, err
 		}
+		b.annotateIncomingUserMessage(ctx, chatID, msg)
 		handled = true
 		activityAt = latestTime(activityAt, time.Now(), messageSortTime(msg))
 		b.boostPolling(time.Now())
@@ -1260,11 +1263,12 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if role == inboundPollRoleControl && looksLikeRenderedHelperOutputPlainText(PlainTextFromTeamsHTML(msg.Body.Content)) {
+	plainText := PlainTextFromTeamsHTML(msg.Body.Content)
+	if role == inboundPollRoleControl && looksLikeRenderedHelperOutputPlainText(plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if looksLikeRenderedHelperOrCodexOutputPlainText(PlainTextFromTeamsHTML(msg.Body.Content)) {
+	if looksLikeRenderedHelperOrCodexOutputPlainText(plainText) || looksLikeRenderedUserTranscriptEchoMessage(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
@@ -1349,6 +1353,73 @@ func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
 		}
 	}
 	return false
+}
+
+func looksLikeRenderedUserTranscriptEchoMessage(msg ChatMessage, text string) bool {
+	if !looksLikeRenderedUserTranscriptPlainText(text) {
+		return false
+	}
+	return teamsHTMLFirstTextIsStrongLabel(msg.Body.Content, "🧑‍💻 User")
+}
+
+func looksLikeRenderedUserTranscriptPlainText(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "🧑‍💻 User:" || strings.HasPrefix(text, "🧑‍💻 User:\n") || strings.HasPrefix(text, "🧑‍💻 User: ") {
+		return true
+	}
+	firstLine := text
+	if idx := strings.IndexByte(firstLine, '\n'); idx >= 0 {
+		firstLine = firstLine[:idx]
+	}
+	return strings.HasPrefix(firstLine, "🧑‍💻 User [part ") && strings.HasSuffix(strings.TrimSpace(firstLine), ":")
+}
+
+func teamsHTMLFirstTextIsStrongLabel(content string, label string) bool {
+	label = strings.TrimSpace(label)
+	if label == "" || strings.TrimSpace(content) == "" {
+		return false
+	}
+	root, err := xhtml.Parse(strings.NewReader("<html><body>" + content + "</body></html>"))
+	if err != nil {
+		return false
+	}
+	first := firstNonEmptyHTMLTextNode(root)
+	if first == nil || !htmlTextNodeHasStrongAncestor(first) {
+		return false
+	}
+	return renderedTeamsLabelMatches(strings.TrimSpace(first.Data), label)
+}
+
+func firstNonEmptyHTMLTextNode(root *xhtml.Node) *xhtml.Node {
+	if root == nil {
+		return nil
+	}
+	if root.Type == xhtml.TextNode && strings.TrimSpace(root.Data) != "" {
+		return root
+	}
+	for child := root.FirstChild; child != nil; child = child.NextSibling {
+		if found := firstNonEmptyHTMLTextNode(child); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func htmlTextNodeHasStrongAncestor(node *xhtml.Node) bool {
+	for parent := node.Parent; parent != nil; parent = parent.Parent {
+		if parent.Type == xhtml.ElementNode && (strings.EqualFold(parent.Data, "strong") || strings.EqualFold(parent.Data, "b")) {
+			return true
+		}
+	}
+	return false
+}
+
+func renderedTeamsLabelMatches(text string, label string) bool {
+	text = strings.TrimSpace(text)
+	if text == label+":" {
+		return true
+	}
+	return strings.HasPrefix(text, label+" [part ") && strings.HasSuffix(text, ":")
 }
 
 func comparableTeamsPlainText(text string) string {
@@ -3337,6 +3408,11 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	} else if blocked {
 		return b.rejectSessionWork(ctx, session, msg, control)
 	}
+	if duplicate, err := b.ignoreRecentDuplicateSessionPrompt(ctx, session, msg, text); err != nil {
+		return err
+	} else if duplicate {
+		return nil
+	}
 	if b.asyncTurns {
 		turns, err := b.sessionTurnQueueState(ctx, session.ID)
 		if err != nil {
@@ -5077,6 +5153,126 @@ func (b *Bridge) runQueuedTurn(ctx context.Context, session *Session, turn teams
 	return b.runQueuedTurnInput(ctx, session, turn, chatID, ExecutionInput{Prompt: text})
 }
 
+type recentDuplicatePrompt struct {
+	Inbound teamstore.InboundEvent
+	Turn    teamstore.Turn
+}
+
+func (b *Bridge) ignoreRecentDuplicateSessionPrompt(ctx context.Context, session *Session, msg ChatMessage, text string) (bool, error) {
+	if b == nil || session == nil || b.store == nil {
+		return false, nil
+	}
+	duplicate, ok, err := b.recentDuplicateSessionPrompt(ctx, session, msg, text, time.Now())
+	if err != nil || !ok {
+		return ok, err
+	}
+	inbound, created, err := b.persistInboundWithStatusAndSource(ctx, session, msg, teamstore.InboundStatusIgnored, "teams_duplicate_prompt")
+	if err != nil {
+		return true, err
+	}
+	if !created {
+		return true, nil
+	}
+	return true, b.sendToChat(ctx, session.ChatID, recentDuplicatePromptNotice(inbound, duplicate))
+}
+
+func (b *Bridge) recentDuplicateSessionPrompt(ctx context.Context, session *Session, msg ChatMessage, text string, now time.Time) (recentDuplicatePrompt, bool, error) {
+	if b == nil || session == nil || b.store == nil || messageHasPromptDedupUnsafeAttachments(msg) {
+		return recentDuplicatePrompt{}, false, nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	text = strings.TrimSpace(firstNonEmptyString(text, promptTextFromTeamsMessageHTML(msg.Body.Content)))
+	hash := normalizedTextHash(text)
+	if hash == "" {
+		return recentDuplicatePrompt{}, false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return recentDuplicatePrompt{}, false, err
+	}
+	var best recentDuplicatePrompt
+	var bestAt time.Time
+	for _, inbound := range state.InboundEvents {
+		if inbound.SessionID != session.ID ||
+			inbound.TeamsChatID != session.ChatID ||
+			inbound.TeamsMessageID == msg.ID ||
+			!strings.EqualFold(strings.TrimSpace(inbound.Source), "teams") ||
+			inbound.TextHash == "" ||
+			inbound.TextHash != hash ||
+			inbound.TurnID == "" {
+			continue
+		}
+		turn, ok := state.Turns[inbound.TurnID]
+		if !ok || turn.SessionID != session.ID || !turnStatusSuppressesDuplicatePrompt(turn.Status) {
+			continue
+		}
+		seenAt := inboundEventActivityTime(inbound)
+		if seenAt.IsZero() || now.Sub(seenAt) < 0 || now.Sub(seenAt) > recentDuplicateSessionPromptWindow {
+			continue
+		}
+		if bestAt.IsZero() || seenAt.After(bestAt) {
+			best = recentDuplicatePrompt{Inbound: inbound, Turn: turn}
+			bestAt = seenAt
+		}
+	}
+	if best.Inbound.ID == "" {
+		return recentDuplicatePrompt{}, false, nil
+	}
+	return best, true, nil
+}
+
+func messageHasPromptDedupUnsafeAttachments(msg ChatMessage) bool {
+	if len(msg.Attachments) > 0 {
+		return true
+	}
+	return len(HostedContentIDsFromHTML(msg.Body.Content)) > 0
+}
+
+func turnStatusSuppressesDuplicatePrompt(status teamstore.TurnStatus) bool {
+	switch status {
+	case teamstore.TurnStatusQueued, teamstore.TurnStatusRunning, teamstore.TurnStatusCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
+func inboundEventActivityTime(inbound teamstore.InboundEvent) time.Time {
+	if !inbound.ReceivedAt.IsZero() {
+		return inbound.ReceivedAt
+	}
+	if !inbound.CreatedAt.IsZero() {
+		return inbound.CreatedAt
+	}
+	return inbound.UpdatedAt
+}
+
+func recentDuplicatePromptNotice(inbound teamstore.InboundEvent, duplicate recentDuplicatePrompt) string {
+	turnID := firstNonEmptyString(duplicate.Turn.ID, duplicate.Inbound.TurnID)
+	var b strings.Builder
+	b.WriteString("Duplicate request ignored.\n\n")
+	b.WriteString("I already accepted the same Teams prompt in this chat recently, so I will not run it again.\n")
+	if turnID != "" {
+		b.WriteString("\nPrevious turn: `")
+		b.WriteString(turnID)
+		b.WriteString("`")
+	}
+	if !duplicate.Inbound.ReceivedAt.IsZero() {
+		b.WriteString("\nAccepted at: `")
+		b.WriteString(duplicate.Inbound.ReceivedAt.Format(time.RFC3339))
+		b.WriteString("`")
+	}
+	if strings.TrimSpace(inbound.TeamsMessageID) != "" {
+		b.WriteString("\nIgnored duplicate Teams message: `")
+		b.WriteString(strings.TrimSpace(inbound.TeamsMessageID))
+		b.WriteString("`")
+	}
+	b.WriteString("\n\nTo intentionally rerun it, change the wording slightly or use `helper retry <turn-id>` if the earlier turn failed.")
+	return b.String()
+}
+
 func (b *Bridge) runQueuedTurnWithExecutor(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, text string) error {
 	return b.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, chatID, ExecutionInput{Prompt: text})
 }
@@ -6739,6 +6935,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
 		if err == nil {
 			b.queueWorkflowNotificationForSentOutbox(ctx, sent)
+			b.markChatUnreadForSentAnswer(ctx, sent, ChatMessage{})
 		}
 		return err
 	}
@@ -6803,8 +7000,25 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
 	if err == nil {
 		b.queueWorkflowNotificationForSentOutbox(ctx, sent)
+		b.markChatUnreadForSentAnswer(ctx, sent, msg)
 	}
 	return err
+}
+
+func (b *Bridge) markChatUnreadForSentAnswer(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {
+	if b == nil || !b.markAnswerChatsUnread || b.graph == nil || !isCompletionNotificationPart(outbox) {
+		return
+	}
+	readAt := parseGraphTime(msg.CreatedDateTime)
+	if !readAt.IsZero() {
+		readAt = readAt.Add(-time.Millisecond)
+	}
+	if err := b.graph.MarkChatUnreadForUser(ctx, outbox.TeamsChatID, b.user, readAt); err != nil {
+		if b.out != nil && !b.markAnswerUnreadWarned {
+			_, _ = fmt.Fprintf(b.out, "Teams mark-unread after Codex answer failed: %v\n", err)
+			b.markAnswerUnreadWarned = true
+		}
+	}
 }
 
 func (b *Bridge) uploadQueuedOutboxAttachment(ctx context.Context, outbox teamstore.OutboxMessage) (DriveItem, error) {
