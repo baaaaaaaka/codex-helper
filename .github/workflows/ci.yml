@@ -258,7 +258,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pattern='Test(PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
+          pattern='Test(WriteFileAtomicallyReplacesExistingFile|PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
           go test ./internal/cli -count=1 -run "$pattern"
 
       - name: Yolo auth regressions (Windows)
@@ -267,7 +267,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $pattern = 'Test(PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
+          $pattern = 'Test(WriteFileAtomicallyReplacesExistingFile|PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
           go test ./internal/cli -count=1 -run $pattern
 
       - name: Teams background keepalive regressions (Linux/macOS)

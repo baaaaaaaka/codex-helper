@@ -124,19 +124,19 @@ func prepareYoloAuthOverride(codexHome string, identity *execIdentity) (*yoloAut
 		mode = info.Mode().Perm()
 	}
 	if changed {
-		if err := os.WriteFile(backupPath, original, 0o600); err != nil {
+		if err := writeFileAtomicallyForIdentity(backupPath, original, 0o600, identity); err != nil {
 			return nil, err
 		}
 		if err := ensurePathOwnedByIdentity(backupPath, identity); err != nil {
 			_ = os.Remove(backupPath)
 			return nil, err
 		}
-		if err := os.WriteFile(authPath, sanitized, mode); err != nil {
+		if err := writeFileAtomicallyForIdentity(authPath, sanitized, mode, identity); err != nil {
 			_ = os.Remove(backupPath)
 			return nil, err
 		}
 		if err := ensurePathOwnedByIdentity(authPath, identity); err != nil {
-			_ = os.WriteFile(authPath, original, mode)
+			_ = writeFileAtomicallyForIdentity(authPath, original, mode, identity)
 			_ = os.Remove(backupPath)
 			return nil, err
 		}
@@ -144,10 +144,10 @@ func prepareYoloAuthOverride(codexHome string, identity *execIdentity) (*yoloAut
 		sanitized = original
 	}
 
-	leasePath, stopLease, err := createYoloAuthLease(authPath)
+	leasePath, stopLease, err := createYoloAuthLease(authPath, identity)
 	if err != nil {
 		if changed {
-			_ = os.WriteFile(authPath, original, mode)
+			_ = writeFileAtomicallyForIdentity(authPath, original, mode, identity)
 			_ = os.Remove(backupPath)
 		}
 		return nil, err
@@ -155,7 +155,7 @@ func prepareYoloAuthOverride(codexHome string, identity *execIdentity) (*yoloAut
 	if err := ensurePathOwnedByIdentity(leasePath, identity); err != nil {
 		_ = os.Remove(leasePath)
 		if changed {
-			_ = os.WriteFile(authPath, original, mode)
+			_ = writeFileAtomicallyForIdentity(authPath, original, mode, identity)
 			_ = os.Remove(backupPath)
 		}
 		return nil, err
@@ -207,7 +207,7 @@ func (o *yoloAuthOverride) Cleanup() {
 	if info, statErr := os.Stat(o.path); statErr == nil {
 		mode = info.Mode().Perm()
 	}
-	if err := os.WriteFile(o.path, backup, mode); err == nil {
+	if err := writeFileAtomicallyForIdentity(o.path, backup, mode, o.identity); err == nil {
 		_ = ensurePathOwnedByIdentity(o.path, o.identity)
 		_ = os.Remove(o.backupPath)
 	}
@@ -242,7 +242,7 @@ func parseYoloAuthLease(data []byte) (yoloAuthLease, bool) {
 	return lease, true
 }
 
-func writeYoloAuthLease(path string, pid int, at time.Time) error {
+func writeYoloAuthLease(path string, pid int, at time.Time, identity *execIdentity) error {
 	payload, err := json.Marshal(yoloAuthLease{
 		Version:       1,
 		PID:           pid,
@@ -252,10 +252,10 @@ func writeYoloAuthLease(path string, pid int, at time.Time) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	return os.WriteFile(path, payload, 0o600)
+	return writeFileAtomicallyForIdentity(path, payload, 0o600, identity)
 }
 
-func createYoloAuthLease(authPath string) (string, func(), error) {
+func createYoloAuthLease(authPath string, identity *execIdentity) (string, func(), error) {
 	file, err := os.CreateTemp(filepath.Dir(authPath), yoloAuthLeasePrefix(authPath)+"*")
 	if err != nil {
 		return "", nil, err
@@ -265,13 +265,16 @@ func createYoloAuthLease(authPath string) (string, func(), error) {
 		_ = os.Remove(path)
 		return "", nil, closeErr
 	}
+	if err := os.Remove(path); err != nil {
+		return "", nil, err
+	}
 
 	pid := os.Getpid()
 	if pid <= 0 {
 		_ = os.Remove(path)
 		return "", nil, fmt.Errorf("invalid pid for auth lease: %d", pid)
 	}
-	if err := writeYoloAuthLease(path, pid, time.Now()); err != nil {
+	if err := writeYoloAuthLease(path, pid, time.Now(), identity); err != nil {
 		_ = os.Remove(path)
 		return "", nil, err
 	}
@@ -289,7 +292,7 @@ func createYoloAuthLease(authPath string) (string, func(), error) {
 			case <-done:
 				return
 			case <-ticker.C:
-				_ = writeYoloAuthLease(path, pid, time.Now())
+				_ = writeYoloAuthLease(path, pid, time.Now(), identity)
 			}
 		}
 	}()

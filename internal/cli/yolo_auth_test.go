@@ -150,6 +150,10 @@ func authJSONHasPlanClaim(t *testing.T, data []byte) bool {
 	return ok
 }
 
+const writeAuthSnapshotShell = "tmp=\"$OUT_AUTH_SNAPSHOT.tmp.$$\"\n" +
+	"cp \"$CODEX_HOME/auth.json\" \"$tmp\"\n" +
+	"mv \"$tmp\" \"$OUT_AUTH_SNAPSHOT\"\n"
+
 func TestPrepareYoloAuthOverrideMasksPlanAndRestores(t *testing.T) {
 	codexDir := t.TempDir()
 	original := writeTestAuthJSON(t, codexDir, true)
@@ -178,6 +182,43 @@ func TestPrepareYoloAuthOverrideMasksPlanAndRestores(t *testing.T) {
 	}
 	if !bytes.Equal(restored, original) {
 		t.Fatal("auth.json should be restored after cleanup")
+	}
+}
+
+func TestWriteFileAtomicallyReplacesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte("old"), 0o640); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+
+	if err := writeFileAtomically(path, []byte("new"), 0o640); err != nil {
+		t.Fatalf("writeFileAtomically: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read replaced file: %v", err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("replaced file = %q, want new", string(data))
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat replaced file: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o640 {
+			t.Fatalf("mode = %#o, want 0640", got)
+		}
+	}
+
+	matches, err := filepath.Glob(filepath.Join(dir, "auth.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary files left behind: %v", matches)
 	}
 }
 
@@ -453,7 +494,7 @@ func TestRunCodexNewSessionSanitizesAuthForChildProcess(t *testing.T) {
 		"    ;;\n" +
 		"esac\n" +
 		"printf '%s' \"$CODEX_HOME\" > \"$OUT_CODEX_HOME\"\n" +
-		"cp \"$CODEX_HOME/auth.json\" \"$OUT_AUTH_SNAPSHOT\"\n" +
+		writeAuthSnapshotShell +
 		"exit 0\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -535,7 +576,7 @@ func TestRunCodexNewSessionSanitizesAuthForRelativeCodexDir(t *testing.T) {
 		"    ;;\n" +
 		"esac\n" +
 		"printf '%s' \"$CODEX_HOME\" > \"$OUT_CODEX_HOME\"\n" +
-		"cp \"$CODEX_HOME/auth.json\" \"$OUT_AUTH_SNAPSHOT\"\n" +
+		writeAuthSnapshotShell +
 		"exit 0\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -613,7 +654,7 @@ func TestRunCodexSessionSanitizesAuthForChildProcess(t *testing.T) {
 		"    ;;\n" +
 		"esac\n" +
 		"printf '%s' \"$CODEX_HOME\" > \"$OUT_CODEX_HOME\"\n" +
-		"cp \"$CODEX_HOME/auth.json\" \"$OUT_AUTH_SNAPSHOT\"\n" +
+		writeAuthSnapshotShell +
 		"exit 0\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -695,7 +736,7 @@ func TestRunCodexNewSessionRestoresAuthOnContextCancel(t *testing.T) {
 		"    exit 0\n" +
 		"    ;;\n" +
 		"esac\n" +
-		"cp \"$CODEX_HOME/auth.json\" \"$OUT_AUTH_SNAPSHOT\"\n" +
+		writeAuthSnapshotShell +
 		"trap 'exit 0' INT TERM\n" +
 		"while :; do sleep 1; done\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
