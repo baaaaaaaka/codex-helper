@@ -2086,10 +2086,12 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 	if err != nil {
 		t.Fatalf("formatWorkspaceDashboard error: %v", err)
 	}
+	expectedBetaPath := dashboardAbsolutePath("/home/user/project/beta")
+	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
 	for _, want := range []string{
-		"**1. beta**\n`/home/user/project/beta`\nSessions: 1 session, latest `2026-04-30 13:00`\n\n**Next:** send `1` or `p 1` to open this workspace",
+		"**1. beta**\n" + dashboardInlineCode(expectedBetaPath) + "\nSessions: 1 session, latest `2026-04-30 13:00`\n\n**Next:** send `1` or `p 1` to open this workspace",
 		"\n\n---\n\n",
-		"**2. alpha**\n`/home/user/project/alpha`\nSessions: 1 session, latest `2026-04-30 12:00`\n\n**Next:** send `2` or `p 2` to open this workspace",
+		"**2. alpha**\n" + dashboardInlineCode(expectedAlphaPath) + "\nSessions: 1 session, latest `2026-04-30 12:00`\n\n**Next:** send `2` or `p 2` to open this workspace",
 	} {
 		if !strings.Contains(workspaces, want) {
 			t.Fatalf("workspace dashboard missing %q in:\n%s", want, workspaces)
@@ -2103,7 +2105,7 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 	if err != nil {
 		t.Fatalf("formatWorkspaceSessionsDashboard error: %v", err)
 	}
-	wantSession := "**1. fix alpha**\n`/home/user/project/alpha`\nSession: updated `2026-04-30 12:00`\n\n**Next:** send `1` or `c 1` to continue this session in Teams"
+	wantSession := "**1. fix alpha**\n" + dashboardInlineCode(expectedAlphaPath) + "\nSession: updated `2026-04-30 12:00`\n\n**Next:** send `1` or `c 1` to continue this session in Teams"
 	if !strings.Contains(sessions, wantSession) {
 		t.Fatalf("session dashboard missing readable block %q in:\n%s", wantSession, sessions)
 	}
