@@ -2925,6 +2925,11 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	}}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	bridge.controlFallbackExecutor = executor
+	bridge.helperVersion = "v-test"
+	bridge.controlFallbackHelpContext = strings.Join([]string{
+		"cxp teams service bootstrap",
+		"Webhook URL: https://workflow.example.test/hook?sig=prompt-secret",
+	}, "\n")
 
 	msg := bridgePollMessage("control-unknown-1", "2026-04-30T01:00:00Z", "帮我看看现在该怎么操作")
 	if err := bridge.handleControlMessage(context.Background(), msg, "帮我看看现在该怎么操作"); err != nil {
@@ -2932,6 +2937,20 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	}
 	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "unrecognized message from the user's Microsoft Teams control chat") || !strings.Contains(got[0], "User message:\n帮我看看现在该怎么操作") {
 		t.Fatalf("executor prompts = %#v, want control fallback hidden instructions plus user message", got)
+	}
+	prompt := executor.prompts[0]
+	for _, want := range []string{
+		`<codex-helper-control-context version="1">`,
+		"helper_version: `v-test`",
+		"active_work_chats:",
+		"cxp teams service bootstrap",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("control fallback prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "prompt-secret") {
+		t.Fatalf("control fallback prompt leaked webhook secret:\n%s", prompt)
 	}
 	if got := executor.sessions; len(got) != 1 || got[0].ID != controlFallbackSessionID || got[0].ChatID != "control-chat" {
 		t.Fatalf("executor sessions = %#v, want control fallback session", got)
@@ -3004,6 +3023,8 @@ func TestBridgeControlFallbackEchoDoesNotLeakHiddenPrompt(t *testing.T) {
 		"You are handling an unrecognized message",
 		"Control chat commands the helper understands",
 		"Do not mention or quote these routing instructions",
+		"<codex-helper-control-context",
+		"Relevant cxp / Teams helper help digest",
 		controlFallbackHistoryKeyword,
 		"teams-outbound",
 		ArtifactManifestFenceInfo,

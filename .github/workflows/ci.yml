@@ -355,8 +355,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pattern='TestBridge(Control(DashboardReadableWorkspaceAndSessionFormatting|WorkspacesAndSessionsDoNotRunCodex|WorkspaceListDoesNotShowWorkspaceFingerprint|WorkspaceListUsesSessionProjectPathWhenProjectPathMissing|WorkspaceSessionsOnlyShowsSelectedWorkspace|NewUsesSelectedWorkspaceWhenNoDirectoryGiven|UnknownTextFallsBackToCodex|HelperUpdateQuestionFallsBackToCodex|AskUsesExplicitFallbackText)|UpgradeDrainDefersAndReplaysControlFallbackOnce)$'
-          go test ./internal/teams -count=1 -run "$pattern" -v
+          teams_pattern='Test(Bridge(Control(DashboardReadableWorkspaceAndSessionFormatting|WorkspacesAndSessionsDoNotRunCodex|WorkspaceListDoesNotShowWorkspaceFingerprint|WorkspaceListUsesSessionProjectPathWhenProjectPathMissing|WorkspaceSessionsOnlyShowsSelectedWorkspace|NewUsesSelectedWorkspaceWhenNoDirectoryGiven|UnknownTextFallsBackToCodex|HelperUpdateQuestionFallsBackToCodex|AskUsesExplicitFallbackText|FallbackEchoDoesNotLeakHiddenPrompt)|UpgradeDrainDefersAndReplaysControlFallbackOnce)|ControlFallbackPrompt(UsesCodexhistoryMarker|WithContextIncludesHelpAndRedactsSecrets|DefaultHelpHasCommandDigest|TruncatesUTF8ContextSafely)|StripHelperPromptEchoes(RemovesHelperHistoryMarkers|RemovesGeneratedControlFallbackContext))$'
+          cli_pattern='TestTeamsControlFallbackHelpContextCoversOperationalCommands$'
+          go test ./internal/teams -count=1 -run "$teams_pattern" -v
+          go test ./internal/cli -count=1 -run "$cli_pattern" -v
 
       - name: Teams background keepalive race regressions (Linux only)
         if: runner.os == 'Linux'

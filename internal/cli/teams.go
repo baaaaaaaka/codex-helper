@@ -688,6 +688,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					Executor:                   executor,
 					ControlFallbackExecutor:    controlFallbackExecutor,
 					ControlFallbackModel:       controlFallbackModel,
+					ControlFallbackHelpContext: teamsControlFallbackHelpContext(),
 					HelperRestarter:            restartTeamsHelperFromTeams,
 					HelperReloader:             reloadTeamsHelperFromTeams,
 					HelperAutoUpdater:          helperAutoUpdater,

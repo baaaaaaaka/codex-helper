@@ -120,6 +120,7 @@ type BridgeOptions struct {
 	Executor                   Executor
 	ControlFallbackExecutor    Executor
 	ControlFallbackModel       string
+	ControlFallbackHelpContext string
 	Runner                     codexrunner.Runner
 	HelperRestarter            HelperRestarter
 	HelperReloader             HelperReloader
@@ -219,6 +220,7 @@ type Bridge struct {
 	helperVersion                string
 	helperAutoUpdatePrerelease   bool
 	codexUpgrader                CodexUpgrader
+	controlFallbackHelpContext   string
 	store                        *teamstore.Store
 	asyncTurns                   bool
 	ownerMu                      sync.Mutex
@@ -484,6 +486,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	}
 	b.controlFallbackExecutor = opts.ControlFallbackExecutor
 	b.controlFallbackModel = strings.TrimSpace(opts.ControlFallbackModel)
+	b.controlFallbackHelpContext = strings.TrimSpace(opts.ControlFallbackHelpContext)
 	b.helperRestarter = opts.HelperRestarter
 	b.helperReloader = opts.HelperReloader
 	b.helperAutoUpdater = opts.HelperAutoUpdater
@@ -1745,14 +1748,14 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 	}
 	if b.asyncTurns {
 		if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
-			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, ControlFallbackCodexPrompt(text))
+			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, b.controlFallbackCodexPrompt(runCtx, text))
 		}); err != nil {
 			return err
 		}
 		b.boostPolling(time.Now())
 		return nil
 	}
-	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, ControlFallbackCodexPrompt(text))
+	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, b.controlFallbackCodexPrompt(ctx, text))
 }
 
 func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, error) {
@@ -3082,6 +3085,73 @@ func (b *Bridge) effectiveControlFallbackModel() string {
 	return DefaultControlFallbackModel
 }
 
+func (b *Bridge) controlFallbackCodexPrompt(ctx context.Context, prompt string) string {
+	return ControlFallbackCodexPromptWithContext(prompt, b.controlFallbackPromptContext(ctx))
+}
+
+func (b *Bridge) controlFallbackPromptContext(ctx context.Context) ControlFallbackPromptContext {
+	if b == nil {
+		return ControlFallbackPromptContext{}
+	}
+	active := make([]string, 0, len(b.reg.Sessions))
+	for _, session := range b.reg.ActiveSessions() {
+		if session.ID == controlFallbackSessionID {
+			continue
+		}
+		active = append(active, controlFallbackSessionLine(session))
+	}
+	return ControlFallbackPromptContext{
+		HelperVersion:     strings.TrimSpace(b.helperVersion),
+		ControlChatTitle:  strings.TrimSpace(b.reg.ControlChatTopic),
+		ControlChatID:     strings.TrimSpace(b.reg.ControlChatID),
+		ActiveWorkChats:   active,
+		CurrentDashboard:  b.controlFallbackDashboardSummary(ctx),
+		HelperHelpContext: b.controlFallbackHelpContext,
+	}
+}
+
+func controlFallbackSessionLine(session Session) string {
+	parts := []string{"`" + strings.TrimSpace(session.ID) + "`"}
+	if title := strings.TrimSpace(firstNonEmptyString(session.UserTitle, session.Topic)); title != "" {
+		parts = append(parts, title)
+	}
+	if cwd := strings.TrimSpace(session.Cwd); cwd != "" {
+		parts = append(parts, "cwd=`"+cwd+"`")
+	}
+	if chatID := strings.TrimSpace(session.ChatID); chatID != "" {
+		parts = append(parts, "chat=`"+chatID+"`")
+	}
+	return strings.Join(parts, " - ")
+}
+
+func (b *Bridge) controlFallbackDashboardSummary(ctx context.Context) string {
+	if b == nil || b.store == nil {
+		return ""
+	}
+	dashboard := b.previousControlDashboard(ctx)
+	if dashboard.CurrentView.Kind == DashboardViewNone || len(dashboard.CurrentView.Items) == 0 {
+		return ""
+	}
+	var lines []string
+	lines = append(lines, "- view: `"+string(dashboard.CurrentView.Kind)+"`")
+	if dashboard.SelectedWorkspaceID != "" {
+		lines = append(lines, "- selected_workspace_id: `"+dashboard.SelectedWorkspaceID+"`")
+	}
+	lines = append(lines, "- visible_items:")
+	for _, item := range dashboard.CurrentView.Items {
+		if len(lines) >= 12 {
+			lines = append(lines, "  - ... more items omitted")
+			break
+		}
+		label := strings.TrimSpace(item.DisplayTitle)
+		if label == "" {
+			label = firstNonEmptyString(item.SessionID, item.WorkspaceID)
+		}
+		lines = append(lines, fmt.Sprintf("  - `%d` %s `%s`", item.Number, item.Kind, label))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, turn teamstore.Turn) error {
 	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
 		ID:          "outbox:" + turn.ID + ":control-ack",
@@ -4280,14 +4350,14 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 		}
 		if b.asyncTurns {
 			if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
-				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, ControlFallbackCodexPrompt(text))
+				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, b.controlFallbackCodexPrompt(runCtx, text))
 			}); err != nil {
 				return err
 			}
 			b.boostPolling(time.Now())
 			return nil
 		}
-		return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, ControlFallbackCodexPrompt(text))
+		return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, b.controlFallbackCodexPrompt(ctx, text))
 	default:
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "unsupported deferred control input")
 	}
@@ -4453,7 +4523,7 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 	basePrompt := TeamsCodexPrompt(prompt)
 	executor := b.executor
 	if session.ID == controlFallbackSessionID {
-		basePrompt = ControlFallbackCodexPrompt(prompt)
+		basePrompt = b.controlFallbackCodexPrompt(ctx, prompt)
 		executor = b.effectiveControlFallbackExecutor()
 	}
 	return b.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, session.ChatID, ExecutionInputWithLocalAttachments(basePrompt, localFiles))

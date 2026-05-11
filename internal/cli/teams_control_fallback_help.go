@@ -1,0 +1,52 @@
+package cli
+
+import "strings"
+
+func teamsControlFallbackHelpContext() string {
+	lines := []string{
+		"cxp / codex-proxy CLI digest:",
+		"- `cxp` or `codex-proxy`: open the local Codex history TUI.",
+		"- `cxp run`: launch Codex through codex-helper proxy/yolo handling.",
+		"- `cxp proxy`: manage the local proxy profile used by Codex.",
+		"- `cxp upgrade`: upgrade codex-helper itself; use `--version <tag>` for a specific release.",
+		"- `cxp history`: inspect local Codex history.",
+		"- `cxp teams`: manage the Microsoft Teams helper.",
+		"",
+		"cxp teams digest:",
+		"- `cxp teams setup`: interactive safe setup checklist.",
+		"- `cxp teams run`: run the Teams listener in the foreground.",
+		"- `cxp teams run --once`: poll Teams once, useful for diagnosis.",
+		"- `cxp teams status`: show registry, owner, listener, bridge, poll, and session status.",
+		"- `cxp teams doctor`: local Teams helper diagnostics; `--live` checks Graph.",
+		"- `cxp teams control --print`: print the bound Teams control chat.",
+		"- `cxp teams service bootstrap`: install or repair the background service/watchdog.",
+		"- `cxp teams service status`: show OS service/task state.",
+		"- `cxp teams service doctor`: diagnose service backend readiness.",
+		"- `cxp teams auth full`: refresh full Teams auth locally.",
+		"- `cxp teams auth full-status`: inspect auth cache expiry without printing tokens.",
+		"",
+		"Teams control chat digest:",
+		"- `projects` / `p`: list workspaces.",
+		"- `project <number>` / `p <number>` / bare number after `projects`: open a workspace.",
+		"- `sessions` / `s` / `history`: list local Codex sessions in the selected workspace.",
+		"- `new <directory>` / `n <directory>`: create a Work chat for a directory.",
+		"- `new` / `n`: create a Work chat for the currently selected workspace.",
+		"- `continue <number-or-session-id>` / `c <...>`: create/open a Work chat for an existing Codex session.",
+		"- `open <number>`: show an existing linked Work chat.",
+		"- `status` / `st`: list active Work chats.",
+		"- `helper webhook setup`: show Teams Workflow webhook setup.",
+		"- `helper update now`: update to the latest stable helper release.",
+		"- `helper update prerelease`: update to the newest eligible release or prerelease.",
+		"- `helper reload now`: load the latest helper code after update.",
+		"- `helper restart now`: restart the Teams helper.",
+		"",
+		"Teams Work chat digest:",
+		"- Regular text is sent to Codex as the task.",
+		"- `helper status`: check current request state.",
+		"- `helper retry last`: retry the last failed/interrupted request.",
+		"- `helper cancel last`: cancel/drop the latest queued/running request.",
+		"- `helper file <relative-path>`: upload a generated file prepared under the Teams outbound folder.",
+		"- `helper close`: close the Work chat binding.",
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
