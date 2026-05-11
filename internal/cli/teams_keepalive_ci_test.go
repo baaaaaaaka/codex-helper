@@ -483,6 +483,7 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
 		"wsl.exe exited",
+		"wsl.exe exited 0; exiting watchdog",
 		"restarting in 10s",
 		"Start-Sleep -Seconds 10",
 		"$mutex.ReleaseMutex(); $mutex.Dispose()",
@@ -1050,8 +1051,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDirectRepairSuccessCI(t *testing.T)
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("bootstrap direct repair error: %v", err)
 	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("bootstrap direct repair calls = %#v, want one", runner.calls)
+	if len(runner.calls) != 4 {
+		t.Fatalf("bootstrap direct repair calls = %#v, want repair, verification, stale task retirement, and stale fallback cleanup", runner.calls)
 	}
 	command := strings.Join(runner.calls[0].args, " ")
 	for _, want := range []string{
@@ -1067,6 +1068,10 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDirectRepairSuccessCI(t *testing.T)
 	}
 	if got := out.String(); !strings.Contains(got, "Teams service bootstrap ready: wsl-windows-task-scheduler") {
 		t.Fatalf("bootstrap output missing success mode:\n%s", got)
+	}
+	retireLegacy := strings.Join(runner.calls[2].args, " ")
+	if !strings.Contains(retireLegacy, "Disable-ScheduledTask") || !strings.Contains(retireLegacy, "continue") || strings.Contains(retireLegacy, "Unregister-ScheduledTask") {
+		t.Fatalf("direct bootstrap should disable legacy WSL tasks without deleting the current task:\n%s", retireLegacy)
 	}
 	configData, err := os.ReadFile(taskConfigPath)
 	if err != nil {
@@ -1120,10 +1125,10 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapSuccessCleansStartupFallbackCI(t *t
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("bootstrap direct repair error: %v", err)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("bootstrap with fallback cleanup calls = %#v, want repair plus cleanup", runner.calls)
+	if len(runner.calls) != 4 {
+		t.Fatalf("bootstrap with fallback cleanup calls = %#v, want repair, verification, stale task retirement, and cleanup", runner.calls)
 	}
-	cleanup := strings.Join(runner.calls[1].args, " ")
+	cleanup := strings.Join(runner.calls[3].args, " ")
 	for _, want := range []string{
 		"GetFolderPath('Startup')",
 		"Remove-Item",
@@ -1202,8 +1207,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("bootstrap UAC repair error: %v\noutput:\n%s", err, out.String())
 	}
-	if len(runner.calls) != 3 {
-		t.Fatalf("bootstrap UAC calls = %#v, want direct, current-user query, elevated repair", runner.calls)
+	if len(runner.calls) != 6 {
+		t.Fatalf("bootstrap UAC calls = %#v, want direct, current-user query, elevated repair, verification, stale task retirement, and cleanup", runner.calls)
 	}
 	gotOut := out.String()
 	if !strings.Contains(gotOut, "NEXT STEP: TYPE yes TO CONTINUE") || !strings.Contains(gotOut, "Type yes and press Enter") {
@@ -1270,6 +1275,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 		errs: []error{
 			errTeamsKeepaliveAccessDeniedForTest{},
 			nil,
+			nil,
 		},
 	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
@@ -1302,10 +1308,14 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("bootstrap fallback error: %v\noutput:\n%s", err, out.String())
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("bootstrap fallback calls = %#v, want direct repair then Startup fallback", runner.calls)
+	if len(runner.calls) != 3 {
+		t.Fatalf("bootstrap fallback calls = %#v, want direct repair, stale task retirement, then Startup fallback", runner.calls)
 	}
-	fallback := strings.Join(runner.calls[1].args, " ")
+	retire := strings.Join(runner.calls[1].args, " ")
+	if !strings.Contains(retire, "Disable-ScheduledTask") || !strings.Contains(retire, "Codex Helper Teams Watchdog") {
+		t.Fatalf("fallback path should disable stale scheduled tasks before installing Startup fallback:\n%s", retire)
+	}
+	fallback := strings.Join(runner.calls[2].args, " ")
 	for _, want := range []string{
 		"GetFolderPath('Startup')",
 		"codex-helper\\teams",
@@ -1354,6 +1364,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapPreservesTaskConfigWhenFallbackFail
 	runner := &scriptedTeamsServiceRunner{
 		errs: []error{
 			errTeamsKeepaliveScheduledTaskFailureForTest{},
+			nil,
 			errTeamsKeepaliveScheduledTaskFailureForTest{},
 		},
 	}
@@ -1394,6 +1405,53 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapPreservesTaskConfigWhenFallbackFail
 	}
 	if string(configData) != "stale scheduled task config" {
 		t.Fatalf("fallback failure should not rewrite stale task config, got:\n%s", configData)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapRefusesFallbackWhenStaleTasksCannotRetireCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveScheduledTaskFailureForTest{},
+			errTeamsKeepaliveAccessDeniedForTest{},
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap", "--no-uac"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("bootstrap should refuse Startup fallback when old Scheduled Tasks cannot be disabled")
+	}
+	if !strings.Contains(err.Error(), "fallback is unsafe") || !strings.Contains(err.Error(), "old WSL Scheduled Tasks could not be disabled") {
+		t.Fatalf("bootstrap error should explain unsafe fallback, got: %v", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("bootstrap calls = %#v, want direct repair and stale task retirement only", runner.calls)
+	}
+	retire := strings.Join(runner.calls[1].args, " ")
+	if !strings.Contains(retire, "Disable-ScheduledTask") || strings.Contains(retire, "Start-Process -FilePath 'wscript.exe'") {
+		t.Fatalf("second call should only retire stale tasks:\n%s", retire)
+	}
+	if strings.Contains(out.String(), "Teams service bootstrap ready") {
+		t.Fatalf("bootstrap should not report success when stale task retirement failed:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") {
+		t.Fatalf("bootstrap should not announce Startup fallback before stale tasks are safely disabled:\n%s", out.String())
 	}
 }
 
@@ -1466,8 +1524,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapNoUACFallsBackOnTaskFailureCI(t *te
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("bootstrap --no-uac fallback error: %v\noutput:\n%s", err, out.String())
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("bootstrap --no-uac calls = %#v, want direct repair then Startup fallback", runner.calls)
+	if len(runner.calls) != 3 {
+		t.Fatalf("bootstrap --no-uac calls = %#v, want direct repair, stale task retirement, then Startup fallback", runner.calls)
 	}
 	if got := out.String(); !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Windows Scheduled Task setup could not be completed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
 		t.Fatalf("bootstrap --no-uac output missing protected-task fallback:\n%s", got)
@@ -1516,10 +1574,10 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *t
 	if !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
 		t.Fatalf("bootstrap output missing fallback mode:\n%s", got)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("bootstrap calls = %#v, want direct repair then Startup fallback", runner.calls)
+	if len(runner.calls) != 3 {
+		t.Fatalf("bootstrap calls = %#v, want direct repair, stale task retirement, then Startup fallback", runner.calls)
 	}
-	if joined := strings.Join(runner.calls[1].args, " "); !strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(joined, "WScript.Shell") || strings.Contains(joined, "Register-ScheduledTask") {
+	if joined := strings.Join(runner.calls[2].args, " "); !strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(joined, "WScript.Shell") || strings.Contains(joined, "Register-ScheduledTask") {
 		t.Fatalf("fallback call should use Startup watchdog without re-registering task:\n%s", joined)
 	}
 }
@@ -1549,10 +1607,14 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbac
 	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") {
 		t.Fatalf("auto ensure access denied error = %v, want Startup fallback diagnostic", err)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("auto ensure calls = %#v, want direct repair plus fallback install", runner.calls)
+	if len(runner.calls) != 3 {
+		t.Fatalf("auto ensure calls = %#v, want direct repair, stale task retirement, plus fallback install", runner.calls)
 	}
-	fallback := strings.Join(runner.calls[1].args, " ")
+	retire := strings.Join(runner.calls[1].args, " ")
+	if !strings.Contains(retire, "Disable-ScheduledTask") {
+		t.Fatalf("auto ensure should retire stale WSL tasks before fallback:\n%s", retire)
+	}
+	fallback := strings.Join(runner.calls[2].args, " ")
 	if strings.Contains(fallback, "Start-Process -FilePath $cmdPath") {
 		t.Fatalf("auto ensure fallback should not start a background watchdog while foreground run is active:\n%s", fallback)
 	}
@@ -1595,8 +1657,8 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallback
 	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") || !strings.Contains(err.Error(), "blocked by Windows policy") {
 		t.Fatalf("auto ensure task failure error = %v, want protected-task Startup fallback diagnostic", err)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("auto ensure calls = %#v, want direct repair plus fallback install", runner.calls)
+	if len(runner.calls) != 3 {
+		t.Fatalf("auto ensure calls = %#v, want direct repair, stale task retirement, plus fallback install", runner.calls)
 	}
 
 	runner.calls = nil

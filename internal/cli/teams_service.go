@@ -532,6 +532,9 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	}
 	if opts.FallbackOnly {
 		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+			if err := wslBackend.RetireScheduledTasks(ctx); err != nil {
+				return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only cannot safely start the Windows Startup watchdog because old WSL Scheduled Tasks could not be disabled: %w", err)
+			}
 			path, err := wslBackend.InstallStartupFallback(ctx, spec, true)
 			return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, err
 		}
@@ -540,9 +543,14 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: true})
 	if err == nil {
 		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
-			_ = wslBackend.RemoveStartupFallbackMarker()
+			if postRepairErr := wslBackend.VerifyAndCleanAfterRepair(ctx, spec); postRepairErr != nil {
+				err = postRepairErr
+			} else {
+				return teamsServiceBootstrapResult{Mode: backend.ID(), Path: path}, nil
+			}
+		} else {
+			return teamsServiceBootstrapResult{Mode: backend.ID(), Path: path}, nil
 		}
-		return teamsServiceBootstrapResult{Mode: backend.ID(), Path: path}, nil
 	}
 	wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
 	if !ok {
@@ -556,25 +564,31 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	if out == nil {
 		out = io.Discard
 	}
+	fallbackReason := ""
 	if accessDenied && !opts.NoUAC && confirmTeamsServiceUACPrompt(opts.In, out, opts.AssumeYes) {
 		principalUser, userErr := teamsServiceCurrentWindowsUser(ctx)
 		if userErr != nil {
-			printTeamsServiceBootstrapTaskFallback(out, "Could not identify the current Windows user for UAC setup: "+teamsServiceBootstrapErrorSummary(userErr))
+			fallbackReason = "Could not identify the current Windows user for UAC setup: " + teamsServiceBootstrapErrorSummary(userErr)
 		} else {
 			if path, elevateErr := wslBackend.RepairElevated(ctx, spec, teamsServiceRepairOptions{Enable: true, Start: true}, principalUser); elevateErr == nil {
-				_ = wslBackend.RemoveStartupFallbackMarker()
+				if postRepairErr := wslBackend.VerifyAndCleanAfterRepair(ctx, spec); postRepairErr != nil {
+					return teamsServiceBootstrapResult{}, fmt.Errorf("elevated Windows Scheduled Task setup completed, but cleanup or verification failed: %w", postRepairErr)
+				}
 				return teamsServiceBootstrapResult{Mode: "wsl-windows-task-scheduler-uac", Path: path}, nil
 			} else {
-				printTeamsServiceBootstrapTaskFallback(out, "UAC Scheduled Task setup failed: "+teamsServiceBootstrapErrorSummary(elevateErr))
+				fallbackReason = "UAC Scheduled Task setup failed: " + teamsServiceBootstrapErrorSummary(elevateErr)
 			}
 		}
 	} else {
-		reason := "Windows Scheduled Task setup could not be completed: " + teamsServiceBootstrapErrorSummary(err)
+		fallbackReason = "Windows Scheduled Task setup could not be completed: " + teamsServiceBootstrapErrorSummary(err)
 		if accessDenied && opts.NoUAC {
-			reason = "Windows Scheduled Task setup could not be completed: Windows denied permission to create or repair the Scheduled Task, and UAC is disabled by --no-uac."
+			fallbackReason = "Windows Scheduled Task setup could not be completed: Windows denied permission to create or repair the Scheduled Task, and UAC is disabled by --no-uac."
 		}
-		printTeamsServiceBootstrapTaskFallback(out, reason)
 	}
+	if retireErr := wslBackend.RetireScheduledTasks(ctx); retireErr != nil {
+		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr))
+	}
+	printTeamsServiceBootstrapTaskFallback(out, fallbackReason)
 	path, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, true)
 	if fallbackErr == nil {
 		_ = wslBackend.removeTaskConfig()
@@ -723,6 +737,9 @@ func ensureTeamsServiceForRun(ctx context.Context, registryPath *string) error {
 			spec, specErr := buildTeamsServiceSpec(registryPath)
 			if specErr != nil {
 				return specErr
+			}
+			if retireErr := wslBackend.RetireScheduledTasks(ctx); retireErr != nil {
+				return fmt.Errorf("WSL Scheduled Task setup failed (%v), and Startup fallback is unsafe because old WSL Scheduled Tasks could not be disabled: %w", err, retireErr)
 			}
 			if _, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, false); fallbackErr != nil {
 				return fmt.Errorf("WSL Scheduled Task setup was blocked (%v), and Startup fallback setup failed: %w", err, fallbackErr)
@@ -1406,6 +1423,35 @@ func (b teamsServiceWSLWindowsTaskBackend) TaskConfigMatches(ctx context.Context
 	return true, nil
 }
 
+func (b teamsServiceWSLWindowsTaskBackend) VerifyAndCleanAfterRepair(ctx context.Context, spec teamsServiceSpec) error {
+	matches, matchErr := b.TaskConfigMatches(ctx, spec)
+	if matchErr != nil {
+		return fmt.Errorf("Windows Scheduled Task setup completed but verification failed: %w", matchErr)
+	}
+	if !matches {
+		return fmt.Errorf("Windows Scheduled Task setup completed but the registered task still does not match the current helper configuration")
+	}
+	if err := b.RetireLegacyScheduledTasks(ctx); err != nil {
+		return fmt.Errorf("Windows Scheduled Task setup completed, but old WSL Scheduled Tasks could not be disabled: %w", err)
+	}
+	if cleanupErr := b.RemoveStartupFallbackMarker(); cleanupErr != nil {
+		return fmt.Errorf("Windows Scheduled Task setup completed, but old Startup watchdog cleanup failed: %w", cleanupErr)
+	}
+	return nil
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) RetireScheduledTasks(ctx context.Context) error {
+	cmd := buildTeamsServiceWSLRetireTaskCommand(b.Name(), true) + "; " + buildTeamsServiceWSLRetireTaskCommand(b.watchdogName(), true)
+	_, err := teamsServiceRunPowerShell(ctx, cmd)
+	return err
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) RetireLegacyScheduledTasks(ctx context.Context) error {
+	cmd := buildTeamsServiceWSLRetireTaskCommand(b.Name(), false) + "; " + buildTeamsServiceWSLRetireTaskCommand(b.watchdogName(), false)
+	_, err := teamsServiceRunPowerShell(ctx, cmd)
+	return err
+}
+
 func (b teamsServiceWSLWindowsTaskBackend) InstallStartupFallback(ctx context.Context, spec teamsServiceSpec, start bool) (string, error) {
 	markerPath, err := b.startupFallbackMarkerPath()
 	if err != nil {
@@ -1470,21 +1516,19 @@ func (b teamsServiceWSLWindowsTaskBackend) RemoveStartupFallbackMarker() error {
 		if err != nil {
 			return err
 		}
+		if suffix, ok := teamsServiceWSLStartupFallbackSuffixFromMarkerPath(markerPath); ok {
+			suffixes = append(suffixes, suffix)
+		}
 		if !installed {
 			continue
 		}
 		if err := os.WriteFile(teamsServiceWSLStartupFallbackStopPath(markerPath), []byte("stop\n"), 0o600); err != nil {
 			return err
 		}
-		if suffix, ok := teamsServiceWSLStartupFallbackSuffixFromMarkerPath(markerPath); ok {
-			suffixes = append(suffixes, suffix)
-		}
 		installedMarkers = append(installedMarkers, markerPath)
 	}
-	if len(suffixes) > 0 {
-		if _, err = teamsServiceRunPowerShell(context.Background(), buildTeamsServiceWSLRemoveStartupFallbackCommand(b.Name(), suffixes)); err != nil {
-			return err
-		}
+	if _, err = teamsServiceRunPowerShell(context.Background(), buildTeamsServiceWSLRemoveStartupFallbackCommand(b.Name(), suffixes)); err != nil {
+		return err
 	}
 	for _, markerPath := range installedMarkers {
 		if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
@@ -2415,6 +2459,22 @@ func buildTeamsServiceWSLTaskConfigMatchesCommand(taskName string, args []string
 		"}"
 }
 
+func buildTeamsServiceWSLRetireTaskCommand(taskName string, includeCurrent bool) string {
+	prefix := teamsServiceWSLTaskNamePrefix(taskName)
+	skipCurrent := ""
+	if !includeCurrent {
+		skipCurrent = "if ($t.TaskName -eq $taskName) { continue }; "
+	}
+	return "$taskName = " + powershellSingleQuote(taskName) + "; " +
+		"$legacyPrefix = " + powershellSingleQuote(prefix) + "; " +
+		"$tasks = @(Get-ScheduledTask | Where-Object { $_.TaskName -like ($legacyPrefix + '*') }); " +
+		"foreach ($t in $tasks) { " +
+		skipCurrent +
+		"Stop-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction SilentlyContinue; " +
+		"Disable-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction Stop | Out-Null " +
+		"}"
+}
+
 func teamsServiceWSLStartTaskAndVerifyPowerShell() string {
 	return "Start-ScheduledTask -TaskName $taskName | Out-Null; " + teamsServiceWSLVerifyTaskRunningPowerShell()
 }
@@ -2613,7 +2673,7 @@ func buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName string, suffixes 
 		"if (Test-Path -LiteralPath $appDir) { " +
 		"Get-ChildItem -LiteralPath $appDir -Filter 'codex-helper-teams-wsl-*.ps1' -File -ErrorAction SilentlyContinue | ForEach-Object { " +
 		"$content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue; " +
-		"if ($null -ne $content -and $content.Contains('starting ' + $legacyPrefix)) { " +
+		"if ($null -ne $content -and ($content.Contains('starting ' + $legacyPrefix) -or $content.Contains($legacyPrefix))) { " +
 		"$suffix = $_.BaseName -replace '^codex-helper-teams-wsl-', ''; " +
 		"if (-not [string]::IsNullOrWhiteSpace($suffix) -and -not $allSuffixes.Contains($suffix)) { $allSuffixes.Add($suffix) } " +
 		"} } }; " +
@@ -2656,6 +2716,7 @@ func buildTeamsServiceWSLStartupWatchdogScript(taskName string, args []string, s
 	b.WriteString("    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $wslArgumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog\r\n")
 	b.WriteString("    $code = if ($null -ne $p) { $p.ExitCode } else { 1 }\r\n")
 	b.WriteString("    if (Test-Path -LiteralPath $stopPath) { Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' stop requested after wsl.exe exited ' + $code); break }\r\n")
+	b.WriteString("    if ($code -eq 0) { Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' wsl.exe exited 0; exiting watchdog'); break }\r\n")
 	b.WriteString("    Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' wsl.exe exited ' + $code + '; restarting in " + strconv.Itoa(teamsServiceTaskRestartInterval) + "s')\r\n")
 	b.WriteString("    Start-Sleep -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "\r\n")
 	b.WriteString("  }\r\n")

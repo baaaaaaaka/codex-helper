@@ -850,21 +850,36 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 			b.reg.MarkSeen(chatID, msg.ID)
 			continue
 		}
+		globalClaim, claimed, err := b.tryClaimGlobalInbound(ctx, chatID, msg.ID)
+		if err != nil {
+			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+			return handled, err
+		}
+		if !claimed {
+			b.reg.MarkSeen(chatID, msg.ID)
+			continue
+		}
 		b.annotateIncomingUserMessage(ctx, chatID, msg)
 		if b.currentLeaseGeneration() > 0 {
 			if err := b.ensureActiveControlLease(ctx); err != nil {
+				releaseGlobalInbound(ctx, globalClaim)
 				_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 				return handled, err
 			}
 		}
 		if err := handle(ctx, msg, text); err != nil {
+			releaseGlobalInbound(ctx, globalClaim)
+			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+			return handled, err
+		}
+		b.reg.MarkSeen(chatID, msg.ID)
+		if err := completeGlobalInbound(ctx, globalClaim); err != nil {
 			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 			return handled, err
 		}
 		handled = true
 		activityAt = latestTime(activityAt, time.Now(), messageSortTime(msg))
 		b.boostPolling(time.Now())
-		b.reg.MarkSeen(chatID, msg.ID)
 	}
 	continuationPath := ""
 	if seeded && role != inboundPollRoleControl && window.Truncated {
