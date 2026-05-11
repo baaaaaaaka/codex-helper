@@ -1545,6 +1545,106 @@ func TestRunSystemNpmCodexUpgradeReportsDiskSpaceAfterNpmFailure(t *testing.T) {
 	}
 }
 
+func TestRunSystemNpmCodexUpgradeForcesOptionalDependencyEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based npm test on windows")
+	}
+	lockCLITestHooks(t)
+
+	root := t.TempDir()
+	systemPrefix := filepath.Join(root, "system-prefix")
+	tmpDir := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(systemPrefix, 0o755); err != nil {
+		t.Fatalf("mkdir system prefix: %v", err)
+	}
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("mkdir tmp dir: %v", err)
+	}
+
+	binDir := t.TempDir()
+	marker := filepath.Join(root, "npm-install-ran")
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + systemPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
+		"  if [ \"${NPM_CONFIG_INCLUDE:-}\" != \"optional\" ] || [ \"${npm_config_include:-}\" != \"optional\" ]; then\n" +
+		"    echo \"optional include env missing\" >&2\n" +
+		"    exit 9\n" +
+		"  fi\n" +
+		"  if { [ \"${NPM_CONFIG_OMIT+x}\" = \"x\" ] && [ \"$NPM_CONFIG_OMIT\" != \"\" ]; } || { [ \"${npm_config_omit+x}\" = \"x\" ] && [ \"$npm_config_omit\" != \"\" ]; }; then\n" +
+		"    echo \"optional omit env not cleared\" >&2\n" +
+		"    exit 9\n" +
+		"  fi\n" +
+		"  if [ \"${NPM_CONFIG_OPTIONAL:-}\" != \"true\" ] || [ \"${npm_config_optional:-}\" != \"true\" ]; then\n" +
+		"    echo \"optional env not forced\" >&2\n" +
+		"    exit 9\n" +
+		"  fi\n" +
+		"  echo ran > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+	t.Setenv("PATH", binDir)
+
+	err := runSystemNpmCodexUpgrade(context.Background(), io.Discard, []string{
+		"PATH=" + binDir,
+		"TMPDIR=" + tmpDir,
+		"NPM_CONFIG_OMIT=optional",
+		"npm_config_omit=optional",
+		"NPM_CONFIG_OPTIONAL=false",
+		"npm_config_optional=false",
+	})
+	if err != nil {
+		t.Fatalf("runSystemNpmCodexUpgrade error: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected npm install marker: %v", err)
+	}
+}
+
+func TestCodexNPMInstallEnvClearsOptionalDependencyOmit(t *testing.T) {
+	env := codexNPMInstallEnv([]string{
+		"PATH=/usr/bin",
+		"NPM_CONFIG_INCLUDE=prod",
+		"NPM_CONFIG_OMIT=optional",
+		"NPM_CONFIG_OPTIONAL=false",
+		"npm_config_include=prod",
+		"npm_config_omit=optional",
+		"npm_config_optional=false",
+		"KEEP=1",
+	})
+
+	if got := envValue(env, "PATH"); got != "/usr/bin" {
+		t.Fatalf("PATH not preserved: %q", got)
+	}
+	if got := envValue(env, "KEEP"); got != "1" {
+		t.Fatalf("KEEP not preserved: %q", got)
+	}
+	if got := envValue(env, "NPM_CONFIG_INCLUDE"); got != "optional" {
+		t.Fatalf("NPM_CONFIG_INCLUDE = %q", got)
+	}
+	if got := envValue(env, "NPM_CONFIG_OMIT"); got != "" {
+		t.Fatalf("NPM_CONFIG_OMIT = %q", got)
+	}
+	if got := envValue(env, "NPM_CONFIG_OPTIONAL"); got != "true" {
+		t.Fatalf("NPM_CONFIG_OPTIONAL = %q", got)
+	}
+	if runtime.GOOS != "windows" {
+		if got := envValue(env, "npm_config_include"); got != "optional" {
+			t.Fatalf("npm_config_include = %q", got)
+		}
+		if got := envValue(env, "npm_config_omit"); got != "" {
+			t.Fatalf("npm_config_omit = %q", got)
+		}
+		if got := envValue(env, "npm_config_optional"); got != "true" {
+			t.Fatalf("npm_config_optional = %q", got)
+		}
+	}
+}
+
 func TestResolveRunCommandIgnoresNonCodex(t *testing.T) {
 	args := []string{"echo", "hello"}
 	got, err := resolveRunCommand(context.Background(), args, io.Discard)
@@ -2167,10 +2267,95 @@ func TestBootstrapScriptChecksNpmUsability(t *testing.T) {
 		"managed Node.js/npm install is missing or broken; reinstalling",
 		"prefix -g",
 		"--include=optional",
+		"NPM_CONFIG_OMIT=",
+		"NPM_CONFIG_OPTIONAL=true",
 	} {
 		if !strings.Contains(codexInstallBootstrap, want) {
 			t.Fatalf("bootstrap script missing %q", want)
 		}
+	}
+}
+
+func TestBootstrapScriptRepairsMissingOptionalDependency(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell bootstrap execution test on windows")
+	}
+
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	prefix := filepath.Join(dir, "npm-prefix")
+	repairMarker := filepath.Join(dir, "repair-marker")
+
+	writeExecutable(t, filepath.Join(binDir, "node"), "#!/bin/sh\n"+
+		"if [ \"$1\" = \"-v\" ]; then echo v22.0.0; exit 0; fi\n"+
+		"if [ \"$1\" = \"-e\" ]; then echo 1.2.3; exit 0; fi\n"+
+		"exit 0\n")
+	writeExecutable(t, filepath.Join(binDir, "npm"), "#!/bin/sh\n"+
+		"if [ \"$1\" = \"--version\" ]; then echo 10.9.7; exit 0; fi\n"+
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then echo \"$CODEX_NPM_PREFIX\"; exit 0; fi\n"+
+		"if [ \"$1\" = \"install\" ]; then\n"+
+		"  if [ \"${NPM_CONFIG_INCLUDE:-}\" != \"optional\" ] || [ \"${npm_config_include:-}\" != \"optional\" ]; then echo include-env-missing >&2; exit 9; fi\n"+
+		"  if { [ \"${NPM_CONFIG_OMIT+x}\" = \"x\" ] && [ \"$NPM_CONFIG_OMIT\" != \"\" ]; } || { [ \"${npm_config_omit+x}\" = \"x\" ] && [ \"$npm_config_omit\" != \"\" ]; }; then echo omit-env-not-cleared >&2; exit 9; fi\n"+
+		"  if [ \"${NPM_CONFIG_OPTIONAL:-}\" != \"true\" ] || [ \"${npm_config_optional:-}\" != \"true\" ]; then echo optional-env-missing >&2; exit 9; fi\n"+
+		"  last=\"\"; for arg in \"$@\"; do last=\"$arg\"; done\n"+
+		"  mkdir -p \"$CODEX_NPM_PREFIX/bin\" \"$CODEX_NPM_PREFIX/lib/node_modules/@openai/codex\"\n"+
+		"  printf '{\"version\":\"1.2.3\"}\\n' > \"$CODEX_NPM_PREFIX/lib/node_modules/@openai/codex/package.json\"\n"+
+		"  case \"$last\" in\n"+
+		"    @openai/codex)\n"+
+		"      cat > \"$CODEX_NPM_PREFIX/bin/codex\" <<'EOF'\n"+
+		"#!/bin/sh\n"+
+		"echo 'Error: Missing optional dependency @openai/codex-darwin-arm64. Reinstall Codex: npm install -g @openai/codex@latest' >&2\n"+
+		"exit 1\n"+
+		"EOF\n"+
+		"      chmod 700 \"$CODEX_NPM_PREFIX/bin/codex\"\n"+
+		"      exit 0\n"+
+		"      ;;\n"+
+		"    @openai/codex-darwin-arm64@1.2.3)\n"+
+		"      echo \"$last\" > \"$REPAIR_MARKER\"\n"+
+		"      cat > \"$CODEX_NPM_PREFIX/bin/codex\" <<'EOF'\n"+
+		"#!/bin/sh\n"+
+		"echo codex 1.2.3\n"+
+		"exit 0\n"+
+		"EOF\n"+
+		"      chmod 700 \"$CODEX_NPM_PREFIX/bin/codex\"\n"+
+		"      exit 0\n"+
+		"      ;;\n"+
+		"  esac\n"+
+		"fi\n"+
+		"exit 8\n")
+
+	scriptPath := filepath.Join(dir, "bootstrap.sh")
+	if err := os.WriteFile(scriptPath, []byte(codexInstallBootstrap), 0o700); err != nil {
+		t.Fatalf("write bootstrap: %v", err)
+	}
+
+	cmd := exec.Command("sh", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"HOME="+dir,
+		"CODEX_NPM_PREFIX="+prefix,
+		"CODEX_NODE_INSTALL_ROOT="+filepath.Join(dir, "node-root"),
+		"CODEX_PROXY_CODEX_INSTALL_MIN_FREE_KB=0",
+		"NPM_CONFIG_OMIT=optional",
+		"npm_config_omit=optional",
+		"NPM_CONFIG_OPTIONAL=false",
+		"npm_config_optional=false",
+		"REPAIR_MARKER="+repairMarker,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bootstrap error: %v\n%s", err, out)
+	}
+
+	got, err := os.ReadFile(repairMarker)
+	if err != nil {
+		t.Fatalf("expected repair marker: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(got)) != "@openai/codex-darwin-arm64@1.2.3" {
+		t.Fatalf("unexpected repair package %q", strings.TrimSpace(string(got)))
 	}
 }
 
@@ -2183,6 +2368,9 @@ func TestBootstrapScriptContainsSelfValidation(t *testing.T) {
 	}
 	if !strings.Contains(codexInstallBootstrap, "--version") {
 		t.Fatal("bootstrap script missing post-install probe")
+	}
+	if !strings.Contains(codexInstallBootstrap, "repair_codex_missing_optional_dependency") {
+		t.Fatal("bootstrap script missing missing-optional-dependency repair")
 	}
 }
 
@@ -2237,6 +2425,19 @@ func TestBootstrapWindowsScriptContainsSelfValidation(t *testing.T) {
 	if !strings.Contains(codexInstallBootstrapWindows, "codex installation finished but") {
 		t.Fatal("Windows bootstrap script missing final probe failure")
 	}
+	if !strings.Contains(codexInstallBootstrapWindows, "Repair-CodexMissingOptionalDependency") {
+		t.Fatal("Windows bootstrap script missing missing-optional-dependency repair")
+	}
+	if !strings.Contains(codexInstallBootstrapWindows, "Test-CodexCommandWithOptionalRepair") {
+		t.Fatal("Windows bootstrap script missing repaired post-install probe")
+	}
+	if !strings.Contains(codexInstallBootstrapWindows, "$script:codexNpmInstallExitCode") {
+		t.Fatal("Windows bootstrap script should keep npm output separate from the exit code")
+	}
+	if strings.Contains(codexInstallBootstrapWindows, "return $LASTEXITCODE") ||
+		strings.Contains(codexInstallBootstrapWindows, "$installCode = Invoke-CodexNpmInstall") {
+		t.Fatal("Windows bootstrap script must not capture npm stdout as the install exit code")
+	}
 }
 
 func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
@@ -2247,6 +2448,8 @@ func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
 		"Invoke-DiskWrite",
 		"Fail-IfDiskSpaceLow",
 		"--include=optional",
+		"NPM_CONFIG_OMIT",
+		"NPM_CONFIG_OPTIONAL",
 		"Assert-DiskSpace \"npm cache\"",
 		"Get-CodexSHA256Hex",
 		"System.Security.Cryptography.SHA256",

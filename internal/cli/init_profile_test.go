@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,37 +93,6 @@ func TestInitProfileInteractiveWithDepsDirectSSHSuccess(t *testing.T) {
 	}
 	if len(cfg.Profiles) != 1 || cfg.Profiles[0].ID != prof.ID {
 		t.Fatalf("expected saved profile, got %+v", cfg.Profiles)
-	}
-}
-
-func TestInteractiveHostKeyCheckArgsDisableAuthPrompts(t *testing.T) {
-	prof := config.Profile{
-		Host:    "host.example",
-		Port:    2319,
-		User:    "erin",
-		SSHArgs: []string{"-i", "/tmp/key"},
-	}
-
-	args := interactiveHostKeyCheckArgs(prof)
-	joined := "\x00" + strings.Join(args, "\x00") + "\x00"
-	for _, want := range []string{
-		"\x00-o\x00ConnectTimeout=15\x00",
-		"\x00-o\x00PreferredAuthentications=none\x00",
-		"\x00-o\x00NumberOfPasswordPrompts=0\x00",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("interactive host-key args missing %q: %#v", want, args)
-		}
-	}
-	if strings.Contains(joined, "\x00-o\x00BatchMode=yes\x00") {
-		t.Fatalf("BatchMode would suppress the host-key prompt: %#v", args)
-	}
-	if got := args[len(args)-2:]; got[0] != "erin@host.example" || got[1] != "exit" {
-		t.Fatalf("destination/command tail = %#v", got)
-	}
-	destIndex := len(args) - 2
-	if destIndex < 2 || args[destIndex-2] != "-i" || args[destIndex-1] != "/tmp/key" {
-		t.Fatalf("profile SSHArgs should be kept immediately before destination: %#v", args)
 	}
 }
 
@@ -212,54 +183,9 @@ func TestInitProfileInteractiveWithDepsDoesNotInstallManagedKeyForNonAuthProbeEr
 	}
 }
 
-func TestInitProfileInteractiveWithDepsOffersInteractiveHostKeyCheckEvenIfInteractiveSessionFails(t *testing.T) {
+func TestInitProfileInteractiveWithDepsDoesNotPromptForHostKeyConfirmation(t *testing.T) {
 	store := newTempStore(t)
-	reader := bufio.NewReader(strings.NewReader("host.example\n22\nfrank\ny\n"))
-	ops := &fakeSSHOps{
-		probeErrs: []error{
-			&sshProbeError{kind: sshProbeFailureHostKey, err: errors.New("host key failed"), output: "Host key verification failed"},
-			errors.New("shell access denied"),
-			nil,
-		},
-	}
-	var out bytes.Buffer
-
-	prof, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, &out)
-	if err != nil {
-		t.Fatalf("initProfileInteractiveWithDeps error: %v", err)
-	}
-
-	if prof.Host != "host.example" || prof.User != "frank" {
-		t.Fatalf("unexpected profile: %+v", prof)
-	}
-	if len(ops.probes) != 3 {
-		t.Fatalf("expected 3 probes, got %d", len(ops.probes))
-	}
-	if got := ops.probeInteractive; len(got) != 3 || got[0] || !got[1] || got[2] {
-		t.Fatalf("expected probe order [false true false], got %v", got)
-	}
-	if got := ops.probeStdin; len(got) != 3 || got[0] != nil || got[1] != reader || got[2] != nil {
-		t.Fatalf("expected only interactive retry to reuse init reader, got %v", got)
-	}
-	if !strings.Contains(out.String(), "SSH could not verify the host key") {
-		t.Fatalf("expected host key guidance, got %q", out.String())
-	}
-	if len(ops.generated) != 0 || len(ops.installed) != 0 {
-		t.Fatalf("expected no managed key flow, got generated=%v installed=%v", ops.generated, ops.installed)
-	}
-
-	cfg, loadErr := store.Load()
-	if loadErr != nil {
-		t.Fatalf("load config: %v", loadErr)
-	}
-	if len(cfg.Profiles) != 1 || cfg.Profiles[0].ID != prof.ID {
-		t.Fatalf("expected saved profile, got %+v", cfg.Profiles)
-	}
-}
-
-func TestInitProfileInteractiveWithDepsReturnsOriginalHostKeyErrorWhenDeclined(t *testing.T) {
-	store := newTempStore(t)
-	reader := bufio.NewReader(strings.NewReader("host.example\n22\ngrace\nn\n"))
+	reader := bufio.NewReader(strings.NewReader("host.example\n22\nfrank\n"))
 	ops := &fakeSSHOps{
 		probeErrs: []error{
 			&sshProbeError{kind: sshProbeFailureHostKey, err: errors.New("host key failed"), output: "Host key verification failed"},
@@ -278,7 +204,10 @@ func TestInitProfileInteractiveWithDepsReturnsOriginalHostKeyErrorWhenDeclined(t
 		t.Fatalf("expected only the initial non-interactive probe, got %v", got)
 	}
 	if got := ops.probeStdin; len(got) != 1 || got[0] != nil {
-		t.Fatalf("expected declined flow to avoid interactive stdin override, got %v", got)
+		t.Fatalf("expected host-key flow to avoid interactive stdin override, got %v", got)
+	}
+	if strings.Contains(out.String(), "Open interactive SSH host key check") {
+		t.Fatalf("did not expect an interactive host-key prompt, got %q", out.String())
 	}
 
 	cfg, loadErr := store.Load()
@@ -317,6 +246,61 @@ func TestSSHProbeUsesTunnelReadinessForNonInteractiveChecks(t *testing.T) {
 	}
 	if !gotCfg.BatchMode {
 		t.Fatalf("expected batch mode for probe tunnel, got %+v", gotCfg)
+	}
+}
+
+func TestInstallPublicKeyAcceptsNewHostKeysByDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based ssh argument test on windows")
+	}
+
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	writeExecutable(t, sshPath, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SSH_ARGS_FILE\"\ncat > \"$SSH_STDIN_FILE\"\n")
+
+	argsFile := filepath.Join(dir, "ssh-args")
+	stdinFile := filepath.Join(dir, "ssh-stdin")
+	t.Setenv("SSH_ARGS_FILE", argsFile)
+	t.Setenv("SSH_STDIN_FILE", stdinFile)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	pubKeyPath := filepath.Join(dir, "id.pub")
+	if err := os.WriteFile(pubKeyPath, []byte("ssh-ed25519 test-key"), 0o600); err != nil {
+		t.Fatalf("write pubkey: %v", err)
+	}
+
+	err := installPublicKey(context.Background(), config.Profile{
+		Host:    "host.example",
+		Port:    2319,
+		User:    "erin",
+		SSHArgs: []string{"-J", "jump.example"},
+	}, pubKeyPath)
+	if err != nil {
+		t.Fatalf("installPublicKey error: %v", err)
+	}
+
+	rawArgs, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read ssh args: %v", err)
+	}
+	joined := "\x00" + strings.ReplaceAll(strings.TrimSpace(string(rawArgs)), "\n", "\x00") + "\x00"
+	for _, want := range []string{
+		"\x00-o\x00StrictHostKeyChecking=accept-new\x00",
+		"\x00-J\x00jump.example\x00",
+		"\x00erin@host.example\x00",
+		"\x00umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys\x00",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("ssh args missing %q: %q", want, joined)
+		}
+	}
+
+	stdin, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatalf("read ssh stdin: %v", err)
+	}
+	if string(stdin) != "ssh-ed25519 test-key\n" {
+		t.Fatalf("expected public key with appended newline, got %q", string(stdin))
 	}
 }
 
