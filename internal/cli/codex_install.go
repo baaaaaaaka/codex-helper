@@ -466,30 +466,107 @@ if [ -z "$npm_cmd" ]; then
   download_local_node
 fi
 
+codex_npm_install() {
+  NPM_CONFIG_INCLUDE=optional \
+  npm_config_include=optional \
+  NPM_CONFIG_OMIT= \
+  npm_config_omit= \
+  NPM_CONFIG_OPTIONAL=true \
+  npm_config_optional=true \
+  PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" --include=optional "$@"
+}
+
+codex_installed_version() {
+  pkg_json="$prefix/lib/node_modules/@openai/codex/package.json"
+  if [ ! -f "$pkg_json" ]; then
+    return 0
+  fi
+  PATH="$node_bin_dir:$PATH" node -e 'const fs = require("fs"); try { const v = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version || ""; if (v) console.log(v); } catch {}' "$pkg_json" 2>/dev/null || true
+}
+
+codex_probe_failure=""
+test_codex_command() {
+  codex_probe_failure=""
+  if [ ! -x "$prefix/bin/codex" ]; then
+    codex_probe_failure="codex command not found: $prefix/bin/codex"
+    return 1
+  fi
+  if output="$(PATH="$node_bin_dir:$prefix/bin:$PATH" "$prefix/bin/codex" --version 2>&1)"; then
+    return 0
+  fi
+  codex_probe_failure="$(printf '%s' "$output" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')"
+  if [ -z "$codex_probe_failure" ]; then
+    codex_probe_failure="--version failed"
+  fi
+  return 1
+}
+
+repair_codex_missing_optional_dependency() {
+  missing_pkg="$(printf '%s\n' "$codex_probe_failure" | sed -n 's/.*Missing optional dependency \(@openai\/codex[-A-Za-z0-9_]*\).*/\1/p' | head -n 1)"
+  if [ -z "$missing_pkg" ]; then
+    return 1
+  fi
+  case "$missing_pkg" in
+    @openai/codex-*) ;;
+    *) return 1 ;;
+  esac
+  version="$(codex_installed_version | head -n 1)"
+  pkg_spec="$missing_pkg"
+  if [ -n "$version" ]; then
+    pkg_spec="$missing_pkg@$version"
+  fi
+  echo "codex native optional dependency is missing; installing $pkg_spec..." >&2
+  check_disk_space "managed npm prefix" "$prefix"
+  check_disk_space "npm cache" "$npm_cache_dir"
+  check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
+  if ! codex_npm_install "$pkg_spec"; then
+    fail_if_disk_space_low "managed npm prefix" "$prefix"
+    fail_if_disk_space_low "npm cache" "$npm_cache_dir"
+    fail_if_disk_space_low "temporary directory" "${TMPDIR:-/tmp}"
+    codex_probe_failure="missing optional dependency repair failed for $pkg_spec"
+    return 1
+  fi
+  return 0
+}
+
+ensure_codex_command_works() {
+  if test_codex_command; then
+    return 0
+  fi
+  if repair_codex_missing_optional_dependency && test_codex_command; then
+    return 0
+  fi
+  return 1
+}
+
 check_disk_space "managed npm prefix" "$prefix"
 mkdir -p "$prefix" || fail_write_or_disk "managed npm prefix" "$prefix" "failed to create managed npm prefix: $prefix"
 check_disk_space "managed npm prefix" "$prefix"
 check_disk_space "npm cache" "$npm_cache_dir"
 check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
-if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" --include=optional @openai/codex; then
+if ! codex_npm_install @openai/codex; then
   fail_if_disk_space_low "managed npm prefix" "$prefix"
   fail_if_disk_space_low "npm cache" "$npm_cache_dir"
   fail_if_disk_space_low "temporary directory" "${TMPDIR:-/tmp}"
   fail_codex_install "npm install -g @openai/codex failed"
 fi
 
-if ! "$prefix/bin/codex" --version >/dev/null 2>&1 && $used_system_node; then
+if ! ensure_codex_command_works && $used_system_node; then
   echo "codex installed with system node is not functional; retrying with local node..." >&2
   download_local_node
   check_disk_space "managed npm prefix" "$prefix"
   check_disk_space "npm cache" "$npm_cache_dir"
   check_disk_space "temporary directory" "${TMPDIR:-/tmp}"
-  if ! PATH="$node_bin_dir:$prefix/bin:$PATH" "$npm_cmd" install -g --prefix "$prefix" --include=optional @openai/codex; then
+  if ! codex_npm_install @openai/codex; then
     fail_if_disk_space_low "managed npm prefix" "$prefix"
     fail_if_disk_space_low "npm cache" "$npm_cache_dir"
     fail_if_disk_space_low "temporary directory" "${TMPDIR:-/tmp}"
     fail_codex_install "npm install -g @openai/codex failed after switching to managed Node.js/npm"
   fi
+fi
+
+if ! ensure_codex_command_works; then
+  fail_codex_install "codex installation finished but $prefix/bin/codex is not functional ($codex_probe_failure)" 76
 fi
 `
 
@@ -984,6 +1061,69 @@ function Test-CodexCommand([string]$codexPath) {
   return $false
 }
 
+function Invoke-CodexNpmInstall([string[]]$packages) {
+  $script:codexNpmInstallExitCode = 0
+  $savedInclude = $env:NPM_CONFIG_INCLUDE
+  $savedOmit = $env:NPM_CONFIG_OMIT
+  $savedOptional = $env:NPM_CONFIG_OPTIONAL
+  try {
+    $env:NPM_CONFIG_INCLUDE = 'optional'
+    $env:NPM_CONFIG_OMIT = ''
+    $env:NPM_CONFIG_OPTIONAL = 'true'
+    & $npmCmd install -g --prefix $npmPrefix --include=optional @packages
+    $script:codexNpmInstallExitCode = $LASTEXITCODE
+  } finally {
+    $env:NPM_CONFIG_INCLUDE = $savedInclude
+    $env:NPM_CONFIG_OMIT = $savedOmit
+    $env:NPM_CONFIG_OPTIONAL = $savedOptional
+  }
+}
+
+function Get-CodexInstalledVersion {
+  $pkgJson = Join-Path $npmPrefix 'node_modules\@openai\codex\package.json'
+  if (-not (Test-Path $pkgJson)) { return "" }
+  try {
+    $pkg = Get-Content -LiteralPath $pkgJson -Raw | ConvertFrom-Json
+    if ($pkg -and -not [string]::IsNullOrWhiteSpace([string]$pkg.version)) {
+      return [string]$pkg.version
+    }
+  } catch {}
+  return ""
+}
+
+function Repair-CodexMissingOptionalDependency {
+  if ([string]::IsNullOrWhiteSpace($script:codexProbeFailure)) { return $false }
+  $match = [regex]::Match($script:codexProbeFailure, 'Missing optional dependency (?<pkg>@openai/codex[-A-Za-z0-9_]+)')
+  if (-not $match.Success) { return $false }
+  $missingPkg = $match.Groups['pkg'].Value
+  if (-not $missingPkg.StartsWith('@openai/codex-')) { return $false }
+  $version = Get-CodexInstalledVersion
+  $pkgSpec = $missingPkg
+  if (-not [string]::IsNullOrWhiteSpace($version)) {
+    $pkgSpec = "$missingPkg@$version"
+  }
+  Write-Host "codex native optional dependency is missing; installing $pkgSpec..." -ForegroundColor Yellow
+  Assert-DiskSpace "managed npm prefix" $npmPrefix
+  Assert-DiskSpace "npm cache" $npmCacheDir
+  Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
+  Invoke-CodexNpmInstall @($pkgSpec)
+  $repairCode = $script:codexNpmInstallExitCode
+  if ($repairCode -ne 0) {
+    Fail-IfDiskSpaceLow "managed npm prefix" $npmPrefix
+    Fail-IfDiskSpaceLow "npm cache" $npmCacheDir
+    Fail-IfDiskSpaceLow "temporary directory" ([IO.Path]::GetTempPath())
+    $script:codexProbeFailure = "missing optional dependency repair failed for $pkgSpec"
+    return $false
+  }
+  return $true
+}
+
+function Test-CodexCommandWithOptionalRepair([string]$codexPath) {
+  if (Test-CodexCommand $codexPath) { return $true }
+  if ((Repair-CodexMissingOptionalDependency) -and (Test-CodexCommand $codexPath)) { return $true }
+  return $false
+}
+
 function Get-CodexSHA256Hex([string]$path) {
   if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
     return (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
@@ -1120,19 +1260,21 @@ $env:PATH = "$nodeDir;$npmPrefix;$prefixBin;$env:PATH"
 Assert-DiskSpace "managed npm prefix" $npmPrefix
 Assert-DiskSpace "npm cache" $npmCacheDir
 Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
-& $npmCmd install -g --prefix $npmPrefix --include=optional @openai/codex
-if ($LASTEXITCODE -ne 0) {
+$installCode = 0
+Invoke-CodexNpmInstall @('@openai/codex')
+$installCode = $script:codexNpmInstallExitCode
+if ($installCode -ne 0) {
   Fail-IfDiskSpaceLow "managed npm prefix" $npmPrefix
   Fail-IfDiskSpaceLow "npm cache" $npmCacheDir
   Fail-IfDiskSpaceLow "temporary directory" ([IO.Path]::GetTempPath())
-  Fail-CodexInstall "npm install -g @openai/codex failed" $LASTEXITCODE
+  Fail-CodexInstall "npm install -g @openai/codex failed" $installCode
 }
 if ($usingManagedNode) {
   Set-CodexManagedNodeShims
 }
 
 $codexCmd = Join-Path $npmPrefix 'codex.cmd'
-$probeOk = Test-CodexCommand $codexCmd
+$probeOk = Test-CodexCommandWithOptionalRepair $codexCmd
 if (-not $probeOk -and $usedSystemNode) {
   Write-Host "codex installed with system node is not functional; retrying with local node..." -ForegroundColor Yellow
   Install-LocalNode
@@ -1144,19 +1286,21 @@ if (-not $probeOk -and $usedSystemNode) {
   Assert-DiskSpace "managed npm prefix" $npmPrefix
   Assert-DiskSpace "npm cache" $npmCacheDir
   Assert-DiskSpace "temporary directory" ([IO.Path]::GetTempPath())
-  & $npmCmd install -g --prefix $npmPrefix --include=optional @openai/codex
-  if ($LASTEXITCODE -ne 0) {
+  $installCode = 0
+  Invoke-CodexNpmInstall @('@openai/codex')
+  $installCode = $script:codexNpmInstallExitCode
+  if ($installCode -ne 0) {
     Fail-IfDiskSpaceLow "managed npm prefix" $npmPrefix
     Fail-IfDiskSpaceLow "npm cache" $npmCacheDir
     Fail-IfDiskSpaceLow "temporary directory" ([IO.Path]::GetTempPath())
-    Fail-CodexInstall "npm install -g @openai/codex failed after switching to managed Node.js/npm" $LASTEXITCODE
+    Fail-CodexInstall "npm install -g @openai/codex failed after switching to managed Node.js/npm" $installCode
   }
   Set-CodexManagedNodeShims
-  $probeOk = Test-CodexCommand $codexCmd
+  $probeOk = Test-CodexCommandWithOptionalRepair $codexCmd
 }
 if (-not $probeOk -and (Install-CodexVCRedistIfNeeded)) {
   Write-Host "Rechecking Codex CLI after VC++ runtime install..." -ForegroundColor Yellow
-  $probeOk = Test-CodexCommand $codexCmd
+  $probeOk = Test-CodexCommandWithOptionalRepair $codexCmd
 }
 if (-not $probeOk) {
   if ([string]::IsNullOrWhiteSpace($script:codexProbeFailure)) {
@@ -1569,9 +1713,7 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 	}
 
 	cmd := exec.CommandContext(ctx, npmPath, "install", "-g", "--include=optional", "@openai/codex")
-	if len(installerEnv) > 0 {
-		cmd.Env = installerEnv
-	}
+	cmd.Env = codexNPMInstallEnv(installerEnv)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	cmd.Stdin = os.Stdin
@@ -1582,6 +1724,55 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 		return fmt.Errorf("system npm codex upgrade failed: %w", err)
 	}
 	return nil
+}
+
+func codexNPMInstallEnv(base []string) []string {
+	env := make([]string, 0, len(base)+6)
+	if len(base) == 0 {
+		env = append(env, os.Environ()...)
+	} else {
+		env = append(env, base...)
+	}
+
+	out := make([]string, 0, len(env)+6)
+	for _, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			out = append(out, kv)
+			continue
+		}
+		if isCodexNPMOptionalConfigKey(k) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	out = append(out,
+		"NPM_CONFIG_INCLUDE=optional",
+		"NPM_CONFIG_OMIT=",
+		"NPM_CONFIG_OPTIONAL=true",
+	)
+	if runtime.GOOS != "windows" {
+		out = append(out,
+			"npm_config_include=optional",
+			"npm_config_omit=",
+			"npm_config_optional=true",
+		)
+	}
+	return out
+}
+
+func isCodexNPMOptionalConfigKey(key string) bool {
+	if envKeyEqual(key, "NPM_CONFIG_INCLUDE") ||
+		envKeyEqual(key, "NPM_CONFIG_OMIT") ||
+		envKeyEqual(key, "NPM_CONFIG_OPTIONAL") {
+		return true
+	}
+	if runtime.GOOS != "windows" {
+		return key == "npm_config_include" ||
+			key == "npm_config_omit" ||
+			key == "npm_config_optional"
+	}
+	return false
 }
 
 func resolveUpgradedCodexPath(ctx context.Context, preferred string) (string, error) {

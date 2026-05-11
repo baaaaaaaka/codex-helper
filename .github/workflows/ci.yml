@@ -154,15 +154,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SSH_TEST_ENABLED=1 go test ./internal/ssh -count=1 -run 'TestTunnelIntegrationStartStop$' -v
+          SSH_TEST_ENABLED=1 go test ./internal/ssh -count=1 -run 'TestTunnelIntegration(StartStop|AcceptsNewHostKey)$' -v
           SSH_TEST_ENABLED=1 SSH_STACK_INTEGRATION_TEST=1 go test ./internal/stack -count=1 -run 'TestStackIntegrationHTTPProxyConnectThroughSSHTunnel$' -v
 
-      - name: SSH host-key retry regressions (Linux only)
-        if: runner.os == 'Linux'
+      - name: SSH accept-new client support
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(InitProfileInteractiveWithDeps(OffersInteractiveHostKeyCheckEvenIfInteractiveSessionFails|ReturnsOriginalHostKeyErrorWhenDeclined)|ClassifySSHProbeFailureDoesNotTreatBannerOffendingAsHostKey)$' -v
+          SSH_ACCEPT_NEW_OPTION_TEST=1 go test ./internal/ssh -count=1 -run 'TestOpenSSHAcceptNewOptionSupported$' -v
+
+      - name: SSH host-key fallback regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/ssh -count=1 -run 'Test(BuildArgs_IncludesRequiredOptions|HostKeyArgsForTarget(Legacy(SeedsKnownHosts|HonorsExplicitStrictHostKeyChecking|SkipsScanWhenKnownHostExists|RetriesWithoutHashFlag|RejectsDiscardKnownHostsFile)|HonorsExplicitStrictHostKeyCheckingBeforeDetection|ValidatesTargetBeforeDetection)|UserKnownHostsFileExpandsHomeShortcut|DetectSSHAcceptNewSupport(RejectsUnsupportedOption|RejectsOldSSHWithoutConfigDump|IgnoresUnrelatedSSHFailure))$' -v
+          go test ./internal/cli -count=1 -run 'Test(InitProfileInteractiveWithDepsDoesNotPromptForHostKeyConfirmation|InstallPublicKeyAcceptsNewHostKeysByDefault|ClassifySSHProbeFailureDoesNotTreatBannerOffendingAsHostKey)$' -v
 
       - name: Installer shell matrix tests (Linux/macOS)
         if: runner.os != 'Windows'
@@ -185,7 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           go test . -count=1 -run 'TestInstallSh(Checksum(DownloadFailureRemainsBestEffort|Mismatch)|SuccessBanner|DiskSpace(FailureBanner|UnknownWarnsButContinues))|TestInstallPs1ChecksumDownloadRemainsBestEffort'
-          go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexInstallerDiskSpace(PrecheckFailsBeforeShell|RechecksDiskSpaceAfterShellFailure)|RunSystemNpmCodexUpgrade(DiskPrecheckFailsBeforeInstall|ReportsDiskSpaceAfterNpmFailure)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|BootstrapScript(ContainsDiskSpacePreflight|ChecksNpmUsability)|BootstrapWindowsScriptContainsDiskAndNpmChecks)$'
+          go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexInstallerDiskSpace(PrecheckFailsBeforeShell|RechecksDiskSpaceAfterShellFailure)|RunSystemNpmCodexUpgrade(DiskPrecheckFailsBeforeInstall|ReportsDiskSpaceAfterNpmFailure|ForcesOptionalDependencyEnv)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|CodexNPMInstallEnvClearsOptionalDependencyOmit|BootstrapScript(ContainsDiskSpacePreflight|ChecksNpmUsability|ContainsSelfValidation|RepairsMissingOptionalDependency)|BootstrapWindowsScriptContains(SelfValidation|DiskAndNpmChecks))$'
 
       - name: Recent install disk/npm regressions (Windows)
         if: runner.os == 'Windows'
@@ -194,7 +200,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           go test . -count=1 -run 'TestInstallPs1(ChecksumDownloadFailureRemainsBestEffort|DiskSpaceFailureBanner|LatestViaAPI|KeepsPathSetupWhenInstallDirAlreadySet)'
-          go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|BootstrapWindowsScriptContainsDiskAndNpmChecks)$'
+          go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|CodexNPMInstallEnvClearsOptionalDependencyOmit|BootstrapWindowsScriptContains(SelfValidation|DiskAndNpmChecks))$'
 
       - name: Recent run/installer/reuse regressions (Linux/macOS)
         if: runner.os != 'Windows'

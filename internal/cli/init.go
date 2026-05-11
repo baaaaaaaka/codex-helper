@@ -133,7 +133,7 @@ func initProfileInteractiveWithDeps(
 		CreatedAt: time.Now(),
 	}
 
-	if err := initialSSHProbe(ctx, reader, ops, prof, out); err != nil {
+	if err := initialSSHProbe(ctx, ops, prof); err != nil {
 		if !shouldInstallManagedKey(err) {
 			return config.Profile{}, err
 		}
@@ -166,43 +166,10 @@ func initProfileInteractiveWithDeps(
 
 func initialSSHProbe(
 	ctx context.Context,
-	reader *bufio.Reader,
 	ops sshOps,
 	prof config.Profile,
-	out io.Writer,
 ) error {
-	err := ops.probe(ctx, prof, false, nil)
-	if err == nil {
-		return nil
-	}
-	if !shouldOfferInteractiveHostKeyCheck(err) {
-		return err
-	}
-
-	if out != nil {
-		_, _ = fmt.Fprintln(out, "SSH could not verify the host key in non-interactive mode.")
-		_, _ = fmt.Fprintln(out, "Open one interactive SSH check to review and accept or update the host key.")
-	}
-	if !promptYesNo(reader, "Open interactive SSH host key check now?", true) {
-		return err
-	}
-	_ = ops.probe(ctx, prof, true, reader)
 	return ops.probe(ctx, prof, false, nil)
-}
-
-func interactiveHostKeyCheckArgs(prof config.Profile) []string {
-	dest := prof.User + "@" + prof.Host
-	args := []string{
-		"-T",
-		"-o", "ConnectTimeout=15",
-		"-o", "PreferredAuthentications=none",
-		"-o", "NumberOfPasswordPrompts=0",
-		"-p", strconv.Itoa(prof.Port),
-	}
-	args = append(args, prof.SSHArgs...)
-	args = append(args, dest)
-	args = append(args, "exit")
-	return args
 }
 
 func prompt(r *bufio.Reader, label, def string) string {
@@ -259,15 +226,9 @@ func promptYesNo(r *bufio.Reader, label string, def bool) bool {
 }
 
 func sshProbe(ctx context.Context, prof config.Profile, interactive bool, stdin io.Reader) error {
+	_ = stdin
 	if interactive {
-		c := exec.CommandContext(ctx, "ssh", interactiveHostKeyCheckArgs(prof)...)
-		if stdin == nil {
-			stdin = os.Stdin
-		}
-		c.Stdin = stdin
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
-		return c.Run()
+		return errors.New("interactive SSH host-key checks are no longer used; retry the non-interactive probe")
 	}
 
 	probePort, err := pickFreeTCPPort()
@@ -408,15 +369,6 @@ func shouldInstallManagedKey(err error) bool {
 	return errors.As(err, &probeErr) && probeErr.kind == sshProbeFailureAuth
 }
 
-func shouldOfferInteractiveHostKeyCheck(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	var probeErr *sshProbeError
-	return errors.As(err, &probeErr) && probeErr.kind == sshProbeFailureHostKey
-}
-
 func generateKeypair(ctx context.Context, store *config.Store, prof config.Profile) (string, error) {
 	dir := filepath.Dir(store.Path())
 	keyDir := filepath.Join(dir, "keys")
@@ -470,9 +422,17 @@ func installPublicKey(ctx context.Context, prof config.Profile, pubKeyPath strin
 
 	args := []string{
 		"-p", strconv.Itoa(prof.Port),
-		prof.User + "@" + prof.Host,
-		"umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys",
 	}
+	hostKeyArgs, err := internalssh.HostKeyArgsForTarget(prof.Host, prof.Port, prof.SSHArgs)
+	if err != nil {
+		return err
+	}
+	args = append(args, hostKeyArgs...)
+	args = append(args, prof.SSHArgs...)
+	args = append(args,
+		prof.User+"@"+prof.Host,
+		"umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys",
+	)
 	c := exec.CommandContext(ctx, "ssh", args...)
 	c.Stdin = bytes.NewReader(pub)
 	c.Stdout = os.Stdout
