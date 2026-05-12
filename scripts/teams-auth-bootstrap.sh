@@ -91,11 +91,13 @@ prompt_required() {
   local name="$1"
   local prompt="$2"
   local value="$3"
+  value="${value%$'\r'}"
   while [ -z "${value//[[:space:]]/}" ]; do
     printf '%s: ' "$prompt" >&2
     if ! IFS= read -r value; then
       fail "$name is required"
     fi
+    value="${value%$'\r'}"
   done
   printf '%s' "$value"
 }

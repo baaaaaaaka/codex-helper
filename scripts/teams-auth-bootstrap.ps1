@@ -72,8 +72,10 @@ function Prompt-Required([string]$Name, [string]$Prompt, [string]$Value) {
 }
 
 function Invoke-Cxp([string[]]$ArgsList) {
+  $global:LASTEXITCODE = $null
   & $script:CodexProxy @ArgsList
-  if ($LASTEXITCODE -ne 0) {
+  $exitCode = $LASTEXITCODE
+  if ($null -ne $exitCode -and $exitCode -ne 0) {
     throw "codex-proxy failed with exit code $LASTEXITCODE: $($ArgsList -join ' ')"
   }
 }

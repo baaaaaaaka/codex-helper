@@ -161,7 +161,11 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 env=env,
-                check=True,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                "stdout:\n" + proc.stdout + "\nstderr:\n" + proc.stderr,
             )
 
             output = proc.stdout + proc.stderr
