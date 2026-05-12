@@ -21,6 +21,10 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
         self.assertIn("scripts/teams-auth-bootstrap.sh", config)
         self.assertIn("scripts/teams-auth-bootstrap.ps1", config)
 
+    def test_powershell_script_avoids_ambiguous_variable_colon(self) -> None:
+        script = POWERSHELL_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("$LASTEXITCODE:", script)
+
     def test_bash_script_interactive_flow_configures_all_client_slots(self) -> None:
         bash = shutil.which("bash")
         if not bash:

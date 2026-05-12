@@ -76,7 +76,7 @@ function Invoke-Cxp([string[]]$ArgsList) {
   & $script:CodexProxy @ArgsList
   $exitCode = $LASTEXITCODE
   if ($null -ne $exitCode -and $exitCode -ne 0) {
-    throw "codex-proxy failed with exit code $LASTEXITCODE: $($ArgsList -join ' ')"
+    throw "codex-proxy failed with exit code ${exitCode}: $($ArgsList -join ' ')"
   }
 }
 
