@@ -3038,6 +3038,136 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	}
 }
 
+func TestBridgeMigrateRegistryProjectionSkipsAndSanitizesControlFallback(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.reg.Sessions = append(bridge.reg.Sessions, Session{
+		ID:        controlFallbackSessionID,
+		ChatID:    "old-control-chat",
+		ChatURL:   "https://teams.example/old-control",
+		Topic:     "old control",
+		Status:    "active",
+		Cwd:       "/tmp/old-control",
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Hour),
+	})
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions[controlFallbackSessionID] = teamstore.SessionContext{
+			ID:           controlFallbackSessionID,
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  "old-control-chat",
+			TeamsChatURL: "https://teams.example/old-control",
+			TeamsTopic:   "old control",
+			RunnerKind:   "control_fallback",
+			Cwd:          "/tmp/old-control",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed durable fallback: %v", err)
+	}
+
+	if err := bridge.migrateRegistryProjectionToStore(context.Background()); err != nil {
+		t.Fatalf("migrateRegistryProjectionToStore error: %v", err)
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	fallback := state.Sessions[controlFallbackSessionID]
+	if fallback.TeamsChatID != "" || fallback.TeamsChatURL != "" || fallback.TeamsTopic != "" || fallback.Cwd != "" {
+		t.Fatalf("control fallback was not sanitized: %#v", fallback)
+	}
+	if _, ok := state.Sessions["s001"]; !ok {
+		t.Fatalf("normal registry work session was not migrated: %#v", state.Sessions)
+	}
+}
+
+func TestBridgeRestoreRegistryFromStoreRepairsStaleSessionProjection(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	now := time.Now()
+	bridge.reg.Sessions = []Session{
+		{
+			ID:        controlFallbackSessionID,
+			ChatID:    "old-control-chat",
+			Status:    "active",
+			CreatedAt: now.Add(-3 * time.Hour),
+			UpdatedAt: now.Add(-3 * time.Hour),
+		},
+		{
+			ID:        "s001",
+			ChatID:    "stale-chat",
+			ChatURL:   "https://teams.example/stale-chat",
+			Topic:     "stale topic",
+			Status:    "active",
+			CreatedAt: now.Add(-2 * time.Hour),
+			UpdatedAt: now.Add(-2 * time.Hour),
+		},
+		{
+			ID:        "s999",
+			ChatID:    "orphan-chat",
+			Status:    "active",
+			CreatedAt: now.Add(-time.Hour),
+			UpdatedAt: now.Add(-time.Hour),
+		},
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions[controlFallbackSessionID] = teamstore.SessionContext{
+			ID:          controlFallbackSessionID,
+			Status:      teamstore.SessionStatusActive,
+			RunnerKind:  "control_fallback",
+			TeamsChatID: "old-control-chat",
+		}
+		state.Sessions["s001"] = teamstore.SessionContext{
+			ID:           "s001",
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  "chat-1",
+			TeamsChatURL: "https://teams.example/chat-1",
+			TeamsTopic:   "durable topic",
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed durable sessions: %v", err)
+	}
+
+	if err := bridge.restoreRegistryFromStore(context.Background()); err != nil {
+		t.Fatalf("restoreRegistryFromStore error: %v", err)
+	}
+
+	if got := bridge.reg.SessionByID(controlFallbackSessionID); got != nil {
+		t.Fatalf("control fallback should not remain in registry projection: %#v", got)
+	}
+	if got := bridge.reg.SessionByID("s999"); got != nil {
+		t.Fatalf("orphan registry session should be removed: %#v", got)
+	}
+	got := bridge.reg.SessionByID("s001")
+	if got == nil || got.ChatID != "chat-1" || got.Topic != "durable topic" {
+		t.Fatalf("registry session was not repaired from durable store: %#v", bridge.reg.Sessions)
+	}
+}
+
+func TestBridgeRestoreRegistryFromStoreKeepsLegacyRegistryWhenStoreHasNoSessions(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+
+	if err := bridge.restoreRegistryFromStore(context.Background()); err != nil {
+		t.Fatalf("restoreRegistryFromStore error: %v", err)
+	}
+
+	got := bridge.reg.SessionByID("s001")
+	if got == nil || got.ChatID != "chat-1" {
+		t.Fatalf("legacy registry session should be kept while durable store has no sessions: %#v", bridge.reg.Sessions)
+	}
+}
+
 func TestBridgeControlHelperUpdateQuestionFallsBackToCodex(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -8781,7 +8911,7 @@ func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T
 
 func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
 	now := time.Now()
-	readGraph := newBridgePollGraph(t, nil)
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{messages: nil}})
 	writeGraph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
@@ -8824,6 +8954,140 @@ func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
 	}
 	if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() || poll.ParkNoticeSentAt.IsZero() {
 		t.Fatalf("work chat was not parked with notice: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromSentOutbox(t *testing.T) {
+	now := time.Now()
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	oldActivity := now.Add(-49 * time.Hour)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{
+			ID:           session.ID,
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  session.ChatID,
+			TeamsChatURL: session.ChatURL,
+			TeamsTopic:   session.Topic,
+			CreatedAt:    oldActivity,
+			UpdatedAt:    oldActivity,
+		}
+		state.OutboxMessages[parkNoticeOutboxID(session)] = teamstore.OutboxMessage{
+			ID:          parkNoticeOutboxID(session),
+			SessionID:   session.ID,
+			TeamsChatID: session.ChatID,
+			Kind:        "freeze-notice",
+			Body:        renderTeamsFreezeNoticeHTML("https://teams.example/control", "r "+resumeKeyForSession(session), "Your Codex work is safe. Paused after 48h idle."),
+			Status:      teamstore.OutboxStatusSent,
+			SentAt:      now.Add(-time.Hour),
+			CreatedAt:   now.Add(-time.Hour),
+			UpdatedAt:   now.Add(-time.Hour),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed durable state: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", session.ChatID, oldActivity)
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("freeze notice was sent again: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("work chat was not marked parked with existing notice: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromGraphHistory(t *testing.T) {
+	now := time.Now()
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	oldActivity := now.Add(-49 * time.Hour)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:           session.ID,
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  session.ChatID,
+		TeamsChatURL: session.ChatURL,
+		TeamsTopic:   session.Topic,
+		CreatedAt:    oldActivity,
+		UpdatedAt:    oldActivity,
+	}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", session.ChatID, oldActivity)
+	resumeCommand := "r " + resumeKeyForSession(session)
+	notice := bridgePollMessage("already-paused-1", now.Add(-time.Hour).Format(time.RFC3339Nano), "This chat is paused\nStep 2: Send: "+resumeCommand)
+	bridge.readGraph = newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{notice}}})
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("freeze notice was sent again: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("work chat was not marked parked with existing Graph notice: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceIgnoresStaleControlFallbackRegistryProjection(t *testing.T) {
+	now := time.Now()
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	oldActivity := now.Add(-49 * time.Hour)
+	bridge.reg.Sessions = []Session{{
+		ID:        controlFallbackSessionID,
+		ChatID:    "old-control-chat",
+		ChatURL:   "https://teams.example/old-control-chat",
+		Topic:     "old control",
+		Status:    "active",
+		CreatedAt: oldActivity,
+		UpdatedAt: oldActivity,
+	}}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions[controlFallbackSessionID] = teamstore.SessionContext{
+			ID:          controlFallbackSessionID,
+			Status:      teamstore.SessionStatusActive,
+			RunnerKind:  "control_fallback",
+			TeamsChatID: "old-control-chat",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed durable fallback: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", "old-control-chat", oldActivity)
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("stale control fallback chat should not receive freeze notice: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "old-control-chat")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState == inboundPollStateParked || !poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("stale control fallback poll was parked/notified: %#v", poll)
 	}
 }
 
@@ -13886,6 +14150,33 @@ func countSentPlainContainingForChat(messages []bridgeSentMessage, chatID string
 		}
 	}
 	return count
+}
+
+func seedIdleWorkPoll(t *testing.T, store *teamstore.Store, controlChatID string, workChatID string, oldActivity time.Time) {
+	t.Helper()
+	now := time.Now()
+	if _, err := store.RecordChatPollSuccess(context.Background(), controlChatID, now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         controlChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), workChatID, oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         workChatID,
+		PollState:      inboundPollStateCold,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
 }
 
 func newBridgeTestGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {

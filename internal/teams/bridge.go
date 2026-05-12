@@ -770,13 +770,20 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 	var decisions []inboundPollDecision
 	pollsByChat := make(map[string]teamstore.ChatPollState)
 	hasPollByChat := make(map[string]bool)
+	pollableByChat := make(map[string]Session)
 	for _, session := range b.reg.ActiveSessions() {
+		pollable, ok := pollableWorkSessionFromRegistry(state, session, b.reg.ControlChatID)
+		if !ok {
+			continue
+		}
+		session = pollable
 		if transcriptImportIsActive(state, session.ID) {
 			continue
 		}
 		poll, hasPoll := state.ChatPolls[session.ChatID]
 		pollsByChat[session.ChatID] = poll
 		hasPollByChat[session.ChatID] = hasPoll
+		pollableByChat[session.ChatID] = session
 		decision := decideInboundPoll(inboundPollInput{
 			ChatID:           session.ChatID,
 			Role:             inboundPollRoleWork,
@@ -808,8 +815,8 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 	}
 	var firstErr error
 	for _, decision := range decisions {
-		session := b.reg.SessionByChatID(decision.ChatID)
-		if session == nil {
+		session, ok := pollableByChat[decision.ChatID]
+		if !ok {
 			continue
 		}
 		s := session
@@ -823,6 +830,96 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 	}
 	return firstErr
+}
+
+func pollableWorkSessionFromRegistry(state teamstore.State, session Session, controlChatID string) (Session, bool) {
+	if !isActiveSessionStatus(session.Status) || isControlFallbackSessionID(session.ID) {
+		return Session{}, false
+	}
+	if strings.TrimSpace(session.ChatID) == "" {
+		return Session{}, false
+	}
+	if strings.TrimSpace(controlChatID) != "" && session.ChatID == controlChatID {
+		return Session{}, false
+	}
+	if len(state.Sessions) == 0 {
+		return session, true
+	}
+	durable, ok := state.Sessions[session.ID]
+	if !ok {
+		return Session{}, false
+	}
+	if isDurableControlFallbackSession(durable) {
+		return Session{}, false
+	}
+	if !isActiveSessionStatus(string(durable.Status)) {
+		return Session{}, false
+	}
+	if strings.TrimSpace(durable.TeamsChatID) == "" || durable.TeamsChatID != session.ChatID {
+		return Session{}, false
+	}
+	return registrySessionFromDurable(durable), true
+}
+
+func isControlFallbackSessionID(sessionID string) bool {
+	return strings.TrimSpace(sessionID) == controlFallbackSessionID
+}
+
+func isDurableControlFallbackSession(session teamstore.SessionContext) bool {
+	return isControlFallbackSessionID(session.ID) || strings.EqualFold(strings.TrimSpace(session.RunnerKind), "control_fallback")
+}
+
+func registrySessionFromDurable(durable teamstore.SessionContext) Session {
+	status := string(durable.Status)
+	if status == "" {
+		status = string(teamstore.SessionStatusActive)
+	}
+	return Session{
+		ID:            durable.ID,
+		ChatID:        durable.TeamsChatID,
+		ChatURL:       durable.TeamsChatURL,
+		Topic:         durable.TeamsTopic,
+		UserTitle:     durable.UserTitle,
+		TitleSource:   durable.TitleSource,
+		Status:        status,
+		CodexThreadID: durable.CodexThreadID,
+		Cwd:           durable.Cwd,
+		CreatedAt:     durable.CreatedAt,
+		UpdatedAt:     durable.UpdatedAt,
+	}
+}
+
+func sanitizeControlFallbackSession(session *teamstore.SessionContext, model string, now time.Time) bool {
+	if session == nil {
+		return false
+	}
+	changed := false
+	setString := func(target *string, value string) {
+		if *target != value {
+			*target = value
+			changed = true
+		}
+	}
+	if session.ID != controlFallbackSessionID {
+		session.ID = controlFallbackSessionID
+		changed = true
+	}
+	if session.Status != teamstore.SessionStatusActive {
+		session.Status = teamstore.SessionStatusActive
+		changed = true
+	}
+	setString(&session.RunnerKind, "control_fallback")
+	if strings.TrimSpace(model) != "" {
+		setString(&session.Model, model)
+	}
+	setString(&session.TeamsChatID, "")
+	setString(&session.TeamsChatURL, "")
+	setString(&session.TeamsTopic, "")
+	setString(&session.Cwd, "")
+	if changed {
+		session.UpdatedAt = now
+	}
+	return changed
 }
 
 func (b *Bridge) pollChat(ctx context.Context, chatID string, top int, handle func(context.Context, ChatMessage, string) error) (bool, error) {
@@ -1239,13 +1336,22 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 		return nil
 	}
 	resumeCommand := "r " + resumeKeyForSession(session)
+	noticeID := parkNoticeOutboxID(session)
+	alreadySent, err := b.parkNoticeAlreadySent(ctx, session, noticeID, resumeCommand)
+	if err != nil {
+		return err
+	}
+	if alreadySent {
+		_, err = b.store.MarkChatPollParkNoticeSent(ctx, session.ChatID, time.Now())
+		return err
+	}
 	body := renderTeamsFreezeNoticeHTML(
 		b.reg.ControlChatURL,
 		resumeCommand,
 		"Your Codex work is safe. Paused after 48h idle.",
 	)
-	err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-		ID:          "outbox:park-notice:" + session.ID + ":" + resumeKeyForSession(session),
+	err = b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:          noticeID,
 		SessionID:   session.ID,
 		TeamsChatID: session.ChatID,
 		Kind:        "freeze-notice",
@@ -1256,6 +1362,67 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 	}
 	_, err = b.store.MarkChatPollParkNoticeSent(ctx, session.ChatID, time.Now())
 	return err
+}
+
+func parkNoticeOutboxID(session Session) string {
+	return "outbox:park-notice:" + session.ID + ":" + resumeKeyForSession(session)
+}
+
+func (b *Bridge) parkNoticeAlreadySent(ctx context.Context, session Session, noticeID string, resumeCommand string) (bool, error) {
+	poll, ok, err := b.store.ChatPoll(ctx, session.ChatID)
+	if err != nil {
+		return false, err
+	}
+	if ok && !poll.ParkNoticeSentAt.IsZero() {
+		return true, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	if sentFreezeNoticeExists(state, session.ChatID, noticeID, resumeCommand) {
+		return true, nil
+	}
+	if b.recentGraphFreezeNoticeExists(ctx, session.ChatID, resumeCommand) {
+		return true, nil
+	}
+	return false, nil
+}
+
+func sentFreezeNoticeExists(state teamstore.State, chatID string, noticeID string, resumeCommand string) bool {
+	for _, msg := range state.OutboxMessages {
+		if msg.TeamsChatID != chatID || msg.Status != teamstore.OutboxStatusSent {
+			continue
+		}
+		if msg.ID == noticeID {
+			return true
+		}
+		if msg.Kind != "freeze-notice" {
+			continue
+		}
+		bodyText := PlainTextFromTeamsHTML(msg.Body)
+		if strings.Contains(bodyText, "This chat is paused") && strings.Contains(bodyText, resumeCommand) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID string, resumeCommand string) bool {
+	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(resumeCommand) == "" {
+		return false
+	}
+	messages, err := b.readGraph.ListMessages(ctx, chatID, 50)
+	if err != nil {
+		return false
+	}
+	for _, msg := range messages {
+		text := PlainTextFromTeamsHTML(msg.Body.Content)
+		if strings.Contains(text, "This chat is paused") && strings.Contains(text, resumeCommand) {
+			return true
+		}
+	}
+	return false
 }
 
 func resumeKeyForSession(session Session) string {
@@ -1813,26 +1980,20 @@ func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, er
 	now := time.Now()
 	model := b.effectiveControlFallbackModel()
 	created, _, err := b.store.CreateSession(ctx, teamstore.SessionContext{
-		ID:           controlFallbackSessionID,
-		Status:       teamstore.SessionStatusActive,
-		TeamsChatURL: b.reg.ControlChatURL,
-		TeamsTopic:   b.reg.ControlChatTopic,
-		RunnerKind:   "control_fallback",
-		Model:        model,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:         controlFallbackSessionID,
+		Status:     teamstore.SessionStatusActive,
+		RunnerKind: "control_fallback",
+		Model:      model,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if created.RunnerKind == "" || created.Model != model || created.TeamsChatURL != b.reg.ControlChatURL || created.TeamsTopic != b.reg.ControlChatTopic {
+	if !isDurableControlFallbackSession(created) || created.Status != teamstore.SessionStatusActive || created.Model != model || created.TeamsChatID != "" || created.TeamsChatURL != "" || created.TeamsTopic != "" || created.Cwd != "" {
 		if err := b.store.UpdateSession(ctx, controlFallbackSessionID, func(state *teamstore.State) error {
 			current := state.Sessions[controlFallbackSessionID]
-			current.RunnerKind = "control_fallback"
-			current.Model = model
-			current.TeamsChatURL = b.reg.ControlChatURL
-			current.TeamsTopic = b.reg.ControlChatTopic
-			current.UpdatedAt = now
+			sanitizeControlFallbackSession(&current, model, now)
 			state.Sessions[controlFallbackSessionID] = current
 			return nil
 		}); err != nil {
@@ -6685,30 +6846,7 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 		b.reg.ControlChatTopic = state.ControlChat.TeamsChatTopic
 		changed = true
 	}
-	for _, durable := range state.Sessions {
-		if durable.ID == "" || durable.TeamsChatID == "" {
-			continue
-		}
-		if b.reg.SessionByID(durable.ID) != nil || b.reg.SessionByChatID(durable.TeamsChatID) != nil {
-			continue
-		}
-		status := string(durable.Status)
-		if status == "" {
-			status = "active"
-		}
-		b.reg.Sessions = append(b.reg.Sessions, Session{
-			ID:            durable.ID,
-			ChatID:        durable.TeamsChatID,
-			ChatURL:       durable.TeamsChatURL,
-			Topic:         durable.TeamsTopic,
-			UserTitle:     durable.UserTitle,
-			TitleSource:   durable.TitleSource,
-			Status:        status,
-			CodexThreadID: durable.CodexThreadID,
-			Cwd:           durable.Cwd,
-			CreatedAt:     durable.CreatedAt,
-			UpdatedAt:     durable.UpdatedAt,
-		})
+	if reconcileRegistrySessionsFromStore(&b.reg, state) {
 		changed = true
 	}
 	for _, inbound := range state.InboundEvents {
@@ -6727,6 +6865,99 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 		return b.Save()
 	}
 	return nil
+}
+
+func reconcileRegistrySessionsFromStore(reg *Registry, state teamstore.State) bool {
+	if reg == nil {
+		return false
+	}
+	var desired []Session
+	for _, durable := range state.Sessions {
+		if durable.ID == "" || durable.TeamsChatID == "" || isDurableControlFallbackSession(durable) {
+			continue
+		}
+		desired = append(desired, registrySessionFromDurable(durable))
+	}
+	sort.Slice(desired, func(i, j int) bool {
+		if !desired[i].UpdatedAt.Equal(desired[j].UpdatedAt) {
+			return desired[i].UpdatedAt.After(desired[j].UpdatedAt)
+		}
+		return desired[i].ID < desired[j].ID
+	})
+	desiredByID := make(map[string]Session, len(desired))
+	desiredByChat := make(map[string]Session, len(desired))
+	for _, session := range desired {
+		desiredByID[session.ID] = session
+		desiredByChat[session.ChatID] = session
+	}
+
+	changed := false
+	var next []Session
+	seenIDs := make(map[string]bool, len(reg.Sessions))
+	seenChats := make(map[string]bool, len(reg.Sessions))
+	for _, existing := range reg.Sessions {
+		existingID := strings.TrimSpace(existing.ID)
+		existingChatID := strings.TrimSpace(existing.ChatID)
+		if existingID == "" || existingChatID == "" || isControlFallbackSessionID(existingID) || (reg.ControlChatID != "" && existingChatID == reg.ControlChatID) {
+			changed = true
+			continue
+		}
+		replacement, ok := desiredByID[existingID]
+		if !ok {
+			replacement, ok = desiredByChat[existingChatID]
+		}
+		if ok {
+			if seenIDs[replacement.ID] || seenChats[replacement.ChatID] {
+				changed = true
+				continue
+			}
+			if !registrySessionsEqual(existing, replacement) {
+				changed = true
+			}
+			next = append(next, replacement)
+			seenIDs[replacement.ID] = true
+			seenChats[replacement.ChatID] = true
+			continue
+		}
+		if len(state.Sessions) > 0 {
+			changed = true
+			continue
+		}
+		if seenIDs[existingID] || seenChats[existingChatID] {
+			changed = true
+			continue
+		}
+		next = append(next, existing)
+		seenIDs[existingID] = true
+		seenChats[existingChatID] = true
+	}
+	for _, session := range desired {
+		if seenIDs[session.ID] || seenChats[session.ChatID] {
+			continue
+		}
+		next = append(next, session)
+		seenIDs[session.ID] = true
+		seenChats[session.ChatID] = true
+		changed = true
+	}
+	if changed {
+		reg.Sessions = next
+	}
+	return changed
+}
+
+func registrySessionsEqual(left Session, right Session) bool {
+	return left.ID == right.ID &&
+		left.ChatID == right.ChatID &&
+		left.ChatURL == right.ChatURL &&
+		left.Topic == right.Topic &&
+		left.UserTitle == right.UserTitle &&
+		left.TitleSource == right.TitleSource &&
+		left.Status == right.Status &&
+		left.CodexThreadID == right.CodexThreadID &&
+		left.Cwd == right.Cwd &&
+		left.CreatedAt.Equal(right.CreatedAt) &&
+		left.UpdatedAt.Equal(right.UpdatedAt)
 }
 
 func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
@@ -6770,6 +7001,9 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 			state.ControlChat.UpdatedAt = now
 		}
 		for _, session := range b.reg.Sessions {
+			if isControlFallbackSessionID(session.ID) {
+				continue
+			}
 			if strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.ChatID) == "" {
 				continue
 			}
@@ -6800,6 +7034,11 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				Cwd:           session.Cwd,
 				CreatedAt:     created,
 				UpdatedAt:     updated,
+			}
+		}
+		if fallback, ok := state.Sessions[controlFallbackSessionID]; ok {
+			if sanitizeControlFallbackSession(&fallback, "", now) {
+				state.Sessions[controlFallbackSessionID] = fallback
 			}
 		}
 		for chatID, chatState := range b.reg.Chats {
