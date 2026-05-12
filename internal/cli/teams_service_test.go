@@ -886,11 +886,12 @@ func TestTeamsServiceBootstrapShowsControlChatInForeground(t *testing.T) {
 	tmp := t.TempDir()
 	runner := &recordingTeamsServiceRunner{}
 	var openValues []bool
-	registryPath := "/home/alice/teams registry.json"
+	cwd := filepath.Join(tmp, "work dir")
+	registryPath := filepath.Join(tmp, "teams registry.json")
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "linux",
 		exe:            "/home/alice/bin/codex-proxy",
-		cwd:            "/home/alice/work dir",
+		cwd:            cwd,
 		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
 		isWSL:          true,
 		wslDistro:      "Ubuntu",
@@ -899,7 +900,11 @@ func TestTeamsServiceBootstrapShowsControlChatInForeground(t *testing.T) {
 		bootstrapControlChat: func(_ context.Context, _ *rootOptions, gotRegistry *string, openControl bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
 			openValues = append(openValues, openControl)
 			if gotRegistry == nil || *gotRegistry != registryPath {
-				t.Fatalf("registry path = %v, want %q", gotRegistry, registryPath)
+				got := "<nil>"
+				if gotRegistry != nil {
+					got = *gotRegistry
+				}
+				t.Fatalf("registry path = %q, want %q", got, registryPath)
 			}
 			return teamsServiceBootstrapControlChatResult{
 				URL:    "https://teams.microsoft.com/l/chat/control",
