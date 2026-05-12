@@ -770,7 +770,11 @@ func TestStoreConcurrentDistinctSessionWritersDoNotCrossMutate(t *testing.T) {
 
 func TestStoreConcurrentInboundTurnDedupAcrossHandles(t *testing.T) {
 	store := newTestStore(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	timeout := 10 * time.Second
+	if runtime.GOOS == "windows" {
+		timeout = 45 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
 		t.Fatalf("CreateSession error: %v", err)
