@@ -254,6 +254,7 @@ type Bridge struct {
 	annotationWarned             bool
 	markAnswerChatsUnread        bool
 	markAnswerUnreadWarned       bool
+	asyncTurnWG                  sync.WaitGroup
 	runningTurnMu                sync.Mutex
 	runningTurnCancels           map[string]*runningTurnCancel
 }
@@ -5992,7 +5993,9 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		}
 	}
 	runCtx := ctx
+	b.asyncTurnWG.Add(1)
 	go func() {
+		defer b.asyncTurnWG.Done()
 		err := b.runClaimedQueuedTurn(runCtx, session, claimed, preferredTurnID, preferred)
 		if err != nil {
 			b.handleClaimedQueuedTurnError(context.Background(), session, claimed, err)

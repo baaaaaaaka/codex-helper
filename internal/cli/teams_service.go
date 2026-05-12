@@ -116,7 +116,11 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
-			control, controlErr := teamsServiceBootstrapControlChat(cmd.Context(), root, registryPath, !noOpenControl, io.Discard)
+			spec, err := buildTeamsServiceSpec(registryPath)
+			if err != nil {
+				return err
+			}
+			control, controlErr := bootstrapControlChatWithServiceSpec(cmd.Context(), root, registryPath, spec, !noOpenControl, io.Discard)
 			result, err := bootstrapTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
 				AssumeYes:    yes,
 				NoUAC:        noUAC,
@@ -465,6 +469,50 @@ func defaultTeamsServiceBootstrapControlChat(ctx context.Context, root *rootOpti
 		}
 	}
 	return result, nil
+}
+
+func bootstrapControlChatWithServiceSpec(ctx context.Context, root *rootOptions, registryPath *string, spec teamsServiceSpec, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+	controlRegistryPath := registryPath
+	if strings.TrimSpace(spec.RegistryPath) != "" {
+		registry := spec.RegistryPath
+		controlRegistryPath = &registry
+	}
+	return withTeamsServiceSpecEnvironment(spec.Environment, func() (teamsServiceBootstrapControlChatResult, error) {
+		return teamsServiceBootstrapControlChat(ctx, root, controlRegistryPath, openControl, errOut)
+	})
+}
+
+type teamsServiceEnvValue struct {
+	value string
+	ok    bool
+}
+
+func withTeamsServiceSpecEnvironment(env map[string]string, fn func() (teamsServiceBootstrapControlChatResult, error)) (teamsServiceBootstrapControlChatResult, error) {
+	keys := sortedEnvironmentKeys(env)
+	if len(keys) == 0 {
+		return fn()
+	}
+	previous := make(map[string]teamsServiceEnvValue, len(keys))
+	for _, key := range keys {
+		value, ok := os.LookupEnv(key)
+		previous[key] = teamsServiceEnvValue{value: value, ok: ok}
+		if err := os.Setenv(key, env[key]); err != nil {
+			restoreTeamsServiceEnvironment(previous)
+			return teamsServiceBootstrapControlChatResult{}, fmt.Errorf("prepare Teams service environment for control chat: %w", err)
+		}
+	}
+	defer restoreTeamsServiceEnvironment(previous)
+	return fn()
+}
+
+func restoreTeamsServiceEnvironment(previous map[string]teamsServiceEnvValue) {
+	for key, value := range previous {
+		if value.ok {
+			_ = os.Setenv(key, value.value)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	}
 }
 
 func printTeamsServiceBootstrapControlChat(out io.Writer, result teamsServiceBootstrapControlChatResult) {

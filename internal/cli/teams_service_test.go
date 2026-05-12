@@ -949,6 +949,141 @@ func TestTeamsServiceBootstrapShowsControlChatInForeground(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceBootstrapPreparesControlChatWithServiceCodexHomeEnv(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	prevUserHome := effectivePathsUserHomeDir
+	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { effectivePathsUserHomeDir = prevUserHome })
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_DIR", "")
+
+	runner := &recordingTeamsServiceRunner{}
+	var gotHome string
+	var gotDir string
+	var gotService string
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:     filepath.Join(tmp, "work"),
+		unitDir: filepath.Join(tmp, "systemd-user"),
+		runner:  runner,
+		bootstrapControlChat: func(_ context.Context, _ *rootOptions, _ *string, _ bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+			gotHome = os.Getenv("CODEX_HOME")
+			gotDir = os.Getenv("CODEX_DIR")
+			gotService = os.Getenv("CODEX_HELPER_TEAMS_SERVICE")
+			return teamsServiceBootstrapControlChatResult{
+				URL:    "https://teams.microsoft.com/l/chat/control",
+				Topic:  "🏠 Codex Control - workstation",
+				ChatID: "control-chat",
+			}, nil
+		},
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap", "--no-open-control"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap error: %v\noutput:\n%s", err, out.String())
+	}
+	wantCodexHome := filepath.Join(home, ".codex")
+	if gotHome != wantCodexHome || gotDir != wantCodexHome {
+		t.Fatalf("bootstrap control chat Codex env = CODEX_HOME:%q CODEX_DIR:%q, want both %q", gotHome, gotDir, wantCodexHome)
+	}
+	if gotService != "1" {
+		t.Fatalf("bootstrap control chat CODEX_HELPER_TEAMS_SERVICE = %q, want 1", gotService)
+	}
+	if os.Getenv("CODEX_HOME") != "" || os.Getenv("CODEX_DIR") != "" {
+		t.Fatalf("bootstrap control chat should restore caller Codex env, got CODEX_HOME:%q CODEX_DIR:%q", os.Getenv("CODEX_HOME"), os.Getenv("CODEX_DIR"))
+	}
+}
+
+func TestTeamsServiceBootstrapPreparesControlChatWithRelativeCodexDirEnv(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	cwd := filepath.Join(tmp, "work")
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_DIR", "relative-codex")
+
+	runner := &recordingTeamsServiceRunner{}
+	var gotHome string
+	var gotDir string
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:     cwd,
+		unitDir: filepath.Join(tmp, "systemd-user"),
+		runner:  runner,
+		bootstrapControlChat: func(_ context.Context, _ *rootOptions, _ *string, _ bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+			gotHome = os.Getenv("CODEX_HOME")
+			gotDir = os.Getenv("CODEX_DIR")
+			return teamsServiceBootstrapControlChatResult{
+				URL:    "https://teams.microsoft.com/l/chat/control",
+				Topic:  "🏠 Codex Control - workstation",
+				ChatID: "control-chat",
+			}, nil
+		},
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap", "--no-open-control"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap error: %v\noutput:\n%s", err, out.String())
+	}
+	wantCodexHome := filepath.Join(cwd, "relative-codex")
+	if gotHome != wantCodexHome || gotDir != wantCodexHome {
+		t.Fatalf("bootstrap control chat Codex env = CODEX_HOME:%q CODEX_DIR:%q, want both %q", gotHome, gotDir, wantCodexHome)
+	}
+	if os.Getenv("CODEX_HOME") != "" || os.Getenv("CODEX_DIR") != "relative-codex" {
+		t.Fatalf("bootstrap control chat should restore caller Codex env, got CODEX_HOME:%q CODEX_DIR:%q", os.Getenv("CODEX_HOME"), os.Getenv("CODEX_DIR"))
+	}
+}
+
+func TestTeamsServiceBootstrapPreparesControlChatWithResolvedRegistryPath(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	cwd := filepath.Join(tmp, "work dir")
+	registryPath := "teams registry.json"
+	runner := &recordingTeamsServiceRunner{}
+	var gotRegistry string
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:     cwd,
+		unitDir: filepath.Join(tmp, "systemd-user"),
+		runner:  runner,
+		bootstrapControlChat: func(_ context.Context, _ *rootOptions, gotRegistryPath *string, _ bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+			if gotRegistryPath != nil {
+				gotRegistry = *gotRegistryPath
+			}
+			return teamsServiceBootstrapControlChatResult{
+				URL:    "https://teams.microsoft.com/l/chat/control",
+				Topic:  "🏠 Codex Control - workstation",
+				ChatID: "control-chat",
+			}, nil
+		},
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap", "--no-open-control"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap error: %v\noutput:\n%s", err, out.String())
+	}
+	wantRegistry := filepath.Join(cwd, registryPath)
+	if gotRegistry != wantRegistry {
+		t.Fatalf("bootstrap control chat registry path = %q, want %q", gotRegistry, wantRegistry)
+	}
+}
+
 func TestTeamsServiceBootstrapSuppressesControlChatDiagnosticOutput(t *testing.T) {
 	lockCLITestHooks(t)
 

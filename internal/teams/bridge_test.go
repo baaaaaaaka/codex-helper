@@ -1028,6 +1028,7 @@ func TestBridgeStartupRecoveryFlushesControlNoticeBeforeQueuedWork(t *testing.T)
 	close(executor.release)
 	waitForCompletedTurnCount(t, store, session.ID, 1)
 	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
+	waitForBridgeAsyncTurns(t, bridge)
 }
 
 func TestBridgeProcessDeferredInboundAsyncRunsAcrossSessions(t *testing.T) {
@@ -1329,6 +1330,23 @@ func waitForNoActiveTurnsOrOutbox(t *testing.T, store *teamstore.Store, sessionI
 			t.Fatalf("timed out waiting for idle turn queue; turns=%#v outbox=%#v", state.Turns, state.OutboxMessages)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForBridgeAsyncTurns(t *testing.T, bridge *Bridge) {
+	t.Helper()
+	if bridge == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		bridge.asyncTurnWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("timed out waiting for async Teams turns to finish")
 	}
 }
 
