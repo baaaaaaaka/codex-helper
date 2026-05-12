@@ -87,6 +87,28 @@ calendar pollution for normal use.
 
 ## 4. Authenticate Teams
 
+For the normal one-client setup, you can use the interactive helper script
+instead of running each command manually:
+
+Linux, macOS, or WSL:
+
+```sh
+scripts/teams-auth-bootstrap.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\teams-auth-bootstrap.ps1
+```
+
+The same scripts are also attached to GitHub releases for source-free setup.
+
+The script asks for the tenant ID and one Teams Graph public client ID, writes
+that client ID into the read, chat-write, file-write, and full auth slots, runs
+`codex-proxy teams auth full`, verifies the local full-token cache, and then
+runs `codex-proxy teams service bootstrap`.
+
 Run one full auth first. This token is used for message polling, chat creation,
 message sends, meeting-chat carriers, and helper file/image uploads:
 

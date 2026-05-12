@@ -47,6 +47,8 @@ release:
     - glob: install.sh
     - glob: install.ps1
     - glob: README.md
+    - glob: scripts/teams-auth-bootstrap.sh
+    - glob: scripts/teams-auth-bootstrap.ps1
 
 changelog:
   sort: asc
