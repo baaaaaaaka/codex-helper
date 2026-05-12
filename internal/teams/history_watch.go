@@ -221,11 +221,20 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 			return err
 		}
 	}
+	sessionStarted, blocked, err := b.publishHistoryWatchSessionStart(ctx, path, result)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return nil
+	}
 	for _, final := range result.Finals {
 		if strings.TrimSpace(final.Key) == "" || final.Key == checkpoint.LastFinalID {
 			continue
 		}
-		handled, err := b.publishHistoryWatchFinal(ctx, path, final)
+		handled, err := b.publishHistoryWatchFinal(ctx, path, final, publishHistoryWatchFinalOptions{
+			ForceDetectedNotification: sessionStarted,
+		})
 		if err != nil {
 			return err
 		}
@@ -289,7 +298,68 @@ func (b *Bridge) removeHistoryWatchCheckpoint(ctx context.Context, id string) er
 	})
 }
 
-func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, final historyTieredFinal) (bool, error) {
+func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path string, result historyTieredTailResult) (bool, bool, error) {
+	if isSubagent, err := codexhistory.SessionFileIsSubagentContext(ctx, path); err == nil && isSubagent {
+		return false, false, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return false, false, err
+	}
+	record, ok := historyTieredFirstVisibleUserPromptRecord(result.Records)
+	if !ok {
+		return false, false, nil
+	}
+	if historyWatchPromptLooksTeamsOrigin(record.Text) {
+		return false, false, nil
+	}
+	threadID := strings.TrimSpace(firstNonEmptyString(record.ThreadID, result.State.ThreadID))
+	local, project, ok, err := b.findHistoryWatchCodexSession(ctx, path, threadID)
+	if err != nil || !ok {
+		return false, true, err
+	}
+	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
+		if err := b.ensureDurableSession(ctx, existing); err != nil {
+			return false, false, err
+		}
+		return false, false, nil
+	}
+	if strings.TrimSpace(local.FirstPrompt) == "" {
+		local.FirstPrompt = formatTranscriptRecordForTeams(record)
+	}
+	_, err = b.publishCodexSessionLocalWithOptions(ctx, local, project, publishCodexSessionOptions{
+		ChatCreatedNotification:         false,
+		ChatCreatedNoticeAfterImport:    true,
+		LocalSessionStartedNotification: true,
+	})
+	if err != nil {
+		return false, false, err
+	}
+	return true, false, nil
+}
+
+func historyTieredFirstVisibleUserPromptRecord(records []TranscriptRecord) (TranscriptRecord, bool) {
+	for _, record := range records {
+		if record.Kind != TranscriptKindUser {
+			continue
+		}
+		if strings.TrimSpace(formatTranscriptRecordForTeams(record)) == "" {
+			continue
+		}
+		return record, true
+	}
+	return TranscriptRecord{}, false
+}
+
+func historyWatchPromptLooksTeamsOrigin(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.Contains(text, teamsHelperSafetyInstructionLead) &&
+		strings.Contains(text, "Codex turn launched by the Teams helper")
+}
+
+type publishHistoryWatchFinalOptions struct {
+	ForceDetectedNotification bool
+}
+
+func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, final historyTieredFinal, opts publishHistoryWatchFinalOptions) (bool, error) {
 	if isSubagent, err := codexhistory.SessionFileIsSubagentContext(ctx, path); err == nil && isSubagent {
 		return true, nil
 	} else if err != nil && !os.IsNotExist(err) {
@@ -301,21 +371,53 @@ func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, fina
 		return false, err
 	}
 	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
+		if err := b.ensureDurableSession(ctx, existing); err != nil {
+			return false, err
+		}
+		if opts.ForceDetectedNotification && !b.sessionHasTeamsManagedTurns(ctx, existing.ID) {
+			b.queueWorkflowNotificationForDetectedCodexAnswer(ctx, existing, final.Key)
+			return true, nil
+		}
+		if !b.sessionHasTeamsManagedTurns(ctx, existing.ID) {
+			if err := b.syncSessionTranscript(ctx, *existing, local); err != nil {
+				return false, err
+			}
+		}
 		return true, nil
 	}
-	workflowNotificationsEnabled := b.workflowNotificationsEnabled(ctx)
 	_, err = b.publishCodexSessionLocalWithOptions(ctx, local, project, publishCodexSessionOptions{
-		ChatCreatedNotification: !workflowNotificationsEnabled,
+		ChatCreatedNotification: !b.workflowUserAttentionAvailable(ctx),
 	})
 	if err != nil {
 		return false, err
 	}
-	if workflowNotificationsEnabled {
-		if session := b.reg.SessionByCodexThreadID(local.SessionID); session != nil {
-			b.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, final.Key)
-		}
+	if session := b.reg.SessionByCodexThreadID(local.SessionID); session != nil {
+		b.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, final.Key)
 	}
 	return true, nil
+}
+
+func (b *Bridge) sessionHasTeamsManagedTurns(ctx context.Context, sessionID string) bool {
+	if b == nil || b.store == nil {
+		return true
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return true
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return true
+	}
+	if durable, ok := state.Sessions[sessionID]; ok && strings.TrimSpace(durable.LatestTurnID) != "" {
+		return true
+	}
+	for _, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) findHistoryWatchCodexSession(ctx context.Context, path string, threadID string) (codexhistory.Session, codexhistory.Project, bool, error) {

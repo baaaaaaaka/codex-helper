@@ -18,8 +18,9 @@ import (
 
 func TestWorkflowNotificationsDisabledByDefault(t *testing.T) {
 	store := newBridgeTestStore(t)
-	graph, _ := newBridgeTestGraph(t)
+	graph, sent := newBridgeTestGraph(t)
 	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	bindBridgeTestControlChat(t, store, "control-chat")
 	bridge.queueWorkflowNotificationForSentOutbox(context.Background(), workflowNotificationTestOutbox("outbox-final", "final", "turn_completed"))
 
 	state, err := store.Load(context.Background())
@@ -28,6 +29,12 @@ func TestWorkflowNotificationsDisabledByDefault(t *testing.T) {
 	}
 	if len(state.Notifications) != 0 {
 		t.Fatalf("notifications = %#v, want none", state.Notifications)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "✅ Codex finished"); got != 1 {
+		t.Fatalf("control fallback mentions = %d, want 1; sent=%#v", got, *sent)
+	}
+	if (*sent)[0].Mentions == 0 {
+		t.Fatalf("control fallback did not mention owner: %#v", *sent)
 	}
 }
 
@@ -110,6 +117,7 @@ func TestWorkflowNotificationSendsManualHelperUpgradeCard(t *testing.T) {
 		Kind:             "control-upgrade-complete",
 		NotificationKind: "helper_upgrade_completed",
 		Body:             helperLifecycleCompletedNoticeBody(helperRestartNoticeActionUpgrade, "v1.2.4"),
+		MentionOwner:     true,
 		Status:           teamstore.OutboxStatusSent,
 	})
 
@@ -189,7 +197,7 @@ func TestWorkflowNotificationFallsBackToSidecarConfigWhenOldHelperErasesState(t 
 func TestWorkflowNotificationDoesNotDuplicateAfterAmbiguousFailure(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
-	graph, _ := newBridgeTestGraph(t)
+	graph, sent := newBridgeTestGraph(t)
 	bridge := newWorkflowNotificationTestBridge(t, graph, store)
 	seedWorkflowNotificationState(t, store, "Avoid duplicate cards after an ambiguous webhook result")
 
@@ -216,6 +224,9 @@ func TestWorkflowNotificationDoesNotDuplicateAfterAmbiguousFailure(t *testing.T)
 	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("webhook calls after requeue = %d, want 1", got)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("ambiguous webhook failure should not also send fallback mention: %#v", *sent)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
@@ -433,10 +444,10 @@ func TestWorkflowNotificationRetriesOnlyRetryableFailuresWithBackoff(t *testing.
 	}
 }
 
-func TestWorkflowNotificationSuppressesAfterControlChatRebind(t *testing.T) {
+func TestWorkflowNotificationFallsBackAfterControlChatRebind(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
-	graph, _ := newBridgeTestGraph(t)
+	graph, sent := newBridgeTestGraph(t)
 	bridge := newWorkflowNotificationTestBridge(t, graph, store)
 	seedWorkflowNotificationState(t, store, "Control changed")
 
@@ -452,6 +463,7 @@ func TestWorkflowNotificationSuppressesAfterControlChatRebind(t *testing.T) {
 		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
 	}
 	bridge.reg.ControlChatID = "new-control-chat"
+	bindBridgeTestControlChat(t, store, "new-control-chat")
 	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-rebound", "final", "turn_completed"))
 
 	if got := atomic.LoadInt32(&calls); got != 0 {
@@ -461,9 +473,63 @@ func TestWorkflowNotificationSuppressesAfterControlChatRebind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	rec := state.Notifications["workflow:"+shortStableID("outbox-rebound")]
-	if rec.Status != teamstore.NotificationStatusQueued {
-		t.Fatalf("notification status = %q, want queued while control binding mismatches", rec.Status)
+	if rec := state.Notifications["workflow:"+shortStableID("outbox-rebound")]; rec.ID != "" {
+		t.Fatalf("control rebind should not queue a stale workflow card: %#v", rec)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"✅ Codex finished", "Workflow card is unavailable because the control chat changed", "Open answer"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("control-rebind fallback missing %q:\n%s", want, joined)
+		}
+	}
+	if len(*sent) != 1 || (*sent)[0].ChatID != "new-control-chat" || (*sent)[0].Mentions == 0 {
+		t.Fatalf("control-rebind fallback sent=%#v, want one owner mention in new control chat", *sent)
+	}
+}
+
+func TestWorkflowNotificationDoesNotUseWebhookWhenCurrentControlUnknown(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Control binding disappeared")
+
+	var calls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Workflow = teamstore.WorkflowNotificationConfig{
+			Enabled:               true,
+			ControlWebhookURLFile: urlFile,
+			ControlChatID:         "control-chat",
+		}
+		state.ControlChat = teamstore.ControlChatBinding{}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed workflow config: %v", err)
+	}
+	bridge.reg.ControlChatID = ""
+	bridge.reg.ControlChatURL = ""
+
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-unknown-control", "final", "turn_completed"))
+
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("webhook calls = %d, want 0 when configured control chat cannot be matched", got)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("fallback messages = %#v, want none without a durable control fallback", *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if rec := state.Notifications["workflow:"+shortStableID("outbox-unknown-control")]; rec.ID != "" {
+		t.Fatalf("unknown control should not queue a stale workflow card: %#v", rec)
 	}
 }
 
@@ -703,12 +769,12 @@ func TestQueueOutboxSuppressesOwnerMentionWhenWorkflowNotificationEnabled(t *tes
 	}
 }
 
-func TestQueueOutboxKeepsOwnerMentionWhenWorkflowNotificationDisabled(t *testing.T) {
+func TestQueueOutboxRedirectsOwnerMentionToControlFallbackWhenWorkflowNotificationDisabled(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	graph, _ := newBridgeTestGraph(t)
 	bridge := newWorkflowNotificationTestBridge(t, graph, store)
-	seedWorkflowNotificationState(t, store, "Keep graph mention without webhook card")
+	seedWorkflowNotificationState(t, store, "Use control chat fallback without webhook card")
 
 	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
 		ID:               "outbox:mention-kept",
@@ -723,8 +789,75 @@ func TestQueueOutboxKeepsOwnerMentionWhenWorkflowNotificationDisabled(t *testing
 	if err != nil {
 		t.Fatalf("queueOutbox: %v", err)
 	}
+	if queued.MentionOwner {
+		t.Fatalf("MentionOwner = true, want false because control chat fallback will mention owner: %#v", queued)
+	}
+}
+
+func TestQueueOutboxKeepsOwnerMentionWhenNoCardOrControlFallbackExists(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	bridge.reg.ControlChatID = ""
+	bridge.reg.ControlChatURL = ""
+	seedWorkflowNotificationState(t, store, "Keep work chat mention without card or control fallback")
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{}
+		return nil
+	}); err != nil {
+		t.Fatalf("clear control chat: %v", err)
+	}
+
+	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:mention-kept-without-control",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "final",
+		Body:             "done",
+		MentionOwner:     true,
+		NotificationKind: "turn_completed",
+	})
+	if err != nil {
+		t.Fatalf("queueOutbox: %v", err)
+	}
 	if !queued.MentionOwner {
-		t.Fatalf("MentionOwner = false, want true when workflow card is disabled: %#v", queued)
+		t.Fatalf("MentionOwner = false, want true when no workflow card or control fallback exists: %#v", queued)
+	}
+}
+
+func TestWorkflowNotificationFallsBackToControlMentionWhenWebhookConfigInvalid(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Invalid webhook should still notify")
+	badPath := filepath.Join(t.TempDir(), "webhook-url")
+	if err := os.WriteFile(badPath, []byte("http://workflow.example.test/hook"), 0o600); err != nil {
+		t.Fatalf("write invalid webhook file: %v", err)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Workflow = teamstore.WorkflowNotificationConfig{
+			Enabled:               true,
+			ControlWebhookURLFile: badPath,
+			ControlChatID:         "control-chat",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed invalid workflow config: %v", err)
+	}
+
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, workflowNotificationTestOutbox("outbox-invalid-webhook", "final", "turn_completed"))
+
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"✅ Codex finished", "Workflow card is unavailable", "absolute https URL", "Open answer"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("fallback message missing %q:\n%s", want, joined)
+		}
+	}
+	if len(*sent) != 1 || (*sent)[0].ChatID != "control-chat" || (*sent)[0].Mentions == 0 {
+		t.Fatalf("invalid webhook fallback sent=%#v, want one owner mention in control chat", *sent)
 	}
 }
 
@@ -816,6 +949,10 @@ func seedWorkflowNotificationState(t *testing.T, store *teamstore.Store, request
 	t.Helper()
 	now := time.Now()
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			TeamsChatID:  "control-chat",
+			TeamsChatURL: TeamsChatURL("control-chat", "tenant-1"),
+		}
 		state.Sessions["s001"] = teamstore.SessionContext{
 			ID:           "s001",
 			Status:       teamstore.SessionStatusActive,

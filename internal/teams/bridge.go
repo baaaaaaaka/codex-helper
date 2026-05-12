@@ -407,6 +407,27 @@ func (b *Bridge) sendChatCreatedNotice(ctx context.Context, sessionID string, ch
 	})
 }
 
+func (b *Bridge) sendLocalSessionStartedNotice(ctx context.Context, sessionID string, chatID string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	text := "Local Codex chat detected."
+	if sessionID != "" {
+		text = "Local Codex chat detected: " + sessionID + "."
+	}
+	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:               directOutboxID(chatID, "local-session-started", text),
+		SessionID:        sessionID,
+		TeamsChatID:      chatID,
+		Kind:             "local-session-started",
+		Body:             text,
+		MentionOwner:     true,
+		NotificationKind: "local_session_started",
+	})
+}
+
 func (b *Bridge) findExistingControlChat(ctx context.Context, topic string) (Chat, bool) {
 	topic = strings.TrimSpace(SanitizeTopic(topic))
 	if topic == "" || b.graph == nil {
@@ -6999,6 +7020,10 @@ func (b *Bridge) shouldSuppressOwnerMentionForWorkflow(ctx context.Context, msg 
 	if err != nil {
 		return false
 	}
+	controlChatID := workflowFallbackControlChatID(state)
+	if controlChatID != "" && strings.TrimSpace(msg.TeamsChatID) != controlChatID {
+		return true
+	}
 	if !workflowNotificationConfigPresent(state.Workflow) && strings.TrimSpace(b.scope.ID) == "" {
 		return false
 	}
@@ -7006,7 +7031,10 @@ func (b *Bridge) shouldSuppressOwnerMentionForWorkflow(ctx context.Context, msg 
 	if err != nil {
 		return false
 	}
-	return cfg.Enabled
+	if cfg.Enabled && b.workflowCardAvailable(ctx) {
+		return true
+	}
+	return false
 }
 
 func workflowNotificationConfigPresent(cfg teamstore.WorkflowNotificationConfig) bool {
@@ -7018,6 +7046,8 @@ func outboxHasWorkflowNotificationCandidate(outbox teamstore.OutboxMessage) bool
 	notificationKind := strings.ToLower(strings.TrimSpace(outbox.NotificationKind))
 	switch {
 	case notificationKind == "chat_created" || kind == "chat-created":
+		return true
+	case notificationKind == "local_session_started" || kind == "local-session-started":
 		return true
 	case notificationKind == "chat_recreated" || kind == "chat-moved":
 		return true
@@ -7997,8 +8027,10 @@ func (b *Bridge) publishCodexSessionLocal(ctx context.Context, local codexhistor
 }
 
 type publishCodexSessionOptions struct {
-	Notify                  func(context.Context, string) error
-	ChatCreatedNotification bool
+	Notify                          func(context.Context, string) error
+	ChatCreatedNotification         bool
+	ChatCreatedNoticeAfterImport    bool
+	LocalSessionStartedNotification bool
 }
 
 func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local codexhistory.Session, project codexhistory.Project, opts publishCodexSessionOptions) (string, error) {
@@ -8073,11 +8105,26 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 			return "", err
 		}
 	}
-	if err := b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification); err != nil {
-		return "", err
+	if !opts.ChatCreatedNoticeAfterImport {
+		if opts.LocalSessionStartedNotification {
+			if err := b.sendLocalSessionStartedNotice(ctx, session.ID, chat.ID); err != nil {
+				return "", err
+			}
+		} else if err := b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification); err != nil {
+			return "", err
+		}
 	}
 	if err := b.importCodexTranscriptToTeams(ctx, session, local); err != nil {
 		return "", err
+	}
+	if opts.ChatCreatedNoticeAfterImport {
+		if opts.LocalSessionStartedNotification {
+			if err := b.sendLocalSessionStartedNotice(ctx, session.ID, chat.ID); err != nil {
+				return "", err
+			}
+		} else if err := b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification); err != nil {
+			return "", err
+		}
 	}
 	return fmt.Sprintf("Published local Codex session as %s: %s\n\nOpen this Teams work chat and send a message there to continue.", session.ID, session.ChatURL), nil
 }

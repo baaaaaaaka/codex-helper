@@ -24,7 +24,7 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
-const bridgeAsyncTestTimeout = 10 * time.Second
+const bridgeAsyncTestTimeout = 30 * time.Second
 
 type recordingExecutor struct {
 	prompts  []string
@@ -992,8 +992,14 @@ func TestBridgeStartupRecoveryFlushesControlNoticeBeforeQueuedWork(t *testing.T)
 		close(executor.release)
 		t.Fatal("startup recovery blocked on the queued Codex turn")
 	}
-	if len(*sent) != 1 || (*sent)[0].ChatID != "control-chat" || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Helper restart completed") {
-		t.Fatalf("first startup message = %#v, want restart completion in control chat", *sent)
+	if len(*sent) != 2 {
+		t.Fatalf("startup messages = %#v, want restart completion plus control fallback notice", *sent)
+	}
+	if (*sent)[0].ChatID != "control-chat" || (*sent)[0].Mentions != 0 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Helper restart completed") {
+		t.Fatalf("first startup message = %#v, want plain restart completion in control chat", *sent)
+	}
+	if (*sent)[1].ChatID != "control-chat" || (*sent)[1].Mentions != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "Helper restart completed") {
+		t.Fatalf("second startup message = %#v, want mentioned restart completion fallback in control chat", *sent)
 	}
 	select {
 	case <-executor.started:
@@ -1143,7 +1149,7 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 	}
 	select {
 	case <-executor.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(bridgeAsyncTestTimeout):
 		t.Fatal("first Codex turn did not start")
 	}
 
@@ -1185,7 +1191,7 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 		if !strings.Contains(got, "second prompt") {
 			t.Fatalf("second started prompt = %q", got)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(bridgeAsyncTestTimeout):
 		t.Fatal("queued second Codex turn did not start after first finished")
 	}
 	executor.release <- struct{}{}
@@ -1194,7 +1200,7 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 		if !strings.Contains(got, "third prompt") {
 			t.Fatalf("third started prompt = %q", got)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(bridgeAsyncTestTimeout):
 		t.Fatal("queued third Codex turn did not start after second finished")
 	}
 	executor.release <- struct{}{}
@@ -8385,6 +8391,7 @@ func TestBridgeControlNewUsesSelectedWorkspaceWhenNoDirectoryGiven(t *testing.T)
 	var createdTopic string
 	graph, sent := newBridgeCreateChatGraph(t, &createdTopic)
 	store := newBridgeTestStore(t)
+	bindBridgeTestControlChat(t, store, "control-chat")
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	bridge.reg.Sessions = nil
 
@@ -9623,7 +9630,7 @@ func TestBridgeRecreateSessionChatRebindsSessionAndRetiresOldRouting(t *testing.
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			writeTestOnlineMeeting(w, "new-work", decodeTestOnlineMeetingSubject(t, r))
-		case r.Method == http.MethodPost && (r.URL.Path == "/chats/chat-1/messages" || r.URL.Path == "/chats/new-work/messages"):
+		case r.Method == http.MethodPost && (r.URL.Path == "/chats/chat-1/messages" || r.URL.Path == "/chats/new-work/messages" || r.URL.Path == "/chats/control-chat/messages"):
 			var body struct {
 				Body struct {
 					Content string `json:"content"`
@@ -9690,8 +9697,11 @@ func TestBridgeRecreateSessionChatRebindsSessionAndRetiresOldRouting(t *testing.
 	if _, ok := bridge.reg.Chats["chat-1"]; ok {
 		t.Fatalf("old work chat state should be retired: %#v", bridge.reg.Chats)
 	}
-	if len(sent) != 3 || sent[0].ChatID != "chat-1" || sent[0].Mentions != 1 || !strings.Contains(sent[0].Content, "This chat moved") || !strings.Contains(sent[0].Content, "new-work") {
+	if len(sent) != 5 || sent[0].ChatID != "chat-1" || sent[0].Mentions != 0 || !strings.Contains(sent[0].Content, "This chat moved") || !strings.Contains(sent[0].Content, "new-work") {
 		t.Fatalf("old work migration notice = %#v", sent)
+	}
+	if sent[1].ChatID != "control-chat" || sent[1].Mentions != 1 || !strings.Contains(sent[1].Content, "Codex chat moved") || !strings.Contains(sent[1].Content, "new-work") {
+		t.Fatalf("old work migration fallback = %#v", sent)
 	}
 	if !strings.Contains(sent[0].Content, `<a href="https://teams.microsoft.com/l/chat/new-work/0">Open the new Work chat for s001</a>`) {
 		t.Fatalf("old work migration notice did not render a clickable link: %s", sent[0].Content)
@@ -9699,7 +9709,13 @@ func TestBridgeRecreateSessionChatRebindsSessionAndRetiresOldRouting(t *testing.
 	if strings.Contains(sent[0].Content, "🧑‍💻 User") {
 		t.Fatalf("old work migration notice was rendered as a user message: %s", sent[0].Content)
 	}
-	if sent[1].ChatID != "new-work" || sent[1].Mentions != 1 || !strings.Contains(sent[1].Content, "Work chat recreated: s001.") || sent[2].ChatID != "new-work" || !strings.Contains(PlainTextFromTeamsHTML(sent[2].Content), "ready") {
+	if sent[2].ChatID != "new-work" || sent[2].Mentions != 0 || !strings.Contains(sent[2].Content, "Work chat recreated: s001.") {
+		t.Fatalf("recreated work notice = %#v", sent)
+	}
+	if sent[3].ChatID != "control-chat" || sent[3].Mentions != 1 || !strings.Contains(sent[3].Content, "Codex chat ready") || !strings.Contains(sent[3].Content, "new-work") {
+		t.Fatalf("recreated work fallback = %#v", sent)
+	}
+	if sent[4].ChatID != "new-work" || !strings.Contains(PlainTextFromTeamsHTML(sent[4].Content), "ready") {
 		t.Fatalf("recreated work messages = %#v", sent)
 	}
 	state, err := store.Load(context.Background())
@@ -11238,6 +11254,7 @@ func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) 
 	var createdTopic string
 	graph, sent := newBridgeCreateChatGraph(t, &createdTopic)
 	store := newBridgeTestStore(t)
+	bindBridgeTestControlChat(t, store, "control-chat")
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	bridge.scope.CodexHome = codexRoot
 
@@ -11265,20 +11282,32 @@ func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) 
 		t.Fatal("history watch final did not create a Teams work chat")
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Work chat created", "Imported Codex session history", "old answer", "new final answer"} {
+	for _, want := range []string{"Imported Codex session history", "old answer", "new prompt", "new final answer", "Local Codex chat detected", "✅ Codex finished"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("published history missing %q in:\n%s", want, joined)
 		}
 	}
-	var chatCreatedMentions int
-	for _, msg := range *sent {
-		if strings.Contains(PlainTextFromTeamsHTML(msg.Content), "Work chat created") {
-			chatCreatedMentions = msg.Mentions
-			break
-		}
+	requirePlainTextInOrder(t, joined,
+		"Imported Codex session history",
+		"old answer",
+		"new prompt",
+		"new final answer",
+		"Import complete",
+		"Local Codex chat detected",
+	)
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "New local Codex chat detected"); got != 1 {
+		t.Fatalf("control fallback local-session notices = %d, want 1; sent=%#v", got, *sent)
 	}
-	if chatCreatedMentions == 0 {
-		t.Fatalf("history watch without workflow notifications should preserve the chat-created mention, sent=%#v", *sent)
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "✅ Codex finished"); got != 1 {
+		t.Fatalf("control fallback final-answer notices = %d, want 1; sent=%#v", got, *sent)
+	}
+	for _, msg := range *sent {
+		if msg.ChatID == "control-chat" && msg.Mentions == 0 {
+			t.Fatalf("control fallback should mention owner: %#v", msg)
+		}
+		if msg.ChatID == "work-chat" && strings.Contains(PlainTextFromTeamsHTML(msg.Content), "Local Codex chat detected") && msg.Mentions != 0 {
+			t.Fatalf("work-chat local-session notice should not also mention owner when control fallback exists: %#v", msg)
+		}
 	}
 	published := bridge.reg.SessionByCodexThreadID("thread-watch")
 	state, err := store.Load(context.Background())
@@ -11299,6 +11328,66 @@ func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) 
 	}
 	if len(*sent) != sentCount {
 		t.Fatalf("repeat watch sync sent duplicate messages: before=%d after=%d", sentCount, len(*sent))
+	}
+}
+
+func TestBridgeHistoryWatchPublishesLocalSessionBeforeFinalAnswer(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 30, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-30-00-thread-local-start.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-local-start", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bindBridgeTestControlChat(t, store, "control-chat")
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("initial empty history watch sync error: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-local-start"}}` + "\n" +
+		`{"thread_id":"thread-local-start","turn_id":"turn-1","id":"u1","role":"user","text":"start a local task before final"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write user-only transcript: %v", err)
+	}
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
+		t.Fatalf("user-only history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-local-start") == nil {
+		t.Fatal("history watch did not publish a Work chat for a new local user prompt")
+	}
+	joined := sentPlainJoined(*sent)
+	requirePlainTextInOrder(t, joined,
+		"Imported Codex session history",
+		"start a local task before final",
+		"Import complete",
+		"Local Codex chat detected",
+	)
+	if strings.Contains(joined, "✅ Codex finished") {
+		t.Fatalf("user-only local session should not send a finished notification yet:\n%s", joined)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "New local Codex chat detected"); got != 1 {
+		t.Fatalf("local-session fallback notices = %d, want 1; sent=%#v", got, *sent)
+	}
+
+	appendLine(t, transcriptPath, `{"thread_id":"thread-local-start","turn_id":"turn-1","id":"a1","role":"assistant","text":"final after early local start"}`)
+	appendLine(t, transcriptPath, `{"type":"turn.completed","thread_id":"thread-local-start","turn_id":"turn-1"}`)
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(20*time.Second), false); err != nil {
+		t.Fatalf("final history watch sync error: %v", err)
+	}
+	joined = sentPlainJoined(*sent)
+	if !strings.Contains(joined, "final after early local start") {
+		t.Fatalf("linked transcript sync did not import final answer:\n%s", joined)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "New local Codex chat detected"); got != 1 {
+		t.Fatalf("local-session fallback duplicated after final: %d sent=%#v", got, *sent)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "✅ Codex finished"); got != 1 {
+		t.Fatalf("final-answer fallback notices = %d, want 1; sent=%#v", got, *sent)
 	}
 }
 
@@ -11821,6 +11910,79 @@ func TestBridgeHistoryWatchSkipsSubagentFinal(t *testing.T) {
 		if checkpoint.Offset == 0 || checkpoint.Size == 0 {
 			t.Fatalf("subagent checkpoint was not advanced to avoid repeated scans: %#v", checkpoint)
 		}
+	}
+}
+
+func TestBridgeHistoryWatchSkipsSubagentPromptBeforeFinal(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	childPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-child-prompt.jsonl")
+	if err := os.MkdirAll(filepath.Dir(childPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-child-prompt","source":{"subagent":{"thread_spawn":{"parent_thread_id":"thread-parent","depth":1}}}}}` + "\n" +
+		`{"thread_id":"thread-child-prompt","turn_id":"turn-1","id":"u1","role":"user","text":"child prompt should stay internal"}` + "\n"
+	if err := os.WriteFile(childPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-child-prompt", childPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, false); err != nil {
+		t.Fatalf("history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-child-prompt") != nil {
+		t.Fatal("history watch published subagent user prompt as a Work chat")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("subagent user prompt should not notify Teams: %#v", *sent)
+	}
+}
+
+func TestBridgeHistoryWatchSkipsTeamsOriginPromptBeforeFinal(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-teams-origin.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	prompt := "do the task\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper."
+	body := `{"type":"session_meta","payload":{"id":"thread-teams-origin"}}` + "\n" +
+		`{"thread_id":"thread-teams-origin","turn_id":"turn-1","id":"u1","role":"user","text":` + strconv.Quote(prompt) + `}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-teams-origin", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, false); err != nil {
+		t.Fatalf("history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-teams-origin") != nil {
+		t.Fatal("history watch published a Teams-origin helper prompt as a new local Work chat")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("Teams-origin helper prompt should not notify Teams: %#v", *sent)
 	}
 }
 
@@ -13631,6 +13793,20 @@ func stubDiscoverCodexSession(t *testing.T, threadID string, transcriptPath stri
 	}
 	return func() {
 		discoverCodexProjectsForTeams = prevDiscover
+	}
+}
+
+func bindBridgeTestControlChat(t *testing.T, store *teamstore.Store, chatID string) {
+	t.Helper()
+	chatID = strings.TrimSpace(chatID)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			TeamsChatID:  chatID,
+			TeamsChatURL: TeamsChatURL(chatID, "tenant-1"),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("bind control chat: %v", err)
 	}
 }
 

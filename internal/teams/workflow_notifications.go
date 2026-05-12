@@ -159,14 +159,14 @@ func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, out
 	if !ok {
 		return
 	}
-	if err := b.queueWorkflowNotification(ctx, event); err != nil {
+	if b.outboxAlreadyMentionedControlOwner(ctx, outbox) && !b.workflowCardAvailable(ctx) {
+		return
+	}
+	if err := b.queueUserAttentionNotification(ctx, event, ""); err != nil {
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
 		}
 		return
-	}
-	if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
-		_, _ = fmt.Fprintf(b.out, "Teams workflow notification send error: %v\n", err)
 	}
 }
 
@@ -199,14 +199,11 @@ func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswer(ctx context.Con
 	event.ID = "workflow:detected-codex-answer:" + shortStableID(session.ID+":"+sourceKey)
 	event.OutboxID = ""
 	event.TurnID = ""
-	if err := b.queueWorkflowNotification(ctx, event); err != nil {
+	if err := b.queueUserAttentionNotification(ctx, event, ""); err != nil {
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
 		}
 		return
-	}
-	if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
-		_, _ = fmt.Fprintf(b.out, "Teams workflow notification send error: %v\n", err)
 	}
 }
 
@@ -217,13 +214,6 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 	state, err := b.store.Load(ctx)
 	if err != nil {
 		return WorkflowNotificationEvent{}, false, err
-	}
-	cfg, err := b.effectiveWorkflowNotificationConfig(state)
-	if err != nil {
-		return WorkflowNotificationEvent{}, false, err
-	}
-	if !cfg.Enabled {
-		return WorkflowNotificationEvent{}, false, nil
 	}
 	if shouldSkipWorkflowNotificationOutbox(outbox) {
 		return WorkflowNotificationEvent{}, false, nil
@@ -252,6 +242,14 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 		event.Kind = "chat_ready"
 		event.Title = "💬 Codex chat ready"
 		event.Hint = "Open this chat to start or continue the task."
+		event.ButtonTitle = "Open chat"
+		if event.RequestSummary == "" {
+			event.RequestSummary = workflowFallbackRequestForSession(session)
+		}
+	case notificationKind == "local_session_started" || kind == "local-session-started":
+		event.Kind = "local_session_started"
+		event.Title = "💬 New local Codex chat detected"
+		event.Hint = "Open this chat to watch the answer and continue from the full local context."
 		event.ButtonTitle = "Open chat"
 		if event.RequestSummary == "" {
 			event.RequestSummary = workflowFallbackRequestForSession(session)
@@ -330,6 +328,149 @@ func (b *Bridge) workflowNotificationsEnabled(ctx context.Context) bool {
 		return false
 	}
 	return cfg.Enabled
+}
+
+func (b *Bridge) workflowUserAttentionAvailable(ctx context.Context) bool {
+	if b == nil || b.store == nil {
+		return false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err == nil && cfg.Enabled {
+		currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+		if workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
+			if _, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile); err == nil {
+				return true
+			}
+		}
+	}
+	return workflowFallbackControlChatID(state) != ""
+}
+
+func (b *Bridge) workflowCardAvailable(ctx context.Context) bool {
+	if b == nil || b.store == nil {
+		return false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	cfg, err := b.effectiveWorkflowNotificationConfig(state)
+	if err != nil || !cfg.Enabled {
+		return false
+	}
+	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	if !workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
+		return false
+	}
+	_, err = readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
+	return err == nil
+}
+
+func workflowConfigMatchesCurrentControl(cfg teamstore.WorkflowNotificationConfig, currentControlChatID string) bool {
+	configControlChatID := strings.TrimSpace(cfg.ControlChatID)
+	currentControlChatID = strings.TrimSpace(currentControlChatID)
+	if configControlChatID == "" {
+		return true
+	}
+	return currentControlChatID != "" && configControlChatID == currentControlChatID
+}
+
+func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event WorkflowNotificationEvent, fallbackReason string) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	cfg, cfgErr := b.effectiveWorkflowNotificationConfig(state)
+	if cfgErr != nil {
+		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, "Workflow card is unavailable: "+redactWorkflowNotificationError(cfgErr))
+	}
+	if !cfg.Enabled {
+		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, fallbackReason)
+	}
+	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	if !workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
+		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, "Workflow card is unavailable because the control chat changed.")
+	}
+	if _, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile); err != nil {
+		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, "Workflow card is unavailable: "+redactWorkflowNotificationError(err))
+	}
+	if err := b.queueWorkflowNotification(ctx, event); err != nil {
+		return err
+	}
+	if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams workflow notification send error: %v\n", err)
+	}
+	return nil
+}
+
+func (b *Bridge) queueWorkflowNotificationFallbackMention(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent, reason string) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	controlChatID := workflowFallbackControlChatID(state)
+	if controlChatID == "" {
+		return nil
+	}
+	body := workflowNotificationFallbackBody(event, reason)
+	if strings.TrimSpace(body) == "" {
+		return nil
+	}
+	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:workflow-fallback:" + shortStableID(event.ID),
+		SessionID:        controlFallbackSessionID,
+		TeamsChatID:      controlChatID,
+		Kind:             "workflow-fallback",
+		Body:             body,
+		MentionOwner:     true,
+		NotificationKind: "owner_notification",
+	})
+}
+
+func workflowNotificationFallbackBody(event WorkflowNotificationEvent, reason string) string {
+	lines := []string{}
+	if title := strings.TrimSpace(event.Title); title != "" {
+		lines = append(lines, title)
+	}
+	if chatTitle := strings.TrimSpace(event.ChatTitle); chatTitle != "" {
+		lines = append(lines, "", chatTitle)
+	}
+	if summary := strings.TrimSpace(event.RequestSummary); summary != "" {
+		lines = append(lines, "", summary)
+	}
+	if hint := strings.TrimSpace(event.Hint); hint != "" {
+		lines = append(lines, "", hint)
+	}
+	if reason = strings.TrimSpace(reason); reason != "" {
+		lines = append(lines, "", reason)
+	}
+	if url := strings.TrimSpace(event.ButtonURL); url != "" {
+		button := strings.TrimSpace(firstNonEmptyString(event.ButtonTitle, "Open chat"))
+		lines = append(lines, "", button+":", url)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func (b *Bridge) outboxAlreadyMentionedControlOwner(ctx context.Context, outbox teamstore.OutboxMessage) bool {
+	if b == nil || b.store == nil || !outbox.MentionOwner {
+		return false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	controlChatID := workflowFallbackControlChatID(state)
+	return controlChatID != "" && strings.TrimSpace(outbox.TeamsChatID) == controlChatID
+}
+
+func workflowFallbackControlChatID(state teamstore.State) string {
+	return strings.TrimSpace(state.ControlChat.TeamsChatID)
 }
 
 func shouldSkipWorkflowNotificationOutbox(outbox teamstore.OutboxMessage) bool {
@@ -851,6 +992,9 @@ func workflowControlChatTitle(b *Bridge, state teamstore.State) string {
 }
 
 func workflowNotificationButtonURL(b *Bridge, session *Session, outbox teamstore.OutboxMessage) string {
+	if movedURL := workflowNotificationMovedChatURL(outbox); movedURL != "" {
+		return movedURL
+	}
 	if session != nil && safeTeamsOpenURL(session.ChatURL) {
 		return strings.TrimSpace(session.ChatURL)
 	}
@@ -862,6 +1006,21 @@ func workflowNotificationButtonURL(b *Bridge, session *Session, outbox teamstore
 		tenantID = b.graph.tenantID()
 	}
 	return TeamsChatURL(outbox.TeamsChatID, tenantID)
+}
+
+func workflowNotificationMovedChatURL(outbox teamstore.OutboxMessage) string {
+	kind := strings.ToLower(strings.TrimSpace(outbox.Kind))
+	notificationKind := strings.ToLower(strings.TrimSpace(outbox.NotificationKind))
+	if notificationKind != "chat_recreated" && kind != "chat-moved" {
+		return ""
+	}
+	for _, field := range strings.Fields(outbox.Body) {
+		candidate := strings.Trim(field, "<>()[]{}\"'.,;")
+		if safeTeamsOpenURL(candidate) {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func workflowNotificationRequestSummary(state teamstore.State, outbox teamstore.OutboxMessage, session *Session) string {
