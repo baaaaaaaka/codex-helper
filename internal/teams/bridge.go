@@ -82,6 +82,8 @@ const (
 type helperRestartNotice struct {
 	Version          int       `json:"version"`
 	Action           string    `json:"action,omitempty"`
+	Tag              string    `json:"tag,omitempty"`
+	Manual           bool      `json:"manual,omitempty"`
 	ControlChatID    string    `json:"control_chat_id,omitempty"`
 	CommandMessageID string    `json:"command_message_id,omitempty"`
 	RequestedAt      time.Time `json:"requested_at,omitempty"`
@@ -90,6 +92,7 @@ type helperRestartNotice struct {
 const (
 	helperRestartNoticeActionRestart = "restart"
 	helperRestartNoticeActionReload  = "reload"
+	helperRestartNoticeActionUpgrade = "upgrade"
 )
 
 const (
@@ -127,6 +130,12 @@ type BridgeOptions struct {
 	HelperAutoUpdater          HelperAutoUpdater
 	HelperAutoUpdatePrerelease bool
 	CodexUpgrader              CodexUpgrader
+}
+
+type helperAutoUpdateApplyOptions struct {
+	Manual           bool
+	ControlChatID    string
+	CommandMessageID string
 }
 
 type HelperRestarter func(context.Context) error
@@ -2113,10 +2122,14 @@ func (b *Bridge) updateHelperFromControl(ctx context.Context, msg ChatMessage, a
 	if err := b.sendControl(ctx, helperUpdateScheduledMessage(*decision.Candidate, req.IncludePrerelease)); err != nil {
 		return err
 	}
-	if err := b.applyHelperAutoUpdateWhenDrained(ctx, BridgeOptions{
+	if err := b.applyHelperAutoUpdateWhenDrainedWithOptions(ctx, BridgeOptions{
 		HelperAutoUpdater: b.helperAutoUpdater,
 		HelperRestarter:   b.helperRestarter,
-	}, *decision.Candidate); err != nil {
+	}, *decision.Candidate, helperAutoUpdateApplyOptions{
+		Manual:           true,
+		ControlChatID:    firstNonEmptyString(b.reg.ControlChatID, msg.ChatID),
+		CommandMessageID: msg.ID,
+	}); err != nil {
 		return b.sendControl(ctx, "⚠️ Helper update failed\n\n"+err.Error())
 	}
 	return nil
@@ -2497,21 +2510,45 @@ func (b *Bridge) writePendingHelperReloadNotice(msg ChatMessage) error {
 	return b.writePendingHelperLifecycleNotice(msg, helperRestartNoticeActionReload)
 }
 
+func (b *Bridge) writePendingHelperUpgradeNotice(chatID string, commandMessageID string, tag string, manual bool) error {
+	return b.writePendingHelperLifecycleNoticeWithOptions(helperRestartNotice{
+		Version:          1,
+		Action:           helperRestartNoticeActionUpgrade,
+		Tag:              strings.TrimSpace(tag),
+		Manual:           manual,
+		ControlChatID:    strings.TrimSpace(chatID),
+		CommandMessageID: strings.TrimSpace(commandMessageID),
+		RequestedAt:      time.Now(),
+	})
+}
+
 func (b *Bridge) writePendingHelperLifecycleNotice(msg ChatMessage, action string) error {
+	return b.writePendingHelperLifecycleNoticeWithOptions(helperRestartNotice{
+		Version:          1,
+		Action:           normalizedHelperRestartNoticeAction(action),
+		ControlChatID:    strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, msg.ChatID)),
+		CommandMessageID: strings.TrimSpace(msg.ID),
+		RequestedAt:      time.Now(),
+	})
+}
+
+func (b *Bridge) writePendingHelperLifecycleNoticeWithOptions(notice helperRestartNotice) error {
 	path, err := b.pendingHelperRestartNoticePath()
 	if err != nil {
 		return err
 	}
-	chatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, msg.ChatID))
-	if chatID == "" {
-		return fmt.Errorf("control chat is not bound")
+	notice.Action = normalizedHelperRestartNoticeAction(notice.Action)
+	notice.ControlChatID = strings.TrimSpace(firstNonEmptyString(notice.ControlChatID, b.reg.ControlChatID))
+	notice.CommandMessageID = strings.TrimSpace(notice.CommandMessageID)
+	notice.Tag = strings.TrimSpace(notice.Tag)
+	if notice.Version == 0 {
+		notice.Version = 1
 	}
-	notice := helperRestartNotice{
-		Version:          1,
-		Action:           normalizedHelperRestartNoticeAction(action),
-		ControlChatID:    chatID,
-		CommandMessageID: strings.TrimSpace(msg.ID),
-		RequestedAt:      time.Now(),
+	if notice.RequestedAt.IsZero() {
+		notice.RequestedAt = time.Now()
+	}
+	if notice.ControlChatID == "" {
+		return fmt.Errorf("control chat is not bound")
 	}
 	data, err := json.MarshalIndent(notice, "", "  ")
 	if err != nil {
@@ -2535,6 +2572,8 @@ func normalizedHelperRestartNoticeAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case helperRestartNoticeActionReload:
 		return helperRestartNoticeActionReload
+	case helperRestartNoticeActionUpgrade:
+		return helperRestartNoticeActionUpgrade
 	default:
 		return helperRestartNoticeActionRestart
 	}
@@ -2574,13 +2613,18 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 	action := normalizedHelperRestartNoticeAction(notice.Action)
 	seed := firstNonEmptyString(notice.CommandMessageID, notice.RequestedAt.Format(time.RFC3339Nano), chatID)
 	kind := "control-" + action + "-complete"
-	body := helperLifecycleCompletedNoticeBody(action)
-	if _, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
+	body := helperLifecycleCompletedNoticeBody(action, notice.Tag)
+	msg := teamstore.OutboxMessage{
 		ID:          "outbox:control:helper-" + action + "-complete:" + shortStableID(seed),
 		TeamsChatID: chatID,
 		Kind:        kind,
 		Body:        body,
-	}); err != nil {
+	}
+	if action == helperRestartNoticeActionUpgrade && notice.Manual {
+		msg.MentionOwner = true
+		msg.NotificationKind = "helper_upgrade_completed"
+	}
+	if _, err := b.queueOutbox(ctx, msg); err != nil {
 		return err
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -2589,10 +2633,17 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 	return nil
 }
 
-func helperLifecycleCompletedNoticeBody(action string) string {
+func helperLifecycleCompletedNoticeBody(action string, tag string) string {
 	switch normalizedHelperRestartNoticeAction(action) {
 	case helperRestartNoticeActionReload:
 		return "✅ Helper reload completed\n\nThe Teams helper is back online and running the reloaded code. Send `st` to check status."
+	case helperRestartNoticeActionUpgrade:
+		lines := []string{"✅ Helper update completed"}
+		if strings.TrimSpace(tag) != "" {
+			lines = append(lines, "", "Version: `"+strings.TrimSpace(tag)+"`")
+		}
+		lines = append(lines, "", "The Teams helper is back online and running the updated code.")
+		return strings.Join(lines, "\n")
 	default:
 		return "✅ Helper restart completed\n\nThe Teams helper is back online. Send `st` to check status."
 	}
@@ -2780,6 +2831,10 @@ func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOption
 }
 
 func (b *Bridge) applyHelperAutoUpdateWhenDrained(ctx context.Context, opts BridgeOptions, candidate HelperAutoUpdateCandidate) error {
+	return b.applyHelperAutoUpdateWhenDrainedWithOptions(ctx, opts, candidate, helperAutoUpdateApplyOptions{})
+}
+
+func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context, opts BridgeOptions, candidate HelperAutoUpdateCandidate, applyOpts helperAutoUpdateApplyOptions) error {
 	if opts.HelperAutoUpdater == nil {
 		return nil
 	}
@@ -2789,6 +2844,21 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrained(ctx context.Context, opts Brid
 			return nil
 		}
 		return err
+	}
+	if applyOpts.Manual {
+		chatID := strings.TrimSpace(firstNonEmptyString(applyOpts.ControlChatID, b.reg.ControlChatID))
+		if chatID != "" {
+			target := teamstore.UpgradeNotificationTarget{
+				TeamsChatID: chatID,
+				TurnID:      strings.TrimSpace(applyOpts.CommandMessageID),
+			}
+			if target.TurnID == "" {
+				target.TurnID = "manual-helper-upgrade"
+			}
+			if _, err := b.store.AddUpgradeNotificationTarget(ctx, req.ID, target); err != nil {
+				return err
+			}
+		}
 	}
 	state, err := b.store.Load(ctx)
 	if err != nil {
@@ -2829,13 +2899,36 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrained(ctx context.Context, opts Brid
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
 		return err
 	}
-	if _, err := b.store.CompleteUpgrade(ctx, req.ID); err != nil {
+	completed, err := b.store.CompleteUpgrade(ctx, req.ID)
+	if err != nil {
 		return err
 	}
+	completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(completed, b.reg.ControlChatID)
 	if opts.HelperRestarter == nil {
 		return nil
 	}
-	return opts.HelperRestarter(ctx)
+	if completionChatID != "" {
+		if err := b.writePendingHelperUpgradeNotice(completionChatID, completionCommandID, tag, manualNotice); err != nil {
+			return err
+		}
+	}
+	if err := opts.HelperRestarter(ctx); err != nil {
+		if completionChatID != "" {
+			_ = b.clearPendingHelperRestartNotice()
+		}
+		return err
+	}
+	return nil
+}
+
+func helperUpgradeCompletionTarget(req teamstore.UpgradeRequest, fallbackControlChatID string) (chatID string, commandMessageID string, manual bool) {
+	for _, target := range req.NotificationTargets {
+		if strings.TrimSpace(target.TeamsChatID) == "" {
+			continue
+		}
+		return strings.TrimSpace(target.TeamsChatID), strings.TrimSpace(target.TurnID), true
+	}
+	return strings.TrimSpace(fallbackControlChatID), "", false
 }
 
 func (b *Bridge) requestCodexUpgradeAfterFailure(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, cause error) error {
@@ -6930,6 +7023,8 @@ func outboxHasWorkflowNotificationCandidate(outbox teamstore.OutboxMessage) bool
 		return true
 	case notificationKind == "turn_completed":
 		return true
+	case notificationKind == "helper_upgrade_completed":
+		return true
 	case strings.Contains(kind, "reload-complete"):
 		return true
 	case strings.Contains(kind, "restart-complete"):
@@ -8453,6 +8548,8 @@ type localTranscriptDeltaState struct {
 	HasActionableTranscript bool
 }
 
+const localTranscriptCompletedTurnSettleWindow = 5 * time.Minute
+
 func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *Session) (localCodexBeforeTeamsGate, error) {
 	if b == nil || session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
 		return localCodexBeforeTeamsGate{}, nil
@@ -8518,6 +8615,13 @@ func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *
 		}, nil
 	}
 	if delta.Active {
+		advanced, err := b.advanceRecentCompletedTeamsTranscriptTail(ctx, *session, local)
+		if err != nil {
+			return localCodexBeforeTeamsGate{}, err
+		}
+		if advanced {
+			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		}
 		if !delta.CheckpointHadRecord && strings.TrimSpace(delta.CheckpointBeforeActive) != "" {
 			if err := b.recordTranscriptCheckpoint(ctx, *session, local.FilePath, delta.CheckpointBeforeActive, delta.CheckpointBeforeLine); err != nil {
 				return localCodexBeforeTeamsGate{}, err
@@ -8667,6 +8771,100 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 		out.NeedsSync = false
 	}
 	return out, nil
+}
+
+func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
+	if b == nil || strings.TrimSpace(local.FilePath) == "" {
+		return false, nil
+	}
+	if err := b.ensureStore(); err != nil {
+		return false, err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		return false, nil
+	}
+	switch checkpoint.Status {
+	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
+		return false, nil
+	}
+	recentTurn, ok := latestRecentCompletedTeamsTurn(state, session.ID, time.Now(), localTranscriptCompletedTurnSettleWindow)
+	if !ok {
+		return false, nil
+	}
+	if !checkpoint.UpdatedAt.IsZero() && !recentTurn.CompletedAt.IsZero() && checkpoint.UpdatedAt.After(recentTurn.CompletedAt) {
+		return false, nil
+	}
+	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
+	if err != nil {
+		return false, err
+	}
+	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") || len(transcript.Records) == 0 {
+		return false, nil
+	}
+	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
+	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
+	dedupe := newTranscriptDedupeState()
+	var lastKey string
+	var lastLine int
+	var lastOffset int64
+	for i, record := range transcript.Records {
+		body := formatTranscriptRecordForTeams(record)
+		skip := strings.TrimSpace(body) == "" ||
+			shouldSkipBackgroundTranscriptRecord(record) ||
+			transcriptRecordIsTerminal(record) ||
+			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
+			dedupe.shouldSkip(record, body) ||
+			record.Kind == TranscriptKindStatus
+		if !skip {
+			return false, nil
+		}
+		key := transcriptRecordCheckpointKey(record)
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		lastKey = key
+		lastLine, lastOffset = transcriptCheckpointPositionForRecord(transcript.Records, i)
+	}
+	if strings.TrimSpace(lastKey) == "" {
+		return false, nil
+	}
+	if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, lastKey, lastLine, lastOffset); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func latestRecentCompletedTeamsTurn(state teamstore.State, sessionID string, now time.Time, window time.Duration) (teamstore.Turn, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || window <= 0 {
+		return teamstore.Turn{}, false
+	}
+	var latest teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusCompleted || turn.CompletedAt.IsZero() {
+			continue
+		}
+		if now.Sub(turn.CompletedAt) > window {
+			continue
+		}
+		inbound, ok := state.InboundEvents[turn.InboundEventID]
+		if !ok {
+			continue
+		}
+		if inbound.Source != "" && inbound.Source != "teams" {
+			continue
+		}
+		if latest.CompletedAt.IsZero() || turn.CompletedAt.After(latest.CompletedAt) {
+			latest = turn
+		}
+	}
+	return latest, !latest.CompletedAt.IsZero()
 }
 
 func (s *localTranscriptDeltaState) setCheckpointBeforeActive(records []TranscriptRecord, index int) {
@@ -9618,23 +9816,23 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		"",
 		"Reply with a number to open a workspace.",
 		"",
+		"---",
 	}
-	for i, workspace := range dashboard.Workspaces {
-		if i > 0 {
-			lines = append(lines, "", "---", "")
-		}
-		lines = append(lines,
-			fmt.Sprintf("**%d. %s**", workspace.Number, dashboardWorkspaceListTitle(workspace)),
+	for _, workspace := range dashboard.Workspaces {
+		lines = append(lines, fmt.Sprintf("**%d. %s**", workspace.Number, dashboardWorkspaceListTitle(workspace)))
+		body := []string{
 			dashboardWorkspaceListPathLine(workspace),
 			dashboardWorkspaceListMeta(workspace),
-		)
-		if dashboardAbsolutePath(workspace.Path) == "" {
-			lines = append(lines, "Older Codex records without a working directory are grouped here.")
 		}
-		lines = append(lines,
+		if dashboardAbsolutePath(workspace.Path) == "" {
+			body = append(body, "Older Codex records without a working directory are grouped here.")
+		}
+		body = append(body,
 			"",
 			fmt.Sprintf("**Next:** send `%d` or `p %d` to open this workspace", workspace.Number, workspace.Number),
 		)
+		lines = append(lines, dashboardBlockquoteLines(body...)...)
+		lines = append(lines, "---")
 	}
 	lines = append(lines, "", "**Other options:**", "- Send a workspace number, for example `1`, to open it.", "- `n <directory>` or `new <directory>` - create a new Work chat directly.")
 	lines = append(lines, "", "Numbers apply to your next reply and expire after 10 minutes. If a number looks wrong, send `projects` again.")
@@ -9659,14 +9857,26 @@ func dashboardWorkspaceListPathLine(workspace DashboardWorkspace) string {
 }
 
 func dashboardWorkspaceListMeta(workspace DashboardWorkspace) string {
-	meta := fmt.Sprintf("%d sessions", workspace.SessionCount)
-	if workspace.SessionCount == 1 {
-		meta = "1 session"
+	if workspace.SessionCount <= 0 {
+		return "Sessions: none"
 	}
+	meta := fmt.Sprintf("%d active, %d idle", workspace.ActiveSessionCount, workspace.IdleSessionCount)
 	if !workspace.UpdatedAt.IsZero() {
-		meta += ", latest " + dashboardInlineCode(workspace.UpdatedAt.Local().Format("2006-01-02 15:04"))
+		meta += ", last updated " + workspace.UpdatedAt.Local().Format("2006-01-02 15:04")
 	}
 	return "Sessions: " + meta
+}
+
+func dashboardBlockquoteLines(lines ...string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			out = append(out, ">")
+			continue
+		}
+		out = append(out, "> "+line)
+	}
+	return out
 }
 
 func dashboardWorkspacePathDisplay(path string) string {
@@ -9774,6 +9984,7 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 		"",
 		"Reply with a number to continue a session in Teams.",
 		"",
+		"---",
 	}
 	if strings.TrimSpace(workspaceLine) == "" {
 		lines = []string{
@@ -9781,6 +9992,7 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 			"",
 			"Reply with a number to continue a session in Teams.",
 			"",
+			"---",
 		}
 	}
 	workspaceByID := make(map[string]DashboardWorkspace, len(dashboard.Workspaces))
@@ -9792,9 +10004,6 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 		session, ok := sessions[sessionKey(item.WorkspaceID, item.SessionID)]
 		if !ok {
 			continue
-		}
-		if displayed > 0 {
-			lines = append(lines, "", "---", "")
 		}
 		action := fmt.Sprintf("send `%d` or `c %d` to continue this session in Teams", item.Number, item.Number)
 		if linked := b.linkedSessionForLocalSessionID(session.ID); linked != nil {
@@ -9811,11 +10020,13 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 		} else if selectedWorkspace.ID != "" {
 			pathLine = dashboardWorkspaceListPathLine(selectedWorkspace)
 		}
-		lines = append(lines, pathLine)
+		body := []string{pathLine}
 		if meta := dashboardSessionListMeta(session); meta != "" {
-			lines = append(lines, meta)
+			body = append(body, meta)
 		}
-		lines = append(lines, "", "**Next:** "+action)
+		body = append(body, "", "**Next:** "+action)
+		lines = append(lines, dashboardBlockquoteLines(body...)...)
+		lines = append(lines, "---")
 		displayed++
 	}
 	lines = append(lines, "", "Need debug IDs? Send `details <number>`. Numbers expire after one reply.", "", "**Next:** send `new` to create a new Work chat in this workspace.")
@@ -9823,10 +10034,14 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 }
 
 func dashboardSessionListMeta(session DashboardSession) string {
-	if session.UpdatedAt.IsZero() {
-		return "Session: update time not recorded"
+	status := "idle"
+	if isActiveSessionStatus(session.Status) {
+		status = "active"
 	}
-	return "Session: updated " + dashboardInlineCode(session.UpdatedAt.Local().Format("2006-01-02 15:04"))
+	if session.UpdatedAt.IsZero() {
+		return "Session: " + status + ", update time not recorded"
+	}
+	return "Session: " + status + ", last updated " + session.UpdatedAt.Local().Format("2006-01-02 15:04")
 }
 
 func (b *Bridge) previousControlDashboard(ctx context.Context) ControlDashboard {

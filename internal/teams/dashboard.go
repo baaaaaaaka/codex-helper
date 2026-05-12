@@ -176,12 +176,14 @@ type ControlDashboard struct {
 }
 
 type DashboardWorkspace struct {
-	Number       int
-	ID           string
-	Path         string
-	DisplayTitle string
-	SessionCount int
-	UpdatedAt    time.Time
+	Number             int
+	ID                 string
+	Path               string
+	DisplayTitle       string
+	SessionCount       int
+	ActiveSessionCount int
+	IdleSessionCount   int
+	UpdatedAt          time.Time
 }
 
 type DashboardSession struct {
@@ -291,12 +293,15 @@ func buildDashboardWorkspaces(previous []DashboardWorkspace, inputs []DashboardW
 			continue
 		}
 		seen[id] = true
+		active, idle := dashboardSessionStatusCounts(input.Sessions)
 		workspaces = append(workspaces, DashboardWorkspace{
-			ID:           id,
-			Path:         strings.TrimSpace(input.Path),
-			DisplayTitle: WorkspaceDisplayTitle(input.UserTitle, input.Path),
-			SessionCount: len(input.Sessions),
-			UpdatedAt:    input.UpdatedAt,
+			ID:                 id,
+			Path:               strings.TrimSpace(input.Path),
+			DisplayTitle:       WorkspaceDisplayTitle(input.UserTitle, input.Path),
+			SessionCount:       len(input.Sessions),
+			ActiveSessionCount: active,
+			IdleSessionCount:   idle,
+			UpdatedAt:          input.UpdatedAt,
 		})
 	}
 	sort.SliceStable(workspaces, func(i, j int) bool { return dashboardWorkspaceLess(workspaces[i], workspaces[j]) })
@@ -304,6 +309,17 @@ func buildDashboardWorkspaces(previous []DashboardWorkspace, inputs []DashboardW
 		workspaces[i].Number = i + 1
 	}
 	return workspaces
+}
+
+func dashboardSessionStatusCounts(sessions []DashboardSessionInput) (active int, idle int) {
+	for _, session := range sessions {
+		if isActiveSessionStatus(session.Status) {
+			active++
+		} else {
+			idle++
+		}
+	}
+	return active, idle
 }
 
 func buildDashboardSessions(previous []DashboardSession, workspaceInputs []DashboardWorkspaceInput, selectedWorkspaceID string) []DashboardSession {

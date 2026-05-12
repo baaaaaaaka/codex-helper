@@ -10,11 +10,12 @@ import (
 )
 
 var (
-	tagPattern        = regexp.MustCompile(`(?s)<[^>]*>`)
-	lineBreakPattern  = regexp.MustCompile(`(?i)<br\s*/?>`)
-	tableCellPattern  = regexp.MustCompile(`(?i)</(?:th|td)>`)
-	tableRowPattern   = regexp.MustCompile(`(?i)</tr>`)
-	blockClosePattern = regexp.MustCompile(`(?i)</(?:p|div|li|pre|table)>`)
+	tagPattern            = regexp.MustCompile(`(?s)<[^>]*>`)
+	horizontalRulePattern = regexp.MustCompile(`(?i)<hr\s*/?>`)
+	lineBreakPattern      = regexp.MustCompile(`(?i)<br\s*/?>`)
+	tableCellPattern      = regexp.MustCompile(`(?i)</(?:th|td)>`)
+	tableRowPattern       = regexp.MustCompile(`(?i)</tr>`)
+	blockClosePattern     = regexp.MustCompile(`(?i)</(?:p|div|li|pre|table|blockquote)>`)
 )
 
 func SanitizeTopic(topic string) string {
@@ -66,6 +67,7 @@ func HTMLMessage(prefix string, text string) string {
 
 func PlainTextFromTeamsHTML(content string) string {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = horizontalRulePattern.ReplaceAllString(content, "\n———\n")
 	content = lineBreakPattern.ReplaceAllString(content, "\n")
 	content = tableCellPattern.ReplaceAllString(content, "\t")
 	content = tableRowPattern.ReplaceAllString(content, "\n")

@@ -182,10 +182,9 @@ func TestBridgeHelperAutoUpdatePassesPrereleaseOptIn(t *testing.T) {
 }
 
 func TestBridgeControlHelperUpdatePrereleaseRunsManualUpdate(t *testing.T) {
-	st, bridge := newBridgeAutoUpdateTest(t)
+	st := newBridgeTestStore(t)
 	graph, sent := newBridgeTestGraph(t)
-	bridge.graph = graph
-	bridge.reg.ControlChatID = "control-chat"
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
 	bridge.helperVersion = "v1.2.3"
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	updater := &fakeHelperAutoUpdater{decision: HelperAutoUpdateDecision{
@@ -224,6 +223,74 @@ func TestBridgeControlHelperUpdatePrereleaseRunsManualUpdate(t *testing.T) {
 	}
 	if state.AutoUpdate.LastInstalledTag != "v1.2.4-rc.1" {
 		t.Fatalf("LastInstalledTag = %q, want v1.2.4-rc.1", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || len(state.Upgrade.NotificationTargets) != 1 || state.Upgrade.NotificationTargets[0].TeamsChatID != "control-chat" {
+		t.Fatalf("manual helper update notification targets = %#v, want control chat target", state.Upgrade)
+	}
+	restartedBridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	if err := restartedBridge.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice after helper update error: %v", err)
+	}
+	if err := restartedBridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush helper update complete notice error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Helper update scheduled", "Helper update completed", "v1.2.4-rc.1", "updated code"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("manual helper update messages missing %q in:\n%s", want, joined)
+		}
+	}
+	if got := strings.Count(joined, "Helper update completed"); got != 1 {
+		t.Fatalf("manual helper update completion count = %d, want 1 in:\n%s", got, joined)
+	}
+}
+
+func TestBridgeHelperAutoUpdateQueuesPlainCompletionNotice(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	updater := &fakeHelperAutoUpdater{decision: HelperAutoUpdateDecision{
+		NextCheckAt: now.Add(30 * time.Minute),
+		Candidate: &HelperAutoUpdateCandidate{
+			TagName: "v1.2.4",
+			Version: "1.2.4",
+		},
+	}}
+	if err := bridge.maybeRunHelperAutoUpdate(context.Background(), BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+		HelperRestarter:   func(context.Context) error { return nil },
+	}); err != nil {
+		t.Fatalf("maybeRunHelperAutoUpdate error: %v", err)
+	}
+	restartedBridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	if err := restartedBridge.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice after auto update error: %v", err)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	var completion teamstore.OutboxMessage
+	for _, outbox := range state.OutboxMessages {
+		if strings.Contains(outbox.Kind, "upgrade-complete") {
+			completion = outbox
+			break
+		}
+	}
+	if completion.ID == "" {
+		t.Fatalf("auto helper update did not queue completion notice: %#v", state.OutboxMessages)
+	}
+	if completion.NotificationKind != "" || completion.MentionOwner {
+		t.Fatalf("auto helper update completion = %#v, want plain Teams message without card/mention", completion)
+	}
+	if err := restartedBridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush auto helper update complete notice error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Helper update completed") || !strings.Contains(joined, "v1.2.4") {
+		t.Fatalf("auto helper update completion message missing in:\n%s", joined)
 	}
 }
 

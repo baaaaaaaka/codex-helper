@@ -185,6 +185,31 @@ func TestControlDashboardOrdersWorkspacesAndSessionsByRecentActivity(t *testing.
 	}
 }
 
+func TestControlDashboardCountsWorkspaceSessionStatuses(t *testing.T) {
+	now := time.Date(2026, 5, 12, 14, 8, 0, 0, time.UTC)
+	dashboard := BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{
+		ViewKind: DashboardViewWorkspaces,
+		Workspaces: []DashboardWorkspaceInput{{
+			ID:        "workspace-a",
+			Path:      "/home/baka/projects/a",
+			UpdatedAt: now,
+			Sessions: []DashboardSessionInput{
+				{ID: "session-default-active"},
+				{ID: "session-explicit-active", Status: "active"},
+				{ID: "session-closed", Status: "closed"},
+				{ID: "session-local-history", Status: "local"},
+			},
+		}},
+	}, now)
+	if len(dashboard.Workspaces) != 1 {
+		t.Fatalf("workspaces = %#v, want one workspace", dashboard.Workspaces)
+	}
+	workspace := dashboard.Workspaces[0]
+	if workspace.SessionCount != 4 || workspace.ActiveSessionCount != 2 || workspace.IdleSessionCount != 2 {
+		t.Fatalf("workspace session counts = total %d active %d idle %d, want 4/2/2", workspace.SessionCount, workspace.ActiveSessionCount, workspace.IdleSessionCount)
+	}
+}
+
 func TestExpiredDashboardViewDoesNotGuess(t *testing.T) {
 	now := time.Date(2026, 4, 30, 10, 0, 0, 0, time.UTC)
 	dashboard := BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{

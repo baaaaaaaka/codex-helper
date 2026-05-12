@@ -17,6 +17,7 @@ const (
 	teamsMarkdownRule
 	teamsMarkdownList
 	teamsMarkdownTable
+	teamsMarkdownBlockquote
 )
 
 type teamsMarkdownBlock struct {
@@ -26,6 +27,7 @@ type teamsMarkdownBlock struct {
 	ordered bool
 	items   []teamsMarkdownListItem
 	table   teamsMarkdownTableData
+	blocks  []teamsMarkdownBlock
 }
 
 type teamsMarkdownListItem struct {
@@ -65,11 +67,23 @@ func renderTeamsMarkdownBlockHTML(block teamsMarkdownBlock) string {
 	if block.kind == teamsMarkdownCodeBlock {
 		return "<pre><code>" + html.EscapeString(block.text) + "</code></pre>"
 	}
+	if block.kind == teamsMarkdownRule {
+		return "<hr/>"
+	}
 	if block.kind == teamsMarkdownList {
 		return renderTeamsMarkdownListHTML(block)
 	}
 	if block.kind == teamsMarkdownTable {
 		return renderTeamsMarkdownTableHTML(block.table)
+	}
+	if block.kind == teamsMarkdownBlockquote {
+		var out strings.Builder
+		out.WriteString("<blockquote>")
+		for _, child := range block.blocks {
+			out.WriteString(renderTeamsMarkdownBlockHTML(child))
+		}
+		out.WriteString("</blockquote>")
+		return out.String()
 	}
 	return "<p>" + renderTeamsMarkdownBlockBodyHTML(block) + "</p>"
 }
@@ -86,8 +100,6 @@ func renderTeamsMarkdownBlockBodyHTML(block teamsMarkdownBlock) string {
 		default:
 			return "<em>" + body + "</em>"
 		}
-	case teamsMarkdownRule:
-		return "———"
 	default:
 		return renderTeamsInlineMarkdownWithLineBreaks(block.text)
 	}
@@ -189,6 +201,12 @@ func parseTeamsMarkdownBlocks(text string) []teamsMarkdownBlock {
 			flushParagraph()
 			continue
 		}
+		if block, next, ok := parseTeamsMarkdownBlockquote(lines, i); ok {
+			flushParagraph()
+			blocks = append(blocks, block)
+			i = next - 1
+			continue
+		}
 		if block, next, ok := parseTeamsMarkdownTableBlock(lines, i); ok {
 			flushParagraph()
 			blocks = append(blocks, block)
@@ -246,6 +264,35 @@ func parseTeamsMarkdownBlocks(text string) []teamsMarkdownBlock {
 	}
 	flushParagraph()
 	return blocks
+}
+
+func parseTeamsMarkdownBlockquote(lines []string, start int) (teamsMarkdownBlock, int, bool) {
+	var quoted []string
+	i := start
+	for ; i < len(lines); i++ {
+		text, ok := teamsMarkdownBlockquoteLine(lines[i])
+		if !ok {
+			break
+		}
+		quoted = append(quoted, text)
+	}
+	if len(quoted) == 0 {
+		return teamsMarkdownBlock{}, start, false
+	}
+	children := parseTeamsMarkdownBlocks(strings.Join(quoted, "\n"))
+	return teamsMarkdownBlock{kind: teamsMarkdownBlockquote, blocks: children}, i, true
+}
+
+func teamsMarkdownBlockquoteLine(line string) (string, bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(trimmed, ">") {
+		return "", false
+	}
+	body := strings.TrimPrefix(trimmed, ">")
+	if strings.HasPrefix(body, " ") {
+		body = body[1:]
+	}
+	return body, true
 }
 
 func parseTeamsMarkdownLooseIndentedCodeBlock(lines []string, start int) (teamsMarkdownBlock, int, bool) {

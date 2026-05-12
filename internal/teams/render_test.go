@@ -175,6 +175,24 @@ func TestRenderTeamsHTMLCodexMarkdownKeepsIndentedNestedListsReadable(t *testing
 	}
 }
 
+func TestRenderTeamsHTMLCodexMarkdownRulesAndBlockquotesUseStructuralHTML(t *testing.T) {
+	got := RenderTeamsHTML(TeamsRenderInput{
+		Kind: TeamsRenderHelper,
+		Text: "---\n**1. codex-helper**\n> `/home/baka/project/codex-helper`\n> Sessions: 1 active, 2 idle, last updated 2026-05-12 14:08\n>\n> **Next:** send `1` to select this project\n---",
+	})
+	for _, want := range []string{
+		`<hr/>`,
+		`<blockquote><p><code>/home/baka/project/codex-helper</code><br>Sessions: 1 active, 2 idle, last updated 2026-05-12 14:08</p><p><strong>Next:</strong> send <code>1</code> to select this project</p></blockquote>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered helper dashboard markdown missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "&gt;") || strings.Contains(got, "<p>---</p>") {
+		t.Fatalf("render should not expose quote markers or raw markdown rules:\n%s", got)
+	}
+}
+
 func TestPlanTeamsHTMLChunksStaysUnderHardLimitAndOrdersParts(t *testing.T) {
 	escapedUnitLen := len("&lt;&amp;&gt;")
 	repeat := TeamsRenderHardLimitBytes/escapedUnitLen + 1000

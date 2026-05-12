@@ -269,6 +269,13 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 		event.Title = "✅ Codex finished"
 		event.Hint = "The answer is ready in the work chat."
 		event.ButtonTitle = "Open answer"
+	case notificationKind == "helper_upgrade_completed":
+		event.Kind = "helper_upgrade_completed"
+		event.Title = "✅ Helper update completed"
+		event.ChatTitle = workflowControlChatTitle(b, state)
+		event.RequestSummary = ""
+		event.Hint = workflowMachineLabel(b) + " is back online and running the updated helper."
+		event.ButtonTitle = "Open Control"
 	case strings.Contains(kind, "reload-complete"):
 		event.Kind = "helper_reload_completed"
 		event.Title = "✅ Helper reload completed"
@@ -331,7 +338,7 @@ func shouldSkipWorkflowNotificationOutbox(outbox teamstore.OutboxMessage) bool {
 		return true
 	}
 	notificationKind := strings.ToLower(strings.TrimSpace(outbox.NotificationKind))
-	if notificationKind == "turn_completed" {
+	if notificationKind == "turn_completed" || notificationKind == "helper_upgrade_completed" {
 		return false
 	}
 	if strings.HasPrefix(kind, "import-") || strings.HasPrefix(kind, "sync-") || isTranscriptImportBatchOutboxKind(kind) {

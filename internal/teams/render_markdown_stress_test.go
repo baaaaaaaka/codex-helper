@@ -44,15 +44,15 @@ func TestRenderTeamsHTMLCodexMarkdownStressCorpus(t *testing.T) {
 			}, "\n"),
 			wantHTML: []string{
 				`<p><strong>🤖 ✅ Codex answer:</strong></p><p><strong>Result</strong></p>`,
-				`&gt; quoted &lt;b&gt;html&lt;/b&gt;`,
+				`<blockquote><p>quoted &lt;b&gt;html&lt;/b&gt;</p></blockquote>`,
 				`<ul><li>first item<br><ul><li>nested item with <strong>bold</strong> and <code>x &lt; y</code></li></ul></li></ul>`,
 				`<ol><li>ordered<br><ol><li>nested ordered</li></ol></li></ol>`,
-				`———`,
+				`<hr/>`,
 				`<pre><code>fmt.Println(&#34;&lt;safe&gt;&#34;)</code></pre>`,
 				`<table><tr><th>a</th><th>b</th></tr>`,
 				`<tr><td>&lt;x&gt;</td><td><strong>y</strong></td></tr>`,
 			},
-			wantPlain:     []string{"🤖 ✅ Codex answer:\nResult", "> quoted <b>html</b>", "first item\nnested item with bold and x < y", "ordered\nnested ordered", "fmt.Println(\"<safe>\")", "<x>\ty"},
+			wantPlain:     []string{"🤖 ✅ Codex answer:\nResult", "quoted <b>html</b>", "first item\nnested item with bold and x < y", "ordered\nnested ordered", "fmt.Println(\"<safe>\")", "<x>\ty"},
 			forbidHTML:    []string{`<b>html</b>`, `fmt.Println("<safe>")`},
 			wantPreBlocks: 1,
 		},
@@ -442,16 +442,16 @@ func TestRenderTeamsHTMLCodexMarkdownBlockStressBothCodexKinds(t *testing.T) {
 			plainParts: []string{"parent", "child after blank\ncontinuation"},
 		},
 		{
-			name:       "blockquote markers stay visible",
+			name:       "blockquote markers render as structural indentation",
 			input:      "> quoted **bold**\n> \n> - item\n>> nested\nnormal",
-			contains:   []string{`&gt; quoted <strong>bold</strong>`, `&gt; - item<br>&gt;&gt; nested<br>normal`},
+			contains:   []string{`<blockquote><p>quoted <strong>bold</strong></p><ul><li>item</li></ul><blockquote><p>nested</p></blockquote></blockquote><p>normal</p>`},
 			preBlocks:  0,
-			plainParts: []string{"> quoted bold", "> - item", ">> nested", "normal"},
+			plainParts: []string{"quoted bold", "item", "nested", "normal"},
 		},
 		{
 			name:       "rules and non rules",
 			input:      "before\n\n---\nafter\n\n* * *\n___\n- - -\nnot --- rule",
-			contains:   []string{"before", "———", "after", "not --- rule"},
+			contains:   []string{"before", "<hr/>", "after", "not --- rule"},
 			forbidden:  []string{"<p>---</p>", "<p>* * *</p>", "<p>___</p>"},
 			preBlocks:  0,
 			plainParts: []string{"before", "———", "after", "not --- rule"},
@@ -928,11 +928,13 @@ func assertTeamsRenderedHTMLSafe(t *testing.T, got string) {
 	if strings.Contains(got, "\r") {
 		t.Fatalf("rendered HTML kept carriage return: %q", got)
 	}
-	for _, allowed := range []string{"p", "br", "strong", "em", "s", "code", "pre", "a", "ul", "ol", "li", "table", "tr", "th", "td"} {
+	for _, allowed := range []string{"p", "br", "strong", "em", "s", "code", "pre", "a", "ul", "ol", "li", "table", "tr", "th", "td", "blockquote"} {
 		got = strings.ReplaceAll(got, "<"+allowed+">", "")
 		got = strings.ReplaceAll(got, "</"+allowed+">", "")
 	}
 	got = strings.ReplaceAll(got, "<br>", "")
+	got = strings.ReplaceAll(got, "<hr/>", "")
+	got = strings.ReplaceAll(got, "<hr>", "")
 	got = stripAllowedAnchorOpenTags(got)
 	if strings.Contains(got, "<") || strings.Contains(got, ">") {
 		unescaped := html.UnescapeString(got)

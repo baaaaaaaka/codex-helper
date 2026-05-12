@@ -2313,14 +2313,14 @@ func TestBridgeControlWorkspacesAndSessionsDoNotRunCodex(t *testing.T) {
 	}
 	workspaceDashboard := PlainTextFromTeamsHTML((*sent)[0].Content)
 	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
-	if !strings.Contains(workspaceDashboard, "1. alpha") || !strings.Contains(workspaceDashboard, expectedAlphaPath) || !strings.Contains(workspaceDashboard, "Sessions: 1 session") || !strings.Contains(workspaceDashboard, "Next: send 1 or p 1") {
+	if !strings.Contains(workspaceDashboard, "1. alpha") || !strings.Contains(workspaceDashboard, expectedAlphaPath) || !strings.Contains(workspaceDashboard, "Sessions: 0 active, 1 idle") || !strings.Contains(workspaceDashboard, "Next: send 1 or p 1") {
 		t.Fatalf("dashboard output missing readable workspace title/path: %q", workspaceDashboard)
 	}
 	sessionDashboard := PlainTextFromTeamsHTML((*sent)[1].Content)
 	if !strings.Contains(sessionDashboard, "Workspace: "+expectedAlphaPath) {
 		t.Fatalf("session dashboard should name selected workspace: %q", sessionDashboard)
 	}
-	if !strings.Contains(sessionDashboard, "1. fix alpha") || !strings.Contains(sessionDashboard, expectedAlphaPath) || !strings.Contains(sessionDashboard, "Session: updated") || !strings.Contains(sessionDashboard, "Next: send 1 or c 1") {
+	if !strings.Contains(sessionDashboard, "1. fix alpha") || !strings.Contains(sessionDashboard, expectedAlphaPath) || !strings.Contains(sessionDashboard, "Session: idle, last updated") || !strings.Contains(sessionDashboard, "Next: send 1 or c 1") {
 		t.Fatalf("session dashboard missing title/action: %q", sessionDashboard)
 	}
 	sessionLines := strings.Split(strings.TrimSpace(sessionDashboard), "\n")
@@ -2383,9 +2383,8 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 	expectedBetaPath := dashboardAbsolutePath("/home/user/project/beta")
 	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
 	for _, want := range []string{
-		"**1. beta**\n" + dashboardInlineCode(expectedBetaPath) + "\nSessions: 1 session, latest `2026-04-30 13:00`\n\n**Next:** send `1` or `p 1` to open this workspace",
-		"\n\n---\n\n",
-		"**2. alpha**\n" + dashboardInlineCode(expectedAlphaPath) + "\nSessions: 1 session, latest `2026-04-30 12:00`\n\n**Next:** send `2` or `p 2` to open this workspace",
+		"---\n**1. beta**\n> " + dashboardInlineCode(expectedBetaPath) + "\n> Sessions: 0 active, 1 idle, last updated 2026-04-30 13:00\n>\n> **Next:** send `1` or `p 1` to open this workspace\n---",
+		"---\n**2. alpha**\n> " + dashboardInlineCode(expectedAlphaPath) + "\n> Sessions: 0 active, 1 idle, last updated 2026-04-30 12:00\n>\n> **Next:** send `2` or `p 2` to open this workspace\n---",
 	} {
 		if !strings.Contains(workspaces, want) {
 			t.Fatalf("workspace dashboard missing %q in:\n%s", want, workspaces)
@@ -2399,7 +2398,7 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 	if err != nil {
 		t.Fatalf("formatWorkspaceSessionsDashboard error: %v", err)
 	}
-	wantSession := "**1. fix alpha**\n" + dashboardInlineCode(expectedAlphaPath) + "\nSession: updated `2026-04-30 12:00`\n\n**Next:** send `1` or `c 1` to continue this session in Teams"
+	wantSession := "---\n**1. fix alpha**\n> " + dashboardInlineCode(expectedAlphaPath) + "\n> Session: idle, last updated 2026-04-30 12:00\n>\n> **Next:** send `1` or `c 1` to continue this session in Teams\n---"
 	if !strings.Contains(sessions, wantSession) {
 		t.Fatalf("session dashboard missing readable block %q in:\n%s", wantSession, sessions)
 	}
@@ -2779,6 +2778,58 @@ func TestBridgeDashboardEmptyWorkspaceKeepsSessionsContext(t *testing.T) {
 	got := PlainTextFromTeamsHTML((*sent)[2].Content)
 	if !strings.Contains(got, "No local Codex sessions") || strings.Contains(got, "thread-beta") {
 		t.Fatalf("/sessions lost empty workspace context: %q", got)
+	}
+}
+
+func TestBridgeDashboardProjectAndSessionListsUseStructuralSeparatorsAndIndent(t *testing.T) {
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "alpha",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-alpha-1",
+				FirstPrompt: "fix alpha one",
+				ProjectPath: "/home/user/project/alpha",
+				ModifiedAt:  time.Date(2026, 5, 12, 14, 8, 0, 0, time.Local),
+			}, {
+				SessionID:   "thread-alpha-2",
+				FirstPrompt: "fix alpha two",
+				ProjectPath: "/home/user/project/alpha",
+				ModifiedAt:  time.Date(2026, 5, 12, 13, 8, 0, 0, time.Local),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-projects-format"), "projects"); err != nil {
+		t.Fatalf("projects error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-sessions-format"), "1"); err != nil {
+		t.Fatalf("sessions error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want projects and sessions", *sent)
+	}
+	projectsHTML := (*sent)[0].Content
+	if !strings.Contains(projectsHTML, "<hr/>") || !strings.Contains(projectsHTML, "<blockquote>") || strings.Contains(projectsHTML, "&gt; Sessions") {
+		t.Fatalf("projects HTML should use structural hr/blockquotes, got:\n%s", projectsHTML)
+	}
+	projectsPlain := PlainTextFromTeamsHTML(projectsHTML)
+	if !strings.Contains(projectsPlain, "———\n1. alpha") || !strings.Contains(projectsPlain, "Sessions: 0 active, 2 idle, last updated 2026-05-12 14:08") || strings.Contains(projectsPlain, "thread-alpha") {
+		t.Fatalf("projects plain text has wrong formatting or leaked session IDs:\n%s", projectsPlain)
+	}
+
+	sessionsHTML := (*sent)[1].Content
+	if !strings.Contains(sessionsHTML, "<hr/>") || !strings.Contains(sessionsHTML, "<blockquote>") || strings.Contains(sessionsHTML, "&gt; Session") {
+		t.Fatalf("sessions HTML should use structural hr/blockquotes, got:\n%s", sessionsHTML)
+	}
+	sessionsPlain := PlainTextFromTeamsHTML(sessionsHTML)
+	if !strings.Contains(sessionsPlain, "———\n1. fix alpha one") || !strings.Contains(sessionsPlain, "Session: idle, last updated 2026-05-12 14:08") {
+		t.Fatalf("sessions plain text has wrong formatting:\n%s", sessionsPlain)
 	}
 }
 
@@ -12128,6 +12179,93 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	}
 }
 
+func TestBridgeStartsTeamsPromptWhenOnlyRecentTeamsTranscriptTailLooksActive(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTranscriptTest(t, store, session, "previous teams prompt")
+
+	staleTeamsTail := initial +
+		`{"id":"u-prev","role":"user","text":"previous teams prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-prev","message":"previous Teams turn status still flushing","phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(staleTeamsTail), 0o600); err != nil {
+		t.Fatalf("write stale Teams tail transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-after-stale-tail", "2026-05-03T01:01:00Z", "new teams prompt")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "new teams prompt"); err != nil {
+		t.Fatalf("handleSessionMessage after stale Teams tail error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "new teams prompt") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Teams prompt did not start after stale Teams transcript tail")
+	}
+	if joined := sentPlainJoined(*sent); strings.Contains(joined, "Your request is queued") || strings.Contains(joined, "Local Codex CLI request") {
+		t.Fatalf("stale Teams tail incorrectly queued new prompt:\n%s", joined)
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
+}
+
+func TestBridgeStillQueuesTeamsPromptWhenRecentTranscriptTailHasLocalUser(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTranscriptTest(t, store, session, "previous teams prompt")
+
+	localTail := initial +
+		`{"id":"u-local","role":"user","text":"local CLI prompt after previous answer"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local CLI is still working","phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(localTail), 0o600); err != nil {
+		t.Fatalf("write local tail transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-after-local-tail", "2026-05-03T01:01:00Z", "new teams prompt")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "new teams prompt"); err != nil {
+		t.Fatalf("handleSessionMessage after local tail error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("Teams prompt started while local transcript tail was active: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Your request is queued") || !strings.Contains(joined, "Local Codex CLI request") {
+		t.Fatalf("local active tail did not queue Teams prompt:\n%s", joined)
+	}
+}
+
 func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -13686,6 +13824,47 @@ func newBridgeTestBridge(graph *GraphClient, store *teamstore.Store, executor Ex
 		},
 		executor: executor,
 		store:    store,
+	}
+}
+
+func seedRecentCompletedTeamsTurnForTranscriptTest(t *testing.T, store *teamstore.Store, session *Session, text string) {
+	t.Helper()
+	if session == nil {
+		t.Fatal("seed completed Teams turn: session is nil")
+	}
+	completedAt := time.Now()
+	inboundID := "inbound-prev:" + shortStableID(session.ID+":"+text)
+	turnID := "turn-prev:" + shortStableID(session.ID+":"+text)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.InboundEvents[inboundID] = teamstore.InboundEvent{
+			ID:             inboundID,
+			SessionID:      session.ID,
+			TeamsChatID:    session.ChatID,
+			TeamsMessageID: "teams-prev-" + shortStableID(text),
+			Text:           text,
+			TextHash:       normalizedTextHash(text),
+			Source:         "teams",
+			Status:         teamstore.InboundStatusPersisted,
+			TurnID:         turnID,
+			CreatedAt:      completedAt.Add(-2 * time.Second),
+			UpdatedAt:      completedAt.Add(-2 * time.Second),
+		}
+		state.Turns[turnID] = teamstore.Turn{
+			ID:             turnID,
+			SessionID:      session.ID,
+			InboundEventID: inboundID,
+			Status:         teamstore.TurnStatusCompleted,
+			StartedAt:      completedAt.Add(-time.Second),
+			CompletedAt:    completedAt,
+			CreatedAt:      completedAt.Add(-2 * time.Second),
+			UpdatedAt:      completedAt,
+		}
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		checkpoint.UpdatedAt = completedAt.Add(-time.Second)
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = checkpoint
+		return nil
+	}); err != nil {
+		t.Fatalf("seed completed Teams turn: %v", err)
 	}
 }
 
