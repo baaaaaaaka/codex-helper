@@ -753,6 +753,99 @@ func TestReadSessionMessages_MixedTypes(t *testing.T) {
 	}
 }
 
+func TestReadSessionPreviewMessagesFiltersToCodexStatusAndAnswer(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/tmp","source":"cli"}}`,
+		`{"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"user prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:02:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"visible status"}}`,
+		`{"timestamp":"2026-01-01T00:03:00Z","type":"response_item","payload":{"type":"function_call","name":"read","arguments":"{}"}}`,
+		`{"timestamp":"2026-01-01T00:04:00Z","type":"response_item","payload":{"type":"function_call_output","output":"tool output"}}`,
+		`{"timestamp":"2026-01-01T00:05:00Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"hidden thinking"}]}}`,
+		`{"timestamp":"2026-01-01T00:06:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible answer 1"}]}}`,
+		`{"timestamp":"2026-01-01T00:07:00Z","type":"turn.failed","error":{"message":"visible failure"}}`,
+		`{"timestamp":"2026-01-01T00:08:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"visible answer 2"}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("messages = %#v, want 4 visible messages", msgs)
+	}
+	want := []struct {
+		role string
+		text string
+	}{
+		{"assistant_commentary", "visible status"},
+		{"assistant", "visible answer 1"},
+		{"assistant_commentary", "visible failure"},
+		{"assistant", "visible answer 2"},
+	}
+	for i := range want {
+		if msgs[i].Role != want[i].role || msgs[i].Content != want[i].text {
+			t.Fatalf("msg[%d] = %#v, want role=%q text=%q", i, msgs[i], want[i].role, want[i].text)
+		}
+	}
+}
+
+func TestReadSessionPreviewMessagesParsesTurnFailedMethodRetryStatus(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","method":"turn/failed","params":{"turnId":"turn-1","willRetry":true}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","method":"turn/failed","params":{"turn":{"id":"turn-2"},"error":{"additionalDetails":"stream reset"}}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-failed-method.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want 2 failed-turn statuses", msgs)
+	}
+	if msgs[0].Role != "assistant_commentary" || msgs[0].Content != "Codex stream disconnected; reconnecting" {
+		t.Fatalf("retry status = %#v", msgs[0])
+	}
+	if msgs[1].Role != "assistant_commentary" || msgs[1].Content != "stream reset" {
+		t.Fatalf("failure status = %#v", msgs[1])
+	}
+}
+
+func TestReadSessionPreviewMessagesLimitCountsOnlyVisibleMessages(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"old visible"}]}}`,
+	}
+	for i := 0; i < 20; i++ {
+		lines = append(lines, `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","output":"hidden tool output"}}`)
+	}
+	lines = append(lines,
+		`{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"new status"}}`,
+		`{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"new answer"}]}}`,
+	)
+	f := filepath.Join(t.TempDir(), "preview-limit.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 2)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if got := len(msgs); got != 2 {
+		t.Fatalf("len = %d, want 2", got)
+	}
+	if msgs[0].Content != "new status" || msgs[1].Content != "new answer" {
+		t.Fatalf("messages = %#v, want last two visible messages", msgs)
+	}
+}
+
 func TestReadSessionMessages_MaxMessagesRingBuffer(t *testing.T) {
 	var lines []string
 	for i := 0; i < 10; i++ {

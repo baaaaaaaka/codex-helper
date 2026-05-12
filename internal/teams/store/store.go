@@ -402,6 +402,9 @@ type UpgradeRequest struct {
 	Reason              string                      `json:"reason,omitempty"`
 	PreviousControl     ServiceControl              `json:"previous_control,omitempty"`
 	NotificationTargets []UpgradeNotificationTarget `json:"notification_targets,omitempty"`
+	InstalledTag        string                      `json:"installed_tag,omitempty"`
+	CompletionNoticeID  string                      `json:"completion_notice_id,omitempty"`
+	CompletionNoticeAt  time.Time                   `json:"completion_notice_at,omitempty"`
 	DeadlineAt          time.Time                   `json:"deadline_at,omitempty"`
 	StartedAt           time.Time                   `json:"started_at,omitempty"`
 	ReadyAt             time.Time                   `json:"ready_at,omitempty"`
@@ -1138,11 +1141,37 @@ func (s *Store) AddUpgradeNotificationTarget(ctx context.Context, upgradeID stri
 	})
 }
 
-func (s *Store) CompleteUpgrade(ctx context.Context, upgradeID string) (UpgradeRequest, error) {
+func (s *Store) CompleteUpgrade(ctx context.Context, upgradeID string, installedTag ...string) (UpgradeRequest, error) {
+	tag := ""
+	if len(installedTag) > 0 {
+		tag = strings.TrimSpace(installedTag[0])
+	}
 	return s.updateUpgrade(ctx, upgradeID, func(req UpgradeRequest, now time.Time) (UpgradeRequest, error) {
 		req.Phase = UpgradePhaseCompleted
 		if req.CompletedAt.IsZero() {
 			req.CompletedAt = now
+		}
+		if tag != "" {
+			req.InstalledTag = tag
+		}
+		return req, nil
+	})
+}
+
+func (s *Store) MarkUpgradeCompletionNoticeQueued(ctx context.Context, upgradeID string, outboxID string) (UpgradeRequest, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	if outboxID == "" {
+		return UpgradeRequest{}, fmt.Errorf("completion notice outbox id is required")
+	}
+	return s.updateUpgrade(ctx, upgradeID, func(req UpgradeRequest, now time.Time) (UpgradeRequest, error) {
+		if req.Phase != UpgradePhaseCompleted {
+			return req, nil
+		}
+		if strings.TrimSpace(req.CompletionNoticeID) == "" {
+			req.CompletionNoticeID = outboxID
+		}
+		if req.CompletionNoticeAt.IsZero() {
+			req.CompletionNoticeAt = now
 		}
 		return req, nil
 	})

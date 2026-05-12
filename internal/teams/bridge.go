@@ -633,6 +633,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.maybeRunHelperAutoUpdate(ctx, opts); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams helper auto-update error: %v\n", err)
 		}
+		if _, err := b.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams helper upgrade completion notice error: %v\n", err)
+		}
 		if err := b.maybeRunPendingCodexUpgrade(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams Codex upgrade error: %v\n", err)
 		}
@@ -672,6 +675,11 @@ func (b *Bridge) initializeControlChatAndRecovery(ctx context.Context) (Chat, er
 	chat, err := b.EnsureControlChat(ctx)
 	if err != nil {
 		return Chat{}, err
+	}
+	if _, err := b.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams helper upgrade completion notice error: %v\n", err)
+		}
 	}
 	if err := b.queuePendingHelperRestartNotice(ctx); err != nil {
 		if b.out != nil {
@@ -2632,6 +2640,16 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 		return fmt.Errorf("pending helper restart notice has no control chat")
 	}
 	action := normalizedHelperRestartNoticeAction(notice.Action)
+	if action == helperRestartNoticeActionUpgrade {
+		if handled, err := b.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil {
+			return err
+		} else if handled {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			return nil
+		}
+	}
 	seed := firstNonEmptyString(notice.CommandMessageID, notice.RequestedAt.Format(time.RFC3339Nano), chatID)
 	kind := "control-" + action + "-complete"
 	body := helperLifecycleCompletedNoticeBody(action, notice.Tag)
@@ -2652,6 +2670,112 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (b *Bridge) queueCompletedHelperUpgradeNoticeIfNeeded(ctx context.Context) (bool, error) {
+	if b == nil || b.store == nil {
+		return false, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	req := state.Upgrade
+	if req == nil || req.Phase != teamstore.UpgradePhaseCompleted || strings.TrimSpace(req.Reason) != teamstore.HelperUpgradeReason {
+		return false, nil
+	}
+	msg, ok := b.completedHelperUpgradeNoticeMessage(state, *req)
+	if !ok {
+		return false, nil
+	}
+	if strings.TrimSpace(req.CompletionNoticeID) == "" {
+		if existing, ok := existingHelperUpgradeCompletionOutbox(state, *req, msg); ok {
+			msg.ID = existing.ID
+		}
+	}
+	if existing, exists := state.OutboxMessages[msg.ID]; exists {
+		if strings.TrimSpace(req.CompletionNoticeID) == "" || req.CompletionNoticeAt.IsZero() {
+			if _, err := b.store.MarkUpgradeCompletionNoticeQueued(ctx, req.ID, msg.ID); err != nil {
+				return false, err
+			}
+		}
+		if existing.Status != teamstore.OutboxStatusSent {
+			if err := b.flushPendingOutboxForChat(ctx, existing.TeamsChatID); err != nil && b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
+			}
+		}
+		return true, nil
+	}
+	if err := b.queueAndBestEffortSendOutbox(ctx, msg); err != nil {
+		return false, err
+	}
+	if _, err := b.store.MarkUpgradeCompletionNoticeQueued(ctx, req.ID, msg.ID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (b *Bridge) completedHelperUpgradeNoticeMessage(state teamstore.State, req teamstore.UpgradeRequest) (teamstore.OutboxMessage, bool) {
+	chatID, commandMessageID, manual := helperUpgradeCompletionTarget(req, firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return teamstore.OutboxMessage{}, false
+	}
+	tag := firstNonEmptyString(req.InstalledTag, state.AutoUpdate.LastInstalledTag, state.AutoUpdate.LastAttemptTag)
+	outboxID := strings.TrimSpace(req.CompletionNoticeID)
+	if outboxID == "" {
+		outboxID = helperUpgradeCompletionOutboxID(req, tag, chatID, commandMessageID)
+	}
+	msg := teamstore.OutboxMessage{
+		ID:          outboxID,
+		TeamsChatID: chatID,
+		Kind:        "control-" + helperRestartNoticeActionUpgrade + "-complete",
+		Body:        helperLifecycleCompletedNoticeBody(helperRestartNoticeActionUpgrade, tag),
+	}
+	if manual {
+		msg.MentionOwner = true
+		msg.NotificationKind = "helper_upgrade_completed"
+	}
+	return msg, true
+}
+
+func helperUpgradeCompletionOutboxID(req teamstore.UpgradeRequest, tag string, chatID string, commandMessageID string) string {
+	seed := strings.Join([]string{
+		strings.TrimSpace(req.ID),
+		strings.TrimSpace(tag),
+		strings.TrimSpace(chatID),
+		strings.TrimSpace(commandMessageID),
+	}, "\x00")
+	return "outbox:control:helper-upgrade-complete:" + shortStableID(seed)
+}
+
+func existingHelperUpgradeCompletionOutbox(state teamstore.State, req teamstore.UpgradeRequest, expected teamstore.OutboxMessage) (teamstore.OutboxMessage, bool) {
+	chatID := strings.TrimSpace(expected.TeamsChatID)
+	if chatID == "" {
+		return teamstore.OutboxMessage{}, false
+	}
+	expectedBody := strings.TrimSpace(expected.Body)
+	var best teamstore.OutboxMessage
+	found := false
+	for _, outbox := range state.OutboxMessages {
+		if strings.TrimSpace(outbox.TeamsChatID) != chatID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(outbox.Kind), "control-"+helperRestartNoticeActionUpgrade+"-complete") {
+			continue
+		}
+		if expectedBody != "" && strings.TrimSpace(outbox.Body) != expectedBody {
+			continue
+		}
+		if !req.CompletedAt.IsZero() && !outbox.CreatedAt.IsZero() && outbox.CreatedAt.Before(req.CompletedAt.Add(-10*time.Minute)) {
+			continue
+		}
+		if !found || outbox.CreatedAt.After(best.CreatedAt) {
+			best = outbox
+			found = true
+		}
+	}
+	return best, found
 }
 
 func helperLifecycleCompletedNoticeBody(action string, tag string) string {
@@ -2920,7 +3044,7 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
 		return err
 	}
-	completed, err := b.store.CompleteUpgrade(ctx, req.ID)
+	completed, err := b.store.CompleteUpgrade(ctx, req.ID, tag)
 	if err != nil {
 		return err
 	}

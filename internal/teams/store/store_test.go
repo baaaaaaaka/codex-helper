@@ -1086,12 +1086,22 @@ func TestUpgradeLifecycleRestoresControl(t *testing.T) {
 	if ready.Phase != UpgradePhaseReady || ready.ReadyAt.IsZero() {
 		t.Fatalf("ready request mismatch: %#v", ready)
 	}
-	completed, err := store.CompleteUpgrade(ctx, req.ID)
+	completed, err := store.CompleteUpgrade(ctx, req.ID, "v1.2.4")
 	if err != nil {
 		t.Fatalf("CompleteUpgrade error: %v", err)
 	}
 	if completed.Phase != UpgradePhaseCompleted || completed.CompletedAt.IsZero() {
 		t.Fatalf("completed request mismatch: %#v", completed)
+	}
+	if completed.InstalledTag != "v1.2.4" {
+		t.Fatalf("InstalledTag = %q, want v1.2.4", completed.InstalledTag)
+	}
+	notified, err := store.MarkUpgradeCompletionNoticeQueued(ctx, req.ID, "outbox-upgrade-complete")
+	if err != nil {
+		t.Fatalf("MarkUpgradeCompletionNoticeQueued error: %v", err)
+	}
+	if notified.CompletionNoticeID != "outbox-upgrade-complete" || notified.CompletionNoticeAt.IsZero() {
+		t.Fatalf("completion notice fields mismatch: %#v", notified)
 	}
 	control, err = store.ReadControl(ctx)
 	if err != nil {

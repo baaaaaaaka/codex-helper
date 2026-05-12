@@ -148,6 +148,35 @@ func TestFormatMessages_AllRoles(t *testing.T) {
 	}
 }
 
+func TestFormatPreviewMessagesShowsOnlyCodexStatusAndAnswer(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "hidden prompt"},
+		{Role: "assistant_commentary", Content: "checking tests"},
+		{Role: "tool", Content: "Tool: exec"},
+		{Role: "tool_result", Content: "stdout"},
+		{Role: "thinking", Content: "reasoning"},
+		{Role: "assistant", Content: "done"},
+	}
+	got := FormatPreviewMessages(msgs, 0)
+	for _, want := range []string{"Codex status:\nchecking tests", "Codex answer:\ndone"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in preview: %q", want, got)
+		}
+	}
+	for _, hidden := range []string{"hidden prompt", "Tool:", "stdout", "reasoning"} {
+		if strings.Contains(got, hidden) {
+			t.Fatalf("preview should hide %q: %q", hidden, got)
+		}
+	}
+}
+
+func TestFormatPreviewMessagesTruncatesVisibleText(t *testing.T) {
+	got := FormatPreviewMessages([]Message{{Role: "assistant", Content: "abcdef"}}, 3)
+	if got != "Codex answer:\nabc…" {
+		t.Fatalf("preview = %q, want truncated answer", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // FormatSession
 // ---------------------------------------------------------------------------

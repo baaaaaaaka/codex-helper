@@ -294,6 +294,237 @@ func TestBridgeHelperAutoUpdateQueuesPlainCompletionNotice(t *testing.T) {
 	}
 }
 
+func TestBridgeCompletedHelperUpgradeNoticeRecoversWithoutPendingFile(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	ctx := context.Background()
+
+	req, err := st.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	if _, err := st.AddUpgradeNotificationTarget(ctx, req.ID, teamstore.UpgradeNotificationTarget{
+		TurnID:      "control-message-1",
+		TeamsChatID: "control-chat",
+	}); err != nil {
+		t.Fatalf("AddUpgradeNotificationTarget error: %v", err)
+	}
+	if _, err := st.RecordAutoUpdateInstalled(ctx, "v1.2.4-rc.1", time.Now()); err != nil {
+		t.Fatalf("RecordAutoUpdateInstalled error: %v", err)
+	}
+	if _, err := st.CompleteUpgrade(ctx, req.ID, "v1.2.4-rc.1"); err != nil {
+		t.Fatalf("CompleteUpgrade error: %v", err)
+	}
+
+	handled, err := bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx)
+	if err != nil {
+		t.Fatalf("queueCompletedHelperUpgradeNoticeIfNeeded error: %v", err)
+	}
+	if !handled {
+		t.Fatal("queueCompletedHelperUpgradeNoticeIfNeeded handled=false, want true")
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(*sent))
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Helper update completed") || !strings.Contains(joined, "v1.2.4-rc.1") {
+		t.Fatalf("completion notice missing expected text:\n%s", joined)
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.Upgrade == nil || state.Upgrade.CompletionNoticeID == "" || state.Upgrade.CompletionNoticeAt.IsZero() {
+		t.Fatalf("upgrade completion notice was not marked durable: %#v", state.Upgrade)
+	}
+	outbox := state.OutboxMessages[state.Upgrade.CompletionNoticeID]
+	if outbox.ID == "" || !outbox.MentionOwner || outbox.NotificationKind != "helper_upgrade_completed" {
+		t.Fatalf("manual completion outbox = %#v, want owner mention and helper_upgrade_completed", outbox)
+	}
+
+	handled, err = bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx)
+	if err != nil {
+		t.Fatalf("second queueCompletedHelperUpgradeNoticeIfNeeded error: %v", err)
+	}
+	if !handled {
+		t.Fatal("second queueCompletedHelperUpgradeNoticeIfNeeded handled=false, want true")
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("completion notice sent %d times, want once", len(*sent))
+	}
+}
+
+func TestBridgeCompletedHelperUpgradeNoticeAutoIsPlainAndDedupes(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	ctx := context.Background()
+
+	req, err := st.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	if _, err := st.RecordAutoUpdateInstalled(ctx, "v1.2.4", time.Now()); err != nil {
+		t.Fatalf("RecordAutoUpdateInstalled error: %v", err)
+	}
+	if _, err := st.CompleteUpgrade(ctx, req.ID, "v1.2.4"); err != nil {
+		t.Fatalf("CompleteUpgrade error: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		handled, err := bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx)
+		if err != nil {
+			t.Fatalf("queueCompletedHelperUpgradeNoticeIfNeeded #%d error: %v", i+1, err)
+		}
+		if !handled {
+			t.Fatalf("queueCompletedHelperUpgradeNoticeIfNeeded #%d handled=false, want true", i+1)
+		}
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("auto completion notice sent %d times, want once", len(*sent))
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	outbox := state.OutboxMessages[state.Upgrade.CompletionNoticeID]
+	if outbox.ID == "" {
+		t.Fatalf("missing auto completion outbox: %#v", state.Upgrade)
+	}
+	if outbox.MentionOwner || outbox.NotificationKind != "" {
+		t.Fatalf("auto completion outbox = %#v, want plain Teams message", outbox)
+	}
+}
+
+func TestBridgePendingUpgradeNoticeDoesNotDuplicateDurableCompletionNotice(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	ctx := context.Background()
+
+	req, err := st.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	if _, err := st.AddUpgradeNotificationTarget(ctx, req.ID, teamstore.UpgradeNotificationTarget{
+		TurnID:      "control-message-1",
+		TeamsChatID: "control-chat",
+	}); err != nil {
+		t.Fatalf("AddUpgradeNotificationTarget error: %v", err)
+	}
+	if _, err := st.CompleteUpgrade(ctx, req.ID, "v1.2.4"); err != nil {
+		t.Fatalf("CompleteUpgrade error: %v", err)
+	}
+	if handled, err := bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil {
+		t.Fatalf("queueCompletedHelperUpgradeNoticeIfNeeded error: %v", err)
+	} else if !handled {
+		t.Fatal("queueCompletedHelperUpgradeNoticeIfNeeded handled=false, want true")
+	}
+	if err := bridge.writePendingHelperUpgradeNotice("control-chat", "control-message-1", "v1.2.4", true); err != nil {
+		t.Fatalf("writePendingHelperUpgradeNotice error: %v", err)
+	}
+	if err := bridge.queuePendingHelperRestartNotice(ctx); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("durable plus pending completion sent %d messages, want one", len(*sent))
+	}
+}
+
+func TestBridgePendingUpgradeNoticeRepairsMissingDurableCompletionOutbox(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	ctx := context.Background()
+
+	req, err := st.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	if _, err := st.CompleteUpgrade(ctx, req.ID, "v1.2.4"); err != nil {
+		t.Fatalf("CompleteUpgrade error: %v", err)
+	}
+	const durableID = "outbox:control:helper-upgrade-complete:missing-durable"
+	if _, err := st.MarkUpgradeCompletionNoticeQueued(ctx, req.ID, durableID); err != nil {
+		t.Fatalf("MarkUpgradeCompletionNoticeQueued error: %v", err)
+	}
+	if err := bridge.writePendingHelperUpgradeNotice("control-chat", "control-message-1", "v1.2.4", true); err != nil {
+		t.Fatalf("writePendingHelperUpgradeNotice error: %v", err)
+	}
+
+	if err := bridge.queuePendingHelperRestartNotice(ctx); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("pending repair sent %d completion messages, want one", len(*sent))
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if outbox := state.OutboxMessages[durableID]; outbox.ID != durableID {
+		t.Fatalf("missing durable outbox was not repaired: %#v", state.OutboxMessages)
+	}
+	for id := range state.OutboxMessages {
+		if strings.Contains(id, shortStableID("control-message-1")) {
+			t.Fatalf("legacy pending completion outbox should not be created when durable record can be repaired: %s", id)
+		}
+	}
+}
+
+func TestBridgeCompletedHelperUpgradeNoticeAdoptsLegacyOutbox(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	ctx := context.Background()
+
+	req, err := st.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	if _, err := st.CompleteUpgrade(ctx, req.ID, "v1.2.4"); err != nil {
+		t.Fatalf("CompleteUpgrade error: %v", err)
+	}
+	legacyID := "outbox:control:helper-upgrade-complete:legacy"
+	if _, _, err := st.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          legacyID,
+		TeamsChatID: "control-chat",
+		Kind:        "control-upgrade-complete",
+		Body:        helperLifecycleCompletedNoticeBody(helperRestartNoticeActionUpgrade, "v1.2.4"),
+		Status:      teamstore.OutboxStatusSent,
+	}); err != nil {
+		t.Fatalf("QueueOutbox legacy completion error: %v", err)
+	}
+
+	handled, err := bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx)
+	if err != nil {
+		t.Fatalf("queueCompletedHelperUpgradeNoticeIfNeeded error: %v", err)
+	}
+	if !handled {
+		t.Fatal("queueCompletedHelperUpgradeNoticeIfNeeded handled=false, want true")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("legacy sent completion should not be resent, sent=%#v", *sent)
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.Upgrade == nil || state.Upgrade.CompletionNoticeID != legacyID {
+		t.Fatalf("CompletionNoticeID = %#v, want legacy id %q", state.Upgrade, legacyID)
+	}
+	var completionCount int
+	for _, outbox := range state.OutboxMessages {
+		if strings.EqualFold(strings.TrimSpace(outbox.Kind), "control-upgrade-complete") {
+			completionCount++
+		}
+	}
+	if completionCount != 1 {
+		t.Fatalf("completion outbox count = %d, want 1", completionCount)
+	}
+}
+
 func TestBridgeControlHelperUpdateWaitsForActiveWork(t *testing.T) {
 	st, bridge := newBridgeAutoUpdateTest(t)
 	graph, sent := newBridgeTestGraph(t)

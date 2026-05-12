@@ -18,6 +18,14 @@ type Message struct {
 }
 
 func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
+	return readSessionMessages(filePath, maxMessages, nil)
+}
+
+func ReadSessionPreviewMessages(filePath string, maxMessages int) ([]Message, error) {
+	return readSessionMessages(filePath, maxMessages, isPreviewMessage)
+}
+
+func readSessionMessages(filePath string, maxMessages int, keep func(Message) bool) ([]Message, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -35,6 +43,9 @@ func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
 		line = bytes.TrimSpace(line)
 		if len(line) > 0 {
 			for _, msg := range parseLineMessages(line) {
+				if keep != nil && !keep(msg) {
+					continue
+				}
 				if msg.sourceID != "" {
 					if seenSourceIDs[msg.sourceID] {
 						continue
@@ -49,6 +60,15 @@ func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
 		}
 	}
 	return ring, nil
+}
+
+func isPreviewMessage(msg Message) bool {
+	switch msg.Role {
+	case "assistant", "assistant_commentary":
+		return strings.TrimSpace(msg.Content) != ""
+	default:
+		return false
+	}
 }
 
 func appendMessage(ring *[]Message, msg Message, maxMessages int) {
@@ -75,12 +95,16 @@ func parseLineMessages(line []byte) []Message {
 		return parseItemCompletedLine(line, ts)
 	case "turn.completed":
 		return parseTurnCompletedLine(line, ts)
+	case "turn.failed":
+		return parseTurnFailedLine(line, ts)
 	}
 	switch env.Method {
 	case "item/completed":
 		return parseItemCompletedRaw(env.Params, ts)
 	case "turn/completed":
 		return parseTurnCompletedRaw(env.Params, ts)
+	case "turn/failed":
+		return parseTurnFailedRaw(env.Params, ts)
 	}
 	return nil
 }
@@ -396,6 +420,69 @@ func parseTurnCompletedRaw(raw json.RawMessage, ts time.Time) []Message {
 		out = append(out, parseCompletedItem(item, ts)...)
 	}
 	return out
+}
+
+func parseTurnFailedLine(line []byte, ts time.Time) []Message {
+	var env struct {
+		Payload json.RawMessage `json:"payload"`
+		Params  json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(line, &env) != nil {
+		return nil
+	}
+	if len(bytes.TrimSpace(env.Payload)) > 0 {
+		if msgs := parseTurnFailedRaw(env.Payload, ts); len(msgs) > 0 {
+			return msgs
+		}
+	}
+	if len(bytes.TrimSpace(env.Params)) > 0 {
+		if msgs := parseTurnFailedRaw(env.Params, ts); len(msgs) > 0 {
+			return msgs
+		}
+	}
+	return parseTurnFailedRaw(json.RawMessage(line), ts)
+}
+
+func parseTurnFailedRaw(raw json.RawMessage, ts time.Time) []Message {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	var payload struct {
+		ID          string `json:"id"`
+		TurnID      string `json:"turn_id"`
+		TurnIDCamel string `json:"turnId"`
+		Turn        struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+		Error struct {
+			Code              string `json:"code"`
+			Message           string `json:"message"`
+			AdditionalDetails string `json:"additionalDetails"`
+		} `json:"error"`
+		Message   string `json:"message"`
+		Code      string `json:"code"`
+		WillRetry bool   `json:"willRetry"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return nil
+	}
+	text := firstNonEmptyString(
+		payload.Error.Message,
+		payload.Message,
+		payload.Error.AdditionalDetails,
+		payload.Error.Code,
+		payload.Code,
+	)
+	if strings.TrimSpace(text) == "" && payload.WillRetry {
+		text = "Codex stream disconnected; reconnecting"
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	sourceID := firstNonEmptyString(payload.ID, payload.TurnID, payload.TurnIDCamel, payload.Turn.ID)
+	return []Message{{Role: "assistant_commentary", Content: text, Timestamp: ts, sourceID: messageSourceID("turn.failed", sourceID)}}
 }
 
 func firstNonEmptyString(values ...string) string {

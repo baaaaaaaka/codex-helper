@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -89,8 +90,37 @@ func postUIEventWithRetry(ctx context.Context, done <-chan struct{}, screen tcel
 
 type previewEvent struct {
 	cacheKey string
+	meta     previewCacheMeta
 	text     string
 	err      error
+}
+
+const previewFilterVersion = "status-answer-v1"
+
+type previewCacheMeta struct {
+	path          string
+	size          int64
+	modTime       time.Time
+	filterVersion string
+	maxMessages   int
+}
+
+func (m previewCacheMeta) equal(other previewCacheMeta) bool {
+	return m.path == other.path &&
+		m.size == other.size &&
+		m.modTime.Equal(other.modTime) &&
+		m.filterVersion == other.filterVersion &&
+		m.maxMessages == other.maxMessages
+}
+
+type previewCacheEntry struct {
+	text string
+	meta previewCacheMeta
+}
+
+type previewErrorEntry struct {
+	message string
+	meta    previewCacheMeta
 }
 
 type projectLoadEvent struct {
@@ -174,9 +204,9 @@ type uiState struct {
 	yoloEnabled     bool
 
 	expandedSessions map[string]bool
-	previewCache     map[string]string
-	previewError     map[string]string
-	previewLoading   map[string]bool
+	previewCache     map[string]previewCacheEntry
+	previewError     map[string]previewErrorEntry
+	previewLoading   map[string]previewCacheMeta
 	previewSearch    string
 	previewSearchBuf string
 	previewMatches   []int
@@ -199,9 +229,9 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 		proxyConfigured:  opts.ProxyConfigured,
 		yoloEnabled:      opts.YoloEnabled,
 		expandedSessions: map[string]bool{},
-		previewCache:     map[string]string{},
-		previewError:     map[string]string{},
-		previewLoading:   map[string]bool{},
+		previewCache:     map[string]previewCacheEntry{},
+		previewError:     map[string]previewErrorEntry{},
+		previewLoading:   map[string]previewCacheMeta{},
 		statusHeight:     1,
 	}
 
@@ -370,15 +400,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 				for {
 					select {
 					case ev := <-previewCh:
-						if ev.cacheKey != "" {
-							if ev.err != nil {
-								state.previewError[ev.cacheKey] = ev.err.Error()
-							} else {
-								state.previewCache[ev.cacheKey] = ev.text
-								delete(state.previewError, ev.cacheKey)
-							}
-							state.previewLoading[ev.cacheKey] = false
-						}
+						applyPreviewEvent(state, ev)
 					default:
 						goto nextEvent
 					}
@@ -1001,25 +1023,73 @@ func ensurePreview(
 	if cacheKey == "" || filePath == "" {
 		return
 	}
-	if _, ok := state.previewCache[cacheKey]; ok {
-		return
-	}
-	if state.previewLoading[cacheKey] {
-		return
-	}
-	state.previewLoading[cacheKey] = true
-
 	maxMessages := opts.PreviewMessages
+	meta, err := previewCacheMetaFor(filePath, maxMessages)
+	if err != nil {
+		state.previewError[cacheKey] = previewErrorEntry{message: err.Error(), meta: meta}
+		delete(state.previewCache, cacheKey)
+		delete(state.previewLoading, cacheKey)
+		return
+	}
+	if entry, ok := state.previewCache[cacheKey]; ok && entry.meta.equal(meta) {
+		return
+	}
+	if errEntry, ok := state.previewError[cacheKey]; ok && errEntry.meta.equal(meta) {
+		return
+	}
+	if loadingMeta, ok := state.previewLoading[cacheKey]; ok {
+		if loadingMeta.equal(meta) {
+			return
+		}
+		delete(state.previewCache, cacheKey)
+		delete(state.previewError, cacheKey)
+	}
+	delete(state.previewCache, cacheKey)
+	delete(state.previewError, cacheKey)
+	state.previewLoading[cacheKey] = meta
 
-	go func(key string, path string, maxMsgs int) {
-		msgs, err := codexhistory.ReadSessionMessages(path, maxMsgs)
+	go func(key string, path string, meta previewCacheMeta) {
+		msgs, err := codexhistory.ReadSessionPreviewMessages(path, meta.maxMessages)
 		text := ""
 		if err == nil {
-			text = codexhistory.FormatMessages(msgs, 0)
+			text = codexhistory.FormatPreviewMessages(msgs, 0)
 		}
-		previewCh <- previewEvent{cacheKey: key, text: text, err: err}
+		previewCh <- previewEvent{cacheKey: key, meta: meta, text: text, err: err}
 		screen.PostEvent(&uiEvent{when: time.Now(), kind: "preview"})
-	}(cacheKey, filePath, maxMessages)
+	}(cacheKey, filePath, meta)
+}
+
+func previewCacheMetaFor(filePath string, maxMessages int) (previewCacheMeta, error) {
+	meta := previewCacheMeta{
+		path:          strings.TrimSpace(filePath),
+		filterVersion: previewFilterVersion,
+		maxMessages:   maxMessages,
+	}
+	info, err := os.Stat(meta.path)
+	if err != nil {
+		return meta, err
+	}
+	meta.size = info.Size()
+	meta.modTime = info.ModTime()
+	return meta, nil
+}
+
+func applyPreviewEvent(state *uiState, ev previewEvent) {
+	if state == nil || ev.cacheKey == "" {
+		return
+	}
+	loadingMeta, ok := state.previewLoading[ev.cacheKey]
+	if !ok || !loadingMeta.equal(ev.meta) {
+		return
+	}
+	delete(state.previewLoading, ev.cacheKey)
+	if ev.err != nil {
+		state.previewError[ev.cacheKey] = previewErrorEntry{message: ev.err.Error(), meta: ev.meta}
+		delete(state.previewCache, ev.cacheKey)
+		return
+	}
+	state.previewCache[ev.cacheKey] = previewCacheEntry{text: ev.text, meta: ev.meta}
+	delete(state.previewError, ev.cacheKey)
 }
 
 func buildProjectItems(projects []codexhistory.Project, defaultCwd string) []projectItem {
@@ -1734,13 +1804,13 @@ func previewTextForItem(state *uiState, session *codexhistory.Session, subagent 
 	if cacheKey == "" {
 		return ""
 	}
-	if errMsg, ok := state.previewError[cacheKey]; ok && errMsg != "" {
-		return "Preview failed: " + errMsg
+	if errEntry, ok := state.previewError[cacheKey]; ok && errEntry.message != "" {
+		return "Preview failed: " + errEntry.message
 	}
-	if text, ok := state.previewCache[cacheKey]; ok && text != "" {
-		return text
+	if entry, ok := state.previewCache[cacheKey]; ok && entry.text != "" {
+		return entry.text
 	}
-	if state.previewLoading[cacheKey] {
+	if _, ok := state.previewLoading[cacheKey]; ok {
 		return "Loading preview..."
 	}
 	return ""

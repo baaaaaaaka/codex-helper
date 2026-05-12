@@ -61,6 +61,32 @@ func FormatMessages(msgs []Message, maxLen int) string {
 	return strings.TrimSpace(b.String())
 }
 
+func FormatPreviewMessages(msgs []Message, maxLen int) string {
+	var b strings.Builder
+	wrote := false
+	for _, msg := range msgs {
+		label := previewRoleLabel(msg.Role)
+		if label == "" {
+			continue
+		}
+		text := strings.TrimSpace(msg.Content)
+		if text == "" {
+			continue
+		}
+		if wrote {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(label)
+		b.WriteString(":\n")
+		if maxLen > 0 {
+			text = truncateRunes(text, maxLen)
+		}
+		b.WriteString(text)
+		wrote = true
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func roleLabel(role string) string {
 	switch role {
 	case "user":
@@ -77,6 +103,17 @@ func roleLabel(role string) string {
 		return "Thinking"
 	default:
 		return "Message"
+	}
+}
+
+func previewRoleLabel(role string) string {
+	switch role {
+	case "assistant":
+		return "Codex answer"
+	case "assistant_commentary":
+		return "Codex status"
+	default:
+		return ""
 	}
 }
 
