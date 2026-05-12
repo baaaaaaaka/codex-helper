@@ -10244,7 +10244,7 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 			"",
 			fmt.Sprintf("**Next:** send `%d` or `p %d` to open this workspace", workspace.Number, workspace.Number),
 		)
-		lines = append(lines, dashboardBlockquoteLines(body...)...)
+		lines = append(lines, dashboardIndentedTextLines(body...)...)
 		lines = append(lines, "---")
 	}
 	lines = append(lines, "", "**Other options:**", "- Send a workspace number, for example `1`, to open it.", "- `n <directory>` or `new <directory>` - create a new Work chat directly.")
@@ -10280,14 +10280,14 @@ func dashboardWorkspaceListMeta(workspace DashboardWorkspace) string {
 	return "Sessions: " + meta
 }
 
-func dashboardBlockquoteLines(lines ...string) []string {
+func dashboardIndentedTextLines(lines ...string) []string {
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
-			out = append(out, ">")
+			out = append(out, "")
 			continue
 		}
-		out = append(out, "> "+line)
+		out = append(out, "  "+line)
 	}
 	return out
 }
@@ -10438,7 +10438,7 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 			body = append(body, meta)
 		}
 		body = append(body, "", "**Next:** "+action)
-		lines = append(lines, dashboardBlockquoteLines(body...)...)
+		lines = append(lines, dashboardIndentedTextLines(body...)...)
 		lines = append(lines, "---")
 		displayed++
 	}

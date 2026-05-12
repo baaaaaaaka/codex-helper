@@ -42,6 +42,14 @@ func resetPersistentCacheStatesForTest() {
 	persistentHistoryIndexState.cache = persistentHistoryIndexCache{}
 	persistentHistoryIndexState.mu.Unlock()
 
+	persistentSessionPreviewState.mu.Lock()
+	persistentSessionPreviewState.path = ""
+	persistentSessionPreviewState.cacheFilePresent = false
+	persistentSessionPreviewState.cacheFileMtime = 0
+	persistentSessionPreviewState.loaded = false
+	persistentSessionPreviewState.cache = persistentSessionPreviewCache{}
+	persistentSessionPreviewState.mu.Unlock()
+
 	persistentSharedSessionMetaState.mu.Lock()
 	persistentSharedSessionMetaState.path = ""
 	persistentSharedSessionMetaState.ownerID = ""

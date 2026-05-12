@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,8 @@ func (ProxyToggleRequested) Error() string { return "proxy toggle requested" }
 var errQuit = errors.New("quit")
 
 const updateErrorDisplayDuration = 4 * time.Second
+const previewLinesCacheMaxEntries = 6
+const previewLinesCacheMaxBytes = 24 * 1024 * 1024
 
 var newScreen = tcell.NewScreen
 var loadingFrames = []string{"-", "\\", "|", "/"}
@@ -114,13 +117,20 @@ func (m previewCacheMeta) equal(other previewCacheMeta) bool {
 }
 
 type previewCacheEntry struct {
-	text string
-	meta previewCacheMeta
+	text     string
+	meta     previewCacheMeta
+	revision string
 }
 
 type previewErrorEntry struct {
 	message string
 	meta    previewCacheMeta
+}
+
+type previewLinesCacheEntry struct {
+	key   string
+	lines []string
+	cost  int
 }
 
 type projectLoadEvent struct {
@@ -203,16 +213,20 @@ type uiState struct {
 	proxyConfigured bool
 	yoloEnabled     bool
 
-	expandedSessions map[string]bool
-	previewCache     map[string]previewCacheEntry
-	previewError     map[string]previewErrorEntry
-	previewLoading   map[string]previewCacheMeta
-	previewSearch    string
-	previewSearchBuf string
-	previewMatches   []int
-	previewMatchIdx  int
-	previewSearchKey string
-	statusHeight     int
+	expandedSessions  map[string]bool
+	previewCache      map[string]previewCacheEntry
+	previewError      map[string]previewErrorEntry
+	previewLoading    map[string]previewCacheMeta
+	previewLines      previewLinesCacheEntry
+	previewLinesCache map[string]previewLinesCacheEntry
+	previewLinesOrder []string
+	previewLinesBytes int
+	previewSearch     string
+	previewSearchBuf  string
+	previewMatches    []int
+	previewMatchIdx   int
+	previewSearchKey  string
+	statusHeight      int
 }
 
 func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
@@ -221,18 +235,19 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 	}
 
 	state := &uiState{
-		loadingProjects:  true,
-		loadingStartedAt: time.Now(),
-		focus:            "projects",
-		lastListFocus:    "projects",
-		proxyEnabled:     opts.ProxyEnabled,
-		proxyConfigured:  opts.ProxyConfigured,
-		yoloEnabled:      opts.YoloEnabled,
-		expandedSessions: map[string]bool{},
-		previewCache:     map[string]previewCacheEntry{},
-		previewError:     map[string]previewErrorEntry{},
-		previewLoading:   map[string]previewCacheMeta{},
-		statusHeight:     1,
+		loadingProjects:   true,
+		loadingStartedAt:  time.Now(),
+		focus:             "projects",
+		lastListFocus:     "projects",
+		proxyEnabled:      opts.ProxyEnabled,
+		proxyConfigured:   opts.ProxyConfigured,
+		yoloEnabled:       opts.YoloEnabled,
+		expandedSessions:  map[string]bool{},
+		previewCache:      map[string]previewCacheEntry{},
+		previewError:      map[string]previewErrorEntry{},
+		previewLoading:    map[string]previewCacheMeta{},
+		previewLinesCache: map[string]previewLinesCacheEntry{},
+		statusHeight:      1,
 	}
 
 	screen, err := newScreen()
@@ -668,9 +683,7 @@ func handleKey(
 	}
 
 	if state.focus == "preview" && isPreviewNavKey(ev) {
-		previewText := previewTextForItem(state, selectedSession, selectedSubagent)
-		lines := buildPreviewLines(selectedProject, selectedSession, selectedSubagent, selectedIsNew, state, previewText, opts)
-		lines = buildWrappedLines(lines, max(0, layoutMode.preview.w-2))
+		lines := wrappedPreviewLinesForSelection(state, selectedProject, selectedSession, selectedSubagent, selectedIsNew, opts, max(0, layoutMode.preview.w-2))
 		applyPreviewNavigation(&state.previewState, len(lines), max(0, layoutMode.preview.h-2), ev)
 		return nil, nil
 	}
@@ -696,9 +709,7 @@ func handleKey(
 	}
 
 	if state.focus == "preview" {
-		previewText := previewTextForItem(state, selectedSession, selectedSubagent)
-		lines := buildPreviewLines(selectedProject, selectedSession, selectedSubagent, selectedIsNew, state, previewText, opts)
-		lines = buildWrappedLines(lines, max(0, layoutMode.preview.w-2))
+		lines := wrappedPreviewLinesForSelection(state, selectedProject, selectedSession, selectedSubagent, selectedIsNew, opts, max(0, layoutMode.preview.w-2))
 		applyPreviewNavigation(&state.previewState, len(lines), max(0, layoutMode.preview.h-2), ev)
 		return nil, nil
 	}
@@ -967,8 +978,6 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		)
 	}
 
-	previewText := previewTextForItem(state, selectedSession, selectedSubagent)
-
 	previewFilter := ""
 	if state.inputMode == "preview" {
 		previewFilter = state.previewSearchBuf
@@ -976,12 +985,11 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		previewFilter = state.previewSearch
 	}
 	drawBox(screen, layoutMode.preview, "Preview", state.focus == "preview", previewFilter)
-	lines := buildPreviewLines(selectedProject, selectedSession, selectedSubagent, selectedIsNew, state, previewText, opts)
-	lines = buildWrappedLines(lines, max(0, layoutMode.preview.w-2))
+	lines := wrappedPreviewLinesForSelection(state, selectedProject, selectedSession, selectedSubagent, selectedIsNew, opts, max(0, layoutMode.preview.w-2))
 	viewH := max(0, layoutMode.preview.h-2)
 	state.previewState.scroll = clamp(state.previewState.scroll, 0, max(0, len(lines)-viewH))
 
-	previewKey := fmt.Sprintf("%s|%d|%s|%s", previewCacheKey(selectedSession, selectedSubagent), layoutMode.preview.w, previewText, state.previewSearch)
+	previewKey := state.previewLines.key + "|search:" + state.previewSearch
 	if previewKey != state.previewSearchKey {
 		state.previewSearchKey = previewKey
 		if state.previewSearch != "" {
@@ -1041,19 +1049,13 @@ func ensurePreview(
 		if loadingMeta.equal(meta) {
 			return
 		}
-		delete(state.previewCache, cacheKey)
 		delete(state.previewError, cacheKey)
 	}
-	delete(state.previewCache, cacheKey)
 	delete(state.previewError, cacheKey)
 	state.previewLoading[cacheKey] = meta
 
 	go func(key string, path string, meta previewCacheMeta) {
-		msgs, err := codexhistory.ReadSessionPreviewMessages(path, meta.maxMessages)
-		text := ""
-		if err == nil {
-			text = codexhistory.FormatPreviewMessages(msgs, 0)
-		}
+		text, err := codexhistory.ReadSessionPreviewText(path, meta.maxMessages, 0)
 		previewCh <- previewEvent{cacheKey: key, meta: meta, text: text, err: err}
 		screen.PostEvent(&uiEvent{when: time.Now(), kind: "preview"})
 	}(cacheKey, filePath, meta)
@@ -1085,10 +1087,9 @@ func applyPreviewEvent(state *uiState, ev previewEvent) {
 	delete(state.previewLoading, ev.cacheKey)
 	if ev.err != nil {
 		state.previewError[ev.cacheKey] = previewErrorEntry{message: ev.err.Error(), meta: ev.meta}
-		delete(state.previewCache, ev.cacheKey)
 		return
 	}
-	state.previewCache[ev.cacheKey] = previewCacheEntry{text: ev.text, meta: ev.meta}
+	state.previewCache[ev.cacheKey] = previewCacheEntry{text: ev.text, meta: ev.meta, revision: previewMetaRevision(ev.meta)}
 	delete(state.previewError, ev.cacheKey)
 }
 
@@ -1805,15 +1806,220 @@ func previewTextForItem(state *uiState, session *codexhistory.Session, subagent 
 		return ""
 	}
 	if errEntry, ok := state.previewError[cacheKey]; ok && errEntry.message != "" {
+		if entry, hasPreview := state.previewCache[cacheKey]; hasPreview && entry.text != "" {
+			return entry.text + "\n\nPreview refresh failed: " + errEntry.message
+		}
 		return "Preview failed: " + errEntry.message
 	}
 	if entry, ok := state.previewCache[cacheKey]; ok && entry.text != "" {
+		if _, loading := state.previewLoading[cacheKey]; loading {
+			return entry.text + "\n\nRefreshing preview..."
+		}
 		return entry.text
 	}
 	if _, ok := state.previewLoading[cacheKey]; ok {
 		return "Loading preview..."
 	}
 	return ""
+}
+
+func wrappedPreviewLinesForSelection(
+	state *uiState,
+	project codexhistory.Project,
+	session *codexhistory.Session,
+	subagent *codexhistory.SubagentSession,
+	selectedIsNew bool,
+	opts Options,
+	width int,
+) []string {
+	if state == nil {
+		return nil
+	}
+	key := previewLinesCacheKey(state, project, session, subagent, selectedIsNew, opts, width)
+	if key != "" && state.previewLines.key == key {
+		return state.previewLines.lines
+	}
+	if key != "" {
+		if cached, ok := state.previewLinesCache[key]; ok {
+			state.previewLines = cached
+			touchPreviewLinesCache(state, key)
+			return cached.lines
+		}
+	}
+	previewText := previewTextForItem(state, session, subagent)
+	lines := buildPreviewLines(project, session, subagent, selectedIsNew, state, previewText, opts)
+	wrapped := buildWrappedLines(lines, width)
+	entry := previewLinesCacheEntry{key: key, lines: wrapped, cost: previewLinesCost(wrapped)}
+	state.previewLines = entry
+	rememberPreviewLines(state, entry)
+	return wrapped
+}
+
+func rememberPreviewLines(state *uiState, entry previewLinesCacheEntry) {
+	if state == nil || entry.key == "" || entry.cost <= 0 || entry.cost > previewLinesCacheMaxBytes {
+		return
+	}
+	if state.previewLinesCache == nil {
+		state.previewLinesCache = map[string]previewLinesCacheEntry{}
+	}
+	if old, ok := state.previewLinesCache[entry.key]; ok {
+		state.previewLinesBytes -= old.cost
+		removePreviewLinesCacheOrder(state, entry.key)
+	}
+	state.previewLinesCache[entry.key] = entry
+	state.previewLinesOrder = append(state.previewLinesOrder, entry.key)
+	state.previewLinesBytes += entry.cost
+	for (len(state.previewLinesOrder) > previewLinesCacheMaxEntries || state.previewLinesBytes > previewLinesCacheMaxBytes) && len(state.previewLinesOrder) > 0 {
+		evictKey := state.previewLinesOrder[0]
+		state.previewLinesOrder = state.previewLinesOrder[1:]
+		evicted, ok := state.previewLinesCache[evictKey]
+		if !ok {
+			continue
+		}
+		delete(state.previewLinesCache, evictKey)
+		state.previewLinesBytes -= evicted.cost
+	}
+}
+
+func touchPreviewLinesCache(state *uiState, key string) {
+	if state == nil || key == "" {
+		return
+	}
+	removePreviewLinesCacheOrder(state, key)
+	state.previewLinesOrder = append(state.previewLinesOrder, key)
+}
+
+func removePreviewLinesCacheOrder(state *uiState, key string) {
+	if state == nil || key == "" || len(state.previewLinesOrder) == 0 {
+		return
+	}
+	for i, existing := range state.previewLinesOrder {
+		if existing == key {
+			copy(state.previewLinesOrder[i:], state.previewLinesOrder[i+1:])
+			state.previewLinesOrder = state.previewLinesOrder[:len(state.previewLinesOrder)-1]
+			return
+		}
+	}
+}
+
+func previewLinesCost(lines []string) int {
+	cost := 0
+	for _, line := range lines {
+		cost += len(line)
+	}
+	return cost
+}
+
+func previewLinesCacheKey(
+	state *uiState,
+	project codexhistory.Project,
+	session *codexhistory.Session,
+	subagent *codexhistory.SubagentSession,
+	selectedIsNew bool,
+	opts Options,
+	width int,
+) string {
+	if state == nil {
+		return ""
+	}
+	parts := []string{
+		fmt.Sprintf("w:%d", width),
+		fmt.Sprintf("loading:%t:%d", shouldShowLoadingRows(state), state.loadingStartedAt.UnixNano()),
+		"loaderr:" + errorString(state.loadError),
+		"project:" + strings.TrimSpace(project.Key),
+		"path:" + strings.TrimSpace(project.Path),
+		fmt.Sprintf("new:%t", selectedIsNew),
+		"default:" + strings.TrimSpace(opts.DefaultCwd),
+		"preview:" + previewContentRevision(state, session, subagent),
+	}
+	if shouldShowLoadingRows(state) {
+		parts = append(parts, fmt.Sprintf("loadingTick:%d", loadingElapsed(state)/(125*time.Millisecond)))
+	}
+	if session != nil {
+		parts = append(parts,
+			"sid:"+strings.TrimSpace(session.SessionID),
+			"summary:"+strings.TrimSpace(session.Summary),
+			"first:"+strings.TrimSpace(session.FirstPrompt),
+			fmt.Sprintf("messages:%d", session.MessageCount),
+			fmt.Sprintf("subagents:%d", len(session.Subagents)),
+			fmt.Sprintf("created:%d", session.CreatedAt.UnixNano()),
+			fmt.Sprintf("modified:%d", session.ModifiedAt.UnixNano()),
+		)
+	}
+	if subagent != nil {
+		parts = append(parts,
+			"aid:"+strings.TrimSpace(subagent.AgentID),
+			"parent:"+strings.TrimSpace(subagent.ParentSessionID),
+			"subfirst:"+strings.TrimSpace(subagent.FirstPrompt),
+			fmt.Sprintf("submessages:%d", subagent.MessageCount),
+			fmt.Sprintf("subcreated:%d", subagent.CreatedAt.UnixNano()),
+			fmt.Sprintf("submodified:%d", subagent.ModifiedAt.UnixNano()),
+		)
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func previewContentRevision(state *uiState, session *codexhistory.Session, subagent *codexhistory.SubagentSession) string {
+	cacheKey := previewCacheKey(session, subagent)
+	if cacheKey == "" {
+		return "none"
+	}
+	if errEntry, ok := state.previewError[cacheKey]; ok && errEntry.message != "" {
+		if entry, hasPreview := state.previewCache[cacheKey]; hasPreview {
+			revision := "ok:" + previewCacheEntryRevision(entry)
+			return revision + ":refreshErr:" + previewMetaRevision(errEntry.meta) + ":" + errEntry.message
+		}
+		return "err:" + previewMetaRevision(errEntry.meta) + ":" + errEntry.message
+	}
+	if entry, ok := state.previewCache[cacheKey]; ok {
+		revision := "ok:" + previewCacheEntryRevision(entry)
+		if loadingMeta, ok := state.previewLoading[cacheKey]; ok {
+			revision += ":refreshing:" + previewMetaRevision(loadingMeta)
+		}
+		return revision
+	}
+	if loadingMeta, ok := state.previewLoading[cacheKey]; ok {
+		return "loading:" + previewMetaRevision(loadingMeta)
+	}
+	return "empty"
+}
+
+func previewCacheEntryRevision(entry previewCacheEntry) string {
+	if entry.revision != "" {
+		return entry.revision
+	}
+	if entry.meta.path != "" {
+		return previewMetaRevision(entry.meta)
+	}
+	return previewTextFallbackRevision(entry.text)
+}
+
+func previewMetaRevision(meta previewCacheMeta) string {
+	return strings.Join([]string{
+		strings.TrimSpace(meta.path),
+		strconv.FormatInt(meta.size, 10),
+		strconv.FormatInt(meta.modTime.UnixNano(), 10),
+		strings.TrimSpace(meta.filterVersion),
+		strconv.Itoa(meta.maxMessages),
+	}, ":")
+}
+
+func previewTextFallbackRevision(text string) string {
+	if text == "" {
+		return "empty"
+	}
+	const edge = 64
+	if len(text) <= edge*2 {
+		return fmt.Sprintf("text:%d:%s", len(text), text)
+	}
+	return fmt.Sprintf("text:%d:%s:%s", len(text), text[:edge], text[len(text)-edge:])
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func applySelection(rows []row, focused bool, state listState) []row {

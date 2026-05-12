@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -142,13 +143,14 @@ func postEventsAfterInit(initDone <-chan struct{}, screen tcell.Screen, events .
 
 func newTestState(projects []codexhistory.Project) *uiState {
 	return &uiState{
-		projects:         projects,
-		focus:            "projects",
-		lastListFocus:    "projects",
-		expandedSessions: map[string]bool{},
-		previewCache:     map[string]previewCacheEntry{},
-		previewError:     map[string]previewErrorEntry{},
-		previewLoading:   map[string]previewCacheMeta{},
+		projects:          projects,
+		focus:             "projects",
+		lastListFocus:     "projects",
+		expandedSessions:  map[string]bool{},
+		previewCache:      map[string]previewCacheEntry{},
+		previewError:      map[string]previewErrorEntry{},
+		previewLoading:    map[string]previewCacheMeta{},
+		previewLinesCache: map[string]previewLinesCacheEntry{},
 	}
 }
 
@@ -1004,6 +1006,153 @@ func TestPreviewTextHelpers(t *testing.T) {
 	}
 }
 
+func TestWrappedPreviewLinesCacheReusesWrappedLongPreview(t *testing.T) {
+	project := codexhistory.Project{Key: "proj-1", Path: "/tmp/proj-1"}
+	session := &codexhistory.Session{SessionID: "sess-1", FilePath: "/tmp/sess-1.jsonl"}
+	state := newTestState([]codexhistory.Project{project})
+	cacheKey := previewCacheKey(session, nil)
+	meta := previewCacheMeta{
+		path:          session.FilePath,
+		size:          100,
+		modTime:       time.Unix(10, 0),
+		filterVersion: previewFilterVersion,
+		maxMessages:   0,
+	}
+	state.previewCache[cacheKey] = previewCacheEntry{
+		text:     strings.Repeat("long preview ", 200),
+		meta:     meta,
+		revision: previewMetaRevision(meta),
+	}
+
+	first := wrappedPreviewLinesForSelection(state, project, session, nil, false, Options{}, 40)
+	second := wrappedPreviewLinesForSelection(state, project, session, nil, false, Options{}, 40)
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatalf("expected wrapped preview lines")
+	}
+	if &first[0] != &second[0] {
+		t.Fatalf("expected unchanged preview to reuse wrapped line cache")
+	}
+
+	meta.size++
+	state.previewCache[cacheKey] = previewCacheEntry{
+		text:     "fresh preview text",
+		meta:     meta,
+		revision: previewMetaRevision(meta),
+	}
+	third := wrappedPreviewLinesForSelection(state, project, session, nil, false, Options{}, 40)
+	if len(third) == 0 || &first[0] == &third[0] {
+		t.Fatalf("expected changed preview revision to rebuild wrapped lines")
+	}
+	if !strings.Contains(strings.Join(third, "\n"), "fresh preview text") {
+		t.Fatalf("rebuilt preview missing fresh text: %#v", third)
+	}
+}
+
+func TestWrappedPreviewLinesCacheKeepsRecentSelections(t *testing.T) {
+	project := codexhistory.Project{Key: "proj-1", Path: "/tmp/proj-1"}
+	sessionA := &codexhistory.Session{SessionID: "sess-a", FilePath: "/tmp/sess-a.jsonl"}
+	sessionB := &codexhistory.Session{SessionID: "sess-b", FilePath: "/tmp/sess-b.jsonl"}
+	state := newTestState([]codexhistory.Project{project})
+	metaA := previewCacheMeta{path: sessionA.FilePath, size: 100, modTime: time.Unix(10, 0), filterVersion: previewFilterVersion}
+	metaB := previewCacheMeta{path: sessionB.FilePath, size: 100, modTime: time.Unix(11, 0), filterVersion: previewFilterVersion}
+	state.previewCache[previewCacheKey(sessionA, nil)] = previewCacheEntry{text: strings.Repeat("a preview ", 200), meta: metaA, revision: previewMetaRevision(metaA)}
+	state.previewCache[previewCacheKey(sessionB, nil)] = previewCacheEntry{text: strings.Repeat("b preview ", 200), meta: metaB, revision: previewMetaRevision(metaB)}
+
+	firstA := wrappedPreviewLinesForSelection(state, project, sessionA, nil, false, Options{}, 40)
+	firstB := wrappedPreviewLinesForSelection(state, project, sessionB, nil, false, Options{}, 40)
+	secondA := wrappedPreviewLinesForSelection(state, project, sessionA, nil, false, Options{}, 40)
+	secondB := wrappedPreviewLinesForSelection(state, project, sessionB, nil, false, Options{}, 40)
+	if len(firstA) == 0 || len(firstB) == 0 || len(secondA) == 0 || len(secondB) == 0 {
+		t.Fatalf("expected wrapped lines for both sessions")
+	}
+	if &firstA[0] != &secondA[0] {
+		t.Fatalf("expected session A wrapped lines to survive switching to B")
+	}
+	if &firstB[0] != &secondB[0] {
+		t.Fatalf("expected session B wrapped lines to survive switching back to A")
+	}
+}
+
+func TestWrappedPreviewLinesCacheEvictsByBudget(t *testing.T) {
+	state := newTestState(nil)
+	for i := 0; i < previewLinesCacheMaxEntries+2; i++ {
+		entry := previewLinesCacheEntry{
+			key:   "key-" + strconv.Itoa(i),
+			lines: []string{"line-" + strconv.Itoa(i)},
+			cost:  1,
+		}
+		rememberPreviewLines(state, entry)
+	}
+	if got := len(state.previewLinesCache); got != previewLinesCacheMaxEntries {
+		t.Fatalf("cache entries = %d, want %d", got, previewLinesCacheMaxEntries)
+	}
+	if _, ok := state.previewLinesCache["key-0"]; ok {
+		t.Fatalf("oldest cache entry should be evicted")
+	}
+
+	tooLarge := previewLinesCacheEntry{
+		key:   "too-large",
+		lines: []string{strings.Repeat("x", previewLinesCacheMaxBytes+1)},
+		cost:  previewLinesCacheMaxBytes + 1,
+	}
+	rememberPreviewLines(state, tooLarge)
+	if _, ok := state.previewLinesCache["too-large"]; ok {
+		t.Fatalf("oversized preview should not be cached")
+	}
+}
+
+func TestDrawPreviewSearchKeyDoesNotEmbedPreviewText(t *testing.T) {
+	screen := newTestScreen(t, 120, 40)
+	longPreview := strings.Repeat("very-long-preview-text ", 2000)
+	project := codexhistory.Project{
+		Key:  "proj-1",
+		Path: "/tmp/proj-1",
+		Sessions: []codexhistory.Session{{
+			SessionID: "sess-1",
+			FilePath:  "/tmp/sess-1.jsonl",
+		}},
+	}
+	state := newTestState([]codexhistory.Project{project})
+	state.focus = "preview"
+	state.lastListFocus = "sessions"
+	state.sessionState.selected = 1
+	cacheKey := previewCacheKey(&project.Sessions[0], nil)
+	meta := previewCacheMeta{
+		path:          project.Sessions[0].FilePath,
+		size:          100,
+		modTime:       time.Unix(10, 0),
+		filterVersion: previewFilterVersion,
+		maxMessages:   0,
+	}
+	state.previewCache[cacheKey] = previewCacheEntry{
+		text:     longPreview,
+		meta:     meta,
+		revision: previewMetaRevision(meta),
+	}
+
+	if err := draw(screen, state, Options{}, make(chan previewEvent, 1)); err != nil {
+		t.Fatalf("draw error: %v", err)
+	}
+	if strings.Contains(state.previewSearchKey, longPreview[:128]) {
+		t.Fatalf("preview search key embedded preview text")
+	}
+	if len(state.previewSearchKey) > 1024 {
+		t.Fatalf("preview search key length = %d, want compact key", len(state.previewSearchKey))
+	}
+}
+
+func TestPreviewLinesCacheKeyRefreshesLoadingPreview(t *testing.T) {
+	state := newTestState(nil)
+	state.loadingProjects = true
+	state.loadingStartedAt = time.Now()
+	key1 := previewLinesCacheKey(state, codexhistory.Project{}, nil, nil, false, Options{}, 40)
+	state.loadingStartedAt = time.Now().Add(-500 * time.Millisecond)
+	key2 := previewLinesCacheKey(state, codexhistory.Project{}, nil, nil, false, Options{}, 40)
+	if key1 == key2 {
+		t.Fatalf("loading preview cache key did not include loading tick")
+	}
+}
+
 func TestBuildPreviewLinesShowsLoadingWhileProjectsLoading(t *testing.T) {
 	state := newTestState(nil)
 	state.loadingProjects = true
@@ -1192,6 +1341,42 @@ func TestEnsurePreview(t *testing.T) {
 	}
 }
 
+func TestEnsurePreviewDefaultShowsCompleteVisibleHistory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sess.jsonl")
+	var lines []string
+	for i := 0; i < 30; i++ {
+		lines = append(lines, `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer `+strconv.Itoa(i)+`"}]}}`)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	screen := newTestScreen(t, 80, 24)
+	state := newTestState(nil)
+	session := &codexhistory.Session{FilePath: path}
+	previewCh := make(chan previewEvent, 1)
+
+	ensurePreview(screen, state, Options{}, session, nil, previewCh)
+	select {
+	case ev := <-previewCh:
+		if ev.err != nil {
+			t.Fatalf("unexpected preview error: %v", ev.err)
+		}
+		if !strings.Contains(ev.text, "answer 0") {
+			t.Fatalf("default preview should include complete visible history: %q", ev.text)
+		}
+		if !strings.Contains(ev.text, "answer "+strconv.Itoa(29)) {
+			t.Fatalf("default preview missing newest answer: %q", ev.text)
+		}
+		if ev.meta.maxMessages != 0 {
+			t.Fatalf("default max messages = %d, want complete history marker 0", ev.meta.maxMessages)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for preview event")
+	}
+}
+
 func TestEnsurePreviewHonorsExplicitMessageLimit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
@@ -1252,11 +1437,11 @@ func TestEnsurePreviewInvalidatesCacheWhenSessionFileChanges(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 	writePreviewSession("new answer with changed size")
 	ensurePreview(screen, state, Options{}, session, nil, previewCh)
-	if got := previewTextForItem(state, session, nil); got != "Loading preview..." {
-		t.Fatalf("expected cache invalidation and loading text, got %q", got)
+	if got := previewTextForItem(state, session, nil); !strings.Contains(got, "old answer") || !strings.Contains(got, "Refreshing preview...") {
+		t.Fatalf("expected stale preview to remain visible while refreshing, got %q", got)
 	}
-	if _, ok := state.previewCache[cacheKey]; ok {
-		t.Fatalf("stale preview cache should be removed while reloading")
+	if _, ok := state.previewCache[cacheKey]; !ok {
+		t.Fatalf("stale preview cache should remain visible while refreshing")
 	}
 	second := <-previewCh
 	applyPreviewEvent(state, second)
@@ -1289,6 +1474,28 @@ func TestApplyPreviewEventIgnoresStaleResults(t *testing.T) {
 	}
 }
 
+func TestApplyPreviewEventKeepsStalePreviewOnRefreshError(t *testing.T) {
+	state := newTestState(nil)
+	cacheKey := "session:one"
+	oldMeta := previewCacheMeta{path: "/tmp/session.jsonl", size: 1, modTime: time.Unix(1, 0), filterVersion: previewFilterVersion}
+	newMeta := previewCacheMeta{path: "/tmp/session.jsonl", size: 2, modTime: time.Unix(2, 0), filterVersion: previewFilterVersion}
+	state.previewCache[cacheKey] = previewCacheEntry{text: "old preview", meta: oldMeta, revision: previewMetaRevision(oldMeta)}
+	state.previewLoading[cacheKey] = newMeta
+	session := &codexhistory.Session{SessionID: "one"}
+
+	applyPreviewEvent(state, previewEvent{cacheKey: cacheKey, meta: newMeta, err: errors.New("read failed")})
+	if got := state.previewCache[cacheKey].text; got != "old preview" {
+		t.Fatalf("refresh error should keep stale preview, got %q", got)
+	}
+	if _, ok := state.previewLoading[cacheKey]; ok {
+		t.Fatalf("refresh error should clear loading state")
+	}
+	got := previewTextForItem(state, session, nil)
+	if !strings.Contains(got, "old preview") || !strings.Contains(got, "Preview refresh failed: read failed") {
+		t.Fatalf("preview text should show stale preview plus refresh error, got %q", got)
+	}
+}
+
 func TestEnsurePreviewSupersedesInFlightLoadWhenFileChanges(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
@@ -1314,8 +1521,8 @@ func TestEnsurePreviewSupersedesInFlightLoadWhenFileChanges(t *testing.T) {
 	if loadingMeta := state.previewLoading[cacheKey]; !loadingMeta.equal(currentMeta) {
 		t.Fatalf("expected newer file revision to supersede old load, got %#v want %#v", loadingMeta, currentMeta)
 	}
-	if _, ok := state.previewCache[cacheKey]; ok {
-		t.Fatalf("stale cache should be removed while loading newer file revision")
+	if got := state.previewCache[cacheKey].text; got != "stale" {
+		t.Fatalf("stale cache should remain visible while loading newer file revision, got %q", got)
 	}
 	if _, ok := state.previewError[cacheKey]; ok {
 		t.Fatalf("stale error should be removed while loading newer file revision")
@@ -1326,8 +1533,8 @@ func TestEnsurePreviewSupersedesInFlightLoadWhenFileChanges(t *testing.T) {
 			t.Fatalf("expected preview event for newer file revision, got %#v want %#v", ev.meta, currentMeta)
 		}
 		applyPreviewEvent(state, previewEvent{cacheKey: cacheKey, meta: oldMeta, text: "stale"})
-		if _, ok := state.previewCache[cacheKey]; ok {
-			t.Fatalf("stale in-flight event should not populate cache")
+		if got := state.previewCache[cacheKey].text; got != "stale" {
+			t.Fatalf("stale in-flight event should not replace visible cache, got %q", got)
 		}
 		applyPreviewEvent(state, ev)
 		if got := previewTextForItem(state, session, nil); !strings.Contains(got, "answer") {

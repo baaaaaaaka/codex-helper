@@ -2407,12 +2407,22 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 	expectedBetaPath := dashboardAbsolutePath("/home/user/project/beta")
 	expectedAlphaPath := dashboardAbsolutePath("/home/user/project/alpha")
 	for _, want := range []string{
-		"---\n**1. beta**\n> " + dashboardInlineCode(expectedBetaPath) + "\n> Sessions: 0 active, 1 idle, last updated 2026-04-30 13:00\n>\n> **Next:** send `1` or `p 1` to open this workspace\n---",
-		"---\n**2. alpha**\n> " + dashboardInlineCode(expectedAlphaPath) + "\n> Sessions: 0 active, 1 idle, last updated 2026-04-30 12:00\n>\n> **Next:** send `2` or `p 2` to open this workspace\n---",
+		"---\n**1. beta**\n  " + dashboardInlineCode(expectedBetaPath) + "\n  Sessions: 0 active, 1 idle, last updated 2026-04-30 13:00\n\n  **Next:** send `1` or `p 1` to open this workspace\n---",
+		"---\n**2. alpha**\n  " + dashboardInlineCode(expectedAlphaPath) + "\n  Sessions: 0 active, 1 idle, last updated 2026-04-30 12:00\n\n  **Next:** send `2` or `p 2` to open this workspace\n---",
 	} {
 		if !strings.Contains(workspaces, want) {
 			t.Fatalf("workspace dashboard missing %q in:\n%s", want, workspaces)
 		}
+	}
+	if strings.Contains(workspaces, "\n>") || strings.Contains(workspaces, "```") {
+		t.Fatalf("workspace dashboard body should be normal indented text, not blockquote or fenced code:\n%s", workspaces)
+	}
+	renderedWorkspaces := RenderTeamsHTML(TeamsRenderInput{Kind: TeamsRenderHelper, Text: workspaces})
+	if strings.Contains(renderedWorkspaces, "<blockquote") || strings.Contains(renderedWorkspaces, "<pre") {
+		t.Fatalf("workspace dashboard rendered as quoted/code block:\n%s", renderedWorkspaces)
+	}
+	if !strings.Contains(renderedWorkspaces, "&nbsp;&nbsp;<code>"+expectedBetaPath+"</code>") {
+		t.Fatalf("workspace dashboard should preserve text indentation in rendered HTML:\n%s", renderedWorkspaces)
 	}
 	if strings.Contains(workspaces, "Sessions: **") || strings.Contains(workspaces, "Sessions: 1 session, latest **") {
 		t.Fatalf("workspace session metadata should not be bolded:\n%s", workspaces)
@@ -2422,9 +2432,19 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 	if err != nil {
 		t.Fatalf("formatWorkspaceSessionsDashboard error: %v", err)
 	}
-	wantSession := "---\n**1. fix alpha**\n> " + dashboardInlineCode(expectedAlphaPath) + "\n> Session: idle, last updated 2026-04-30 12:00\n>\n> **Next:** send `1` or `c 1` to continue this session in Teams\n---"
+	wantSession := "---\n**1. fix alpha**\n  " + dashboardInlineCode(expectedAlphaPath) + "\n  Session: idle, last updated 2026-04-30 12:00\n\n  **Next:** send `1` or `c 1` to continue this session in Teams\n---"
 	if !strings.Contains(sessions, wantSession) {
 		t.Fatalf("session dashboard missing readable block %q in:\n%s", wantSession, sessions)
+	}
+	if strings.Contains(sessions, "\n>") || strings.Contains(sessions, "```") {
+		t.Fatalf("session dashboard body should be normal indented text, not blockquote or fenced code:\n%s", sessions)
+	}
+	renderedSessions := RenderTeamsHTML(TeamsRenderInput{Kind: TeamsRenderHelper, Text: sessions})
+	if strings.Contains(renderedSessions, "<blockquote") || strings.Contains(renderedSessions, "<pre") {
+		t.Fatalf("session dashboard rendered as quoted/code block:\n%s", renderedSessions)
+	}
+	if !strings.Contains(renderedSessions, "&nbsp;&nbsp;<code>"+expectedAlphaPath+"</code>") {
+		t.Fatalf("session dashboard should preserve text indentation in rendered HTML:\n%s", renderedSessions)
 	}
 	if strings.Contains(sessions, "Session: **") || strings.Contains(sessions, "Session: updated **") {
 		t.Fatalf("session metadata should not be bolded:\n%s", sessions)
@@ -2839,8 +2859,11 @@ func TestBridgeDashboardProjectAndSessionListsUseStructuralSeparatorsAndIndent(t
 		t.Fatalf("sent = %#v, want projects and sessions", *sent)
 	}
 	projectsHTML := (*sent)[0].Content
-	if !strings.Contains(projectsHTML, "<hr/>") || !strings.Contains(projectsHTML, "<blockquote>") || strings.Contains(projectsHTML, "&gt; Sessions") {
-		t.Fatalf("projects HTML should use structural hr/blockquotes, got:\n%s", projectsHTML)
+	if !strings.Contains(projectsHTML, "<hr/>") || strings.Contains(projectsHTML, "<blockquote>") || strings.Contains(projectsHTML, "<pre") || strings.Contains(projectsHTML, "&gt; Sessions") {
+		t.Fatalf("projects HTML should use structural hr and normal indented text, got:\n%s", projectsHTML)
+	}
+	if !strings.Contains(projectsHTML, "&nbsp;&nbsp;<code>"+dashboardAbsolutePath("/home/user/project/alpha")+"</code>") {
+		t.Fatalf("projects HTML should preserve normal-text indentation, got:\n%s", projectsHTML)
 	}
 	projectsPlain := PlainTextFromTeamsHTML(projectsHTML)
 	if !strings.Contains(projectsPlain, "———\n1. alpha") || !strings.Contains(projectsPlain, "Sessions: 0 active, 2 idle, last updated 2026-05-12 14:08") || strings.Contains(projectsPlain, "thread-alpha") {
@@ -2848,8 +2871,11 @@ func TestBridgeDashboardProjectAndSessionListsUseStructuralSeparatorsAndIndent(t
 	}
 
 	sessionsHTML := (*sent)[1].Content
-	if !strings.Contains(sessionsHTML, "<hr/>") || !strings.Contains(sessionsHTML, "<blockquote>") || strings.Contains(sessionsHTML, "&gt; Session") {
-		t.Fatalf("sessions HTML should use structural hr/blockquotes, got:\n%s", sessionsHTML)
+	if !strings.Contains(sessionsHTML, "<hr/>") || strings.Contains(sessionsHTML, "<blockquote>") || strings.Contains(sessionsHTML, "<pre") || strings.Contains(sessionsHTML, "&gt; Session") {
+		t.Fatalf("sessions HTML should use structural hr and normal indented text, got:\n%s", sessionsHTML)
+	}
+	if !strings.Contains(sessionsHTML, "&nbsp;&nbsp;<code>"+dashboardAbsolutePath("/home/user/project/alpha")+"</code>") {
+		t.Fatalf("sessions HTML should preserve normal-text indentation, got:\n%s", sessionsHTML)
 	}
 	sessionsPlain := PlainTextFromTeamsHTML(sessionsHTML)
 	if !strings.Contains(sessionsPlain, "———\n1. fix alpha one") || !strings.Contains(sessionsPlain, "Session: idle, last updated 2026-05-12 14:08") {

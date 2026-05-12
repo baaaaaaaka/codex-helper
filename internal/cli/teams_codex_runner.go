@@ -78,11 +78,21 @@ func (e teamsCodexExecutor) RunInput(ctx context.Context, session *teams.Session
 	return e.RunInputWithEventHandler(ctx, session, input, nil)
 }
 
+func teamsCodexEffectiveWorkDir(session *teams.Session, fallback string) string {
+	if session != nil {
+		if cwd := strings.TrimSpace(session.Cwd); cwd != "" {
+			return cwd
+		}
+	}
+	return strings.TrimSpace(fallback)
+}
+
 func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, session *teams.Session, input teams.ExecutionInput, handler codexrunner.EventHandler) (teams.ExecutionResult, error) {
+	workDir := teamsCodexEffectiveWorkDir(session, e.workDir)
 	turnInput := codexrunner.TurnInput{
 		Prompt:       input.Prompt,
 		ImagePaths:   append([]string{}, input.ImagePaths...),
-		WorkingDir:   e.workDir,
+		WorkingDir:   workDir,
 		Timeout:      e.timeout,
 		EventHandler: handler,
 	}

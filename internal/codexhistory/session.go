@@ -17,12 +17,28 @@ type Message struct {
 	sourceID  string
 }
 
+var sessionPreviewTailInitialBytes int64 = 256 * 1024
+
 func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
 	return readSessionMessages(filePath, maxMessages, nil)
 }
 
 func ReadSessionPreviewMessages(filePath string, maxMessages int) ([]Message, error) {
-	return readSessionMessages(filePath, maxMessages, isPreviewMessage)
+	if maxMessages > 0 {
+		return readRecentSessionMessages(filePath, maxMessages, isPreviewMessage)
+	}
+	return readSessionPreviewMessagesCached(filePath)
+}
+
+func ReadSessionPreviewText(filePath string, maxMessages int, maxLen int) (string, error) {
+	if maxMessages > 0 || maxLen > 0 {
+		msgs, err := ReadSessionPreviewMessages(filePath, maxMessages)
+		if err != nil {
+			return "", err
+		}
+		return FormatPreviewMessages(msgs, maxLen), nil
+	}
+	return readSessionPreviewTextCached(filePath)
 }
 
 func readSessionMessages(filePath string, maxMessages int, keep func(Message) bool) ([]Message, error) {
@@ -57,6 +73,110 @@ func readSessionMessages(filePath string, maxMessages int, keep func(Message) bo
 		}
 		if err == io.EOF {
 			break
+		}
+	}
+	return ring, nil
+}
+
+func readRecentSessionMessages(filePath string, maxMessages int, keep func(Message) bool) ([]Message, error) {
+	if maxMessages <= 0 {
+		return readSessionMessages(filePath, maxMessages, keep)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	if size <= 0 {
+		return nil, nil
+	}
+	window := sessionPreviewTailInitialBytes
+	if window <= 0 {
+		window = 256 * 1024
+	}
+	if window > size {
+		window = size
+	}
+	for {
+		offset := size - window
+		msgs, err := readSessionMessagesWindow(filePath, offset, window, maxMessages, keep)
+		if err != nil {
+			return nil, err
+		}
+		if len(msgs) >= maxMessages || offset == 0 {
+			return msgs, nil
+		}
+		if window > size/2 {
+			window = size
+		} else {
+			window *= 2
+			if window > size {
+				window = size
+			}
+		}
+	}
+}
+
+func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMessages int, keep func(Message) bool, seenSourceIDs ...map[string]bool) ([]Message, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	lineAligned := offset == 0
+	if offset > 0 {
+		var prev [1]byte
+		if n, err := f.ReadAt(prev[:], offset-1); err == nil && n == 1 && prev[0] == '\n' {
+			lineAligned = true
+		}
+	}
+
+	buf := make([]byte, size)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	buf = buf[:n]
+	if !lineAligned {
+		newline := bytes.IndexByte(buf, '\n')
+		if newline < 0 {
+			return nil, nil
+		}
+		buf = buf[newline+1:]
+	}
+
+	var ring []Message
+	seen := map[string]bool{}
+	if len(seenSourceIDs) > 0 && seenSourceIDs[0] != nil {
+		seen = seenSourceIDs[0]
+	}
+	for len(buf) > 0 {
+		line := buf
+		if idx := bytes.IndexByte(buf, '\n'); idx >= 0 {
+			line = buf[:idx]
+			buf = buf[idx+1:]
+		} else {
+			buf = nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		for _, msg := range parseLineMessages(line) {
+			if keep != nil && !keep(msg) {
+				continue
+			}
+			if msg.sourceID != "" {
+				if seen[msg.sourceID] {
+					continue
+				}
+				seen[msg.sourceID] = true
+			}
+			appendMessage(&ring, msg, maxMessages)
 		}
 	}
 	return ring, nil

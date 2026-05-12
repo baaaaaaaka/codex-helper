@@ -170,6 +170,63 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexExecutorUsesSessionCwdForNewThread(t *testing.T) {
+	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
+		ThreadID:          "thread-new",
+		TurnID:            "turn-new",
+		FinalAgentMessage: "final",
+	}}
+	executor := teamsCodexExecutor{runner: runner, workDir: "/helper/default"}
+	_, err := executor.Run(context.Background(), &teams.Session{Cwd: "  /workspace/project  "}, "start")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if runner.resumed {
+		t.Fatal("new session should start a new thread, not resume")
+	}
+	if runner.input.WorkingDir != "/workspace/project" {
+		t.Fatalf("working dir = %q, want session cwd", runner.input.WorkingDir)
+	}
+}
+
+func TestTeamsCodexExecutorUsesSessionCwdForExistingThread(t *testing.T) {
+	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
+		ThreadID:          "thread-existing",
+		TurnID:            "turn-existing",
+		FinalAgentMessage: "final",
+	}}
+	executor := teamsCodexExecutor{runner: runner, workDir: "/helper/default"}
+	_, err := executor.Run(context.Background(), &teams.Session{
+		CodexThreadID: "thread-existing",
+		Cwd:           "/workspace/project",
+	}, "continue")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !runner.resumed || runner.threadID != "thread-existing" {
+		t.Fatalf("expected resume with exact thread id, runner=%#v", runner)
+	}
+	if runner.input.WorkingDir != "/workspace/project" {
+		t.Fatalf("working dir = %q, want session cwd", runner.input.WorkingDir)
+	}
+}
+
+func TestTeamsCodexExecutorFallsBackToDefaultWorkDirWhenSessionCwdEmpty(t *testing.T) {
+	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
+		ThreadID:          "thread-new",
+		TurnID:            "turn-new",
+		FinalAgentMessage: "final",
+	}}
+	executor := teamsCodexExecutor{runner: runner, workDir: "  /helper/default  "}
+	_, err := executor.Run(context.Background(), &teams.Session{}, "start")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if runner.input.WorkingDir != "/helper/default" {
+		t.Fatalf("working dir = %q, want fallback workdir", runner.input.WorkingDir)
+	}
+}
+
 func TestTeamsCodexExecutorSkipsThreadNameBackfillForUserTitle(t *testing.T) {
 	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
 		ThreadID:          "thread-existing",
