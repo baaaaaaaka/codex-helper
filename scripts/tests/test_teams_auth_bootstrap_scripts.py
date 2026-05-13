@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BASH_SCRIPT = REPO_ROOT / "scripts" / "teams-auth-bootstrap.sh"
 POWERSHELL_SCRIPT = REPO_ROOT / "scripts" / "teams-auth-bootstrap.ps1"
 GORELEASER_CONFIG = REPO_ROOT / ".goreleaser.yaml"
+README = REPO_ROOT / "README.md"
 
 
 class TeamsAuthBootstrapScriptTests(unittest.TestCase):
@@ -24,6 +25,17 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
     def test_powershell_script_avoids_ambiguous_variable_colon(self) -> None:
         script = POWERSHELL_SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("$LASTEXITCODE:", script)
+
+    def test_readme_powershell_download_command_preserves_child_variables(self) -> None:
+        readme = README.read_text(encoding="utf-8")
+        self.assertIn(
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command \'$u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"',
+            readme,
+        )
+        self.assertNotIn(
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command "$u=\'https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1\'',
+            readme,
+        )
 
     def test_bash_script_interactive_flow_configures_all_client_slots(self) -> None:
         bash = shutil.which("bash")

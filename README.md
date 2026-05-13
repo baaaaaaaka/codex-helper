@@ -69,7 +69,7 @@ sh -c 'set -e; url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/ma
 Windows (PowerShell):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1'; $p=Join-Path $env:TEMP 'teams-auth-bootstrap.ps1'; iwr -useb $u -OutFile $p; & $p; Remove-Item -Force $p"
+powershell -NoProfile -ExecutionPolicy Bypass -Command '$u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"; $p=Join-Path $env:TEMP "teams-auth-bootstrap.ps1"; iwr -useb $u -OutFile $p; & $p; Remove-Item -Force $p'
 ```
 
 When setup finishes, open the Teams control chat shown by bootstrap and send
