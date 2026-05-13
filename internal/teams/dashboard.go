@@ -500,7 +500,8 @@ func buildDashboardView(kind DashboardViewKind, selectedWorkspaceID string, work
 	}
 	switch kind {
 	case DashboardViewSessions:
-		for _, session := range sessions {
+		for i := len(sessions) - 1; i >= 0; i-- {
+			session := sessions[i]
 			if session.WorkspaceID != selectedWorkspaceID {
 				continue
 			}
@@ -514,7 +515,8 @@ func buildDashboardView(kind DashboardViewKind, selectedWorkspaceID string, work
 		}
 	default:
 		view.Kind = DashboardViewWorkspaces
-		for _, workspace := range workspaces {
+		for i := len(workspaces) - 1; i >= 0; i-- {
+			workspace := workspaces[i]
 			view.Items = append(view.Items, DashboardViewItem{
 				Number:       workspace.Number,
 				Kind:         DashboardSelectionWorkspace,

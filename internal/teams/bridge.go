@@ -10284,7 +10284,15 @@ func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
 		"",
 		"---",
 	}
+	workspaces := make(map[string]DashboardWorkspace, len(dashboard.Workspaces))
 	for _, workspace := range dashboard.Workspaces {
+		workspaces[workspace.ID] = workspace
+	}
+	for _, item := range dashboard.CurrentView.Items {
+		workspace, ok := workspaces[item.WorkspaceID]
+		if !ok {
+			continue
+		}
 		lines = append(lines, fmt.Sprintf("**%d. %s**", workspace.Number, dashboardWorkspaceListTitle(workspace)))
 		body := []string{
 			dashboardWorkspaceListPathLine(workspace),

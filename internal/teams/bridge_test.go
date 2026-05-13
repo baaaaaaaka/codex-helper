@@ -2414,6 +2414,16 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 			t.Fatalf("workspace dashboard missing %q in:\n%s", want, workspaces)
 		}
 	}
+	if alphaIndex, betaIndex := strings.Index(workspaces, "**2. alpha**"), strings.Index(workspaces, "**1. beta**"); alphaIndex < 0 || betaIndex < 0 || alphaIndex > betaIndex {
+		t.Fatalf("workspace dashboard should display numbers descending top-to-bottom:\n%s", workspaces)
+	}
+	selection, err := bridge.resolveDashboardTarget(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("resolve newest displayed workspace number: %v", err)
+	}
+	if selection.Kind != DashboardSelectionWorkspace || selection.WorkspaceID != workspaceIDForPath(expectedBetaPath) {
+		t.Fatalf("workspace number 1 selection = %#v, want beta", selection)
+	}
 	if strings.Contains(workspaces, "\n>") || strings.Contains(workspaces, "```") {
 		t.Fatalf("workspace dashboard body should be normal indented text, not blockquote or fenced code:\n%s", workspaces)
 	}
@@ -2880,6 +2890,9 @@ func TestBridgeDashboardProjectAndSessionListsUseStructuralSeparatorsAndIndent(t
 	sessionsPlain := PlainTextFromTeamsHTML(sessionsHTML)
 	if !strings.Contains(sessionsPlain, "———\n1. fix alpha one") || !strings.Contains(sessionsPlain, "Session: idle, last updated 2026-05-12 14:08") {
 		t.Fatalf("sessions plain text has wrong formatting:\n%s", sessionsPlain)
+	}
+	if newerIndex, olderIndex := strings.Index(sessionsPlain, "1. fix alpha one"), strings.Index(sessionsPlain, "2. fix alpha two"); newerIndex < 0 || olderIndex < 0 || olderIndex > newerIndex {
+		t.Fatalf("sessions plain text should display numbers descending top-to-bottom:\n%s", sessionsPlain)
 	}
 }
 

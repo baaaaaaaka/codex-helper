@@ -152,11 +152,21 @@ func TestControlDashboardOrdersWorkspacesAndSessionsByRecentActivity(t *testing.
 			}},
 		}},
 	}, now)
-	if len(dashboard.Workspaces) != 2 || dashboard.Workspaces[0].ID != "workspace-new" || dashboard.CurrentView.Items[0].WorkspaceID != "workspace-new" {
+	if len(dashboard.Workspaces) != 2 || dashboard.Workspaces[0].ID != "workspace-new" {
 		t.Fatalf("workspace recency order = %#v, view = %#v", dashboard.Workspaces, dashboard.CurrentView.Items)
 	}
 	if dashboard.Workspaces[0].Number != 1 || dashboard.Workspaces[1].Number != 2 {
-		t.Fatalf("workspace numbers should follow display order: %#v", dashboard.Workspaces)
+		t.Fatalf("workspace numbers should follow recency rank: %#v", dashboard.Workspaces)
+	}
+	if len(dashboard.CurrentView.Items) != 2 || dashboard.CurrentView.Items[0].WorkspaceID != "workspace-old" || dashboard.CurrentView.Items[0].Number != 2 || dashboard.CurrentView.Items[1].WorkspaceID != "workspace-new" || dashboard.CurrentView.Items[1].Number != 1 {
+		t.Fatalf("workspace view should display numbers descending top-to-bottom: %#v", dashboard.CurrentView.Items)
+	}
+	selection, err := ResolveDashboardNumber(ChatScopeControl, dashboard.CurrentView, 1, now)
+	if err != nil {
+		t.Fatalf("ResolveDashboardNumber workspace 1 error: %v", err)
+	}
+	if selection.Kind != DashboardSelectionWorkspace || selection.WorkspaceID != "workspace-new" {
+		t.Fatalf("workspace number 1 should still select newest workspace: %#v", selection)
 	}
 
 	dashboard = BuildControlDashboard(dashboard, ControlDashboardInput{
@@ -177,11 +187,18 @@ func TestControlDashboardOrdersWorkspacesAndSessionsByRecentActivity(t *testing.
 			}},
 		}},
 	}, now.Add(time.Minute))
-	if len(dashboard.CurrentView.Items) != 2 || dashboard.CurrentView.Items[0].SessionID != "session-newer" {
-		t.Fatalf("session recency order = %#v", dashboard.CurrentView.Items)
+	if len(dashboard.Sessions) < 2 || dashboard.Sessions[0].ID != "session-newer" {
+		t.Fatalf("session recency order = %#v", dashboard.Sessions)
 	}
-	if dashboard.CurrentView.Items[0].Number != 1 || dashboard.CurrentView.Items[1].Number != 2 {
-		t.Fatalf("session numbers should follow display order: %#v", dashboard.CurrentView.Items)
+	if len(dashboard.CurrentView.Items) != 2 || dashboard.CurrentView.Items[0].SessionID != "session-older" || dashboard.CurrentView.Items[0].Number != 2 || dashboard.CurrentView.Items[1].SessionID != "session-newer" || dashboard.CurrentView.Items[1].Number != 1 {
+		t.Fatalf("session view should display numbers descending top-to-bottom: %#v", dashboard.CurrentView.Items)
+	}
+	selection, err = ResolveDashboardNumber(ChatScopeControl, dashboard.CurrentView, 1, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ResolveDashboardNumber session 1 error: %v", err)
+	}
+	if selection.Kind != DashboardSelectionSession || selection.SessionID != "session-newer" {
+		t.Fatalf("session number 1 should still select newest session: %#v", selection)
 	}
 }
 
@@ -273,7 +290,7 @@ func TestDashboardTitlesSanitizeAndHidePathDetails(t *testing.T) {
 	}
 }
 
-func TestControlDashboardLargeCorpusStressKeepsCurrentViewSequentialPrivateNumbers(t *testing.T) {
+func TestControlDashboardLargeCorpusStressKeepsCurrentViewDescendingPrivateNumbers(t *testing.T) {
 	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
 	workspaces := makeDashboardStressInputs(120, 12, now)
 	first := BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{
@@ -288,7 +305,7 @@ func TestControlDashboardLargeCorpusStressKeepsCurrentViewSequentialPrivateNumbe
 		t.Fatalf("session count = %d, want %d", got, 120*12)
 	}
 	assertDashboardViewNumbersUnique(t, first.CurrentView)
-	assertDashboardViewNumbersSequential(t, first.CurrentView)
+	assertDashboardViewNumbersDescending(t, first.CurrentView)
 	assertDashboardTitlesDoNotLeakPrivatePaths(t, first)
 
 	for i, j := 0, len(workspaces)-1; i < j; i, j = i+1, j-1 {
@@ -316,16 +333,16 @@ func TestControlDashboardLargeCorpusStressKeepsCurrentViewSequentialPrivateNumbe
 		Workspaces:          workspaces,
 	}, now.Add(time.Minute))
 	if got := dashboardWorkspaceNumber(t, second, "workspace-119"); got != 1 {
-		t.Fatalf("newest workspace number = %d, want current first row number 1", got)
+		t.Fatalf("newest workspace number = %d, want recency rank 1", got)
 	}
 	if got := dashboardSessionNumber(t, second, "workspace-042", "session-042-new"); got != 1 {
-		t.Fatalf("newest session number = %d, want current first row number 1", got)
+		t.Fatalf("newest session number = %d, want recency rank 1", got)
 	}
 	assertDashboardViewNumbersUnique(t, second.CurrentView)
-	assertDashboardViewNumbersSequential(t, second.CurrentView)
+	assertDashboardViewNumbersDescending(t, second.CurrentView)
 	assertDashboardTitlesDoNotLeakPrivatePaths(t, second)
 	if _, err := ResolveDashboardNumber(ChatScopeControl, second.CurrentView, 1, now.Add(2*time.Minute)); err != nil {
-		t.Fatalf("current first session number should resolve before expiry: %v", err)
+		t.Fatalf("newest session number should resolve before expiry: %v", err)
 	}
 	if _, err := ResolveDashboardNumber(ChatScopeControl, second.CurrentView, 1, now.Add(20*time.Minute)); !errors.Is(err, ErrDashboardViewExpired) {
 		t.Fatalf("expired large dashboard view error = %v, want ErrDashboardViewExpired", err)
@@ -394,10 +411,10 @@ func assertDashboardViewNumbersUnique(t *testing.T, view DashboardView) {
 	}
 }
 
-func assertDashboardViewNumbersSequential(t *testing.T, view DashboardView) {
+func assertDashboardViewNumbersDescending(t *testing.T, view DashboardView) {
 	t.Helper()
 	for i, item := range view.Items {
-		if want := i + 1; item.Number != want {
+		if want := len(view.Items) - i; item.Number != want {
 			t.Fatalf("dashboard view item %d has number %d, want %d in %#v", i, item.Number, want, view.Items)
 		}
 	}
