@@ -41,7 +41,41 @@ asked whether to use the SSH proxy. Choose **no** for direct connections.
 Choose **yes** to enter SSH host/port/user and let the tool create a dedicated
 key if needed. You can toggle proxy mode later with `Ctrl+P` in the TUI.
 
-### 3) Next steps
+### 3) Optional: initialize Teams helper
+
+Teams helper is currently available from **pre-release builds only**. After the
+normal install, switch `codex-proxy` to the newest pre-release:
+
+```bash
+codex-proxy upgrade --include-prerelease
+```
+
+If your installed stable version does not recognize `--include-prerelease`,
+install the newest `v0.1.0-rc.*` tag from GitHub Releases explicitly with the
+installer `--version` option once. After that, future pre-release updates can
+use `codex-proxy upgrade --include-prerelease`. The detailed install section
+below shows the exact `--version` installer commands.
+
+Then run the interactive Teams setup script. It asks for the required Teams
+auth metadata, starts Microsoft device login, verifies the local auth cache,
+and bootstraps the background helper service.
+
+Linux / macOS / WSL:
+
+```bash
+sh -c 'set -e; url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.sh"; tmp="${TMPDIR:-/tmp}/teams-auth-bootstrap.sh"; if command -v curl >/dev/null 2>&1; then curl -fsSL "$url" -o "$tmp"; elif command -v wget >/dev/null 2>&1; then wget -qO "$tmp" "$url"; else echo "need curl or wget" >&2; exit 1; fi; bash "$tmp"; rm -f "$tmp"'
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1'; $p=Join-Path $env:TEMP 'teams-auth-bootstrap.ps1'; iwr -useb $u -OutFile $p; & $p; Remove-Item -Force $p"
+```
+
+When setup finishes, open the Teams control chat shown by bootstrap and send
+`help`.
+
+### 4) Next steps
 
 - Press Enter to open the selected Codex session.
 - If there is no history yet, Enter starts a new session in the current directory.
@@ -98,6 +132,10 @@ codex-proxy proxy doctor
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
 | `codex-proxy proxy prune` | Remove dead/unhealthy instances |
 | `codex-proxy proxy doctor` | Report environment issues and installation hints |
+| `codex-proxy teams status` | Show Teams helper state, control chat, service, owner, and queue status |
+| `codex-proxy teams doctor` | Check local Teams helper auth and service readiness |
+| `codex-proxy teams service bootstrap` | Install or repair the background Teams helper service |
+| `codex-proxy teams control --print` | Print the configured Teams control chat link |
 | `codex-proxy upgrade` | Self-update from GitHub Releases |
 
 Common flags:
@@ -185,6 +223,98 @@ To use a specific Codex binary:
 codex-proxy tui --codex-path /path/to/codex
 ```
 
+## Teams helper
+
+Teams helper lets you drive Codex from Microsoft Teams while keeping execution
+on your own machine. A local `codex-proxy teams run` listener reads Teams
+messages, starts or resumes Codex sessions in the selected project directory,
+and sends status, answer, artifact, and notification updates back to Teams.
+
+Teams helper is currently a **pre-release-only** feature. Install the normal
+binary first, then update to the newest pre-release before setup:
+
+```bash
+codex-proxy upgrade --include-prerelease
+```
+
+If the installed stable binary is too old to support `--include-prerelease`,
+install the newest `v0.1.0-rc.*` tag explicitly with the installer `--version`
+option once, then use `codex-proxy upgrade --include-prerelease` for later
+pre-release updates.
+
+From an existing Teams control chat, you can ask the helper itself to move to
+the newest release or pre-release:
+
+```text
+helper update prerelease
+```
+
+### Fast setup
+
+The recommended setup path is the interactive bootstrap script from the quick
+start section. It performs the complete local setup flow:
+
+1. Configure Teams auth metadata.
+2. Run Microsoft device login.
+3. Verify the local Teams auth cache.
+4. Install or repair the background Teams helper service.
+5. Open or print the Teams control chat link.
+
+The script stores auth metadata and tokens locally under the current user. It
+does not require a project checkout and does not hard-code Teams auth values;
+it asks for the required values interactively unless you provide them with
+environment variables or script flags.
+
+### How it works
+
+The helper creates a **control chat** for machine-level commands and separate
+work chats for Codex sessions. Use the control chat to list projects, choose a
+project/session, start new Codex work, check status, recover stuck state,
+restart or reload the helper, and update the helper.
+
+When a Teams work chat message is routed to Codex, the helper queues it,
+starts Codex with the selected session working directory, streams progress as
+status updates, and posts the final answer back to the work chat. If a Codex
+answer is detected from another local entry point, the helper can create or
+link the matching Teams chat and notify you there as well.
+
+Teams file and image attachments can be passed through to Codex when available.
+Generated files listed in a Codex artifact manifest can be uploaded back to
+Teams when file-write auth is configured.
+
+The background service keeps the listener alive after terminal close, SSH
+disconnect, WSL session exit, sleep/wake, or helper upgrade. Service bootstrap
+chooses the native per-user service mechanism for the platform where possible
+and repairs old helper service definitions when it can do so safely.
+
+### Common Teams commands
+
+Run these locally when diagnosing setup:
+
+```bash
+codex-proxy teams status
+codex-proxy teams doctor --live
+codex-proxy teams control --print
+codex-proxy teams service doctor
+codex-proxy teams service status
+codex-proxy teams service bootstrap
+```
+
+In the Teams control chat, start with:
+
+```text
+help
+projects
+status
+```
+
+If you update the helper while Teams work is active, the helper drains current
+work first, restarts the service when needed, and then sends a completion or
+failure notice back to Teams.
+
+For a deeper deployment and troubleshooting guide, see
+[`docs/teams_source_deployment_guide.md`](docs/teams_source_deployment_guide.md).
+
 ## Upgrade
 
 Upgrade from GitHub Releases:
@@ -197,6 +327,7 @@ Optional flags:
 
 - `--repo owner/name` (override GitHub repo)
 - `--version vX.Y.Z` (install a specific version)
+- `--include-prerelease` (allow latest to resolve to the newest pre-release)
 - `--install-path /path/to/codex-proxy` (override install path; file or directory)
 
 Teams background mode also checks `codex-helper` GitHub Releases every 30
