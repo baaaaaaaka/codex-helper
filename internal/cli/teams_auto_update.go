@@ -174,6 +174,7 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 	}
 	return teams.HelperAutoUpdateApplyResult{
 		Version:            res.Version,
+		InstallPath:        res.InstallPath,
 		RestartRequired:    res.RestartRequired,
 		PendingReplacePath: res.PendingReplacePath,
 	}, nil

@@ -26,6 +26,7 @@ const (
 type teamsUpgradeFinishOptions struct {
 	Success            bool
 	ServiceRestart     teamsUpgradeServiceRestartMode
+	InstallPath        string
 	PendingReplacePath string
 }
 
@@ -230,7 +231,7 @@ func stopTeamsServiceForHelperUpgrade(ctx context.Context, in io.Reader, out io.
 					_, _ = fmt.Fprintln(out, "Scheduling Teams service restart after the pending helper replacement...")
 				}
 			}
-			return scheduleDelayedTeamsServiceStartAfterUpgrade(ctx, registryPath, refresh, opts.PendingReplacePath)
+			return scheduleDelayedTeamsServiceStartAfterUpgrade(ctx, registryPath, refresh, opts.PendingReplacePath, opts.InstallPath)
 		}
 		if out != nil {
 			_, _ = fmt.Fprintln(out, "Restarting Teams service after upgrade...")
@@ -352,9 +353,12 @@ func startTeamsServiceAfterUpgrade(ctx context.Context, registryPath *string, re
 	return startTeamsService(ctx, false)
 }
 
-func scheduleDelayedTeamsServiceStartAfterUpgrade(ctx context.Context, registryPath *string, refresh teamsUpgradeServiceRefreshResult, pendingReplacePath string) error {
+func scheduleDelayedTeamsServiceStartAfterUpgrade(ctx context.Context, registryPath *string, refresh teamsUpgradeServiceRefreshResult, pendingReplacePath string, installPath string) error {
 	if refresh.StartupFallback {
 		return scheduleDelayedTeamsStartupFallbackStart(ctx, registryPath)
+	}
+	if teamsServiceGOOS() == "windows" && strings.TrimSpace(pendingReplacePath) != "" {
+		return scheduleTeamsPendingHelperActivationForReplacement(ctx, pendingReplacePath, installPath)
 	}
 	return scheduleDelayedTeamsServiceStart(ctx, pendingReplacePath)
 }
@@ -433,7 +437,7 @@ func delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath string) string
 		return "Start-Sleep -Seconds 3; "
 	}
 	return "$pendingReplace = " + powershellSingleQuote(path) + "; " +
-		"for ($i = 0; $i -lt 120 -and (Test-Path -LiteralPath $pendingReplace); $i++) { Start-Sleep -Milliseconds 500 }; " +
+		"for ($i = 0; $i -lt 240 -and (Test-Path -LiteralPath $pendingReplace); $i++) { Start-Sleep -Milliseconds 500 }; " +
 		"Start-Sleep -Seconds 1; "
 }
 

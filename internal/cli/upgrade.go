@@ -64,6 +64,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				if cleanupErr := finishTeams(context.Background(), teamsUpgradeFinishOptions{
 					Success:            updateSucceeded,
 					ServiceRestart:     restartMode,
+					InstallPath:        res.InstallPath,
 					PendingReplacePath: res.PendingReplacePath,
 				}); cleanupErr != nil && err == nil {
 					err = cleanupErr

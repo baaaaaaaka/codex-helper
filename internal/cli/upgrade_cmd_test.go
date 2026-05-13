@@ -1214,6 +1214,189 @@ func TestScheduleDelayedTeamsServiceStartUsesConfiguredPowerShell(t *testing.T) 
 	}
 }
 
+func TestScheduleDelayedTeamsServiceStartUsesWindowsPendingActivation(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	pending := filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.123")
+	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write pending helper: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            filepath.Join(tmp, "codex-proxy.exe"),
+		windowsTaskDir: filepath.Join(tmp, "tasks"),
+	})
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() { teamsServiceStartDetached = prevDetached })
+	var detachedName string
+	var detachedArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		detachedName = name
+		detachedArgs = append([]string(nil), args...)
+		return nil
+	}
+
+	if err := scheduleDelayedTeamsServiceStartAfterUpgrade(context.Background(), nil, teamsUpgradeServiceRefreshResult{}, pending, filepath.Join(tmp, "codex-proxy.exe")); err != nil {
+		t.Fatalf("scheduleDelayedTeamsServiceStartAfterUpgrade error: %v", err)
+	}
+	if detachedName != "powershell.exe" {
+		t.Fatalf("detached name = %q, want powershell.exe", detachedName)
+	}
+	joined := strings.Join(detachedArgs, " ")
+	for _, want := range []string{
+		pending,
+		filepath.Join(tmp, "codex-proxy.exe"),
+		teamsServiceWindowsWatchdogTaskName,
+		teamsServiceWindowsTaskName,
+		"$want='1.2.3'",
+		"Move-Item -Force",
+		"if (Test-DestVersion) { $ready=$true }",
+		"if ($ready) { foreach",
+		"Start-ScheduledTask",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("windows activation command missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestRestartTeamsHelperFromTeamsUsesPendingActivationForWindowsService(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	pending := filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.123")
+	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write pending helper: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            filepath.Join(tmp, "codex-proxy.exe"),
+		windowsTaskDir: filepath.Join(tmp, "tasks"),
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	prevDetached := teamsServiceStartDetached
+	prevExit := exitFunc
+	prevStart := startSelf
+	t.Cleanup(func() {
+		teamsServiceStartDetached = prevDetached
+		exitFunc = prevExit
+		startSelf = prevStart
+	})
+	var detachedName string
+	var detachedArgs []string
+	var exitCode *int
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		detachedName = name
+		detachedArgs = append([]string(nil), args...)
+		return nil
+	}
+	exitFunc = func(code int) {
+		exitCode = &code
+	}
+	startSelf = func(string, []string) error {
+		t.Fatal("pending Windows service restart must not start the old helper entry directly")
+		return nil
+	}
+
+	if err := restartTeamsHelperFromTeamsAfterPendingReplacement(context.Background(), pending, filepath.Join(tmp, "codex-proxy.exe")); err != nil {
+		t.Fatalf("restartTeamsHelperFromTeamsAfterPendingReplacement error: %v", err)
+	}
+	if exitCode == nil || *exitCode != 0 {
+		t.Fatalf("exitCode = %v, want 0", exitCode)
+	}
+	if detachedName != "powershell.exe" {
+		t.Fatalf("detached name = %q, want powershell.exe", detachedName)
+	}
+	joined := strings.Join(detachedArgs, " ")
+	for _, want := range []string{
+		pending,
+		filepath.Join(tmp, "codex-proxy.exe"),
+		"$want='1.2.3'",
+		"Stop-ScheduledTask",
+		"Move-Item -Force",
+		"if (Test-DestVersion) { $ready=$true }",
+		"if ($ready) { foreach",
+		"Start-ScheduledTask",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("pending activation restart command missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestRestartTeamsHelperFromTeamsUsesPendingProcessRestartForWindowsManualRun(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	pending := filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.123")
+	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write pending helper: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            filepath.Join(tmp, "codex-proxy.exe"),
+		windowsTaskDir: filepath.Join(tmp, "tasks"),
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+	prevDetached := teamsServiceStartDetached
+	prevExit := exitFunc
+	prevStart := startSelf
+	prevArgs := os.Args
+	t.Cleanup(func() {
+		teamsServiceStartDetached = prevDetached
+		exitFunc = prevExit
+		startSelf = prevStart
+		os.Args = prevArgs
+	})
+	os.Args = []string{filepath.Join(tmp, "codex-proxy.exe"), "teams", "run", "--auto-service=false"}
+	var detachedName string
+	var detachedArgs []string
+	var exitCode *int
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		detachedName = name
+		detachedArgs = append([]string(nil), args...)
+		return nil
+	}
+	exitFunc = func(code int) {
+		exitCode = &code
+	}
+	startSelf = func(string, []string) error {
+		t.Fatal("pending Windows manual restart must not start the old helper entry directly")
+		return nil
+	}
+
+	if err := restartTeamsHelperFromTeamsAfterPendingReplacement(context.Background(), pending, filepath.Join(tmp, "codex-proxy.exe")); err != nil {
+		t.Fatalf("restartTeamsHelperFromTeamsAfterPendingReplacement error: %v", err)
+	}
+	if exitCode == nil || *exitCode != 0 {
+		t.Fatalf("exitCode = %v, want 0", exitCode)
+	}
+	if detachedName != "powershell.exe" {
+		t.Fatalf("detached name = %q, want powershell.exe", detachedName)
+	}
+	joined := strings.Join(detachedArgs, " ")
+	for _, want := range []string{
+		pending,
+		filepath.Join(tmp, "codex-proxy.exe"),
+		"$want='1.2.3'",
+		"Move-Item -Force",
+		"if (Test-DestVersion) { $ready=$true }",
+		"if ($ready) { try { Start-Process",
+		"Start-Process -FilePath $dest",
+		"'teams'",
+		"'run'",
+		"'--auto-service=false'",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("pending process restart command missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "Start-ScheduledTask") {
+		t.Fatalf("manual pending restart should not start scheduled tasks:\n%s", joined)
+	}
+}
+
 func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testing.T) {
 	lockCLITestHooks(t)
 

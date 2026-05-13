@@ -485,7 +485,7 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	var got update.UpdateOptions
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
 		got = opts
-		return update.ApplyResult{Version: "1.2.4"}, nil
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
 	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{
@@ -512,5 +512,8 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	}
 	if res.Version != "1.2.4" {
 		t.Fatalf("result version = %q, want 1.2.4", res.Version)
+	}
+	if res.InstallPath != fakeInstallPath {
+		t.Fatalf("result install path = %q, want %q", res.InstallPath, fakeInstallPath)
 	}
 }

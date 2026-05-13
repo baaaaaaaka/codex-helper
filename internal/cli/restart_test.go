@@ -100,6 +100,49 @@ func TestHandleUpdateAndRestartValidatesBinaryAndReportsPendingReplacement(t *te
 	}
 }
 
+func TestHandleUpdateAndRestartDoesNotTouchTeamsServiceForPlainPendingReplacement(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	prevPerform := performUpdate
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsServiceStartDetached = prevDetached
+	})
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{
+			Version:            "1.2.3",
+			InstallPath:        filepath.Join(tmp, "codex-proxy.exe"),
+			RestartRequired:    true,
+			PendingReplacePath: filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.123"),
+		}, nil
+	}
+	var detachedCalls int
+	teamsServiceStartDetached = func(_ context.Context, _ string, args ...string) error {
+		detachedCalls++
+		return nil
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            filepath.Join(tmp, "codex-proxy.exe"),
+		windowsTaskDir: filepath.Join(tmp, "tasks"),
+	})
+
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := handleUpdateAndRestart(context.Background(), cmd); err != nil {
+		t.Fatalf("handleUpdateAndRestart error: %v", err)
+	}
+	if detachedCalls != 0 {
+		t.Fatalf("plain --upgrade scheduled Teams service activation %d time(s), want 0", detachedCalls)
+	}
+	if !strings.Contains(out.String(), "Update replacement for v1.2.3 is pending.") {
+		t.Fatalf("unexpected pending replacement output: %q", out.String())
+	}
+}
+
 func TestRestartSelfUsesStablePathWhenRunningReloadBackup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("non-Windows restart uses exec; Windows is covered by service restart tests")

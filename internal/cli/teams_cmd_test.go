@@ -176,6 +176,36 @@ func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	}
 }
 
+func TestFormatTeamsHelperVersionStatusReportsOwnerEntryAndPending(t *testing.T) {
+	lockCLITestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fixture is not executable on Windows")
+	}
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho 'codex-proxy version 0.1.0-rc.68 (old)'\n"), 0o700); err != nil {
+		t.Fatalf("write fake helper: %v", err)
+	}
+	pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.73_linux_"+runtime.GOARCH+".123")
+	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write pending helper: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exe,
+		unitDir: filepath.Join(tmp, "systemd"),
+	})
+
+	got := formatTeamsHelperVersionStatus(context.Background(), []teamsstore.OwnerMetadata{{
+		HelperVersion: "v0.1.0-rc.68",
+	}})
+	for _, want := range []string{"owner=v0.1.0-rc.68", "entry=v0.1.0-rc.68", "pending=v0.1.0-rc.73"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("helper version status missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestTeamsWorkflowStatusRedactsWebhookURL(t *testing.T) {
 	lockCLITestHooks(t)
 

@@ -591,22 +591,36 @@ func TestBridgeHelperAutoUpdatePendingReplacementWaitsForVerifiedVersion(t *test
 		},
 		applyResult: HelperAutoUpdateApplyResult{
 			Version:            "1.2.4",
+			InstallPath:        "C:\\Users\\test\\.local\\bin\\codex-proxy.exe",
 			RestartRequired:    true,
 			PendingReplacePath: "C:\\Users\\test\\.local\\bin\\.codex-proxy_1.2.4.exe.tmp",
 		},
 	}
 	bridge.helperAutoUpdater = updater
 	var restartCalls int
+	var pendingRestartPath string
+	var pendingRestartInstallPath string
 	bridge.helperRestarter = func(context.Context) error {
 		restartCalls++
+		return nil
+	}
+	bridge.helperPendingRestarter = func(_ context.Context, path string, installPath string) error {
+		pendingRestartPath = path
+		pendingRestartInstallPath = installPath
 		return nil
 	}
 
 	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-update-pending"), "helper update now"); err != nil {
 		t.Fatalf("handleControlMessage update now error: %v", err)
 	}
-	if updater.applyCalls != 1 || restartCalls != 1 {
-		t.Fatalf("applyCalls=%d restartCalls=%d, want 1/1", updater.applyCalls, restartCalls)
+	if updater.applyCalls != 1 || restartCalls != 0 {
+		t.Fatalf("applyCalls=%d restartCalls=%d, want 1/0", updater.applyCalls, restartCalls)
+	}
+	if pendingRestartPath != updater.applyResult.PendingReplacePath {
+		t.Fatalf("pending restart path = %q, want %q", pendingRestartPath, updater.applyResult.PendingReplacePath)
+	}
+	if pendingRestartInstallPath != updater.applyResult.InstallPath {
+		t.Fatalf("pending restart install path = %q, want %q", pendingRestartInstallPath, updater.applyResult.InstallPath)
 	}
 	state, err := st.Load(context.Background())
 	if err != nil {
@@ -659,6 +673,12 @@ func TestBridgeHelperAutoUpdatePendingReplacementWaitsForVerifiedVersion(t *test
 	}
 	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
 		t.Fatalf("LastInstalledTag after verified restart = %q, want v1.2.4", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted || state.Upgrade.InstalledTag != "v1.2.4" {
+		t.Fatalf("upgrade after verified restart = %#v, want completed v1.2.4", state.Upgrade)
+	}
+	if state.Upgrade.CompletionNoticeID == "" || state.Upgrade.CompletionNoticeAt.IsZero() {
+		t.Fatalf("upgrade completion notice not durable after verified restart: %#v", state.Upgrade)
 	}
 }
 
@@ -754,6 +774,47 @@ func TestBridgeHelperAutoUpdateRestarterFailureKeepsInstalledState(t *testing.T)
 	}
 	if state.ServiceControl.Draining {
 		t.Fatalf("ServiceControl still draining after completed install: %#v", state.ServiceControl)
+	}
+}
+
+func TestBridgeHelperUpgradeCompletionDoesNotUseLastAttemptAsInstalledVersion(t *testing.T) {
+	st, bridge := newBridgeAutoUpdateTest(t)
+	bridge.helperVersion = "v1.2.4"
+	ctx := context.Background()
+	req, err := st.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	req, err = st.AddUpgradeNotificationTarget(ctx, req.ID, teamstore.UpgradeNotificationTarget{
+		TeamsChatID: "control-chat",
+		TurnID:      "command-1",
+	})
+	if err != nil {
+		t.Fatalf("AddUpgradeNotificationTarget error: %v", err)
+	}
+	if _, err := st.RecordAutoUpdateAttempt(ctx, "v1.2.4", time.Now()); err != nil {
+		t.Fatalf("RecordAutoUpdateAttempt error: %v", err)
+	}
+	req, err = st.CompleteUpgrade(ctx, req.ID)
+	if err != nil {
+		t.Fatalf("CompleteUpgrade error: %v", err)
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if msg, ok := bridge.completedHelperUpgradeNoticeMessage(state, req); ok {
+		t.Fatalf("completion message should not be generated from last attempt tag: %#v", msg)
+	}
+	if _, err := st.RecordAutoUpdateInstalled(ctx, "v1.2.4", time.Now()); err != nil {
+		t.Fatalf("RecordAutoUpdateInstalled error: %v", err)
+	}
+	state, err = st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after installed error: %v", err)
+	}
+	if msg, ok := bridge.completedHelperUpgradeNoticeMessage(state, req); !ok || !strings.Contains(msg.Body, "v1.2.4") {
+		t.Fatalf("completion message after verified install = %#v ok=%v, want v1.2.4", msg, ok)
 	}
 }
 

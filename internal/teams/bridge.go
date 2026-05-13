@@ -146,6 +146,7 @@ type BridgeOptions struct {
 	ControlFallbackHelpContext string
 	Runner                     codexrunner.Runner
 	HelperRestarter            HelperRestarter
+	HelperPendingRestarter     HelperPendingRestarter
 	HelperReloader             HelperReloader
 	HelperAutoUpdater          HelperAutoUpdater
 	HelperAutoUpdatePrerelease bool
@@ -159,6 +160,8 @@ type helperAutoUpdateApplyOptions struct {
 }
 
 type HelperRestarter func(context.Context) error
+
+type HelperPendingRestarter func(context.Context, string, string) error
 
 type HelperReloader func(context.Context, HelperReloadOptions) error
 
@@ -203,6 +206,7 @@ type HelperAutoUpdateCandidate struct {
 
 type HelperAutoUpdateApplyResult struct {
 	Version            string
+	InstallPath        string
 	RestartRequired    bool
 	PendingReplacePath string
 }
@@ -245,6 +249,7 @@ type Bridge struct {
 	controlFallbackExecutor      Executor
 	controlFallbackModel         string
 	helperRestarter              HelperRestarter
+	helperPendingRestarter       HelperPendingRestarter
 	helperReloader               HelperReloader
 	helperAutoUpdater            HelperAutoUpdater
 	helperVersion                string
@@ -550,6 +555,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	b.controlFallbackModel = strings.TrimSpace(opts.ControlFallbackModel)
 	b.controlFallbackHelpContext = strings.TrimSpace(opts.ControlFallbackHelpContext)
 	b.helperRestarter = opts.HelperRestarter
+	b.helperPendingRestarter = opts.HelperPendingRestarter
 	b.helperReloader = opts.HelperReloader
 	b.helperAutoUpdater = opts.HelperAutoUpdater
 	b.helperVersion = strings.TrimSpace(opts.HelperVersion)
@@ -2456,8 +2462,10 @@ func (b *Bridge) updateHelperFromControl(ctx context.Context, msg ChatMessage, a
 		return err
 	}
 	if err := b.applyHelperAutoUpdateWhenDrainedWithOptions(ctx, BridgeOptions{
-		HelperAutoUpdater: b.helperAutoUpdater,
-		HelperRestarter:   b.helperRestarter,
+		HelperAutoUpdater:          b.helperAutoUpdater,
+		HelperRestarter:            b.helperRestarter,
+		HelperPendingRestarter:     b.helperPendingRestarter,
+		HelperAutoUpdatePrerelease: b.helperAutoUpdatePrerelease,
 	}, *decision.Candidate, helperAutoUpdateApplyOptions{
 		Manual:           true,
 		ControlChatID:    firstNonEmptyString(b.reg.ControlChatID, msg.ChatID),
@@ -2960,6 +2968,23 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 		if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
 			return err
 		}
+		state, err := b.store.Load(ctx)
+		if err != nil {
+			return err
+		}
+		if state.Upgrade != nil && strings.TrimSpace(state.Upgrade.Reason) == teamstore.HelperUpgradeReason {
+			if _, err := b.store.CompleteUpgrade(ctx, state.Upgrade.ID, tag); err != nil {
+				return err
+			}
+			if handled, err := b.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil {
+				return err
+			} else if handled {
+				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+				return nil
+			}
+		}
 	}
 	seed := firstNonEmptyString(notice.CommandMessageID, notice.RequestedAt.Format(time.RFC3339Nano), chatID)
 	kind := "control-" + action + "-complete"
@@ -3045,7 +3070,13 @@ func (b *Bridge) completedHelperUpgradeNoticeMessage(state teamstore.State, req 
 	if chatID == "" {
 		return teamstore.OutboxMessage{}, false
 	}
-	tag := firstNonEmptyString(req.InstalledTag, state.AutoUpdate.LastInstalledTag, state.AutoUpdate.LastAttemptTag)
+	tag := firstNonEmptyString(req.InstalledTag, state.AutoUpdate.LastInstalledTag)
+	if strings.TrimSpace(tag) == "" {
+		return teamstore.OutboxMessage{}, false
+	}
+	if strings.TrimSpace(b.helperVersion) != "" && !helperVersionMatchesTag(b.helperVersion, tag) {
+		return teamstore.OutboxMessage{}, false
+	}
 	outboxID := strings.TrimSpace(req.CompletionNoticeID)
 	if outboxID == "" {
 		outboxID = helperUpgradeCompletionOutboxID(req, tag, chatID, commandMessageID)
@@ -3374,6 +3405,15 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 			if err := b.writePendingHelperUpgradeNotice(completionChatID, completionCommandID, tag, manualNotice); err != nil {
 				return err
 			}
+		}
+		if opts.HelperPendingRestarter != nil && strings.TrimSpace(res.PendingReplacePath) != "" {
+			if err := opts.HelperPendingRestarter(ctx, res.PendingReplacePath, res.InstallPath); err != nil {
+				if completionChatID != "" {
+					_ = b.clearPendingHelperRestartNotice()
+				}
+				return err
+			}
+			return nil
 		}
 		if opts.HelperRestarter == nil {
 			return fmt.Errorf("%s", pendingReason)

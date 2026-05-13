@@ -562,7 +562,12 @@ func printTeamsServiceBootstrapReady(out io.Writer, result teamsServiceBootstrap
 	_, _ = fmt.Fprintln(out, "============================================================")
 	_, _ = fmt.Fprintln(out, "BOOTSTRAP COMPLETE")
 	_, _ = fmt.Fprintln(out, "============================================================")
-	_, _ = fmt.Fprintf(out, "Teams service bootstrap ready: %s\n", result.Mode)
+	if result.Mode == "windows-pending-helper-activation" {
+		_, _ = fmt.Fprintln(out, "Teams helper update activation scheduled.")
+		_, _ = fmt.Fprintln(out, "The service will start after the staged helper replaces the old entry.")
+	} else {
+		_, _ = fmt.Fprintf(out, "Teams service bootstrap ready: %s\n", result.Mode)
+	}
 	if strings.TrimSpace(result.Path) != "" {
 		_, _ = fmt.Fprintf(out, "Teams service config: %s\n", result.Path)
 	}
@@ -578,6 +583,18 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	spec, err := buildTeamsServiceSpec(registryPath)
 	if err != nil {
 		return teamsServiceBootstrapResult{}, err
+	}
+	if activation, ok, err := discoverTeamsPendingHelperActivation(ctx, spec.Executable, ""); err != nil {
+		return teamsServiceBootstrapResult{}, fmt.Errorf("check pending helper activation: %w", err)
+	} else if ok {
+		path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false})
+		if err != nil {
+			return teamsServiceBootstrapResult{}, fmt.Errorf("repair Teams service before pending helper activation: %w", err)
+		}
+		if err := scheduleTeamsPendingHelperActivation(ctx, activation); err != nil {
+			return teamsServiceBootstrapResult{}, fmt.Errorf("schedule pending helper activation: %w", err)
+		}
+		return teamsServiceBootstrapResult{Mode: "windows-pending-helper-activation", Path: path}, nil
 	}
 	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
 		if _, err := teamsServiceRetireLocalDuplicateProcesses(ctx, spec); err != nil {
