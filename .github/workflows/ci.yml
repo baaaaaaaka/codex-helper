@@ -298,6 +298,7 @@ jobs:
           $teamsRuntimeKeepalive = 'Test(TeamsBackgroundKeepalive|TeamsStartupFallback|GlobalInbound|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           go test ./internal/cli -count=1 -run $teamsCliKeepalive -v
           go test ./internal/teams ./internal/teams/store -count=1 -run $teamsRuntimeKeepalive -v
+          go test ./internal/update -count=1 -run 'TestWindowsDeferredMoveScriptWaitsRetriesAndEscapesPaths$' -v
 
       - name: Teams native supervisor validation (Linux)
         if: runner.os == 'Linux'
@@ -328,7 +329,7 @@ jobs:
           set -euo pipefail
           adapter_pattern='Test(TeamsCodexExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|RunnerExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|BridgeSession(CodexFailureWithOnlyExistingThreadIDMarksFailed|TerminalCodexFailureWithTurnIDMarksFailed))$'
           runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerProcess(TransportReadFailureIncludesLimitedStderr|DiagnosticWaitsForStderrDrainAfterExit))$'
-          helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater.*|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|PassesPrereleaseOptIn|QueuesPlainCompletionNotice|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState)|BridgeControlHelperUpdate(PrereleaseRunsManualUpdate|WaitsForActiveWork))$'
+          helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater.*|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|PassesPrereleaseOptIn|QueuesPlainCompletionNotice|PendingReplacementWaitsForVerifiedVersion|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState)|BridgeControlHelperUpdate(PrereleaseRunsManualUpdate|WaitsForActiveWork))$'
           upgrade_pattern='Test(BridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork|BridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat|CodexErrorRequiresUpgradeHeuristics|UpgradeNotificationTargetsDeduplicate|RunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner)$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestMarkTurnFailedWithCodexIDsPersistsDiagnostics$' -v

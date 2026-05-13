@@ -184,8 +184,9 @@ type HelperAutoUpdateCandidate struct {
 }
 
 type HelperAutoUpdateApplyResult struct {
-	Version         string
-	RestartRequired bool
+	Version            string
+	RestartRequired    bool
+	PendingReplacePath string
 }
 
 type PersistentPollFailureError struct {
@@ -2926,6 +2927,7 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 	}
 	action := normalizedHelperRestartNoticeAction(notice.Action)
 	if action == helperRestartNoticeActionUpgrade {
+		tag := strings.TrimSpace(notice.Tag)
 		if handled, err := b.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil {
 			return err
 		} else if handled {
@@ -2933,6 +2935,12 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 				return err
 			}
 			return nil
+		}
+		if tag == "" || !helperVersionMatchesTag(b.helperVersion, tag) {
+			return nil
+		}
+		if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
+			return err
 		}
 	}
 	seed := firstNonEmptyString(notice.CommandMessageID, notice.RequestedAt.Format(time.RFC3339Nano), chatID)
@@ -2955,6 +2963,19 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func helperVersionMatchesTag(helperVersion string, tag string) bool {
+	expected := strings.TrimPrefix(strings.TrimSpace(tag), "v")
+	actual := strings.TrimSpace(helperVersion)
+	if fields := strings.Fields(actual); len(fields) > 0 {
+		actual = fields[0]
+	}
+	actual = strings.TrimPrefix(actual, "v")
+	if expected == "" || actual == "" {
+		return false
+	}
+	return strings.EqualFold(actual, expected)
 }
 
 func (b *Bridge) queueCompletedHelperUpgradeNoticeIfNeeded(ctx context.Context) (bool, error) {
@@ -3285,9 +3306,11 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 			if target.TurnID == "" {
 				target.TurnID = "manual-helper-upgrade"
 			}
-			if _, err := b.store.AddUpgradeNotificationTarget(ctx, req.ID, target); err != nil {
+			updated, err := b.store.AddUpgradeNotificationTarget(ctx, req.ID, target)
+			if err != nil {
 				return err
 			}
+			req = updated
 		}
 	}
 	state, err := b.store.Load(ctx)
@@ -3324,6 +3347,26 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 	tag := candidate.TagName
 	if strings.TrimSpace(tag) == "" && strings.TrimSpace(res.Version) != "" {
 		tag = "v" + strings.TrimPrefix(strings.TrimSpace(res.Version), "v")
+	}
+	if res.RestartRequired || strings.TrimSpace(res.PendingReplacePath) != "" {
+		pendingReason := "helper update replacement is pending; waiting for the restarted helper to verify " + strings.TrimSpace(tag)
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
+		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
+		if completionChatID != "" {
+			if err := b.writePendingHelperUpgradeNotice(completionChatID, completionCommandID, tag, manualNotice); err != nil {
+				return err
+			}
+		}
+		if opts.HelperRestarter == nil {
+			return fmt.Errorf("%s", pendingReason)
+		}
+		if err := opts.HelperRestarter(ctx); err != nil {
+			if completionChatID != "" {
+				_ = b.clearPendingHelperRestartNotice()
+			}
+			return err
+		}
+		return nil
 	}
 	if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())

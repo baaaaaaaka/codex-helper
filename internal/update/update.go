@@ -60,15 +60,17 @@ type UpdateOptions struct {
 }
 
 type ApplyResult struct {
-	Repo            string
-	Version         string
-	Asset           string
-	InstallPath     string
-	RestartRequired bool
+	Repo               string
+	Version            string
+	Asset              string
+	InstallPath        string
+	RestartRequired    bool
+	PendingReplacePath string
 }
 
 type replaceResult struct {
-	restartRequired bool
+	restartRequired    bool
+	pendingReplacePath string
 }
 
 type releaseInfo struct {
@@ -262,11 +264,12 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 	}
 
 	return ApplyResult{
-		Repo:            repo,
-		Version:         verNoV,
-		Asset:           asset,
-		InstallPath:     installPath,
-		RestartRequired: rep.restartRequired,
+		Repo:               repo,
+		Version:            verNoV,
+		Asset:              asset,
+		InstallPath:        installPath,
+		RestartRequired:    rep.restartRequired,
+		PendingReplacePath: rep.pendingReplacePath,
 	}, nil
 }
 

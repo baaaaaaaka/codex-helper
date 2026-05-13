@@ -89,6 +89,9 @@ func TestUpgradeCmdExplicitVersionCallsPerformUpdate(t *testing.T) {
 	if got.Timeout != 120*time.Second {
 		t.Fatalf("expected 120s update timeout, got %s", got.Timeout)
 	}
+	if !got.ValidateBinary {
+		t.Fatal("upgrade command must validate the downloaded binary before replacing itself")
+	}
 	if !strings.Contains(out.String(), "Updated to v1.2.3.") {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
@@ -124,7 +127,7 @@ func TestUpgradeCmdLatestCanIncludePrerelease(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade: %v", err)
 	}
-	if got.Repo != "owner/name" || got.Version != "" || !got.IncludePrerelease {
+	if got.Repo != "owner/name" || got.Version != "" || !got.IncludePrerelease || !got.ValidateBinary {
 		t.Fatalf("PerformUpdate options = %#v, want latest prerelease lookup", got)
 	}
 	if !strings.Contains(out.String(), "Updated to v1.2.4-rc.1.") {
@@ -135,6 +138,7 @@ func TestUpgradeCmdLatestCanIncludePrerelease(t *testing.T) {
 func TestUpgradeCmdRestartRequiredMessage(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)
+	tmp := t.TempDir()
 
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
@@ -147,7 +151,7 @@ func TestUpgradeCmdRestartRequiredMessage(t *testing.T) {
 		return update.Status{Supported: true, UpdateAvailable: true}
 	}
 	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		return update.ApplyResult{Version: "1.2.3", RestartRequired: true}, nil
+		return update.ApplyResult{Version: "1.2.3", RestartRequired: true, PendingReplacePath: filepath.Join(tmp, ".codex-proxy_1.2.3.tmp")}, nil
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
@@ -156,7 +160,8 @@ func TestUpgradeCmdRestartRequiredMessage(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade: %v", err)
 	}
-	if !strings.Contains(out.String(), "Update scheduled for v1.2.3. Please restart `codex-proxy`.") {
+	if !strings.Contains(out.String(), "Update replacement for v1.2.3 is pending.") ||
+		!strings.Contains(out.String(), "verify `codex-proxy --version`") {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
 }
@@ -957,9 +962,17 @@ func TestUpgradeCmdDelaysTeamsServiceRestartWhenUpdateNeedsProcessExit(t *testin
 	if detachedName != "sh" || len(detachedArgs) != 2 || !strings.Contains(detachedArgs[1], "systemctl --user start '"+teamsServiceUnitName+"'") {
 		t.Fatalf("unexpected detached restart: name=%q args=%#v", detachedName, detachedArgs)
 	}
-	if !strings.Contains(out.String(), "Scheduling Teams service restart after the updated helper is ready") ||
-		!strings.Contains(out.String(), "Update scheduled for v1.2.3. Please restart `codex-proxy`.") {
+	if !strings.Contains(out.String(), "Scheduling Teams service restart after the pending helper replacement") ||
+		!strings.Contains(out.String(), "Update replacement for v1.2.3 is pending.") ||
+		!strings.Contains(out.String(), "verify `codex-proxy --version`") {
 		t.Fatalf("upgrade output missing delayed restart/restart-required messages:\n%s", out.String())
+	}
+	upgrade, ok, err := st.ReadUpgrade(context.Background())
+	if err != nil {
+		t.Fatalf("ReadUpgrade error: %v", err)
+	}
+	if !ok || upgrade.Phase != teamsstore.UpgradePhaseAborted || !strings.Contains(upgrade.AbortReason, "did not complete") {
+		t.Fatalf("restart-required upgrade state = %#v ok=%v, want aborted pending install", upgrade, ok)
 	}
 }
 
@@ -1153,7 +1166,7 @@ func TestScheduleDelayedTeamsServiceStartUsesWSLWindowsTask(t *testing.T) {
 	}
 	t.Cleanup(func() { teamsServiceStartDetached = prevDetached })
 
-	if err := scheduleDelayedTeamsServiceStart(context.Background()); err != nil {
+	if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
 		t.Fatalf("scheduleDelayedTeamsServiceStart error: %v", err)
 	}
 	joined := strings.Join(detachedArgs, " ")
@@ -1193,7 +1206,7 @@ func TestScheduleDelayedTeamsServiceStartUsesConfiguredPowerShell(t *testing.T) 
 	}
 	t.Cleanup(func() { teamsServiceStartDetached = prevDetached })
 
-	if err := scheduleDelayedTeamsServiceStart(context.Background()); err != nil {
+	if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
 		t.Fatalf("scheduleDelayedTeamsServiceStart error: %v", err)
 	}
 	if detachedName != configuredPowerShell || !strings.Contains(strings.Join(detachedArgs, " "), "Start-ScheduledTask") {

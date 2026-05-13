@@ -1833,7 +1833,7 @@ func TestTeamsBackgroundKeepaliveDelayedRestartCommandsCI(t *testing.T) {
 			if err != nil {
 				t.Fatalf("backend error: %v", err)
 			}
-			name, args, err := delayedTeamsServiceStartCommand(backend)
+			name, args, err := delayedTeamsServiceStartCommand(backend, "")
 			if err != nil {
 				t.Fatalf("delayedTeamsServiceStartCommand error: %v", err)
 			}
@@ -1852,6 +1852,32 @@ func TestTeamsBackgroundKeepaliveDelayedRestartCommandsCI(t *testing.T) {
 			}
 		})
 	}
+	t.Run("windows waits for pending replacement file", func(t *testing.T) {
+		tmp := t.TempDir()
+		withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+			goos:           "windows",
+			exe:            filepath.Join(tmp, "codex-proxy.exe"),
+			cwd:            tmp,
+			windowsTaskDir: filepath.Join(tmp, "windows-task"),
+			runner:         &recordingTeamsServiceRunner{},
+		})
+		backend, err := teamsServiceBackendForCurrentPlatform()
+		if err != nil {
+			t.Fatalf("backend error: %v", err)
+		}
+		pending := filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.tmp")
+		name, args, err := delayedTeamsServiceStartCommand(backend, pending)
+		if err != nil {
+			t.Fatalf("delayedTeamsServiceStartCommand error: %v", err)
+		}
+		if name != "powershell.exe" {
+			t.Fatalf("restart command name = %q, want powershell.exe", name)
+		}
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "Test-Path -LiteralPath $pendingReplace") || !strings.Contains(joined, powershellSingleQuote(pending)) {
+			t.Fatalf("windows pending restart command must wait for staged replacement:\n%s", joined)
+		}
+	})
 }
 
 func TestTeamsBackgroundKeepaliveServiceActionsCI(t *testing.T) {

@@ -24,8 +24,9 @@ const (
 )
 
 type teamsUpgradeFinishOptions struct {
-	Success        bool
-	ServiceRestart teamsUpgradeServiceRestartMode
+	Success            bool
+	ServiceRestart     teamsUpgradeServiceRestartMode
+	PendingReplacePath string
 }
 
 type teamsUpgradeFinalizer func(context.Context, teamsUpgradeFinishOptions) error
@@ -223,9 +224,13 @@ func stopTeamsServiceForHelperUpgrade(ctx context.Context, in io.Reader, out io.
 		}
 		if opts.ServiceRestart == teamsUpgradeRestartDelayed {
 			if out != nil {
-				_, _ = fmt.Fprintln(out, "Scheduling Teams service restart after the updated helper is ready...")
+				if opts.Success {
+					_, _ = fmt.Fprintln(out, "Scheduling Teams service restart after the updated helper is ready...")
+				} else {
+					_, _ = fmt.Fprintln(out, "Scheduling Teams service restart after the pending helper replacement...")
+				}
 			}
-			return scheduleDelayedTeamsServiceStartAfterUpgrade(ctx, registryPath, refresh)
+			return scheduleDelayedTeamsServiceStartAfterUpgrade(ctx, registryPath, refresh, opts.PendingReplacePath)
 		}
 		if out != nil {
 			_, _ = fmt.Fprintln(out, "Restarting Teams service after upgrade...")
@@ -347,11 +352,11 @@ func startTeamsServiceAfterUpgrade(ctx context.Context, registryPath *string, re
 	return startTeamsService(ctx, false)
 }
 
-func scheduleDelayedTeamsServiceStartAfterUpgrade(ctx context.Context, registryPath *string, refresh teamsUpgradeServiceRefreshResult) error {
+func scheduleDelayedTeamsServiceStartAfterUpgrade(ctx context.Context, registryPath *string, refresh teamsUpgradeServiceRefreshResult, pendingReplacePath string) error {
 	if refresh.StartupFallback {
 		return scheduleDelayedTeamsStartupFallbackStart(ctx, registryPath)
 	}
-	return scheduleDelayedTeamsServiceStart(ctx)
+	return scheduleDelayedTeamsServiceStart(ctx, pendingReplacePath)
 }
 
 func scheduleDelayedTeamsStartupFallbackStart(ctx context.Context, registryPath *string) error {
@@ -377,12 +382,12 @@ func scheduleDelayedTeamsStartupFallbackStart(ctx context.Context, registryPath 
 	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
 }
 
-func scheduleDelayedTeamsServiceStart(ctx context.Context) error {
+func scheduleDelayedTeamsServiceStart(ctx context.Context, pendingReplacePath string) error {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return err
 	}
-	name, args, err := delayedTeamsServiceStartCommand(backend)
+	name, args, err := delayedTeamsServiceStartCommand(backend, pendingReplacePath)
 	if err != nil {
 		return err
 	}
@@ -394,7 +399,7 @@ func defaultTeamsServiceStartDetached(_ context.Context, name string, args ...st
 	return cmd.Start()
 }
 
-func delayedTeamsServiceStartCommand(backend teamsServiceBackend) (string, []string, error) {
+func delayedTeamsServiceStartCommand(backend teamsServiceBackend, pendingReplacePath string) (string, []string, error) {
 	if backend.ID() == "wsl-windows-task-scheduler" {
 		wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
 		if !ok {
@@ -407,7 +412,7 @@ func delayedTeamsServiceStartCommand(backend teamsServiceBackend) (string, []str
 	}
 	switch teamsServiceGOOS() {
 	case "windows":
-		command := "Start-Sleep -Seconds 3; Start-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsTaskName)
+		command := delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath) + "Start-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsTaskName)
 		return teamsServicePowerShellExecutable(), []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}, nil
 	case "darwin":
 		path, err := backend.Path()
@@ -420,6 +425,16 @@ func delayedTeamsServiceStartCommand(backend teamsServiceBackend) (string, []str
 		script := "sleep 3; systemctl --user start " + shellQuote(backend.Name()) + " >/dev/null 2>&1"
 		return "sh", []string{"-c", script}, nil
 	}
+}
+
+func delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath string) string {
+	path := strings.TrimSpace(pendingReplacePath)
+	if path == "" {
+		return "Start-Sleep -Seconds 3; "
+	}
+	return "$pendingReplace = " + powershellSingleQuote(path) + "; " +
+		"for ($i = 0; $i -lt 120 -and (Test-Path -LiteralPath $pendingReplace); $i++) { Start-Sleep -Milliseconds 500 }; " +
+		"Start-Sleep -Seconds 1; "
 }
 
 func teamsUpgradeServiceActive(ctx context.Context) (bool, error) {

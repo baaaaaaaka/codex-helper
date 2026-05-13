@@ -27,10 +27,11 @@ var (
 
 func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 	res, err := performUpdate(ctx, update.UpdateOptions{
-		Repo:        "",
-		Version:     "latest",
-		InstallPath: "",
-		Timeout:     120 * time.Second,
+		Repo:           "",
+		Version:        "latest",
+		InstallPath:    "",
+		Timeout:        120 * time.Second,
+		ValidateBinary: true,
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Upgrade failed: %v\n", err)
@@ -38,7 +39,7 @@ func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 	}
 
 	if res.RestartRequired {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update scheduled for v%s. Please restart `codex-proxy`.\n", res.Version)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update replacement for v%s is pending. Restart `codex-proxy`, then verify `codex-proxy --version` before treating the update as installed.\n", res.Version)
 		return nil
 	}
 

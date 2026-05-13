@@ -51,17 +51,21 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				Version:           versionOverride,
 				InstallPath:       installPath,
 				Timeout:           120 * time.Second,
+				ValidateBinary:    true,
 				IncludePrerelease: includePrerelease,
 			})
 			if finishTeams != nil {
-				updateSucceeded := err == nil
+				replacementPending := res.RestartRequired || strings.TrimSpace(res.PendingReplacePath) != ""
+				updateSucceeded := err == nil && !replacementPending
 				restartMode := teamsUpgradeRestartImmediate
-				if updateSucceeded {
-					if res.RestartRequired {
-						restartMode = teamsUpgradeRestartDelayed
-					}
+				if err == nil && replacementPending {
+					restartMode = teamsUpgradeRestartDelayed
 				}
-				if cleanupErr := finishTeams(context.Background(), teamsUpgradeFinishOptions{Success: updateSucceeded, ServiceRestart: restartMode}); cleanupErr != nil && err == nil {
+				if cleanupErr := finishTeams(context.Background(), teamsUpgradeFinishOptions{
+					Success:            updateSucceeded,
+					ServiceRestart:     restartMode,
+					PendingReplacePath: res.PendingReplacePath,
+				}); cleanupErr != nil && err == nil {
 					err = cleanupErr
 				}
 			}
@@ -70,7 +74,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 			}
 
 			if res.RestartRequired {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update scheduled for v%s. Please restart `codex-proxy`.\n", res.Version)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update replacement for v%s is pending. Restart `codex-proxy`, then verify `codex-proxy --version` before treating the update as installed.\n", res.Version)
 				return nil
 			}
 

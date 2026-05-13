@@ -173,7 +173,8 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
 	return teams.HelperAutoUpdateApplyResult{
-		Version:         res.Version,
-		RestartRequired: res.RestartRequired,
+		Version:            res.Version,
+		RestartRequired:    res.RestartRequired,
+		PendingReplacePath: res.PendingReplacePath,
 	}, nil
 }

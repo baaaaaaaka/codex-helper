@@ -782,7 +782,7 @@ func restartTeamsHelperFromTeams(context.Context) error {
 		return err
 	}
 	if teamsServiceGOOS() == "windows" && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
-		if err := scheduleDelayedTeamsServiceStart(context.Background()); err != nil {
+		if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
 			return err
 		}
 		exitFunc(0)

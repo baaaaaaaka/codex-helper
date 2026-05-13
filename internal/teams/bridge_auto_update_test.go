@@ -11,12 +11,13 @@ import (
 )
 
 type fakeHelperAutoUpdater struct {
-	decision   HelperAutoUpdateDecision
-	applyCalls int
-	applied    []HelperAutoUpdateCandidate
-	checks     []HelperAutoUpdateCheck
-	checkErr   error
-	applyErr   error
+	decision    HelperAutoUpdateDecision
+	applyCalls  int
+	applied     []HelperAutoUpdateCandidate
+	checks      []HelperAutoUpdateCheck
+	checkErr    error
+	applyErr    error
+	applyResult HelperAutoUpdateApplyResult
 }
 
 func (f *fakeHelperAutoUpdater) Check(_ context.Context, check HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error) {
@@ -30,7 +31,10 @@ func (f *fakeHelperAutoUpdater) Apply(_ context.Context, candidate HelperAutoUpd
 	if f.applyErr != nil {
 		return HelperAutoUpdateApplyResult{}, f.applyErr
 	}
-	return HelperAutoUpdateApplyResult{Version: candidate.Version}, nil
+	if strings.TrimSpace(f.applyResult.Version) == "" {
+		f.applyResult.Version = candidate.Version
+	}
+	return f.applyResult, nil
 }
 
 func TestBridgeHelperAutoUpdateAppliesEligibleCandidate(t *testing.T) {
@@ -569,6 +573,92 @@ func TestBridgeControlHelperUpdateWaitsForActiveWork(t *testing.T) {
 	}
 	if state.AutoUpdate.CandidateTag != "v1.2.4" {
 		t.Fatalf("CandidateTag = %q, want v1.2.4", state.AutoUpdate.CandidateTag)
+	}
+}
+
+func TestBridgeHelperAutoUpdatePendingReplacementWaitsForVerifiedVersion(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	updater := &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			NextCheckAt: now.Add(30 * time.Minute),
+			Candidate: &HelperAutoUpdateCandidate{
+				TagName: "v1.2.4",
+				Version: "1.2.4",
+			},
+		},
+		applyResult: HelperAutoUpdateApplyResult{
+			Version:            "1.2.4",
+			RestartRequired:    true,
+			PendingReplacePath: "C:\\Users\\test\\.local\\bin\\.codex-proxy_1.2.4.exe.tmp",
+		},
+	}
+	bridge.helperAutoUpdater = updater
+	var restartCalls int
+	bridge.helperRestarter = func(context.Context) error {
+		restartCalls++
+		return nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-update-pending"), "helper update now"); err != nil {
+		t.Fatalf("handleControlMessage update now error: %v", err)
+	}
+	if updater.applyCalls != 1 || restartCalls != 1 {
+		t.Fatalf("applyCalls=%d restartCalls=%d, want 1/1", updater.applyCalls, restartCalls)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "" {
+		t.Fatalf("LastInstalledTag = %q, want empty before verified restart", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, "replacement is pending") {
+		t.Fatalf("upgrade = %#v, want aborted pending replacement", state.Upgrade)
+	}
+
+	restartedOld := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedOld.helperVersion = "v1.2.3"
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice with old version error: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush old pending outbox: %v", err)
+	}
+	if strings.Contains(sentPlainJoined(*sent), "Helper update completed") {
+		t.Fatalf("completion notice sent before helper version matched:\n%s", sentPlainJoined(*sent))
+	}
+	state, err = st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after old restart error: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "" {
+		t.Fatalf("LastInstalledTag after old restart = %q, want empty", state.AutoUpdate.LastInstalledTag)
+	}
+
+	restartedNew := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedNew.helperVersion = "v1.2.4 (abc123) 2026-05-04T00:00:00Z"
+	if err := restartedNew.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice with new version error: %v", err)
+	}
+	if err := restartedNew.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush new pending outbox: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Helper update completed") || !strings.Contains(joined, "v1.2.4") {
+		t.Fatalf("completion notice missing after verified restart:\n%s", joined)
+	}
+	if got := strings.Count(joined, "Helper update completed"); got != 1 {
+		t.Fatalf("completion notice count = %d, want 1 in:\n%s", got, joined)
+	}
+	state, err = st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after new restart error: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
+		t.Fatalf("LastInstalledTag after verified restart = %q, want v1.2.4", state.AutoUpdate.LastInstalledTag)
 	}
 }
 

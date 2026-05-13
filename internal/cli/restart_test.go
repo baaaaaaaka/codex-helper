@@ -1,12 +1,18 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/update"
+	"github.com/spf13/cobra"
 )
 
 func TestRestartSelfExecsSameBinaryWithCurrentArgs(t *testing.T) {
@@ -60,6 +66,37 @@ func TestRestartSelfExecsSameBinaryWithCurrentArgs(t *testing.T) {
 	}
 	if len(gotEnv) == 0 {
 		t.Fatal("exec env was empty")
+	}
+}
+
+func TestHandleUpdateAndRestartValidatesBinaryAndReportsPendingReplacement(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevPerform := performUpdate
+	t.Cleanup(func() { performUpdate = prevPerform })
+
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		return update.ApplyResult{
+			Version:            "1.2.3",
+			RestartRequired:    true,
+			PendingReplacePath: filepath.Join(t.TempDir(), ".codex-proxy_1.2.3.tmp"),
+		}, nil
+	}
+
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := handleUpdateAndRestart(context.Background(), cmd); err != nil {
+		t.Fatalf("handleUpdateAndRestart error: %v", err)
+	}
+	if !got.ValidateBinary {
+		t.Fatal("handleUpdateAndRestart must validate the downloaded binary before replacing itself")
+	}
+	if !strings.Contains(out.String(), "Update replacement for v1.2.3 is pending.") ||
+		!strings.Contains(out.String(), "verify `codex-proxy --version`") {
+		t.Fatalf("unexpected pending replacement output: %q", out.String())
 	}
 }
 
