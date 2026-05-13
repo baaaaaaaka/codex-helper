@@ -44,7 +44,7 @@ func teamsControlFallbackHelpContext() string {
 		"- Regular text is sent to Codex as the task.",
 		"- `helper status`: check current request state.",
 		"- `helper retry last`: retry the last failed/interrupted request.",
-		"- `helper cancel last`: cancel/drop the latest queued/running request.",
+		"- `helper cancel last` / `helper cancel all`: cancel/drop queued/running request(s).",
 		"- `helper file <relative-path>`: upload a generated file prepared under the Teams outbound folder.",
 		"- `helper close`: close the Work chat binding.",
 	}

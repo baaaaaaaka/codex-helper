@@ -14,6 +14,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp teams service bootstrap`",
 		"`helper update prerelease`",
 		"`helper cancel last`",
+		"`helper cancel all`",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("teamsControlFallbackHelpContext missing %q:\n%s", want, got)

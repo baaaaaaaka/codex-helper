@@ -187,7 +187,7 @@ func TestLiveBridgeWorkSessionCommandsOptIn(t *testing.T) {
 	if _, err := graph.SendHTML(ctx, workSession.ChatID, "<p>helper cancel</p>"); err != nil {
 		t.Fatalf("send live work helper cancel usage failed: %v", err)
 	}
-	waitForOutbox("work cancel usage", workSession.ChatID, "usage:", "helper cancel <turn-id>")
+	waitForOutbox("work cancel usage", workSession.ChatID, "usage:", "helper cancel all", "helper cancel <turn-id>")
 
 	missingCancel := "turn:missing-cancel-" + nonce
 	if _, err := graph.SendHTML(ctx, workSession.ChatID, "<p>helper cancel "+html.EscapeString(missingCancel)+"</p>"); err != nil {

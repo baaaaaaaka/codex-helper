@@ -67,6 +67,12 @@ var codexStreamRetryStatusRepeatDelay = 5 * time.Minute
 var queuedTurnAttentionDelay = 10 * time.Minute
 var queuedTurnAttentionRepeatDelay = 10 * time.Minute
 
+var errTranscriptCheckpointNotFound = errors.New("transcript checkpoint was not found")
+
+func transcriptCheckpointNeedsAttentionMessage() string {
+	return "Local Codex history sync needs attention. I could not find the saved transcript checkpoint, so I did not guess an import position or import local history from the wrong place."
+}
+
 const controlFallbackSessionID = "__control_fallback__"
 
 const (
@@ -2237,7 +2243,7 @@ func sessionAdvancedHelpText() string {
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
-		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
+		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
 		"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
 		"Other text, including unknown slash-prefixed text, is sent to Codex.",
 	}, "\n")
@@ -5190,7 +5196,7 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 
 func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID string) error {
 	if turnID == "" {
-		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel last`, `helper cancel <turn-id>`, or `!cancel <turn-id>`")
+		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>`, or `!cancel <turn-id>`\n\nThese commands apply to this Work chat.")
 	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
@@ -5199,7 +5205,10 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 	if err != nil {
 		return err
 	}
-	if strings.EqualFold(strings.TrimSpace(turnID), "last") {
+	switch strings.ToLower(strings.TrimSpace(turnID)) {
+	case "all":
+		return b.cancelAllTurnsCommand(ctx, session, state)
+	case "last":
 		resolved, ok := latestCancelableTurnID(state, session.ID)
 		if !ok {
 			return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this session.")
@@ -5221,34 +5230,49 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 			TurnID:      turn.ID,
 			TeamsChatID: session.ChatID,
 			Kind:        "canceled",
-			Body:        "turn canceled: " + turn.ID,
+			Body:        formatCancelOneResponse(state, session.ID, turn, "turn canceled", true),
 		})
 	case teamstore.TurnStatusRunning:
 		if !b.requestRunningTurnCancel(turn.ID) {
 			return b.sendToChat(ctx, session.ChatID, "This Codex request is running, but this helper process does not own its live cancel handle. It may have started before the latest helper loaded or before a restart. Wait for it to finish, or use `helper status` to decide whether recovery is needed.")
 		}
-		return b.sendToChat(ctx, session.ChatID, "cancel requested for running turn: "+turn.ID)
+		return b.sendToChat(ctx, session.ChatID, formatCancelOneResponse(state, session.ID, turn, "cancel requested for running turn", true))
 	default:
 		return b.sendToChat(ctx, session.ChatID, fmt.Sprintf("turn %s is %s and cannot be canceled.", turn.ID, turn.Status))
 	}
 }
 
+func (b *Bridge) cancelAllTurnsCommand(ctx context.Context, session *Session, state teamstore.State) error {
+	targets := cancelableTurnsForSession(state, session.ID)
+	if len(targets) == 0 {
+		return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this session.")
+	}
+	var canceledQueued []teamstore.Turn
+	var requestedRunning []teamstore.Turn
+	var unavailableRunning []teamstore.Turn
+	for _, turn := range targets {
+		switch turn.Status {
+		case teamstore.TurnStatusQueued:
+			if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
+				return err
+			}
+			canceledQueued = append(canceledQueued, turn)
+		case teamstore.TurnStatusRunning:
+			if b.requestRunningTurnCancel(turn.ID) {
+				requestedRunning = append(requestedRunning, turn)
+			} else {
+				unavailableRunning = append(unavailableRunning, turn)
+			}
+		}
+	}
+	return b.sendToChat(ctx, session.ChatID, formatCancelAllResponse(state, canceledQueued, requestedRunning, unavailableRunning))
+}
+
 func latestCancelableTurnID(state teamstore.State, sessionID string) (string, bool) {
 	var latest teamstore.Turn
 	latestRank := 0
-	for _, turn := range state.Turns {
-		if turn.SessionID != sessionID {
-			continue
-		}
-		rank := 0
-		switch turn.Status {
-		case teamstore.TurnStatusRunning:
-			rank = 2
-		case teamstore.TurnStatusQueued:
-			rank = 1
-		default:
-			continue
-		}
+	for _, turn := range cancelableTurnsForSession(state, sessionID) {
+		rank := cancelableTurnRank(turn)
 		if latest.ID == "" || rank > latestRank || (rank == latestRank && turnSortTime(turn).After(turnSortTime(latest))) {
 			latest = turn
 			latestRank = rank
@@ -5258,6 +5282,116 @@ func latestCancelableTurnID(state teamstore.State, sessionID string) (string, bo
 		return "", false
 	}
 	return latest.ID, true
+}
+
+func cancelableTurnsForSession(state teamstore.State, sessionID string) []teamstore.Turn {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	var turns []teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID || cancelableTurnRank(turn) == 0 {
+			continue
+		}
+		turns = append(turns, turn)
+	}
+	sort.SliceStable(turns, func(i, j int) bool {
+		if cancelableTurnRank(turns[i]) != cancelableTurnRank(turns[j]) {
+			return cancelableTurnRank(turns[i]) > cancelableTurnRank(turns[j])
+		}
+		if !turnSortTime(turns[i]).Equal(turnSortTime(turns[j])) {
+			return turnSortTime(turns[i]).Before(turnSortTime(turns[j]))
+		}
+		return turns[i].ID < turns[j].ID
+	})
+	return turns
+}
+
+func cancelableTurnRank(turn teamstore.Turn) int {
+	switch turn.Status {
+	case teamstore.TurnStatusRunning:
+		return 2
+	case teamstore.TurnStatusQueued:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func formatCancelOneResponse(state teamstore.State, sessionID string, turn teamstore.Turn, action string, includeRemaining bool) string {
+	lines := []string{strings.TrimSpace(action) + ": `" + turn.ID + "`"}
+	if summary := turnPromptSummary(state, turn); summary != "" {
+		label := "**Canceled prompt:**"
+		if turn.Status == teamstore.TurnStatusRunning {
+			label = "**Prompt being canceled:**"
+		}
+		lines = append(lines, "", label, summary)
+	}
+	if includeRemaining {
+		lines = append(lines, "")
+		lines = append(lines, formatRemainingQueuedPrompts(state, sessionID, map[string]bool{turn.ID: true})...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatCancelAllResponse(state teamstore.State, canceledQueued []teamstore.Turn, requestedRunning []teamstore.Turn, unavailableRunning []teamstore.Turn) string {
+	lines := []string{"cancel all requested for this Work chat."}
+	if len(canceledQueued)+len(requestedRunning) == 0 && len(unavailableRunning) > 0 {
+		lines[0] = "cancel all could not cancel every running request in this Work chat."
+	}
+	if len(requestedRunning) > 0 {
+		lines = append(lines, "", "**Running requests cancel requested:**")
+		lines = append(lines, formatTurnPromptList(state, requestedRunning)...)
+	}
+	if len(canceledQueued) > 0 {
+		lines = append(lines, "", "**Queued requests canceled:**")
+		lines = append(lines, formatTurnPromptList(state, canceledQueued)...)
+	}
+	if len(unavailableRunning) > 0 {
+		lines = append(lines, "", "**Could not cancel these running requests:**")
+		lines = append(lines, formatTurnPromptList(state, unavailableRunning)...)
+		lines = append(lines, "", "This helper process does not own their live cancel handles. They may have started before the latest helper loaded or before a restart.")
+	}
+	if len(canceledQueued)+len(requestedRunning)+len(unavailableRunning) == 0 {
+		lines = append(lines, "", "No running or queued requests were canceled.")
+	}
+	lines = append(lines, "", "No queued prompts remain.")
+	return strings.Join(lines, "\n")
+}
+
+func formatRemainingQueuedPrompts(state teamstore.State, sessionID string, exclude map[string]bool) []string {
+	var queued []teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusQueued || exclude[turn.ID] {
+			continue
+		}
+		queued = append(queued, turn)
+	}
+	sort.SliceStable(queued, func(i, j int) bool {
+		if !turnSortTime(queued[i]).Equal(turnSortTime(queued[j])) {
+			return turnSortTime(queued[i]).Before(turnSortTime(queued[j]))
+		}
+		return queued[i].ID < queued[j].ID
+	})
+	if len(queued) == 0 {
+		return []string{"No other prompts are queued."}
+	}
+	lines := []string{"**Still queued:**"}
+	lines = append(lines, formatTurnPromptList(state, queued)...)
+	return lines
+}
+
+func formatTurnPromptList(state teamstore.State, turns []teamstore.Turn) []string {
+	lines := make([]string, 0, len(turns))
+	for i, turn := range turns {
+		summary := turnPromptSummary(state, turn)
+		if summary == "" {
+			summary = "Prompt unavailable for `" + turn.ID + "`"
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s", i+1, summary))
+	}
+	return lines
 }
 
 func (b *Bridge) sendFileCommand(ctx context.Context, session *Session, relPath string) error {
@@ -8701,18 +8835,27 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		} else if importing {
 			return fmt.Sprintf("Already published as %s: %s\n\nHistory import is still running. Wait for \"Import complete\" in the Work chat before sending a new task there.", existing.ID, existing.ChatURL), nil
 		}
-		hasNew, err := b.transcriptHasNewRecords(ctx, existing.ID, local.FilePath)
-		if err != nil {
+		hasNew, err := b.transcriptHasNewRecords(ctx, *existing, local)
+		historySyncNeedsAttention := false
+		if errors.Is(err, errTranscriptCheckpointNotFound) {
+			historySyncNeedsAttention = true
+		} else if err != nil {
 			return "", fmt.Errorf("check history import for %s: %w", existing.ID, err)
 		}
 		importStatus := "No new local history was imported."
-		if hasNew {
+		if historySyncNeedsAttention {
+			importStatus = transcriptCheckpointNeedsAttentionMessage()
+		} else if hasNew {
 			if opts.Notify != nil {
 				if err := opts.Notify(ctx, publishHistoryPreparingMessage(existing.ID, existing.ChatURL, true)); err != nil {
 					return "", err
 				}
 			}
 			if err := b.importCodexTranscriptToTeams(ctx, *existing, local); err != nil {
+				if errors.Is(err, errTranscriptCheckpointNotFound) {
+					importStatus = transcriptCheckpointNeedsAttentionMessage()
+					return fmt.Sprintf("Already published as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus), nil
+				}
 				return "", fmt.Errorf("resume history import for %s: %w", existing.ID, err)
 			}
 			importStatus = "New local history was imported."
@@ -8773,6 +8916,9 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		}
 	}
 	if err := b.importCodexTranscriptToTeams(ctx, session, local); err != nil {
+		if errors.Is(err, errTranscriptCheckpointNotFound) {
+			return fmt.Sprintf("Published local Codex session as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", session.ID, session.ChatURL, transcriptCheckpointNeedsAttentionMessage()), nil
+		}
 		return "", err
 	}
 	if opts.ChatCreatedNoticeAfterImport {
@@ -8835,6 +8981,9 @@ func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Sessi
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, local.FilePath, importTurnID, "import", transcriptCheckpointID(session.ID))
 	if err != nil {
 		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
+		if errors.Is(err, errTranscriptCheckpointNotFound) {
+			_ = b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-needs-attention", transcriptCheckpointNeedsAttentionMessage())
+		}
 		return err
 	}
 	if err := b.importSubagentMarkersToTeams(ctx, session, local, importTurnID); err != nil {
@@ -8875,6 +9024,9 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, *session, local.FilePath, importTurnID, "sync", transcriptCheckpointID(session.ID))
 	if err != nil {
 		_ = b.markTranscriptImportFailed(ctx, *session, local.FilePath)
+		if errors.Is(err, errTranscriptCheckpointNotFound) {
+			return b.sendToChat(ctx, session.ChatID, transcriptCheckpointNeedsAttentionMessage())
+		}
 		return b.sendToChat(ctx, session.ChatID, "History import failed: "+err.Error())
 	}
 	if err := b.markTranscriptImportCompleteAtEOF(ctx, *session, local.FilePath, lastRecordID, lastLine); err != nil {
@@ -8912,10 +9064,6 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	if filePath == "" {
 		return "", 0, transcriptImportStats{}, nil
 	}
-	transcript, err := ReadSessionTranscript(filePath)
-	if err != nil {
-		return "", 0, transcriptImportStats{}, fmt.Errorf("read local transcript: %w", err)
-	}
 	state, err := b.store.Load(ctx)
 	if err != nil {
 		return "", 0, transcriptImportStats{}, err
@@ -8923,15 +9071,53 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	if checkpointID == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
-	if checkpoint := state.ImportCheckpoints[checkpointID]; checkpoint.LastRecordID != "" {
-		transcript, err = ReadSessionTranscriptSince(filePath, checkpoint.LastRecordID)
+	var transcript Transcript
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID == "" {
+		transcript, err = ReadSessionTranscript(filePath)
 		if err != nil {
-			_ = b.markTranscriptImportFailedWithID(ctx, session, filePath, checkpointID)
-			return "", 0, transcriptImportStats{}, err
+			return "", 0, transcriptImportStats{}, fmt.Errorf("read local transcript: %w", err)
 		}
-		if transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
+	} else {
+		for attempt := 0; attempt < 2; attempt++ {
+			transcript, err = b.readLinkedTranscriptDelta(filePath, checkpoint, session.CodexThreadID, session.CodexThreadID)
+			if err != nil {
+				_ = b.markTranscriptImportFailedWithID(ctx, session, filePath, checkpointID)
+				return "", 0, transcriptImportStats{}, err
+			}
+			if !transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
+				break
+			}
 			_ = b.markTranscriptImportFailedWithID(ctx, session, filePath, checkpointID)
-			return "", 0, transcriptImportStats{}, fmt.Errorf("transcript checkpoint was not found; run `continue` again only after local history is intact")
+			if checkpointID != transcriptCheckpointID(session.ID) {
+				return "", 0, transcriptImportStats{}, errTranscriptCheckpointNotFound
+			}
+			recovered, recoverErr := b.recoverFailedTranscriptCheckpoint(ctx, session, codexhistory.Session{
+				SessionID:   session.CodexThreadID,
+				ProjectPath: session.Cwd,
+				FilePath:    filePath,
+			})
+			if recoverErr != nil {
+				return "", 0, transcriptImportStats{}, recoverErr
+			}
+			if !recovered {
+				return "", 0, transcriptImportStats{}, errTranscriptCheckpointNotFound
+			}
+			state, err = b.store.Load(ctx)
+			if err != nil {
+				return "", 0, transcriptImportStats{}, err
+			}
+			checkpoint = state.ImportCheckpoints[checkpointID]
+			if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+				transcript, err = ReadSessionTranscript(filePath)
+				if err != nil {
+					return "", 0, transcriptImportStats{}, fmt.Errorf("read local transcript: %w", err)
+				}
+				break
+			}
+			if attempt == 1 {
+				return "", 0, transcriptImportStats{}, errTranscriptCheckpointNotFound
+			}
 		}
 	}
 	stats := transcriptImportStats{Total: len(transcript.Records)}
@@ -9203,8 +9389,8 @@ func formatSubagentImportMarker(parent codexhistory.Session, subagent codexhisto
 	return strings.Join(lines, "\n")
 }
 
-func (b *Bridge) transcriptHasNewRecords(ctx context.Context, sessionID string, filePath string) (bool, error) {
-	filePath = strings.TrimSpace(filePath)
+func (b *Bridge) transcriptHasNewRecords(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
+	filePath := strings.TrimSpace(local.FilePath)
 	if filePath == "" {
 		return false, nil
 	}
@@ -9215,19 +9401,42 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, sessionID string, 
 	if err != nil {
 		return false, err
 	}
-	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(sessionID)]
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status == importCheckpointStatusFailed {
+		if strings.TrimSpace(checkpoint.LastRecordID) == "" && checkpoint.LastSourceLine <= 0 {
+			return true, nil
+		}
+		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
+		if err != nil {
+			return false, err
+		}
+		if recovered {
+			return b.transcriptHasNewRecords(ctx, session, local)
+		}
+		return false, errTranscriptCheckpointNotFound
+	}
 	if checkpoint.Status != "" && checkpoint.Status != importCheckpointStatusComplete {
 		return true, nil
 	}
 	if checkpoint.LastRecordID == "" {
 		return true, nil
 	}
-	transcript, err := ReadSessionTranscriptSince(filePath, checkpoint.LastRecordID)
+	transcript, err := b.readLinkedTranscriptDelta(filePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
 	if err != nil {
 		return false, err
 	}
 	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
-		return false, fmt.Errorf("transcript checkpoint was not found; refusing to guess an import position")
+		if err := b.markTranscriptImportFailed(ctx, session, filePath); err != nil {
+			return false, err
+		}
+		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
+		if err != nil {
+			return false, err
+		}
+		if recovered {
+			return b.transcriptHasNewRecords(ctx, session, local)
+		}
+		return false, errTranscriptCheckpointNotFound
 	}
 	for _, record := range transcript.Records {
 		if strings.TrimSpace(record.Text) != "" {
@@ -10021,6 +10230,12 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID)
 	if err != nil {
 		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+		if errors.Is(err, errTranscriptCheckpointNotFound) {
+			if sendErr := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-needs-attention", transcriptCheckpointNeedsAttentionMessage()); sendErr != nil {
+				return sendErr
+			}
+			return nil
+		}
 		return err
 	}
 	if checkpointID == transcriptCheckpointID(session.ID) {
