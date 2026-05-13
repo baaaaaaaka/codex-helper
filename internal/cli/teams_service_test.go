@@ -572,7 +572,11 @@ func TestTeamsServiceSystemctlSubcommandsUseUserService(t *testing.T) {
 			{name: "systemctl", args: []string{"--user", "status", "--no-pager", teamsServiceWatchdogTimerName}},
 		}},
 		{name: "start", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "start", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
-		{name: "stop", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "stop", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
+		{name: "stop", wantCalls: []teamsServiceCommandCall{
+			{name: "systemctl", args: []string{"--user", "stop", teamsServiceWatchdogTimerName}},
+			{name: "systemctl", args: []string{"--user", "stop", teamsServiceWatchdogUnitName}},
+			{name: "systemctl", args: []string{"--user", "stop", teamsServiceUnitName}},
+		}},
 		{name: "restart", wantCalls: []teamsServiceCommandCall{{name: "systemctl", args: []string{"--user", "restart", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName}}}},
 	} {
 		runner.calls = nil
@@ -589,6 +593,78 @@ func TestTeamsServiceSystemctlSubcommandsUseUserService(t *testing.T) {
 		if tc.name == "status" && !strings.Contains(out.String(), "active") {
 			t.Fatalf("status should print systemctl output:\n%s", out.String())
 		}
+	}
+}
+
+func TestTeamsServiceSystemctlStopIgnoresMissingWatchdogUnits(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			[]byte("Unit codex-helper-teams-watchdog.timer not loaded.\n"),
+			nil,
+			[]byte("stopped main\n"),
+		},
+		errs: []error{
+			errors.New("exit status 5"),
+			errors.New("systemctl --user stop failed: unit could not be found"),
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  runner,
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"stop"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service stop: %v\n%s", err, out.String())
+	}
+	wantCalls := []teamsServiceCommandCall{
+		{name: "systemctl", args: []string{"--user", "stop", teamsServiceWatchdogTimerName}},
+		{name: "systemctl", args: []string{"--user", "stop", teamsServiceWatchdogUnitName}},
+		{name: "systemctl", args: []string{"--user", "stop", teamsServiceUnitName}},
+	}
+	if !reflect.DeepEqual(runner.calls, wantCalls) {
+		t.Fatalf("stop calls = %#v, want %#v", runner.calls, wantCalls)
+	}
+	if strings.Contains(out.String(), "not loaded") || strings.Contains(out.String(), "could not be found") {
+		t.Fatalf("missing watchdog errors should be suppressed:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Stopped Teams service") {
+		t.Fatalf("stop success output missing:\n%s", out.String())
+	}
+}
+
+func TestTeamsServiceSystemctlStopStillFailsWhenPrimaryStopFails(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{nil, nil, errors.New("exit status 5")},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  runner,
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"stop"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "exit status 5") {
+		t.Fatalf("execute service stop error = %v, want primary stop failure\n%s", err, out.String())
 	}
 }
 

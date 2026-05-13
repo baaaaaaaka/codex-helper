@@ -9222,18 +9222,30 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
 	dedupe := newTranscriptDedupeState()
+	sawRecentTeamsTurnRecord := false
 	var lastKey string
 	var lastLine int
 	var lastOffset int64
 	for i, record := range transcript.Records {
 		body := formatTranscriptRecordForTeams(record)
-		skip := strings.TrimSpace(body) == "" ||
-			shouldSkipBackgroundTranscriptRecord(record) ||
-			transcriptRecordIsTerminal(record) ||
-			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
-			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
-			dedupe.shouldSkip(record, body) ||
-			record.Kind == TranscriptKindStatus
+		skip := strings.TrimSpace(body) == ""
+		if !skip && (shouldSkipBackgroundTranscriptRecord(record) || transcriptRecordIsTerminal(record)) {
+			skip = true
+		}
+		if !skip && shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) {
+			sawRecentTeamsTurnRecord = true
+			skip = true
+		}
+		if !skip && shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) {
+			sawRecentTeamsTurnRecord = true
+			skip = true
+		}
+		if !skip && dedupe.shouldSkip(record, body) {
+			skip = true
+		}
+		if !skip && record.Kind == TranscriptKindStatus && sawRecentTeamsTurnRecord {
+			skip = true
+		}
 		if !skip {
 			return false, nil
 		}
@@ -9245,6 +9257,9 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 		lastLine, lastOffset = transcriptCheckpointPositionForRecord(transcript.Records, i)
 	}
 	if strings.TrimSpace(lastKey) == "" {
+		return false, nil
+	}
+	if !sawRecentTeamsTurnRecord {
 		return false, nil
 	}
 	if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, lastKey, lastLine, lastOffset); err != nil {
@@ -9278,6 +9293,35 @@ func latestRecentCompletedTeamsTurn(state teamstore.State, sessionID string, now
 		}
 	}
 	return latest, !latest.CompletedAt.IsZero()
+}
+
+type recentCompletedTeamsTranscriptMirrorSkipper struct {
+	enabled bool
+	seen    bool
+}
+
+func newRecentCompletedTeamsTranscriptMirrorSkipper(state teamstore.State, sessionID string, now time.Time) recentCompletedTeamsTranscriptMirrorSkipper {
+	_, ok := latestRecentCompletedTeamsTurn(state, sessionID, now, localTranscriptCompletedTurnSettleWindow)
+	return recentCompletedTeamsTranscriptMirrorSkipper{enabled: ok}
+}
+
+func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record TranscriptRecord, body string, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool) bool {
+	if s == nil || !s.enabled {
+		return false
+	}
+	if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+		shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) {
+		s.seen = true
+		return true
+	}
+	if record.Kind == TranscriptKindStatus && s.seen {
+		return true
+	}
+	if s.seen {
+		s.enabled = false
+		s.seen = false
+	}
+	return false
 }
 
 func (s *localTranscriptDeltaState) setCheckpointBeforeActive(records []TranscriptRecord, index int) {
@@ -9509,13 +9553,20 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	if len(transcript.Records) == 0 {
 		return nil
 	}
+	if advanced, err := b.advanceRecentCompletedTeamsTranscriptTail(ctx, session, local); err != nil {
+		return err
+	} else if advanced {
+		return nil
+	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
-	visibleBacklog := countVisibleTranscriptSyncRecords(transcript.Records, teamsOriginHashes, knownHashes)
+	now := time.Now()
+	visibleBacklog := countVisibleTranscriptSyncRecords(transcript.Records, teamsOriginHashes, knownHashes, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
 	if visibleBacklog > transcriptSyncMaxAutoBacklogRecords {
 		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, visibleBacklog)
 	}
 	dedupe := newTranscriptDedupeState()
+	recentTeamsMirror := newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now)
 	syncTurnID := "sync:" + session.ID
 	sent := 0
 	for i, record := range transcript.Records {
@@ -9536,7 +9587,8 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			}
 			continue
 		}
-		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
+			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			dedupe.shouldSkip(record, body) {
 			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
@@ -9720,7 +9772,7 @@ func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session 
 	return true, b.markTranscriptImportComplete(ctx, session, sourcePath, transcriptRecordCheckpointKey(recovered), recovered.SourceLine)
 }
 
-func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool) int {
+func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool, recentTeamsMirror recentCompletedTeamsTranscriptMirrorSkipper) int {
 	dedupe := newTranscriptDedupeState()
 	visible := 0
 	for _, record := range records {
@@ -9734,7 +9786,8 @@ func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHa
 		if strings.TrimSpace(body) == "" {
 			continue
 		}
-		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
+			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			dedupe.shouldSkip(record, body) {
 			continue

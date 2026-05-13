@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -946,8 +947,10 @@ func (b teamsServiceSystemdBackend) Uninstall(ctx context.Context) (string, erro
 
 func (teamsServiceSystemdBackend) Run(ctx context.Context, action string) ([]byte, error) {
 	switch action {
-	case "enable", "disable", "start", "stop", "restart":
+	case "enable", "disable", "start", "restart":
 		return teamsServiceRunSystemctl(ctx, action, teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName)
+	case "stop":
+		return teamsServiceSystemdStop(ctx)
 	case "status":
 		main, err := teamsServiceRunSystemctl(ctx, "status", "--no-pager", teamsServiceUnitName)
 		watchdog, watchdogErr := teamsServiceRunSystemctl(ctx, "status", "--no-pager", teamsServiceWatchdogUnitName)
@@ -971,6 +974,37 @@ func (teamsServiceSystemdBackend) Run(ctx context.Context, action string) ([]byt
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for systemd: %s", action)
 	}
+}
+
+func teamsServiceSystemdStop(ctx context.Context) ([]byte, error) {
+	var out []byte
+	for _, unit := range []string{teamsServiceWatchdogTimerName, teamsServiceWatchdogUnitName} {
+		data, err := teamsServiceRunSystemctl(ctx, "stop", unit)
+		if err != nil {
+			if teamsServiceSystemdUnitMissingError(err, data) {
+				continue
+			}
+			return appendLaunchctlOutput(out, data), err
+		}
+		out = appendLaunchctlOutput(out, data)
+	}
+	data, err := teamsServiceRunSystemctl(ctx, "stop", teamsServiceUnitName)
+	return appendLaunchctlOutput(out, data), err
+}
+
+func teamsServiceSystemdUnitMissingError(err error, data []byte) bool {
+	if err == nil {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 5 {
+		return true
+	}
+	text := strings.ToLower(string(data) + "\n" + err.Error())
+	return strings.Contains(text, "exit status 5") ||
+		strings.Contains(text, "unit not found") ||
+		strings.Contains(text, "could not be found") ||
+		strings.Contains(text, "not loaded")
 }
 
 func (teamsServiceSystemdBackend) RunPrimary(ctx context.Context, action string) ([]byte, error) {

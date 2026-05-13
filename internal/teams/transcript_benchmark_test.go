@@ -50,7 +50,7 @@ func BenchmarkTeamsTranscriptVisibleFilterLongMixed(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if got := countVisibleTranscriptSyncRecords(transcript.Records, teamsOriginHashes, knownHashes); got == 0 {
+		if got := countVisibleTranscriptSyncRecords(transcript.Records, teamsOriginHashes, knownHashes, recentCompletedTeamsTranscriptMirrorSkipper{}); got == 0 {
 			b.Fatal("expected visible records")
 		}
 	}

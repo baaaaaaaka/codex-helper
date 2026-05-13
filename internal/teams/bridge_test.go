@@ -12450,18 +12450,6 @@ func TestBridgeSyncLinkedTranscriptSkipsTeamsOriginNoiseAndDeliveredFinal(t *tes
 	}); err != nil {
 		t.Fatalf("QueueOutbox final error: %v", err)
 	}
-	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
-		ID:             "outbox:delivered-status",
-		SessionID:      "s001",
-		TurnID:         turn.ID,
-		TeamsChatID:    "chat-1",
-		Kind:           "codex-progress-001",
-		Body:           "already streamed status",
-		Status:         teamstore.OutboxStatusSent,
-		TeamsMessageID: "teams-status",
-	}); err != nil {
-		t.Fatalf("QueueOutbox status error: %v", err)
-	}
 	if _, err := store.MarkTurnCompleted(context.Background(), turn.ID, "thread-1", "codex-turn-1"); err != nil {
 		t.Fatalf("MarkTurnCompleted error: %v", err)
 	}
@@ -12491,6 +12479,87 @@ func TestBridgeSyncLinkedTranscriptSkipsTeamsOriginNoiseAndDeliveredFinal(t *tes
 	for _, leaked := range []string{"team prompt", "teams-outbound", "already streamed status", "answer from codex", "exec_command"} {
 		if strings.Contains(plain, leaked) {
 			t.Fatalf("synced message leaked %q: %q", leaked, plain)
+		}
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptKeepsUnanchoredLocalStatusAfterRecentTeamsTurn(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTranscriptTest(t, store, session, "previous teams prompt")
+
+	localTranscript := initial +
+		`{"id":"u-local","role":"user","text":"local CLI prompt after previous Teams answer"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local CLI visible status","phase":"commentary"}}` + "\n" +
+		`{"id":"a-local","role":"assistant","text":"local CLI final answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(localTranscript), 0o600); err != nil {
+		t.Fatalf("write local transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync local transcript error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"🧑‍💻 User:\nlocal CLI prompt after previous Teams answer",
+		"🤖 ⏳ Codex status:\nlocal CLI visible status",
+		"🤖 ✅ Codex answer:\nlocal CLI final answer",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("local transcript sync missing %q in:\n%s", want, joined)
+		}
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptStopsSkippingAfterTeamsMirrorTail(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTranscriptTest(t, store, session, "previous teams prompt")
+
+	combinedTranscript := initial +
+		`{"id":"u-prev","role":"user","text":"previous teams prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-prev","message":"previous Teams turn status still flushing","phase":"commentary"}}` + "\n" +
+		`{"id":"u-local","role":"user","text":"local CLI prompt after previous Teams answer"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local CLI visible status","phase":"commentary"}}` + "\n" +
+		`{"id":"a-local","role":"assistant","text":"local CLI final answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(combinedTranscript), 0o600); err != nil {
+		t.Fatalf("write combined transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync combined transcript error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"🧑‍💻 User:\nlocal CLI prompt after previous Teams answer",
+		"🤖 ⏳ Codex status:\nlocal CLI visible status",
+		"🤖 ✅ Codex answer:\nlocal CLI final answer",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("local transcript sync missing %q in:\n%s", want, joined)
+		}
+	}
+	for _, leaked := range []string{"previous teams prompt", "previous Teams turn status still flushing"} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("Teams mirror transcript leaked %q in:\n%s", leaked, joined)
 		}
 	}
 }
