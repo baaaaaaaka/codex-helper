@@ -2421,7 +2421,7 @@ func TestBridgeControlDashboardReadableWorkspaceAndSessionFormatting(t *testing.
 	if err != nil {
 		t.Fatalf("resolve newest displayed workspace number: %v", err)
 	}
-	if selection.Kind != DashboardSelectionWorkspace || selection.WorkspaceID != workspaceIDForPath(expectedBetaPath) {
+	if selection.Kind != DashboardSelectionWorkspace || selection.WorkspaceID != workspaceIDForPath("/home/user/project/beta") {
 		t.Fatalf("workspace number 1 selection = %#v, want beta", selection)
 	}
 	if strings.Contains(workspaces, "\n>") || strings.Contains(workspaces, "```") {
