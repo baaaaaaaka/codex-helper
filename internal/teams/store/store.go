@@ -475,14 +475,15 @@ type ChatPollState struct {
 }
 
 type ChatPollScheduleUpdate struct {
-	ChatID            string
-	PollState         string
-	PreviousPollState string
-	NextPollAt        time.Time
-	LastActivityAt    time.Time
-	BlockedUntil      time.Time
-	ClearBlockedUntil bool
-	ResetFailures     bool
+	ChatID                string
+	PollState             string
+	PreviousPollState     string
+	NextPollAt            time.Time
+	LastActivityAt        time.Time
+	BlockedUntil          time.Time
+	ClearBlockedUntil     bool
+	ClearContinuationPath bool
+	ResetFailures         bool
 }
 
 type OwnerMetadata struct {
@@ -2060,6 +2061,10 @@ func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollSched
 				poll.BlockedUntil = update.BlockedUntil
 				changed = true
 			}
+		}
+		if update.ClearContinuationPath && poll.ContinuationPath != "" {
+			poll.ContinuationPath = ""
+			changed = true
 		}
 		if update.ResetFailures {
 			if poll.FailureCount != 0 {

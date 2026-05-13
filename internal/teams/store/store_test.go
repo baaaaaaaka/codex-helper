@@ -2202,6 +2202,29 @@ func TestChatPollStateTracksCursorAndErrors(t *testing.T) {
 	}
 }
 
+func TestChatPollScheduleCanClearContinuationPath(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
+	if _, err := store.RecordChatPollSuccessWithContinuation(ctx, "chat-1", now.Add(-time.Hour), true, true, 50, "/chats/chat-1/messages?$skiptoken=stale"); err != nil {
+		t.Fatalf("RecordChatPollSuccessWithContinuation error: %v", err)
+	}
+
+	poll, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:                "chat-1",
+		PollState:             "hot",
+		NextPollAt:            now,
+		LastActivityAt:        now,
+		ClearContinuationPath: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedule clear continuation error: %v", err)
+	}
+	if poll.ContinuationPath != "" {
+		t.Fatalf("continuation path was not cleared: %#v", poll)
+	}
+}
+
 func TestChatPollScheduleStatePersistsParkAndBlock(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

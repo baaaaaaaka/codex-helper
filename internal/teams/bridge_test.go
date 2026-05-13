@@ -595,6 +595,76 @@ func TestBridgeAddsCancelHintAfterLongCodexIdleStatus(t *testing.T) {
 	}
 }
 
+func TestBridgeWarnsWhenCodexIdleMayBeStuck(t *testing.T) {
+	oldInitial := codexIdleStatusInitialDelay
+	oldRepeat := codexIdleStatusRepeatDelay
+	oldCancelHintAfter := codexIdleStatusCancelHintAfter
+	oldMessage := codexIdleStatusMessage
+	oldHint := codexIdleStatusCancelHint
+	oldStuckAfter := codexSuspectedStuckAfter
+	oldStuckMessage := codexSuspectedStuckMessage
+	codexIdleStatusInitialDelay = 10 * time.Millisecond
+	codexIdleStatusRepeatDelay = 10 * time.Millisecond
+	codexIdleStatusCancelHintAfter = time.Hour
+	codexIdleStatusMessage = "Still working. No new Codex update yet."
+	codexIdleStatusCancelHint = "cancel hint should not be used"
+	codexSuspectedStuckAfter = 15 * time.Millisecond
+	codexSuspectedStuckMessage = "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the current request, send `helper cancel last` in this chat."
+	defer func() {
+		codexIdleStatusInitialDelay = oldInitial
+		codexIdleStatusRepeatDelay = oldRepeat
+		codexIdleStatusCancelHintAfter = oldCancelHintAfter
+		codexIdleStatusMessage = oldMessage
+		codexIdleStatusCancelHint = oldHint
+		codexSuspectedStuckAfter = oldStuckAfter
+		codexSuspectedStuckMessage = oldStuckMessage
+	}()
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingStreamingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result: ExecutionResult{
+			Text:          "done after suspected stuck warning",
+			CodexThreadID: "thread-1",
+			CodexTurnID:   "turn-1",
+		},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-suspected-stuck"), "run a quiet long task")
+	}()
+
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("streaming executor did not start")
+	}
+	waitForOutboxBody(t, store, "may be stuck")
+	close(executor.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleSessionMessage error: %v", err)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("handleSessionMessage did not finish")
+	}
+
+	var joined strings.Builder
+	for _, msg := range *sent {
+		joined.WriteString(PlainTextFromTeamsHTML(msg.Content))
+		joined.WriteString("\n")
+	}
+	for _, want := range []string{"Codex has not produced any update", "may be stuck", "helper cancel last", "done after suspected stuck warning"} {
+		if !strings.Contains(joined.String(), want) {
+			t.Fatalf("suspected stuck transcript missing %q:\n%s", want, joined.String())
+		}
+	}
+}
+
 func TestBridgeSendsCodexStreamRetryStatusWithoutSpamming(t *testing.T) {
 	oldRepeat := codexStreamRetryStatusRepeatDelay
 	codexStreamRetryStatusRepeatDelay = time.Hour
@@ -9243,6 +9313,30 @@ func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromSentOutbox(t *testing.T) {
 	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
 	session := bridge.reg.Sessions[0]
 	oldActivity := now.Add(-49 * time.Hour)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	parked, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	})
+	if err != nil {
+		t.Fatalf("park work poll: %v", err)
+	}
+	sentAt := parked.ParkedAt.Add(time.Minute)
+	noticeID := parkNoticeOutboxID(session, parked.ParkedAt)
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
 		state.Sessions[session.ID] = teamstore.SessionContext{
 			ID:           session.ID,
@@ -9253,22 +9347,21 @@ func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromSentOutbox(t *testing.T) {
 			CreatedAt:    oldActivity,
 			UpdatedAt:    oldActivity,
 		}
-		state.OutboxMessages[parkNoticeOutboxID(session)] = teamstore.OutboxMessage{
-			ID:          parkNoticeOutboxID(session),
+		state.OutboxMessages[noticeID] = teamstore.OutboxMessage{
+			ID:          noticeID,
 			SessionID:   session.ID,
 			TeamsChatID: session.ChatID,
 			Kind:        "freeze-notice",
 			Body:        renderTeamsFreezeNoticeHTML("https://teams.example/control", "r "+resumeKeyForSession(session), "Your Codex work is safe. Paused after 48h idle."),
 			Status:      teamstore.OutboxStatusSent,
-			SentAt:      now.Add(-time.Hour),
-			CreatedAt:   now.Add(-time.Hour),
-			UpdatedAt:   now.Add(-time.Hour),
+			SentAt:      sentAt,
+			CreatedAt:   sentAt,
+			UpdatedAt:   sentAt,
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("seed durable state: %v", err)
 	}
-	seedIdleWorkPoll(t, store, "control-chat", session.ChatID, oldActivity)
 	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity
 
@@ -9305,9 +9398,30 @@ func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromGraphHistory(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateSession error: %v", err)
 	}
-	seedIdleWorkPoll(t, store, "control-chat", session.ChatID, oldActivity)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	parked, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	})
+	if err != nil {
+		t.Fatalf("park work poll: %v", err)
+	}
 	resumeCommand := "r " + resumeKeyForSession(session)
-	notice := bridgePollMessage("already-paused-1", now.Add(-time.Hour).Format(time.RFC3339Nano), "This chat is paused\nStep 2: Send: "+resumeCommand)
+	notice := bridgePollMessage("already-paused-1", parked.ParkedAt.Add(time.Minute).Format(time.RFC3339Nano), "This chat is paused\nStep 2: Send: "+resumeCommand)
 	bridge.readGraph = newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{notice}}})
 	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity
@@ -9324,6 +9438,52 @@ func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromGraphHistory(t *testing.T) {
 	}
 	if poll.PollState != inboundPollStateParked || poll.ParkNoticeSentAt.IsZero() {
 		t.Fatalf("work chat was not marked parked with existing Graph notice: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceSendsNewFreezeNoticeAfterEarlierResume(t *testing.T) {
+	now := time.Now()
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	oldActivity := now.Add(-49 * time.Hour)
+	oldFreezeAt := now.Add(-72 * time.Hour)
+	oldNoticeID := parkNoticeOutboxID(session, oldFreezeAt.Add(-time.Minute))
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{
+			ID:           session.ID,
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  session.ChatID,
+			TeamsChatURL: session.ChatURL,
+			TeamsTopic:   session.Topic,
+			CreatedAt:    oldActivity,
+			UpdatedAt:    oldActivity,
+		}
+		state.OutboxMessages[oldNoticeID] = teamstore.OutboxMessage{
+			ID:          oldNoticeID,
+			SessionID:   session.ID,
+			TeamsChatID: session.ChatID,
+			Kind:        "freeze-notice",
+			Body:        renderTeamsFreezeNoticeHTML("https://teams.example/control", "r "+resumeKeyForSession(session), "Your Codex work is safe. Paused after 48h idle."),
+			Status:      teamstore.OutboxStatusSent,
+			SentAt:      oldFreezeAt,
+			CreatedAt:   oldFreezeAt,
+			UpdatedAt:   oldFreezeAt,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed old freeze notice: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", session.ChatID, oldActivity)
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat is paused") != 1 {
+		t.Fatalf("new freeze notice was not sent after earlier resume: %#v", *sent)
 	}
 }
 
@@ -9425,7 +9585,10 @@ func TestBridgeControlResumeKeyReactivatesParkedWorkChat(t *testing.T) {
 	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("resume-1", "2026-05-02T01:05:00Z", "r "+key), "r "+key); err != nil {
 		t.Fatalf("resume command error: %v", err)
 	}
-	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Resumed s001") {
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 1 {
+		t.Fatalf("work-chat resume notice = %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "Resumed s001") != 1 {
 		t.Fatalf("resume response = %#v", *sent)
 	}
 	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
@@ -9434,6 +9597,65 @@ func TestBridgeControlResumeKeyReactivatesParkedWorkChat(t *testing.T) {
 	}
 	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || poll.LastActivityAt.IsZero() {
 		t.Fatalf("resume did not make chat hot and due: %#v", poll)
+	}
+}
+
+func TestBridgeControlResumeClearsStaleContinuationBeforePolling(t *testing.T) {
+	now := time.Now()
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: nil,
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if got := r.URL.Query().Get("$skiptoken"); got != "" {
+				t.Fatalf("resumed work poll followed stale continuation skiptoken %q", got)
+			}
+		},
+	}})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	session := bridge.reg.Sessions[0]
+	oldActivity := now.Add(-49 * time.Hour)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), session.ChatID, oldActivity, true, true, 50, "/chats/chat-1/messages?$skiptoken=stale"); err != nil {
+		t.Fatalf("seed stale continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+
+	key := resumeKeyForSession(session)
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("resume-1", "2026-05-02T01:05:00Z", "r "+key), "r "+key); err != nil {
+		t.Fatalf("resume command error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 1 {
+		t.Fatalf("work-chat resume notice = %#v", *sent)
+	}
+	resumed, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if resumed.ContinuationPath != "" {
+		t.Fatalf("resume kept stale continuation path: %#v", resumed)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce after resume error: %v", err)
 	}
 }
 

@@ -61,6 +61,8 @@ var codexIdleStatusRepeatDelay = 5 * time.Minute
 var codexIdleStatusCancelHintAfter = 7 * time.Minute
 var codexIdleStatusMessage = "Still working. No new Codex update yet."
 var codexIdleStatusCancelHint = "This is taking longer than usual. To stop the current request, send `helper cancel last` in this chat."
+var codexSuspectedStuckAfter = 15 * time.Minute
+var codexSuspectedStuckMessage = "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the current request, send `helper cancel last` in this chat."
 var codexStreamRetryStatusRepeatDelay = 5 * time.Minute
 var queuedTurnAttentionDelay = 10 * time.Minute
 var queuedTurnAttentionRepeatDelay = 10 * time.Minute
@@ -1337,7 +1339,11 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 		return nil
 	}
 	resumeCommand := "r " + resumeKeyForSession(session)
-	noticeID := parkNoticeOutboxID(session)
+	poll, _, err := b.store.ChatPoll(ctx, session.ChatID)
+	if err != nil {
+		return err
+	}
+	noticeID := parkNoticeOutboxID(session, poll.ParkedAt)
 	alreadySent, err := b.parkNoticeAlreadySent(ctx, session, noticeID, resumeCommand)
 	if err != nil {
 		return err
@@ -1365,8 +1371,12 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 	return err
 }
 
-func parkNoticeOutboxID(session Session) string {
-	return "outbox:park-notice:" + session.ID + ":" + resumeKeyForSession(session)
+func parkNoticeOutboxID(session Session, parkedAt time.Time) string {
+	id := "outbox:park-notice:" + session.ID + ":" + resumeKeyForSession(session)
+	if !parkedAt.IsZero() {
+		id += ":" + parkedAt.UTC().Format("20060102T150405.000000000Z")
+	}
+	return id
 }
 
 func (b *Bridge) parkNoticeAlreadySent(ctx context.Context, session Session, noticeID string, resumeCommand string) (bool, error) {
@@ -1377,23 +1387,30 @@ func (b *Bridge) parkNoticeAlreadySent(ctx context.Context, session Session, not
 	if ok && !poll.ParkNoticeSentAt.IsZero() {
 		return true, nil
 	}
+	parkedAt := poll.ParkedAt
 	state, err := b.store.Load(ctx)
 	if err != nil {
 		return false, err
 	}
-	if sentFreezeNoticeExists(state, session.ChatID, noticeID, resumeCommand) {
+	if sentFreezeNoticeExists(state, session.ChatID, noticeID, resumeCommand, parkedAt) {
 		return true, nil
 	}
-	if b.recentGraphFreezeNoticeExists(ctx, session.ChatID, resumeCommand) {
+	if b.recentGraphFreezeNoticeExists(ctx, session.ChatID, resumeCommand, parkedAt) {
 		return true, nil
 	}
 	return false, nil
 }
 
-func sentFreezeNoticeExists(state teamstore.State, chatID string, noticeID string, resumeCommand string) bool {
+func sentFreezeNoticeExists(state teamstore.State, chatID string, noticeID string, resumeCommand string, since time.Time) bool {
 	for _, msg := range state.OutboxMessages {
 		if msg.TeamsChatID != chatID || msg.Status != teamstore.OutboxStatusSent {
 			continue
+		}
+		if !since.IsZero() {
+			sentAt := outboxMessageActivityTime(msg)
+			if !sentAt.IsZero() && sentAt.Before(since) {
+				continue
+			}
 		}
 		if msg.ID == noticeID {
 			return true
@@ -1409,7 +1426,16 @@ func sentFreezeNoticeExists(state teamstore.State, chatID string, noticeID strin
 	return false
 }
 
-func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID string, resumeCommand string) bool {
+func outboxMessageActivityTime(msg teamstore.OutboxMessage) time.Time {
+	for _, value := range []time.Time{msg.SentAt, msg.UpdatedAt, msg.CreatedAt, msg.LastSendAttempt} {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
+func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID string, resumeCommand string, since time.Time) bool {
 	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(resumeCommand) == "" {
 		return false
 	}
@@ -1418,6 +1444,12 @@ func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID strin
 		return false
 	}
 	for _, msg := range messages {
+		if !since.IsZero() {
+			sentAt := messageSortTime(msg)
+			if !sentAt.IsZero() && sentAt.Before(since) {
+				continue
+			}
+		}
 		text := PlainTextFromTeamsHTML(msg.Body.Content)
 		if strings.Contains(text, "This chat is paused") && strings.Contains(text, resumeCommand) {
 			return true
@@ -6428,10 +6460,28 @@ func (f *codexEventForwarder) sendIdleStatus(quietFor time.Duration) {
 		return
 	}
 	message := codexIdleStatusMessage
-	if quietFor >= codexIdleStatusCancelHintAfter && strings.TrimSpace(codexIdleStatusCancelHint) != "" {
+	if codexSuspectedStuckAfter > 0 && quietFor >= codexSuspectedStuckAfter && strings.TrimSpace(codexSuspectedStuckMessage) != "" {
+		message = formatCodexSuspectedStuckMessage(quietFor)
+	} else if quietFor >= codexIdleStatusCancelHintAfter && strings.TrimSpace(codexIdleStatusCancelHint) != "" {
 		message += "\n\n" + codexIdleStatusCancelHint
 	}
 	_ = f.send("status", message)
+}
+
+func formatCodexSuspectedStuckMessage(quietFor time.Duration) string {
+	message := strings.TrimSpace(codexSuspectedStuckMessage)
+	if strings.Contains(message, "%s") {
+		return fmt.Sprintf(message, formatCodexQuietDuration(quietFor))
+	}
+	return message
+}
+
+func formatCodexQuietDuration(quietFor time.Duration) string {
+	rounded := quietFor.Round(time.Minute)
+	if rounded < time.Minute {
+		return "less than 1m"
+	}
+	return strings.TrimSuffix(rounded.String(), "0s")
 }
 
 func (f *codexEventForwarder) sendStreamRetryStatus(event codexrunner.StreamEvent) {
@@ -10817,23 +10867,49 @@ func (b *Bridge) resumeParkedWorkChat(ctx context.Context, arg string) (string, 
 	}
 	now := time.Now()
 	if _, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
-		ChatID:            match.ChatID,
-		PollState:         inboundPollStateHot,
-		PreviousPollState: "",
-		NextPollAt:        now,
-		LastActivityAt:    now,
-		ClearBlockedUntil: true,
-		ResetFailures:     true,
+		ChatID:                match.ChatID,
+		PollState:             inboundPollStateHot,
+		PreviousPollState:     "",
+		NextPollAt:            now,
+		LastActivityAt:        now,
+		ClearBlockedUntil:     true,
+		ClearContinuationPath: true,
+		ResetFailures:         true,
 	}); err != nil {
 		return "", err
 	}
 	match.UpdatedAt = now
 	_ = b.ensureDurableSession(ctx, match)
+	if err := b.sendWorkChatResumeNotice(ctx, *match, now); err != nil {
+		return "", err
+	}
 	b.boostPolling(now)
 	if match.ChatURL != "" {
 		return fmt.Sprintf("Resumed %s.\n\nOpen Work chat: %s\n\nMessages in that chat will be read again.", match.ID, match.ChatURL), nil
 	}
 	return fmt.Sprintf("Resumed %s.\n\nMessages in that Work chat will be read again.", match.ID), nil
+}
+
+func (b *Bridge) sendWorkChatResumeNotice(ctx context.Context, session Session, resumedAt time.Time) error {
+	chatID := strings.TrimSpace(session.ChatID)
+	if chatID == "" {
+		return nil
+	}
+	if resumedAt.IsZero() {
+		resumedAt = time.Now()
+	}
+	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:          resumeNoticeOutboxID(session, resumedAt),
+		SessionID:   session.ID,
+		TeamsChatID: chatID,
+		Kind:        "helper",
+		Body:        "This chat has been resumed. Messages sent here will be read again.",
+	})
+}
+
+func resumeNoticeOutboxID(session Session, resumedAt time.Time) string {
+	stamp := resumedAt.UTC().Format("20060102T150405.000000000Z")
+	return "outbox:resume-notice:" + strings.TrimSpace(session.ID) + ":" + stamp
 }
 
 func (b *Bridge) resolveControlSelection(ctx context.Context, target DashboardCommandTarget) (string, error) {
