@@ -9298,14 +9298,38 @@ func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *
 		if err := b.syncSessionTranscript(ctx, *session, local); err != nil {
 			return localCodexBeforeTeamsGate{}, err
 		}
-		remaining, err := b.localTranscriptHasActionableDelta(ctx, *session, local)
+		remainingDelta, err := b.classifyLocalTranscriptDelta(ctx, *session, local)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return localCodexBeforeTeamsGate{}, nil
 			}
 			return localCodexBeforeTeamsGate{}, err
 		}
-		if remaining {
+		switch remainingDelta.CheckpointStatus {
+		case importCheckpointStatusImporting:
+			return localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: "⏳ Queued. I’m preparing this chat history first, then I’ll respond.",
+			}, nil
+		case importCheckpointStatusBlocked:
+			return localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: "⚠️ Queued. Local Codex history has a paused backlog. Send `helper publish-history` here; I’ll continue after the import finishes.",
+			}, nil
+		case importCheckpointStatusFailed:
+			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, *session, local)
+			if err != nil {
+				return localCodexBeforeTeamsGate{}, err
+			}
+			if recovered {
+				return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+			}
+			return localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: "⚠️ Queued. Local Codex history sync needs attention before I continue this chat.",
+			}, nil
+		}
+		if remainingDelta.Active || remainingDelta.NeedsSync || remainingDelta.HasActionableTranscript {
 			return localCodexBeforeTeamsGate{
 				Block:   true,
 				AckBody: "⏳ Queued. I’m syncing recent Codex updates first, then I’ll respond.",
@@ -9384,7 +9408,11 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 		return out, err
 	}
 	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
-		return out, fmt.Errorf("transcript checkpoint was not found; refusing to guess a sync position")
+		if err := b.markTranscriptImportFailed(ctx, session, local.FilePath); err != nil {
+			return out, err
+		}
+		out.CheckpointStatus = importCheckpointStatusFailed
+		return out, nil
 	}
 	if len(transcript.Records) == 0 {
 		return out, nil
@@ -9797,7 +9825,7 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		return err
 	}
 	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
-		return fmt.Errorf("transcript checkpoint was not found; refusing to guess a sync position")
+		return b.markTranscriptImportFailed(ctx, session, local.FilePath)
 	}
 	if len(transcript.Records) == 0 {
 		return nil

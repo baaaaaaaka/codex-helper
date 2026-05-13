@@ -11917,6 +11917,63 @@ func TestBridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog(t *testing.T) {
 	}
 }
 
+func TestBridgeTeamsPromptBlocksWhenForegroundSyncCreatesBlockedBacklog(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+1; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"a%03d","role":"assistant","text":"foreground blocked backlog answer %03d"}`+"\n", i, i))
+	}
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write blocked backlog transcript: %v", err)
+	}
+
+	msg := bridgePollMessage("teams-after-foreground-catchup", "2026-05-03T01:06:00Z", "teams prompt after foreground catchup")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt after foreground catchup"); err != nil {
+		t.Fatalf("handleSessionMessage with foreground blocked history error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("Teams prompt started before foreground history backlog was imported: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"paused automatic history sync",
+		"helper publish-history",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("foreground blocked backlog output missing %q in:\n%s", want, joined)
+		}
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state error: %v", err)
+	}
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusBlocked {
+		t.Fatalf("checkpoint status = %#v, want blocked", checkpoint)
+	}
+	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
+		t.Fatalf("queued turn count = %d, want 1", got)
+	}
+}
+
 func TestBridgeCoworkerPromptDuringTranscriptImportGetsMentionedReceipt(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"old","role":"assistant","text":"old answer"}`+"\n"), 0o600); err != nil {
@@ -13553,6 +13610,187 @@ func TestBridgeAllowsTeamsPromptAfterLocalTranscriptFailureTerminal(t *testing.T
 	}
 }
 
+func TestBridgeMissingTranscriptCheckpointDoesNotStarveLaterWorkChatCommands(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgePollAndSendGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{
+			bridgePollMessage("normal-before-bad-checkpoint", "2026-05-03T01:00:00Z", "normal task before status"),
+			bridgePollMessage("helper-status-after-bad-checkpoint", "2026-05-03T01:00:05Z", "helper status"),
+		},
+	}})
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:           transcriptCheckpointID(session.ID),
+			SessionID:    session.ID,
+			SourcePath:   transcriptPath,
+			LastRecordID: "missing-checkpoint",
+			Status:       importCheckpointStatusComplete,
+			UpdatedAt:    time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale checkpoint: %v", err)
+	}
+	cursor := time.Date(2026, 5, 3, 0, 59, 0, 0, time.UTC)
+	if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, cursor, true, false, 0); err != nil {
+		t.Fatalf("seed poll cursor: %v", err)
+	}
+
+	handled, err := bridge.pollChatWithRole(context.Background(), session.ChatID, 50, inboundPollRoleWork, false, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, session.ChatID, msg, text)
+	})
+	if err != nil {
+		t.Fatalf("pollChatWithRole error: %v", err)
+	}
+	if !handled {
+		t.Fatal("poll should handle the queued task and later helper status")
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("Codex turn should not start while checkpoint recovery is blocked: %q", got)
+	default:
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 1 {
+		t.Fatalf("inbound count = %d, want one queued normal task: %#v", got, state.InboundEvents)
+	}
+	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
+		t.Fatalf("queued turn count = %d, want 1", got)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
+		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	}
+	poll := state.ChatPolls[session.ChatID]
+	if poll.LastError != "" || poll.FailureCount != 0 {
+		t.Fatalf("poll error state = %#v, want success after continuing past checkpoint block", poll)
+	}
+	if !bridge.reg.HasSeen(session.ChatID, "normal-before-bad-checkpoint") || !bridge.reg.HasSeen(session.ChatID, "helper-status-after-bad-checkpoint") {
+		t.Fatalf("messages were not marked seen: %#v", bridge.reg.Chats[session.ChatID].SeenMessageIDs)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"Local Codex history sync needs attention before I can run your request.",
+		"Session: s001",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("work chat output missing %q in:\n%s", want, joined)
+		}
+	}
+}
+
+func TestBridgePrepareRecoversCheckpointNotFoundBySourceLine(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.asyncTurns = true
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID(session.ID),
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "missing-checkpoint",
+			LastSourceLine: 1,
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale checkpoint: %v", err)
+	}
+
+	gate, err := bridge.prepareLocalCodexBeforeTeamsTurn(context.Background(), session)
+	if err != nil {
+		t.Fatalf("prepareLocalCodexBeforeTeamsTurn error: %v", err)
+	}
+	if gate.Block {
+		t.Fatalf("recoverable missing checkpoint should not block: %#v", gate)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "u1" || checkpoint.LastSourceLine != 1 {
+		t.Fatalf("checkpoint = %#v, want recovered complete at u1", checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptMarksMissingCheckpointFailed(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:           transcriptCheckpointID(session.ID),
+			SessionID:    session.ID,
+			SourcePath:   transcriptPath,
+			LastRecordID: "missing-checkpoint",
+			Status:       importCheckpointStatusComplete,
+			UpdatedAt:    time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale checkpoint: %v", err)
+	}
+
+	err := bridge.syncSessionTranscript(context.Background(), *session, codexhistory.Session{
+		SessionID: "thread-1",
+		FilePath:  transcriptPath,
+	})
+	if err != nil {
+		t.Fatalf("syncSessionTranscript error = %v, want checkpoint to be marked failed", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("sync should not send guessed transcript output: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
+		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	}
+}
+
 func TestBridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -14412,6 +14650,64 @@ func newBridgePollGraph(t *testing.T, pages []bridgePollPage) *GraphClient {
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
+}
+
+func newBridgePollAndSendGraph(t *testing.T, pages []bridgePollPage) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	nextPage := 0
+	var sent []bridgeSentMessage
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			if nextPage >= len(pages) {
+				t.Fatalf("unexpected extra Graph poll: %s", r.URL.String())
+			}
+			page := pages[nextPage]
+			nextPage++
+			if page.assert != nil {
+				page.assert(t, r)
+			}
+			payload := map[string]any{"value": page.messages}
+			if page.nextLink != "" {
+				payload["@odata.nextLink"] = page.nextLink
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(payload); err != nil {
+				t.Fatalf("encode poll response: %v", err)
+			}
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		return w.Result(), nil
+	})}
+	t.Cleanup(func() {
+		if nextPage != len(pages) {
+			t.Fatalf("Graph poll count = %d, want %d", nextPage, len(pages))
+		}
+	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     client,
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
 }
 
 func newBridgeRetryGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]bridgeSentMessage) {
