@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-05-13T08:03:25Z",
+  "generated_at": "2026-05-13T08:41:37Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.66_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.66_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.66_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.66_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.0-rc.66",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-05-13T08:41:01Z",
+      "tag_name": "v0.1.0-rc.66",
+      "version": "0.1.0-rc.66"
+    },
     {
       "assets": [
         {
