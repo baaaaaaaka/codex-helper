@@ -528,6 +528,8 @@ type InboundEvent struct {
 	SessionID       string        `json:"session_id,omitempty"`
 	TeamsChatID     string        `json:"teams_chat_id"`
 	TeamsMessageID  string        `json:"teams_message_id"`
+	AuthorUserID    string        `json:"author_user_id,omitempty"`
+	AuthorName      string        `json:"author_name,omitempty"`
 	ScopeID         string        `json:"scope_id,omitempty"`
 	MachineID       string        `json:"machine_id,omitempty"`
 	LeaseGeneration int64         `json:"lease_generation,omitempty"`
@@ -593,6 +595,8 @@ type OutboxMessage struct {
 	AckKind                string       `json:"ack_kind,omitempty"`
 	NotificationKind       string       `json:"notification_kind,omitempty"`
 	MentionOwner           bool         `json:"mention_owner,omitempty"`
+	MentionUserID          string       `json:"mention_user_id,omitempty"`
+	MentionUserName        string       `json:"mention_user_name,omitempty"`
 	UpgradeNonBlocking     bool         `json:"upgrade_non_blocking,omitempty"`
 	ArtifactIDs            []string     `json:"artifact_ids,omitempty"`
 	Status                 OutboxStatus `json:"status"`

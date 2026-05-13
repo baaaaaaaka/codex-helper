@@ -1235,6 +1235,75 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 	)
 }
 
+func TestBridgeAsyncTurnsMentionsCoworkerQueuedBehindActiveTurn(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	first := bridgePollMessage("first", "2026-05-03T01:00:00Z", "first prompt")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", first, "first prompt"); err != nil {
+		t.Fatalf("first handleSessionMessage error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("first Codex turn did not start")
+	}
+
+	coworker := bridgePollMessage("second", "2026-05-03T01:00:05Z", "second prompt")
+	coworker.From.User.ID = "user-2"
+	coworker.From.User.DisplayName = "Alex Kim"
+	if err := bridge.handleSessionMessage(ctx, "chat-1", coworker, "second prompt"); err != nil {
+		t.Fatalf("coworker handleSessionMessage error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("coworker queued turn started before first finished: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Alex Kim") || !strings.Contains(joined, "Your request is queued.") {
+		t.Fatalf("coworker queued ack missing mention or queued text:\n%s", joined)
+	}
+	if len(*sent) < 2 || (*sent)[1].Mentions != 1 {
+		t.Fatalf("coworker queued ack should mention the sender, sent=%#v", *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	var coworkerInbound teamstore.InboundEvent
+	for _, inbound := range state.InboundEvents {
+		if inbound.TeamsMessageID == "second" {
+			coworkerInbound = inbound
+			break
+		}
+	}
+	if coworkerInbound.AuthorUserID != "user-2" || coworkerInbound.AuthorName != "Alex Kim" || coworkerInbound.Status != teamstore.InboundStatusQueued {
+		t.Fatalf("coworker inbound metadata = %#v, want queued author user-2/Alex Kim", coworkerInbound)
+	}
+
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "second prompt") {
+			t.Fatalf("second started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("queued coworker turn did not start after first finished")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 2)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+}
+
 func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T) {
 	graph, sent := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
@@ -7176,6 +7245,103 @@ func TestBridgePollUsesReadGraphAndSendsWithWriteGraph(t *testing.T) {
 	}
 }
 
+func TestBridgePollForwardsCoworkerWorkMessageAndMentionsReceipt(t *testing.T) {
+	msg := bridgePollMessage("coworker-1", "2026-04-30T01:05:00Z", "please debug this failure")
+	msg.From.User.ID = "user-2"
+	msg.From.User.DisplayName = "Alex Kim"
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "coworker answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(writeGraph, store, executor)
+	bridge.readGraph = readGraph
+	bridge.annotateUserMessages = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "please debug this failure") {
+		t.Fatalf("executor prompts = %#v, want coworker prompt", executor.prompts)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want receipt plus final", *sent)
+	}
+	receipt := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if (*sent)[0].Mentions != 1 || !strings.Contains(receipt, "Alex Kim") || !strings.Contains(receipt, "Codex received your question") {
+		t.Fatalf("receipt = %#v plain=%q, want coworker mention and receipt text", (*sent)[0], receipt)
+	}
+	if !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "coworker answer") {
+		t.Fatalf("final answer not sent: %#v", *sent)
+	}
+}
+
+func TestBridgeRejectsCoworkerWorkHelperCommand(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	msg := bridgeTestMessageWithText("coworker-command-1", "helper close")
+	msg.From.User.ID = "user-2"
+	msg.From.User.DisplayName = "Alex Kim"
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "helper close"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none for coworker helper command", executor.prompts)
+	}
+	if session := bridge.reg.SessionByChatID("chat-1"); session == nil || session.Status != "active" {
+		t.Fatalf("session after coworker command = %#v, want active", session)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %#v, want command rejection", *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if (*sent)[0].Mentions != 1 || !strings.Contains(plain, "Alex Kim") || !strings.Contains(plain, "Only the helper owner can run helper commands") {
+		t.Fatalf("rejection = %#v plain=%q, want coworker mention and owner-only text", (*sent)[0], plain)
+	}
+}
+
+func TestBridgeControlPollIgnoresCoworkerMessage(t *testing.T) {
+	msg := bridgePollMessage("coworker-control-1", "2026-04-30T01:05:00Z", "helper restart now")
+	msg.From.User.ID = "user-2"
+	msg.From.User.DisplayName = "Alex Kim"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.reg.ControlChatID = "control-chat"
+	var handled []string
+
+	if _, err := bridge.pollChatWithRole(context.Background(), "control-chat", 50, inboundPollRoleControl, false, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("control poll error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("coworker control message was handled: %#v", handled)
+	}
+	if !bridge.reg.HasSeen("control-chat", "coworker-control-1") {
+		t.Fatal("ignored coworker control message was not marked seen")
+	}
+}
+
 func TestBridgePollAnnotatesIncomingUserMessageBestEffort(t *testing.T) {
 	patched := false
 	msg := bridgePollMessage("new-1", "2026-04-30T01:05:00Z", "run split-client check")
@@ -7438,6 +7604,62 @@ func TestBridgePollIgnoresDurableDeliveredOutboxAfterRegistryLoss(t *testing.T) 
 	}
 	if got := state.OutboxMessages[contentOnlyOutbox.ID].TeamsMessageID; got != "teams-helper-sent-by-content" {
 		t.Fatalf("content-matched outbox TeamsMessageID = %q, want teams-helper-sent-by-content", got)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestBridgePollIgnoresMentionedDurableOutboxAfterRegistryLoss(t *testing.T) {
+	mentionedOutbox := teamstore.OutboxMessage{
+		ID:              "outbox:external-command:abc123",
+		TeamsChatID:     "chat-1",
+		Kind:            "control",
+		Body:            "Only the helper owner can run helper commands in this Work chat.",
+		MentionUserID:   "user-2",
+		MentionUserName: "Alex Kim",
+		Status:          teamstore.OutboxStatusSent,
+	}
+	rendered, _ := renderOutboxUserMentionHTML(mentionedOutbox, User{ID: "user-2", DisplayName: "Alex Kim"})
+	mentionedMessage := bridgePollMessage("teams-mentioned-helper", "2026-04-30T01:05:01Z", "")
+	mentionedMessage.Body.Content = rendered
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{mentionedMessage},
+	}})
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, mentionedOutbox); err != nil {
+		t.Fatalf("QueueOutbox mentioned helper message error: %v", err)
+	}
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.reg.Chats = map[string]ChatState{}
+	var handled []string
+
+	if _, err := bridge.pollChat(ctx, "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled mentioned helper outbox as inbound prompt: %#v", handled)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none", executor.prompts)
+	}
+	if !bridge.reg.HasSent("chat-1", "teams-mentioned-helper") {
+		t.Fatal("mentioned durable outbox was not restored into registry")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.OutboxMessages[mentionedOutbox.ID].TeamsMessageID; got != "teams-mentioned-helper" {
+		t.Fatalf("mentioned outbox TeamsMessageID = %q, want teams-mentioned-helper", got)
 	}
 	if got := len(state.InboundEvents); got != 0 {
 		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
@@ -11470,6 +11692,54 @@ func TestBridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog(t *testing.T) {
 	}
 	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
 		t.Fatalf("queued turn count = %d, want 1", got)
+	}
+}
+
+func TestBridgeCoworkerPromptDuringTranscriptImportGetsMentionedReceipt(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"old","role":"assistant","text":"old answer"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := bridge.markTranscriptImportStarted(context.Background(), *session, transcriptPath); err != nil {
+		t.Fatalf("mark import started: %v", err)
+	}
+	msg := bridgePollMessage("coworker-during-import", "2026-05-03T01:06:00Z", "run this after import")
+	msg.From.User.ID = "user-2"
+	msg.From.User.DisplayName = "Alex Kim"
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "run this after import"); err != nil {
+		t.Fatalf("handle coworker message during import error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %#v, want one deferred receipt", *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if (*sent)[0].Mentions != 1 || !strings.Contains(plain, "Alex Kim") || !strings.Contains(plain, "Codex received your question") || !strings.Contains(plain, "preparing this chat history") {
+		t.Fatalf("deferred receipt = %#v plain=%q, want coworker mention and import receipt", (*sent)[0], plain)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	var inbound teamstore.InboundEvent
+	for _, candidate := range state.InboundEvents {
+		if candidate.TeamsMessageID == "coworker-during-import" {
+			inbound = candidate
+			break
+		}
+	}
+	if inbound.Status != teamstore.InboundStatusDeferred || inbound.AuthorUserID != "user-2" || inbound.AuthorName != "Alex Kim" {
+		t.Fatalf("deferred coworker inbound = %#v, want deferred author user-2/Alex Kim", inbound)
+	}
+	if got := queuedTurnCountForSession(state, session.ID); got != 0 {
+		t.Fatalf("queued turn count during import = %d, want 0", got)
 	}
 }
 

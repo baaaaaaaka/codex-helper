@@ -1457,7 +1457,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 	if msg.From.User == nil {
 		return true, nil
 	}
-	if b.user.ID != "" && msg.From.User.ID != b.user.ID {
+	if strings.TrimSpace(msg.From.User.ID) == "" {
+		return true, nil
+	}
+	if role != inboundPollRoleWork && !messageAuthoredByCurrentUser(msg, b.user) {
 		return true, nil
 	}
 	if b.store != nil {
@@ -1511,7 +1514,7 @@ func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context,
 		if outbox.TeamsChatID != chatID || !outboxMayHaveReachedTeams(outbox) {
 			continue
 		}
-		if comparableTeamsPlainText(PlainTextFromTeamsHTML(renderOutboxHTML(outbox))) != incomingKey {
+		if !outboxRenderedPlainTextMatches(outbox, b.user, incomingKey) {
 			continue
 		}
 		if outbox.TeamsMessageID == "" && msg.ID != "" {
@@ -1522,6 +1525,39 @@ func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context,
 		return true, nil
 	}
 	return false, nil
+}
+
+func outboxRenderedPlainTextMatches(outbox teamstore.OutboxMessage, owner User, incomingKey string) bool {
+	for _, rendered := range renderedOutboxHTMLVariants(outbox, owner) {
+		if comparableTeamsPlainText(PlainTextFromTeamsHTML(rendered)) == incomingKey {
+			return true
+		}
+	}
+	return false
+}
+
+func renderedOutboxHTMLVariants(outbox teamstore.OutboxMessage, owner User) []string {
+	var variants []string
+	add := func(rendered string) {
+		if strings.TrimSpace(rendered) == "" {
+			return
+		}
+		for _, existing := range variants {
+			if existing == rendered {
+				return
+			}
+		}
+		variants = append(variants, rendered)
+	}
+	add(renderOutboxHTML(outbox))
+	if outbox.MentionOwner {
+		rendered, _ := renderOutboxMentionHTML(outbox, owner)
+		add(rendered)
+	} else if user, ok := outboxMentionUser(outbox); ok {
+		rendered, _ := renderOutboxUserMentionHTML(outbox, user)
+		add(rendered)
+	}
+	return variants
 }
 
 func outboxMayHaveReachedTeams(outbox teamstore.OutboxMessage) bool {
@@ -1649,6 +1685,9 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	if !b.annotateUserMessages || b.annotationDisabled || b.graph == nil {
 		return
 	}
+	if !messageAuthoredByCurrentUser(msg, b.user) {
+		return
+	}
 	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
 		return
 	}
@@ -1690,6 +1729,58 @@ func userAnnotatedMessageHTML(msg ChatMessage, _ User) (string, bool) {
 		content = "<p>" + html.EscapeString(PlainTextFromTeamsHTML(content)) + "</p>"
 	}
 	return `<p><strong>` + html.EscapeString(label) + `:</strong></p>` + content, true
+}
+
+func messageAuthoredByCurrentUser(msg ChatMessage, current User) bool {
+	senderID := strings.TrimSpace(chatMessageAuthorUserID(msg))
+	currentID := strings.TrimSpace(current.ID)
+	return senderID != "" && currentID != "" && strings.EqualFold(senderID, currentID)
+}
+
+func chatMessageExternalAuthor(msg ChatMessage, current User) (User, bool) {
+	senderID := strings.TrimSpace(chatMessageAuthorUserID(msg))
+	currentID := strings.TrimSpace(current.ID)
+	if senderID == "" || currentID == "" || strings.EqualFold(senderID, currentID) {
+		return User{}, false
+	}
+	return User{
+		ID:          senderID,
+		DisplayName: chatMessageAuthorDisplayName(msg),
+	}, true
+}
+
+func inboundExternalAuthor(inbound teamstore.InboundEvent, current User) (User, bool) {
+	senderID := strings.TrimSpace(inbound.AuthorUserID)
+	currentID := strings.TrimSpace(current.ID)
+	if senderID == "" || currentID == "" || strings.EqualFold(senderID, currentID) {
+		return User{}, false
+	}
+	return User{
+		ID:          senderID,
+		DisplayName: strings.TrimSpace(inbound.AuthorName),
+	}, true
+}
+
+func chatMessageAuthorUserID(msg ChatMessage) string {
+	if msg.From.User == nil {
+		return ""
+	}
+	return strings.TrimSpace(msg.From.User.ID)
+}
+
+func chatMessageAuthorDisplayName(msg ChatMessage) string {
+	if msg.From.User == nil {
+		return ""
+	}
+	return strings.TrimSpace(msg.From.User.DisplayName)
+}
+
+func applyOutboxMentionUser(msg *teamstore.OutboxMessage, user User) {
+	if msg == nil || strings.TrimSpace(user.ID) == "" {
+		return
+	}
+	msg.MentionUserID = strings.TrimSpace(user.ID)
+	msg.MentionUserName = strings.TrimSpace(firstNonEmptyString(user.DisplayName, user.UserPrincipalName))
 }
 
 func hasUserAnnotationPrefix(content string) bool {
@@ -3833,6 +3924,9 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		return nil
 	}
 	if parsed := ParseDashboardCommand(ChatScopeWork, text); parsed.HelperCommand {
+		if !messageAuthoredByCurrentUser(msg, b.user) {
+			return b.rejectExternalWorkCommand(ctx, session, msg)
+		}
 		switch parsed.Name {
 		case DashboardCommandClose:
 			session.Status = "closed"
@@ -3914,7 +4008,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
 			session.UpdatedAt = time.Now()
-			if err := b.queueTeamsPromptAck(ctx, session, turn, true); err != nil {
+			if err := b.queueTeamsPromptAckForMessage(ctx, session, turn, msg, true); err != nil {
 				return err
 			}
 			b.boostPolling(time.Now())
@@ -3939,7 +4033,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 			if !created || !turnCreated {
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
-			if err := b.queueTeamsPromptBlockedAck(ctx, session, turn, gate); err != nil {
+			if err := b.queueTeamsPromptBlockedAckForMessage(ctx, session, turn, msg, gate); err != nil {
 				return err
 			}
 			b.boostPolling(time.Now())
@@ -4000,7 +4094,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 	}
 	session.UpdatedAt = time.Now()
-	if err := b.queueTeamsPromptAck(ctx, session, turn, false); err != nil {
+	if err := b.queueTeamsPromptAckForMessage(ctx, session, turn, msg, false); err != nil {
 		cleanupLocalFiles()
 		return err
 	}
@@ -4024,6 +4118,24 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	defer cleanupLocalFiles()
 
 	return b.runQueuedTurnInput(ctx, session, turn, chatID, ExecutionInputWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles))
+}
+
+func (b *Bridge) rejectExternalWorkCommand(ctx context.Context, session *Session, msg ChatMessage) error {
+	if session == nil {
+		return nil
+	}
+	body := "Only the helper owner can run helper commands in this Work chat. Send a normal question or task here and I will pass it to Codex."
+	outbox := teamstore.OutboxMessage{
+		ID:          "outbox:external-command:" + shortStableID(session.ID+":"+msg.ID),
+		SessionID:   session.ID,
+		TeamsChatID: session.ChatID,
+		Kind:        "control",
+		Body:        body,
+	}
+	if author, ok := chatMessageExternalAuthor(msg, b.user); ok {
+		applyOutboxMentionUser(&outbox, author)
+	}
+	return b.queueAndSendOutbox(ctx, outbox)
 }
 
 func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID string) error {
@@ -4142,18 +4254,28 @@ func turnSortTime(turn teamstore.Turn) time.Time {
 }
 
 func (b *Bridge) queueTeamsPromptAck(ctx context.Context, session *Session, turn teamstore.Turn, queuedBehindActive bool) error {
+	return b.queueTeamsPromptAckForMessage(ctx, session, turn, ChatMessage{}, queuedBehindActive)
+}
+
+func (b *Bridge) queueTeamsPromptAckForMessage(ctx context.Context, session *Session, turn teamstore.Turn, msg ChatMessage, queuedBehindActive bool) error {
 	body := "⏳ Codex is working. Request accepted."
 	if queuedBehindActive {
 		body = b.formatBlockedTeamsPromptAck(ctx, session, localCodexBeforeTeamsGate{
 			Block:   true,
 			AckBody: "A Codex request is already running in this Work chat.",
 		})
+	} else if _, ok := chatMessageExternalAuthor(msg, b.user); ok {
+		body = "⏳ Codex received your question. Request accepted."
 	}
-	return b.queueTeamsPromptAckWithBody(ctx, session, turn, body)
+	return b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, body, msg)
 }
 
 func (b *Bridge) queueTeamsPromptBlockedAck(ctx context.Context, session *Session, turn teamstore.Turn, gate localCodexBeforeTeamsGate) error {
-	return b.queueTeamsPromptAckWithBody(ctx, session, turn, b.formatBlockedTeamsPromptAck(ctx, session, gate))
+	return b.queueTeamsPromptBlockedAckForMessage(ctx, session, turn, ChatMessage{}, gate)
+}
+
+func (b *Bridge) queueTeamsPromptBlockedAckForMessage(ctx context.Context, session *Session, turn teamstore.Turn, msg ChatMessage, gate localCodexBeforeTeamsGate) error {
+	return b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, b.formatBlockedTeamsPromptAck(ctx, session, gate), msg)
 }
 
 func (b *Bridge) formatBlockedTeamsPromptAck(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) string {
@@ -4271,11 +4393,15 @@ func turnPromptSummary(state teamstore.State, turn teamstore.Turn) string {
 }
 
 func (b *Bridge) queueTeamsPromptAckWithBody(ctx context.Context, session *Session, turn teamstore.Turn, body string) error {
+	return b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, body, ChatMessage{})
+}
+
+func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, session *Session, turn teamstore.Turn, body string, msg ChatMessage) error {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		body = "⏳ Codex is working. Request accepted."
 	}
-	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
+	outbox := teamstore.OutboxMessage{
 		ID:          "outbox:" + turn.ID + ":ack",
 		SessionID:   session.ID,
 		TurnID:      turn.ID,
@@ -4283,7 +4409,11 @@ func (b *Bridge) queueTeamsPromptAckWithBody(ctx context.Context, session *Sessi
 		Kind:        "ack",
 		AckKind:     "teams_prompt",
 		Body:        body,
-	})
+	}
+	if author, ok := chatMessageExternalAuthor(msg, b.user); ok {
+		applyOutboxMentionUser(&outbox, author)
+	}
+	queued, err := b.queueOutbox(ctx, outbox)
 	if err != nil {
 		return err
 	}
@@ -6718,7 +6848,7 @@ func (b *Bridge) sendDeferredUpgradeNotice(ctx context.Context, chatID string, i
 	if chatID == "" {
 		return nil
 	}
-	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
+	outbox := teamstore.OutboxMessage{
 		ID:                 "outbox:" + inbound.ID + ":deferred-upgrade-notice",
 		SessionID:          inbound.SessionID,
 		TeamsChatID:        chatID,
@@ -6726,7 +6856,11 @@ func (b *Bridge) sendDeferredUpgradeNotice(ctx context.Context, chatID string, i
 		AckKind:            "upgrade_deferred",
 		Body:               "upgrade in progress. I saved this message and will resume it after the upgrade finishes.",
 		UpgradeNonBlocking: true,
-	})
+	}
+	if author, ok := inboundExternalAuthor(inbound, b.user); ok {
+		applyOutboxMentionUser(&outbox, author)
+	}
+	queued, err := b.queueOutbox(ctx, outbox)
 	if err != nil {
 		return err
 	}
@@ -6735,6 +6869,41 @@ func (b *Bridge) sendDeferredUpgradeNotice(ctx context.Context, chatID string, i
 	}
 	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams deferred ACK send error: %v\n", err)
+	}
+	return nil
+}
+
+func (b *Bridge) sendExternalDeferredReceipt(ctx context.Context, chatID string, inbound teamstore.InboundEvent, body string) error {
+	author, ok := inboundExternalAuthor(inbound, b.user)
+	if !ok {
+		return nil
+	}
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		body = "⏳ Codex received your question."
+	}
+	outbox := teamstore.OutboxMessage{
+		ID:          "outbox:" + inbound.ID + ":external-receipt",
+		SessionID:   inbound.SessionID,
+		TeamsChatID: chatID,
+		Kind:        "ack",
+		AckKind:     "external_prompt",
+		Body:        body,
+	}
+	applyOutboxMentionUser(&outbox, author)
+	queued, err := b.queueOutbox(ctx, outbox)
+	if err != nil {
+		return err
+	}
+	if queued.Status == teamstore.OutboxStatusSent {
+		return nil
+	}
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: false}); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams external receipt send error: %v\n", err)
 	}
 	return nil
 }
@@ -7216,6 +7385,8 @@ func (b *Bridge) persistInboundWithStatusAndSource(ctx context.Context, session 
 		SessionID:       session.ID,
 		TeamsChatID:     session.ChatID,
 		TeamsMessageID:  msg.ID,
+		AuthorUserID:    chatMessageAuthorUserID(msg),
+		AuthorName:      chatMessageAuthorDisplayName(msg),
 		ScopeID:         b.scope.ID,
 		MachineID:       b.machine.ID,
 		LeaseGeneration: leaseGeneration,
@@ -7237,8 +7408,14 @@ func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, 
 	if len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 {
 		source = "teams_session_import_deferred_attachment"
 	}
-	_, _, err := b.persistInboundWithStatusAndSource(ctx, session, msg, teamstore.InboundStatusDeferred, source)
-	return err
+	inbound, created, err := b.persistInboundWithStatusAndSource(ctx, session, msg, teamstore.InboundStatusDeferred, source)
+	if err != nil {
+		return err
+	}
+	if created {
+		return b.sendExternalDeferredReceipt(ctx, session.ChatID, inbound, "⏳ Codex received your question. I’m preparing this chat history first, then I’ll respond.")
+	}
+	return nil
 }
 
 func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamstore.InboundEvent) (teamstore.Turn, bool, error) {
@@ -7554,6 +7731,9 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	} else if outbox.MentionOwner {
 		body, mentions := renderOutboxMentionHTML(outbox, b.user)
 		msg, err = b.graph.SendHTMLWithMentions(ctx, outbox.TeamsChatID, body, mentions)
+	} else if user, ok := outboxMentionUser(outbox); ok {
+		body, mentions := renderOutboxUserMentionHTML(outbox, user)
+		msg, err = b.graph.SendHTMLWithMentions(ctx, outbox.TeamsChatID, body, mentions)
 	} else {
 		msg, err = b.graph.SendHTML(ctx, outbox.TeamsChatID, renderOutboxHTML(outbox))
 	}
@@ -7789,10 +7969,18 @@ func renderOutboxHTML(outbox teamstore.OutboxMessage) string {
 }
 
 func renderOutboxMentionHTML(outbox teamstore.OutboxMessage, owner User) (string, []ChatMention) {
+	return renderOutboxMentionHTMLWithFallback(outbox, owner, "owner")
+}
+
+func renderOutboxUserMentionHTML(outbox teamstore.OutboxMessage, user User) (string, []ChatMention) {
+	return renderOutboxMentionHTMLWithFallback(outbox, user, "user")
+}
+
+func renderOutboxMentionHTMLWithFallback(outbox teamstore.OutboxMessage, owner User, fallback string) (string, []ChatMention) {
 	if isChatMovedOutboxKind(outbox.Kind) {
 		return renderChatMovedOutboxHTML(outbox, owner, true)
 	}
-	mentionText := strings.TrimSpace(firstNonEmptyString(owner.DisplayName, owner.UserPrincipalName, "owner"))
+	mentionText := strings.TrimSpace(firstNonEmptyString(owner.DisplayName, owner.UserPrincipalName, fallback))
 	mention := `<at id="0">` + html.EscapeString(mentionText) + `</at>`
 	label := teamsRenderLabel(renderKindForOutbox(outbox.Kind), normalizedPartIndex(outbox), normalizedPartCount(outbox))
 	body := normalizeTeamsRenderTextForKind(renderKindForOutbox(outbox.Kind), outbox.Body)
@@ -7808,6 +7996,17 @@ func renderOutboxMentionHTML(outbox teamstore.OutboxMessage, owner User) (string
 		Text: mentionText,
 		User: owner,
 	}}
+}
+
+func outboxMentionUser(outbox teamstore.OutboxMessage) (User, bool) {
+	id := strings.TrimSpace(outbox.MentionUserID)
+	if id == "" {
+		return User{}, false
+	}
+	return User{
+		ID:          id,
+		DisplayName: strings.TrimSpace(outbox.MentionUserName),
+	}, true
 }
 
 func isChatMovedOutboxKind(kind string) bool {
