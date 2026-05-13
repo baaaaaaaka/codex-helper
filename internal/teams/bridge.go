@@ -69,6 +69,18 @@ var queuedTurnAttentionRepeatDelay = 10 * time.Minute
 
 var errTranscriptCheckpointNotFound = errors.New("transcript checkpoint was not found")
 
+func isTranscriptCheckpointNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errTranscriptCheckpointNotFound) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "transcript checkpoint was not found") &&
+		strings.Contains(msg, "refusing to guess")
+}
+
 func transcriptCheckpointNeedsAttentionMessage() string {
 	return "Local Codex history sync needs attention. I could not find the saved transcript checkpoint, so I did not guess an import position or import local history from the wrong place."
 }
@@ -8837,7 +8849,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		}
 		hasNew, err := b.transcriptHasNewRecords(ctx, *existing, local)
 		historySyncNeedsAttention := false
-		if errors.Is(err, errTranscriptCheckpointNotFound) {
+		if isTranscriptCheckpointNotFoundError(err) {
 			historySyncNeedsAttention = true
 		} else if err != nil {
 			return "", fmt.Errorf("check history import for %s: %w", existing.ID, err)
@@ -8852,7 +8864,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 				}
 			}
 			if err := b.importCodexTranscriptToTeams(ctx, *existing, local); err != nil {
-				if errors.Is(err, errTranscriptCheckpointNotFound) {
+				if isTranscriptCheckpointNotFoundError(err) {
 					importStatus = transcriptCheckpointNeedsAttentionMessage()
 					return fmt.Sprintf("Already published as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus), nil
 				}
@@ -8916,7 +8928,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		}
 	}
 	if err := b.importCodexTranscriptToTeams(ctx, session, local); err != nil {
-		if errors.Is(err, errTranscriptCheckpointNotFound) {
+		if isTranscriptCheckpointNotFoundError(err) {
 			return fmt.Sprintf("Published local Codex session as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", session.ID, session.ChatURL, transcriptCheckpointNeedsAttentionMessage()), nil
 		}
 		return "", err
@@ -8981,7 +8993,7 @@ func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Sessi
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, local.FilePath, importTurnID, "import", transcriptCheckpointID(session.ID))
 	if err != nil {
 		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
-		if errors.Is(err, errTranscriptCheckpointNotFound) {
+		if isTranscriptCheckpointNotFoundError(err) {
 			_ = b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-needs-attention", transcriptCheckpointNeedsAttentionMessage())
 		}
 		return err
@@ -9024,7 +9036,7 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, *session, local.FilePath, importTurnID, "sync", transcriptCheckpointID(session.ID))
 	if err != nil {
 		_ = b.markTranscriptImportFailed(ctx, *session, local.FilePath)
-		if errors.Is(err, errTranscriptCheckpointNotFound) {
+		if isTranscriptCheckpointNotFoundError(err) {
 			return b.sendToChat(ctx, session.ChatID, transcriptCheckpointNeedsAttentionMessage())
 		}
 		return b.sendToChat(ctx, session.ChatID, "History import failed: "+err.Error())
@@ -10230,7 +10242,7 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID)
 	if err != nil {
 		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
-		if errors.Is(err, errTranscriptCheckpointNotFound) {
+		if isTranscriptCheckpointNotFoundError(err) {
 			if sendErr := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-needs-attention", transcriptCheckpointNeedsAttentionMessage()); sendErr != nil {
 				return sendErr
 			}

@@ -4816,6 +4816,16 @@ func TestBridgePublishExistingSessionDoesNotRawErrorOnMissingCheckpoint(t *testi
 	}
 }
 
+func TestTranscriptCheckpointNotFoundErrorMatchesLegacyRawMessage(t *testing.T) {
+	legacyErr := fmt.Errorf("check history import for s001: %w", errors.New("transcript checkpoint was not found; refusing to guess an import position"))
+	if !isTranscriptCheckpointNotFoundError(legacyErr) {
+		t.Fatalf("legacy checkpoint error was not recognized: %v", legacyErr)
+	}
+	if isTranscriptCheckpointNotFoundError(errors.New("transcript checkpoint was not found for unrelated reason")) {
+		t.Fatalf("unrelated checkpoint error should not be classified as missing import checkpoint")
+	}
+}
+
 func TestBridgePublishExistingBlockedSessionDoesNotRawErrorOnMissingCheckpoint(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
