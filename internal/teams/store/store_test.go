@@ -1505,6 +1505,57 @@ func TestHasUpgradeBlockingWorkTurnStatusMatrix(t *testing.T) {
 	}
 }
 
+func TestUpgradeBlockersDescribeBlockingWork(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	state := State{
+		Turns: map[string]Turn{
+			"turn-running": {ID: "turn-running", SessionID: "s1", Status: TurnStatusRunning},
+			"turn-done":    {ID: "turn-done", SessionID: "s1", Status: TurnStatusCompleted},
+		},
+		OutboxMessages: map[string]OutboxMessage{
+			"outbox-blocked": {ID: "outbox-blocked", SessionID: "s2", TeamsChatID: "chat-2", Kind: "answer", Status: OutboxStatusQueued},
+			"outbox-sent":    {ID: "outbox-sent", SessionID: "s2", TeamsChatID: "chat-2", Kind: "answer", Status: OutboxStatusSent},
+		},
+		ChatRateLimits: map[string]ChatRateLimitState{},
+		ImportCheckpoints: map[string]ImportCheckpoint{
+			"transcript:s1": {ID: "transcript:s1", SessionID: "s1", Status: "importing"},
+		},
+	}
+	blockers := UpgradeBlockers(state, now)
+	if len(blockers) != 2 {
+		t.Fatalf("UpgradeBlockers len = %d, want 2: %#v", len(blockers), blockers)
+	}
+	if blockers[0].Kind != "outbox" || blockers[0].ID != "outbox-blocked" || blockers[0].Status != string(OutboxStatusQueued) || blockers[0].Detail != "answer" {
+		t.Fatalf("outbox blocker mismatch: %#v", blockers[0])
+	}
+	if blockers[1].Kind != "turn" || blockers[1].ID != "turn-running" || blockers[1].Status != string(TurnStatusRunning) {
+		t.Fatalf("turn blocker mismatch: %#v", blockers[1])
+	}
+}
+
+func TestHasUpgradeBlockingWorkIgnoresImportCheckpointWithoutWork(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	state := State{
+		Turns:          map[string]Turn{},
+		OutboxMessages: map[string]OutboxMessage{},
+		ChatRateLimits: map[string]ChatRateLimitState{},
+		ImportCheckpoints: map[string]ImportCheckpoint{
+			"transcript:s1": {
+				ID:           "transcript:s1",
+				SessionID:    "s1",
+				Status:       "importing",
+				ImportTurnID: "import:s1",
+			},
+		},
+	}
+	if HasUpgradeBlockingWork(state, now) {
+		t.Fatalf("import checkpoint without queued/running turn or blocking outbox should not block upgrade")
+	}
+	if blockers := UpgradeBlockers(state, now); len(blockers) != 0 {
+		t.Fatalf("UpgradeBlockers = %#v, want none", blockers)
+	}
+}
+
 func TestPermissionsUnix(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix file mode assertion")

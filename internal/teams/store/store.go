@@ -613,6 +613,14 @@ type RecoveryReport struct {
 	InterruptedTurnIDs []string
 }
 
+type UpgradeBlocker struct {
+	Kind      string
+	ID        string
+	SessionID string
+	Status    string
+	Detail    string
+}
+
 var ErrOwnerLive = errors.New("Teams owner is active")
 
 var (
@@ -1462,20 +1470,45 @@ func (s *Store) DeferredInbound(ctx context.Context) ([]InboundEvent, error) {
 }
 
 func HasUpgradeBlockingWork(state State, now time.Time) bool {
+	return len(UpgradeBlockers(state, now)) > 0
+}
+
+func UpgradeBlockers(state State, now time.Time) []UpgradeBlocker {
 	if now.IsZero() {
 		now = time.Now()
 	}
+	var blockers []UpgradeBlocker
 	for _, turn := range state.Turns {
 		if turn.Status == TurnStatusQueued || turn.Status == TurnStatusRunning {
-			return true
+			blockers = append(blockers, UpgradeBlocker{
+				Kind:      "turn",
+				ID:        turn.ID,
+				SessionID: turn.SessionID,
+				Status:    string(turn.Status),
+			})
 		}
 	}
 	for _, msg := range state.OutboxMessages {
 		if OutboxBlocksUpgrade(state, msg, now) {
-			return true
+			blockers = append(blockers, UpgradeBlocker{
+				Kind:      "outbox",
+				ID:        msg.ID,
+				SessionID: msg.SessionID,
+				Status:    string(msg.Status),
+				Detail:    msg.Kind,
+			})
 		}
 	}
-	return false
+	sort.Slice(blockers, func(i, j int) bool {
+		if blockers[i].Kind != blockers[j].Kind {
+			return blockers[i].Kind < blockers[j].Kind
+		}
+		if blockers[i].SessionID != blockers[j].SessionID {
+			return blockers[i].SessionID < blockers[j].SessionID
+		}
+		return blockers[i].ID < blockers[j].ID
+	})
+	return blockers
 }
 
 func OutboxBlocksUpgrade(state State, msg OutboxMessage, now time.Time) bool {

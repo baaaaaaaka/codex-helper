@@ -949,6 +949,9 @@ func TestTeamsRecoverAllowsStaleOwner(t *testing.T) {
 	}
 
 	out := executeRootForTeamsTest(t, "teams", "recover", "--stale-after", "1ms")
+	if !strings.Contains(out, "Cleared stale owners: 1") {
+		t.Fatalf("stale recover should report cleared owner:\n%s", out)
+	}
 	if !strings.Contains(out, "Recovered interrupted turns: 1") {
 		t.Fatalf("stale recover output mismatch:\n%s", out)
 	}
@@ -956,6 +959,43 @@ func TestTeamsRecoverAllowsStaleOwner(t *testing.T) {
 		t.Fatalf("ReadOwner error: %v", err)
 	} else if ok {
 		t.Fatal("owner should be cleared after stale recover")
+	}
+}
+
+func TestTeamsRecoverReportsRemainingUpgradeBlockers(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{
+		ID:          "s1",
+		Status:      teamsstore.SessionStatusActive,
+		TeamsChatID: "chat-1",
+	}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := st.QueueOutbox(ctx, teamsstore.OutboxMessage{
+		ID:          "outbox:blocking",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "answer",
+		Body:        "pending answer",
+	}); err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+
+	out := executeRootForTeamsTest(t, "teams", "recover")
+	if !strings.Contains(out, "Recovered interrupted turns: 0") {
+		t.Fatalf("recover should report no interrupted turns:\n%s", out)
+	}
+	if !strings.Contains(out, "Remaining upgrade blockers: 1") ||
+		!strings.Contains(out, "outbox s1 outbox:blocking status=queued kind=answer") {
+		t.Fatalf("recover should report remaining outbox blocker:\n%s", out)
 	}
 }
 

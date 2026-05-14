@@ -667,7 +667,7 @@ func TestRunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner(t *testi
 			prevUpgrade := upgradeCodexInstalledForTeamsRun
 			t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
 			upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
-				t.Fatal("upgrade should not run while Teams work is unfinished")
+				t.Fatal("upgrade should not run while Teams work is upgrade-blocking")
 				return "", nil
 			}
 			st, err := openTeamsStore()
@@ -678,8 +678,11 @@ func TestRunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner(t *testi
 
 			cmd := newRootCmd()
 			err = runTeamsUpgradeCodexOnce(cmd, &rootOptions{}, "")
-			if err == nil || !strings.Contains(err.Error(), "unfinished turns") {
-				t.Fatalf("expected unfinished work error, got %v", err)
+			if err == nil || !strings.Contains(err.Error(), "upgrade-blocking work") {
+				t.Fatalf("expected upgrade-blocking work error, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "status=") {
+				t.Fatalf("upgrade-blocking error should name concrete blocker status, got %v", err)
 			}
 		})
 	}

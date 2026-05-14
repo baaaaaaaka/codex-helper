@@ -1326,19 +1326,20 @@ func (b teamsServiceWindowsTaskBackend) Uninstall(ctx context.Context) (string, 
 func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([]byte, error) {
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
 	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
+	resolveWatchdog := "$watchdogTask = Get-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction SilentlyContinue; "
 	switch action {
 	case "enable":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null")
+		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }")
 	case "disable":
-		return teamsServiceRunPowerShell(ctx, "Disable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null; Disable-ScheduledTask -TaskName "+task+" | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $watchdogTask) { Disable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Disable-ScheduledTask -TaskName "+task+" | Out-Null")
 	case "status":
-		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; $watchdog = Get-ScheduledTask -TaskName "+watchdogTask+"; $watchdogInfo = Get-ScheduledTaskInfo -TaskName "+watchdogTask+"; $watchdog | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime")
+		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; "+resolveWatchdog+"if ($null -ne $watchdogTask) { $watchdogInfo = Get-ScheduledTaskInfo -TaskName "+watchdogTask+"; $watchdogTask | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime } else { Write-Output 'Watchdog task not installed' }")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, "Start-ScheduledTask -TaskName "+task+"; Start-ScheduledTask -TaskName "+watchdogTask)
+		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-ScheduledTask -TaskName "+task+"; if ($null -ne $watchdogTask) { Start-ScheduledTask -TaskName "+watchdogTask+" }")
 	case "stop":
 		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction SilentlyContinue; Stop-ScheduledTask -TaskName "+task)
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName "+task+"; Start-ScheduledTask -TaskName "+watchdogTask)
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-ScheduledTask -TaskName "+task+"; if ($null -ne $watchdogTask) { Start-ScheduledTask -TaskName "+watchdogTask+" }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
 	}
@@ -1354,11 +1355,11 @@ func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action str
 	case "status":
 		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, "Start-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; Start-ScheduledTask -TaskName "+task)
 	case "stop":
 		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task)
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Enable-ScheduledTask -TaskName "+task+" | Out-Null; Start-ScheduledTask -TaskName "+task)
 	default:
 		return nil, fmt.Errorf("unsupported primary Teams service action for Task Scheduler: %s", action)
 	}
@@ -1737,11 +1738,11 @@ func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action strin
 		}
 		return data, err
 	case "start":
-		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell()+" }")
+		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLEnableStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLEnableStartTaskIfStoppedAndVerifyPowerShell()+" }")
 	case "stop":
 		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $task) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }; "+resolve+"Stop-ScheduledTask -TaskName $taskName")
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell()+" }")
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLEnableStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLEnableStartTaskIfStoppedAndVerifyPowerShell()+" }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for WSL Task Scheduler: %s", action)
 	}
@@ -1773,11 +1774,11 @@ func (b teamsServiceWSLWindowsTaskBackend) RunPrimary(ctx context.Context, actio
 	case "status":
 		return teamsServiceRunPowerShell(ctx, resolve+"$info = Get-ScheduledTaskInfo -TaskName $taskName; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLStartTaskAndVerifyPowerShell())
+		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLEnableStartTaskAndVerifyPowerShell())
 	case "stop":
 		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName")
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLStartTaskAndVerifyPowerShell())
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLEnableStartTaskAndVerifyPowerShell())
 	default:
 		return nil, fmt.Errorf("unsupported primary Teams service action for WSL Task Scheduler: %s", action)
 	}
@@ -2640,6 +2641,14 @@ func teamsServiceWSLStartTaskAndVerifyPowerShell() string {
 
 func teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell() string {
 	return "if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName | Out-Null }; " + teamsServiceWSLVerifyTaskRunningPowerShell()
+}
+
+func teamsServiceWSLEnableStartTaskAndVerifyPowerShell() string {
+	return "Enable-ScheduledTask -TaskName $taskName | Out-Null; " + teamsServiceWSLStartTaskAndVerifyPowerShell()
+}
+
+func teamsServiceWSLEnableStartTaskIfStoppedAndVerifyPowerShell() string {
+	return "if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName | Out-Null }; " + teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell()
 }
 
 func teamsServiceWSLVerifyTaskRunningPowerShell() string {

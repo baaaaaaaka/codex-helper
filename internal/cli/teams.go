@@ -1050,6 +1050,8 @@ func newTeamsRecoverCmd() *cobra.Command {
 				return nil
 			}
 			var recovered []string
+			var clearedOwners []string
+			var remainingBlockers []string
 			for _, path := range paths {
 				st, err := teamsstore.Open(path)
 				if err != nil {
@@ -1066,6 +1068,7 @@ func newTeamsRecoverCmd() *cobra.Command {
 					if err := st.ClearOwner(cmd.Context()); err != nil {
 						return err
 					}
+					clearedOwners = append(clearedOwners, fmt.Sprintf("%s pid=%d host=%s active_session=%s active_turn=%s", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID))
 				}
 				report, err := st.Recover(cmd.Context())
 				if err != nil {
@@ -1074,11 +1077,30 @@ func newTeamsRecoverCmd() *cobra.Command {
 				for _, id := range report.InterruptedTurnIDs {
 					recovered = append(recovered, path+" "+id)
 				}
+				state, err := st.Load(cmd.Context())
+				if err != nil {
+					return err
+				}
+				if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
+					remainingBlockers = append(remainingBlockers, path+" "+teamsUpgradeBlockerSummary(blockers))
+				}
 			}
+			sort.Strings(clearedOwners)
 			sort.Strings(recovered)
+			sort.Strings(remainingBlockers)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Cleared stale owners: %d\n", len(clearedOwners))
+			for _, id := range clearedOwners {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Recovered interrupted turns: %d\n", len(recovered))
 			for _, id := range recovered {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
+			}
+			if len(remainingBlockers) > 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Remaining upgrade blockers: %d\n", len(remainingBlockers))
+				for _, id := range remainingBlockers {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
+				}
 			}
 			return nil
 		},

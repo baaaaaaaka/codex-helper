@@ -196,7 +196,7 @@ func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPa
 		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +
 		"catch { $lastErr='move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message; Log $lastErr; Start-Sleep -Milliseconds 500 } }; " +
 		"if ($ready) { Write-Status 'success' 'activated pending helper' } else { if ([string]::IsNullOrWhiteSpace($lastErr)) { $lastErr='activation failed before service start' }; Log ('activation failed before service start: ' + $lastErr); Write-Status 'failed' $lastErr }; " +
-		"foreach ($task in @(" + powershellSingleQuote(teamsServiceWindowsTaskName) + "," + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + ")) { try { Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('start task failed ' + $task + ': ' + $_.Exception.Message) } }"
+		"foreach ($task in @(" + powershellSingleQuote(teamsServiceWindowsTaskName) + "," + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + ")) { try { Enable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null; Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('start task failed ' + $task + ': ' + $_.Exception.Message) } }"
 }
 
 func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, installPath string, version string, args []string) string {

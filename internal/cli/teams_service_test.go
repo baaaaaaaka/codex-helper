@@ -1631,7 +1631,7 @@ func TestTeamsServiceStartAndRestartActivatePendingWindowsHelperBeforeOldEntry(t
 				t.Fatalf("%s detached name = %q, want powershell.exe", tc.name, detachedName)
 			}
 			joined := strings.Join(detachedArgs, " ")
-			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Start-ScheduledTask"} {
+			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-ScheduledTask"} {
 				if !strings.Contains(joined, want) {
 					t.Fatalf("%s activation command missing %q:\n%s", tc.name, want, joined)
 				}

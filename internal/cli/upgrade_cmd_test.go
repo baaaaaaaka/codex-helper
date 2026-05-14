@@ -98,6 +98,63 @@ func TestUpgradeCmdExplicitVersionCallsPerformUpdate(t *testing.T) {
 	}
 }
 
+func TestUpgradeCmdRecoverContractUnblocksQueuedTurn(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performCalls := 0
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		performCalls++
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{ID: "s1", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, _, err := st.QueueTurn(ctx, teamsstore.Turn{ID: "turn:queued", SessionID: "s1", Status: teamsstore.TurnStatusQueued}); err != nil {
+		t.Fatalf("QueueTurn: %v", err)
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "upgrade-blocking work") || !strings.Contains(err.Error(), "turn s1 turn:queued status=queued") {
+		t.Fatalf("expected concrete upgrade blocker, got %v", err)
+	}
+	if performCalls != 0 {
+		t.Fatalf("performUpdate calls before recover = %d, want 0", performCalls)
+	}
+
+	out := executeRootForTeamsTest(t, "teams", "recover")
+	if !strings.Contains(out, "Recovered interrupted turns: 1") || strings.Contains(out, "Remaining upgrade blockers") {
+		t.Fatalf("recover should clear queued turn blocker:\n%s", out)
+	}
+
+	cmd = newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("upgrade after recover: %v", err)
+	}
+	if performCalls != 1 {
+		t.Fatalf("performUpdate calls after recover = %d, want 1", performCalls)
+	}
+}
+
 func TestUpgradeCmdLatestCanIncludePrerelease(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)
@@ -393,6 +450,62 @@ func TestUpgradeCmdAllowsDeferredTeamsInboundWithoutOwner(t *testing.T) {
 	}
 }
 
+func TestUpgradeCmdAllowsOrphanedTranscriptImportCheckpointWithoutOwner(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performCalled := false
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		performCalled = true
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ImportCheckpoints["transcript:s001"] = teamsstore.ImportCheckpoint{
+			ID:           "transcript:s001",
+			SessionID:    "s001",
+			Status:       "importing",
+			ImportTurnID: "import:s001",
+			LastRecordID: "fallback:missing",
+			SourcePath:   filepath.Join(tmp, "missing-rollout.jsonl"),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("write import checkpoint: %v", err)
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade with orphaned import checkpoint: %v", err)
+	}
+	if !performCalled {
+		t.Fatal("performUpdate was not called with orphaned import checkpoint")
+	}
+}
+
 func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -630,7 +743,8 @@ func TestUpgradeCmdWSLMatchingTaskRefreshSkipsRepairAndUAC(t *testing.T) {
 	}
 	lastCall := runner.calls[len(runner.calls)-1]
 	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
-	if !strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
+	if !strings.Contains(lastJoined, "Enable-ScheduledTask -TaskName $taskName") ||
+		!strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
 		t.Fatalf("expected normal Scheduled Task start, last call=%#v all calls=%#v", lastCall, runner.calls)
 	}
 }
@@ -1172,9 +1286,11 @@ func TestScheduleDelayedTeamsServiceStartUsesWSLWindowsTask(t *testing.T) {
 	}
 	joined := strings.Join(detachedArgs, " ")
 	if detachedName != "powershell.exe" ||
+		!strings.Contains(joined, "Enable-ScheduledTask") ||
 		!strings.Contains(joined, "Start-ScheduledTask") ||
 		!strings.Contains(joined, "Codex Helper Teams Bridge (WSL Ubuntu-22.04 alice work ") ||
 		!strings.Contains(joined, "Codex Helper Teams Watchdog (WSL Ubuntu-22.04 alice work ") ||
+		!strings.Contains(joined, "$task.State -eq 'Disabled'") ||
 		!strings.Contains(joined, "$task.State -ne 'Running'") {
 		t.Fatalf("unexpected WSL delayed restart: name=%q args=%#v", detachedName, detachedArgs)
 	}
@@ -1308,7 +1424,7 @@ func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testi
 		}
 	}
 	activation := strings.Join(detachedArgs, " ")
-	for _, want := range []string{pending, exe, ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Start-ScheduledTask"} {
+	for _, want := range []string{pending, exe, ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-ScheduledTask"} {
 		if !strings.Contains(activation, want) {
 			t.Fatalf("activation command missing %q:\n%s", want, activation)
 		}

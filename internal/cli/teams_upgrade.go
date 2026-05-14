@@ -55,8 +55,8 @@ func ensureTeamsIdleBeforeCodexUpgrade(ctx context.Context) error {
 			}
 			return fmt.Errorf("Teams bridge is already running for %s; stop it or run `codex-proxy teams drain` before using --upgrade-codex", path)
 		}
-		if teamsStateHasUnfinishedWork(state) {
-			return fmt.Errorf("Teams state has unfinished turns in %s but no active owner; run `codex-proxy teams recover` before using --upgrade-codex", path)
+		if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
+			return fmt.Errorf("Teams state has upgrade-blocking work in %s but no active owner: %s; run `codex-proxy teams recover` before using --upgrade-codex", path, teamsUpgradeBlockerSummary(blockers))
 		}
 	}
 	return nil
@@ -94,8 +94,8 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 		}
 		owner, hasOwner := stateOwner(state)
 		if !hasOwner {
-			if teamsStateHasUnfinishedWork(state) {
-				return nil, fmt.Errorf("Teams state has unfinished turns in %s but no active owner; run `codex-proxy teams recover` before upgrading", path)
+			if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
+				return nil, fmt.Errorf("Teams state has upgrade-blocking work in %s but no active owner: %s; run `codex-proxy teams recover` before upgrading", path, teamsUpgradeBlockerSummary(blockers))
 			}
 			continue
 		}
@@ -411,13 +411,14 @@ func delayedTeamsServiceStartCommand(backend teamsServiceBackend, pendingReplace
 			return "", nil, fmt.Errorf("WSL Teams service backend has unexpected type %T", backend)
 		}
 		command := "Start-Sleep -Seconds 3; " +
-			teamsServiceWSLResolveTaskPowerShell(wslBackend.Name()) + "Start-ScheduledTask -TaskName $taskName; " +
-			teamsServiceWSLResolveOptionalTaskPowerShell(wslBackend.watchdogName()) + "if ($null -ne $task -and $task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName }"
+			teamsServiceWSLResolveTaskPowerShell(wslBackend.Name()) + "Enable-ScheduledTask -TaskName $taskName | Out-Null; Start-ScheduledTask -TaskName $taskName; " +
+			teamsServiceWSLResolveOptionalTaskPowerShell(wslBackend.watchdogName()) + "if ($null -ne $task) { if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName | Out-Null }; if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName } }"
 		return teamsServicePowerShellExecutable(), []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}, nil
 	}
 	switch teamsServiceGOOS() {
 	case "windows":
-		command := delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath) + "Start-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsTaskName)
+		task := powershellSingleQuote(teamsServiceWindowsTaskName)
+		command := delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath) + "Enable-ScheduledTask -TaskName " + task + " | Out-Null; Start-ScheduledTask -TaskName " + task
 		return teamsServicePowerShellExecutable(), []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}, nil
 	case "darwin":
 		path, err := backend.Path()
@@ -494,5 +495,38 @@ func stateOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool) {
 }
 
 func teamsStateHasUnfinishedWork(state teamsstore.State) bool {
-	return teamsstore.HasUpgradeBlockingWork(state, time.Now())
+	return len(teamsUpgradeBlockers(state)) > 0
+}
+
+func teamsUpgradeBlockers(state teamsstore.State) []teamsstore.UpgradeBlocker {
+	return teamsstore.UpgradeBlockers(state, time.Now())
+}
+
+func teamsUpgradeBlockerSummary(blockers []teamsstore.UpgradeBlocker) string {
+	if len(blockers) == 0 {
+		return "no queued/running turns or blocking outbox messages"
+	}
+	const max = 4
+	parts := make([]string, 0, min(len(blockers), max)+1)
+	for i, blocker := range blockers {
+		if i >= max {
+			parts = append(parts, fmt.Sprintf("+%d more", len(blockers)-max))
+			break
+		}
+		segment := blocker.Kind
+		if blocker.SessionID != "" {
+			segment += " " + blocker.SessionID
+		}
+		if blocker.ID != "" {
+			segment += " " + blocker.ID
+		}
+		if blocker.Status != "" {
+			segment += " status=" + blocker.Status
+		}
+		if blocker.Detail != "" {
+			segment += " kind=" + blocker.Detail
+		}
+		parts = append(parts, segment)
+	}
+	return strings.Join(parts, "; ")
 }
