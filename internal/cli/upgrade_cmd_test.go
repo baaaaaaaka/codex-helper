@@ -1251,9 +1251,10 @@ func TestScheduleDelayedTeamsServiceStartUsesWindowsPendingActivation(t *testing
 		teamsServiceWindowsWatchdogTaskName,
 		teamsServiceWindowsTaskName,
 		"$want='1.2.3'",
+		".activation.json",
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
-		"if ($ready) { foreach",
+		"Write-Status 'failed'",
 		"Start-ScheduledTask",
 	} {
 		if !strings.Contains(joined, want) {
@@ -1307,7 +1308,7 @@ func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testi
 		}
 	}
 	activation := strings.Join(detachedArgs, " ")
-	for _, want := range []string{pending, exe, "Move-Item -Force", "Start-ScheduledTask"} {
+	for _, want := range []string{pending, exe, ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Start-ScheduledTask"} {
 		if !strings.Contains(activation, want) {
 			t.Fatalf("activation command missing %q:\n%s", want, activation)
 		}
@@ -1366,10 +1367,11 @@ func TestRestartTeamsHelperFromTeamsUsesPendingActivationForWindowsService(t *te
 		pending,
 		filepath.Join(tmp, "codex-proxy.exe"),
 		"$want='1.2.3'",
+		".activation.json",
 		"Stop-ScheduledTask",
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
-		"if ($ready) { foreach",
+		"Write-Status 'failed'",
 		"Start-ScheduledTask",
 	} {
 		if !strings.Contains(joined, want) {
@@ -1433,9 +1435,11 @@ func TestRestartTeamsHelperFromTeamsUsesPendingProcessRestartForWindowsManualRun
 		pending,
 		filepath.Join(tmp, "codex-proxy.exe"),
 		"$want='1.2.3'",
+		".activation.json",
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
-		"if ($ready) { try { Start-Process",
+		"Write-Status 'failed'",
+		"if (Test-Path -LiteralPath $dest) { try { Start-Process",
 		"Start-Process -FilePath $dest",
 		"'teams'",
 		"'run'",

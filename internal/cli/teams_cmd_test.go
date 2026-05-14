@@ -190,6 +190,18 @@ func TestFormatTeamsHelperVersionStatusReportsOwnerEntryAndPending(t *testing.T)
 	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
 		t.Fatalf("write pending helper: %v", err)
 	}
+	failedPending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.74_linux_"+runtime.GOARCH+".123")
+	if err := os.WriteFile(failedPending, []byte("failed"), 0o600); err != nil {
+		t.Fatalf("write failed pending helper: %v", err)
+	}
+	failedStatus := append([]byte{0xef, 0xbb, 0xbf}, []byte(`{"version":1,"status":"failed","message":"file is locked"}`)...)
+	if err := os.WriteFile(failedPending+".activation.json", failedStatus, 0o600); err != nil {
+		t.Fatalf("write failed pending status: %v", err)
+	}
+	stalePending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.67_linux_"+runtime.GOARCH+".123")
+	if err := os.WriteFile(stalePending, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write stale pending helper: %v", err)
+	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     exe,
@@ -199,7 +211,11 @@ func TestFormatTeamsHelperVersionStatusReportsOwnerEntryAndPending(t *testing.T)
 	got := formatTeamsHelperVersionStatus(context.Background(), []teamsstore.OwnerMetadata{{
 		HelperVersion: "v0.1.0-rc.68",
 	}})
-	for _, want := range []string{"owner=v0.1.0-rc.68", "entry=v0.1.0-rc.68", "pending=v0.1.0-rc.73"} {
+	for _, want := range []string{
+		"owner=v0.1.0-rc.68",
+		"entry=v0.1.0-rc.68",
+		"pending=failed:v0.1.0-rc.74, newer:v0.1.0-rc.73, stale:v0.1.0-rc.67",
+	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("helper version status missing %q: %s", want, got)
 		}

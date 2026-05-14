@@ -122,6 +122,9 @@ func FindPendingReplacementsForPlatform(installPath string, goos string, goarch 
 		if !strings.HasPrefix(name, "."+assetPrefix) {
 			continue
 		}
+		if strings.HasSuffix(name, ".activation.json") || strings.HasSuffix(name, ".activation.json.tmp") {
+			continue
+		}
 		rest := strings.TrimPrefix(name, "."+assetPrefix)
 		idx := strings.Index(rest, assetSuffix+".")
 		if idx <= 0 {

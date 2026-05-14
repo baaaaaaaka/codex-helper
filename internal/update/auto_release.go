@@ -504,6 +504,11 @@ func compareVersionNewer(remote, local string) (bool, bool) {
 
 const versionCompareInvalid = -2
 
+func CompareVersions(left, right string) (int, bool) {
+	cmp := compareVersion(left, right)
+	return cmp, cmp != versionCompareInvalid
+}
+
 func compareVersion(left, right string) int {
 	lv, lok := parseComparableVersion(left)
 	rv, rok := parseComparableVersion(right)

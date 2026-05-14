@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1686,11 +1687,17 @@ func formatTeamsHelperVersionStatus(ctx context.Context, owners []teamsstore.Own
 		}
 	}
 	entryVersion := "unknown"
+	entryVersionRaw := ""
+	entryVersionComparable := false
 	installPath := ""
 	if exe, err := teamsServiceExecutable(); err == nil {
 		installPath = stableRestartExecutablePath(exe)
 		if probed, err := update.ProbeBinaryVersion(ctx, installPath, 5*time.Second); err == nil {
-			entryVersion = "v" + strings.TrimPrefix(probed.Version, "v")
+			entryVersionRaw = strings.TrimPrefix(strings.TrimSpace(probed.Version), "v")
+			entryVersion = "v" + entryVersionRaw
+			if entryVersionRaw != "" {
+				_, entryVersionComparable = update.CompareVersions(entryVersionRaw, entryVersionRaw)
+			}
 		} else {
 			entryVersion = "error: " + err.Error()
 		}
@@ -1704,12 +1711,56 @@ func formatTeamsHelperVersionStatus(ctx context.Context, owners []teamsstore.Own
 					parts = append(parts, fmt.Sprintf("+%d more", len(pending)-i))
 					break
 				}
-				parts = append(parts, "v"+strings.TrimPrefix(candidate.Version, "v"))
+				parts = append(parts, formatTeamsPendingReplacementStatus(candidate, entryVersionRaw, entryVersionComparable))
 			}
 			pendingText = strings.Join(parts, ", ")
 		}
 	}
 	return fmt.Sprintf("owner=%s, entry=%s, pending=%s", ownerVersion, entryVersion, pendingText)
+}
+
+func formatTeamsPendingReplacementStatus(candidate update.PendingReplacement, entryVersion string, entryVersionComparable bool) string {
+	version := "v" + strings.TrimPrefix(strings.TrimSpace(candidate.Version), "v")
+	if status, ok := readTeamsPendingActivationStatus(candidate.Path); ok && strings.EqualFold(status, "failed") {
+		return "failed:" + version
+	}
+	if entryVersion == "" {
+		return "unknown:" + version
+	}
+	if cmp, ok := update.CompareVersions(candidate.Version, entryVersion); ok {
+		if cmp > 0 {
+			return "newer:" + version
+		}
+		return "stale:" + version
+	}
+	if entryVersionComparable {
+		return "unknown:" + version
+	}
+	return "unknown:" + version
+}
+
+type teamsPendingActivationStatus struct {
+	Status string `json:"status,omitempty"`
+}
+
+func readTeamsPendingActivationStatus(pendingPath string) (string, bool) {
+	pendingPath = strings.TrimSpace(pendingPath)
+	if pendingPath == "" {
+		return "", false
+	}
+	data, err := os.ReadFile(pendingPath + ".activation.json")
+	if err != nil {
+		return "", false
+	}
+	if len(data) >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf {
+		data = data[3:]
+	}
+	var status teamsPendingActivationStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return "", false
+	}
+	statusText := strings.TrimSpace(status.Status)
+	return statusText, statusText != ""
 }
 
 func formatTeamsOSServiceStatus(ctx context.Context) string {

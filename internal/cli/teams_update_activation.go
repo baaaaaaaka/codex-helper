@@ -37,8 +37,15 @@ func discoverTeamsPendingHelperActivation(ctx context.Context, installPath strin
 	}
 	targetVersion = strings.TrimPrefix(strings.TrimSpace(targetVersion), "v")
 	formalVersion := ""
+	formalVersionComparable := false
+	formalProbeFailed := false
 	if formal, err := teamsUpdateProbeBinaryVersion(ctx, installPath, 5*time.Second); err == nil {
 		formalVersion = strings.TrimPrefix(formal.Version, "v")
+		if formalVersion != "" {
+			_, formalVersionComparable = update.CompareVersions(formalVersion, formalVersion)
+		}
+	} else if !os.IsNotExist(err) {
+		formalProbeFailed = true
 	}
 	for _, candidate := range pending {
 		version := strings.TrimPrefix(strings.TrimSpace(candidate.Version), "v")
@@ -48,8 +55,22 @@ func discoverTeamsPendingHelperActivation(ctx context.Context, installPath strin
 		if targetVersion != "" && !strings.EqualFold(version, targetVersion) {
 			continue
 		}
-		if formalVersion != "" && strings.EqualFold(formalVersion, version) {
+		if targetVersion == "" && formalProbeFailed {
 			continue
+		}
+		if formalVersion != "" {
+			cmp, ok := update.CompareVersions(version, formalVersion)
+			if ok {
+				if cmp <= 0 {
+					continue
+				}
+			} else if formalVersionComparable {
+				continue
+			} else if targetVersion == "" {
+				continue
+			} else if strings.EqualFold(formalVersion, version) {
+				continue
+			}
 		}
 		probed, err := teamsUpdateProbeBinaryVersion(ctx, candidate.Path, 5*time.Second)
 		if err != nil {
@@ -149,13 +170,16 @@ func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPa
 		"$src=" + powershellSingleQuote(pendingPath) + "; " +
 		"$dest=" + powershellSingleQuote(installPath) + "; " +
 		"$want=" + powershellSingleQuote(strings.TrimPrefix(strings.TrimSpace(version), "v")) + "; " +
+		"$statusPath=$src + '.activation.json'; " +
 		"$parent=" + fmt.Sprintf("%d", currentProcessID()) + "; " +
 		"$tasks=@(" + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + "," + powershellSingleQuote(teamsServiceWindowsTaskName) + "); " +
 		"$logDir=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\updates'; " +
 		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null; " +
 		"$log=Join-Path $logDir 'teams-helper-activation.log'; " +
 		"function Log([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $m) } catch {} }; " +
+		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8; Move-Item -Force -LiteralPath $tmp -Destination $statusPath } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
 		"Log ('activation starting src=' + $src + ' dest=' + $dest + ' want=' + $want + ' parent=' + $parent); " +
+		"Write-Status 'running' 'activation started'; " +
 		"try { Wait-Process -Id $parent -Timeout 120 -ErrorAction SilentlyContinue } catch { Log ('parent wait failed: ' + $_.Exception.Message) }; " +
 		"foreach ($task in $tasks) { try { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('stop task failed ' + $task + ': ' + $_.Exception.Message) } }; " +
 		"$destFull=[System.IO.Path]::GetFullPath($dest); " +
@@ -165,13 +189,14 @@ func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPa
 		"if (($j % 10) -eq 0) { Log ('waiting for process(es): ' + (($procs | ForEach-Object { $_.ProcessId }) -join ',')) }; " +
 		"Start-Sleep -Milliseconds 500 }; " +
 		"$ready=$false; " +
-		"function Test-DestVersion { try { $v=& $dest --version 2>&1; $text=($v -join ' '); Log ('formal version: ' + $text); if ([string]::IsNullOrWhiteSpace($want)) { return $false }; return ($text -like ('*' + $want + '*')) } catch { Log ('formal version probe failed: ' + $_.Exception.Message); return $false } }; " +
+		"$lastErr=''; " +
+		"function Test-DestVersion { try { $v=& $dest --version 2>&1; $text=($v -join ' '); Log ('formal version: ' + $text); if ([string]::IsNullOrWhiteSpace($want)) { $script:lastErr='pending helper target version is unknown'; return $false }; if ($text -like ('*' + $want + '*')) { return $true }; $script:lastErr='formal entry version did not match target: ' + $text; return $false } catch { $script:lastErr='formal version probe failed: ' + $_.Exception.Message; Log $script:lastErr; return $false } }; " +
 		"for ($i=0; $i -lt 240; $i++) { " +
 		"if (-not (Test-Path -LiteralPath $src)) { Log ('source missing: ' + $src); if (Test-DestVersion) { $ready=$true; Log 'formal entry already matches pending target' }; break }; " +
 		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +
-		"catch { Log ('move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message); Start-Sleep -Milliseconds 500 } }; " +
-		"if (-not $ready) { Log 'activation failed before service start' }; " +
-		"if ($ready) { foreach ($task in @(" + powershellSingleQuote(teamsServiceWindowsTaskName) + "," + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + ")) { try { Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('start task failed ' + $task + ': ' + $_.Exception.Message) } } }"
+		"catch { $lastErr='move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message; Log $lastErr; Start-Sleep -Milliseconds 500 } }; " +
+		"if ($ready) { Write-Status 'success' 'activated pending helper' } else { if ([string]::IsNullOrWhiteSpace($lastErr)) { $lastErr='activation failed before service start' }; Log ('activation failed before service start: ' + $lastErr); Write-Status 'failed' $lastErr }; " +
+		"foreach ($task in @(" + powershellSingleQuote(teamsServiceWindowsTaskName) + "," + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + ")) { try { Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('start task failed ' + $task + ': ' + $_.Exception.Message) } }"
 }
 
 func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, installPath string, version string, args []string) string {
@@ -179,13 +204,16 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"$src=" + powershellSingleQuote(pendingPath) + "; " +
 		"$dest=" + powershellSingleQuote(installPath) + "; " +
 		"$want=" + powershellSingleQuote(strings.TrimPrefix(strings.TrimSpace(version), "v")) + "; " +
+		"$statusPath=$src + '.activation.json'; " +
 		"$argList=" + powershellArrayLiteral(args) + "; " +
 		"$parent=" + fmt.Sprintf("%d", currentProcessID()) + "; " +
 		"$logDir=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\updates'; " +
 		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null; " +
 		"$log=Join-Path $logDir 'teams-helper-process-restart.log'; " +
 		"function Log([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $m) } catch {} }; " +
+		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8; Move-Item -Force -LiteralPath $tmp -Destination $statusPath } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
 		"Log ('process restart starting src=' + $src + ' dest=' + $dest + ' want=' + $want + ' parent=' + $parent); " +
+		"Write-Status 'running' 'activation started'; " +
 		"try { Wait-Process -Id $parent -Timeout 120 -ErrorAction SilentlyContinue } catch { Log ('parent wait failed: ' + $_.Exception.Message) }; " +
 		"$destFull=[System.IO.Path]::GetFullPath($dest); " +
 		"for ($j=0; $j -lt 240; $j++) { " +
@@ -194,13 +222,14 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"if (($j % 10) -eq 0) { Log ('waiting for process(es): ' + (($procs | ForEach-Object { $_.ProcessId }) -join ',')) }; " +
 		"Start-Sleep -Milliseconds 500 }; " +
 		"$ready=$false; " +
-		"function Test-DestVersion { try { $v=& $dest --version 2>&1; $text=($v -join ' '); Log ('formal version: ' + $text); if ([string]::IsNullOrWhiteSpace($want)) { return $false }; return ($text -like ('*' + $want + '*')) } catch { Log ('formal version probe failed: ' + $_.Exception.Message); return $false } }; " +
+		"$lastErr=''; " +
+		"function Test-DestVersion { try { $v=& $dest --version 2>&1; $text=($v -join ' '); Log ('formal version: ' + $text); if ([string]::IsNullOrWhiteSpace($want)) { $script:lastErr='pending helper target version is unknown'; return $false }; if ($text -like ('*' + $want + '*')) { return $true }; $script:lastErr='formal entry version did not match target: ' + $text; return $false } catch { $script:lastErr='formal version probe failed: ' + $_.Exception.Message; Log $script:lastErr; return $false } }; " +
 		"for ($i=0; $i -lt 240; $i++) { " +
 		"if (-not (Test-Path -LiteralPath $src)) { Log ('source missing: ' + $src); if (Test-DestVersion) { $ready=$true; Log 'formal entry already matches pending target' }; break }; " +
 		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +
-		"catch { Log ('move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message); Start-Sleep -Milliseconds 500 } }; " +
-		"if ($ready) { $null = Test-DestVersion } else { Log 'process restart failed before start' }; " +
-		"if ($ready) { try { Start-Process -FilePath $dest -ArgumentList $argList -WindowStyle Hidden | Out-Null; Log 'started updated helper process' } catch { Log ('start process failed: ' + $_.Exception.Message) } }"
+		"catch { $lastErr='move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message; Log $lastErr; Start-Sleep -Milliseconds 500 } }; " +
+		"if ($ready) { $null = Test-DestVersion; Write-Status 'success' 'activated pending helper' } else { if ([string]::IsNullOrWhiteSpace($lastErr)) { $lastErr='process restart failed before start' }; Log $lastErr; Write-Status 'failed' $lastErr }; " +
+		"if (Test-Path -LiteralPath $dest) { try { Start-Process -FilePath $dest -ArgumentList $argList -WindowStyle Hidden | Out-Null; Log 'started helper process' } catch { Log ('start process failed: ' + $_.Exception.Message) } }"
 }
 
 func currentProcessID() int {

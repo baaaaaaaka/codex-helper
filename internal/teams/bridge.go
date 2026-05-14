@@ -100,13 +100,25 @@ const (
 )
 
 type helperRestartNotice struct {
-	Version          int       `json:"version"`
-	Action           string    `json:"action,omitempty"`
-	Tag              string    `json:"tag,omitempty"`
-	Manual           bool      `json:"manual,omitempty"`
-	ControlChatID    string    `json:"control_chat_id,omitempty"`
-	CommandMessageID string    `json:"command_message_id,omitempty"`
-	RequestedAt      time.Time `json:"requested_at,omitempty"`
+	Version            int       `json:"version"`
+	Action             string    `json:"action,omitempty"`
+	Tag                string    `json:"tag,omitempty"`
+	Manual             bool      `json:"manual,omitempty"`
+	ControlChatID      string    `json:"control_chat_id,omitempty"`
+	CommandMessageID   string    `json:"command_message_id,omitempty"`
+	PendingReplacePath string    `json:"pending_replace_path,omitempty"`
+	InstallPath        string    `json:"install_path,omitempty"`
+	RequestedAt        time.Time `json:"requested_at,omitempty"`
+}
+
+type helperActivationStatus struct {
+	Version   int       `json:"version"`
+	Status    string    `json:"status,omitempty"`
+	Message   string    `json:"message,omitempty"`
+	Source    string    `json:"source,omitempty"`
+	Dest      string    `json:"dest,omitempty"`
+	Want      string    `json:"want,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 const (
@@ -2852,14 +2864,20 @@ func (b *Bridge) writePendingHelperReloadNotice(msg ChatMessage) error {
 }
 
 func (b *Bridge) writePendingHelperUpgradeNotice(chatID string, commandMessageID string, tag string, manual bool) error {
+	return b.writePendingHelperUpgradeNoticeWithReplacement(chatID, commandMessageID, tag, manual, "", "")
+}
+
+func (b *Bridge) writePendingHelperUpgradeNoticeWithReplacement(chatID string, commandMessageID string, tag string, manual bool, pendingReplacePath string, installPath string) error {
 	return b.writePendingHelperLifecycleNoticeWithOptions(helperRestartNotice{
-		Version:          1,
-		Action:           helperRestartNoticeActionUpgrade,
-		Tag:              strings.TrimSpace(tag),
-		Manual:           manual,
-		ControlChatID:    strings.TrimSpace(chatID),
-		CommandMessageID: strings.TrimSpace(commandMessageID),
-		RequestedAt:      time.Now(),
+		Version:            1,
+		Action:             helperRestartNoticeActionUpgrade,
+		Tag:                strings.TrimSpace(tag),
+		Manual:             manual,
+		ControlChatID:      strings.TrimSpace(chatID),
+		CommandMessageID:   strings.TrimSpace(commandMessageID),
+		PendingReplacePath: strings.TrimSpace(pendingReplacePath),
+		InstallPath:        strings.TrimSpace(installPath),
+		RequestedAt:        time.Now(),
 	})
 }
 
@@ -2882,6 +2900,8 @@ func (b *Bridge) writePendingHelperLifecycleNoticeWithOptions(notice helperResta
 	notice.ControlChatID = strings.TrimSpace(firstNonEmptyString(notice.ControlChatID, b.reg.ControlChatID))
 	notice.CommandMessageID = strings.TrimSpace(notice.CommandMessageID)
 	notice.Tag = strings.TrimSpace(notice.Tag)
+	notice.PendingReplacePath = strings.TrimSpace(notice.PendingReplacePath)
+	notice.InstallPath = strings.TrimSpace(notice.InstallPath)
 	if notice.Version == 0 {
 		notice.Version = 1
 	}
@@ -2963,6 +2983,13 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 			return nil
 		}
 		if tag == "" || !helperVersionMatchesTag(b.helperVersion, tag) {
+			if handled, err := b.queuePendingHelperActivationFailureNotice(ctx, notice); err != nil {
+				return err
+			} else if handled {
+				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
 			return nil
 		}
 		if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
@@ -3006,6 +3033,77 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (b *Bridge) queuePendingHelperActivationFailureNotice(ctx context.Context, notice helperRestartNotice) (bool, error) {
+	status, ok, err := readHelperActivationStatus(notice.PendingReplacePath)
+	if err != nil {
+		if b != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams helper activation status read error: %v\n", err)
+		}
+		return false, nil
+	}
+	if !ok || !strings.EqualFold(strings.TrimSpace(status.Status), "failed") {
+		return false, nil
+	}
+	chatID := strings.TrimSpace(firstNonEmptyString(notice.ControlChatID, b.reg.ControlChatID))
+	if chatID == "" {
+		return false, fmt.Errorf("pending helper activation failure notice has no control chat")
+	}
+	seed := strings.Join([]string{
+		strings.TrimSpace(notice.CommandMessageID),
+		strings.TrimSpace(notice.Tag),
+		strings.TrimSpace(notice.PendingReplacePath),
+		status.UpdatedAt.Format(time.RFC3339Nano),
+		strings.TrimSpace(status.Message),
+	}, "\x00")
+	msg := teamstore.OutboxMessage{
+		ID:               "outbox:control:helper-upgrade-activation-failed:" + shortStableID(seed),
+		TeamsChatID:      chatID,
+		Kind:             "failed-helper-upgrade-activation",
+		Body:             helperActivationFailureNoticeBody(notice, status),
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	}
+	if err := b.queueAndBestEffortSendOutbox(ctx, msg); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func readHelperActivationStatus(pendingPath string) (helperActivationStatus, bool, error) {
+	path := helperActivationStatusPath(pendingPath)
+	if path == "" {
+		return helperActivationStatus{}, false, nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return helperActivationStatus{}, false, nil
+	}
+	if err != nil {
+		return helperActivationStatus{}, false, err
+	}
+	data = trimUTF8BOM(data)
+	var status helperActivationStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return helperActivationStatus{}, false, err
+	}
+	return status, true, nil
+}
+
+func helperActivationStatusPath(pendingPath string) string {
+	pendingPath = strings.TrimSpace(pendingPath)
+	if pendingPath == "" {
+		return ""
+	}
+	return pendingPath + ".activation.json"
+}
+
+func trimUTF8BOM(data []byte) []byte {
+	if len(data) >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf {
+		return data[3:]
+	}
+	return data
 }
 
 func helperVersionMatchesTag(helperVersion string, tag string) bool {
@@ -3147,6 +3245,18 @@ func helperLifecycleCompletedNoticeBody(action string, tag string) string {
 	default:
 		return "✅ Helper restart completed\n\nThe Teams helper is back online. Send `st` to check status."
 	}
+}
+
+func helperActivationFailureNoticeBody(notice helperRestartNotice, status helperActivationStatus) string {
+	lines := []string{"⚠️ Helper update activation failed"}
+	if tag := strings.TrimSpace(notice.Tag); tag != "" {
+		lines = append(lines, "", "Target: `"+tag+"`")
+	}
+	if msg := strings.TrimSpace(status.Message); msg != "" {
+		lines = append(lines, "", "Reason: "+msg)
+	}
+	lines = append(lines, "", "The helper may still be running the previous version. Send `st` to check the actual owner and entry versions.")
+	return strings.Join(lines, "\n")
 }
 
 func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (string, bool, error) {
@@ -3402,7 +3512,7 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
 		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 		if completionChatID != "" {
-			if err := b.writePendingHelperUpgradeNotice(completionChatID, completionCommandID, tag, manualNotice); err != nil {
+			if err := b.writePendingHelperUpgradeNoticeWithReplacement(completionChatID, completionCommandID, tag, manualNotice, res.PendingReplacePath, res.InstallPath); err != nil {
 				return err
 			}
 		}

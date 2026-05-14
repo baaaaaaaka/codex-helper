@@ -16,6 +16,8 @@ func TestFindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets(t 
 	files := []string{
 		".codex-proxy_0.1.0-rc.70_windows_amd64.exe.3939715129",
 		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575",
+		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575.activation.json",
+		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575.activation.json.tmp",
 		".codex-proxy_0.1.0-rc.72_windows_amd64.exe.3261172515",
 		".codex-proxy_0.1.0-rc.71_linux_amd64.ignored",
 		"codex-proxy.exe",

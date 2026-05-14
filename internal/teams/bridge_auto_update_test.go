@@ -3,6 +3,8 @@ package teams
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -679,6 +681,66 @@ func TestBridgeHelperAutoUpdatePendingReplacementWaitsForVerifiedVersion(t *test
 	}
 	if state.Upgrade.CompletionNoticeID == "" || state.Upgrade.CompletionNoticeAt.IsZero() {
 		t.Fatalf("upgrade completion notice not durable after verified restart: %#v", state.Upgrade)
+	}
+}
+
+func TestBridgeHelperAutoUpdatePendingReplacementFailureNotifiesOnce(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	tmp := t.TempDir()
+	pendingPath := filepath.Join(tmp, ".codex-proxy_1.2.4_windows_amd64.exe.123")
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	statusJSON := `{"version":1,"status":"failed","message":"move attempt 240 failed: file is locked","source":"` + strings.ReplaceAll(pendingPath, `\`, `\\`) + `","dest":"` + strings.ReplaceAll(installPath, `\`, `\\`) + `","want":"1.2.4","updated_at":"2026-05-04T00:00:00Z"}`
+	statusData := append([]byte{0xef, 0xbb, 0xbf}, []byte(statusJSON)...)
+	if err := os.WriteFile(helperActivationStatusPath(pendingPath), statusData, 0o600); err != nil {
+		t.Fatalf("write activation status: %v", err)
+	}
+	if err := bridge.writePendingHelperUpgradeNoticeWithReplacement("control-chat", "cmd-1", "v1.2.4", true, pendingPath, installPath); err != nil {
+		t.Fatalf("write pending upgrade notice: %v", err)
+	}
+
+	restartedOld := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedOld.helperVersion = "v1.2.3"
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice with failed activation error: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush pending failure outbox: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Helper update activation failed") || !strings.Contains(joined, "move attempt 240 failed") || !strings.Contains(joined, "v1.2.4") {
+		t.Fatalf("activation failure notice missing details:\n%s", joined)
+	}
+	if got := strings.Count(joined, "Helper update activation failed"); got != 1 {
+		t.Fatalf("activation failure notice count = %d, want 1 in:\n%s", got, joined)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after failure notice: %v", err)
+	}
+	var found bool
+	for _, outbox := range state.OutboxMessages {
+		if outbox.Kind != "failed-helper-upgrade-activation" {
+			continue
+		}
+		found = true
+		if !outbox.MentionOwner || outbox.NotificationKind != "needs_attention" {
+			t.Fatalf("failure outbox notification fields = %#v, want owner attention", outbox)
+		}
+	}
+	if !found {
+		t.Fatalf("failure outbox not found in state: %#v", state.OutboxMessages)
+	}
+
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("second queuePendingHelperRestartNotice with failed activation error: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("second flush pending failure outbox: %v", err)
+	}
+	if got := strings.Count(sentPlainJoined(*sent), "Helper update activation failed"); got != 1 {
+		t.Fatalf("activation failure notice duplicated, count = %d in:\n%s", got, sentPlainJoined(*sent))
 	}
 }
 

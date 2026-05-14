@@ -1385,14 +1385,176 @@ func TestTeamsServiceBootstrapSchedulesPendingHelperActivationBeforeStartingOldW
 		teamsServiceWindowsTaskName,
 		teamsServiceWindowsWatchdogTaskName,
 		"$want='0.1.0-rc.73'",
+		".activation.json",
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
-		"if ($ready) { foreach",
+		"Write-Status 'failed'",
 		"Start-ScheduledTask",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("activation command missing %q:\nname=%s\nargs=%s", want, detachedName, joined)
 		}
+	}
+}
+
+func TestDiscoverTeamsPendingHelperActivationRejectsStalePendingVersion(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	stale := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.73_windows_amd64.exe.123")
+	prevFind := teamsUpdateFindPendingReplacementsForPlatform
+	prevProbe := teamsUpdateProbeBinaryVersion
+	t.Cleanup(func() {
+		teamsUpdateFindPendingReplacementsForPlatform = prevFind
+		teamsUpdateProbeBinaryVersion = prevProbe
+	})
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "windows", exe: exe})
+	teamsUpdateFindPendingReplacementsForPlatform = func(path string, goos string, goarch string) ([]update.PendingReplacement, error) {
+		return []update.PendingReplacement{{Path: stale, Version: "0.1.0-rc.73", ModTime: time.Now()}}, nil
+	}
+	var pendingProbeCount int
+	teamsUpdateProbeBinaryVersion = func(_ context.Context, path string, _ time.Duration) (update.BinaryVersion, error) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(exe):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.74"}, nil
+		case filepath.Clean(stale):
+			pendingProbeCount++
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.73"}, nil
+		default:
+			t.Fatalf("unexpected probe path %q", path)
+			return update.BinaryVersion{}, nil
+		}
+	}
+
+	activation, ok, err := discoverTeamsPendingHelperActivation(context.Background(), exe, "")
+	if err != nil {
+		t.Fatalf("discoverTeamsPendingHelperActivation error: %v", err)
+	}
+	if ok {
+		t.Fatalf("activation = %#v, want stale pending replacement ignored", activation)
+	}
+	if pendingProbeCount != 0 {
+		t.Fatalf("stale pending was probed %d time(s), want skipped before probe", pendingProbeCount)
+	}
+}
+
+func TestDiscoverTeamsPendingHelperActivationAcceptsNewerPendingVersion(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.75_windows_amd64.exe.123")
+	prevFind := teamsUpdateFindPendingReplacementsForPlatform
+	prevProbe := teamsUpdateProbeBinaryVersion
+	t.Cleanup(func() {
+		teamsUpdateFindPendingReplacementsForPlatform = prevFind
+		teamsUpdateProbeBinaryVersion = prevProbe
+	})
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "windows", exe: exe})
+	teamsUpdateFindPendingReplacementsForPlatform = func(path string, goos string, goarch string) ([]update.PendingReplacement, error) {
+		return []update.PendingReplacement{{Path: pending, Version: "0.1.0-rc.75", ModTime: time.Now()}}, nil
+	}
+	teamsUpdateProbeBinaryVersion = func(_ context.Context, path string, _ time.Duration) (update.BinaryVersion, error) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(exe):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.74"}, nil
+		case filepath.Clean(pending):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.75"}, nil
+		default:
+			t.Fatalf("unexpected probe path %q", path)
+			return update.BinaryVersion{}, nil
+		}
+	}
+
+	activation, ok, err := discoverTeamsPendingHelperActivation(context.Background(), exe, "")
+	if err != nil {
+		t.Fatalf("discoverTeamsPendingHelperActivation error: %v", err)
+	}
+	if !ok {
+		t.Fatal("discoverTeamsPendingHelperActivation ok = false, want newer pending activation")
+	}
+	if activation.PendingPath != pending || activation.InstallPath != exe || activation.Version != "0.1.0-rc.75" {
+		t.Fatalf("activation = %#v, want pending %q for %q", activation, pending, exe)
+	}
+}
+
+func TestDiscoverTeamsPendingHelperActivationRejectsPendingWhenFormalVersionIsNotComparable(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.75_windows_amd64.exe.123")
+	prevFind := teamsUpdateFindPendingReplacementsForPlatform
+	prevProbe := teamsUpdateProbeBinaryVersion
+	t.Cleanup(func() {
+		teamsUpdateFindPendingReplacementsForPlatform = prevFind
+		teamsUpdateProbeBinaryVersion = prevProbe
+	})
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "windows", exe: exe})
+	teamsUpdateFindPendingReplacementsForPlatform = func(path string, goos string, goarch string) ([]update.PendingReplacement, error) {
+		return []update.PendingReplacement{{Path: pending, Version: "0.1.0-rc.75", ModTime: time.Now()}}, nil
+	}
+	teamsUpdateProbeBinaryVersion = func(_ context.Context, path string, _ time.Duration) (update.BinaryVersion, error) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(exe):
+			return update.BinaryVersion{Path: path, Version: "dev"}, nil
+		case filepath.Clean(pending):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.75"}, nil
+		default:
+			t.Fatalf("unexpected probe path %q", path)
+			return update.BinaryVersion{}, nil
+		}
+	}
+
+	activation, ok, err := discoverTeamsPendingHelperActivation(context.Background(), exe, "")
+	if err != nil {
+		t.Fatalf("discoverTeamsPendingHelperActivation error: %v", err)
+	}
+	if ok {
+		t.Fatalf("activation = %#v, want pending ignored when formal entry is not comparable", activation)
+	}
+}
+
+func TestDiscoverTeamsPendingHelperActivationRejectsPendingWhenFormalProbeFails(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.75_windows_amd64.exe.123")
+	prevFind := teamsUpdateFindPendingReplacementsForPlatform
+	prevProbe := teamsUpdateProbeBinaryVersion
+	t.Cleanup(func() {
+		teamsUpdateFindPendingReplacementsForPlatform = prevFind
+		teamsUpdateProbeBinaryVersion = prevProbe
+	})
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "windows", exe: exe})
+	teamsUpdateFindPendingReplacementsForPlatform = func(path string, goos string, goarch string) ([]update.PendingReplacement, error) {
+		return []update.PendingReplacement{{Path: pending, Version: "0.1.0-rc.75", ModTime: time.Now()}}, nil
+	}
+	var pendingProbeCount int
+	teamsUpdateProbeBinaryVersion = func(_ context.Context, path string, _ time.Duration) (update.BinaryVersion, error) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(exe):
+			return update.BinaryVersion{}, errors.New("formal entry probe timed out")
+		case filepath.Clean(pending):
+			pendingProbeCount++
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.75"}, nil
+		default:
+			t.Fatalf("unexpected probe path %q", path)
+			return update.BinaryVersion{}, nil
+		}
+	}
+
+	activation, ok, err := discoverTeamsPendingHelperActivation(context.Background(), exe, "")
+	if err != nil {
+		t.Fatalf("discoverTeamsPendingHelperActivation error: %v", err)
+	}
+	if ok {
+		t.Fatalf("activation = %#v, want pending ignored when formal entry probe fails", activation)
+	}
+	if pendingProbeCount != 0 {
+		t.Fatalf("pending was probed %d time(s), want skipped after formal probe failure", pendingProbeCount)
 	}
 }
 
@@ -1469,7 +1631,7 @@ func TestTeamsServiceStartAndRestartActivatePendingWindowsHelperBeforeOldEntry(t
 				t.Fatalf("%s detached name = %q, want powershell.exe", tc.name, detachedName)
 			}
 			joined := strings.Join(detachedArgs, " ")
-			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", "Move-Item -Force", "Start-ScheduledTask"} {
+			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Start-ScheduledTask"} {
 				if !strings.Contains(joined, want) {
 					t.Fatalf("%s activation command missing %q:\n%s", tc.name, want, joined)
 				}
