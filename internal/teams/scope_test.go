@@ -60,8 +60,7 @@ func TestTeamsBackgroundKeepaliveScopeIdentityStableAcrossLocalEnvCI(t *testing.
 
 func TestTeamsBackgroundKeepaliveResolveStorePathInheritsLegacyScopeCI(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	configBase, cacheBase := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
 	t.Setenv(envTeamsProfile, "default")
 	t.Setenv("CODEX_HOME", "/home/alice/.codex")
@@ -74,7 +73,7 @@ func TestTeamsBackgroundKeepaliveResolveStorePathInheritsLegacyScopeCI(t *testin
 		OSUser:        "alice",
 		Profile:       "default",
 	}
-	oldPath := filepath.Join(tmp, "config", "codex-helper", "teams", "scopes", "scope_legacy", "state.json")
+	oldPath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_legacy", "state.json")
 	oldStore, err := teamstore.Open(oldPath)
 	if err != nil {
 		t.Fatalf("Open legacy store: %v", err)
@@ -117,7 +116,7 @@ func TestTeamsBackgroundKeepaliveResolveStorePathInheritsLegacyScopeCI(t *testin
 	if err != nil {
 		t.Fatalf("ResolveRegistryPathForScope error: %v", err)
 	}
-	wantRegistryPath := filepath.Join(tmp, "cache", "codex-helper", "teams", "scopes", "scope_legacy", "registry.json")
+	wantRegistryPath := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", "scope_legacy", "registry.json")
 	if registryScope.ID != oldScope.ID || registryPath != wantRegistryPath {
 		t.Fatalf("resolved registry = %#v %q, want %q", registryScope, registryPath, wantRegistryPath)
 	}
@@ -129,11 +128,11 @@ func TestTeamsBackgroundKeepaliveResolveStorePathInheritsLegacyScopeCI(t *testin
 
 func TestTeamsBackgroundKeepaliveResolveStorePathUsesControlBindingWhenScopeMissingCI(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
 	t.Setenv(envTeamsProfile, "default")
 
-	oldPath := filepath.Join(tmp, "config", "codex-helper", "teams", "scopes", "scope_without_recorded_scope", "state.json")
+	oldPath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_without_recorded_scope", "state.json")
 	oldStore, err := teamstore.Open(oldPath)
 	if err != nil {
 		t.Fatalf("Open legacy store: %v", err)
@@ -170,6 +169,22 @@ func TestTeamsBackgroundKeepaliveResolveStorePathUsesControlBindingWhenScopeMiss
 	if resolved.ID != current.ID {
 		t.Fatalf("resolved scope = %#v, want current canonical scope id %q for legacy state without recorded scope", resolved, current.ID)
 	}
+}
+
+func isolateTeamsScopeUserDirsForTest(t *testing.T, tmp string) (string, string) {
+	t.Helper()
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	configBase, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir error: %v", err)
+	}
+	cacheBase, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatalf("UserCacheDir error: %v", err)
+	}
+	return configBase, cacheBase
 }
 
 func TestMachineRecordHonorsPrimaryEphemeralEnv(t *testing.T) {
