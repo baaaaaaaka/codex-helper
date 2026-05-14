@@ -532,7 +532,14 @@ jobs:
           $env:CODEX_HELPER_TEAMS_READ_TOKEN_CACHE = Join-Path $env:RUNNER_TEMP "teams-appserver-read-token.json"
           $env:CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE = Join-Path $env:RUNNER_TEMP "teams-appserver-full-token.json"
           $env:CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE = Join-Path $env:RUNNER_TEMP "teams-appserver-file-token.json"
-          go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path $codexCommand.Source --workdir $env:RUNNER_TEMP --probe-timeout 20s --appserver-probe-runs 2
+          $codexPath = $codexCommand.Source
+          if ($codexPath -and $codexPath.EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $cmdCandidate = [System.IO.Path]::ChangeExtension($codexPath, ".cmd")
+            if (Test-Path -LiteralPath $cmdCandidate) {
+              $codexPath = $cmdCandidate
+            }
+          }
+          go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path $codexPath --workdir $env:RUNNER_TEMP --probe-timeout 20s --appserver-probe-runs 2
 
       - name: Codex upgrade integration (system npm, Linux/macOS)
         if: runner.os != 'Windows'
