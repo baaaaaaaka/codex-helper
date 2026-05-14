@@ -2009,6 +2009,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.sendControl(ctx, message)
 		case DashboardCommandStatus:
 			return b.sendControl(ctx, b.formatSessionList())
+		case DashboardCommandSkills:
+			return b.handleSkillsCommand(ctx, b.reg.ControlChatID, parsed.Argument)
 		case DashboardCommandRestart:
 			return b.restartHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandReload:
@@ -2199,6 +2201,7 @@ func controlHelpText() string {
 		"- `s` / `sessions` - show sessions in the selected workspace",
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
 		"- `st` / `status` - show active Work chats",
+		"- `skills` - list installed skill subscriptions",
 		"",
 		"After `p`, reply with a number such as `1` to open that workspace. On a workspace page, send `new` to create a Work chat in that workspace.",
 		"",
@@ -2235,6 +2238,7 @@ func controlAdvancedHelpText() string {
 		"- `helper webhook setup` - show a guided Workflow webhook setup flow",
 		"- `helper webhook <url>` - enable Workflow notification cards with a Teams Workflow webhook URL",
 		"- `helper webhook off` - disable Workflow notification cards",
+		"- `helper skills list` / `helper skills sync [name]` / `helper skills push [name]` - inspect or sync skill subscriptions",
 		"",
 		"work chat commands:",
 		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
@@ -2259,6 +2263,7 @@ func sessionHelpText() string {
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`helper details` or `!details` - show debug IDs and links",
 		"`helper publish-history` - import a paused local Codex history backlog",
+		"`helper skills list` / `helper skills push` - inspect skill subscriptions and local skill edits",
 		"",
 		"Send `helper help advanced` for retry, cancel, and rename commands.",
 	}, "\n")
@@ -4202,6 +4207,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 			return b.sendToChat(ctx, chatID, b.formatSessionDetails(session))
 		case DashboardCommandPublishHistory:
 			return b.publishWorkSessionHistory(ctx, session)
+		case DashboardCommandSkills:
+			return b.handleSkillsCommand(ctx, chatID, parsed.Argument)
 		case DashboardCommandHelp:
 			if isAdvancedHelpArg(parsed.Argument) {
 				return b.sendToChat(ctx, chatID, sessionAdvancedHelpText())

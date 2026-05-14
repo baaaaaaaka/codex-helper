@@ -18,7 +18,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "history", "init", "proxy", "run", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "history", "init", "proxy", "run", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -27,6 +27,35 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	if cmd.Flags().Lookup("upgrade-codex") == nil {
 		t.Fatal("expected --upgrade-codex flag")
+	}
+}
+
+func TestSkillsCommandWiresPlannedSubcommands(t *testing.T) {
+	cmd := newRootCmd()
+	skillsCmd, _, err := cmd.Find([]string{"skills"})
+	if err != nil {
+		t.Fatalf("find skills command: %v", err)
+	}
+
+	var names []string
+	for _, sub := range skillsCmd.Commands() {
+		names = append(names, sub.Name())
+	}
+	sort.Strings(names)
+
+	want := []string{"add", "doctor", "list", "push", "remove", "sync"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("unexpected skills subcommands\n got: %#v\nwant: %#v", names, want)
+	}
+	if skillsCmd.PersistentFlags().Lookup("codex-dir") == nil {
+		t.Fatal("skills command should expose --codex-dir")
+	}
+	syncCmd, _, err := skillsCmd.Find([]string{"sync"})
+	if err != nil {
+		t.Fatalf("find skills sync: %v", err)
+	}
+	if syncCmd.Use != "sync [name]" {
+		t.Fatalf("skills sync use = %q", syncCmd.Use)
 	}
 }
 

@@ -67,6 +67,8 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "helper webhook https://workflow.example.test/hook", name: DashboardCommandWebhook, raw: "https://workflow.example.test/hook"},
 		{text: "helper workflow off", name: DashboardCommandWebhook, raw: "off"},
 		{text: "helper status", name: DashboardCommandStatus},
+		{text: "helper skills", name: DashboardCommandSkills},
+		{text: "helper skills sync acme", name: DashboardCommandSkills, raw: "sync acme"},
 		{text: "helper help advanced", name: DashboardCommandHelp, raw: "advanced"},
 		{text: "cx p 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "cx h", name: DashboardCommandHelp},
@@ -182,7 +184,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/close", "/help", "/details", "!status", "!file report.txt", "!ph", "helper status", "helper retry turn-1", "helper file report.txt", "helper publish-history", "codex status", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/close", "/help", "/details", "!status", "!file report.txt", "!ph", "helper status", "helper retry turn-1", "helper file report.txt", "helper publish-history", "helper skills push", "codex status", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {

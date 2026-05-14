@@ -112,6 +112,8 @@ jobs:
           "$HOME/.local/bin/codex-proxy" --version | grep -q "${GITHUB_REF_NAME#v}"
           "$HOME/.local/bin/cxp" --version | grep -q "${GITHUB_REF_NAME#v}"
           "$HOME/.local/bin/codex-proxy" proxy doctor || true
+          CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash scripts/ci/skills_smoke.sh
+          CODEX_HELPER_BIN="$HOME/.local/bin/cxp" bash scripts/ci/skills_smoke.sh
           upgrade_target="$RUNNER_TEMP/codex-proxy-upgrade-smoke/codex-proxy"
           mkdir -p "$(dirname "$upgrade_target")"
           "$HOME/.local/bin/codex-proxy" upgrade --repo "${GITHUB_REPOSITORY}" --version "${GITHUB_REF_NAME}" --install-path "$upgrade_target"
@@ -130,6 +132,11 @@ jobs:
           & $exe --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
           & $cxp --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
           & $exe proxy doctor | Out-Default
+          $env:CODEX_HELPER_BIN = $exe
+          .\scripts\ci\skills_smoke.ps1
+          $env:CODEX_HELPER_BIN = $cxp
+          .\scripts\ci\skills_smoke.ps1
+          Remove-Item Env:\CODEX_HELPER_BIN
           $upgradeDir = Join-Path $env:RUNNER_TEMP "codex-proxy-upgrade-smoke"
           New-Item -ItemType Directory -Force -Path $upgradeDir | Out-Null
           $upgradeTarget = Join-Path $upgradeDir "codex-proxy.exe"

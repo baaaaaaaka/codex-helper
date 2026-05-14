@@ -15,6 +15,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/skills"
 	"github.com/baaaaaaaka/codex-helper/internal/tui"
 )
 
@@ -131,6 +132,130 @@ func TestRunHistoryTuiShowsYoloToggleWithPersistedFalse(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected selectSession to be called")
+	}
+}
+
+func TestRunHistoryTuiSkillsMenuReturnsToTuiLoop(t *testing.T) {
+	lockCLITestHooks(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	codexDir := filepath.Join(t.TempDir(), "codex")
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevSelect := selectSession
+	t.Cleanup(func() {
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		selectSession = prevSelect
+	})
+
+	ensureCalls := 0
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		ensureCalls++
+		return false, config.Config{Version: config.CurrentVersion}, nil
+	}
+
+	selectCalls := 0
+	selectSession = func(_ context.Context, _ tui.Options) (*tui.Selection, error) {
+		selectCalls++
+		switch selectCalls {
+		case 1:
+			return nil, tui.SkillsRequested{}
+		case 2:
+			return nil, nil
+		default:
+			t.Fatalf("selectSession called %d times, want 2", selectCalls)
+			return nil, nil
+		}
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetIn(strings.NewReader("6\n"))
+	var out strings.Builder
+	cmd.SetOut(&out)
+	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", codexDir, "", 0); err != nil {
+		t.Fatalf("runHistoryTui error: %v", err)
+	}
+	if selectCalls != 2 {
+		t.Fatalf("selectSession calls = %d, want 2", selectCalls)
+	}
+	if ensureCalls != 2 {
+		t.Fatalf("ensureProxyPreference calls = %d, want 2", ensureCalls)
+	}
+	for _, want := range []string{"Skills", "Back to TUI"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("skills menu output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) {
+	lockCLITestHooks(t)
+	setEffectivePathsHooksForTest(t)
+	requireCLIGit(t)
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	cache := filepath.Join(root, "cache")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("CODEX_DIR", "")
+	t.Setenv("CODEX_HOME", "")
+	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
+	effectivePathsRunningAsRoot = func() bool { return false }
+
+	repo := initCLISkillRepo(t)
+	cfgPath := filepath.Join(root, "config", "config.json")
+	codexDir := filepath.Join(root, "codex")
+	mgr, err := newSkillsManager(&rootOptions{configPath: cfgPath}, codexDir, io.Discard)
+	if err != nil {
+		t.Fatalf("new skills manager: %v", err)
+	}
+	source, result, err := mgr.Add(context.Background(), repo, skills.AddOptions{Name: "acme", Ref: "HEAD", Path: "skills/review"})
+	if err != nil {
+		t.Fatalf("add skill source: %v", err)
+	}
+	if len(result.Installed) != 1 {
+		t.Fatalf("installed skills = %d, want 1", len(result.Installed))
+	}
+	writeCLIFile(t, filepath.Join(repo, "skills", "review", "SKILL.md"), "---\nname: review\ndescription: Review code\n---\nauto update\n", 0o644)
+	cliGitRun(t, repo, "add", "-A")
+	cliGitRun(t, repo, "commit", "-m", "auto update")
+
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevSelect := selectSession
+	t.Cleanup(func() {
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		selectSession = prevSelect
+	})
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		return false, config.Config{Version: config.CurrentVersion}, nil
+	}
+	selectSession = func(_ context.Context, _ tui.Options) (*tui.Selection, error) {
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			data, _ := os.ReadFile(filepath.Join(codexDir, "skills", "acme__review", "SKILL.md"))
+			st, _ := mgr.Store.LoadState()
+			var state skills.SourceState
+			for _, candidate := range st.Sources {
+				if candidate.ID == source.ID {
+					state = candidate
+					break
+				}
+			}
+			if strings.Contains(string(data), "auto update") && state.LastAutoSyncDay != "" {
+				return nil, nil
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("auto-sync did not update installed skill; state=%#v skill=%q", state, string(data))
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", codexDir, "", 0); err != nil {
+		t.Fatalf("runHistoryTui error: %v", err)
 	}
 }
 

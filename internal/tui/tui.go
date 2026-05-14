@@ -22,6 +22,10 @@ type UpdateRequested struct{}
 
 func (UpdateRequested) Error() string { return "update requested" }
 
+type SkillsRequested struct{}
+
+func (SkillsRequested) Error() string { return "skills requested" }
+
 type ProxyToggleRequested struct {
 	Enable        bool
 	RequireConfig bool
@@ -501,6 +505,8 @@ func handleKey(
 			return nil, UpdateRequested{}
 		}
 		return nil, nil
+	case tcell.KeyCtrlK:
+		return nil, SkillsRequested{}
 	case tcell.KeyCtrlP:
 		enable := !state.proxyEnabled
 		if enable && !state.proxyConfigured {

@@ -41,6 +41,7 @@ const (
 	DashboardCommandRetry          DashboardCommandName = "retry"
 	DashboardCommandCancel         DashboardCommandName = "cancel"
 	DashboardCommandSendFile       DashboardCommandName = "send-file"
+	DashboardCommandSkills         DashboardCommandName = "skills"
 )
 
 type ParsedDashboardCommand struct {
@@ -311,6 +312,8 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == "" || isAdvancedHelpArg(arg)
 	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
 		return arg == ""
+	case DashboardCommandSkills:
+		return true
 	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
 	default:
@@ -349,6 +352,8 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandHelp, true
 	case "st", "status":
 		return DashboardCommandStatus, true
+	case "skills", "skill":
+		return DashboardCommandSkills, true
 	default:
 		return DashboardCommandNone, false
 	}
@@ -433,6 +438,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandDetails, true
 	case "publish-history", "sync-history", "import-history":
 		return DashboardCommandPublishHistory, true
+	case "skills", "skill":
+		return DashboardCommandSkills, true
 	default:
 		return DashboardCommandNone, false
 	}

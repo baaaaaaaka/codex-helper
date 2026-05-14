@@ -51,6 +51,7 @@ func newRootCmd() *cobra.Command {
 		newTuiCmd(opts),
 		newTeamsCmd(opts),
 		newProxyCmd(opts),
+		newSkillsCmd(opts),
 		newUpgradeCmd(opts),
 		newHistoryCmd(opts),
 	)

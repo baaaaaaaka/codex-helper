@@ -2534,6 +2534,20 @@ func TestDrawShowsSubagentToggleHint(t *testing.T) {
 	}
 }
 
+func TestCtrlKRequestsSkillsMenu(t *testing.T) {
+	screen := newTestScreen(t, 80, 20)
+	state := newTestState([]codexhistory.Project{{Key: "one", Path: "/tmp"}})
+
+	_, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyCtrlK, 0, 0))
+	if err == nil {
+		t.Fatal("Ctrl+K error = nil, want SkillsRequested")
+	}
+	var req SkillsRequested
+	if !errors.As(err, &req) {
+		t.Fatalf("Ctrl+K error = %T %v, want SkillsRequested", err, err)
+	}
+}
+
 func TestPreviewCacheKeySeparatesSessionAndSubagent(t *testing.T) {
 	session := codexhistory.Session{SessionID: "sess-1", FilePath: "/tmp/sess-1.jsonl"}
 	subagent := codexhistory.SubagentSession{AgentID: "agent-1", FilePath: "/tmp/agent-1.jsonl"}

@@ -226,6 +226,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 	if err != nil {
 		return err
 	}
+	startSkillsDailyAutoSync(ctx, paths)
 
 	for {
 		useProxy, cfg, err := ensureProxyPreferenceFunc(ctx, store, profileRef, cmd.ErrOrStderr())
@@ -278,6 +279,13 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			var upd tui.UpdateRequested
 			if errors.As(err, &upd) {
 				return handleUpdateAndRestart(ctx, cmd)
+			}
+			var skillsReq tui.SkillsRequested
+			if errors.As(err, &skillsReq) {
+				if err := runSkillsTextMenu(ctx, root, codexDir, cmd.InOrStdin(), cmd.OutOrStdout()); err != nil {
+					return err
+				}
+				continue
 			}
 			var toggle tui.ProxyToggleRequested
 			if errors.As(err, &toggle) {

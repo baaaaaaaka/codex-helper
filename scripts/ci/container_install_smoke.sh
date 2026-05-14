@@ -6,7 +6,7 @@ tag="${TAG:?}"
 fetcher="${FETCHER:?}"
 
 install_deps() {
-  local pkgs=(ca-certificates)
+  local pkgs=(ca-certificates git)
   if command -v apt-get >/dev/null 2>&1; then
     pkgs+=(openssh-client openssh-server)
   else
@@ -124,7 +124,12 @@ else
 fi
 
 "$HOME/.local/bin/codex-proxy" --version | grep -q "${tag#v}"
+"$HOME/.local/bin/cxp" --version | grep -q "${tag#v}"
 "$HOME/.local/bin/codex-proxy" proxy doctor || true
+"$HOME/.local/bin/codex-proxy" --config "$HOME/codex-proxy-skills-config.json" skills list | grep -q "No skill subscriptions."
+"$HOME/.local/bin/cxp" --config "$HOME/codex-proxy-skills-cxp-config.json" skills list | grep -q "No skill subscriptions."
+CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash /ci/skills_smoke.sh
+CODEX_HELPER_BIN="$HOME/.local/bin/cxp" bash /ci/skills_smoke.sh
 
 cfg="$HOME/codex-proxy-config.json"
 cat >"$cfg" <<EOF
