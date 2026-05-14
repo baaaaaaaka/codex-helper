@@ -488,6 +488,16 @@ jobs:
             echo "Codex app-server is unavailable, skipping Teams app-server probe"
             exit 0
           fi
+          export CODEX_HELPER_TEAMS_PROFILE=ci-appserver-probe
+          export CODEX_HELPER_TEAMS_TENANT_ID=ci-tenant
+          export CODEX_HELPER_TEAMS_CLIENT_ID=ci-client
+          export CODEX_HELPER_TEAMS_READ_CLIENT_ID=ci-read-client
+          export CODEX_HELPER_TEAMS_FULL_CLIENT_ID=ci-full-client
+          export CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID=ci-file-client
+          export CODEX_HELPER_TEAMS_TOKEN_CACHE="$RUNNER_TEMP/teams-appserver-token.json"
+          export CODEX_HELPER_TEAMS_READ_TOKEN_CACHE="$RUNNER_TEMP/teams-appserver-read-token.json"
+          export CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE="$RUNNER_TEMP/teams-appserver-full-token.json"
+          export CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE="$RUNNER_TEMP/teams-appserver-file-token.json"
           go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path "$(command -v codex)" --workdir "$RUNNER_TEMP" --probe-timeout 20s --appserver-probe-runs 2
 
       - name: Teams app-server probe (Windows)
@@ -512,6 +522,16 @@ jobs:
             Write-Host "Codex app-server is unavailable, skipping Teams app-server probe"
             exit 0
           }
+          $env:CODEX_HELPER_TEAMS_PROFILE = "ci-appserver-probe"
+          $env:CODEX_HELPER_TEAMS_TENANT_ID = "ci-tenant"
+          $env:CODEX_HELPER_TEAMS_CLIENT_ID = "ci-client"
+          $env:CODEX_HELPER_TEAMS_READ_CLIENT_ID = "ci-read-client"
+          $env:CODEX_HELPER_TEAMS_FULL_CLIENT_ID = "ci-full-client"
+          $env:CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID = "ci-file-client"
+          $env:CODEX_HELPER_TEAMS_TOKEN_CACHE = Join-Path $env:RUNNER_TEMP "teams-appserver-token.json"
+          $env:CODEX_HELPER_TEAMS_READ_TOKEN_CACHE = Join-Path $env:RUNNER_TEMP "teams-appserver-read-token.json"
+          $env:CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE = Join-Path $env:RUNNER_TEMP "teams-appserver-full-token.json"
+          $env:CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE = Join-Path $env:RUNNER_TEMP "teams-appserver-file-token.json"
           go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path $codexCommand.Source --workdir $env:RUNNER_TEMP --probe-timeout 20s --appserver-probe-runs 2
 
       - name: Codex upgrade integration (system npm, Linux/macOS)
