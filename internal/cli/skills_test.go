@@ -286,9 +286,9 @@ func TestRunSkillsTextMenuAddListSyncAndBackCombo(t *testing.T) {
 			t.Fatalf("menu output missing %q:\n%s", want, text)
 		}
 	}
-	matches, err := filepath.Glob(filepath.Join(codexDir, "skills", "*__review", "SKILL.md"))
+	matches, err := installedReviewSkillManifests(filepath.Join(codexDir, "skills"))
 	if err != nil {
-		t.Fatalf("glob installed skill: %v", err)
+		t.Fatalf("list installed skills: %v", err)
 	}
 	if len(matches) != 1 {
 		t.Fatalf("menu-installed skill matches = %v, want 1", matches)
@@ -446,6 +446,26 @@ func writeCLIFile(t *testing.T, path string, content string, mode os.FileMode) {
 	if err := os.WriteFile(path, []byte(content), mode); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+func installedReviewSkillManifests(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var matches []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasSuffix(entry.Name(), "__review") {
+			continue
+		}
+		manifest := filepath.Join(root, entry.Name(), "SKILL.md")
+		if _, err := os.Stat(manifest); err == nil {
+			matches = append(matches, manifest)
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	return matches, nil
 }
 
 type directRefGitRunner struct {
