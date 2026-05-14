@@ -71,6 +71,33 @@ func TestAppServerProcessStarterPassesExtraEnv(t *testing.T) {
 	}
 }
 
+func TestAppServerProcessExecutablePrefersWindowsCmdShimOverPowerShellShim(t *testing.T) {
+	previousGOOS := appServerProcessRuntimeGOOS
+	appServerProcessRuntimeGOOS = func() string { return "windows" }
+	t.Cleanup(func() { appServerProcessRuntimeGOOS = previousGOOS })
+
+	dir := t.TempDir()
+	ps1Path := filepath.Join(dir, "codex.ps1")
+	cmdPath := filepath.Join(dir, "codex.cmd")
+	if err := os.WriteFile(ps1Path, []byte("pwsh shim"), 0o600); err != nil {
+		t.Fatalf("write ps1 shim: %v", err)
+	}
+	if got := appServerProcessExecutable(ps1Path); got != ps1Path {
+		t.Fatalf("executable without .cmd = %q, want %q", got, ps1Path)
+	}
+	if err := os.WriteFile(cmdPath, []byte("@echo off\r\n"), 0o600); err != nil {
+		t.Fatalf("write cmd shim: %v", err)
+	}
+	if got := appServerProcessExecutable(ps1Path); got != cmdPath {
+		t.Fatalf("executable with .cmd = %q, want %q", got, cmdPath)
+	}
+
+	appServerProcessRuntimeGOOS = func() string { return "linux" }
+	if got := appServerProcessExecutable(ps1Path); got != ps1Path {
+		t.Fatalf("non-Windows executable = %q, want %q", got, ps1Path)
+	}
+}
+
 func TestAppServerProcessTransportWriteLineAndReadLine(t *testing.T) {
 	transport := startProcessHelper(t, AppServerProcessStarter{}, "echo")
 	defer transport.Close()

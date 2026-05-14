@@ -1418,7 +1418,9 @@ func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, root *rootOptions, regis
 
 func printTeamsAuthDoctorSummary(out io.Writer) error {
 	fullCfg, err := teams.DefaultFullAuthConfig()
-	if err == nil {
+	if err != nil {
+		printTeamsAuthConfigNotConfigured(out, "Teams full auth cache", err)
+	} else {
 		fullStatus, err := readTeamsTokenStatus(fullCfg.CachePath)
 		if err != nil {
 			return err
@@ -1427,41 +1429,48 @@ func printTeamsAuthDoctorSummary(out io.Writer) error {
 	}
 	readCfg, err := teams.DefaultEffectiveReadAuthConfig()
 	if err != nil {
-		return err
-	}
-	readStatus, err := readTeamsTokenStatus(readCfg.CachePath)
-	if err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(out, "Teams read auth cache: %s (%s)\n", readStatus, readCfg.CachePath)
-	if readStatus == "missing" {
-		_, _ = fmt.Fprintf(out, "Read auth next step: run `%s` in a foreground terminal.\n", teamsAuthCommandForCache(readCfg.CachePath, "codex-proxy teams auth read"))
+		printTeamsAuthConfigNotConfigured(out, "Teams read auth cache", err)
+	} else {
+		readStatus, err := readTeamsTokenStatus(readCfg.CachePath)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "Teams read auth cache: %s (%s)\n", readStatus, readCfg.CachePath)
+		if readStatus == "missing" {
+			_, _ = fmt.Fprintf(out, "Read auth next step: run `%s` in a foreground terminal.\n", teamsAuthCommandForCache(readCfg.CachePath, "codex-proxy teams auth read"))
+		}
 	}
 	chatCfg, err := teams.DefaultEffectiveAuthConfig()
 	if err != nil {
-		return err
-	}
-	chatStatus, err := readTeamsTokenStatus(chatCfg.CachePath)
-	if err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(out, "Teams auth cache: %s (%s)\n", chatStatus, chatCfg.CachePath)
-	if chatStatus == "missing" {
-		_, _ = fmt.Fprintf(out, "Auth next step: run `%s` in a foreground terminal.\n", teamsAuthCommandForCache(chatCfg.CachePath, "codex-proxy teams auth"))
+		printTeamsAuthConfigNotConfigured(out, "Teams auth cache", err)
+	} else {
+		chatStatus, err := readTeamsTokenStatus(chatCfg.CachePath)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "Teams auth cache: %s (%s)\n", chatStatus, chatCfg.CachePath)
+		if chatStatus == "missing" {
+			_, _ = fmt.Fprintf(out, "Auth next step: run `%s` in a foreground terminal.\n", teamsAuthCommandForCache(chatCfg.CachePath, "codex-proxy teams auth"))
+		}
 	}
 	fileCfg, err := teams.DefaultEffectiveFileWriteAuthConfig()
 	if err != nil {
-		return err
-	}
-	fileStatus, err := readTeamsTokenStatus(fileCfg.CachePath)
-	if err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(out, "Teams file-write auth cache: %s (%s)\n", fileStatus, fileCfg.CachePath)
-	if fileStatus == "missing" {
-		_, _ = fmt.Fprintf(out, "File upload next step: run `%s` before using `helper file <relative-path>` or `codex-proxy teams send-file`.\n", teamsAuthCommandForCache(fileCfg.CachePath, "codex-proxy teams auth file-write"))
+		printTeamsAuthConfigNotConfigured(out, "Teams file-write auth cache", err)
+	} else {
+		fileStatus, err := readTeamsTokenStatus(fileCfg.CachePath)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "Teams file-write auth cache: %s (%s)\n", fileStatus, fileCfg.CachePath)
+		if fileStatus == "missing" {
+			_, _ = fmt.Fprintf(out, "File upload next step: run `%s` before using `helper file <relative-path>` or `codex-proxy teams send-file`.\n", teamsAuthCommandForCache(fileCfg.CachePath, "codex-proxy teams auth file-write"))
+		}
 	}
 	return nil
+}
+
+func printTeamsAuthConfigNotConfigured(out io.Writer, label string, err error) {
+	_, _ = fmt.Fprintf(out, "%s: not configured (%v)\n", label, err)
 }
 
 func defaultRunTeamsAppServerProbe(cmd *cobra.Command, opts teamsAppServerProbeOptions) error {

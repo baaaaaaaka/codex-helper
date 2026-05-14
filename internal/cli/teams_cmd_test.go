@@ -714,6 +714,43 @@ func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	}
 }
 
+func TestTeamsDoctorAppServerProbeWithoutAuthConfigStaysLocalOnly(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	for _, name := range []string{
+		"CODEX_HELPER_TEAMS_TENANT_ID",
+		"CODEX_HELPER_TEAMS_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_READ_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
+	} {
+		t.Setenv(name, "")
+	}
+
+	prevProbe := runTeamsAppServerProbe
+	runTeamsAppServerProbe = func(cmd *cobra.Command, _ teamsAppServerProbeOptions) error {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Codex app-server: ok (2 cold probe(s), min 1ms, max 2ms, total 3ms)")
+		return nil
+	}
+	t.Cleanup(func() { runTeamsAppServerProbe = prevProbe })
+
+	out := executeRootForTeamsTest(t, "teams", "doctor", "--appserver-probe")
+	for _, want := range []string{
+		"Graph: not checked",
+		"Codex app-server: ok",
+		"Teams read auth cache: not configured",
+		"Teams auth cache: not configured",
+		"Teams file-write auth cache: not configured",
+		"Next steps: run `codex-proxy teams setup`",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestTeamsLogoutRemovesOnlyLocalAuthCache(t *testing.T) {
 	lockCLITestHooks(t)
 

@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,8 @@ import (
 const defaultAppServerProcessStderrLimit = 32 * 1024
 
 var errAppServerProcessStdoutClosed = errors.New("app-server stdout closed")
+
+var appServerProcessRuntimeGOOS = func() string { return runtime.GOOS }
 
 type AppServerProcessStarter struct {
 	StderrLimit int
@@ -37,6 +41,7 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 	if command == "" {
 		command = defaultCodexCommand
 	}
+	command = appServerProcessExecutable(command)
 
 	processCtx, cancelProcess := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(processCtx, command, req.Args...)
@@ -110,6 +115,21 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 		return nil, err
 	}
 	return transport, nil
+}
+
+func appServerProcessExecutable(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return defaultCodexCommand
+	}
+	if appServerProcessRuntimeGOOS() != "windows" || !strings.EqualFold(filepath.Ext(command), ".ps1") {
+		return command
+	}
+	cmdPath := strings.TrimSuffix(command, filepath.Ext(command)) + ".cmd"
+	if _, err := os.Stat(cmdPath); err == nil {
+		return cmdPath
+	}
+	return command
 }
 
 type appServerProcessTransport struct {
