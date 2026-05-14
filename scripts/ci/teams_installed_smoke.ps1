@@ -38,9 +38,18 @@ function Invoke-Smoke {
     [Parameter(Mandatory = $true)][string[]]$CommandArgs
   )
   $out = Join-Path $base "$Name.txt"
-  & $bin @CommandArgs 2>&1 | Tee-Object -FilePath $out
-  if ($LASTEXITCODE -ne 0) {
-    throw "smoke command $Name failed with exit code $LASTEXITCODE"
+  $nativePreference = $PSNativeCommandUseErrorActionPreference
+  $PSNativeCommandUseErrorActionPreference = $false
+  try {
+    $commandOutput = & $bin @CommandArgs 2>&1
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $PSNativeCommandUseErrorActionPreference = $nativePreference
+  }
+  $commandOutput | Set-Content -LiteralPath $out
+  $commandOutput | ForEach-Object { Write-Host $_ }
+  if ($exitCode -ne 0) {
+    throw "smoke command $Name failed with exit code $exitCode"
   }
   return $out
 }
