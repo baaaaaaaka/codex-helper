@@ -274,6 +274,7 @@ type Bridge struct {
 	owner                        teamstore.OwnerMetadata
 	ownerStaleAfter              time.Duration
 	ownerHeartbeatInterval       time.Duration
+	outboxFlushMu                sync.Mutex
 	pollMu                       sync.Mutex
 	fastPollUntil                time.Time
 	lastPollErrorLog             string
@@ -8019,41 +8020,50 @@ func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID strin
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
-	pending, err := b.store.PendingOutbox(ctx)
-	if err != nil {
-		return err
-	}
-	sort.Slice(pending, func(i, j int) bool {
-		if pending[i].TeamsChatID != pending[j].TeamsChatID {
-			return pending[i].CreatedAt.Before(pending[j].CreatedAt)
-		}
-		if pending[i].Sequence != pending[j].Sequence {
-			return pending[i].Sequence < pending[j].Sequence
-		}
-		return pending[i].CreatedAt.Before(pending[j].CreatedAt)
-	})
-	var firstBlockedErr error
-	for _, msg := range pending {
-		if chatID != "" && msg.TeamsChatID != chatID {
-			continue
-		}
-		if sessionID != "" && msg.SessionID != sessionID {
-			continue
-		}
-		if turnID != "" && msg.TurnID != turnID {
-			continue
-		}
-		if err := b.sendQueuedOutboxWithOptions(ctx, msg, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil {
-			if isOutboxDeliveryDeferred(err) {
-				if firstBlockedErr == nil {
-					firstBlockedErr = err
-				}
-				continue
-			}
+	var sentSideEffects []sentOutboxSideEffect
+	b.outboxFlushMu.Lock()
+	err := func() error {
+		defer b.outboxFlushMu.Unlock()
+		pending, err := b.store.PendingOutbox(ctx)
+		if err != nil {
 			return err
 		}
+		sort.Slice(pending, func(i, j int) bool {
+			if pending[i].TeamsChatID != pending[j].TeamsChatID {
+				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+			}
+			if pending[i].Sequence != pending[j].Sequence {
+				return pending[i].Sequence < pending[j].Sequence
+			}
+			return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+		})
+		var firstBlockedErr error
+		for _, msg := range pending {
+			if chatID != "" && msg.TeamsChatID != chatID {
+				continue
+			}
+			if sessionID != "" && msg.SessionID != sessionID {
+				continue
+			}
+			if turnID != "" && msg.TurnID != turnID {
+				continue
+			}
+			if err := b.sendQueuedOutboxWithOptions(ctx, msg, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, SentSideEffects: &sentSideEffects}); err != nil {
+				if isOutboxDeliveryDeferred(err) {
+					if firstBlockedErr == nil {
+						firstBlockedErr = err
+					}
+					continue
+				}
+				return err
+			}
+		}
+		return firstBlockedErr
+	}()
+	for _, effect := range sentSideEffects {
+		b.handleSentOutboxSideEffects(ctx, effect.Outbox, effect.TeamsMessage)
 	}
-	return firstBlockedErr
+	return err
 }
 
 func (b *Bridge) sendQueuedOutbox(ctx context.Context, outbox teamstore.OutboxMessage) error {
@@ -8063,6 +8073,12 @@ func (b *Bridge) sendQueuedOutbox(ctx context.Context, outbox teamstore.OutboxMe
 type outboxSendOptions struct {
 	RespectRateLimitBlock bool
 	RecordRateLimit       bool
+	SentSideEffects       *[]sentOutboxSideEffect
+}
+
+type sentOutboxSideEffect struct {
+	Outbox       teamstore.OutboxMessage
+	TeamsMessage ChatMessage
 }
 
 func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamstore.OutboxMessage, opts outboxSendOptions) error {
@@ -8078,8 +8094,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	if outbox.Status == teamstore.OutboxStatusAccepted && outbox.TeamsMessageID != "" {
 		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
 		if err == nil {
-			b.queueWorkflowNotificationForSentOutbox(ctx, sent)
-			b.markChatUnreadForSentAnswer(ctx, sent, ChatMessage{})
+			b.recordSentOutboxSideEffect(ctx, sent, ChatMessage{}, opts)
 		}
 		return err
 	}
@@ -8146,10 +8161,22 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	}
 	sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
 	if err == nil {
-		b.queueWorkflowNotificationForSentOutbox(ctx, sent)
-		b.markChatUnreadForSentAnswer(ctx, sent, msg)
+		b.recordSentOutboxSideEffect(ctx, sent, msg, opts)
 	}
 	return err
+}
+
+func (b *Bridge) recordSentOutboxSideEffect(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions) {
+	if opts.SentSideEffects != nil {
+		*opts.SentSideEffects = append(*opts.SentSideEffects, sentOutboxSideEffect{Outbox: outbox, TeamsMessage: msg})
+		return
+	}
+	b.handleSentOutboxSideEffects(ctx, outbox, msg)
+}
+
+func (b *Bridge) handleSentOutboxSideEffects(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {
+	b.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+	b.markChatUnreadForSentAnswer(ctx, outbox, msg)
 }
 
 func (b *Bridge) markChatUnreadForSentAnswer(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {

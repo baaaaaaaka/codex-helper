@@ -14390,6 +14390,95 @@ func TestBridgeOutboxRateLimitBlocksOnlyFailingChat(t *testing.T) {
 	}
 }
 
+func TestBridgeFlushPendingOutboxSerializesConcurrentFlushes(t *testing.T) {
+	store := newBridgeTestStore(t)
+	var sentMu sync.Mutex
+	var sent []string
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	defer release()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		var body struct {
+			Body struct {
+				Content string `json:"content"`
+			} `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode Graph request: %v", err)
+		}
+		if strings.Contains(body.Body.Content, "first message") {
+			firstOnce.Do(func() { close(firstStarted) })
+			select {
+			case <-releaseFirst:
+			case <-time.After(bridgeAsyncTestTimeout):
+				t.Error("timed out waiting to release first outbox send")
+			}
+		}
+		sentMu.Lock()
+		sent = append(sent, body.Body.Content)
+		id := len(sent)
+		sentMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, id)
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	ctx := context.Background()
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{ID: "outbox:first", TeamsChatID: "chat-1", Kind: "helper", Body: "first message"}); err != nil {
+		t.Fatalf("QueueOutbox first error: %v", err)
+	}
+
+	firstErr := make(chan error, 1)
+	go func() { firstErr <- bridge.flushPendingOutboxForChat(ctx, "chat-1") }()
+	select {
+	case <-firstStarted:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("first outbox send did not start")
+	}
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{ID: "outbox:second", TeamsChatID: "chat-1", Kind: "helper", Body: "second message"}); err != nil {
+		t.Fatalf("QueueOutbox second error: %v", err)
+	}
+	secondStarted := make(chan struct{})
+	secondErr := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondErr <- bridge.flushPendingOutboxForChat(ctx, "chat-1")
+	}()
+	<-secondStarted
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second flush returned while earlier same-chat outbox was in flight: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-firstErr; err != nil {
+		t.Fatalf("first flush error: %v", err)
+	}
+	if err := <-secondErr; err != nil {
+		t.Fatalf("second flush error: %v", err)
+	}
+	sentMu.Lock()
+	got := append([]string(nil), sent...)
+	sentMu.Unlock()
+	if len(got) != 2 || !strings.Contains(PlainTextFromTeamsHTML(got[0]), "first message") || !strings.Contains(PlainTextFromTeamsHTML(got[1]), "second message") {
+		t.Fatalf("sent outbox order = %#v, want first then second", got)
+	}
+}
+
 func TestBridgeFlushPendingOutboxContinuesAfterRateLimitedChat(t *testing.T) {
 	store := newBridgeTestStore(t)
 	var sent []string
