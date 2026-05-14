@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1257,6 +1258,58 @@ func TestScheduleDelayedTeamsServiceStartUsesWindowsPendingActivation(t *testing
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("windows activation command missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	pending := filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.123")
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            exe,
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		runner:         runner,
+	})
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() { teamsServiceStartDetached = prevDetached })
+	var detachedArgs []string
+	teamsServiceStartDetached = func(_ context.Context, _ string, args ...string) error {
+		detachedArgs = append([]string(nil), args...)
+		return nil
+	}
+
+	finalize, err := stopTeamsServiceForHelperUpgrade(context.Background(), nil, io.Discard, nil, nil)
+	if err != nil {
+		t.Fatalf("stopTeamsServiceForHelperUpgrade error: %v", err)
+	}
+	if err := finalize(context.Background(), teamsUpgradeFinishOptions{
+		Success:            false,
+		ServiceRestart:     teamsUpgradeRestartDelayed,
+		InstallPath:        exe,
+		PendingReplacePath: pending,
+	}); err != nil {
+		t.Fatalf("finalize pending Windows helper activation error: %v", err)
+	}
+	joinedCalls := make([]string, 0, len(runner.calls))
+	for _, call := range runner.calls {
+		joinedCalls = append(joinedCalls, strings.Join(call.args, " "))
+	}
+	joined := strings.Join(joinedCalls, "\n")
+	for _, want := range []string{"Stop-ScheduledTask", "Register-ScheduledTask", "Enable-ScheduledTask"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("finalizer should refresh Windows service before activation, missing %q in calls=%#v", want, runner.calls)
+		}
+	}
+	activation := strings.Join(detachedArgs, " ")
+	for _, want := range []string{pending, exe, "Move-Item -Force", "Start-ScheduledTask"} {
+		if !strings.Contains(activation, want) {
+			t.Fatalf("activation command missing %q:\n%s", want, activation)
 		}
 	}
 }

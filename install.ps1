@@ -134,6 +134,57 @@ function Get-CodexProxySHA256Hex([string]$path) {
   }
 }
 
+function Get-CodexProxyProcessesForPath([string]$path) {
+  if ([string]::IsNullOrWhiteSpace($path)) {
+    return @()
+  }
+  try {
+    $target = [IO.Path]::GetFullPath($path)
+  } catch {
+    return @()
+  }
+  try {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'codex-proxy.exe'" -ErrorAction SilentlyContinue | Where-Object {
+      try {
+        -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target)
+      } catch {
+        $false
+      }
+    })
+  } catch {
+    return @()
+  }
+}
+
+function Stop-CodexProxyTeamsTasksForInstall {
+  foreach ($taskName in @("Codex Helper Teams Watchdog", "Codex Helper Teams Bridge")) {
+    try {
+      $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+      if ($null -ne $task) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+      }
+    } catch {
+      # Best effort only. If the binary is still locked, the final Move-Item
+      # error remains the authoritative install failure.
+    }
+  }
+}
+
+function Wait-CodexProxyInstallPathReleased([string]$path) {
+  for ($i = 0; $i -lt 120; $i++) {
+    $procs = @(Get-CodexProxyProcessesForPath $path)
+    if ($procs.Count -eq 0) {
+      return
+    }
+    if ($i -eq 0) {
+      $ids = ($procs | ForEach-Object { $_.ProcessId }) -join ", "
+      Write-Host "Waiting for existing codex-proxy process(es) to exit: $ids"
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  Write-Warning "codex-proxy.exe is still running from $path; install may fail if Windows keeps the file locked."
+}
+
 function Test-IsCodexOwnedLegacyFile([string]$path) {
   return Test-FileContainsMarker -path $path -markers @(
     "github.com/baaaaaaaka/codex-helper",
@@ -434,6 +485,10 @@ try {
 }
 
 $dst = Join-Path $installDirResolved "codex-proxy.exe"
+if (@(Get-CodexProxyProcessesForPath $dst).Count -gt 0) {
+  Stop-CodexProxyTeamsTasksForInstall
+  Wait-CodexProxyInstallPathReleased $dst
+}
 Invoke-DiskWrite -Label "codex-proxy binary install" -PathValue $dst -DefaultReason "Failed to move codex-proxy into $dst" -Action {
   Move-Item -Force -Path $tmp -Destination $dst
 }

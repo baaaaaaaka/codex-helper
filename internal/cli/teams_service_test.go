@@ -1396,6 +1396,88 @@ func TestTeamsServiceBootstrapSchedulesPendingHelperActivationBeforeStartingOldW
 	}
 }
 
+func TestTeamsServiceStartAndRestartActivatePendingWindowsHelperBeforeOldEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "start", args: []string{"teams", "service", "start"}, want: "Scheduled Teams service start after activating pending helper v0.1.0-rc.74."},
+		{name: "restart", args: []string{"teams", "service", "restart"}, want: "Scheduled Teams service restart after activating pending helper v0.1.0-rc.74."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lockCLITestHooks(t)
+
+			tmp := t.TempDir()
+			exe := filepath.Join(tmp, "codex-proxy.exe")
+			pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.74_windows_amd64.exe.123")
+			prevFind := teamsUpdateFindPendingReplacementsForPlatform
+			prevProbe := teamsUpdateProbeBinaryVersion
+			prevDetached := teamsServiceStartDetached
+			t.Cleanup(func() {
+				teamsUpdateFindPendingReplacementsForPlatform = prevFind
+				teamsUpdateProbeBinaryVersion = prevProbe
+				teamsServiceStartDetached = prevDetached
+			})
+			teamsUpdateFindPendingReplacementsForPlatform = func(path string, goos string, goarch string) ([]update.PendingReplacement, error) {
+				if filepath.Clean(path) != filepath.Clean(exe) || goos != "windows" {
+					t.Fatalf("FindPendingReplacements path/goos = %q/%q, want %q/windows", path, goos, exe)
+				}
+				return []update.PendingReplacement{{Path: pending, Version: "0.1.0-rc.74", ModTime: time.Now()}}, nil
+			}
+			teamsUpdateProbeBinaryVersion = func(_ context.Context, path string, _ time.Duration) (update.BinaryVersion, error) {
+				switch filepath.Clean(path) {
+				case filepath.Clean(exe):
+					return update.BinaryVersion{Path: path, Version: "0.1.0-rc.68"}, nil
+				case filepath.Clean(pending):
+					return update.BinaryVersion{Path: path, Version: "0.1.0-rc.74"}, nil
+				default:
+					t.Fatalf("unexpected probe path %q", path)
+					return update.BinaryVersion{}, nil
+				}
+			}
+			var detachedName string
+			var detachedArgs []string
+			teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+				detachedName = name
+				detachedArgs = append([]string(nil), args...)
+				return nil
+			}
+			runner := &recordingTeamsServiceRunner{}
+			withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+				goos:           "windows",
+				exe:            exe,
+				windowsTaskDir: filepath.Join(tmp, "tasks"),
+				runner:         runner,
+			})
+
+			cmd := newRootCmd()
+			cmd.SetArgs(tc.args)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("%s command error: %v", tc.name, err)
+			}
+			if strings.TrimSpace(out.String()) != tc.want {
+				t.Fatalf("%s output = %q, want %q", tc.name, strings.TrimSpace(out.String()), tc.want)
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("%s should not start old scheduled task directly, calls=%#v", tc.name, runner.calls)
+			}
+			if detachedName != "powershell.exe" {
+				t.Fatalf("%s detached name = %q, want powershell.exe", tc.name, detachedName)
+			}
+			joined := strings.Join(detachedArgs, " ")
+			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", "Move-Item -Force", "Start-ScheduledTask"} {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("%s activation command missing %q:\n%s", tc.name, want, joined)
+				}
+			}
+		})
+	}
+}
+
 func TestTeamsServiceOpenURLCommandMatrix(t *testing.T) {
 	lockCLITestHooks(t)
 

@@ -213,7 +213,8 @@ func stopTeamsServiceForHelperUpgrade(ctx context.Context, in io.Reader, out io.
 			return nil
 		}
 		refresh := teamsUpgradeServiceRefreshResult{}
-		if opts.Success {
+		refreshService := opts.Success || (teamsServiceGOOS() == "windows" && strings.TrimSpace(opts.PendingReplacePath) != "")
+		if refreshService {
 			if out != nil {
 				_, _ = fmt.Fprintln(out, "Refreshing Teams service config before restart...")
 			}

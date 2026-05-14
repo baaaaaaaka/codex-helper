@@ -262,6 +262,11 @@ func newTeamsServiceStartCmd() *cobra.Command {
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
+			if scheduled, err := schedulePendingTeamsServiceActivationBeforeStart(cmd.Context(), cmd.OutOrStdout(), "start"); err != nil {
+				return err
+			} else if scheduled {
+				return nil
+			}
 			backend, err := teamsServiceBackendForCurrentPlatform()
 			if err != nil {
 				return err
@@ -309,6 +314,11 @@ func newTeamsServiceRestartCmd() *cobra.Command {
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
+			if scheduled, err := schedulePendingTeamsServiceActivationBeforeStart(cmd.Context(), cmd.OutOrStdout(), "restart"); err != nil {
+				return err
+			} else if scheduled {
+				return nil
+			}
 			if err := startTeamsService(cmd.Context(), true); err != nil {
 				return err
 			}
@@ -320,6 +330,34 @@ func newTeamsServiceRestartCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func schedulePendingTeamsServiceActivationBeforeStart(ctx context.Context, out io.Writer, action string) (bool, error) {
+	if teamsServiceGOOS() != "windows" {
+		return false, nil
+	}
+	installPath, err := teamsServiceExecutable()
+	if err != nil {
+		return false, err
+	}
+	activation, ok, err := discoverTeamsPendingHelperActivation(ctx, installPath, "")
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	if err := scheduleTeamsPendingHelperActivation(ctx, activation); err != nil {
+		return false, err
+	}
+	if out != nil {
+		verb := "start"
+		if strings.EqualFold(action, "restart") {
+			verb = "restart"
+		}
+		_, _ = fmt.Fprintf(out, "Scheduled Teams service %s after activating pending helper v%s.\n", verb, activation.Version)
+	}
+	return true, nil
 }
 
 func newTeamsServiceDoctorCmd() *cobra.Command {
