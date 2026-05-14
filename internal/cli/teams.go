@@ -1050,6 +1050,8 @@ func newTeamsRecoverCmd() *cobra.Command {
 				return nil
 			}
 			var recovered []string
+			var supersededOutbox []string
+			var preservedOutbox []string
 			var clearedOwners []string
 			var remainingBlockers []string
 			for _, path := range paths {
@@ -1077,6 +1079,12 @@ func newTeamsRecoverCmd() *cobra.Command {
 				for _, id := range report.InterruptedTurnIDs {
 					recovered = append(recovered, path+" "+id)
 				}
+				for _, id := range report.SupersededOutboxIDs {
+					supersededOutbox = append(supersededOutbox, path+" "+id)
+				}
+				for _, id := range report.PreservedOutboxBlockerIDs {
+					preservedOutbox = append(preservedOutbox, path+" "+id)
+				}
 				state, err := st.Load(cmd.Context())
 				if err != nil {
 					return err
@@ -1087,6 +1095,8 @@ func newTeamsRecoverCmd() *cobra.Command {
 			}
 			sort.Strings(clearedOwners)
 			sort.Strings(recovered)
+			sort.Strings(supersededOutbox)
+			sort.Strings(preservedOutbox)
 			sort.Strings(remainingBlockers)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Cleared stale owners: %d\n", len(clearedOwners))
 			for _, id := range clearedOwners {
@@ -1095,6 +1105,16 @@ func newTeamsRecoverCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Recovered interrupted turns: %d\n", len(recovered))
 			for _, id := range recovered {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Superseded transient outbox: %d\n", len(supersededOutbox))
+			for _, id := range supersededOutbox {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
+			}
+			if len(preservedOutbox) > 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Preserved protected outbox: %d\n", len(preservedOutbox))
+				for _, id := range preservedOutbox {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
+				}
 			}
 			if len(remainingBlockers) > 0 {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Remaining upgrade blockers: %d\n", len(remainingBlockers))

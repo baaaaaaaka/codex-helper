@@ -1030,9 +1030,73 @@ func TestTeamsRecoverReportsRemainingUpgradeBlockers(t *testing.T) {
 	if !strings.Contains(out, "Recovered interrupted turns: 0") {
 		t.Fatalf("recover should report no interrupted turns:\n%s", out)
 	}
+	if !strings.Contains(out, "Preserved protected outbox: 1") {
+		t.Fatalf("recover should report protected outbox preservation:\n%s", out)
+	}
 	if !strings.Contains(out, "Remaining upgrade blockers: 1") ||
 		!strings.Contains(out, "outbox s1 outbox:blocking status=queued kind=answer") {
 		t.Fatalf("recover should report remaining outbox blocker:\n%s", out)
+	}
+}
+
+func TestTeamsRecoverDoesNotReportNotificationOutboxAsUpgradeBlockers(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{
+		ID:          "s1",
+		Status:      teamsstore.SessionStatusActive,
+		TeamsChatID: "chat-1",
+	}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	for _, msg := range []teamsstore.OutboxMessage{
+		{
+			ID:          "outbox:turn-1:codex-status-001",
+			SessionID:   "s1",
+			TeamsChatID: "chat-1",
+			Kind:        "codex-status-001",
+			Body:        "still running",
+			Status:      teamsstore.OutboxStatusQueued,
+		},
+		{
+			ID:          "outbox:turn-1:interrupted",
+			SessionID:   "s1",
+			TeamsChatID: "chat-1",
+			Kind:        "interrupted",
+			Body:        "ambiguous after restart",
+			Status:      teamsstore.OutboxStatusQueued,
+		},
+	} {
+		if _, _, err := st.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
+		}
+	}
+
+	out := executeRootForTeamsTest(t, "teams", "recover")
+	if !strings.Contains(out, "Recovered interrupted turns: 0") {
+		t.Fatalf("recover should report no interrupted turns:\n%s", out)
+	}
+	if !strings.Contains(out, "Superseded transient outbox: 2") {
+		t.Fatalf("recover should report transient outbox reconciliation:\n%s", out)
+	}
+	if strings.Contains(out, "Remaining upgrade blockers") {
+		t.Fatalf("notification outbox should not remain upgrade-blocking:\n%s", out)
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	for _, id := range []string{"outbox:turn-1:codex-status-001", "outbox:turn-1:interrupted"} {
+		if got := state.OutboxMessages[id].Status; got != teamsstore.OutboxStatusSkipped {
+			t.Fatalf("%s status = %q, want skipped", id, got)
+		}
 	}
 }
 

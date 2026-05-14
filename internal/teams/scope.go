@@ -1,12 +1,15 @@
 package teams
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
@@ -32,15 +35,44 @@ func ScopeIdentityForUser(user User) teamstore.ScopeIdentity {
 		scope.Profile = "default"
 	}
 	scope.ID = stableID("scope", []string{
-		"v1",
-		scope.OSUser,
+		"v2",
 		scope.AccountID,
 		scope.UserPrincipal,
 		scope.Profile,
-		scope.ConfigPath,
-		scope.CodexHome,
 	})
 	return scope
+}
+
+func ResolveStorePathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIdentity, string, error) {
+	scope = normalizeScopeForResolution(scope)
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		return scope, "", err
+	}
+	resolved, path, ok, err := resolveExistingScopeStore(scope, currentPath)
+	if err != nil {
+		return scope, "", err
+	}
+	if ok {
+		scope.ID = resolved.ID
+		if !resolved.CreatedAt.IsZero() {
+			scope.CreatedAt = resolved.CreatedAt
+		}
+		return scope, path, nil
+	}
+	return scope, currentPath, nil
+}
+
+func ResolveRegistryPathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIdentity, string, error) {
+	resolved, _, err := ResolveStorePathForScope(scope)
+	if err != nil {
+		return scope, "", err
+	}
+	path, err := DefaultRegistryPathForScope(resolved.ID)
+	if err != nil {
+		return resolved, "", err
+	}
+	return resolved, path, nil
 }
 
 func DefaultStorePathForScope(scopeID string) (string, error) {
@@ -57,6 +89,163 @@ func DefaultRegistryPathForScope(scopeID string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(base, "codex-helper", "teams", "scopes", safeScopePathPart(scopeID), "registry.json"), nil
+}
+
+type resolvedScopeStoreCandidate struct {
+	scope   teamstore.ScopeIdentity
+	path    string
+	score   int
+	updated time.Time
+}
+
+func resolveExistingScopeStore(scope teamstore.ScopeIdentity, currentPath string) (teamstore.ScopeIdentity, string, bool, error) {
+	paths, err := candidateScopeStorePaths(currentPath)
+	if err != nil {
+		return teamstore.ScopeIdentity{}, "", false, err
+	}
+	now := time.Now()
+	var candidates []resolvedScopeStoreCandidate
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return teamstore.ScopeIdentity{}, "", false, err
+			}
+		}
+		st, err := teamstore.Open(path)
+		if err != nil {
+			return teamstore.ScopeIdentity{}, "", false, err
+		}
+		state, err := st.Load(context.Background())
+		if err != nil {
+			return teamstore.ScopeIdentity{}, "", false, err
+		}
+		if !scopeStateMatches(scope, state) {
+			continue
+		}
+		candidateScope := state.Scope
+		if strings.TrimSpace(candidateScope.ID) == "" {
+			candidateScope = scope
+		}
+		candidate := resolvedScopeStoreCandidate{
+			scope:   candidateScope,
+			path:    path,
+			score:   scopeStoreResolutionScore(state, path, currentPath, now),
+			updated: candidateScope.UpdatedAt,
+		}
+		if info, err := os.Stat(path); err == nil && info.ModTime().After(candidate.updated) {
+			candidate.updated = info.ModTime()
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return teamstore.ScopeIdentity{}, "", false, nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		if !candidates[i].updated.Equal(candidates[j].updated) {
+			return candidates[i].updated.After(candidates[j].updated)
+		}
+		return candidates[i].path < candidates[j].path
+	})
+	best := candidates[0]
+	return best.scope, best.path, true, nil
+}
+
+func candidateScopeStorePaths(currentPath string) ([]string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	matches, err := filepath.Glob(filepath.Join(base, "codex-helper", "teams", "scopes", "*", "state.json"))
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var paths []string
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	add(currentPath)
+	sort.Strings(matches)
+	for _, path := range matches {
+		add(path)
+	}
+	return paths, nil
+}
+
+func scopeStoreResolutionScore(state teamstore.State, path string, currentPath string, now time.Time) int {
+	score := 0
+	if path == currentPath {
+		score += 10
+	}
+	if teamstore.HasUpgradeBlockingWork(state, now) {
+		score += 1000
+	}
+	if state.ServiceOwner != nil || state.LockOwner != nil {
+		score += 900
+	}
+	if state.ControlLease.HolderMachineID != "" {
+		score += 800
+	}
+	if strings.TrimSpace(state.ControlChat.TeamsChatID) != "" {
+		score += 500
+	}
+	score += len(state.Sessions) * 10
+	score += len(state.OutboxMessages)
+	return score
+}
+
+func scopeStateMatches(current teamstore.ScopeIdentity, state teamstore.State) bool {
+	if scopeIdentityMatches(current, state.Scope) {
+		return true
+	}
+	control := state.ControlChat
+	if strings.TrimSpace(control.ScopeID) == "" && strings.TrimSpace(control.AccountID) == "" && strings.TrimSpace(control.Profile) == "" {
+		return false
+	}
+	return scopeIdentityMatches(current, teamstore.ScopeIdentity{
+		ID:        control.ScopeID,
+		AccountID: control.AccountID,
+		Profile:   control.Profile,
+	})
+}
+
+func scopeIdentityMatches(current teamstore.ScopeIdentity, existing teamstore.ScopeIdentity) bool {
+	current = normalizeScopeForResolution(current)
+	existing = normalizeScopeForResolution(existing)
+	if current.ID != "" && current.ID == existing.ID {
+		return true
+	}
+	if current.Profile != existing.Profile {
+		return false
+	}
+	accountMatches := current.AccountID != "" && existing.AccountID != "" && current.AccountID == existing.AccountID
+	principalMatches := current.UserPrincipal != "" && existing.UserPrincipal != "" && strings.EqualFold(current.UserPrincipal, existing.UserPrincipal)
+	return accountMatches || principalMatches
+}
+
+func normalizeScopeForResolution(scope teamstore.ScopeIdentity) teamstore.ScopeIdentity {
+	scope.ID = strings.TrimSpace(scope.ID)
+	scope.AccountID = strings.TrimSpace(scope.AccountID)
+	scope.UserPrincipal = strings.TrimSpace(scope.UserPrincipal)
+	scope.OSUser = strings.TrimSpace(scope.OSUser)
+	scope.Profile = strings.TrimSpace(scope.Profile)
+	if scope.Profile == "" {
+		scope.Profile = "default"
+	}
+	scope.ConfigPath = strings.TrimSpace(scope.ConfigPath)
+	scope.CodexHome = strings.TrimSpace(scope.CodexHome)
+	return scope
 }
 
 func MachineRecordForUser(user User, scope teamstore.ScopeIdentity) teamstore.MachineRecord {

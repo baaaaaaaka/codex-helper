@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -472,7 +473,8 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 	script := buildTeamsServiceWSLStartupWatchdogScript("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, "abc")
 	for _, want := range []string{
 		"System.Threading.Mutex",
-		"if (-not $created) { exit 0 }",
+		"$deadline = (Get-Date).AddSeconds(60)",
+		"Start-Sleep -Seconds 2",
 		"while ($true)",
 		"codex-helper-teams-wsl-stop-abc.signal",
 		"Test-Path -LiteralPath $stopPath",
@@ -483,7 +485,6 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
 		"wsl.exe exited",
-		"wsl.exe exited 0; exiting watchdog",
 		"restarting in 10s",
 		"Start-Sleep -Seconds 10",
 		"$mutex.ReleaseMutex(); $mutex.Dispose()",
@@ -498,6 +499,9 @@ func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *tes
 	}
 	if strings.Contains(script, "& wsl.exe @wslArgs") {
 		t.Fatalf("WSL Startup watchdog script must not launch wsl.exe directly in a visible console path:\n%s", script)
+	}
+	if strings.Contains(script, "wsl.exe exited 0; exiting watchdog") {
+		t.Fatalf("WSL Startup watchdog must keep watching after a clean WSL exit unless a stop signal is present:\n%s", script)
 	}
 
 	startCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, true)
@@ -1337,7 +1341,6 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 		"wsl.exe",
 		"--auto-service=false",
 		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE=",
-		"CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1",
 		"Remove-Item -LiteralPath $stopPath",
 		"Remove-Item -LiteralPath $legacyCmdLauncherPath",
 		"$launcherPath = Join-Path $startup",
@@ -1353,6 +1356,9 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 	}
 	if strings.Contains(fallback, "Set-Content -LiteralPath $legacyCmdLauncherPath") || strings.Contains(fallback, "Start-Process -FilePath 'cmd.exe'") {
 		t.Fatalf("Startup fallback should not create or start a console .cmd launcher:\n%s", fallback)
+	}
+	if strings.Contains(fallback, "CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1") {
+		t.Fatalf("Startup fallback must not retire itself when another helper temporarily owns the shared home:\n%s", fallback)
 	}
 	if strings.Contains(fallback, "-Verb RunAs") || strings.Contains(fallback, "Register-ScheduledTask") {
 		t.Fatalf("Startup fallback should not use UAC or Task Scheduler:\n%s", fallback)
@@ -1793,6 +1799,169 @@ func TestTeamsBackgroundKeepaliveWSLStatusReportsStartupFallbackCI(t *testing.T)
 	}
 	if got := out.String(); !strings.Contains(got, "Startup watchdog fallback: installed") || !strings.Contains(got, markerPath) {
 		t.Fatalf("service status did not report fallback marker:\n%s", got)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledTaskCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevDelay := teamsServiceStartupFallbackRestartDelay
+	teamsServiceStartupFallbackRestartDelay = 0
+	t.Cleanup(func() { teamsServiceStartupFallbackRestartDelay = prevDelay })
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{output: []byte("ok")}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte("Fallback=Windows Startup watchdog\n"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	stopPath := teamsServiceWSLStartupFallbackStopPath(markerPath)
+	suffix, ok := teamsServiceWSLStartupFallbackSuffixFromMarkerPath(markerPath)
+	if !ok {
+		t.Fatalf("could not resolve startup fallback suffix from %s", markerPath)
+	}
+
+	for _, action := range []string{"stop", "start", "restart"} {
+		runner.calls = nil
+		if _, err := backend.Run(context.Background(), action); err != nil {
+			t.Fatalf("fallback service %s error: %v", action, err)
+		}
+		if len(runner.calls) == 0 {
+			t.Fatalf("fallback service %s made no PowerShell calls", action)
+		}
+		assertTeamsServiceCallsDoNotContain(t, runner.calls, "Get-ScheduledTask", "Enable-ScheduledTask", "Start-ScheduledTask", "Stop-ScheduledTask")
+		joined := strings.Join(runner.calls[len(runner.calls)-1].args, " ")
+		switch action {
+		case "stop":
+			if !strings.Contains(joined, "Set-Content -LiteralPath $stopPath") || !strings.Contains(joined, suffix) || !strings.Contains(joined, ".signal") {
+				t.Fatalf("fallback stop should write the Startup watchdog stop signal:\n%s", joined)
+			}
+			if _, err := os.Stat(stopPath); err != nil {
+				t.Fatalf("fallback stop should write Linux stop marker: %v", err)
+			}
+		case "start":
+			if !strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(joined, "codex-helper-teams-wsl-"+suffix+".vbs") {
+				t.Fatalf("fallback start should launch existing hidden Startup watchdog:\n%s", joined)
+			}
+			if _, err := os.Stat(stopPath); !os.IsNotExist(err) {
+				t.Fatalf("fallback start should clear Linux stop marker, stat err=%v", err)
+			}
+		case "restart":
+			if len(runner.calls) != 2 {
+				t.Fatalf("fallback restart calls = %#v, want stop signal then hidden launcher", runner.calls)
+			}
+			first := strings.Join(runner.calls[0].args, " ")
+			second := strings.Join(runner.calls[1].args, " ")
+			if !strings.Contains(first, "Set-Content -LiteralPath $stopPath") || !strings.Contains(second, "Start-Process -FilePath 'wscript.exe'") {
+				t.Fatalf("fallback restart should stop then start via Startup watchdog:\nfirst=%s\nsecond=%s", first, second)
+			}
+			if _, err := os.Stat(stopPath); !os.IsNotExist(err) {
+				t.Fatalf("fallback restart should clear Linux stop marker before starting, stat err=%v", err)
+			}
+		}
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackStartRewritesLegacyConfigCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{output: []byte("ok")}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	legacyArgs := []string{
+		"-d", "Ubuntu",
+		"-u", "alice",
+		"--exec",
+		"env",
+		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK=1",
+		"CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1",
+		"/home/alice/bin/codex-proxy",
+		"teams",
+		"run",
+		"--auto-service=false",
+	}
+	if err := os.WriteFile(markerPath, []byte(buildTeamsServiceWSLStartupFallbackConfig(backend.Name(), legacyArgs)), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if _, err := backend.Run(context.Background(), "start"); err != nil {
+		t.Fatalf("fallback start error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("fallback start calls = %#v, want one PowerShell call", runner.calls)
+	}
+	command := strings.Join(runner.calls[0].args, " ")
+	for _, want := range []string{
+		"Set-Content -LiteralPath $scriptPath",
+		"Start-Process -FilePath 'wscript.exe'",
+		"$deadline = (Get-Date).AddSeconds(60)",
+		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK=1",
+		"/home/alice/bin/codex-proxy",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("fallback start rewrite command missing %q:\n%s", want, command)
+		}
+	}
+	if strings.Contains(command, "CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1") {
+		t.Fatalf("fallback start should strip legacy standby-exit env from rewritten watchdog:\n%s", command)
+	}
+	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Enable-ScheduledTask", "Start-ScheduledTask", "Stop-ScheduledTask")
+}
+
+func TestTeamsBackgroundKeepaliveWindowsCommandLineRoundTripCI(t *testing.T) {
+	args := []string{
+		"-d",
+		"Ubuntu",
+		"--cd",
+		"/home/alice/work dir",
+		"--exec",
+		"env",
+		`NO_PROXY=*.example.com`,
+		`QUOTED=a "quote" and slash\`,
+		"",
+		"/home/alice/bin/codex-proxy",
+	}
+	line := windowsCommandLine(args)
+	got, err := splitWindowsCommandLine(line)
+	if err != nil {
+		t.Fatalf("splitWindowsCommandLine error: %v", err)
+	}
+	if !reflect.DeepEqual(got, args) {
+		t.Fatalf("splitWindowsCommandLine = %#v, want %#v\nline=%s", got, args, line)
 	}
 }
 

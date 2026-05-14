@@ -331,10 +331,12 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 	}
 	scope := ScopeIdentityForUser(user)
 	if strings.TrimSpace(registryPath) == "" {
-		registryPath, err = DefaultRegistryPathForScope(scope.ID)
+		var resolvedScope teamstore.ScopeIdentity
+		resolvedScope, registryPath, err = ResolveRegistryPathForScope(scope)
 		if err != nil {
 			return nil, err
 		}
+		scope = resolvedScope
 	}
 	reg, err := LoadRegistry(registryPath)
 	if err != nil {
@@ -539,9 +541,14 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		storePath := opts.StorePath
 		if strings.TrimSpace(storePath) == "" {
 			var err error
-			storePath, err = DefaultStorePathForScope(b.scope.ID)
+			var resolvedScope teamstore.ScopeIdentity
+			resolvedScope, storePath, err = ResolveStorePathForScope(b.scope)
 			if err != nil {
 				return err
+			}
+			if resolvedScope.ID != b.scope.ID {
+				b.scope = resolvedScope
+				b.machine = MachineRecordForUser(b.user, b.scope)
 			}
 		}
 		store, err := teamstore.Open(storePath)

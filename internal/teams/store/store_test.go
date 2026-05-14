@@ -1390,6 +1390,47 @@ func TestOutboxBlocksUpgradeStatusMatrix(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "legacy queued codex status does not block",
+			msg:  OutboxMessage{ID: "queued-status", TeamsChatID: "chat-1", Kind: "codex-status-001", Status: OutboxStatusQueued},
+			want: false,
+		},
+		{
+			name: "legacy queued interrupted notice does not block",
+			msg:  OutboxMessage{ID: "queued-interrupted", TeamsChatID: "chat-1", Kind: "interrupted", Status: OutboxStatusQueued},
+			want: false,
+		},
+		{
+			name: "generic error still blocks",
+			msg:  OutboxMessage{ID: "queued-error", TeamsChatID: "chat-1", Kind: "error", Status: OutboxStatusQueued},
+			want: true,
+		},
+		{
+			name: "generic recovery still blocks",
+			msg:  OutboxMessage{ID: "queued-recovery", TeamsChatID: "chat-1", Kind: "recovery-missing-message", Status: OutboxStatusQueued},
+			want: true,
+		},
+		{
+			name: "final overrides nonblocking hint",
+			msg:  OutboxMessage{ID: "queued-final", TeamsChatID: "chat-1", Kind: "final", Status: OutboxStatusQueued, UpgradeNonBlocking: true},
+			want: true,
+		},
+		{
+			name:  "final overrides rate limit",
+			msg:   OutboxMessage{ID: "queued-rate-limited-final", TeamsChatID: "chat-1", Kind: "final", Status: OutboxStatusQueued},
+			limit: ChatRateLimitState{ChatID: "chat-1", BlockedUntil: now.Add(time.Minute)},
+			want:  true,
+		},
+		{
+			name: "attachment overrides nonblocking hint",
+			msg:  OutboxMessage{ID: "queued-attachment", TeamsChatID: "chat-1", Kind: "helper", AttachmentPath: "/tmp/report.txt", Status: OutboxStatusQueued, UpgradeNonBlocking: true},
+			want: true,
+		},
+		{
+			name: "turn completed notification overrides nonblocking hint",
+			msg:  OutboxMessage{ID: "queued-completed", TeamsChatID: "chat-1", Kind: "helper", NotificationKind: "turn_completed", Status: OutboxStatusQueued, UpgradeNonBlocking: true},
+			want: true,
+		},
+		{
 			name:  "queued rate limited does not block",
 			msg:   OutboxMessage{ID: "queued-rate-limited", TeamsChatID: "chat-1", Status: OutboxStatusQueued},
 			limit: ChatRateLimitState{ChatID: "chat-1", BlockedUntil: now.Add(time.Minute)},
@@ -1432,6 +1473,86 @@ func TestOutboxBlocksUpgradeStatusMatrix(t *testing.T) {
 				t.Fatalf("OutboxBlocksUpgrade = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestQueueOutboxMarksNotificationKindsUpgradeNonBlocking(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:status",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-status-001",
+		Body:        "still working",
+	}); err != nil {
+		t.Fatalf("QueueOutbox status error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:final",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "answer",
+	}); err != nil {
+		t.Fatalf("QueueOutbox final error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if !state.OutboxMessages["outbox:status"].UpgradeNonBlocking {
+		t.Fatalf("status outbox should be upgrade non-blocking: %#v", state.OutboxMessages["outbox:status"])
+	}
+	if state.OutboxMessages["outbox:final"].UpgradeNonBlocking {
+		t.Fatalf("final outbox should still block upgrade: %#v", state.OutboxMessages["outbox:final"])
+	}
+}
+
+func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	for _, msg := range []OutboxMessage{
+		{ID: "outbox:status", SessionID: "s1", TeamsChatID: "chat-1", Kind: "codex-status-001", Status: OutboxStatusQueued},
+		{ID: "outbox:interrupted", SessionID: "s1", TeamsChatID: "chat-1", Kind: "interrupted", Status: OutboxStatusSending},
+		{ID: "outbox:final", SessionID: "s1", TeamsChatID: "chat-1", Kind: "final", Status: OutboxStatusQueued, UpgradeNonBlocking: true},
+		{ID: "outbox:artifact", SessionID: "s1", TeamsChatID: "chat-1", Kind: "helper", AttachmentPath: "/tmp/report.txt", Status: OutboxStatusQueued, UpgradeNonBlocking: true},
+	} {
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
+		}
+	}
+
+	report, err := store.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover error: %v", err)
+	}
+	if got, want := report.SupersededOutboxIDs, []string{"outbox:interrupted", "outbox:status"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SupersededOutboxIDs = %#v, want %#v", got, want)
+	}
+	if got, want := report.PreservedOutboxBlockerIDs, []string{"outbox:artifact", "outbox:final"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PreservedOutboxBlockerIDs = %#v, want %#v", got, want)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	for _, id := range []string{"outbox:status", "outbox:interrupted"} {
+		if got := state.OutboxMessages[id].Status; got != OutboxStatusSkipped {
+			t.Fatalf("%s status = %q, want %q", id, got, OutboxStatusSkipped)
+		}
+		if OutboxBlocksUpgrade(state, state.OutboxMessages[id], time.Now()) {
+			t.Fatalf("%s should not block upgrade after recover", id)
+		}
+	}
+	for _, id := range []string{"outbox:final", "outbox:artifact"} {
+		if got := state.OutboxMessages[id].Status; got != OutboxStatusQueued {
+			t.Fatalf("%s status = %q, want queued", id, got)
+		}
+		if !OutboxBlocksUpgrade(state, state.OutboxMessages[id], time.Now()) {
+			t.Fatalf("%s should still block upgrade after recover", id)
+		}
 	}
 }
 

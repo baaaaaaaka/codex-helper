@@ -63,6 +63,7 @@ const (
 	OutboxStatusSending  OutboxStatus = "sending"
 	OutboxStatusAccepted OutboxStatus = "accepted"
 	OutboxStatusSent     OutboxStatus = "sent"
+	OutboxStatusSkipped  OutboxStatus = "skipped"
 )
 
 var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
@@ -610,7 +611,9 @@ type OutboxMessage struct {
 }
 
 type RecoveryReport struct {
-	InterruptedTurnIDs []string
+	InterruptedTurnIDs        []string
+	SupersededOutboxIDs       []string
+	PreservedOutboxBlockerIDs []string
 }
 
 type UpgradeBlocker struct {
@@ -1515,7 +1518,17 @@ func OutboxBlocksUpgrade(state State, msg OutboxMessage, now time.Time) bool {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if msg.UpgradeNonBlocking {
+	if outboxDeliveryProtected(msg) {
+		switch msg.Status {
+		case OutboxStatusQueued:
+			return true
+		case OutboxStatusSending:
+			return msg.LastSendAttempt.IsZero() || now.Sub(msg.LastSendAttempt) <= outboxSendLease
+		default:
+			return false
+		}
+	}
+	if msg.UpgradeNonBlocking || outboxDeliveryTransient(msg) {
 		return false
 	}
 	if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(now) {
@@ -1529,6 +1542,42 @@ func OutboxBlocksUpgrade(state State, msg OutboxMessage, now time.Time) bool {
 	default:
 		return false
 	}
+}
+
+func outboxDeliveryProtected(msg OutboxMessage) bool {
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	notificationKind := strings.ToLower(strings.TrimSpace(msg.NotificationKind))
+	if len(msg.ArtifactIDs) > 0 ||
+		strings.TrimSpace(msg.AttachmentPath) != "" ||
+		strings.TrimSpace(msg.DriveItemID) != "" {
+		return true
+	}
+	switch kind {
+	case "final", "answer", "artifact", "attachment":
+		return true
+	}
+	if strings.HasPrefix(kind, "final-") ||
+		strings.HasPrefix(kind, "answer-") ||
+		strings.Contains(kind, "final") ||
+		strings.Contains(kind, "answer") ||
+		strings.Contains(kind, "artifact") ||
+		strings.Contains(kind, "attachment") {
+		return true
+	}
+	return notificationKind == "turn_completed"
+}
+
+func outboxDeliveryTransient(msg OutboxMessage) bool {
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	switch kind {
+	case "canceled", "interrupted", "queued-status":
+		return true
+	}
+	return strings.HasPrefix(kind, "codex-status-") ||
+		strings.HasPrefix(kind, "codex-progress-") ||
+		strings.HasPrefix(kind, "status-") ||
+		strings.HasPrefix(kind, "progress-") ||
+		strings.HasPrefix(kind, "interrupted-after-restart")
 }
 
 func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
@@ -1735,6 +1784,9 @@ func (s *Store) QueueOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessa
 		}
 		if msg.Status == "" {
 			msg.Status = OutboxStatusQueued
+		}
+		if outboxDeliveryTransient(msg) && !outboxDeliveryProtected(msg) {
+			msg.UpgradeNonBlocking = true
 		}
 		if msg.Sequence <= 0 {
 			msg.Sequence = allocateChatSequence(state, msg.TeamsChatID, now)
@@ -2154,6 +2206,28 @@ func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
 			markInboundIgnoredForInterruptedTurn(state, turn, now)
 			report.InterruptedTurnIDs = append(report.InterruptedTurnIDs, id)
 		}
+		for id, msg := range state.OutboxMessages {
+			if outboxDeliveryProtected(msg) {
+				if OutboxBlocksUpgrade(*state, msg, now) {
+					report.PreservedOutboxBlockerIDs = append(report.PreservedOutboxBlockerIDs, id)
+				}
+				continue
+			}
+			if !outboxDeliveryTransient(msg) {
+				continue
+			}
+			switch msg.Status {
+			case OutboxStatusQueued, OutboxStatusSending:
+				msg.Status = OutboxStatusSkipped
+				msg.LastSendError = "superseded by teams recover"
+				msg.UpdatedAt = now
+				state.OutboxMessages[id] = msg
+				report.SupersededOutboxIDs = append(report.SupersededOutboxIDs, id)
+			}
+		}
+		sort.Strings(report.InterruptedTurnIDs)
+		sort.Strings(report.SupersededOutboxIDs)
+		sort.Strings(report.PreservedOutboxBlockerIDs)
 		return nil
 	})
 	return report, err
