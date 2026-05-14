@@ -79,6 +79,17 @@ func TestDiscoverSkillTreesSupportsRepoRootSkill(t *testing.T) {
 	}
 }
 
+func TestExportNameForSkillPreservesSkillSuffixWhenSourceNameIsLong(t *testing.T) {
+	source := Source{Name: strings.Repeat("very-long-source-name-", 8)}
+	name := exportNameForSkill(source, "review", "skills/review")
+	if len(name) > 80 {
+		t.Fatalf("export name len = %d, want <= 80: %q", len(name), name)
+	}
+	if !strings.HasSuffix(name, "__review") {
+		t.Fatalf("export name = %q, want __review suffix preserved", name)
+	}
+}
+
 func TestDetectCaseFoldCollisionsRejectsCrossPlatformAmbiguity(t *testing.T) {
 	err := detectCaseFoldCollisions([]treeFile{
 		{RepoPath: "skills/review/SKILL.md", RelPath: "skills/review/SKILL.md"},

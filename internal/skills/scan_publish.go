@@ -227,6 +227,7 @@ func parseSkillName(data []byte, sourceDir string) (string, error) {
 }
 
 func exportNameForSkill(source Source, skillName string, sourceDir string) string {
+	const maxExportNameLen = 80
 	base := safeName(source.Name)
 	skill := safeName(skillName)
 	if base == "" {
@@ -235,12 +236,30 @@ func exportNameForSkill(source Source, skillName string, sourceDir string) strin
 	if skill == "" {
 		skill = safeName(path.Base(sourceDir))
 	}
-	name := base + "__" + skill
-	if len(name) > 80 {
-		name = name[:80]
-		name = strings.TrimRight(name, ".-_")
+	if len(skill) > 40 {
+		skill = strings.TrimRight(skill[:40], ".-_")
+		if skill == "" {
+			skill = "skill"
+		}
 	}
-	return name
+	suffix := "__" + skill
+	maxBaseLen := maxExportNameLen - len(suffix)
+	if maxBaseLen < 8 {
+		maxBaseLen = 8
+		maxSkillLen := maxExportNameLen - maxBaseLen - 2
+		skill = strings.TrimRight(skill[:maxSkillLen], ".-_")
+		if skill == "" {
+			skill = "skill"
+		}
+		suffix = "__" + skill
+	}
+	if len(base) > maxBaseLen {
+		base = strings.TrimRight(base[:maxBaseLen], ".-_")
+		if base == "" {
+			base = "source"
+		}
+	}
+	return base + suffix
 }
 
 func publishSkills(targetRoot string, source Source, commit string, trees []skillTree) ([]InstalledSkill, error) {
