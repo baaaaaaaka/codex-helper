@@ -344,7 +344,7 @@ jobs:
           set -euo pipefail
           bridge_pattern='Test(BridgeAsync(QueuedTurnsRunAcrossSessionsButSerializeEachSession|TurnsQueuesTeamsInputWhileCodexIsRunning|TurnsSendsQueuedNoticeForEveryNewBacklogMessage)|BridgeWarnsWhenCodexIdleMayBeStuck|BridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive|BridgeSessionCancel(LastRunningTurnCancelsExecutor|RunningTurnWithoutLiveHandleExplainsLimit)|LatestCancelableTurnIDPrefersRunningOverQueued|BridgePollOnce(BoostsAfterRealInboundAndFinalOutput|PrioritizesRunningWorkChatUnderPerCycleLimit|ContinuesOtherDueChatsAfterReadRateLimit|ParksIdleWorkChatAndSendsFreezeNotice|DoesNotRepeatFreezeNoticeFrom(SentOutbox|GraphHistory)|SendsNewFreezeNoticeAfterEarlierResume|IgnoresStaleControlFallbackRegistryProjection)|BridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn|BridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity|BridgeControlResume(ClearsStaleContinuationBeforePolling|KeyOnlyReactivatesMatchingParkedChat|KeyReactivatesParkedWorkChat)|BridgeControlPollIgnoresHistoricalHelperOutputAndClearsContinuation|BridgeSyncLinkedTranscript(DedupesQueuedLiveFinal|ResumesInterruptedImportAfterOwnerRestart|RetriesRemainingRecordsFromSameLine)|BridgeHistoryWatch.*|LinkedCheckpointFileUnchangedRequiresFullyProcessedOffset|ChatPollScheduleCanClearContinuationPath|StoreConcurrentDistinctSessionWritersDoNotCrossMutate|InboundPollDecision(Thresholds|FutureActivityStaysHot|IgnoresControlContinuation)|SortInboundPollDecisionsPrioritizesRunningUnderCycleCap)$'
           transcript_pattern='Test(ReadSessionTranscriptSince(RefusesMissingCheckpoint|MatchesFullTailForSourceCheckpoint|MatchesFullTailForFallbackCheckpoint|RefusesInvalidLineLikeCheckpoint|FallsBackForPrefixDuplicateSourceIDs|AvoidsFullParseWorkForTail)|HistoryTiered(StatDetectsOnlyChangedFiles|ListSessionFilesInDirs|ScanTail(WaitsForCompletedTurn|MethodTurnCompletedWithItems|MultipleFinalAnswersInOneTail|UsesLastAssistantBeforeTerminal|DoesNotCompleteDifferentTurn|TreatsFinalAnswerPhaseAsComplete|FallbackIDsMatchFullParserWithSessionID|DoesNotTreatFinalAnswerTextAsPhase|DoesNotConsumeIncompleteTrailingLine|CapsLargeTail|CanRecoverAfterLargeTailCap|TruncateDoesNotSkipRewrittenContent)))$'
-          render_artifact_pattern='Test(DefaultTeamsChunkLimitsAreClientConservative|RenderTeamsHTMLCodexMarkdownRulesAndBlockquotesUseStructuralHTML|ParseArtifactManifestAllowsZipArtifacts|PrepareOutboundAttachmentAllowsZip|BridgePollAllowsOwnerMessageStartingWithHelperPrefix)$'
+          render_artifact_pattern='Test(DefaultTeamsChunkLimitsAreClientConservative|RenderTeamsHTMLCodexMarkdownRulesAndBlockquotesUseStructuralHTML|ParseArtifactManifestAllowsZipArtifacts|PrepareOutboundAttachmentAllowsZip|BridgePollAllowsOwnerMessageStartingWithHelperPrefix|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
           workflow_pattern='Test(WorkflowNotificationsDisabledByDefault|WorkflowNotification(SendsAfterDurableOutboxSent|SendsDetectedCodexAnswerOnce|SendsManualHelperUpgradeCard|SkipsPlainAutoHelperUpgradeNotice|FallsBackToSidecarConfigWhenOldHelperErasesState|DoesNotDuplicateAfterAmbiguousFailure|ConcurrentFlushClaimsOnce|StaleSendingBecomesUnknown|RetriesOnlyRetryableFailuresWithBackoff|SuppressesAfterControlChatRebind|SkipsHistoricalImportsAndNotifiesDetectedSyncFinals|SupportsRecreatedChatMovedNotice)|QueueOutbox(SuppressesOwnerMentionWhenWorkflowNotificationEnabled|KeepsOwnerMentionWhenWorkflowNotificationDisabled)|WorkflowWebhookURLFileSafety|ConfigureWorkflowNotificationsFromWebhookURLWritesPrivateSecret|BridgeControlWebhook(CommandConfiguresWorkflowWithoutRunningCodex|RejectsInvalidURLWithoutRunningCodex)|PostWorkflowWebhook(SendsAdaptiveCard|RejectsUnsafeActionURL|RejectsNonAbsoluteWebhookURL|RejectsOversizedPayload|RetriesTooManyRequests|ClassifiesServerErrorAsDeliveryUncertain|ClassifiesTransportErrorAsDeliveryUncertain|ClassifiesInterruptedRateLimitWaitAsRetryable))$'
           workflow_cli_pattern='TestTeamsWorkflowStatus(RedactsWebhookURL|ReadsSidecarConfig)$'
           go test ./internal/teams ./internal/teams/store -count=1 -run "$bridge_pattern" -v
@@ -386,6 +386,19 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\ci\teams_supervisor_smoke.ps1
+
+      - name: Teams installed binary local smoke (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/teams_installed_smoke.sh
+
+      - name: Teams installed binary local smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\scripts\ci\teams_installed_smoke.ps1
 
       - name: Self-update env pollution regressions (Linux/macOS)
         if: runner.os != 'Windows'
@@ -461,6 +474,45 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional '@openai/codex'
+
+      - name: Teams app-server probe (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v codex >/dev/null 2>&1; then
+            echo "Codex not available, skipping Teams app-server probe"
+            exit 0
+          fi
+          if ! codex app-server --help >/dev/null 2>&1; then
+            echo "Codex app-server is unavailable, skipping Teams app-server probe"
+            exit 0
+          fi
+          go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path "$(command -v codex)" --workdir "$RUNNER_TEMP" --probe-timeout 20s --appserver-probe-runs 2
+
+      - name: Teams app-server probe (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
+          if (-not $codexCommand) {
+            Write-Host "Codex not available, skipping Teams app-server probe"
+            exit 0
+          }
+          $appServerAvailable = $false
+          try {
+            & codex app-server --help *> $null
+            $appServerAvailable = ($LASTEXITCODE -eq 0)
+          } catch {
+            $appServerAvailable = $false
+          }
+          if (-not $appServerAvailable) {
+            Write-Host "Codex app-server is unavailable, skipping Teams app-server probe"
+            exit 0
+          }
+          go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path $codexCommand.Source --workdir $env:RUNNER_TEMP --probe-timeout 20s --appserver-probe-runs 2
 
       - name: Codex upgrade integration (system npm, Linux/macOS)
         if: runner.os != 'Windows'
@@ -753,6 +805,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          teams_resource_pattern='Test(BridgePollDropsHelperAttachmentEchoWithoutDurableMatch|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
           img="$DISTRO_IMAGE"
           echo "==> $img (cloudgate tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
@@ -763,9 +816,9 @@ jobs:
           echo "==> $img (proc zombie/parser tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_proc_test -test.v -test.count=1 -test.run='Test(IsAliveTreatsLinuxZombieAsDead|LinuxProcStateFromStatParsesLastParen)$'
-          echo "==> $img (Teams resource cleanup tests)"
+          echo "==> $img (Teams resource cleanup, artifact, transcript, and simulated-live tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_test -test.v -test.count=1 -test.run='Test(BridgePollDropsHelperAttachmentEchoWithoutDurableMatch|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch)$'
+            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_resource_pattern"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestChatPollSchedule(NoopDoesNotRewriteState|BlockedNoopPreservesPreviousState|ParkedNoopPreservesParkedAt)$'
 
@@ -774,6 +827,7 @@ jobs:
         run: |
           set -euo pipefail
           teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
+          teams_nonroot_artifact='Test(P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
           img="$DISTRO_IMAGE"
           echo "==> $img (Teams keepalive tests as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
@@ -803,6 +857,16 @@ jobs:
             -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
             -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_teams_store_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
+          echo "==> $img (Teams artifact/transcript/simulated-live tests as non-root uid 1000)"
+          docker run --rm --user 1000:1000 \
+            -e HOME=/tmp/codex-home \
+            -e XDG_CONFIG_HOME=/tmp/codex-config \
+            -e XDG_CACHE_HOME=/tmp/codex-cache \
+            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+            -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_nonroot_artifact"
           echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \

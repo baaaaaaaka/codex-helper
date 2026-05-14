@@ -224,6 +224,41 @@ jobs:
           go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
           go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
 
+      - name: Teams app-server probe (Linux/macOS)
+        if: runner.os != 'Windows'
+        id: appserver_probe_unix
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! codex app-server --help >/dev/null 2>&1; then
+            echo "Codex app-server is unavailable for ${CODEX_VERSION}, skipping Teams app-server probe"
+            exit 0
+          fi
+          go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path "$(command -v codex)" --workdir "$RUNNER_TEMP" --probe-timeout 20s --appserver-probe-runs 2
+
+      - name: Teams app-server probe (Windows)
+        if: runner.os == 'Windows'
+        id: appserver_probe_windows
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $appServerAvailable = $false
+          try {
+            & codex app-server --help *> $null
+            $appServerAvailable = ($LASTEXITCODE -eq 0)
+          } catch {
+            $appServerAvailable = $false
+          }
+          if (-not $appServerAvailable) {
+            Write-Host "Codex app-server is unavailable for $env:CODEX_VERSION, skipping Teams app-server probe"
+            exit 0
+          }
+          $codexPath = (Get-Command codex).Source
+          go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path $codexPath --workdir $env:RUNNER_TEMP --probe-timeout 20s --appserver-probe-runs 2
+
       - name: Write platform result
         if: always()
         shell: bash
@@ -231,15 +266,19 @@ jobs:
           RUNNER_OS: ${{ runner.os }}
           PROBE_OUTCOME_UNIX: ${{ steps.wrapper_probe_unix.outcome }}
           PROBE_OUTCOME_WINDOWS: ${{ steps.wrapper_probe_windows.outcome }}
+          APPSERVER_OUTCOME_UNIX: ${{ steps.appserver_probe_unix.outcome }}
+          APPSERVER_OUTCOME_WINDOWS: ${{ steps.appserver_probe_windows.outcome }}
           SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
         run: |
           set -euo pipefail
           status="fail"
           probe_outcome="$PROBE_OUTCOME_UNIX"
+          appserver_outcome="$APPSERVER_OUTCOME_UNIX"
           if [ "$RUNNER_OS" = "Windows" ]; then
             probe_outcome="$PROBE_OUTCOME_WINDOWS"
+            appserver_outcome="$APPSERVER_OUTCOME_WINDOWS"
           fi
-          if [ "$probe_outcome" = "success" ] && [ "$SMOKE_OUTCOME" = "success" ]; then
+          if [ "$probe_outcome" = "success" ] && [ "$SMOKE_OUTCOME" = "success" ] && [ "$appserver_outcome" = "success" ]; then
             status="pass"
           fi
           mkdir -p results
@@ -255,10 +294,10 @@ jobs:
           path: results/${{ env.PLATFORM_NAME }}-${{ env.CODEX_VERSION }}.json
 
       - name: Fail when probe or smoke failed
-        if: steps.smoke.outcome != 'success' || (runner.os == 'Windows' && steps.wrapper_probe_windows.outcome != 'success') || (runner.os != 'Windows' && steps.wrapper_probe_unix.outcome != 'success')
+        if: steps.smoke.outcome != 'success' || (runner.os == 'Windows' && (steps.wrapper_probe_windows.outcome != 'success' || steps.appserver_probe_windows.outcome != 'success')) || (runner.os != 'Windows' && (steps.wrapper_probe_unix.outcome != 'success' || steps.appserver_probe_unix.outcome != 'success'))
         shell: bash
         run: |
-          echo "Codex wrapper probe or patch+yolo smoke failed on ${PLATFORM_NAME}" >&2
+          echo "Codex wrapper probe, Teams app-server probe, or patch+yolo smoke failed on ${PLATFORM_NAME}" >&2
           exit 1
 
   test-linux-distros:
