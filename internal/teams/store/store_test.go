@@ -3016,6 +3016,138 @@ func TestTeamsBackgroundKeepaliveOldGenerationCannotReleaseNewHolderCI(t *testin
 	}
 }
 
+func TestTeamsBackgroundKeepaliveSharedHomeTakeoverPreservesQueuedWorkAndRejectsOldMachineCI(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	scope := ScopeIdentity{ID: "scope-1", AccountID: "user-1", OSUser: "alice", Profile: "default"}
+
+	machineA := MachineRecord{ID: "machine-a", ScopeID: scope.ID, Kind: MachineKindPrimary, Hostname: "host-a", Priority: 10}
+	ownerA := testOwner("session-a", "turn-a", now)
+	ownerA.PID = 1111
+	ownerA.Hostname = "host-a"
+	ownerA.ScopeID = scope.ID
+	ownerA.MachineID = machineA.ID
+	first, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineA, Owner: ownerA, Duration: time.Minute, Now: now})
+	if err != nil {
+		t.Fatalf("machine A ClaimControlLease error: %v", err)
+	}
+	if first.Mode != LeaseModeActive || first.Lease.Generation != 1 {
+		t.Fatalf("machine A decision = %#v, want active generation 1", first)
+	}
+	ownerA.LeaseGeneration = first.Lease.Generation
+	if _, err := store.RecordOwnerHeartbeat(ctx, ownerA, time.Minute, now); err != nil {
+		t.Fatalf("machine A RecordOwnerHeartbeat error: %v", err)
+	}
+	queued, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:              "outbox:machine-a-before-takeover",
+		SessionID:       "session-a",
+		TurnID:          "turn-a",
+		TeamsChatID:     "chat-1",
+		ScopeID:         scope.ID,
+		MachineID:       machineA.ID,
+		LeaseGeneration: first.Lease.Generation,
+		Kind:            "final",
+		Body:            "queued before shared-home takeover",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox before takeover error: %v", err)
+	}
+
+	takeoverAt := now.Add(2 * time.Minute)
+	machineB := MachineRecord{ID: "machine-b", ScopeID: scope.ID, Kind: MachineKindPrimary, Hostname: "host-b", Priority: 10}
+	ownerB := testOwner("session-b", "turn-b", takeoverAt)
+	ownerB.PID = 2222
+	ownerB.Hostname = "host-b"
+	ownerB.ScopeID = scope.ID
+	ownerB.MachineID = machineB.ID
+	second, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineB, Owner: ownerB, Duration: time.Minute, Now: takeoverAt})
+	if err != nil {
+		t.Fatalf("machine B ClaimControlLease error: %v", err)
+	}
+	if second.Mode != LeaseModeActive || second.Lease.HolderMachineID != machineB.ID || second.Lease.Generation <= first.Lease.Generation {
+		t.Fatalf("machine B decision = %#v, want active newer generation", second)
+	}
+	ownerB.LeaseGeneration = second.Lease.Generation
+	if _, recovered, err := store.RecoverStaleOwner(ctx, ownerB, time.Minute, takeoverAt); err != nil {
+		t.Fatalf("machine B RecoverStaleOwner error: %v", err)
+	} else if !recovered {
+		t.Fatal("machine B RecoverStaleOwner recovered = false")
+	}
+
+	if _, err := store.ValidateControlLease(ctx, machineA.ID, first.Lease.Generation, takeoverAt.Add(time.Second)); !errors.Is(err, ErrControlLeaseNotHeld) {
+		t.Fatalf("machine A old generation ValidateControlLease error = %v, want ErrControlLeaseNotHeld", err)
+	}
+	released, err := store.ReleaseControlLeaseIfHolder(ctx, machineA.ID, first.Lease.Generation)
+	if err != nil {
+		t.Fatalf("machine A stale ReleaseControlLeaseIfHolder error: %v", err)
+	}
+	if released {
+		t.Fatal("machine A stale generation released machine B lease")
+	}
+
+	wokenA := ownerA
+	wokenA.ActiveSessionID = "session-a-resumed"
+	wokenA.ActiveTurnID = "turn-a-resumed"
+	if _, err := store.RecordOwnerHeartbeat(ctx, wokenA, time.Minute, takeoverAt.Add(10*time.Second)); !errors.Is(err, ErrOwnerLive) {
+		t.Fatalf("machine A stale RecordOwnerHeartbeat error = %v, want ErrOwnerLive", err)
+	}
+
+	pending, err := store.PendingOutboxAt(ctx, takeoverAt.Add(10*time.Second))
+	if err != nil {
+		t.Fatalf("PendingOutboxAt after takeover error: %v", err)
+	}
+	var preserved *OutboxMessage
+	for i := range pending {
+		if pending[i].ID == queued.ID {
+			preserved = &pending[i]
+			break
+		}
+	}
+	if preserved == nil {
+		t.Fatalf("pre-takeover outbox missing after shared-home takeover: %#v", pending)
+	}
+	if preserved.Body != queued.Body || preserved.MachineID != machineA.ID || preserved.LeaseGeneration != first.Lease.Generation {
+		t.Fatalf("pre-takeover outbox mutated: %#v", *preserved)
+	}
+
+	later, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:              "outbox:machine-b-after-takeover",
+		SessionID:       "session-b",
+		TurnID:          "turn-b",
+		TeamsChatID:     "chat-1",
+		ScopeID:         scope.ID,
+		MachineID:       machineB.ID,
+		LeaseGeneration: second.Lease.Generation,
+		Kind:            "final",
+		Body:            "queued after shared-home takeover",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox after takeover error: %v", err)
+	}
+	earlier, ok, err := store.EarlierUnsentOutbox(ctx, later)
+	if err != nil {
+		t.Fatalf("EarlierUnsentOutbox error: %v", err)
+	}
+	if !ok || earlier.ID != queued.ID {
+		t.Fatalf("post-takeover outbox should remain ordered behind pre-takeover outbox; earlier=%#v ok=%v", earlier, ok)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load final state error: %v", err)
+	}
+	if state.ControlLease.HolderMachineID != machineB.ID || state.ControlLease.Generation != second.Lease.Generation {
+		t.Fatalf("final control lease = %#v, want machine B generation %d", state.ControlLease, second.Lease.Generation)
+	}
+	if state.Machines[machineA.ID].Status != MachineStatusStandby || state.Machines[machineB.ID].Status != MachineStatusActive {
+		t.Fatalf("final machine statuses unexpected: %#v", state.Machines)
+	}
+	if owner, ok := state.readOwner(); !ok || owner.MachineID != machineB.ID || owner.LeaseGeneration != second.Lease.Generation {
+		t.Fatalf("final owner = %#v ok=%v, want machine B generation %d", owner, ok, second.Lease.Generation)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveSameHolderRefreshPreservesGenerationCI(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

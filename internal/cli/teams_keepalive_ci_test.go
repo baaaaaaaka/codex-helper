@@ -1928,6 +1928,262 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackProcessCleanupPowerShellCI(t 
 	}
 }
 
+type simulatedTeamsStartupFallbackProcess struct {
+	pid         int
+	commandLine string
+	current     bool
+	stopped     bool
+}
+
+func simulateTeamsStartupFallbackCleanup(processes []simulatedTeamsStartupFallbackProcess, needles ...string) []simulatedTeamsStartupFallbackProcess {
+	out := append([]simulatedTeamsStartupFallbackProcess(nil), processes...)
+	lowerNeedles := make([]string, 0, len(needles))
+	for _, needle := range needles {
+		needle = strings.TrimSpace(needle)
+		if needle != "" {
+			lowerNeedles = append(lowerNeedles, strings.ToLower(needle))
+		}
+	}
+	for i := range out {
+		if out[i].current || strings.TrimSpace(out[i].commandLine) == "" {
+			continue
+		}
+		lowerCommand := strings.ToLower(out[i].commandLine)
+		for _, needle := range lowerNeedles {
+			if strings.Contains(lowerCommand, needle) {
+				out[i].stopped = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+func simulatedStoppedStartupFallbackPIDs(processes []simulatedTeamsStartupFallbackProcess) []int {
+	var pids []int
+	for _, process := range processes {
+		if process.stopped {
+			pids = append(pids, process.pid)
+		}
+	}
+	return pids
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackCleanupSimulationCI(t *testing.T) {
+	scriptPath := `C:\Users\Alice\AppData\Local\codex-helper\teams\codex-helper-teams-wsl-AbC.ps1`
+	launcherPath := `C:\Users\Alice\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\codex-helper-teams-wsl-AbC.vbs`
+	legacyCmdLauncherPath := `C:\Users\Alice\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\codex-helper-teams-wsl-AbC.cmd`
+	processes := []simulatedTeamsStartupFallbackProcess{
+		{pid: 101, commandLine: `powershell.exe -NoProfile -File "` + strings.ToUpper(scriptPath) + `"`},
+		{pid: 102, commandLine: `wscript.exe //B //Nologo "` + launcherPath + `"`},
+		{pid: 103, commandLine: `cmd.exe /c "` + legacyCmdLauncherPath + `"`},
+		{pid: 104, commandLine: `powershell.exe -NoProfile -File "C:\Temp\codex-helper-teams-wsl-AbC.ps1"`},
+		{pid: 105, commandLine: `powershell.exe -Command cleanup "` + scriptPath + `"`, current: true},
+		{pid: 106},
+	}
+
+	cleaned := simulateTeamsStartupFallbackCleanup(processes, scriptPath, launcherPath, legacyCmdLauncherPath)
+	if got, want := simulatedStoppedStartupFallbackPIDs(cleaned), []int{101, 102, 103}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stopped pids = %#v, want %#v; processes=%#v", got, want, cleaned)
+	}
+}
+
+type simulatedTeamsStartupFallbackSupervisor struct {
+	wrapperAlive bool
+	childAlive   bool
+	listenerHeld bool
+	starts       int
+	cleanups     int
+}
+
+func (s *simulatedTeamsStartupFallbackSupervisor) cleanupStaleWrapper() {
+	s.cleanups++
+	s.wrapperAlive = false
+}
+
+func (s *simulatedTeamsStartupFallbackSupervisor) startAfterCleanup() string {
+	s.cleanupStaleWrapper()
+	if s.listenerHeld {
+		return "listener-held-by-existing-process"
+	}
+	s.wrapperAlive = true
+	s.childAlive = true
+	s.listenerHeld = true
+	s.starts++
+	return ""
+}
+
+func (s *simulatedTeamsStartupFallbackSupervisor) childExit() {
+	s.childAlive = false
+	s.listenerHeld = false
+}
+
+func (s simulatedTeamsStartupFallbackSupervisor) health() string {
+	switch {
+	case s.wrapperAlive && s.childAlive && s.listenerHeld:
+		return "healthy"
+	case !s.wrapperAlive && s.childAlive && s.listenerHeld:
+		return "orphan-listener"
+	case s.wrapperAlive && !s.listenerHeld:
+		return "wrapper-without-listener"
+	default:
+		return "stopped"
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackOrphanChildSimulationCI(t *testing.T) {
+	supervisor := simulatedTeamsStartupFallbackSupervisor{
+		wrapperAlive: true,
+		childAlive:   true,
+		listenerHeld: true,
+	}
+	supervisor.cleanupStaleWrapper()
+	if got := supervisor.health(); got != "orphan-listener" {
+		t.Fatalf("health after wrapper cleanup = %q, want orphan-listener", got)
+	}
+	if got := supervisor.startAfterCleanup(); got != "listener-held-by-existing-process" {
+		t.Fatalf("start while orphan child holds listener = %q, want listener-held-by-existing-process", got)
+	}
+	if supervisor.starts != 0 {
+		t.Fatalf("start count while listener is occupied = %d, want 0", supervisor.starts)
+	}
+
+	supervisor.childExit()
+	if got := supervisor.health(); got != "stopped" {
+		t.Fatalf("health after orphan child exits = %q, want stopped", got)
+	}
+	if got := supervisor.startAfterCleanup(); got != "" {
+		t.Fatalf("start after orphan child exits error = %q, want success", got)
+	}
+	if got := supervisor.health(); got != "healthy" {
+		t.Fatalf("health after clean restart = %q, want healthy", got)
+	}
+	if supervisor.starts != 1 || supervisor.cleanups != 3 {
+		t.Fatalf("supervisor counters = starts:%d cleanups:%d, want starts:1 cleanups:3", supervisor.starts, supervisor.cleanups)
+	}
+}
+
+type simulatedTeamsServiceHealthInput struct {
+	windowsTaskState       string
+	startupFallbackRunning bool
+	listenerAlive          bool
+	ownerPresent           bool
+	ownerHeartbeatAge      time.Duration
+	lastPollAge            time.Duration
+	queuedOutbox           int
+}
+
+func simulatedTeamsServiceHealth(input simulatedTeamsServiceHealthInput, ownerStaleAfter time.Duration, pollStaleAfter time.Duration) string {
+	supervisorRunning := strings.EqualFold(input.windowsTaskState, "running") || input.startupFallbackRunning
+	if !input.listenerAlive {
+		if input.queuedOutbox > 0 {
+			return "upgrade-blocked-listener-stopped"
+		}
+		if supervisorRunning {
+			return "supervisor-running-listener-stopped"
+		}
+		return "listener-stopped"
+	}
+	if !input.ownerPresent {
+		return "owner-missing"
+	}
+	if ownerStaleAfter > 0 && input.ownerHeartbeatAge > ownerStaleAfter {
+		return "owner-stale"
+	}
+	if pollStaleAfter > 0 && input.lastPollAge > pollStaleAfter {
+		return "poll-stale"
+	}
+	if !supervisorRunning {
+		return "listener-unsupervised"
+	}
+	if strings.EqualFold(input.windowsTaskState, "disabled") && input.startupFallbackRunning {
+		return "healthy-fallback"
+	}
+	return "healthy"
+}
+
+func TestTeamsBackgroundKeepaliveSimulatedStatusRequiresListenerOwnerAndPollFreshCI(t *testing.T) {
+	const ownerStaleAfter = time.Minute
+	const pollStaleAfter = 2 * time.Minute
+	tests := []struct {
+		name  string
+		input simulatedTeamsServiceHealthInput
+		want  string
+	}{
+		{
+			name: "disabled task can be healthy when startup fallback owns a fresh listener",
+			input: simulatedTeamsServiceHealthInput{
+				windowsTaskState:       "Disabled",
+				startupFallbackRunning: true,
+				listenerAlive:          true,
+				ownerPresent:           true,
+				ownerHeartbeatAge:      10 * time.Second,
+				lastPollAge:            20 * time.Second,
+			},
+			want: "healthy-fallback",
+		},
+		{
+			name: "running scheduler task alone is not healthy",
+			input: simulatedTeamsServiceHealthInput{
+				windowsTaskState: "Running",
+				listenerAlive:    false,
+				ownerPresent:     true,
+			},
+			want: "supervisor-running-listener-stopped",
+		},
+		{
+			name: "queued outbox without listener remains an upgrade blocker",
+			input: simulatedTeamsServiceHealthInput{
+				windowsTaskState: "Disabled",
+				listenerAlive:    false,
+				queuedOutbox:     3,
+			},
+			want: "upgrade-blocked-listener-stopped",
+		},
+		{
+			name: "listener with stale owner heartbeat is unhealthy",
+			input: simulatedTeamsServiceHealthInput{
+				windowsTaskState:       "Disabled",
+				startupFallbackRunning: true,
+				listenerAlive:          true,
+				ownerPresent:           true,
+				ownerHeartbeatAge:      90 * time.Second,
+				lastPollAge:            20 * time.Second,
+			},
+			want: "owner-stale",
+		},
+		{
+			name: "listener with stale poll is unhealthy",
+			input: simulatedTeamsServiceHealthInput{
+				windowsTaskState:       "Disabled",
+				startupFallbackRunning: true,
+				listenerAlive:          true,
+				ownerPresent:           true,
+				ownerHeartbeatAge:      10 * time.Second,
+				lastPollAge:            5 * time.Minute,
+			},
+			want: "poll-stale",
+		},
+		{
+			name: "listener without any supervisor is a restart risk",
+			input: simulatedTeamsServiceHealthInput{
+				listenerAlive:     true,
+				ownerPresent:      true,
+				ownerHeartbeatAge: 10 * time.Second,
+				lastPollAge:       10 * time.Second,
+			},
+			want: "listener-unsupervised",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := simulatedTeamsServiceHealth(tc.input, ownerStaleAfter, pollStaleAfter); got != tc.want {
+				t.Fatalf("health = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTeamsBackgroundKeepaliveWSLStartupFallbackProcessCleanupNativeWindowsCI(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("native PowerShell process cleanup is Windows-only")
