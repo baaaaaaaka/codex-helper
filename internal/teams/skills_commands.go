@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,14 +18,9 @@ func (b *Bridge) handleSkillsCommand(ctx context.Context, chatID string, arg str
 	if err != nil {
 		return b.sendToChat(ctx, chatID, "skills setup failed: "+err.Error())
 	}
-	fields := strings.Fields(strings.TrimSpace(arg))
-	name := ""
-	action := "list"
-	if len(fields) > 0 {
-		action = strings.ToLower(fields[0])
-	}
-	if len(fields) > 1 {
-		name = fields[1]
+	action, rest := splitTeamsSkillsCommand(arg)
+	if action == "" {
+		action = "list"
 	}
 	switch action {
 	case "", "list", "status", "st":
@@ -33,7 +29,15 @@ func (b *Bridge) handleSkillsCommand(ctx context.Context, chatID string, arg str
 			return b.sendToChat(ctx, chatID, "skills list failed: "+err.Error())
 		}
 		return b.sendToChat(ctx, chatID, formatTeamsSkillEntries(entries))
+	case "add":
+		rawURL := cleanTeamsSkillURL(rest)
+		if rawURL == "" {
+			return b.sendToChat(ctx, chatID, "usage: `helper skills add <github/gitlab/git-url>`")
+		}
+		source, result, err := mgr.Add(ctx, rawURL, skills.AddOptions{})
+		return b.sendToChat(ctx, chatID, formatTeamsSkillAddResult(source, result, err))
 	case "sync":
+		name := firstTeamsSkillArg(rest)
 		results, err := mgr.Sync(ctx, skills.SyncOptions{Name: name, All: name == ""})
 		body := formatTeamsSkillSyncResults(results)
 		if err != nil {
@@ -41,6 +45,7 @@ func (b *Bridge) handleSkillsCommand(ctx context.Context, chatID string, arg str
 		}
 		return b.sendToChat(ctx, chatID, body)
 	case "push":
+		name := firstTeamsSkillArg(rest)
 		changes, err := mgr.LocalChanges(ctx, name)
 		if err != nil {
 			return b.sendToChat(ctx, chatID, "skills push review failed: "+err.Error())
@@ -49,11 +54,34 @@ func (b *Bridge) handleSkillsCommand(ctx context.Context, chatID string, arg str
 			return b.sendToChat(ctx, chatID, "No local skill changes to push.")
 		}
 		return b.sendToChat(ctx, chatID, formatTeamsSkillPushReview(changes))
-	case "add", "remove", "rm":
+	case "remove", "rm":
 		return b.sendToChat(ctx, chatID, "Use local `cxp skills "+action+"` for this operation so auth prompts and destructive confirmations happen in your terminal.")
 	default:
-		return b.sendToChat(ctx, chatID, "usage: `helper skills list`, `helper skills sync [name]`, or `helper skills push [name]`")
+		return b.sendToChat(ctx, chatID, "usage: `helper skills list`, `helper skills add <github/gitlab/git-url>`, `helper skills sync [name]`, or `helper skills push [name]`")
 	}
+}
+
+func splitTeamsSkillsCommand(arg string) (string, string) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return "", ""
+	}
+	action, rest := splitDashboardCommandBody(arg)
+	return strings.ToLower(strings.TrimSpace(action)), strings.TrimSpace(rest)
+}
+
+func firstTeamsSkillArg(rest string) string {
+	fields := strings.Fields(strings.TrimSpace(rest))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func cleanTeamsSkillURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, "<>")
+	return strings.TrimSpace(raw)
 }
 
 func newTeamsSkillsManager() (*skills.Manager, error) {
@@ -113,6 +141,46 @@ func formatTeamsSkillEntries(entries []skills.StatusEntry) string {
 	return b.String()
 }
 
+func formatTeamsSkillAddResult(source skills.Source, result skills.SyncResult, err error) string {
+	if source.Name == "" {
+		if err != nil {
+			return "skills add failed: " + err.Error()
+		}
+		return "skills add failed."
+	}
+	var b strings.Builder
+	b.WriteString("## Skills Add\n")
+	_, _ = fmt.Fprintf(&b, "\n- **%s**", source.Name)
+	if source.RemoteURL != "" {
+		_, _ = fmt.Fprintf(&b, "\n  - remote: `%s`", redactTeamsSkillURL(source.RemoteURL))
+	}
+	if source.Ref != "" {
+		_, _ = fmt.Fprintf(&b, "\n  - ref: `%s`", source.Ref)
+	}
+	if source.Path != "" {
+		_, _ = fmt.Fprintf(&b, "\n  - path: `%s`", source.Path)
+	}
+	if source.AutoSync {
+		b.WriteString("\n  - auto-sync: on")
+	} else {
+		b.WriteString("\n  - auto-sync: off")
+	}
+	if err != nil {
+		status := result.State.Status
+		if status == "" {
+			status = skills.StatusSyncFailed
+		}
+		_, _ = fmt.Fprintf(&b, "\n  - status: `%s`", status)
+		_, _ = fmt.Fprintf(&b, "\n\nInitial sync failed: %s", err.Error())
+		return b.String()
+	}
+	_, _ = fmt.Fprintf(&b, "\n\nInstalled %d skill(s).", len(result.Installed))
+	for _, skill := range result.Installed {
+		_, _ = fmt.Fprintf(&b, "\n- `%s` -> `%s`", skill.Name, skill.ExportName)
+	}
+	return b.String()
+}
+
 func formatTeamsSkillSyncResults(results []skills.SyncResult) string {
 	if len(results) == 0 {
 		return "No skill subscriptions matched."
@@ -147,4 +215,13 @@ func shortTeamsSHA(v string) string {
 		return v
 	}
 	return v[:12]
+}
+
+func redactTeamsSkillURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.User == nil {
+		return raw
+	}
+	parsed.User = url.User("redacted")
+	return parsed.String()
 }

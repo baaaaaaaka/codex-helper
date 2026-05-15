@@ -71,7 +71,7 @@ func TestHandleSkillsCommandQueuesListPushReviewAndLocalOnlyRefusal(t *testing.T
 		machine: teamstore.MachineRecord{ID: "machine"},
 	}
 	ctx := context.Background()
-	for _, cmd := range []string{"list", "push", "add"} {
+	for _, cmd := range []string{"list", "push", "remove"} {
 		if err := bridge.handleSkillsCommand(ctx, "chat-1", cmd); err != nil {
 			t.Fatalf("handle skills %s: %v", cmd, err)
 		}
@@ -84,6 +84,95 @@ func TestHandleSkillsCommandQueuesListPushReviewAndLocalOnlyRefusal(t *testing.T
 	for _, want := range []string{"Skills", "acme", "Skills Push Review", "cxp skills push", "Use local"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("outbox missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestHandleSkillsCommandAddsSourceAndInstallsSkills(t *testing.T) {
+	mgr := newTeamsSkillsTestManager(t)
+	mgr.Git = teamsSkillsAddGitRunner{}
+	prev := newTeamsSkillsManagerForCommand
+	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
+
+	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
+	if err != nil {
+		t.Fatalf("open teams store: %v", err)
+	}
+	graphServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected graph request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m1"}`))
+	}))
+	t.Cleanup(graphServer.Close)
+	bridge := &Bridge{
+		graph:   newTestGraphClient(&fakeGraphAuth{token: "token"}, graphServer, nil),
+		store:   store,
+		scope:   teamstore.ScopeIdentity{ID: "scope"},
+		machine: teamstore.MachineRecord{ID: "machine"},
+	}
+	ctx := context.Background()
+	if err := bridge.handleSkillsCommand(ctx, "chat-1", "add <https://github.com/acme/skills/tree/main/skills/review>"); err != nil {
+		t.Fatalf("handle skills add: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load teams state: %v", err)
+	}
+	body := joinedOutboxBodies(state.OutboxMessages)
+	for _, want := range []string{"Skills Add", "acme-skills", "path: `skills/review`", "Installed 1 skill", "`review` -> `acme-skills__review`"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("skills add response missing %q:\n%s", want, body)
+		}
+	}
+	entries, err := mgr.List(ctx)
+	if err != nil {
+		t.Fatalf("list after add: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Source.Name != "acme-skills" || len(entries[0].State.InstalledSkills) != 1 {
+		t.Fatalf("entries after add = %#v", entries)
+	}
+}
+
+func TestHandleSkillsCommandAddReportsAuthHint(t *testing.T) {
+	mgr := newTeamsSkillsTestManager(t)
+	mgr.Git = teamsSkillsAuthFailGitRunner{}
+	prev := newTeamsSkillsManagerForCommand
+	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
+
+	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
+	if err != nil {
+		t.Fatalf("open teams store: %v", err)
+	}
+	graphServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected graph request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m1"}`))
+	}))
+	t.Cleanup(graphServer.Close)
+	bridge := &Bridge{
+		graph:   newTestGraphClient(&fakeGraphAuth{token: "token"}, graphServer, nil),
+		store:   store,
+		scope:   teamstore.ScopeIdentity{ID: "scope"},
+		machine: teamstore.MachineRecord{ID: "machine"},
+	}
+	ctx := context.Background()
+	if err := bridge.handleSkillsCommand(ctx, "chat-1", "add https://github.com/acme/private/tree/main/skills"); err != nil {
+		t.Fatalf("handle skills add auth failure: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load teams state: %v", err)
+	}
+	body := joinedOutboxBodies(state.OutboxMessages)
+	for _, want := range []string{"Skills Add", "private", "status: `auth_required`", "Authentication hint: run `gh auth login`"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("skills add auth response missing %q:\n%s", want, body)
 		}
 	}
 }
@@ -314,4 +403,47 @@ func joinedOutboxBodies(messages map[string]teamstore.OutboxMessage) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+type teamsSkillsAddGitRunner struct{}
+
+func (teamsSkillsAddGitRunner) Run(_ context.Context, _ string, _ []string, args ...string) ([]byte, error) {
+	joined := strings.Join(args, "\x00")
+	switch {
+	case len(args) >= 1 && args[0] == "init":
+		return nil, nil
+	case len(args) >= 1 && args[0] == "config":
+		return nil, nil
+	case len(args) == 3 && args[0] == "ls-remote" && args[1] == "--heads":
+		return []byte("0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n"), nil
+	case len(args) == 4 && args[0] == "ls-remote" && args[1] == "--symref":
+		return []byte("ref: refs/heads/main\tHEAD\n0123456789abcdef0123456789abcdef01234567\tHEAD\n"), nil
+	case strings.HasPrefix(joined, "fetch\x00"):
+		return nil, nil
+	case len(args) >= 1 && args[0] == "rev-parse":
+		return []byte("0123456789abcdef0123456789abcdef01234567\n"), nil
+	case len(args) >= 1 && args[0] == "ls-tree":
+		return []byte("100644 blob skillmd\tskills/review/SKILL.md\x00"), nil
+	case len(args) == 3 && args[0] == "cat-file" && args[1] == "blob" && args[2] == "skillmd":
+		return []byte("---\nname: review\ndescription: Review\n---\nbody\n"), nil
+	default:
+		return nil, errString("unexpected git args: " + strings.Join(args, " "))
+	}
+}
+
+type teamsSkillsAuthFailGitRunner struct{}
+
+func (teamsSkillsAuthFailGitRunner) Run(_ context.Context, _ string, _ []string, args ...string) ([]byte, error) {
+	switch {
+	case len(args) >= 1 && args[0] == "init":
+		return nil, nil
+	case len(args) >= 1 && args[0] == "config":
+		return nil, nil
+	case len(args) >= 1 && args[0] == "ls-remote":
+		return nil, &skills.GitError{Args: args, Output: "fatal: repository not found", Err: errString("exit status 128")}
+	case len(args) >= 1 && args[0] == "fetch":
+		return nil, &skills.GitError{Args: args, Output: "fatal: repository not found", Err: errString("exit status 128")}
+	default:
+		return nil, errString("unexpected git args: " + strings.Join(args, " "))
+	}
 }
