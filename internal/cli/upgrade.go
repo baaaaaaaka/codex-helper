@@ -37,39 +37,49 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 					IncludePrerelease: includePrerelease,
 				})
 				if status.Supported && !status.UpdateAvailable {
+					if err := rescueTeamsForNoopHelperUpgrade(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), teamsDrainTimeout, installPath); err != nil {
+						return err
+					}
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Already up to date.")
 					return nil
 				}
 			}
 
-			finishTeams, err := prepareTeamsForHelperUpgrade(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), teamsDrainTimeout, nil)
-			if err != nil {
-				return err
-			}
-			res, err := performUpdate(ctx, update.UpdateOptions{
-				Repo:              repo,
-				Version:           versionOverride,
-				InstallPath:       installPath,
-				Timeout:           120 * time.Second,
-				ValidateBinary:    true,
-				IncludePrerelease: includePrerelease,
+			var finishTeams teamsUpgradeFinalizer
+			var res update.ApplyResult
+			err := withTeamsHelperUpgradeInstallLock(ctx, installPath, func() error {
+				var prepareErr error
+				finishTeams, prepareErr = prepareTeamsForHelperUpgrade(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), teamsDrainTimeout, nil)
+				if prepareErr != nil {
+					return prepareErr
+				}
+				res, prepareErr = performUpdate(ctx, update.UpdateOptions{
+					Repo:              repo,
+					Version:           versionOverride,
+					InstallPath:       installPath,
+					Timeout:           120 * time.Second,
+					ValidateBinary:    true,
+					IncludePrerelease: includePrerelease,
+				})
+				updateErr := prepareErr
+				if finishTeams != nil {
+					replacementPending := res.RestartRequired || strings.TrimSpace(res.PendingReplacePath) != ""
+					updateSucceeded := updateErr == nil && !replacementPending
+					restartMode := teamsUpgradeRestartImmediate
+					if updateErr == nil && replacementPending {
+						restartMode = teamsUpgradeRestartDelayed
+					}
+					if cleanupErr := finishTeams(context.Background(), teamsUpgradeFinishOptions{
+						Success:            updateSucceeded,
+						ServiceRestart:     restartMode,
+						InstallPath:        res.InstallPath,
+						PendingReplacePath: res.PendingReplacePath,
+					}); cleanupErr != nil && updateErr == nil {
+						updateErr = cleanupErr
+					}
+				}
+				return updateErr
 			})
-			if finishTeams != nil {
-				replacementPending := res.RestartRequired || strings.TrimSpace(res.PendingReplacePath) != ""
-				updateSucceeded := err == nil && !replacementPending
-				restartMode := teamsUpgradeRestartImmediate
-				if err == nil && replacementPending {
-					restartMode = teamsUpgradeRestartDelayed
-				}
-				if cleanupErr := finishTeams(context.Background(), teamsUpgradeFinishOptions{
-					Success:            updateSucceeded,
-					ServiceRestart:     restartMode,
-					InstallPath:        res.InstallPath,
-					PendingReplacePath: res.PendingReplacePath,
-				}); cleanupErr != nil && err == nil {
-					err = cleanupErr
-				}
-			}
 			if err != nil {
 				return err
 			}

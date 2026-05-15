@@ -1263,6 +1263,127 @@ func TestUpgradeLifecycleRestoresControl(t *testing.T) {
 	}
 }
 
+func TestUpgradeRescueInterruptsRunningPreservesQueuedAndSkipsTransientOutbox(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateSession(ctx, SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(ctx, Turn{ID: "turn:queued", SessionID: "s1", Status: TurnStatusQueued}); err != nil {
+		t.Fatalf("QueueTurn queued error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(ctx, Turn{ID: "turn:running", SessionID: "s1", Status: TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn running error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:status",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-status-001",
+		Status:      OutboxStatusQueued,
+	}); err != nil {
+		t.Fatalf("QueueOutbox status error: %v", err)
+	}
+
+	report, err := store.RescueForUpgrade(ctx, UpgradeRescueOptions{Reason: HelperUpgradeReason})
+	if err != nil {
+		t.Fatalf("RescueForUpgrade error: %v", err)
+	}
+	if report.Upgrade.Phase != UpgradePhaseDraining || report.Upgrade.RescueStartedAt.IsZero() || report.Upgrade.RescueCompletedAt.IsZero() {
+		t.Fatalf("upgrade rescue metadata mismatch: %#v", report.Upgrade)
+	}
+	if got := report.PreservedQueuedTurnIDs; !reflect.DeepEqual(got, []string{"turn:queued"}) {
+		t.Fatalf("PreservedQueuedTurnIDs = %#v, want queued turn", got)
+	}
+	if got := report.InterruptedTurnIDs; !reflect.DeepEqual(got, []string{"turn:running"}) {
+		t.Fatalf("InterruptedTurnIDs = %#v, want running turn", got)
+	}
+	if got := report.SupersededOutboxIDs; !reflect.DeepEqual(got, []string{"outbox:status"}) {
+		t.Fatalf("SupersededOutboxIDs = %#v, want transient outbox", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns["turn:queued"].Status; got != TurnStatusQueued {
+		t.Fatalf("queued turn status = %q, want queued", got)
+	}
+	running := state.Turns["turn:running"]
+	if running.Status != TurnStatusInterrupted || running.RecoveryReason != "interrupted by helper upgrade rescue" {
+		t.Fatalf("running turn after rescue = %#v", running)
+	}
+	if got := state.OutboxMessages["outbox:status"].Status; got != OutboxStatusSkipped {
+		t.Fatalf("transient outbox status = %q, want skipped", got)
+	}
+}
+
+func TestUpgradeRescuePreservesProtectedOutboxBlocker(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:answer",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "answer",
+		Body:        "saved answer",
+		Status:      OutboxStatusQueued,
+	}); err != nil {
+		t.Fatalf("QueueOutbox protected error: %v", err)
+	}
+	report, err := store.RescueForUpgrade(ctx, UpgradeRescueOptions{Reason: HelperUpgradeReason})
+	if err != nil {
+		t.Fatalf("RescueForUpgrade error: %v", err)
+	}
+	if got := report.PreservedOutboxBlockerIDs; !reflect.DeepEqual(got, []string{"outbox:answer"}) {
+		t.Fatalf("PreservedOutboxBlockerIDs = %#v, want protected outbox", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.OutboxMessages["outbox:answer"].Status; got != OutboxStatusQueued {
+		t.Fatalf("protected outbox status = %q, want queued", got)
+	}
+	if !OutboxBlocksUpgrade(state, state.OutboxMessages["outbox:answer"], time.Now()) {
+		t.Fatal("protected outbox should still block upgrade after rescue")
+	}
+}
+
+func TestUpgradeRescueFencesStaleOwnerButRefusesLiveOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	live := testOwner("s1", "turn:running", now)
+	if _, err := store.RecordOwnerHeartbeat(ctx, live, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat live error: %v", err)
+	}
+	if _, err := store.RescueForUpgrade(ctx, UpgradeRescueOptions{Reason: HelperUpgradeReason, StaleAfter: time.Minute}); !errors.Is(err, ErrOwnerLive) {
+		t.Fatalf("live owner rescue error = %v, want ErrOwnerLive", err)
+	}
+	if err := store.ClearOwner(ctx); err != nil {
+		t.Fatalf("ClearOwner after live refusal error: %v", err)
+	}
+	staleHeartbeat := time.Now().Add(-2 * time.Minute)
+	stale := testOwner("s1", "turn:running", staleHeartbeat)
+	if _, err := store.RecordOwnerHeartbeat(ctx, stale, time.Minute, staleHeartbeat); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat stale error: %v", err)
+	}
+	report, err := store.RescueForUpgrade(ctx, UpgradeRescueOptions{Reason: HelperUpgradeReason, StaleAfter: time.Minute})
+	if err != nil {
+		t.Fatalf("stale RescueForUpgrade error: %v", err)
+	}
+	if report.ClearedOwner == nil {
+		t.Fatal("stale owner should be cleared")
+	}
+	if _, ok, err := store.ReadOwner(ctx); err != nil {
+		t.Fatalf("ReadOwner error: %v", err)
+	} else if ok {
+		t.Fatal("owner should be absent after stale rescue")
+	}
+}
+
 func TestUpgradeNotificationTargetsDeduplicate(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

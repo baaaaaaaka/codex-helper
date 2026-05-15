@@ -391,6 +391,7 @@ type ServiceControl struct {
 type UpgradePhase string
 
 const (
+	UpgradePhaseRescuing  UpgradePhase = "rescuing"
 	UpgradePhaseDraining  UpgradePhase = "draining"
 	UpgradePhaseReady     UpgradePhase = "ready"
 	UpgradePhaseCompleted UpgradePhase = "completed"
@@ -408,11 +409,23 @@ type UpgradeRequest struct {
 	CompletionNoticeAt  time.Time                   `json:"completion_notice_at,omitempty"`
 	DeadlineAt          time.Time                   `json:"deadline_at,omitempty"`
 	StartedAt           time.Time                   `json:"started_at,omitempty"`
+	RescueStartedAt     time.Time                   `json:"rescue_started_at,omitempty"`
+	RescueCompletedAt   time.Time                   `json:"rescue_completed_at,omitempty"`
+	RescueActions       []UpgradeRescueAction       `json:"rescue_actions,omitempty"`
 	ReadyAt             time.Time                   `json:"ready_at,omitempty"`
 	CompletedAt         time.Time                   `json:"completed_at,omitempty"`
 	AbortedAt           time.Time                   `json:"aborted_at,omitempty"`
 	AbortReason         string                      `json:"abort_reason,omitempty"`
 	UpdatedAt           time.Time                   `json:"updated_at,omitempty"`
+}
+
+type UpgradeRescueAction struct {
+	Kind      string    `json:"kind,omitempty"`
+	ID        string    `json:"id,omitempty"`
+	SessionID string    `json:"session_id,omitempty"`
+	Status    string    `json:"status,omitempty"`
+	Detail    string    `json:"detail,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 type UpgradeNotificationTarget struct {
@@ -622,6 +635,23 @@ type UpgradeBlocker struct {
 	SessionID string
 	Status    string
 	Detail    string
+}
+
+type UpgradeRescueOptions struct {
+	Reason     string
+	StaleAfter time.Duration
+	ForceOwner bool
+}
+
+type UpgradeRescueReport struct {
+	Upgrade                     UpgradeRequest
+	ClearedOwner                *OwnerMetadata
+	PreservedQueuedTurnIDs      []string
+	InterruptedTurnIDs          []string
+	SupersededOutboxIDs         []string
+	PreservedOutboxBlockerIDs   []string
+	RemainingUpgradeBlockers    []UpgradeBlocker
+	SkippedBecauseOwnerIsActive bool
 }
 
 var ErrOwnerLive = errors.New("Teams owner is active")
@@ -1029,6 +1059,144 @@ func (s *Store) BeginUpgrade(ctx context.Context, reason string, timeout time.Du
 		return nil
 	})
 	return out, err
+}
+
+func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions) (UpgradeRescueReport, error) {
+	reason := strings.TrimSpace(opts.Reason)
+	if reason == "" {
+		reason = HelperUpgradeReason
+	}
+	staleAfter := opts.StaleAfter
+	if staleAfter <= 0 {
+		staleAfter = 2 * time.Minute
+	}
+	var report UpgradeRescueReport
+	err := s.Update(ctx, func(state *State) error {
+		now := time.Now()
+		req := UpgradeRequest{}
+		if activeUpgrade(state.Upgrade) {
+			if state.Upgrade.Reason != reason {
+				return ErrUpgradeInProgress
+			}
+			req = *state.Upgrade
+		} else {
+			previous := state.ServiceControl
+			req = UpgradeRequest{
+				ID:              upgradeID(reason, now),
+				Phase:           UpgradePhaseRescuing,
+				Reason:          reason,
+				PreviousControl: previous,
+				StartedAt:       now,
+				UpdatedAt:       now,
+			}
+			control := previous
+			control.Draining = true
+			control.Reason = reason
+			control.UpdatedAt = now
+			state.ServiceControl = control
+		}
+		if req.Phase != UpgradePhaseCompleted && req.Phase != UpgradePhaseAborted {
+			req.Phase = UpgradePhaseRescuing
+		}
+		if req.RescueStartedAt.IsZero() {
+			req.RescueStartedAt = now
+		}
+
+		if owner, ok := state.readOwner(); ok {
+			canFence := opts.ForceOwner || IsStale(owner, staleAfter, now) || OwnerAppearsLocallyDead(owner)
+			if !canFence {
+				report.SkippedBecauseOwnerIsActive = true
+				return &OwnerConflictError{Existing: owner, Now: now, StaleAfter: staleAfter}
+			}
+			cleared := owner
+			report.ClearedOwner = &cleared
+			state.ServiceOwner = nil
+			state.LockOwner = nil
+			req.RescueActions = append(req.RescueActions, UpgradeRescueAction{
+				Kind:      "clear-owner",
+				ID:        owner.MachineID,
+				SessionID: owner.ActiveSessionID,
+				Detail:    owner.ActiveTurnID,
+				CreatedAt: now,
+			})
+		}
+
+		for id, turn := range state.Turns {
+			switch turn.Status {
+			case TurnStatusQueued:
+				report.PreservedQueuedTurnIDs = append(report.PreservedQueuedTurnIDs, id)
+				req.RescueActions = append(req.RescueActions, UpgradeRescueAction{
+					Kind:      "preserve-queued-turn",
+					ID:        id,
+					SessionID: turn.SessionID,
+					Status:    string(turn.Status),
+					CreatedAt: now,
+				})
+			case TurnStatusRunning:
+				turn.Status = TurnStatusInterrupted
+				turn.InterruptedAt = now
+				turn.RecoveryReason = "interrupted by helper upgrade rescue"
+				turn.UpdatedAt = now
+				state.Turns[id] = turn
+				markInboundIgnoredForInterruptedTurn(state, turn, now)
+				report.InterruptedTurnIDs = append(report.InterruptedTurnIDs, id)
+				req.RescueActions = append(req.RescueActions, UpgradeRescueAction{
+					Kind:      "interrupt-running-turn",
+					ID:        id,
+					SessionID: turn.SessionID,
+					Status:    string(TurnStatusInterrupted),
+					CreatedAt: now,
+				})
+			}
+		}
+		for id, msg := range state.OutboxMessages {
+			if outboxDeliveryProtected(msg) {
+				if OutboxBlocksUpgrade(*state, msg, now) {
+					report.PreservedOutboxBlockerIDs = append(report.PreservedOutboxBlockerIDs, id)
+					req.RescueActions = append(req.RescueActions, UpgradeRescueAction{
+						Kind:      "preserve-protected-outbox",
+						ID:        id,
+						SessionID: msg.SessionID,
+						Status:    string(msg.Status),
+						Detail:    msg.Kind,
+						CreatedAt: now,
+					})
+				}
+				continue
+			}
+			if !outboxDeliveryTransient(msg) {
+				continue
+			}
+			switch msg.Status {
+			case OutboxStatusQueued, OutboxStatusSending:
+				msg.Status = OutboxStatusSkipped
+				msg.LastSendError = "superseded by helper upgrade rescue"
+				msg.UpdatedAt = now
+				state.OutboxMessages[id] = msg
+				report.SupersededOutboxIDs = append(report.SupersededOutboxIDs, id)
+				req.RescueActions = append(req.RescueActions, UpgradeRescueAction{
+					Kind:      "skip-transient-outbox",
+					ID:        id,
+					SessionID: msg.SessionID,
+					Status:    string(OutboxStatusSkipped),
+					Detail:    msg.Kind,
+					CreatedAt: now,
+				})
+			}
+		}
+		req.Phase = UpgradePhaseDraining
+		req.RescueCompletedAt = now
+		req.UpdatedAt = now
+		state.Upgrade = &req
+		report.Upgrade = req
+		report.RemainingUpgradeBlockers = UpgradeBlockers(*state, now)
+		sort.Strings(report.PreservedQueuedTurnIDs)
+		sort.Strings(report.InterruptedTurnIDs)
+		sort.Strings(report.SupersededOutboxIDs)
+		sort.Strings(report.PreservedOutboxBlockerIDs)
+		return nil
+	})
+	return report, err
 }
 
 func (s *Store) ReadUpgrade(ctx context.Context) (UpgradeRequest, bool, error) {
@@ -1578,6 +1746,10 @@ func outboxDeliveryTransient(msg OutboxMessage) bool {
 		strings.HasPrefix(kind, "status-") ||
 		strings.HasPrefix(kind, "progress-") ||
 		strings.HasPrefix(kind, "interrupted-after-restart")
+}
+
+func OutboxDeliveryTransient(msg OutboxMessage) bool {
+	return outboxDeliveryTransient(msg)
 }
 
 func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {

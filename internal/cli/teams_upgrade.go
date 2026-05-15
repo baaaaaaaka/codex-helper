@@ -2,13 +2,17 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
 var teamsUpgradePollInterval = 500 * time.Millisecond
@@ -94,13 +98,46 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 		}
 		owner, hasOwner := stateOwner(state)
 		if !hasOwner {
-			if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
-				return nil, fmt.Errorf("Teams state has upgrade-blocking work in %s but no active owner: %s; run `codex-proxy teams recover` before upgrading", path, teamsUpgradeBlockerSummary(blockers))
+			if helperUpgradeNeedsRescue(state) {
+				report, rescueErr := st.RescueForUpgrade(ctx, teamsstore.UpgradeRescueOptions{Reason: teamsUpgradeDrainReason, StaleAfter: 2 * time.Minute})
+				if rescueErr != nil {
+					return nil, rescueErr
+				}
+				if out != nil {
+					printTeamsUpgradeRescueReport(out, path, report)
+				}
+				state, err = st.Load(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if blockers := teamsHelperUpgradeBlockers(state); len(blockers) > 0 {
+					_, _ = st.AbortUpgrade(context.Background(), report.Upgrade.ID, "helper upgrade rescue left protected Teams work")
+					return nil, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))
+				}
+				if report.Upgrade.ID != "" {
+					stores = append(stores, upgradeStore{Path: path, St: st, Req: report.Upgrade})
+				}
 			}
 			continue
 		}
 		if teamsstore.IsStale(owner, 2*time.Minute, time.Now()) {
-			return nil, fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before upgrading", path)
+			report, rescueErr := st.RescueForUpgrade(ctx, teamsstore.UpgradeRescueOptions{Reason: teamsUpgradeDrainReason, StaleAfter: 2 * time.Minute})
+			if rescueErr != nil {
+				return nil, rescueErr
+			}
+			if out != nil {
+				printTeamsUpgradeRescueReport(out, path, report)
+			}
+			state, err = st.Load(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if blockers := teamsHelperUpgradeBlockers(state); len(blockers) > 0 {
+				_, _ = st.AbortUpgrade(context.Background(), report.Upgrade.ID, "helper upgrade rescue left protected Teams work")
+				return nil, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))
+			}
+			stores = append(stores, upgradeStore{Path: path, St: st, Req: report.Upgrade})
+			continue
 		}
 		req, err := st.BeginUpgrade(ctx, teamsUpgradeDrainReason, timeout)
 		if err != nil {
@@ -185,6 +222,58 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 	}
 }
 
+func rescueTeamsForNoopHelperUpgrade(ctx context.Context, in io.Reader, out io.Writer, timeout time.Duration, installPath string) error {
+	needsRescue, err := helperUpgradeNeedsNoopRescue(ctx)
+	if err != nil {
+		return err
+	}
+	if !needsRescue {
+		return nil
+	}
+	return withTeamsHelperUpgradeInstallLock(ctx, installPath, func() error {
+		finishTeams, err := prepareTeamsForHelperUpgrade(ctx, in, out, timeout, nil)
+		if err != nil {
+			return err
+		}
+		if finishTeams == nil {
+			return nil
+		}
+		return finishTeams(context.Background(), teamsUpgradeFinishOptions{
+			Success:        true,
+			ServiceRestart: teamsUpgradeRestartImmediate,
+		})
+	})
+}
+
+func helperUpgradeNeedsNoopRescue(ctx context.Context) (bool, error) {
+	paths, err := existingTeamsStorePaths()
+	if err != nil {
+		return false, err
+	}
+	now := time.Now()
+	for _, path := range paths {
+		st, err := teamsstore.Open(path)
+		if err != nil {
+			return false, err
+		}
+		state, err := st.Load(ctx)
+		if err != nil {
+			return false, err
+		}
+		owner, hasOwner := stateOwner(state)
+		if !hasOwner {
+			if helperUpgradeNeedsRescue(state) {
+				return true, nil
+			}
+			continue
+		}
+		if teamsstore.IsStale(owner, 2*time.Minute, now) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func stopTeamsServiceForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writer, beforeRestart func(context.Context, bool) error, registryPath *string) (teamsUpgradeFinalizer, error) {
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "Stopping Teams service before upgrade...")
@@ -239,6 +328,44 @@ func stopTeamsServiceForHelperUpgrade(ctx context.Context, in io.Reader, out io.
 		}
 		return startTeamsServiceAfterUpgrade(ctx, registryPath, refresh)
 	}, nil
+}
+
+func withTeamsHelperUpgradeInstallLock(ctx context.Context, installPath string, fn func() error) error {
+	resolved, err := update.ResolveInstallPath(installPath)
+	if err != nil {
+		return err
+	}
+	lock := flock.New(resolved + ".auto-update.lock")
+	ok, err := tryLockHelperInstallPath(ctx, lock)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("another codex-helper upgrade is already using install path %s", resolved)
+	}
+	defer func() { _ = lock.Unlock() }()
+	return fn()
+}
+
+func tryLockHelperInstallPath(ctx context.Context, lock *flock.Flock) (bool, error) {
+	lockCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	ok, err := lock.TryLockContext(lockCtx, 10*time.Millisecond)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, ctxErr
+			}
+			return false, nil
+		}
+		return false, err
+	}
+	if !ok {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+	}
+	return ok, nil
 }
 
 type teamsUpgradeServiceRefreshResult struct {
@@ -475,7 +602,7 @@ func teamsUpgradeStateDrained(ctx context.Context, st *teamsstore.Store) (bool, 
 	if _, ok := stateOwner(state); ok {
 		return false, nil
 	}
-	return !teamsStateHasUnfinishedWork(state), nil
+	return len(teamsHelperUpgradeBlockers(state)) == 0, nil
 }
 
 func stateOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool) {
@@ -494,8 +621,52 @@ func stateOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool) {
 	return teamsstore.OwnerMetadata{}, false
 }
 
-func teamsStateHasUnfinishedWork(state teamsstore.State) bool {
-	return len(teamsUpgradeBlockers(state)) > 0
+func helperUpgradeNeedsRescue(state teamsstore.State) bool {
+	for _, turn := range state.Turns {
+		if turn.Status == teamsstore.TurnStatusRunning {
+			return true
+		}
+	}
+	for _, msg := range state.OutboxMessages {
+		if msg.Status != teamsstore.OutboxStatusQueued && msg.Status != teamsstore.OutboxStatusSending {
+			continue
+		}
+		if teamsstore.OutboxBlocksUpgrade(state, msg, time.Now()) {
+			return true
+		}
+		if teamsstore.OutboxDeliveryTransient(msg) {
+			return true
+		}
+	}
+	return false
+}
+
+func teamsHelperUpgradeBlockers(state teamsstore.State) []teamsstore.UpgradeBlocker {
+	now := time.Now()
+	var blockers []teamsstore.UpgradeBlocker
+	for _, turn := range state.Turns {
+		if turn.Status != teamsstore.TurnStatusRunning {
+			continue
+		}
+		blockers = append(blockers, teamsstore.UpgradeBlocker{
+			Kind:      "turn",
+			ID:        turn.ID,
+			SessionID: turn.SessionID,
+			Status:    string(turn.Status),
+		})
+	}
+	for _, msg := range state.OutboxMessages {
+		if teamsstore.OutboxBlocksUpgrade(state, msg, now) {
+			blockers = append(blockers, teamsstore.UpgradeBlocker{
+				Kind:      "outbox",
+				ID:        msg.ID,
+				SessionID: msg.SessionID,
+				Status:    string(msg.Status),
+				Detail:    msg.Kind,
+			})
+		}
+	}
+	return blockers
 }
 
 func teamsUpgradeBlockers(state teamsstore.State) []teamsstore.UpgradeBlocker {
@@ -529,4 +700,24 @@ func teamsUpgradeBlockerSummary(blockers []teamsstore.UpgradeBlocker) string {
 		parts = append(parts, segment)
 	}
 	return strings.Join(parts, "; ")
+}
+
+func printTeamsUpgradeRescueReport(out io.Writer, path string, report teamsstore.UpgradeRescueReport) {
+	if out == nil {
+		return
+	}
+	clearedOwners := 0
+	if report.ClearedOwner != nil {
+		clearedOwners = 1
+	}
+	_, _ = fmt.Fprintf(
+		out,
+		"Teams upgrade rescue for %s: cleared stale helpers=%d preserved queued requests=%d interrupted abandoned requests=%d skipped stale notices=%d preserved saved replies/files=%d\n",
+		path,
+		clearedOwners,
+		len(report.PreservedQueuedTurnIDs),
+		len(report.InterruptedTurnIDs),
+		len(report.SupersededOutboxIDs),
+		len(report.PreservedOutboxBlockerIDs),
+	)
 }

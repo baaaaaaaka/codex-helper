@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -52,6 +54,67 @@ func TestUpgradeCmdAlreadyUpToDateSkipsDownload(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Already up to date.") {
 		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
+func TestUpgradeCmdAlreadyUpToDateRescuesStaleTeamsState(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		return update.Status{Supported: true, UpdateAvailable: false}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("PerformUpdate should not run when latest is already installed")
+		return update.ApplyResult{}, nil
+	}
+
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore: %v", err)
+	}
+	ctx := context.Background()
+	staleHeartbeat := time.Now().Add(-3 * time.Minute)
+	owner := teamsstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        "stale-host",
+		ExecutablePath:  "/usr/local/bin/codex-proxy",
+		HelperVersion:   "v-old",
+		StartedAt:       staleHeartbeat,
+		ActiveSessionID: "s1",
+		ActiveTurnID:    "turn:old",
+	}
+	if _, err := st.RecordOwnerHeartbeat(ctx, owner, time.Minute, staleHeartbeat); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat stale owner: %v", err)
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute already-up-to-date rescue: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Teams upgrade rescue") || !strings.Contains(out.String(), "cleared stale helpers=1") || !strings.Contains(out.String(), "Already up to date.") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+	if _, ok, err := st.ReadOwner(ctx); err != nil {
+		t.Fatalf("ReadOwner: %v", err)
+	} else if ok {
+		t.Fatal("stale owner should be cleared by no-op upgrade rescue")
+	}
+	upgrade, ok, err := st.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade: %v", err)
+	}
+	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
+		t.Fatalf("upgrade state = %#v ok=%v, want completed", upgrade, ok)
 	}
 }
 
@@ -98,7 +161,45 @@ func TestUpgradeCmdExplicitVersionCallsPerformUpdate(t *testing.T) {
 	}
 }
 
-func TestUpgradeCmdRecoverContractUnblocksQueuedTurn(t *testing.T) {
+func TestUpgradeCmdUsesAutoUpdateInstallLock(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("PerformUpdate should not run while the shared auto-update lock is held")
+		return update.ApplyResult{}, nil
+	}
+
+	installPath := filepath.Join(t.TempDir(), "codex-proxy")
+	lock := flock.New(installPath + ".auto-update.lock")
+	locked, err := lock.TryLock()
+	if err != nil {
+		t.Fatalf("TryLock error: %v", err)
+	}
+	if !locked {
+		t.Fatal("failed to acquire test auto-update lock")
+	}
+	t.Cleanup(func() { _ = lock.Unlock() })
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3", "--install-path", installPath})
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "another codex-helper upgrade is already using install path") {
+		t.Fatalf("expected shared install lock error, got %v", err)
+	}
+}
+
+func TestUpgradeCmdAllowsOrphanQueuedTurn(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)
 
@@ -132,26 +233,210 @@ func TestUpgradeCmdRecoverContractUnblocksQueuedTurn(t *testing.T) {
 
 	cmd := newUpgradeCmd(&rootOptions{})
 	cmd.SetArgs([]string{"--version", "v1.2.3"})
-	err = cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "upgrade-blocking work") || !strings.Contains(err.Error(), "turn s1 turn:queued status=queued") {
-		t.Fatalf("expected concrete upgrade blocker, got %v", err)
-	}
-	if performCalls != 0 {
-		t.Fatalf("performUpdate calls before recover = %d, want 0", performCalls)
-	}
-
-	out := executeRootForTeamsTest(t, "teams", "recover")
-	if !strings.Contains(out, "Recovered interrupted turns: 1") || strings.Contains(out, "Remaining upgrade blockers") {
-		t.Fatalf("recover should clear queued turn blocker:\n%s", out)
-	}
-
-	cmd = newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
 	if err := cmd.Execute(); err != nil {
-		t.Fatalf("upgrade after recover: %v", err)
+		t.Fatalf("upgrade should preserve orphan queued turn without manual recover: %v", err)
 	}
 	if performCalls != 1 {
-		t.Fatalf("performUpdate calls after recover = %d, want 1", performCalls)
+		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state after upgrade: %v", err)
+	}
+	if got := state.Turns["turn:queued"].Status; got != teamsstore.TurnStatusQueued {
+		t.Fatalf("queued turn status = %q, want queued for new helper to run", got)
+	}
+}
+
+func TestUpgradeCmdRescuesOrphanRunningTurnAndTransientOutbox(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performCalls := 0
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		performCalls++
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{ID: "s1", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, _, err := st.QueueTurn(ctx, teamsstore.Turn{ID: "turn:running", SessionID: "s1", Status: teamsstore.TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn: %v", err)
+	}
+	if _, _, err := st.QueueOutbox(ctx, teamsstore.OutboxMessage{
+		ID:          "outbox:status",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-status-001",
+		Status:      teamsstore.OutboxStatusQueued,
+	}); err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("upgrade should rescue orphan running turn: %v\n%s", err, out.String())
+	}
+	if performCalls != 1 {
+		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
+	}
+	if !strings.Contains(out.String(), "Teams upgrade rescue") || !strings.Contains(out.String(), "interrupted abandoned requests=1") || !strings.Contains(out.String(), "skipped stale notices=1") {
+		t.Fatalf("upgrade output missing rescue summary:\n%s", out.String())
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state after rescue: %v", err)
+	}
+	if got := state.Turns["turn:running"].Status; got != teamsstore.TurnStatusInterrupted {
+		t.Fatalf("running turn status = %q, want interrupted", got)
+	}
+	if got := state.OutboxMessages["outbox:status"].Status; got != teamsstore.OutboxStatusSkipped {
+		t.Fatalf("transient outbox status = %q, want skipped", got)
+	}
+	upgrade, ok, err := st.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade: %v", err)
+	}
+	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
+		t.Fatalf("upgrade state = %#v ok=%v, want completed", upgrade, ok)
+	}
+}
+
+func TestUpgradeCmdRescuesStaleOwnerBeforeUpdate(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performCalls := 0
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		performCalls++
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore: %v", err)
+	}
+	ctx := context.Background()
+	staleHeartbeat := time.Now().Add(-3 * time.Minute)
+	owner := teamsstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        "stale-host",
+		ExecutablePath:  "/usr/local/bin/codex-proxy",
+		HelperVersion:   "v-old",
+		StartedAt:       staleHeartbeat,
+		ActiveSessionID: "s1",
+		ActiveTurnID:    "turn:old",
+	}
+	if _, err := st.RecordOwnerHeartbeat(ctx, owner, time.Minute, staleHeartbeat); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat stale owner: %v", err)
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("upgrade should rescue stale owner: %v\n%s", err, out.String())
+	}
+	if performCalls != 1 {
+		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
+	}
+	if !strings.Contains(out.String(), "Teams upgrade rescue") || !strings.Contains(out.String(), "cleared stale helpers=1") {
+		t.Fatalf("upgrade output missing stale owner rescue summary:\n%s", out.String())
+	}
+	if _, ok, err := st.ReadOwner(ctx); err != nil {
+		t.Fatalf("ReadOwner: %v", err)
+	} else if ok {
+		t.Fatal("stale owner should be cleared by upgrade rescue")
+	}
+	upgrade, ok, err := st.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade: %v", err)
+	}
+	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
+		t.Fatalf("upgrade state = %#v ok=%v, want completed", upgrade, ok)
+	}
+}
+
+func TestUpgradeCmdPausesOnProtectedOutboxDuringRescue(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("PerformUpdate should not run while protected Teams output remains")
+		return update.ApplyResult{}, nil
+	}
+
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{ID: "s1", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, _, err := st.QueueOutbox(ctx, teamsstore.OutboxMessage{
+		ID:          "outbox:answer",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "answer",
+		Body:        "saved answer",
+		Status:      teamsstore.OutboxStatusQueued,
+	}); err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "Teams upgrade paused") || !strings.Contains(err.Error(), "outbox s1 outbox:answer status=queued kind=answer") {
+		t.Fatalf("expected protected outbox pause, got %v", err)
+	}
+	upgrade, ok, err := st.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade: %v", err)
+	}
+	if !ok || upgrade.Phase != teamsstore.UpgradePhaseAborted {
+		t.Fatalf("upgrade state = %#v ok=%v, want aborted after pause", upgrade, ok)
 	}
 }
 

@@ -154,7 +154,7 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
 	lock := flock.New(installPath + ".auto-update.lock")
-	ok, err := lock.TryLockContext(ctx, 100*time.Millisecond)
+	ok, err := tryLockHelperInstallPath(ctx, lock)
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}

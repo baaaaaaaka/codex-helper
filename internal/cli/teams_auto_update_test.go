@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -515,5 +517,44 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	}
 	if res.InstallPath != fakeInstallPath {
 		t.Fatalf("result install path = %q, want %q", res.InstallPath, fakeInstallPath)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterApplyUsesSharedInstallLock(t *testing.T) {
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+	})
+	fakeInstallPath := filepath.Join(t.TempDir(), "codex-proxy")
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) {
+		return fakeInstallPath, nil
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("PerformUpdate should not run while the shared install lock is held")
+		return update.ApplyResult{}, nil
+	}
+	lock := flock.New(fakeInstallPath + ".auto-update.lock")
+	locked, err := lock.TryLock()
+	if err != nil {
+		t.Fatalf("TryLock error: %v", err)
+	}
+	if !locked {
+		t.Fatal("failed to acquire test install lock")
+	}
+	t.Cleanup(func() { _ = lock.Unlock() })
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	_, err = updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{
+		TagName:     "v1.2.4",
+		Version:     "1.2.4",
+		Priority:    "p0",
+		PublishedAt: time.Now(),
+		EligibleAt:  time.Now(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "another helper auto-update is already updating") {
+		t.Fatalf("expected shared install lock error, got %v", err)
 	}
 }
