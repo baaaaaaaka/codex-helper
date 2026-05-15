@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
+	"path"
 	"strings"
 	"testing"
 )
@@ -534,16 +534,18 @@ func copyProfileCreate(in profileCreateInput, fn func(*profileCreateInput)) prof
 }
 
 func artifactPathAllowed(sharedRoot, candidate string) bool {
-	root := filepath.Clean(sharedRoot)
-	path := filepath.Clean(candidate)
-	if !filepath.IsAbs(path) {
+	root := path.Clean(sharedRoot)
+	candidatePath := path.Clean(candidate)
+	if !path.IsAbs(root) || !path.IsAbs(candidatePath) {
 		return false
 	}
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
+	if candidatePath == root {
 		return false
 	}
-	return rel != "." && rel != "" && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
+	if !strings.HasSuffix(root, "/") {
+		root += "/"
+	}
+	return strings.HasPrefix(candidatePath, root)
 }
 
 func TestArtifactPathsMustBeCoordinatorReadableSharedPaths(t *testing.T) {
