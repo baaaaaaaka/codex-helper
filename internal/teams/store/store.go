@@ -1846,7 +1846,8 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 		if candidate.ID == msg.ID || candidate.TeamsChatID != chatID || candidate.Sequence <= 0 || candidate.Sequence >= msg.Sequence {
 			continue
 		}
-		if candidate.Status == OutboxStatusSent {
+		switch candidate.Status {
+		case OutboxStatusSent, OutboxStatusSkipped:
 			continue
 		}
 		if !found || candidate.Sequence < earlier.Sequence || candidate.Sequence == earlier.Sequence && candidate.CreatedAt.Before(earlier.CreatedAt) {

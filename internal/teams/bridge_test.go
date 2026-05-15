@@ -14109,6 +14109,183 @@ func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
 	}
 }
 
+func TestBridgeSkippedOutboxDoesNotBlockQueuedTurnWaitNotice(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s002", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeMultiSessionQueueGraph(t, false)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	bridge.reg.Sessions[0].ID = "s002"
+	bridge.reg.Sessions[0].CodexThreadID = "thread-s002"
+	blockedSession := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-s002")
+	laterSession := appendBridgeTestSession(t, bridge, store, "s005", "chat-5")
+
+	activeTranscript := initial +
+		`{"id":"u-local","role":"user","text":"local CLI prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local CLI is editing files","phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(activeTranscript), 0o600); err != nil {
+		t.Fatalf("write active transcript: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:s002:recover-skipped",
+		SessionID:   blockedSession.ID,
+		TeamsChatID: blockedSession.ChatID,
+		Kind:        "codex-status-001",
+		Body:        "superseded by teams recover",
+		Status:      teamstore.OutboxStatusSkipped,
+		CreatedAt:   time.Now().Add(-5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("queue skipped outbox: %v", err)
+	}
+	queueBridgeTurnForTest(t, bridge, blockedSession, "s002-message", "blocked prompt", time.Now().Add(-queuedTurnAttentionDelay-time.Minute))
+	queueBridgeTurnForTest(t, bridge, laterSession, "s005-message", "later prompt", time.Time{})
+
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if got.SessionID != "s005" || !strings.Contains(got.Prompt, "later prompt") {
+			t.Fatalf("started queued turn = %#v, want s005 later prompt", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("s005 queued turn did not start after skipped s002 outbox")
+	}
+	if executor.promptCount("s002") != 0 {
+		t.Fatalf("blocked s002 session started despite active local transcript")
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Still waiting") || !strings.Contains(joined, "Local Codex is still active for this chat") {
+		t.Fatalf("skipped outbox blocked queued wait notice; sent:\n%s", joined)
+	}
+	close(executor.release)
+	waitForBridgeAsyncTurns(t, bridge)
+	waitForCompletedTurnCount(t, store, "s005", 1)
+}
+
+func TestBridgeQueuedTurnWaitNoticeFailureDoesNotStarveLaterSessions(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s002", transcriptPath)
+	defer restoreDiscover()
+	graph, _ := newBridgeMultiSessionQueueGraph(t, true)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	var out bytes.Buffer
+	bridge.out = &out
+	bridge.reg.Sessions[0].ID = "s002"
+	bridge.reg.Sessions[0].CodexThreadID = "thread-s002"
+	blockedSession := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-s002")
+	laterSession := appendBridgeTestSession(t, bridge, store, "s005", "chat-5")
+
+	activeTranscript := initial +
+		`{"id":"u-local","role":"user","text":"local CLI prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"s-local","message":"local CLI is editing files","phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(activeTranscript), 0o600); err != nil {
+		t.Fatalf("write active transcript: %v", err)
+	}
+	queueBridgeTurnForTest(t, bridge, blockedSession, "s002-message", "blocked prompt", time.Now().Add(-queuedTurnAttentionDelay-time.Minute))
+	queueBridgeTurnForTest(t, bridge, laterSession, "s005-message", "later prompt", time.Time{})
+
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns should isolate queued-wait send failure, got: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if got.SessionID != "s005" || !strings.Contains(got.Prompt, "later prompt") {
+			t.Fatalf("started queued turn = %#v, want s005 later prompt", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("s005 queued turn did not start after s002 queued-wait send failure")
+	}
+	if executor.promptCount("s002") != 0 {
+		t.Fatalf("blocked s002 session started despite active local transcript")
+	}
+	if !strings.Contains(out.String(), "Teams best-effort outbox send error") {
+		t.Fatalf("queued-wait send failure was not logged:\n%s", out.String())
+	}
+	close(executor.release)
+	waitForBridgeAsyncTurns(t, bridge)
+	waitForCompletedTurnCount(t, store, "s005", 1)
+}
+
+func TestBridgeQueuedTurnGateErrorDoesNotStarveLaterSessions(t *testing.T) {
+	graph, _ := newBridgeMultiSessionQueueGraph(t, false)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	var out bytes.Buffer
+	bridge.out = &out
+	bridge.reg.Sessions[0].ID = "s002"
+	bridge.reg.Sessions[0].CodexThreadID = "thread-s002"
+	blockedSession := bridge.reg.SessionByID("s002")
+	if blockedSession == nil {
+		t.Fatal("missing s002 session")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), blockedSession); err != nil {
+		t.Fatalf("ensure durable s002: %v", err)
+	}
+	badTranscriptPath := t.TempDir()
+	if err := store.UpdateSession(context.Background(), blockedSession.ID, func(state *teamstore.State) error {
+		checkpointID := transcriptCheckpointID(blockedSession.ID)
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID:         checkpointID,
+			SessionID:  blockedSession.ID,
+			SourcePath: badTranscriptPath,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed bad transcript checkpoint: %v", err)
+	}
+	laterSession := appendBridgeTestSession(t, bridge, store, "s005", "chat-5")
+	queueBridgeTurnForTest(t, bridge, blockedSession, "s002-message", "blocked prompt", time.Time{})
+	queueBridgeTurnForTest(t, bridge, laterSession, "s005-message", "later prompt", time.Time{})
+
+	err := bridge.processQueuedTurns(context.Background())
+	if err == nil || !strings.Contains(err.Error(), badTranscriptPath) {
+		t.Fatalf("processQueuedTurns error = %v, want bad transcript failure after continuing", err)
+	}
+	select {
+	case got := <-executor.started:
+		if got.SessionID != "s005" || !strings.Contains(got.Prompt, "later prompt") {
+			t.Fatalf("started queued turn = %#v, want s005 later prompt", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("s005 queued turn did not start after s002 gate error")
+	}
+	if executor.promptCount("s002") != 0 {
+		t.Fatalf("errored s002 session started despite gate failure")
+	}
+	if !strings.Contains(out.String(), "Teams queued turn gate error for session s002") {
+		t.Fatalf("queued gate failure was not logged:\n%s", out.String())
+	}
+	close(executor.release)
+	waitForBridgeAsyncTurns(t, bridge)
+	waitForCompletedTurnCount(t, store, "s005", 1)
+}
+
 func TestBridgeSyncsCompletedLocalTranscriptBeforeStartingTeamsPrompt(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -14722,6 +14899,57 @@ func TestBridgeFlushPendingOutboxContinuesAfterRateLimitedChat(t *testing.T) {
 	}
 	if limit := state.ChatRateLimits["chat-1"]; !limit.BlockedUntil.After(time.Now()) || limit.PoisonOutboxID != "outbox:blocked" {
 		t.Fatalf("chat-1 rate-limit state not recorded: %#v", limit)
+	}
+}
+
+func TestBridgeFlushPendingOutboxContinuesOtherChatsAfterSendFailure(t *testing.T) {
+	store := newBridgeTestStore(t)
+	var sent []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		if chatID == "chat-1" {
+			http.Error(w, `{"error":{"code":"ServiceUnavailable"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		sent = append(sent, chatID)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"sent-%s","messageType":"message"}`, chatID)
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{ID: "outbox:failed", TeamsChatID: "chat-1", Kind: "helper", Body: "failed"}); err != nil {
+		t.Fatalf("QueueOutbox failed error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{ID: "outbox:open", TeamsChatID: "chat-2", Kind: "helper", Body: "open"}); err != nil {
+		t.Fatalf("QueueOutbox open error: %v", err)
+	}
+
+	err := bridge.flushPendingOutbox(context.Background(), "", "")
+	if err == nil || isOutboxDeliveryDeferred(err) {
+		t.Fatalf("flushPendingOutbox error = %v, want non-deferred send failure after continuing", err)
+	}
+	if len(sent) != 1 || sent[0] != "chat-2" {
+		t.Fatalf("sent chats = %#v, want chat-2 despite chat-1 failure", sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	if got := state.OutboxMessages["outbox:open"].Status; got != teamstore.OutboxStatusSent {
+		t.Fatalf("chat-2 outbox status = %q, want sent", got)
+	}
+	if got := state.OutboxMessages["outbox:failed"]; got.Status != teamstore.OutboxStatusQueued || got.LastSendError == "" {
+		t.Fatalf("chat-1 failed outbox = %#v, want queued with LastSendError", got)
 	}
 }
 
@@ -15580,6 +15808,53 @@ func newBridgeAsyncQueueGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage)
 	}, &sent
 }
 
+func newBridgeMultiSessionQueueGraph(t *testing.T, failChat1Posts bool) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	var sentMu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-5/messages/s005-message":
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(bridgePollMessage("s005-message", "2026-05-03T01:00:05Z", "later prompt")); err != nil {
+				t.Fatalf("encode queued message: %v", err)
+			}
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			if failChat1Posts && chatID == "chat-1" {
+				http.Error(w, "chat-1 send failure", http.StatusServiceUnavailable)
+				return
+			}
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			sentMu.Lock()
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			id := len(sent)
+			sentMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, id)
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
 func newBridgeHostedContentGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
 	t.Helper()
 	var sent []bridgeSentMessage
@@ -15776,6 +16051,73 @@ func seedLinkedTranscriptForTest(t *testing.T, bridge *Bridge, transcriptPath st
 		t.Fatalf("seed checkpoint = %#v, want source path %q and a last record", checkpoint, transcriptPath)
 	}
 	return session
+}
+
+func appendBridgeTestSession(t *testing.T, bridge *Bridge, store *teamstore.Store, sessionID string, chatID string) *Session {
+	t.Helper()
+	now := time.Now()
+	bridge.reg.Sessions = append(bridge.reg.Sessions, Session{
+		ID:        sessionID,
+		ChatID:    chatID,
+		ChatURL:   "https://teams.example/" + chatID,
+		Topic:     "topic " + sessionID,
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	session := bridge.reg.SessionByID(sessionID)
+	if session == nil {
+		t.Fatalf("appended session %s was not found", sessionID)
+	}
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session %s: %v", sessionID, err)
+	}
+	if store != nil {
+		state, err := store.Load(context.Background())
+		if err != nil {
+			t.Fatalf("load store after session append: %v", err)
+		}
+		if _, ok := state.Sessions[sessionID]; !ok {
+			t.Fatalf("session %s was not persisted", sessionID)
+		}
+	}
+	return session
+}
+
+func queueBridgeTurnForTest(t *testing.T, bridge *Bridge, session *Session, messageID string, text string, queuedAt time.Time) teamstore.Turn {
+	t.Helper()
+	inbound, _, err := bridge.store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		ID:             "inbound:" + session.ID + ":" + messageID,
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: messageID,
+		Text:           text,
+		Source:         "teams",
+		Status:         teamstore.InboundStatusPersisted,
+	})
+	if err != nil {
+		t.Fatalf("persist inbound %s: %v", messageID, err)
+	}
+	turn, _, err := bridge.queueTurn(context.Background(), session, inbound)
+	if err != nil {
+		t.Fatalf("queue turn %s: %v", messageID, err)
+	}
+	if !queuedAt.IsZero() {
+		if err := bridge.store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+			current := state.Turns[turn.ID]
+			current.QueuedAt = queuedAt
+			current.CreatedAt = queuedAt
+			current.UpdatedAt = queuedAt
+			state.Turns[turn.ID] = current
+			return nil
+		}); err != nil {
+			t.Fatalf("age queued turn %s: %v", turn.ID, err)
+		}
+		turn.QueuedAt = queuedAt
+		turn.CreatedAt = queuedAt
+		turn.UpdatedAt = queuedAt
+	}
+	return turn
 }
 
 func queuedTurnCountForSession(state teamstore.State, sessionID string) int {

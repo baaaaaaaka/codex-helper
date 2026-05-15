@@ -374,6 +374,44 @@ func TestAcceptedOutboxIsPromotedWithoutResend(t *testing.T) {
 	}
 }
 
+func TestPendingOutboxStatusMatrix(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 2, 9, 30, 0, 0, time.UTC)
+	messages := []OutboxMessage{
+		{ID: "queued", TeamsChatID: "chat-1", Status: OutboxStatusQueued},
+		{ID: "accepted-with-teams-id", TeamsChatID: "chat-1", Status: OutboxStatusAccepted, TeamsMessageID: "teams-accepted"},
+		{ID: "accepted-without-teams-id", TeamsChatID: "chat-1", Status: OutboxStatusAccepted},
+		{ID: "fresh-sending", TeamsChatID: "chat-1", Status: OutboxStatusSending, LastSendAttempt: now.Add(-outboxSendLease + time.Second)},
+		{ID: "stale-sending", TeamsChatID: "chat-1", Status: OutboxStatusSending, LastSendAttempt: now.Add(-outboxSendLease - time.Second)},
+		{ID: "sent", TeamsChatID: "chat-1", Status: OutboxStatusSent, TeamsMessageID: "teams-sent"},
+		{ID: "skipped", TeamsChatID: "chat-1", Status: OutboxStatusSkipped},
+	}
+	for _, msg := range messages {
+		msg.Kind = "helper"
+		msg.Body = msg.ID
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
+		}
+	}
+	pending, err := store.PendingOutboxAt(ctx, now)
+	if err != nil {
+		t.Fatalf("PendingOutboxAt error: %v", err)
+	}
+	got := make(map[string]bool)
+	for _, msg := range pending {
+		got[msg.ID] = true
+	}
+	want := map[string]bool{
+		"queued":                 true,
+		"accepted-with-teams-id": true,
+		"stale-sending":          true,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending status matrix = %#v, want %#v; pending=%#v", got, want, pending)
+	}
+}
+
 func TestMarkTurnCompletedWithEmptyCodexTurnIDPreservesLatestKnownCodexTurnID(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -932,6 +970,115 @@ func TestEarlierUnsentOutboxPreservesSameChatOrdering(t *testing.T) {
 	}
 }
 
+func TestEarlierUnsentOutboxStatusMatrix(t *testing.T) {
+	now := time.Date(2026, 4, 30, 12, 40, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		status    OutboxStatus
+		teamsID   string
+		wantBlock bool
+	}{
+		{name: "queued blocks", status: OutboxStatusQueued, wantBlock: true},
+		{name: "sending blocks", status: OutboxStatusSending, wantBlock: true},
+		{name: "accepted blocks until promoted", status: OutboxStatusAccepted, teamsID: "teams-accepted", wantBlock: true},
+		{name: "sent does not block", status: OutboxStatusSent, teamsID: "teams-sent"},
+		{name: "skipped does not block", status: OutboxStatusSkipped},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			earlier := OutboxMessage{
+				ID:             "outbox:earlier",
+				TeamsChatID:    "chat-1",
+				TeamsMessageID: tc.teamsID,
+				Sequence:       1,
+				Kind:           "helper",
+				Body:           "earlier",
+				Status:         tc.status,
+				CreatedAt:      now,
+			}
+			later := OutboxMessage{
+				ID:          "outbox:later",
+				TeamsChatID: "chat-1",
+				Sequence:    2,
+				Kind:        "helper",
+				Body:        "later",
+				CreatedAt:   now.Add(time.Second),
+			}
+			if _, _, err := store.QueueOutbox(ctx, earlier); err != nil {
+				t.Fatalf("QueueOutbox earlier error: %v", err)
+			}
+			if _, _, err := store.QueueOutbox(ctx, later); err != nil {
+				t.Fatalf("QueueOutbox later error: %v", err)
+			}
+			got, ok, err := store.EarlierUnsentOutbox(ctx, later)
+			if err != nil {
+				t.Fatalf("EarlierUnsentOutbox error: %v", err)
+			}
+			if ok != tc.wantBlock {
+				t.Fatalf("EarlierUnsentOutbox ok = %v, want %v; earlier=%#v", ok, tc.wantBlock, got)
+			}
+			if tc.wantBlock && got.ID != earlier.ID {
+				t.Fatalf("EarlierUnsentOutbox = %#v, want %#v", got, earlier)
+			}
+		})
+	}
+}
+
+func TestEarlierUnsentOutboxIgnoresSkippedMessages(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 30, 12, 45, 0, 0, time.UTC)
+	messages := []OutboxMessage{
+		{ID: "outbox:skipped", TeamsChatID: "chat-1", Sequence: 1, Kind: "codex-status-001", Body: "superseded", Status: OutboxStatusSkipped, CreatedAt: now},
+		{ID: "outbox:current", TeamsChatID: "chat-1", Sequence: 2, Kind: "queued-wait", Body: "current", CreatedAt: now.Add(time.Second)},
+	}
+	for _, msg := range messages {
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox(%s) error: %v", msg.ID, err)
+		}
+	}
+	if _, ok, err := store.EarlierUnsentOutbox(ctx, messages[1]); err != nil {
+		t.Fatalf("EarlierUnsentOutbox error: %v", err)
+	} else if ok {
+		t.Fatal("skipped same-chat message should not block later outbox delivery")
+	}
+
+	if _, err := store.MarkOutboxSent(ctx, "outbox:current", "teams-current"); err != nil {
+		t.Fatalf("MarkOutboxSent current error: %v", err)
+	}
+	blocking, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:blocking",
+		TeamsChatID: "chat-1",
+		Sequence:    3,
+		Kind:        "helper",
+		Body:        "must still block",
+		CreatedAt:   now.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox blocking error: %v", err)
+	}
+	later, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:later",
+		TeamsChatID: "chat-1",
+		Sequence:    4,
+		Kind:        "helper",
+		Body:        "later",
+		CreatedAt:   now.Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox later error: %v", err)
+	}
+	earlier, ok, err := store.EarlierUnsentOutbox(ctx, later)
+	if err != nil {
+		t.Fatalf("EarlierUnsentOutbox later error: %v", err)
+	}
+	if !ok || earlier.ID != blocking.ID {
+		t.Fatalf("earlier unsent = %#v ok=%v, want queued blocker %#v", earlier, ok, blocking)
+	}
+}
+
 func TestMarkOutboxDriveItemPersistsUploadMetadataAndClearsError(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1459,6 +1606,11 @@ func TestOutboxBlocksUpgradeStatusMatrix(t *testing.T) {
 		{
 			name: "sent does not block",
 			msg:  OutboxMessage{ID: "sent", TeamsChatID: "chat-1", Status: OutboxStatusSent, TeamsMessageID: "teams-1"},
+			want: false,
+		},
+		{
+			name: "skipped does not block",
+			msg:  OutboxMessage{ID: "skipped", TeamsChatID: "chat-1", Status: OutboxStatusSkipped},
 			want: false,
 		},
 	}

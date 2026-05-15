@@ -5057,6 +5057,18 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 		}
 	}
 	sort.Strings(sessionIDs)
+	var firstErr error
+	recordSessionErr := func(session *Session, stage string, err error) {
+		if err == nil {
+			return
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams queued turn %s error for session %s: %v\n", stage, session.ID, err)
+		}
+	}
 	for _, sessionID := range sessionIDs {
 		session := b.sessionForIDState(state, sessionID)
 		if session == nil {
@@ -5064,21 +5076,23 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 		}
 		gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
 		if err != nil {
-			return err
+			recordSessionErr(session, "gate", err)
+			continue
 		}
 		if gate.Block {
 			if turn, ok := oldestQueuedTurnForSessionState(state, sessionID); ok {
 				if err := b.sendQueuedTurnAttentionIfDue(ctx, session, turn, gate, time.Now()); err != nil {
-					return err
+					recordSessionErr(session, "wait notice", err)
 				}
 			}
 			continue
 		}
 		if _, err := b.startQueuedTurn(ctx, session, "", nil); err != nil {
-			return err
+			recordSessionErr(session, "start", err)
+			continue
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func oldestQueuedTurnForSessionState(state teamstore.State, sessionID string) (teamstore.Turn, bool) {
@@ -5142,7 +5156,7 @@ func (b *Bridge) sendQueuedTurnAttentionIfDue(ctx context.Context, session *Sess
 		"Your Teams message is queued and will run after this clears.",
 		"If this looks stale, send `helper status` here. To drop the queued message, send `helper cancel last`.",
 	}, "\n")
-	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:          fmt.Sprintf("outbox:%s:queued-wait:%d", turn.ID, bucket),
 		SessionID:   session.ID,
 		TurnID:      turn.ID,
@@ -8152,6 +8166,7 @@ func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID strin
 			}
 			return pending[i].CreatedAt.Before(pending[j].CreatedAt)
 		})
+		var firstErr error
 		var firstBlockedErr error
 		for _, msg := range pending {
 			if chatID != "" && msg.TeamsChatID != chatID {
@@ -8170,8 +8185,14 @@ func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID strin
 					}
 					continue
 				}
-				return err
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
 			}
+		}
+		if firstErr != nil {
+			return firstErr
 		}
 		return firstBlockedErr
 	}()
