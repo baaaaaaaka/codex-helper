@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/flock"
-
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -153,8 +151,7 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
-	lock := flock.New(installPath + ".auto-update.lock")
-	ok, err := tryLockHelperInstallPath(ctx, lock)
+	lock, ok, err := acquireHelperInstallLock(ctx, installPath)
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}

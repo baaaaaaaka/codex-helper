@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -196,6 +197,39 @@ func TestUpgradeCmdUsesAutoUpdateInstallLock(t *testing.T) {
 	err = cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "another codex-helper upgrade is already using install path") {
 		t.Fatalf("expected shared install lock error, got %v", err)
+	}
+}
+
+func TestUpgradeCmdFallsBackToCacheLockWhenInstallPathLockUnavailable(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux procfs as an unwritable install-lock directory")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performCalls := 0
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		performCalls++
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3", "--install-path", "/proc/codex-proxy"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("upgrade should use cache lock when install-path lock is unavailable: %v", err)
+	}
+	if performCalls != 1 {
+		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
 	}
 }
 

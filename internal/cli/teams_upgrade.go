@@ -2,10 +2,14 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -335,8 +339,7 @@ func withTeamsHelperUpgradeInstallLock(ctx context.Context, installPath string, 
 	if err != nil {
 		return err
 	}
-	lock := flock.New(resolved + ".auto-update.lock")
-	ok, err := tryLockHelperInstallPath(ctx, lock)
+	lock, ok, err := acquireHelperInstallLock(ctx, resolved)
 	if err != nil {
 		return err
 	}
@@ -347,25 +350,78 @@ func withTeamsHelperUpgradeInstallLock(ctx context.Context, installPath string, 
 	return fn()
 }
 
-func tryLockHelperInstallPath(ctx context.Context, lock *flock.Flock) (bool, error) {
+func acquireHelperInstallLock(ctx context.Context, resolved string) (*flock.Flock, bool, error) {
+	paths := helperInstallLockPaths(resolved)
+	var lastErr error
+	for i, lockPath := range paths {
+		lock, ok, err := tryLockHelperInstallPath(ctx, lockPath)
+		if err != nil {
+			lastErr = err
+			if i+1 < len(paths) && helperInstallLockUnavailable(err) {
+				continue
+			}
+			return nil, false, err
+		}
+		if !ok {
+			return nil, false, nil
+		}
+		return lock, true, nil
+	}
+	if lastErr != nil {
+		return nil, false, lastErr
+	}
+	return nil, false, fmt.Errorf("could not create codex-helper upgrade lock for install path %s", resolved)
+}
+
+func helperInstallLockPaths(resolvedInstallPath string) []string {
+	paths := []string{resolvedInstallPath + ".auto-update.lock"}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		return paths
+	}
+	sum := sha256.Sum256([]byte(resolvedInstallPath))
+	base := filepath.Base(resolvedInstallPath)
+	if strings.TrimSpace(base) == "" || base == "." || base == string(filepath.Separator) {
+		base = "codex-proxy"
+	}
+	paths = append(paths, filepath.Join(cacheDir, "codex-helper", "locks", hex.EncodeToString(sum[:8])+"-"+base+".auto-update.lock"))
+	return paths
+}
+
+func tryLockHelperInstallPath(ctx context.Context, lockPath string) (*flock.Flock, bool, error) {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, false, err
+	}
+	lock := flock.New(lockPath)
 	lockCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	ok, err := lock.TryLockContext(lockCtx, 10*time.Millisecond)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return false, ctxErr
+				return nil, false, ctxErr
 			}
-			return false, nil
+			return nil, false, nil
 		}
-		return false, err
+		return nil, false, err
 	}
 	if !ok {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return false, ctxErr
+			return nil, false, ctxErr
 		}
 	}
-	return ok, nil
+	return lock, ok, nil
+}
+
+func helperInstallLockUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.IsPermission(err) || os.IsNotExist(err) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "read-only file system") || strings.Contains(text, "access is denied")
 }
 
 type teamsUpgradeServiceRefreshResult struct {
