@@ -39,18 +39,21 @@ type teamsServiceWatchdogOptions struct {
 }
 
 type teamsServiceWatchdogSnapshot struct {
-	Installed           bool
-	Active              bool
-	StateFiles          int
-	ServicePaused       bool
-	ServiceDraining     bool
-	OwnerFound          bool
-	OwnerFresh          bool
-	OwnerActiveTurn     bool
-	LastOwnerHeartbeat  time.Time
-	FreshOwnerStartedAt time.Time
-	PollActivityFound   bool
-	PollActivityAt      time.Time
+	Installed                          bool
+	Active                             bool
+	StateFiles                         int
+	ServicePaused                      bool
+	ServiceDraining                    bool
+	HelperUpgradeDrainExpired          bool
+	HelperUpgradeDrainLocalOwnerFresh  bool
+	HelperUpgradeDrainRemoteOwnerFresh bool
+	OwnerFound                         bool
+	OwnerFresh                         bool
+	OwnerActiveTurn                    bool
+	LastOwnerHeartbeat                 time.Time
+	FreshOwnerStartedAt                time.Time
+	PollActivityFound                  bool
+	PollActivityAt                     time.Time
 }
 
 type teamsServiceWatchdogState struct {
@@ -228,7 +231,8 @@ func mergeTeamsServiceWatchdogState(snapshot *teamsServiceWatchdogSnapshot, stat
 	if state.ServiceControl.Draining {
 		snapshot.ServiceDraining = true
 	}
-	if owner, ok := rawTeamsStateOwner(state); ok {
+	owner, hasOwner := rawTeamsStateOwner(state)
+	if hasOwner {
 		snapshot.OwnerFound = true
 		if owner.LastHeartbeat.After(snapshot.LastOwnerHeartbeat) {
 			snapshot.LastOwnerHeartbeat = owner.LastHeartbeat
@@ -241,6 +245,19 @@ func mergeTeamsServiceWatchdogState(snapshot *teamsServiceWatchdogSnapshot, stat
 			}
 			if !owner.StartedAt.IsZero() && (snapshot.FreshOwnerStartedAt.IsZero() || owner.StartedAt.Before(snapshot.FreshOwnerStartedAt)) {
 				snapshot.FreshOwnerStartedAt = owner.StartedAt
+			}
+		}
+	}
+	if teamsstore.HelperUpgradeDrainExpired(state, opts.Now) {
+		snapshot.HelperUpgradeDrainExpired = true
+		if hasOwner {
+			fresh := !teamsstore.IsStale(owner, opts.OwnerStaleAfter, opts.Now) && !teamsstore.OwnerAppearsLocallyDead(owner)
+			if fresh {
+				if teamsstore.OwnerAppearsLocal(owner) {
+					snapshot.HelperUpgradeDrainLocalOwnerFresh = true
+				} else {
+					snapshot.HelperUpgradeDrainRemoteOwnerFresh = true
+				}
 			}
 		}
 	}
@@ -313,6 +330,9 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is paused"}
 	}
 	if snapshot.ServiceDraining {
+		if snapshot.HelperUpgradeDrainExpired {
+			return evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot, state, opts)
+		}
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is draining"}
 	}
 	if snapshot.StateFiles == 0 {
@@ -322,6 +342,24 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	stale, reason := teamsServiceWatchdogStaleReason(snapshot, opts)
 	if !stale {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason}
+	}
+	consecutive := state.ConsecutiveStale + 1
+	if consecutive < opts.MinConsecutiveStale {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
+	}
+	if until, ok := teamsServiceWatchdogCooldownUntil(state, opts); ok {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; waiting for restart cooldown", Stale: true, ConsecutiveStale: consecutive, CooldownUntil: until}
+	}
+	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
+}
+
+func evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot teamsServiceWatchdogSnapshot, state teamsServiceWatchdogState, opts teamsServiceWatchdogOptions) teamsServiceWatchdogDecision {
+	reason := "helper upgrade drain expired"
+	if snapshot.OwnerFresh && snapshot.OwnerActiveTurn {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; active turn is still heartbeating"}
+	}
+	if snapshot.HelperUpgradeDrainRemoteOwnerFresh {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; owner is fresh on another machine"}
 	}
 	consecutive := state.ConsecutiveStale + 1
 	if consecutive < opts.MinConsecutiveStale {

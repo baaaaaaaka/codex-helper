@@ -608,6 +608,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	if err := b.clearStaleHelperReloadDrainOnStart(ctx); err != nil {
 		return err
 	}
+	if err := b.completeExpiredHelperUpgradeDrainOnStart(ctx); err != nil {
+		return err
+	}
 	ownerHeartbeatCtx, cancelOwnerHeartbeat := context.WithCancel(ctx)
 	ownerHeartbeatDone := b.startOwnerHeartbeat(ownerHeartbeatCtx)
 	stopOwnerHeartbeat := func() {
@@ -2952,6 +2955,40 @@ func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
 	})
 }
 
+func (b *Bridge) completeExpiredHelperUpgradeDrainOnStart(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if !teamstore.HelperUpgradeDrainExpired(state, now) {
+		return nil
+	}
+	owner, hasOwner := helperRestartStateOwner(state)
+	if hasOwner {
+		staleAfter := b.ownerStaleAfter
+		if staleAfter <= 0 {
+			staleAfter = 5 * time.Minute
+		}
+		ownerFresh := !teamstore.IsStale(owner, staleAfter, now) && !teamstore.OwnerAppearsLocallyDead(owner)
+		if ownerFresh && !teamstore.OwnerAppearsLocal(owner) {
+			return nil
+		}
+		if ownerFresh && strings.TrimSpace(owner.ActiveTurnID) != "" {
+			return nil
+		}
+	}
+	if state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
+		_, err := b.store.CompleteUpgrade(ctx, state.Upgrade.ID, b.helperVersion)
+		return err
+	}
+	_, err = b.store.ClearDrain(ctx)
+	return err
+}
+
 func (b *Bridge) pendingHelperRestartNoticePath() (string, error) {
 	if err := b.ensureStore(); err != nil {
 		return "", err
@@ -3376,6 +3413,13 @@ func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (s
 		return "", false, err
 	}
 	if state.ServiceControl.Draining {
+		now := time.Now()
+		if teamstore.HelperUpgradeDrainExpired(state, now) {
+			if message, blocked := b.expiredHelperUpgradeRestartBlockMessage(state, force, now); blocked {
+				return message, true, nil
+			}
+			return "", false, nil
+		}
 		return helperDrainBlockedMessage(state.ServiceControl, "restart"), true, nil
 	}
 	if !force && teamstore.HasUpgradeBlockingWork(state, time.Now()) {
@@ -3389,6 +3433,50 @@ func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (s
 		}, "\n"), true, nil
 	}
 	return "", false, nil
+}
+
+func (b *Bridge) expiredHelperUpgradeRestartBlockMessage(state teamstore.State, force bool, now time.Time) (string, bool) {
+	owner, hasOwner := helperRestartStateOwner(state)
+	if !hasOwner {
+		return "", false
+	}
+	staleAfter := b.ownerStaleAfter
+	if staleAfter <= 0 {
+		staleAfter = 5 * time.Minute
+	}
+	ownerFresh := !teamstore.IsStale(owner, staleAfter, now) && !teamstore.OwnerAppearsLocallyDead(owner)
+	if !ownerFresh {
+		return "", false
+	}
+	if !teamstore.OwnerAppearsLocal(owner) {
+		return strings.Join([]string{
+			"⏳ Helper upgrade recovery is waiting for another machine.",
+			"",
+			"The helper upgrade drain has expired, but the active owner is still heartbeating on another machine.",
+			"I will not restart this machine because that could create two Teams helpers using the same shared home.",
+			"",
+			"Owner: host=" + firstNonEmptyString(owner.Hostname, "unknown") + " version=" + firstNonEmptyString(owner.HelperVersion, "unknown"),
+		}, "\n"), true
+	}
+	if strings.TrimSpace(owner.ActiveTurnID) != "" && !force {
+		return strings.Join([]string{
+			"⏳ Helper upgrade recovery is waiting for active Codex work.",
+			"",
+			"The helper upgrade drain has expired, but the current owner still reports an active turn.",
+			"Wait for it to finish, or send `helper restart force` if you accept interrupting it.",
+		}, "\n"), true
+	}
+	return "", false
+}
+
+func helperRestartStateOwner(state teamstore.State) (teamstore.OwnerMetadata, bool) {
+	if state.ServiceOwner != nil {
+		return *state.ServiceOwner, true
+	}
+	if state.LockOwner != nil {
+		return *state.LockOwner, true
+	}
+	return teamstore.OwnerMetadata{}, false
 }
 
 func helperDrainBlockedMessage(control teamstore.ServiceControl, action string) string {

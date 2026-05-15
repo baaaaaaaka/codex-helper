@@ -1263,6 +1263,58 @@ func TestUpgradeLifecycleRestoresControl(t *testing.T) {
 	}
 }
 
+func TestHelperUpgradeDrainExpired(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	base := State{
+		ServiceControl: ServiceControl{Draining: true, Reason: HelperUpgradeReason},
+		Upgrade: &UpgradeRequest{
+			ID:         "upgrade-1",
+			Phase:      UpgradePhaseDraining,
+			Reason:     HelperUpgradeReason,
+			DeadlineAt: now.Add(-time.Second),
+		},
+	}
+	if !HelperUpgradeDrainExpired(base, now) {
+		t.Fatal("expired helper upgrade drain was not detected")
+	}
+
+	future := base
+	future.Upgrade = cloneUpgradeForTest(base.Upgrade)
+	future.Upgrade.DeadlineAt = now.Add(time.Second)
+	if HelperUpgradeDrainExpired(future, now) {
+		t.Fatal("future helper upgrade drain reported expired")
+	}
+
+	completed := base
+	completed.Upgrade = cloneUpgradeForTest(base.Upgrade)
+	completed.Upgrade.Phase = UpgradePhaseCompleted
+	if HelperUpgradeDrainExpired(completed, now) {
+		t.Fatal("completed helper upgrade reported expired")
+	}
+
+	plainDrain := base
+	plainDrain.Upgrade = nil
+	if HelperUpgradeDrainExpired(plainDrain, now) {
+		t.Fatal("plain helper drain without upgrade request reported expired")
+	}
+
+	codexUpgrade := base
+	codexUpgrade.ServiceControl.Reason = CodexUpgradeReason
+	codexUpgrade.Upgrade = cloneUpgradeForTest(base.Upgrade)
+	codexUpgrade.Upgrade.Reason = CodexUpgradeReason
+	if HelperUpgradeDrainExpired(codexUpgrade, now) {
+		t.Fatal("Codex upgrade drain reported as helper upgrade expired")
+	}
+}
+
+func cloneUpgradeForTest(req *UpgradeRequest) *UpgradeRequest {
+	if req == nil {
+		return nil
+	}
+	out := *req
+	return &out
+}
+
 func TestUpgradeRescueInterruptsRunningPreservesQueuedAndSkipsTransientOutbox(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -3641,6 +3693,25 @@ func TestRecordOwnerHeartbeatReplacesDeadLocalOwnerBeforeStale(t *testing.T) {
 	}
 	if recorded.PID != contender.PID || recorded.ActiveSessionID != "session-new" || recorded.ActiveTurnID != "turn-new" {
 		t.Fatalf("dead local owner was not replaced: %#v", recorded)
+	}
+}
+
+func TestOwnerAppearsLocal(t *testing.T) {
+	prevHostname := ownerHostname
+	t.Cleanup(func() { ownerHostname = prevHostname })
+	ownerHostname = func() (string, error) { return "host-a", nil }
+
+	if !OwnerAppearsLocal(OwnerMetadata{Hostname: "host-a"}) {
+		t.Fatal("owner on current host was not recognized as local")
+	}
+	if !OwnerAppearsLocal(OwnerMetadata{Hostname: " HOST-A "}) {
+		t.Fatal("owner hostname comparison should ignore case and surrounding space")
+	}
+	if OwnerAppearsLocal(OwnerMetadata{Hostname: "host-b"}) {
+		t.Fatal("owner on another host was recognized as local")
+	}
+	if OwnerAppearsLocal(OwnerMetadata{}) {
+		t.Fatal("owner without hostname was recognized as local")
 	}
 }
 

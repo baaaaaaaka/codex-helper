@@ -127,6 +127,180 @@ func TestTeamsServiceWatchdogDoesNotRestartFreshOwnerWithActiveTurn(t *testing.T
 	}
 }
 
+func TestTeamsServiceWatchdogRestartsExpiredHelperUpgradeDrainWithLocalOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                         true,
+		Active:                            true,
+		StateFiles:                        1,
+		ServiceDraining:                   true,
+		HelperUpgradeDrainExpired:         true,
+		HelperUpgradeDrainLocalOwnerFresh: true,
+		OwnerFound:                        true,
+		OwnerFresh:                        true,
+		LastOwnerHeartbeat:                now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
+		t.Fatalf("decision = %+v, want restart for expired helper upgrade drain", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogDoesNotRestartExpiredHelperUpgradeDrainWithRemoteFreshOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                          true,
+		Active:                             true,
+		StateFiles:                         1,
+		ServiceDraining:                    true,
+		HelperUpgradeDrainExpired:          true,
+		HelperUpgradeDrainRemoteOwnerFresh: true,
+		OwnerFound:                         true,
+		OwnerFresh:                         true,
+		LastOwnerHeartbeat:                 now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "another machine") {
+		t.Fatalf("decision = %+v, want noop for fresh remote owner", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogRemoteFreshOwnerWinsOverLocalUpgradeEvidence(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                          true,
+		Active:                             true,
+		StateFiles:                         1,
+		ServiceDraining:                    true,
+		HelperUpgradeDrainExpired:          true,
+		HelperUpgradeDrainLocalOwnerFresh:  true,
+		HelperUpgradeDrainRemoteOwnerFresh: true,
+		OwnerFound:                         true,
+		OwnerFresh:                         true,
+		LastOwnerHeartbeat:                 now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "another machine") {
+		t.Fatalf("decision = %+v, want remote owner evidence to block restart", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogDoesNotRestartExpiredHelperUpgradeDrainWithActiveTurn(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                         true,
+		Active:                            true,
+		StateFiles:                        1,
+		ServiceDraining:                   true,
+		HelperUpgradeDrainExpired:         true,
+		HelperUpgradeDrainLocalOwnerFresh: true,
+		OwnerFound:                        true,
+		OwnerFresh:                        true,
+		OwnerActiveTurn:                   true,
+		LastOwnerHeartbeat:                now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "active turn") {
+		t.Fatalf("decision = %+v, want noop for active turn", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogExpiredHelperUpgradeDrainRespectsRestartCooldown(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                         true,
+		Active:                            true,
+		StateFiles:                        1,
+		ServiceDraining:                   true,
+		HelperUpgradeDrainExpired:         true,
+		HelperUpgradeDrainLocalOwnerFresh: true,
+		OwnerFound:                        true,
+		OwnerFresh:                        true,
+		LastOwnerHeartbeat:                now.Add(-5 * time.Second),
+	}
+	state := teamsServiceWatchdogState{LastActionAt: now.Add(-10 * time.Second)}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, state, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.CooldownUntil.IsZero() {
+		t.Fatalf("decision = %+v, want noop until cooldown", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogMergeDetectsExpiredHelperUpgradeDrainLocalOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	owner := teamsstore.OwnerMetadata{
+		PID:             os.Getpid(),
+		Hostname:        hostname,
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeat:   now.Add(-5 * time.Second),
+		ActiveSessionID: "s002",
+	}
+	state := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{Draining: true, Reason: teamsstore.HelperUpgradeReason},
+		Upgrade: &teamsstore.UpgradeRequest{
+			ID:         "upgrade-1",
+			Phase:      teamsstore.UpgradePhaseDraining,
+			Reason:     teamsstore.HelperUpgradeReason,
+			DeadlineAt: now.Add(-time.Minute),
+		},
+		ServiceOwner: &owner,
+		LockOwner:    &owner,
+	}
+	var snapshot teamsServiceWatchdogSnapshot
+
+	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
+	if !snapshot.ServiceDraining || !snapshot.HelperUpgradeDrainExpired || !snapshot.HelperUpgradeDrainLocalOwnerFresh {
+		t.Fatalf("snapshot did not detect local expired helper upgrade drain: %+v", snapshot)
+	}
+}
+
+func TestTeamsServiceWatchdogMergeDetectsExpiredHelperUpgradeDrainRemoteOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	owner := teamsstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        hostname + "-remote",
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeat:   now.Add(-5 * time.Second),
+		ActiveSessionID: "s002",
+	}
+	state := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{Draining: true, Reason: teamsstore.HelperUpgradeReason},
+		Upgrade: &teamsstore.UpgradeRequest{
+			ID:         "upgrade-1",
+			Phase:      teamsstore.UpgradePhaseDraining,
+			Reason:     teamsstore.HelperUpgradeReason,
+			DeadlineAt: now.Add(-time.Minute),
+		},
+		ServiceOwner: &owner,
+		LockOwner:    &owner,
+	}
+	var snapshot teamsServiceWatchdogSnapshot
+
+	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
+	if !snapshot.ServiceDraining || !snapshot.HelperUpgradeDrainExpired || !snapshot.HelperUpgradeDrainRemoteOwnerFresh || snapshot.HelperUpgradeDrainLocalOwnerFresh {
+		t.Fatalf("snapshot did not detect remote expired helper upgrade drain owner: %+v", snapshot)
+	}
+}
+
 func TestTeamsServiceWatchdogPollActivityUsesControlPollError(t *testing.T) {
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
 	state := teamsstore.State{

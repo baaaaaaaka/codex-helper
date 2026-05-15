@@ -4043,6 +4043,233 @@ func TestBridgeControlRestartDoesNotRunDuringHelperUpgrade(t *testing.T) {
 	}
 }
 
+func TestBridgeControlRestartRunsAfterExpiredHelperUpgradeDrain(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedExpiredHelperUpgradeDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.87", "", "", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-expired-upgrade"), "helper restart now"); err != nil {
+		t.Fatalf("handleControlMessage restart expired upgrade error: %v", err)
+	}
+	select {
+	case <-restarted:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("helper restart now did not run after expired helper upgrade drain")
+	}
+}
+
+func TestBridgeControlRestartDoesNotRecoverExpiredHelperUpgradeOwnedByRemoteMachine(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedExpiredHelperUpgradeDrain(t, store)
+	remoteOwner := teamstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        "remote-shared-home-host",
+		ExecutablePath:  "/home/baka/.local/bin/codex-proxy",
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       time.Now().Add(-time.Hour),
+		LastHeartbeat:   time.Now(),
+		ActiveSessionID: "s002",
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceOwner = &remoteOwner
+		state.LockOwner = &remoteOwner
+		return nil
+	}); err != nil {
+		t.Fatalf("Update owner error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-expired-remote-upgrade"), "helper restart force"); err != nil {
+		t.Fatalf("handleControlMessage restart expired remote upgrade error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("helper restart must not recover a fresh remote owner")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "another machine") || !strings.Contains(got, "remote-shared-home-host") {
+		t.Fatalf("remote owner recovery response = %q", got)
+	}
+}
+
+func TestBridgeControlRestartNowBlocksExpiredHelperUpgradeWithActiveTurn(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedExpiredHelperUpgradeDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.87", "s002", "turn-live", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-expired-active-upgrade"), "helper restart now"); err != nil {
+		t.Fatalf("handleControlMessage restart expired active upgrade error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("helper restart now must not interrupt active turn during expired helper upgrade drain")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "active Codex work") || !strings.Contains(got, "helper restart force") {
+		t.Fatalf("active owner recovery response = %q", got)
+	}
+}
+
+func TestBridgeControlRestartForceRunsAfterExpiredHelperUpgradeWithActiveTurn(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedExpiredHelperUpgradeDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.87", "s002", "turn-live", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-force-expired-active-upgrade"), "helper restart force"); err != nil {
+		t.Fatalf("handleControlMessage restart force expired active upgrade error: %v", err)
+	}
+	select {
+	case <-restarted:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("helper restart force did not run after expired helper upgrade drain with active turn")
+	}
+}
+
+func TestBridgeCompletesExpiredHelperUpgradeDrainOnStart(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.helperVersion = "v0.1.0-rc.93"
+	seedExpiredHelperUpgradeDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.93", "", "", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.completeExpiredHelperUpgradeDrainOnStart(context.Background()); err != nil {
+		t.Fatalf("completeExpiredHelperUpgradeDrainOnStart error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.ServiceControl.Draining {
+		t.Fatalf("ServiceControl still draining: %#v", state.ServiceControl)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted || state.Upgrade.InstalledTag != "v0.1.0-rc.93" {
+		t.Fatalf("upgrade not completed with running helper version: %#v", state.Upgrade)
+	}
+}
+
+func TestBridgeDoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.helperVersion = "v0.1.0-rc.93"
+	seedExpiredHelperUpgradeDrain(t, store)
+	remoteOwner := teamstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        "remote-shared-home-host",
+		ExecutablePath:  "/home/baka/.local/bin/codex-proxy",
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       time.Now().Add(-time.Hour),
+		LastHeartbeat:   time.Now(),
+		ActiveSessionID: "s002",
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceOwner = &remoteOwner
+		state.LockOwner = &remoteOwner
+		return nil
+	}); err != nil {
+		t.Fatalf("Update owner error: %v", err)
+	}
+
+	if err := bridge.completeExpiredHelperUpgradeDrainOnStart(context.Background()); err != nil {
+		t.Fatalf("completeExpiredHelperUpgradeDrainOnStart error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if !state.ServiceControl.Draining {
+		t.Fatalf("remote-owned upgrade drain was cleared: %#v", state.ServiceControl)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase == teamstore.UpgradePhaseCompleted {
+		t.Fatalf("remote-owned upgrade was completed: %#v", state.Upgrade)
+	}
+}
+
+func seedExpiredHelperUpgradeDrain(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	req, err := store.BeginUpgrade(context.Background(), teamstore.HelperUpgradeReason, time.Hour)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		if state.Upgrade == nil || state.Upgrade.ID != req.ID {
+			return fmt.Errorf("upgrade state mismatch: %#v", state.Upgrade)
+		}
+		state.Upgrade.DeadlineAt = time.Now().Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("expire upgrade error: %v", err)
+	}
+}
+
 func TestBridgeControlReloadRequiresConfirmationAndRunsReloader(t *testing.T) {
 	prevDelay := helperRestartDelay
 	helperRestartDelay = 0

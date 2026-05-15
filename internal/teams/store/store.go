@@ -1518,15 +1518,36 @@ func IsStale(owner OwnerMetadata, staleAfter time.Duration, now time.Time) bool 
 	return !owner.LastHeartbeat.After(now) && now.Sub(owner.LastHeartbeat) > staleAfter
 }
 
+func HelperUpgradeDrainExpired(state State, now time.Time) bool {
+	if !state.ServiceControl.Draining || state.ServiceControl.Reason != HelperUpgradeReason {
+		return false
+	}
+	if !activeUpgrade(state.Upgrade) || state.Upgrade.Reason != HelperUpgradeReason || state.Upgrade.DeadlineAt.IsZero() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return !state.Upgrade.DeadlineAt.After(now)
+}
+
+func OwnerAppearsLocal(owner OwnerMetadata) bool {
+	if strings.TrimSpace(owner.Hostname) == "" {
+		return false
+	}
+	hostname, err := ownerHostname()
+	hostname = strings.TrimSpace(hostname)
+	if err != nil || hostname == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(owner.Hostname), hostname)
+}
+
 func OwnerAppearsLocallyDead(owner OwnerMetadata) bool {
 	if owner.PID <= 0 || strings.TrimSpace(owner.Hostname) == "" {
 		return false
 	}
-	hostname, err := ownerHostname()
-	if err != nil || strings.TrimSpace(hostname) == "" {
-		return false
-	}
-	if owner.Hostname != hostname {
+	if !OwnerAppearsLocal(owner) {
 		return false
 	}
 	return !ownerProcessAlive(owner.PID)
