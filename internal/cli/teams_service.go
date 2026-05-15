@@ -3084,7 +3084,7 @@ func teamsServiceWSLStopStartupFallbackProcessesPowerShell(pathExpressions ...st
 		"try { Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { " +
 		"$proc = $_; $cmd = [string]$proc.CommandLine; " +
 		"if ($proc.ProcessId -ne $PID -and -not [string]::IsNullOrWhiteSpace($cmd)) { " +
-		"foreach ($needle in $watchdogNeedles) { if ($cmd.Contains($needle)) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue; break } } " +
+		"foreach ($needle in $watchdogNeedles) { if ($cmd.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue; break } } " +
 		"} " +
 		"} } catch { }; "
 }

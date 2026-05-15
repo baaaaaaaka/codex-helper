@@ -1154,6 +1154,9 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapSuccessCleansStartupFallbackCI(t *t
 		".ps1",
 		"legacy123",
 		"Set-Content -LiteralPath $stopPath",
+		"Get-CimInstance Win32_Process",
+		"OrdinalIgnoreCase",
+		"Stop-Process -Id $proc.ProcessId -Force",
 		"$content.Contains('starting ' + $legacyPrefix)",
 		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.cmd'",
 		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.vbs'",
@@ -1860,6 +1863,7 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledT
 				"Get-CimInstance Win32_Process",
 				"$proc.ProcessId -ne $PID",
 				"Stop-Process -Id $proc.ProcessId -Force",
+				"OrdinalIgnoreCase",
 				"$scriptPrefix + $suffix + '.ps1",
 				"$scriptPrefix + $suffix + '.vbs",
 				"$scriptPrefix + $suffix + '.cmd",
@@ -1878,6 +1882,9 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledT
 			if !strings.Contains(joined, "Get-CimInstance Win32_Process") || !strings.Contains(joined, "$proc.ProcessId -ne $PID") {
 				t.Fatalf("fallback start should retire stale existing watchdog wrapper before relaunch:\n%s", joined)
 			}
+			if !strings.Contains(joined, "OrdinalIgnoreCase") {
+				t.Fatalf("fallback start should match stale wrapper command lines case-insensitively:\n%s", joined)
+			}
 			if _, err := os.Stat(stopPath); !os.IsNotExist(err) {
 				t.Fatalf("fallback start should clear Linux stop marker, stat err=%v", err)
 			}
@@ -1895,6 +1902,126 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledT
 			}
 		}
 	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackProcessCleanupPowerShellCI(t *testing.T) {
+	command := "$scriptPath = 'C:\\Users\\Alice\\AppData\\Local\\codex-helper\\teams\\codex-helper-teams-wsl-AbC.ps1'; " +
+		"$launcherPath = 'C:\\Users\\Alice\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\codex-helper-teams-wsl-AbC.vbs'; " +
+		"$legacyCmdLauncherPath = 'C:\\Users\\Alice\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\codex-helper-teams-wsl-AbC.cmd'; " +
+		teamsServiceWSLStopStartupFallbackProcessesPowerShell("$scriptPath", "$launcherPath", "$legacyCmdLauncherPath")
+	for _, want := range []string{
+		"Get-CimInstance Win32_Process",
+		"$proc.ProcessId -ne $PID",
+		"OrdinalIgnoreCase",
+		"Stop-Process -Id $proc.ProcessId -Force",
+		"catch { }",
+		"$scriptPath",
+		"$launcherPath",
+		"$legacyCmdLauncherPath",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("startup fallback process cleanup PowerShell missing %q:\n%s", want, command)
+		}
+	}
+	if strings.Contains(command, "$cmd.Contains(") {
+		t.Fatalf("startup fallback cleanup should not use case-sensitive Contains matching:\n%s", command)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackProcessCleanupNativeWindowsCI(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("native PowerShell process cleanup is Windows-only")
+	}
+	powershellExe, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Fatalf("powershell.exe not found: %v", err)
+	}
+
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "codex-helper-teams-wsl-CiMixed.ps1")
+	launcherPath := filepath.Join(tmp, "codex-helper-teams-wsl-CiMixed.vbs")
+	legacyCmdLauncherPath := filepath.Join(tmp, "codex-helper-teams-wsl-CiMixed.cmd")
+	for _, path := range []string{scriptPath, launcherPath, legacyCmdLauncherPath} {
+		if err := os.WriteFile(path, []byte("placeholder"), 0o600); err != nil {
+			t.Fatalf("write placeholder %s: %v", path, err)
+		}
+	}
+
+	child := exec.Command(powershellExe,
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		"$watchdogScript = "+powershellSingleQuote(scriptPath)+"; Start-Sleep -Seconds 300",
+	)
+	if err := child.Start(); err != nil {
+		t.Fatalf("start stale watchdog stand-in: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = child.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-exited:
+		default:
+			_ = child.Process.Kill()
+			<-exited
+		}
+	})
+
+	waitForWindowsProcessCommandLineContains(t, powershellExe, child.Process.Pid, scriptPath)
+
+	cleanupCommand := "$scriptPath = " + powershellSingleQuote(strings.ToUpper(scriptPath)) + "; " +
+		"$launcherPath = " + powershellSingleQuote(strings.ToUpper(launcherPath)) + "; " +
+		"$legacyCmdLauncherPath = " + powershellSingleQuote(strings.ToUpper(legacyCmdLauncherPath)) + "; " +
+		teamsServiceWSLStopStartupFallbackProcessesPowerShell("$scriptPath", "$launcherPath", "$legacyCmdLauncherPath")
+	out, err := exec.Command(powershellExe,
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		cleanupCommand,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("cleanup stale watchdog stand-in failed: %v\n%s", err, out)
+	}
+
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("stale watchdog stand-in pid %d was not stopped by cleanup PowerShell", child.Process.Pid)
+	}
+}
+
+func waitForWindowsProcessCommandLineContains(t *testing.T, powershellExe string, pid int, needle string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		query := "$p = Get-CimInstance Win32_Process -Filter " + powershellSingleQuote("ProcessId = "+strconv.Itoa(pid)) + "; " +
+			"if ($null -eq $p) { exit 2 }; " +
+			"$cmd = [string]$p.CommandLine; " +
+			"if ($cmd.IndexOf(" + powershellSingleQuote(needle) + ", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { exit 0 }; " +
+			"Write-Output $cmd; exit 3"
+		out, err := exec.Command(powershellExe,
+			"-NoProfile",
+			"-NonInteractive",
+			"-ExecutionPolicy",
+			"Bypass",
+			"-Command",
+			query,
+		).CombinedOutput()
+		if err == nil {
+			return
+		}
+		lastOut = out
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("process %d command line did not contain %q; last output:\n%s", pid, needle, lastOut)
 }
 
 func TestTeamsBackgroundKeepaliveWSLStartupFallbackStartRewritesLegacyConfigCI(t *testing.T) {
@@ -1949,6 +2076,9 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackStartRewritesLegacyConfigCI(t
 		"$deadline = (Get-Date).AddSeconds(60)",
 		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK=1",
 		"/home/alice/bin/codex-proxy",
+		"Get-CimInstance Win32_Process",
+		"OrdinalIgnoreCase",
+		"Stop-Process -Id $proc.ProcessId -Force",
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("fallback start rewrite command missing %q:\n%s", want, command)
