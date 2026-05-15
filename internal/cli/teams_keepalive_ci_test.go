@@ -1343,6 +1343,9 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE=",
 		"Remove-Item -LiteralPath $stopPath",
 		"Remove-Item -LiteralPath $legacyCmdLauncherPath",
+		"Get-CimInstance Win32_Process",
+		"$proc.ProcessId -ne $PID",
+		"Stop-Process -Id $proc.ProcessId -Force",
 		"$launcherPath = Join-Path $startup",
 		"Set-Content -LiteralPath $launcherPath",
 		"WScript.Shell",
@@ -1853,12 +1856,27 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledT
 			if !strings.Contains(joined, "Set-Content -LiteralPath $stopPath") || !strings.Contains(joined, suffix) || !strings.Contains(joined, ".signal") {
 				t.Fatalf("fallback stop should write the Startup watchdog stop signal:\n%s", joined)
 			}
+			for _, want := range []string{
+				"Get-CimInstance Win32_Process",
+				"$proc.ProcessId -ne $PID",
+				"Stop-Process -Id $proc.ProcessId -Force",
+				"$scriptPrefix + $suffix + '.ps1",
+				"$scriptPrefix + $suffix + '.vbs",
+				"$scriptPrefix + $suffix + '.cmd",
+			} {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("fallback stop should retire stale watchdog wrapper processes; missing %q:\n%s", want, joined)
+				}
+			}
 			if _, err := os.Stat(stopPath); err != nil {
 				t.Fatalf("fallback stop should write Linux stop marker: %v", err)
 			}
 		case "start":
 			if !strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(joined, "codex-helper-teams-wsl-"+suffix+".vbs") {
 				t.Fatalf("fallback start should launch existing hidden Startup watchdog:\n%s", joined)
+			}
+			if !strings.Contains(joined, "Get-CimInstance Win32_Process") || !strings.Contains(joined, "$proc.ProcessId -ne $PID") {
+				t.Fatalf("fallback start should retire stale existing watchdog wrapper before relaunch:\n%s", joined)
 			}
 			if _, err := os.Stat(stopPath); !os.IsNotExist(err) {
 				t.Fatalf("fallback start should clear Linux stop marker, stat err=%v", err)
@@ -1869,7 +1887,7 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledT
 			}
 			first := strings.Join(runner.calls[0].args, " ")
 			second := strings.Join(runner.calls[1].args, " ")
-			if !strings.Contains(first, "Set-Content -LiteralPath $stopPath") || !strings.Contains(second, "Start-Process -FilePath 'wscript.exe'") {
+			if !strings.Contains(first, "Set-Content -LiteralPath $stopPath") || !strings.Contains(first, "Get-CimInstance Win32_Process") || !strings.Contains(second, "Start-Process -FilePath 'wscript.exe'") {
 				t.Fatalf("fallback restart should stop then start via Startup watchdog:\nfirst=%s\nsecond=%s", first, second)
 			}
 			if _, err := os.Stat(stopPath); !os.IsNotExist(err) {

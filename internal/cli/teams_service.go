@@ -2987,26 +2987,37 @@ func buildTeamsServiceWSLStartupFallbackCommandWithArgumentLine(taskName string,
 
 func buildTeamsServiceWSLStartExistingStartupFallbackCommand(suffix string) string {
 	launcherName := "codex-helper-teams-wsl-" + suffix + ".vbs"
+	scriptName := "codex-helper-teams-wsl-" + suffix + ".ps1"
+	legacyCmdLauncherName := "codex-helper-teams-wsl-" + suffix + ".cmd"
 	stopName := "codex-helper-teams-wsl-stop-" + suffix + ".signal"
 	return "$startup = [Environment]::GetFolderPath('Startup'); " +
 		"if ([string]::IsNullOrWhiteSpace($startup)) { throw 'Windows Startup folder is unavailable' }; " +
 		"$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
 		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
 		"$launcherPath = Join-Path $startup " + powershellSingleQuote(launcherName) + "; " +
+		"$scriptPath = Join-Path $appDir " + powershellSingleQuote(scriptName) + "; " +
+		"$legacyCmdLauncherPath = Join-Path $startup " + powershellSingleQuote(legacyCmdLauncherName) + "; " +
 		"$stopPath = Join-Path $appDir " + powershellSingleQuote(stopName) + "; " +
 		"Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue; " +
 		"if (-not (Test-Path -LiteralPath $launcherPath)) { throw ('Teams WSL Startup watchdog launcher not found: ' + $launcherPath) }; " +
+		teamsServiceWSLStopStartupFallbackProcessesPowerShell("$scriptPath", "$launcherPath", "$legacyCmdLauncherPath") +
 		"Start-Process -FilePath 'wscript.exe' -ArgumentList ('//B //Nologo \"' + $launcherPath + '\"') -WindowStyle Hidden | Out-Null"
 }
 
 func buildTeamsServiceWSLStopStartupFallbackCommand(suffixes []string) string {
 	return "$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
 		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
+		"$startup = [Environment]::GetFolderPath('Startup'); " +
+		"$scriptPrefix = 'codex-helper-teams-wsl-'; " +
 		"$suffixes = " + powershellArrayLiteral(uniqueNonEmptyStrings(suffixes)) + "; " +
 		"foreach ($suffix in $suffixes) { " +
 		"if ([string]::IsNullOrWhiteSpace($suffix)) { continue }; " +
 		"$stopPath = Join-Path $appDir ('codex-helper-teams-wsl-stop-' + $suffix + '.signal'); " +
-		"Set-Content -LiteralPath $stopPath -Value 'stop' -Encoding ASCII " +
+		"Set-Content -LiteralPath $stopPath -Value 'stop' -Encoding ASCII; " +
+		"$scriptPath = Join-Path $appDir ($scriptPrefix + $suffix + '.ps1'); " +
+		"$launcherPath = if (-not [string]::IsNullOrWhiteSpace($startup)) { Join-Path $startup ($scriptPrefix + $suffix + '.vbs') } else { '' }; " +
+		"$legacyCmdLauncherPath = if (-not [string]::IsNullOrWhiteSpace($startup)) { Join-Path $startup ($scriptPrefix + $suffix + '.cmd') } else { '' }; " +
+		teamsServiceWSLStopStartupFallbackProcessesPowerShell("$scriptPath", "$launcherPath", "$legacyCmdLauncherPath") +
 		"}"
 }
 
@@ -3049,8 +3060,33 @@ func buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName string, suffixes 
 		"if (-not [string]::IsNullOrWhiteSpace($startup)) { $paths += (Join-Path $startup ($scriptPrefix + $suffix + '.cmd')); $paths += (Join-Path $startup ($scriptPrefix + $suffix + '.vbs')) }; " +
 		"$paths += (Join-Path $appDir ($scriptPrefix + $suffix + '.ps1')); " +
 		"$paths += (Join-Path $appDir ($scriptPrefix + $suffix + '.vbs')); " +
+		"$scriptPath = Join-Path $appDir ($scriptPrefix + $suffix + '.ps1'); " +
+		"$launcherPath = if (-not [string]::IsNullOrWhiteSpace($startup)) { Join-Path $startup ($scriptPrefix + $suffix + '.vbs') } else { '' }; " +
+		"$legacyCmdLauncherPath = if (-not [string]::IsNullOrWhiteSpace($startup)) { Join-Path $startup ($scriptPrefix + $suffix + '.cmd') } else { '' }; " +
+		teamsServiceWSLStopStartupFallbackProcessesPowerShell("$scriptPath", "$launcherPath", "$legacyCmdLauncherPath") +
 		"foreach ($path in $paths) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } " +
 		"}"
+}
+
+func teamsServiceWSLStopStartupFallbackProcessesPowerShell(pathExpressions ...string) string {
+	paths := make([]string, 0, len(pathExpressions))
+	for _, expr := range pathExpressions {
+		expr = strings.TrimSpace(expr)
+		if expr == "" {
+			continue
+		}
+		paths = append(paths, expr)
+	}
+	if len(paths) == 0 {
+		return ""
+	}
+	return "$watchdogNeedles = @(" + strings.Join(paths, ", ") + ") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }; " +
+		"try { Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { " +
+		"$proc = $_; $cmd = [string]$proc.CommandLine; " +
+		"if ($proc.ProcessId -ne $PID -and -not [string]::IsNullOrWhiteSpace($cmd)) { " +
+		"foreach ($needle in $watchdogNeedles) { if ($cmd.Contains($needle)) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue; break } } " +
+		"} " +
+		"} } catch { }; "
 }
 
 func buildTeamsServiceWSLStartupWatchdogScript(taskName string, args []string, suffix string) string {
