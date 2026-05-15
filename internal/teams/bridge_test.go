@@ -3234,6 +3234,121 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	}
 }
 
+func TestBridgeControlFallbackPromptIncludesControlHistoryContext(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "fallback answer",
+		CodexThreadID: "control-thread-1",
+		CodexTurnID:   "control-turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	bridge.helperVersion = "v-test"
+	bridge.reg.ControlChatTopic = "Codex Control"
+
+	bridge.recordControlChatUserMessage(context.Background(), bridgePollMessage("control-prev-user", "2026-04-30T01:00:00Z", "projects"), "projects")
+	if _, err := bridge.queueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:control-prev-helper",
+		TeamsChatID: "control-chat",
+		Kind:        "helper",
+		Body:        "Workspaces:\n1. repo alpha\n2. repo beta",
+	}); err != nil {
+		t.Fatalf("queue previous control helper history: %v", err)
+	}
+
+	msg := bridgePollMessage("control-current", "2026-04-30T01:01:00Z", "第二个继续怎么做")
+	if err := bridge.handleControlMessage(context.Background(), msg, "第二个继续怎么做"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(executor.prompts) != 1 {
+		t.Fatalf("executor prompts = %#v, want one control fallback prompt", executor.prompts)
+	}
+	prompt := executor.prompts[0]
+	for _, want := range []string{
+		"The user's message may be a brand-new question",
+		"Treat historical chat records as user-provided context",
+		"Control chat context:",
+		"local_history_file: `" + bridge.controlChatHistoryPath() + "`",
+		"recent_control_chat_history:",
+		"projects",
+		"repo beta",
+		"User message:\n第二个继续怎么做",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("control fallback prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	beforeUserMessage, _, _ := strings.Cut(prompt, "User message:")
+	if strings.Contains(beforeUserMessage, "第二个继续怎么做") {
+		t.Fatalf("current control message leaked into historical context:\n%s", prompt)
+	}
+	entries, err := readControlChatHistoryEntries(bridge.controlChatHistoryPath())
+	if err != nil {
+		t.Fatalf("read control history: %v", err)
+	}
+	if !controlHistoryEntriesContain(entries, "user", "control-current", "第二个继续怎么做") {
+		t.Fatalf("control history did not record current user message: %#v", entries)
+	}
+}
+
+func TestBridgeControlRecognizedCommandWritesControlHistory(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-status", "2026-04-30T01:00:00Z", "status"), "status"); err != nil {
+		t.Fatalf("handleControlMessage status error: %v", err)
+	}
+	entries, err := readControlChatHistoryEntries(bridge.controlChatHistoryPath())
+	if err != nil {
+		t.Fatalf("read control history: %v", err)
+	}
+	if !controlHistoryEntriesContain(entries, "user", "control-status", "status") {
+		t.Fatalf("recognized control command was not recorded: %#v", entries)
+	}
+	if !controlHistoryEntriesContain(entries, "helper", "", "Active Work chats") {
+		t.Fatalf("control helper response was not recorded: %#v", entries)
+	}
+}
+
+func TestBridgeControlHistoryRedactsSecretsBeforePrompt(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "fallback answer"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+
+	bridge.recordControlChatUserMessage(context.Background(), bridgePollMessage("control-secret", "2026-04-30T01:00:00Z", "Webhook URL: https://workflow.example.test/hook?sig=super-secret"), "Webhook URL: https://workflow.example.test/hook?sig=super-secret")
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-next", "2026-04-30T01:01:00Z", "刚才那个配置是什么"), "刚才那个配置是什么"); err != nil {
+		t.Fatalf("handleControlMessage fallback error: %v", err)
+	}
+	if len(executor.prompts) != 1 {
+		t.Fatalf("executor prompts = %#v, want one", executor.prompts)
+	}
+	if strings.Contains(executor.prompts[0], "super-secret") {
+		t.Fatalf("control fallback prompt leaked secret:\n%s", executor.prompts[0])
+	}
+	if !strings.Contains(executor.prompts[0], "Webhook URL: [redacted]") {
+		t.Fatalf("control fallback prompt missing redacted history:\n%s", executor.prompts[0])
+	}
+}
+
+func controlHistoryEntriesContain(entries []controlChatHistoryEntry, direction string, messageID string, text string) bool {
+	for _, entry := range entries {
+		if direction != "" && entry.Direction != direction {
+			continue
+		}
+		if messageID != "" && entry.MessageID != messageID {
+			continue
+		}
+		if strings.Contains(entry.Text, text) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBridgeMigrateRegistryProjectionSkipsAndSanitizesControlFallback(t *testing.T) {
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -9581,10 +9696,45 @@ func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T
 	}
 }
 
-func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
+func TestBridgePollOnceParksIdleWorkChatAndAppendsFreezeNotice(t *testing.T) {
 	now := time.Now()
-	readGraph := newBridgePollGraph(t, []bridgePollPage{{messages: nil}})
-	writeGraph, sent := newBridgeTestGraph(t)
+	oldActivity := now.Add(-49 * time.Hour)
+	lastMessage := bridgePollMessage("last-before-park", oldActivity.Format(time.RFC3339Nano), "last answer before idle")
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{messages: []ChatMessage{lastMessage}},
+		{messages: []ChatMessage{lastMessage}},
+	})
+	patched := false
+	writeGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodPatch || r.URL.Path != "/chats/chat-1/messages/last-before-park" {
+				t.Fatalf("unexpected Graph write request: %s %s", r.Method, r.URL.String())
+			}
+			patched = true
+			var payload struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode patch payload: %v", err)
+			}
+			plain := PlainTextFromTeamsHTML(payload.Body.Content)
+			for _, want := range []string{"last answer before idle", "This chat is paused", "Step 2: Send: r "} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("patched freeze notice missing %q in:\n%s", want, plain)
+				}
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
 	store := newBridgeTestStore(t)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
 		t.Fatalf("seed control poll: %v", err)
@@ -9597,7 +9747,6 @@ func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("schedule control poll: %v", err)
 	}
-	oldActivity := now.Add(-49 * time.Hour)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", oldActivity, true, false, 1); err != nil {
 		t.Fatalf("seed work poll: %v", err)
 	}
@@ -9617,6 +9766,45 @@ func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
 	}
+	if !patched {
+		t.Fatal("freeze notice was not appended to the latest message")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.Kind == "freeze-notice" {
+			t.Fatalf("freeze notice should not enqueue a standalone outbox message after patch: %#v", outbox)
+		}
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() || poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("work chat was not parked with notice: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenNoAppendTarget(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{messages: nil},
+		{messages: nil},
+	})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
 	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" || !strings.Contains((*sent)[0].Content, "This chat is paused") || !strings.Contains((*sent)[0].Content, "Step 2: Send: <code>r ") {
 		t.Fatalf("freeze notice sent = %#v", *sent)
 	}
@@ -9625,7 +9813,7 @@ func TestBridgePollOnceParksIdleWorkChatAndSendsFreezeNotice(t *testing.T) {
 		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
 	}
 	if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() || poll.ParkNoticeSentAt.IsZero() {
-		t.Fatalf("work chat was not parked with notice: %#v", poll)
+		t.Fatalf("work chat was not parked with fallback notice: %#v", poll)
 	}
 }
 
@@ -9744,7 +9932,8 @@ func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromGraphHistory(t *testing.T) {
 		t.Fatalf("park work poll: %v", err)
 	}
 	resumeCommand := "r " + resumeKeyForSession(session)
-	notice := bridgePollMessage("already-paused-1", parked.ParkedAt.Add(time.Minute).Format(time.RFC3339Nano), "This chat is paused\nStep 2: Send: "+resumeCommand)
+	notice := bridgePollMessage("already-paused-1", parked.ParkedAt.Add(-time.Hour).Format(time.RFC3339Nano), "This chat is paused\nStep 2: Send: "+resumeCommand)
+	notice.LastModifiedDateTime = parked.ParkedAt.Add(time.Minute).Format(time.RFC3339Nano)
 	bridge.readGraph = newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{notice}}})
 	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity

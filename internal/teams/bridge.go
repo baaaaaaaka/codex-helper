@@ -1402,6 +1402,11 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 		resumeCommand,
 		"Your Codex work is safe. Paused after 48h idle.",
 	)
+	appended, _ := b.appendFreezeNoticeToLatestMessage(ctx, session.ChatID, resumeCommand, poll.ParkedAt, body)
+	if appended {
+		_, err = b.store.MarkChatPollParkNoticeSent(ctx, session.ChatID, time.Now())
+		return err
+	}
 	err = b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:          noticeID,
 		SessionID:   session.ID,
@@ -1414,6 +1419,79 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 	}
 	_, err = b.store.MarkChatPollParkNoticeSent(ctx, session.ChatID, time.Now())
 	return err
+}
+
+func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, chatID string, resumeCommand string, since time.Time, noticeHTML string) (bool, error) {
+	if b == nil || b.graph == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(noticeHTML) == "" {
+		return false, nil
+	}
+	messages, err := b.readGraph.ListMessages(ctx, chatID, 50)
+	if err != nil {
+		return false, err
+	}
+	for _, msg := range messages {
+		if graphMessageContainsFreezeNotice(msg, resumeCommand) && !chatMessageActivityTime(msg).Before(since) {
+			return true, nil
+		}
+	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		left := messageSortTime(messages[i])
+		right := messageSortTime(messages[j])
+		if left.Equal(right) {
+			return messages[i].ID > messages[j].ID
+		}
+		return left.After(right)
+	})
+	for _, msg := range messages {
+		if graphMessageContainsFreezeNotice(msg, resumeCommand) {
+			return true, nil
+		}
+		updated, ok := appendFreezeNoticeToMessageHTML(msg, resumeCommand, noticeHTML)
+		if !ok {
+			continue
+		}
+		if err := b.graph.UpdateChatMessageHTML(ctx, chatID, msg.ID, updated); err != nil {
+			if shouldTryOlderFreezeNoticePatchTarget(err) {
+				continue
+			}
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func appendFreezeNoticeToMessageHTML(msg ChatMessage, resumeCommand string, noticeHTML string) (string, bool) {
+	if msg.ID == "" || strings.TrimSpace(msg.DeletedDateTime) != "" {
+		return "", false
+	}
+	if msg.MessageType != "" && msg.MessageType != "message" {
+		return "", false
+	}
+	content := strings.TrimSpace(msg.Body.Content)
+	if content == "" {
+		return "", false
+	}
+	if graphMessageContainsFreezeNotice(msg, resumeCommand) {
+		return "", false
+	}
+	if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
+		content = "<p>" + html.EscapeString(PlainTextFromTeamsHTML(content)) + "</p>"
+	}
+	return content + `<p>&nbsp;</p>` + noticeHTML, true
+}
+
+func shouldTryOlderFreezeNoticePatchTarget(err error) bool {
+	var graphErr *GraphStatusError
+	if !errors.As(err, &graphErr) {
+		return false
+	}
+	switch graphErr.StatusCode {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed:
+		return true
+	default:
+		return false
+	}
 }
 
 func parkNoticeOutboxID(session Session, parkedAt time.Time) string {
@@ -1490,17 +1568,32 @@ func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID strin
 	}
 	for _, msg := range messages {
 		if !since.IsZero() {
-			sentAt := messageSortTime(msg)
+			sentAt := chatMessageActivityTime(msg)
 			if !sentAt.IsZero() && sentAt.Before(since) {
 				continue
 			}
 		}
-		text := PlainTextFromTeamsHTML(msg.Body.Content)
-		if strings.Contains(text, "This chat is paused") && strings.Contains(text, resumeCommand) {
+		if graphMessageContainsFreezeNotice(msg, resumeCommand) {
 			return true
 		}
 	}
 	return false
+}
+
+func graphMessageContainsFreezeNotice(msg ChatMessage, resumeCommand string) bool {
+	text := PlainTextFromTeamsHTML(msg.Body.Content)
+	return strings.Contains(text, "This chat is paused") && (strings.TrimSpace(resumeCommand) == "" || strings.Contains(text, resumeCommand))
+}
+
+func chatMessageActivityTime(msg ChatMessage) time.Time {
+	var out time.Time
+	for _, raw := range []string{msg.CreatedDateTime, msg.LastModifiedDateTime} {
+		t := parseGraphTime(raw)
+		if t.After(out) {
+			out = t
+		}
+	}
+	return out
 }
 
 func resumeKeyForSession(session Session) string {
@@ -1962,6 +2055,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 	if msg.Body.Content == "" && strings.TrimSpace(text) != "" {
 		msg.Body.Content = text
 	}
+	b.recordControlChatUserMessage(ctx, msg, text)
 	if len(msg.Attachments) > 0 {
 		return b.sendControl(ctx, UnsupportedControlAttachmentMessage(msg.Attachments))
 	}
@@ -2129,19 +2223,20 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 		return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 	}
 	session.UpdatedAt = time.Now()
+	prompt := b.controlFallbackCodexPromptForMessage(ctx, text, msg.ID)
 	if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 		return err
 	}
 	if b.asyncTurns {
 		if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
-			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, b.controlFallbackCodexPrompt(runCtx, text))
+			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, prompt)
 		}); err != nil {
 			return err
 		}
 		b.boostPolling(time.Now())
 		return nil
 	}
-	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, b.controlFallbackCodexPrompt(ctx, text))
+	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, prompt)
 }
 
 func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, error) {
@@ -3843,10 +3938,14 @@ func (b *Bridge) effectiveControlFallbackModel() string {
 }
 
 func (b *Bridge) controlFallbackCodexPrompt(ctx context.Context, prompt string) string {
-	return ControlFallbackCodexPromptWithContext(prompt, b.controlFallbackPromptContext(ctx))
+	return b.controlFallbackCodexPromptForMessage(ctx, prompt, "")
 }
 
-func (b *Bridge) controlFallbackPromptContext(ctx context.Context) ControlFallbackPromptContext {
+func (b *Bridge) controlFallbackCodexPromptForMessage(ctx context.Context, prompt string, excludeMessageID string) string {
+	return ControlFallbackCodexPromptWithContext(prompt, b.controlFallbackPromptContext(ctx, excludeMessageID))
+}
+
+func (b *Bridge) controlFallbackPromptContext(ctx context.Context, excludeMessageID string) ControlFallbackPromptContext {
 	if b == nil {
 		return ControlFallbackPromptContext{}
 	}
@@ -3857,13 +3956,16 @@ func (b *Bridge) controlFallbackPromptContext(ctx context.Context) ControlFallba
 		}
 		active = append(active, controlFallbackSessionLine(session))
 	}
+	historyPath, recentHistory := b.controlChatHistoryPromptContext(excludeMessageID)
 	return ControlFallbackPromptContext{
-		HelperVersion:     strings.TrimSpace(b.helperVersion),
-		ControlChatTitle:  strings.TrimSpace(b.reg.ControlChatTopic),
-		ControlChatID:     strings.TrimSpace(b.reg.ControlChatID),
-		ActiveWorkChats:   active,
-		CurrentDashboard:  b.controlFallbackDashboardSummary(ctx),
-		HelperHelpContext: b.controlFallbackHelpContext,
+		HelperVersion:        strings.TrimSpace(b.helperVersion),
+		ControlChatTitle:     strings.TrimSpace(b.reg.ControlChatTopic),
+		ControlChatID:        strings.TrimSpace(b.reg.ControlChatID),
+		ActiveWorkChats:      active,
+		CurrentDashboard:     b.controlFallbackDashboardSummary(ctx),
+		HelperHelpContext:    b.controlFallbackHelpContext,
+		ControlHistoryPath:   historyPath,
+		RecentControlHistory: recentHistory,
 	}
 }
 
@@ -5143,19 +5245,20 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 		if !turnCreated {
 			return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 		}
+		prompt := b.controlFallbackCodexPromptForMessage(ctx, text, inbound.TeamsMessageID)
 		if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 			return err
 		}
 		if b.asyncTurns {
 			if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
-				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, b.controlFallbackCodexPrompt(runCtx, text))
+				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, prompt)
 			}); err != nil {
 				return err
 			}
 			b.boostPolling(time.Now())
 			return nil
 		}
-		return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, b.controlFallbackCodexPrompt(ctx, text))
+		return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, prompt)
 	default:
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "unsupported deferred control input")
 	}
@@ -7954,9 +8057,12 @@ func (b *Bridge) queueOutbox(ctx context.Context, msg teamstore.OutboxMessage) (
 	if b.shouldSuppressOwnerMentionForWorkflow(ctx, msg) {
 		msg.MentionOwner = false
 	}
-	queued, _, err := b.store.QueueOutbox(ctx, msg)
+	queued, created, err := b.store.QueueOutbox(ctx, msg)
 	if err != nil {
 		return teamstore.OutboxMessage{}, err
+	}
+	if created {
+		b.recordControlChatHelperMessage(ctx, queued)
 	}
 	return queued, nil
 }
