@@ -6508,13 +6508,15 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 			_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice error: %v\n", err)
 		}
 	}
+	sessionSnapshot := *session
 	runCtx := ctx
 	b.asyncTurnWG.Add(1)
 	go func() {
 		defer b.asyncTurnWG.Done()
-		err := b.runClaimedQueuedTurn(runCtx, session, claimed, preferredTurnID, preferred)
+		runSession := &sessionSnapshot
+		err := b.runClaimedQueuedTurn(runCtx, runSession, claimed, preferredTurnID, preferred)
 		if err != nil {
-			b.handleClaimedQueuedTurnError(context.Background(), session, claimed, err)
+			b.handleClaimedQueuedTurnError(context.Background(), runSession, claimed, err)
 		}
 		if err := b.processQueuedTurns(context.Background()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams queued turn follow-up error: %v\n", err)
