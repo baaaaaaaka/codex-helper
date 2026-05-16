@@ -4043,6 +4043,48 @@ func TestBridgeControlRestartDoesNotRunDuringHelperUpgrade(t *testing.T) {
 	}
 }
 
+func TestBridgeControlRestartDoesNotRunDuringHelperReloadCodexUpgradeOrManualDrain(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{name: "reload", reason: teamstore.HelperReloadReason, want: "reload is already in progress"},
+		{name: "codex-upgrade", reason: teamstore.CodexUpgradeReason, want: "Codex CLI upgrade is already in progress"},
+		{name: "manual", reason: "manual maintenance", want: "manual maintenance"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			restarted := make(chan struct{}, 1)
+			bridge.helperRestarter = func(context.Context) error {
+				restarted <- struct{}{}
+				return nil
+			}
+			if _, err := store.SetDraining(context.Background(), tc.reason); err != nil {
+				t.Fatalf("SetDraining error: %v", err)
+			}
+
+			if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-drain-"+tc.name), "helper restart force"); err != nil {
+				t.Fatalf("handleControlMessage restart %s drain error: %v", tc.name, err)
+			}
+			select {
+			case <-restarted:
+				t.Fatalf("helper restart must not run during %s drain", tc.name)
+			default:
+			}
+			if len(*sent) != 1 {
+				t.Fatalf("sent message count = %d, want 1", len(*sent))
+			}
+			got := PlainTextFromTeamsHTML((*sent)[0].Content)
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("drain restart response = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBridgeControlRestartRunsAfterExpiredHelperUpgradeDrain(t *testing.T) {
 	prevDelay := helperRestartDelay
 	helperRestartDelay = 0
@@ -4186,6 +4228,149 @@ func TestBridgeControlRestartForceRunsAfterExpiredHelperUpgradeWithActiveTurn(t 
 	}
 }
 
+func TestBridgeControlRestartRunsAfterStaleHelperReloadDrain(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedStaleHelperReloadDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.87", "", "", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-stale-reload"), "helper restart now"); err != nil {
+		t.Fatalf("handleControlMessage restart stale reload error: %v", err)
+	}
+	select {
+	case <-restarted:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("helper restart now did not run after stale helper reload drain")
+	}
+}
+
+func TestBridgeControlRestartDoesNotRecoverStaleHelperReloadOwnedByRemoteMachine(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedStaleHelperReloadDrain(t, store)
+	remoteOwner := teamstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        "remote-shared-home-host",
+		ExecutablePath:  "/home/baka/.local/bin/codex-proxy",
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       time.Now().Add(-time.Hour),
+		LastHeartbeat:   time.Now(),
+		ActiveSessionID: "s002",
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceOwner = &remoteOwner
+		state.LockOwner = &remoteOwner
+		return nil
+	}); err != nil {
+		t.Fatalf("Update owner error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-stale-remote-reload"), "helper restart force"); err != nil {
+		t.Fatalf("handleControlMessage restart stale remote reload error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("helper restart must not recover a fresh remote owner")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "another machine") || !strings.Contains(got, "remote-shared-home-host") {
+		t.Fatalf("remote owner recovery response = %q", got)
+	}
+}
+
+func TestBridgeControlRestartNowBlocksStaleHelperReloadWithActiveTurn(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedStaleHelperReloadDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.87", "s002", "turn-live", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-stale-active-reload"), "helper restart now"); err != nil {
+		t.Fatalf("handleControlMessage restart stale active reload error: %v", err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("helper restart now must not interrupt active turn during stale helper reload drain")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "active Codex work") || !strings.Contains(got, "helper restart force") {
+		t.Fatalf("active owner recovery response = %q", got)
+	}
+}
+
+func TestBridgeControlRestartForceRunsAfterStaleHelperReloadWithActiveTurn(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	restarted := make(chan struct{}, 1)
+	bridge.helperRestarter = func(context.Context) error {
+		restarted <- struct{}{}
+		return nil
+	}
+	seedStaleHelperReloadDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.87", "s002", "turn-live", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-restart-force-stale-active-reload"), "helper restart force"); err != nil {
+		t.Fatalf("handleControlMessage restart force stale active reload error: %v", err)
+	}
+	select {
+	case <-restarted:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("helper restart force did not run after stale helper reload drain with active turn")
+	}
+}
+
 func TestBridgeCompletesExpiredHelperUpgradeDrainOnStart(t *testing.T) {
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -4267,6 +4452,20 @@ func seedExpiredHelperUpgradeDrain(t *testing.T, store *teamstore.Store) {
 		return nil
 	}); err != nil {
 		t.Fatalf("expire upgrade error: %v", err)
+	}
+}
+
+func seedStaleHelperReloadDrain(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceControl = teamstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamstore.HelperReloadReason,
+			UpdatedAt: time.Now().Add(-helperReloadDrainStaleAfter - time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale helper reload drain: %v", err)
 	}
 }
 
@@ -4515,6 +4714,7 @@ func TestBridgeControlReloadDoesNotRunDuringHelperUpgradeOrReload(t *testing.T) 
 	}{
 		{name: "upgrade", reason: teamstore.HelperUpgradeReason, want: "upgrade is already in progress"},
 		{name: "reload", reason: teamstore.HelperReloadReason, want: "reload is already in progress"},
+		{name: "codex-upgrade", reason: teamstore.CodexUpgradeReason, want: "Codex CLI upgrade is already in progress"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			graph, sent := newBridgeTestGraph(t)
@@ -4544,6 +4744,128 @@ func TestBridgeControlReloadDoesNotRunDuringHelperUpgradeOrReload(t *testing.T) 
 				t.Fatalf("drain reload response = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBridgeControlReloadRetriesStaleHelperReloadDrain(t *testing.T) {
+	prevDelay := helperRestartDelay
+	helperRestartDelay = 0
+	t.Cleanup(func() { helperRestartDelay = prevDelay })
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	reloaded := make(chan HelperReloadOptions, 1)
+	bridge.helperReloader = func(ctx context.Context, opts HelperReloadOptions) error {
+		if opts.BeforeRestart != nil {
+			if err := opts.BeforeRestart(ctx); err != nil {
+				return err
+			}
+		}
+		reloaded <- opts
+		return nil
+	}
+	seedStaleHelperReloadDrain(t, store)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s1", Status: teamstore.SessionStatusActive}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn-queued", SessionID: "s1", Status: teamstore.TurnStatusQueued}); err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-stale-reload"), "helper reload now"); err != nil {
+		t.Fatalf("handleControlMessage reload stale reload error: %v", err)
+	}
+	select {
+	case opts := <-reloaded:
+		if opts.Force {
+			t.Fatal("helper reload now should not set force while recovering stale reload drain")
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("helper reload now did not retry stale helper reload drain")
+	}
+	waitBridgeControlNotDraining(t, store)
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "reload started") {
+		t.Fatalf("reload retry response = %#v", *sent)
+	}
+}
+
+func TestBridgeControlReloadDoesNotRecoverStaleHelperReloadOwnedByRemoteMachine(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	reloaded := make(chan struct{}, 1)
+	bridge.helperReloader = func(context.Context, HelperReloadOptions) error {
+		reloaded <- struct{}{}
+		return nil
+	}
+	seedStaleHelperReloadDrain(t, store)
+	remoteOwner := teamstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        "remote-shared-home-host",
+		ExecutablePath:  "/home/baka/.local/bin/codex-proxy",
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       time.Now().Add(-time.Hour),
+		LastHeartbeat:   time.Now(),
+		ActiveSessionID: "s002",
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceOwner = &remoteOwner
+		state.LockOwner = &remoteOwner
+		return nil
+	}); err != nil {
+		t.Fatalf("Update owner error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-stale-remote-reload"), "helper reload force"); err != nil {
+		t.Fatalf("handleControlMessage reload stale remote reload error: %v", err)
+	}
+	select {
+	case <-reloaded:
+		t.Fatal("helper reload must not recover a fresh remote owner")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "another machine") || !strings.Contains(got, "remote-shared-home-host") {
+		t.Fatalf("remote owner reload recovery response = %q", got)
+	}
+}
+
+func TestBridgeControlReloadNowBlocksStaleHelperReloadWithActiveTurn(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	reloaded := make(chan struct{}, 1)
+	bridge.helperReloader = func(context.Context, HelperReloadOptions) error {
+		reloaded <- struct{}{}
+		return nil
+	}
+	seedStaleHelperReloadDrain(t, store)
+	owner, err := teamstore.CurrentOwner("v0.1.0-rc.87", "s002", "turn-live", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Hour, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-stale-active-reload"), "helper reload now"); err != nil {
+		t.Fatalf("handleControlMessage reload stale active reload error: %v", err)
+	}
+	select {
+	case <-reloaded:
+		t.Fatal("helper reload now must not interrupt active turn during stale helper reload drain")
+	default:
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "active Codex work") || !strings.Contains(got, "helper reload force") {
+		t.Fatalf("active owner reload recovery response = %q", got)
 	}
 }
 
@@ -9090,6 +9412,50 @@ func TestBridgeUpgradeDrainingSessionMessageIsDeferred(t *testing.T) {
 	}
 }
 
+func TestBridgeReloadDrainingSessionMessageIsDeferredAndReplayed(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.SetDraining(context.Background(), teamstore.HelperReloadReason); err != nil {
+		t.Fatalf("SetDraining error: %v", err)
+	}
+	executor := &recordingExecutor{result: ExecutionResult{Text: "resumed after reload", CodexThreadID: "thread-reload", CodexTurnID: "turn-reload"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-reload"), "please run after reload")
+	if err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 0 {
+		t.Fatalf("executor prompts = %#v, want none before reload drain clears", got)
+	}
+	if got := len(*sent); got != 1 {
+		t.Fatalf("sent message count = %d, want 1 reload notice", got)
+	}
+	if !strings.Contains((*sent)[0].Content, "helper reload in progress") {
+		t.Fatalf("reload notice = %q", (*sent)[0].Content)
+	}
+	deferred, err := store.DeferredInbound(context.Background())
+	if err != nil {
+		t.Fatalf("DeferredInbound error: %v", err)
+	}
+	if len(deferred) != 1 || deferred[0].Status != teamstore.InboundStatusDeferred || deferred[0].Text != "please run after reload" {
+		t.Fatalf("deferred inbound = %#v", deferred)
+	}
+
+	if _, err := store.ClearDrain(context.Background()); err != nil {
+		t.Fatalf("ClearDrain error: %v", err)
+	}
+	if err := bridge.processDeferredInbound(context.Background()); err != nil {
+		t.Fatalf("processDeferredInbound error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "please run after reload") {
+		t.Fatalf("executor prompts = %#v, want deferred reload input replayed", got)
+	}
+	if len(*sent) != 3 || !strings.Contains((*sent)[2].Content, "resumed after reload") {
+		t.Fatalf("sent messages = %#v, want reload notice, ACK, and result", *sent)
+	}
+}
+
 func TestBridgeProcessesDeferredUpgradeInputAfterDrainClears(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -9224,6 +9590,87 @@ func TestBridgeUpgradeDrainingControlNewIsDeferredAndReplayed(t *testing.T) {
 	}
 	if len(sent) != 4 {
 		t.Fatalf("sent messages = %d, want upgrade notice, creation mention, anchor, and control ack: %#v", len(sent), sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.InboundEvents[deferred[0].ID].Status; got != teamstore.InboundStatusIgnored {
+		t.Fatalf("deferred control inbound status = %s, want ignored after replay", got)
+	}
+}
+
+func TestBridgeReloadDrainingControlNewIsDeferredAndReplayed(t *testing.T) {
+	parent := t.TempDir()
+	workDir := filepath.Join(parent, "reload-deferred-workspace")
+	var createCalls int
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			createCalls++
+			writeTestOnlineMeeting(w, "work-chat", "deferred")
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode message: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	store := newBridgeTestStore(t)
+	if _, err := store.SetDraining(context.Background(), teamstore.HelperReloadReason); err != nil {
+		t.Fatalf("SetDraining error: %v", err)
+	}
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.reg.Sessions = nil
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-reload-deferred-new"), "/new "+workDir+" -- reload deferred task"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if createCalls != 0 || len(sent) != 1 || !strings.Contains(sent[0].Content, "helper reload in progress") {
+		t.Fatalf("control /new should be deferred during helper reload, createCalls=%d sent=%#v", createCalls, sent)
+	}
+	deferred, err := store.DeferredInbound(context.Background())
+	if err != nil {
+		t.Fatalf("DeferredInbound error: %v", err)
+	}
+	if len(deferred) != 1 || deferred[0].Source != "teams_control_new" || !strings.Contains(deferred[0].Text, "reload deferred task") {
+		t.Fatalf("deferred control inbound = %#v", deferred)
+	}
+
+	if _, err := store.ClearDrain(context.Background()); err != nil {
+		t.Fatalf("ClearDrain error: %v", err)
+	}
+	if err := bridge.processDeferredInbound(context.Background()); err != nil {
+		t.Fatalf("processDeferredInbound error: %v", err)
+	}
+	if createCalls != 1 {
+		t.Fatalf("create chat calls = %d, want 1", createCalls)
+	}
+	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
+		t.Fatalf("workdir was not created: info=%#v err=%v", info, err)
+	}
+	if len(sent) != 4 {
+		t.Fatalf("sent messages = %d, want reload notice, creation mention, anchor, and control ack: %#v", len(sent), sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -15614,6 +16061,60 @@ func TestBridgeFlushPromotesAcceptedOutboxBeforeLaterQueuedMessage(t *testing.T)
 	}
 	if state.OutboxMessages[accepted.ID].Sequence >= state.OutboxMessages[queued.ID].Sequence {
 		t.Fatalf("outbox sequence order changed: accepted=%d queued=%d", state.OutboxMessages[accepted.ID].Sequence, state.OutboxMessages[queued.ID].Sequence)
+	}
+}
+
+func TestBridgeFlushPromotesAcceptedOutboxDuringRateLimitWithoutPosting(t *testing.T) {
+	store := newBridgeTestStore(t)
+	accepted, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:accepted-rate-limited",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "already accepted",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox accepted error: %v", err)
+	}
+	if _, err := store.MarkOutboxAccepted(context.Background(), accepted.ID, "teams-accepted-rate-limited"); err != nil {
+		t.Fatalf("MarkOutboxAccepted error: %v", err)
+	}
+	queued, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:queued-rate-limited",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "queued after accepted",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox queued error: %v", err)
+	}
+	if _, err := store.SetChatRateLimit(context.Background(), "chat-1", time.Now().Add(time.Hour), "429 retry-after"); err != nil {
+		t.Fatalf("SetChatRateLimit error: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("rate-limited accepted promotion should not post to Graph: %s %s", r.Method, r.URL.String())
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+
+	if err := bridge.flushPendingOutboxForChat(context.Background(), "chat-1"); err != nil {
+		t.Fatalf("flushPendingOutboxForChat error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if msg := state.OutboxMessages[accepted.ID]; msg.Status != teamstore.OutboxStatusSent || msg.TeamsMessageID != "teams-accepted-rate-limited" {
+		t.Fatalf("accepted outbox not promoted during rate limit: %#v", msg)
+	}
+	if msg := state.OutboxMessages[queued.ID]; msg.Status != teamstore.OutboxStatusQueued {
+		t.Fatalf("queued outbox should remain blocked by rate limit: %#v", msg)
 	}
 }
 

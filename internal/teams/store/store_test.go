@@ -934,6 +934,53 @@ func TestPendingOutboxAtRespectsRateLimitExpiry(t *testing.T) {
 	}
 }
 
+func TestPendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 16, 2, 0, 0, 0, time.UTC)
+	accepted, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:accepted-before-crash",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "already accepted by Graph",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox accepted error: %v", err)
+	}
+	if _, err := store.MarkOutboxAccepted(ctx, accepted.ID, "teams-message-1"); err != nil {
+		t.Fatalf("MarkOutboxAccepted error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:queued-after-crash",
+		TeamsChatID: "chat-1",
+		Kind:        "helper",
+		Body:        "must wait for retry-after",
+	}); err != nil {
+		t.Fatalf("QueueOutbox queued error: %v", err)
+	}
+	if _, err := store.SetChatRateLimit(ctx, "chat-1", now.Add(time.Hour), "429 after accepted send"); err != nil {
+		t.Fatalf("SetChatRateLimit error: %v", err)
+	}
+
+	pending, err := store.PendingOutboxAt(ctx, now)
+	if err != nil {
+		t.Fatalf("PendingOutboxAt error: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != accepted.ID || pending[0].TeamsMessageID != "teams-message-1" {
+		t.Fatalf("pending during rate limit = %#v, want only accepted message for local promotion", pending)
+	}
+	if _, err := store.MarkOutboxSent(ctx, accepted.ID, "teams-message-1"); err != nil {
+		t.Fatalf("MarkOutboxSent accepted error: %v", err)
+	}
+	pending, err = store.PendingOutboxAt(ctx, now)
+	if err != nil {
+		t.Fatalf("PendingOutboxAt after promotion error: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending after promotion while still rate limited = %#v, want queued message still blocked", pending)
+	}
+}
+
 func TestEarlierUnsentOutboxPreservesSameChatOrdering(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1304,6 +1351,55 @@ func TestHelperUpgradeDrainExpired(t *testing.T) {
 	codexUpgrade.Upgrade.Reason = CodexUpgradeReason
 	if HelperUpgradeDrainExpired(codexUpgrade, now) {
 		t.Fatal("Codex upgrade drain reported as helper upgrade expired")
+	}
+}
+
+func TestHelperReloadDrainStale(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	staleAfter := 6 * time.Minute
+	base := State{
+		ServiceControl: ServiceControl{
+			Draining:  true,
+			Reason:    HelperReloadReason,
+			UpdatedAt: now.Add(-staleAfter - time.Second),
+		},
+	}
+	if !HelperReloadDrainStale(base, now, staleAfter) {
+		t.Fatal("stale helper reload drain was not detected")
+	}
+
+	fresh := base
+	fresh.ServiceControl.UpdatedAt = now.Add(-staleAfter + time.Second)
+	if HelperReloadDrainStale(fresh, now, staleAfter) {
+		t.Fatal("fresh helper reload drain reported stale")
+	}
+
+	unknownUpdatedAt := base
+	unknownUpdatedAt.ServiceControl.UpdatedAt = time.Time{}
+	if !HelperReloadDrainStale(unknownUpdatedAt, now, staleAfter) {
+		t.Fatal("helper reload drain without timestamp should be recoverable")
+	}
+
+	future := base
+	future.ServiceControl.UpdatedAt = now.Add(time.Second)
+	if HelperReloadDrainStale(future, now, staleAfter) {
+		t.Fatal("future helper reload drain timestamp reported stale")
+	}
+
+	upgradeDrain := base
+	upgradeDrain.ServiceControl.Reason = HelperUpgradeReason
+	if HelperReloadDrainStale(upgradeDrain, now, staleAfter) {
+		t.Fatal("helper upgrade drain reported as stale reload drain")
+	}
+
+	notDraining := base
+	notDraining.ServiceControl.Draining = false
+	if HelperReloadDrainStale(notDraining, now, staleAfter) {
+		t.Fatal("non-draining service control reported as stale reload drain")
+	}
+
+	if HelperReloadDrainStale(base, now, 0) {
+		t.Fatal("zero stale threshold must not report stale")
 	}
 }
 

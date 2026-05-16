@@ -56,6 +56,7 @@ const (
 var ownerMentionLongTurnThreshold = time.Minute
 var discoverCodexProjectsForTeams = codexhistory.DiscoverProjectsContext
 var helperRestartDelay = 3 * time.Second
+var helperReloadDrainStaleAfter = 6 * time.Minute
 var codexIdleStatusInitialDelay = 2 * time.Minute
 var codexIdleStatusRepeatDelay = 5 * time.Minute
 var codexIdleStatusCancelHintAfter = 7 * time.Minute
@@ -2144,7 +2145,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 					if err != nil {
 						return err
 					}
-					return b.sendDeferredUpgradeNotice(ctx, b.reg.ControlChatID, inbound)
+					return b.sendDeferredServiceControlNotice(ctx, b.reg.ControlChatID, inbound, control)
 				}
 				return b.sendControl(ctx, serviceControlBlockedMessage(control, "publishing existing sessions"))
 			}
@@ -2206,7 +2207,7 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 			if err != nil {
 				return err
 			}
-			return b.sendDeferredUpgradeNotice(ctx, session.ChatID, inbound)
+			return b.sendDeferredServiceControlNotice(ctx, session.ChatID, inbound, control)
 		}
 		return b.sendControl(ctx, serviceControlBlockedMessage(control, "control fallback requests"))
 	}
@@ -2890,12 +2891,23 @@ func (b *Bridge) beginHelperReloadDrain(ctx context.Context, force bool) (teamst
 	var blocked bool
 	err := b.store.Update(ctx, func(state *teamstore.State) error {
 		previous = state.ServiceControl
+		recoveringStaleReloadDrain := false
 		if state.ServiceControl.Draining {
-			blocked = true
-			blockedMessage = helperDrainBlockedMessage(state.ServiceControl, "reload")
-			return nil
+			if teamstore.HelperReloadDrainStale(*state, now, helperReloadDrainStaleAfter) {
+				if message, isBlocked := b.staleHelperReloadLifecycleBlockMessage(*state, force, "reload", now); isBlocked {
+					blocked = true
+					blockedMessage = message
+					return nil
+				}
+				previous = clearStaleHelperReloadControl(state.ServiceControl, now)
+				recoveringStaleReloadDrain = true
+			} else {
+				blocked = true
+				blockedMessage = helperDrainBlockedMessage(state.ServiceControl, "reload")
+				return nil
+			}
 		}
-		if !force && teamstore.HasUpgradeBlockingWork(*state, now) {
+		if !recoveringStaleReloadDrain && !force && teamstore.HasUpgradeBlockingWork(*state, now) {
 			blocked = true
 			blockedMessage = strings.Join([]string{
 				"⏳ Codex work is still active.",
@@ -2907,7 +2919,7 @@ func (b *Bridge) beginHelperReloadDrain(ctx context.Context, force bool) (teamst
 			}, "\n")
 			return nil
 		}
-		next := state.ServiceControl
+		next := previous
 		next.Draining = true
 		next.Reason = teamstore.HelperReloadReason
 		next.UpdatedAt = now
@@ -2945,14 +2957,18 @@ func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
 		if !current.Draining || current.Reason != teamstore.HelperReloadReason {
 			return nil
 		}
-		current.Draining = false
-		if !current.Paused {
-			current.Reason = ""
-		}
-		current.UpdatedAt = time.Now()
-		state.ServiceControl = current
+		state.ServiceControl = clearStaleHelperReloadControl(current, time.Now())
 		return nil
 	})
+}
+
+func clearStaleHelperReloadControl(control teamstore.ServiceControl, now time.Time) teamstore.ServiceControl {
+	control.Draining = false
+	if !control.Paused {
+		control.Reason = ""
+	}
+	control.UpdatedAt = now
+	return control
 }
 
 func (b *Bridge) completeExpiredHelperUpgradeDrainOnStart(ctx context.Context) error {
@@ -3420,6 +3436,12 @@ func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (s
 			}
 			return "", false, nil
 		}
+		if teamstore.HelperReloadDrainStale(state, now, helperReloadDrainStaleAfter) {
+			if message, blocked := b.staleHelperReloadLifecycleBlockMessage(state, force, "restart", now); blocked {
+				return message, true, nil
+			}
+			return "", false, nil
+		}
 		return helperDrainBlockedMessage(state.ServiceControl, "restart"), true, nil
 	}
 	if !force && teamstore.HasUpgradeBlockingWork(state, time.Now()) {
@@ -3464,6 +3486,44 @@ func (b *Bridge) expiredHelperUpgradeRestartBlockMessage(state teamstore.State, 
 			"",
 			"The helper upgrade drain has expired, but the current owner still reports an active turn.",
 			"Wait for it to finish, or send `helper restart force` if you accept interrupting it.",
+		}, "\n"), true
+	}
+	return "", false
+}
+
+func (b *Bridge) staleHelperReloadLifecycleBlockMessage(state teamstore.State, force bool, action string, now time.Time) (string, bool) {
+	owner, hasOwner := helperRestartStateOwner(state)
+	if !hasOwner {
+		return "", false
+	}
+	staleAfter := b.ownerStaleAfter
+	if staleAfter <= 0 {
+		staleAfter = 5 * time.Minute
+	}
+	ownerFresh := !teamstore.IsStale(owner, staleAfter, now) && !teamstore.OwnerAppearsLocallyDead(owner)
+	if !ownerFresh {
+		return "", false
+	}
+	action = strings.TrimSpace(action)
+	if action == "" {
+		action = "restart"
+	}
+	if !teamstore.OwnerAppearsLocal(owner) {
+		return strings.Join([]string{
+			"⏳ Helper reload recovery is waiting for another machine.",
+			"",
+			"The previous helper reload drain is stale, but the active owner is still heartbeating on another machine.",
+			"I will not " + action + " this machine because that could create two Teams helpers using the same shared home.",
+			"",
+			"Owner: host=" + firstNonEmptyString(owner.Hostname, "unknown") + " version=" + firstNonEmptyString(owner.HelperVersion, "unknown"),
+		}, "\n"), true
+	}
+	if strings.TrimSpace(owner.ActiveTurnID) != "" && !force {
+		return strings.Join([]string{
+			"⏳ Helper reload recovery is waiting for active Codex work.",
+			"",
+			"The previous helper reload drain is stale, but the current owner still reports an active turn.",
+			"Wait for it to finish, or send `helper " + action + " force` if you accept interrupting it.",
 		}, "\n"), true
 	}
 	return "", false
@@ -4130,7 +4190,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 			if err != nil {
 				return err
 			}
-			return b.sendDeferredUpgradeNotice(ctx, b.reg.ControlChatID, inbound)
+			return b.sendDeferredServiceControlNotice(ctx, b.reg.ControlChatID, inbound, control)
 		}
 		return b.sendControl(ctx, serviceControlBlockedMessage(control, "new sessions"))
 	}
@@ -7455,17 +7515,29 @@ func (b *Bridge) sendControl(ctx context.Context, text string) error {
 }
 
 func (b *Bridge) sendDeferredUpgradeNotice(ctx context.Context, chatID string, inbound teamstore.InboundEvent) error {
+	return b.sendDeferredServiceControlNotice(ctx, chatID, inbound, teamstore.ServiceControl{Draining: true, Reason: teamstore.HelperUpgradeReason})
+}
+
+func (b *Bridge) sendDeferredServiceControlNotice(ctx context.Context, chatID string, inbound teamstore.InboundEvent, control teamstore.ServiceControl) error {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return nil
 	}
+	ackKind := "upgrade_deferred"
+	suffix := "deferred-upgrade-notice"
+	body := "upgrade in progress. I saved this message and will resume it after the upgrade finishes."
+	if control.Reason == teamstore.HelperReloadReason {
+		ackKind = "reload_deferred"
+		suffix = "deferred-reload-notice"
+		body = "helper reload in progress. I saved this message and will resume it after the helper is back online."
+	}
 	outbox := teamstore.OutboxMessage{
-		ID:                 "outbox:" + inbound.ID + ":deferred-upgrade-notice",
+		ID:                 "outbox:" + inbound.ID + ":" + suffix,
 		SessionID:          inbound.SessionID,
 		TeamsChatID:        chatID,
 		Kind:               "ack",
-		AckKind:            "upgrade_deferred",
-		Body:               "upgrade in progress. I saved this message and will resume it after the upgrade finishes.",
+		AckKind:            ackKind,
+		Body:               body,
 		UpgradeNonBlocking: true,
 	}
 	if author, ok := inboundExternalAuthor(inbound, b.user); ok {
@@ -7535,7 +7607,7 @@ func serviceControlDefersInput(control teamstore.ServiceControl) bool {
 		return false
 	}
 	switch control.Reason {
-	case teamstore.HelperUpgradeReason, teamstore.CodexUpgradeReason:
+	case teamstore.HelperUpgradeReason, teamstore.CodexUpgradeReason, teamstore.HelperReloadReason:
 		return true
 	default:
 		return false
@@ -7562,7 +7634,7 @@ func (b *Bridge) rejectSessionWork(ctx context.Context, session *Session, msg Ch
 		return err
 	}
 	if status == teamstore.InboundStatusDeferred {
-		return b.sendDeferredUpgradeNotice(ctx, session.ChatID, inbound)
+		return b.sendDeferredServiceControlNotice(ctx, session.ChatID, inbound, control)
 	}
 	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:          "outbox:" + inbound.ID + ":control",

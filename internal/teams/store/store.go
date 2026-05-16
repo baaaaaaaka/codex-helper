@@ -1531,6 +1531,23 @@ func HelperUpgradeDrainExpired(state State, now time.Time) bool {
 	return !state.Upgrade.DeadlineAt.After(now)
 }
 
+func HelperReloadDrainStale(state State, now time.Time, staleAfter time.Duration) bool {
+	if !state.ServiceControl.Draining || state.ServiceControl.Reason != HelperReloadReason {
+		return false
+	}
+	if staleAfter <= 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	updatedAt := state.ServiceControl.UpdatedAt
+	if updatedAt.IsZero() {
+		return true
+	}
+	return !updatedAt.After(now) && now.Sub(updatedAt) > staleAfter
+}
+
 func OwnerAppearsLocal(owner OwnerMetadata) bool {
 	if strings.TrimSpace(owner.Hostname) == "" {
 		return false
@@ -2135,10 +2152,13 @@ func (s *Store) PendingOutboxAt(ctx context.Context, now time.Time) ([]OutboxMes
 	}
 	var pending []OutboxMessage
 	for _, msg := range state.OutboxMessages {
-		if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(now) {
-			continue
+		acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && msg.TeamsMessageID != ""
+		if !acceptedWithTeamsID {
+			if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(now) {
+				continue
+			}
 		}
-		if msg.Status == OutboxStatusAccepted && msg.TeamsMessageID != "" ||
+		if acceptedWithTeamsID ||
 			msg.Status == OutboxStatusQueued ||
 			msg.Status == OutboxStatusSending && (msg.LastSendAttempt.IsZero() || now.Sub(msg.LastSendAttempt) > outboxSendLease) {
 			pending = append(pending, msg)

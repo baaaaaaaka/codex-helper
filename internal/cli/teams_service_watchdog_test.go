@@ -127,6 +127,43 @@ func TestTeamsServiceWatchdogDoesNotRestartFreshOwnerWithActiveTurn(t *testing.T
 	}
 }
 
+func TestTeamsServiceWatchdogLifecycleStatePrecedenceMatrix(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	for _, tc := range []struct {
+		name     string
+		snapshot teamsServiceWatchdogSnapshot
+		want     string
+		reason   string
+	}{
+		{
+			name:     "paused drain without recoverable evidence remains quiet",
+			snapshot: teamsServiceWatchdogSnapshot{Installed: true, Active: true, StateFiles: 1, ServicePaused: true, ServiceDraining: true},
+			want:     teamsServiceWatchdogActionNoop,
+			reason:   "paused",
+		},
+		{
+			name:     "fresh helper reload drain remains quiet",
+			snapshot: teamsServiceWatchdogSnapshot{Installed: true, Active: true, StateFiles: 1, ServiceDraining: true},
+			want:     teamsServiceWatchdogActionNoop,
+			reason:   "draining",
+		},
+		{
+			name:     "manual drain remains quiet",
+			snapshot: teamsServiceWatchdogSnapshot{Installed: true, Active: true, StateFiles: 1, ServiceDraining: true, OwnerFound: true},
+			want:     teamsServiceWatchdogActionNoop,
+			reason:   "draining",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decision := evaluateTeamsServiceWatchdog(tc.snapshot, teamsServiceWatchdogState{}, opts)
+			if decision.Action != tc.want || !strings.Contains(decision.Reason, tc.reason) {
+				t.Fatalf("decision = %+v, want action=%s reason containing %q", decision, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
 func TestTeamsServiceWatchdogRestartsExpiredHelperUpgradeDrainWithLocalOwner(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
@@ -191,6 +228,28 @@ func TestTeamsServiceWatchdogRemoteFreshOwnerWinsOverLocalUpgradeEvidence(t *tes
 	}
 }
 
+func TestTeamsServiceWatchdogRemoteFreshOwnerWinsOverLocalReloadEvidence(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                         true,
+		Active:                            true,
+		StateFiles:                        2,
+		ServiceDraining:                   true,
+		HelperReloadDrainStale:            true,
+		HelperReloadDrainLocalOwnerFresh:  true,
+		HelperReloadDrainRemoteOwnerFresh: true,
+		OwnerFound:                        true,
+		OwnerFresh:                        true,
+		LastOwnerHeartbeat:                now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "another machine") {
+		t.Fatalf("decision = %+v, want remote owner evidence to block restart", decision)
+	}
+}
+
 func TestTeamsServiceWatchdogDoesNotRestartExpiredHelperUpgradeDrainWithActiveTurn(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
@@ -235,6 +294,92 @@ func TestTeamsServiceWatchdogExpiredHelperUpgradeDrainRespectsRestartCooldown(t 
 	}
 }
 
+func TestTeamsServiceWatchdogRestartsStaleHelperReloadDrainWithLocalOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                        true,
+		Active:                           true,
+		StateFiles:                       1,
+		ServiceDraining:                  true,
+		HelperReloadDrainStale:           true,
+		HelperReloadDrainLocalOwnerFresh: true,
+		OwnerFound:                       true,
+		OwnerFresh:                       true,
+		LastOwnerHeartbeat:               now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
+		t.Fatalf("decision = %+v, want restart for stale helper reload drain", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogDoesNotRestartStaleHelperReloadDrainWithRemoteFreshOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                         true,
+		Active:                            true,
+		StateFiles:                        1,
+		ServiceDraining:                   true,
+		HelperReloadDrainStale:            true,
+		HelperReloadDrainRemoteOwnerFresh: true,
+		OwnerFound:                        true,
+		OwnerFresh:                        true,
+		LastOwnerHeartbeat:                now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "another machine") {
+		t.Fatalf("decision = %+v, want noop for fresh remote owner", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogDoesNotRestartStaleHelperReloadDrainWithActiveTurn(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                        true,
+		Active:                           true,
+		StateFiles:                       1,
+		ServiceDraining:                  true,
+		HelperReloadDrainStale:           true,
+		HelperReloadDrainLocalOwnerFresh: true,
+		OwnerFound:                       true,
+		OwnerFresh:                       true,
+		OwnerActiveTurn:                  true,
+		LastOwnerHeartbeat:               now.Add(-5 * time.Second),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "active turn") {
+		t.Fatalf("decision = %+v, want noop for active turn", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogStaleHelperReloadDrainRespectsRestartCooldown(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                        true,
+		Active:                           true,
+		StateFiles:                       1,
+		ServiceDraining:                  true,
+		HelperReloadDrainStale:           true,
+		HelperReloadDrainLocalOwnerFresh: true,
+		OwnerFound:                       true,
+		OwnerFresh:                       true,
+		LastOwnerHeartbeat:               now.Add(-5 * time.Second),
+	}
+	state := teamsServiceWatchdogState{LastActionAt: now.Add(-10 * time.Second)}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, state, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.CooldownUntil.IsZero() {
+		t.Fatalf("decision = %+v, want noop until cooldown", decision)
+	}
+}
+
 func TestTeamsServiceWatchdogMergeDetectsExpiredHelperUpgradeDrainLocalOwner(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	hostname, err := os.Hostname()
@@ -261,6 +406,9 @@ func TestTeamsServiceWatchdogMergeDetectsExpiredHelperUpgradeDrainLocalOwner(t *
 		LockOwner:    &owner,
 	}
 	var snapshot teamsServiceWatchdogSnapshot
+	snapshot.Installed = true
+	snapshot.Active = true
+	snapshot.StateFiles = 1
 
 	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
 	if !snapshot.ServiceDraining || !snapshot.HelperUpgradeDrainExpired || !snapshot.HelperUpgradeDrainLocalOwnerFresh {
@@ -294,10 +442,253 @@ func TestTeamsServiceWatchdogMergeDetectsExpiredHelperUpgradeDrainRemoteOwner(t 
 		LockOwner:    &owner,
 	}
 	var snapshot teamsServiceWatchdogSnapshot
+	snapshot.Installed = true
+	snapshot.Active = true
+	snapshot.StateFiles = 1
 
 	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
 	if !snapshot.ServiceDraining || !snapshot.HelperUpgradeDrainExpired || !snapshot.HelperUpgradeDrainRemoteOwnerFresh || snapshot.HelperUpgradeDrainLocalOwnerFresh {
 		t.Fatalf("snapshot did not detect remote expired helper upgrade drain owner: %+v", snapshot)
+	}
+}
+
+func TestTeamsServiceWatchdogMergeDetectsStaleHelperReloadDrainLocalOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	owner := teamsstore.OwnerMetadata{
+		PID:             os.Getpid(),
+		Hostname:        hostname,
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeat:   now.Add(-5 * time.Second),
+		ActiveSessionID: "s002",
+	}
+	state := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamsstore.HelperReloadReason,
+			UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+		},
+		ServiceOwner: &owner,
+		LockOwner:    &owner,
+	}
+	var snapshot teamsServiceWatchdogSnapshot
+
+	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
+	if !snapshot.ServiceDraining || !snapshot.HelperReloadDrainStale || !snapshot.HelperReloadDrainLocalOwnerFresh {
+		t.Fatalf("snapshot did not detect local stale helper reload drain: %+v", snapshot)
+	}
+}
+
+func TestTeamsServiceWatchdogMergeDetectsStaleHelperReloadDrainRemoteOwner(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	owner := teamsstore.OwnerMetadata{
+		PID:             4242,
+		Hostname:        hostname + "-remote",
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeat:   now.Add(-5 * time.Second),
+		ActiveSessionID: "s002",
+	}
+	state := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamsstore.HelperReloadReason,
+			UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+		},
+		ServiceOwner: &owner,
+		LockOwner:    &owner,
+	}
+	var snapshot teamsServiceWatchdogSnapshot
+
+	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
+	if !snapshot.ServiceDraining || !snapshot.HelperReloadDrainStale || !snapshot.HelperReloadDrainRemoteOwnerFresh || snapshot.HelperReloadDrainLocalOwnerFresh {
+		t.Fatalf("snapshot did not detect remote stale helper reload drain owner: %+v", snapshot)
+	}
+}
+
+func TestTeamsServiceWatchdogMergeDoesNotRecoverPausedStateDrain(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	owner := teamsstore.OwnerMetadata{
+		PID:           os.Getpid(),
+		Hostname:      hostname,
+		HelperVersion: "v0.1.0-rc.87",
+		StartedAt:     now.Add(-time.Hour),
+		LastHeartbeat: now.Add(-5 * time.Second),
+	}
+	state := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{
+			Paused:    true,
+			Draining:  true,
+			Reason:    teamsstore.HelperReloadReason,
+			UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+		},
+		ServiceOwner: &owner,
+		LockOwner:    &owner,
+	}
+	var snapshot teamsServiceWatchdogSnapshot
+	snapshot.Installed = true
+	snapshot.Active = true
+	snapshot.StateFiles = 1
+
+	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
+	if !snapshot.ServicePaused || !snapshot.ServiceDraining {
+		t.Fatalf("paused draining state was not reflected: %+v", snapshot)
+	}
+	if snapshot.HelperReloadDrainStale || snapshot.HelperReloadDrainLocalOwnerFresh || snapshot.HelperReloadDrainRemoteOwnerFresh {
+		t.Fatalf("paused state drain should not be considered recoverable: %+v", snapshot)
+	}
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "paused") {
+		t.Fatalf("decision = %+v, want paused noop", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogRecoverableDrainWinsOverSeparatePausedState(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	owner := teamsstore.OwnerMetadata{
+		PID:           os.Getpid(),
+		Hostname:      hostname,
+		HelperVersion: "v0.1.0-rc.87",
+		StartedAt:     now.Add(-time.Hour),
+		LastHeartbeat: now.Add(-5 * time.Second),
+	}
+	pausedState := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{
+			Paused:    true,
+			Reason:    "manual pause",
+			UpdatedAt: now.Add(-time.Minute),
+		},
+	}
+	staleReloadState := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamsstore.HelperReloadReason,
+			UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+		},
+		ServiceOwner: &owner,
+		LockOwner:    &owner,
+	}
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	var snapshot teamsServiceWatchdogSnapshot
+	snapshot.Installed = true
+	snapshot.Active = true
+	snapshot.StateFiles = 2
+	mergeTeamsServiceWatchdogState(&snapshot, pausedState, opts)
+	mergeTeamsServiceWatchdogState(&snapshot, staleReloadState, opts)
+
+	if !snapshot.ServicePaused || !snapshot.HelperReloadDrainStale || !snapshot.HelperReloadDrainLocalOwnerFresh {
+		t.Fatalf("snapshot did not retain both paused and recoverable drain evidence: %+v", snapshot)
+	}
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
+		t.Fatalf("decision = %+v, want restart for recoverable drain despite separate paused state", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogManyStateFilesRecoveryMatrix(t *testing.T) {
+	now := time.Date(2026, 5, 16, 2, 0, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	localOwner := teamsstore.OwnerMetadata{
+		PID:           os.Getpid(),
+		Hostname:      hostname,
+		HelperVersion: "v0.1.0-rc.87",
+		StartedAt:     now.Add(-time.Hour),
+		LastHeartbeat: now.Add(-5 * time.Second),
+	}
+	remoteOwner := teamsstore.OwnerMetadata{
+		PID:           4242,
+		Hostname:      hostname + "-remote",
+		HelperVersion: "v0.1.0-rc.87",
+		StartedAt:     now.Add(-time.Hour),
+		LastHeartbeat: now.Add(-5 * time.Second),
+	}
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	pausedState := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{
+			Paused:    true,
+			Reason:    "manual pause in unrelated scope",
+			UpdatedAt: now.Add(-time.Minute),
+		},
+	}
+	staleReloadState := func(owner teamsstore.OwnerMetadata) teamsstore.State {
+		return teamsstore.State{
+			ServiceControl: teamsstore.ServiceControl{
+				Draining:  true,
+				Reason:    teamsstore.HelperReloadReason,
+				UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+			},
+			ServiceOwner: &owner,
+			LockOwner:    &owner,
+		}
+	}
+
+	for _, tc := range []struct {
+		name             string
+		localActiveTurn  bool
+		includeRemote    bool
+		wantAction       string
+		wantReasonSubstr string
+	}{
+		{
+			name:             "local stale reload drain recovers despite many paused scopes",
+			wantAction:       teamsServiceWatchdogActionRestart,
+			wantReasonSubstr: "helper reload drain is stale",
+		},
+		{
+			name:             "fresh local active turn still prevents recovery",
+			localActiveTurn:  true,
+			wantAction:       teamsServiceWatchdogActionNoop,
+			wantReasonSubstr: "active turn",
+		},
+		{
+			name:             "fresh remote owner in shared home prevents local takeover",
+			includeRemote:    true,
+			wantAction:       teamsServiceWatchdogActionNoop,
+			wantReasonSubstr: "another machine",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := teamsServiceWatchdogSnapshot{Installed: true, Active: true}
+			merge := func(state teamsstore.State) {
+				snapshot.StateFiles++
+				mergeTeamsServiceWatchdogState(&snapshot, state, opts)
+			}
+			for i := 0; i < 250; i++ {
+				merge(pausedState)
+			}
+			owner := localOwner
+			if tc.localActiveTurn {
+				owner.ActiveTurnID = "turn-active"
+			}
+			merge(staleReloadState(owner))
+			if tc.includeRemote {
+				merge(staleReloadState(remoteOwner))
+			}
+
+			decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+			if decision.Action != tc.wantAction || !strings.Contains(decision.Reason, tc.wantReasonSubstr) {
+				t.Fatalf("decision = %+v snapshot=%+v, want action=%s reason containing %q", decision, snapshot, tc.wantAction, tc.wantReasonSubstr)
+			}
+		})
 	}
 }
 
