@@ -101,6 +101,10 @@ func (s *pathReuseStore) tombstone(path string) {
 	s.tombstones[filepath.Clean(path)] = true
 }
 
+func (s *pathReuseStore) addTemp(path string) {
+	s.tempFiles[filepath.Clean(path)] = true
+}
+
 func (s *pathReuseStore) canCreateJobPath(path string) bool {
 	return !s.tombstones[filepath.Clean(path)]
 }
@@ -120,7 +124,7 @@ func TestCleanupRejectsTombstonePathReuseAndReapsZombieTemps(t *testing.T) {
 	if store.canCreateJobPath("/shared/beacon/jobs/job-1") {
 		t.Fatal("job path must never be reused after tombstone")
 	}
-	store.tempFiles["/shared/beacon/jobs/job-2/result.tmp"] = true
+	store.addTemp("/shared/beacon/jobs/job-2/result.tmp")
 	if store.reapTemp("/shared/beacon/jobs/job-2/result.tmp", true) {
 		t.Fatal("temp file for live lease must not be reaped")
 	}
