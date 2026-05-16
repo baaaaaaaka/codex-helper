@@ -14,6 +14,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -590,6 +591,20 @@ func isolateUpgradeTeamsStateForTest(t *testing.T, tmp string) {
 	isolateTeamsUserDirsForTest(t, tmp)
 }
 
+func seedBeaconStateForUpgradeTest(t *testing.T, fn func(*beacon.State)) {
+	t.Helper()
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon.NewStore: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		fn(st)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon state: %v", err)
+	}
+}
+
 func teamsServiceJoinedCalls(calls []teamsServiceCommandCall) string {
 	var parts []string
 	for _, call := range calls {
@@ -766,6 +781,88 @@ func TestUpgradeCmdAllowsDeferredTeamsInboundWithoutOwner(t *testing.T) {
 	}
 	if !performCalled {
 		t.Fatal("performUpdate was not called with deferred-only Teams state")
+	}
+}
+
+func TestUpgradeCmdBlocksOnActiveBeaconJobWithoutTeamsStore(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+	seedBeaconStateForUpgradeTest(t, func(st *beacon.State) {
+		st.Machines["gpu-a"] = beacon.Machine{
+			ID:            "gpu-a",
+			LeaseID:       "lease-gpu-a",
+			ProviderJobID: "slurm-123",
+			Profile:       "gpu",
+			State:         "accepting",
+			Jobs:          []string{"job-1"},
+		}
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("performUpdate should not run while beacon work is active")
+		return update.ApplyResult{}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "Beacon state has upgrade-blocking work") || !strings.Contains(err.Error(), "beacon_job job-1") {
+		t.Fatalf("expected active beacon blocker, got %v", err)
+	}
+}
+
+func TestUpgradeCmdBlocksOnUnreadableBeaconState(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+	path := filepath.Join(t.TempDir(), "beacon.json")
+	t.Setenv("CODEX_HELPER_BEACON_STORE", path)
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatalf("write corrupt beacon state: %v", err)
+	}
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("performUpdate should not run with unreadable beacon state")
+		return update.ApplyResult{}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "beacon_state") || !strings.Contains(err.Error(), "unreadable") {
+		t.Fatalf("expected unreadable beacon state blocker, got %v", err)
+	}
+}
+
+func TestBeaconUpgradeBlockerLoaderMissingStateHasNoSideEffects(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "missing", "beacon.json")
+	t.Setenv("CODEX_HELPER_BEACON_STORE", path)
+
+	if blockers := defaultLoadBeaconUpgradeBlockers(beacon.UpgradeHelperRestart, ""); len(blockers) != 0 {
+		t.Fatalf("missing beacon state should not block upgrade, got %#v", blockers)
+	}
+	if _, err := os.Stat(filepath.Dir(path)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing beacon state loader created parent directory or returned wrong error: %v", err)
 	}
 }
 

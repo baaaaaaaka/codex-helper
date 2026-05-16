@@ -254,14 +254,16 @@ const (
 func providerStateReconcile(state providerJobState, job jobState) reconcileAction {
 	switch state {
 	case providerRunning:
-		return reconcileAccept
-	case providerPending, providerSuspended:
-		return reconcileDrain
+		return reconcileRunning
+	case providerPending:
+		return reconcilePending
+	case providerSuspended:
+		return reconcileSuspended
 	case providerDone:
 		if job == jobTerminal {
-			return reconcileLost
+			return reconcileCompleted
 		}
-		return reconcileQuarantine
+		return reconcileFinalizing
 	case providerPreempted, providerRequeued, providerFailed, providerNodeFail:
 		if job == jobStarted || job == jobStartIntent {
 			return reconcileQuarantine
@@ -279,14 +281,14 @@ func TestProviderJobStatesMapToConservativeLeaseActions(t *testing.T) {
 		job   jobState
 		want  reconcileAction
 	}{
-		{name: "running accepts", state: providerRunning, job: jobQueued, want: reconcileAccept},
-		{name: "pending drains", state: providerPending, job: jobQueued, want: reconcileDrain},
-		{name: "suspended drains", state: providerSuspended, job: jobStarted, want: reconcileDrain},
+		{name: "running awaits worker readiness", state: providerRunning, job: jobQueued, want: reconcileRunning},
+		{name: "pending remains pending", state: providerPending, job: jobQueued, want: reconcilePending},
+		{name: "suspended pauses without cleanup", state: providerSuspended, job: jobStarted, want: reconcileSuspended},
 		{name: "preempted started quarantines", state: providerPreempted, job: jobStarted, want: reconcileQuarantine},
 		{name: "requeued before start lost", state: providerRequeued, job: jobClaimed, want: reconcileLost},
 		{name: "node fail started quarantines", state: providerNodeFail, job: jobStarted, want: reconcileQuarantine},
-		{name: "done terminal lost", state: providerDone, job: jobTerminal, want: reconcileLost},
-		{name: "done without terminal quarantines", state: providerDone, job: jobStarted, want: reconcileQuarantine},
+		{name: "done terminal completed", state: providerDone, job: jobTerminal, want: reconcileCompleted},
+		{name: "done without terminal enters finalizing grace", state: providerDone, job: jobStarted, want: reconcileFinalizing},
 	}
 	for _, tt := range tests {
 		if got := providerStateReconcile(tt.state, tt.job); got != tt.want {

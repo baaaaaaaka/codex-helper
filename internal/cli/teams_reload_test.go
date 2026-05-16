@@ -171,6 +171,96 @@ func TestTeamsHelperReloadTestFailureDoesNotReplaceOrRestart(t *testing.T) {
 	}
 }
 
+func TestTeamsHelperReloadBeaconBlockerBeforeBuildDoesNotReplace(t *testing.T) {
+	lockCLITestHooks(t)
+	prevRun := teamsReloadRunCommand
+	prevRestart := teamsReloadRestart
+	t.Cleanup(func() {
+		teamsReloadRunCommand = prevRun
+		teamsReloadRestart = prevRestart
+	})
+
+	sourceDir := writeTeamsReloadSource(t)
+	installPath := filepath.Join(t.TempDir(), "codex-proxy")
+	if err := os.WriteFile(installPath, []byte("old helper"), 0o755); err != nil {
+		t.Fatalf("write install binary: %v", err)
+	}
+	teamsReloadRunCommand = func(context.Context, string, []string, string, ...string) (teamsReloadCommandResult, error) {
+		t.Fatal("reload must not run tests or build while beacon work blocks reload")
+		return teamsReloadCommandResult{}, nil
+	}
+	teamsReloadRestart = func(context.Context) error {
+		t.Fatal("restart must not run while beacon work blocks reload")
+		return nil
+	}
+
+	err := runTeamsHelperReload(context.Background(), teamsHelperReloadOptions{
+		SourceDir:   sourceDir,
+		InstallPath: installPath,
+		BlockerCheck: func() error {
+			return errors.New("Beacon state has upgrade-blocking work before helper reload: beacon_job job-1")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "beacon_job job-1") {
+		t.Fatalf("runTeamsHelperReload error = %v, want beacon blocker", err)
+	}
+	if got := readFileString(t, installPath); got != "old helper" {
+		t.Fatalf("install binary changed after beacon blocker: %q", got)
+	}
+}
+
+func TestTeamsHelperReloadBeaconBlockerAfterInstallRestoresBackup(t *testing.T) {
+	lockCLITestHooks(t)
+	prevRun := teamsReloadRunCommand
+	prevRestart := teamsReloadRestart
+	prevNow := teamsReloadNow
+	t.Cleanup(func() {
+		teamsReloadRunCommand = prevRun
+		teamsReloadRestart = prevRestart
+		teamsReloadNow = prevNow
+	})
+
+	sourceDir := writeTeamsReloadSource(t)
+	installPath := filepath.Join(t.TempDir(), "codex-proxy")
+	if err := os.WriteFile(installPath, []byte("old helper"), 0o755); err != nil {
+		t.Fatalf("write install binary: %v", err)
+	}
+	teamsReloadNow = func() time.Time { return time.Unix(250, 0) }
+	teamsReloadRunCommand = func(_ context.Context, _ string, _ []string, name string, args ...string) (teamsReloadCommandResult, error) {
+		if name == "go" && len(args) >= 4 && args[0] == "build" {
+			if err := os.WriteFile(args[3], []byte("new helper"), 0o755); err != nil {
+				t.Fatalf("write rebuilt helper: %v", err)
+			}
+		}
+		return teamsReloadCommandResult{}, nil
+	}
+	teamsReloadRestart = func(context.Context) error {
+		t.Fatal("restart must not run after a late beacon blocker")
+		return nil
+	}
+	checks := 0
+	err := runTeamsHelperReload(context.Background(), teamsHelperReloadOptions{
+		SourceDir:   sourceDir,
+		InstallPath: installPath,
+		BlockerCheck: func() error {
+			checks++
+			if checks == 1 {
+				return nil
+			}
+			return errors.New("Beacon state has upgrade-blocking work before helper reload: beacon_job job-2")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "prepare helper restart") || !strings.Contains(err.Error(), "beacon_job job-2") {
+		t.Fatalf("runTeamsHelperReload error = %v, want late beacon blocker rollback", err)
+	}
+	if checks != 2 {
+		t.Fatalf("blocker checks = %d, want 2", checks)
+	}
+	if got := readFileString(t, installPath); got != "old helper" {
+		t.Fatalf("install binary after late blocker rollback = %q, want old helper", got)
+	}
+}
+
 func TestTeamsHelperReloadRestartFailureRestoresBackup(t *testing.T) {
 	lockCLITestHooks(t)
 	prevRun := teamsReloadRunCommand

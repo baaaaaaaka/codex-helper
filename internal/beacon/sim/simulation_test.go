@@ -203,20 +203,22 @@ const (
 type terminalIntegrity string
 
 const (
-	terminalNone      terminalIntegrity = "none"
-	terminalValid     terminalIntegrity = "valid"
-	terminalEventGap  terminalIntegrity = "event_gap"
-	terminalHMACBad   terminalIntegrity = "hmac_bad"
-	terminalSeqBad    terminalIntegrity = "seq_bad"
-	terminalDuplicate terminalIntegrity = "duplicate"
-	terminalLateWrite terminalIntegrity = "late_write"
+	terminalNone              terminalIntegrity = "none"
+	terminalValid             terminalIntegrity = "valid"
+	terminalEventGap          terminalIntegrity = "event_gap"
+	terminalHMACBad           terminalIntegrity = "hmac_bad"
+	terminalSeqBad            terminalIntegrity = "seq_bad"
+	terminalDuplicate         terminalIntegrity = "duplicate"
+	terminalDuplicateSame     terminalIntegrity = "duplicate_same"
+	terminalDuplicateConflict terminalIntegrity = "duplicate_conflict"
+	terminalLateWrite         terminalIntegrity = "late_write"
 )
 
 func recoverJob(state jobState, workerAlive bool, terminal terminalIntegrity) recoveryAction {
 	switch terminal {
-	case terminalValid:
+	case terminalValid, terminalDuplicateSame:
 		return recoverComplete
-	case terminalEventGap, terminalHMACBad, terminalSeqBad, terminalDuplicate, terminalLateWrite:
+	case terminalEventGap, terminalHMACBad, terminalSeqBad, terminalDuplicate, terminalDuplicateConflict, terminalLateWrite:
 		return recoverQuarantine
 	}
 	if workerAlive {
@@ -245,8 +247,10 @@ func TestRecoveryNeverReplaysStartedCodex(t *testing.T) {
 		{state: jobStarted, want: recoverAmbiguous},
 		{state: jobStarted, workerAlive: true, want: recoverMonitor},
 		{state: jobStarted, terminal: terminalValid, want: recoverComplete},
+		{state: jobTerminal, terminal: terminalDuplicateSame, want: recoverComplete},
 		{state: jobTerminal, terminal: terminalEventGap, want: recoverQuarantine},
 		{state: jobTerminal, terminal: terminalDuplicate, want: recoverQuarantine},
+		{state: jobTerminal, terminal: terminalDuplicateConflict, want: recoverQuarantine},
 	}
 	for _, tt := range tests {
 		if got := recoverJob(tt.state, tt.workerAlive, tt.terminal); got != tt.want {
@@ -256,44 +260,80 @@ func TestRecoveryNeverReplaysStartedCodex(t *testing.T) {
 }
 
 type writeStamp struct {
-	jobID         string
-	jobAttempt    int
-	workerID      string
-	leaseEpoch    int
-	claimEpoch    int
-	protocolWrite int
+	jobID          string
+	jobAttempt     int
+	workerID       string
+	providerJobID  string
+	allocationID   string
+	stepID         string
+	runIncarnation string
+	host           string
+	leaseEpoch     int
+	claimEpoch     int
+	protocolWrite  int
+	signatureHash  string
+	macKeyID       string
+	mac            string
+	eventHash      string
 }
 
 func acceptWorkerWrite(expected, got writeStamp, minWriteVersion, maxWriteVersion int) bool {
 	return got.jobID == expected.jobID &&
 		got.jobAttempt == expected.jobAttempt &&
 		got.workerID == expected.workerID &&
+		got.providerJobID == expected.providerJobID &&
+		got.allocationID == expected.allocationID &&
+		got.stepID == expected.stepID &&
+		got.runIncarnation == expected.runIncarnation &&
+		got.host == expected.host &&
 		got.leaseEpoch == expected.leaseEpoch &&
 		got.claimEpoch == expected.claimEpoch &&
+		got.signatureHash == expected.signatureHash &&
+		got.macKeyID == expected.macKeyID &&
+		got.mac == expected.mac &&
+		got.eventHash == expected.eventHash &&
 		got.protocolWrite >= minWriteVersion &&
 		got.protocolWrite <= maxWriteVersion
 }
 
 func TestFencingRejectsLateWritesAcrossEpochsAttemptsAndProtocols(t *testing.T) {
 	expected := writeStamp{
-		jobID:         "job-1",
-		jobAttempt:    2,
-		workerID:      "worker-a",
-		leaseEpoch:    7,
-		claimEpoch:    3,
-		protocolWrite: 1,
+		jobID:          "job-1",
+		jobAttempt:     2,
+		workerID:       "worker-a",
+		providerJobID:  "slurm-100",
+		allocationID:   "alloc-100",
+		stepID:         "step-1",
+		runIncarnation: "boot-a",
+		host:           "gpu-a",
+		leaseEpoch:     7,
+		claimEpoch:     3,
+		protocolWrite:  1,
+		signatureHash:  "sig-a",
+		macKeyID:       "cap-a",
+		mac:            "mac-a",
+		eventHash:      "event-a",
 	}
 	if !acceptWorkerWrite(expected, expected, 1, 1) {
 		t.Fatal("matching write stamp should be accepted")
 	}
 
 	cases := map[string]writeStamp{
-		"old attempt":     copyStamp(expected, func(s *writeStamp) { s.jobAttempt = 1 }),
-		"wrong worker":    copyStamp(expected, func(s *writeStamp) { s.workerID = "worker-b" }),
-		"old lease epoch": copyStamp(expected, func(s *writeStamp) { s.leaseEpoch = 6 }),
-		"old claim epoch": copyStamp(expected, func(s *writeStamp) { s.claimEpoch = 2 }),
-		"future protocol": copyStamp(expected, func(s *writeStamp) { s.protocolWrite = 2 }),
-		"wrong job":       copyStamp(expected, func(s *writeStamp) { s.jobID = "job-2" }),
+		"old attempt":      copyStamp(expected, func(s *writeStamp) { s.jobAttempt = 1 }),
+		"wrong worker":     copyStamp(expected, func(s *writeStamp) { s.workerID = "worker-b" }),
+		"wrong provider":   copyStamp(expected, func(s *writeStamp) { s.providerJobID = "slurm-101" }),
+		"wrong allocation": copyStamp(expected, func(s *writeStamp) { s.allocationID = "alloc-101" }),
+		"wrong step":       copyStamp(expected, func(s *writeStamp) { s.stepID = "step-2" }),
+		"wrong run":        copyStamp(expected, func(s *writeStamp) { s.runIncarnation = "boot-b" }),
+		"wrong host":       copyStamp(expected, func(s *writeStamp) { s.host = "gpu-b" }),
+		"old lease epoch":  copyStamp(expected, func(s *writeStamp) { s.leaseEpoch = 6 }),
+		"old claim epoch":  copyStamp(expected, func(s *writeStamp) { s.claimEpoch = 2 }),
+		"future protocol":  copyStamp(expected, func(s *writeStamp) { s.protocolWrite = 2 }),
+		"wrong signature":  copyStamp(expected, func(s *writeStamp) { s.signatureHash = "sig-b" }),
+		"wrong mac key":    copyStamp(expected, func(s *writeStamp) { s.macKeyID = "cap-b" }),
+		"bad mac":          copyStamp(expected, func(s *writeStamp) { s.mac = "mac-b" }),
+		"wrong event hash": copyStamp(expected, func(s *writeStamp) { s.eventHash = "event-b" }),
+		"wrong job":        copyStamp(expected, func(s *writeStamp) { s.jobID = "job-2" }),
 	}
 	for name, got := range cases {
 		if acceptWorkerWrite(expected, got, 1, 1) {
@@ -432,18 +472,34 @@ func TestTTLGateIncludesCheckpointAndGraceBudget(t *testing.T) {
 }
 
 type helperUpgradeInput struct {
-	activeBeaconJobs int
-	idleWorkers      int
-	blockingOutbox   int
-	queuedTeamsTurns int
-	force            bool
+	activeBeaconJobs     int
+	staleOwnerMarkers    int
+	unreconciledMarkers  int
+	startedBeaconJobs    int
+	protocolMismatchJobs int
+	idleWorkers          int
+	blockingOutbox       int
+	queuedTeamsTurns     int
+	runningTeamsTurns    int
+	force                bool
 }
 
 func helperUpgradeBlocked(in helperUpgradeInput) bool {
-	if in.force {
+	if in.force &&
+		in.activeBeaconJobs == 0 &&
+		in.unreconciledMarkers == 0 &&
+		in.startedBeaconJobs == 0 &&
+		in.blockingOutbox == 0 &&
+		in.protocolMismatchJobs == 0 &&
+		in.runningTeamsTurns == 0 {
 		return false
 	}
-	return in.activeBeaconJobs > 0 || in.blockingOutbox > 0 || in.queuedTeamsTurns > 0
+	return in.activeBeaconJobs > 0 ||
+		in.unreconciledMarkers > 0 ||
+		in.startedBeaconJobs > 0 ||
+		in.blockingOutbox > 0 ||
+		in.runningTeamsTurns > 0 ||
+		in.protocolMismatchJobs > 0
 }
 
 func TestHelperUpgradeBlockersIncludeActiveBeaconJobsButNotIdleWorkers(t *testing.T) {
@@ -454,9 +510,16 @@ func TestHelperUpgradeBlockersIncludeActiveBeaconJobsButNotIdleWorkers(t *testin
 	}{
 		{name: "idle workers do not block", in: helperUpgradeInput{idleWorkers: 3}},
 		{name: "active beacon job blocks", in: helperUpgradeInput{activeBeaconJobs: 1}, want: true},
-		{name: "queued Teams turn blocks", in: helperUpgradeInput{queuedTeamsTurns: 1}, want: true},
+		{name: "queued Teams turn preserved for helper restart", in: helperUpgradeInput{queuedTeamsTurns: 1}},
+		{name: "running Teams turn blocks", in: helperUpgradeInput{runningTeamsTurns: 1}, want: true},
 		{name: "outbox blocks", in: helperUpgradeInput{blockingOutbox: 1}, want: true},
-		{name: "force bypasses blockers", in: helperUpgradeInput{activeBeaconJobs: 1, blockingOutbox: 1, force: true}},
+		{name: "force may bypass stale owner marker only", in: helperUpgradeInput{staleOwnerMarkers: 1, force: true}},
+		{name: "force does not bypass unreconciled active job", in: helperUpgradeInput{activeBeaconJobs: 1, force: true}, want: true},
+		{name: "force does not bypass unreconciled marker", in: helperUpgradeInput{unreconciledMarkers: 1, force: true}, want: true},
+		{name: "force does not bypass started beacon job", in: helperUpgradeInput{startedBeaconJobs: 1, force: true}, want: true},
+		{name: "force does not bypass running Teams turn", in: helperUpgradeInput{runningTeamsTurns: 1, force: true}, want: true},
+		{name: "force does not bypass protected outbox", in: helperUpgradeInput{blockingOutbox: 1, force: true}, want: true},
+		{name: "force does not bypass protocol mismatch", in: helperUpgradeInput{protocolMismatchJobs: 1, force: true}, want: true},
 	}
 	for _, tt := range tests {
 		if got := helperUpgradeBlocked(tt.in); got != tt.want {
@@ -524,6 +587,7 @@ func TestCrossFeatureScenariosExposeUnsafeCombinations(t *testing.T) {
 			codexUpgrade:      copyCodexUpgrade(baseUpgrade, func(in *codexUpgradeInput) { in.activeSameTarget = true }),
 			recoverState:      jobTerminal,
 			terminalIntegrity: terminalLateWrite,
+			wantHelperBlocked: true,
 			wantRecover:       recoverQuarantine,
 		},
 		{
@@ -581,7 +645,9 @@ func cleanupDecision(in cleanupInput) cleanupAction {
 	switch in.jobState {
 	case jobStarted, jobStartIntent:
 		return cleanupQuarantine
-	case jobTerminal, jobTombstoned:
+	case jobTerminal:
+		return cleanupTombstone
+	case jobTombstoned:
 		if in.retentionExpired {
 			return cleanupDelete
 		}
@@ -601,7 +667,8 @@ func TestCleanupNeverDeletesLiveOrStartedAmbiguousWork(t *testing.T) {
 		{name: "scheduler alive untouched", in: cleanupInput{schedulerAlive: true, jobState: jobStarted}, want: cleanupNone},
 		{name: "started lost quarantined", in: cleanupInput{jobState: jobStarted}, want: cleanupQuarantine},
 		{name: "terminal retained before retention", in: cleanupInput{jobState: jobTerminal}, want: cleanupTombstone},
-		{name: "terminal deleted after retention", in: cleanupInput{jobState: jobTerminal, retentionExpired: true}, want: cleanupDelete},
+		{name: "terminal first tombstoned even after retention", in: cleanupInput{jobState: jobTerminal, retentionExpired: true}, want: cleanupTombstone},
+		{name: "tombstone deleted after retention", in: cleanupInput{jobState: jobTombstoned, retentionExpired: true}, want: cleanupDelete},
 	}
 	for _, tt := range tests {
 		if got := cleanupDecision(tt.in); got != tt.want {

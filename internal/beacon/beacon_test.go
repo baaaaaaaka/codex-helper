@@ -1,0 +1,657 @@
+package beacon
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestProfileLifecycleDraftDoctorConfirmAndProxy(t *testing.T) {
+	var st State
+	proxyExists := func(name string) bool { return name == "jump-a" }
+	p, err := CreateProfile(&st, CreateProfileInput{
+		Name:         "gpu",
+		Provider:     ProviderSlurm,
+		ProxyMode:    ProxySSHProfile,
+		ProxyProfile: "jump-a",
+		Slurm:        SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+		Now:          time.Unix(1, 0),
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if p.Ready(proxyExists) {
+		t.Fatal("created profile should remain draft until doctor and confirm")
+	}
+	if reasons := strings.Join(p.DraftReasons(proxyExists), ","); !strings.Contains(reasons, "doctor failed") || !strings.Contains(reasons, "needs confirm") {
+		t.Fatalf("draft reasons should mention doctor and confirm, got %q", reasons)
+	}
+	p, err = DoctorProfile(&st, "gpu", time.Unix(2, 0), proxyExists)
+	if err != nil {
+		t.Fatalf("DoctorProfile: %v", err)
+	}
+	p, err = ConfirmProfile(&st, "gpu", time.Unix(3, 0), proxyExists)
+	if err != nil {
+		t.Fatalf("ConfirmProfile: %v", err)
+	}
+	if !p.Ready(proxyExists) {
+		t.Fatalf("profile should be ready, reasons=%v", p.DraftReasons(proxyExists))
+	}
+}
+
+func TestLSFProfileQueueOnlyDraftNeedsOnlyDoctorAndConfirm(t *testing.T) {
+	var st State
+	p, err := CreateProfile(&st, CreateProfileInput{
+		Name:      "lsf",
+		Provider:  ProviderLSF,
+		ProxyMode: ProxyNone,
+		LSF:       LSFProfile{QueueName: "o_pri_interactive"},
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if got := strings.Join(p.DraftReasons(nil), ","); strings.Contains(got, "lsf resource shape cannot be derived") || !strings.Contains(got, "doctor failed") || !strings.Contains(got, "needs confirm") {
+		t.Fatalf("queue-only LSF profile should need only doctor/confirm, got %q", got)
+	}
+	p, err = DoctorProfile(&st, "lsf", time.Unix(2, 0), nil)
+	if err != nil {
+		t.Fatalf("DoctorProfile: %v", err)
+	}
+	p, err = ConfirmProfile(&st, "lsf", time.Unix(3, 0), nil)
+	if err != nil {
+		t.Fatalf("ConfirmProfile: %v", err)
+	}
+	if !p.Ready(nil) {
+		t.Fatalf("queue-only LSF profile should be ready after doctor/confirm, got %v", p.DraftReasons(nil))
+	}
+}
+
+func TestNewTargetDefaultsLocalAndExplicitBeaconNeverFallsBack(t *testing.T) {
+	var st State
+	got := ResolveNewTarget(st, NewTargetInput{LegacyProxyRoute: "jump-a"}, nil)
+	if got.Target != TargetLocal || got.ProxyRoute != "jump-a" || got.Error != "" {
+		t.Fatalf("default new should stay local with proxy route preserved, got %#v", got)
+	}
+	got = ResolveNewTarget(st, NewTargetInput{ExplicitBeaconProfile: "missing", LegacyProxyRoute: "jump-a"}, nil)
+	if got.Target != TargetBeacon || got.Error == "" {
+		t.Fatalf("explicit beacon missing profile should error without local fallback, got %#v", got)
+	}
+}
+
+func TestPlacementDecidesLocalReuseAllocateAndExclusive(t *testing.T) {
+	st := State{
+		Profiles: map[string]Profile{
+			"gpu": readyProfile("gpu"),
+		},
+		Machines: map[string]Machine{
+			"gpu-shared": {
+				ID:        "gpu-shared",
+				LeaseID:   "lease-shared",
+				Profile:   "gpu",
+				State:     "accepting",
+				Isolation: IsolationShared,
+				Jobs:      []string{"job-existing"},
+			},
+			"gpu-exclusive-busy": {
+				ID:        "gpu-exclusive-busy",
+				LeaseID:   "lease-exclusive-busy",
+				Profile:   "gpu",
+				State:     "accepting",
+				Isolation: IsolationExclusive,
+				Chats:     []string{"other-conv"},
+			},
+			"gpu-lost": {
+				ID:        "gpu-lost",
+				LeaseID:   "lease-lost",
+				Profile:   "gpu",
+				State:     "lost",
+				Isolation: IsolationShared,
+			},
+		},
+	}
+	local, err := DecidePlacement(st, PlacementInput{LegacyProxyRoute: "jump-a"}, nil)
+	if err != nil {
+		t.Fatalf("local placement: %v", err)
+	}
+	if local.Action != "run_local" || local.Target.Target != TargetLocal || local.Target.ProxyRoute != "jump-a" {
+		t.Fatalf("default placement should be local and keep proxy route separate, got %#v", local)
+	}
+	shared, err := DecidePlacement(st, PlacementInput{ExplicitBeaconProfile: "gpu", ConversationID: "conv"}, nil)
+	if err != nil {
+		t.Fatalf("shared placement: %v", err)
+	}
+	if shared.Action != "reuse_machine" || shared.MachineID != "gpu-shared" {
+		t.Fatalf("shared placement should reuse accepting shared machine, got %#v", shared)
+	}
+	exclusive, err := DecidePlacement(st, PlacementInput{ExplicitBeaconProfile: "gpu", ConversationID: "conv", Isolation: IsolationExclusive}, nil)
+	if err != nil {
+		t.Fatalf("exclusive placement: %v", err)
+	}
+	if exclusive.Action != "allocate_machine" {
+		t.Fatalf("exclusive placement should not share busy exclusive machine, got %#v", exclusive)
+	}
+	st.Machines["gpu-exclusive-idle"] = Machine{ID: "gpu-exclusive-idle", LeaseID: "lease-exclusive-idle", Profile: "gpu", State: "accepting", Isolation: IsolationExclusive}
+	exclusive, err = DecidePlacement(st, PlacementInput{ExplicitBeaconProfile: "gpu", ConversationID: "conv", Isolation: IsolationExclusive}, nil)
+	if err != nil {
+		t.Fatalf("exclusive idle placement: %v", err)
+	}
+	if exclusive.Action != "reuse_machine" || exclusive.MachineID != "gpu-exclusive-idle" {
+		t.Fatalf("exclusive placement should reuse idle exclusive machine only, got %#v", exclusive)
+	}
+}
+
+func TestPlacementDoesNotReuseExternalOrIncompatibleMachines(t *testing.T) {
+	st := State{
+		Profiles: map[string]Profile{
+			"gpu": readyProfile("gpu"),
+		},
+		Machines: map[string]Machine{
+			"external": {
+				ID:            "external",
+				LeaseID:       "lease-external",
+				Profile:       "gpu",
+				State:         "accepting",
+				Isolation:     IsolationShared,
+				ExternalOwned: true,
+			},
+			"wrong-profile": {
+				ID:        "wrong-profile",
+				LeaseID:   "lease-cpu",
+				Profile:   "cpu",
+				State:     "accepting",
+				Isolation: IsolationShared,
+			},
+			"incompatible-state": {
+				ID:        "incompatible-state",
+				LeaseID:   "lease-incompatible",
+				Profile:   "gpu",
+				State:     "protocol_mismatch",
+				Isolation: IsolationShared,
+			},
+			"exclusive-busy": {
+				ID:        "exclusive-busy",
+				LeaseID:   "lease-exclusive",
+				Profile:   "gpu",
+				State:     "accepting",
+				Isolation: IsolationExclusive,
+				Chats:     []string{"other-conv"},
+			},
+		},
+	}
+	decision, err := DecidePlacement(st, PlacementInput{ExplicitBeaconProfile: "gpu", ConversationID: "conv"}, nil)
+	if err != nil {
+		t.Fatalf("DecidePlacement: %v", err)
+	}
+	if decision.Action != "allocate_machine" {
+		t.Fatalf("placement should allocate instead of reusing external/incompatible machines, got %#v", decision)
+	}
+	st.Machines["exclusive-same-conv"] = Machine{
+		ID:        "exclusive-same-conv",
+		LeaseID:   "lease-same-conv",
+		Profile:   "gpu",
+		State:     "accepting",
+		Isolation: IsolationExclusive,
+		Chats:     []string{"conv"},
+	}
+	decision, err = DecidePlacement(st, PlacementInput{ExplicitBeaconProfile: "gpu", ConversationID: "conv", Isolation: IsolationExclusive}, nil)
+	if err != nil {
+		t.Fatalf("exclusive DecidePlacement: %v", err)
+	}
+	if decision.Action != "reuse_machine" || decision.MachineID != "exclusive-same-conv" {
+		t.Fatalf("exclusive same-conversation idle machine should be reusable, got %#v", decision)
+	}
+}
+
+func TestPlacementRejectsDraftBeaconProfileWithoutLocalFallback(t *testing.T) {
+	st := State{
+		Profiles: map[string]Profile{
+			"draft": {Name: "draft", Provider: ProviderSlurm, ProxyMode: ProxyNone},
+		},
+	}
+	decision, err := DecidePlacement(st, PlacementInput{ExplicitBeaconProfile: "draft", LegacyProxyRoute: "jump-a"}, nil)
+	if err == nil || decision.Action != "reject" || decision.Target.Target != TargetBeacon {
+		t.Fatalf("draft explicit beacon profile should reject without local fallback, decision=%#v err=%v", decision, err)
+	}
+}
+
+func TestSwitchProfileSnapshotsFutureQueuedTurns(t *testing.T) {
+	var st State
+	st.Profiles = map[string]Profile{
+		"gpu": readyProfile("gpu"),
+		"cpu": readyProfile("cpu"),
+	}
+	st.Conversations = map[string]Conversation{
+		"conv": {ID: "conv", Current: TargetSnapshot{Target: TargetBeacon, Profile: "gpu", Signature: "sig-gpu"}},
+	}
+	first, err := QueueTurn(&st, "conv", "turn-1", time.Unix(1, 0))
+	if err != nil {
+		t.Fatalf("QueueTurn first: %v", err)
+	}
+	if first.Snapshot.Profile != "gpu" {
+		t.Fatalf("first turn should snapshot gpu, got %#v", first)
+	}
+	res, err := SwitchProfile(&st, SwitchInput{ConversationID: "conv", ProfileName: "cpu", Signature: "sig-cpu", HasQueuedOrRunning: true, SignatureCompatible: true}, nil)
+	if err != nil {
+		t.Fatalf("SwitchProfile: %v", err)
+	}
+	if res.Action != "pending" {
+		t.Fatalf("switch with queued work should be pending, got %#v", res)
+	}
+	second, err := QueueTurn(&st, "conv", "turn-2", time.Unix(2, 0))
+	if err != nil {
+		t.Fatalf("QueueTurn second: %v", err)
+	}
+	if second.Snapshot.Profile != "cpu" || st.Conversations["conv"].Queued[0].Snapshot.Profile != "gpu" {
+		t.Fatalf("queued snapshots should preserve old and use pending for future, conv=%#v", st.Conversations["conv"])
+	}
+}
+
+func TestDeleteProfileRejectsProfilesInUse(t *testing.T) {
+	st := State{
+		Profiles: map[string]Profile{
+			"gpu": readyProfile("gpu"),
+		},
+		Machines: map[string]Machine{
+			"gpu-a": {ID: "gpu-a", Profile: "gpu", State: "accepting"},
+		},
+	}
+	if err := DeleteProfile(&st, "gpu"); err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("DeleteProfile active machine error = %v, want in-use rejection", err)
+	}
+	delete(st.Machines, "gpu-a")
+	st.Conversations = map[string]Conversation{
+		"conv": {
+			ID:      "conv",
+			Current: TargetSnapshot{Target: TargetBeacon, Profile: "gpu"},
+			Queued:  []QueuedTurn{{ID: "turn-1", Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}}},
+		},
+	}
+	if err := DeleteProfile(&st, "gpu"); err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("DeleteProfile conversation error = %v, want in-use rejection", err)
+	}
+	st.Conversations = nil
+	if err := DeleteProfile(&st, "gpu"); err != nil {
+		t.Fatalf("unused DeleteProfile: %v", err)
+	}
+}
+
+func TestIdempotencySurvivesStoreReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	err = store.Update(func(st *State) error {
+		_, _, err := ApplyIdempotent(st, "msg-1", "new --beacon-profile gpu", "", time.Unix(1, 0), func() (string, error) {
+			return "allocation-1", nil
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	store2, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore reload: %v", err)
+	}
+	err = store2.Update(func(st *State) error {
+		result, created, err := ApplyIdempotent(st, "msg-1", "new --beacon-profile gpu", "", time.Unix(2, 0), func() (string, error) {
+			return "allocation-2", nil
+		})
+		if err != nil {
+			return err
+		}
+		if created || result != "allocation-1" {
+			t.Fatalf("duplicate after reload should reuse original result, created=%v result=%q", created, result)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+}
+
+func TestStoreConcurrentUpdatesFromDistinctHandlesDoNotLoseWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beacon.json")
+	const writers = 40
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			store, err := NewStore(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			errs <- store.Update(func(st *State) error {
+				st.Idempotency[fmt.Sprintf("writer-%02d", i)] = IdempotencyRecord{Key: fmt.Sprintf("writer-%02d", i), Result: "ok"}
+				return nil
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent update: %v", err)
+		}
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore final: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load final: %v", err)
+	}
+	if len(st.Idempotency) != writers {
+		t.Fatalf("idempotency records = %d, want %d", len(st.Idempotency), writers)
+	}
+}
+
+func TestReleasePreviewHardKillAndExternalProtection(t *testing.T) {
+	m := Machine{ID: "gpu-a", LeaseID: "lease-1", ProviderJobID: "slurm-1", Chats: []string{"chat-a"}, Jobs: []string{"job-1"}}
+	res, err := DecideRelease(m, ReleaseInput{})
+	if err != nil {
+		t.Fatalf("DecideRelease: %v", err)
+	}
+	if res.Action != "drain" || res.Preview.Confirmation != "KILL-lease-1" {
+		t.Fatalf("running release should drain and show confirmation preview, got %#v", res)
+	}
+	res, err = DecideRelease(m, ReleaseInput{HardKill: true, ExactID: "lease-1", ConfirmToken: "KILL-lease-1", ProvidedToken: "KILL-lease-1"})
+	if err != nil {
+		t.Fatalf("DecideRelease kill: %v", err)
+	}
+	if res.Action != "kill_quarantine" {
+		t.Fatalf("confirmed hard kill should quarantine, got %#v", res)
+	}
+	m.ExternalOwned = true
+	res, err = DecideRelease(m, ReleaseInput{HardKill: true, ExactID: "lease-1", ConfirmToken: "KILL-lease-1", ProvidedToken: "KILL-lease-1"})
+	if err != nil {
+		t.Fatalf("DecideRelease external: %v", err)
+	}
+	if res.Action != "reject_external" {
+		t.Fatalf("external BYO allocation should reject provider kill, got %#v", res)
+	}
+}
+
+func TestUpgradeBlockersAreOperationSpecific(t *testing.T) {
+	if blockers := UpgradeBlockers(UpgradeInput{Operation: UpgradeHelperRestart, QueuedTeamsTurns: 1}); len(blockers) != 0 {
+		t.Fatalf("helper restart may preserve queued turns, got %#v", blockers)
+	}
+	if blockers := UpgradeBlockers(UpgradeInput{Operation: UpgradeHelperRestart, RunningTeamsTurns: 1, Force: true}); !contains(blockers, "running_teams_turn") {
+		t.Fatalf("force must not bypass running Teams turns, got %#v", blockers)
+	}
+	if blockers := UpgradeBlockers(UpgradeInput{Operation: UpgradePrelistenCodex, QueuedTeamsTurns: 1}); !contains(blockers, "queued_teams_turn") {
+		t.Fatalf("Codex upgrade must block queued turns, got %#v", blockers)
+	}
+	if blockers := UpgradeBlockers(UpgradeInput{Operation: UpgradeBeaconCodexTarget, ActiveBeaconOtherTarget: 1}); len(blockers) != 0 {
+		t.Fatalf("per-target Codex upgrade should ignore other target, got %#v", blockers)
+	}
+}
+
+func TestUpgradeBlockersForStateClassifiesBeaconWork(t *testing.T) {
+	st := State{
+		Machines: map[string]Machine{
+			"idle": {
+				ID:      "idle",
+				LeaseID: "lease-idle",
+				State:   "accepting",
+			},
+			"active": {
+				ID:            "active",
+				LeaseID:       "lease-active",
+				ProviderJobID: "slurm-1",
+				Profile:       "gpu",
+				State:         "accepting",
+				Jobs:          []string{"job-1"},
+			},
+			"ambiguous": {
+				ID:      "ambiguous",
+				LeaseID: "lease-ambiguous",
+				State:   "ambiguous",
+			},
+		},
+		Conversations: map[string]Conversation{
+			"conv": {
+				ID: "conv",
+				Queued: []QueuedTurn{
+					{ID: "turn-gpu", Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: "gpu", Signature: "sig-gpu"}},
+					{ID: "turn-cpu", Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: "cpu", Signature: "sig-cpu"}},
+					{ID: "turn-local", Snapshot: TargetSnapshot{Target: TargetLocal}},
+				},
+			},
+		},
+	}
+	helper := UpgradeBlockersForState(st, UpgradePendingReplacement, "")
+	if len(helper) != 2 || helper[0].Kind != "beacon_job" || helper[1].Kind != "beacon_marker" {
+		t.Fatalf("helper blockers should include active job and ambiguous marker only, got %#v", helper)
+	}
+	target := UpgradeBlockersForState(st, UpgradeBeaconCodexTarget, "sig-gpu")
+	if !hasUpgradeBlocker(target, "beacon_queued_turn", "turn-gpu") {
+		t.Fatalf("target upgrade should block matching queued turn, got %#v", target)
+	}
+	if hasUpgradeBlocker(target, "beacon_queued_turn", "turn-cpu") {
+		t.Fatalf("target upgrade should ignore other signature, got %#v", target)
+	}
+}
+
+func TestArtifactTerminalAndAuditSafety(t *testing.T) {
+	if err := ValidateArtifact(ArtifactRef{
+		Root:                 "/shared/job/artifacts",
+		Path:                 "/shared/job/artifacts/report.txt",
+		DeclaredHash:         "hash",
+		ActualHash:           "hash",
+		Size:                 10,
+		Limit:                100,
+		OpenedNoFollow:       true,
+		FstatStable:          true,
+		HashFromOpenedFile:   true,
+		StagedFromOpenedFile: true,
+		HardlinkCount:        1,
+		UploadOK:             true,
+	}); err != nil {
+		t.Fatalf("valid artifact: %v", err)
+	}
+	if err := ValidateArtifact(ArtifactRef{Root: "/shared/job/artifacts", Path: "/shared/job/artifacts/missing", Missing: true}); err == nil {
+		t.Fatal("missing artifact should fail")
+	}
+	var st State
+	terminal, err := AcceptTerminal(&st, "job-1", []byte(`{"ok":true}`), time.Unix(1, 0))
+	if err != nil || terminal.Action != "complete" || !terminal.OutboxQueued {
+		t.Fatalf("first terminal = %#v err=%v", terminal, err)
+	}
+	terminal, err = AcceptTerminal(&st, "job-1", []byte(`{"ok":true}`), time.Unix(2, 0))
+	if err != nil || terminal.Action != "complete" || terminal.OutboxQueued {
+		t.Fatalf("duplicate terminal should be no-op, got %#v err=%v", terminal, err)
+	}
+	terminal, err = AcceptTerminal(&st, "job-1", []byte(`{"ok":false}`), time.Unix(3, 0))
+	if err != nil || terminal.Action != "quarantine" {
+		t.Fatalf("conflicting terminal should quarantine, got %#v err=%v", terminal, err)
+	}
+	if _, err := AppendAudit(&st, "terminal_accept", "job-1", time.Unix(4, 0)); err != nil {
+		t.Fatalf("AppendAudit: %v", err)
+	}
+	if err := ValidateAudit(st); err != nil {
+		t.Fatalf("ValidateAudit: %v", err)
+	}
+	st.Audit = st.Audit[:0]
+	if err := ValidateAudit(st); err == nil {
+		t.Fatal("audit truncation should be detected")
+	}
+}
+
+func TestArtifactValidationRejectsUnsafeVariants(t *testing.T) {
+	base := ArtifactRef{
+		Root:                 "/shared/job/artifacts",
+		Path:                 "/shared/job/artifacts/report.txt",
+		DeclaredHash:         "hash",
+		ActualHash:           "hash",
+		Size:                 10,
+		Limit:                100,
+		OpenedNoFollow:       true,
+		FstatStable:          true,
+		HashFromOpenedFile:   true,
+		StagedFromOpenedFile: true,
+		HardlinkCount:        1,
+		UploadOK:             true,
+	}
+	cases := map[string]ArtifactRef{
+		"symlink race":           copyArtifact(base, func(ref *ArtifactRef) { ref.OpenedNoFollow = false }),
+		"unstable fstat":         copyArtifact(base, func(ref *ArtifactRef) { ref.FstatStable = false }),
+		"hash not opened file":   copyArtifact(base, func(ref *ArtifactRef) { ref.HashFromOpenedFile = false }),
+		"staged not opened file": copyArtifact(base, func(ref *ArtifactRef) { ref.StagedFromOpenedFile = false }),
+		"hardlink":               copyArtifact(base, func(ref *ArtifactRef) { ref.HardlinkCount = 2 }),
+		"zero size":              copyArtifact(base, func(ref *ArtifactRef) { ref.Size = 0 }),
+		"too large":              copyArtifact(base, func(ref *ArtifactRef) { ref.Size = 101 }),
+		"hash mismatch":          copyArtifact(base, func(ref *ArtifactRef) { ref.ActualHash = "other" }),
+		"outside root":           copyArtifact(base, func(ref *ArtifactRef) { ref.Path = "/shared/job/report.txt" }),
+		"upload failed":          copyArtifact(base, func(ref *ArtifactRef) { ref.UploadOK = false }),
+		"worker delivery field":  copyArtifact(base, func(ref *ArtifactRef) { ref.WorkerDeliveryField = true }),
+	}
+	for name, ref := range cases {
+		if err := ValidateArtifact(ref); err == nil {
+			t.Fatalf("%s should be rejected", name)
+		}
+	}
+}
+
+func TestTerminalRejectsEmptyJobAndRepairsMissingOutboxFlag(t *testing.T) {
+	var st State
+	if _, err := AcceptTerminal(&st, "", []byte(`{"ok":true}`), time.Unix(1, 0)); err == nil {
+		t.Fatal("empty terminal job id should fail")
+	}
+	first, err := AcceptTerminal(&st, "job-1", []byte(`{"ok":true}`), time.Unix(2, 0))
+	if err != nil || !first.OutboxQueued {
+		t.Fatalf("first terminal = %#v err=%v", first, err)
+	}
+	rec := st.Terminals["job-1"]
+	rec.OutboxQueued = false
+	st.Terminals["job-1"] = rec
+	second, err := AcceptTerminal(&st, "job-1", []byte(`{"ok":true}`), time.Unix(3, 0))
+	if err != nil || second.Action != "complete" || !second.OutboxQueued {
+		t.Fatalf("duplicate terminal should repair missing outbox flag, got %#v err=%v", second, err)
+	}
+}
+
+func TestAuditValidationRejectsTamperAndSecretLeak(t *testing.T) {
+	var st State
+	if _, err := AppendAudit(&st, "machine_release", "lease-1", time.Unix(1, 0)); err != nil {
+		t.Fatalf("AppendAudit first: %v", err)
+	}
+	if _, err := AppendAudit(&st, "machine_kill", "lease-2", time.Unix(2, 0)); err != nil {
+		t.Fatalf("AppendAudit second: %v", err)
+	}
+	for name, mutate := range map[string]func(State) State{
+		"seq gap": func(in State) State {
+			in.Audit[1].Seq = 3
+			return in
+		},
+		"bad prev": func(in State) State {
+			in.Audit[1].PrevHash = "wrong"
+			return in
+		},
+		"secret leak": func(in State) State {
+			in.Audit[0].Secret = "token"
+			return in
+		},
+		"hash tamper": func(in State) State {
+			in.Audit[0].Target = "lease-other"
+			return in
+		},
+		"head mismatch": func(in State) State {
+			in.AuditHead.Hash = "wrong"
+			return in
+		},
+	} {
+		copied := cloneAuditState(st)
+		if err := ValidateAudit(mutate(copied)); err == nil {
+			t.Fatalf("%s should be rejected", name)
+		}
+	}
+}
+
+func TestStoreRejectsCorruptOversizedAndUnsupportedState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatalf("write corrupt: %v", err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := store.Load(); err == nil {
+		t.Fatal("corrupt JSON should fail")
+	}
+	big := strings.Repeat(" ", 16<<20+1)
+	if err := os.WriteFile(path, []byte(big), 0o600); err != nil {
+		t.Fatalf("write big: %v", err)
+	}
+	if _, err := store.Load(); err == nil {
+		t.Fatal("oversized state should fail")
+	}
+	if err := os.WriteFile(path, []byte(`{"version":999}`), 0o600); err != nil {
+		t.Fatalf("write unsupported version: %v", err)
+	}
+	if _, err := store.Load(); err == nil || !strings.Contains(err.Error(), "unsupported beacon state version") {
+		t.Fatalf("unsupported version error = %v", err)
+	}
+	if err := store.Save(State{Version: 999}); err == nil {
+		t.Fatal("Save should refuse unsupported version")
+	}
+	parentFile := filepath.Join(dir, "parent-file")
+	if err := os.WriteFile(parentFile, []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("write parent file: %v", err)
+	}
+	if _, err := NewStore(filepath.Join(parentFile, "state.json")); err == nil {
+		t.Fatal("NewStore should reject a non-directory parent")
+	}
+}
+
+func copyArtifact(in ArtifactRef, fn func(*ArtifactRef)) ArtifactRef {
+	fn(&in)
+	return in
+}
+
+func cloneAuditState(in State) State {
+	out := in
+	out.Audit = append([]AuditRecord(nil), in.Audit...)
+	return out
+}
+
+func hasUpgradeBlocker(values []UpgradeBlocker, kind string, id string) bool {
+	for _, value := range values {
+		if value.Kind == kind && value.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func readyProfile(name string) Profile {
+	return Profile{
+		Name:              name,
+		Provider:          ProviderLocal,
+		ProxyMode:         ProxyNone,
+		IsolationDefault:  IsolationShared,
+		Confirmed:         true,
+		ProviderPreviewOK: true,
+		DoctorOK:          true,
+	}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

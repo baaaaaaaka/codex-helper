@@ -43,6 +43,7 @@ func reloadTeamsHelperFromTeams(ctx context.Context, opts teams.HelperReloadOpti
 		SourceDir:     sourceDir,
 		InstallPath:   installPath,
 		BeforeRestart: opts.BeforeRestart,
+		BlockerCheck:  helperReloadBeaconBlockerError,
 	})
 }
 
@@ -50,6 +51,7 @@ type teamsHelperReloadOptions struct {
 	SourceDir     string
 	InstallPath   string
 	BeforeRestart func(context.Context) error
+	BlockerCheck  func() error
 }
 
 func runTeamsHelperReload(ctx context.Context, opts teamsHelperReloadOptions) error {
@@ -60,6 +62,11 @@ func runTeamsHelperReload(ctx context.Context, opts teamsHelperReloadOptions) er
 	installPath, err := validateTeamsReloadInstallPath(opts.InstallPath)
 	if err != nil {
 		return err
+	}
+	if opts.BlockerCheck != nil {
+		if err := opts.BlockerCheck(); err != nil {
+			return err
+		}
 	}
 	env := teamsReloadBuildEnv()
 	if err := runTeamsReloadTests(ctx, sourceDir, env); err != nil {
@@ -93,6 +100,11 @@ func runTeamsHelperReload(ctx context.Context, opts teamsHelperReloadOptions) er
 	}
 	if opts.BeforeRestart != nil {
 		if err := opts.BeforeRestart(ctx); err != nil {
+			return restore("prepare helper restart", err)
+		}
+	}
+	if opts.BlockerCheck != nil {
+		if err := opts.BlockerCheck(); err != nil {
 			return restore("prepare helper restart", err)
 		}
 	}

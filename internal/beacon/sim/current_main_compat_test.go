@@ -315,6 +315,9 @@ type conversationPlacement struct {
 
 func (c *conversationPlacement) queueTurn(id string) {
 	snapshot := c.current
+	if c.pending != nil {
+		snapshot = *c.pending
+	}
 	c.queue = append(c.queue, plannedTurn{id: id, snapshot: snapshot})
 }
 
@@ -357,5 +360,21 @@ func TestQueuedTurnKeepsExecutionTargetSnapshotAcrossProfileSwitch(t *testing.T)
 	c.queueTurn("turn-2")
 	if c.queue[0].snapshot.profile != "cpu" {
 		t.Fatalf("next turn should use switched profile, got %#v", c.queue[0].snapshot)
+	}
+}
+
+func TestProfileSwitchAppliesToFutureQueuedTurnsAfterCommand(t *testing.T) {
+	c := conversationPlacement{
+		current: executionSnapshot{target: targetBeacon, profile: "gpu-h100", signature: "image-a"},
+	}
+	c.queueTurn("turn-running")
+	c.switchProfile(executionSnapshot{target: targetBeacon, profile: "cpu", signature: "image-a"})
+	c.queueTurn("turn-after-switch")
+
+	if c.queue[0].snapshot.profile != "gpu-h100" {
+		t.Fatalf("already queued turn should keep original target, got %#v", c.queue[0].snapshot)
+	}
+	if c.queue[1].snapshot.profile != "cpu" {
+		t.Fatalf("turn queued after switch should use pending target, got %#v", c.queue[1].snapshot)
 	}
 }

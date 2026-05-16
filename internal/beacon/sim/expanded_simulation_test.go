@@ -98,6 +98,11 @@ const (
 	reconcileDrain      reconcileAction = "drain"
 	reconcileLost       reconcileAction = "lost"
 	reconcileQuarantine reconcileAction = "quarantine"
+	reconcilePending    reconcileAction = "pending"
+	reconcileRunning    reconcileAction = "running"
+	reconcileSuspended  reconcileAction = "suspended"
+	reconcileCompleted  reconcileAction = "completed"
+	reconcileFinalizing reconcileAction = "finalizing"
 )
 
 type reconcileInput struct {
@@ -478,19 +483,16 @@ func decideProfileSwitch(in profileSwitchInput) profileSwitchAction {
 	if !in.targetReady {
 		return switchReject
 	}
-	if in.turnState == turnQueued || in.turnState == turnRunning {
-		if in.mode == switchPending {
-			return switchApplyPending
+	if !in.signatureCompatible {
+		if in.mode == switchFork {
+			return switchApplyNow
 		}
-		return switchReject
+		return switchRequireFork
 	}
-	if in.signatureCompatible {
-		return switchApplyNow
+	if in.turnState == turnQueued || in.turnState == turnRunning {
+		return switchApplyPending
 	}
-	if in.mode == switchFork {
-		return switchApplyNow
-	}
-	return switchRequireFork
+	return switchApplyNow
 }
 
 func TestExistingConversationProfileSwitchRules(t *testing.T) {
@@ -504,8 +506,8 @@ func TestExistingConversationProfileSwitchRules(t *testing.T) {
 		want profileSwitchAction
 	}{
 		{name: "draft target rejected", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.targetReady = false }), want: switchReject},
-		{name: "queued turn requires pending mode", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.turnState = turnQueued }), want: switchReject},
-		{name: "running turn requires pending mode", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.turnState = turnRunning }), want: switchReject},
+		{name: "queued turn schedules pending by default", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.turnState = turnQueued }), want: switchApplyPending},
+		{name: "running turn schedules pending by default", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.turnState = turnRunning }), want: switchApplyPending},
 		{name: "queued turn can schedule pending switch", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.turnState = turnQueued; in.mode = switchPending }), want: switchApplyPending},
 		{name: "running turn can schedule pending switch", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.turnState = turnRunning; in.mode = switchPending }), want: switchApplyPending},
 		{name: "incompatible resume requires fork", in: copyProfileSwitch(base, func(in *profileSwitchInput) { in.signatureCompatible = false }), want: switchRequireFork},

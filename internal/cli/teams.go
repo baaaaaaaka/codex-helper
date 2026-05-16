@@ -785,6 +785,9 @@ func restartTeamsHelperFromTeams(context.Context) error {
 	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
 		return err
 	}
+	if err := helperRestartBeaconBlockerError(); err != nil {
+		return err
+	}
 	if teamsServiceGOOS() == "windows" && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
 		if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
 			return err
@@ -800,6 +803,9 @@ func restartTeamsHelperFromTeamsAfterPendingReplacement(ctx context.Context, pen
 		return restartTeamsHelperFromTeams(ctx)
 	}
 	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
+		return err
+	}
+	if err := helperRestartBeaconBlockerError(); err != nil {
 		return err
 	}
 	if teamsServiceGOOS() == "windows" {

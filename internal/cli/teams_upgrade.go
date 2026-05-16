@@ -15,6 +15,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -67,6 +68,9 @@ func ensureTeamsIdleBeforeCodexUpgrade(ctx context.Context) error {
 			return fmt.Errorf("Teams state has upgrade-blocking work in %s but no active owner: %s; run `codex-proxy teams recover` before using --upgrade-codex", path, teamsUpgradeBlockerSummary(blockers))
 		}
 	}
+	if blockers := beaconUpgradeBlockersForOperation(beacon.UpgradePrelistenCodex, ""); len(blockers) > 0 {
+		return fmt.Errorf("Beacon state has upgrade-blocking work before Codex upgrade: %s", teamsUpgradeBlockerSummary(blockers))
+	}
 	return nil
 }
 
@@ -79,11 +83,18 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 	if err != nil {
 		return nil, err
 	}
+	beaconBlockers := beaconUpgradeBlockersForOperation(beacon.UpgradePendingReplacement, "")
 	if len(paths) == 0 {
+		if len(beaconBlockers) > 0 {
+			return nil, fmt.Errorf("Beacon state has upgrade-blocking work before helper upgrade: %s", teamsUpgradeBlockerSummary(beaconBlockers))
+		}
 		if serviceWasActive {
 			return stopTeamsServiceForHelperUpgrade(ctx, in, out, nil, registryPath)
 		}
 		return nil, nil
+	}
+	if len(beaconBlockers) > 0 {
+		return nil, fmt.Errorf("Beacon state has upgrade-blocking work before helper upgrade: %s", teamsUpgradeBlockerSummary(beaconBlockers))
 	}
 	type upgradeStore struct {
 		Path string
@@ -114,7 +125,7 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 				if err != nil {
 					return nil, err
 				}
-				if blockers := teamsHelperUpgradeBlockers(state); len(blockers) > 0 {
+				if blockers := helperUpgradeBlockers(state); len(blockers) > 0 {
 					_, _ = st.AbortUpgrade(context.Background(), report.Upgrade.ID, "helper upgrade rescue left protected Teams work")
 					return nil, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))
 				}
@@ -136,7 +147,7 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 			if err != nil {
 				return nil, err
 			}
-			if blockers := teamsHelperUpgradeBlockers(state); len(blockers) > 0 {
+			if blockers := helperUpgradeBlockers(state); len(blockers) > 0 {
 				_, _ = st.AbortUpgrade(context.Background(), report.Upgrade.ID, "helper upgrade rescue left protected Teams work")
 				return nil, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))
 			}
@@ -658,7 +669,7 @@ func teamsUpgradeStateDrained(ctx context.Context, st *teamsstore.Store) (bool, 
 	if _, ok := stateOwner(state); ok {
 		return false, nil
 	}
-	return len(teamsHelperUpgradeBlockers(state)) == 0, nil
+	return len(helperUpgradeBlockers(state)) == 0, nil
 }
 
 func stateOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool) {
@@ -725,8 +736,94 @@ func teamsHelperUpgradeBlockers(state teamsstore.State) []teamsstore.UpgradeBloc
 	return blockers
 }
 
+func helperUpgradeBlockers(state teamsstore.State) []teamsstore.UpgradeBlocker {
+	blockers := teamsHelperUpgradeBlockers(state)
+	blockers = append(blockers, beaconUpgradeBlockersForOperation(beacon.UpgradePendingReplacement, "")...)
+	return blockers
+}
+
 func teamsUpgradeBlockers(state teamsstore.State) []teamsstore.UpgradeBlocker {
 	return teamsstore.UpgradeBlockers(state, time.Now())
+}
+
+var loadBeaconUpgradeBlockers = defaultLoadBeaconUpgradeBlockers
+
+func beaconUpgradeBlockersForOperation(op beacon.UpgradeOperation, codexTargetSignature string) []teamsstore.UpgradeBlocker {
+	return loadBeaconUpgradeBlockers(op, codexTargetSignature)
+}
+
+func defaultLoadBeaconUpgradeBlockers(op beacon.UpgradeOperation, codexTargetSignature string) []teamsstore.UpgradeBlocker {
+	path, err := beacon.DefaultStorePath()
+	if err != nil {
+		return []teamsstore.UpgradeBlocker{{
+			Kind:   "beacon_state",
+			Status: "unreadable",
+			Detail: err.Error(),
+		}}
+	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return []teamsstore.UpgradeBlocker{{
+			Kind:   "beacon_state",
+			ID:     path,
+			Status: "unreadable",
+			Detail: err.Error(),
+		}}
+	}
+	store, err := beacon.NewStore(path)
+	if err != nil {
+		return []teamsstore.UpgradeBlocker{{
+			Kind:   "beacon_state",
+			ID:     path,
+			Status: "unreadable",
+			Detail: err.Error(),
+		}}
+	}
+	st, err := store.Load()
+	if err != nil {
+		return []teamsstore.UpgradeBlocker{{
+			Kind:   "beacon_state",
+			ID:     store.Path(),
+			Status: "unreadable",
+			Detail: err.Error(),
+		}}
+	}
+	raw := beacon.UpgradeBlockersForState(st, op, codexTargetSignature)
+	blockers := make([]teamsstore.UpgradeBlocker, 0, len(raw))
+	for _, b := range raw {
+		detail := strings.TrimSpace(b.Detail)
+		if strings.TrimSpace(b.MachineID) != "" {
+			if detail != "" {
+				detail += " "
+			}
+			detail += "machine=" + strings.TrimSpace(b.MachineID)
+		}
+		blockers = append(blockers, teamsstore.UpgradeBlocker{
+			Kind:      b.Kind,
+			ID:        b.ID,
+			SessionID: b.ConversationID,
+			Status:    b.Status,
+			Detail:    detail,
+		})
+	}
+	return blockers
+}
+
+func helperReloadBeaconBlockerError() error {
+	return beaconLifecycleBlockerError(beacon.UpgradeHelperReload, "helper reload")
+}
+
+func helperRestartBeaconBlockerError() error {
+	return beaconLifecycleBlockerError(beacon.UpgradeHelperRestart, "helper restart")
+}
+
+func beaconLifecycleBlockerError(op beacon.UpgradeOperation, label string) error {
+	if blockers := beaconUpgradeBlockersForOperation(op, ""); len(blockers) > 0 {
+		return fmt.Errorf("Beacon state has upgrade-blocking work before %s: %s", label, teamsUpgradeBlockerSummary(blockers))
+	}
+	return nil
 }
 
 func teamsUpgradeBlockerSummary(blockers []teamsstore.UpgradeBlocker) string {
