@@ -127,6 +127,18 @@ codex-proxy proxy doctor
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
 | `codex-proxy history show <session-id>` | Print full history for a session |
 | `codex-proxy history open <session-id>` | Open a session in Codex |
+| `codex-proxy skills add <git-url>` | Install skills from a git source and keep them updated |
+| `codex-proxy skills list` | List Codex skill subscriptions |
+| `codex-proxy skills sync [name]` | Sync one skill source, or all sources when no name is given |
+| `codex-proxy skills push [name]` | Push local skill edits with per-change confirmation |
+| `codex-proxy skills doctor` | Check local skill subscription state |
+| `codex-proxy skills remove <name>` | Remove a skill subscription and managed installed skills |
+| `codex-proxy beacon profile list` | List beacon execution profiles |
+| `codex-proxy beacon profile create <name>` | Create a draft beacon execution profile |
+| `codex-proxy beacon profile doctor <name>` | Mark a beacon profile doctor check successful |
+| `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review |
+| `codex-proxy beacon status [--session <id>]` | Show beacon target state |
+| `codex-proxy beacon switch-profile <name> --session <id>` | Switch a conversation to a ready beacon profile |
 | `codex-proxy proxy start [profile]` | Start a long-lived proxy daemon |
 | `codex-proxy proxy list` | List known proxy instances |
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
@@ -144,6 +156,54 @@ Common flags:
 - `tui` / `history tui` support `--codex-dir`, `--codex-path`, `--profile`, and `--refresh-interval` (default `5s`, use `0` to disable)
 - `history open` supports `--codex-dir`, `--codex-path`, and `--profile`
 - `history list` / `history show` support `--codex-dir`
+- `skills` supports `--codex-dir`
+- `beacon` supports `--store /path/to/beacon.json` to override the beacon state file
+
+## Beacon execution profiles
+
+Beacon profiles describe where Codex work should execute. They are separate
+from SSH proxy profiles: `codex-proxy proxy` controls network routing, while
+`codex-proxy beacon profile ...` controls scheduler or worker placement.
+
+Create a Slurm draft profile with the scheduler fields your site requires:
+
+```bash
+codex-proxy beacon profile create gpu \
+  --provider slurm \
+  --partition interactive \
+  --image image.sqsh \
+  --nodes 1 \
+  --gpu 1 \
+  --duration 4
+```
+
+LSF and local drafts use smaller inputs:
+
+```bash
+codex-proxy beacon profile create batch --provider lsf --queue normal
+codex-proxy beacon profile create local --provider local
+```
+
+If the beacon job should use an existing SSH proxy profile for network access,
+add `--proxy ssh_profile --proxy-profile <existing-profile>`. Add
+`--isolation shared` or `--isolation exclusive` to choose the default lease
+sharing mode.
+
+Profiles stay draft until checked and confirmed:
+
+```bash
+codex-proxy beacon profile doctor gpu
+codex-proxy beacon profile confirm gpu
+codex-proxy beacon profile status gpu
+```
+
+After a profile is ready, inspect target state or switch an existing
+conversation explicitly:
+
+```bash
+codex-proxy beacon status --session <session-id>
+codex-proxy beacon switch-profile gpu --session <session-id>
+```
 
 ## Codex history
 
@@ -307,6 +367,16 @@ help
 projects
 status
 ```
+
+Beacon profile setup is a local `codex-proxy beacon ...` CLI workflow. You can
+ask questions about it in the Teams control chat, but profile mutation commands
+should be run locally unless the helper prints a specific supported Teams
+command.
+
+Control-chat Codex fallback runs under the Teams helper service environment,
+not necessarily your interactive shell. If it needs to inspect the local helper
+binary, the child process receives `CODEX_HELPER_CLI_PATH`; a missing `cxp`
+alias in that environment does not mean the installed helper is missing.
 
 If you update the helper while Teams work is active, the helper drains current
 work first, restarts the service when needed, and then sends a completion or

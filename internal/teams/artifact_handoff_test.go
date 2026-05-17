@@ -57,7 +57,13 @@ func TestControlFallbackPromptDefaultHelpHasCommandDigest(t *testing.T) {
 	for _, want := range []string{
 		"Relevant cxp / Teams helper help digest:",
 		"Control chat quick help:",
+		"Beacon CLI quick help:",
+		"cxp beacon profile create",
+		"cxp beacon profile confirm",
+		"Beacon execution profiles are separate from SSH proxy profiles",
 		"Work chat quick help:",
+		"helper skills add",
+		"helper skills sync",
 		"helper cancel last",
 	} {
 		if !strings.Contains(got, want) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -120,6 +121,9 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	if !hasEnvValue(gotOpts.ExtraEnv, envTeamsCodexParentPID, fmt.Sprint(os.Getpid())) {
 		t.Fatalf("expected Teams parent pid env in launch options: %#v", gotOpts.ExtraEnv)
 	}
+	if envValue(gotOpts.ExtraEnv, envTeamsHelperCLIPath) == "" {
+		t.Fatalf("expected Teams helper CLI path env in launch options: %#v", gotOpts.ExtraEnv)
+	}
 	if !strings.Contains(string(result.Stdout), "thread-managed") {
 		t.Fatalf("stdout was not captured: %s", string(result.Stdout))
 	}
@@ -132,6 +136,71 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	}
 	if cacheExists(t, codexDir) {
 		t.Fatal("Teams yolo launch should remove the bypass cache after Codex exits")
+	}
+}
+
+func TestTeamsCodexChildEnvExposesHelperCLIPathAndDir(t *testing.T) {
+	prevExecutablePath := teamsChildExecutablePath
+	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
+
+	dir := filepath.Join(t.TempDir(), "helper bin")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir helper dir: %v", err)
+	}
+	exe := filepath.Join(dir, "cxp")
+	teamsChildExecutablePath = func() (string, error) { return exe, nil }
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	got := teamsCodexChildEnv()
+	if !hasEnvValue(got, envTeamsHelperCLIPath, exe) {
+		t.Fatalf("expected helper CLI path env: %#v", got)
+	}
+	if !hasEnvValue(got, envTeamsHelperCLIDir, dir) {
+		t.Fatalf("expected helper CLI dir env: %#v", got)
+	}
+	path := envValue(got, "PATH")
+	if !strings.HasPrefix(path, dir+string(os.PathListSeparator)) {
+		t.Fatalf("PATH = %q, want helper dir prepended", path)
+	}
+}
+
+func TestTeamsCodexChildEnvDoesNotDuplicateHelperDirInPATH(t *testing.T) {
+	prevExecutablePath := teamsChildExecutablePath
+	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
+
+	dir := t.TempDir()
+	teamsChildExecutablePath = func() (string, error) { return filepath.Join(dir, "codex-proxy"), nil }
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin")
+
+	got := teamsCodexChildEnv()
+	if path := envValue(got, "PATH"); path != dir+string(os.PathListSeparator)+"/usr/bin" {
+		t.Fatalf("PATH = %q, want unchanged when helper dir is already present", path)
+	}
+}
+
+func TestTeamsCodexChildEnvMakesHelperDirDiscoverableOnPATH(t *testing.T) {
+	prevExecutablePath := teamsChildExecutablePath
+	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
+	if os.PathSeparator != '/' {
+		t.Skip("shell PATH lookup test uses POSIX shell")
+	}
+
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "cxp")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write helper stub: %v", err)
+	}
+	teamsChildExecutablePath = func() (string, error) { return exe, nil }
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	cmd := exec.Command("/bin/sh", "-c", "command -v cxp")
+	cmd.Env = []string{"PATH=" + envValue(teamsCodexChildEnv(), "PATH")}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("command -v cxp: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != exe {
+		t.Fatalf("command -v cxp = %q, want %q", got, exe)
 	}
 }
 
