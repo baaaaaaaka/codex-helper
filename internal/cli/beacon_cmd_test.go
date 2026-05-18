@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -331,6 +332,385 @@ func TestBeaconMachineCLIReleaseAndKillPreview(t *testing.T) {
 	}
 }
 
+func TestBeaconAllocationCLIListStatusAndReconcile(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		_, _, err := beacon.EnsureAllocationRequest(st, "conv-1", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", Signature: "sig-a"}, time.Unix(1, 0))
+		return err
+	}); err != nil {
+		t.Fatalf("seed allocation: %v", err)
+	}
+
+	out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "allocation", "list")
+	if err != nil {
+		t.Fatalf("allocation list: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "profile=gpu") || !strings.Contains(out, "state=request_persisted") {
+		t.Fatalf("allocation list output = %s", out)
+	}
+	out, err = runBeaconRootCommand(t, "beacon", "--store", storePath, "allocation", "status", "conv-1")
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("allocation status by unknown ref should fail, out=%q err=%v", out, err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	var req beacon.AllocationRequest
+	for _, value := range st.Allocations {
+		req = value
+	}
+	out, err = runBeaconRootCommand(t, "beacon", "--store", storePath, "allocation", "status", req.ID)
+	if err != nil {
+		t.Fatalf("allocation status: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "allocation="+req.ID) || !strings.Contains(out, "name="+req.DeterministicName) {
+		t.Fatalf("allocation status output = %s", out)
+	}
+
+	t.Setenv(beacon.BeaconSlurmQueryCommandEnv, writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-777 raw_state=PD reason=resources`))
+	out, err = runBeaconRootCommand(t, "beacon", "--store", storePath, "allocation", "reconcile", req.ID)
+	if err != nil {
+		t.Fatalf("allocation reconcile: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "action=adopt_existing") || !strings.Contains(out, "provider_job=slurm-777") {
+		t.Fatalf("allocation reconcile output = %s", out)
+	}
+	st, err = store.Load()
+	if err != nil {
+		t.Fatalf("load after reconcile: %v", err)
+	}
+	if got := st.Allocations[req.ID].ProviderIdentity.ProviderJobID; got != "slurm-777" {
+		t.Fatalf("provider job after reconcile = %q", got)
+	}
+}
+
+func TestBeaconProviderTemplateCLI(t *testing.T) {
+	out, err := runBeaconRootCommand(t, "beacon", "provider", "template", "slurm")
+	if err != nil {
+		t.Fatalf("provider template slurm: %v\n%s", err, out)
+	}
+	for _, want := range []string{"squeue", "sbatch", "scancel", "beacon worker serve --allocation", "--provider-job-id", "cancel)", "renew)", "renew_requires_site_policy", "exit 1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("slurm template missing %q:\n%s", want, out)
+		}
+	}
+	out, err = runBeaconRootCommand(t, "beacon", "provider", "template", "lsf")
+	if err != nil {
+		t.Fatalf("provider template lsf: %v\n%s", err, out)
+	}
+	for _, want := range []string{"bjobs", "bsub", "bkill", "beacon worker serve --allocation", "--provider-job-id", "cancel)", "renew)", "renew_requires_site_policy", "exit 1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("lsf template missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestBeaconAllocationReconcileAllRecoversStaleState(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "conv-reconcile", "turn-reconcile", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-rec"
+		req.State = beacon.AllocationSubmitted
+		st.Allocations[req.ID] = req
+		st.Machines["machine-rec"] = beacon.Machine{ID: "machine-rec", LeaseID: "lease-rec", ProviderJobID: "slurm-rec", WorkerID: "worker-rec", Profile: "gpu", State: string(beacon.LeaseAccepting), LastHeartbeat: time.Unix(1, 0)}
+		st.JobAttempts["job-claimed"] = beacon.JobAttempt{ID: "job-claimed", RequestID: req.ID, Phase: beacon.JobClaimed, WorkerID: "worker-rec", UpdatedAt: time.Unix(1, 0)}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed reconcile-all state: %v", err)
+	}
+	t.Setenv(beacon.BeaconSlurmQueryCommandEnv, writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-rec raw_state=R reason=running`))
+	out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "allocation", "reconcile-all", "--stale-after", "1s", "--stale-job-after", "1s")
+	if err != nil {
+		t.Fatalf("allocation reconcile-all: %v\n%s", err, out)
+	}
+	for _, want := range []string{"allocation=" + req.ID, "state=running", "machine=machine-rec action=drain_stale", "job=job-claimed action=recover_stale phase=queued"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("reconcile-all output missing %q:\n%s", want, out)
+		}
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after reconcile-all: %v", err)
+	}
+	if st.Machines["machine-rec"].State != string(beacon.LeaseDraining) || st.JobAttempts["job-claimed"].Phase != beacon.JobQueued {
+		t.Fatalf("reconcile-all state = machine=%#v job=%#v", st.Machines["machine-rec"], st.JobAttempts["job-claimed"])
+	}
+}
+
+func TestBeaconWorkerRunOnceClaimsJobAndWritesTerminal(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(beacon.LeaseAccepting)}
+		req, _, err := beacon.EnsureAllocationRequest(st, "conv-1", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		_, _, err = beacon.EnqueueJobAttempt(st, req.ID, st.Machines["machine-1"], beacon.JobPayload{Prompt: "remote prompt", WorkingDir: t.TempDir()}, time.Unix(2, 0))
+		return err
+	}); err != nil {
+		t.Fatalf("seed beacon job: %v", err)
+	}
+	codexPath := writeBeaconCLICodexFixture(t, "worker done")
+	out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "worker", "run-once", "--machine", "machine-1", "--worker", "worker-1", "--codex-path", codexPath)
+	if err != nil {
+		t.Fatalf("worker run-once: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "terminal=valid") || !strings.Contains(out, "outbox_queued=true") {
+		t.Fatalf("worker output = %s", out)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after worker: %v", err)
+	}
+	if len(st.Terminals) != 1 {
+		t.Fatalf("terminal count = %d, state=%#v", len(st.Terminals), st)
+	}
+	for _, terminal := range st.Terminals {
+		if !strings.Contains(terminal.Payload, "worker done") || !strings.Contains(terminal.Payload, "thread-worker") {
+			t.Fatalf("terminal payload = %#v", terminal)
+		}
+	}
+	if jobs := st.Machines["machine-1"].Jobs; len(jobs) != 0 {
+		t.Fatalf("worker terminal should clear active machine job, jobs=%#v", jobs)
+	}
+}
+
+func TestBeaconWorkerRunOnceRegistersAllocationAndWaitsForJob(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "conv-1", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-42"
+		req.State = beacon.AllocationSubmitted
+		st.Allocations[req.ID] = req
+		return nil
+	}); err != nil {
+		t.Fatalf("seed allocation: %v", err)
+	}
+	codexPath := writeBeaconCLICodexFixture(t, "waited worker done")
+	type commandResult struct {
+		out string
+		err error
+	}
+	done := make(chan commandResult, 1)
+	go func() {
+		out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "worker", "run-once", "--allocation", req.ID, "--worker", "worker-alloc", "--provider-job", "slurm-42", "--wait", "2s", "--codex-path", codexPath)
+		done <- commandResult{out: out, err: err}
+	}()
+	machine := waitForBeaconMachineByProviderJob(t, store, "slurm-42")
+	if err := store.Update(func(st *beacon.State) error {
+		_, _, err := beacon.EnqueueJobAttempt(st, req.ID, machine, beacon.JobPayload{Prompt: "remote prompt", WorkingDir: t.TempDir()}, time.Unix(2, 0))
+		return err
+	}); err != nil {
+		t.Fatalf("enqueue job after worker registration: %v", err)
+	}
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("worker run-once --allocation: %v\n%s", res.err, res.out)
+		}
+		if !strings.Contains(res.out, "registered machine="+machine.ID) || !strings.Contains(res.out, "terminal=valid") {
+			t.Fatalf("worker output = %s", res.out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for allocation worker command")
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after allocation worker: %v", err)
+	}
+	if len(st.Terminals) != 1 {
+		t.Fatalf("terminal count = %d, state=%#v", len(st.Terminals), st)
+	}
+	for _, terminal := range st.Terminals {
+		if !strings.Contains(terminal.Payload, "waited worker done") {
+			t.Fatalf("terminal payload = %#v", terminal)
+		}
+	}
+}
+
+func TestBeaconWorkerRegistrationFailurePreservesNeedsAttention(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "conv-bad", "turn-bad", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-bad"
+		req.State = beacon.AllocationSubmitted
+		st.Allocations[req.ID] = req
+		return nil
+	}); err != nil {
+		t.Fatalf("seed allocation: %v", err)
+	}
+	missingCodex := filepath.Join(t.TempDir(), "missing-codex")
+	out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "worker", "run-once", "--allocation", req.ID, "--provider-job", "slurm-bad", "--codex-path", missingCodex)
+	if err == nil || !strings.Contains(err.Error(), "not accepting after doctor") {
+		t.Fatalf("bad worker registration should fail before claim, err=%v out=%s", err, out)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after bad worker: %v", err)
+	}
+	var machine beacon.Machine
+	for _, current := range st.Machines {
+		if current.ProviderJobID == "slurm-bad" {
+			machine = current
+			break
+		}
+	}
+	if machine.ID == "" || machine.State != string(beacon.LeaseNeedsAttention) || len(machine.DoctorBlockers) == 0 {
+		t.Fatalf("doctor failure should remain visible as needs_attention, machine=%#v state=%#v", machine, st)
+	}
+}
+
+func TestBeaconWorkerServeRegistersAndRunsOneJob(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "conv-serve", "turn-serve", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-serve"
+		req.State = beacon.AllocationSubmitted
+		st.Allocations[req.ID] = req
+		return nil
+	}); err != nil {
+		t.Fatalf("seed serve allocation: %v", err)
+	}
+	codexPath := writeBeaconCLICodexFixture(t, "served worker done")
+	type commandResult struct {
+		out string
+		err error
+	}
+	done := make(chan commandResult, 1)
+	go func() {
+		out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "worker", "serve", "--allocation", req.ID, "--worker", "worker-serve", "--provider-job", "slurm-serve", "--idle-timeout", "2s", "--max-jobs", "1", "--codex-path", codexPath)
+		done <- commandResult{out: out, err: err}
+	}()
+	machine := waitForBeaconMachineByProviderJob(t, store, "slurm-serve")
+	if machine.State != string(beacon.LeaseAccepting) {
+		t.Fatalf("serve registered machine state = %#v", machine)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		_, _, err := beacon.EnqueueJobAttempt(st, req.ID, machine, beacon.JobPayload{Prompt: "serve prompt", WorkingDir: t.TempDir()}, time.Unix(2, 0))
+		return err
+	}); err != nil {
+		t.Fatalf("enqueue serve job: %v", err)
+	}
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("worker serve: %v\n%s", res.err, res.out)
+		}
+		for _, want := range []string{"registered machine=" + machine.ID, "terminal=valid", "Served max jobs: 1"} {
+			if !strings.Contains(res.out, want) {
+				t.Fatalf("worker serve output missing %q:\n%s", want, res.out)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for worker serve")
+	}
+}
+
 func TestBeaconMachineCLIReleaseIdleMachineRemovesLease(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	store, err := beacon.NewStore(storePath)
@@ -357,6 +737,68 @@ func TestBeaconMachineCLIReleaseIdleMachineRemovesLease(t *testing.T) {
 	if _, ok := st.Machines["cpu-a"]; ok {
 		t.Fatalf("idle machine should be removed after release: %#v", st.Machines["cpu-a"])
 	}
+}
+
+func writeBeaconCLIProviderFixture(t *testing.T, output string) string {
+	t.Helper()
+	if os.PathSeparator != '/' {
+		t.Skip("POSIX provider fixture script")
+	}
+	path := filepath.Join(t.TempDir(), "provider-fixture.sh")
+	body := "#!/bin/sh\nprintf '%s\\n' " + shellSingleQuoteForBeaconCLITest(output) + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatalf("write provider fixture: %v", err)
+	}
+	return path
+}
+
+func writeBeaconCLICodexFixture(t *testing.T, final string) string {
+	t.Helper()
+	if os.PathSeparator != '/' {
+		t.Skip("POSIX codex fixture script")
+	}
+	path := filepath.Join(t.TempDir(), "codex-fixture.sh")
+	body := strings.Join([]string{
+		"#!/bin/sh",
+		"cat >/dev/null",
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-worker\"}'",
+		"printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":" + shellSingleQuoteForBeaconCLITestJSON(final) + "}}'",
+		"printf '%s\\n' '{\"type\":\"turn.completed\"}'",
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatalf("write codex fixture: %v", err)
+	}
+	return path
+}
+
+func waitForBeaconMachineByProviderJob(t *testing.T, store *beacon.Store, providerJobID string) beacon.Machine {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := store.Load()
+		if err != nil {
+			t.Fatalf("load beacon state while waiting for machine: %v", err)
+		}
+		for _, machine := range st.Machines {
+			if machine.ProviderJobID == providerJobID {
+				return machine
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for beacon machine provider job %s", providerJobID)
+	return beacon.Machine{}
+}
+
+func shellSingleQuoteForBeaconCLITestJSON(value string) string {
+	escaped := strings.ReplaceAll(value, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `"` + escaped + `"`
+}
+
+func shellSingleQuoteForBeaconCLITest(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func runBeaconRootCommand(t *testing.T, args ...string) (string, error) {

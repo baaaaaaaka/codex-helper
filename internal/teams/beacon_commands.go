@@ -55,6 +55,13 @@ func (b *Bridge) runBeaconControlCommand(ctx context.Context, msg ChatMessage, a
 		return b.handleBeaconMachineCommand(ctx, msg, b.reg.ControlChatID, words[1:])
 	case "machine":
 		return b.handleBeaconMachineCommand(ctx, msg, b.reg.ControlChatID, words[1:])
+	case "allocations":
+		if len(words) == 1 {
+			return b.formatBeaconAllocations()
+		}
+		return b.handleBeaconAllocationCommand(ctx, words[1:])
+	case "allocation":
+		return b.handleBeaconAllocationCommand(ctx, words[1:])
 	case "status":
 		sessionID := beaconStatusSessionArg(words[1:])
 		if sessionID == "" {
@@ -86,8 +93,8 @@ func (b *Bridge) runBeaconWorkCommand(ctx context.Context, session *Session, msg
 		return b.handleBeaconWorkSwitch(ctx, msg, session, words[1:], true)
 	case "local":
 		return b.handleBeaconWorkSwitchLocal(ctx, msg, session)
-	case "profile", "profiles", "machine", "machines":
-		return "Wrong chat.\n\nBeacon profile and machine administration belongs in the control chat. Send `beacon list` there for the global view.", nil
+	case "profile", "profiles", "machine", "machines", "allocation", "allocations":
+		return "Wrong chat.\n\nBeacon profile, allocation, and machine administration belongs in the control chat. Send `beacon list` there for the global view.", nil
 	default:
 		return "", fmt.Errorf("unknown beacon work command %q; send `beacon help`", words[0])
 	}
@@ -250,6 +257,36 @@ func (b *Bridge) handleBeaconMachineCommand(ctx context.Context, msg ChatMessage
 	}
 }
 
+func (b *Bridge) handleBeaconAllocationCommand(ctx context.Context, words []string) (string, error) {
+	if len(words) == 0 {
+		return b.formatBeaconAllocations()
+	}
+	switch strings.ToLower(words[0]) {
+	case "list", "ls":
+		return b.formatBeaconAllocations()
+	case "status":
+		ref, err := singleBeaconNameArg("beacon allocation status", words[1:])
+		if err != nil {
+			return "", err
+		}
+		store, err := beacon.NewStore("")
+		if err != nil {
+			return "", err
+		}
+		st, err := store.Load()
+		if err != nil {
+			return "", err
+		}
+		req, ok := findBeaconAllocation(st, ref)
+		if !ok {
+			return "", fmt.Errorf("beacon allocation %q not found", ref)
+		}
+		return formatBeaconAllocationStatus(req), nil
+	default:
+		return "", fmt.Errorf("unknown beacon allocation command %q; use list or status", words[0])
+	}
+}
+
 func (b *Bridge) handleBeaconWorkSwitch(ctx context.Context, msg ChatMessage, session *Session, words []string, fork bool) (string, error) {
 	if len(words) == 0 {
 		return "", fmt.Errorf("usage: `beacon switch <profile>`")
@@ -354,6 +391,8 @@ func (b *Bridge) formatBeaconList() (string, error) {
 	proxyExists := b.beaconProxyResolver()
 	lines := []string{"Beacon list", "", "Profiles:"}
 	lines = append(lines, formatBeaconProfileListLines(st, proxyExists)...)
+	lines = append(lines, "", "Allocations:")
+	lines = append(lines, formatBeaconAllocationListLines(st)...)
 	lines = append(lines, "", "Machines:")
 	lines = append(lines, formatBeaconMachineListLines(st)...)
 	return strings.Join(lines, "\n"), nil
@@ -384,6 +423,20 @@ func (b *Bridge) formatBeaconMachines() (string, error) {
 	}
 	lines := []string{"Beacon machines"}
 	lines = append(lines, formatBeaconMachineListLines(st)...)
+	return strings.Join(lines, "\n"), nil
+}
+
+func (b *Bridge) formatBeaconAllocations() (string, error) {
+	store, err := beacon.NewStore("")
+	if err != nil {
+		return "", err
+	}
+	st, err := store.Load()
+	if err != nil {
+		return "", err
+	}
+	lines := []string{"Beacon allocations"}
+	lines = append(lines, formatBeaconAllocationListLines(st)...)
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -728,6 +781,18 @@ func formatBeaconMachineListLines(st beacon.State) []string {
 	return lines
 }
 
+func formatBeaconAllocationListLines(st beacon.State) []string {
+	allocations := sortedBeaconAllocations(st)
+	if len(allocations) == 0 {
+		return []string{"- none"}
+	}
+	lines := make([]string, 0, len(allocations))
+	for _, req := range allocations {
+		lines = append(lines, fmt.Sprintf("- %s: state=%s, profile=%s, provider=%s, provider_job=%s, provider_state=%s, reason=%s", req.ID, firstNonEmptyString(string(req.State), "unknown"), req.Profile, req.Provider, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason))
+	}
+	return lines
+}
+
 func formatBeaconProfileMutation(action string, p beacon.Profile, proxyExists func(string) bool) string {
 	state := "draft"
 	if p.Ready(proxyExists) {
@@ -791,6 +856,23 @@ func formatBeaconMachineStatus(m beacon.Machine) string {
 		"- chats: " + strings.Join(p.Chats, ","),
 		"- jobs: " + strings.Join(p.Jobs, ","),
 		"- kill confirmation: " + p.Confirmation,
+	}, "\n")
+}
+
+func formatBeaconAllocationStatus(req beacon.AllocationRequest) string {
+	return strings.Join([]string{
+		"Beacon allocation",
+		"- allocation: " + req.ID,
+		"- conversation: " + req.ConversationID,
+		"- turn: " + req.TurnID,
+		"- profile: " + req.Profile,
+		fmt.Sprintf("- provider: %s", req.Provider),
+		fmt.Sprintf("- isolation: %s", req.Isolation),
+		fmt.Sprintf("- state: %s", req.State),
+		"- deterministic name: " + req.DeterministicName,
+		"- provider job: " + req.ProviderIdentity.ProviderJobID,
+		"- provider state: " + req.RawProviderState,
+		"- provider reason: " + req.ProviderReason,
 	}, "\n")
 }
 
@@ -858,6 +940,30 @@ func sortedBeaconMachines(st beacon.State) []beacon.Machine {
 	return out
 }
 
+func sortedBeaconAllocations(st beacon.State) []beacon.AllocationRequest {
+	out := make([]beacon.AllocationRequest, 0, len(st.Allocations))
+	for _, req := range st.Allocations {
+		out = append(out, req)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func findBeaconAllocation(st beacon.State, ref string) (beacon.AllocationRequest, bool) {
+	ref = strings.TrimSpace(ref)
+	for _, req := range st.Allocations {
+		if req.ID == ref || req.DeterministicName == ref || req.ProviderIdentity.ProviderJobID == ref {
+			return req, true
+		}
+	}
+	return beacon.AllocationRequest{}, false
+}
+
 func findBeaconMachine(st beacon.State, ref string) (beacon.Machine, bool) {
 	_, m, ok := findBeaconMachineEntry(st, ref)
 	return m, ok
@@ -902,7 +1008,10 @@ func beaconControlHelpText() string {
 		"- `beacon profile create <name> --provider local`",
 		"- `beacon profile doctor <name>` then `beacon profile confirm <name>`",
 		"- `beacon profile status <name>`",
+		"- `beacon allocation list|status`",
 		"- `beacon machine list|status|release|kill`",
+		"- provider adapter: `cxp beacon provider template slurm|lsf`",
+		"- worker process: `cxp beacon worker serve --allocation <request-id>`",
 		"- `new <directory> --beacon <profile>` - create a Work chat on a ready beacon profile",
 		"",
 		"Work chat:",

@@ -112,6 +112,16 @@ func profileInUse(st State, name string) bool {
 			}
 		}
 	}
+	for _, snap := range st.TurnTargets {
+		if strings.TrimSpace(snap.Profile) == name {
+			return true
+		}
+	}
+	for _, req := range st.Allocations {
+		if strings.TrimSpace(req.Profile) == name || strings.TrimSpace(req.Target.Profile) == name {
+			return true
+		}
+	}
 	return false
 }
 

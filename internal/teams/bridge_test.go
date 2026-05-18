@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
@@ -6837,6 +6838,137 @@ func TestBridgeSessionCancelLastQueuedTurnMarksInterrupted(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionCancelQueuedBeaconTurnTombstonesRemoteJob(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	base := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
+	turn := queueBridgeTestTurnWithPrompt(t, store, session, "beacon-cancel", "beacon queued prompt", teamstore.TurnStatusQueued, base)
+	beaconStore, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	if err := beaconStore.Update(func(st *beacon.State) error {
+		st.Allocations["req-1"] = beacon.AllocationRequest{ID: "req-1", ConversationID: session.ID, TurnID: turn.ID, State: beacon.AllocationRunning, Provider: beacon.ProviderSlurm, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
+		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(beacon.LeaseAccepting), Jobs: []string{"job-1"}}
+		st.JobAttempts["job-1"] = beacon.JobAttempt{ID: "job-1", RequestID: "req-1", TurnID: turn.ID, WorkerID: "worker-1", LeaseID: "lease-1", Phase: beacon.JobStarted, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon state: %v", err)
+	}
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("cancel-beacon"), "helper cancel last"); err != nil {
+		t.Fatalf("cancel beacon turn: %v", err)
+	}
+	st, err := beaconStore.Load()
+	if err != nil {
+		t.Fatalf("load beacon state: %v", err)
+	}
+	if st.Allocations["req-1"].State != beacon.AllocationCanceled || st.JobAttempts["job-1"].Phase != beacon.JobTombstoned || len(st.Machines["machine-1"].Jobs) != 0 {
+		t.Fatalf("beacon state was not tombstoned: allocation=%#v job=%#v machine=%#v", st.Allocations["req-1"], st.JobAttempts["job-1"], st.Machines["machine-1"])
+	}
+	if got := sentPlainJoined(*sent); !strings.Contains(got, "turn canceled") {
+		t.Fatalf("cancel response = %q", got)
+	}
+}
+
+func TestBridgeBeaconReconcileProjectsProviderStateWithoutSubmitting(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	now := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
+	if err := store.Update(func(st *beacon.State) error {
+		st.Allocations["req-1"] = beacon.AllocationRequest{ID: "req-1", Provider: beacon.ProviderSlurm, State: beacon.AllocationRunning, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
+		st.Allocations["req-new"] = beacon.AllocationRequest{ID: "req-new", Provider: beacon.ProviderSlurm, State: beacon.AllocationRequestPersisted}
+		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(beacon.LeaseAccepting), LastHeartbeat: now.Add(-time.Hour), Jobs: []string{"job-1"}}
+		st.JobAttempts["job-1"] = beacon.JobAttempt{ID: "job-1", RequestID: "req-1", Phase: beacon.JobStarted}
+		st.JobAttempts["claimed-stale"] = beacon.JobAttempt{ID: "claimed-stale", RequestID: "req-new", Phase: beacon.JobClaimed, LeaseID: "old-lease", ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "old-provider"}, UpdatedAt: now.Add(-time.Hour)}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon store: %v", err)
+	}
+	bridge := &Bridge{}
+	adapter := &reconcileBeaconTestAdapter{query: beacon.SchedulerQueryResult{RawState: "F", Reason: "node failed"}}
+	if err := bridge.reconcileBeaconState(context.Background(), store, adapter, now); err != nil {
+		t.Fatalf("reconcileBeaconState: %v", err)
+	}
+	if adapter.submits != 0 {
+		t.Fatalf("periodic reconcile must not submit new allocations, submits=%d", adapter.submits)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load beacon store: %v", err)
+	}
+	if st.Allocations["req-1"].State != beacon.AllocationNeedsAttention || st.Machines["machine-1"].State != string(beacon.LeaseNeedsAttention) || st.JobAttempts["job-1"].Phase != beacon.JobQuarantined {
+		t.Fatalf("provider projection did not propagate: allocation=%#v machine=%#v job=%#v", st.Allocations["req-1"], st.Machines["machine-1"], st.JobAttempts["job-1"])
+	}
+	if stale := st.JobAttempts["claimed-stale"]; stale.Phase != beacon.JobQueued || stale.LeaseID != "" || stale.ProviderIdentity.ProviderJobID != "" {
+		t.Fatalf("stale claimed job should be requeued with old binding cleared: %#v", stale)
+	}
+}
+
+type reconcileBeaconTestAdapter struct {
+	query   beacon.SchedulerQueryResult
+	renew   beacon.SchedulerQueryResult
+	submits int
+	renews  int
+}
+
+func (a *reconcileBeaconTestAdapter) QueryAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
+	return a.query, nil
+}
+
+func (a *reconcileBeaconTestAdapter) SubmitAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
+	a.submits++
+	return beacon.SchedulerQueryResult{}, nil
+}
+
+func (a *reconcileBeaconTestAdapter) RenewAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
+	a.renews++
+	return a.renew, nil
+}
+
+func TestBridgeBeaconLeaseMaintenanceRenewsDueAllocation(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	now := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
+	deadline := now.Add(time.Minute)
+	if err := store.Update(func(st *beacon.State) error {
+		st.Allocations["req-1"] = beacon.AllocationRequest{ID: "req-1", Provider: beacon.ProviderSlurm, State: beacon.AllocationRunning, ProviderDeadline: deadline, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
+		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(beacon.LeaseAccepting), LeaseExpiresAt: deadline}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon store: %v", err)
+	}
+	renewedDeadline := now.Add(30 * time.Minute)
+	adapter := &reconcileBeaconTestAdapter{renew: beacon.SchedulerQueryResult{RawState: "R", Reason: "renewed", ProviderDeadline: renewedDeadline}}
+	if err := (&Bridge{}).renewDueBeaconAllocations(context.Background(), store, adapter, beacon.AllocationRenewOptions{}, now); err != nil {
+		t.Fatalf("renewDueBeaconAllocations: %v", err)
+	}
+	if adapter.renews != 1 || adapter.submits != 0 {
+		t.Fatalf("lease maintenance should renew without submitting, renews=%d submits=%d", adapter.renews, adapter.submits)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load beacon store: %v", err)
+	}
+	if req := st.Allocations["req-1"]; req.RenewEpoch != 1 || !req.ProviderDeadline.Equal(renewedDeadline) || req.RenewError != "" {
+		t.Fatalf("allocation was not renewed cleanly: %#v", req)
+	}
+	if got := st.Machines["machine-1"].LeaseExpiresAt; !got.Equal(renewedDeadline) {
+		t.Fatalf("machine lease deadline = %s, want %s", got, renewedDeadline)
+	}
+}
+
 func TestBridgeSessionCancelAllCancelsQueuedAndRequestsRunning(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -8899,6 +9031,68 @@ func TestBridgePollDropsRenderedHelperLabelOutputInWorkChat(t *testing.T) {
 	}
 	if !bridge.reg.HasSent("chat-1", "stale-helper-cancel") {
 		t.Fatal("ignored rendered helper label output was not marked sent")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestBridgePollDropsPlainHelperCancelOutputInWorkChat(t *testing.T) {
+	msg := bridgePollMessage("plain-helper-cancel", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = "<p>cancel requested for running turn: turn:inbound:19</p><p>Prompt being canceled:</p><p>Codex request canceled.</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled plain helper cancel output as inbound prompt: %#v", handled)
+	}
+	if !bridge.reg.HasSent("chat-1", "plain-helper-cancel") {
+		t.Fatal("ignored plain helper cancel output was not marked sent")
+	}
+}
+
+func TestBridgePollDropsBeaconMaintenanceOutputWithoutDurableMatch(t *testing.T) {
+	messages := []ChatMessage{
+		bridgePollMessage("beacon-reconcile-error", "2026-04-30T01:05:00Z", "Teams beacon reconcile error: scheduler unavailable"),
+		bridgePollMessage("beacon-renew-error", "2026-04-30T01:05:01Z", "Teams beacon lease maintenance error: renew timeout"),
+		bridgePollMessage("beacon-renewed", "2026-04-30T01:05:02Z", "Teams beacon lease renewed: allocation=req-1 provider_job=slurm-1 deadline=2026-05-18T10:00:00Z"),
+	}
+	graph := newBridgePollGraph(t, []bridgePollPage{{messages: messages}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled beacon maintenance output as inbound prompt: %#v", handled)
+	}
+	for _, msg := range messages {
+		if !bridge.reg.HasSent("chat-1", msg.ID) {
+			t.Fatalf("ignored beacon maintenance output %s was not marked sent", msg.ID)
+		}
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {

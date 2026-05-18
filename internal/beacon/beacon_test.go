@@ -442,6 +442,38 @@ func TestUpgradeBlockersForStateClassifiesBeaconWork(t *testing.T) {
 	}
 }
 
+func TestUpgradeBlockersForStateIncludesActiveAllocations(t *testing.T) {
+	st := State{
+		Allocations: map[string]AllocationRequest{
+			"req-active": {
+				ID:             "req-active",
+				ConversationID: "conv",
+				TurnID:         "turn",
+				Profile:        "gpu",
+				State:          AllocationSubmitted,
+				Execution:      ExecutionSignature{Hash: "sig-gpu"},
+				RenewEpoch:     2,
+				ReplacementID:  "req-replacement",
+				ProviderIdentity: ProviderIdentity{
+					ProviderJobID: "slurm-1",
+				},
+			},
+			"req-canceled": {ID: "req-canceled", State: AllocationCanceled, Execution: ExecutionSignature{Hash: "sig-gpu"}},
+			"req-other":    {ID: "req-other", State: AllocationSubmitted, Execution: ExecutionSignature{Hash: "sig-other"}},
+		},
+	}
+	blockers := UpgradeBlockersForState(st, UpgradeBeaconCodexTarget, "sig-gpu")
+	if !hasUpgradeBlocker(blockers, "beacon_allocation", "req-active") {
+		t.Fatalf("target upgrade should block matching active allocation, got %#v", blockers)
+	}
+	if hasUpgradeBlocker(blockers, "beacon_allocation", "req-canceled") || hasUpgradeBlocker(blockers, "beacon_allocation", "req-other") {
+		t.Fatalf("target upgrade should ignore canceled and other-target allocations, got %#v", blockers)
+	}
+	if !strings.Contains(blockers[0].Detail, "renew_epoch=2") || !strings.Contains(blockers[0].Detail, "replacement=req-replacement") {
+		t.Fatalf("allocation blocker should expose renewal/replacement detail, got %#v", blockers)
+	}
+}
+
 func TestArtifactTerminalAndAuditSafety(t *testing.T) {
 	if err := ValidateArtifact(ArtifactRef{
 		Root:                 "/shared/job/artifacts",

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
@@ -285,6 +286,8 @@ type Bridge struct {
 	lastTranscriptSync           time.Time
 	lastHistoryWatchSync         time.Time
 	lastHistoryWatchReconcile    time.Time
+	lastBeaconReconcile          time.Time
+	lastBeaconLeaseMaintenance   time.Time
 	maxWorkChatPollsPerCycle     int
 	dashboardProjectsMu          sync.Mutex
 	dashboardProjectsCache       []codexhistory.Project
@@ -690,6 +693,12 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		if err := b.maybeRunPendingCodexUpgrade(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams Codex upgrade error: %v\n", err)
+		}
+		if err := b.maybeRunBeaconReconcile(ctx, time.Now()); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams beacon reconcile error: %v\n", err)
+		}
+		if err := b.maybeRunBeaconLeaseMaintenance(ctx, time.Now()); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams beacon lease maintenance error: %v\n", err)
 		}
 		if drained, err := b.drainComplete(ctx); err != nil {
 			return err
@@ -1784,6 +1793,14 @@ func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
 		"🤖 🛠️ Codex command:",
 		"🤖 Codex progress:",
 		"💻 Code:",
+		"cancel requested for running turn:",
+		"Prompt being canceled:",
+		"No other prompts are queued.",
+		"Codex request canceled.",
+		"Teams helper safety:",
+		"Teams beacon reconcile error:",
+		"Teams beacon lease maintenance error:",
+		"Teams beacon lease renewed:",
 	} {
 		if strings.HasPrefix(text, prefix) {
 			return true
@@ -5776,6 +5793,9 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
 			return err
 		}
+		if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
+			return err
+		}
 		return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
 			ID:          "outbox:" + turn.ID + ":canceled",
 			SessionID:   session.ID,
@@ -5787,6 +5807,9 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 	case teamstore.TurnStatusRunning:
 		if !b.requestRunningTurnCancel(turn.ID) {
 			return b.sendToChat(ctx, session.ChatID, "This Codex request is running, but this helper process does not own its live cancel handle. It may have started before the latest helper loaded or before a restart. Wait for it to finish, or use `helper status` to decide whether recovery is needed.")
+		}
+		if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
+			return err
 		}
 		return b.sendToChat(ctx, session.ChatID, formatCancelOneResponse(state, session.ID, turn, "cancel requested for running turn", true))
 	default:
@@ -5808,9 +5831,15 @@ func (b *Bridge) cancelAllTurnsCommand(ctx context.Context, session *Session, st
 			if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
 				return err
 			}
+			if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
+				return err
+			}
 			canceledQueued = append(canceledQueued, turn)
 		case teamstore.TurnStatusRunning:
 			if b.requestRunningTurnCancel(turn.ID) {
+				if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
+					return err
+				}
 				requestedRunning = append(requestedRunning, turn)
 			} else {
 				unavailableRunning = append(unavailableRunning, turn)
@@ -6661,6 +6690,29 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		sessionID = session.ID
 	}
 	b.cancelSupersededRunningTurnsForSession(sessionID, turn.ID)
+	plan, handled, err := b.prepareBeaconTurnExecution(ctx, session, turn)
+	if handled {
+		message := "beacon execution could not start"
+		if err != nil {
+			message = err.Error()
+		}
+		if plan.AllocationRequestID != "" {
+			message += "\n\n" + beaconTurnExecutionStatus(plan)
+		}
+		if cleanupErr := b.recordBeaconTurnStartFailure(ctx, session, turn, plan, message); cleanupErr != nil {
+			return cleanupErr
+		}
+		if _, markErr := b.store.MarkTurnFailed(ctx, turn.ID, message); markErr != nil {
+			return markErr
+		}
+		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", message, outboxQueueOptions{
+			MentionOwner:     true,
+			NotificationKind: "needs_attention",
+		})
+	}
+	if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
+		executor = BeaconJobExecutor{Plan: plan}
+	}
 	if _, err := b.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, ""); err != nil {
 		return err
 	}
@@ -6675,6 +6727,11 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	cancelExec()
 	if err != nil {
 		if cancelRequested && isCanceledExecutionError(err) {
+			if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
+				if beaconErr := b.cancelBeaconTurn(ctx, session, turn, firstNonEmptyString(cancelReason, "canceled by user")); beaconErr != nil && b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "beacon turn cancel cleanup error: %v\n", beaconErr)
+				}
+			}
 			if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, firstNonEmptyString(cancelReason, "canceled by user")); markErr != nil {
 				return markErr
 			}
@@ -6701,6 +6758,13 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		if _, markErr := b.store.MarkTurnFailedWithCodexIDs(ctx, turn.ID, err.Error(), firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); markErr != nil {
 			return markErr
 		}
+		if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
+			if beaconErr := b.recordBeaconTurnFinish(ctx, session, turn, plan, err.Error()); beaconErr != nil {
+				if b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "beacon turn failure cleanup error: %v\n", beaconErr)
+				}
+			}
+		}
 		if codexErrorRequiresUpgrade(err) {
 			if upgradeErr := b.requestCodexUpgradeAfterFailure(ctx, session, turn, chatID, err); upgradeErr != nil {
 				return upgradeErr
@@ -6713,6 +6777,11 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		})
 	}
 	if cancelRequested {
+		if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
+			if beaconErr := b.cancelBeaconTurn(ctx, session, turn, firstNonEmptyString(cancelReason, "canceled by user")); beaconErr != nil && b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "beacon turn cancel cleanup error: %v\n", beaconErr)
+			}
+		}
 		if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, firstNonEmptyString(cancelReason, "canceled by user")); markErr != nil {
 			return markErr
 		}
@@ -6744,6 +6813,13 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	session.UpdatedAt = time.Now()
 	if _, err := b.store.MarkTurnCompleted(ctx, turn.ID, result.CodexThreadID, result.CodexTurnID); err != nil {
 		return err
+	}
+	if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
+		if beaconErr := b.recordBeaconTurnFinish(ctx, session, turn, plan, ""); beaconErr != nil {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "beacon turn cleanup error: %v\n", beaconErr)
+			}
+		}
 	}
 	if len(queued) > 0 {
 		if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {

@@ -84,6 +84,335 @@ func TestTeamsBeaconNewWorkChatAndWorkSwitch(t *testing.T) {
 	}
 }
 
+func TestTeamsBeaconTurnDoesNotFallBackToLocalExecutor(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	seedTeamsBeaconProfile(t, "gpu")
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		st.Conversations["s001"] = beacon.Conversation{ID: "s001", Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", Signature: "sig-gpu"}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon conversation: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	teamStore := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "local should not run"}}
+	bridge := newBridgeTestBridge(graph, teamStore, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("beacon-run", "run on gpu"), "run on gpu"); err != nil {
+		t.Fatalf("handleSessionMessage: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("beacon turn must not fall back to local Codex executor, prompts=%#v", executor.prompts)
+	}
+	teamsState, err := teamStore.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load teams state: %v", err)
+	}
+	var failed teamstore.Turn
+	for _, turn := range teamsState.Turns {
+		failed = turn
+	}
+	if failed.Status != teamstore.TurnStatusFailed || !strings.Contains(failed.FailureMessage, "beacon allocation is not ready") {
+		t.Fatalf("turn should fail before local Codex starts, turn=%#v", failed)
+	}
+	beaconState := loadTeamsBeaconState(t)
+	if len(beaconState.Allocations) != 1 {
+		t.Fatalf("beacon allocation request count = %d, want 1: %#v", len(beaconState.Allocations), beaconState.Allocations)
+	}
+	for _, req := range beaconState.Allocations {
+		if req.State != beacon.AllocationNeedsAttention || !strings.Contains(req.ProviderReason, beacon.BeaconSlurmQueryCommandEnv) {
+			t.Fatalf("failed beacon start should mark allocation needs_attention, req=%#v", req)
+		}
+	}
+	if queued := beaconState.Conversations["s001"].Queued; len(queued) != 0 {
+		t.Fatalf("failed pre-start beacon turn should not leave a queued turn snapshot, queued=%#v", queued)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"beacon allocation is not ready", "local fallback is disabled", "allocation=req-"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("beacon failure response missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestTeamsBeaconTurnReconcilesConfiguredProviderAdapter(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv(beacon.BeaconSlurmQueryCommandEnv, writeBeaconProviderFixture(t, `durable_negative=true`))
+	t.Setenv(beacon.BeaconSlurmSubmitCommandEnv, writeBeaconProviderFixture(t, `{"provider_job_id":"slurm-999","raw_state":"PD","reason":"submitted"}`))
+	prevAllocationPoll := beaconAllocationPollInterval
+	prevJobPoll := beaconJobPollInterval
+	beaconAllocationPollInterval = 5 * time.Millisecond
+	beaconJobPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		beaconAllocationPollInterval = prevAllocationPoll
+		beaconJobPollInterval = prevJobPoll
+	})
+	seedTeamsBeaconProfile(t, "gpu")
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		st.Conversations["s001"] = beacon.Conversation{ID: "s001", Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", Signature: "sig-gpu"}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon conversation: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	teamStore := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "local should not run"}}
+	bridge := newBridgeTestBridge(graph, teamStore, executor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.handleSessionMessage(ctx, "chat-1", bridgeTestMessageWithText("beacon-run-provider", "run on configured gpu"), "run on configured gpu")
+	}()
+	req := waitForBeaconAllocationProviderJob(t, store, "slurm-999")
+	if err := store.Update(func(st *beacon.State) error {
+		_, err := beacon.RegisterWorkerMachineForAllocation(st, req.ID, beacon.WorkerRegistrationInput{
+			MachineID:     "machine-provider",
+			LeaseID:       "lease-provider",
+			ProviderJobID: "slurm-999",
+			Host:          "worker-host",
+			State:         beacon.LeaseAccepting,
+			Doctor:        healthyTeamsBeaconDoctor(),
+		}, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("register worker machine: %v", err)
+	}
+	job := waitForBeaconQueuedJob(t, store, "machine-provider")
+	if err := store.Update(func(st *beacon.State) error {
+		claimed, ok, err := beacon.ClaimNextJobForMachine(st, "machine-provider", "worker-provider", time.Now())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("queued provider job disappeared")
+		}
+		if claimed.ID != job.ID {
+			return fmt.Errorf("claimed job %s, want %s", claimed.ID, job.ID)
+		}
+		started, err := beacon.MarkJobStarted(st, claimed.ID, time.Now())
+		if err != nil {
+			return err
+		}
+		_, err = beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
+			JobID:      started.ID,
+			RequestID:  started.RequestID,
+			TurnID:     started.TurnID,
+			WorkerID:   started.WorkerID,
+			LeaseID:    started.LeaseID,
+			ClaimEpoch: started.ClaimEpoch,
+			ProviderIdentity: beacon.ProviderIdentity{
+				ProviderJobID: started.ProviderIdentity.ProviderJobID,
+			},
+			Payload: []byte(`{"text":"provider remote done","codex_thread_id":"thread-provider","codex_turn_id":"turn-provider"}`),
+		}, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("complete provider beacon job: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleSessionMessage: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for provider beacon job completion")
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("beacon turn must not run local Codex while allocation is pending or remote-ready, prompts=%#v", executor.prompts)
+	}
+	beaconState := loadTeamsBeaconState(t)
+	if len(beaconState.Allocations) != 1 {
+		t.Fatalf("beacon allocation request count = %d, want 1", len(beaconState.Allocations))
+	}
+	for _, req := range beaconState.Allocations {
+		if req.ProviderIdentity.ProviderJobID != "slurm-999" || req.RawProviderState != "PD" || req.ProviderReason != "submitted" {
+			t.Fatalf("provider adapter result not persisted: %#v", req)
+		}
+		if req.State != beacon.AllocationRunning {
+			t.Fatalf("allocation should be bound to accepting worker after remote completion: %#v", req)
+		}
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"provider remote done"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("beacon provider response missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestTeamsBeaconReadyWorkerCompletesViaBeaconJob(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	prevPoll := beaconJobPollInterval
+	beaconJobPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { beaconJobPollInterval = prevPoll })
+	seedTeamsBeaconProfile(t, "gpu")
+	beaconStore, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	if err := beaconStore.Update(func(st *beacon.State) error {
+		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(beacon.LeaseAccepting), ProviderState: beacon.ProviderJobRunning, Doctor: healthyTeamsBeaconDoctor(), LastHeartbeat: time.Now()}
+		st.Conversations["s001"] = beacon.Conversation{ID: "s001", Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon machine: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	teamStore := newBridgeTestStore(t)
+	localExecutor := &recordingExecutor{result: ExecutionResult{Text: "local should not run"}}
+	bridge := newBridgeTestBridge(graph, teamStore, localExecutor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.handleSessionMessage(ctx, "chat-1", bridgeTestMessageWithText("beacon-worker-run", "run remotely"), "run remotely")
+	}()
+	job := waitForBeaconQueuedJob(t, beaconStore, "machine-1")
+	if err := beaconStore.Update(func(st *beacon.State) error {
+		claimed, ok, err := beacon.ClaimNextJobForMachine(st, "machine-1", "worker-1", time.Now())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("queued job disappeared")
+		}
+		if claimed.ID != job.ID {
+			return fmt.Errorf("claimed job %s, want %s", claimed.ID, job.ID)
+		}
+		started, err := beacon.MarkJobStarted(st, claimed.ID, time.Now())
+		if err != nil {
+			return err
+		}
+		_, err = beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
+			JobID:      started.ID,
+			RequestID:  started.RequestID,
+			TurnID:     started.TurnID,
+			WorkerID:   started.WorkerID,
+			LeaseID:    started.LeaseID,
+			ClaimEpoch: started.ClaimEpoch,
+			ProviderIdentity: beacon.ProviderIdentity{
+				ProviderJobID: started.ProviderIdentity.ProviderJobID,
+			},
+			Payload: []byte(`{"text":"remote done","codex_thread_id":"thread-remote","codex_turn_id":"turn-remote"}`),
+		}, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("complete beacon job: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleSessionMessage: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for beacon job completion")
+	}
+	if len(localExecutor.prompts) != 0 {
+		t.Fatalf("ready beacon worker must not use local executor, prompts=%#v", localExecutor.prompts)
+	}
+	teamsState, err := teamStore.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load teams state: %v", err)
+	}
+	var completed teamstore.Turn
+	for _, turn := range teamsState.Turns {
+		completed = turn
+	}
+	if completed.Status != teamstore.TurnStatusCompleted || completed.CodexThreadID != "thread-remote" || completed.CodexTurnID != "turn-remote" {
+		t.Fatalf("teams turn = %#v", completed)
+	}
+	beaconState := loadTeamsBeaconState(t)
+	if queued := beaconState.Conversations["s001"].Queued; len(queued) != 0 {
+		t.Fatalf("completed beacon turn should clean queued snapshot, queued=%#v", queued)
+	}
+	if jobs := beaconState.Machines["machine-1"].Jobs; len(jobs) != 0 {
+		t.Fatalf("completed beacon job should leave machine reusable, jobs=%#v", jobs)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "remote done") {
+		t.Fatalf("remote terminal response missing:\n%s", joined)
+	}
+}
+
+func TestBeaconJobExecutorRechecksMachineReadinessBeforeEnqueue(t *testing.T) {
+	store, err := beacon.NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "s001", "turn-stale-machine", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", Signature: "sig-gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}, time.Now())
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = beacon.AllocationRunning
+		req.Target.MachineID = "machine-1"
+		req.Target.LeaseID = "lease-1"
+		req.Target.ProviderJobID = "slurm-1"
+		st.Allocations[req.ID] = req
+		st.Machines["machine-1"] = beacon.Machine{
+			ID:            "machine-1",
+			LeaseID:       "lease-1",
+			ProviderJobID: "slurm-1",
+			Profile:       "gpu",
+			State:         string(beacon.LeaseAccepting),
+			ProviderState: beacon.ProviderJobRunning,
+			Doctor:        healthyTeamsBeaconDoctor(),
+			Execution:     beacon.ExecutionSignature{Hash: "sig-gpu"},
+			LastHeartbeat: time.Now().Add(-10 * time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale beacon machine: %v", err)
+	}
+	_, err = enqueueBeaconJobForTurn(context.Background(), store, beacon.TurnExecutionPlan{
+		Action:              beacon.TurnRunBeacon,
+		ConversationID:      "s001",
+		TurnID:              "turn-stale-machine",
+		AllocationRequestID: req.ID,
+		MachineID:           "machine-1",
+		LeaseID:             "lease-1",
+		ProviderJobID:       "slurm-1",
+		Snapshot:            beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", Signature: "sig-gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"},
+	}, &Session{ID: "s001", Cwd: t.TempDir()}, ExecutionInput{Prompt: "must not enqueue on stale worker"})
+	if err == nil || !strings.Contains(err.Error(), "no longer accepting") {
+		t.Fatalf("enqueue should reject stale machine, err=%v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load beacon store: %v", err)
+	}
+	if len(st.JobAttempts) != 0 {
+		t.Fatalf("stale machine should not receive a queued job: %#v", st.JobAttempts)
+	}
+}
+
 func TestTeamsBeaconNewUsesSelectedWorkspaceAndIsolation(t *testing.T) {
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -239,7 +568,7 @@ func TestTeamsBeaconWorkSwitchLocalImmediateAndPending(t *testing.T) {
 	}
 }
 
-func TestTeamsBeaconListIncludesMachines(t *testing.T) {
+func TestTeamsBeaconListIncludesAllocationsAndMachines(t *testing.T) {
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	seedTeamsBeaconProfile(t, "gpu")
@@ -249,6 +578,19 @@ func TestTeamsBeaconListIncludesMachines(t *testing.T) {
 		t.Fatalf("beacon store: %v", err)
 	}
 	if err := store.Update(func(st *beacon.State) error {
+		st.Allocations["req-1"] = beacon.AllocationRequest{
+			ID:                "req-1",
+			ConversationID:    "s001",
+			TurnID:            "turn-1",
+			Profile:           "gpu",
+			Provider:          beacon.ProviderSlurm,
+			State:             beacon.AllocationSubmitted,
+			DeterministicName: "cxp-req-1",
+			ProviderIdentity:  beacon.ProviderIdentity{ProviderJobID: "slurm-1"},
+			RawProviderState:  "PD",
+			ProviderReason:    "resources",
+			CreatedAt:         time.Unix(1, 0),
+		}
 		st.Machines["gpu-a"] = beacon.Machine{ID: "gpu-a", LeaseID: "lease-gpu", Profile: "gpu", State: "accepting", Jobs: []string{"job-1"}, Chats: []string{"s001"}}
 		return nil
 	}); err != nil {
@@ -261,7 +603,7 @@ func TestTeamsBeaconListIncludesMachines(t *testing.T) {
 		t.Fatalf("beacon list: %v", err)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Beacon list", "Profiles:", "gpu: ready", "Machines:", "gpu-a: state=accepting"} {
+	for _, want := range []string{"Beacon list", "Profiles:", "gpu: ready", "Allocations:", "req-1: state=submitted", "provider_job=slurm-1", "Machines:", "gpu-a: state=accepting"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon list missing %q:\n%s", want, joined)
 		}
@@ -639,6 +981,61 @@ func seedTeamsBeaconProfile(t *testing.T, name string) {
 	}
 }
 
+func writeBeaconProviderFixture(t *testing.T, output string) string {
+	t.Helper()
+	if os.PathSeparator != '/' {
+		t.Skip("POSIX provider fixture script")
+	}
+	path := filepath.Join(t.TempDir(), "provider-fixture.sh")
+	body := "#!/bin/sh\nprintf '%s\\n' " + shellSingleQuoteForBeaconTest(output) + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatalf("write provider fixture: %v", err)
+	}
+	return path
+}
+
+func waitForBeaconQueuedJob(t *testing.T, store *beacon.Store, machineID string) beacon.JobAttempt {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := store.Load()
+		if err != nil {
+			t.Fatalf("load beacon state while waiting for job: %v", err)
+		}
+		for _, job := range st.JobAttempts {
+			if job.Phase == beacon.JobQueued && job.Target.MachineID == machineID {
+				return job
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for queued beacon job")
+	return beacon.JobAttempt{}
+}
+
+func waitForBeaconAllocationProviderJob(t *testing.T, store *beacon.Store, providerJobID string) beacon.AllocationRequest {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := store.Load()
+		if err != nil {
+			t.Fatalf("load beacon state while waiting for allocation: %v", err)
+		}
+		for _, req := range st.Allocations {
+			if req.ProviderIdentity.ProviderJobID == providerJobID {
+				return req
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for beacon allocation provider job %s", providerJobID)
+	return beacon.AllocationRequest{}
+}
+
+func shellSingleQuoteForBeaconTest(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
 func newFlakyBeaconMessageGraph(t *testing.T, failures int) (*GraphClient, *[]bridgeSentMessage) {
 	t.Helper()
 	var sent []bridgeSentMessage
@@ -689,6 +1086,28 @@ func loadTeamsBeaconState(t *testing.T) beacon.State {
 		t.Fatalf("load beacon state: %v", err)
 	}
 	return st
+}
+
+func healthyTeamsBeaconDoctor() beacon.WorkerDoctor {
+	return beacon.WorkerDoctor{
+		SharedRootMounted:  true,
+		AtomicCreateOK:     true,
+		FreeBytesOK:        true,
+		FreeInodesOK:       true,
+		CodexAvailable:     true,
+		CXPAvailable:       true,
+		HomeOK:             true,
+		TmpWritable:        true,
+		ProxyOK:            true,
+		AuthPathOK:         true,
+		ImageDigestMatch:   true,
+		ProtocolOK:         true,
+		MembershipProofOK:  true,
+		ContainerRuntimeOK: true,
+		ModulesOK:          true,
+		BindMountsOK:       true,
+		ProxyEnvInsideOK:   true,
+	}
 }
 
 func newBeaconMeetingBridgeTestGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {

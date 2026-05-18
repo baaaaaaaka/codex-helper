@@ -4,6 +4,10 @@ Beacon mode lets a stable coordinator, normally the Teams service on a login or 
 
 This document records the current compatibility constraints with the existing Teams bridge, outbox, recovery, and upgrade code.
 
+For the cross-feature interference ledger that should be updated before adding
+new beacon behavior, see
+[`cxp_feature_interference_matrix.md`](cxp_feature_interference_matrix.md).
+
 ## Goals
 
 - `new` without an explicit beacon profile runs locally on the machine where the current `cxp` or Teams service is running.

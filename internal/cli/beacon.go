@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -23,7 +28,10 @@ func newBeaconCmd(root *rootOptions) *cobra.Command {
 		newBeaconProfileCmd(root, &storePath),
 		newBeaconStatusCmd(&storePath),
 		newBeaconSwitchProfileCmd(root, &storePath),
+		newBeaconAllocationCmd(&storePath),
 		newBeaconMachineCmd(&storePath),
+		newBeaconWorkerCmd(&storePath),
+		newBeaconProviderCmd(),
 	)
 	return cmd
 }
@@ -326,6 +334,820 @@ func newBeaconMachineCmd(storePath *string) *cobra.Command {
 	return cmd
 }
 
+func newBeaconWorkerCmd(storePath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "worker", Short: "Run a beacon worker inside an allocated machine"}
+	cmd.AddCommand(newBeaconWorkerRunOnceCmd(storePath), newBeaconWorkerServeCmd(storePath))
+	return cmd
+}
+
+func newBeaconProviderCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "provider", Short: "Print beacon scheduler provider adapter templates"}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "template <slurm|lsf>",
+		Short: "Print a scheduler adapter template",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch strings.ToLower(strings.TrimSpace(args[0])) {
+			case "slurm":
+				_, _ = cmd.OutOrStdout().Write([]byte(beaconSlurmAdapterTemplate))
+			case "lsf":
+				_, _ = cmd.OutOrStdout().Write([]byte(beaconLSFAdapterTemplate))
+			default:
+				return fmt.Errorf("unknown beacon provider %q; expected slurm or lsf", args[0])
+			}
+			return nil
+		},
+	})
+	return cmd
+}
+
+const beaconSlurmAdapterTemplate = `#!/bin/sh
+set -eu
+operation=
+request_id=
+name=
+partition=
+image=
+nodes=1
+gpu=0
+duration=
+provider_job_id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --operation) operation="$2"; shift 2 ;;
+    --request-id) request_id="$2"; shift 2 ;;
+    --name) name="$2"; shift 2 ;;
+    --provider-job-id) provider_job_id="$2"; shift 2 ;;
+    --partition) partition="$2"; shift 2 ;;
+    --image) image="$2"; shift 2 ;;
+    --nodes) nodes="$2"; shift 2 ;;
+    --gpu) gpu="$2"; shift 2 ;;
+    --duration) duration="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$operation" ] || [ -z "$request_id" ] || [ -z "$name" ]; then
+  echo "query_error=true reason=missing_required_beacon_adapter_args"
+  exit 0
+fi
+find_slurm_line() {
+  if [ -n "$provider_job_id" ]; then
+    squeue --noheader --jobs "$provider_job_id" --format '%A|%t|%R' 2>/dev/null | head -n 1 || true
+  else
+    squeue --noheader --name "$name" --format '%A|%t|%R' 2>/dev/null | head -n 1 || true
+  fi
+}
+slurm_job_id() {
+  line=$(find_slurm_line)
+  if [ -n "$line" ]; then
+    printf '%s' "$line" | awk -F'|' '{print $1}'
+  fi
+}
+query_slurm() {
+  line=$(find_slurm_line)
+  if [ -z "$line" ]; then
+    echo "durable_negative=true"
+    return 0
+  fi
+  job_id=$(printf '%s' "$line" | awk -F'|' '{print $1}')
+  raw_state=$(printf '%s' "$line" | awk -F'|' '{print $2}')
+  reason=$(printf '%s' "$line" | awk -F'|' '{print $3}')
+  echo "provider_job_id=$job_id raw_state=$raw_state reason=$reason"
+}
+case "$operation" in
+  query)
+    query_slurm
+    ;;
+  submit)
+    cxp_bin=${CXP_BEACON_CXP_BIN:-cxp}
+    worker_idle=${CXP_BEACON_WORKER_IDLE_TIMEOUT:-30m}
+    wrap="exec $cxp_bin beacon worker serve --allocation $request_id --idle-timeout $worker_idle"
+    args="--parsable --job-name=$name --nodes=$nodes"
+    [ -n "$partition" ] && args="$args --partition=$partition"
+    [ -n "$duration" ] && args="$args --time=$duration"
+    [ "$gpu" != "0" ] && args="$args --gres=gpu:$gpu"
+    job_id=$(sbatch $args --wrap "$wrap" | awk -F';' '{print $1}')
+    echo "provider_job_id=$job_id raw_state=PD reason=submitted"
+    ;;
+  cancel)
+    job_id=$(slurm_job_id)
+    if [ -z "$job_id" ]; then
+      echo "durable_negative=true reason=no_matching_job_to_cancel"
+      exit 0
+    fi
+    scancel "$job_id"
+    echo "provider_job_id=$job_id raw_state=CA reason=cancel_requested"
+    ;;
+  renew)
+    job_id=$(slurm_job_id)
+    if [ -z "$job_id" ]; then
+      echo "durable_negative=true reason=no_matching_job_to_renew"
+      exit 0
+    fi
+    # Site policy decides how to extend walltime, for example:
+    # scontrol update JobId="$job_id" TimeLimit="$duration"
+    echo "provider_job_id=$job_id reason=renew_requires_site_policy"
+    exit 1
+    ;;
+  *)
+    echo "query_error=true reason=unknown_operation_$operation"
+    ;;
+esac
+`
+
+const beaconLSFAdapterTemplate = `#!/bin/sh
+set -eu
+operation=
+request_id=
+name=
+queue=
+provider_job_id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --operation) operation="$2"; shift 2 ;;
+    --request-id) request_id="$2"; shift 2 ;;
+    --name) name="$2"; shift 2 ;;
+    --provider-job-id) provider_job_id="$2"; shift 2 ;;
+    --queue) queue="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$operation" ] || [ -z "$request_id" ] || [ -z "$name" ]; then
+  echo "query_error=true reason=missing_required_beacon_adapter_args"
+  exit 0
+fi
+find_lsf_line() {
+  if [ -n "$provider_job_id" ]; then
+    bjobs -noheader "$provider_job_id" -o 'jobid stat pend_reason' 2>/dev/null | head -n 1 || true
+  else
+    bjobs -noheader -J "$name" -o 'jobid stat pend_reason' 2>/dev/null | head -n 1 || true
+  fi
+}
+lsf_job_id() {
+  line=$(find_lsf_line)
+  if [ -n "$line" ]; then
+    printf '%s' "$line" | awk '{print $1}'
+  fi
+}
+query_lsf() {
+  line=$(find_lsf_line)
+  if [ -z "$line" ]; then
+    echo "durable_negative=true"
+    return 0
+  fi
+  job_id=$(printf '%s' "$line" | awk '{print $1}')
+  raw_state=$(printf '%s' "$line" | awk '{print $2}')
+  reason=$(printf '%s' "$line" | cut -d' ' -f3-)
+  echo "provider_job_id=$job_id raw_state=$raw_state reason=$reason"
+}
+case "$operation" in
+  query)
+    query_lsf
+    ;;
+  submit)
+    cxp_bin=${CXP_BEACON_CXP_BIN:-cxp}
+    worker_idle=${CXP_BEACON_WORKER_IDLE_TIMEOUT:-30m}
+    command="exec $cxp_bin beacon worker serve --allocation $request_id --idle-timeout $worker_idle"
+    if [ -n "$queue" ]; then
+      out=$(printf '%s\n' "$command" | bsub -J "$name" -q "$queue")
+    else
+      out=$(printf '%s\n' "$command" | bsub -J "$name")
+    fi
+    job_id=$(printf '%s\n' "$out" | sed -n 's/.*<\([0-9][0-9]*\)>.*/\1/p' | head -n 1)
+    echo "provider_job_id=$job_id raw_state=PEND reason=submitted"
+    ;;
+  cancel)
+    job_id=$(lsf_job_id)
+    if [ -z "$job_id" ]; then
+      echo "durable_negative=true reason=no_matching_job_to_cancel"
+      exit 0
+    fi
+    bkill "$job_id"
+    echo "provider_job_id=$job_id raw_state=EXIT reason=cancel_requested"
+    ;;
+  renew)
+    job_id=$(lsf_job_id)
+    if [ -z "$job_id" ]; then
+      echo "durable_negative=true reason=no_matching_job_to_renew"
+      exit 0
+    fi
+    # Site policy decides how to extend walltime or queues.
+    echo "provider_job_id=$job_id reason=renew_requires_site_policy"
+    exit 1
+    ;;
+  *)
+    echo "query_error=true reason=unknown_operation_$operation"
+    ;;
+esac
+`
+
+func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
+	var machineID string
+	var allocationID string
+	var leaseID string
+	var providerJobID string
+	var host string
+	var workerID string
+	var codexPath string
+	var waitDuration time.Duration
+	cmd := &cobra.Command{
+		Use:   "run-once",
+		Short: "Claim one queued beacon job, run Codex, and publish a terminal result",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if strings.TrimSpace(workerID) == "" {
+				workerID = defaultBeaconWorkerID()
+			}
+			if strings.TrimSpace(host) == "" {
+				host = defaultBeaconWorkerHost()
+			}
+			if strings.TrimSpace(providerJobID) == "" {
+				providerJobID = defaultBeaconProviderJobID()
+			}
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(allocationID) != "" {
+				var machine beacon.Machine
+				if err := store.Update(func(st *beacon.State) error {
+					var err error
+					machine, err = beacon.RegisterWorkerMachineForAllocation(st, allocationID, beacon.WorkerRegistrationInput{
+						MachineID:       machineID,
+						LeaseID:         leaseID,
+						ProviderJobID:   providerJobID,
+						WorkerID:        workerID,
+						Host:            host,
+						State:           beacon.LeaseAccepting,
+						Doctor:          runBeaconWorkerDoctor(codexPath),
+						MembershipProof: defaultBeaconMembershipProof(providerJobID),
+					}, time.Now())
+					return err
+				}); err != nil {
+					return err
+				}
+				machineID = machine.ID
+				leaseID = machine.LeaseID
+				providerJobID = machine.ProviderJobID
+				defer func() { _ = markBeaconWorkerMachineDrained(store, machineID) }()
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "registered machine=%s lease=%s provider_job=%s\n", machineID, leaseID, providerJobID)
+				if machine.State != string(beacon.LeaseAccepting) {
+					return fmt.Errorf("worker machine %s is not accepting after doctor: state=%s blockers=%s", machine.ID, machine.State, strings.Join(machine.DoctorBlockers, "; "))
+				}
+			}
+			if strings.TrimSpace(machineID) == "" {
+				return fmt.Errorf("--machine is required unless --allocation is provided")
+			}
+			var job beacon.JobAttempt
+			var ok bool
+			if err := waitAndClaimBeaconWorkerJob(cmd.Context(), store, machineID, workerID, waitDuration, &job, &ok); err != nil {
+				return err
+			}
+			if !ok {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No queued beacon jobs.")
+				return nil
+			}
+			if err := store.Update(func(st *beacon.State) error {
+				_, err := beacon.MarkJobStarted(st, job.ID, time.Now())
+				return err
+			}); err != nil {
+				return err
+			}
+			stopHeartbeat := startBeaconWorkerHeartbeat(cmd.Context(), store, machineID, workerID, time.Minute)
+			payload, runErr := runBeaconWorkerJob(cmd.Context(), job, codexPath)
+			stopHeartbeat()
+			payloadBytes, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("marshal worker terminal payload: %w", err)
+			}
+			var decision beacon.WorkerTerminalDecision
+			if err := store.Update(func(st *beacon.State) error {
+				var err error
+				decision, err = beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
+					JobID:      job.ID,
+					RequestID:  job.RequestID,
+					TurnID:     job.TurnID,
+					WorkerID:   workerID,
+					LeaseID:    job.LeaseID,
+					ClaimEpoch: job.ClaimEpoch,
+					ProviderIdentity: beacon.ProviderIdentity{
+						ProviderJobID: job.ProviderIdentity.ProviderJobID,
+					},
+					Payload: payloadBytes,
+				}, time.Now())
+				return err
+			}); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "job=%s terminal=%s outbox_queued=%t\n", job.ID, decision.Integrity, decision.OutboxQueued)
+			return runErr
+		},
+	}
+	cmd.Flags().StringVar(&machineID, "machine", "", "Beacon machine id to claim jobs for")
+	cmd.Flags().StringVar(&allocationID, "allocation", "", "Managed allocation request id to register this worker for")
+	cmd.Flags().StringVar(&leaseID, "lease", "", "Beacon lease id to register with --allocation")
+	cmd.Flags().StringVar(&providerJobID, "provider-job", "", "Scheduler provider job id for this worker (default: SLURM_JOB_ID or LSB_JOBID)")
+	cmd.Flags().StringVar(&host, "host", "", "Worker hostname to register with --allocation")
+	cmd.Flags().StringVar(&workerID, "worker", "", "Worker id to stamp terminal output with")
+	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable path (default: codex)")
+	cmd.Flags().DurationVar(&waitDuration, "wait", 0, "Wait for a queued job before exiting, for example 30m")
+	return cmd
+}
+
+func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
+	var allocationID string
+	var machineID string
+	var leaseID string
+	var providerJobID string
+	var host string
+	var workerID string
+	var codexPath string
+	var idleTimeout time.Duration
+	var maxJobs int
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Register a beacon worker and serve queued jobs until idle or stopped",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if strings.TrimSpace(allocationID) == "" {
+				return fmt.Errorf("--allocation is required")
+			}
+			if strings.TrimSpace(workerID) == "" {
+				workerID = defaultBeaconWorkerID()
+			}
+			if strings.TrimSpace(host) == "" {
+				host = defaultBeaconWorkerHost()
+			}
+			if strings.TrimSpace(providerJobID) == "" {
+				providerJobID = defaultBeaconProviderJobID()
+			}
+			if idleTimeout <= 0 {
+				idleTimeout = 30 * time.Minute
+			}
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			var machine beacon.Machine
+			if err := store.Update(func(st *beacon.State) error {
+				var err error
+				machine, err = beacon.RegisterWorkerMachineForAllocation(st, allocationID, beacon.WorkerRegistrationInput{
+					MachineID:       machineID,
+					LeaseID:         leaseID,
+					ProviderJobID:   providerJobID,
+					WorkerID:        workerID,
+					Host:            host,
+					State:           beacon.LeaseAccepting,
+					Doctor:          runBeaconWorkerDoctor(codexPath),
+					MembershipProof: defaultBeaconMembershipProof(providerJobID),
+				}, time.Now())
+				return err
+			}); err != nil {
+				return err
+			}
+			machineID = machine.ID
+			defer func() { _ = markBeaconWorkerMachineDrained(store, machineID) }()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "registered machine=%s lease=%s provider_job=%s\n", machine.ID, machine.LeaseID, machine.ProviderJobID)
+			if machine.State != string(beacon.LeaseAccepting) {
+				return fmt.Errorf("worker machine %s is not accepting after doctor: state=%s blockers=%s", machine.ID, machine.State, strings.Join(machine.DoctorBlockers, "; "))
+			}
+			served := 0
+			for {
+				var job beacon.JobAttempt
+				var ok bool
+				if err := waitAndClaimBeaconWorkerJob(cmd.Context(), store, machineID, workerID, idleTimeout, &job, &ok); err != nil {
+					return err
+				}
+				if !ok {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "No queued beacon jobs before idle timeout after serving %d job(s).\n", served)
+					return nil
+				}
+				if err := runClaimedBeaconWorkerJob(cmd.Context(), cmd.OutOrStdout(), store, machineID, workerID, codexPath, job); err != nil {
+					return err
+				}
+				served++
+				if maxJobs > 0 && served >= maxJobs {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Served max jobs: %d\n", served)
+					return nil
+				}
+			}
+		},
+	}
+	cmd.Flags().StringVar(&allocationID, "allocation", "", "Managed allocation request id to register this worker for")
+	cmd.Flags().StringVar(&machineID, "machine", "", "Beacon machine id to register")
+	cmd.Flags().StringVar(&leaseID, "lease", "", "Beacon lease id to register")
+	cmd.Flags().StringVar(&providerJobID, "provider-job", "", "Scheduler provider job id for this worker (default: SLURM_JOB_ID or LSB_JOBID)")
+	cmd.Flags().StringVar(&host, "host", "", "Worker hostname")
+	cmd.Flags().StringVar(&workerID, "worker", "", "Worker id to stamp terminal output with")
+	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable path (default: codex)")
+	cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 30*time.Minute, "Exit after this long without a queued job")
+	cmd.Flags().IntVar(&maxJobs, "max-jobs", 0, "Maximum jobs to serve before exiting (0 means unlimited until idle)")
+	return cmd
+}
+
+func markBeaconWorkerMachineDrained(store *beacon.Store, machineID string) error {
+	if store == nil {
+		return nil
+	}
+	machineID = strings.TrimSpace(machineID)
+	if machineID == "" {
+		return nil
+	}
+	return store.Update(func(st *beacon.State) error {
+		machine, ok := st.Machines[machineID]
+		if !ok {
+			return nil
+		}
+		switch strings.ToLower(strings.TrimSpace(machine.State)) {
+		case string(beacon.LeaseNeedsAttention), string(beacon.LeaseLost), string(beacon.LeaseExpired), string(beacon.LeaseIncompatible), string(beacon.LeaseAmbiguous), "kill_quarantine":
+			return nil
+		}
+		machine.State = string(beacon.LeaseDrained)
+		st.Machines[machineID] = machine
+		return nil
+	})
+}
+
+func waitAndClaimBeaconWorkerJob(ctx context.Context, store *beacon.Store, machineID string, workerID string, waitDuration time.Duration, job *beacon.JobAttempt, ok *bool) error {
+	deadline := time.Time{}
+	if waitDuration > 0 {
+		deadline = time.Now().Add(waitDuration)
+	}
+	for {
+		if err := store.Update(func(st *beacon.State) error {
+			if _, err := beacon.RecordWorkerHeartbeat(st, machineID, workerID, time.Now()); err != nil {
+				return err
+			}
+			var err error
+			*job, *ok, err = beacon.ClaimNextJobForMachine(st, machineID, workerID, time.Now())
+			return err
+		}); err != nil {
+			return err
+		}
+		if *ok || waitDuration <= 0 {
+			return nil
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return fmt.Errorf("timed out waiting for queued beacon job on machine %q", machineID)
+		}
+		wait := time.Second
+		if remaining := time.Until(deadline); !deadline.IsZero() && remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			wait = 10 * time.Millisecond
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func runClaimedBeaconWorkerJob(ctx context.Context, out anyWriter, store *beacon.Store, machineID string, workerID string, codexPath string, job beacon.JobAttempt) error {
+	if err := store.Update(func(st *beacon.State) error {
+		_, err := beacon.MarkJobStarted(st, job.ID, time.Now())
+		return err
+	}); err != nil {
+		return err
+	}
+	stopHeartbeat := startBeaconWorkerHeartbeat(ctx, store, machineID, workerID, time.Minute)
+	payload, runErr := runBeaconWorkerJob(ctx, job, codexPath)
+	stopHeartbeat()
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal worker terminal payload: %w", err)
+	}
+	var decision beacon.WorkerTerminalDecision
+	if err := store.Update(func(st *beacon.State) error {
+		var err error
+		decision, err = beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
+			JobID:      job.ID,
+			RequestID:  job.RequestID,
+			TurnID:     job.TurnID,
+			WorkerID:   workerID,
+			LeaseID:    job.LeaseID,
+			ClaimEpoch: job.ClaimEpoch,
+			ProviderIdentity: beacon.ProviderIdentity{
+				ProviderJobID: job.ProviderIdentity.ProviderJobID,
+			},
+			Payload: payloadBytes,
+		}, time.Now())
+		return err
+	}); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(out, "job=%s terminal=%s outbox_queued=%t\n", job.ID, decision.Integrity, decision.OutboxQueued)
+	return runErr
+}
+
+type anyWriter interface {
+	Write([]byte) (int, error)
+}
+
+func startBeaconWorkerHeartbeat(ctx context.Context, store *beacon.Store, machineID string, workerID string, interval time.Duration) func() {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			_ = store.Update(func(st *beacon.State) error {
+				_, err := beacon.RecordWorkerHeartbeat(st, machineID, workerID, time.Now())
+				return err
+			})
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath string) (beacon.JobTerminalPayload, error) {
+	command := strings.TrimSpace(codexPath)
+	if command == "" {
+		command = "codex"
+	}
+	runner := &codexrunner.ExecRunner{Command: command, WorkingDir: job.Payload.WorkingDir}
+	result, err := runner.StartTurn(ctx, codexrunner.StartTurnInput{
+		ThreadID: strings.TrimSpace(job.Payload.CodexThreadID),
+		TurnInput: codexrunner.TurnInput{
+			Prompt:     job.Payload.Prompt,
+			ImagePaths: append([]string(nil), job.Payload.ImagePaths...),
+			WorkingDir: job.Payload.WorkingDir,
+		},
+	})
+	payload := beacon.JobTerminalPayload{
+		Text:             strings.TrimSpace(result.FinalAgentMessage),
+		CodexThreadID:    result.ThreadID,
+		CodexThreadTitle: strings.TrimSpace(result.ThreadName),
+		CodexTurnID:      result.TurnID,
+	}
+	if err != nil {
+		payload.Error = err.Error()
+		return payload, err
+	}
+	if payload.Text == "" {
+		payload.Text = "(Codex finished without a final message.)"
+	}
+	return payload, nil
+}
+
+func defaultBeaconWorkerID() string {
+	host, _ := os.Hostname()
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "unknown-host"
+	}
+	return fmt.Sprintf("%s:%d", host, os.Getpid())
+}
+
+func defaultBeaconWorkerHost() string {
+	host, _ := os.Hostname()
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "unknown-host"
+	}
+	return host
+}
+
+func defaultBeaconProviderJobID() string {
+	for _, name := range []string{"SLURM_JOB_ID", "LSB_JOBID"} {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func defaultBeaconMembershipProof(providerJobID string) string {
+	providerJobID = strings.TrimSpace(providerJobID)
+	if providerJobID == "" {
+		return ""
+	}
+	if strings.TrimSpace(os.Getenv("SLURM_JOB_ID")) == providerJobID {
+		return "slurm:" + providerJobID
+	}
+	if strings.TrimSpace(os.Getenv("LSB_JOBID")) == providerJobID {
+		return "lsf:" + providerJobID
+	}
+	return providerJobID
+}
+
+func runBeaconWorkerDoctor(codexPath string) beacon.WorkerDoctor {
+	doctor := beacon.WorkerDoctor{
+		SharedRootMounted: true,
+		FreeBytesOK:       true,
+		FreeInodesOK:      true,
+		HomeOK:            true,
+		TmpWritable:       true,
+		ProxyOK:           true,
+		AuthPathOK:        true,
+		ImageDigestMatch:  true,
+		ProtocolOK:        true,
+		MembershipProofOK: true,
+		// Site-specific checks can be tightened by wrapper scripts before starting the worker.
+		ContainerRuntimeOK: true,
+		ModulesOK:          true,
+		BindMountsOK:       true,
+		ProxyEnvInsideOK:   true,
+	}
+	command := strings.TrimSpace(codexPath)
+	if command == "" {
+		command = "codex"
+	}
+	if strings.ContainsRune(command, rune(os.PathSeparator)) {
+		if st, err := os.Stat(command); err == nil && !st.IsDir() {
+			doctor.CodexAvailable = true
+		}
+	} else if _, err := exec.LookPath(command); err == nil {
+		doctor.CodexAvailable = true
+	}
+	if exe, err := os.Executable(); err == nil {
+		if st, statErr := os.Stat(exe); statErr == nil && !st.IsDir() {
+			doctor.CXPAvailable = true
+		}
+	}
+	if _, err := os.UserHomeDir(); err != nil {
+		doctor.HomeOK = false
+	}
+	tmp, err := os.CreateTemp("", "cxp-beacon-doctor-*")
+	if err != nil {
+		doctor.TmpWritable = false
+		doctor.AtomicCreateOK = false
+		return doctor
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write([]byte("ok")); err != nil {
+		doctor.AtomicCreateOK = false
+	}
+	if err := tmp.Close(); err != nil {
+		doctor.AtomicCreateOK = false
+	}
+	renamed := tmpName + ".renamed"
+	if err := os.Rename(tmpName, renamed); err != nil {
+		doctor.AtomicCreateOK = false
+		_ = os.Remove(tmpName)
+	} else {
+		doctor.AtomicCreateOK = true
+		_ = os.Remove(renamed)
+	}
+	return doctor
+}
+
+func newBeaconAllocationCmd(storePath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "allocation", Short: "Manage beacon allocation requests"}
+	cmd.AddCommand(newBeaconAllocationListCmd(storePath), newBeaconAllocationStatusCmd(storePath), newBeaconAllocationReconcileCmd(storePath), newBeaconAllocationReconcileAllCmd(storePath))
+	return cmd
+}
+
+func newBeaconAllocationListCmd(storePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List beacon allocation requests",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			st, err := loadBeaconState(*storePath)
+			if err != nil {
+				return err
+			}
+			allocations := sortedBeaconAllocations(st)
+			if len(allocations) == 0 {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon allocations.")
+				return nil
+			}
+			for _, req := range allocations {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\tprofile=%s\tprovider=%s\tstate=%s\tprovider_job=%s\tprovider_state=%s\treason=%s\n", req.ID, req.Profile, req.Provider, req.State, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason)
+			}
+			return nil
+		},
+	}
+}
+
+func newBeaconAllocationStatusCmd(storePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "status <allocation-or-provider-job>",
+		Short: "Show beacon allocation request status",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st, err := loadBeaconState(*storePath)
+			if err != nil {
+				return err
+			}
+			req, ok := findBeaconAllocation(st, args[0])
+			if !ok {
+				return fmt.Errorf("beacon allocation %q not found", args[0])
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "allocation=%s conversation=%s turn=%s profile=%s provider=%s isolation=%s state=%s name=%s provider_job=%s provider_state=%s reason=%s\n", req.ID, req.ConversationID, req.TurnID, req.Profile, req.Provider, req.Isolation, req.State, req.DeterministicName, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason)
+			return nil
+		},
+	}
+}
+
+func newBeaconAllocationReconcileCmd(storePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "reconcile <allocation>",
+		Short: "Query or submit a beacon allocation through the configured provider adapter",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			var req beacon.AllocationRequest
+			var action beacon.AllocationSubmitAction
+			var reconcileErr error
+			st, err := store.Load()
+			if err != nil {
+				return err
+			}
+			found, ok := findBeaconAllocation(st, args[0])
+			if !ok {
+				return fmt.Errorf("beacon allocation %q not found", args[0])
+			}
+			req, action, reconcileErr = beacon.ReconcileAllocationSubmitOutsideLock(cmd.Context(), store, found.ID, beacon.NewCommandProviderAdapterFromEnv(nil), time.Now())
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "action=%s allocation=%s state=%s provider_job=%s provider_state=%s reason=%s\n", action, req.ID, req.State, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason)
+			return reconcileErr
+		},
+	}
+}
+
+func newBeaconAllocationReconcileAllCmd(storePath *string) *cobra.Command {
+	var staleAfter time.Duration
+	var staleJobAfter time.Duration
+	cmd := &cobra.Command{
+		Use:   "reconcile-all",
+		Short: "Reconcile every beacon allocation and drain stale worker machines",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			var lines []string
+			var errorsOut []string
+			st, err := store.Load()
+			if err != nil {
+				return err
+			}
+			allocations := sortedBeaconAllocations(st)
+			adapter := beacon.NewCommandProviderAdapterFromEnv(nil)
+			now := time.Now()
+			for _, current := range allocations {
+				req, action, reconcileErr := beacon.ReconcileAllocationSubmitOutsideLock(cmd.Context(), store, current.ID, adapter, now)
+				if strings.TrimSpace(req.ProviderIdentity.ProviderJobID) != "" && strings.TrimSpace(req.RawProviderState) != "" {
+					_ = store.Update(func(st *beacon.State) error {
+						projection := beacon.ProjectRawProviderState(req.Provider, req.RawProviderState, req.ProviderReason, beaconAllocationHasStartedJob(*st, req.ID), beaconAllocationHasEverRun(req))
+						var err error
+						req, err = beacon.UpdateAllocationProjection(st, req.ID, projection, now)
+						return err
+					})
+				}
+				lines = append(lines, fmt.Sprintf("allocation=%s action=%s state=%s provider_job=%s provider_state=%s reason=%s", req.ID, action, req.State, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason))
+				if reconcileErr != nil {
+					errorsOut = append(errorsOut, fmt.Sprintf("%s: %v", current.ID, reconcileErr))
+				}
+			}
+			if err := store.Update(func(st *beacon.State) error {
+				for _, machine := range beacon.DrainStaleWorkerMachines(st, staleAfter, now) {
+					lines = append(lines, fmt.Sprintf("machine=%s action=drain_stale last_heartbeat=%s", machine.ID, machine.LastHeartbeat.Format(time.RFC3339)))
+				}
+				for _, job := range beacon.RecoverStaleJobAttempts(st, staleJobAfter, now) {
+					lines = append(lines, fmt.Sprintf("job=%s action=recover_stale phase=%s", job.ID, job.Phase))
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			if len(lines) == 0 {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon allocations.")
+			} else {
+				for _, line := range lines {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
+				}
+			}
+			if len(errorsOut) > 0 {
+				return fmt.Errorf("reconcile errors: %s", strings.Join(errorsOut, "; "))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().DurationVar(&staleAfter, "stale-after", 2*time.Minute, "Drain accepting worker machines whose heartbeat is older than this")
+	cmd.Flags().DurationVar(&staleJobAfter, "stale-job-after", 10*time.Minute, "Recover claimed jobs or mark started jobs ambiguous after this much silence")
+	return cmd
+}
+
 func newBeaconMachineListCmd(storePath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -490,6 +1312,43 @@ func findBeaconMachineEntry(st beacon.State, ref string) (string, beacon.Machine
 	return "", beacon.Machine{}, false
 }
 
+func sortedBeaconAllocations(st beacon.State) []beacon.AllocationRequest {
+	out := make([]beacon.AllocationRequest, 0, len(st.Allocations))
+	for _, req := range st.Allocations {
+		out = append(out, req)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func findBeaconAllocation(st beacon.State, ref string) (beacon.AllocationRequest, bool) {
+	ref = strings.TrimSpace(ref)
+	for _, req := range st.Allocations {
+		if req.ID == ref || req.DeterministicName == ref || req.ProviderIdentity.ProviderJobID == ref {
+			return req, true
+		}
+	}
+	return beacon.AllocationRequest{}, false
+}
+
+func beaconAllocationHasStartedJob(st beacon.State, allocationID string) bool {
+	return beacon.AllocationHasStartedJob(st, allocationID)
+}
+
+func beaconAllocationHasEverRun(req beacon.AllocationRequest) bool {
+	switch req.State {
+	case beacon.AllocationRunning, beacon.AllocationExpired, beacon.AllocationFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 func applyBeaconMachineRelease(st *beacon.State, key string, m beacon.Machine, action string) {
 	switch action {
 	case "drain":
@@ -498,6 +1357,8 @@ func applyBeaconMachineRelease(st *beacon.State, key string, m beacon.Machine, a
 	case "release":
 		delete(st.Machines, key)
 	case "kill_quarantine":
+		beacon.TombstoneJobsForMachine(st, m, "machine hard-killed by operator", time.Now())
+		m.Jobs = nil
 		m.State = "kill_quarantine"
 		st.Machines[key] = m
 	}

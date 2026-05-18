@@ -162,6 +162,7 @@ func QueueTurn(st *State, conversationID string, turnID string, now time.Time) (
 	}
 	conv.UpdatedAt = now
 	st.Conversations[convID] = conv
+	st.TurnTargets[turnID] = snapshot
 	return turn, nil
 }
 
@@ -186,6 +187,31 @@ func RenderStatus(st State, conversationID string) string {
 			turnSnapshot += ":" + conv.Queued[0].Snapshot.Profile
 		}
 	}
+	allocationID := ""
+	allocationState := ""
+	providerState := ""
+	providerReason := ""
+	var statusAllocation AllocationRequest
+	hasStatusAllocation := false
+	if len(conv.Queued) > 0 {
+		reqID := ManagedRequestID(conversationID, conv.Queued[0].ID)
+		if req, ok := st.Allocations[reqID]; ok {
+			statusAllocation = req
+			hasStatusAllocation = true
+		}
+	}
+	if !hasStatusAllocation {
+		statusAllocation, hasStatusAllocation = latestAllocationForConversation(st, conversationID)
+	}
+	if hasStatusAllocation {
+		allocationID = statusAllocation.ID
+		allocationState = string(statusAllocation.State)
+		providerState = statusAllocation.RawProviderState
+		providerReason = statusAllocation.ProviderReason
+		if current.ProviderJobID == "" {
+			current.ProviderJobID = statusAllocation.ProviderIdentity.ProviderJobID
+		}
+	}
 	return strings.Join([]string{
 		"current_target=" + current.Target,
 		"profile=" + current.Profile,
@@ -196,5 +222,23 @@ func RenderStatus(st State, conversationID string) string {
 		"lease=" + current.LeaseID,
 		"machine=" + current.MachineID,
 		"provider_job=" + current.ProviderJobID,
+		"allocation=" + allocationID,
+		"allocation_state=" + allocationState,
+		"provider_state=" + providerState,
+		"provider_reason=" + providerReason,
 	}, " ")
+}
+
+func latestAllocationForConversation(st State, conversationID string) (AllocationRequest, bool) {
+	conversationID = strings.TrimSpace(conversationID)
+	var best AllocationRequest
+	for _, req := range st.Allocations {
+		if strings.TrimSpace(req.ConversationID) != conversationID {
+			continue
+		}
+		if best.ID == "" || req.UpdatedAt.After(best.UpdatedAt) || (req.UpdatedAt.Equal(best.UpdatedAt) && req.ID > best.ID) {
+			best = req
+		}
+	}
+	return best, best.ID != ""
 }
