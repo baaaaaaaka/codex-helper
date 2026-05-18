@@ -51,7 +51,13 @@ func (s *Store) Path() string { return s.path }
 func (s *Store) Load() (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.loadUnlocked()
+	var st State
+	err := s.withFileLockUnlocked(func() error {
+		var err error
+		st, err = s.loadUnlocked()
+		return err
+	})
+	return st, err
 }
 
 func (s *Store) Save(st State) error {

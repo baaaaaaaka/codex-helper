@@ -53,6 +53,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 
 func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing.T) {
 	fallback := teamsControlFallbackHelpContext()
+	repoRoot := sourceCheckoutRootForDocsDriftTest(t)
 	read := func(path string) string {
 		t.Helper()
 		data, err := os.ReadFile(path)
@@ -61,8 +62,8 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 		}
 		return string(data)
 	}
-	readme := read(filepath.Join("..", "..", "README.md"))
-	skill := read(filepath.Join("..", "skills", "builtin", "cxp", "references", "commands.md"))
+	readme := read(filepath.Join(repoRoot, "README.md"))
+	skill := read(filepath.Join(repoRoot, "internal", "skills", "builtin", "cxp", "references", "commands.md"))
 	checks := []struct {
 		name     string
 		fallback []string
@@ -111,4 +112,33 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 			}
 		})
 	}
+}
+
+func sourceCheckoutRootForDocsDriftTest(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	start := dir
+	for {
+		if regularFileExists(filepath.Join(dir, "README.md")) &&
+			regularFileExists(filepath.Join(dir, "internal", "skills", "builtin", "cxp", "references", "commands.md")) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	t.Skipf("source checkout not available from %s; docs drift test runs in source-tree CI", start)
+	return ""
+}
+
+func regularFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }

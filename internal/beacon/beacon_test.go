@@ -355,6 +355,51 @@ func TestStoreConcurrentUpdatesFromDistinctHandlesDoNotLoseWrites(t *testing.T) 
 	}
 }
 
+func TestStoreLoadWaitsForProcessLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(State{Version: StateVersion}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	processLock := beaconStoreProcessLock(path)
+	processLock.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			processLock.Unlock()
+		}
+	}()
+
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := store.Load()
+		done <- err
+	}()
+	<-started
+	select {
+	case err := <-done:
+		t.Fatalf("Load returned while beacon state process lock was held: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	processLock.Unlock()
+	locked = false
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Load after unlock: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Load did not resume after beacon state process lock was released")
+	}
+}
+
 func TestReleasePreviewHardKillAndExternalProtection(t *testing.T) {
 	m := Machine{ID: "gpu-a", LeaseID: "lease-1", ProviderJobID: "slurm-1", Chats: []string{"chat-a"}, Jobs: []string{"job-1"}}
 	res, err := DecideRelease(m, ReleaseInput{})
