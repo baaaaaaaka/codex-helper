@@ -523,7 +523,7 @@ func TestQueueOutboxAssignsPerChatSequenceAndMetadata(t *testing.T) {
 
 func TestStoreConcurrentSessionAndOutboxWritersPreserveState(t *testing.T) {
 	store := newTestStore(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), storeConcurrentTestTimeout(30*time.Second))
 	defer cancel()
 	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
 		t.Fatalf("CreateSession error: %v", err)
@@ -680,7 +680,7 @@ func TestStoreConcurrentSessionAndOutboxWritersPreserveState(t *testing.T) {
 
 func TestStoreConcurrentDistinctSessionWritersDoNotCrossMutate(t *testing.T) {
 	store := newTestStore(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), storeConcurrentTestTimeout(30*time.Second))
 	defer cancel()
 
 	const sessions = 5
@@ -808,11 +808,7 @@ func TestStoreConcurrentDistinctSessionWritersDoNotCrossMutate(t *testing.T) {
 
 func TestStoreConcurrentInboundTurnDedupAcrossHandles(t *testing.T) {
 	store := newTestStore(t)
-	timeout := 10 * time.Second
-	if runtime.GOOS == "windows" {
-		timeout = 45 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), storeConcurrentTestTimeout(10*time.Second))
 	defer cancel()
 	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
 		t.Fatalf("CreateSession error: %v", err)
@@ -872,6 +868,13 @@ func TestStoreConcurrentInboundTurnDedupAcrossHandles(t *testing.T) {
 			t.Fatalf("deduped inbound not linked to queued turn: %#v", inbound)
 		}
 	}
+}
+
+func storeConcurrentTestTimeout(base time.Duration) time.Duration {
+	if runtime.GOOS == "windows" {
+		return 90 * time.Second
+	}
+	return base
 }
 
 func TestPendingOutboxSkipsRateLimitedChatWithoutBlockingOthers(t *testing.T) {

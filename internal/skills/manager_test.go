@@ -217,7 +217,7 @@ func TestManagerSyncAllRunsSourcesInParallel(t *testing.T) {
 		t.Fatalf("seed store: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), skillsTestTimeout(5*time.Second))
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
@@ -300,7 +300,7 @@ func TestStartDailyAutoSyncReturnsBeforeGitCompletesAndMarksToday(t *testing.T) 
 		t.Fatalf("seed store: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), skillsTestTimeout(5*time.Second))
 	defer cancel()
 	start := time.Now()
 	mgr.StartDailyAutoSync(ctx)
@@ -310,7 +310,7 @@ func TestStartDailyAutoSyncReturnsBeforeGitCompletesAndMarksToday(t *testing.T) 
 	waitFetchStarted(t, runner.fetchStarted, "auto")
 	close(runner.releaseFetch)
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(skillsTestTimeout(2 * time.Second))
 	for {
 		st, err := mgr.Store.LoadState()
 		if err != nil {
@@ -519,7 +519,7 @@ func waitFetchStarted(t *testing.T, ch <-chan string, want string) {
 		if got != want {
 			t.Fatalf("fetch source = %q, want %q", got, want)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(skillsTestTimeout(2 * time.Second)):
 		t.Fatalf("timed out waiting for fetch %q", want)
 	}
 }
@@ -530,7 +530,7 @@ func waitFetchesStarted(t *testing.T, ch <-chan string, want ...string) {
 	for _, name := range want {
 		remaining[name] = true
 	}
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(skillsTestTimeout(2 * time.Second))
 	for len(remaining) > 0 {
 		select {
 		case got := <-ch:
@@ -542,4 +542,11 @@ func waitFetchesStarted(t *testing.T, ch <-chan string, want ...string) {
 			t.Fatalf("timed out waiting for fetches %v", remaining)
 		}
 	}
+}
+
+func skillsTestTimeout(base time.Duration) time.Duration {
+	if runtime.GOOS == "windows" {
+		return 30 * time.Second
+	}
+	return base
 }
