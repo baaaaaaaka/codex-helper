@@ -5,6 +5,7 @@ INSTALL_SHOW_SUMMARY=1
 INSTALL_FAILURE_REASON=""
 INSTALL_SUCCESS_DETAILS=""
 INSTALL_MIN_FREE_KB="${CODEX_PROXY_INSTALL_MIN_FREE_KB:-131072}"
+BUILTIN_SKILL_DETAILS=""
 
 print_install_banner() {
   title="$1"
@@ -661,6 +662,20 @@ update_shell_config() {
   fi
 }
 
+install_builtin_skills() {
+  if [ "${CODEX_PROXY_SKIP_BUILTIN_SKILLS:-}" = "1" ]; then
+    BUILTIN_SKILL_DETAILS="Built-in cxp skill install skipped by CODEX_PROXY_SKIP_BUILTIN_SKILLS=1"
+    return 0
+  fi
+  if "$dst" skills install-builtin --yes >/dev/null 2>&1; then
+    BUILTIN_SKILL_DETAILS="Built-in cxp skill installed/checked"
+    return 0
+  fi
+  echo "Warning: failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry." >&2
+  BUILTIN_SKILL_DETAILS="Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
+  return 0
+}
+
 get_latest_tag_from_redirect() {
   url="$release_base/$repo/releases/latest"
   tag=""
@@ -854,9 +869,11 @@ for legacy_name in claude-proxy clp; do
 done
 
 update_shell_config
+install_builtin_skills
 INSTALL_SUCCESS_DETAILS="$(cat <<EOF
 Installed: $dst
 Run: $dst proxy doctor
 Shell config checked for install/managed CLI PATH and alias 'cxp' (reload attempted)
+$BUILTIN_SKILL_DETAILS
 EOF
 )"

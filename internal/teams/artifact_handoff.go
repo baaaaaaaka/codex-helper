@@ -109,6 +109,9 @@ Work chat helper commands:
 - helper skills list, helper skills add <url>, helper skills sync [name], or helper skills push [name]: inspect or sync skill subscriptions
 - helper close: close the Work chat binding
 
+Local cxp skills commands:
+- cxp skills install-builtin: install or repair bundled local skills such as the cxp usage skill
+
 Local cxp beacon commands:
 - cxp beacon profile list: list beacon profiles
 - cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration>: create a Slurm draft profile
@@ -117,6 +120,7 @@ Local cxp beacon commands:
 - cxp beacon profile doctor <name> then cxp beacon profile confirm <name>: make a draft profile ready
 - cxp beacon profile status <name> and cxp beacon status --session <id>: inspect profile or target state
 - cxp beacon switch-profile <name> --session <id>: switch a conversation target after the profile is ready
+- cxp beacon switch-profile <name> --session <id> --after-current-turn: defer a switch so an active Codex turn can finish before future turns use the new profile
 
 Reply in the user's language. Keep the answer concise and practical.
 If the user appears to want one of the helper workflows, tell them the exact command to send.
@@ -207,6 +211,7 @@ func defaultControlFallbackHelpDigest() string {
 		"`cxp beacon profile doctor <name>` then `cxp beacon profile confirm <name>` - mark a draft profile checked and ready",
 		"`cxp beacon profile status <name>` / `cxp beacon profile list` - inspect beacon profiles",
 		"`cxp beacon switch-profile <name> --session <id>` - switch a conversation target after the profile is ready",
+		"`cxp beacon switch-profile <name> --session <id> --after-current-turn` - defer a beacon switch until the active Codex turn finishes",
 		"Beacon execution profiles are separate from SSH proxy profiles; do not use `cxp proxy` for beacon profile setup.",
 		"",
 		"Work chat quick help:",

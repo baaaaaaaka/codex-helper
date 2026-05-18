@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -89,6 +92,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				return nil
 			}
 
+			installBundledSkillsFromHelper(ctx, res.InstallPath, cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s.\n", res.Version)
 			return nil
 		},
@@ -101,4 +105,24 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 	cmd.Flags().DurationVar(&teamsDrainTimeout, "teams-drain-timeout", 2*time.Minute, "How long to wait for an active Teams bridge to drain before upgrading")
 
 	return cmd
+}
+
+func installBundledSkillsFromHelper(ctx context.Context, helperPath string, out io.Writer) {
+	helperPath = strings.TrimSpace(helperPath)
+	if helperPath == "" {
+		return
+	}
+	installCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(installCtx, helperPath, "skills", "install-builtin", "--yes")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			detail = ": " + detail
+		}
+		_, _ = fmt.Fprintf(out, "Warning: failed to install built-in cxp skill after upgrade; run `%s skills install-builtin --yes` to retry%s\n", helperPath, detail)
+	}
 }

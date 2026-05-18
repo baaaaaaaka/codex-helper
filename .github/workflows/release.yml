@@ -111,13 +111,19 @@ jobs:
           ./install.sh --repo "${GITHUB_REPOSITORY}" --version "${GITHUB_REF_NAME}" --dir "$HOME/.local/bin"
           "$HOME/.local/bin/codex-proxy" --version | grep -q "${GITHUB_REF_NAME#v}"
           "$HOME/.local/bin/cxp" --version | grep -q "${GITHUB_REF_NAME#v}"
+          test -f "$HOME/.codex/skills/cxp/SKILL.md"
+          test -f "$HOME/.codex/skills/cxp/references/commands.md"
+          grep -q -- "--after-current-turn" "$HOME/.codex/skills/cxp/references/commands.md"
           "$HOME/.local/bin/codex-proxy" proxy doctor || true
           CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash scripts/ci/skills_smoke.sh
           CODEX_HELPER_BIN="$HOME/.local/bin/cxp" bash scripts/ci/skills_smoke.sh
           upgrade_target="$RUNNER_TEMP/codex-proxy-upgrade-smoke/codex-proxy"
           mkdir -p "$(dirname "$upgrade_target")"
+          rm -rf "$HOME/.codex/skills/cxp"
           "$HOME/.local/bin/codex-proxy" upgrade --repo "${GITHUB_REPOSITORY}" --version "${GITHUB_REF_NAME}" --install-path "$upgrade_target"
           "$upgrade_target" --version | grep -q "${GITHUB_REF_NAME#v}"
+          test -f "$HOME/.codex/skills/cxp/SKILL.md"
+          test -f "$HOME/.codex/skills/cxp/references/commands.md"
 
       - name: Install (Windows)
         if: runner.os == 'Windows'
@@ -131,6 +137,11 @@ jobs:
           $cxp = Join-Path $installDir "cxp.cmd"
           & $exe --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
           & $cxp --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
+          $builtinSkill = Join-Path $env:USERPROFILE ".codex\skills\cxp"
+          if (!(Test-Path -LiteralPath (Join-Path $builtinSkill "SKILL.md"))) { throw "builtin cxp SKILL.md missing" }
+          $builtinReference = Join-Path $builtinSkill "references\commands.md"
+          if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
+          if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--after-current-turn") { throw "builtin cxp command reference missing deferred beacon switch guidance" }
           & $exe proxy doctor | Out-Default
           $env:CODEX_HELPER_BIN = $exe
           .\scripts\ci\skills_smoke.ps1
@@ -140,8 +151,11 @@ jobs:
           $upgradeDir = Join-Path $env:RUNNER_TEMP "codex-proxy-upgrade-smoke"
           New-Item -ItemType Directory -Force -Path $upgradeDir | Out-Null
           $upgradeTarget = Join-Path $upgradeDir "codex-proxy.exe"
+          Remove-Item -Recurse -Force -LiteralPath $builtinSkill -ErrorAction SilentlyContinue
           & $exe upgrade --repo $env:GITHUB_REPOSITORY --version $env:GITHUB_REF_NAME --install-path $upgradeTarget
           & $upgradeTarget --version | Select-String ($env:GITHUB_REF_NAME.TrimStart("v")) | Out-Null
+          if (!(Test-Path -LiteralPath (Join-Path $builtinSkill "SKILL.md"))) { throw "upgrade did not reinstall builtin cxp SKILL.md" }
+          if (!(Test-Path -LiteralPath $builtinReference)) { throw "upgrade did not reinstall builtin cxp command reference" }
 
   install-container-smoke:
     name: Install smoke (containers)

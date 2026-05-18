@@ -19,6 +19,13 @@ git_repo() {
 }
 
 mkdir -p "$repo/skills/review/scripts" "$codex_dir"
+
+"${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" install-builtin --yes
+test -f "$codex_dir/skills/cxp/SKILL.md"
+test -f "$codex_dir/skills/cxp/references/commands.md"
+grep -q -- "--after-current-turn" "$codex_dir/skills/cxp/references/commands.md"
+"${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" list | grep -q "No skill subscriptions."
+
 git_repo init
 git_repo config user.name "Skill Smoke"
 git_repo config user.email "skill-smoke@example.invalid"

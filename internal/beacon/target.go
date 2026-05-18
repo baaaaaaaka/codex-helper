@@ -99,9 +99,13 @@ func SwitchProfile(st *State, in SwitchInput, proxyExists func(string) bool) (Sw
 		conv.Pending = &next
 		conv.UpdatedAt = now
 		st.Conversations[convID] = conv
+		message := "current turn stays " + targetSnapshotLabel(conv.Current) + "; future turns use " + p.Name
+		if !in.SignatureCompatible && in.Fork {
+			message += "; fork accepted for incompatible execution signature"
+		}
 		return SwitchResult{
 			Action:  "pending",
-			Message: "current turn stays " + conv.Current.Profile + "; future turns use " + p.Name + "; fork with beacon switch-profile " + p.Name + " --fork",
+			Message: message,
 		}, nil
 	}
 	conv.Current = next
@@ -109,6 +113,24 @@ func SwitchProfile(st *State, in SwitchInput, proxyExists func(string) bool) (Sw
 	conv.UpdatedAt = now
 	st.Conversations[convID] = conv
 	return SwitchResult{Action: "applied", Message: "current target is " + p.Name}, nil
+}
+
+func targetSnapshotLabel(snapshot TargetSnapshot) string {
+	switch strings.TrimSpace(snapshot.Target) {
+	case TargetBeacon:
+		if strings.TrimSpace(snapshot.Profile) != "" {
+			return TargetBeacon + ":" + strings.TrimSpace(snapshot.Profile)
+		}
+		return TargetBeacon
+	case TargetLocal, "":
+		return TargetLocal
+	default:
+		label := strings.TrimSpace(snapshot.Target)
+		if strings.TrimSpace(snapshot.Profile) != "" {
+			label += ":" + strings.TrimSpace(snapshot.Profile)
+		}
+		return label
+	}
 }
 
 func QueueTurn(st *State, conversationID string, turnID string, now time.Time) (QueuedTurn, error) {

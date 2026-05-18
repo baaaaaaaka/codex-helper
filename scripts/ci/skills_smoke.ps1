@@ -25,6 +25,16 @@ function Write-SmokeFile {
 }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $repo "skills\review\scripts"), $codexDir | Out-Null
+
+& $helperExe @helperArgs --config $config skills --codex-dir $codexDir install-builtin --yes
+$builtinSkill = Join-Path $codexDir "skills\cxp"
+if (!(Test-Path -LiteralPath (Join-Path $builtinSkill "SKILL.md"))) { throw "builtin cxp SKILL.md missing" }
+$builtinReference = Join-Path $builtinSkill "references\commands.md"
+if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
+if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--after-current-turn") { throw "builtin cxp command reference missing deferred beacon switch guidance" }
+$listBeforeAdd = & $helperExe @helperArgs --config $config skills --codex-dir $codexDir list
+if (($listBeforeAdd -join "`n") -notmatch "No skill subscriptions.") { throw "builtin skill should not appear as a git subscription: $listBeforeAdd" }
+
 & git -C $repo init
 & git -C $repo config user.name "Skill Smoke"
 & git -C $repo config user.email "skill-smoke@example.invalid"

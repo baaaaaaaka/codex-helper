@@ -163,6 +163,102 @@ func TestUpgradeCmdExplicitVersionCallsPerformUpdate(t *testing.T) {
 	}
 }
 
+func TestUpgradeCmdInstallsBundledSkillsWithUpdatedBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script helper stub is POSIX-only")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	root := t.TempDir()
+	marker := filepath.Join(root, "builtin-install-called")
+	helperPath := filepath.Join(root, "codex-proxy")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ] && [ \"$3\" = \"--yes\" ]; then\n" +
+		"  printf called > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 64\n"
+	if err := os.WriteFile(helperPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write helper stub: %v", err)
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{Version: "1.2.3", InstallPath: helperPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3", "--install-path", helperPath})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("updated binary was not asked to install bundled skills: %v", err)
+	}
+}
+
+func TestUpgradeCmdBuiltinSkillInstallFailureWarnsButUpgradeSucceeds(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script helper stub is POSIX-only")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	root := t.TempDir()
+	helperPath := filepath.Join(root, "codex-proxy")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ] && [ \"$3\" = \"--yes\" ]; then\n" +
+		"  echo builtin install failed >&2\n" +
+		"  exit 42\n" +
+		"fi\n" +
+		"exit 64\n"
+	if err := os.WriteFile(helperPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write helper stub: %v", err)
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{Version: "1.2.3", InstallPath: helperPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3", "--install-path", helperPath})
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&stderr)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade should succeed despite builtin skill warning: %v\nstdout=%s\nstderr=%s", err, out.String(), stderr.String())
+	}
+	if !strings.Contains(out.String(), "Updated to v1.2.3.") {
+		t.Fatalf("upgrade success output missing: %q", out.String())
+	}
+	if !strings.Contains(stderr.String(), "Warning: failed to install built-in cxp skill after upgrade") || !strings.Contains(stderr.String(), "builtin install failed") {
+		t.Fatalf("expected builtin install warning with detail, got %q", stderr.String())
+	}
+}
+
 func TestUpgradeCmdUsesAutoUpdateInstallLock(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)

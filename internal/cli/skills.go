@@ -28,6 +28,7 @@ func newSkillsCmd(root *rootOptions) *cobra.Command {
 	}
 	cmd.PersistentFlags().StringVar(&codexDir, "codex-dir", "", "Override Codex data dir (default: ~/.codex)")
 	cmd.AddCommand(
+		newSkillsInstallBuiltinCmd(root, &codexDir),
 		newSkillsAddCmd(root, &codexDir),
 		newSkillsListCmd(root, &codexDir),
 		newSkillsSyncCmd(root, &codexDir),
@@ -35,6 +36,55 @@ func newSkillsCmd(root *rootOptions) *cobra.Command {
 		newSkillsDoctorCmd(root, &codexDir),
 		newSkillsPushCmd(root, &codexDir),
 	)
+	return cmd
+}
+
+func newSkillsInstallBuiltinCmd(root *rootOptions, codexDir *string) *cobra.Command {
+	var yes bool
+	cmd := &cobra.Command{
+		Use:   "install-builtin [name]",
+		Short: "Install bundled skills into the Codex skills directory",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := withSignalContext(cmd.Context())
+			defer stop()
+			mgr, err := newSkillsManager(root, *codexDir, cmd.OutOrStdout())
+			if err != nil {
+				return err
+			}
+			name := ""
+			if len(args) > 0 {
+				name = args[0]
+			}
+			if !yes {
+				target, err := mgr.TargetRoot(skills.TargetCodexHome)
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Target: %s\n", target)
+				if strings.TrimSpace(name) == "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Built-in skills: %s\n", strings.Join(skills.BuiltinSkillNames(), ", "))
+				} else {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Built-in skill: %s\n", name)
+				}
+				ok, err := promptSkillYesNo(cmd.InOrStdin(), cmd.OutOrStdout(), "Install bundled skill(s)?", true)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return nil
+				}
+			}
+			results, err := mgr.InstallBuiltins(ctx, skills.BuiltinInstallOptions{Name: name})
+			for _, result := range results {
+				for _, skill := range result.Installed {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Installed bundled skill %s -> %s\n", skill.Name, skill.TargetPath)
+				}
+			}
+			return err
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Skip the install confirmation prompt")
 	return cmd
 }
 

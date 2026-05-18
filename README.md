@@ -127,6 +127,7 @@ codex-proxy proxy doctor
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
 | `codex-proxy history show <session-id>` | Print full history for a session |
 | `codex-proxy history open <session-id>` | Open a session in Codex |
+| `codex-proxy skills install-builtin` | Install or repair bundled skills, including the built-in `cxp` usage skill |
 | `codex-proxy skills add <git-url>` | Install skills from a git source and keep them updated |
 | `codex-proxy skills list` | List Codex skill subscriptions |
 | `codex-proxy skills sync [name]` | Sync one skill source, or all sources when no name is given |
@@ -139,6 +140,7 @@ codex-proxy proxy doctor
 | `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review |
 | `codex-proxy beacon status [--session <id>]` | Show beacon target state |
 | `codex-proxy beacon switch-profile <name> --session <id>` | Switch a conversation to a ready beacon profile |
+| `codex-proxy beacon switch-profile <name> --session <id> --after-current-turn` | Defer a beacon switch so the current Codex turn can finish |
 | `codex-proxy proxy start [profile]` | Start a long-lived proxy daemon |
 | `codex-proxy proxy list` | List known proxy instances |
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
@@ -203,6 +205,29 @@ conversation explicitly:
 ```bash
 codex-proxy beacon status --session <session-id>
 codex-proxy beacon switch-profile gpu --session <session-id>
+```
+
+When issuing a beacon switch from inside an active Codex turn, prefer the
+deferred form so the current answer stays on its existing target and later
+turns use the new profile:
+
+```bash
+codex-proxy beacon switch-profile gpu --session <session-id> --after-current-turn
+```
+
+## Built-in cxp skill
+
+The installer best-effort installs a bundled `cxp` Codex skill into
+`~/.codex/skills/cxp`. The skill contains the local command map and the safe
+handoff rules for disruptive operations such as beacon profile switching and
+Teams helper restarts. It is managed as a built-in skill, not as a git-backed
+subscription, so it does not appear as a remote source in `codex-proxy skills
+list`.
+
+To repair or install it manually:
+
+```bash
+codex-proxy skills install-builtin
 ```
 
 ## Codex history

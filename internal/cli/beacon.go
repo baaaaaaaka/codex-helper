@@ -273,6 +273,7 @@ func newBeaconSwitchProfileCmd(root *rootOptions, storePath *string) *cobra.Comm
 	var session string
 	var fork bool
 	var queuedOrRunning bool
+	var afterCurrentTurn bool
 	var signature string
 	var signatureCompatible bool
 	cmd := &cobra.Command{
@@ -299,7 +300,7 @@ func newBeaconSwitchProfileCmd(root *rootOptions, storePath *string) *cobra.Comm
 					ProfileName:         args[0],
 					Signature:           signature,
 					Fork:                fork,
-					HasQueuedOrRunning:  queuedOrRunning,
+					HasQueuedOrRunning:  queuedOrRunning || afterCurrentTurn,
 					SignatureCompatible: signatureCompatible,
 				}, proxyExists)
 				return err
@@ -313,6 +314,7 @@ func newBeaconSwitchProfileCmd(root *rootOptions, storePath *string) *cobra.Comm
 	cmd.Flags().StringVar(&session, "session", "", "Conversation/session id")
 	cmd.Flags().BoolVar(&fork, "fork", false, "Fork when execution signatures are incompatible")
 	cmd.Flags().BoolVar(&queuedOrRunning, "queued-or-running", false, "Schedule switch as pending because work is queued or running")
+	cmd.Flags().BoolVar(&afterCurrentTurn, "after-current-turn", false, "Defer switch until the current Codex turn finishes")
 	cmd.Flags().StringVar(&signature, "signature", "", "Execution signature snapshot")
 	cmd.Flags().BoolVar(&signatureCompatible, "signature-compatible", true, "Whether the target signature is compatible")
 	return cmd

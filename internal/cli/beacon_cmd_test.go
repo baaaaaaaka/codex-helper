@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -112,6 +113,118 @@ func TestBeaconCLISwitchRejectsMissingProxyProfile(t *testing.T) {
 	out, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "switch-profile", "gpu", "--session", "conv-1")
 	if err == nil || !strings.Contains(err.Error(), "proxy profile not found") {
 		t.Fatalf("switch output=%q error=%v, want missing proxy rejection", out, err)
+	}
+}
+
+func TestBeaconCLISwitchAfterCurrentTurnSetsPendingTarget(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		st.Conversations["conv-1"] = beacon.Conversation{
+			ID:      "conv-1",
+			Current: beacon.TargetSnapshot{Target: beacon.TargetLocal},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon state: %v", err)
+	}
+
+	out, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "switch-profile", "gpu", "--session", "conv-1", "--after-current-turn")
+	if err != nil {
+		t.Fatalf("switch after current turn: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "future turns use gpu") {
+		t.Fatalf("switch output = %s", out)
+	}
+	if strings.Contains(out, "stays ;") || !strings.Contains(out, "current turn stays local") {
+		t.Fatalf("switch output should name the preserved local target, got %s", out)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load beacon state: %v", err)
+	}
+	conv := st.Conversations["conv-1"]
+	if conv.Current.Target != beacon.TargetLocal {
+		t.Fatalf("current target = %#v, want local target preserved", conv.Current)
+	}
+	if conv.Pending == nil || conv.Pending.Target != beacon.TargetBeacon || conv.Pending.Profile != "gpu" {
+		t.Fatalf("pending target = %#v, want beacon gpu", conv.Pending)
+	}
+	queued, err := beacon.QueueTurn(&st, "conv-1", "turn-next", time.Now())
+	if err != nil {
+		t.Fatalf("QueueTurn after deferred switch: %v", err)
+	}
+	if queued.Snapshot.Target != beacon.TargetBeacon || queued.Snapshot.Profile != "gpu" {
+		t.Fatalf("queued snapshot = %#v, want future turn on beacon gpu", queued.Snapshot)
+	}
+}
+
+func TestBeaconCLISwitchRequiresForkForIncompatibleSignature(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		st.Conversations["conv-1"] = beacon.Conversation{
+			ID:      "conv-1",
+			Current: beacon.TargetSnapshot{Target: beacon.TargetLocal},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon state: %v", err)
+	}
+
+	out, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "switch-profile", "gpu", "--session", "conv-1", "--signature-compatible=false")
+	if err != nil {
+		t.Fatalf("incompatible switch should return guidance, not a hard error: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "incompatible execution signature") || !strings.Contains(out, "--fork") {
+		t.Fatalf("incompatible switch output = %s", out)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after rejected switch: %v", err)
+	}
+	if st.Conversations["conv-1"].Current.Target != beacon.TargetLocal || st.Conversations["conv-1"].Pending != nil {
+		t.Fatalf("incompatible switch without fork changed state: %#v", st.Conversations["conv-1"])
+	}
+
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "switch-profile", "gpu", "--session", "conv-1", "--signature-compatible=false", "--fork")
+	if err != nil {
+		t.Fatalf("switch with fork: %v\n%s", err, out)
+	}
+	st, err = store.Load()
+	if err != nil {
+		t.Fatalf("load after fork switch: %v", err)
+	}
+	if st.Conversations["conv-1"].Current.Target != beacon.TargetBeacon || st.Conversations["conv-1"].Current.Profile != "gpu" {
+		t.Fatalf("fork switch did not apply beacon target: %#v", st.Conversations["conv-1"].Current)
 	}
 }
 

@@ -60,6 +60,7 @@ func TestControlFallbackPromptDefaultHelpHasCommandDigest(t *testing.T) {
 		"Beacon CLI quick help:",
 		"cxp beacon profile create",
 		"cxp beacon profile confirm",
+		"--after-current-turn",
 		"Beacon execution profiles are separate from SSH proxy profiles",
 		"Work chat quick help:",
 		"helper skills add",

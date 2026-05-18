@@ -69,6 +69,29 @@ func TestInstallShSuccessBanner(t *testing.T) {
 	}
 }
 
+func TestInstallShBuiltinSkillFailureWarnsButInstallSucceeds(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	assetData := []byte("#!/bin/sh\nif [ \"$1\" = \"skills\" ]; then\n  exit 42\nfi\nif [ \"$1\" = \"--version\" ]; then\n  echo codex-proxy 1.2.3\n  exit 0\nfi\nexit 0\n")
+	checksum := sha256.Sum256(assetData)
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_ASSET_DATA", string(assetData))
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_CHECKSUMS", fmt.Sprintf("%x  %s\n", checksum, run.asset))
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh should not fail when built-in skill install fails: %v\n%s", err, string(output))
+	}
+	text := string(output)
+	if !strings.Contains(text, "CODEX-PROXY INSTALL SUCCESS") {
+		t.Fatalf("expected success banner, got %s", text)
+	}
+	if !strings.Contains(text, "Warning: failed to install built-in cxp skill") {
+		t.Fatalf("expected built-in skill warning, got %s", text)
+	}
+}
+
 func TestInstallShChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_CHECKSUMS_FAIL", "1")

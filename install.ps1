@@ -498,6 +498,23 @@ $cxpContent = "@echo off`r`n`"%~dp0codex-proxy.exe`" %*`r`n"
 Invoke-DiskWrite -Label "cxp shim install" -PathValue $cxpCmd -DefaultReason "Failed to install cxp shim: $cxpCmd" -Action {
   Set-Content -Path $cxpCmd -Value $cxpContent -Encoding ASCII
 }
+$builtinSkillDetail = ""
+if ($env:CODEX_PROXY_SKIP_BUILTIN_SKILLS -eq "1") {
+  $builtinSkillDetail = "Built-in cxp skill install skipped by CODEX_PROXY_SKIP_BUILTIN_SKILLS=1"
+} else {
+  try {
+    & $dst skills install-builtin --yes *> $null
+    if ($LASTEXITCODE -eq 0) {
+      $builtinSkillDetail = "Built-in cxp skill installed/checked"
+    } else {
+      Write-Warning "Failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry."
+      $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
+    }
+  } catch {
+    Write-Warning "Failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry. $($_.Exception.Message)"
+    $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
+  }
+}
 $managedPrefix = $env:CODEX_NPM_PREFIX
 if ([string]::IsNullOrWhiteSpace($managedPrefix)) {
   $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
@@ -594,7 +611,8 @@ foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
 $script:InstallSuccessDetails = @(
   "Installed: $dst",
   "Shell profile and user PATH checked for install/managed CLI directories (reload attempted):",
-  "  $profilePath"
+  "  $profilePath",
+  $builtinSkillDetail
 )
 Write-InstallBanner "CODEX-PROXY INSTALL SUCCESS"
 foreach ($line in $script:InstallSuccessDetails) {

@@ -148,6 +148,52 @@ func TestNewSkillsManagerUsesEffectivePaths(t *testing.T) {
 	}
 }
 
+func TestSkillsCommandInstallBuiltinCxp(t *testing.T) {
+	lockCLITestHooks(t)
+	setEffectivePathsHooksForTest(t)
+	home := t.TempDir()
+	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
+	effectivePathsRunningAsRoot = func() bool { return false }
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CODEX_DIR", "")
+	t.Setenv("CODEX_HOME", "")
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	codexDir := filepath.Join(t.TempDir(), "codex")
+	out, err := runSkillsRootCommand(t,
+		"--config", configPath,
+		"skills", "--codex-dir", codexDir,
+		"install-builtin", "cxp",
+		"--yes",
+	)
+	if err != nil {
+		t.Fatalf("skills install-builtin: %v\n%s", err, out)
+	}
+	installed := filepath.Join(codexDir, "skills", "cxp")
+	if _, err := os.Stat(filepath.Join(installed, "SKILL.md")); err != nil {
+		t.Fatalf("builtin SKILL.md missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(installed, "references", "commands.md")); err != nil {
+		t.Fatalf("builtin command reference missing: %v", err)
+	}
+	if !strings.Contains(out, "Installed bundled skill cxp -> "+installed) {
+		t.Fatalf("install-builtin output = %s", out)
+	}
+
+	listOut, err := runSkillsRootCommand(t,
+		"--config", configPath,
+		"skills", "--codex-dir", codexDir,
+		"list",
+	)
+	if err != nil {
+		t.Fatalf("skills list: %v\n%s", err, listOut)
+	}
+	if !strings.Contains(listOut, "No skill subscriptions.") {
+		t.Fatalf("builtin skill should not appear as a git subscription:\n%s", listOut)
+	}
+}
+
 func TestRunSkillsPushPushesOnlyConfirmedChangesToReviewBranch(t *testing.T) {
 	repo := initCLISkillRepo(t)
 	mgr := newCLISkillsManager(t)
