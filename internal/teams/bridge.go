@@ -2125,6 +2125,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.sendControl(ctx, b.formatSessionList())
 		case DashboardCommandSkills:
 			return b.handleSkillsCommand(ctx, b.reg.ControlChatID, parsed.Argument)
+		case DashboardCommandBeacon:
+			return b.handleBeaconControlCommand(ctx, msg, parsed.Argument)
 		case DashboardCommandRestart:
 			return b.restartHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandReload:
@@ -2355,15 +2357,16 @@ func controlAdvancedHelpText() string {
 		"- `helper webhook off` - disable Workflow notification cards",
 		"- `helper skills list` / `helper skills add <url>` / `helper skills sync [name]` / `helper skills push [name]` - inspect or sync skill subscriptions",
 		"",
+		"Beacon commands:",
+		"- `beacon list` - list beacon profiles and machines",
+		"- `beacon profile create <name> ...` - create a draft beacon profile",
+		"- `beacon profile doctor <name>` then `beacon profile confirm <name>` - mark a profile ready",
+		"- `beacon machine list|status|release|kill` - inspect or manage beacon workers",
+		"- `new <directory> --beacon <profile>` - create a Work chat on a ready beacon profile",
+		"- Beacon execution profiles are separate from SSH proxy profiles managed by `cxp proxy`.",
+		"",
 		"Local CLI:",
 		"- `cxp skills install-builtin` - install or repair bundled local skills",
-		"",
-		"Beacon CLI:",
-		"- `cxp beacon profile list` - list beacon execution profiles",
-		"- `cxp beacon profile create <name> ...` - create a draft beacon profile locally",
-		"- `cxp beacon profile doctor <name>` then `cxp beacon profile confirm <name>` - mark a profile ready",
-		"- `cxp beacon switch-profile <name> --session <id> --after-current-turn` - defer switching future turns to a ready profile",
-		"- Beacon execution profiles are separate from SSH proxy profiles managed by `cxp proxy`.",
 		"",
 		"work chat commands:",
 		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
@@ -2387,6 +2390,8 @@ func sessionHelpText() string {
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`helper details` or `!details` - show debug IDs and links",
+		"`beacon status` - show this Work chat execution target",
+		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
 		"`helper publish-history` - import a paused local Codex history backlog",
 		"`helper skills list` / `helper skills add <url>` / `helper skills push` - inspect skill subscriptions and local skill edits",
 		"",
@@ -2399,6 +2404,7 @@ func sessionAdvancedHelpText() string {
 		"💬 Work chat advanced help",
 		"`helper status` or `!status` - check progress",
 		"`helper details` or `!details` - show IDs and debug details",
+		"`beacon status`, `beacon list`, `beacon switch <profile>`, or `beacon switch local` - inspect or switch this Work chat execution target",
 		"`helper rename <title>` or `!rename <title>` - rename this Teams chat",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
@@ -4221,6 +4227,9 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	if err != nil {
 		return b.sendControl(ctx, err.Error())
 	}
+	if err := b.validateBeaconNewSession(parsed); err != nil {
+		return b.sendControl(ctx, err.Error())
+	}
 	if parsed.WorkDir != "" {
 		if err := os.MkdirAll(parsed.WorkDir, 0o700); err != nil {
 			return b.sendControl(ctx, "create workspace failed: "+err.Error())
@@ -4254,6 +4263,9 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return err
 	}
+	if err := b.activateBeaconNewSession(session.ID, parsed); err != nil {
+		return err
+	}
 	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+"."); err != nil {
 		return err
 	}
@@ -4262,7 +4274,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		SessionID:   session.ID,
 		TeamsChatID: chat.ID,
 		Kind:        "anchor",
-		Body:        sessionReadyMessage(session, parsed.Title),
+		Body:        sessionReadyMessage(session, parsed.Title, parsed.beaconTargetLabel()),
 	}); err != nil {
 		return err
 	}
@@ -4287,8 +4299,21 @@ func (b *Bridge) controlCommandAlreadyHandled(ctx context.Context, msg ChatMessa
 }
 
 type newSessionRequest struct {
-	WorkDir string
-	Title   string
+	WorkDir         string
+	Title           string
+	BeaconProfile   string
+	BeaconIsolation string
+}
+
+func (r newSessionRequest) beaconTargetLabel() string {
+	if strings.TrimSpace(r.BeaconProfile) == "" {
+		return ""
+	}
+	label := "beacon:" + strings.TrimSpace(r.BeaconProfile)
+	if strings.TrimSpace(r.BeaconIsolation) != "" {
+		label += " isolation=" + strings.TrimSpace(r.BeaconIsolation)
+	}
+	return label
 }
 
 func (b *Bridge) parseNewSessionRequest(ctx context.Context, raw string) (newSessionRequest, error) {
@@ -4296,7 +4321,7 @@ func (b *Bridge) parseNewSessionRequest(ctx context.Context, raw string) (newSes
 	if err != nil {
 		return newSessionRequest{}, err
 	}
-	if parsed.WorkDir == "" && strings.TrimSpace(raw) == "" {
+	if parsed.WorkDir == "" {
 		if workspace, ok := b.currentControlWorkspace(ctx); ok {
 			parsed.WorkDir = workspace.Path
 		}
@@ -4314,22 +4339,33 @@ func parseNewSessionRequest(raw string) (newSessionRequest, error) {
 	}
 	before, after, hasSep := strings.Cut(raw, " -- ")
 	if !hasSep {
-		resolved, err := resolveUserWorkspacePath(raw)
+		cleaned, profile, isolation, err := parseBeaconOptionsFromNewSession(raw)
 		if err != nil {
 			return newSessionRequest{}, err
 		}
-		return newSessionRequest{WorkDir: resolved}, nil
+		if strings.TrimSpace(cleaned) == "" {
+			return newSessionRequest{BeaconProfile: profile, BeaconIsolation: isolation}, nil
+		}
+		resolved, err := resolveUserWorkspacePath(cleaned)
+		if err != nil {
+			return newSessionRequest{}, err
+		}
+		return newSessionRequest{WorkDir: resolved, BeaconProfile: profile, BeaconIsolation: isolation}, nil
 	}
-	dir := strings.TrimSpace(before)
+	dir, profile, isolation, err := parseBeaconOptionsFromNewSession(before)
+	if err != nil {
+		return newSessionRequest{}, err
+	}
+	dir = strings.TrimSpace(dir)
 	title := strings.TrimSpace(after)
 	if dir == "" {
-		return newSessionRequest{}, fmt.Errorf("usage: `new <directory>`")
+		return newSessionRequest{Title: title, BeaconProfile: profile, BeaconIsolation: isolation}, nil
 	}
 	resolved, err := resolveUserWorkspacePath(dir)
 	if err != nil {
 		return newSessionRequest{}, err
 	}
-	return newSessionRequest{WorkDir: resolved, Title: title}, nil
+	return newSessionRequest{WorkDir: resolved, Title: title, BeaconProfile: profile, BeaconIsolation: isolation}, nil
 }
 
 func (b *Bridge) currentControlWorkspace(ctx context.Context) (teamstore.WorkspaceRecord, bool) {
@@ -4392,7 +4428,7 @@ func (b *Bridge) createWorkspaceDirectory(ctx context.Context, raw string) error
 	return b.sendControl(ctx, "Directory is ready: "+dir+"\n\nNext: send `new "+quoteTeamsCommandPath(dir)+"` to create a work chat for this directory.")
 }
 
-func sessionReadyMessage(session Session, prompt string) string {
+func sessionReadyMessage(session Session, prompt string, target ...string) string {
 	var lines []string
 	lines = append(lines, "💬 Work chat is ready.")
 	lines = append(lines, "Send a task in this chat. Codex will start automatically and continue this session.")
@@ -4401,6 +4437,9 @@ func sessionReadyMessage(session Session, prompt string) string {
 		lines = append(lines, "Session: "+session.ID)
 	}
 	lines = append(lines, "Project: "+sessionReadyProjectLabel(session))
+	if len(target) > 0 && strings.TrimSpace(target[0]) != "" {
+		lines = append(lines, "Execution target: "+strings.TrimSpace(target[0]))
+	}
 	lines = append(lines, "Commands: `helper status` or `!status`, `helper help`, `helper close` to close this Codex session in Teams.")
 	lines = append(lines, "Need the full path? Send `helper status`.")
 	return strings.Join(lines, "\n")
@@ -4485,6 +4524,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 			return b.publishWorkSessionHistory(ctx, session)
 		case DashboardCommandSkills:
 			return b.handleSkillsCommand(ctx, chatID, parsed.Argument)
+		case DashboardCommandBeacon:
+			return b.handleBeaconWorkCommand(ctx, session, msg, parsed.Argument)
 		case DashboardCommandHelp:
 			if isAdvancedHelpArg(parsed.Argument) {
 				return b.sendToChat(ctx, chatID, sessionAdvancedHelpText())
@@ -9033,6 +9074,9 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 	if strings.TrimSpace(session.Cwd) != "" {
 		lines = append(lines, "Folder: "+session.Cwd)
 	}
+	if target := b.beaconTargetSummary(session.ID); target != "" {
+		lines = append(lines, target)
+	}
 	var latest teamstore.Turn
 	var hasLatest bool
 	pendingOutbox := 0
@@ -9284,6 +9328,9 @@ func (b *Bridge) formatSessionDetails(session *Session) string {
 	}
 	if session.CodexThreadID != "" {
 		lines = append(lines, "Codex thread: "+session.CodexThreadID)
+	}
+	if target := b.beaconTargetSummary(session.ID); target != "" {
+		lines = append(lines, target)
 	}
 	if session.ChatURL != "" {
 		lines = append(lines, "Teams chat: "+session.ChatURL)

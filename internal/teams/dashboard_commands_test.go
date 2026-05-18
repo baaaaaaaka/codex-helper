@@ -69,6 +69,9 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "helper status", name: DashboardCommandStatus},
 		{text: "helper skills", name: DashboardCommandSkills},
 		{text: "helper skills sync acme", name: DashboardCommandSkills, raw: "sync acme"},
+		{text: "beacon list", name: DashboardCommandBeacon, raw: "list"},
+		{text: "/beacon machine list", name: DashboardCommandBeacon, raw: "machine list"},
+		{text: "helper beacon profile list", name: DashboardCommandBeacon, raw: "profile list"},
 		{text: "helper help advanced", name: DashboardCommandHelp, raw: "advanced"},
 		{text: "cx p 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "cx h", name: DashboardCommandHelp},
@@ -197,6 +200,34 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 	}
 	if cmd := ParseDashboardCommand(ChatScopeWork, "help advanced"); cmd.Name != DashboardCommandHelp || cmd.Argument != "advanced" {
 		t.Fatalf("help advanced parse = %#v, want help with advanced arg", cmd)
+	}
+}
+
+func TestParseBeaconWorkDashboardCommands(t *testing.T) {
+	tests := []struct {
+		text string
+		arg  string
+	}{
+		{text: "beacon status", arg: "status"},
+		{text: "/beacon list", arg: "list"},
+		{text: "!beacon switch gpu", arg: "switch gpu"},
+		{text: "helper beacon switch local", arg: "switch local"},
+		{text: "codex beacon fork gpu", arg: "fork gpu"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.text, func(t *testing.T) {
+			cmd := ParseDashboardCommand(ChatScopeWork, tt.text)
+			if !cmd.HelperCommand || cmd.Name != DashboardCommandBeacon {
+				t.Fatalf("beacon work command parsed as %#v", cmd)
+			}
+			if cmd.Argument != tt.arg {
+				t.Fatalf("beacon work argument = %q, want %q", cmd.Argument, tt.arg)
+			}
+			if cmd.ForwardToCodex || cmd.RequiresCodex {
+				t.Fatalf("beacon work command should not be forwarded to Codex: %#v", cmd)
+			}
+		})
 	}
 }
 

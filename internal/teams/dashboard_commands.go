@@ -42,6 +42,7 @@ const (
 	DashboardCommandCancel         DashboardCommandName = "cancel"
 	DashboardCommandSendFile       DashboardCommandName = "send-file"
 	DashboardCommandSkills         DashboardCommandName = "skills"
+	DashboardCommandBeacon         DashboardCommandName = "beacon"
 )
 
 type ParsedDashboardCommand struct {
@@ -196,6 +197,8 @@ func workBareCommandName(text string) (DashboardCommandName, string, bool) {
 		if strings.TrimSpace(arg) == "" || isAdvancedHelpArg(arg) {
 			return DashboardCommandHelp, arg, true
 		}
+	case "beacon":
+		return DashboardCommandBeacon, arg, true
 	default:
 	}
 	return DashboardCommandNone, "", false
@@ -312,7 +315,7 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == "" || isAdvancedHelpArg(arg)
 	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
 		return arg == ""
-	case DashboardCommandSkills:
+	case DashboardCommandSkills, DashboardCommandBeacon:
 		return true
 	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
@@ -354,6 +357,8 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandStatus, true
 	case "skills", "skill":
 		return DashboardCommandSkills, true
+	case "beacon":
+		return DashboardCommandBeacon, true
 	default:
 		return DashboardCommandNone, false
 	}
@@ -440,6 +445,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandPublishHistory, true
 	case "skills", "skill":
 		return DashboardCommandSkills, true
+	case "beacon":
+		return DashboardCommandBeacon, true
 	default:
 		return DashboardCommandNone, false
 	}

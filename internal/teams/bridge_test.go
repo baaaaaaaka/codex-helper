@@ -2789,6 +2789,26 @@ func TestParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle(t *testing.T
 		t.Fatalf("quoted directory request parsed as %#v", got)
 	}
 
+	got, err = parseNewSessionRequest(tmp + " --beacon gpu --beacon-isolation exclusive -- inspect beacon build")
+	if err != nil {
+		t.Fatalf("parse beacon directory request: %v", err)
+	}
+	if got.WorkDir != tmp || got.Title != "inspect beacon build" || got.BeaconProfile != "gpu" || got.BeaconIsolation != "exclusive" {
+		t.Fatalf("beacon directory request parsed as %#v", got)
+	}
+
+	got, err = parseNewSessionRequest("--beacon gpu --beacon-isolation shared")
+	if err != nil {
+		t.Fatalf("parse beacon selected-workspace request: %v", err)
+	}
+	if got.WorkDir != "" || got.Title != "" || got.BeaconProfile != "gpu" || got.BeaconIsolation != "shared" {
+		t.Fatalf("beacon selected-workspace request parsed as %#v", got)
+	}
+
+	if _, err = parseNewSessionRequest(tmp + " --beacon"); err == nil {
+		t.Fatal("missing beacon profile should fail")
+	}
+
 	got, err = parseNewSessionRequest("")
 	if err != nil {
 		t.Fatalf("empty request should be resolved by selected workspace later: %v", err)
