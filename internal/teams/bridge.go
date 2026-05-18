@@ -1664,7 +1664,7 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if looksLikeRenderedHelperOrCodexOutputPlainText(plainText) || looksLikeRenderedUserTranscriptEchoMessage(msg, plainText) {
+	if looksLikeRenderedHelperOutputMessage(msg, plainText) || looksLikeRenderedHelperOrCodexOutputPlainText(plainText) || looksLikeRenderedUserTranscriptEchoMessage(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
@@ -1766,6 +1766,14 @@ func looksLikeRenderedOutboxPlainText(text string) bool {
 func looksLikeRenderedHelperOutputPlainText(text string) bool {
 	text = strings.TrimSpace(text)
 	return strings.HasPrefix(text, "🔧 Helper:") || strings.HasPrefix(text, "Helper:")
+}
+
+func looksLikeRenderedHelperOutputMessage(msg ChatMessage, text string) bool {
+	if !looksLikeRenderedHelperOutputPlainText(text) {
+		return false
+	}
+	return teamsHTMLFirstTextIsStrongLabel(msg.Body.Content, "🔧 Helper") ||
+		teamsHTMLFirstTextIsStrongLabel(msg.Body.Content, "Helper")
 }
 
 func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
@@ -4798,15 +4806,15 @@ func (b *Bridge) queueTeamsPromptBlockedAckForMessage(ctx context.Context, sessi
 
 func (b *Bridge) formatBlockedTeamsPromptAck(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) string {
 	reason := blockedAckReason(gate)
-	ahead := b.requestAheadSummary(ctx, session, gate)
-	return strings.Join([]string{
+	lines := []string{
 		"⚠️ **Your request is queued.**",
 		reason,
 		"",
 		"---",
 		"",
-		"**Request ahead of you:**",
-		ahead,
+	}
+	lines = append(lines, b.sessionTurnQueueSnapshotLines(ctx, session, gate)...)
+	lines = append(lines,
 		"",
 		"---",
 		"",
@@ -4815,7 +4823,8 @@ func (b *Bridge) formatBlockedTeamsPromptAck(ctx context.Context, session *Sessi
 		"- Need it immediately: send it in a different 💬 Work chat.",
 		"- Drop this queued request: `helper cancel last`.",
 		"- Interrupt the request ahead only if it looks stuck: open the 🏠 Control chat and send `helper restart force`.",
-	}, "\n")
+	)
+	return strings.Join(lines, "\n")
 }
 
 func blockedAckReason(gate localCodexBeforeTeamsGate) string {
@@ -4838,17 +4847,7 @@ func blockedAckReason(gate localCodexBeforeTeamsGate) string {
 	}
 }
 
-func (b *Bridge) requestAheadSummary(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) string {
-	if b != nil && b.store != nil && session != nil {
-		if state, err := b.store.Load(ctx); err == nil {
-			if turn, ok := runningTurnForSessionState(state, session.ID); ok {
-				if summary := turnPromptSummary(state, turn); summary != "" {
-					return summary
-				}
-				return "A Teams Codex request is running, but its original prompt is not available."
-			}
-		}
-	}
+func requestAheadFallbackSummary(gate localCodexBeforeTeamsGate) string {
 	text := strings.TrimSpace(gate.AckBody)
 	switch {
 	case strings.Contains(text, "active in the CLI"):
@@ -4866,21 +4865,78 @@ func (b *Bridge) requestAheadSummary(ctx context.Context, session *Session, gate
 	}
 }
 
-func runningTurnForSessionState(state teamstore.State, sessionID string) (teamstore.Turn, bool) {
+func (b *Bridge) sessionTurnQueueSnapshotLines(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) []string {
+	fallback := requestAheadFallbackSummary(gate)
+	if b != nil && b.store != nil && session != nil {
+		if state, err := b.store.Load(ctx); err == nil {
+			if lines := formatSessionTurnQueueSnapshot(state, session.ID, fallback); len(lines) > 0 {
+				return lines
+			}
+		}
+	}
+	return []string{"**Currently blocking:**", fallback}
+}
+
+func formatSessionTurnQueueSnapshot(state teamstore.State, sessionID string, blockingFallback string) []string {
+	var lines []string
+	running := runningTurnsForSessionState(state, sessionID)
+	queued := queuedTurnsForSessionState(state, sessionID)
+	if len(running) > 0 {
+		lines = append(lines, "**Running now:**")
+		lines = append(lines, formatTurnPromptList(state, running)...)
+	} else if strings.TrimSpace(blockingFallback) != "" {
+		lines = append(lines, "**Currently blocking:**", strings.TrimSpace(blockingFallback))
+	}
+	if len(queued) > 0 {
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, "**Queued requests:**")
+		lines = append(lines, formatTurnPromptList(state, queued)...)
+	}
+	return lines
+}
+
+func runningTurnsForSessionState(state teamstore.State, sessionID string) []teamstore.Turn {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return teamstore.Turn{}, false
+		return nil
 	}
-	var out teamstore.Turn
+	var turns []teamstore.Turn
 	for _, turn := range state.Turns {
-		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusRunning {
-			continue
-		}
-		if out.ID == "" || turnSortTime(turn).After(turnSortTime(out)) {
-			out = turn
+		if turn.SessionID == sessionID && turn.Status == teamstore.TurnStatusRunning {
+			turns = append(turns, turn)
 		}
 	}
-	return out, out.ID != ""
+	sort.SliceStable(turns, func(i, j int) bool {
+		if !turnSortTime(turns[i]).Equal(turnSortTime(turns[j])) {
+			return turnSortTime(turns[i]).Before(turnSortTime(turns[j]))
+		}
+		return turns[i].ID < turns[j].ID
+	})
+	return turns
+}
+
+func queuedTurnsForSessionState(state teamstore.State, sessionID string) []teamstore.Turn {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	var turns []teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID == sessionID && turn.Status == teamstore.TurnStatusQueued {
+			turns = append(turns, turn)
+		}
+	}
+	sort.SliceStable(turns, func(i, j int) bool {
+		left := queuedTurnAgeBaseTime(turns[i])
+		right := queuedTurnAgeBaseTime(turns[j])
+		if !left.Equal(right) {
+			return left.Before(right)
+		}
+		return turns[i].ID < turns[j].ID
+	})
+	return turns
 }
 
 func sessionHasQueuedOrRunningTurnState(state teamstore.State, sessionID string) bool {
@@ -5314,6 +5370,9 @@ func (b *Bridge) sendQueuedTurnAttentionIfDue(ctx context.Context, session *Sess
 		"Your Teams message is queued and will run after this clears.",
 		"If this looks stale, send `helper status` here. To drop the queued message, send `helper cancel last`.",
 	}, "\n")
+	if queueLines := b.sessionTurnQueueSnapshotLines(ctx, session, gate); len(queueLines) > 0 {
+		body += "\n\n---\n\n" + strings.Join(queueLines, "\n")
+	}
 	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:          fmt.Sprintf("outbox:%s:queued-wait:%d", turn.ID, bucket),
 		SessionID:   session.ID,
@@ -5813,19 +5872,17 @@ func formatCancelAllResponse(state teamstore.State, canceledQueued []teamstore.T
 }
 
 func formatRemainingQueuedPrompts(state teamstore.State, sessionID string, exclude map[string]bool) []string {
-	var queued []teamstore.Turn
-	for _, turn := range state.Turns {
-		if turn.SessionID != sessionID || turn.Status != teamstore.TurnStatusQueued || exclude[turn.ID] {
-			continue
+	queued := queuedTurnsForSessionState(state, sessionID)
+	if len(exclude) > 0 {
+		filtered := queued[:0]
+		for _, turn := range queued {
+			if exclude[turn.ID] {
+				continue
+			}
+			filtered = append(filtered, turn)
 		}
-		queued = append(queued, turn)
+		queued = filtered
 	}
-	sort.SliceStable(queued, func(i, j int) bool {
-		if !turnSortTime(queued[i]).Equal(turnSortTime(queued[j])) {
-			return turnSortTime(queued[i]).Before(turnSortTime(queued[j]))
-		}
-		return queued[i].ID < queued[j].ID
-	})
 	if len(queued) == 0 {
 		return []string{"No other prompts are queued."}
 	}
@@ -6835,7 +6892,7 @@ func (b *Bridge) formatQueuedTurnStartNotice(ctx context.Context, sessionID stri
 	if current == "" {
 		current = "Queued request `" + shortenTeamsLine(claimed.ID, 80) + "`"
 	}
-	remaining := remainingQueuedTurnSummariesForSessionState(state, sessionID)
+	remaining := queuedTurnsForSessionState(state, sessionID)
 	lines := []string{
 		"▶️ **Codex is starting this queued request.**",
 		"",
@@ -6849,41 +6906,9 @@ func (b *Bridge) formatQueuedTurnStartNotice(ctx context.Context, sessionID stri
 	if len(remaining) == 0 {
 		lines = append(lines, "No other queued requests.")
 	} else {
-		for _, summary := range remaining {
-			lines = append(lines, "- "+summary)
-		}
+		lines = append(lines, formatTurnPromptList(state, remaining)...)
 	}
 	return strings.Join(lines, "\n"), true, nil
-}
-
-func remainingQueuedTurnSummariesForSessionState(state teamstore.State, sessionID string) []string {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return nil
-	}
-	var turns []teamstore.Turn
-	for _, turn := range state.Turns {
-		if turn.SessionID == sessionID && turn.Status == teamstore.TurnStatusQueued {
-			turns = append(turns, turn)
-		}
-	}
-	sort.Slice(turns, func(i, j int) bool {
-		left := queuedTurnAgeBaseTime(turns[i])
-		right := queuedTurnAgeBaseTime(turns[j])
-		if !left.Equal(right) {
-			return left.Before(right)
-		}
-		return turns[i].ID < turns[j].ID
-	})
-	out := make([]string, 0, len(turns))
-	for _, turn := range turns {
-		summary := turnPromptSummary(state, turn)
-		if summary == "" {
-			summary = "Queued request `" + shortenTeamsLine(turn.ID, 80) + "`"
-		}
-		out = append(out, summary)
-	}
-	return out
 }
 
 func (b *Bridge) runClaimedQueuedTurn(ctx context.Context, session *Session, claimed teamstore.Turn, preferredTurnID string, preferred queuedTurnRunner) error {

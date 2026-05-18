@@ -804,8 +804,10 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 	for _, want := range []string{
 		"Codex is working. Request accepted.",
 		"⚠️ Your request is queued.",
-		"Request ahead of you:",
+		"Running now:",
+		"Queued requests:",
 		"first prompt",
+		"second prompt",
 		"helper cancel last",
 		"🤖 ✅ Codex answer:\ndone 1",
 		"🤖 ✅ Codex answer:\ndone 2",
@@ -1255,6 +1257,19 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 	if got := strings.Count(joined, "Your request is queued."); got != 2 {
 		t.Fatalf("queued notice count = %d, want 2 for two distinct queued Teams messages in:\n%s", got, joined)
 	}
+	requirePlainTextInOrder(t, joined,
+		"Your request is queued.",
+		"Running now:",
+		"first prompt",
+		"Queued requests:",
+		"second prompt",
+		"Your request is queued.",
+		"Running now:",
+		"first prompt",
+		"Queued requests:",
+		"second prompt",
+		"third prompt",
+	)
 
 	executor.release <- struct{}{}
 	select {
@@ -7164,6 +7179,91 @@ func TestLatestCancelableTurnIDPrefersRunningOverQueued(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionTurnQueueSnapshotListsRunningAndQueuedInExecutionOrder(t *testing.T) {
+	base := time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC)
+	state := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			"inbound:running-newer": {ID: "inbound:running-newer", Text: "running newer prompt"},
+			"inbound:running-older": {ID: "inbound:running-older", Text: "running older prompt"},
+			"inbound:queued-first":  {ID: "inbound:queued-first", Text: "queued first prompt"},
+			"inbound:queued-second": {ID: "inbound:queued-second", Text: "queued second prompt"},
+			"inbound:other-session": {ID: "inbound:other-session", Text: "other session prompt"},
+		},
+		Turns: map[string]teamstore.Turn{
+			"turn:running-newer": {
+				ID:             "turn:running-newer",
+				SessionID:      "s001",
+				InboundEventID: "inbound:running-newer",
+				Status:         teamstore.TurnStatusRunning,
+				StartedAt:      base.Add(2 * time.Minute),
+			},
+			"turn:running-older": {
+				ID:             "turn:running-older",
+				SessionID:      "s001",
+				InboundEventID: "inbound:running-older",
+				Status:         teamstore.TurnStatusRunning,
+				StartedAt:      base.Add(time.Minute),
+			},
+			"turn:queued-second": {
+				ID:             "turn:queued-second",
+				SessionID:      "s001",
+				InboundEventID: "inbound:queued-second",
+				Status:         teamstore.TurnStatusQueued,
+				QueuedAt:       base.Add(4 * time.Minute),
+			},
+			"turn:queued-first": {
+				ID:             "turn:queued-first",
+				SessionID:      "s001",
+				InboundEventID: "inbound:queued-first",
+				Status:         teamstore.TurnStatusQueued,
+				QueuedAt:       base.Add(3 * time.Minute),
+			},
+			"turn:other-session": {
+				ID:             "turn:other-session",
+				SessionID:      "s002",
+				InboundEventID: "inbound:other-session",
+				Status:         teamstore.TurnStatusQueued,
+				QueuedAt:       base,
+			},
+		},
+	}
+
+	joined := strings.Join(formatSessionTurnQueueSnapshot(state, "s001", "fallback blocker"), "\n")
+	requirePlainTextInOrder(t, joined,
+		"Running now:",
+		"running older prompt",
+		"running newer prompt",
+		"Queued requests:",
+		"queued first prompt",
+		"queued second prompt",
+	)
+	if strings.Contains(joined, "fallback blocker") {
+		t.Fatalf("snapshot used fallback even though running turns are known:\n%s", joined)
+	}
+	if strings.Contains(joined, "other session prompt") {
+		t.Fatalf("snapshot leaked another session queue:\n%s", joined)
+	}
+
+	for id, turn := range state.Turns {
+		if turn.Status == teamstore.TurnStatusRunning {
+			turn.Status = teamstore.TurnStatusCompleted
+			turn.CompletedAt = turn.StartedAt.Add(time.Minute)
+			state.Turns[id] = turn
+		}
+	}
+	joined = strings.Join(formatSessionTurnQueueSnapshot(state, "s001", "local CLI blocker"), "\n")
+	requirePlainTextInOrder(t, joined,
+		"Currently blocking:",
+		"local CLI blocker",
+		"Queued requests:",
+		"queued first prompt",
+		"queued second prompt",
+	)
+	if strings.Contains(joined, "running older prompt") || strings.Contains(joined, "running newer prompt") {
+		t.Fatalf("snapshot listed completed running turns:\n%s", joined)
+	}
+}
+
 func TestBridgeSessionRetryFailedTurnFetchesOriginalMessage(t *testing.T) {
 	graph, sent := newBridgeRetryGraph(t, bridgePollMessage("original-1", "2026-04-30T01:00:00Z", "retry prompt"))
 	store := newBridgeTestStore(t)
@@ -8756,6 +8856,39 @@ func TestBridgePollDropsRenderedHelperOrCodexOutputWithoutDurableMatch(t *testin
 	}
 }
 
+func TestBridgePollDropsRenderedHelperLabelOutputInWorkChat(t *testing.T) {
+	msg := bridgePollMessage("stale-helper-cancel", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = "<p><strong>🔧 Helper:</strong></p><p>Codex request canceled.</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled rendered helper label output as inbound prompt: %#v", handled)
+	}
+	if !bridge.reg.HasSent("chat-1", "stale-helper-cancel") {
+		t.Fatal("ignored rendered helper label output was not marked sent")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
 func TestBridgePollDropsRenderedUserTranscriptEchoWithoutDurableMatch(t *testing.T) {
 	msg := bridgePollMessage("stale-user-transcript", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = "<p><strong>🧑‍💻 User:</strong></p><p>run the same request once</p>"
@@ -9020,7 +9153,7 @@ func TestBridgePollAllowsCodexPrefixedUserMessageWithAttachment(t *testing.T) {
 
 func TestBridgePollAllowsOwnerMessageStartingWithHelperPrefix(t *testing.T) {
 	msg := bridgePollMessage("owner-helper-prefixed-question", "2026-04-30T01:05:00Z", "")
-	msg.Body.Content = "<p><strong>🔧 Helper:</strong><br>artifact manifest rejected; what should I do?</p>"
+	msg.Body.Content = "<p>🔧 Helper:<br>artifact manifest rejected; what should I do?</p>"
 	graph := newBridgePollGraph(t, []bridgePollPage{{
 		messages: []ChatMessage{msg},
 	}})
@@ -14555,7 +14688,12 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	case <-time.After(50 * time.Millisecond):
 	}
 	activeAck := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if len(*sent) != 1 || !strings.Contains(activeAck, "Your request is queued") || !strings.Contains(activeAck, "Local Codex CLI request") || strings.Contains(activeAck, "Request ahead of you:\nteams prompt during local") {
+	if len(*sent) != 1 ||
+		!strings.Contains(activeAck, "Your request is queued") ||
+		!strings.Contains(activeAck, "Currently blocking:") ||
+		!strings.Contains(activeAck, "Local Codex CLI request") ||
+		!strings.Contains(activeAck, "Queued requests:") ||
+		!strings.Contains(activeAck, "teams prompt during local") {
 		t.Fatalf("active local CLI ack = %#v, want one clear queued notice", *sent)
 	}
 	secondMsg := bridgePollMessage("teams-during-local-second", "2026-05-03T01:01:05Z", "second teams prompt during local")
@@ -14564,6 +14702,12 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	}
 	if len(*sent) != 2 {
 		t.Fatalf("queued local-active prompts sent %d ack messages, want 2", len(*sent))
+	}
+	secondAck := PlainTextFromTeamsHTML((*sent)[1].Content)
+	for _, want := range []string{"Queued requests:", "teams prompt during local", "second teams prompt during local"} {
+		if !strings.Contains(secondAck, want) {
+			t.Fatalf("second local-active ack missing %q:\n%s", want, secondAck)
+		}
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -14747,6 +14891,10 @@ func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
 	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "teams prompt during local"); err != nil {
 		t.Fatalf("handleSessionMessage while local active error: %v", err)
 	}
+	secondMsg := bridgePollMessage("teams-during-local-second", "2026-05-03T01:01:05Z", "second teams prompt during local")
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, secondMsg, "second teams prompt during local"); err != nil {
+		t.Fatalf("second handleSessionMessage while local active error: %v", err)
+	}
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
 		for id, turn := range state.Turns {
 			if turn.SessionID == session.ID && turn.Status == teamstore.TurnStatusQueued {
@@ -14776,7 +14924,7 @@ func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
 	if got := strings.Count(joined, "Still waiting"); got != 1 {
 		t.Fatalf("queued wait reminder count = %d, want one in:\n%s", got, joined)
 	}
-	for _, want := range []string{"Local Codex is still active for this chat", "helper cancel last"} {
+	for _, want := range []string{"Local Codex is still active for this chat", "helper cancel last", "Queued requests:", "teams prompt during local", "second teams prompt during local"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("queued wait reminder missing %q in:\n%s", want, joined)
 		}
@@ -15351,7 +15499,12 @@ func TestBridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	toolAck := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if len(*sent) != 1 || !strings.Contains(toolAck, "Your request is queued") || !strings.Contains(toolAck, "Local Codex CLI request") || strings.Contains(toolAck, "Request ahead of you:\nteams prompt during tool") {
+	if len(*sent) != 1 ||
+		!strings.Contains(toolAck, "Your request is queued") ||
+		!strings.Contains(toolAck, "Currently blocking:") ||
+		!strings.Contains(toolAck, "Local Codex CLI request") ||
+		!strings.Contains(toolAck, "Queued requests:") ||
+		!strings.Contains(toolAck, "teams prompt during tool") {
 		t.Fatalf("tool-only active ack = %#v", *sent)
 	}
 
