@@ -781,6 +781,9 @@ func defaultLoadBeaconUpgradeBlockers(op beacon.UpgradeOperation, codexTargetSig
 			Detail: err.Error(),
 		}}
 	}
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_ = beacon.RefreshKnownProviderAllocationsOutsideLock(refreshCtx, store, beacon.NewCommandProviderAdapterFromEnv(nil), time.Now())
+	cancel()
 	st, err := store.Load()
 	if err != nil {
 		return []teamsstore.UpgradeBlocker{{

@@ -917,6 +917,68 @@ func TestUpgradeCmdBlocksOnActiveBeaconJobWithoutTeamsStore(t *testing.T) {
 	}
 }
 
+func TestUpgradeCmdReconcilesGoneBeaconAllocationBeforeBlocking(t *testing.T) {
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+	t.Setenv(beacon.BeaconSlurmQueryCommandEnv, writeBeaconCLIProviderFixture(t, `durable_negative=true reason=gone`))
+	seedBeaconStateForUpgradeTest(t, func(st *beacon.State) {
+		st.Allocations["req-stale"] = beacon.AllocationRequest{
+			ID:               "req-stale",
+			ConversationID:   "s001",
+			TurnID:           "turn-stale",
+			Profile:          "fgx_dev",
+			Provider:         beacon.ProviderSlurm,
+			State:            beacon.AllocationRunning,
+			ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "1683928"},
+			Target:           beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "fgx_dev", ProviderJobID: "1683928"},
+			SubmitAttempts:   1,
+		}
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	updated := false
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		updated = true
+		return update.ApplyResult{Version: "1.2.3"}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("stale gone allocation should be reconciled before upgrade blocking: %v", err)
+	}
+	if !updated {
+		t.Fatal("performUpdate was not called after stale beacon allocation was reconciled")
+	}
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon.NewStore: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	req := st.Allocations["req-stale"]
+	if req.State != beacon.AllocationRequestPersisted ||
+		req.ProviderIdentity.ProviderJobID != "" ||
+		req.Target.ProviderJobID != "" ||
+		req.ReplacementID != "1683928" {
+		t.Fatalf("stale provider job was not cleared for replacement: %#v", req)
+	}
+	if blockers := beacon.UpgradeBlockersForState(st, beacon.UpgradePendingReplacement, ""); len(blockers) != 0 {
+		t.Fatalf("stale gone allocation should not block helper upgrade after refresh, got %#v", blockers)
+	}
+}
+
 func TestUpgradeCmdBlocksOnUnreadableBeaconState(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)

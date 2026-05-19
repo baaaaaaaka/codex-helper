@@ -876,6 +876,12 @@ func TestUpgradeBlockersForStateIncludesActiveAllocations(t *testing.T) {
 					ProviderJobID: "slurm-1",
 				},
 			},
+			"req-persisted": {
+				ID:        "req-persisted",
+				State:     AllocationRequestPersisted,
+				Profile:   "gpu",
+				Execution: ExecutionSignature{Hash: "sig-gpu"},
+			},
 			"req-canceled": {ID: "req-canceled", State: AllocationCanceled, Execution: ExecutionSignature{Hash: "sig-gpu"}},
 			"req-other":    {ID: "req-other", State: AllocationSubmitted, Execution: ExecutionSignature{Hash: "sig-other"}},
 		},
@@ -884,8 +890,10 @@ func TestUpgradeBlockersForStateIncludesActiveAllocations(t *testing.T) {
 	if !hasUpgradeBlocker(blockers, "beacon_allocation", "req-active") {
 		t.Fatalf("target upgrade should block matching active allocation, got %#v", blockers)
 	}
-	if hasUpgradeBlocker(blockers, "beacon_allocation", "req-canceled") || hasUpgradeBlocker(blockers, "beacon_allocation", "req-other") {
-		t.Fatalf("target upgrade should ignore canceled and other-target allocations, got %#v", blockers)
+	if hasUpgradeBlocker(blockers, "beacon_allocation", "req-canceled") ||
+		hasUpgradeBlocker(blockers, "beacon_allocation", "req-other") ||
+		hasUpgradeBlocker(blockers, "beacon_allocation", "req-persisted") {
+		t.Fatalf("target upgrade should ignore canceled, other-target, and no-resource allocations, got %#v", blockers)
 	}
 	if !strings.Contains(blockers[0].Detail, "renew_epoch=2") || !strings.Contains(blockers[0].Detail, "replacement=req-replacement") {
 		t.Fatalf("allocation blocker should expose renewal/replacement detail, got %#v", blockers)

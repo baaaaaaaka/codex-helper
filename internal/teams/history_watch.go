@@ -49,6 +49,7 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	if err != nil {
 		return err
 	}
+	recentSet := historyWatchPathSet(recent)
 	paths = append(paths, recent...)
 	if reconcile {
 		reconciled, err := b.historyWatchReconcilePaths(ctx)
@@ -57,6 +58,18 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 				return err
 			}
 		} else {
+			if initialized {
+				baseline := historyWatchMissingNonRecentPaths(reconciled, recentSet, state)
+				if len(baseline) > 0 {
+					if err := b.baselineCodexHistoryWatch(ctx, baseline, now); err != nil {
+						return err
+					}
+					state, err = b.store.Load(ctx)
+					if err != nil {
+						return err
+					}
+				}
+			}
 			paths = append(paths, reconciled...)
 		}
 	}
@@ -102,6 +115,31 @@ func historyWatchPathsFromState(state teamstore.State) []string {
 		if strings.TrimSpace(checkpoint.Path) != "" {
 			out = append(out, checkpoint.Path)
 		}
+	}
+	return out
+}
+
+func historyWatchPathSet(paths []string) map[string]bool {
+	out := make(map[string]bool, len(paths))
+	for _, path := range uniqueSortedCleanPaths(paths) {
+		out[path] = true
+	}
+	return out
+}
+
+func historyWatchMissingNonRecentPaths(paths []string, recent map[string]bool, state teamstore.State) []string {
+	known := make(map[string]bool, len(state.HistoryWatch))
+	for _, checkpoint := range state.HistoryWatch {
+		if path := cleanComparablePath(checkpoint.Path); path != "" {
+			known[path] = true
+		}
+	}
+	var out []string
+	for _, path := range uniqueSortedCleanPaths(paths) {
+		if path == "" || recent[path] || known[path] {
+			continue
+		}
+		out = append(out, path)
 	}
 	return out
 }
@@ -329,6 +367,7 @@ func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path strin
 		ChatCreatedNotification:         false,
 		ChatCreatedNoticeAfterImport:    true,
 		LocalSessionStartedNotification: true,
+		BackgroundImport:                true,
 	})
 	if err != nil {
 		return false, false, err
@@ -441,6 +480,7 @@ func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, fina
 	}
 	_, err = b.publishCodexSessionLocalWithOptions(ctx, local, project, publishCodexSessionOptions{
 		ChatCreatedNotification: !b.workflowUserAttentionAvailable(ctx),
+		BackgroundImport:        true,
 	})
 	if err != nil {
 		return false, err

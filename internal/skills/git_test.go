@@ -40,6 +40,32 @@ func TestGitErrorScrubsURLSecrets(t *testing.T) {
 	}
 }
 
+func TestAuthHintGitLabSSHIncludesPortAndMissingUserNote(t *testing.T) {
+	hint := authHint(Source{
+		Provider:  "gitlab",
+		RemoteURL: "ssh://gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git",
+	})
+	if !strings.Contains(hint, "`ssh -T -p 12051 git@gitlab-master.nvidia.com`") {
+		t.Fatalf("auth hint missing port-aware SSH check:\n%s", hint)
+	}
+	if !strings.Contains(hint, "SSH URL has no user") {
+		t.Fatalf("auth hint missing no-user diagnosis:\n%s", hint)
+	}
+}
+
+func TestAuthHintSSHKeepsExplicitUser(t *testing.T) {
+	hint := authHint(Source{
+		Provider:  "gitlab",
+		RemoteURL: "ssh://deploy@gitlab.example.com:2222/acme/skills.git",
+	})
+	if !strings.Contains(hint, "`ssh -T -p 2222 deploy@gitlab.example.com`") {
+		t.Fatalf("auth hint missing explicit SSH user:\n%s", hint)
+	}
+	if strings.Contains(hint, "SSH URL has no user") {
+		t.Fatalf("auth hint incorrectly reported missing user:\n%s", hint)
+	}
+}
+
 type errGitExitForTest struct{}
 
 func (errGitExitForTest) Error() string { return "exit status 128" }

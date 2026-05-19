@@ -6135,15 +6135,15 @@ func TestBridgeImportTranscriptDedupesNonAdjacentAssistantStatusEcho(t *testing.
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	session := bridge.reg.Sessions[0]
 
-	lastRecordID, _, stats, err := bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import:"+session.ID, "import", transcriptCheckpointID(session.ID))
+	result, err := bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import:"+session.ID, "import", transcriptCheckpointID(session.ID), transcriptImportRunOptions{})
 	if err != nil {
 		t.Fatalf("import transcript records: %v", err)
 	}
-	if lastRecordID != "a2" {
-		t.Fatalf("lastRecordID = %q, want a2", lastRecordID)
+	if result.LastRecordID != "a2" || !result.Complete {
+		t.Fatalf("import result = %#v, want complete at a2", result)
 	}
-	if stats.Total != 6 || stats.Imported != 5 {
-		t.Fatalf("stats = %#v, want total 6 imported 5", stats)
+	if result.Stats.Total != 6 || result.Stats.Imported != 5 {
+		t.Fatalf("stats = %#v, want total 6 imported 5", result.Stats)
 	}
 	var imported []string
 	for _, msg := range *sent {
@@ -6184,15 +6184,15 @@ func TestBridgeImportTranscriptBatchesVisibleHistoryRecords(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	session := bridge.reg.Sessions[0]
 
-	lastRecordID, _, stats, err := bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import:"+session.ID, "import", transcriptCheckpointID(session.ID))
+	result, err := bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import:"+session.ID, "import", transcriptCheckpointID(session.ID), transcriptImportRunOptions{})
 	if err != nil {
 		t.Fatalf("import transcript records: %v", err)
 	}
-	if lastRecordID != "a-12" {
-		t.Fatalf("lastRecordID = %q, want a-12", lastRecordID)
+	if result.LastRecordID != "a-12" || !result.Complete {
+		t.Fatalf("import result = %#v, want complete at a-12", result)
 	}
-	if stats.Total != 48 || stats.Imported != 36 || stats.SkippedBackground != 12 {
-		t.Fatalf("stats = %#v, want total 48 imported 36 skipped 12", stats)
+	if result.Stats.Total != 48 || result.Stats.Imported != 36 || result.Stats.SkippedBackground != 12 {
+		t.Fatalf("stats = %#v, want total 48 imported 36 skipped 12", result.Stats)
 	}
 	if len(*sent) >= 36 {
 		t.Fatalf("history import sent %d Teams messages, want visible records batched below 36", len(*sent))
@@ -6229,6 +6229,52 @@ func TestBridgeImportTranscriptBatchesVisibleHistoryRecords(t *testing.T) {
 	}
 	if renderOutboxHTML(batchOutbox) != batchOutbox.Body {
 		t.Fatal("import batch outbox should render its pre-rendered safe HTML body directly")
+	}
+}
+
+func TestBridgeBackgroundImportQueuesOneBatchAndResumesLater(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-budgeted-import"}}`,
+		`{"id":"a1","thread_id":"thread-budgeted-import","role":"assistant","text":` + strconv.Quote(strings.Repeat("first budgeted answer ", 1400)) + `}`,
+		`{"id":"a2","thread_id":"thread-budgeted-import","role":"assistant","text":"second budgeted answer"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	session.CodexThreadID = "thread-budgeted-import"
+	bridge.reg.Sessions[0] = session
+	if err := bridge.ensureDurableSession(context.Background(), &session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+	local := codexhistory.Session{SessionID: "thread-budgeted-import", ProjectPath: session.Cwd, FilePath: transcriptPath}
+
+	if err := bridge.importCodexTranscriptToTeamsWithOptions(context.Background(), session, local, transcriptImportRunOptions{QueueOnly: true, MaxBatches: 1}); err != nil {
+		t.Fatalf("background import: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("background import should queue without sending, sent=%#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a1" || !strings.HasPrefix(checkpoint.ImportTurnID, "import-bg:") {
+		t.Fatalf("checkpoint after first budgeted batch = %#v, want paused complete at a1", checkpoint)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("resume budgeted import: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if !sentPlainContains(*sent, "second budgeted answer") || !sentPlainContains(*sent, "Import complete") {
+		t.Fatalf("resumed background import missing final content: %#v", *sent)
 	}
 }
 
@@ -14161,6 +14207,7 @@ func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) 
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
 		t.Fatalf("second history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if bridge.reg.SessionByCodexThreadID("thread-watch") == nil {
 		t.Fatal("history watch final did not publish a linked Teams session")
 	}
@@ -14243,6 +14290,7 @@ func TestBridgeHistoryWatchPublishesLocalSessionBeforeFinalAnswer(t *testing.T) 
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
 		t.Fatalf("user-only history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if bridge.reg.SessionByCodexThreadID("thread-local-start") == nil {
 		t.Fatal("history watch did not publish a Work chat for a new local user prompt")
 	}
@@ -14265,6 +14313,7 @@ func TestBridgeHistoryWatchPublishesLocalSessionBeforeFinalAnswer(t *testing.T) 
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(20*time.Second), false); err != nil {
 		t.Fatalf("final history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	joined = sentPlainJoined(*sent)
 	if !strings.Contains(joined, "final after early local start") {
 		t.Fatalf("linked transcript sync did not import final answer:\n%s", joined)
@@ -14321,6 +14370,7 @@ func TestBridgeHistoryWatchSendsWorkflowCardForDetectedFinal(t *testing.T) {
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
 		t.Fatalf("history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	seenMu.Lock()
 	seenCount := len(seen)
 	var firstSeen map[string]any
@@ -14379,6 +14429,7 @@ func TestBridgeHistoryWatchDiscoversNewRecentFileWithoutFullReconcile(t *testing
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
 		t.Fatalf("recent-file history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if bridge.reg.SessionByCodexThreadID("thread-new") == nil {
 		t.Fatal("history watch did not publish a new recent transcript without full reconcile")
 	}
@@ -14432,6 +14483,7 @@ func TestBridgeHistoryWatchPersistsPendingAssistantAcrossPolls(t *testing.T) {
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(20*time.Second), false); err != nil {
 		t.Fatalf("terminal history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if bridge.reg.SessionByCodexThreadID("thread-pending") == nil {
 		t.Fatal("history watch did not publish final after terminal arrived in a later poll")
 	}
@@ -14491,6 +14543,7 @@ func TestBridgeHistoryWatchPublishLookupUsesScopedCodexHome(t *testing.T) {
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
 		t.Fatalf("scoped history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if bridge.reg.SessionByCodexThreadID("thread-scoped") == nil {
 		t.Fatalf("history watch did not publish scoped Codex home session; discover roots=%#v", roots)
 	}
@@ -14532,6 +14585,13 @@ func TestBridgeHistoryWatchFallsBackForLargeTail(t *testing.T) {
 	}
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
 		t.Fatalf("large-tail history watch sync error: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if !sentPlainContains(*sent, "large tail final") {
+		if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+			t.Fatalf("large-tail linked transcript resume error: %v", err)
+		}
+		flushBridgeQueuedNotificationsForTest(t, bridge)
 	}
 	if bridge.reg.SessionByCodexThreadID("thread-large-tail") == nil {
 		t.Fatal("history watch did not publish final after large tail fallback")
@@ -14604,6 +14664,60 @@ func TestBridgeHistoryWatchDoesNotMarkReadyWhenInitialReconcileFails(t *testing.
 	}
 }
 
+func TestBridgeHistoryWatchReconcileBaselinesMissingOldSessions(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	oldPath := filepath.Join(codexRoot, "sessions", "2026", "04", "01", "rollout-2026-04-01T09-00-00-thread-old-reconcile.jsonl")
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0o700); err != nil {
+		t.Fatalf("mkdir old transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-old-reconcile"}}` + "\n" +
+		`{"thread_id":"thread-old-reconcile","turn_id":"turn-1","id":"u1","role":"user","text":"old prompt should not import"}` + "\n" +
+		`{"thread_id":"thread-old-reconcile","turn_id":"turn-1","id":"a1","role":"assistant","text":"old final should not import"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-old-reconcile","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(oldPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write old transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-old-reconcile", oldPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Hour)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("reconcile history watch sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("old reconciled history should be baselined, sent=%#v", *sent)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-old-reconcile") != nil {
+		t.Fatal("old reconciled history was published as a Work chat")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	info, err := os.Stat(oldPath)
+	if err != nil {
+		t.Fatalf("stat old transcript: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.Path != oldPath || checkpoint.Offset != info.Size() || checkpoint.Size != info.Size() {
+			t.Fatalf("old reconciled checkpoint = %#v, want EOF for %s size %d", checkpoint, oldPath, info.Size())
+		}
+	}
+}
+
 func TestBridgeHistoryWatchDoesNotAdvanceWhenPublishTargetIsTemporarilyMissing(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
 	codexRoot := t.TempDir()
@@ -14658,6 +14772,7 @@ func TestBridgeHistoryWatchDoesNotAdvanceWhenPublishTargetIsTemporarilyMissing(t
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), false); err != nil {
 		t.Fatalf("history watch retry sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if bridge.reg.SessionByCodexThreadID("thread-late") == nil {
 		t.Fatal("history watch final was not retried after publish target became available")
 	}
@@ -14981,6 +15096,7 @@ func TestBridgeHistoryWatchDoesNotSkipLocalPromptWithSameTextAsTeamsInboundDiffe
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now, false); err != nil {
 		t.Fatalf("history watch sync error: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if bridge.reg.SessionByCodexThreadID("thread-local-same-prompt") == nil {
 		t.Fatal("history watch skipped an unrelated local Codex prompt with the same text as a Teams inbound")
 	}
@@ -16567,6 +16683,43 @@ func TestBridgeFlushPendingOutboxContinuesAfterRateLimitedChat(t *testing.T) {
 	}
 }
 
+func TestBridgeMainLoopOutboxFlushUsesSmallBudget(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	for i := 1; i <= mainLoopOutboxFlushMaxMessages+2; i++ {
+		msg := teamstore.OutboxMessage{
+			ID:          fmt.Sprintf("outbox:budget-%d", i),
+			TeamsChatID: "chat-1",
+			Kind:        "helper",
+			Body:        fmt.Sprintf("budgeted message %d", i),
+		}
+		if _, _, err := store.QueueOutbox(context.Background(), msg); err != nil {
+			t.Fatalf("QueueOutbox %d error: %v", i, err)
+		}
+	}
+
+	if err := bridge.flushPendingOutboxMainLoop(context.Background()); err != nil {
+		t.Fatalf("flushPendingOutboxMainLoop error: %v", err)
+	}
+	if len(*sent) != mainLoopOutboxFlushMaxMessages {
+		t.Fatalf("main-loop flush sent %d messages, want budget %d", len(*sent), mainLoopOutboxFlushMaxMessages)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	queued := 0
+	for _, msg := range state.OutboxMessages {
+		if msg.Status == teamstore.OutboxStatusQueued {
+			queued++
+		}
+	}
+	if queued != 2 {
+		t.Fatalf("queued messages after budgeted flush = %d, want 2", queued)
+	}
+}
+
 func TestBridgeFlushPendingOutboxContinuesOtherChatsAfterSendFailure(t *testing.T) {
 	store := newBridgeTestStore(t)
 	var sent []string
@@ -17866,6 +18019,19 @@ func requirePlainTextInOrder(t *testing.T, text string, wants ...string) {
 			t.Fatalf("missing %q after offset %d in:\n%s", want, offset, text)
 		}
 		offset += idx + len(want)
+	}
+}
+
+func flushBridgeQueuedNotificationsForTest(t *testing.T, bridge *Bridge) {
+	t.Helper()
+	if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flushPendingOutbox: %v", err)
+	}
+	if err := bridge.flushPendingWorkflowNotifications(context.Background()); err != nil {
+		t.Fatalf("flushPendingWorkflowNotifications: %v", err)
+	}
+	if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flushPendingOutbox after workflow: %v", err)
 	}
 }
 

@@ -196,15 +196,36 @@ func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswer(ctx context.Con
 	if !ok {
 		return
 	}
-	event.ID = "workflow:detected-codex-answer:" + shortStableID(session.ID+":"+sourceKey)
+	event.ID = "workflow:detected-codex-answer:" + shortStableID(session.ID)
 	event.OutboxID = ""
 	event.TurnID = ""
-	if err := b.queueUserAttentionNotification(ctx, event, ""); err != nil {
+	if err := b.queueDetectedCodexAnswerNotification(ctx, event); err != nil {
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
 		}
 		return
 	}
+}
+
+func (b *Bridge) queueDetectedCodexAnswerNotification(ctx context.Context, event WorkflowNotificationEvent) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	cfg, cfgErr := b.effectiveWorkflowNotificationConfig(state)
+	if cfgErr == nil && cfg.Enabled {
+		currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+		if workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
+			if _, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile); err == nil {
+				return b.queueWorkflowNotification(ctx, event)
+			}
+		}
+	}
+	_, err = b.queueWorkflowNotificationFallbackMentionOnly(ctx, state, event, "")
+	return err
 }
 
 func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox teamstore.OutboxMessage) (WorkflowNotificationEvent, bool, error) {
@@ -411,18 +432,29 @@ func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event Workf
 }
 
 func (b *Bridge) queueWorkflowNotificationFallbackMention(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent, reason string) error {
+	queued, err := b.queueWorkflowNotificationFallbackMentionOnly(ctx, state, event, reason)
+	if err != nil || !queued {
+		return err
+	}
+	if err := b.flushPendingOutboxForChat(ctx, workflowFallbackControlChatID(state)); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams workflow fallback send error: %v\n", err)
+	}
+	return nil
+}
+
+func (b *Bridge) queueWorkflowNotificationFallbackMentionOnly(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent, reason string) (bool, error) {
 	if b == nil || b.store == nil {
-		return nil
+		return false, nil
 	}
 	controlChatID := workflowFallbackControlChatID(state)
 	if controlChatID == "" {
-		return nil
+		return false, nil
 	}
 	body := workflowNotificationFallbackBody(event, reason)
 	if strings.TrimSpace(body) == "" {
-		return nil
+		return false, nil
 	}
-	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
+	if _, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
 		ID:               "outbox:workflow-fallback:" + shortStableID(event.ID),
 		SessionID:        controlFallbackSessionID,
 		TeamsChatID:      controlChatID,
@@ -430,7 +462,10 @@ func (b *Bridge) queueWorkflowNotificationFallbackMention(ctx context.Context, s
 		Body:             body,
 		MentionOwner:     true,
 		NotificationKind: "owner_notification",
-	})
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func workflowNotificationFallbackBody(event WorkflowNotificationEvent, reason string) string {
@@ -551,6 +586,10 @@ func (b *Bridge) queueWorkflowNotification(ctx context.Context, event WorkflowNo
 }
 
 func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
+	return b.flushPendingWorkflowNotificationsWithLimit(ctx, 0)
+}
+
+func (b *Bridge) flushPendingWorkflowNotificationsWithLimit(ctx context.Context, maxNotifications int) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
@@ -575,6 +614,7 @@ func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
 	}
 	now := time.Now()
 	var firstErr error
+	attempts := 0
 	for _, rec := range state.Notifications {
 		if rec.Status == teamstore.NotificationStatusSent || rec.Status == teamstore.NotificationStatusUnknown {
 			continue
@@ -604,11 +644,18 @@ func (b *Bridge) flushPendingWorkflowNotifications(ctx context.Context) error {
 		if !ok {
 			continue
 		}
+		attempts++
 		if err := b.sendWorkflowNotificationRecord(ctx, webhookURL, claimed); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
+			if maxNotifications > 0 && attempts >= maxNotifications {
+				break
+			}
 			continue
+		}
+		if maxNotifications > 0 && attempts >= maxNotifications {
+			break
 		}
 	}
 	return firstErr

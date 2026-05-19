@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -308,6 +309,45 @@ func TestWorkflowNotificationConcurrentFlushClaimsOnce(t *testing.T) {
 	}
 }
 
+func TestWorkflowNotificationFlushLimitSendsOneQueuedCard(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Budget webhook sends")
+
+	var calls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+	for i := 1; i <= 3; i++ {
+		if err := bridge.queueWorkflowNotification(ctx, WorkflowNotificationEvent{
+			ID:          fmt.Sprintf("workflow:budget:%d", i),
+			Kind:        "turn_completed",
+			Title:       "✅ Codex finished",
+			ChatTitle:   "💬 test-host - Budget",
+			ButtonTitle: "Open answer",
+			ButtonURL:   TeamsChatURL("chat-1", "tenant-1"),
+		}); err != nil {
+			t.Fatalf("queueWorkflowNotification %d: %v", i, err)
+		}
+	}
+
+	if err := bridge.flushPendingWorkflowNotificationsWithLimit(ctx, 1); err != nil {
+		t.Fatalf("flushPendingWorkflowNotificationsWithLimit: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("webhook calls = %d, want 1", got)
+	}
+}
+
 func TestWorkflowNotificationStaleSendingBecomesUnknown(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
@@ -606,6 +646,12 @@ func TestWorkflowNotificationSendsDetectedCodexAnswerOnce(t *testing.T) {
 	bridge.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, "codex-final-key")
 	bridge.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, "codex-final-key")
 
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("webhook calls before flush = %d, want deferred delivery", got)
+	}
+	if err := bridge.flushPendingWorkflowNotificationsWithLimit(ctx, mainLoopWorkflowFlushMaxNotifications); err != nil {
+		t.Fatalf("flushPendingWorkflowNotificationsWithLimit: %v", err)
+	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("webhook calls = %d, want 1", got)
 	}
@@ -619,7 +665,7 @@ func TestWorkflowNotificationSendsDetectedCodexAnswerOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	key := "workflow:detected-codex-answer:" + shortStableID(session.ID+":codex-final-key")
+	key := "workflow:detected-codex-answer:" + shortStableID(session.ID)
 	if rec := state.Notifications[key]; rec.Status != teamstore.NotificationStatusSent || rec.Attempts != 1 {
 		t.Fatalf("detected answer notification = %#v, want sent once", rec)
 	}

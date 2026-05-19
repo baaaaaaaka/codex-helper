@@ -45,7 +45,10 @@ const (
 	// Teams chat and delay inbound polling.
 	transcriptSyncMaxRecordsPerSessionPerCycle = 8
 	transcriptSyncMaxAutoBacklogRecords        = 80
+	transcriptImportMaxBatchesPerCycle         = 1
 	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
+	mainLoopOutboxFlushMaxMessages             = 2
+	mainLoopWorkflowFlushMaxNotifications      = 1
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
 	// body content. Split far below that to reduce Teams client rendering
@@ -70,6 +73,7 @@ var queuedTurnAttentionDelay = 10 * time.Minute
 var queuedTurnAttentionRepeatDelay = 10 * time.Minute
 
 var errTranscriptCheckpointNotFound = errors.New("transcript checkpoint was not found")
+var errTranscriptImportBudgetExhausted = errors.New("transcript import batch budget exhausted")
 
 func isTranscriptCheckpointNotFoundError(err error) bool {
 	if err == nil {
@@ -429,8 +433,17 @@ func (b *Bridge) sendChatCreatedMention(ctx context.Context, sessionID string, c
 
 func (b *Bridge) sendChatCreatedNotice(ctx context.Context, sessionID string, chatID string, text string, notify bool) error {
 	chatID = strings.TrimSpace(chatID)
+	queued, err := b.queueChatCreatedNotice(ctx, sessionID, chatID, text, notify)
+	if err != nil || !queued {
+		return err
+	}
+	return b.flushPendingOutboxForChat(ctx, chatID)
+}
+
+func (b *Bridge) queueChatCreatedNotice(ctx context.Context, sessionID string, chatID string, text string, notify bool) (bool, error) {
+	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
-		return nil
+		return false, nil
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -442,7 +455,7 @@ func (b *Bridge) sendChatCreatedNotice(ctx context.Context, sessionID string, ch
 		kind = "chat-created-silent"
 		notificationKind = ""
 	}
-	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+	if _, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
 		ID:               directOutboxID(chatID, "chat-created", text),
 		SessionID:        sessionID,
 		TeamsChatID:      chatID,
@@ -450,20 +463,32 @@ func (b *Bridge) sendChatCreatedNotice(ctx context.Context, sessionID string, ch
 		Body:             text,
 		MentionOwner:     notify,
 		NotificationKind: notificationKind,
-	})
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (b *Bridge) sendLocalSessionStartedNotice(ctx context.Context, sessionID string, chatID string) error {
 	chatID = strings.TrimSpace(chatID)
+	queued, err := b.queueLocalSessionStartedNotice(ctx, sessionID, chatID)
+	if err != nil || !queued {
+		return err
+	}
+	return b.flushPendingOutboxForChat(ctx, chatID)
+}
+
+func (b *Bridge) queueLocalSessionStartedNotice(ctx context.Context, sessionID string, chatID string) (bool, error) {
+	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
-		return nil
+		return false, nil
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	text := "Local Codex chat detected."
 	if sessionID != "" {
 		text = "Local Codex chat detected: " + sessionID + "."
 	}
-	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+	if _, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
 		ID:               directOutboxID(chatID, "local-session-started", text),
 		SessionID:        sessionID,
 		TeamsChatID:      chatID,
@@ -471,7 +496,10 @@ func (b *Bridge) sendLocalSessionStartedNotice(ctx context.Context, sessionID st
 		Body:             text,
 		MentionOwner:     true,
 		NotificationKind: "local_session_started",
-	})
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (b *Bridge) findExistingControlChat(ctx context.Context, topic string) (Chat, bool) {
@@ -663,10 +691,10 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.recordCurrentOwnerHeartbeat(ctx); err != nil {
 			return err
 		}
-		if err := b.flushPendingOutbox(ctx, "", ""); err != nil && b.out != nil {
+		if err := b.flushPendingOutboxMainLoop(ctx); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
-		if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
+		if err := b.flushPendingWorkflowNotificationsWithLimit(ctx, mainLoopWorkflowFlushMaxNotifications); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification flush error: %v\n", err)
 		}
 		if err := b.pollOnce(ctx, opts.Top); err != nil {
@@ -8396,11 +8424,15 @@ func (b *Bridge) queueAndSendOutboxChunks(ctx context.Context, sessionID string,
 }
 
 func (b *Bridge) queueAndSendOutboxChunksWithOptions(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string, opts outboxQueueOptions) error {
+	return b.queueOrSendOutboxChunks(ctx, sessionID, turnID, chatID, kind, text, opts, false)
+}
+
+func (b *Bridge) queueOrSendOutboxChunks(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string, opts outboxQueueOptions, queueOnly bool) error {
 	queued, err := b.queueOutboxChunksWithOptions(ctx, sessionID, turnID, chatID, kind, text, opts)
 	if err != nil {
 		return err
 	}
-	if len(queued) == 0 {
+	if len(queued) == 0 || queueOnly {
 		return nil
 	}
 	if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
@@ -8579,11 +8611,23 @@ func (b *Bridge) flushPendingOutbox(ctx context.Context, sessionID string, turnI
 	return b.flushPendingOutboxFiltered(ctx, sessionID, turnID, "")
 }
 
+func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
+	return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", "", outboxFlushOptions{MaxMessages: mainLoopOutboxFlushMaxMessages})
+}
+
 func (b *Bridge) flushPendingOutboxForChat(ctx context.Context, chatID string) error {
 	return b.flushPendingOutboxFiltered(ctx, "", "", chatID)
 }
 
 func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID string, turnID string, chatID string) error {
+	return b.flushPendingOutboxFilteredWithOptions(ctx, sessionID, turnID, chatID, outboxFlushOptions{})
+}
+
+type outboxFlushOptions struct {
+	MaxMessages int
+}
+
+func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sessionID string, turnID string, chatID string, opts outboxFlushOptions) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
@@ -8606,6 +8650,7 @@ func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID strin
 		})
 		var firstErr error
 		var firstBlockedErr error
+		sent := 0
 		for _, msg := range pending {
 			if chatID != "" && msg.TeamsChatID != chatID {
 				continue
@@ -8628,9 +8673,16 @@ func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID strin
 				}
 				continue
 			}
+			sent++
+			if opts.MaxMessages > 0 && sent >= opts.MaxMessages {
+				break
+			}
 		}
 		if firstErr != nil {
 			return firstErr
+		}
+		if opts.MaxMessages > 0 && sent >= opts.MaxMessages {
+			return nil
 		}
 		return firstBlockedErr
 	}()
@@ -9625,6 +9677,7 @@ type publishCodexSessionOptions struct {
 	ChatCreatedNotification         bool
 	ChatCreatedNoticeAfterImport    bool
 	LocalSessionStartedNotification bool
+	BackgroundImport                bool
 }
 
 func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local codexhistory.Session, project codexhistory.Project, opts publishCodexSessionOptions) (string, error) {
@@ -9653,14 +9706,23 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 					return "", err
 				}
 			}
-			if err := b.importCodexTranscriptToTeams(ctx, *existing, local); err != nil {
+			importOpts := transcriptImportRunOptions{}
+			if opts.BackgroundImport {
+				importOpts.QueueOnly = true
+				importOpts.MaxBatches = transcriptImportMaxBatchesPerCycle
+			}
+			if err := b.importCodexTranscriptToTeamsWithOptions(ctx, *existing, local, importOpts); err != nil {
 				if isTranscriptCheckpointNotFoundError(err) {
 					importStatus = transcriptCheckpointNeedsAttentionMessage()
 					return fmt.Sprintf("Already published as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus), nil
 				}
 				return "", fmt.Errorf("resume history import for %s: %w", existing.ID, err)
 			}
-			importStatus = "New local history was imported."
+			if opts.BackgroundImport {
+				importStatus = "New local history import was queued."
+			} else {
+				importStatus = "New local history was imported."
+			}
 		}
 		return fmt.Sprintf("Already published as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus), nil
 	}
@@ -9710,14 +9772,33 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 	}
 	if !opts.ChatCreatedNoticeAfterImport {
 		if opts.LocalSessionStartedNotification {
-			if err := b.sendLocalSessionStartedNotice(ctx, session.ID, chat.ID); err != nil {
+			var err error
+			if opts.BackgroundImport {
+				_, err = b.queueLocalSessionStartedNotice(ctx, session.ID, chat.ID)
+			} else {
+				err = b.sendLocalSessionStartedNotice(ctx, session.ID, chat.ID)
+			}
+			if err != nil {
 				return "", err
 			}
-		} else if err := b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification); err != nil {
-			return "", err
+		} else {
+			var err error
+			if opts.BackgroundImport {
+				_, err = b.queueChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+			} else {
+				err = b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+			}
+			if err != nil {
+				return "", err
+			}
 		}
 	}
-	if err := b.importCodexTranscriptToTeams(ctx, session, local); err != nil {
+	importOpts := transcriptImportRunOptions{}
+	if opts.BackgroundImport {
+		importOpts.QueueOnly = true
+		importOpts.MaxBatches = transcriptImportMaxBatchesPerCycle
+	}
+	if err := b.importCodexTranscriptToTeamsWithOptions(ctx, session, local, importOpts); err != nil {
 		if isTranscriptCheckpointNotFoundError(err) {
 			return fmt.Sprintf("Published local Codex session as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", session.ID, session.ChatURL, transcriptCheckpointNeedsAttentionMessage()), nil
 		}
@@ -9725,11 +9806,25 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 	}
 	if opts.ChatCreatedNoticeAfterImport {
 		if opts.LocalSessionStartedNotification {
-			if err := b.sendLocalSessionStartedNotice(ctx, session.ID, chat.ID); err != nil {
+			var err error
+			if opts.BackgroundImport {
+				_, err = b.queueLocalSessionStartedNotice(ctx, session.ID, chat.ID)
+			} else {
+				err = b.sendLocalSessionStartedNotice(ctx, session.ID, chat.ID)
+			}
+			if err != nil {
 				return "", err
 			}
-		} else if err := b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification); err != nil {
-			return "", err
+		} else {
+			var err error
+			if opts.BackgroundImport {
+				_, err = b.queueChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+			} else {
+				err = b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+			}
+			if err != nil {
+				return "", err
+			}
 		}
 	}
 	return fmt.Sprintf("Published local Codex session as %s: %s\n\nOpen this Teams work chat and send a message there to continue.", session.ID, session.ChatURL), nil
@@ -9770,34 +9865,57 @@ func (b *Bridge) resolvePublishTargetSessionID(ctx context.Context, target Dashb
 	return selection.SessionID, nil
 }
 
+type transcriptImportRunOptions struct {
+	QueueOnly  bool
+	MaxBatches int
+}
+
+type transcriptImportResult struct {
+	LastRecordID string
+	LastLine     int
+	LastOffset   int64
+	Stats        transcriptImportStats
+	Complete     bool
+}
+
 func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Session, local codexhistory.Session) error {
+	return b.importCodexTranscriptToTeamsWithOptions(ctx, session, local, transcriptImportRunOptions{})
+}
+
+func (b *Bridge) importCodexTranscriptToTeamsWithOptions(ctx context.Context, session Session, local codexhistory.Session, opts transcriptImportRunOptions) error {
 	importTurnID := "import:" + session.ID
+	if opts.QueueOnly && opts.MaxBatches > 0 {
+		importTurnID = "import-bg:" + session.ID
+	}
 	if err := b.markTranscriptImportStartedForRun(ctx, session, local.FilePath, transcriptCheckpointID(session.ID), importTurnID, "import"); err != nil {
 		return err
 	}
 	title := "Imported Codex session history\n\nThe messages below came from your local Codex session. Reply in this chat to continue from here.\n\nSession: " + local.DisplayTitle()
-	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-title", title); err != nil {
+	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-title", title, outboxQueueOptions{}, opts.QueueOnly); err != nil {
 		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
 		return err
 	}
-	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, local.FilePath, importTurnID, "import", transcriptCheckpointID(session.ID))
+	result, err := b.importTranscriptRecordsToTeams(ctx, session, local.FilePath, importTurnID, "import", transcriptCheckpointID(session.ID), opts)
 	if err != nil {
 		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
 		if isTranscriptCheckpointNotFoundError(err) {
-			_ = b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-needs-attention", transcriptCheckpointNeedsAttentionMessage())
+			_ = b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-needs-attention", transcriptCheckpointNeedsAttentionMessage(), outboxQueueOptions{}, opts.QueueOnly)
 		}
 		return err
 	}
-	if err := b.importSubagentMarkersToTeams(ctx, session, local, importTurnID); err != nil {
+	if !result.Complete {
+		return b.markTranscriptImportPausedAt(ctx, session, local.FilePath, result.LastRecordID, result.LastLine, result.LastOffset, transcriptCheckpointID(session.ID), importTurnID, "import")
+	}
+	if err := b.importSubagentMarkersToTeamsWithOptions(ctx, session, local, importTurnID, opts); err != nil {
 		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
 		return err
 	}
-	complete := formatTranscriptImportCompleteMessage(stats)
-	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-complete", complete); err != nil {
+	complete := formatTranscriptImportCompleteMessage(result.Stats)
+	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-complete", complete, outboxQueueOptions{}, opts.QueueOnly); err != nil {
 		_ = b.markTranscriptImportFailed(ctx, session, local.FilePath)
 		return err
 	}
-	return b.markTranscriptImportCompleteAtEOF(ctx, session, local.FilePath, lastRecordID, lastLine)
+	return b.markTranscriptImportCompleteAtEOF(ctx, session, local.FilePath, result.LastRecordID, result.LastLine)
 }
 
 func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session) error {
@@ -9823,7 +9941,7 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 	if err := b.markTranscriptImportStartedForRun(ctx, *session, local.FilePath, transcriptCheckpointID(session.ID), importTurnID, "sync"); err != nil {
 		return err
 	}
-	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, *session, local.FilePath, importTurnID, "sync", transcriptCheckpointID(session.ID))
+	result, err := b.importTranscriptRecordsToTeams(ctx, *session, local.FilePath, importTurnID, "sync", transcriptCheckpointID(session.ID), transcriptImportRunOptions{})
 	if err != nil {
 		_ = b.markTranscriptImportFailed(ctx, *session, local.FilePath)
 		if isTranscriptCheckpointNotFoundError(err) {
@@ -9831,11 +9949,11 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 		}
 		return b.sendToChat(ctx, session.ChatID, "History import failed: "+err.Error())
 	}
-	if err := b.markTranscriptImportCompleteAtEOF(ctx, *session, local.FilePath, lastRecordID, lastLine); err != nil {
+	if err := b.markTranscriptImportCompleteAtEOF(ctx, *session, local.FilePath, result.LastRecordID, result.LastLine); err != nil {
 		return err
 	}
-	body := formatTranscriptImportCompleteMessage(stats)
-	if stats.Imported == 0 && stats.SkippedBackground == 0 {
+	body := formatTranscriptImportCompleteMessage(result.Stats)
+	if result.Stats.Imported == 0 && result.Stats.SkippedBackground == 0 {
 		body = "No new visible local Codex history needed to be imported. This chat is ready."
 	}
 	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "sync-complete", body); err != nil {
@@ -9861,14 +9979,14 @@ func formatTranscriptImportCompleteMessage(stats transcriptImportStats) string {
 	)
 }
 
-func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Session, filePath string, importTurnID string, kindPrefix string, checkpointID string) (string, int, transcriptImportStats, error) {
+func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Session, filePath string, importTurnID string, kindPrefix string, checkpointID string, opts transcriptImportRunOptions) (transcriptImportResult, error) {
 	filePath = strings.TrimSpace(filePath)
 	if filePath == "" {
-		return "", 0, transcriptImportStats{}, nil
+		return transcriptImportResult{Complete: true}, nil
 	}
 	state, err := b.store.Load(ctx)
 	if err != nil {
-		return "", 0, transcriptImportStats{}, err
+		return transcriptImportResult{}, err
 	}
 	if checkpointID == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
@@ -9878,21 +9996,21 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	if checkpoint.LastRecordID == "" {
 		transcript, err = ReadSessionTranscript(filePath)
 		if err != nil {
-			return "", 0, transcriptImportStats{}, fmt.Errorf("read local transcript: %w", err)
+			return transcriptImportResult{}, fmt.Errorf("read local transcript: %w", err)
 		}
 	} else {
 		for attempt := 0; attempt < 2; attempt++ {
 			transcript, err = b.readLinkedTranscriptDelta(filePath, checkpoint, session.CodexThreadID, session.CodexThreadID)
 			if err != nil {
 				_ = b.markTranscriptImportFailedWithID(ctx, session, filePath, checkpointID)
-				return "", 0, transcriptImportStats{}, err
+				return transcriptImportResult{}, err
 			}
 			if !transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
 				break
 			}
 			_ = b.markTranscriptImportFailedWithID(ctx, session, filePath, checkpointID)
 			if checkpointID != transcriptCheckpointID(session.ID) {
-				return "", 0, transcriptImportStats{}, errTranscriptCheckpointNotFound
+				return transcriptImportResult{}, errTranscriptCheckpointNotFound
 			}
 			recovered, recoverErr := b.recoverFailedTranscriptCheckpoint(ctx, session, codexhistory.Session{
 				SessionID:   session.CodexThreadID,
@@ -9900,55 +10018,61 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 				FilePath:    filePath,
 			})
 			if recoverErr != nil {
-				return "", 0, transcriptImportStats{}, recoverErr
+				return transcriptImportResult{}, recoverErr
 			}
 			if !recovered {
-				return "", 0, transcriptImportStats{}, errTranscriptCheckpointNotFound
+				return transcriptImportResult{}, errTranscriptCheckpointNotFound
 			}
 			state, err = b.store.Load(ctx)
 			if err != nil {
-				return "", 0, transcriptImportStats{}, err
+				return transcriptImportResult{}, err
 			}
 			checkpoint = state.ImportCheckpoints[checkpointID]
 			if strings.TrimSpace(checkpoint.LastRecordID) == "" {
 				transcript, err = ReadSessionTranscript(filePath)
 				if err != nil {
-					return "", 0, transcriptImportStats{}, fmt.Errorf("read local transcript: %w", err)
+					return transcriptImportResult{}, fmt.Errorf("read local transcript: %w", err)
 				}
 				break
 			}
 			if attempt == 1 {
-				return "", 0, transcriptImportStats{}, errTranscriptCheckpointNotFound
+				return transcriptImportResult{}, errTranscriptCheckpointNotFound
 			}
 		}
 	}
 	stats := transcriptImportStats{Total: len(transcript.Records)}
 	dedupe := newTranscriptDedupeState()
-	batcher := newTranscriptImportBatcher(b, session, filePath, importTurnID, kindPrefix, checkpointID)
+	batcher := newTranscriptImportBatcher(b, session, filePath, importTurnID, kindPrefix, checkpointID, opts)
+	var lastRecordID string
+	var lastLine int
+	var lastOffset int64
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
+		checkpointKey := transcriptRecordCheckpointKey(record)
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
-		checkpointKey := transcriptRecordCheckpointKey(record)
 		if shouldSkipImportedTranscriptRecord(record) {
 			stats.SkippedBackground++
 			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
-				return "", 0, stats, err
+				return transcriptImportResult{}, err
 			}
+			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
 			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
-				return "", 0, stats, err
+				return transcriptImportResult{}, err
 			}
+			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
 			continue
 		}
 		if dedupe.shouldSkip(record, body) {
 			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
-				return "", 0, stats, err
+				return transcriptImportResult{}, err
 			}
+			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
 			continue
 		}
 		record.SourceLine = checkpointLine
@@ -9959,19 +10083,43 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 			Kind:          kind,
 			Body:          body,
 			CheckpointKey: checkpointKey,
-		}); err != nil {
-			return "", 0, stats, err
+		}); errors.Is(err, errTranscriptImportBudgetExhausted) {
+			return transcriptImportResult{
+				LastRecordID: lastRecordID,
+				LastLine:     lastLine,
+				LastOffset:   lastOffset,
+				Stats:        stats,
+				Complete:     false,
+			}, nil
+		} else if err != nil {
+			return transcriptImportResult{}, err
 		}
 		stats.Imported++
+		lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
 	}
 	if err := batcher.flush(ctx); err != nil {
-		return "", 0, stats, err
+		if errors.Is(err, errTranscriptImportBudgetExhausted) {
+			return transcriptImportResult{
+				LastRecordID: lastRecordID,
+				LastLine:     lastLine,
+				LastOffset:   lastOffset,
+				Stats:        stats,
+				Complete:     false,
+			}, nil
+		}
+		return transcriptImportResult{}, err
 	}
 	if len(transcript.Records) == 0 {
-		return "", 0, stats, nil
+		return transcriptImportResult{Stats: stats, Complete: true}, nil
 	}
 	last := transcript.Records[len(transcript.Records)-1]
-	return transcriptRecordCheckpointKey(last), last.SourceLine, stats, nil
+	return transcriptImportResult{
+		LastRecordID: transcriptRecordCheckpointKey(last),
+		LastLine:     last.SourceLine,
+		LastOffset:   last.SourceOffset,
+		Stats:        stats,
+		Complete:     true,
+	}, nil
 }
 
 type transcriptImportBatchRecord struct {
@@ -9988,20 +10136,23 @@ type transcriptImportCheckpointRecord struct {
 }
 
 type transcriptImportBatcher struct {
-	bridge       *Bridge
-	session      Session
-	filePath     string
-	importTurnID string
-	kindPrefix   string
-	checkpointID string
-	records      []transcriptImportBatchRecord
-	checkpoints  []transcriptImportCheckpointRecord
-	htmlParts    []string
-	htmlBytes    int
-	batchIndex   int
+	bridge        *Bridge
+	session       Session
+	filePath      string
+	importTurnID  string
+	kindPrefix    string
+	checkpointID  string
+	records       []transcriptImportBatchRecord
+	checkpoints   []transcriptImportCheckpointRecord
+	htmlParts     []string
+	htmlBytes     int
+	batchIndex    int
+	queueOnly     bool
+	maxBatches    int
+	queuedBatches int
 }
 
-func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, importTurnID string, kindPrefix string, checkpointID string) *transcriptImportBatcher {
+func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, importTurnID string, kindPrefix string, checkpointID string, opts transcriptImportRunOptions) *transcriptImportBatcher {
 	return &transcriptImportBatcher{
 		bridge:       b,
 		session:      session,
@@ -10009,10 +10160,15 @@ func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, imp
 		importTurnID: importTurnID,
 		kindPrefix:   strings.TrimSpace(kindPrefix),
 		checkpointID: checkpointID,
+		queueOnly:    opts.QueueOnly,
+		maxBatches:   opts.MaxBatches,
 	}
 }
 
 func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImportBatchRecord) error {
+	if b.budgetExhausted() {
+		return errTranscriptImportBudgetExhausted
+	}
 	html := renderTeamsHTMLPart(TeamsRenderInput{
 		Surface: TeamsRenderSurfaceOutbox,
 		Kind:    renderKindForOutbox(record.Kind),
@@ -10022,9 +10178,13 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 		if err := b.flush(ctx); err != nil {
 			return err
 		}
-		if err := b.bridge.queueAndSendOutboxChunks(ctx, b.session.ID, b.importTurnID, b.session.ChatID, record.Kind, record.Body); err != nil {
+		if b.budgetExhausted() {
+			return errTranscriptImportBudgetExhausted
+		}
+		if err := b.bridge.queueOrSendOutboxChunks(ctx, b.session.ID, b.importTurnID, b.session.ChatID, record.Kind, record.Body, outboxQueueOptions{}, b.queueOnly); err != nil {
 			return err
 		}
+		b.queuedBatches++
 		return b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, record.CheckpointKey, record.Record.SourceLine, record.Record.SourceOffset, b.checkpointID)
 	}
 	addedBytes := len(html)
@@ -10034,6 +10194,9 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 	if len(b.htmlParts) > 0 && b.htmlBytes+addedBytes > teamsChunkHTMLContentBytes {
 		if err := b.flush(ctx); err != nil {
 			return err
+		}
+		if b.budgetExhausted() {
+			return errTranscriptImportBudgetExhausted
 		}
 	}
 	if len(b.htmlParts) > 0 {
@@ -10058,14 +10221,18 @@ func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 	if len(b.records) == 0 {
 		return nil
 	}
+	if b.budgetExhausted() {
+		return errTranscriptImportBudgetExhausted
+	}
 	b.batchIndex++
 	html := strings.Join(b.htmlParts, transcriptImportBatchSeparatorHTML)
 	first := b.records[0]
 	last := b.records[len(b.records)-1]
 	kind := transcriptImportBatchOutboxKind(b.kindPrefix, first.Record, last.Record, b.batchIndex)
-	if err := b.bridge.queueAndSendTranscriptImportBatch(ctx, b.session.ID, b.importTurnID, b.session.ChatID, kind, html); err != nil {
+	if err := b.bridge.queueOrSendTranscriptImportBatch(ctx, b.session.ID, b.importTurnID, b.session.ChatID, kind, html, b.queueOnly); err != nil {
 		return err
 	}
+	b.queuedBatches++
 	for _, checkpoint := range b.checkpoints {
 		if err := b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, b.checkpointID); err != nil {
 			return err
@@ -10076,6 +10243,10 @@ func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 	b.htmlParts = nil
 	b.htmlBytes = 0
 	return nil
+}
+
+func (b *transcriptImportBatcher) budgetExhausted() bool {
+	return b != nil && b.maxBatches > 0 && b.queuedBatches >= b.maxBatches
 }
 
 func transcriptImportBatchOutboxKind(prefix string, first TranscriptRecord, last TranscriptRecord, index int) string {
@@ -10089,11 +10260,15 @@ func transcriptImportBatchOutboxKind(prefix string, first TranscriptRecord, last
 }
 
 func (b *Bridge) queueAndSendTranscriptImportBatch(ctx context.Context, sessionID string, turnID string, chatID string, kind string, html string) error {
+	return b.queueOrSendTranscriptImportBatch(ctx, sessionID, turnID, chatID, kind, html, false)
+}
+
+func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, sessionID string, turnID string, chatID string, kind string, html string, queueOnly bool) error {
 	html = strings.TrimSpace(html)
 	if html == "" {
 		return nil
 	}
-	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
 		SessionID:     sessionID,
 		TurnID:        turnID,
 		TeamsChatID:   chatID,
@@ -10103,9 +10278,17 @@ func (b *Bridge) queueAndSendTranscriptImportBatch(ctx context.Context, sessionI
 		PartCount:     1,
 		RenderedBytes: len(html),
 	})
+	if err != nil || queueOnly || queued.Status == teamstore.OutboxStatusSent {
+		return err
+	}
+	return b.flushPendingOutboxForChat(ctx, queued.TeamsChatID)
 }
 
 func (b *Bridge) importSubagentMarkersToTeams(ctx context.Context, session Session, local codexhistory.Session, importTurnID string) error {
+	return b.importSubagentMarkersToTeamsWithOptions(ctx, session, local, importTurnID, transcriptImportRunOptions{})
+}
+
+func (b *Bridge) importSubagentMarkersToTeamsWithOptions(ctx context.Context, session Session, local codexhistory.Session, importTurnID string, opts transcriptImportRunOptions) error {
 	if len(local.Subagents) == 0 {
 		return nil
 	}
@@ -10126,7 +10309,7 @@ func (b *Bridge) importSubagentMarkersToTeams(ctx context.Context, session Sessi
 			return err
 		}
 		marker := formatSubagentImportMarker(local, subagent)
-		if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-subagent-marker-"+key, marker); err != nil {
+		if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, "import-subagent-marker-"+key, marker, outboxQueueOptions{}, opts.QueueOnly); err != nil {
 			return err
 		}
 		if err := b.markTranscriptImportCompleteWithID(ctx, session, sourcePath, "subagent:"+key, 0, checkpointID); err != nil {
@@ -10863,6 +11046,9 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			hasCheckpoint = true
 		}
 	}
+	if hasCheckpoint && transcriptImportCheckpointNeedsBudgetedResume(checkpoint, local.FilePath) {
+		return b.resumeBudgetedTranscriptImport(ctx, session, local, checkpoint)
+	}
 	if !hasCheckpoint || checkpoint.LastRecordID == "" {
 		transcript, err := ReadSessionTranscript(local.FilePath)
 		if err != nil {
@@ -11018,6 +11204,62 @@ func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportC
 	return info.Size() == checkpoint.SourceSize && info.ModTime().Equal(checkpoint.SourceModTime)
 }
 
+func transcriptImportCheckpointNeedsBudgetedResume(checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
+	if checkpoint.Status != importCheckpointStatusComplete {
+		return false
+	}
+	if !strings.HasPrefix(strings.TrimSpace(checkpoint.ImportTurnID), "import-bg:") || strings.TrimSpace(checkpoint.KindPrefix) == "" {
+		return false
+	}
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		return false
+	}
+	sourceSize, _ := transcriptSourceFileState(firstNonEmptyString(sourcePath, checkpoint.SourcePath))
+	return sourceSize > 0
+}
+
+func (b *Bridge) resumeBudgetedTranscriptImport(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
+	sourcePath := strings.TrimSpace(firstNonEmptyString(local.FilePath, checkpoint.SourcePath))
+	if sourcePath == "" {
+		return nil
+	}
+	importTurnID := strings.TrimSpace(firstNonEmptyString(checkpoint.ImportTurnID, "import:"+session.ID))
+	kindPrefix := strings.TrimSpace(firstNonEmptyString(checkpoint.KindPrefix, "import"))
+	checkpointID := strings.TrimSpace(firstNonEmptyString(checkpoint.ID, transcriptCheckpointID(session.ID)))
+	opts := transcriptImportRunOptions{QueueOnly: true, MaxBatches: transcriptImportMaxBatchesPerCycle}
+	if err := b.markTranscriptImportStartedForRun(ctx, session, sourcePath, checkpointID, importTurnID, kindPrefix); err != nil {
+		return err
+	}
+	result, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID, opts)
+	if err != nil {
+		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+		if isTranscriptCheckpointNotFoundError(err) {
+			if sendErr := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-needs-attention", transcriptCheckpointNeedsAttentionMessage(), outboxQueueOptions{}, true); sendErr != nil {
+				return sendErr
+			}
+			return nil
+		}
+		return err
+	}
+	if !result.Complete {
+		return b.markTranscriptImportPausedAt(ctx, session, sourcePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix)
+	}
+	if checkpointID == transcriptCheckpointID(session.ID) {
+		resumedLocal := local
+		resumedLocal.FilePath = sourcePath
+		if err := b.importSubagentMarkersToTeamsWithOptions(ctx, session, resumedLocal, importTurnID, opts); err != nil {
+			_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+			return err
+		}
+	}
+	complete := formatTranscriptImportCompleteMessage(result.Stats)
+	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", complete, outboxQueueOptions{}, true); err != nil {
+		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+		return err
+	}
+	return b.markTranscriptImportCompleteAtEOFWithID(ctx, session, sourcePath, result.LastRecordID, result.LastLine, checkpointID)
+}
+
 func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
 	sourcePath := strings.TrimSpace(firstNonEmptyString(checkpoint.SourcePath, local.FilePath))
 	if sourcePath == "" {
@@ -11029,7 +11271,7 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 	if err := b.markTranscriptImportStartedForRun(ctx, session, sourcePath, checkpointID, importTurnID, kindPrefix); err != nil {
 		return err
 	}
-	lastRecordID, lastLine, stats, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID)
+	result, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID, transcriptImportRunOptions{})
 	if err != nil {
 		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
 		if isTranscriptCheckpointNotFoundError(err) {
@@ -11040,6 +11282,9 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 		}
 		return err
 	}
+	if !result.Complete {
+		return b.markTranscriptImportPausedAt(ctx, session, sourcePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix)
+	}
 	if checkpointID == transcriptCheckpointID(session.ID) {
 		resumedLocal := local
 		resumedLocal.FilePath = sourcePath
@@ -11048,12 +11293,12 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 			return err
 		}
 	}
-	complete := formatTranscriptImportCompleteMessage(stats)
+	complete := formatTranscriptImportCompleteMessage(result.Stats)
 	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", complete); err != nil {
 		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
 		return err
 	}
-	if err := b.markTranscriptImportCompleteAtEOFWithID(ctx, session, sourcePath, lastRecordID, lastLine, checkpointID); err != nil {
+	if err := b.markTranscriptImportCompleteAtEOFWithID(ctx, session, sourcePath, result.LastRecordID, result.LastLine, checkpointID); err != nil {
 		return err
 	}
 	return b.processQueuedTurns(ctx)
@@ -11641,6 +11886,39 @@ func (b *Bridge) markTranscriptImportCompleteAtEOFWithID(ctx context.Context, se
 	return b.markTranscriptImportCompleteDetailedWithID(ctx, session, sourcePath, lastRecordID, lastLine, checkpointID, true)
 }
 
+func (b *Bridge) markTranscriptImportPausedAt(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, importTurnID string, kindPrefix string) error {
+	if strings.TrimSpace(lastRecordID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(checkpointID) == "" {
+		checkpointID = transcriptCheckpointID(session.ID)
+	}
+	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
+	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+		now := time.Now()
+		id := checkpointID
+		checkpoint := state.ImportCheckpoints[id]
+		checkpoint.ID = id
+		checkpoint.SessionID = session.ID
+		checkpoint.SourcePath = sourcePath
+		checkpoint.LastRecordID = lastRecordID
+		checkpoint.LastSourceLine = lastLine
+		checkpoint.LastOffset = lastOffset
+		checkpoint.SourceSize = sourceSize
+		checkpoint.SourceModTime = sourceModTime
+		if strings.TrimSpace(importTurnID) != "" {
+			checkpoint.ImportTurnID = strings.TrimSpace(importTurnID)
+		}
+		if strings.TrimSpace(kindPrefix) != "" {
+			checkpoint.KindPrefix = strings.TrimSpace(kindPrefix)
+		}
+		checkpoint.Status = importCheckpointStatusComplete
+		checkpoint.UpdatedAt = now
+		state.ImportCheckpoints[id] = checkpoint
+		return nil
+	})
+}
+
 func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, checkpointID string, completeEOF bool) error {
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
@@ -11661,6 +11939,8 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 		checkpoint.SourceModTime = sourceModTime
 		if completeEOF && sourceSize > 0 {
 			checkpoint.LastOffset = sourceSize
+			checkpoint.ImportTurnID = ""
+			checkpoint.KindPrefix = ""
 		}
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now

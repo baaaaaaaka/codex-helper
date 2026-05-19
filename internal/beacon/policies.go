@@ -531,7 +531,7 @@ func UpgradeBlockersForState(st State, op UpgradeOperation, codexTargetSignature
 	}
 
 	for _, req := range st.Allocations {
-		if !allocationMayBlockUpgrade(req, op, target) {
+		if !allocationMayBlockUpgrade(st, req, op, target) {
 			continue
 		}
 		blockers = append(blockers, UpgradeBlocker{
@@ -581,12 +581,15 @@ func UpgradeBlockersForState(st State, op UpgradeOperation, codexTargetSignature
 	return blockers
 }
 
-func allocationMayBlockUpgrade(req AllocationRequest, op UpgradeOperation, target string) bool {
+func allocationMayBlockUpgrade(st State, req AllocationRequest, op UpgradeOperation, target string) bool {
 	switch req.State {
 	case AllocationCanceled, AllocationExpired, AllocationFailed:
 		return false
 	}
 	if target != "" && strings.TrimSpace(req.Execution.Hash) != target && strings.TrimSpace(req.Target.Signature) != target {
+		return false
+	}
+	if !allocationHasUpgradeBlockingResource(st, req) {
 		return false
 	}
 	switch op {
@@ -599,6 +602,25 @@ func allocationMayBlockUpgrade(req AllocationRequest, op UpgradeOperation, targe
 	default:
 		return true
 	}
+}
+
+func allocationHasUpgradeBlockingResource(st State, req AllocationRequest) bool {
+	if strings.TrimSpace(firstNonEmpty(req.ProviderIdentity.ProviderJobID, req.Target.ProviderJobID)) != "" {
+		return true
+	}
+	if strings.TrimSpace(req.Target.MachineID) != "" || strings.TrimSpace(req.Target.LeaseID) != "" {
+		return true
+	}
+	if AllocationHasStartedJob(st, req.ID) {
+		return true
+	}
+	if !req.RenewStartedAt.IsZero() && (req.RenewCompletedAt.IsZero() || req.RenewCompletedAt.Before(req.RenewStartedAt)) {
+		return true
+	}
+	if !req.CancelRequestedAt.IsZero() && req.State != AllocationCanceled {
+		return true
+	}
+	return false
 }
 
 func beaconAllocationBlockerDetail(req AllocationRequest) string {

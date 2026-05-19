@@ -245,14 +245,71 @@ func authHint(source Source) string {
 	if u, err := parseRemoteHost(source.RemoteURL); err == nil && u != "" {
 		host = u
 	}
+	sshCheck, sshUserMissing := sshAuthCheckCommand(source.RemoteURL, "git")
+	if sshCheck == "" {
+		sshCheck = "ssh -T git@" + host
+	}
+	missingUserNote := ""
+	if sshUserMissing {
+		missingUserNote = " The subscribed SSH URL has no user, so SSH will use your local OS username; Git SSH remotes usually need `git@` or an SSH config with `User git`."
+	}
 	switch source.Provider {
 	case "github":
-		return "Authentication hint: run `gh auth login`, then `gh auth setup-git`; for SSH remotes also check `ssh -T git@github.com`."
+		return "Authentication hint: run `gh auth login`, then `gh auth setup-git`; for SSH remotes also check `" + sshCheck + "`." + missingUserNote
 	case "gitlab":
-		return "Authentication hint: run `glab auth login` if you use glab, or verify your SSH key with `ssh -T git@" + host + "`."
+		return "Authentication hint: run `glab auth login` if you use glab, or verify your SSH key with `" + sshCheck + "`." + missingUserNote
 	default:
-		return "Authentication hint: verify that your git credentials can read " + source.RemoteURL + ". For SSH remotes, test with `ssh -T git@" + host + "`."
+		return "Authentication hint: verify that your git credentials can read " + source.RemoteURL + ". For SSH remotes, test with `" + sshCheck + "`." + missingUserNote
 	}
+}
+
+func sshAuthCheckCommand(remote, fallbackUser string) (string, bool) {
+	info, ok := parseSSHRemote(remote)
+	if !ok || info.host == "" {
+		return "", false
+	}
+	user := info.user
+	userMissing := false
+	if user == "" && fallbackUser != "" {
+		user = fallbackUser
+		userMissing = true
+	}
+	target := info.host
+	if user != "" {
+		target = user + "@" + info.host
+	}
+	parts := []string{"ssh", "-T"}
+	if info.port != "" {
+		parts = append(parts, "-p", info.port)
+	}
+	parts = append(parts, target)
+	return strings.Join(parts, " "), userMissing
+}
+
+type sshRemoteInfo struct {
+	user string
+	host string
+	port string
+}
+
+func parseSSHRemote(remote string) (sshRemoteInfo, bool) {
+	if strings.Contains(remote, "://") {
+		u, err := url.Parse(remote)
+		if err != nil || strings.ToLower(u.Scheme) != "ssh" {
+			return sshRemoteInfo{}, false
+		}
+		user := ""
+		if u.User != nil {
+			user = u.User.Username()
+		}
+		return sshRemoteInfo{user: user, host: u.Hostname(), port: u.Port()}, true
+	}
+	at := strings.Index(remote, "@")
+	colon := strings.Index(remote, ":")
+	if at <= 0 || colon <= at+1 {
+		return sshRemoteInfo{}, false
+	}
+	return sshRemoteInfo{user: remote[:at], host: remote[at+1 : colon]}, true
 }
 
 func parseRemoteHost(remote string) (string, error) {

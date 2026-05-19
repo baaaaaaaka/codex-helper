@@ -652,6 +652,10 @@ type AllocationCancelAdapter interface {
 	CancelAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
 }
 
+type allocationQueryAdapter interface {
+	QueryAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
+}
+
 type AllocationCancelAction string
 
 const (
@@ -846,6 +850,108 @@ func ReconcileAllocationSubmitOutsideLock(ctx context.Context, store *Store, req
 		return updated, action, queryErr
 	}
 	return updated, action, submitErr
+}
+
+func RefreshKnownProviderAllocationsOutsideLock(ctx context.Context, store *Store, adapter AllocationAdapter, now time.Time) []error {
+	if store == nil {
+		return []error{fmt.Errorf("nil beacon store")}
+	}
+	if adapter == nil {
+		return []error{fmt.Errorf("allocation adapter is required")}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	st, err := store.Load()
+	if err != nil {
+		return []error{err}
+	}
+	st.normalize()
+	var ids []string
+	for id, req := range st.Allocations {
+		if !allocationShouldRefreshProviderState(req) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var errs []error
+	for _, id := range ids {
+		req, ok := st.Allocations[id]
+		if !ok {
+			continue
+		}
+		originalProviderJobID := firstNonEmpty(req.ProviderIdentity.ProviderJobID, req.Target.ProviderJobID)
+		query, queryErr := adapter.QueryAllocation(ctx, req)
+		if queryErr != nil {
+			query.QueryError = true
+			query.Reason = queryErr.Error()
+			errs = append(errs, fmt.Errorf("%s: %w", id, queryErr))
+		}
+		if err := store.Update(func(st *State) error {
+			current, ok := st.Allocations[id]
+			if !ok || allocationStateTerminal(current.State) {
+				return nil
+			}
+			if firstNonEmpty(current.ProviderIdentity.ProviderJobID, current.Target.ProviderJobID) != originalProviderJobID {
+				return nil
+			}
+			if query.QueryError {
+				current.ProviderReason = strings.TrimSpace(query.Reason)
+				current.UpdatedAt = now
+				st.Allocations[id] = current
+				return nil
+			}
+			if strings.TrimSpace(query.ProviderJobID) != "" && strings.TrimSpace(query.ProviderJobID) != originalProviderJobID {
+				current.State = AllocationNeedsAttention
+				current.ProviderReason = fmt.Sprintf("provider query returned different job id %s while allocation is bound to %s", strings.TrimSpace(query.ProviderJobID), originalProviderJobID)
+				current.RawProviderState = strings.TrimSpace(query.RawState)
+				current.UpdatedAt = now
+				st.Allocations[id] = current
+				return nil
+			}
+			if !query.ProviderDeadline.IsZero() {
+				current.ProviderDeadline = query.ProviderDeadline
+			}
+			if query.DurableNegative {
+				reason := firstNonEmpty(strings.TrimSpace(query.Reason), "provider job is no longer visible in scheduler")
+				projection := ProjectMissingProviderJob(current.Provider, reason, AllocationHasStartedJob(*st, current.ID), allocationHasEverRun(current))
+				_, err := UpdateAllocationProjection(st, current.ID, projection, now)
+				return err
+			}
+			if strings.TrimSpace(query.RawState) != "" {
+				current.RawProviderState = strings.TrimSpace(query.RawState)
+				current.ProviderReason = strings.TrimSpace(query.Reason)
+				st.Allocations[id] = current
+				projection := ProjectRawProviderState(current.Provider, current.RawProviderState, current.ProviderReason, AllocationHasStartedJob(*st, current.ID), allocationHasEverRun(current))
+				_, err := UpdateAllocationProjection(st, current.ID, projection, now)
+				return err
+			}
+			if strings.TrimSpace(query.Reason) != "" {
+				current.ProviderReason = strings.TrimSpace(query.Reason)
+				current.UpdatedAt = now
+				st.Allocations[id] = current
+			}
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", id, err))
+		}
+		latest, loadErr := store.Load()
+		if loadErr != nil {
+			errs = append(errs, loadErr)
+			break
+		}
+		st = latest
+		st.normalize()
+	}
+	return errs
+}
+
+func allocationShouldRefreshProviderState(req AllocationRequest) bool {
+	if allocationStateTerminal(req.State) || req.Provider == ProviderLocal {
+		return false
+	}
+	return strings.TrimSpace(firstNonEmpty(req.ProviderIdentity.ProviderJobID, req.Target.ProviderJobID)) != ""
 }
 
 func ReconcileAllocationRenewOutsideLock(ctx context.Context, store *Store, requestID string, adapter AllocationRenewAdapter, opts AllocationRenewOptions, now time.Time) (AllocationRequest, AllocationRenewAction, error) {
@@ -1051,6 +1157,25 @@ func CancelAllocationOutsideLock(ctx context.Context, store *Store, ref string, 
 	var cancelResult SchedulerQueryResult
 	if action == AllocationCancelProviderCancel {
 		cancelResult, cancelErr = adapter.CancelAllocation(ctx, claimed)
+		if cancelErr != nil && IsProviderCommandNotConfigured(cancelErr) {
+			if queryAdapter, ok := adapter.(allocationQueryAdapter); ok {
+				queryResult, queryErr := queryAdapter.QueryAllocation(ctx, claimed)
+				if queryErr == nil && queryResult.DurableNegative {
+					cancelResult = queryResult
+					if strings.TrimSpace(cancelResult.ProviderJobID) == "" {
+						cancelResult.ProviderJobID = providerJobID
+					}
+					cancelResult.Reason = firstNonEmpty(
+						strings.TrimSpace(cancelResult.Reason),
+						"provider job is already gone; local allocation released without cancel adapter",
+					)
+					action = AllocationCancelMarkCanceled
+					cancelErr = nil
+				} else if queryErr != nil {
+					cancelErr = fmt.Errorf("%w; provider query fallback failed: %v", cancelErr, queryErr)
+				}
+			}
+		}
 	}
 	var updated AllocationRequest
 	updateErr := store.Update(func(st *State) error {
@@ -1807,6 +1932,23 @@ func ProjectRawProviderState(provider Provider, rawState string, reason string, 
 	default:
 		projection.Projected = ProviderJobUnknown
 		projection.Action = ReconcileDrain
+	}
+	return projection
+}
+
+func ProjectMissingProviderJob(provider Provider, reason string, started bool, previouslyRan bool) ProviderProjection {
+	if strings.TrimSpace(reason) == "" {
+		reason = "provider job is no longer visible in scheduler"
+	}
+	projection := ProviderProjection{
+		Provider:      provider,
+		Reason:        reason,
+		Projected:     ProviderJobFailed,
+		Action:        ReconcileLost,
+		PreviouslyRan: previouslyRan,
+	}
+	if started {
+		projection.Action = ReconcileQuarantine
 	}
 	return projection
 }
