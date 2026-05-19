@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -204,7 +205,11 @@ func TestTeamsCodexChildEnvExposesRecoveredStableHelperPath(t *testing.T) {
 	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
 
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	name := "codex-proxy"
+	if runtime.GOOS == "windows" {
+		name = "codex-proxy.exe"
+	}
+	stable := filepath.Join(dir, name)
 	if err := os.WriteFile(stable, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write stable helper: %v", err)
 	}
