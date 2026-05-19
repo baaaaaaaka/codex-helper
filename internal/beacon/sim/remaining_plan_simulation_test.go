@@ -666,17 +666,23 @@ func TestRemainingPlanArtifactPipelineOrdersQueueOneProtectedOutcome(t *testing.
 }
 
 type remainingServiceEnvField struct {
-	name     string
-	family   string
-	required bool
-	secret   bool
+	name       string
+	family     string
+	required   bool
+	configured bool
+	secret     bool
 }
 
 func remainingServiceConfigValid(fields []remainingServiceEnvField, rendered map[string]string) bool {
+	expectedFamilies := map[string]bool{}
 	seenFamilies := map[string]bool{}
 	for _, field := range fields {
+		expected := field.required || field.configured
+		if expected {
+			expectedFamilies[field.family] = true
+		}
 		value := strings.TrimSpace(rendered[field.name])
-		if field.required && value == "" {
+		if expected && value == "" {
 			return false
 		}
 		if value != "" {
@@ -686,7 +692,7 @@ func remainingServiceConfigValid(fields []remainingServiceEnvField, rendered map
 			return false
 		}
 	}
-	for _, family := range []string{"root", "teams", "graph", "proxy", "beacon"} {
+	for family := range expectedFamilies {
 		if !seenFamilies[family] {
 			return false
 		}
@@ -700,9 +706,9 @@ func TestRemainingPlanServiceConfigDriftCoversNonBeaconEnvFamilies(t *testing.T)
 		{name: "CODEX_DIR", family: "root", required: true},
 		{name: "CODEX_HELPER_TEAMS_STORE", family: "teams", required: true},
 		{name: "CODEX_HELPER_GRAPH_AUTH_CACHE", family: "graph", required: true, secret: true},
-		{name: "CODEX_PROXY_HTTP_PROXY", family: "proxy"},
+		{name: "CODEX_PROXY_HTTP_PROXY", family: "proxy", configured: true},
 		{name: "CODEX_HELPER_BEACON_STORE", family: "beacon", required: true},
-		{name: "CODEX_HELPER_BEACON_SLURM_QUERY", family: "beacon"},
+		{name: "CODEX_HELPER_BEACON_SLURM_QUERY", family: "beacon", configured: true},
 	}
 	good := map[string]string{
 		"CODEX_HOME":                      "/home/user/.codex",
@@ -715,6 +721,17 @@ func TestRemainingPlanServiceConfigDriftCoversNonBeaconEnvFamilies(t *testing.T)
 	}
 	if !remainingServiceConfigValid(fields, good) {
 		t.Fatal("complete service config should pass simulated drift check")
+	}
+	if !remainingServiceConfigValid(copyRemainingServiceFields(fields, func(fields []remainingServiceEnvField) {
+		for i := range fields {
+			if fields[i].family == "proxy" {
+				fields[i].configured = false
+			}
+		}
+	}), copyRemainingStringMap(good, func(m map[string]string) {
+		delete(m, "CODEX_PROXY_HTTP_PROXY")
+	})) {
+		t.Fatal("unconfigured proxy family should be allowed to stay absent")
 	}
 	for name, rendered := range map[string]map[string]string{
 		"missing graph family": copyRemainingStringMap(good, func(m map[string]string) {
@@ -734,6 +751,12 @@ func TestRemainingPlanServiceConfigDriftCoversNonBeaconEnvFamilies(t *testing.T)
 			t.Fatalf("%s should fail service config drift simulation: %#v", name, rendered)
 		}
 	}
+}
+
+func copyRemainingServiceFields(in []remainingServiceEnvField, fn func([]remainingServiceEnvField)) []remainingServiceEnvField {
+	out := append([]remainingServiceEnvField(nil), in...)
+	fn(out)
+	return out
 }
 
 func copyRemainingStringMap(in map[string]string, fn func(map[string]string)) map[string]string {
@@ -861,7 +884,7 @@ type remainingNotificationInput struct {
 }
 
 func remainingNotificationDecision(in remainingNotificationInput) remainingNotificationRoute {
-	if in.protectedOutbox && !in.workflowSendOK {
+	if in.protectedOutbox && in.workflowConfigured && !in.workflowSendOK {
 		return remainingNotifyProtectedWait
 	}
 	if in.workflowConfigured && in.workflowSendOK {
@@ -882,6 +905,9 @@ func TestRemainingPlanWorkflowFallbackDoesNotDropProtectedBeaconOutput(t *testin
 	}
 	if got := remainingNotificationDecision(remainingNotificationInput{workflowConfigured: true, workflowSendOK: false, protectedOutbox: true, ownerMentionOff: true}); got != remainingNotifyProtectedWait {
 		t.Fatalf("protected beacon output should wait instead of disappearing, got %s", got)
+	}
+	if got := remainingNotificationDecision(remainingNotificationInput{workflowConfigured: false, workflowSendOK: false, protectedOutbox: true}); got != remainingNotifyControlMention {
+		t.Fatalf("protected output may fall back to control mention when webhook is absent, got %s", got)
 	}
 	if got := remainingNotificationDecision(remainingNotificationInput{workflowConfigured: true, workflowSendOK: false, transient: true}); got != remainingNotifyDropTransient {
 		t.Fatalf("transient status may be dropped/superseded, got %s", got)
@@ -913,9 +939,7 @@ type remainingUpgradeCheck struct {
 func remainingSameInstallTarget(a, b remainingInstallTarget) bool {
 	return a.os == b.os &&
 		a.arch == b.arch &&
-		a.path == b.path &&
-		a.profileRevision == b.profileRevision &&
-		a.executionHash == b.executionHash
+		a.path == b.path
 }
 
 func remainingCanPromoteTargetedUpgrade(in remainingUpgradeCheck) bool {
@@ -964,10 +988,15 @@ func TestRemainingPlanPerBeaconTargetUpgradeMatchingIsExact(t *testing.T) {
 	}
 	otherRevision := copyRemainingInstallTarget(target, func(t *remainingInstallTarget) { t.profileRevision = "gpu@3" })
 	otherPath := copyRemainingInstallTarget(target, func(t *remainingInstallTarget) { t.path = "/other/codex" })
-	if !remainingCanPromoteTargetedUpgrade(copyRemainingUpgrade(base, func(in *remainingUpgradeCheck) {
-		in.active = []remainingInstallTarget{otherRevision, otherPath}
+	if remainingCanPromoteTargetedUpgrade(copyRemainingUpgrade(base, func(in *remainingUpgradeCheck) {
+		in.active = []remainingInstallTarget{otherRevision}
 	})) {
-		t.Fatal("different profile revision/path should not block exact targeted upgrade")
+		t.Fatal("same install path must block even when profile revision or execution hash differ")
+	}
+	if !remainingCanPromoteTargetedUpgrade(copyRemainingUpgrade(base, func(in *remainingUpgradeCheck) {
+		in.active = []remainingInstallTarget{otherPath}
+	})) {
+		t.Fatal("different install path should not block exact targeted upgrade")
 	}
 }
 
