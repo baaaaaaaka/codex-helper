@@ -371,7 +371,7 @@ func printSkillEntries(out io.Writer, entries []skills.StatusEntry) {
 			auto = "auto-sync on"
 		}
 		_, _ = fmt.Fprintf(out, "%s  %s  %s\n", entry.Source.Name, state, auto)
-		_, _ = fmt.Fprintf(out, "  %s", entry.Source.RemoteURL)
+		_, _ = fmt.Fprintf(out, "  %s", skills.RedactURLSecrets(entry.Source.RemoteURL))
 		if entry.Source.Ref != "" {
 			_, _ = fmt.Fprintf(out, " @ %s", entry.Source.Ref)
 		}
@@ -458,7 +458,7 @@ func runSkillsPush(ctx context.Context, mgr *skills.Manager, name string, direct
 	for _, sourceID := range sortedChangeSourceIDs(grouped) {
 		sourceChanges := grouped[sourceID]
 		source := sourceChanges[0].Source
-		_, _ = fmt.Fprintf(out, "\nSource %s (%s)\n", source.Name, source.RemoteURL)
+		_, _ = fmt.Fprintf(out, "\nSource %s (%s)\n", source.Name, skills.RedactURLSecrets(source.RemoteURL))
 		var confirmed []skills.LocalChange
 		for _, change := range sourceChanges {
 			printSkillChange(out, change)
@@ -636,7 +636,7 @@ func pushConfirmedSkillChanges(ctx context.Context, mgr *skills.Manager, source 
 	repoDir := filepath.Join(tempDir, "repo")
 	git := mgr.Git
 	if _, err := git.Run(ctx, "", nil, "clone", "--no-checkout", source.RemoteURL, repoDir); err != nil {
-		return err
+		return skills.AnnotateGitAuthError(source, err)
 	}
 	_, _ = git.Run(ctx, repoDir, nil, "config", "core.hooksPath", "NUL")
 	if _, err := git.Run(ctx, repoDir, nil, "checkout", "--detach", baseCommit); err != nil {
@@ -684,7 +684,7 @@ func pushConfirmedSkillChanges(ctx context.Context, mgr *skills.Manager, source 
 			return err
 		}
 	}
-	_, _ = fmt.Fprintf(out, "Remote: %s\nRef: %s\n", source.RemoteURL, refspec)
+	_, _ = fmt.Fprintf(out, "Remote: %s\nRef: %s\n", skills.RedactURLSecrets(source.RemoteURL), refspec)
 	ok, err = promptSkillYesNo(in, out, "Push now?", false)
 	if err != nil {
 		return err
@@ -694,7 +694,7 @@ func pushConfirmedSkillChanges(ctx context.Context, mgr *skills.Manager, source 
 		return nil
 	}
 	if _, err := git.Run(ctx, repoDir, nil, "push", "origin", refspec); err != nil {
-		return err
+		return skills.AnnotateGitAuthError(source, err)
 	}
 	_, _ = fmt.Fprintf(out, "Pushed %s\n", refspec)
 	return nil
@@ -717,7 +717,7 @@ func directPushRefSpec(ctx context.Context, git skills.GitRunner, source skills.
 	}
 	out, err := git.Run(ctx, "", nil, "ls-remote", "--heads", source.RemoteURL, branch)
 	if err != nil {
-		return "", err
+		return "", skills.AnnotateGitAuthError(source, err)
 	}
 	if strings.TrimSpace(string(out)) == "" {
 		return "", fmt.Errorf("--direct branch %q was not found on the remote", branch)

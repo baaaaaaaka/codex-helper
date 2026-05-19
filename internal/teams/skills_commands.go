@@ -3,7 +3,6 @@ package teams
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,10 +217,5 @@ func shortTeamsSHA(v string) string {
 }
 
 func redactTeamsSkillURL(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User == nil {
-		return raw
-	}
-	parsed.User = url.User("redacted")
-	return parsed.String()
+	return skills.RedactURLSecrets(raw)
 }

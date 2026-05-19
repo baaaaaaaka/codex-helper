@@ -306,6 +306,49 @@ func TestDirectPushRefSpecRequiresExistingBranch(t *testing.T) {
 	}
 }
 
+func TestPushConfirmedSkillChangesAnnotatesCloneAuthFailure(t *testing.T) {
+	source := skills.Source{
+		Name:      "jawei-fgx_tin_skill",
+		Provider:  "gitlab",
+		RemoteURL: "ssh://gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git",
+	}
+	mgr := &skills.Manager{Git: authFailCLIGitRunner{}}
+	err := pushConfirmedSkillChanges(context.Background(), mgr, source, []skills.LocalChange{{
+		Source:     source,
+		Commit:     "0123456789abcdef0123456789abcdef01234567",
+		SourcePath: "skills/review/SKILL.md",
+		RelPath:    "SKILL.md",
+	}}, false, strings.NewReader(""), &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("push with clone auth failure succeeded, want error")
+	}
+	text := err.Error()
+	if !strings.Contains(text, "`ssh -T -p 12051 git@gitlab-master.nvidia.com`") {
+		t.Fatalf("push auth error missing SSH check:\n%s", text)
+	}
+	if !strings.Contains(text, "SSH URL has no user") {
+		t.Fatalf("push auth error missing missing-user note:\n%s", text)
+	}
+}
+
+func TestPrintSkillEntriesRedactsHTTPSecretsAndKeepsSSHUser(t *testing.T) {
+	var out bytes.Buffer
+	printSkillEntries(&out, []skills.StatusEntry{
+		{Source: skills.Source{Name: "secret", RemoteURL: "https://token:secret@git.example.com/acme/private.git"}},
+		{Source: skills.Source{Name: "ssh", RemoteURL: "ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git"}},
+	})
+	text := out.String()
+	if strings.Contains(text, "token:secret") {
+		t.Fatalf("skill list leaked credential:\n%s", text)
+	}
+	if !strings.Contains(text, "https://<redacted>@git.example.com/acme/private.git") {
+		t.Fatalf("skill list missing redacted URL:\n%s", text)
+	}
+	if !strings.Contains(text, "ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git") {
+		t.Fatalf("skill list should keep SSH user visible:\n%s", text)
+	}
+}
+
 func TestRunSkillsTextMenuAddListSyncAndBackCombo(t *testing.T) {
 	lockCLITestHooks(t)
 	setEffectivePathsHooksForTest(t)
@@ -536,5 +579,15 @@ func (r directRefGitRunner) Run(_ context.Context, _ string, _ []string, args ..
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unexpected git args: %v", args)
+	}
+}
+
+type authFailCLIGitRunner struct{}
+
+func (authFailCLIGitRunner) Run(_ context.Context, _ string, _ []string, args ...string) ([]byte, error) {
+	return nil, &skills.GitError{
+		Args:   args,
+		Output: "git@gitlab-master.nvidia.com: Permission denied (publickey).",
+		Err:    fmt.Errorf("exit status 128"),
 	}
 }

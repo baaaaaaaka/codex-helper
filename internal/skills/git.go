@@ -80,6 +80,7 @@ func safeGitEnv(extra []string) []string {
 		"GIT_WORK_TREE":        true,
 		"GIT_INDEX_FILE":       true,
 		"GIT_OBJECT_DIRECTORY": true,
+		"GIT_CONFIG_NOSYSTEM":  true,
 	}
 	for _, kv := range base {
 		name := kv
@@ -94,7 +95,6 @@ func safeGitEnv(extra []string) []string {
 	env = append(env,
 		"GIT_TERMINAL_PROMPT=0",
 		"GCM_INTERACTIVE=never",
-		"GIT_CONFIG_NOSYSTEM=1",
 	)
 	env = append(env, extra...)
 	return env
@@ -139,6 +139,36 @@ func scrubURLSecrets(s string) string {
 			s = s[:start] + "<redacted>@" + s[secretEnd+1:]
 			offset = start + len("<redacted>@")
 		}
+	}
+	s = scrubSSHURLPasswords(s)
+	return s
+}
+
+func scrubSSHURLPasswords(s string) string {
+	const scheme = "ssh://"
+	offset := 0
+	for offset < len(s) {
+		idx := strings.Index(strings.ToLower(s[offset:]), scheme)
+		if idx < 0 {
+			break
+		}
+		idx += offset
+		start := idx + len(scheme)
+		at := strings.IndexByte(s[start:], '@')
+		if at < 0 {
+			offset = start
+			continue
+		}
+		userInfoEnd := start + at
+		userInfo := s[start:userInfoEnd]
+		colon := strings.IndexByte(userInfo, ':')
+		if colon < 0 {
+			offset = userInfoEnd + 1
+			continue
+		}
+		redacted := userInfo[:colon+1] + "<redacted>"
+		s = s[:start] + redacted + s[userInfoEnd:]
+		offset = start + len(redacted) + 1
 	}
 	return s
 }
@@ -227,6 +257,9 @@ func knownRemoteRefs(ctx context.Context, git GitRunner, remote string) []string
 }
 
 func authHintError(source Source, err error) error {
+	if err == nil {
+		return nil
+	}
 	text := strings.ToLower(err.Error())
 	if strings.Contains(text, "permission denied") ||
 		strings.Contains(text, "publickey") ||
@@ -238,6 +271,10 @@ func authHintError(source Source, err error) error {
 		return fmt.Errorf("%w\n\n%s", err, authHint(source))
 	}
 	return err
+}
+
+func AnnotateGitAuthError(source Source, err error) error {
+	return authHintError(source, err)
 }
 
 func authHint(source Source) string {
@@ -259,8 +296,12 @@ func authHint(source Source) string {
 	case "gitlab":
 		return "Authentication hint: run `glab auth login` if you use glab, or verify your SSH key with `" + sshCheck + "`." + missingUserNote
 	default:
-		return "Authentication hint: verify that your git credentials can read " + source.RemoteURL + ". For SSH remotes, test with `" + sshCheck + "`." + missingUserNote
+		return "Authentication hint: verify that your git credentials can read " + scrubURLSecrets(source.RemoteURL) + ". For SSH remotes, test with `" + sshCheck + "`." + missingUserNote
 	}
+}
+
+func RedactURLSecrets(s string) string {
+	return scrubURLSecrets(s)
 }
 
 func sshAuthCheckCommand(remote, fallbackUser string) (string, bool) {

@@ -236,6 +236,52 @@ func TestManagerSyncAllRunsSourcesInParallel(t *testing.T) {
 	}
 }
 
+func TestManagerNormalizesLegacyGitLabSSHRemoteForGitOperations(t *testing.T) {
+	mgr := newTestManager(t)
+	runner := &recordingFetchGitRunner{}
+	mgr.Git = runner
+	source := Source{
+		ID:         "legacy-gitlab",
+		Name:       "legacy",
+		RemoteURL:  "ssh://gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git",
+		Ref:        "main",
+		TargetKind: TargetCodexHome,
+		TargetRoot: filepath.Join(mgr.CodexDir, "skills"),
+		AutoSync:   true,
+		AddedAt:    nowUTC(),
+		UpdatedAt:  nowUTC(),
+	}
+	if err := mgr.Store.Update(func(cfg *Config, st *State) error {
+		cfg.Sources = []Source{source}
+		st.Sources = nil
+		return nil
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+
+	results, err := mgr.Sync(context.Background(), SyncOptions{Name: "legacy"})
+	if err != nil {
+		t.Fatalf("sync legacy source: %v", err)
+	}
+	wantRemote := "ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git"
+	if runner.fetchRemote != wantRemote {
+		t.Fatalf("fetch remote = %q, want %q", runner.fetchRemote, wantRemote)
+	}
+	if len(results) != 1 || results[0].Source.RemoteURL != wantRemote {
+		t.Fatalf("result source = %#v, want normalized remote", results)
+	}
+	if results[0].Source.Provider != "gitlab" {
+		t.Fatalf("result provider = %q, want gitlab", results[0].Source.Provider)
+	}
+	entries, err := mgr.List(context.Background())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Source.RemoteURL != wantRemote {
+		t.Fatalf("list source = %#v, want normalized remote", entries)
+	}
+}
+
 func TestStartDailyAutoSyncSkipsDisabledAndAlreadySyncedSources(t *testing.T) {
 	mgr := newTestManager(t)
 	mgr.Git = panicGitRunner{}
@@ -397,6 +443,42 @@ func (panicGitRunner) Run(_ context.Context, dir string, _ []string, args ...str
 type blockingFetchGitRunner struct {
 	fetchStarted chan string
 	releaseFetch chan struct{}
+}
+
+type recordingFetchGitRunner struct {
+	fetchRemote string
+}
+
+func (r *recordingFetchGitRunner) Run(_ context.Context, dir string, _ []string, args ...string) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("empty git args")
+	}
+	switch args[0] {
+	case "init":
+		if len(args) < 3 || args[1] != "--bare" {
+			return nil, fmt.Errorf("unexpected init args: %v", args)
+		}
+		if err := os.MkdirAll(args[2], 0o700); err != nil {
+			return nil, err
+		}
+		return nil, os.WriteFile(filepath.Join(args[2], "HEAD"), []byte("ref: refs/heads/main\n"), 0o600)
+	case "config":
+		return nil, nil
+	case "fetch":
+		if len(args) < 6 {
+			return nil, fmt.Errorf("unexpected fetch args: %v", args)
+		}
+		r.fetchRemote = args[4]
+		return nil, nil
+	case "rev-parse":
+		return []byte("0123456789abcdef0123456789abcdef01234567\n"), nil
+	case "ls-tree":
+		return []byte("100644 blob skilloid\tSKILL.md\x00"), nil
+	case "cat-file":
+		return []byte("---\nname: review\ndescription: Review code\n---\nbody\n"), nil
+	default:
+		return nil, fmt.Errorf("unexpected git args in %s: %v", dir, args)
+	}
 }
 
 func (r *blockingFetchGitRunner) Run(ctx context.Context, dir string, _ []string, args ...string) ([]byte, error) {

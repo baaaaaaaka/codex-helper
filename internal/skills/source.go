@@ -46,7 +46,7 @@ func ParseURL(raw string, opts URLParseOptions) (URLInfo, error) {
 		case host == "github.com" && len(segments) >= 2:
 			info.Provider = "github"
 			info.Name = safeName(segments[0] + "-" + stripGitSuffix(segments[1]))
-			info.RemoteURL = (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: "/" + segments[0] + "/" + stripGitSuffix(segments[1]) + ".git"}).String()
+			info.RemoteURL = normalizedProviderRemoteURL(parsed, "/"+segments[0]+"/"+stripGitSuffix(segments[1])+".git")
 			if len(segments) >= 4 && segments[2] == "tree" {
 				ref, sub := splitRefAndPath(segments[3:], opts.KnownRefs)
 				info.Ref = ref
@@ -61,7 +61,7 @@ func ParseURL(raw string, opts URLParseOptions) (URLInfo, error) {
 				info.Name = safeName(strings.Join(repoSegments, "-"))
 				remoteSegments := append([]string(nil), repoSegments...)
 				remoteSegments[len(remoteSegments)-1] = remoteSegments[len(remoteSegments)-1] + ".git"
-				info.RemoteURL = (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: "/" + strings.Join(remoteSegments, "/")}).String()
+				info.RemoteURL = normalizedProviderRemoteURL(parsed, "/"+strings.Join(remoteSegments, "/"))
 				if repoEnd+2 < len(segments) && segments[repoEnd] == "-" && segments[repoEnd+1] == "tree" {
 					ref, sub := splitRefAndPath(segments[repoEnd+2:], opts.KnownRefs)
 					info.Ref = ref
@@ -96,6 +96,61 @@ func ParseURL(raw string, opts URLParseOptions) (URLInfo, error) {
 		info.RemoteURL = raw
 	}
 	return info, nil
+}
+
+func normalizedProviderRemoteURL(parsed *url.URL, remotePath string) string {
+	normalized := &url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: remotePath}
+	if user := normalizedProviderSSHUser(parsed); user != nil {
+		normalized.User = user
+	}
+	return normalized.String()
+}
+
+func normalizeSourceRemoteForGit(source Source) Source {
+	if source.Provider == "" {
+		source.Provider = inferProviderFromRemoteURL(source.RemoteURL)
+	}
+	if source.Provider != "github" && source.Provider != "gitlab" {
+		return source
+	}
+	parsed, err := url.Parse(source.RemoteURL)
+	if err != nil {
+		return source
+	}
+	if user := normalizedProviderSSHUser(parsed); user != nil {
+		parsed.User = user
+		source.RemoteURL = parsed.String()
+	}
+	return source
+}
+
+func normalizedProviderSSHUser(parsed *url.URL) *url.Userinfo {
+	if !strings.EqualFold(parsed.Scheme, "ssh") {
+		return nil
+	}
+	user := "git"
+	if parsed.User != nil && strings.TrimSpace(parsed.User.Username()) != "" {
+		user = parsed.User.Username()
+	}
+	return url.User(user)
+}
+
+func inferProviderFromRemoteURL(raw string) string {
+	if sshInfo, ok := parseScpLikeGitURL(raw); ok {
+		return sshInfo.Provider
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		return ""
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "github.com" {
+		return "github"
+	}
+	if host == "gitlab.com" || strings.Contains(host, "gitlab") {
+		return "gitlab"
+	}
+	return ""
 }
 
 type scpLikeGitURL struct {

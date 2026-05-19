@@ -177,6 +177,17 @@ func TestHandleSkillsCommandAddReportsAuthHint(t *testing.T) {
 	}
 }
 
+func TestRedactTeamsSkillURLRedactsHTTPSecretsButKeepsSSHUser(t *testing.T) {
+	got := redactTeamsSkillURL("https://token:secret@git.example.com/acme/private.git")
+	if strings.Contains(got, "token:secret") || !strings.Contains(got, "https://<redacted>@git.example.com/acme/private.git") {
+		t.Fatalf("HTTP secret redaction = %q", got)
+	}
+	got = redactTeamsSkillURL("ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git")
+	if got != "ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git" {
+		t.Fatalf("SSH URL redaction = %q", got)
+	}
+}
+
 func TestSkillsCommandDispatchesThroughControlAndWorkChats(t *testing.T) {
 	mgr := newTeamsSkillsTestManager(t)
 	prev := newTeamsSkillsManagerForCommand

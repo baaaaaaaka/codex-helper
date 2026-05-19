@@ -182,6 +182,7 @@ func (m *Manager) List(ctx context.Context) ([]StatusEntry, error) {
 	}
 	entries := make([]StatusEntry, 0, len(cfg.Sources))
 	for _, source := range cfg.Sources {
+		source = normalizeSourceRemoteForGit(source)
 		state, ok := sourceStateByID(st, source.ID)
 		if !ok {
 			state = SourceState{ID: source.ID, Status: StatusReady}
@@ -204,7 +205,7 @@ func (m *Manager) Sync(ctx context.Context, opts SyncOptions) ([]SyncResult, err
 	var selected []Source
 	for _, source := range cfg.Sources {
 		if opts.All || strings.TrimSpace(opts.Name) == "" || sourceMatches(source, opts.Name) {
-			selected = append(selected, source)
+			selected = append(selected, normalizeSourceRemoteForGit(source))
 		}
 	}
 	if len(selected) == 0 {
@@ -426,6 +427,7 @@ func (m *Manager) StartDailyAutoSync(ctx context.Context) {
 		if !source.AutoSync {
 			continue
 		}
+		source = normalizeSourceRemoteForGit(source)
 		state, _ := sourceStateByID(st, source.ID)
 		if state.LastAutoSyncDay == today {
 			continue

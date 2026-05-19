@@ -68,6 +68,46 @@ func TestParseURLGitLabCustomHostFolderWithQuery(t *testing.T) {
 	}
 }
 
+func TestParseURLGitLabSSHRemotePreservesOrDefaultsUser(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{
+			raw:  "ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git",
+			want: "ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git",
+		},
+		{
+			raw:  "ssh://gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git",
+			want: "ssh://git@gitlab-master.nvidia.com:12051/jawei/fgx_tin_skill.git",
+		},
+	} {
+		info, err := ParseURL(tc.raw, URLParseOptions{})
+		if err != nil {
+			t.Fatalf("ParseURL(%s): %v", tc.raw, err)
+		}
+		if info.Provider != "gitlab" {
+			t.Fatalf("%s provider = %q", tc.raw, info.Provider)
+		}
+		if info.RemoteURL != tc.want {
+			t.Fatalf("%s remote = %q, want %q", tc.raw, info.RemoteURL, tc.want)
+		}
+	}
+}
+
+func TestParseURLGitHubSSHRemotePreservesUserAndPath(t *testing.T) {
+	info, err := ParseURL("ssh://git@github.com/acme/codex-skills/tree/main/skills/review", URLParseOptions{})
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	if info.RemoteURL != "ssh://git@github.com/acme/codex-skills.git" {
+		t.Fatalf("remote = %q", info.RemoteURL)
+	}
+	if info.Ref != "main" || info.Path != "skills/review" {
+		t.Fatalf("ref/path = %q/%q", info.Ref, info.Path)
+	}
+}
+
 func TestParseURLGitHubSkillCollectionAndSingleSkillFolders(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string
