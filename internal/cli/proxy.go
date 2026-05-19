@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
@@ -57,7 +58,7 @@ var (
 	proxyCheckHTTPProxy       = func(hc manager.HealthClient, port int, expectedInstanceID string) error {
 		return hc.CheckHTTPProxy(port, expectedInstanceID)
 	}
-	proxyExecutable    = os.Executable
+	proxyExecutable    = helperpath.RawExecutable
 	proxyCommand       = exec.Command
 	runProxyDaemonFunc = runProxyDaemon
 )
@@ -134,6 +135,11 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			resolvedExe, err := helperpath.StableRunnablePathFromSources(exe, restartArgv0(), helperpath.Options{})
+			if err != nil {
+				return err
+			}
+			exe = resolvedExe.Path
 
 			args := []string{"--config", store.Path(), "proxy", "daemon", "--instance-id", instanceID}
 

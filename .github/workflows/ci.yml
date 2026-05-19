@@ -445,6 +445,38 @@ jobs:
           $pattern = 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix))$'
           go test ./internal/cli -count=1 -run $pattern
 
+      - name: Helper path and service persistence regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/helperpath -count=1 -v
+          helper_pattern='Test(HandleUpdateAndRestartUsesSharedInstallLock|TeamsService(InstallUsesStablePathWhenExecutableIsNFSSillyRename|BootstrapDryRunDoesNotWriteOrStart|BootstrapNoStartRepairsButDoesNotStart|InstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile|RepairMergesAllowedEnvironmentFromExistingSystemdUnit|StartPendingActivationUsesStableExecutablePath)|PendingHelperActivationAllowsTempSourceButRequiresStableDestination|TeamsCodexChildEnv(DoesNotExposeTransientHelperPath|ExposesRecoveredStableHelperPath)|ResolveTeamsHelperExecutableStatusReportsRawStableAndActivationPending|FormatTeamsHelperVersionStatusReportsOwnerEntryAndPending|RunInternalNpmWrapper.*|OSExecutableUsageIsCentralized)'
+          go test ./internal/cli -count=1 -run "$helper_pattern" -v
+          go test ./internal/update -count=1 -run 'Test(ResolveInstallPath(UsesStableSiblingForNFSSillyRename|FallsBackToStableArgv0Last|RejectsExplicitNFSSillyRename)|PerformUpdateUsesStableInstallTargetForTransientRuntimePath)$' -v
+          go test ./internal/teams/store -count=1 -run 'Test(CurrentOwner(StoresStableExecutableWhenRawPathIsTransient|FallsBackToStableArgv0WhenRawPathIsGoBuild|RejectsUnresolvedTransientExecutable|RejectsUnresolvedGoBuildHelperExecutable)|SameOwnerProcessCanonicalizesNFSSillyRename)$' -v
+          go test ./internal/codexrunner -count=1 -v
+
+      - name: Self-update clean-env regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix)|RunTargetOnceWithOptionsUsesPatchInfoForSelfUpdateGuard)$' -v
+
+      - name: Self-update clean-env regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          Get-ChildItem Env: | Where-Object {
+            $_.Name -like 'CODEX_PROXY_*' -or
+            $_.Name -like 'CODEX_HELPER_*' -or
+            $_.Name -eq 'npm_config_prefix'
+          } | ForEach-Object { Remove-Item ("Env:" + $_.Name) -ErrorAction SilentlyContinue }
+          $pattern = 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix))$'
+          go test ./internal/cli -count=1 -run $pattern -v
+
       - name: go vet
         run: go vet ./...
 

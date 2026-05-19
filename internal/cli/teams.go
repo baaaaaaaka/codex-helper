@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -1691,6 +1692,21 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	}
 	_, _ = fmt.Fprintf(out, "Sessions: %d total, %d active\n", len(statusSessions), activeStatusSessionCount(statusSessions))
 	_, _ = fmt.Fprintf(out, "State: %s\n", defaultStatePath)
+	pathStatus := resolveTeamsHelperExecutableStatus()
+	if pathStatus.Raw != "" {
+		_, _ = fmt.Fprintf(out, "Helper raw executable: %s\n", pathStatus.Raw)
+	}
+	if pathStatus.Stable != "" {
+		_, _ = fmt.Fprintf(out, "Helper stable executable: %s\n", pathStatus.Stable)
+	}
+	if pathStatus.Source != "" || pathStatus.Reason != "" {
+		_, _ = fmt.Fprintf(out, "Helper path resolution: source=%s reason=%s\n", firstNonEmptyCLI(pathStatus.Source, "unknown"), firstNonEmptyCLI(pathStatus.Reason, "unknown"))
+	}
+	if pathStatus.Warning != "" {
+		_, _ = fmt.Fprintf(out, "Helper path warning: %s\n", pathStatus.Warning)
+	}
+	_, _ = fmt.Fprintf(out, "OS service: %s\n", formatTeamsOSServiceStatus(cmd.Context()))
+	_, _ = fmt.Fprintf(out, "Helper version: %s\n", formatTeamsHelperVersionStatus(cmd.Context(), owners))
 	if len(statePaths) == 0 {
 		_, _ = fmt.Fprintln(out, "Bridge: not running")
 		_, _ = fmt.Fprintln(out, "State summary: unavailable")
@@ -1705,8 +1721,6 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	if serviceControl, ok := summarizeServiceControls(serviceControls); ok {
 		_, _ = fmt.Fprintf(out, "Service control: %s\n", formatServiceControl(serviceControl))
 	}
-	_, _ = fmt.Fprintf(out, "OS service: %s\n", formatTeamsOSServiceStatus(cmd.Context()))
-	_, _ = fmt.Fprintf(out, "Helper version: %s\n", formatTeamsHelperVersionStatus(cmd.Context(), owners))
 	if len(owners) == 0 {
 		_, _ = fmt.Fprintln(out, "Bridge: not running")
 		_, _ = fmt.Fprintln(out, "Teams listener: stopped - Teams messages are not being read.")
@@ -1728,6 +1742,40 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	return nil
 }
 
+type teamsHelperExecutableStatus struct {
+	Raw               string
+	Stable            string
+	Source            string
+	Reason            string
+	Warning           string
+	ActivationPending bool
+}
+
+func resolveTeamsHelperExecutableStatus() teamsHelperExecutableStatus {
+	raw, err := teamsServiceExecutable()
+	if err != nil {
+		return teamsHelperExecutableStatus{Warning: "raw executable unavailable: " + err.Error()}
+	}
+	out := teamsHelperExecutableStatus{Raw: raw}
+	resolved, resolveErr := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	if resolveErr != nil {
+		class := helperpath.ClassifyPath(raw)
+		out.Stable = class.Clean
+		out.Reason = class.Reason
+		out.Warning = resolveErr.Error()
+		out.ActivationPending = true
+		return out
+	}
+	out.Stable = resolved.Path
+	out.Source = string(resolved.Source)
+	out.Reason = resolved.Reason
+	class := helperpath.ClassifyPath(raw)
+	if class.Transient || (strings.TrimSpace(resolved.Path) != "" && resolved.Path != strings.TrimSpace(class.Clean)) {
+		out.ActivationPending = true
+	}
+	return out
+}
+
 func formatTeamsHelperVersionStatus(ctx context.Context, owners []teamsstore.OwnerMetadata) string {
 	ownerVersion := "none"
 	if len(owners) > 0 {
@@ -1746,9 +1794,9 @@ func formatTeamsHelperVersionStatus(ctx context.Context, owners []teamsstore.Own
 	entryVersion := "unknown"
 	entryVersionRaw := ""
 	entryVersionComparable := false
-	installPath := ""
-	if exe, err := teamsServiceExecutable(); err == nil {
-		installPath = stableRestartExecutablePath(exe)
+	pathStatus := resolveTeamsHelperExecutableStatus()
+	installPath := pathStatus.Stable
+	if installPath != "" {
 		if probed, err := update.ProbeBinaryVersion(ctx, installPath, 5*time.Second); err == nil {
 			entryVersionRaw = strings.TrimPrefix(strings.TrimSpace(probed.Version), "v")
 			entryVersion = "v" + entryVersionRaw
@@ -1773,7 +1821,16 @@ func formatTeamsHelperVersionStatus(ctx context.Context, owners []teamsstore.Own
 			pendingText = strings.Join(parts, ", ")
 		}
 	}
-	return fmt.Sprintf("owner=%s, entry=%s, pending=%s", ownerVersion, entryVersion, pendingText)
+	activationText := "none"
+	if pathStatus.ActivationPending {
+		activationText = "pending"
+		if pathStatus.Warning != "" {
+			activationText += ": " + pathStatus.Warning
+		} else if pathStatus.Reason != "" {
+			activationText += ": " + pathStatus.Reason
+		}
+	}
+	return fmt.Sprintf("owner=%s, entry=%s, pending=%s, activation=%s", ownerVersion, entryVersion, pendingText, activationText)
 }
 
 func formatTeamsPendingReplacementStatus(candidate update.PendingReplacement, entryVersion string, entryVersionComparable bool) string {

@@ -232,8 +232,9 @@ func turnStartFailureNextSteps(code string, notConfigured ProviderCommandNotConf
 		next := []string{}
 		if profile != "" && flag != "" && provider != "" {
 			next = append(next, fmt.Sprintf("Run `beacon profile update %s --provider %s ... %s <adapter-script>` in the control chat to store the adapter on the profile. This does not require a helper reload.", profile, strings.ToLower(string(provider)), flag))
+			next = append(next, "If the adapter depends on your normal scheduler shell setup, include `--adapter-shell user` so cxp resolves that shell environment before direct-running the adapter.")
 		}
-		next = append(next, fmt.Sprintf("Or configure `%s` in the Teams helper service environment, not only in an interactive shell.", envName))
+		next = append(next, fmt.Sprintf("Advanced fallback: configure `%s` in the Teams helper service environment.", envName))
 		if provider != "" {
 			next = append(next, fmt.Sprintf("For a starter script, run `cxp beacon provider template %s` on the helper host.", strings.ToLower(string(provider))))
 		} else {
@@ -643,29 +644,52 @@ func AllocationSummaryLines(st State) []string {
 	if len(allocations) == 0 {
 		return []string{"- none"}
 	}
-	lines := make([]string, 0, len(allocations))
+	lines := make([]string, 0, len(allocations)*4)
 	for _, req := range allocations {
 		status := string(req.State)
 		if status == "" {
 			status = "unknown"
 		}
-		line := fmt.Sprintf("- %s: %s on %s (%s)", detailValue(req.ID), status, detailValue(req.Profile), providerLabel(req.Provider))
-		var facts []string
+		lines = append(lines, fmt.Sprintf("- %s: %s on %s (%s)", detailValue(req.ID), status, detailValue(req.Profile), providerLabel(req.Provider)))
 		if strings.TrimSpace(req.ProviderIdentity.ProviderJobID) != "" {
-			facts = append(facts, "provider_job="+req.ProviderIdentity.ProviderJobID)
+			lines = append(lines, "  provider_job: "+strings.TrimSpace(req.ProviderIdentity.ProviderJobID))
 		}
 		if strings.TrimSpace(req.RawProviderState) != "" {
-			facts = append(facts, "provider_state="+req.RawProviderState)
+			lines = append(lines, "  provider_state: "+strings.TrimSpace(req.RawProviderState))
 		}
 		if strings.TrimSpace(req.ProviderReason) != "" {
-			facts = append(facts, "reason="+req.ProviderReason)
+			lines = append(lines, "  reason: "+allocationSummaryReason(req.ProviderReason))
 		}
-		if len(facts) > 0 {
-			line += " - " + strings.Join(facts, ", ")
-		}
-		lines = append(lines, line)
 	}
 	return lines
+}
+
+func allocationSummaryReason(reason string) string {
+	reason = strings.Join(strings.Fields(strings.ReplaceAll(strings.TrimSpace(reason), ";", "; ")), " ")
+	if reason == "" {
+		return ""
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(reason, "_", " "))
+	switch {
+	case strings.Contains(normalized, "submit account") || strings.Contains(normalized, "without specifying the account"):
+		return "submit failed: missing Slurm account; set SUBMIT_ACCOUNT in the helper/adapter environment or pass --account"
+	case strings.Contains(normalized, "provider adapter") && strings.Contains(normalized, "not configured"):
+		return summarizeLongText(reason, 180)
+	default:
+		return summarizeLongText(reason, 180)
+	}
+}
+
+func summarizeLongText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if limit <= 0 || len(runes) <= limit {
+		return value
+	}
+	if limit < len("...(truncated)") {
+		return string(runes[:limit])
+	}
+	return strings.TrimSpace(string(runes[:limit-len("...(truncated)")])) + "...(truncated)"
 }
 
 func MachineSummaryLines(st State) []string {

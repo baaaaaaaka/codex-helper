@@ -154,6 +154,102 @@ func TestParseProviderCommandResultSupportsJSONAndKeyValue(t *testing.T) {
 	}
 }
 
+func TestCommandProviderAdapterCanRunThroughUserShell(t *testing.T) {
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("CODEX_HELPER_CLI_PATH", "/opt/cxp")
+	req := slurmAllocationRequestForAdapter(t)
+	req.ProfileSnapshot.Adapter = ProviderCommandConfig{
+		SlurmSubmitCommand: "/opt/cxp/submit-slurm",
+		ShellMode:          ProviderCommandShellUser,
+	}
+	shellEnv := "startup banner\n" + providerShellEnvBegin + "\x00PATH=/opt/site/bin:/usr/bin\x00SUBMIT_ACCOUNT=acct\x00CODEX_HELPER_CLI_PATH=/tmp/.nfs802014de01c482a800000492\x00CODEX_PROXY_INSTALL_DIR=/tmp/codex-proxy\x00" + providerShellEnvEnd + "\x00trailing output\n"
+	runner := &recordingProviderRunner{outputByCommand: map[string]string{
+		"/bin/zsh":              shellEnv,
+		"/opt/cxp/submit-slurm": `{"provider_job_id":"shell-1","raw_state":"PD"}`,
+	}}
+	adapter := CommandProviderAdapter{Runner: runner}
+
+	submitted, err := adapter.SubmitAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("submit allocation: %v", err)
+	}
+	if submitted.ProviderJobID != "shell-1" {
+		t.Fatalf("submitted = %#v", submitted)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("calls = %#v", runner.calls)
+	}
+	envCall := runner.calls[0]
+	if envCall.name != "/bin/zsh" {
+		t.Fatalf("shell command = %q, want /bin/zsh", envCall.name)
+	}
+	for _, want := range []string{"-lic", providerShellEnvBegin, providerShellEnvEnd} {
+		if !containsProviderArgSubstring(envCall.args, want) {
+			t.Fatalf("shell env args missing %q: %#v", want, envCall.args)
+		}
+	}
+	adapterCall := runner.calls[1]
+	if adapterCall.name != "/opt/cxp/submit-slurm" {
+		t.Fatalf("adapter command = %q", adapterCall.name)
+	}
+	if !containsProviderArgPair(adapterCall.args, "--operation", "submit") {
+		t.Fatalf("adapter args were not forwarded: %#v", adapterCall.args)
+	}
+	for _, want := range []string{"PATH=/opt/site/bin:/usr/bin", "SUBMIT_ACCOUNT=acct", "CODEX_HELPER_CLI_PATH=/opt/cxp"} {
+		if !containsProviderArg(adapterCall.env, want) {
+			t.Fatalf("adapter env missing %q: %#v", want, adapterCall.env)
+		}
+	}
+	for _, blocked := range []string{"CODEX_HELPER_CLI_PATH=/tmp/.nfs802014de01c482a800000492", "CODEX_PROXY_INSTALL_DIR=/tmp/codex-proxy"} {
+		if containsProviderArg(adapterCall.env, blocked) {
+			t.Fatalf("adapter env should not include shell volatile helper env %q: %#v", blocked, adapterCall.env)
+		}
+	}
+}
+
+func TestCommandProviderAdapterShellCommandFallbackRunsAdapterThroughShell(t *testing.T) {
+	t.Setenv("SHELL", "/bin/zsh")
+	req := slurmAllocationRequestForAdapter(t)
+	req.ProfileSnapshot.Adapter = ProviderCommandConfig{
+		SlurmSubmitCommand: "/opt/cxp/submit-slurm",
+		ShellMode:          ProviderCommandShellCommand,
+	}
+	runner := &recordingProviderRunner{output: `{"provider_job_id":"shell-command-1","raw_state":"PD"}`}
+	adapter := CommandProviderAdapter{Runner: runner}
+
+	submitted, err := adapter.SubmitAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("submit allocation: %v", err)
+	}
+	if submitted.ProviderJobID != "shell-command-1" || len(runner.calls) != 1 {
+		t.Fatalf("submitted=%#v calls=%#v", submitted, runner.calls)
+	}
+	call := runner.calls[0]
+	for _, want := range []string{"/bin/zsh", "-lic", `exec "$0" "$@"`, "/opt/cxp/submit-slurm"} {
+		if call.name != want && !containsProviderArg(call.args, want) {
+			t.Fatalf("shell-command call missing %q: %#v", want, call)
+		}
+	}
+}
+
+func TestExecProviderCommandRunnerIgnoresSuccessfulStderr(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "adapter.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho shell startup warning >&2\necho '{\"provider_job_id\":\"stderr-ok\",\"raw_state\":\"PD\"}'\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	out, err := ExecProviderCommandRunner{}.RunProviderCommand(context.Background(), script, nil)
+	if err != nil {
+		t.Fatalf("run provider command: %v", err)
+	}
+	result, err := ParseProviderCommandResult(out)
+	if err != nil {
+		t.Fatalf("parse provider command output %q: %v", out, err)
+	}
+	if result.ProviderJobID != "stderr-ok" || result.RawState != "PD" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestCommandProviderAdapterCancelAndRenewUseDedicatedCommands(t *testing.T) {
 	req := slurmAllocationRequestForAdapter(t)
 	req.ProviderIdentity.ProviderJobID = "12345"
@@ -189,6 +285,7 @@ func TestBeaconProviderEnvironmentVariablesStayDocumented(t *testing.T) {
 		BeaconLSFSubmitCommandEnv,
 		BeaconLSFCancelCommandEnv,
 		BeaconLSFRenewCommandEnv,
+		BeaconProviderShellModeEnv,
 	}
 	files := map[string]string{
 		"README":        filepath.Join("..", "..", "README.md"),
@@ -403,6 +500,7 @@ func slurmAllocationRequestForAdapter(t *testing.T) AllocationRequest {
 type providerRunnerCall struct {
 	name string
 	args []string
+	env  []string
 }
 
 type recordingProviderRunner struct {
@@ -423,9 +521,29 @@ func (r *recordingProviderRunner) RunProviderCommand(_ context.Context, name str
 	return r.output, nil
 }
 
+func (r *recordingProviderRunner) RunProviderCommandWithEnv(_ context.Context, name string, args []string, env []string) (string, error) {
+	r.calls = append(r.calls, providerRunnerCall{name: name, args: append([]string(nil), args...), env: append([]string(nil), env...)})
+	if err := r.errByCommand[name]; err != nil {
+		return "", err
+	}
+	if out, ok := r.outputByCommand[name]; ok {
+		return out, nil
+	}
+	return r.output, nil
+}
+
 func containsProviderArg(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsProviderArgSubstring(values []string, want string) bool {
+	for _, value := range values {
+		if strings.Contains(value, want) {
 			return true
 		}
 	}

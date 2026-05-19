@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/url"
@@ -21,6 +22,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -62,8 +65,14 @@ func (teamsServiceExecRunner) Run(ctx context.Context, name string, args ...stri
 }
 
 var (
-	teamsServiceGOOS                                                  = func() string { return runtime.GOOS }
-	teamsServiceExecutable                                            = os.Executable
+	teamsServiceGOOS       = func() string { return runtime.GOOS }
+	teamsServiceExecutable = helperpath.RawExecutable
+	teamsServiceArgv0      = func() string {
+		if len(os.Args) == 0 {
+			return ""
+		}
+		return os.Args[0]
+	}
 	teamsServiceGetwd                                                 = os.Getwd
 	teamsServiceSystemdUserDir                                        = defaultTeamsServiceSystemdUserDir
 	teamsServiceLaunchAgentDir                                        = defaultTeamsServiceLaunchAgentDir
@@ -107,6 +116,8 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 	var noUAC bool
 	var fallbackOnly bool
 	var noOpenControl bool
+	var noStart bool
+	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "bootstrap",
 		Short: "Install or repair the Teams bridge background service",
@@ -115,6 +126,22 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := rejectTeamsHelperSelfManagementFromChild("bootstrap the Teams service", "helper reload now"); err != nil {
 				return err
+			}
+			if dryRun {
+				return printTeamsServiceDryRun(cmd.Context(), cmd.OutOrStdout(), registryPath)
+			}
+			if noStart {
+				result, err := bootstrapTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
+					NoStart: true,
+					In:      cmd.InOrStdin(),
+					Out:     cmd.OutOrStdout(),
+				})
+				if err != nil {
+					return err
+				}
+				printTeamsServiceBootstrapReady(cmd.OutOrStdout(), result)
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Service was repaired but not started.")
+				return nil
 			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
@@ -147,6 +174,8 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 	cmd.Flags().BoolVar(&noUAC, "no-uac", false, "Do not open a Windows UAC prompt; use the current-user Startup fallback if needed")
 	cmd.Flags().BoolVar(&fallbackOnly, "fallback-only", false, "Install the current-user Startup watchdog instead of trying Windows Task Scheduler")
 	cmd.Flags().BoolVar(&noOpenControl, "no-open-control", false, "Do not try to open the Teams control chat link automatically")
+	cmd.Flags().BoolVar(&noStart, "no-start", false, "Repair the service config and enable it without starting the service or preparing the control chat")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Render the service config that would be written without modifying services, tasks, or Teams state")
 	return cmd
 }
 
@@ -342,6 +371,11 @@ func schedulePendingTeamsServiceActivationBeforeStart(ctx context.Context, out i
 	if err != nil {
 		return false, err
 	}
+	resolved, resolveErr := helperpath.StableRunnablePathFromSources(installPath, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	if resolveErr != nil {
+		return false, resolveErr
+	}
+	installPath = resolved.Path
 	activation, ok, err := discoverTeamsPendingHelperActivation(ctx, installPath, "")
 	if err != nil {
 		return false, err
@@ -381,10 +415,18 @@ func newTeamsServiceDoctorCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service config: %s\n", path)
 			if exe, err := teamsServiceExecutable(); err != nil {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service executable: unavailable (%v)\n", err)
-			} else if err := validateTeamsServiceExecutable(exe); err != nil {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service executable: not installable (%v)\n", err)
 			} else {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service executable: %s\n", exe)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service raw executable: %s\n", exe)
+				if resolved, resolveErr := helperpath.StableRunnablePathFromSources(exe, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()}); resolveErr != nil {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service stable executable: unresolved (%v)\n", resolveErr)
+				} else if err := validateTeamsServiceExecutable(resolved.Path); err != nil {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service stable executable: not installable (%v)\n", err)
+				} else {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service stable executable: %s\n", resolved.Path)
+					if resolved.Recovered || resolved.Source == helperpath.SourceArgv0 {
+						_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service path resolution: source=%s reason=%s\n", resolved.Source, resolved.Reason)
+					}
+				}
 			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service auth: not ready (%v)\n", err)
@@ -450,10 +492,67 @@ func repairTeamsService(ctx context.Context, registryPath *string, opts teamsSer
 	return path, nil
 }
 
+func printTeamsServiceDryRun(ctx context.Context, out io.Writer, registryPath *string) error {
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return err
+	}
+	spec, err := buildTeamsServiceSpec(registryPath)
+	if err != nil {
+		return err
+	}
+	path, err := backend.Path()
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		out = io.Discard
+	}
+	_, _ = fmt.Fprintf(out, "Teams service dry-run: backend=%s name=%s path=%s\n", backend.ID(), backend.Name(), path)
+	_, _ = fmt.Fprintf(out, "Executable: %s\n", spec.Executable)
+	_, _ = fmt.Fprintf(out, "WorkingDirectory: %s\n", spec.WorkingDir)
+	if spec.RegistryPath != "" {
+		_, _ = fmt.Fprintf(out, "Registry: %s\n", spec.RegistryPath)
+	}
+	switch typed := backend.(type) {
+	case teamsServiceSystemdBackend:
+		_, _ = fmt.Fprintln(out, "--- systemd main unit ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceUnit(spec))
+		_, _ = fmt.Fprintln(out, "--- systemd watchdog unit ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceWatchdogUnit(spec))
+	case teamsServiceLaunchAgentBackend:
+		_, _ = fmt.Fprintln(out, "--- launchd main plist ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceLaunchAgentPlist(spec))
+		_, _ = fmt.Fprintln(out, "--- launchd watchdog plist ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceWatchdogLaunchAgentPlist(spec))
+	case teamsServiceWindowsTaskBackend:
+		_, _ = fmt.Fprintln(out, "--- windows task xml ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceWindowsTaskXML(spec))
+		_, _ = fmt.Fprintln(out, "--- windows watchdog task xml ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceWindowsWatchdogTaskXML(spec))
+	case teamsServiceWSLWindowsTaskBackend:
+		args := buildTeamsServiceWSLArguments(spec)
+		watchdogArgs := buildTeamsServiceWSLWatchdogArguments(spec)
+		_, _ = fmt.Fprintln(out, "--- wsl task config ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceWSLTaskConfig(typed.Name(), args))
+		_, _ = fmt.Fprintln(out, "--- wsl watchdog task config ---")
+		_, _ = fmt.Fprint(out, buildTeamsServiceWSLTaskConfig(typed.watchdogName(), watchdogArgs))
+	default:
+		_, _ = fmt.Fprintln(out, "Rendered config preview is not available for this backend.")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
 type teamsServiceBootstrapOptions struct {
 	AssumeYes    bool
 	NoUAC        bool
 	FallbackOnly bool
+	NoStart      bool
 	In           io.Reader
 	Out          io.Writer
 }
@@ -631,10 +730,17 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		if err != nil {
 			return teamsServiceBootstrapResult{}, fmt.Errorf("repair Teams service before pending helper activation: %w", err)
 		}
+		if opts.NoStart {
+			return teamsServiceBootstrapResult{Mode: backend.ID() + "-no-start", Path: path}, nil
+		}
 		if err := scheduleTeamsPendingHelperActivation(ctx, activation); err != nil {
 			return teamsServiceBootstrapResult{}, fmt.Errorf("schedule pending helper activation: %w", err)
 		}
 		return teamsServiceBootstrapResult{Mode: "windows-pending-helper-activation", Path: path}, nil
+	}
+	if opts.NoStart {
+		path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false})
+		return teamsServiceBootstrapResult{Mode: backend.ID() + "-no-start", Path: path}, err
 	}
 	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
 		if _, err := teamsServiceRetireLocalDuplicateProcesses(ctx, spec); err != nil {
@@ -2157,7 +2263,11 @@ func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
-	exe = stableRestartExecutablePath(exe)
+	resolvedExe, err := helperpath.StableRunnablePathFromSources(exe, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	if err != nil {
+		return teamsServiceSpec{}, err
+	}
+	exe = resolvedExe.Path
 	if err := validateTeamsServiceExecutable(exe); err != nil {
 		return teamsServiceSpec{}, err
 	}
@@ -2165,7 +2275,6 @@ func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
-	exe = stableRestartExecutablePath(exe)
 	cwd, err := teamsServiceGetwd()
 	if err != nil {
 		return teamsServiceSpec{}, err
@@ -2230,13 +2339,31 @@ func teamsServiceEnvironmentForWorkingDir(workingDir string) (map[string]string,
 	}
 	for _, name := range teamsServiceEnvironmentAllowlist() {
 		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-			if teamsServiceShouldDropProxyEnv(name, value) {
+			if !teamsServiceEnvironmentValueAllowed(name, value) {
 				continue
 			}
 			env[name] = value
 		}
 	}
-	if strings.TrimSpace(env[envCodexHome]) == "" || strings.TrimSpace(env["CODEX_DIR"]) == "" {
+	for name, value := range teamsServiceExistingEnvironment() {
+		if strings.TrimSpace(env[name]) != "" || !teamsServiceEnvironmentValueAllowed(name, value) {
+			continue
+		}
+		env[name] = value
+	}
+	codexHomeEnv := strings.TrimSpace(env[envCodexHome])
+	codexDirEnv := strings.TrimSpace(env["CODEX_DIR"])
+	switch {
+	case codexHomeEnv != "" || codexDirEnv != "":
+		if codexHomeEnv == "" {
+			codexHomeEnv = codexDirEnv
+		}
+		if codexDirEnv == "" {
+			codexDirEnv = codexHomeEnv
+		}
+		env[envCodexHome] = normalizeTeamsServiceCodexHomeEnv(codexHomeEnv, workingDir)
+		env["CODEX_DIR"] = normalizeTeamsServiceCodexHomeEnv(codexDirEnv, workingDir)
+	case codexHomeEnv == "" && codexDirEnv == "":
 		codexHome, err := resolveCodexHome("", workingDir)
 		if err == nil && strings.TrimSpace(codexHome) != "" {
 			codexHome = strings.TrimSpace(codexHome)
@@ -2247,11 +2374,119 @@ func teamsServiceEnvironmentForWorkingDir(workingDir string) (map[string]string,
 	return env, nil
 }
 
+func normalizeTeamsServiceCodexHomeEnv(value string, workingDir string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if !filepath.IsAbs(value) && strings.TrimSpace(workingDir) != "" {
+		value = filepath.Join(workingDir, value)
+	}
+	if abs, err := filepath.Abs(value); err == nil {
+		value = abs
+	}
+	return value
+}
+
+func teamsServiceExistingEnvironment() map[string]string {
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return nil
+	}
+	path, err := backend.Path()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	switch backend.(type) {
+	case teamsServiceSystemdBackend:
+		return parseTeamsServiceSystemdEnvironment(string(data))
+	case teamsServiceLaunchAgentBackend:
+		return parseTeamsServiceLaunchAgentEnvironment(string(data))
+	default:
+		return nil
+	}
+}
+
+func teamsServiceEnvironmentValueAllowed(name string, value string) bool {
+	if !teamsServiceEnvironmentNameAllowed(name) {
+		return false
+	}
+	return !teamsServiceShouldDropProxyEnv(name, value)
+}
+
+func teamsServiceEnvironmentNameAllowed(name string) bool {
+	for _, allowed := range teamsServiceEnvironmentAllowlist() {
+		if name == allowed {
+			return true
+		}
+	}
+	return false
+}
+
 func teamsServiceShouldDropProxyEnv(name string, value string) bool {
-	if !teamsServiceProxyEnvName(name) || !teamsServiceDropLocalProxyEnv() {
+	if !teamsServiceProxyEnvName(name) {
+		return false
+	}
+	if teamsServiceProxyHasCredentials(value) {
+		return true
+	}
+	if !teamsServiceDropLocalProxyEnv() {
 		return false
 	}
 	return teamsServiceProxyIsLoopback(value)
+}
+
+func parseTeamsServiceSystemdEnvironment(data string) map[string]string {
+	out := make(map[string]string)
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Environment=") {
+			continue
+		}
+		item := strings.TrimSpace(strings.TrimPrefix(line, "Environment="))
+		if unquoted, err := strconv.Unquote(item); err == nil {
+			item = unquoted
+		}
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			continue
+		}
+		out[strings.TrimSpace(key)] = value
+	}
+	return out
+}
+
+func parseTeamsServiceLaunchAgentEnvironment(data string) map[string]string {
+	out := make(map[string]string)
+	inEnv := false
+	var pendingKey string
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "<key>EnvironmentVariables</key>") {
+			inEnv = true
+			pendingKey = ""
+			continue
+		}
+		if !inEnv {
+			continue
+		}
+		if strings.Contains(line, "</dict>") {
+			break
+		}
+		if strings.HasPrefix(line, "<key>") && strings.Contains(line, "</key>") {
+			pendingKey = html.UnescapeString(strings.TrimSuffix(strings.TrimPrefix(line, "<key>"), "</key>"))
+			continue
+		}
+		if pendingKey != "" && strings.HasPrefix(line, "<string>") && strings.Contains(line, "</string>") {
+			out[pendingKey] = html.UnescapeString(strings.TrimSuffix(strings.TrimPrefix(line, "<string>"), "</string>"))
+			pendingKey = ""
+		}
+	}
+	return out
 }
 
 func teamsServiceProxyEnvName(name string) bool {
@@ -2299,11 +2534,36 @@ func teamsServiceProxyIsLoopback(value string) bool {
 	return false
 }
 
+func teamsServiceProxyHasCredentials(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.User == nil {
+		if strings.Contains(value, "://") {
+			return false
+		}
+		head := value
+		if idx := strings.IndexAny(head, "/?#"); idx >= 0 {
+			head = head[:idx]
+		}
+		userInfo, _, hasUserInfo := strings.Cut(head, "@")
+		return hasUserInfo && strings.TrimSpace(userInfo) != ""
+	}
+	if parsed.User.Username() != "" {
+		return true
+	}
+	_, hasPassword := parsed.User.Password()
+	return hasPassword
+}
+
 func teamsServiceEnvironmentAllowlist() []string {
 	return []string{
 		"CODEX_HOME",
 		"CODEX_DIR",
 		"CODEX_HELPER_CONFIG",
+		"CODEX_HELPER_TEAMS_AUTH_CONFIG",
 		"CODEX_HELPER_TEAMS_PROFILE",
 		"CODEX_HELPER_TEAMS_AUTH_PROFILE",
 		"CODEX_HELPER_TEAMS_MACHINE_ID",
@@ -2324,6 +2584,22 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HELPER_TEAMS_FILE_WRITE_TENANT_ID",
 		"CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID",
 		"CODEX_HELPER_TEAMS_FILE_WRITE_SCOPES",
+		"CODEX_HELPER_TEAMS_FULL_TENANT_ID",
+		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_FULL_SCOPES",
+		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
+		"CODEX_HELPER_BEACON_STORE",
+		beacon.BeaconSlurmQueryCommandEnv,
+		beacon.BeaconSlurmSubmitCommandEnv,
+		beacon.BeaconSlurmCancelCommandEnv,
+		beacon.BeaconSlurmRenewCommandEnv,
+		beacon.BeaconLSFQueryCommandEnv,
+		beacon.BeaconLSFSubmitCommandEnv,
+		beacon.BeaconLSFCancelCommandEnv,
+		beacon.BeaconLSFRenewCommandEnv,
+		beacon.BeaconProviderShellModeEnv,
+		update.EnvRepo,
+		update.EnvUpdateIndexURL,
 		"HTTP_PROXY",
 		"HTTPS_PROXY",
 		"ALL_PROXY",

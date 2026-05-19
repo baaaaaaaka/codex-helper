@@ -112,27 +112,49 @@ func UpdateProfileConfig(st *State, in UpdateProfileInput) (Profile, error) {
 	old = normalizeProfileRevision(old)
 	st.ProfileHistory[profileHistoryKey(old.Name, old.Revision)] = old
 	pinProfileReferences(st, old.Name, old.Revision)
+	provider := in.Provider
+	if provider == "" {
+		provider = old.Provider
+	}
 	proxyMode := in.ProxyMode
+	if proxyMode == "" {
+		proxyMode = old.ProxyMode
+	}
 	if proxyMode == "" {
 		proxyMode = ProxyNone
 	}
+	proxyProfile := strings.TrimSpace(in.ProxyProfile)
+	if in.ProxyMode == "" && proxyProfile == "" {
+		proxyProfile = old.ProxyProfile
+	}
 	isolation := in.IsolationDefault
+	if isolation == "" {
+		isolation = old.IsolationDefault
+	}
 	if isolation == "" {
 		isolation = IsolationShared
 	}
+	slurm := in.Slurm
+	if provider == old.Provider && provider == ProviderSlurm && slurm == (SlurmProfile{}) {
+		slurm = old.Slurm
+	}
+	lsf := in.LSF
+	if provider == old.Provider && provider == ProviderLSF && lsf == (LSFProfile{}) {
+		lsf = old.LSF
+	}
 	adapter := in.Adapter
-	if old.Provider == in.Provider {
+	if old.Provider == provider {
 		adapter = MergeProviderCommandConfig(old.Adapter, in.Adapter)
 	}
 	p := Profile{
 		Name:             name,
 		Revision:         old.Revision + 1,
-		Provider:         in.Provider,
+		Provider:         provider,
 		ProxyMode:        proxyMode,
-		ProxyProfile:     strings.TrimSpace(in.ProxyProfile),
+		ProxyProfile:     proxyProfile,
 		IsolationDefault: isolation,
-		Slurm:            in.Slurm,
-		LSF:              in.LSF,
+		Slurm:            slurm,
+		LSF:              lsf,
 		Adapter:          adapter,
 		CreatedAt:        old.CreatedAt,
 		UpdatedAt:        now,
@@ -505,6 +527,9 @@ func profileDoctorConfigurationIssues(p Profile, proxyExists func(string) bool) 
 	if p.IsolationDefault != "" && p.IsolationDefault != IsolationShared && p.IsolationDefault != IsolationExclusive {
 		issues = append(issues, "isolation must be shared or exclusive")
 	}
+	if !ProviderCommandShellModeOK(p.Adapter.ShellMode) {
+		issues = append(issues, "adapter shell must be direct, login, interactive-login, user, or shell-command")
+	}
 	if !p.ProviderPreviewOK {
 		issues = append(issues, "provider preview missing")
 	}
@@ -815,6 +840,9 @@ func (p Profile) DraftReasons(proxyExists func(string) bool) []string {
 	}
 	if p.IsolationDefault != "" && p.IsolationDefault != IsolationShared && p.IsolationDefault != IsolationExclusive {
 		reasons = append(reasons, "isolation must be shared or exclusive")
+	}
+	if !ProviderCommandShellModeOK(p.Adapter.ShellMode) {
+		reasons = append(reasons, "adapter shell must be direct, login, interactive-login, user, or shell-command")
 	}
 	if !p.ProviderPreviewOK {
 		reasons = append(reasons, "provider preview missing")

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -96,6 +97,11 @@ func scheduleTeamsPendingHelperActivation(ctx context.Context, activation teamsP
 	if strings.TrimSpace(activation.PendingPath) == "" || strings.TrimSpace(activation.InstallPath) == "" {
 		return fmt.Errorf("pending helper activation requires both pending and install paths")
 	}
+	var err error
+	activation, err = normalizeTeamsPendingHelperActivation(activation)
+	if err != nil {
+		return err
+	}
 	command := windowsTeamsPendingHelperActivationPowerShell(activation.PendingPath, activation.InstallPath, activation.Version)
 	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
 }
@@ -120,8 +126,22 @@ func scheduleTeamsPendingHelperProcessRestart(ctx context.Context, pendingPath s
 	if strings.TrimSpace(activation.PendingPath) == "" || strings.TrimSpace(activation.InstallPath) == "" {
 		return fmt.Errorf("pending helper process restart requires both pending and install paths")
 	}
+	var err error
+	activation, err = normalizeTeamsPendingHelperActivation(activation)
+	if err != nil {
+		return err
+	}
 	command := windowsTeamsPendingHelperProcessRestartPowerShell(activation.PendingPath, activation.InstallPath, activation.Version, args)
 	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
+}
+
+func normalizeTeamsPendingHelperActivation(activation teamsPendingHelperActivation) (teamsPendingHelperActivation, error) {
+	resolved, err := helperpath.StableInstallTarget(strings.TrimSpace(activation.InstallPath), "", "", helperpath.Options{GOOS: "windows"})
+	if err != nil {
+		return teamsPendingHelperActivation{}, fmt.Errorf("pending helper activation install path is not stable: %w", err)
+	}
+	activation.InstallPath = resolved.Path
+	return activation, nil
 }
 
 func teamsPendingHelperActivationForPendingPath(pendingPath string) teamsPendingHelperActivation {

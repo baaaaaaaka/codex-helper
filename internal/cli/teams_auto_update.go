@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -18,6 +20,7 @@ type teamsReleaseAutoUpdater struct {
 var teamsAutoUpdateResolveInstallPath = update.ResolveInstallPath
 var teamsAutoUpdateListReleases = update.ListReleases
 var teamsAutoUpdateFetchReleaseIndex = update.FetchReleaseIndex
+var teamsAutoUpdateExecutable = func() (string, error) { return teamsServiceExecutable() }
 
 func newTeamsReleaseAutoUpdater(repo string, includePrerelease bool) teams.HelperAutoUpdater {
 	return teamsReleaseAutoUpdater{repo: repo, includePrerelease: includePrerelease}
@@ -159,6 +162,7 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 		return teams.HelperAutoUpdateApplyResult{}, fmt.Errorf("another helper auto-update is already updating %s", installPath)
 	}
 	defer func() { _ = lock.Unlock() }()
+	activationPending, activationReason := teamsAutoUpdateShouldDeferActivation(installPath)
 	res, err := performUpdate(ctx, update.UpdateOptions{
 		Repo:           u.repo,
 		Version:        candidate.TagName,
@@ -174,5 +178,38 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 		InstallPath:        res.InstallPath,
 		RestartRequired:    res.RestartRequired,
 		PendingReplacePath: res.PendingReplacePath,
+		ActivationPending:  activationPending,
+		ActivationReason:   activationReason,
 	}, nil
+}
+
+func teamsAutoUpdateShouldDeferActivation(stableInstallPath string) (bool, string) {
+	raw, err := teamsAutoUpdateExecutable()
+	if err != nil {
+		return true, "helper update installed, but activation is pending because the running helper executable path could not be inspected: " + err.Error()
+	}
+	resolved, err := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	if err != nil {
+		return true, "helper update installed, but activation is pending because the running helper executable path is not stable: " + err.Error()
+	}
+	class := helperpath.Classify(raw)
+	if class.Transient {
+		return true, "helper update installed to " + stableInstallPath + ", but activation is pending because the running helper executable is transient: " + class.Reason
+	}
+	if strings.TrimSpace(stableInstallPath) != "" && !sameHelperExecutablePath(resolved.Path, stableInstallPath, teamsServiceGOOS()) {
+		return true, "helper update installed to " + stableInstallPath + ", but activation is pending because the running helper executable is " + resolved.Path
+	}
+	return false, ""
+}
+
+func sameHelperExecutablePath(a string, b string, goos string) bool {
+	a = filepath.Clean(strings.TrimSpace(a))
+	b = filepath.Clean(strings.TrimSpace(b))
+	if a == "" || b == "" {
+		return a == b
+	}
+	if strings.EqualFold(strings.TrimSpace(goos), "windows") {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }

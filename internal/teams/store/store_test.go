@@ -3386,6 +3386,113 @@ func TestClaimControlLeaseSameMachineReloadBackupPathRefreshesActiveOwner(t *tes
 	}
 }
 
+func TestSameOwnerProcessCanonicalizesNFSSillyRename(t *testing.T) {
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable: %v", err)
+	}
+	a := OwnerMetadata{PID: 1234, Hostname: "host-a", ExecutablePath: stable}
+	b := OwnerMetadata{PID: 1234, Hostname: "host-a", ExecutablePath: filepath.Join(dir, ".nfs802014de01c482a800000492")}
+	if !sameOwnerProcess(a, b) {
+		t.Fatalf("sameOwnerProcess should canonicalize NFS silly rename: a=%#v b=%#v", a, b)
+	}
+}
+
+func TestCurrentOwnerStoresStableExecutableWhenRawPathIsTransient(t *testing.T) {
+	prevExecutable := currentOwnerExecutable
+	prevArgv0 := currentOwnerArgv0
+	t.Cleanup(func() {
+		currentOwnerExecutable = prevExecutable
+		currentOwnerArgv0 = prevArgv0
+	})
+
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable: %v", err)
+	}
+	currentOwnerExecutable = func() (string, error) {
+		return filepath.Join(dir, ".nfs802014de01c482a800000492"), nil
+	}
+
+	owner, err := CurrentOwner("0.1.0-test", "session-1", "turn-1", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if owner.ExecutablePath != stable {
+		t.Fatalf("owner executable = %q, want stable %q", owner.ExecutablePath, stable)
+	}
+}
+
+func TestCurrentOwnerFallsBackToStableArgv0WhenRawPathIsGoBuild(t *testing.T) {
+	prevExecutable := currentOwnerExecutable
+	prevArgv0 := currentOwnerArgv0
+	t.Cleanup(func() {
+		currentOwnerExecutable = prevExecutable
+		currentOwnerArgv0 = prevArgv0
+	})
+
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable: %v", err)
+	}
+	currentOwnerExecutable = func() (string, error) {
+		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", "codex-proxy"), nil
+	}
+	currentOwnerArgv0 = func() string { return stable }
+
+	owner, err := CurrentOwner("0.1.0-test", "", "", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if owner.ExecutablePath != stable {
+		t.Fatalf("owner executable = %q, want argv0 stable %q", owner.ExecutablePath, stable)
+	}
+}
+
+func TestCurrentOwnerRejectsUnresolvedTransientExecutable(t *testing.T) {
+	prevExecutable := currentOwnerExecutable
+	prevArgv0 := currentOwnerArgv0
+	t.Cleanup(func() {
+		currentOwnerExecutable = prevExecutable
+		currentOwnerArgv0 = prevArgv0
+	})
+
+	currentOwnerExecutable = func() (string, error) {
+		return filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), nil
+	}
+	currentOwnerArgv0 = func() string { return "" }
+
+	owner, err := CurrentOwner("0.1.0-test", "", "", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	if err == nil || !strings.Contains(err.Error(), "stable owner executable") {
+		t.Fatalf("CurrentOwner error = %v, want unresolved stable owner executable failure", err)
+	}
+	if owner.ExecutablePath != "" {
+		t.Fatalf("owner executable = %q, want empty on failure", owner.ExecutablePath)
+	}
+}
+
+func TestCurrentOwnerRejectsUnresolvedGoBuildHelperExecutable(t *testing.T) {
+	prevExecutable := currentOwnerExecutable
+	prevArgv0 := currentOwnerArgv0
+	t.Cleanup(func() {
+		currentOwnerExecutable = prevExecutable
+		currentOwnerArgv0 = prevArgv0
+	})
+
+	currentOwnerExecutable = func() (string, error) {
+		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", "codex-proxy"), nil
+	}
+	currentOwnerArgv0 = func() string { return "" }
+
+	_, err := CurrentOwner("0.1.0-test", "", "", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	if err == nil || !strings.Contains(err.Error(), "stable owner executable") {
+		t.Fatalf("CurrentOwner error = %v, want unresolved go-build helper executable failure", err)
+	}
+}
+
 func TestClaimControlLeaseDoesNotPreemptActiveTurn(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

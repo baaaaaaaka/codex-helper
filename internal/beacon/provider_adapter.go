@@ -22,10 +22,23 @@ const (
 	BeaconLSFSubmitCommandEnv   = "CODEX_HELPER_BEACON_LSF_SUBMIT"
 	BeaconLSFCancelCommandEnv   = "CODEX_HELPER_BEACON_LSF_CANCEL"
 	BeaconLSFRenewCommandEnv    = "CODEX_HELPER_BEACON_LSF_RENEW"
+	BeaconProviderShellModeEnv  = "CODEX_HELPER_BEACON_PROVIDER_SHELL_MODE"
+)
+
+const (
+	ProviderCommandShellDirect           = "direct"
+	ProviderCommandShellLogin            = "login"
+	ProviderCommandShellInteractiveLogin = "interactive-login"
+	ProviderCommandShellUser             = "user"
+	ProviderCommandShellCommand          = "shell-command"
 )
 
 type ProviderCommandRunner interface {
 	RunProviderCommand(ctx context.Context, name string, args []string) (string, error)
+}
+
+type ProviderCommandEnvRunner interface {
+	RunProviderCommandWithEnv(ctx context.Context, name string, args []string, env []string) (string, error)
 }
 
 type ProviderCommandRunnerFunc func(context.Context, string, []string) (string, error)
@@ -43,6 +56,7 @@ type ProviderCommandConfig struct {
 	LSFSubmitCommand   string `json:"lsf_submit_command,omitempty"`
 	LSFCancelCommand   string `json:"lsf_cancel_command,omitempty"`
 	LSFRenewCommand    string `json:"lsf_renew_command,omitempty"`
+	ShellMode          string `json:"shell_mode,omitempty"`
 }
 
 func ProviderCommandConfigFromEnv(getenv func(string) string) ProviderCommandConfig {
@@ -58,6 +72,7 @@ func ProviderCommandConfigFromEnv(getenv func(string) string) ProviderCommandCon
 		LSFSubmitCommand:   strings.TrimSpace(getenv(BeaconLSFSubmitCommandEnv)),
 		LSFCancelCommand:   strings.TrimSpace(getenv(BeaconLSFCancelCommandEnv)),
 		LSFRenewCommand:    strings.TrimSpace(getenv(BeaconLSFRenewCommandEnv)),
+		ShellMode:          strings.TrimSpace(getenv(BeaconProviderShellModeEnv)),
 	}
 }
 
@@ -104,6 +119,9 @@ func MergeProviderCommandConfig(base ProviderCommandConfig, override ProviderCom
 	if strings.TrimSpace(override.LSFRenewCommand) != "" {
 		out.LSFRenewCommand = strings.TrimSpace(override.LSFRenewCommand)
 	}
+	if strings.TrimSpace(override.ShellMode) != "" {
+		out.ShellMode = strings.TrimSpace(override.ShellMode)
+	}
 	return out
 }
 
@@ -134,7 +152,7 @@ func (a CommandProviderAdapter) QueryAllocation(ctx context.Context, req Allocat
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, command, providerCommandArgs(req, "query"))
+	out, err := a.run(ctx, req, command, providerCommandArgs(req, "query"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("query beacon provider allocation via %s: %w", source, err)
 	}
@@ -150,7 +168,7 @@ func (a CommandProviderAdapter) SubmitAllocation(ctx context.Context, req Alloca
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, command, providerCommandArgs(req, "submit"))
+	out, err := a.run(ctx, req, command, providerCommandArgs(req, "submit"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("submit beacon provider allocation via %s: %w", source, err)
 	}
@@ -166,7 +184,7 @@ func (a CommandProviderAdapter) CancelAllocation(ctx context.Context, req Alloca
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, command, providerCommandArgs(req, "cancel"))
+	out, err := a.run(ctx, req, command, providerCommandArgs(req, "cancel"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("cancel beacon provider allocation via %s: %w", source, err)
 	}
@@ -182,7 +200,7 @@ func (a CommandProviderAdapter) RenewAllocation(ctx context.Context, req Allocat
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, command, providerCommandArgs(req, "renew"))
+	out, err := a.run(ctx, req, command, providerCommandArgs(req, "renew"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("renew beacon provider allocation via %s: %w", source, err)
 	}
@@ -302,32 +320,228 @@ func providerCommandError(provider Provider, operation string) error {
 	}
 }
 
-func (a CommandProviderAdapter) run(ctx context.Context, command string, args []string) (string, error) {
+func (a CommandProviderAdapter) run(ctx context.Context, req AllocationRequest, command string, args []string) (string, error) {
 	runner := a.Runner
 	if runner == nil {
 		runner = ExecProviderCommandRunner{}
 	}
-	return runner.RunProviderCommand(ctx, command, args)
+	shellMode := providerCommandShellMode(a.Config, req.ProfileSnapshot.Adapter)
+	switch strings.ToLower(strings.TrimSpace(shellMode)) {
+	case "", ProviderCommandShellDirect:
+		return runner.RunProviderCommand(ctx, command, args)
+	case ProviderCommandShellCommand:
+		var err error
+		command, args, err = providerShellCommand(shellMode, command, args)
+		if err != nil {
+			return "", err
+		}
+		return runner.RunProviderCommand(ctx, command, args)
+	default:
+		env, err := a.resolveProviderShellEnv(ctx, runner, shellMode)
+		if err != nil {
+			return "", err
+		}
+		env = mergeProviderCommandEnv(os.Environ(), env)
+		if envRunner, ok := runner.(ProviderCommandEnvRunner); ok {
+			return envRunner.RunProviderCommandWithEnv(ctx, command, args, env)
+		}
+		return "", fmt.Errorf("provider command runner does not support shell-resolved environment")
+	}
+}
+
+func providerCommandShellMode(base ProviderCommandConfig, profile ProviderCommandConfig) string {
+	mode := strings.TrimSpace(profile.ShellMode)
+	if mode == "" {
+		mode = strings.TrimSpace(base.ShellMode)
+	}
+	if mode == "" {
+		return ProviderCommandShellDirect
+	}
+	return mode
+}
+
+func providerShellCommand(mode string, command string, args []string) (string, []string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" || mode == ProviderCommandShellDirect {
+		return command, args, nil
+	}
+	shell := defaultProviderUserShell()
+	flag := "-lc"
+	switch mode {
+	case ProviderCommandShellCommand:
+		flag = "-lic"
+	case ProviderCommandShellLogin:
+		flag = "-lc"
+	case ProviderCommandShellInteractiveLogin, ProviderCommandShellUser:
+		flag = "-lic"
+	default:
+		return "", nil, fmt.Errorf("unknown provider adapter shell mode %q", mode)
+	}
+	shellArgs := []string{flag, `exec "$0" "$@"`, command}
+	shellArgs = append(shellArgs, args...)
+	return shell, shellArgs, nil
+}
+
+func ProviderCommandShellModeOK(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", ProviderCommandShellDirect, ProviderCommandShellLogin, ProviderCommandShellInteractiveLogin, ProviderCommandShellUser, ProviderCommandShellCommand:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a CommandProviderAdapter) resolveProviderShellEnv(ctx context.Context, runner ProviderCommandRunner, mode string) ([]string, error) {
+	command, args, err := providerShellEnvCommand(mode)
+	if err != nil {
+		return nil, err
+	}
+	envCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := runner.RunProviderCommand(envCtx, command, args)
+	if err != nil {
+		return nil, fmt.Errorf("resolve provider adapter environment via %s: %w", mode, err)
+	}
+	env, err := parseProviderShellEnv(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse provider adapter environment from %s: %w", mode, err)
+	}
+	return filterProviderShellEnv(env), nil
+}
+
+const (
+	providerShellEnvBegin = "__CXP_PROVIDER_ENV_BEGIN__"
+	providerShellEnvEnd   = "__CXP_PROVIDER_ENV_END__"
+)
+
+func providerShellEnvCommand(mode string) (string, []string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" || mode == ProviderCommandShellDirect {
+		return "", nil, fmt.Errorf("direct provider adapter mode does not resolve shell environment")
+	}
+	shell := defaultProviderUserShell()
+	flag := "-lc"
+	switch mode {
+	case ProviderCommandShellLogin:
+		flag = "-lc"
+	case ProviderCommandShellInteractiveLogin, ProviderCommandShellUser:
+		flag = "-lic"
+	default:
+		return "", nil, fmt.Errorf("unknown provider adapter shell mode %q", mode)
+	}
+	script := fmt.Sprintf(`printf '%s\0'; env -0; printf '%s\0'`, providerShellEnvBegin, providerShellEnvEnd)
+	return shell, []string{flag, script}, nil
+}
+
+func parseProviderShellEnv(out string) ([]string, error) {
+	beginMarker := providerShellEnvBegin + "\x00"
+	begin := strings.Index(out, beginMarker)
+	if begin < 0 {
+		return nil, fmt.Errorf("missing environment begin marker")
+	}
+	remaining := out[begin+len(beginMarker):]
+	endMarker := providerShellEnvEnd + "\x00"
+	end := strings.Index(remaining, endMarker)
+	if end < 0 {
+		return nil, fmt.Errorf("missing environment end marker")
+	}
+	raw := remaining[:end]
+	var env []string
+	for _, entry := range strings.Split(raw, "\x00") {
+		if entry == "" {
+			continue
+		}
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			continue
+		}
+		env = append(env, entry)
+	}
+	if len(env) == 0 {
+		return nil, fmt.Errorf("environment was empty")
+	}
+	return env, nil
+}
+
+func mergeProviderCommandEnv(base []string, override []string) []string {
+	positions := map[string]int{}
+	var out []string
+	for _, entry := range append(append([]string(nil), base...), override...) {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		if pos, ok := positions[key]; ok {
+			out[pos] = entry
+			continue
+		}
+		positions[key] = len(out)
+		out = append(out, entry)
+	}
+	return out
+}
+
+func filterProviderShellEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			continue
+		}
+		if !providerShellEnvNameAllowed(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func providerShellEnvNameAllowed(name string) bool {
+	name = strings.TrimSpace(name)
+	switch name {
+	case "CODEX_HELPER_CLI_PATH", "CODEX_HELPER_CLI_DIR", "CODEX_PROXY_INSTALL_DIR", "CODEX_PROXY_NPM_WRAPPER_EXE", "CODEX_PROXY_VERSION":
+		return false
+	}
+	return !strings.HasPrefix(name, "CODEX_PROXY_")
+}
+
+func defaultProviderUserShell() string {
+	if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
+		return shell
+	}
+	return "/bin/bash"
 }
 
 type ExecProviderCommandRunner struct{}
 
 func (ExecProviderCommandRunner) RunProviderCommand(ctx context.Context, name string, args []string) (string, error) {
+	return runExecProviderCommand(ctx, name, args, nil)
+}
+
+func (ExecProviderCommandRunner) RunProviderCommandWithEnv(ctx context.Context, name string, args []string, env []string) (string, error) {
+	return runExecProviderCommand(ctx, name, args, env)
+}
+
+func runExecProviderCommand(ctx context.Context, name string, args []string, env []string) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		return "", fmt.Errorf("empty provider command")
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		text := strings.TrimSpace(out.String())
-		if text != "" {
-			return out.String(), fmt.Errorf("%w: %s", err, truncateProviderOutput(text))
-		}
-		return out.String(), err
+	if env != nil {
+		cmd.Env = append([]string(nil), env...)
 	}
-	return out.String(), nil
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		text := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
+		if text != "" {
+			return stdout.String(), fmt.Errorf("%w: %s", err, truncateProviderOutput(text))
+		}
+		return stdout.String(), err
+	}
+	return stdout.String(), nil
 }
 
 func providerCommandArgs(req AllocationRequest, operation string) []string {

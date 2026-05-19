@@ -147,6 +147,47 @@ func TestResolveInstallPathUsesStableSiblingForNFSSillyRename(t *testing.T) {
 	}
 }
 
+func TestResolveInstallPathFallsBackToStableArgv0Last(t *testing.T) {
+	t.Setenv(EnvInstallDir, "")
+	prevExecutablePath := executablePath
+	prevArgv0Path := argv0Path
+	t.Cleanup(func() {
+		executablePath = prevExecutablePath
+		argv0Path = prevArgv0Path
+	})
+
+	dir := t.TempDir()
+	stable := filepath.Join(dir, binaryName())
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable binary: %v", err)
+	}
+	executablePath = func() (string, error) {
+		return filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), nil
+	}
+	argv0Path = func() string { return stable }
+
+	got, err := ResolveInstallPath("")
+	if err != nil {
+		t.Fatalf("ResolveInstallPath error: %v", err)
+	}
+	if got != stable {
+		t.Fatalf("ResolveInstallPath = %q, want argv0 stable %q", got, stable)
+	}
+}
+
+func TestResolveInstallPathRejectsExplicitNFSSillyRename(t *testing.T) {
+	dir := t.TempDir()
+	stable := filepath.Join(dir, binaryName())
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable binary: %v", err)
+	}
+	running := filepath.Join(dir, ".nfs802014de01c482a800000492")
+	_, err := ResolveInstallPath(running)
+	if err == nil || !strings.Contains(err.Error(), "transient") {
+		t.Fatalf("ResolveInstallPath explicit .nfs error = %v, want transient rejection", err)
+	}
+}
+
 func TestStableInstallPathKeepsNFSSillyRenameWhenSiblingMissing(t *testing.T) {
 	running := filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492")
 	if got := StableInstallPathFromExecutable(running); got != running {
@@ -194,6 +235,60 @@ func TestPerformUpdateExplicitVersion(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("expected payload to be installed")
+	}
+}
+
+func TestPerformUpdateUsesStableInstallTargetForTransientRuntimePath(t *testing.T) {
+	requireRuntimeAsset(t)
+	t.Setenv(EnvInstallDir, "")
+	tag := "v1.2.5"
+	ver := "1.2.5"
+	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("assetName error: %v", err)
+	}
+	payload := []byte("binary-payload")
+	server := newReleaseServer(t, tag, asset, payload)
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+
+	prevExecutablePath := executablePath
+	prevArgv0Path := argv0Path
+	t.Cleanup(func() {
+		executablePath = prevExecutablePath
+		argv0Path = prevArgv0Path
+	})
+
+	tmpDir := t.TempDir()
+	dest := filepath.Join(tmpDir, binaryName())
+	if err := os.WriteFile(dest, []byte("old"), 0o755); err != nil {
+		t.Fatalf("write dest: %v", err)
+	}
+	raw := filepath.Join(tmpDir, ".nfs802014de01c482a800000492")
+	executablePath = func() (string, error) { return raw, nil }
+	argv0Path = func() string { return "" }
+
+	res, err := PerformUpdate(context.Background(), UpdateOptions{
+		Repo:    "owner/name",
+		Version: tag,
+		Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("PerformUpdate error: %v", err)
+	}
+	if res.InstallPath != dest {
+		t.Fatalf("install path = %q, want stable %q", res.InstallPath, dest)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read dest: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("expected payload to be installed at stable target, got %q", got)
+	}
+	if _, err := os.Stat(raw); !os.IsNotExist(err) {
+		t.Fatalf("transient raw path should not be created or replaced, stat err=%v", err)
 	}
 }
 

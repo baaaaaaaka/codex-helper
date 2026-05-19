@@ -441,6 +441,40 @@ func TestUpdateProfileCreatesRevisionAndPinsExistingTargets(t *testing.T) {
 	}
 }
 
+func TestUpdateProfileConfigPreservesExistingFieldsForPartialAdapterShellUpdate(t *testing.T) {
+	now := time.Unix(1, 0)
+	st := State{}
+	created, err := CreateProfile(&st, CreateProfileInput{
+		Name:             "gpu",
+		Provider:         ProviderSlurm,
+		ProxyMode:        ProxyNone,
+		IsolationDefault: IsolationExclusive,
+		Slurm:            SlurmProfile{Nodes: 2, GPUCount: 8, Partition: "interactive", Image: "image.sqsh", Duration: 6},
+		Adapter:          ProviderCommandConfigForProvider(ProviderSlurm, "/old/query", "/old/submit", "/old/cancel", "/old/renew"),
+		Now:              now,
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	updated, err := UpdateProfileConfig(&st, UpdateProfileInput{
+		Name:    "gpu",
+		Adapter: ProviderCommandConfig{ShellMode: ProviderCommandShellUser},
+		Now:     now.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfileConfig: %v", err)
+	}
+	if updated.Revision != created.Revision+1 || updated.Provider != ProviderSlurm || updated.IsolationDefault != IsolationExclusive {
+		t.Fatalf("updated metadata = %#v", updated)
+	}
+	if updated.Slurm != created.Slurm {
+		t.Fatalf("partial update changed slurm fields: got %#v want %#v", updated.Slurm, created.Slurm)
+	}
+	if updated.Adapter.SlurmSubmitCommand != "/old/submit" || updated.Adapter.ShellMode != ProviderCommandShellUser {
+		t.Fatalf("partial update adapter = %#v", updated.Adapter)
+	}
+}
+
 func TestRollbackProfileRevisionPublishesNewRevisionAndPruneKeepsPinnedHistory(t *testing.T) {
 	now := time.Unix(1, 0)
 	st := State{}

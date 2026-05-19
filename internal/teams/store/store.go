@@ -16,6 +16,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
@@ -76,6 +77,16 @@ var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
 var ErrUpgradeInProgress = errors.New("Teams upgrade already in progress")
 
 var errStoreNoChange = errors.New("teams store no change")
+
+var (
+	currentOwnerExecutable = helperpath.RawExecutable
+	currentOwnerArgv0      = func() string {
+		if len(os.Args) == 0 {
+			return ""
+		}
+		return os.Args[0]
+	}
+)
 
 const outboxSendLease = 2 * time.Minute
 
@@ -1415,9 +1426,23 @@ func CurrentOwner(helperVersion string, activeSessionID string, activeTurnID str
 	if err != nil {
 		return OwnerMetadata{}, err
 	}
-	executable, err := os.Executable()
+	rawExecutable, err := currentOwnerExecutable()
 	if err != nil {
 		return OwnerMetadata{}, err
+	}
+	executable := rawExecutable
+	if resolved, resolveErr := helperpath.StableRunnablePathFromSources(rawExecutable, currentOwnerArgv0(), helperpath.Options{}); resolveErr == nil && strings.TrimSpace(resolved.Path) != "" {
+		executable = resolved.Path
+	} else if class := helperpath.ClassifyPath(rawExecutable); class.Transient {
+		if !allowUnresolvedGoTestOwnerExecutable(class) {
+			msg := fmt.Sprintf("cannot resolve stable owner executable from %q", rawExecutable)
+			if resolveErr != nil {
+				return OwnerMetadata{}, fmt.Errorf("%s: %w", msg, resolveErr)
+			}
+			return OwnerMetadata{}, errors.New(msg)
+		}
+	} else if strings.TrimSpace(class.Clean) != "" {
+		executable = class.Clean
 	}
 	return OwnerMetadata{
 		PID:             os.Getpid(),
@@ -1429,6 +1454,10 @@ func CurrentOwner(helperVersion string, activeSessionID string, activeTurnID str
 		ActiveSessionID: activeSessionID,
 		ActiveTurnID:    activeTurnID,
 	}, nil
+}
+
+func allowUnresolvedGoTestOwnerExecutable(class helperpath.Classification) bool {
+	return class.Kind == helperpath.KindGoBuildTemp && strings.HasSuffix(class.Base, ".test")
 }
 
 func (s *Store) RecordOwnerHeartbeat(ctx context.Context, owner OwnerMetadata, staleAfter time.Duration, now time.Time) (OwnerMetadata, error) {
@@ -3192,15 +3221,7 @@ func sameOwnerProcess(a OwnerMetadata, b OwnerMetadata) bool {
 }
 
 func canonicalOwnerExecutablePath(path string) string {
-	path = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))
-	if path == "" {
-		return ""
-	}
-	dir, base := filepath.Split(path)
-	if idx := strings.Index(base, ".reload-backup-"); idx >= 0 {
-		return filepath.Join(dir, base[:idx])
-	}
-	return path
+	return helperpath.CanonicalOwnerExecutable(path, helperpath.Options{})
 }
 
 func sameOwnerInstance(a OwnerMetadata, b OwnerMetadata) bool {

@@ -17,7 +17,6 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
-	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
 var teamsUpgradePollInterval = 500 * time.Millisecond
@@ -346,7 +345,7 @@ func stopTeamsServiceForHelperUpgrade(ctx context.Context, in io.Reader, out io.
 }
 
 func withTeamsHelperUpgradeInstallLock(ctx context.Context, installPath string, fn func() error) error {
-	resolved, err := update.ResolveInstallPath(installPath)
+	resolved, err := resolveInstallPathForCLI(installPath)
 	if err != nil {
 		return err
 	}

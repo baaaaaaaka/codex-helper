@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 const (
@@ -15,7 +17,7 @@ const (
 	envTeamsHelperCLIDir   = "CODEX_HELPER_CLI_DIR"
 )
 
-var teamsChildExecutablePath = os.Executable
+var teamsChildExecutablePath = helperpath.RawExecutable
 
 func teamsCodexChildEnv() []string {
 	env := []string{
@@ -29,6 +31,11 @@ func teamsCodexChildEnv() []string {
 	if strings.TrimSpace(exe) == "" {
 		return env
 	}
+	resolved, err := helperpath.StableRunnablePathFromSources(exe, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	if err != nil {
+		return env
+	}
+	exe = resolved.Path
 	env = append(env, envTeamsHelperCLIPath+"="+exe)
 	dir := filepath.Dir(exe)
 	if strings.TrimSpace(dir) == "" || dir == "." {

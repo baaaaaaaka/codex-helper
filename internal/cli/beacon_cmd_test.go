@@ -103,6 +103,31 @@ func TestBeaconProfileCLIWorkflow(t *testing.T) {
 	}
 }
 
+func TestBeaconBootstrapDiagnosticsUsesStableCXPPath(t *testing.T) {
+	lockCLITestHooks(t)
+	prevExecutable := beaconExecutable
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		beaconExecutable = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	beaconExecutable = func() (string, error) {
+		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", "codex-proxy"), nil
+	}
+	restartArgv0 = func() string { return stable }
+
+	got := beaconWorkerBootstrapDiagnostics("", "")
+	if got.CXPPath != stable {
+		t.Fatalf("CXPPath = %q, want stable %q", got.CXPPath, stable)
+	}
+}
+
 func TestBeaconCLIRejectsDraftSwitchAndShowsStatus(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	configPath := filepath.Join(t.TempDir(), "config.json")
@@ -518,6 +543,48 @@ func TestBeaconProfileAdapterCommandsDriveAllocationReconcileWithoutHelperEnv(t 
 	}
 }
 
+func TestBeaconProfileUpdateAdapterShellPreservesExistingFields(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	adapter := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-profile raw_state=PD`)
+
+	out, err := runBeaconRootCommand(t,
+		"--config", configPath,
+		"beacon", "--store", storePath,
+		"profile", "create", "gpu",
+		"--provider", "slurm",
+		"--nodes", "1",
+		"--gpu", "1",
+		"--partition", "interactive",
+		"--image", "image.sqsh",
+		"--duration", "4",
+		"--query-command", adapter,
+		"--submit-command", adapter,
+	)
+	if err != nil {
+		t.Fatalf("profile create: %v\n%s", err, out)
+	}
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "update", "gpu", "--adapter-shell", "user")
+	if err != nil {
+		t.Fatalf("profile update: %v\n%s", err, out)
+	}
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	p := st.Profiles["gpu"]
+	if p.Provider != beacon.ProviderSlurm || p.Slurm.Image != "image.sqsh" || p.Slurm.GPUCount != 1 {
+		t.Fatalf("partial update changed profile fields: %#v", p)
+	}
+	if p.Adapter.SlurmSubmitCommand != adapter || p.Adapter.ShellMode != beacon.ProviderCommandShellUser {
+		t.Fatalf("partial update adapter = %#v", p.Adapter)
+	}
+}
+
 func TestBeaconReleaseCLIResolvesProfileAllocations(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	store, err := beacon.NewStore(storePath)
@@ -688,6 +755,15 @@ func TestBeaconWorkerRunOnceClaimsJobAndWritesTerminal(t *testing.T) {
 }
 
 func TestBeaconWorkerRunOnceRegistersAllocationAndWaitsForJob(t *testing.T) {
+	lockCLITestHooks(t)
+	stableHelper := filepath.Join(t.TempDir(), "codex-proxy")
+	if err := os.WriteFile(stableHelper, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	prevExecutable := beaconExecutable
+	beaconExecutable = func() (string, error) { return stableHelper, nil }
+	t.Cleanup(func() { beaconExecutable = prevExecutable })
+
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	store, err := beacon.NewStore(storePath)
 	if err != nil {
@@ -811,6 +887,15 @@ func TestBeaconWorkerRegistrationFailurePreservesNeedsAttention(t *testing.T) {
 }
 
 func TestBeaconWorkerServeRegistersAndRunsOneJob(t *testing.T) {
+	lockCLITestHooks(t)
+	stableHelper := filepath.Join(t.TempDir(), "codex-proxy")
+	if err := os.WriteFile(stableHelper, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	prevExecutable := beaconExecutable
+	beaconExecutable = func() (string, error) { return stableHelper, nil }
+	t.Cleanup(func() { beaconExecutable = prevExecutable })
+
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	store, err := beacon.NewStore(storePath)
 	if err != nil {

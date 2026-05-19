@@ -27,11 +27,14 @@ func TestPrepareCodexSelfUpdateGuardEnvPrependsWrapper(t *testing.T) {
 	prevDetect := codexSelfUpdateDetectSource
 	prevLookPath := codexSelfUpdateLookPath
 	prevExecutable := codexSelfUpdateExecutable
+	prevArgv0 := restartArgv0
 	t.Cleanup(func() {
 		codexSelfUpdateDetectSource = prevDetect
 		codexSelfUpdateLookPath = prevLookPath
 		codexSelfUpdateExecutable = prevExecutable
+		restartArgv0 = prevArgv0
 	})
+	restartArgv0 = func() string { return "" }
 
 	codexSelfUpdateDetectSource = func(context.Context, string, []string) (codexUpgradeSource, error) {
 		return codexUpgradeSource{
@@ -108,6 +111,42 @@ func TestPrepareCodexSelfUpdateGuardEnvSkipsUnknownSource(t *testing.T) {
 
 	if len(updated) != len(input) || updated[0] != input[0] {
 		t.Fatalf("expected unchanged env, got %#v", updated)
+	}
+}
+
+func TestPrepareCodexSelfUpdateGuardEnvFailsClosedForTransientHelperPath(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevDetect := codexSelfUpdateDetectSource
+	prevLookPath := codexSelfUpdateLookPath
+	prevExecutable := codexSelfUpdateExecutable
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		codexSelfUpdateDetectSource = prevDetect
+		codexSelfUpdateLookPath = prevLookPath
+		codexSelfUpdateExecutable = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+	restartArgv0 = func() string { return "" }
+
+	codexSelfUpdateDetectSource = func(context.Context, string, []string) (codexUpgradeSource, error) {
+		return codexUpgradeSource{
+			origin:    codexInstallOriginSystem,
+			codexPath: "/tmp/codex",
+			npmPrefix: "/tmp/npm-global",
+		}, nil
+	}
+	codexSelfUpdateLookPath = func(string) (string, error) {
+		return "/usr/bin/npm", nil
+	}
+	codexSelfUpdateExecutable = func() (string, error) {
+		return filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), nil
+	}
+
+	_, cleanup, err := prepareCodexSelfUpdateGuardEnv(context.Background(), "/tmp/codex", []string{"PATH=/usr/bin:/bin"}, nil)
+	t.Cleanup(cleanup)
+	if err == nil || !strings.Contains(err.Error(), "stable helper executable") {
+		t.Fatalf("prepare guard env error = %v, want stable helper path failure", err)
 	}
 }
 

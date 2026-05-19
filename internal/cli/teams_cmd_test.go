@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
@@ -23,6 +24,20 @@ func TestTeamsStatusReportsLocalStateWithoutCreatingDefaultState(t *testing.T) {
 
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "codex-proxy")
+	if runtime.GOOS == "windows" {
+		exe = filepath.Join(tmp, "codex-proxy.exe")
+	}
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho 'codex-proxy version 0.1.0-test'\n"), 0o700); err != nil {
+		t.Fatalf("write fake helper: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    runtime.GOOS,
+		exe:     exe,
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd"),
+		runner:  &recordingTeamsServiceRunner{output: []byte("inactive\n")},
+	})
 
 	registryPath := filepath.Join(tmp, "teams-registry.json")
 	cmd := newRootCmd()
@@ -38,6 +53,10 @@ func TestTeamsStatusReportsLocalStateWithoutCreatingDefaultState(t *testing.T) {
 		"Teams status",
 		"Control chat: unavailable",
 		"Sessions: 0 total, 0 active",
+		"OS service:",
+		"Helper raw executable: " + exe,
+		"Helper stable executable: " + exe,
+		"Helper version:",
 		"State summary: unavailable",
 	} {
 		if !strings.Contains(got, want) {
@@ -219,6 +238,29 @@ func TestFormatTeamsHelperVersionStatusReportsOwnerEntryAndPending(t *testing.T)
 		if !strings.Contains(got, want) {
 			t.Fatalf("helper version status missing %q: %s", want, got)
 		}
+	}
+}
+
+func TestResolveTeamsHelperExecutableStatusReportsRawStableAndActivationPending(t *testing.T) {
+	lockCLITestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("NFS-style raw path fixture is Unix-focused")
+	}
+	tmp := t.TempDir()
+	stable := filepath.Join(tmp, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("#!/bin/sh\necho 'codex-proxy version 0.1.0-rc.70'\n"), 0o700); err != nil {
+		t.Fatalf("write stable helper: %v", err)
+	}
+	raw := filepath.Join(tmp, ".nfs802014de01c482a800000492")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  raw,
+		cwd:  tmp,
+	})
+
+	got := resolveTeamsHelperExecutableStatus()
+	if got.Raw != raw || got.Stable != stable || !got.ActivationPending || got.Source != string(helperpath.SourceExecutable) {
+		t.Fatalf("path status = %#v, want raw %q stable %q pending executable source", got, raw, stable)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -186,10 +187,101 @@ func TestTeamsServiceInstallUsesStablePathWhenExecutableIsNFSSillyRename(t *test
 	}
 }
 
+func TestTeamsServiceBootstrapDryRunDoesNotWriteOrStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd dry-run rendering is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	unitDir := filepath.Join(tmp, "systemd")
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	if err := os.MkdirAll(filepath.Dir(exePath), 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	if err := os.WriteFile(exePath, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write exe: %v", err)
+	}
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exePath,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"bootstrap", "--dry-run"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap --dry-run error: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("dry-run should not call service runner, calls=%#v", runner.calls)
+	}
+	if _, err := os.Stat(filepath.Join(unitDir, teamsServiceUnitName)); !os.IsNotExist(err) {
+		t.Fatalf("dry-run should not write unit, stat err=%v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Teams service dry-run") || !strings.Contains(got, "--- systemd main unit ---") || !strings.Contains(got, exePath) {
+		t.Fatalf("dry-run output missing rendered unit details:\n%s", got)
+	}
+}
+
+func TestTeamsServiceBootstrapNoStartRepairsButDoesNotStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd no-start rendering is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	unitDir := filepath.Join(tmp, "systemd")
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	if err := os.MkdirAll(filepath.Dir(exePath), 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	if err := os.WriteFile(exePath, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write exe: %v", err)
+	}
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exePath,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"bootstrap", "--no-start"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap --no-start error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(unitDir, teamsServiceUnitName)); err != nil {
+		t.Fatalf("no-start should write unit: %v", err)
+	}
+	for _, forbidden := range []string{"start", "restart"} {
+		if teamsServiceCallSeen(runner.calls, forbidden) {
+			t.Fatalf("no-start should not %s service, calls=%#v", forbidden, runner.calls)
+		}
+	}
+	if !teamsServiceCallSeen(runner.calls, "enable") {
+		t.Fatalf("no-start should enable repaired service, calls=%#v", runner.calls)
+	}
+	if !strings.Contains(out.String(), "Service was repaired but not started.") {
+		t.Fatalf("no-start output missing safety message:\n%s", out.String())
+	}
+}
+
 func TestTeamsServiceInstallWithoutRegistryLetsBridgeUseScopedDefaults(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_DIR", "")
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	exePath := filepath.Join(tmp, "bin", "codex-proxy")
 	cwd := filepath.Join(tmp, "work")
@@ -236,7 +328,7 @@ func TestTeamsServiceInstallRejectsGoRunTemporaryExecutable(t *testing.T) {
 	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
 	cmd.SetArgs([]string{"install"})
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "temporary go run binary") {
+	if err == nil || !strings.Contains(err.Error(), "temporary helper executable path") {
 		t.Fatalf("expected go run executable rejection, got %v", err)
 	}
 }
@@ -300,8 +392,9 @@ func TestTeamsServiceDoctorReportsAuthAndExecutableWithoutFailingFast(t *testing
 	got := out.String()
 	for _, want := range []string{
 		"Teams service backend: systemd-user",
-		"Teams service executable: not installable",
-		"temporary go run binary",
+		"Teams service raw executable:",
+		"Teams service stable executable: unresolved",
+		"temporary helper executable path",
 		"Teams service auth: not ready",
 		"auth missing",
 		"Linux: systemd --user keeps the Teams bridge independent of the terminal",
@@ -354,6 +447,143 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing preserved env %q:\n%s", want, unit)
+		}
+	}
+}
+
+func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(tmp, "beacon.json"))
+	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", filepath.Join(tmp, "auth.json"))
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", filepath.Join(tmp, "full-token.json"))
+	t.Setenv(beacon.BeaconSlurmQueryCommandEnv, filepath.Join(tmp, "slurm-query"))
+	t.Setenv(beacon.BeaconSlurmSubmitCommandEnv, filepath.Join(tmp, "slurm-submit"))
+	t.Setenv(beacon.BeaconLSFCancelCommandEnv, filepath.Join(tmp, "lsf-cancel"))
+	t.Setenv(update.EnvRepo, "owner/name")
+	t.Setenv(update.EnvUpdateIndexURL, "https://example.test/releases.json")
+	t.Setenv("HTTPS_PROXY", "http://user:pass@proxy.example.test:8080")
+	t.Setenv(envTeamsHelperCLIPath, "/tmp/.nfs802014de01c482a800000492")
+	t.Setenv(envTeamsHelperCLIDir, "/tmp")
+	t.Setenv(envCodexProxyWrapperExe, "/tmp/.nfswrapper")
+	t.Setenv(update.EnvInstallDir, "/tmp/.nfsbad")
+	t.Setenv(update.EnvVersion, "v0.0.0-bad")
+	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_SECRET", "secret")
+	t.Setenv("CODEX_HELPER_TEAMS_BEARER_TOKEN", "token")
+
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exePath,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	for _, want := range []string{
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_BEACON_STORE="+filepath.Join(tmp, "beacon.json")),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_AUTH_CONFIG="+filepath.Join(tmp, "auth.json")),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE="+filepath.Join(tmp, "full-token.json")),
+		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmQueryCommandEnv+"="+filepath.Join(tmp, "slurm-query")),
+		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmSubmitCommandEnv+"="+filepath.Join(tmp, "slurm-submit")),
+		"Environment=" + systemdQuoteArg(beacon.BeaconLSFCancelCommandEnv+"="+filepath.Join(tmp, "lsf-cancel")),
+		"Environment=" + systemdQuoteArg(update.EnvRepo+"=owner/name"),
+		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://example.test/releases.json"),
+		"Environment=" + systemdQuoteArg(update.EnvInstallDir+"="+exePath),
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit missing env %q:\n%s", want, unit)
+		}
+	}
+	for _, forbidden := range []string{
+		envTeamsHelperCLIPath + "=",
+		envTeamsHelperCLIDir + "=",
+		envCodexProxyWrapperExe + "=",
+		update.EnvInstallDir + "=/tmp/.nfsbad",
+		update.EnvVersion + "=",
+		"CODEX_HELPER_TEAMS_CLIENT_SECRET=",
+		"CODEX_HELPER_TEAMS_BEARER_TOKEN=",
+		"HTTPS_PROXY=",
+		"user:pass@proxy.example.test",
+	} {
+		if strings.Contains(unit, forbidden) {
+			t.Fatalf("unit contains forbidden env %q:\n%s", forbidden, unit)
+		}
+	}
+}
+
+func TestTeamsServiceRepairMergesAllowedEnvironmentFromExistingSystemdUnit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd unit merge test is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_DIR", "")
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatalf("mkdir unit dir: %v", err)
+	}
+	oldUnit := strings.Join([]string{
+		"[Service]",
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_BEACON_STORE="+filepath.Join(tmp, "old-beacon.json")),
+		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmQueryCommandEnv+"="+filepath.Join(tmp, "old-slurm-query")),
+		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://old.example.test/index.json"),
+		"Environment=" + systemdQuoteArg("CODEX_HOME="+filepath.Join(tmp, "old-codex-home")),
+		"Environment=" + systemdQuoteArg(envTeamsHelperCLIPath+"=/tmp/.nfsbad"),
+		"Environment=" + systemdQuoteArg("HTTPS_PROXY=http://user:pass@proxy.example.test:8080"),
+		"Environment=" + systemdQuoteArg("HTTP_PROXY=user:pass@proxy.example.test:8080"),
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte(oldUnit), 0o600); err != nil {
+		t.Fatalf("write old unit: %v", err)
+	}
+
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exePath,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	unit := string(data)
+	for _, want := range []string{
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_BEACON_STORE="+filepath.Join(tmp, "old-beacon.json")),
+		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmQueryCommandEnv+"="+filepath.Join(tmp, "old-slurm-query")),
+		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://old.example.test/index.json"),
+		"Environment=" + systemdQuoteArg("CODEX_HOME="+filepath.Join(tmp, "old-codex-home")),
+		"Environment=" + systemdQuoteArg("CODEX_DIR="+filepath.Join(tmp, "old-codex-home")),
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("merged unit missing %q:\n%s", want, unit)
+		}
+	}
+	for _, forbidden := range []string{envTeamsHelperCLIPath + "=/tmp/.nfsbad", "user:pass@proxy.example.test"} {
+		if strings.Contains(unit, forbidden) {
+			t.Fatalf("merged unit contains forbidden %q:\n%s", forbidden, unit)
 		}
 	}
 }
@@ -1449,6 +1679,91 @@ func TestTeamsServiceBootstrapSchedulesPendingHelperActivationBeforeStartingOldW
 	}
 }
 
+func TestTeamsServiceStartPendingActivationUsesStableExecutablePath(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	if err := os.WriteFile(exe, []byte("stable"), 0o644); err != nil {
+		t.Fatalf("write exe: %v", err)
+	}
+	raw := exe + ".reload-backup-111-222"
+	pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.75_windows_amd64.exe.123")
+	prevFind := teamsUpdateFindPendingReplacementsForPlatform
+	prevProbe := teamsUpdateProbeBinaryVersion
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() {
+		teamsUpdateFindPendingReplacementsForPlatform = prevFind
+		teamsUpdateProbeBinaryVersion = prevProbe
+		teamsServiceStartDetached = prevDetached
+	})
+	teamsUpdateFindPendingReplacementsForPlatform = func(path string, goos string, goarch string) ([]update.PendingReplacement, error) {
+		if filepath.Clean(path) != filepath.Clean(exe) || goos != "windows" {
+			t.Fatalf("FindPendingReplacements path/goos = %q/%q, want stable %q/windows", path, goos, exe)
+		}
+		return []update.PendingReplacement{{Path: pending, Version: "0.1.0-rc.75", ModTime: time.Now()}}, nil
+	}
+	teamsUpdateProbeBinaryVersion = func(_ context.Context, path string, _ time.Duration) (update.BinaryVersion, error) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(exe):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.70"}, nil
+		case filepath.Clean(pending):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.75"}, nil
+		default:
+			t.Fatalf("unexpected probe path %q", path)
+			return update.BinaryVersion{}, nil
+		}
+	}
+	var detachedArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		detachedArgs = append([]string{name}, args...)
+		return nil
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            raw,
+		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		runner:         &recordingTeamsServiceRunner{},
+	})
+
+	scheduled, err := schedulePendingTeamsServiceActivationBeforeStart(context.Background(), io.Discard, "start")
+	if err != nil {
+		t.Fatalf("schedulePendingTeamsServiceActivationBeforeStart error: %v", err)
+	}
+	if !scheduled {
+		t.Fatal("expected pending activation to be scheduled")
+	}
+	if len(detachedArgs) == 0 {
+		t.Fatal("expected detached activation process")
+	}
+}
+
+func TestPendingHelperActivationAllowsTempSourceButRequiresStableDestination(t *testing.T) {
+	tmp := t.TempDir()
+	stableDest := filepath.Join(tmp, "codex-proxy.exe")
+	pendingSource := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.75_windows_amd64.exe.123")
+	activation, err := normalizeTeamsPendingHelperActivation(teamsPendingHelperActivation{
+		InstallPath: stableDest,
+		PendingPath: pendingSource,
+		Version:     "0.1.0-rc.75",
+	})
+	if err != nil {
+		t.Fatalf("pending source with stable destination should be allowed: %v", err)
+	}
+	if activation.PendingPath != pendingSource || activation.InstallPath != stableDest {
+		t.Fatalf("activation normalized unexpectedly: %#v", activation)
+	}
+
+	_, err = normalizeTeamsPendingHelperActivation(teamsPendingHelperActivation{
+		InstallPath: filepath.Join(tmp, ".nfs802014de01c482a9000004bf"),
+		PendingPath: pendingSource,
+		Version:     "0.1.0-rc.75",
+	})
+	if err == nil || !strings.Contains(err.Error(), "install path is not stable") {
+		t.Fatalf("transient destination should be rejected, got %v", err)
+	}
+}
+
 func TestDiscoverTeamsPendingHelperActivationRejectsStalePendingVersion(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -2077,6 +2392,7 @@ func assertTeamsServiceCallsDoNotContain(t *testing.T, calls []teamsServiceComma
 type teamsServiceTestHooks struct {
 	goos                 string
 	exe                  string
+	argv0                string
 	cwd                  string
 	unitDir              string
 	launchAgentDir       string
@@ -2099,6 +2415,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	t.Setenv("CODEX_HELPER_TEAMS_AUTO_SERVICE", "")
 	prevGOOS := teamsServiceGOOS
 	prevExecutable := teamsServiceExecutable
+	prevArgv0 := teamsServiceArgv0
 	prevGetwd := teamsServiceGetwd
 	prevSystemdUserDir := teamsServiceSystemdUserDir
 	prevLaunchAgentDir := teamsServiceLaunchAgentDir
@@ -2116,6 +2433,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevLocalProcessGraceDelay := teamsServiceLocalProcessGraceDelay
 	teamsServiceGOOS = func() string { return hooks.goos }
 	teamsServiceExecutable = func() (string, error) { return hooks.exe, nil }
+	teamsServiceArgv0 = func() string { return hooks.argv0 }
 	teamsServiceGetwd = func() (string, error) { return hooks.cwd, nil }
 	teamsServiceSystemdUserDir = func() (string, error) { return hooks.unitDir, nil }
 	teamsServiceLaunchAgentDir = func() (string, error) { return hooks.launchAgentDir, nil }
@@ -2144,6 +2462,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	t.Cleanup(func() {
 		teamsServiceGOOS = prevGOOS
 		teamsServiceExecutable = prevExecutable
+		teamsServiceArgv0 = prevArgv0
 		teamsServiceGetwd = prevGetwd
 		teamsServiceSystemdUserDir = prevSystemdUserDir
 		teamsServiceLaunchAgentDir = prevLaunchAgentDir

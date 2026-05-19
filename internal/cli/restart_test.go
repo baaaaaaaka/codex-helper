@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gofrs/flock"
+
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 	"github.com/spf13/cobra"
 )
@@ -143,6 +145,57 @@ func TestHandleUpdateAndRestartDoesNotTouchTeamsServiceForPlainPendingReplacemen
 	}
 }
 
+func TestHandleUpdateAndRestartUsesSharedInstallLock(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy")
+	if err := os.WriteFile(installPath, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write install path: %v", err)
+	}
+
+	prevExecutablePath := executablePath
+	prevArgv0 := restartArgv0
+	prevResolve := resolveInstallPathForCLI
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		executablePath = prevExecutablePath
+		restartArgv0 = prevArgv0
+		resolveInstallPathForCLI = prevResolve
+		performUpdate = prevPerform
+	})
+	executablePath = func() (string, error) { return installPath, nil }
+	restartArgv0 = func() string { return "" }
+	resolveInstallPathForCLI = func(path string) (string, error) {
+		if path != "" {
+			return update.ResolveInstallPath(path)
+		}
+		return installPath, nil
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("PerformUpdate should not run while shared install lock is held")
+		return update.ApplyResult{}, nil
+	}
+
+	lock := flock.New(installPath + ".auto-update.lock")
+	locked, err := lock.TryLock()
+	if err != nil {
+		t.Fatalf("TryLock error: %v", err)
+	}
+	if !locked {
+		t.Fatal("failed to acquire test auto-update lock")
+	}
+	t.Cleanup(func() { _ = lock.Unlock() })
+
+	cmd := &cobra.Command{}
+	var stderr bytes.Buffer
+	cmd.SetErr(&stderr)
+	err = handleUpdateAndRestart(context.Background(), cmd)
+	if err == nil || !strings.Contains(err.Error(), "another codex-helper upgrade is already using install path") {
+		t.Fatalf("expected shared install lock error, got %v stderr=%q", err, stderr.String())
+	}
+}
+
 func TestRestartSelfUsesStablePathWhenRunningReloadBackup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("non-Windows restart uses exec; Windows is covered by service restart tests")
@@ -248,5 +301,30 @@ func TestRestartSelfUsesStablePathWhenRunningNFSSillyRename(t *testing.T) {
 	wantArgs := []string{stable, "teams", "run", "--auto-service=false"}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("exec args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}
+
+func TestRestartSelfFailsClosedWhenNFSSillyRenameCannotRecover(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("NFS silly rename handling is for Unix service restarts")
+	}
+
+	prevExecutablePath := executablePath
+	prevExecSelf := execSelf
+	t.Cleanup(func() {
+		executablePath = prevExecutablePath
+		execSelf = prevExecSelf
+	})
+
+	running := filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492")
+	executablePath = func() (string, error) { return running, nil }
+	execSelf = func(string, []string, []string) error {
+		t.Fatal("restartSelf must not exec an unrecoverable transient path")
+		return nil
+	}
+
+	err := restartSelf()
+	if err == nil || !strings.Contains(err.Error(), "cannot recover") {
+		t.Fatalf("restartSelf error = %v, want unrecoverable transient path", err)
 	}
 }

@@ -227,6 +227,8 @@ type HelperAutoUpdateApplyResult struct {
 	InstallPath        string
 	RestartRequired    bool
 	PendingReplacePath string
+	ActivationPending  bool
+	ActivationReason   string
 }
 
 type PersistentPollFailureError struct {
@@ -2538,6 +2540,7 @@ func controlAdvancedHelpText() string {
 		"- `beacon list` - list beacon profiles and machines",
 		"- `beacon profile create <name> ...` - create a draft beacon profile",
 		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
+		"- add `--adapter-shell user` when scheduler submission depends on your normal shell setup",
 		"- `beacon profile update <name> ...` - create a new profile revision",
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>` - inspect, restore, and prune revisions",
 		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",
@@ -3995,6 +3998,20 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 				_ = b.clearPendingHelperRestartNotice()
 			}
 			return err
+		}
+		return nil
+	}
+	if res.ActivationPending {
+		pendingReason := strings.TrimSpace(res.ActivationReason)
+		if pendingReason == "" {
+			pendingReason = "helper update activation is pending; waiting for the restarted helper to verify " + strings.TrimSpace(tag)
+		}
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
+		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
+		if completionChatID != "" {
+			if err := b.writePendingHelperUpgradeNotice(completionChatID, completionCommandID, tag, manualNotice); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -6868,12 +6885,15 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		if _, markErr := b.store.MarkTurnFailed(ctx, turn.ID, message); markErr != nil {
 			return markErr
 		}
-		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", message, outboxQueueOptions{
+		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "helper", message, outboxQueueOptions{
 			MentionOwner:     true,
 			NotificationKind: "needs_attention",
 		})
 	}
 	if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
+		if plan.Action == beacon.TurnWaitAllocation {
+			_ = b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "helper", formatBeaconTurnAllocationProgress(plan), outboxQueueOptions{})
+		}
 		executor = BeaconJobExecutor{Plan: plan}
 	}
 	if _, err := b.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, ""); err != nil {

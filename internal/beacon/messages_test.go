@@ -80,6 +80,33 @@ func TestConversationStatusNoticePendingSchedulerSeparatesNextAndDetails(t *test
 	}
 }
 
+func TestAllocationSummaryLinesAreReadableForLongSubmitReason(t *testing.T) {
+	st := State{Allocations: map[string]AllocationRequest{
+		"req-1": {
+			ID:               "req-1",
+			Profile:          "fgx_dev",
+			Provider:         ProviderSlurm,
+			State:            AllocationNeedsAttention,
+			RawProviderState: "CG",
+			ProviderReason:   "submit_failed_CLUSTER=NSS_CLUSTER_STACK=NSS_CLUSTER_NAME=NV_PDX_CS_002;2026-05-19ERRORsubmit_slurm_parent:Attempt_to_submit_a_job_without_specifying_the_account.Please_set_up_SUBMIT_ACCOUNT_in_your_bashrc,or_provide_it_with_the--account_arg;",
+			UpdatedAt:        time.Unix(1, 0),
+		},
+	}}
+	lines := strings.Join(AllocationSummaryLines(st), "\n")
+	for _, want := range []string{
+		"- req-1: needs_attention on fgx_dev (Slurm)",
+		"provider_state: CG",
+		"reason: submit failed: missing Slurm account; set SUBMIT_ACCOUNT",
+	} {
+		if !strings.Contains(lines, want) {
+			t.Fatalf("allocation summary missing %q:\n%s", want, lines)
+		}
+	}
+	if strings.Contains(lines, "NSS_CLUSTER_STACK") || strings.Contains(lines, "submit_slurm_parent") {
+		t.Fatalf("allocation summary should not inline noisy provider logs:\n%s", lines)
+	}
+}
+
 func TestMachineStatusNoticeShowsBootstrapDiagnostics(t *testing.T) {
 	msg := MachineStatusNotice(Machine{
 		ID:            "machine-1",

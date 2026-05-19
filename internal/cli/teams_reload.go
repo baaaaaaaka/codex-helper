@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
@@ -157,7 +158,11 @@ func validateTeamsReloadInstallPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	abs = stableRestartExecutablePath(abs)
+	resolved, err := helperpath.StableRunnablePathFromSources(abs, restartArgv0(), helperpath.Options{})
+	if err != nil {
+		return "", err
+	}
+	abs = resolved.Path
 	for _, part := range strings.FieldsFunc(filepath.Clean(abs), func(r rune) bool {
 		return r == filepath.Separator || r == '/' || r == '\\'
 	}) {

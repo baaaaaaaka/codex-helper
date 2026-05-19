@@ -140,6 +140,9 @@ func TestTeamsBeaconTurnDoesNotFallBackToLocalExecutor(t *testing.T) {
 			t.Fatalf("beacon failure response missing %q:\n%s", want, joined)
 		}
 	}
+	if !strings.Contains(joined, "🔧 Helper:") || strings.Contains(joined, "🤖 ⏳ Codex status") {
+		t.Fatalf("beacon orchestration failure should be rendered as helper output, got:\n%s", joined)
+	}
 }
 
 func TestTeamsBeaconTurnReconcilesConfiguredProviderAdapter(t *testing.T) {
@@ -247,7 +250,7 @@ func TestTeamsBeaconTurnReconcilesConfiguredProviderAdapter(t *testing.T) {
 		}
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"provider remote done"} {
+	for _, want := range []string{"Beacon allocation", "Profile: gpu", "Scheduler job: slurm-999", "provider remote done"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon provider response missing %q:\n%s", want, joined)
 		}
@@ -826,7 +829,7 @@ func TestTeamsBeaconListIncludesAllocationsAndMachines(t *testing.T) {
 		t.Fatalf("beacon list: %v", err)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Beacon list", "Profiles:", "gpu: ready", "Allocations:", "req-1: submitted on gpu (Slurm)", "provider_job=slurm-1", "Machines:", "gpu-a: accepting on gpu"} {
+	for _, want := range []string{"Beacon list", "Profiles:", "gpu: ready", "Allocations:", "req-1: submitted on gpu (Slurm)", "provider_job: slurm-1", "provider_state: PD", "reason: resources", "Machines:", "gpu-a: accepting on gpu"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon list missing %q:\n%s", want, joined)
 		}
@@ -1121,19 +1124,34 @@ func TestTeamsBeaconProfileCreateStoresAdapterCommands(t *testing.T) {
 
 	if err := bridge.handleControlMessage(
 		context.Background(),
-		bridgeTestMessageWithText("profile-create-adapter", "beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew"),
-		"beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew",
+		bridgeTestMessageWithText("profile-create-adapter", "beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew --adapter-shell user"),
+		"beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew --adapter-shell user",
 	); err != nil {
 		t.Fatalf("create profile: %v", err)
 	}
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "adapter: profile:query,submit,cancel,renew") {
+	if !strings.Contains(joined, "adapter: profile:query,submit,cancel,renew shell=user") {
 		t.Fatalf("profile create response missing adapter summary:\n%s", joined)
 	}
 	st := loadTeamsBeaconState(t)
 	got := st.Profiles["gpu"].Adapter
 	if got.SlurmQueryCommand != "/opt/cxp/query" || got.SlurmSubmitCommand != "/opt/cxp/submit" || got.SlurmCancelCommand != "/opt/cxp/cancel" || got.SlurmRenewCommand != "/opt/cxp/renew" {
 		t.Fatalf("stored adapter = %#v", got)
+	}
+	if got.ShellMode != beacon.ProviderCommandShellUser {
+		t.Fatalf("stored adapter shell mode = %q", got.ShellMode)
+	}
+	if err := bridge.handleControlMessage(
+		context.Background(),
+		bridgeTestMessageWithText("profile-update-adapter-shell", "beacon profile update gpu --adapter-shell login"),
+		"beacon profile update gpu --adapter-shell login",
+	); err != nil {
+		t.Fatalf("update profile adapter shell: %v", err)
+	}
+	st = loadTeamsBeaconState(t)
+	got = st.Profiles["gpu"].Adapter
+	if st.Profiles["gpu"].Provider != beacon.ProviderSlurm || got.SlurmSubmitCommand != "/opt/cxp/submit" || got.ShellMode != beacon.ProviderCommandShellLogin {
+		t.Fatalf("partial update should preserve adapter commands and update shell: profile=%#v adapter=%#v", st.Profiles["gpu"], got)
 	}
 }
 

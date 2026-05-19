@@ -178,6 +178,49 @@ func TestTeamsCodexChildEnvDoesNotDuplicateHelperDirInPATH(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexChildEnvDoesNotExposeTransientHelperPath(t *testing.T) {
+	prevExecutablePath := teamsChildExecutablePath
+	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
+
+	dir := t.TempDir()
+	running := filepath.Join(dir, ".nfs802014de01c482a800000492")
+	teamsChildExecutablePath = func() (string, error) { return running, nil }
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	got := teamsCodexChildEnv()
+	if _, ok := sliceEnvValue(got, envTeamsHelperCLIPath); ok {
+		t.Fatalf("transient helper path should not be exposed: %#v", got)
+	}
+	if _, ok := sliceEnvValue(got, envTeamsHelperCLIDir); ok {
+		t.Fatalf("transient helper dir should not be exposed: %#v", got)
+	}
+	if path := envValue(got, "PATH"); strings.Contains(path, dir) {
+		t.Fatalf("PATH should not include transient helper dir, got %q", path)
+	}
+}
+
+func TestTeamsCodexChildEnvExposesRecoveredStableHelperPath(t *testing.T) {
+	prevExecutablePath := teamsChildExecutablePath
+	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
+
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write stable helper: %v", err)
+	}
+	running := filepath.Join(dir, ".nfs802014de01c482a800000492")
+	teamsChildExecutablePath = func() (string, error) { return running, nil }
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	got := teamsCodexChildEnv()
+	if !hasEnvValue(got, envTeamsHelperCLIPath, stable) {
+		t.Fatalf("expected recovered stable helper path %q: %#v", stable, got)
+	}
+	if !hasEnvValue(got, envTeamsHelperCLIDir, dir) {
+		t.Fatalf("expected recovered helper dir %q: %#v", dir, got)
+	}
+}
+
 func TestTeamsCodexChildEnvMakesHelperDirDiscoverableOnPATH(t *testing.T) {
 	prevExecutablePath := teamsChildExecutablePath
 	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })

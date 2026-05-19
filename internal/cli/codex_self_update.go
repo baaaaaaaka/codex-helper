@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/spf13/cobra"
 )
 
@@ -25,7 +26,7 @@ const (
 
 var (
 	codexSelfUpdateLookPath     = exec.LookPath
-	codexSelfUpdateExecutable   = os.Executable
+	codexSelfUpdateExecutable   = helperpath.RawExecutable
 	codexSelfUpdateDetectSource = detectCodexUpgradeSourceForPath
 	codexSelfUpdateCleanupStale = cleanupStaleCodexRetiredPathsForSource
 	codexSelfUpdateRunRealNpm   = runCodexSelfUpdateRealNpm
@@ -70,6 +71,11 @@ func prepareCodexSelfUpdateGuardEnv(
 	if err != nil {
 		return envVars, func() {}, err
 	}
+	resolvedWrapperExe, err := helperpath.StableRunnablePathFromSources(wrapperExe, restartArgv0(), helperpath.Options{})
+	if err != nil {
+		return envVars, func() {}, fmt.Errorf("codex self-update guard cannot resolve stable helper executable: %w", err)
+	}
+	wrapperExe = resolvedWrapperExe.Path
 
 	tempDir := strings.TrimSpace(envTempDir(envVars))
 	wrapperDir, err := os.MkdirTemp(tempDir, "codex-proxy-npm-")

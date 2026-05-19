@@ -126,9 +126,9 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 			return formatBeaconProfileMutation("Created", p, proxyExists), nil
 		})
 	case "update", "edit":
-		in, err := parseBeaconProfileCreateInput(words[1:])
+		in, err := parseBeaconProfileUpdateInput(words[1:])
 		if err != nil {
-			return "", fmt.Errorf("%s", strings.NewReplacer("create", "update").Replace(err.Error()))
+			return "", err
 		}
 		normalized := normalizedBeaconCommand("profile update " + strings.Join(words[1:], " "))
 		return b.updateBeaconStateFromTeams(msg, idempotencyScope, normalized, "", func(st *beacon.State) (string, error) {
@@ -893,19 +893,28 @@ func (in teamsBeaconProfileCreateInput) withProxyResolver(proxyExists func(strin
 }
 
 func parseBeaconProfileCreateInput(words []string) (teamsBeaconProfileCreateInput, error) {
+	return parseBeaconProfileInput(words, "create", beacon.ProviderSlurm, beacon.ProxyNone, beacon.IsolationShared)
+}
+
+func parseBeaconProfileUpdateInput(words []string) (teamsBeaconProfileCreateInput, error) {
+	return parseBeaconProfileInput(words, "update", "", "", "")
+}
+
+func parseBeaconProfileInput(words []string, verb string, defaultProvider beacon.Provider, defaultProxy beacon.ProxyMode, defaultIsolation beacon.Isolation) (teamsBeaconProfileCreateInput, error) {
 	if len(words) == 0 {
-		return teamsBeaconProfileCreateInput{}, fmt.Errorf("usage: `beacon profile create <name> [--provider slurm|lsf|local ...]`")
+		return teamsBeaconProfileCreateInput{}, fmt.Errorf("usage: `beacon profile %s <name> [--provider slurm|lsf|local ...]`", verb)
 	}
 	in := teamsBeaconProfileCreateInput{CreateProfileInput: beacon.CreateProfileInput{
 		Name:             words[0],
-		Provider:         beacon.ProviderSlurm,
-		ProxyMode:        beacon.ProxyNone,
-		IsolationDefault: beacon.IsolationShared,
+		Provider:         defaultProvider,
+		ProxyMode:        defaultProxy,
+		IsolationDefault: defaultIsolation,
 	}}
 	var queryCommand string
 	var submitCommand string
 	var cancelCommand string
 	var renewCommand string
+	var adapterShell string
 	for i := 1; i < len(words); i++ {
 		key := strings.ToLower(strings.TrimSpace(words[i]))
 		value := func() (string, error) {
@@ -1000,16 +1009,39 @@ func parseBeaconProfileCreateInput(words []string) (teamsBeaconProfileCreateInpu
 				return teamsBeaconProfileCreateInput{}, err
 			}
 			renewCommand = v
+		case "--adapter-shell":
+			v, err := value()
+			if err != nil {
+				return teamsBeaconProfileCreateInput{}, err
+			}
+			adapterShell = v
 		case "--lsf-site-policy":
 			in.LSF.SitePolicyDerivesResources = true
 		case "--lsf-advanced-approved":
 			in.LSF.AdvancedApproved = true
 		default:
-			return teamsBeaconProfileCreateInput{}, fmt.Errorf("unknown beacon profile create flag %q", words[i])
+			return teamsBeaconProfileCreateInput{}, fmt.Errorf("unknown beacon profile %s flag %q", verb, words[i])
 		}
 	}
-	in.Adapter = beacon.ProviderCommandConfigForProvider(in.Provider, queryCommand, submitCommand, cancelCommand, renewCommand)
+	in.Adapter = beaconProviderCommandConfigForProfileInput(in.Provider, queryCommand, submitCommand, cancelCommand, renewCommand)
+	in.Adapter.ShellMode = strings.TrimSpace(adapterShell)
 	return in, nil
+}
+
+func beaconProviderCommandConfigForProfileInput(provider beacon.Provider, query, submit, cancel, renew string) beacon.ProviderCommandConfig {
+	if provider == "" {
+		return beacon.ProviderCommandConfig{
+			SlurmQueryCommand:  strings.TrimSpace(query),
+			SlurmSubmitCommand: strings.TrimSpace(submit),
+			SlurmCancelCommand: strings.TrimSpace(cancel),
+			SlurmRenewCommand:  strings.TrimSpace(renew),
+			LSFQueryCommand:    strings.TrimSpace(query),
+			LSFSubmitCommand:   strings.TrimSpace(submit),
+			LSFCancelCommand:   strings.TrimSpace(cancel),
+			LSFRenewCommand:    strings.TrimSpace(renew),
+		}
+	}
+	return beacon.ProviderCommandConfigForProvider(provider, query, submit, cancel, renew)
 }
 
 func parseBeaconIntFlag(flag string, value func() (string, error)) (int, error) {
@@ -1521,10 +1553,18 @@ func profileProxyLabel(p beacon.Profile) string {
 
 func beaconProfileAdapterLabel(p beacon.Profile) string {
 	ops := beacon.ConfiguredProviderCommandOperations(p.Adapter, p.Provider)
+	shell := strings.TrimSpace(p.Adapter.ShellMode)
 	if len(ops) == 0 {
+		if shell != "" {
+			return "helper environment, shell=" + shell
+		}
 		return "helper environment"
 	}
-	return "profile:" + strings.Join(ops, ",")
+	label := "profile:" + strings.Join(ops, ",")
+	if shell != "" {
+		label += " shell=" + shell
+	}
+	return label
 }
 
 func beaconProfileProxyRoute(p beacon.Profile) string {
@@ -1626,6 +1666,7 @@ func beaconControlHelpText() string {
 		"- `beacon list` - list all profiles and machines",
 		"- `beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <hours>`",
 		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
+		"- add `--adapter-shell user` when scheduler submission depends on your normal shell setup",
 		"- `beacon profile update <name> ...` - create a new profile revision without breaking bound Work chats",
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>`",
 		"- `beacon profile create <name> --provider lsf --queue <queue>`",

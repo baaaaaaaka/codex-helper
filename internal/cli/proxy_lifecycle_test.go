@@ -96,7 +96,11 @@ func TestProxyStartBackgroundPassesResolvedConfigPathToDaemon(t *testing.T) {
 		proxyCommand = prevCommand
 	})
 
-	proxyExecutable = func() (string, error) { return "/fake/codex-proxy", nil }
+	exePath := filepath.Join(filepath.Dir(store.Path()), "codex-proxy")
+	if err := os.WriteFile(exePath, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	proxyExecutable = func() (string, error) { return exePath, nil }
 
 	var gotName string
 	var gotArgs []string
@@ -116,8 +120,8 @@ func TestProxyStartBackgroundPassesResolvedConfigPathToDaemon(t *testing.T) {
 		t.Fatalf("execute proxy start: %v", err)
 	}
 
-	if gotName != "/fake/codex-proxy" {
-		t.Fatalf("expected daemon executable %q, got %q", "/fake/codex-proxy", gotName)
+	if gotName != exePath {
+		t.Fatalf("expected daemon executable %q, got %q", exePath, gotName)
 	}
 	if len(gotArgs) != 6 {
 		t.Fatalf("unexpected daemon args: %v", gotArgs)
@@ -130,6 +134,57 @@ func TestProxyStartBackgroundPassesResolvedConfigPathToDaemon(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Started instance ") {
 		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
+func TestProxyStartBackgroundUsesStableExecutableForTransientRawPath(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		Profiles: []config.Profile{{
+			ID:   "p1",
+			Name: "dev",
+			Host: "host",
+			Port: 22,
+			User: "alice",
+		}},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	binDir := filepath.Join(filepath.Dir(store.Path()), "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	stable := filepath.Join(binDir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	raw := filepath.Join(binDir, ".nfs802014de01c482a800000492")
+
+	prevExecutable := proxyExecutable
+	prevCommand := proxyCommand
+	t.Cleanup(func() {
+		proxyExecutable = prevExecutable
+		proxyCommand = prevCommand
+	})
+	proxyExecutable = func() (string, error) { return raw, nil }
+
+	var gotName string
+	proxyCommand = func(name string, args ...string) *exec.Cmd {
+		gotName = name
+		return exec.Command("sh", "-c", "exit 0")
+	}
+
+	cmd := newProxyStartCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy start: %v", err)
+	}
+	if gotName != stable {
+		t.Fatalf("daemon executable = %q, want stable %q", gotName, stable)
 	}
 }
 

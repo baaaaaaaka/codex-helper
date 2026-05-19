@@ -13,25 +13,43 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
 var (
-	performUpdate  = update.PerformUpdate
-	checkForUpdate = update.CheckForUpdate
-	executablePath = os.Executable
-	execSelf       = syscall.Exec
-	exitFunc       = os.Exit
-	startSelf      = startRestartProcess
+	performUpdate            = update.PerformUpdate
+	checkForUpdate           = update.CheckForUpdate
+	resolveInstallPathForCLI = update.ResolveInstallPath
+	executablePath           = helperpath.RawExecutable
+	restartArgv0             = func() string {
+		if len(os.Args) == 0 {
+			return ""
+		}
+		return os.Args[0]
+	}
+	execSelf  = syscall.Exec
+	exitFunc  = os.Exit
+	startSelf = startRestartProcess
 )
 
 func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
-	res, err := performUpdate(ctx, update.UpdateOptions{
-		Repo:           "",
-		Version:        "latest",
-		InstallPath:    "",
-		Timeout:        120 * time.Second,
-		ValidateBinary: true,
+	installPath, err := resolveInstallPathForCLI("")
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Upgrade failed: %v\n", err)
+		return err
+	}
+	var res update.ApplyResult
+	err = withTeamsHelperUpgradeInstallLock(ctx, installPath, func() error {
+		var updateErr error
+		res, updateErr = performUpdate(ctx, update.UpdateOptions{
+			Repo:           "",
+			Version:        "latest",
+			InstallPath:    installPath,
+			Timeout:        120 * time.Second,
+			ValidateBinary: true,
+		})
+		return updateErr
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Upgrade failed: %v\n", err)
@@ -52,7 +70,10 @@ func restartSelf() error {
 	if err != nil {
 		return err
 	}
-	exe = stableRestartExecutablePath(exe)
+	exe, err = resolveRestartExecutablePathFromSources(exe, restartArgv0())
+	if err != nil {
+		return err
+	}
 	args := append([]string{exe}, os.Args[1:]...)
 	if runtime.GOOS == "windows" {
 		if err := startSelf(exe, args[1:]); err != nil {
@@ -65,18 +86,23 @@ func restartSelf() error {
 }
 
 func stableRestartExecutablePath(path string) string {
-	stable := stripReloadBackupSuffix(path)
-	if stable != path {
-		if info, err := os.Stat(stable); err == nil && !info.IsDir() {
-			return stable
-		}
+	exe, err := resolveRestartExecutablePath(path)
+	if err != nil {
 		return path
 	}
-	stable = update.StableInstallPathFromExecutable(path)
-	if stable != filepath.Clean(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))) {
-		return stable
+	return exe
+}
+
+func resolveRestartExecutablePath(path string) (string, error) {
+	return resolveRestartExecutablePathFromSources(path, "")
+}
+
+func resolveRestartExecutablePathFromSources(path string, argv0 string) (string, error) {
+	resolved, err := helperpath.StableRunnablePathFromSources(path, argv0, helperpath.Options{})
+	if err != nil {
+		return "", err
 	}
-	return path
+	return resolved.Path, nil
 }
 
 func stripReloadBackupSuffix(path string) string {

@@ -426,6 +426,39 @@ func updateBeaconTurnPlanFromAllocation(plan *beacon.TurnExecutionPlan, req beac
 	plan.SubmitAction = action
 }
 
+func formatBeaconTurnAllocationProgress(plan beacon.TurnExecutionPlan) string {
+	var lines []string
+	lines = append(lines,
+		"Beacon allocation",
+		"",
+		"cxp is preparing a beacon worker for this turn.",
+		"",
+		"State:",
+		"- Profile: `"+firstNonEmptyString(plan.Snapshot.Profile, plan.Snapshot.Target)+"`",
+		"- Allocation: `"+firstNonEmptyString(plan.AllocationRequestID, "<pending>")+"`",
+		"- Allocation state: `"+firstNonEmptyString(string(plan.AllocationState), "<unknown>")+"`",
+	)
+	if strings.TrimSpace(string(plan.SubmitAction)) != "" {
+		lines = append(lines, "- Submit action: `"+string(plan.SubmitAction)+"`")
+	}
+	if strings.TrimSpace(plan.ProviderJobID) != "" {
+		lines = append(lines, "- Scheduler job: `"+plan.ProviderJobID+"`")
+	}
+	if strings.TrimSpace(plan.ProviderState) != "" {
+		lines = append(lines, "- Scheduler state: `"+plan.ProviderState+"`")
+	}
+	lines = append(lines,
+		"",
+		"What cxp is doing:",
+		"- Waiting for the scheduler job to start and for a beacon worker to register.",
+		"- Codex will start after the worker is ready.",
+	)
+	if strings.TrimSpace(plan.ProviderReason) != "" {
+		lines = append(lines, "", "Details:", "- Provider reason: `"+plan.ProviderReason+"`")
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (b *Bridge) recordBeaconTurnStartFailure(ctx context.Context, session *Session, turn teamstore.Turn, plan beacon.TurnExecutionPlan, reason string) error {
 	if b == nil || session == nil || strings.TrimSpace(turn.ID) == "" {
 		return nil

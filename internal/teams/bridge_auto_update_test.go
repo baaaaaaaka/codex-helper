@@ -83,6 +83,55 @@ func TestBridgeHelperAutoUpdateAppliesEligibleCandidate(t *testing.T) {
 	}
 }
 
+func TestBridgeHelperAutoUpdateDefersActivationWithoutRestarting(t *testing.T) {
+	st, bridge := newBridgeAutoUpdateTest(t)
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	updater := &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			NextCheckAt: now.Add(30 * time.Minute),
+			Candidate: &HelperAutoUpdateCandidate{
+				TagName:     "v1.2.4",
+				Version:     "1.2.4",
+				Priority:    "p0",
+				PublishedAt: now.Add(-time.Minute),
+				EligibleAt:  now.Add(-time.Minute),
+				Asset:       "codex-proxy_1.2.4_linux_amd64",
+			},
+		},
+		applyResult: HelperAutoUpdateApplyResult{
+			Version:           "1.2.4",
+			InstallPath:       "/home/me/.local/bin/codex-proxy",
+			ActivationPending: true,
+			ActivationReason:  "running helper executable is transient",
+		},
+	}
+	var restartCalls int
+	err := bridge.maybeRunHelperAutoUpdate(context.Background(), BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+		HelperRestarter: func(context.Context) error {
+			restartCalls++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("maybeRunHelperAutoUpdate error: %v", err)
+	}
+	if restartCalls != 0 {
+		t.Fatalf("restartCalls = %d, want no restart for pending activation", restartCalls)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "" {
+		t.Fatalf("LastInstalledTag = %q, want empty until activation is verified", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, "transient") {
+		t.Fatalf("upgrade = %#v, want aborted pending activation", state.Upgrade)
+	}
+}
+
 func TestBridgeHelperAutoUpdateWaitsForBlockingWorkThenAppliesPendingCandidate(t *testing.T) {
 	st, bridge := newBridgeAutoUpdateTest(t)
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)

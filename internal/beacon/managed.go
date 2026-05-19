@@ -621,6 +621,9 @@ func DecideAllocationSubmit(req AllocationRequest, query SchedulerQueryResult) A
 	if strings.TrimSpace(query.ProviderJobID) != "" {
 		return AllocationSubmitAdopt
 	}
+	if providerRequiresJobID(req.Provider) && req.SubmitAttempts > 0 && !query.DurableNegative && (strings.TrimSpace(query.RawState) != "" || strings.TrimSpace(query.Reason) != "") {
+		return AllocationSubmitAttention
+	}
 	if req.SubmitAttempts > 0 && !query.DurableNegative {
 		return AllocationSubmitWait
 	}
@@ -715,7 +718,7 @@ func ReconcileAllocationSubmit(ctx context.Context, st *State, requestID string,
 		return req, action, nil
 	case AllocationSubmitAttention:
 		req.State = AllocationNeedsAttention
-		req.ProviderReason = firstNonEmpty(strings.TrimSpace(query.Reason), "multiple provider jobs matched deterministic allocation name")
+		req.ProviderReason = allocationSubmitAttentionReason(req, query)
 		req.RawProviderState = strings.TrimSpace(query.RawState)
 		if !query.ProviderDeadline.IsZero() {
 			req.ProviderDeadline = query.ProviderDeadline
@@ -738,9 +741,15 @@ func ReconcileAllocationSubmit(ctx context.Context, st *State, requestID string,
 	case AllocationSubmitNow:
 		submitted, err := adapter.SubmitAllocation(ctx, req)
 		req.SubmitAttempts++
+		if err == nil {
+			err = validateAllocationSubmitResult(req, submitted)
+		}
 		if err != nil {
 			req.State = AllocationNeedsAttention
 			req.ProviderReason = err.Error()
+			if strings.TrimSpace(submitted.RawState) != "" {
+				req.RawProviderState = strings.TrimSpace(submitted.RawState)
+			}
 			req.UpdatedAt = now
 			st.Allocations[requestID] = req
 			return req, action, err
@@ -819,6 +828,9 @@ func ReconcileAllocationSubmitOutsideLock(ctx context.Context, store *Store, req
 		}
 		req = current
 		submitted, submitErr = adapter.SubmitAllocation(ctx, req)
+		if submitErr == nil {
+			submitErr = validateAllocationSubmitResult(req, submitted)
+		}
 	}
 	var updated AllocationRequest
 	updateErr := store.Update(func(st *State) error {
@@ -1429,7 +1441,7 @@ func applyAllocationSubmitResult(req AllocationRequest, query SchedulerQueryResu
 		}
 	case AllocationSubmitAttention:
 		req.State = AllocationNeedsAttention
-		req.ProviderReason = firstNonEmpty(strings.TrimSpace(query.Reason), "multiple provider jobs matched deterministic allocation name")
+		req.ProviderReason = allocationSubmitAttentionReason(req, query)
 		req.RawProviderState = strings.TrimSpace(query.RawState)
 		if !query.ProviderDeadline.IsZero() {
 			req.ProviderDeadline = query.ProviderDeadline
@@ -1447,6 +1459,9 @@ func applyAllocationSubmitResult(req AllocationRequest, query SchedulerQueryResu
 		if submitErr != nil {
 			req.State = AllocationNeedsAttention
 			req.ProviderReason = submitErr.Error()
+			if strings.TrimSpace(submitted.RawState) != "" {
+				req.RawProviderState = strings.TrimSpace(submitted.RawState)
+			}
 			break
 		}
 		if strings.TrimSpace(submitted.ProviderJobID) != "" {
@@ -1461,6 +1476,24 @@ func applyAllocationSubmitResult(req AllocationRequest, query SchedulerQueryResu
 	}
 	req.UpdatedAt = now
 	return req
+}
+
+func validateAllocationSubmitResult(req AllocationRequest, submitted SchedulerQueryResult) error {
+	if !providerRequiresJobID(req.Provider) || strings.TrimSpace(submitted.ProviderJobID) != "" {
+		return nil
+	}
+	reason := firstNonEmpty(strings.TrimSpace(submitted.Reason), strings.TrimSpace(submitted.RawState), "submit adapter did not return a provider job id")
+	return fmt.Errorf("submit adapter for %s did not return provider_job_id: %s", req.Provider, reason)
+}
+
+func allocationSubmitAttentionReason(req AllocationRequest, query SchedulerQueryResult) string {
+	if query.MultipleMatches {
+		return firstNonEmpty(strings.TrimSpace(query.Reason), "multiple provider jobs matched deterministic allocation name")
+	}
+	if providerRequiresJobID(req.Provider) && req.SubmitAttempts > 0 && strings.TrimSpace(req.ProviderIdentity.ProviderJobID) == "" {
+		return firstNonEmpty(strings.TrimSpace(query.Reason), "provider query did not return provider_job_id after a previous submit")
+	}
+	return firstNonEmpty(strings.TrimSpace(query.Reason), "allocation submit needs attention")
 }
 
 func allocationStateTerminal(state AllocationState) bool {

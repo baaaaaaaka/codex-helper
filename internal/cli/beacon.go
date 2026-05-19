@@ -14,8 +14,11 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/spf13/cobra"
 )
+
+var beaconExecutable = helperpath.RawExecutable
 
 func newBeaconCmd(root *rootOptions) *cobra.Command {
 	var storePath string
@@ -113,6 +116,7 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	var submitCommand string
 	var cancelCommand string
 	var renewCommand string
+	var adapterShell string
 
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -138,7 +142,7 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 					IsolationDefault:             beacon.Isolation(isolation),
 					Slurm:                        beacon.SlurmProfile{Nodes: nodes, GPUCount: gpuCount, Partition: partition, Image: image, Duration: duration},
 					LSF:                          beacon.LSFProfile{QueueName: queue, SitePolicyDerivesResources: lsfSitePolicy, AdvancedApproved: lsfAdvanced},
-					Adapter:                      beacon.ProviderCommandConfigForProvider(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand),
+					Adapter:                      providerCommandConfigForProfileInput(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand, adapterShell),
 					ExistingProxyProfileResolver: proxyExists,
 				})
 				return err
@@ -171,6 +175,7 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	cmd.Flags().StringVar(&submitCommand, "submit-command", "", "Provider submit adapter command stored on this profile")
 	cmd.Flags().StringVar(&cancelCommand, "cancel-command", "", "Provider cancel adapter command stored on this profile")
 	cmd.Flags().StringVar(&renewCommand, "renew-command", "", "Provider renew adapter command stored on this profile")
+	cmd.Flags().StringVar(&adapterShell, "adapter-shell", "", "Provider adapter shell mode: direct, login, interactive-login, user, or shell-command")
 	return cmd
 }
 
@@ -191,6 +196,7 @@ func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	var submitCommand string
 	var cancelCommand string
 	var renewCommand string
+	var adapterShell string
 
 	cmd := &cobra.Command{
 		Use:   "update <name>",
@@ -216,7 +222,7 @@ func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Comm
 					IsolationDefault:             beacon.Isolation(isolation),
 					Slurm:                        beacon.SlurmProfile{Nodes: nodes, GPUCount: gpuCount, Partition: partition, Image: image, Duration: duration},
 					LSF:                          beacon.LSFProfile{QueueName: queue, SitePolicyDerivesResources: lsfSitePolicy, AdvancedApproved: lsfAdvanced},
-					Adapter:                      beacon.ProviderCommandConfigForProvider(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand),
+					Adapter:                      providerCommandConfigForProfileInput(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand, adapterShell),
 					ExistingProxyProfileResolver: proxyExists,
 				})
 				return err
@@ -233,10 +239,10 @@ func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Comm
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&provider, "provider", "slurm", "Provider: slurm, lsf, or local")
-	cmd.Flags().StringVar(&proxyMode, "proxy", "none", "Proxy mode: none or ssh_profile")
+	cmd.Flags().StringVar(&provider, "provider", "", "Provider: slurm, lsf, or local")
+	cmd.Flags().StringVar(&proxyMode, "proxy", "", "Proxy mode: none or ssh_profile")
 	cmd.Flags().StringVar(&proxyProfile, "proxy-profile", "", "Existing SSH proxy profile to use when --proxy=ssh_profile")
-	cmd.Flags().StringVar(&isolation, "isolation", string(beacon.IsolationShared), "Default isolation: shared or exclusive")
+	cmd.Flags().StringVar(&isolation, "isolation", "", "Default isolation: shared or exclusive")
 	cmd.Flags().IntVar(&nodes, "nodes", 0, "Slurm node count")
 	cmd.Flags().IntVar(&gpuCount, "gpu", 0, "Slurm GPU count")
 	cmd.Flags().StringVar(&partition, "partition", "", "Slurm partition")
@@ -249,7 +255,28 @@ func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	cmd.Flags().StringVar(&submitCommand, "submit-command", "", "Provider submit adapter command stored on this profile")
 	cmd.Flags().StringVar(&cancelCommand, "cancel-command", "", "Provider cancel adapter command stored on this profile")
 	cmd.Flags().StringVar(&renewCommand, "renew-command", "", "Provider renew adapter command stored on this profile")
+	cmd.Flags().StringVar(&adapterShell, "adapter-shell", "", "Provider adapter shell mode: direct, login, interactive-login, user, or shell-command")
 	return cmd
+}
+
+func providerCommandConfigForProfileInput(provider beacon.Provider, query, submit, cancel, renew, shellMode string) beacon.ProviderCommandConfig {
+	if provider == "" {
+		config := beacon.ProviderCommandConfig{
+			SlurmQueryCommand:  strings.TrimSpace(query),
+			SlurmSubmitCommand: strings.TrimSpace(submit),
+			SlurmCancelCommand: strings.TrimSpace(cancel),
+			SlurmRenewCommand:  strings.TrimSpace(renew),
+			LSFQueryCommand:    strings.TrimSpace(query),
+			LSFSubmitCommand:   strings.TrimSpace(submit),
+			LSFCancelCommand:   strings.TrimSpace(cancel),
+			LSFRenewCommand:    strings.TrimSpace(renew),
+			ShellMode:          strings.TrimSpace(shellMode),
+		}
+		return config
+	}
+	config := beacon.ProviderCommandConfigForProvider(provider, query, submit, cancel, renew)
+	config.ShellMode = strings.TrimSpace(shellMode)
+	return config
 }
 
 func newBeaconProfileHistoryCmd(root *rootOptions, storePath *string) *cobra.Command {
@@ -389,10 +416,18 @@ func newBeaconProfileStatusCmd(root *rootOptions, storePath *string) *cobra.Comm
 
 func cliBeaconAdapterLabel(p beacon.Profile) string {
 	ops := beacon.ConfiguredProviderCommandOperations(p.Adapter, p.Provider)
+	shell := strings.TrimSpace(p.Adapter.ShellMode)
 	if len(ops) == 0 {
+		if shell != "" {
+			return "env,shell=" + shell
+		}
 		return "env"
 	}
-	return "profile:" + strings.Join(ops, ",")
+	label := "profile:" + strings.Join(ops, ",")
+	if shell != "" {
+		label += ",shell=" + shell
+	}
+	return label
 }
 
 func cliBeaconProfileRevision(revision int) int {
@@ -1221,8 +1256,10 @@ func beaconWorkerBootstrapDiagnostics(codexPath string, storePath string) beacon
 		}
 	}
 	cxpPath := ""
-	if exe, err := os.Executable(); err == nil {
-		cxpPath = exe
+	if exe, err := beaconExecutable(); err == nil {
+		if resolved, resolveErr := helperpath.StableRunnablePathFromSources(exe, restartArgv0(), helperpath.Options{}); resolveErr == nil {
+			cxpPath = resolved.Path
+		}
 	}
 	codex := strings.TrimSpace(codexPath)
 	if codex == "" {
@@ -1272,9 +1309,16 @@ func runBeaconWorkerDoctor(codexPath string) beacon.WorkerDoctor {
 	} else if _, err := exec.LookPath(command); err == nil {
 		doctor.CodexAvailable = true
 	}
-	if exe, err := os.Executable(); err == nil {
-		if st, statErr := os.Stat(exe); statErr == nil && !st.IsDir() {
-			doctor.CXPAvailable = true
+	if exe, err := beaconExecutable(); err == nil {
+		if resolved, resolveErr := helperpath.StableRunnablePathFromSources(exe, restartArgv0(), helperpath.Options{}); resolveErr == nil {
+			exe = resolved.Path
+		} else {
+			exe = ""
+		}
+		if exe != "" {
+			if st, statErr := os.Stat(exe); statErr == nil && !st.IsDir() {
+				doctor.CXPAvailable = true
+			}
 		}
 	}
 	if _, err := os.UserHomeDir(); err != nil {

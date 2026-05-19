@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 const (
@@ -30,7 +32,13 @@ var (
 	githubAPIBase     = "https://api.github.com"
 	githubReleaseBase = "https://github.com"
 	githubRawBase     = "https://raw.githubusercontent.com"
-	executablePath    = os.Executable
+	executablePath    = helperpath.RawExecutable
+	argv0Path         = func() string {
+		if len(os.Args) == 0 {
+			return ""
+		}
+		return os.Args[0]
+	}
 )
 
 type Status struct {
@@ -99,75 +107,33 @@ func ResolveVersion(explicit string) string {
 }
 
 func ResolveInstallPath(explicit string) (string, error) {
-	if v := strings.TrimSpace(explicit); v != "" {
-		return normalizeInstallPath(v)
+	var exe string
+	if strings.TrimSpace(explicit) == "" && strings.TrimSpace(os.Getenv(EnvInstallDir)) == "" {
+		var err error
+		exe, err = executablePath()
+		if err != nil {
+			return "", err
+		}
 	}
-	if v := strings.TrimSpace(os.Getenv(EnvInstallDir)); v != "" {
-		return normalizeInstallPath(v)
-	}
-	exe, err := executablePath()
+	resolved, err := helperpath.StableInstallTargetFromSources(explicit, os.Getenv(EnvInstallDir), exe, argv0Path(), helperpath.Options{})
 	if err != nil {
 		return "", err
 	}
-	return StableInstallPathFromExecutable(exe), nil
-}
-
-func normalizeInstallPath(path string) (string, error) {
-	info, err := os.Stat(path)
-	if err == nil && info.IsDir() {
-		return filepath.Join(path, binaryName()), nil
-	}
-	return StableInstallPathFromExecutable(path), nil
+	return resolved.Path, nil
 }
 
 // StableInstallPathFromExecutable maps transient self-exec paths back to the
 // durable helper install path when the platform exposes one.
 func StableInstallPathFromExecutable(path string) string {
-	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))
-	if trimmed == "" {
-		return ""
+	resolved, err := helperpath.StableInstallTarget("", "", path, helperpath.Options{})
+	if err == nil {
+		return resolved.Path
 	}
-	cleaned := filepath.Clean(trimmed)
-	if stable, ok := stableInstallPathForNFSSillyRename(cleaned); ok {
-		return stable
+	class := helperpath.Classify(path)
+	if strings.TrimSpace(class.Clean) != "" {
+		return class.Clean
 	}
-	return cleaned
-}
-
-func stableInstallPathForNFSSillyRename(path string) (string, bool) {
-	if !isNFSSillyRenamedExecutable(filepath.Base(path)) {
-		return "", false
-	}
-	candidate := filepath.Join(filepath.Dir(path), binaryName())
-	if candidate == path {
-		return "", false
-	}
-	info, err := os.Stat(candidate)
-	if err != nil || info.IsDir() {
-		return "", false
-	}
-	if runtime.GOOS != "windows" && info.Mode()&0o111 == 0 {
-		return "", false
-	}
-	return filepath.Clean(candidate), true
-}
-
-func isNFSSillyRenamedExecutable(base string) bool {
-	base = strings.TrimSpace(base)
-	if !strings.HasPrefix(base, ".nfs") {
-		return false
-	}
-	rest := strings.TrimPrefix(base, ".nfs")
-	if rest == "" {
-		return false
-	}
-	for _, r := range rest {
-		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
-			continue
-		}
-		return false
-	}
-	return true
+	return strings.TrimSpace(path)
 }
 
 func CheckForUpdate(ctx context.Context, opts CheckOptions) Status {
@@ -342,10 +308,7 @@ func fetchLatestSelectableRelease(ctx context.Context, repo string, timeout time
 }
 
 func binaryName() string {
-	if runtime.GOOS == "windows" {
-		return "codex-proxy.exe"
-	}
-	return "codex-proxy"
+	return helperpath.BinaryName(runtime.GOOS)
 }
 
 func normalizeVersion(v string) string {

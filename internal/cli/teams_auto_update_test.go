@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -517,6 +518,120 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	}
 	if res.InstallPath != fakeInstallPath {
 		t.Fatalf("result install path = %q, want %q", res.InstallPath, fakeInstallPath)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterApplyDefersActivationFromTransientExecutable(t *testing.T) {
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable: %v", err)
+	}
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return stable, nil }
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return filepath.Join(dir, ".nfs802014de01c482a800000492"), nil
+	}
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if !res.ActivationPending || !strings.Contains(res.ActivationReason, "transient") {
+		t.Fatalf("activation = pending %v reason %q, want transient pending", res.ActivationPending, res.ActivationReason)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterApplyKeepsImmediateActivationForStableExecutable(t *testing.T) {
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable: %v", err)
+	}
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return stable, nil }
+	teamsAutoUpdateExecutable = func() (string, error) { return stable, nil }
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if res.ActivationPending || res.ActivationReason != "" {
+		t.Fatalf("activation = pending %v reason %q, want immediate activation", res.ActivationPending, res.ActivationReason)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterChecksActivationBeforeReplacingStableExecutable(t *testing.T) {
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable: %v", err)
+	}
+	rawExecutable := stable
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return stable, nil }
+	teamsAutoUpdateExecutable = func() (string, error) { return rawExecutable, nil }
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		rawExecutable = stable + " (deleted)"
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if res.ActivationPending || res.ActivationReason != "" {
+		t.Fatalf("activation = pending %v reason %q, want pre-update stable executable to activate immediately", res.ActivationPending, res.ActivationReason)
+	}
+}
+
+func TestTeamsAutoUpdateActivationComparesWindowsPathsCaseInsensitively(t *testing.T) {
+	lockCLITestHooks(t)
+	prevExecutable := teamsAutoUpdateExecutable
+	prevGOOS := teamsServiceGOOS
+	t.Cleanup(func() {
+		teamsAutoUpdateExecutable = prevExecutable
+		teamsServiceGOOS = prevGOOS
+	})
+	teamsServiceGOOS = func() string { return "windows" }
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return `c:\Users\Alice\AppData\Local\codex-helper\codex-proxy.exe`, nil
+	}
+
+	pending, reason := teamsAutoUpdateShouldDeferActivation(`C:\Users\Alice\AppData\Local\codex-helper\codex-proxy.exe`)
+	if pending || reason != "" {
+		t.Fatalf("activation pending=%v reason=%q, want no pending for same Windows path with different case", pending, reason)
 	}
 }
 

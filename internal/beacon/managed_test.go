@@ -269,6 +269,105 @@ func TestReconcileAllocationSubmitUsesAdapterWithoutDuplicateSubmit(t *testing.T
 	}
 }
 
+func TestReconcileAllocationSubmitRequiresProviderJobForRemoteProvider(t *testing.T) {
+	var st State
+	st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+		p.Provider = ProviderSlurm
+		p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+	})}
+	req, _, err := EnsureAllocationRequest(&st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+	if err != nil {
+		t.Fatalf("EnsureAllocationRequest: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{
+		query:  SchedulerQueryResult{DurableNegative: true},
+		submit: SchedulerQueryResult{Reason: "submit_failed: account is required"},
+	}
+	updated, action, err := ReconcileAllocationSubmit(context.Background(), &st, req.ID, adapter, time.Unix(2, 0))
+	if err == nil || !strings.Contains(err.Error(), "provider_job_id") {
+		t.Fatalf("ReconcileAllocationSubmit error = %v, want missing provider job id", err)
+	}
+	if action != AllocationSubmitNow || updated.State != AllocationNeedsAttention || updated.ProviderIdentity.ProviderJobID != "" {
+		t.Fatalf("remote submit without provider job should need attention, action=%s req=%#v", action, updated)
+	}
+	if !strings.Contains(updated.ProviderReason, "account is required") {
+		t.Fatalf("provider reason = %q, want submit failure reason", updated.ProviderReason)
+	}
+}
+
+func TestReconcileAllocationSubmitPreservesRawStateWhenRemoteSubmitLacksJobID(t *testing.T) {
+	var st State
+	st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+		p.Provider = ProviderSlurm
+		p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+	})}
+	req, _, err := EnsureAllocationRequest(&st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+	if err != nil {
+		t.Fatalf("EnsureAllocationRequest: %v", err)
+	}
+	req.RawProviderState = "old-raw-state"
+	st.Allocations[req.ID] = req
+	adapter := &fakeAllocationAdapter{
+		query:  SchedulerQueryResult{DurableNegative: true},
+		submit: SchedulerQueryResult{Reason: "submit_failed: account is required"},
+	}
+	updated, _, err := ReconcileAllocationSubmit(context.Background(), &st, req.ID, adapter, time.Unix(2, 0))
+	if err == nil {
+		t.Fatal("ReconcileAllocationSubmit error = nil, want missing provider job id")
+	}
+	if updated.RawProviderState != "old-raw-state" {
+		t.Fatalf("raw provider state = %q, want old diagnostic preserved", updated.RawProviderState)
+	}
+}
+
+func TestReconcileAllocationSubmitMarksLegacyRemoteSubmitWithoutProviderJobNeedsAttention(t *testing.T) {
+	var st State
+	st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+		p.Provider = ProviderSlurm
+		p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+	})}
+	req, _, err := EnsureAllocationRequest(&st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+	if err != nil {
+		t.Fatalf("EnsureAllocationRequest: %v", err)
+	}
+	req.State = AllocationSubmitted
+	req.SubmitAttempts = 1
+	st.Allocations[req.ID] = req
+	adapter := &fakeAllocationAdapter{
+		query: SchedulerQueryResult{RawState: "submit_failed", Reason: "missing SUBMIT_ACCOUNT"},
+	}
+	updated, action, err := ReconcileAllocationSubmit(context.Background(), &st, req.ID, adapter, time.Unix(2, 0))
+	if err != nil {
+		t.Fatalf("ReconcileAllocationSubmit: %v", err)
+	}
+	if action != AllocationSubmitAttention || updated.State != AllocationNeedsAttention || adapter.submits != 0 {
+		t.Fatalf("legacy missing provider job should need attention without resubmit, action=%s submits=%d req=%#v", action, adapter.submits, updated)
+	}
+	if !strings.Contains(updated.ProviderReason, "SUBMIT_ACCOUNT") {
+		t.Fatalf("provider reason = %q, want scheduler diagnostic", updated.ProviderReason)
+	}
+}
+
+func TestReconcileAllocationSubmitAllowsLocalProviderWithoutProviderJobID(t *testing.T) {
+	var st State
+	st.Profiles = map[string]Profile{"local": readyProfile("local")}
+	req, _, err := EnsureAllocationRequest(&st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "local"}, time.Unix(1, 0))
+	if err != nil {
+		t.Fatalf("EnsureAllocationRequest: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{
+		query:  SchedulerQueryResult{DurableNegative: true},
+		submit: SchedulerQueryResult{Reason: "local ready"},
+	}
+	updated, action, err := ReconcileAllocationSubmit(context.Background(), &st, req.ID, adapter, time.Unix(2, 0))
+	if err != nil {
+		t.Fatalf("local submit without provider job should be allowed: %v", err)
+	}
+	if action != AllocationSubmitNow || updated.State != AllocationSubmitted {
+		t.Fatalf("local submit action/state = %s/%s, want submit/submitted", action, updated.State)
+	}
+}
+
 func TestProviderRunDoesNotMeanWorkerAccepting(t *testing.T) {
 	base := LeaseReadiness{
 		ProviderState:       ProviderJobRunning,
@@ -1706,6 +1805,39 @@ func TestReconcileAllocationSubmitOutsideLockRechecksCancelBeforeSubmit(t *testi
 	}
 	if action != AllocationSubmitAlreadyKnown || updated.State != AllocationCanceled || adapter.submits != 0 {
 		t.Fatalf("cancel before submit should skip external submit, action=%s submits=%d req=%#v", action, adapter.submits, updated)
+	}
+}
+
+func TestReconcileAllocationSubmitOutsideLockRejectsRemoteSubmitWithoutProviderJob(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	var st State
+	st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+		p.Provider = ProviderSlurm
+		p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+	})}
+	req, _, err := EnsureAllocationRequest(&st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+	if err != nil {
+		t.Fatalf("EnsureAllocationRequest: %v", err)
+	}
+	if err := store.Save(st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{
+		query:  SchedulerQueryResult{DurableNegative: true},
+		submit: SchedulerQueryResult{Reason: "submit_failed: missing SUBMIT_ACCOUNT"},
+	}
+	updated, action, err := ReconcileAllocationSubmitOutsideLock(context.Background(), store, req.ID, adapter, time.Unix(3, 0))
+	if err == nil || !strings.Contains(err.Error(), "provider_job_id") {
+		t.Fatalf("ReconcileAllocationSubmitOutsideLock error = %v, want missing provider job id", err)
+	}
+	if action != AllocationSubmitNow || updated.State != AllocationNeedsAttention || updated.ProviderIdentity.ProviderJobID != "" {
+		t.Fatalf("remote submit without provider job should need attention, action=%s req=%#v", action, updated)
+	}
+	if !strings.Contains(updated.ProviderReason, "SUBMIT_ACCOUNT") {
+		t.Fatalf("provider reason = %q, want submit failure reason", updated.ProviderReason)
 	}
 }
 
