@@ -72,7 +72,7 @@ func TestTeamsBeaconNewWorkChatAndWorkSwitch(t *testing.T) {
 	}
 
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Execution target: beacon:gpu", "Beacon status", "current_target=beacon", "profile=gpu", "Switched this Work chat to beacon:cpu"} {
+	for _, want := range []string{"Execution target: beacon:gpu", "Beacon status", "Current target: beacon:gpu", "profile=gpu", "Switched this Work chat to beacon:cpu"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon work output missing %q:\n%s", want, joined)
 		}
@@ -117,7 +117,7 @@ func TestTeamsBeaconTurnDoesNotFallBackToLocalExecutor(t *testing.T) {
 	for _, turn := range teamsState.Turns {
 		failed = turn
 	}
-	if failed.Status != teamstore.TurnStatusFailed || !strings.Contains(failed.FailureMessage, "beacon allocation is not ready") {
+	if failed.Status != teamstore.TurnStatusFailed || !strings.Contains(failed.FailureMessage, "Beacon cannot start") {
 		t.Fatalf("turn should fail before local Codex starts, turn=%#v", failed)
 	}
 	beaconState := loadTeamsBeaconState(t)
@@ -133,7 +133,7 @@ func TestTeamsBeaconTurnDoesNotFallBackToLocalExecutor(t *testing.T) {
 		t.Fatalf("failed pre-start beacon turn should not leave a queued turn snapshot, queued=%#v", queued)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"beacon allocation is not ready", "local fallback is disabled", "allocation=req-"} {
+	for _, want := range []string{"Beacon cannot start", "Slurm provider adapter is not configured", "explicit beacon targets disable local fallback", "error_code=BEACON_PROVIDER_ADAPTER_NOT_CONFIGURED", "allocation=req-"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon failure response missing %q:\n%s", want, joined)
 		}
@@ -603,7 +603,7 @@ func TestTeamsBeaconListIncludesAllocationsAndMachines(t *testing.T) {
 		t.Fatalf("beacon list: %v", err)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Beacon list", "Profiles:", "gpu: ready", "Allocations:", "req-1: state=submitted", "provider_job=slurm-1", "Machines:", "gpu-a: state=accepting"} {
+	for _, want := range []string{"Beacon list", "Profiles:", "gpu: ready", "Allocations:", "req-1: submitted on gpu (Slurm)", "provider_job=slurm-1", "Machines:", "gpu-a: accepting on gpu"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon list missing %q:\n%s", want, joined)
 		}

@@ -6696,10 +6696,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		if err != nil {
 			message = err.Error()
 		}
-		if plan.AllocationRequestID != "" {
-			message += "\n\n" + beaconTurnExecutionStatus(plan)
-		}
-		if cleanupErr := b.recordBeaconTurnStartFailure(ctx, session, turn, plan, message); cleanupErr != nil {
+		if cleanupErr := b.recordBeaconTurnStartFailure(ctx, session, turn, plan, beaconTurnStartFailureProviderReason(plan, message)); cleanupErr != nil {
 			return cleanupErr
 		}
 		if _, markErr := b.store.MarkTurnFailed(ctx, turn.ID, message); markErr != nil {
@@ -6771,7 +6768,11 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			}
 			return nil
 		}
-		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", "error: "+err.Error(), outboxQueueOptions{
+		errorBody := "error: " + err.Error()
+		if (plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation) && strings.HasPrefix(strings.TrimSpace(err.Error()), "Beacon ") {
+			errorBody = err.Error()
+		}
+		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", errorBody, outboxQueueOptions{
 			MentionOwner:     true,
 			NotificationKind: "needs_attention",
 		})
@@ -7077,6 +7078,18 @@ func (b *Bridge) handleClaimedQueuedTurnError(ctx context.Context, session *Sess
 	}); queueErr != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams queued turn error notification failed: %v\n", queueErr)
 	}
+}
+
+func beaconTurnStartFailureProviderReason(plan beacon.TurnExecutionPlan, message string) string {
+	if reason := strings.TrimSpace(plan.ProviderReason); reason != "" {
+		return reason
+	}
+	for _, line := range strings.Split(strings.TrimSpace(message), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line
+		}
+	}
+	return strings.TrimSpace(message)
 }
 
 func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, input ExecutionInput) (ExecutionResult, error) {
@@ -8226,10 +8239,23 @@ func (b *Bridge) persistInboundWithStatusAndSource(ctx context.Context, session 
 		MachineID:       b.machine.ID,
 		LeaseGeneration: leaseGeneration,
 		Text:            text,
-		TextHash:        normalizedTextHash(text),
+		TextHash:        inboundTextHashForTeamsMessage(text, msg),
 		Source:          source,
 		Status:          status,
 	})
+}
+
+func inboundTextHashForTeamsMessage(text string, msg ChatMessage) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		switch {
+		case hasMessageReferenceAttachment(msg.Attachments):
+			text = defaultReferencedTeamsMessagePrompt
+		case len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0:
+			text = defaultLocalAttachmentPrompt
+		}
+	}
+	return normalizedTextHash(text)
 }
 
 func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, session *Session, msg ChatMessage) error {
@@ -11044,23 +11070,138 @@ func (b *Bridge) sessionTranscriptImportInProgress(ctx context.Context, sessionI
 func teamsOriginTextHashes(state teamstore.State, sessionID string) map[string]bool {
 	hashes := make(map[string]bool)
 	for _, inbound := range state.InboundEvents {
-		if inbound.SessionID != sessionID || inbound.TextHash == "" || inbound.TurnID == "" {
+		if inbound.SessionID != sessionID || inbound.TurnID == "" {
 			continue
 		}
 		if inbound.Source != "" && inbound.Source != "teams" {
 			continue
 		}
-		hashes[inbound.TextHash] = true
+		addTeamsOriginInboundTextHashes(hashes, inbound)
 	}
 	return hashes
+}
+
+func addTeamsOriginInboundTextHashes(hashes map[string]bool, inbound teamstore.InboundEvent) {
+	if hashes == nil {
+		return
+	}
+	if inbound.TextHash != "" {
+		hashes[inbound.TextHash] = true
+		return
+	}
+	if text := strings.TrimSpace(inbound.Text); text != "" {
+		if hash := normalizedTextHash(text); hash != "" {
+			hashes[hash] = true
+		}
+		return
+	}
+	for _, fallback := range []string{defaultReferencedTeamsMessagePrompt, defaultLocalAttachmentPrompt} {
+		if hash := normalizedTextHash(fallback); hash != "" {
+			hashes[hash] = true
+		}
+	}
 }
 
 func shouldSkipTeamsOriginTranscriptRecord(record TranscriptRecord, body string, hashes map[string]bool) bool {
 	if record.Kind != TranscriptKindUser {
 		return false
 	}
-	hash := normalizedTextHash(body)
-	return hash != "" && hashes[hash]
+	for _, candidate := range teamsOriginTranscriptUserHashCandidates(body) {
+		hash := normalizedTextHash(candidate)
+		if hash != "" && hashes[hash] {
+			return true
+		}
+	}
+	return false
+}
+
+func teamsOriginTranscriptUserHashCandidates(body string) []string {
+	var candidates []string
+	seen := make(map[string]bool)
+	add := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" || seen[text] {
+			return
+		}
+		seen[text] = true
+		candidates = append(candidates, text)
+	}
+
+	add(body)
+	withoutImages := stripCodexImagePlaceholders(body)
+	add(withoutImages)
+	withoutReferences := stripReferencedTeamsMessagePromptSection(body)
+	add(withoutReferences)
+	add(stripReferencedTeamsMessagePromptSection(withoutImages))
+	add(stripLocalAttachmentPromptSection(body))
+	add(stripLocalAttachmentPromptSection(withoutImages))
+	add(stripLocalAttachmentPromptSection(withoutReferences))
+	return candidates
+}
+
+func stripCodexImagePlaceholders(text string) string {
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	inImageBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if inImageBlock {
+			if strings.EqualFold(trimmed, "</image>") {
+				inImageBlock = false
+			}
+			continue
+		}
+		if isCodexImagePlaceholderStart(trimmed) {
+			if !strings.Contains(trimmed, "</image>") {
+				inImageBlock = true
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func isCodexImagePlaceholderStart(line string) bool {
+	if !strings.HasPrefix(line, "<image ") || !strings.HasSuffix(line, ">") {
+		return false
+	}
+	line = strings.ToLower(line)
+	return strings.Contains(line, "name=[image #") ||
+		strings.Contains(line, `name="image #`) ||
+		strings.Contains(line, `name='image #`)
+}
+
+func stripLocalAttachmentPromptSection(text string) string {
+	const marker = "Attached files saved locally for this turn:"
+	if idx := strings.Index(text, "\n\n"+marker); idx >= 0 {
+		return strings.TrimSpace(text[:idx])
+	}
+	if strings.HasPrefix(strings.TrimSpace(text), marker) {
+		return ""
+	}
+	for _, lineBreak := range []string{"\n", "\r\n"} {
+		if idx := strings.Index(text, lineBreak+marker); idx >= 0 {
+			return strings.TrimSpace(text[:idx])
+		}
+	}
+	return strings.TrimSpace(text)
+}
+
+func stripReferencedTeamsMessagePromptSection(text string) string {
+	const marker = "Referenced Teams message"
+	if idx := strings.Index(text, "\n\n"+marker); idx >= 0 {
+		return strings.TrimSpace(text[:idx])
+	}
+	if strings.HasPrefix(strings.TrimSpace(text), marker) {
+		return ""
+	}
+	for _, lineBreak := range []string{"\n", "\r\n"} {
+		if idx := strings.Index(text, lineBreak+marker); idx >= 0 {
+			return strings.TrimSpace(text[:idx])
+		}
+	}
+	return strings.TrimSpace(text)
 }
 
 func knownTranscriptOutboxHashes(state teamstore.State, sessionID string) map[TranscriptKind]map[string]bool {

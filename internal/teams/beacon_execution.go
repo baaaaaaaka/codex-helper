@@ -54,10 +54,10 @@ func (b *Bridge) prepareBeaconTurnExecution(ctx context.Context, session *Sessio
 	case beacon.TurnWaitAllocation:
 		plan, err = b.reconcileBeaconTurnAllocation(ctx, store, plan)
 		if err != nil {
-			return plan, true, fmt.Errorf("beacon allocation is not ready for this turn: allocation=%s profile=%s action=%s provider_reason=%s reason=%s", plan.AllocationRequestID, plan.Snapshot.Profile, plan.SubmitAction, firstNonEmptyString(plan.ProviderReason, err.Error()), plan.Reason)
+			return plan, true, fmt.Errorf("%s", beacon.TurnStartFailureNotice(plan, err).Render())
 		}
 		if beaconAllocationCannotProgress(plan) {
-			return plan, true, fmt.Errorf("beacon allocation is not ready for this turn: allocation=%s profile=%s action=%s allocation_state=%s provider_job=%s provider_state=%s provider_reason=%s reason=%s", plan.AllocationRequestID, plan.Snapshot.Profile, plan.SubmitAction, plan.AllocationState, plan.ProviderJobID, plan.ProviderState, plan.ProviderReason, plan.Reason)
+			return plan, true, fmt.Errorf("%s", beacon.TurnStartFailureNotice(plan, nil).Render())
 		}
 		return plan, false, nil
 	case beacon.TurnRunBeacon:
@@ -323,22 +323,6 @@ func updateBeaconTurnPlanFromAllocation(plan *beacon.TurnExecutionPlan, req beac
 	plan.ProviderState = req.RawProviderState
 	plan.ProviderReason = req.ProviderReason
 	plan.SubmitAction = action
-}
-
-func beaconTurnExecutionStatus(plan beacon.TurnExecutionPlan) string {
-	parts := []string{
-		"target=" + strings.TrimSpace(plan.Snapshot.Target),
-		"profile=" + strings.TrimSpace(plan.Snapshot.Profile),
-		"allocation=" + strings.TrimSpace(plan.AllocationRequestID),
-		"allocation_state=" + strings.TrimSpace(string(plan.AllocationState)),
-		"submit_action=" + strings.TrimSpace(string(plan.SubmitAction)),
-		"machine=" + strings.TrimSpace(plan.MachineID),
-		"lease=" + strings.TrimSpace(plan.LeaseID),
-		"provider_job=" + strings.TrimSpace(plan.ProviderJobID),
-		"provider_state=" + strings.TrimSpace(plan.ProviderState),
-		"provider_reason=" + strings.TrimSpace(plan.ProviderReason),
-	}
-	return strings.Join(parts, " ")
 }
 
 func (b *Bridge) recordBeaconTurnStartFailure(ctx context.Context, session *Session, turn teamstore.Turn, plan beacon.TurnExecutionPlan, reason string) error {

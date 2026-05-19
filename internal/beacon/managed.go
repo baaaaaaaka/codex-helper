@@ -1592,13 +1592,27 @@ type BeaconErrorContext struct {
 }
 
 func RenderBeaconError(in BeaconErrorContext) string {
-	return "phase=" + strings.TrimSpace(in.Phase) +
-		" target=" + strings.TrimSpace(in.Target) +
-		" provider_job=" + strings.TrimSpace(in.ProviderJobID) +
-		" provider_state=" + strings.TrimSpace(in.ProviderState) +
-		" provider_reason=" + strings.TrimSpace(in.ProviderReason) +
-		" conversation=" + strings.TrimSpace(in.ConversationID) +
-		" job=" + strings.TrimSpace(in.JobID) +
-		" retry=" + strings.TrimSpace(in.Retry) +
-		" next=" + strings.TrimSpace(in.Next)
+	next := strings.TrimSpace(in.Next)
+	if next == "" {
+		next = "inspect the beacon status before retrying"
+	}
+	return BeaconNotice{
+		Title: "Beacon needs attention: " + firstNonEmpty(strings.TrimSpace(in.Phase), "unknown phase") + ".",
+		WhatHappened: []string{
+			"Target `" + detailValue(in.Target) + "` reached phase `" + detailValue(in.Phase) + "` and needs operator attention.",
+			"Retry policy: `" + detailValue(in.Retry) + "`.",
+		},
+		Next: []string{next},
+		Details: []NoticeDetail{
+			{"phase", in.Phase},
+			{"target", in.Target},
+			{"provider_job", in.ProviderJobID},
+			{"provider_state", in.ProviderState},
+			{"provider_reason", in.ProviderReason},
+			{"conversation", in.ConversationID},
+			{"job", in.JobID},
+			{"retry", in.Retry},
+			{"next", in.Next},
+		},
+	}.Render()
 }

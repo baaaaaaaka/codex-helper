@@ -16,6 +16,8 @@ const maxHostedContentPerMessage = 5
 const maxReferenceAttachmentsPerMessage = 5
 const maxMessageReferencesPerMessage = 3
 const maxReferencedMessageRunes = 2000
+const defaultReferencedTeamsMessagePrompt = "Please respond using the referenced Teams message context."
+const defaultLocalAttachmentPrompt = "Please inspect the attached file(s)."
 
 var hostedContentRefPattern = regexp.MustCompile(`(?i)/hostedContents/([^/"'<>\s]+)/\$value`)
 
@@ -253,6 +255,15 @@ func isSupportedReferenceAttachment(attachment MessageAttachment) bool {
 	return allowedSharePointHost(host)
 }
 
+func hasMessageReferenceAttachment(attachments []MessageAttachment) bool {
+	for _, attachment := range attachments {
+		if isMessageReferenceAttachment(attachment) {
+			return true
+		}
+	}
+	return false
+}
+
 func isMessageReferenceAttachment(attachment MessageAttachment) bool {
 	switch strings.ToLower(strings.TrimSpace(attachment.ContentType)) {
 	case "messagereference", "forwardedmessagereference":
@@ -300,7 +311,7 @@ func PromptWithReferencedMessages(text string, refs []ReferencedMessage) string 
 		return text
 	}
 	if text == "" {
-		text = "Please respond using the referenced Teams message context."
+		text = defaultReferencedTeamsMessagePrompt
 	}
 	var b strings.Builder
 	b.WriteString(text)
@@ -515,7 +526,7 @@ func PromptWithLocalAttachments(text string, files []LocalAttachment) string {
 		return text
 	}
 	if text == "" {
-		text = "Please inspect the attached file(s)."
+		text = defaultLocalAttachmentPrompt
 	}
 	var b strings.Builder
 	b.WriteString(text)

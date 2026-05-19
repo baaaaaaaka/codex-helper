@@ -308,7 +308,7 @@ func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path strin
 	if !ok {
 		return false, false, nil
 	}
-	if historyWatchPromptLooksTeamsOrigin(record.Text) {
+	if b.historyWatchRecordLooksTeamsOrigin(ctx, record) {
 		return false, false, nil
 	}
 	threadID := strings.TrimSpace(firstNonEmptyString(record.ThreadID, result.State.ThreadID))
@@ -353,6 +353,60 @@ func historyWatchPromptLooksTeamsOrigin(text string) bool {
 	text = strings.TrimSpace(text)
 	return strings.Contains(text, teamsHelperSafetyInstructionLead) &&
 		strings.Contains(text, "Codex turn launched by the Teams helper")
+}
+
+func (b *Bridge) historyWatchRecordLooksTeamsOrigin(ctx context.Context, record TranscriptRecord) bool {
+	if historyWatchPromptLooksTeamsOrigin(record.Text) {
+		return true
+	}
+	if b == nil || b.store == nil || record.Kind != TranscriptKindUser {
+		return false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	body := formatTranscriptRecordForTeams(record)
+	if strings.TrimSpace(body) == "" {
+		return false
+	}
+	threadID := strings.TrimSpace(record.ThreadID)
+	return shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTextHashesForHistoryWatch(state, threadID))
+}
+
+func teamsOriginTextHashesForHistoryWatch(state teamstore.State, threadID string) map[string]bool {
+	hashes := make(map[string]bool)
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return hashes
+	}
+	for _, inbound := range state.InboundEvents {
+		if inbound.TurnID == "" {
+			continue
+		}
+		if inbound.Source != "" && inbound.Source != "teams" {
+			continue
+		}
+		if !teamsOriginInboundMatchesHistoryThread(state, inbound, threadID) {
+			continue
+		}
+		addTeamsOriginInboundTextHashes(hashes, inbound)
+	}
+	return hashes
+}
+
+func teamsOriginInboundMatchesHistoryThread(state teamstore.State, inbound teamstore.InboundEvent, threadID string) bool {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return false
+	}
+	if turn, ok := state.Turns[inbound.TurnID]; ok && strings.TrimSpace(turn.CodexThreadID) == threadID {
+		return true
+	}
+	if session, ok := state.Sessions[inbound.SessionID]; ok && strings.TrimSpace(session.CodexThreadID) == threadID {
+		return true
+	}
+	return false
 }
 
 type publishHistoryWatchFinalOptions struct {

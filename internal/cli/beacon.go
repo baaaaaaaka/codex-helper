@@ -269,7 +269,7 @@ func newBeaconStatusCmd(storePath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), beacon.RenderStatus(st, session))
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), beacon.ConversationStatusNotice(st, session).Render())
 			return nil
 		},
 	}
@@ -1027,8 +1027,8 @@ func newBeaconAllocationListCmd(storePath *string) *cobra.Command {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon allocations.")
 				return nil
 			}
-			for _, req := range allocations {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\tprofile=%s\tprovider=%s\tstate=%s\tprovider_job=%s\tprovider_state=%s\treason=%s\n", req.ID, req.Profile, req.Provider, req.State, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason)
+			for _, line := range beacon.AllocationSummaryLines(st) {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 			}
 			return nil
 		},
@@ -1049,7 +1049,7 @@ func newBeaconAllocationStatusCmd(storePath *string) *cobra.Command {
 			if !ok {
 				return fmt.Errorf("beacon allocation %q not found", args[0])
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "allocation=%s conversation=%s turn=%s profile=%s provider=%s isolation=%s state=%s name=%s provider_job=%s provider_state=%s reason=%s\n", req.ID, req.ConversationID, req.TurnID, req.Profile, req.Provider, req.Isolation, req.State, req.DeterministicName, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), beacon.AllocationStatusNotice(req).Render())
 			return nil
 		},
 	}
@@ -1077,7 +1077,8 @@ func newBeaconAllocationReconcileCmd(storePath *string) *cobra.Command {
 				return fmt.Errorf("beacon allocation %q not found", args[0])
 			}
 			req, action, reconcileErr = beacon.ReconcileAllocationSubmitOutsideLock(cmd.Context(), store, found.ID, beacon.NewCommandProviderAdapterFromEnv(nil), time.Now())
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "action=%s allocation=%s state=%s provider_job=%s provider_state=%s reason=%s\n", action, req.ID, req.State, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Beacon allocation reconcile: %s.\n\n", action)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), beacon.AllocationStatusNotice(req).Render())
 			return reconcileErr
 		},
 	}
@@ -1114,7 +1115,21 @@ func newBeaconAllocationReconcileAllCmd(storePath *string) *cobra.Command {
 						return err
 					})
 				}
-				lines = append(lines, fmt.Sprintf("allocation=%s action=%s state=%s provider_job=%s provider_state=%s reason=%s", req.ID, action, req.State, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason))
+				line := fmt.Sprintf("- allocation %s: action=%s, state=%s", req.ID, action, req.State)
+				var facts []string
+				if strings.TrimSpace(req.ProviderIdentity.ProviderJobID) != "" {
+					facts = append(facts, "provider_job="+req.ProviderIdentity.ProviderJobID)
+				}
+				if strings.TrimSpace(req.RawProviderState) != "" {
+					facts = append(facts, "provider_state="+req.RawProviderState)
+				}
+				if strings.TrimSpace(req.ProviderReason) != "" {
+					facts = append(facts, "reason="+req.ProviderReason)
+				}
+				if len(facts) > 0 {
+					line += " - " + strings.Join(facts, ", ")
+				}
+				lines = append(lines, line)
 				if reconcileErr != nil {
 					errorsOut = append(errorsOut, fmt.Sprintf("%s: %v", current.ID, reconcileErr))
 				}
@@ -1162,13 +1177,8 @@ func newBeaconMachineListCmd(storePath *string) *cobra.Command {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon machines.")
 				return nil
 			}
-			var machines []beacon.Machine
-			for _, m := range st.Machines {
-				machines = append(machines, m)
-			}
-			sort.Slice(machines, func(i, j int) bool { return machines[i].ID < machines[j].ID })
-			for _, m := range machines {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\tlease=%s\tprovider_job=%s\tstate=%s\tjobs=%s\n", m.ID, m.LeaseID, m.ProviderJobID, m.State, strings.Join(m.Jobs, ","))
+			for _, line := range beacon.MachineSummaryLines(st) {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 			}
 			return nil
 		},
@@ -1189,8 +1199,7 @@ func newBeaconMachineStatusCmd(storePath *string) *cobra.Command {
 			if !ok {
 				return fmt.Errorf("beacon machine or lease %q not found", args[0])
 			}
-			p := beacon.PreviewRelease(m)
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "machine=%s lease=%s provider_job=%s chats=%s jobs=%s confirm=%s\n", p.MachineID, p.LeaseID, p.ProviderJobID, strings.Join(p.Chats, ","), strings.Join(p.Jobs, ","), p.Confirmation)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), beacon.MachineStatusNotice(m).Render())
 			return nil
 		},
 	}

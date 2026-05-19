@@ -61,7 +61,7 @@ func waitBeaconAllocationReady(ctx context.Context, store *beacon.Store, initial
 			return next, nil
 		case beacon.TurnWaitAllocation:
 			if beaconAllocationCannotProgress(next) {
-				return next, fmt.Errorf("beacon allocation needs attention before this turn can run: %s", beaconTurnExecutionStatus(next))
+				return next, fmt.Errorf("%s", beacon.TurnStartFailureNotice(next, nil).Render())
 			}
 			plan = next
 		case beacon.TurnReject:

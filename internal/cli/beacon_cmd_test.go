@@ -292,7 +292,7 @@ func TestBeaconMachineCLIReleaseAndKillPreview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("machine status: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "confirm=KILL-lease-1") || !strings.Contains(out, "jobs=job-1") {
+	if !strings.Contains(out, "kill_confirmation=KILL-lease-1") || !strings.Contains(out, "jobs=job-1") {
 		t.Fatalf("machine status output = %s", out)
 	}
 	out, err = runBeaconRootCommand(t, "beacon", "--store", storePath, "machine", "release", "gpu-a")
@@ -359,7 +359,7 @@ func TestBeaconAllocationCLIListStatusAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocation list: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "profile=gpu") || !strings.Contains(out, "state=request_persisted") {
+	if !strings.Contains(out, "request_persisted on gpu") || !strings.Contains(out, "(Slurm)") {
 		t.Fatalf("allocation list output = %s", out)
 	}
 	out, err = runBeaconRootCommand(t, "beacon", "--store", storePath, "allocation", "status", "conv-1")
@@ -378,7 +378,7 @@ func TestBeaconAllocationCLIListStatusAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocation status: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "allocation="+req.ID) || !strings.Contains(out, "name="+req.DeterministicName) {
+	if !strings.Contains(out, "Beacon allocation: "+req.ID) || !strings.Contains(out, "deterministic_name="+req.DeterministicName) {
 		t.Fatalf("allocation status output = %s", out)
 	}
 
@@ -387,7 +387,7 @@ func TestBeaconAllocationCLIListStatusAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocation reconcile: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "action=adopt_existing") || !strings.Contains(out, "provider_job=slurm-777") {
+	if !strings.Contains(out, "Beacon allocation reconcile: adopt_existing") || !strings.Contains(out, "provider_job=slurm-777") {
 		t.Fatalf("allocation reconcile output = %s", out)
 	}
 	st, err = store.Load()
@@ -457,7 +457,7 @@ func TestBeaconAllocationReconcileAllRecoversStaleState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocation reconcile-all: %v\n%s", err, out)
 	}
-	for _, want := range []string{"allocation=" + req.ID, "state=running", "machine=machine-rec action=drain_stale", "job=job-claimed action=recover_stale phase=queued"} {
+	for _, want := range []string{"allocation " + req.ID + ":", "state=running", "machine=machine-rec action=drain_stale", "job=job-claimed action=recover_stale phase=queued"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("reconcile-all output missing %q:\n%s", want, out)
 		}

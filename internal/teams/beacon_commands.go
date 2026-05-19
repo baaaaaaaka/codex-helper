@@ -449,8 +449,7 @@ func (b *Bridge) formatBeaconSessionStatus(sessionID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	status := beacon.RenderStatus(st, sessionID)
-	return "Beacon status\n\nSession: " + strings.TrimSpace(sessionID) + "\n" + status, nil
+	return beacon.ConversationStatusNotice(st, sessionID).Render(), nil
 }
 
 func (b *Bridge) beaconTargetSummary(sessionID string) string {
@@ -770,27 +769,11 @@ func formatBeaconProfileListLines(st beacon.State, proxyExists func(string) bool
 }
 
 func formatBeaconMachineListLines(st beacon.State) []string {
-	machines := sortedBeaconMachines(st)
-	if len(machines) == 0 {
-		return []string{"- none"}
-	}
-	lines := make([]string, 0, len(machines))
-	for _, m := range machines {
-		lines = append(lines, fmt.Sprintf("- %s: state=%s, profile=%s, lease=%s, jobs=%d, chats=%d", firstNonEmptyString(m.ID, m.LeaseID), firstNonEmptyString(m.State, "unknown"), m.Profile, m.LeaseID, len(m.Jobs), len(m.Chats)))
-	}
-	return lines
+	return beacon.MachineSummaryLines(st)
 }
 
 func formatBeaconAllocationListLines(st beacon.State) []string {
-	allocations := sortedBeaconAllocations(st)
-	if len(allocations) == 0 {
-		return []string{"- none"}
-	}
-	lines := make([]string, 0, len(allocations))
-	for _, req := range allocations {
-		lines = append(lines, fmt.Sprintf("- %s: state=%s, profile=%s, provider=%s, provider_job=%s, provider_state=%s, reason=%s", req.ID, firstNonEmptyString(string(req.State), "unknown"), req.Profile, req.Provider, req.ProviderIdentity.ProviderJobID, req.RawProviderState, req.ProviderReason))
-	}
-	return lines
+	return beacon.AllocationSummaryLines(st)
 }
 
 func formatBeaconProfileMutation(action string, p beacon.Profile, proxyExists func(string) bool) string {
@@ -844,36 +827,11 @@ func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) 
 }
 
 func formatBeaconMachineStatus(m beacon.Machine) string {
-	p := beacon.PreviewRelease(m)
-	return strings.Join([]string{
-		"Beacon machine",
-		"- machine: " + firstNonEmptyString(p.MachineID, m.ID),
-		"- lease: " + p.LeaseID,
-		"- provider job: " + p.ProviderJobID,
-		"- profile: " + m.Profile,
-		"- state: " + firstNonEmptyString(m.State, "unknown"),
-		"- host: " + m.Host,
-		"- chats: " + strings.Join(p.Chats, ","),
-		"- jobs: " + strings.Join(p.Jobs, ","),
-		"- kill confirmation: " + p.Confirmation,
-	}, "\n")
+	return beacon.MachineStatusNotice(m).Render()
 }
 
 func formatBeaconAllocationStatus(req beacon.AllocationRequest) string {
-	return strings.Join([]string{
-		"Beacon allocation",
-		"- allocation: " + req.ID,
-		"- conversation: " + req.ConversationID,
-		"- turn: " + req.TurnID,
-		"- profile: " + req.Profile,
-		fmt.Sprintf("- provider: %s", req.Provider),
-		fmt.Sprintf("- isolation: %s", req.Isolation),
-		fmt.Sprintf("- state: %s", req.State),
-		"- deterministic name: " + req.DeterministicName,
-		"- provider job: " + req.ProviderIdentity.ProviderJobID,
-		"- provider state: " + req.RawProviderState,
-		"- provider reason: " + req.ProviderReason,
-	}, "\n")
+	return beacon.AllocationStatusNotice(req).Render()
 }
 
 func formatBeaconReleaseResult(res beacon.ReleaseResult) string {
