@@ -233,11 +233,12 @@ func TestCommandProviderAdapterShellCommandFallbackRunsAdapterThroughShell(t *te
 }
 
 func TestExecProviderCommandRunnerIgnoresSuccessfulStderr(t *testing.T) {
-	script := filepath.Join(t.TempDir(), "adapter.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho shell startup warning >&2\necho '{\"provider_job_id\":\"stderr-ok\",\"raw_state\":\"PD\"}'\n"), 0o755); err != nil {
-		t.Fatalf("write script: %v", err)
-	}
-	out, err := ExecProviderCommandRunner{}.RunProviderCommand(context.Background(), script, nil)
+	out, err := ExecProviderCommandRunner{}.RunProviderCommandWithEnv(
+		context.Background(),
+		os.Args[0],
+		[]string{"-test.run=^TestExecProviderCommandRunnerHelperProcess$"},
+		append(os.Environ(), "CODEX_HELPER_TEST_PROVIDER_ADAPTER=stderr-ok"),
+	)
 	if err != nil {
 		t.Fatalf("run provider command: %v", err)
 	}
@@ -248,6 +249,15 @@ func TestExecProviderCommandRunnerIgnoresSuccessfulStderr(t *testing.T) {
 	if result.ProviderJobID != "stderr-ok" || result.RawState != "PD" {
 		t.Fatalf("result = %#v", result)
 	}
+}
+
+func TestExecProviderCommandRunnerHelperProcess(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_TEST_PROVIDER_ADAPTER") != "stderr-ok" {
+		return
+	}
+	_, _ = os.Stderr.WriteString("shell startup warning\n")
+	_, _ = os.Stdout.WriteString("{\"provider_job_id\":\"stderr-ok\",\"raw_state\":\"PD\"}\n")
+	os.Exit(0)
 }
 
 func TestCommandProviderAdapterCancelAndRenewUseDedicatedCommands(t *testing.T) {
