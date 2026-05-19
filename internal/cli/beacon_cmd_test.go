@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -113,12 +114,16 @@ func TestBeaconBootstrapDiagnosticsUsesStableCXPPath(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	name := "codex-proxy"
+	if runtime.GOOS == "windows" {
+		name = "codex-proxy.exe"
+	}
+	stable := filepath.Join(dir, name)
 	if err := os.WriteFile(stable, []byte("helper"), 0o755); err != nil {
 		t.Fatalf("write helper: %v", err)
 	}
 	beaconExecutable = func() (string, error) {
-		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", "codex-proxy"), nil
+		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", name), nil
 	}
 	restartArgv0 = func() string { return stable }
 
