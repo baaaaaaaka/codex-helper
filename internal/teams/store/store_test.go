@@ -877,6 +877,13 @@ func storeConcurrentTestTimeout(base time.Duration) time.Duration {
 	return base
 }
 
+func storeTestHelperBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "codex-proxy.exe"
+	}
+	return "codex-proxy"
+}
+
 func TestPendingOutboxSkipsRateLimitedChatWithoutBlockingOthers(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -3388,7 +3395,7 @@ func TestClaimControlLeaseSameMachineReloadBackupPathRefreshesActiveOwner(t *tes
 
 func TestSameOwnerProcessCanonicalizesNFSSillyRename(t *testing.T) {
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	stable := filepath.Join(dir, storeTestHelperBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
@@ -3408,7 +3415,7 @@ func TestCurrentOwnerStoresStableExecutableWhenRawPathIsTransient(t *testing.T) 
 	})
 
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	stable := filepath.Join(dir, storeTestHelperBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
@@ -3434,12 +3441,13 @@ func TestCurrentOwnerFallsBackToStableArgv0WhenRawPathIsGoBuild(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	name := storeTestHelperBinaryName()
+	stable := filepath.Join(dir, name)
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
 	currentOwnerExecutable = func() (string, error) {
-		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", "codex-proxy"), nil
+		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", name), nil
 	}
 	currentOwnerArgv0 = func() string { return stable }
 
@@ -3482,8 +3490,9 @@ func TestCurrentOwnerRejectsUnresolvedGoBuildHelperExecutable(t *testing.T) {
 		currentOwnerArgv0 = prevArgv0
 	})
 
+	name := storeTestHelperBinaryName()
 	currentOwnerExecutable = func() (string, error) {
-		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", "codex-proxy"), nil
+		return filepath.Join(t.TempDir(), "go-build123", "b001", "exe", name), nil
 	}
 	currentOwnerArgv0 = func() string { return "" }
 
