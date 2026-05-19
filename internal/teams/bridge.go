@@ -306,6 +306,8 @@ type Bridge struct {
 	asyncTurnWG                  sync.WaitGroup
 	runningTurnMu                sync.Mutex
 	runningTurnCancels           map[string]*runningTurnCancel
+	acceptedOutboxMu             sync.Mutex
+	acceptedOutboxes             map[string]acceptedOutboxRecovery
 }
 
 type runningTurnCancel struct {
@@ -314,6 +316,11 @@ type runningTurnCancel struct {
 	requested bool
 	reason    string
 	silent    bool
+}
+
+type acceptedOutboxRecovery struct {
+	TeamsMessageID string
+	AcceptedAt     time.Time
 }
 
 func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer) (*Bridge, error) {
@@ -1746,7 +1753,7 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperLifecycleOutputMessage(msg, plainText) {
+	if role == inboundPollRoleControl && messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperLifecycleOutputMessage(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
@@ -1968,6 +1975,7 @@ func looksLikeRenderedHelperLifecycleOutputPlainText(text string) bool {
 		"usage: `helper cancel last`",
 		"no running or queued turn is available to cancel in this session.",
 		"turn canceled:",
+		"Codex request canceled.",
 		"cancel all requested for this Work chat.",
 		"cancel all could not cancel every running request",
 		"This Codex request is running, but this helper process does not own",
@@ -7585,6 +7593,9 @@ func (f *codexEventForwarder) send(kind string, text string) error {
 	if text == "" || f.bridge == nil || strings.TrimSpace(f.chatID) == "" {
 		return nil
 	}
+	if !f.bridge.canQueueLiveTurnOutbox(f.ctx, f.sessionID, f.turnID) {
+		return nil
+	}
 	f.seq++
 	msgKind := fmt.Sprintf("codex-%s-%03d", kind, f.seq)
 	err := f.bridge.queueAndSendOutboxChunks(f.ctx, f.sessionID, f.turnID, f.chatID, msgKind, text)
@@ -7592,6 +7603,24 @@ func (f *codexEventForwarder) send(kind string, text string) error {
 		f.err = err
 	}
 	return err
+}
+
+func (b *Bridge) canQueueLiveTurnOutbox(ctx context.Context, sessionID string, turnID string) bool {
+	if b == nil || b.store == nil || strings.TrimSpace(turnID) == "" {
+		return true
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return true
+	}
+	turn, ok := state.Turns[turnID]
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(sessionID) != "" && strings.TrimSpace(turn.SessionID) != strings.TrimSpace(sessionID) {
+		return false
+	}
+	return turn.Status == teamstore.TurnStatusRunning
 }
 
 func newCodexIdleStatusTimer(delay time.Duration) *time.Timer {
@@ -8650,6 +8679,104 @@ func (b *Bridge) queueOutboxChunksWithOptions(ctx context.Context, sessionID str
 	return queued, nil
 }
 
+func (b *Bridge) queueAndSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions) error {
+	return b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, text, opts, "sync:"+session.ID, transcriptCheckpointID(session.ID), false)
+}
+
+func (b *Bridge) queueOrSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions, turnID string, checkpointID string, queueOnly bool) error {
+	queued, err := b.queueTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, text, opts, turnID)
+	if err != nil {
+		return err
+	}
+	if len(queued) > 0 && !queueOnly {
+		if err := b.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
+			return err
+		}
+		b.boostPolling(time.Now())
+	}
+	if strings.TrimSpace(checkpointID) == "" {
+		checkpointID = transcriptCheckpointID(session.ID)
+	}
+	return b.recordTranscriptCheckpointDetailedWithID(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset, checkpointID)
+}
+
+func (b *Bridge) queueTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions, turnID string) ([]teamstore.OutboxMessage, error) {
+	if shouldSuppressCodexCommandOutbox(kind) {
+		return nil, nil
+	}
+	renderKind := renderKindForOutbox(kind)
+	if renderKind == TeamsRenderAssistant {
+		text = StripOAIMemoryCitationBlocks(text)
+	}
+	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
+		Surface: TeamsRenderSurfaceOutbox,
+		Kind:    renderKind,
+		Text:    text,
+	}, TeamsRenderOptions{
+		HardLimitBytes:   safeTeamsHTMLContentBytes,
+		TargetLimitBytes: teamsChunkHTMLContentBytes,
+	})
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	record.SourceLine = checkpointLine
+	record.SourceOffset = checkpointOffset
+	baseDelivery := transcriptDeliveryRecord(session, local, record, kind, text)
+	queued := make([]teamstore.OutboxMessage, 0, len(chunks))
+	leaseGeneration := b.currentLeaseGeneration()
+	if strings.TrimSpace(turnID) == "" {
+		turnID = "sync:" + session.ID
+	}
+	for i, chunk := range chunks {
+		msgKind := kind
+		body := chunk.Text
+		if len(chunks) > 1 {
+			msgKind = fmt.Sprintf("%s-%03d", kind, i+1)
+		}
+		delivery := baseDelivery
+		delivery.ID = transcriptDeliveryPartID(baseDelivery.ID, chunk.PartIndex, chunk.PartCount)
+		delivery.Kind = msgKind
+		msg := teamstore.OutboxMessage{
+			ID:              transcriptDeliveryOutboxID(delivery.ID),
+			SessionID:       session.ID,
+			TurnID:          turnID,
+			TeamsChatID:     session.ChatID,
+			ScopeID:         b.scope.ID,
+			MachineID:       b.machine.ID,
+			LeaseGeneration: leaseGeneration,
+			Kind:            msgKind,
+			Body:            body,
+			SourceTextHash:  normalizedTextHash(text),
+			PartIndex:       chunk.PartIndex,
+			PartCount:       chunk.PartCount,
+			RenderedBytes:   chunk.ByteLength,
+		}
+		mentionThisPart := opts.MentionOwner && i == 0
+		if opts.MentionOwner && shouldMentionOwnerOnLastOutboxPart(kind, opts.NotificationKind) {
+			mentionThisPart = i == len(chunks)-1
+		}
+		if mentionThisPart {
+			msg.MentionOwner = true
+			msg.NotificationKind = opts.NotificationKind
+		}
+		if msg.NotificationKind == "" && msg.MentionOwner {
+			msg.NotificationKind = "owner_notification"
+		}
+		queuedMsg, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
+			Message:  msg,
+			Delivery: delivery,
+		})
+		if err != nil {
+			return nil, err
+		}
+		switch queuedMsg.Status {
+		case teamstore.OutboxStatusQueued, teamstore.OutboxStatusSending, teamstore.OutboxStatusAccepted:
+			queued = append(queued, queuedMsg)
+		}
+	}
+	return queued, nil
+}
+
 func (b *Bridge) queueAndSendOutbox(ctx context.Context, msg teamstore.OutboxMessage) error {
 	queued, err := b.queueOutbox(ctx, msg)
 	if err != nil {
@@ -8857,6 +8984,40 @@ type sentOutboxSideEffect struct {
 	TeamsMessage ChatMessage
 }
 
+func (b *Bridge) rememberAcceptedOutbox(outboxID string, teamsMessageID string) {
+	if b == nil || strings.TrimSpace(outboxID) == "" || strings.TrimSpace(teamsMessageID) == "" {
+		return
+	}
+	b.acceptedOutboxMu.Lock()
+	defer b.acceptedOutboxMu.Unlock()
+	if b.acceptedOutboxes == nil {
+		b.acceptedOutboxes = make(map[string]acceptedOutboxRecovery)
+	}
+	b.acceptedOutboxes[strings.TrimSpace(outboxID)] = acceptedOutboxRecovery{
+		TeamsMessageID: strings.TrimSpace(teamsMessageID),
+		AcceptedAt:     time.Now(),
+	}
+}
+
+func (b *Bridge) recoveredAcceptedOutbox(outboxID string) (acceptedOutboxRecovery, bool) {
+	if b == nil || strings.TrimSpace(outboxID) == "" {
+		return acceptedOutboxRecovery{}, false
+	}
+	b.acceptedOutboxMu.Lock()
+	defer b.acceptedOutboxMu.Unlock()
+	record, ok := b.acceptedOutboxes[strings.TrimSpace(outboxID)]
+	return record, ok
+}
+
+func (b *Bridge) forgetAcceptedOutbox(outboxID string) {
+	if b == nil || strings.TrimSpace(outboxID) == "" {
+		return
+	}
+	b.acceptedOutboxMu.Lock()
+	defer b.acceptedOutboxMu.Unlock()
+	delete(b.acceptedOutboxes, strings.TrimSpace(outboxID))
+}
+
 func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamstore.OutboxMessage, opts outboxSendOptions) error {
 	if b.currentLeaseGeneration() > 0 {
 		if err := b.ensureActiveControlLease(ctx); err != nil {
@@ -8870,8 +9031,23 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	if outbox.Status == teamstore.OutboxStatusAccepted && outbox.TeamsMessageID != "" {
 		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
 		if err == nil {
+			b.forgetAcceptedOutbox(outbox.ID)
 			b.recordSentOutboxSideEffect(ctx, sent, ChatMessage{}, opts)
 		}
+		return err
+	}
+	if recovered, ok := b.recoveredAcceptedOutbox(outbox.ID); ok && strings.TrimSpace(recovered.TeamsMessageID) != "" {
+		if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, recovered.TeamsMessageID); err != nil {
+			return err
+		}
+		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, recovered.TeamsMessageID)
+		if err == nil {
+			b.forgetAcceptedOutbox(outbox.ID)
+			b.recordSentOutboxSideEffect(ctx, sent, ChatMessage{ID: recovered.TeamsMessageID}, opts)
+		}
+		return err
+	}
+	if recovered, err := b.recoverAcceptedOutboxFromGraph(ctx, outbox, opts); recovered || err != nil {
 		return err
 	}
 	if opts.RespectRateLimitBlock {
@@ -8932,14 +9108,57 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return err
 	}
 	b.markRegistrySent(outbox.TeamsChatID, msg.ID)
+	b.rememberAcceptedOutbox(outbox.ID, msg.ID)
 	if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, msg.ID); err != nil {
 		return err
 	}
 	sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
 	if err == nil {
+		b.forgetAcceptedOutbox(outbox.ID)
 		b.recordSentOutboxSideEffect(ctx, sent, msg, opts)
 	}
 	return err
+}
+
+func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox teamstore.OutboxMessage, opts outboxSendOptions) (bool, error) {
+	if b == nil || b.store == nil || b.readClient() == nil || strings.TrimSpace(outbox.ID) == "" || strings.TrimSpace(outbox.TeamsChatID) == "" {
+		return false, nil
+	}
+	if outbox.Status != teamstore.OutboxStatusSending || strings.TrimSpace(outbox.LastSendError) != "" {
+		return false, nil
+	}
+	if strings.TrimSpace(outbox.TeamsMessageID) != "" || outbox.LastSendAttempt.IsZero() {
+		return false, nil
+	}
+	messages, err := b.readClient().ListMessages(ctx, outbox.TeamsChatID, 50)
+	if err != nil {
+		return true, err
+	}
+	minActivity := outbox.LastSendAttempt.Add(-2 * time.Minute)
+	for _, msg := range messages {
+		if strings.TrimSpace(msg.ID) == "" || !messageAuthoredByCurrentUser(msg, b.user) {
+			continue
+		}
+		activity := chatMessageActivityTime(msg)
+		if !activity.IsZero() && activity.Before(minActivity) {
+			continue
+		}
+		incomingKey := comparableTeamsPlainText(PlainTextFromTeamsHTML(msg.Body.Content))
+		if !outboxRenderedPlainTextMatches(outbox, b.user, incomingKey) {
+			continue
+		}
+		b.markRegistrySent(outbox.TeamsChatID, msg.ID)
+		if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, msg.ID); err != nil {
+			return true, err
+		}
+		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
+		if err == nil {
+			b.forgetAcceptedOutbox(outbox.ID)
+			b.recordSentOutboxSideEffect(ctx, sent, msg, opts)
+		}
+		return true, err
+	}
+	return false, nil
 }
 
 func (b *Bridge) recordSentOutboxSideEffect(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions) {
@@ -10333,11 +10552,16 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 		if b.budgetExhausted() {
 			return errTranscriptImportBudgetExhausted
 		}
-		if err := b.bridge.queueOrSendOutboxChunks(ctx, b.session.ID, b.importTurnID, b.session.ChatID, record.Kind, record.Body, outboxQueueOptions{}, b.queueOnly); err != nil {
+		local := codexhistory.Session{
+			SessionID:   b.session.CodexThreadID,
+			ProjectPath: b.session.Cwd,
+			FilePath:    b.filePath,
+		}
+		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, b.queueOnly); err != nil {
 			return err
 		}
 		b.queuedBatches++
-		return b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, record.CheckpointKey, record.Record.SourceLine, record.Record.SourceOffset, b.checkpointID)
+		return nil
 	}
 	addedBytes := len(html)
 	if len(b.htmlParts) > 0 {
@@ -10381,7 +10605,7 @@ func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 	first := b.records[0]
 	last := b.records[len(b.records)-1]
 	kind := transcriptImportBatchOutboxKind(b.kindPrefix, first.Record, last.Record, b.batchIndex)
-	if err := b.bridge.queueOrSendTranscriptImportBatch(ctx, b.session.ID, b.importTurnID, b.session.ChatID, kind, html, b.queueOnly); err != nil {
+	if err := b.bridge.queueOrSendTranscriptImportBatch(ctx, b.session, b.filePath, b.checkpointID, b.importTurnID, kind, html, first.Record, last.Record, b.queueOnly); err != nil {
 		return err
 	}
 	b.queuedBatches++
@@ -10411,26 +10635,35 @@ func transcriptImportBatchOutboxKind(prefix string, first TranscriptRecord, last
 	return fmt.Sprintf("%s-batch-%04d-%s-%s", prefix, index, firstKey, lastKey)
 }
 
-func (b *Bridge) queueAndSendTranscriptImportBatch(ctx context.Context, sessionID string, turnID string, chatID string, kind string, html string) error {
-	return b.queueOrSendTranscriptImportBatch(ctx, sessionID, turnID, chatID, kind, html, false)
+func (b *Bridge) queueAndSendTranscriptImportBatch(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord) error {
+	return b.queueOrSendTranscriptImportBatch(ctx, session, sourcePath, checkpointID, turnID, kind, html, first, last, false)
 }
 
-func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, sessionID string, turnID string, chatID string, kind string, html string, queueOnly bool) error {
+func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord, queueOnly bool) error {
 	html = strings.TrimSpace(html)
 	if html == "" {
 		return nil
 	}
-	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
-		SessionID:     sessionID,
-		TurnID:        turnID,
-		TeamsChatID:   chatID,
-		Kind:          kind,
-		Body:          html,
-		PartIndex:     1,
-		PartCount:     1,
-		RenderedBytes: len(html),
+	delivery := transcriptImportBatchDeliveryRecord(session, sourcePath, checkpointID, turnID, kind, html, first, last)
+	queued, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
+		Message: teamstore.OutboxMessage{
+			ID:              transcriptDeliveryOutboxID(delivery.ID),
+			SessionID:       session.ID,
+			TurnID:          turnID,
+			TeamsChatID:     session.ChatID,
+			ScopeID:         b.scope.ID,
+			MachineID:       b.machine.ID,
+			LeaseGeneration: b.currentLeaseGeneration(),
+			Kind:            kind,
+			Body:            html,
+			PartIndex:       1,
+			PartCount:       1,
+			RenderedBytes:   len(html),
+			SourceTextHash:  normalizedTextHash(html),
+		},
+		Delivery: delivery,
 	})
-	if err != nil || queueOnly || queued.Status == teamstore.OutboxStatusSent {
+	if err != nil || queueOnly || queued.ID == "" || queued.Status == teamstore.OutboxStatusSent {
 		return err
 	}
 	return b.flushPendingOutboxForChat(ctx, queued.TeamsChatID)
@@ -11072,6 +11305,121 @@ func transcriptRecordCheckpointKey(record TranscriptRecord) string {
 	return firstNonEmptyString(record.ItemID, record.DedupeKey)
 }
 
+func transcriptDeliveryRecord(session Session, local codexhistory.Session, record TranscriptRecord, kind string, body string) teamstore.TranscriptDeliveryRecord {
+	recordID := transcriptRecordCheckpointKey(record)
+	sourcePath := strings.TrimSpace(local.FilePath)
+	threadID := firstNonEmptyString(record.ThreadID, local.SessionID, session.CodexThreadID)
+	textHash := normalizedTextHash(body)
+	parts := []string{
+		"v1",
+		strings.TrimSpace(session.ID),
+		strings.TrimSpace(threadID),
+		cleanComparablePath(sourcePath),
+		strings.TrimSpace(recordID),
+		strconv.Itoa(record.SourceLine),
+		strconv.FormatInt(record.SourceOffset, 10),
+		string(record.Kind),
+		strings.TrimSpace(textHash),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return teamstore.TranscriptDeliveryRecord{
+		ID:             "transcript-delivery:" + strings.TrimSpace(session.ID) + ":" + hex.EncodeToString(sum[:])[:24],
+		SessionID:      strings.TrimSpace(session.ID),
+		CodexThreadID:  strings.TrimSpace(threadID),
+		SourcePath:     sourcePath,
+		SourceLine:     record.SourceLine,
+		SourceOffset:   record.SourceOffset,
+		SourceRecordID: strings.TrimSpace(recordID),
+		Kind:           strings.TrimSpace(kind),
+		TextHash:       textHash,
+		Status:         teamstore.TranscriptDeliveryStatusQueued,
+	}
+}
+
+func transcriptImportBatchDeliveryRecord(session Session, sourcePath string, checkpointID string, importTurnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord) teamstore.TranscriptDeliveryRecord {
+	firstID := transcriptRecordCheckpointKey(first)
+	lastID := transcriptRecordCheckpointKey(last)
+	threadID := firstNonEmptyString(first.ThreadID, last.ThreadID, session.CodexThreadID)
+	textHash := normalizedTextHash(html)
+	parts := []string{
+		"v1-import-batch",
+		strings.TrimSpace(session.ID),
+		strings.TrimSpace(threadID),
+		cleanComparablePath(sourcePath),
+		strings.TrimSpace(checkpointID),
+		strings.TrimSpace(importTurnID),
+		strings.TrimSpace(kind),
+		strings.TrimSpace(firstID),
+		strconv.Itoa(first.SourceLine),
+		strconv.FormatInt(first.SourceOffset, 10),
+		strings.TrimSpace(lastID),
+		strconv.Itoa(last.SourceLine),
+		strconv.FormatInt(last.SourceOffset, 10),
+		strings.TrimSpace(textHash),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	sourceRecordID := strings.TrimSpace(firstID)
+	if sourceRecordID == "" {
+		sourceRecordID = strings.TrimSpace(lastID)
+	} else if lastID != "" && lastID != firstID {
+		sourceRecordID += ".." + strings.TrimSpace(lastID)
+	}
+	return teamstore.TranscriptDeliveryRecord{
+		ID:             "transcript-delivery:" + strings.TrimSpace(session.ID) + ":" + hex.EncodeToString(sum[:])[:24],
+		SessionID:      strings.TrimSpace(session.ID),
+		CodexThreadID:  strings.TrimSpace(threadID),
+		SourcePath:     strings.TrimSpace(sourcePath),
+		SourceLine:     last.SourceLine,
+		SourceOffset:   last.SourceOffset,
+		SourceRecordID: sourceRecordID,
+		Kind:           strings.TrimSpace(kind),
+		TextHash:       textHash,
+		Status:         teamstore.TranscriptDeliveryStatusQueued,
+	}
+}
+
+func transcriptDeliveryPartID(baseID string, partIndex int, partCount int) string {
+	baseID = strings.TrimSpace(baseID)
+	if partCount <= 1 {
+		return baseID
+	}
+	if partIndex <= 0 {
+		partIndex = 1
+	}
+	return fmt.Sprintf("%s:part:%03d-of-%03d", baseID, partIndex, partCount)
+}
+
+func transcriptDeliveryOutboxID(deliveryID string) string {
+	return "outbox:" + strings.TrimSpace(deliveryID)
+}
+
+func transcriptDeliveryCheckpoint(session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64) teamstore.ImportCheckpoint {
+	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
+	return teamstore.ImportCheckpoint{
+		ID:             transcriptCheckpointID(session.ID),
+		SessionID:      session.ID,
+		SourcePath:     sourcePath,
+		LastRecordID:   lastRecordID,
+		LastSourceLine: lastLine,
+		LastOffset:     lastOffset,
+		SourceSize:     sourceSize,
+		SourceModTime:  sourceModTime,
+		Status:         importCheckpointStatusComplete,
+	}
+}
+
+func (b *Bridge) recordSkippedTranscriptDelivery(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	record.SourceLine = checkpointLine
+	record.SourceOffset = checkpointOffset
+	delivery := transcriptDeliveryRecord(session, local, record, kind, body)
+	delivery.Status = teamstore.TranscriptDeliveryStatusSkipped
+	_, _, err := b.store.RecordTranscriptDelivery(ctx, delivery, transcriptDeliveryCheckpoint(session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset))
+	return err
+}
+
 func (b *Bridge) syncLinkedTranscriptsIfDue(ctx context.Context, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now()
@@ -11230,16 +11578,17 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
 	now := time.Now()
-	visibleBacklog := countVisibleTranscriptSyncRecords(transcript.Records, teamsOriginHashes, knownHashes, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
+	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, knownHashes, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
 	if visibleBacklog > transcriptSyncMaxAutoBacklogRecords {
 		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, visibleBacklog)
 	}
 	dedupe := newTranscriptDedupeState()
 	recentTeamsMirror := newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now)
-	syncTurnID := "sync:" + session.ID
 	sent := 0
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
+		record.SourceLine = checkpointLine
+		record.SourceOffset = checkpointOffset
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
@@ -11256,21 +11605,18 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			}
 			continue
 		}
+		kind := transcriptRecordOutboxKind("sync", record, i+1)
 		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
 			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			dedupe.shouldSkip(record, body) {
-			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
+			if err := b.recordSkippedTranscriptDelivery(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
 				return err
 			}
 			continue
 		}
-		kind := transcriptRecordOutboxKind("sync", record, i+1)
 		opts := transcriptSyncOutboxOptions(record)
-		if err := b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, syncTurnID, session.ChatID, kind, body, opts); err != nil {
-			return err
-		}
-		if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
+		if err := b.queueAndSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, opts); err != nil {
 			return err
 		}
 		sent++
@@ -11506,10 +11852,13 @@ func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session 
 	return true, b.markTranscriptImportComplete(ctx, session, sourcePath, transcriptRecordCheckpointKey(recovered), recovered.SourceLine)
 }
 
-func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool, recentTeamsMirror recentCompletedTeamsTranscriptMirrorSkipper) int {
+func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, local codexhistory.Session, records []TranscriptRecord, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool, recentTeamsMirror recentCompletedTeamsTranscriptMirrorSkipper) int {
 	dedupe := newTranscriptDedupeState()
 	visible := 0
-	for _, record := range records {
+	for i, record := range records {
+		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(records, i)
+		record.SourceLine = checkpointLine
+		record.SourceOffset = checkpointOffset
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
@@ -11518,6 +11867,10 @@ func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHa
 		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
+			continue
+		}
+		kind := transcriptRecordOutboxKind("sync", record, i+1)
+		if transcriptDeliveryKnown(state, session, local, record, kind, body) {
 			continue
 		}
 		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
@@ -11529,6 +11882,23 @@ func countVisibleTranscriptSyncRecords(records []TranscriptRecord, teamsOriginHa
 		visible++
 	}
 	return visible
+}
+
+func transcriptDeliveryKnown(state teamstore.State, session Session, local codexhistory.Session, record TranscriptRecord, kind string, body string) bool {
+	base := transcriptDeliveryRecord(session, local, record, kind, body)
+	if strings.TrimSpace(base.ID) == "" {
+		return false
+	}
+	if _, ok := state.TranscriptDeliveries[base.ID]; ok {
+		return true
+	}
+	prefix := base.ID + ":part:"
+	for id := range state.TranscriptDeliveries {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) blockAutomaticTranscriptSync(ctx context.Context, session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint, backlogRecords int) error {

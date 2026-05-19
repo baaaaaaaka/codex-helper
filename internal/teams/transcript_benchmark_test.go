@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 func BenchmarkTeamsTranscriptReadLongMixed(b *testing.B) {
@@ -50,7 +53,7 @@ func BenchmarkTeamsTranscriptVisibleFilterLongMixed(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if got := countVisibleTranscriptSyncRecords(transcript.Records, teamsOriginHashes, knownHashes, recentCompletedTeamsTranscriptMirrorSkipper{}); got == 0 {
+		if got := countVisibleTranscriptSyncRecords(teamstore.State{}, Session{ID: "s-bench"}, codexhistory.Session{SessionID: "thread-bench", FilePath: path}, transcript.Records, teamsOriginHashes, knownHashes, recentCompletedTeamsTranscriptMirrorSkipper{}); got == 0 {
 			b.Fatal("expected visible records")
 		}
 	}

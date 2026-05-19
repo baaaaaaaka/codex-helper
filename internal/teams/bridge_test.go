@@ -6227,6 +6227,12 @@ func TestBridgeImportTranscriptBatchesVisibleHistoryRecords(t *testing.T) {
 	if batchOutbox.ID == "" {
 		t.Fatalf("missing import batch outbox in state: %#v", state.OutboxMessages)
 	}
+	if !strings.HasPrefix(batchOutbox.ID, "outbox:transcript-delivery:"+session.ID+":") {
+		t.Fatalf("import batch outbox id = %q, want source-bound transcript delivery id", batchOutbox.ID)
+	}
+	if len(state.TranscriptDeliveries) == 0 {
+		t.Fatal("import batch did not record transcript delivery ledger")
+	}
 	if renderOutboxHTML(batchOutbox) != batchOutbox.Body {
 		t.Fatal("import batch outbox should render its pre-rendered safe HTML body directly")
 	}
@@ -7325,6 +7331,42 @@ func TestBridgeInterruptedTurnReturningSuccessDoesNotQueueFinal(t *testing.T) {
 	}
 	if got := sentPlainJoined(*sent); strings.Contains(got, "stale final must not be queued") {
 		t.Fatalf("interrupted turn sent stale final:\n%s", got)
+	}
+}
+
+func TestBridgeInterruptedTurnDropsLateStreamingStatus(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:late-stream", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if _, err := store.MarkTurnRunning(context.Background(), turn.ID, "thread-1", "codex-turn-1"); err != nil {
+		t.Fatalf("MarkTurnRunning error: %v", err)
+	}
+	forwarder := bridge.startCodexEventForwarder(context.Background(), session, turn, session.ChatID)
+	if _, err := store.MarkTurnInterrupted(context.Background(), turn.ID, "canceled by user"); err != nil {
+		t.Fatalf("MarkTurnInterrupted error: %v", err)
+	}
+	forwarder.Handle(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Text: "late status must be dropped"})
+	forwarder.Close("")
+
+	if got := sentPlainJoined(*sent); strings.Contains(got, "late status must be dropped") {
+		t.Fatalf("late streaming status was sent:\n%s", got)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.Contains(msg.Body, "late status must be dropped") {
+			t.Fatalf("late streaming status was queued: %#v", msg)
+		}
 	}
 }
 
@@ -9238,6 +9280,26 @@ func TestBridgeShouldIgnoreFreshRenderedHelperEcho(t *testing.T) {
 	}
 	if !bridge.reg.HasSent(bridge.reg.ControlChatID, msg.ID) {
 		t.Fatal("ignored helper echo was not marked sent")
+	}
+}
+
+func TestBridgeShouldIgnoreFreshRenderedHelperCanceledEcho(t *testing.T) {
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	msg := bridgeTestMessage("fresh-helper-canceled")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p><strong>🔧 Helper:</strong></p><p>Codex request canceled.</p>"
+
+	ignore, err := bridge.shouldIgnoreMessage(context.Background(), bridge.reg.ControlChatID, msg, inboundPollRoleControl, false)
+	if err != nil {
+		t.Fatalf("shouldIgnoreMessage error: %v", err)
+	}
+	if !ignore {
+		t.Fatal("fresh rendered helper canceled echo should be ignored without legacy cursor fallback")
+	}
+	if !bridge.reg.HasSent(bridge.reg.ControlChatID, msg.ID) {
+		t.Fatal("ignored helper canceled echo was not marked sent")
 	}
 }
 
@@ -13502,6 +13564,264 @@ func TestBridgeSyncLinkedTranscriptDedupesQueuedLiveFinal(t *testing.T) {
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	beforeState, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load before sync error: %v", err)
+	}
+	beforeCheckpoint := beforeState.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+
+	statusText := "already streamed status that must not replay"
+	updatedTranscript := initial + `{"type":"event_msg","payload":{"type":"agent_message","id":"s2","message":` + strconv.Quote(statusText) + `,"phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updatedTranscript), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("first sync error: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), statusText) {
+		t.Fatalf("first sync sent = %#v, want status once", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after first sync error: %v", err)
+	}
+	if got := len(state.TranscriptDeliveries); got == 0 {
+		t.Fatal("first sync did not record transcript delivery")
+	}
+
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = beforeCheckpoint
+		for id := range state.OutboxMessages {
+			delete(state.OutboxMessages, id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("simulate pruned outbox and regressed checkpoint: %v", err)
+	}
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("replay sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("delivery ledger did not suppress replay, sent=%#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after replay sync error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID == beforeCheckpoint.LastRecordID || checkpoint.LastRecordID == "" {
+		t.Fatalf("checkpoint did not advance past delivered status: before=%#v after=%#v", beforeCheckpoint, checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptMultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	beforeState, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load before sync error: %v", err)
+	}
+	beforeCheckpoint := beforeState.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+
+	statusText := strings.Repeat("large status replay guard ", 2600)
+	updatedTranscript := initial + `{"type":"event_msg","payload":{"type":"agent_message","id":"s-large","message":` + strconv.Quote(statusText) + `,"phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updatedTranscript), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("first sync error: %v", err)
+	}
+	if len(*sent) < 2 {
+		t.Fatalf("first sync sent %d message(s), want multipart transcript delivery", len(*sent))
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after first sync error: %v", err)
+	}
+	var deliveryParts int
+	for id, delivery := range state.TranscriptDeliveries {
+		if strings.Contains(id, ":part:") && strings.Contains(delivery.TextHash, normalizedTextHash(statusText)) {
+			deliveryParts++
+		}
+	}
+	if deliveryParts < 2 {
+		t.Fatalf("multipart transcript delivery records = %d, want at least 2: %#v", deliveryParts, state.TranscriptDeliveries)
+	}
+
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = beforeCheckpoint
+		for id := range state.OutboxMessages {
+			delete(state.OutboxMessages, id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("simulate pruned multipart outbox and regressed checkpoint: %v", err)
+	}
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("replay sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("multipart delivery ledger did not suppress replay, sent=%#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after replay sync error: %v", err)
+	}
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.LastRecordID == beforeCheckpoint.LastRecordID || checkpoint.LastRecordID == "" {
+		t.Fatalf("checkpoint did not advance past delivered multipart status: before=%#v after=%#v", beforeCheckpoint, checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptDeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load seeded state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	for i := 0; i < transcriptSyncMaxAutoBacklogRecords+5; i++ {
+		updated.WriteString(fmt.Sprintf(`{"id":"a%03d","thread_id":"thread-1","role":"assistant","text":"already delivered backlog answer %03d"}`+"\n", i, i))
+	}
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	delta, err := bridge.readLinkedTranscriptDelta(transcriptPath, checkpoint, "thread-1", "thread-1")
+	if err != nil {
+		t.Fatalf("read linked transcript delta: %v", err)
+	}
+	if len(delta.Records) <= transcriptSyncMaxAutoBacklogRecords {
+		t.Fatalf("delta records = %d, want backlog above auto limit", len(delta.Records))
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		for i, record := range delta.Records {
+			checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(delta.Records, i)
+			record.SourceLine = checkpointLine
+			record.SourceOffset = checkpointOffset
+			body := formatTranscriptRecordForTeams(record)
+			kind := transcriptRecordOutboxKind("sync", record, i+1)
+			delivery := transcriptDeliveryRecord(*session, codexhistory.Session{SessionID: "thread-1", FilePath: transcriptPath}, record, kind, body)
+			delivery.Status = teamstore.TranscriptDeliveryStatusSent
+			delivery.TeamsMessageID = fmt.Sprintf("teams-delivered-%03d", i)
+			delivery.SentAt = time.Now()
+			state.TranscriptDeliveries[delivery.ID] = delivery
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed delivered transcript ledger: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync after checkpoint regression with delivered ledger error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("delivered ledger should prevent backlog block/send, sent=%#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after sync: %v", err)
+	}
+	if got := state.ImportCheckpoints[transcriptCheckpointID(session.ID)].Status; got == importCheckpointStatusBlocked {
+		t.Fatalf("checkpoint status = %q, want not blocked for already-delivered backlog", got)
+	}
+}
+
+func TestBridgeTranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-import-ledger"}}`,
+		`{"id":"u1","thread_id":"thread-import-ledger","role":"user","text":"imported prompt"}`,
+		`{"id":"a1","thread_id":"thread-import-ledger","role":"assistant","text":"imported answer that must not replay"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-import-ledger"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	importTurnID := "publish-history:" + session.ID
+	if _, err := bridge.importTranscriptRecordsToTeams(context.Background(), *session, transcriptPath, importTurnID, "sync", checkpointID, transcriptImportRunOptions{}); err != nil {
+		t.Fatalf("first import error: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "imported answer that must not replay") {
+		t.Fatalf("first import sent = %#v, want imported batch once", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after first import: %v", err)
+	}
+	if len(state.TranscriptDeliveries) == 0 {
+		t.Fatal("first import did not record transcript delivery")
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		delete(state.ImportCheckpoints, checkpointID)
+		for id := range state.OutboxMessages {
+			delete(state.OutboxMessages, id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("simulate pruned import outbox and regressed checkpoint: %v", err)
+	}
+
+	*sent = nil
+	if _, err := bridge.importTranscriptRecordsToTeams(context.Background(), *session, transcriptPath, importTurnID, "sync", checkpointID, transcriptImportRunOptions{}); err != nil {
+		t.Fatalf("replay import error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("delivery ledger did not suppress import replay, sent=%#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after replay import: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID != "a1" {
+		t.Fatalf("checkpoint after replay import = %#v, want advanced back to a1 without sending", checkpoint)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptMirrorsLocalCodexConversation(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -17273,6 +17593,317 @@ func TestBridgeFlushPromotesAcceptedOutboxWithoutPostingAgain(t *testing.T) {
 	}
 	if got := state.OutboxMessages[msg.ID].Status; got != teamstore.OutboxStatusSent {
 		t.Fatalf("outbox status = %q, want sent", got)
+	}
+}
+
+func TestBridgeFlushRecoversGraphMessageIDAfterAcceptedPersistFailure(t *testing.T) {
+	store := newBridgeTestStore(t)
+	queued, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:accepted-persist-failure",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "graph accepted before state write failed",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	var posts int
+	var backup []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		posts++
+		if posts == 1 {
+			var err error
+			backup, err = os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("backup store after send attempt: %v", err)
+			}
+			if err := os.Remove(store.Path()); err != nil {
+				t.Fatalf("remove store path for write failure: %v", err)
+			}
+			if err := os.Mkdir(store.Path(), 0o700); err != nil {
+				t.Fatalf("replace store file with directory: %v", err)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"teams-accepted-before-persist","messageType":"message"}`)
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+
+	if err := bridge.sendQueuedOutbox(context.Background(), queued); err == nil {
+		t.Fatal("first send succeeded despite sabotaged accepted-state persist")
+	}
+	if posts != 1 {
+		t.Fatalf("Graph posts after failed persist = %d, want 1", posts)
+	}
+	if len(backup) == 0 {
+		t.Fatal("test did not capture store backup")
+	}
+	if err := os.Remove(store.Path()); err != nil {
+		t.Fatalf("remove sabotaged store directory: %v", err)
+	}
+	if err := os.WriteFile(store.Path(), backup, 0o600); err != nil {
+		t.Fatalf("restore store backup: %v", err)
+	}
+	if err := bridge.sendQueuedOutbox(context.Background(), queued); err != nil {
+		t.Fatalf("recovered accepted outbox send error: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("Graph posts after recovery = %d, want no duplicate post", posts)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if msg := state.OutboxMessages[queued.ID]; msg.Status != teamstore.OutboxStatusSent || msg.TeamsMessageID != "teams-accepted-before-persist" {
+		t.Fatalf("recovered outbox = %#v, want sent with original Teams message id", msg)
+	}
+}
+
+func TestBridgeFlushRecoversAcceptedOutboxFromGraphAfterRestart(t *testing.T) {
+	store := newBridgeTestStore(t)
+	queued, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:accepted-persist-failure-restart",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "graph accepted before helper restart",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	var posts int
+	var lists int
+	var backup []byte
+	var postedContent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			if r.URL.Path != "/chats/chat-1/messages" {
+				t.Fatalf("unexpected Graph POST: %s", r.URL.String())
+			}
+			posts++
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph POST: %v", err)
+			}
+			postedContent = body.Body.Content
+			if posts == 1 {
+				var err error
+				backup, err = os.ReadFile(store.Path())
+				if err != nil {
+					t.Fatalf("backup store after send attempt: %v", err)
+				}
+				if err := os.Remove(store.Path()); err != nil {
+					t.Fatalf("remove store path for write failure: %v", err)
+				}
+				if err := os.Mkdir(store.Path(), 0o700); err != nil {
+					t.Fatalf("replace store file with directory: %v", err)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"teams-accepted-before-restart","messageType":"message"}`)
+		case http.MethodGet:
+			if r.URL.Path != "/chats/chat-1/messages" {
+				t.Fatalf("unexpected Graph GET: %s", r.URL.String())
+			}
+			lists++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"value": []any{map[string]any{
+					"id":                   "teams-accepted-before-restart",
+					"messageType":          "message",
+					"createdDateTime":      time.Now().UTC().Format(time.RFC3339Nano),
+					"lastModifiedDateTime": time.Now().UTC().Format(time.RFC3339Nano),
+					"from": map[string]any{"user": map[string]any{
+						"id":          "user-1",
+						"displayName": "User",
+					}},
+					"body": map[string]any{
+						"contentType": "html",
+						"content":     postedContent,
+					},
+				}},
+			})
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	if err := bridge.sendQueuedOutbox(context.Background(), queued); err == nil {
+		t.Fatal("first send succeeded despite sabotaged accepted-state persist")
+	}
+	if posts != 1 || len(backup) == 0 || strings.TrimSpace(postedContent) == "" {
+		t.Fatalf("test setup failed: posts=%d backup=%d posted=%q", posts, len(backup), postedContent)
+	}
+	if err := os.Remove(store.Path()); err != nil {
+		t.Fatalf("remove sabotaged store directory: %v", err)
+	}
+	if err := os.WriteFile(store.Path(), backup, 0o600); err != nil {
+		t.Fatalf("restore store backup: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load restored state: %v", err)
+	}
+	retryOutbox := state.OutboxMessages[queued.ID]
+	if retryOutbox.LastSendAttempt.IsZero() {
+		t.Fatalf("restored outbox missing send attempt: %#v", retryOutbox)
+	}
+	restarted := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	if err := restarted.sendQueuedOutbox(context.Background(), retryOutbox); err != nil {
+		t.Fatalf("restart recovery send error: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("Graph posts after restart recovery = %d, want no duplicate post", posts)
+	}
+	if lists == 0 {
+		t.Fatal("restart recovery did not query Graph before retrying send")
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state: %v", err)
+	}
+	if msg := state.OutboxMessages[queued.ID]; msg.Status != teamstore.OutboxStatusSent || msg.TeamsMessageID != "teams-accepted-before-restart" {
+		t.Fatalf("recovered outbox = %#v, want sent with Graph-discovered Teams message id", msg)
+	}
+}
+
+func TestBridgeFlushDefersGraphRecoveryWhenListMessagesFails(t *testing.T) {
+	store := newBridgeTestStore(t)
+	queued, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:accepted-persist-failure-list-error",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "graph may have accepted this before list failed",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	if _, err := store.MarkOutboxSendAttempt(context.Background(), queued.ID); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	retryOutbox := state.OutboxMessages[queued.ID]
+	var lists int
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.Path != "/chats/chat-1/messages" {
+				t.Fatalf("unexpected Graph GET: %s", r.URL.String())
+			}
+			lists++
+			http.Error(w, "temporary list failure", http.StatusServiceUnavailable)
+		case http.MethodPost:
+			posts++
+			t.Fatalf("Graph POST should not run while accepted-outbox recovery cannot inspect recent messages")
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+
+	if err := bridge.sendQueuedOutbox(context.Background(), retryOutbox); err == nil {
+		t.Fatal("sendQueuedOutbox succeeded despite failed Graph recovery preflight")
+	}
+	if lists == 0 {
+		t.Fatal("Graph recovery did not inspect recent messages")
+	}
+	if posts != 0 {
+		t.Fatalf("Graph posts = %d, want no duplicate post while recovery is uncertain", posts)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load final state: %v", err)
+	}
+	if msg := state.OutboxMessages[queued.ID]; msg.Status != teamstore.OutboxStatusSending || msg.LastSendError != "" {
+		t.Fatalf("outbox after deferred recovery = %#v, want sending without ordinary retry error", msg)
+	}
+}
+
+func TestBridgeFlushDoesNotGraphRecoverOrdinaryQueuedSendError(t *testing.T) {
+	store := newBridgeTestStore(t)
+	queued, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:ordinary-send-error",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "ordinary retry should post without graph preflight",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	if _, err := store.MarkOutboxSendError(context.Background(), queued.ID, "previous Graph 500"); err != nil {
+		t.Fatalf("MarkOutboxSendError error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	retryOutbox := state.OutboxMessages[queued.ID]
+	if retryOutbox.Status != teamstore.OutboxStatusQueued || retryOutbox.LastSendError == "" || retryOutbox.LastSendAttempt.IsZero() {
+		t.Fatalf("retry outbox not in expected queued error state: %#v", retryOutbox)
+	}
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			t.Fatalf("ordinary queued send error should not query Graph before retry: %s", r.URL.String())
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		posts++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"teams-ordinary-retry","messageType":"message"}`)
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+
+	if err := bridge.sendQueuedOutbox(context.Background(), retryOutbox); err != nil {
+		t.Fatalf("retry ordinary queued send error: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("Graph posts = %d, want one normal retry post", posts)
 	}
 }
 

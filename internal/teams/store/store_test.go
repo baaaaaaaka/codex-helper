@@ -1938,6 +1938,87 @@ func TestQueueOutboxMarksNotificationKindsUpgradeNonBlocking(t *testing.T) {
 	}
 }
 
+func TestMarkTurnInterruptedSkipsPendingTransientOutbox(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(ctx, Turn{ID: "turn:streaming", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if _, err := store.MarkTurnRunning(ctx, turn.ID, "thread-1", "codex-turn-1"); err != nil {
+		t.Fatalf("MarkTurnRunning error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:status",
+		SessionID:   "s1",
+		TurnID:      turn.ID,
+		TeamsChatID: "chat-1",
+		Kind:        "codex-status-001",
+		Body:        "stale status",
+	}); err != nil {
+		t.Fatalf("QueueOutbox status error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:final",
+		SessionID:   "s1",
+		TurnID:      turn.ID,
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "protected final",
+	}); err != nil {
+		t.Fatalf("QueueOutbox final error: %v", err)
+	}
+
+	if _, err := store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
+		t.Fatalf("MarkTurnInterrupted error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.OutboxMessages["outbox:status"].Status; got != OutboxStatusSkipped {
+		t.Fatalf("status outbox status = %q, want skipped", got)
+	}
+	if got := state.OutboxMessages["outbox:final"].Status; got != OutboxStatusQueued {
+		t.Fatalf("final outbox status = %q, want queued", got)
+	}
+}
+
+func TestRecordTranscriptDeliveryAdvancesCheckpointPosition(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	checkpointID := "checkpoint:s1"
+	if _, _, err := store.RecordTranscriptDelivery(ctx, TranscriptDeliveryRecord{
+		ID:        "delivery:s1:r1",
+		SessionID: "s1",
+		Status:    TranscriptDeliveryStatusSkipped,
+	}, ImportCheckpoint{
+		ID:             checkpointID,
+		SessionID:      "s1",
+		SourcePath:     "/tmp/session.jsonl",
+		LastRecordID:   "r1",
+		LastSourceLine: 42,
+		LastOffset:     2048,
+		Status:         "complete",
+	}); err != nil {
+		t.Fatalf("RecordTranscriptDelivery error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID != "r1" || checkpoint.LastSourceLine != 42 || checkpoint.LastOffset != 2048 {
+		t.Fatalf("checkpoint = %#v, want full source position for skipped delivery", checkpoint)
+	}
+}
+
 func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
