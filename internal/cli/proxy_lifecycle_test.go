@@ -157,7 +157,11 @@ func TestProxyStartBackgroundUsesStableExecutableForTransientRawPath(t *testing.
 	if err := os.MkdirAll(binDir, 0o700); err != nil {
 		t.Fatalf("mkdir bin: %v", err)
 	}
-	stable := filepath.Join(binDir, "codex-proxy")
+	name := "codex-proxy"
+	if runtime.GOOS == "windows" {
+		name = "codex-proxy.exe"
+	}
+	stable := filepath.Join(binDir, name)
 	if err := os.WriteFile(stable, []byte("helper"), 0o755); err != nil {
 		t.Fatalf("write helper: %v", err)
 	}

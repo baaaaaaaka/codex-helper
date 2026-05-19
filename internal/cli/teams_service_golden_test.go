@@ -31,7 +31,7 @@ func TestTeamsServiceRendererOutputsUseStableExecutable(t *testing.T) {
 		"wsl startup fallback": buildTeamsServiceWSLStartupFallbackConfig(teamsServiceWindowsTaskName, buildTeamsServiceWSLArguments(spec)),
 	}
 	for name, body := range rendered {
-		if !strings.Contains(body, stable) {
+		if !containsRenderedPath(body, stable) {
 			t.Fatalf("%s renderer missing stable executable %q:\n%s", name, stable, body)
 		}
 		for _, forbidden := range []string{raw, ".nfs802014de01c482a9000004bf", " (deleted)", ".reload-backup-", "go-build"} {
@@ -40,4 +40,12 @@ func TestTeamsServiceRendererOutputsUseStableExecutable(t *testing.T) {
 			}
 		}
 	}
+}
+
+func containsRenderedPath(body string, path string) bool {
+	if strings.Contains(body, path) {
+		return true
+	}
+	escapedBackslashes := strings.ReplaceAll(path, `\`, `\\`)
+	return escapedBackslashes != path && strings.Contains(body, escapedBackslashes)
 }
