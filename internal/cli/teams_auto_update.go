@@ -190,6 +190,10 @@ func teamsAutoUpdateShouldDeferActivation(stableInstallPath string) (bool, strin
 	}
 	resolved, err := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
 	if err != nil {
+		class := helperpath.Classify(raw)
+		if class.Transient {
+			return true, "helper update installed to " + stableInstallPath + ", but activation is pending because the running helper executable is transient: " + class.Reason
+		}
 		return true, "helper update installed, but activation is pending because the running helper executable path is not stable: " + err.Error()
 	}
 	class := helperpath.Classify(raw)
