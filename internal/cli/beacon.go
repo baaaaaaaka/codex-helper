@@ -416,7 +416,8 @@ func newBeaconProfileStatusCmd(root *rootOptions, storePath *string) *cobra.Comm
 
 func cliBeaconAdapterLabel(p beacon.Profile) string {
 	ops := beacon.ConfiguredProviderCommandOperations(p.Adapter, p.Provider)
-	shell := strings.TrimSpace(p.Adapter.ShellMode)
+	shell, defaulted := beacon.ProviderCommandShellModeForProfileWithBase(p, beacon.ProviderCommandConfigFromEnv(os.Getenv))
+	shell = cliBeaconShellLabel(shell, defaulted)
 	if len(ops) == 0 {
 		if shell != "" {
 			return "env,shell=" + shell
@@ -428,6 +429,17 @@ func cliBeaconAdapterLabel(p beacon.Profile) string {
 		label += ",shell=" + shell
 	}
 	return label
+}
+
+func cliBeaconShellLabel(shell string, defaulted bool) string {
+	shell = strings.TrimSpace(shell)
+	if shell == "" || shell == beacon.ProviderCommandShellDirect && defaulted {
+		return ""
+	}
+	if defaulted {
+		return shell + "(default)"
+	}
+	return shell
 }
 
 func cliBeaconProfileRevision(revision int) int {

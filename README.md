@@ -280,12 +280,11 @@ provider job id, provider state, and provider reason that need attention.
 Provider submission is adapter-based. The least surprising Teams workflow is to
 store adapter commands on the beacon profile with `--query-command`,
 `--submit-command`, `--cancel-command`, and `--renew-command`; those profile
-changes apply to future turns without reloading the Teams helper. If the site
-submission command relies on your normal shell setup, such as modules,
-`submit_job`, NSS, or `SUBMIT_ACCOUNT`, add `--adapter-shell user` so cxp first
-resolves the environment through your configured login shell and then direct
-execs the adapter with that environment instead of asking you to copy those
-environment variables into the helper service. To start from a
+changes apply to future turns without reloading the Teams helper. Managed
+Slurm/LSF adapters use your default user shell environment by default, so site
+setup from modules, `submit_job`, NSS, or `SUBMIT_ACCOUNT` is available without
+copying those variables into the helper service. Add `--adapter-shell direct`
+only when an adapter needs the older clean service environment. To start from a
 site-editable Slurm or LSF wrapper, print a template:
 
 ```bash
@@ -308,14 +307,14 @@ export CODEX_HELPER_BEACON_LSF_RENEW=/path/to/renew-lsf-allocation
 export CODEX_HELPER_BEACON_PROVIDER_SHELL_MODE=user
 ```
 
-By default the adapter is invoked directly, without a shell. With
-`--adapter-shell user` or `CODEX_HELPER_BEACON_PROVIDER_SHELL_MODE=user`, cxp
-uses `$SHELL -lic` only to capture a framed environment snapshot, then runs the
-adapter directly with that environment so shell startup output cannot pollute
-the adapter protocol. Use `--adapter-shell shell-command` only for rare sites
-where scheduler submission is a shell function or alias that cannot be captured
-as environment. The adapter receives flags such as `--request-id`, `--name`,
-`--profile`, `--provider`, `--partition`, `--image`, `--queue`, and
+When no adapter shell mode is set, managed Slurm/LSF adapters behave as
+`--adapter-shell user`. cxp uses `$SHELL -lic` only to capture a framed
+environment snapshot, then runs the adapter directly with that environment so
+shell startup output cannot pollute the adapter protocol. Use
+`--adapter-shell shell-command` only for rare sites where scheduler submission is
+a shell function or alias that cannot be captured as environment. The adapter
+receives flags such as `--request-id`, `--name`, `--profile`, `--provider`,
+`--partition`, `--image`, `--queue`, and
 `--operation query|submit|cancel|renew`. It should print JSON like
 `{"provider_job_id":"123","raw_state":"PD","reason":"Resources","provider_deadline":"2026-05-18T10:30:00Z"}`
 or key-value output such as

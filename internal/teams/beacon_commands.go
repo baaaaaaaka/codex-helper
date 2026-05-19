@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -1553,7 +1554,8 @@ func profileProxyLabel(p beacon.Profile) string {
 
 func beaconProfileAdapterLabel(p beacon.Profile) string {
 	ops := beacon.ConfiguredProviderCommandOperations(p.Adapter, p.Provider)
-	shell := strings.TrimSpace(p.Adapter.ShellMode)
+	shell, defaulted := beacon.ProviderCommandShellModeForProfileWithBase(p, beacon.ProviderCommandConfigFromEnv(os.Getenv))
+	shell = beaconProfileShellLabel(shell, defaulted)
 	if len(ops) == 0 {
 		if shell != "" {
 			return "helper environment, shell=" + shell
@@ -1565,6 +1567,17 @@ func beaconProfileAdapterLabel(p beacon.Profile) string {
 		label += " shell=" + shell
 	}
 	return label
+}
+
+func beaconProfileShellLabel(shell string, defaulted bool) string {
+	shell = strings.TrimSpace(shell)
+	if shell == "" || shell == beacon.ProviderCommandShellDirect && defaulted {
+		return ""
+	}
+	if defaulted {
+		return shell + " (default)"
+	}
+	return shell
 }
 
 func beaconProfileProxyRoute(p beacon.Profile) string {
@@ -1666,7 +1679,7 @@ func beaconControlHelpText() string {
 		"- `beacon list` - list all profiles and machines",
 		"- `beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <hours>`",
 		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
-		"- add `--adapter-shell user` when scheduler submission depends on your normal shell setup",
+		"- Slurm/LSF adapters use your normal shell setup by default; add `--adapter-shell direct` only for a clean service environment",
 		"- `beacon profile update <name> ...` - create a new profile revision without breaking bound Work chats",
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>`",
 		"- `beacon profile create <name> --provider lsf --queue <queue>`",

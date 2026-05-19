@@ -2580,7 +2580,7 @@ func controlAdvancedHelpText() string {
 		"- `beacon list` - list beacon profiles and machines",
 		"- `beacon profile create <name> ...` - create a draft beacon profile",
 		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
-		"- add `--adapter-shell user` when scheduler submission depends on your normal shell setup",
+		"- Slurm/LSF adapters use your normal shell setup by default; add `--adapter-shell direct` only for a clean service environment",
 		"- `beacon profile update <name> ...` - create a new profile revision",
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>` - inspect, restore, and prune revisions",
 		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",

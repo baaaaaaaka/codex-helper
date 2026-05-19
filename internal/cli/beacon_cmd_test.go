@@ -14,6 +14,7 @@ import (
 )
 
 func TestBeaconProfileCLIWorkflow(t *testing.T) {
+	t.Setenv(beacon.BeaconProviderShellModeEnv, "")
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	adapter := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-doctor raw_state=PD reason=doctor`)
@@ -59,7 +60,7 @@ func TestBeaconProfileCLIWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("profile status: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "profile=gpu") || !strings.Contains(out, "status=ready") {
+	if !strings.Contains(out, "profile=gpu") || !strings.Contains(out, "status=ready") || !strings.Contains(out, "adapter=profile:query,submit,cancel,renew,shell=user(default)") {
 		t.Fatalf("status output = %s", out)
 	}
 
@@ -101,6 +102,17 @@ func TestBeaconProfileCLIWorkflow(t *testing.T) {
 	}
 	if !strings.Contains(out, "Pruned 2") {
 		t.Fatalf("profile gc output = %s", out)
+	}
+}
+
+func TestCLIBeaconAdapterLabelHonorsGlobalShellMode(t *testing.T) {
+	t.Setenv(beacon.BeaconProviderShellModeEnv, beacon.ProviderCommandShellDirect)
+	profile := beacon.Profile{
+		Provider: beacon.ProviderSlurm,
+		Adapter:  beacon.ProviderCommandConfigForProvider(beacon.ProviderSlurm, "/query", "/submit", "/cancel", "/renew"),
+	}
+	if got := cliBeaconAdapterLabel(profile); got != "profile:query,submit,cancel,renew,shell=direct" {
+		t.Fatalf("adapter label = %q", got)
 	}
 }
 

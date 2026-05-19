@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"strconv"
 	"strings"
 	"time"
@@ -325,7 +326,7 @@ func (a CommandProviderAdapter) run(ctx context.Context, req AllocationRequest, 
 	if runner == nil {
 		runner = ExecProviderCommandRunner{}
 	}
-	shellMode := providerCommandShellMode(a.Config, req.ProfileSnapshot.Adapter)
+	shellMode := ProviderCommandShellModeForRequest(req, a.Config)
 	switch strings.ToLower(strings.TrimSpace(shellMode)) {
 	case "", ProviderCommandShellDirect:
 		return runner.RunProviderCommand(ctx, command, args)
@@ -349,13 +350,46 @@ func (a CommandProviderAdapter) run(ctx context.Context, req AllocationRequest, 
 	}
 }
 
-func providerCommandShellMode(base ProviderCommandConfig, profile ProviderCommandConfig) string {
+func ProviderCommandShellModeForRequest(req AllocationRequest, base ProviderCommandConfig) string {
+	provider := req.Provider
+	if provider == "" {
+		provider = req.ProfileSnapshot.Provider
+	}
+	return providerCommandShellMode(provider, base, req.ProfileSnapshot.Adapter)
+}
+
+func ProviderCommandShellModeForProfile(profile Profile) (string, bool) {
+	return ProviderCommandShellModeForProfileWithBase(profile, ProviderCommandConfig{})
+}
+
+func ProviderCommandShellModeForProfileWithBase(profile Profile, base ProviderCommandConfig) (string, bool) {
+	mode := strings.TrimSpace(profile.Adapter.ShellMode)
+	if mode != "" {
+		return mode, false
+	}
+	mode = strings.TrimSpace(base.ShellMode)
+	if mode != "" {
+		return mode, false
+	}
+	return DefaultProviderCommandShellMode(profile.Provider), true
+}
+
+func DefaultProviderCommandShellMode(provider Provider) string {
+	switch provider {
+	case ProviderSlurm, ProviderLSF:
+		return ProviderCommandShellUser
+	default:
+		return ProviderCommandShellDirect
+	}
+}
+
+func providerCommandShellMode(provider Provider, base ProviderCommandConfig, profile ProviderCommandConfig) string {
 	mode := strings.TrimSpace(profile.ShellMode)
 	if mode == "" {
 		mode = strings.TrimSpace(base.ShellMode)
 	}
 	if mode == "" {
-		return ProviderCommandShellDirect
+		return DefaultProviderCommandShellMode(provider)
 	}
 	return mode
 }
@@ -509,7 +543,41 @@ func defaultProviderUserShell() string {
 	if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
 		return shell
 	}
+	if shell := lookupProviderLoginShell(); shell != "" {
+		return shell
+	}
 	return "/bin/bash"
+}
+
+func lookupProviderLoginShell() string {
+	current, err := user.Current()
+	if err != nil || strings.TrimSpace(current.Uid) == "" {
+		return ""
+	}
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return ""
+	}
+	return providerLoginShellFromPasswd(string(data), current.Uid)
+}
+
+func providerLoginShellFromPasswd(data string, uid string) string {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return ""
+	}
+	for _, line := range strings.Split(data, "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) < 7 || fields[2] != uid {
+			continue
+		}
+		shell := strings.TrimSpace(fields[6])
+		if shell != "" && strings.HasPrefix(shell, "/") {
+			return shell
+		}
+		return ""
+	}
+	return ""
 }
 
 type ExecProviderCommandRunner struct{}

@@ -4,20 +4,22 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestCommandProviderAdapterSubmitsSlurmWithProfileSnapshotAndNoShell(t *testing.T) {
+func TestCommandProviderAdapterExplicitDirectSubmitsSlurmWithoutShell(t *testing.T) {
 	req := slurmAllocationRequestForAdapter(t)
 	runner := &recordingProviderRunner{
 		output: `{"provider_job_id":"12345","raw_state":"PD","reason":"queued"}`,
 	}
 	adapter := CommandProviderAdapter{
-		Config: ProviderCommandConfig{SlurmQueryCommand: "/opt/cxp/query-slurm", SlurmSubmitCommand: "/opt/cxp/submit-slurm"},
+		Config: ProviderCommandConfig{SlurmQueryCommand: "/opt/cxp/query-slurm", SlurmSubmitCommand: "/opt/cxp/submit-slurm", ShellMode: ProviderCommandShellDirect},
 		Runner: runner,
 	}
 
@@ -65,6 +67,161 @@ func TestCommandProviderAdapterSubmitsSlurmWithProfileSnapshotAndNoShell(t *test
 	}
 }
 
+func TestCommandProviderAdapterDefaultsManagedProvidersToUserShell(t *testing.T) {
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("CODEX_HELPER_CLI_PATH", "/opt/cxp")
+	req := slurmAllocationRequestForAdapter(t)
+	shellEnv := providerShellEnvBegin + "\x00PATH=/opt/site/bin:/usr/bin\x00SUBMIT_ACCOUNT=acct\x00" + providerShellEnvEnd + "\x00"
+	runner := &recordingProviderRunner{outputByCommand: map[string]string{
+		"/bin/zsh":             shellEnv,
+		"/opt/cxp/query-slurm": `{"provider_job_id":"12345","raw_state":"PD","reason":"queued"}`,
+	}}
+	adapter := CommandProviderAdapter{
+		Config: ProviderCommandConfig{SlurmQueryCommand: "/opt/cxp/query-slurm"},
+		Runner: runner,
+	}
+
+	query, err := adapter.QueryAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("query allocation: %v", err)
+	}
+	if query.ProviderJobID != "12345" {
+		t.Fatalf("query result = %#v", query)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runner calls = %#v", runner.calls)
+	}
+	if runner.calls[0].name != "/bin/zsh" || !containsProviderArgSubstring(runner.calls[0].args, "-lic") {
+		t.Fatalf("default shell env call = %#v", runner.calls[0])
+	}
+	if runner.calls[1].name != "/opt/cxp/query-slurm" {
+		t.Fatalf("adapter call = %#v", runner.calls[1])
+	}
+	if !containsProviderArg(runner.calls[1].env, "SUBMIT_ACCOUNT=acct") {
+		t.Fatalf("adapter env did not inherit user shell account: %#v", runner.calls[1].env)
+	}
+}
+
+func TestCommandProviderAdapterDefaultsLSFToUserShell(t *testing.T) {
+	t.Setenv("SHELL", "/bin/zsh")
+	req := lsfAllocationRequestForAdapter(t)
+	shellEnv := providerShellEnvBegin + "\x00PATH=/opt/lsf/bin:/usr/bin\x00LSB_DEFAULTQUEUE=normal\x00" + providerShellEnvEnd + "\x00"
+	runner := &recordingProviderRunner{outputByCommand: map[string]string{
+		"/bin/zsh":           shellEnv,
+		"/opt/cxp/query-lsf": `{"provider_job_id":"777","raw_state":"PEND","reason":"queued"}`,
+	}}
+	adapter := CommandProviderAdapter{
+		Config: ProviderCommandConfig{LSFQueryCommand: "/opt/cxp/query-lsf"},
+		Runner: runner,
+	}
+
+	query, err := adapter.QueryAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("query allocation: %v", err)
+	}
+	if query.ProviderJobID != "777" || len(runner.calls) != 2 || runner.calls[0].name != "/bin/zsh" || runner.calls[1].name != "/opt/cxp/query-lsf" {
+		t.Fatalf("query=%#v calls=%#v", query, runner.calls)
+	}
+	if !containsProviderArg(runner.calls[1].env, "LSB_DEFAULTQUEUE=normal") {
+		t.Fatalf("adapter env did not inherit user shell LSF env: %#v", runner.calls[1].env)
+	}
+}
+
+func TestCommandProviderAdapterDefaultUserShellLoadsLoginProfileIntegration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell startup test")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", bash)
+	if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte("export SUBMIT_ACCOUNT=acct_from_profile\n"), 0o600); err != nil {
+		t.Fatalf("write bash profile: %v", err)
+	}
+	adapterPath := filepath.Join(t.TempDir(), "submit-slurm")
+	adapterScript := "#!/usr/bin/env bash\nset -eu\nprintf 'provider_job_id=%s raw_state=PD reason=ok\\n' \"$SUBMIT_ACCOUNT\"\n"
+	if err := os.WriteFile(adapterPath, []byte(adapterScript), 0o700); err != nil {
+		t.Fatalf("write adapter: %v", err)
+	}
+	req := slurmAllocationRequestForAdapter(t)
+	adapter := CommandProviderAdapter{
+		Config: ProviderCommandConfig{SlurmSubmitCommand: adapterPath},
+		Runner: ExecProviderCommandRunner{},
+	}
+
+	submitted, err := adapter.SubmitAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("submit allocation: %v", err)
+	}
+	if submitted.ProviderJobID != "acct_from_profile" {
+		t.Fatalf("submitted = %#v, want provider job from shell profile", submitted)
+	}
+}
+
+func TestProviderLoginShellFromPasswd(t *testing.T) {
+	passwd := strings.Join([]string{
+		"root:x:0:0:root:/root:/bin/bash",
+		"alice:x:1001:1001:Alice:/home/alice:/bin/zsh",
+		"bob:x:1002:1002:Bob:/home/bob:",
+	}, "\n")
+	if got := providerLoginShellFromPasswd(passwd, "1001"); got != "/bin/zsh" {
+		t.Fatalf("shell = %q, want /bin/zsh", got)
+	}
+	for _, uid := range []string{"", "1002", "9999"} {
+		if got := providerLoginShellFromPasswd(passwd, uid); got != "" {
+			t.Fatalf("shell for uid %q = %q, want empty", uid, got)
+		}
+	}
+}
+
+func TestProviderCommandShellModePrecedence(t *testing.T) {
+	cases := []struct {
+		name        string
+		profile     Profile
+		base        ProviderCommandConfig
+		want        string
+		wantDefault bool
+	}{
+		{
+			name:        "managed provider defaults to user shell",
+			profile:     Profile{Provider: ProviderSlurm},
+			want:        ProviderCommandShellUser,
+			wantDefault: true,
+		},
+		{
+			name:        "local provider stays direct by default",
+			profile:     Profile{Provider: ProviderLocal},
+			want:        ProviderCommandShellDirect,
+			wantDefault: true,
+		},
+		{
+			name:        "global explicit shell mode overrides managed default",
+			profile:     Profile{Provider: ProviderSlurm},
+			base:        ProviderCommandConfig{ShellMode: ProviderCommandShellDirect},
+			want:        ProviderCommandShellDirect,
+			wantDefault: false,
+		},
+		{
+			name:        "profile shell mode overrides global mode",
+			profile:     Profile{Provider: ProviderSlurm, Adapter: ProviderCommandConfig{ShellMode: ProviderCommandShellLogin}},
+			base:        ProviderCommandConfig{ShellMode: ProviderCommandShellDirect},
+			want:        ProviderCommandShellLogin,
+			wantDefault: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, defaulted := ProviderCommandShellModeForProfileWithBase(tc.profile, tc.base)
+			if got != tc.want || defaulted != tc.wantDefault {
+				t.Fatalf("shell mode = %q defaulted=%v, want %q defaulted=%v", got, defaulted, tc.want, tc.wantDefault)
+			}
+		})
+	}
+}
+
 func TestCommandProviderAdapterMissingCommandIsActionable(t *testing.T) {
 	req := slurmAllocationRequestForAdapter(t)
 	adapter := CommandProviderAdapter{Config: ProviderCommandConfig{}, Runner: &recordingProviderRunner{}}
@@ -93,7 +250,7 @@ func TestCommandProviderAdapterUsesProfileCommandsBeforeEnvironment(t *testing.T
 		},
 	}
 	adapter := CommandProviderAdapter{
-		Config: ProviderCommandConfig{SlurmQueryCommand: "/env/query", SlurmSubmitCommand: "/env/submit"},
+		Config: ProviderCommandConfig{SlurmQueryCommand: "/env/query", SlurmSubmitCommand: "/env/submit", ShellMode: ProviderCommandShellDirect},
 		Runner: runner,
 	}
 
@@ -119,7 +276,7 @@ func TestCommandProviderAdapterFallsBackToEnvironmentCommands(t *testing.T) {
 	req := slurmAllocationRequestForAdapter(t)
 	runner := &recordingProviderRunner{output: "provider_job_id=333 raw_state=PD"}
 	adapter := CommandProviderAdapter{
-		Config: ProviderCommandConfig{SlurmQueryCommand: "/env/query"},
+		Config: ProviderCommandConfig{SlurmQueryCommand: "/env/query", ShellMode: ProviderCommandShellDirect},
 		Runner: runner,
 	}
 	result, err := adapter.QueryAllocation(context.Background(), req)
@@ -265,7 +422,7 @@ func TestCommandProviderAdapterCancelAndRenewUseDedicatedCommands(t *testing.T) 
 	req.ProviderIdentity.ProviderJobID = "12345"
 	runner := &recordingProviderRunner{output: `{"provider_job_id":"12345","raw_state":"CA","reason":"canceled"}`}
 	adapter := CommandProviderAdapter{
-		Config: ProviderCommandConfig{SlurmCancelCommand: "/opt/cxp/cancel-slurm", SlurmRenewCommand: "/opt/cxp/renew-slurm"},
+		Config: ProviderCommandConfig{SlurmCancelCommand: "/opt/cxp/cancel-slurm", SlurmRenewCommand: "/opt/cxp/renew-slurm", ShellMode: ProviderCommandShellDirect},
 		Runner: runner,
 	}
 	if _, err := adapter.CancelAllocation(context.Background(), req); err != nil {
@@ -390,7 +547,7 @@ func TestCommandProviderAdapterLSFUsesQueueSnapshot(t *testing.T) {
 	}
 	runner := &recordingProviderRunner{output: "provider_job_id=lsf-1 raw_state=PEND"}
 	adapter := CommandProviderAdapter{
-		Config: ProviderCommandConfig{LSFSubmitCommand: "/opt/cxp/submit-lsf"},
+		Config: ProviderCommandConfig{LSFSubmitCommand: "/opt/cxp/submit-lsf", ShellMode: ProviderCommandShellDirect},
 		Runner: runner,
 	}
 	result, err := adapter.SubmitAllocation(context.Background(), req)
@@ -429,7 +586,7 @@ func TestReconcileAllocationWithCommandAdapterPersistsSubmitError(t *testing.T) 
 		errByCommand:    map[string]error{"/submit": errors.New("scheduler down")},
 	}
 	adapter := CommandProviderAdapter{
-		Config: ProviderCommandConfig{SlurmQueryCommand: "/query", SlurmSubmitCommand: "/submit"},
+		Config: ProviderCommandConfig{SlurmQueryCommand: "/query", SlurmSubmitCommand: "/submit", ShellMode: ProviderCommandShellDirect},
 		Runner: runner,
 	}
 
@@ -505,6 +662,20 @@ func slurmAllocationRequestForAdapter(t *testing.T) AllocationRequest {
 		t.Fatalf("EnsureAllocationRequest: %v", err)
 	}
 	return req
+}
+
+func lsfAllocationRequestForAdapter(t *testing.T) AllocationRequest {
+	t.Helper()
+	return AllocationRequest{
+		ID:                "req-lsf",
+		ConversationID:    "conv",
+		TurnID:            "turn",
+		Profile:           "batch",
+		ProfileSnapshot:   Profile{Name: "batch", Provider: ProviderLSF, LSF: LSFProfile{QueueName: "normal", SitePolicyDerivesResources: true, AdvancedApproved: true}},
+		Provider:          ProviderLSF,
+		Isolation:         IsolationExclusive,
+		DeterministicName: "cxp-req-lsf",
+	}
 }
 
 type providerRunnerCall struct {

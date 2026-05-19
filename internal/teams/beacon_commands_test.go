@@ -1118,19 +1118,20 @@ func TestTeamsBeaconProfileUpdateCreatesNewRevision(t *testing.T) {
 
 func TestTeamsBeaconProfileCreateStoresAdapterCommands(t *testing.T) {
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	t.Setenv(beacon.BeaconProviderShellModeEnv, "")
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	graph, sent := newBridgeTestGraph(t)
 	bridge := newBridgeTestBridge(graph, newBridgeTestStore(t), &recordingExecutor{})
 
 	if err := bridge.handleControlMessage(
 		context.Background(),
-		bridgeTestMessageWithText("profile-create-adapter", "beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew --adapter-shell user"),
-		"beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew --adapter-shell user",
+		bridgeTestMessageWithText("profile-create-adapter", "beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew"),
+		"beacon profile create gpu --provider slurm --query-command /opt/cxp/query --submit-command /opt/cxp/submit --cancel-command /opt/cxp/cancel --renew-command /opt/cxp/renew",
 	); err != nil {
 		t.Fatalf("create profile: %v", err)
 	}
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "adapter: profile:query,submit,cancel,renew shell=user") {
+	if !strings.Contains(joined, "adapter: profile:query,submit,cancel,renew shell=user (default)") {
 		t.Fatalf("profile create response missing adapter summary:\n%s", joined)
 	}
 	st := loadTeamsBeaconState(t)
@@ -1138,7 +1139,7 @@ func TestTeamsBeaconProfileCreateStoresAdapterCommands(t *testing.T) {
 	if got.SlurmQueryCommand != "/opt/cxp/query" || got.SlurmSubmitCommand != "/opt/cxp/submit" || got.SlurmCancelCommand != "/opt/cxp/cancel" || got.SlurmRenewCommand != "/opt/cxp/renew" {
 		t.Fatalf("stored adapter = %#v", got)
 	}
-	if got.ShellMode != beacon.ProviderCommandShellUser {
+	if got.ShellMode != "" {
 		t.Fatalf("stored adapter shell mode = %q", got.ShellMode)
 	}
 	if err := bridge.handleControlMessage(
@@ -1152,6 +1153,17 @@ func TestTeamsBeaconProfileCreateStoresAdapterCommands(t *testing.T) {
 	got = st.Profiles["gpu"].Adapter
 	if st.Profiles["gpu"].Provider != beacon.ProviderSlurm || got.SlurmSubmitCommand != "/opt/cxp/submit" || got.ShellMode != beacon.ProviderCommandShellLogin {
 		t.Fatalf("partial update should preserve adapter commands and update shell: profile=%#v adapter=%#v", st.Profiles["gpu"], got)
+	}
+}
+
+func TestTeamsBeaconProfileAdapterLabelHonorsGlobalShellMode(t *testing.T) {
+	t.Setenv(beacon.BeaconProviderShellModeEnv, beacon.ProviderCommandShellDirect)
+	profile := beacon.Profile{
+		Provider: beacon.ProviderSlurm,
+		Adapter:  beacon.ProviderCommandConfigForProvider(beacon.ProviderSlurm, "/query", "/submit", "/cancel", "/renew"),
+	}
+	if got := beaconProfileAdapterLabel(profile); got != "profile:query,submit,cancel,renew shell=direct" {
+		t.Fatalf("adapter label = %q", got)
 	}
 }
 
