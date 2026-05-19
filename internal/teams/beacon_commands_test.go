@@ -189,7 +189,7 @@ func TestTeamsBeaconTurnReconcilesConfiguredProviderAdapter(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register worker machine: %v", err)
 	}
-	job := waitForBeaconQueuedJob(t, store, "machine-provider")
+	job := waitForBeaconQueuedJobOrDone(t, store, "machine-provider", done)
 	if err := store.Update(func(st *beacon.State) error {
 		claimed, ok, err := beacon.ClaimNextJobForMachine(st, "machine-provider", "worker-provider", time.Now())
 		if err != nil {
@@ -1171,8 +1171,28 @@ func writeBeaconProviderFixture(t *testing.T, output string) string {
 
 func waitForBeaconQueuedJob(t *testing.T, store *beacon.Store, machineID string) beacon.JobAttempt {
 	t.Helper()
+	return waitForBeaconQueuedJobOrDone(t, store, machineID, nil)
+}
+
+func waitForBeaconQueuedJobOrDone(t *testing.T, store *beacon.Store, machineID string, done <-chan error) beacon.JobAttempt {
+	t.Helper()
 	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			st, loadErr := store.Load()
+			stateText := ""
+			if loadErr != nil {
+				stateText = fmt.Sprintf("; failed to load beacon state: %v", loadErr)
+			} else {
+				stateText = fmt.Sprintf("; allocations=%#v machines=%#v jobs=%#v", st.Allocations, st.Machines, st.JobAttempts)
+			}
+			if err != nil {
+				t.Fatalf("beacon turn ended before queuing job on machine %q: %v%s", machineID, err, stateText)
+			}
+			t.Fatalf("beacon turn ended before queuing job on machine %q%s", machineID, stateText)
+		default:
+		}
 		st, err := store.Load()
 		if err != nil {
 			t.Fatalf("load beacon state while waiting for job: %v", err)
@@ -1184,7 +1204,11 @@ func waitForBeaconQueuedJob(t *testing.T, store *beacon.Store, machineID string)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for queued beacon job")
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("timed out waiting for queued beacon job on machine %q; failed to load beacon state: %v", machineID, err)
+	}
+	t.Fatalf("timed out waiting for queued beacon job on machine %q; allocations=%#v machines=%#v jobs=%#v", machineID, st.Allocations, st.Machines, st.JobAttempts)
 	return beacon.JobAttempt{}
 }
 

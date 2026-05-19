@@ -898,11 +898,17 @@ func TestMachineReadinessRequiresFreshHeartbeatDoctorProviderAndSignature(t *tes
 	if !MachineCanAcceptAllocation(ready, req, now) {
 		t.Fatal("ready machine should accept allocation")
 	}
+	pendingProjection := copyMachine(ready, func(in *Machine) {
+		in.ProviderState = ProviderJobPending
+	})
+	if !MachineCanAcceptAllocation(pendingProjection, req, now) {
+		t.Fatal("accepting worker should remain usable when scheduler projection still says pending")
+	}
 	cases := map[string]Machine{
 		"stale heartbeat": copyMachine(ready, func(in *Machine) { in.LastHeartbeat = now.Add(-10 * time.Minute) }),
 		"missing doctor":  copyMachine(ready, func(in *Machine) { in.Doctor = WorkerDoctor{} }),
-		"pending provider": copyMachine(ready, func(in *Machine) {
-			in.ProviderState = ProviderJobPending
+		"suspended provider": copyMachine(ready, func(in *Machine) {
+			in.ProviderState = ProviderJobSuspended
 		}),
 		"signature mismatch": copyMachine(ready, func(in *Machine) {
 			in.Execution.Hash = "sig-b"

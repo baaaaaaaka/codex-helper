@@ -386,7 +386,7 @@ func MachineCanAcceptAllocation(machine Machine, req AllocationRequest, now time
 	if strings.TrimSpace(req.Execution.Hash) != "" && strings.TrimSpace(machine.Execution.Hash) != strings.TrimSpace(req.Execution.Hash) {
 		return false
 	}
-	if machine.ProviderState != "" && machine.ProviderState != ProviderJobRunning {
+	if machine.ProviderState != "" && machine.ProviderState != ProviderJobRunning && machine.ProviderState != ProviderJobPending {
 		return false
 	}
 	if !leaseTTLAccepts(machine, now) {
