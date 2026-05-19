@@ -3,9 +3,25 @@ package helperpath
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func hostTestOptions() Options {
+	return Options{GOOS: runtime.GOOS}
+}
+
+func hostTestHelperBinaryName() string {
+	return BinaryName(runtime.GOOS)
+}
+
+func hostTestCXPBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "cxp.exe"
+	}
+	return "cxp"
+}
 
 func TestClassifyTransientHelperPaths(t *testing.T) {
 	tests := []struct {
@@ -37,13 +53,14 @@ func TestClassifyInvalidNFSSillyNameAsStable(t *testing.T) {
 
 func TestStableInstallTargetRules(t *testing.T) {
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	opts := hostTestOptions()
+	stable := filepath.Join(dir, hostTestHelperBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
 	runningNFS := filepath.Join(dir, ".nfs802014de01c482a800000492")
 
-	got, err := StableInstallTarget("", "", runningNFS, Options{GOOS: "linux"})
+	got, err := StableInstallTarget("", "", runningNFS, opts)
 	if err != nil {
 		t.Fatalf("StableInstallTarget os executable: %v", err)
 	}
@@ -51,11 +68,11 @@ func TestStableInstallTargetRules(t *testing.T) {
 		t.Fatalf("resolved = %#v, want recovered stable %q", got, stable)
 	}
 
-	if _, err := StableInstallTarget(runningNFS, "", "", Options{GOOS: "linux"}); err == nil {
+	if _, err := StableInstallTarget(runningNFS, "", "", opts); err == nil {
 		t.Fatal("explicit .nfs install path should fail closed")
 	}
 
-	got, err = StableInstallTarget(dir, "", "", Options{GOOS: "linux"})
+	got, err = StableInstallTarget(dir, "", "", opts)
 	if err != nil {
 		t.Fatalf("StableInstallTarget dir: %v", err)
 	}
@@ -64,7 +81,7 @@ func TestStableInstallTargetRules(t *testing.T) {
 	}
 
 	custom := filepath.Join(dir, "codex-proxy-canary")
-	got, err = StableInstallTarget(custom, "", "", Options{GOOS: "linux"})
+	got, err = StableInstallTarget(custom, "", "", opts)
 	if err != nil {
 		t.Fatalf("custom file target: %v", err)
 	}
@@ -75,16 +92,17 @@ func TestStableInstallTargetRules(t *testing.T) {
 
 func TestProbePathSeparatesClassificationFromFilesystem(t *testing.T) {
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	opts := hostTestOptions()
+	stable := filepath.Join(dir, hostTestHelperBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
-	probe := ProbePath(stable, Options{GOOS: "linux"})
+	probe := ProbePath(stable, opts)
 	if probe.Kind != KindStable || !probe.Exists || probe.IsDir || !probe.Executable || !probe.PlausibleHelperEntry {
 		t.Fatalf("stable probe = %#v", probe)
 	}
 
-	nfs := ProbePath(filepath.Join(dir, ".nfs802014de01c482a800000492"), Options{GOOS: "linux"})
+	nfs := ProbePath(filepath.Join(dir, ".nfs802014de01c482a800000492"), opts)
 	if nfs.Kind != KindNFSSilly || !nfs.Transient || nfs.Exists {
 		t.Fatalf("nfs probe = %#v, want transient without implicit sibling probing", nfs)
 	}
@@ -93,7 +111,7 @@ func TestProbePathSeparatesClassificationFromFilesystem(t *testing.T) {
 	if err := os.WriteFile(custom, []byte("custom"), 0o755); err != nil {
 		t.Fatalf("write custom: %v", err)
 	}
-	customProbe := ProbePath(custom, Options{GOOS: "linux"})
+	customProbe := ProbePath(custom, opts)
 	if !customProbe.Exists || !customProbe.Executable || customProbe.PlausibleHelperEntry {
 		t.Fatalf("custom probe = %#v, want executable but not known entry basename", customProbe)
 	}
@@ -101,17 +119,18 @@ func TestProbePathSeparatesClassificationFromFilesystem(t *testing.T) {
 
 func TestStableInstallTargetSourcePolicy(t *testing.T) {
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	opts := hostTestOptions()
+	stable := filepath.Join(dir, hostTestHelperBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
 	runningNFS := filepath.Join(dir, ".nfs802014de01c482a800000492")
 
-	if _, err := StableInstallTargetFromSources(runningNFS, "", stable, stable, Options{GOOS: "linux"}); err == nil {
+	if _, err := StableInstallTargetFromSources(runningNFS, "", stable, stable, opts); err == nil {
 		t.Fatal("explicit transient install path should fail closed without argv0 fallback")
 	}
 
-	got, err := StableInstallTargetFromSources("", dir, runningNFS, "", Options{GOOS: "linux"})
+	got, err := StableInstallTargetFromSources("", dir, runningNFS, "", opts)
 	if err != nil {
 		t.Fatalf("env dir target: %v", err)
 	}
@@ -119,7 +138,7 @@ func TestStableInstallTargetSourcePolicy(t *testing.T) {
 		t.Fatalf("env dir target = %#v, want %s from env", got, stable)
 	}
 
-	got, err = StableInstallTargetFromSources("", "", filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), stable, Options{GOOS: "linux"})
+	got, err = StableInstallTargetFromSources("", "", filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), stable, opts)
 	if err != nil {
 		t.Fatalf("argv0 fallback: %v", err)
 	}
@@ -127,7 +146,7 @@ func TestStableInstallTargetSourcePolicy(t *testing.T) {
 		t.Fatalf("argv0 fallback = %#v, want %s", got, stable)
 	}
 
-	if _, err := StableInstallTargetFromSources("", "", filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), filepath.Base(stable), Options{GOOS: "linux"}); err == nil {
+	if _, err := StableInstallTargetFromSources("", "", filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), filepath.Base(stable), opts); err == nil {
 		t.Fatal("relative argv0 fallback should be rejected")
 	}
 
@@ -135,18 +154,19 @@ func TestStableInstallTargetSourcePolicy(t *testing.T) {
 	if err := os.WriteFile(badBase, []byte("bad"), 0o755); err != nil {
 		t.Fatalf("write bad base: %v", err)
 	}
-	if _, err := StableInstallTargetFromSources("", "", filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), badBase, Options{GOOS: "linux"}); err == nil {
+	if _, err := StableInstallTargetFromSources("", "", filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), badBase, opts); err == nil {
 		t.Fatal("argv0 fallback with an unknown helper basename should be rejected")
 	}
 }
 
 func TestStableRunnablePathSourcePolicy(t *testing.T) {
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "cxp")
+	opts := hostTestOptions()
+	stable := filepath.Join(dir, hostTestCXPBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
-	got, err := StableRunnablePathFromSources(filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), stable, Options{GOOS: "linux"})
+	got, err := StableRunnablePathFromSources(filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), stable, opts)
 	if err != nil {
 		t.Fatalf("argv0 runnable fallback: %v", err)
 	}
@@ -168,7 +188,7 @@ func TestWindowsExecutableProbeIgnoresModeBits(t *testing.T) {
 }
 
 func TestStableRunnablePathFailsClosedForUnrecoverableTransient(t *testing.T) {
-	_, err := StableRunnablePath(filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), Options{GOOS: "linux"})
+	_, err := StableRunnablePath(filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492"), hostTestOptions())
 	if err == nil || !strings.Contains(err.Error(), "cannot recover") {
 		t.Fatalf("StableRunnablePath error = %v, want unrecoverable transient", err)
 	}
@@ -213,11 +233,12 @@ func TestStableRunnablePathAcceptsSymlinkToHelper(t *testing.T) {
 
 func TestStableRunnablePathRecoversDeletedExecutable(t *testing.T) {
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	opts := hostTestOptions()
+	stable := filepath.Join(dir, hostTestHelperBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
-	got, err := StableRunnablePath(stable+" (deleted)", Options{GOOS: "linux"})
+	got, err := StableRunnablePath(stable+" (deleted)", opts)
 	if err != nil {
 		t.Fatalf("StableRunnablePath deleted: %v", err)
 	}
@@ -228,12 +249,13 @@ func TestStableRunnablePathRecoversDeletedExecutable(t *testing.T) {
 
 func TestCanonicalOwnerExecutableRecoversNFSSibling(t *testing.T) {
 	dir := t.TempDir()
-	stable := filepath.Join(dir, "codex-proxy")
+	opts := hostTestOptions()
+	stable := filepath.Join(dir, hostTestHelperBinaryName())
 	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
 		t.Fatalf("write stable: %v", err)
 	}
 	running := filepath.Join(dir, ".nfs802014de01c482a800000492")
-	if got := CanonicalOwnerExecutable(running, Options{GOOS: "linux"}); got != stable {
+	if got := CanonicalOwnerExecutable(running, opts); got != stable {
 		t.Fatalf("CanonicalOwnerExecutable = %q, want %q", got, stable)
 	}
 }
