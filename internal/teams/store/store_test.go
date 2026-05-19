@@ -3493,6 +3493,27 @@ func TestCurrentOwnerRejectsUnresolvedGoBuildHelperExecutable(t *testing.T) {
 	}
 }
 
+func TestCurrentOwnerAllowsUnresolvedWindowsGoTestExecutable(t *testing.T) {
+	prevExecutable := currentOwnerExecutable
+	prevArgv0 := currentOwnerArgv0
+	t.Cleanup(func() {
+		currentOwnerExecutable = prevExecutable
+		currentOwnerArgv0 = prevArgv0
+	})
+
+	raw := filepath.Join(t.TempDir(), "go-build123", "b001", "cli.test.exe")
+	currentOwnerExecutable = func() (string, error) { return raw, nil }
+	currentOwnerArgv0 = func() string { return "" }
+
+	owner, err := CurrentOwner("0.1.0-test", "", "", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if owner.ExecutablePath != raw {
+		t.Fatalf("owner executable = %q, want test executable %q", owner.ExecutablePath, raw)
+	}
+}
+
 func TestClaimControlLeaseDoesNotPreemptActiveTurn(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

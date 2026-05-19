@@ -453,7 +453,7 @@ jobs:
           helper_pattern='Test(HandleUpdateAndRestartUsesSharedInstallLock|TeamsService(InstallUsesStablePathWhenExecutableIsNFSSillyRename|BootstrapDryRunDoesNotWriteOrStart|BootstrapNoStartRepairsButDoesNotStart|InstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile|RepairMergesAllowedEnvironmentFromExistingSystemdUnit|StartPendingActivationUsesStableExecutablePath)|PendingHelperActivationAllowsTempSourceButRequiresStableDestination|TeamsCodexChildEnv(DoesNotExposeTransientHelperPath|ExposesRecoveredStableHelperPath)|ResolveTeamsHelperExecutableStatusReportsRawStableAndActivationPending|FormatTeamsHelperVersionStatusReportsOwnerEntryAndPending|RunInternalNpmWrapper.*|OSExecutableUsageIsCentralized)'
           go test ./internal/cli -count=1 -run "$helper_pattern" -v
           go test ./internal/update -count=1 -run 'Test(ResolveInstallPath(UsesStableSiblingForNFSSillyRename|FallsBackToStableArgv0Last|RejectsExplicitNFSSillyRename)|PerformUpdateUsesStableInstallTargetForTransientRuntimePath)$' -v
-          go test ./internal/teams/store -count=1 -run 'Test(CurrentOwner(StoresStableExecutableWhenRawPathIsTransient|FallsBackToStableArgv0WhenRawPathIsGoBuild|RejectsUnresolvedTransientExecutable|RejectsUnresolvedGoBuildHelperExecutable)|SameOwnerProcessCanonicalizesNFSSillyRename)$' -v
+          go test ./internal/teams/store -count=1 -run 'Test(CurrentOwner(StoresStableExecutableWhenRawPathIsTransient|FallsBackToStableArgv0WhenRawPathIsGoBuild|RejectsUnresolvedTransientExecutable|RejectsUnresolvedGoBuildHelperExecutable|AllowsUnresolvedWindowsGoTestExecutable)|SameOwnerProcessCanonicalizesNFSSillyRename)$' -v
           go test ./internal/codexrunner -count=1 -v
 
       - name: Self-update clean-env regressions (Linux/macOS)

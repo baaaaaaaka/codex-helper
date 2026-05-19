@@ -1457,7 +1457,8 @@ func CurrentOwner(helperVersion string, activeSessionID string, activeTurnID str
 }
 
 func allowUnresolvedGoTestOwnerExecutable(class helperpath.Classification) bool {
-	return class.Kind == helperpath.KindGoBuildTemp && strings.HasSuffix(class.Base, ".test")
+	base := strings.ToLower(strings.TrimSpace(class.Base))
+	return class.Kind == helperpath.KindGoBuildTemp && (strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe"))
 }
 
 func (s *Store) RecordOwnerHeartbeat(ctx context.Context, owner OwnerMetadata, staleAfter time.Duration, now time.Time) (OwnerMetadata, error) {
