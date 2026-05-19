@@ -80,6 +80,41 @@ func TestConversationStatusNoticePendingSchedulerSeparatesNextAndDetails(t *test
 	}
 }
 
+func TestMachineStatusNoticeShowsBootstrapDiagnostics(t *testing.T) {
+	msg := MachineStatusNotice(Machine{
+		ID:            "machine-1",
+		LeaseID:       "lease-1",
+		ProviderJobID: "slurm-1",
+		Profile:       "gpu",
+		Host:          "node-a",
+		State:         string(LeaseAccepting),
+		LastHeartbeat: time.Unix(10, 0).UTC(),
+		Bootstrap: BootstrapDiagnostics{
+			NodeList:        "node-a",
+			StdoutPath:      "/logs/slurm.out",
+			StderrPath:      "/logs/slurm.err",
+			SharedStorePath: "/shared/beacon/state.json",
+			CodexPath:       "/usr/bin/codex",
+			CXPPath:         "/usr/bin/cxp",
+			ProtocolVersion: "1",
+		},
+	}).Render()
+	for _, want := range []string{
+		"Scheduler node list: `node-a`.",
+		"node_list: `node-a`",
+		"bootstrap_stdout: `/logs/slurm.out`",
+		"shared_store: `/shared/beacon/state.json`",
+		"codex_path: `/usr/bin/codex`",
+		"cxp_path: `/usr/bin/cxp`",
+		"worker_protocol: `1`",
+		"last_heartbeat: `1970-01-01T00:00:10Z`",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("machine status missing %q:\n%s", want, msg)
+		}
+	}
+}
+
 func TestRenderBeaconErrorUsesNoticeShape(t *testing.T) {
 	msg := RenderBeaconError(BeaconErrorContext{
 		Phase:          "bootstrap",

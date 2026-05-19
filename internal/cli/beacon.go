@@ -403,7 +403,8 @@ func cliBeaconProfileRevision(revision int) int {
 }
 
 func newBeaconProfileDoctorCmd(root *rootOptions, storePath *string) *cobra.Command {
-	return &cobra.Command{
+	var smoke bool
+	cmd := &cobra.Command{
 		Use:   "doctor <name>",
 		Short: "Validate beacon profile scheduler adapter readiness",
 		Args:  cobra.ExactArgs(1),
@@ -428,10 +429,27 @@ func newBeaconProfileDoctorCmd(root *rootOptions, storePath *string) *cobra.Comm
 			}); err != nil {
 				return err
 			}
+			if smoke {
+				smokeOps := beacon.RunProfileDoctorSmoke(cmd.Context(), p, beacon.ProfileDoctorSmokeInput{
+					Adapter: beacon.NewCommandProviderAdapterFromEnv(nil),
+				})
+				if err := store.Update(func(st *beacon.State) error {
+					var err error
+					p, err = beacon.ApplyProfileDoctorSmokeReport(st, p.Name, p.Revision, smokeOps, time.Now())
+					if err == nil {
+						report = p.DoctorReport
+					}
+					return err
+				}); err != nil {
+					return err
+				}
+			}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), formatBeaconProfileDoctorResultCLI(p, report, proxyExists))
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&smoke, "smoke", false, "Run a submit/query/cancel provider smoke test after static doctor checks")
+	return cmd
 }
 
 func newBeaconProfileConfirmCmd(root *rootOptions, storePath *string) *cobra.Command {
@@ -828,6 +846,7 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 						Host:            host,
 						State:           beacon.LeaseAccepting,
 						Doctor:          runBeaconWorkerDoctor(codexPath),
+						Bootstrap:       beaconWorkerBootstrapDiagnostics(codexPath, *storePath),
 						MembershipProof: defaultBeaconMembershipProof(providerJobID),
 					}, time.Now())
 					return err
@@ -947,6 +966,7 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 					Host:            host,
 					State:           beacon.LeaseAccepting,
 					Doctor:          runBeaconWorkerDoctor(codexPath),
+					Bootstrap:       beaconWorkerBootstrapDiagnostics(codexPath, *storePath),
 					MembershipProof: defaultBeaconMembershipProof(providerJobID),
 				}, time.Now())
 				return err
@@ -1191,6 +1211,36 @@ func defaultBeaconMembershipProof(providerJobID string) string {
 		return "lsf:" + providerJobID
 	}
 	return providerJobID
+}
+
+func beaconWorkerBootstrapDiagnostics(codexPath string, storePath string) beacon.BootstrapDiagnostics {
+	sharedStore := strings.TrimSpace(storePath)
+	if sharedStore == "" {
+		if path, err := beacon.DefaultStorePath(); err == nil {
+			sharedStore = path
+		}
+	}
+	cxpPath := ""
+	if exe, err := os.Executable(); err == nil {
+		cxpPath = exe
+	}
+	codex := strings.TrimSpace(codexPath)
+	if codex == "" {
+		if path, err := exec.LookPath("codex"); err == nil {
+			codex = path
+		} else {
+			codex = "codex"
+		}
+	}
+	return beacon.BootstrapDiagnostics{
+		NodeList:        firstNonEmptyString(os.Getenv("SLURM_JOB_NODELIST"), os.Getenv("LSB_HOSTS"), os.Getenv("HOSTNAME")),
+		StdoutPath:      firstNonEmptyString(os.Getenv("CODEX_HELPER_BEACON_BOOTSTRAP_STDOUT"), os.Getenv("CXP_BEACON_BOOTSTRAP_STDOUT")),
+		StderrPath:      firstNonEmptyString(os.Getenv("CODEX_HELPER_BEACON_BOOTSTRAP_STDERR"), os.Getenv("CXP_BEACON_BOOTSTRAP_STDERR")),
+		SharedStorePath: sharedStore,
+		CodexPath:       codex,
+		CXPPath:         cxpPath,
+		ProtocolVersion: "1",
+	}
 }
 
 func runBeaconWorkerDoctor(codexPath string) beacon.WorkerDoctor {
@@ -1664,6 +1714,24 @@ func formatBeaconProfileDoctorResultCLI(p beacon.Profile, report beacon.ProfileD
 			facts = append(facts, "error="+op.Error)
 		}
 		lines = append(lines, "adapter: "+strings.Join(facts, " "))
+	}
+	for _, op := range report.Smoke {
+		var facts []string
+		facts = append(facts, "operation="+op.Operation)
+		facts = append(facts, "status="+firstNonEmptyString(op.Status, "unknown"))
+		if strings.TrimSpace(op.ProviderJobID) != "" {
+			facts = append(facts, "provider_job="+op.ProviderJobID)
+		}
+		if strings.TrimSpace(op.RawState) != "" {
+			facts = append(facts, "provider_state="+op.RawState)
+		}
+		if strings.TrimSpace(op.Reason) != "" {
+			facts = append(facts, "reason="+strings.ReplaceAll(op.Reason, " ", "_"))
+		}
+		if strings.TrimSpace(op.Error) != "" {
+			facts = append(facts, "error="+op.Error)
+		}
+		lines = append(lines, "smoke: "+strings.Join(facts, " "))
 	}
 	for _, issue := range report.Issues {
 		lines = append(lines, "issue: "+issue)

@@ -39,9 +39,12 @@ func TestBeaconProfileCLIWorkflow(t *testing.T) {
 		t.Fatalf("create output should show draft reasons:\n%s", out)
 	}
 
-	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "doctor", "gpu")
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "doctor", "gpu", "--smoke")
 	if err != nil {
 		t.Fatalf("profile doctor: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "smoke: operation=smoke_submit") || !strings.Contains(out, "provider_job=slurm-doctor") {
+		t.Fatalf("profile doctor smoke output missing expected facts:\n%s", out)
 	}
 	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "confirm", "gpu")
 	if err != nil {

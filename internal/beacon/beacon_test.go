@@ -1,6 +1,7 @@
 package beacon
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,25 @@ import (
 	"testing"
 	"time"
 )
+
+type profileDoctorSmokeAdapter struct {
+	calls []string
+}
+
+func (a *profileDoctorSmokeAdapter) SubmitAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error) {
+	a.calls = append(a.calls, "submit")
+	return SchedulerQueryResult{ProviderJobID: "slurm-42", RawState: "PD", Reason: "submitted"}, nil
+}
+
+func (a *profileDoctorSmokeAdapter) QueryAllocation(_ context.Context, req AllocationRequest) (SchedulerQueryResult, error) {
+	a.calls = append(a.calls, "query:"+req.ProviderIdentity.ProviderJobID)
+	return SchedulerQueryResult{ProviderJobID: req.ProviderIdentity.ProviderJobID, RawState: "R", Reason: "node-a"}, nil
+}
+
+func (a *profileDoctorSmokeAdapter) CancelAllocation(_ context.Context, req AllocationRequest) (SchedulerQueryResult, error) {
+	a.calls = append(a.calls, "cancel:"+req.ProviderIdentity.ProviderJobID)
+	return SchedulerQueryResult{ProviderJobID: req.ProviderIdentity.ProviderJobID, RawState: "CA", Reason: "cancel_requested"}, nil
+}
 
 func TestProfileLifecycleDraftDoctorConfirmAndProxy(t *testing.T) {
 	var st State
@@ -98,6 +118,35 @@ func TestProfileDoctorReportChecksProviderAdapters(t *testing.T) {
 	}
 	if !p.DoctorOK || !report.Passed {
 		t.Fatalf("configured adapters should pass doctor: profile=%#v report=%#v", p, report)
+	}
+}
+
+func TestProfileDoctorSmokeSubmitQueryCancelAndPersistsReport(t *testing.T) {
+	var st State
+	p, err := CreateProfile(&st, CreateProfileInput{
+		Name:      "gpu",
+		Provider:  ProviderSlurm,
+		ProxyMode: ProxyNone,
+		Slurm:     SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+		Adapter:   ProviderCommandConfigForProvider(ProviderSlurm, "/query", "/submit", "/cancel", "/renew"),
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	adapter := &profileDoctorSmokeAdapter{}
+	smoke := RunProfileDoctorSmoke(context.Background(), p, ProfileDoctorSmokeInput{Adapter: adapter})
+	if got, want := strings.Join(adapter.calls, ","), "submit,query:slurm-42,cancel:slurm-42"; got != want {
+		t.Fatalf("smoke adapter calls = %q, want %q", got, want)
+	}
+	if len(smoke) != 3 || smoke[0].ProviderJobID != "slurm-42" || smoke[1].RawState != "R" || smoke[2].RawState != "CA" {
+		t.Fatalf("unexpected smoke report: %#v", smoke)
+	}
+	p, err = ApplyProfileDoctorSmokeReport(&st, "gpu", p.Revision, smoke, time.Unix(2, 0))
+	if err != nil {
+		t.Fatalf("ApplyProfileDoctorSmokeReport: %v", err)
+	}
+	if !p.DoctorReport.Passed || len(p.DoctorReport.Smoke) != 3 {
+		t.Fatalf("profile smoke report not persisted cleanly: %#v", p.DoctorReport)
 	}
 }
 
@@ -615,6 +664,138 @@ func TestAllocationReleasePreviewRequiresConfirmationAcrossMultipleChats(t *test
 	preview := PreviewAllocationRelease(st, "profile", "gpu", []AllocationRequest{st.Allocations["req-a"], st.Allocations["req-b"]}, false)
 	if !preview.RequiresConfirmation || !strings.HasPrefix(preview.Confirmation, "RELEASE-") {
 		t.Fatalf("multi-chat profile release should require confirmation: %#v", preview)
+	}
+}
+
+func TestDetachConversationDemandPreservesSharedMachineForOtherChats(t *testing.T) {
+	st := State{
+		Allocations: map[string]AllocationRequest{
+			"req-a": {ID: "req-a", ConversationID: "chat-a", Profile: "gpu", Provider: ProviderSlurm, ProviderIdentity: ProviderIdentity{ProviderJobID: "slurm-1"}, State: AllocationRunning},
+			"req-b": {ID: "req-b", ConversationID: "chat-b", Profile: "gpu", Provider: ProviderSlurm, ProviderIdentity: ProviderIdentity{ProviderJobID: "slurm-1"}, State: AllocationRunning},
+		},
+		Machines: map[string]Machine{
+			"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(LeaseAccepting), Chats: []string{"chat-a", "chat-b"}},
+		},
+	}
+	result := DetachConversationDemand(&st, "chat-a", "user released work chat", time.Unix(3, 0))
+	if got := strings.Join(result.Detached, ","); got != "req-a" {
+		t.Fatalf("detached = %q, want req-a result=%#v", got, result)
+	}
+	if st.Allocations["req-a"].State != AllocationCanceled || st.Allocations["req-b"].State != AllocationRunning {
+		t.Fatalf("detach should cancel only chat-a allocation: %#v", st.Allocations)
+	}
+	if got := strings.Join(st.Machines["machine-1"].Chats, ","); got != "chat-b" {
+		t.Fatalf("machine chats = %q, want chat-b", got)
+	}
+	if st.Machines["machine-1"].State != string(LeaseAccepting) {
+		t.Fatalf("shared machine should remain accepting: %#v", st.Machines["machine-1"])
+	}
+}
+
+func TestDetachConversationDemandDrainsStartedJobWithoutProviderCancelIntent(t *testing.T) {
+	now := time.Unix(3, 0)
+	st := State{
+		Allocations: map[string]AllocationRequest{
+			"req-a": {ID: "req-a", ConversationID: "chat-a", Profile: "gpu", Provider: ProviderSlurm, ProviderIdentity: ProviderIdentity{ProviderJobID: "slurm-1"}, State: AllocationRunning},
+			"req-b": {ID: "req-b", ConversationID: "chat-b", Profile: "gpu", Provider: ProviderSlurm, ProviderIdentity: ProviderIdentity{ProviderJobID: "slurm-1"}, State: AllocationRunning},
+		},
+		Machines: map[string]Machine{
+			"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(LeaseAccepting), Chats: []string{"chat-a", "chat-b"}, Jobs: []string{"job-a"}},
+		},
+		JobAttempts: map[string]JobAttempt{
+			"job-a": {ID: "job-a", RequestID: "req-a", TurnID: "turn-a", Phase: JobStarted},
+		},
+	}
+	result := DetachConversationDemand(&st, "chat-a", "user released work chat", now)
+	if got := strings.Join(result.Draining, ","); got != "req-a" {
+		t.Fatalf("draining = %q, want req-a result=%#v", got, result)
+	}
+	req := st.Allocations["req-a"]
+	if req.DetachRequestedAt.IsZero() || !req.CancelRequestedAt.IsZero() {
+		t.Fatalf("detach should not become provider cancel intent while job is active: %#v", req)
+	}
+	finalized := FinalizeConversationDetachIntents(&st, now.Add(time.Minute))
+	if got := strings.Join(finalized.Draining, ","); got != "req-a" {
+		t.Fatalf("active detach finalization = %#v, want draining req-a", finalized)
+	}
+	req = st.Allocations["req-a"]
+	if req.State != AllocationRunning || !req.CancelRequestedAt.IsZero() || strings.Join(st.Machines["machine-1"].Chats, ",") != "chat-a,chat-b" {
+		t.Fatalf("active detach should leave provider and chat membership untouched: req=%#v machine=%#v", req, st.Machines["machine-1"])
+	}
+
+	job := st.JobAttempts["job-a"]
+	job.Phase = JobTerminal
+	st.JobAttempts[job.ID] = job
+	finalized = FinalizeConversationDetachIntents(&st, now.Add(2*time.Minute))
+	if got := strings.Join(finalized.Detached, ","); got != "req-a" {
+		t.Fatalf("final detached = %q, want req-a result=%#v", got, finalized)
+	}
+	req = st.Allocations["req-a"]
+	if req.State != AllocationCanceled || !req.CancelRequestedAt.IsZero() || !req.DetachRequestedAt.IsZero() {
+		t.Fatalf("drained shared detach should only cancel this allocation: %#v", req)
+	}
+	if got := strings.Join(st.Machines["machine-1"].Chats, ","); got != "chat-b" {
+		t.Fatalf("machine chats = %q, want chat-b", got)
+	}
+	if st.Allocations["req-b"].State != AllocationRunning {
+		t.Fatalf("other chat allocation should keep running: %#v", st.Allocations["req-b"])
+	}
+}
+
+func TestFinalizeConversationDetachEscalatesWhenNoOtherChatRemains(t *testing.T) {
+	now := time.Unix(3, 0)
+	st := State{
+		Allocations: map[string]AllocationRequest{
+			"req-a": {
+				ID:                "req-a",
+				ConversationID:    "chat-a",
+				Profile:           "gpu",
+				Provider:          ProviderSlurm,
+				ProviderIdentity:  ProviderIdentity{ProviderJobID: "slurm-1"},
+				State:             AllocationRunning,
+				DetachRequestedAt: now,
+				DetachReason:      "user released work chat",
+			},
+		},
+		Machines: map[string]Machine{
+			"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(LeaseAccepting), Chats: []string{"chat-a"}},
+		},
+		JobAttempts: map[string]JobAttempt{
+			"job-a": {ID: "job-a", RequestID: "req-a", TurnID: "turn-a", Phase: JobTerminal},
+		},
+	}
+	finalized := FinalizeConversationDetachIntents(&st, now.Add(time.Minute))
+	if got := strings.Join(finalized.Escalated, ","); got != "req-a" {
+		t.Fatalf("escalated = %q, want req-a result=%#v", got, finalized)
+	}
+	req := st.Allocations["req-a"]
+	if req.State != AllocationRunning || req.CancelRequestedAt.IsZero() || !req.DetachRequestedAt.IsZero() {
+		t.Fatalf("last-chat detach should become normal provider cancel intent: %#v", req)
+	}
+}
+
+func TestDrainIdleWorkerMachinesOnlyDrainsNoDemandMachines(t *testing.T) {
+	now := time.Unix(1000, 0)
+	st := State{Machines: map[string]Machine{
+		"idle":      {ID: "idle", State: string(LeaseAccepting), UpdatedAt: now.Add(-time.Hour)},
+		"chat":      {ID: "chat", State: string(LeaseAccepting), UpdatedAt: now.Add(-time.Hour), Chats: []string{"s001"}},
+		"job":       {ID: "job", State: string(LeaseAccepting), UpdatedAt: now.Add(-time.Hour), Jobs: []string{"job-1"}},
+		"fresh":     {ID: "fresh", State: string(LeaseAccepting), UpdatedAt: now.Add(-time.Minute)},
+		"draining":  {ID: "draining", State: string(LeaseDraining), UpdatedAt: now.Add(-time.Hour)},
+		"exclusive": {ID: "exclusive", State: string(LeaseAccepting), Isolation: IsolationExclusive, UpdatedAt: now.Add(-time.Hour)},
+		"external":  {ID: "external", State: string(LeaseAccepting), ExternalOwned: true, UpdatedAt: now.Add(-time.Hour)},
+	}}
+	drained := DrainIdleWorkerMachines(&st, 30*time.Minute, now)
+	if got := len(drained); got != 2 {
+		t.Fatalf("DrainIdleWorkerMachines drained %d, want 2: %#v", got, drained)
+	}
+	if st.Machines["idle"].State != string(LeaseDraining) || st.Machines["exclusive"].State != string(LeaseDraining) {
+		t.Fatalf("idle shared/exclusive machines should drain: %#v", st.Machines)
+	}
+	for _, id := range []string{"chat", "job", "fresh", "external"} {
+		if st.Machines[id].State != string(LeaseAccepting) {
+			t.Fatalf("machine %s should stay accepting: %#v", id, st.Machines[id])
+		}
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 var beaconReconcileInterval = 30 * time.Second
 var beaconLeaseMaintenanceInterval = 30 * time.Second
 var beaconReconcileStaleWorkerAfter = beacon.DefaultWorkerHeartbeatStaleAfter
+var beaconReconcileIdleWorkerAfter = 30 * time.Minute
 var beaconReconcileStaleJobAfter = 10 * time.Minute
 
 func (b *Bridge) prepareBeaconTurnExecution(ctx context.Context, session *Session, turn teamstore.Turn) (beacon.TurnExecutionPlan, bool, error) {
@@ -143,8 +144,24 @@ func (b *Bridge) reconcileBeaconState(ctx context.Context, store *beacon.Store, 
 			return err
 		}
 	}
+	if err := store.Update(func(st *beacon.State) error {
+		beacon.FinalizeConversationDetachIntents(st, now)
+		return nil
+	}); err != nil {
+		return err
+	}
 	if cancelAdapter, ok := adapter.(beacon.AllocationCancelAdapter); ok {
 		current, err := store.Load()
+		if err != nil {
+			return err
+		}
+		for _, req := range beaconAllocationsWithCancelIntent(current) {
+			_, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, cancelAdapter, "reconciling pending beacon release request", false, now)
+			if cancelErr != nil && !beacon.IsProviderCommandNotConfigured(cancelErr) {
+				return cancelErr
+			}
+		}
+		current, err = store.Load()
 		if err != nil {
 			return err
 		}
@@ -157,6 +174,7 @@ func (b *Bridge) reconcileBeaconState(ctx context.Context, store *beacon.Store, 
 	}
 	return store.Update(func(st *beacon.State) error {
 		beacon.DrainStaleWorkerMachines(st, beaconReconcileStaleWorkerAfter, now)
+		beacon.DrainIdleWorkerMachines(st, beaconReconcileIdleWorkerAfter, now)
 		beacon.RecoverStaleJobAttempts(st, beaconReconcileStaleJobAfter, now)
 		return nil
 	})
@@ -227,6 +245,18 @@ func (b *Bridge) renewDueBeaconAllocations(ctx context.Context, store *beacon.St
 		return fmt.Errorf("beacon renewal errors: %s", strings.Join(errorsOut, "; "))
 	}
 	return nil
+}
+
+func beaconAllocationsWithCancelIntent(st beacon.State) []beacon.AllocationRequest {
+	var out []beacon.AllocationRequest
+	for _, req := range st.Allocations {
+		if beaconAllocationStateDone(req.State) || req.CancelRequestedAt.IsZero() {
+			continue
+		}
+		out = append(out, req)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 func beaconAllocationHasStartedJobState(st beacon.State, allocationID string) bool {

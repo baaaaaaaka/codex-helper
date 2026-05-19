@@ -140,11 +140,15 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 			return formatBeaconProfileMutation("Updated", p, proxyExists), nil
 		})
 	case "doctor":
-		name, err := singleBeaconNameArg("beacon profile doctor", words[1:])
+		name, smoke, err := parseBeaconProfileDoctorArgs(words[1:])
 		if err != nil {
 			return "", err
 		}
 		normalized := normalizedBeaconCommand("profile doctor " + name)
+		if smoke {
+			normalized = normalizedBeaconCommand("profile doctor " + name + " --smoke")
+			return b.handleBeaconProfileDoctorSmoke(ctx, msg, idempotencyScope, normalized, name)
+		}
 		return b.updateBeaconStateFromTeams(msg, idempotencyScope, normalized, "", func(st *beacon.State) (string, error) {
 			proxyExists := b.beaconProxyResolver()
 			p, report, err := beacon.DoctorProfileWithInput(st, name, beacon.DoctorProfileInput{
@@ -453,6 +457,16 @@ func releaseBeaconConversationAllocations(ctx context.Context, sessionID string,
 	}
 	preview := beacon.PreviewAllocationRelease(st, "work-chat", sessionID, allocations, false)
 	if releaseConfirmationRequired(preview, "") {
+		var detach beacon.ConversationDetachResult
+		if err := store.Update(func(st *beacon.State) error {
+			detach = beacon.DetachConversationDemand(st, sessionID, reason, time.Now())
+			return nil
+		}); err != nil {
+			return "", err
+		}
+		if len(detach.Detached) > 0 || len(detach.Draining) > 0 {
+			return formatBeaconConversationDetachResult(detach), nil
+		}
 		return formatBeaconAllocationReleasePreview(preview) + "\n\nThis shared resource is used by more than one chat. Use the control chat with the confirmation token if you want to release it for everyone.", nil
 	}
 	var lines []string
@@ -563,6 +577,74 @@ func (b *Bridge) updateBeaconStateFromTeams(msg ChatMessage, idempotencyScope st
 		return err
 	})
 	return out, err
+}
+
+func (b *Bridge) handleBeaconProfileDoctorSmoke(ctx context.Context, msg ChatMessage, idempotencyScope string, normalized string, name string) (string, error) {
+	store, err := beacon.NewStore("")
+	if err != nil {
+		return "", err
+	}
+	messageID := scopedBeaconTeamsMessageID(idempotencyScope, msg.ID)
+	key := beacon.IdempotencyKey(messageID, normalized, "")
+	proxyExists := b.beaconProxyResolver()
+	var p beacon.Profile
+	var cached string
+	var staticFailed bool
+	if err := store.Update(func(st *beacon.State) error {
+		if messageID != "" {
+			if rec, ok := st.Idempotency[key]; ok {
+				cached = rec.Result
+				return nil
+			}
+		}
+		var report beacon.ProfileDoctorReport
+		var err error
+		p, report, err = beacon.DoctorProfileWithInput(st, name, beacon.DoctorProfileInput{
+			Now:                 time.Now(),
+			ProxyExists:         proxyExists,
+			EnvProviderCommands: beacon.ProviderCommandConfigFromEnv(nil),
+		})
+		if err != nil {
+			return err
+		}
+		staticFailed = !report.Passed
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	if cached != "" {
+		return cached, nil
+	}
+	if staticFailed {
+		out := formatBeaconProfileDoctorResult(p, p.DoctorReport, proxyExists)
+		if messageID != "" {
+			if err := store.Update(func(st *beacon.State) error {
+				st.Idempotency[key] = beacon.IdempotencyRecord{Key: key, Result: out, CreatedAt: time.Now()}
+				return nil
+			}); err != nil {
+				return "", err
+			}
+		}
+		return out, nil
+	}
+	smokeOps := beacon.RunProfileDoctorSmoke(ctx, p, beacon.ProfileDoctorSmokeInput{
+		Adapter: beacon.NewCommandProviderAdapterFromEnv(nil),
+	})
+	var out string
+	if err := store.Update(func(st *beacon.State) error {
+		updated, err := beacon.ApplyProfileDoctorSmokeReport(st, p.Name, p.Revision, smokeOps, time.Now())
+		if err != nil {
+			return err
+		}
+		out = formatBeaconProfileDoctorResult(updated, updated.DoctorReport, proxyExists)
+		if messageID != "" {
+			st.Idempotency[key] = beacon.IdempotencyRecord{Key: key, Result: out, CreatedAt: time.Now()}
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 func scopedBeaconTeamsMessageID(scope string, messageID string) string {
@@ -949,6 +1031,33 @@ func singleBeaconNameArg(usage string, words []string) (string, error) {
 	return strings.TrimSpace(words[0]), nil
 }
 
+func parseBeaconProfileDoctorArgs(words []string) (string, bool, error) {
+	var name string
+	var smoke bool
+	for _, word := range words {
+		word = strings.TrimSpace(word)
+		if word == "" {
+			continue
+		}
+		switch strings.ToLower(word) {
+		case "--smoke":
+			smoke = true
+		default:
+			if strings.HasPrefix(word, "-") {
+				return "", false, fmt.Errorf("unknown beacon profile doctor flag %q", word)
+			}
+			if name != "" {
+				return "", false, fmt.Errorf("usage: `beacon profile doctor <name> [--smoke]`")
+			}
+			name = word
+		}
+	}
+	if name == "" {
+		return "", false, fmt.Errorf("usage: `beacon profile doctor <name> [--smoke]`")
+	}
+	return name, smoke, nil
+}
+
 func parseBeaconMachineKillArgs(words []string) (string, string, error) {
 	if len(words) == 0 || strings.TrimSpace(words[0]) == "" {
 		return "", "", fmt.Errorf("usage: `beacon machine kill <machine-or-lease-or-job> --confirm <token>`")
@@ -1119,6 +1228,25 @@ func formatBeaconProfileDoctorResult(p beacon.Profile, report beacon.ProfileDoct
 			lines = append(lines, line)
 		}
 	}
+	if len(report.Smoke) > 0 {
+		lines = append(lines, "", "Smoke test:")
+		for _, op := range report.Smoke {
+			line := fmt.Sprintf("- %s: `%s`", op.Operation, firstNonEmptyString(op.Status, "unknown"))
+			if strings.TrimSpace(op.ProviderJobID) != "" {
+				line += " provider_job=`" + op.ProviderJobID + "`"
+			}
+			if strings.TrimSpace(op.RawState) != "" {
+				line += " state=`" + op.RawState + "`"
+			}
+			if strings.TrimSpace(op.Reason) != "" {
+				line += " reason=`" + op.Reason + "`"
+			}
+			if strings.TrimSpace(op.Error) != "" {
+				line += " - " + op.Error
+			}
+			lines = append(lines, line)
+		}
+	}
 	if len(report.Issues) > 0 {
 		lines = append(lines, "", "Action needed:")
 		for _, issue := range report.Issues {
@@ -1157,12 +1285,25 @@ func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) 
 			lines = append(lines, "- "+reason)
 		}
 	}
-	if len(p.DoctorReport.Operations) > 0 || len(p.DoctorReport.Issues) > 0 {
+	if len(p.DoctorReport.Operations) > 0 || len(p.DoctorReport.Smoke) > 0 || len(p.DoctorReport.Issues) > 0 {
 		lines = append(lines, "Doctor report:")
 		for _, op := range p.DoctorReport.Operations {
 			line := fmt.Sprintf("- %s: %s", op.Operation, firstNonEmptyString(op.Status, "unknown"))
 			if strings.TrimSpace(op.Source) != "" {
 				line += " via " + op.Source
+			}
+			if strings.TrimSpace(op.Error) != "" {
+				line += " - " + op.Error
+			}
+			lines = append(lines, line)
+		}
+		for _, op := range p.DoctorReport.Smoke {
+			line := fmt.Sprintf("- %s: %s", op.Operation, firstNonEmptyString(op.Status, "unknown"))
+			if strings.TrimSpace(op.ProviderJobID) != "" {
+				line += " provider_job=" + op.ProviderJobID
+			}
+			if strings.TrimSpace(op.RawState) != "" {
+				line += " state=" + op.RawState
 			}
 			if strings.TrimSpace(op.Error) != "" {
 				line += " - " + op.Error
@@ -1249,6 +1390,28 @@ func formatBeaconAllocationCancelResult(res beacon.AllocationCancelResult) strin
 	}
 	if strings.TrimSpace(req.ProviderReason) != "" {
 		lines = append(lines, "", "Details:", req.ProviderReason)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatBeaconConversationDetachResult(res beacon.ConversationDetachResult) string {
+	lines := []string{
+		"Beacon release",
+		"",
+		"Summary:",
+		"Detached this Work chat from shared beacon resources without releasing them for other chats.",
+		"",
+		"State:",
+		"- chat: `" + res.ConversationID + "`",
+		"- detached allocations: `" + strings.Join(res.Detached, ",") + "`",
+		"- draining allocations: `" + strings.Join(res.Draining, ",") + "`",
+		"- escalated releases: `" + strings.Join(res.Escalated, ",") + "`",
+		"",
+		"Action needed:",
+		"- None. The profile binding is unchanged; a future turn can acquire a fresh worker if needed.",
+	}
+	if len(res.Skipped) > 0 {
+		lines = append(lines, "", "Details:", "Skipped non-shared allocations: `"+strings.Join(res.Skipped, ",")+"`.")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1467,7 +1630,8 @@ func beaconControlHelpText() string {
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>`",
 		"- `beacon profile create <name> --provider lsf --queue <queue>`",
 		"- `beacon profile create <name> --provider local`",
-		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",
+		"- `beacon profile doctor <name>` - validate profile fields and provider adapters without touching the scheduler",
+		"- `beacon profile doctor <name> --smoke` - submit, query, and cancel one real scheduler allocation",
 		"- `beacon profile confirm <name>` - confirm a profile after reviewing doctor output",
 		"- `beacon profile status <name>`",
 		"- `beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]` - preview and release a resource without internal object knowledge",
@@ -1480,7 +1644,7 @@ func beaconControlHelpText() string {
 		"- `beacon status`",
 		"- `beacon switch <profile>`",
 		"- `beacon switch local` - future turns run locally and cxp drains/releases this chat's old beacon resource when safe",
-		"- `beacon release` - release this Work chat's current beacon resource; shared resources show a confirmation preview",
+		"- `beacon release` - release this Work chat's current beacon resource; shared workers detach only this chat unless control chat confirms a global release",
 	}, "\n")
 }
 
@@ -1492,7 +1656,7 @@ func beaconWorkHelpText() string {
 		"- `beacon list` - list all profiles and machines",
 		"- `beacon switch <profile>` - switch future turns to a ready profile",
 		"- `beacon switch local` - switch future turns back to local execution and release old beacon resources when safe",
-		"- `beacon release` - release this chat's current beacon resource; shared resources show a confirmation preview",
+		"- `beacon release` - release this chat's current beacon resource; shared workers detach only this chat",
 		"- `beacon fork <profile>` - fork when the execution signature is incompatible",
 		"",
 		"Profile and machine administration belongs in the control chat.",

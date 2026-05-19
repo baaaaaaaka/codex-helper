@@ -140,7 +140,8 @@ codex-proxy proxy doctor
 | `codex-proxy beacon profile history <name>` | List current and historical revisions for a beacon profile |
 | `codex-proxy beacon profile rollback <name> <revision>` | Publish a historical profile revision as a new latest revision |
 | `codex-proxy beacon profile gc <name>` | Prune historical revisions no active target/allocation still references |
-| `codex-proxy beacon profile doctor <name>` | Validate profile fields and provider adapter commands |
+| `codex-proxy beacon profile doctor <name>` | Validate profile fields and provider adapter commands without touching the scheduler |
+| `codex-proxy beacon profile doctor <name> --smoke` | Submit, query, and cancel one scheduler allocation to verify adapters |
 | `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review |
 | `codex-proxy beacon status [--session <id>]` | Show beacon target state |
 | `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | Preview and release a beacon resource by profile, allocation id, provider job id, or machine id |
@@ -155,7 +156,7 @@ codex-proxy proxy doctor
 | `codex-proxy beacon provider template lsf` | Print a starter LSF adapter script |
 | `codex-proxy beacon worker run-once --machine <id>` | Claim one queued beacon job on an allocated worker and publish its terminal result |
 | `codex-proxy beacon worker run-once --allocation <id> --wait 30m` | Register the current scheduler worker, wait for its Teams job, and publish the terminal result |
-| `codex-proxy beacon worker serve --allocation <id>` | Register a long-lived worker and serve jobs until idle or stopped |
+| `codex-proxy beacon worker serve --allocation <id>` | Register a long-lived worker with bootstrap diagnostics and serve jobs until idle or stopped |
 | `codex-proxy proxy start [profile]` | Start a long-lived proxy daemon |
 | `codex-proxy proxy list` | List known proxy instances |
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
@@ -216,9 +217,15 @@ future Teams turns will need:
 
 ```bash
 codex-proxy beacon profile doctor gpu
+codex-proxy beacon profile doctor gpu --smoke
 codex-proxy beacon profile confirm gpu
 codex-proxy beacon profile status gpu
 ```
+
+Plain `doctor` is non-destructive and checks profile fields plus adapter
+presence/executability. Add `--smoke` only when you want cxp to submit, query,
+and cancel one real scheduler allocation to verify the adapter output contract
+from the same profile/environment future Teams turns will use.
 
 To change a profile, update it in place. The helper records a new revision, while
 queued or running turns keep their existing target snapshot:
@@ -250,7 +257,10 @@ In Teams, use `beacon switch <profile>` from the Work chat. The helper then
 submits, queries, waits for the worker, renews, and cleans up the managed
 allocation automatically. If you need to manually free the current resource,
 send `beacon release` in the Work chat; the profile binding stays unchanged, so
-future turns may acquire a fresh worker for the same profile. `beacon local`
+future turns may acquire a fresh worker for the same profile. If the worker is
+shared, Work-chat release detaches only the current chat's demand and leaves the
+shared worker available to other chats; control-chat release is still required
+for a shared or forced release that would affect everyone. `beacon local`
 switches future turns back to local execution and asks the helper to drain or
 release this chat's old beacon resource when that is safe.
 
@@ -308,7 +318,11 @@ whose provider deadline is near. Provider calls are never made while holding the
 beacon state lock, and renewal results are applied only when the provider job id
 and renew epoch still match. During helper drain, the renewal controller only
 protects allocations whose job may already have started; it does not create new
-scheduler work for pre-start turns.
+scheduler work for pre-start turns. Release/cancel intents are durable, so the
+active owner retries them during reconcile if an earlier path recorded the
+intent before the provider adapter became available. The same reconcile pass
+drains idle workers with no chat/job demand so shared and exclusive workers do
+not stay accepting forever after demand disappears.
 
 Inside an allocated worker, the scheduler job should register itself against the
 managed allocation and wait for the Teams turn to enqueue work:
@@ -331,8 +345,9 @@ codex-proxy beacon worker serve --allocation <request-id> --idle-timeout 30m
 ```
 
 `serve` records worker heartbeats, runs the worker doctor before accepting jobs,
-and drains the machine on exit. A controller or cron job can reconcile stale
-state with:
+stores bootstrap diagnostics such as node list, stdout/stderr paths, shared
+beacon store path, and `codex`/`cxp` paths, then drains the machine on exit. A
+controller or cron job can reconcile stale state with:
 
 ```bash
 codex-proxy beacon allocation reconcile-all

@@ -44,14 +44,15 @@ Beacon profiles describe where future Codex work executes. Create and confirm a 
 - `cxp beacon profile create <name> --provider local`: create a local draft profile.
 - `cxp beacon profile create <name> ... --proxy ssh_profile --proxy-profile <existing-proxy>`: attach an existing SSH proxy profile when the beacon job needs that network route.
 - `cxp beacon profile create <name> ... --isolation shared|exclusive`: set the default lease sharing mode.
-- `cxp beacon profile doctor <name>`: validate profile fields and the query/submit/cancel/renew adapter commands visible to cxp.
+- `cxp beacon profile doctor <name>`: validate profile fields and the query/submit/cancel/renew adapter commands visible to cxp without touching the scheduler.
+- `cxp beacon profile doctor <name> --smoke`: submit, query, and cancel one real scheduler allocation to verify adapter output and cleanup.
 - `cxp beacon profile confirm <name>`: confirm a reviewed profile so it can be used.
 - `cxp beacon profile status <name>`: inspect one profile.
 - `cxp beacon status --session <session-id>`: inspect a conversation's current, pending, and queued target state.
 - `cxp beacon switch-profile <name> --session <session-id>`: switch immediately when no Codex work is queued or running.
 - `cxp beacon switch-profile <name> --session <session-id> --after-current-turn`: defer the switch so the current Codex turn stays on its existing target and future turns use the new profile.
 - `cxp beacon switch-profile <name> --session <session-id> --fork`: fork when the target execution signature is incompatible and the user accepts the fork.
-- `cxp beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]`: preview and release a beacon resource. In Teams Work chat, `beacon release` releases the current chat's resource when safe; shared resources show a confirmation preview.
+- `cxp beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]`: preview and release a beacon resource. In Teams Work chat, `beacon release` releases the current chat's resource when safe; if a worker is shared, it detaches only the current chat and leaves other chats running unless the user confirms a control-chat shared/forced release.
 - `cxp beacon allocation list`: list managed allocation requests.
 - `cxp beacon allocation status <allocation-or-provider-job>`: inspect one allocation request.
 - `cxp beacon allocation cancel <allocation-or-provider-job>`: cancel one managed allocation through the configured provider adapter.
@@ -60,7 +61,7 @@ Beacon profiles describe where future Codex work executes. Create and confirm a 
 - `cxp beacon provider template slurm|lsf`: print a starter scheduler adapter script that can be edited for the site.
 - `cxp beacon worker run-once --machine <machine-id>`: run inside an allocated worker, claim one queued job, execute Codex, and publish the fenced terminal result.
 - `cxp beacon worker run-once --allocation <request-id> --wait 30m`: register the current Slurm/LSF worker for a managed allocation, wait for the Teams job, execute Codex, and publish the terminal result.
-- `cxp beacon worker serve --allocation <request-id>`: register a long-lived worker, send heartbeats, serve jobs until idle or stopped, then drain on exit.
+- `cxp beacon worker serve --allocation <request-id>`: register a long-lived worker, store bootstrap diagnostics, send heartbeats, serve jobs until idle or stopped, then drain on exit.
 - `cxp beacon machine list`: list beacon machines.
 - `cxp beacon machine status <machine-or-lease>`: inspect a machine/lease and get confirmation tokens.
 - `cxp beacon machine release <machine-or-lease>`: drain or release a machine.

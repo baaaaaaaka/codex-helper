@@ -1,6 +1,7 @@
 package beacon
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,6 +33,15 @@ type DoctorProfileInput struct {
 	EnvProviderCommands      ProviderCommandConfig
 	SkipProviderAdapterCheck bool
 	CheckExecutable          func(string) error
+}
+
+type ProfileDoctorSmokeInput struct {
+	Now     time.Time
+	Adapter interface {
+		SubmitAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
+		QueryAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
+		CancelAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
+	}
 }
 
 func CreateProfile(st *State, in CreateProfileInput) (Profile, error) {
@@ -330,6 +340,125 @@ func BuildProfileDoctorReport(p Profile, in DoctorProfileInput) ProfileDoctorRep
 	}
 	report.Passed = len(report.Issues) == 0
 	return report
+}
+
+func RunProfileDoctorSmoke(ctx context.Context, p Profile, in ProfileDoctorSmokeInput) []ProfileDoctorOperation {
+	p = normalizeProfileRevision(p)
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if in.Adapter == nil {
+		return []ProfileDoctorOperation{{Operation: "smoke", Status: "failed", Error: "provider adapter is not configured"}}
+	}
+	switch p.Provider {
+	case ProviderSlurm, ProviderLSF:
+	default:
+		return []ProfileDoctorOperation{{Operation: "smoke", Status: "skipped", Reason: "local provider does not use external scheduler adapters"}}
+	}
+	req := AllocationRequest{
+		ID:                "doctor-" + sanitizeJobName(firstNonEmpty(p.Name, "profile")),
+		ConversationID:    "doctor",
+		TurnID:            "doctor",
+		Profile:           p.Name,
+		ProfileSnapshot:   p,
+		Provider:          p.Provider,
+		Isolation:         p.IsolationDefault,
+		Target:            TargetSnapshot{Target: TargetBeacon, Profile: p.Name, ProfileRevision: p.Revision},
+		DeterministicName: "cxp-doctor-" + sanitizeJobName(firstNonEmpty(p.Name, "profile")),
+		State:             AllocationRequestPersisted,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	if req.Isolation == "" {
+		req.Isolation = IsolationExclusive
+	}
+	var out []ProfileDoctorOperation
+	submit, err := in.Adapter.SubmitAllocation(ctx, req)
+	out = append(out, profileDoctorSmokeOperation("submit", submit, err))
+	if err != nil {
+		return out
+	}
+	if strings.TrimSpace(submit.ProviderJobID) != "" {
+		req.ProviderIdentity.ProviderJobID = strings.TrimSpace(submit.ProviderJobID)
+		req.Target.ProviderJobID = strings.TrimSpace(submit.ProviderJobID)
+	}
+	query, queryErr := in.Adapter.QueryAllocation(ctx, req)
+	out = append(out, profileDoctorSmokeOperation("query", query, queryErr))
+	cancel, cancelErr := in.Adapter.CancelAllocation(ctx, req)
+	out = append(out, profileDoctorSmokeOperation("cancel", cancel, cancelErr))
+	return out
+}
+
+func ApplyProfileDoctorSmokeReport(st *State, name string, revision int, smoke []ProfileDoctorOperation, now time.Time) (Profile, error) {
+	if st == nil {
+		return Profile{}, fmt.Errorf("nil beacon state")
+	}
+	st.normalize()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Profile{}, fmt.Errorf("profile name is required")
+	}
+	p, ok := st.Profiles[name]
+	if !ok {
+		return Profile{}, fmt.Errorf("beacon profile %q not found", name)
+	}
+	p = normalizeProfileRevision(p)
+	if revision > 0 && p.Revision != revision {
+		return Profile{}, fmt.Errorf("beacon profile %q changed from revision %d to %d during doctor smoke", name, revision, p.Revision)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	p.DoctorReport.Smoke = append([]ProfileDoctorOperation(nil), smoke...)
+	p.DoctorReport.Issues = profileDoctorIssuesWithSmoke(p.DoctorReport.Issues, smoke)
+	p.DoctorReport.Passed = len(p.DoctorReport.Issues) == 0
+	p.DoctorOK = p.DoctorReport.Passed
+	p.UpdatedAt = now
+	st.Profiles[name] = p
+	_, _ = AppendAudit(st, "profile_doctor_smoke", profileHistoryKey(name, p.Revision), now)
+	return p, nil
+}
+
+func profileDoctorSmokeOperation(operation string, result SchedulerQueryResult, err error) ProfileDoctorOperation {
+	op := ProfileDoctorOperation{
+		Operation:     "smoke_" + strings.TrimSpace(operation),
+		Status:        "ok",
+		ProviderJobID: strings.TrimSpace(result.ProviderJobID),
+		RawState:      strings.TrimSpace(result.RawState),
+		Reason:        strings.TrimSpace(result.Reason),
+	}
+	if result.QueryError {
+		op.Status = "failed"
+		op.Error = firstNonEmpty(op.Error, "provider returned query_error=true")
+	}
+	if err != nil {
+		op.Status = "failed"
+		op.Error = err.Error()
+	}
+	if result.DurableNegative && op.Reason == "" {
+		op.Reason = "durable_negative"
+	}
+	return op
+}
+
+func profileDoctorIssuesWithSmoke(base []string, smoke []ProfileDoctorOperation) []string {
+	var issues []string
+	for _, issue := range base {
+		if strings.Contains(strings.ToLower(issue), "smoke") {
+			continue
+		}
+		issues = append(issues, issue)
+	}
+	for _, op := range smoke {
+		switch strings.TrimSpace(op.Status) {
+		case "", "ok", "skipped":
+			continue
+		default:
+			issues = append(issues, fmt.Sprintf("%s smoke %s", op.Operation, firstNonEmpty(op.Error, op.Status)))
+		}
+	}
+	return issues
 }
 
 func profileDoctorConfigurationIssues(p Profile, proxyExists func(string) bool) []string {

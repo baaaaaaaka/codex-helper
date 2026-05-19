@@ -52,16 +52,20 @@ type ProfileDoctorReport struct {
 	Passed     bool                     `json:"passed"`
 	Issues     []string                 `json:"issues,omitempty"`
 	Operations []ProfileDoctorOperation `json:"operations,omitempty"`
+	Smoke      []ProfileDoctorOperation `json:"smoke,omitempty"`
 }
 
 type ProfileDoctorOperation struct {
-	Operation   string `json:"operation,omitempty"`
-	Source      string `json:"source,omitempty"`
-	Command     string `json:"command,omitempty"`
-	EnvName     string `json:"env_name,omitempty"`
-	ProfileFlag string `json:"profile_flag,omitempty"`
-	Status      string `json:"status,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Operation     string `json:"operation,omitempty"`
+	Source        string `json:"source,omitempty"`
+	Command       string `json:"command,omitempty"`
+	EnvName       string `json:"env_name,omitempty"`
+	ProfileFlag   string `json:"profile_flag,omitempty"`
+	Status        string `json:"status,omitempty"`
+	ProviderJobID string `json:"provider_job_id,omitempty"`
+	RawState      string `json:"raw_state,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 type SlurmProfile struct {
@@ -163,6 +167,8 @@ type AllocationRequest struct {
 	ReplacementEpoch  int                `json:"replacement_epoch,omitempty"`
 	CancelRequestedAt time.Time          `json:"cancel_requested_at,omitempty"`
 	CancelReason      string             `json:"cancel_reason,omitempty"`
+	DetachRequestedAt time.Time          `json:"detach_requested_at,omitempty"`
+	DetachReason      string             `json:"detach_reason,omitempty"`
 	SubmitAttempts    int                `json:"submit_attempts,omitempty"`
 	CreatedAt         time.Time          `json:"created_at,omitempty"`
 	UpdatedAt         time.Time          `json:"updated_at,omitempty"`
@@ -184,26 +190,37 @@ const (
 )
 
 type Machine struct {
-	ID              string             `json:"id"`
-	LeaseID         string             `json:"lease_id"`
-	ProviderJobID   string             `json:"provider_job_id,omitempty"`
-	WorkerID        string             `json:"worker_id,omitempty"`
-	Profile         string             `json:"profile,omitempty"`
-	Host            string             `json:"host,omitempty"`
-	Isolation       Isolation          `json:"isolation,omitempty"`
-	State           string             `json:"state,omitempty"`
-	ExternalOwned   bool               `json:"external_owned,omitempty"`
-	Doctor          WorkerDoctor       `json:"doctor,omitempty"`
-	DoctorBlockers  []string           `json:"doctor_blockers,omitempty"`
-	MembershipProof string             `json:"membership_proof,omitempty"`
-	ProviderState   ProviderJobState   `json:"provider_state,omitempty"`
-	Execution       ExecutionSignature `json:"execution,omitempty"`
-	LeaseExpiresAt  time.Time          `json:"lease_expires_at,omitempty"`
-	LastHeartbeat   time.Time          `json:"last_heartbeat,omitempty"`
-	StartedAt       time.Time          `json:"started_at,omitempty"`
-	UpdatedAt       time.Time          `json:"updated_at,omitempty"`
-	Chats           []string           `json:"chats,omitempty"`
-	Jobs            []string           `json:"jobs,omitempty"`
+	ID              string               `json:"id"`
+	LeaseID         string               `json:"lease_id"`
+	ProviderJobID   string               `json:"provider_job_id,omitempty"`
+	WorkerID        string               `json:"worker_id,omitempty"`
+	Profile         string               `json:"profile,omitempty"`
+	Host            string               `json:"host,omitempty"`
+	Isolation       Isolation            `json:"isolation,omitempty"`
+	State           string               `json:"state,omitempty"`
+	ExternalOwned   bool                 `json:"external_owned,omitempty"`
+	Doctor          WorkerDoctor         `json:"doctor,omitempty"`
+	DoctorBlockers  []string             `json:"doctor_blockers,omitempty"`
+	Bootstrap       BootstrapDiagnostics `json:"bootstrap,omitempty"`
+	MembershipProof string               `json:"membership_proof,omitempty"`
+	ProviderState   ProviderJobState     `json:"provider_state,omitempty"`
+	Execution       ExecutionSignature   `json:"execution,omitempty"`
+	LeaseExpiresAt  time.Time            `json:"lease_expires_at,omitempty"`
+	LastHeartbeat   time.Time            `json:"last_heartbeat,omitempty"`
+	StartedAt       time.Time            `json:"started_at,omitempty"`
+	UpdatedAt       time.Time            `json:"updated_at,omitempty"`
+	Chats           []string             `json:"chats,omitempty"`
+	Jobs            []string             `json:"jobs,omitempty"`
+}
+
+type BootstrapDiagnostics struct {
+	NodeList        string `json:"node_list,omitempty"`
+	StdoutPath      string `json:"stdout_path,omitempty"`
+	StderrPath      string `json:"stderr_path,omitempty"`
+	SharedStorePath string `json:"shared_store_path,omitempty"`
+	CodexPath       string `json:"codex_path,omitempty"`
+	CXPPath         string `json:"cxp_path,omitempty"`
+	ProtocolVersion string `json:"protocol_version,omitempty"`
 }
 
 type JobPhase string

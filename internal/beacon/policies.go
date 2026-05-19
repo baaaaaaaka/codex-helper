@@ -85,6 +85,14 @@ type AllocationReleaseItem struct {
 	RunningTurns []string
 }
 
+type ConversationDetachResult struct {
+	ConversationID string
+	Detached       []string
+	Draining       []string
+	Escalated      []string
+	Skipped        []string
+}
+
 func PreviewRelease(m Machine) ReleasePreview {
 	token := "KILL-" + strings.TrimSpace(m.LeaseID)
 	return ReleasePreview{
@@ -253,6 +261,146 @@ func allocationReleaseTurns(st State, req AllocationRequest) (queued []string, r
 		}
 	}
 	return uniqueSortedStrings(queued), uniqueSortedStrings(running)
+}
+
+func DetachConversationDemand(st *State, conversationID string, reason string, now time.Time) ConversationDetachResult {
+	if st == nil {
+		return ConversationDetachResult{}
+	}
+	st.normalize()
+	conversationID = strings.TrimSpace(conversationID)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reason = firstNonEmpty(reason, "detached from shared beacon resource")
+	result := ConversationDetachResult{ConversationID: conversationID}
+	for id, req := range st.Allocations {
+		if strings.TrimSpace(req.ConversationID) != conversationID || allocationStateTerminal(req.State) {
+			continue
+		}
+		if !allocationHasOtherChats(*st, req, conversationID) {
+			result.Skipped = append(result.Skipped, id)
+			continue
+		}
+		req.DetachRequestedAt = now
+		req.DetachReason = reason
+		req.UpdatedAt = now
+		if allocationHasActiveStartedJob(*st, req.ID) {
+			req.ProviderReason = firstNonEmpty(req.ProviderReason, "release requested while this chat may still have running work; detaching after the turn drains")
+			st.Allocations[id] = req
+			result.Draining = append(result.Draining, id)
+			_, _ = AppendAudit(st, "allocation_detach_drain_started", id, now)
+			continue
+		}
+		tombstoneAllocationJobs(st, req, reason, now)
+		req.State = AllocationCanceled
+		req.ProviderReason = firstNonEmpty(req.ProviderReason, reason)
+		req.DetachRequestedAt = time.Time{}
+		req.DetachReason = ""
+		st.Allocations[id] = req
+		removeConversationFromAllocationMachines(st, req, conversationID, now)
+		result.Detached = append(result.Detached, id)
+		_, _ = AppendAudit(st, "allocation_detach_chat", id, now)
+	}
+	sort.Strings(result.Detached)
+	sort.Strings(result.Draining)
+	sort.Strings(result.Escalated)
+	sort.Strings(result.Skipped)
+	return result
+}
+
+func FinalizeConversationDetachIntents(st *State, now time.Time) ConversationDetachResult {
+	if st == nil {
+		return ConversationDetachResult{}
+	}
+	st.normalize()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	result := ConversationDetachResult{}
+	for id, req := range st.Allocations {
+		if allocationStateTerminal(req.State) || req.DetachRequestedAt.IsZero() {
+			continue
+		}
+		if result.ConversationID == "" {
+			result.ConversationID = strings.TrimSpace(req.ConversationID)
+		}
+		if allocationHasActiveStartedJob(*st, req.ID) {
+			result.Draining = append(result.Draining, id)
+			continue
+		}
+		reason := firstNonEmpty(req.DetachReason, "detached from shared beacon resource")
+		if !allocationHasOtherChats(*st, req, req.ConversationID) {
+			req.CancelRequestedAt = now
+			req.CancelReason = reason
+			req.DetachRequestedAt = time.Time{}
+			req.DetachReason = ""
+			req.ProviderReason = firstNonEmpty(req.ProviderReason, "shared detach became a full release after other chats drained")
+			req.UpdatedAt = now
+			st.Allocations[id] = req
+			result.Escalated = append(result.Escalated, id)
+			_, _ = AppendAudit(st, "allocation_detach_escalated_release", id, now)
+			continue
+		}
+		tombstoneAllocationJobs(st, req, reason, now)
+		req.State = AllocationCanceled
+		req.ProviderReason = firstNonEmpty(req.ProviderReason, reason)
+		req.DetachRequestedAt = time.Time{}
+		req.DetachReason = ""
+		req.UpdatedAt = now
+		st.Allocations[id] = req
+		removeConversationFromAllocationMachines(st, req, req.ConversationID, now)
+		result.Detached = append(result.Detached, id)
+		_, _ = AppendAudit(st, "allocation_detach_chat", id, now)
+	}
+	sort.Strings(result.Detached)
+	sort.Strings(result.Draining)
+	sort.Strings(result.Escalated)
+	return result
+}
+
+func allocationHasOtherChats(st State, req AllocationRequest, conversationID string) bool {
+	conversationID = strings.TrimSpace(conversationID)
+	for _, chat := range allocationReleaseChats(st, req) {
+		if strings.TrimSpace(chat) != "" && strings.TrimSpace(chat) != conversationID {
+			return true
+		}
+	}
+	return false
+}
+
+func removeConversationFromAllocationMachines(st *State, req AllocationRequest, conversationID string, now time.Time) {
+	if st == nil {
+		return
+	}
+	providerJobID, leaseID, ok := allocationMachineMatchKeys(req)
+	if !ok {
+		return
+	}
+	for key, machine := range st.Machines {
+		if strings.TrimSpace(providerJobID) != "" && strings.TrimSpace(machine.ProviderJobID) != strings.TrimSpace(providerJobID) {
+			continue
+		}
+		if strings.TrimSpace(providerJobID) == "" && strings.TrimSpace(machine.LeaseID) != strings.TrimSpace(leaseID) {
+			continue
+		}
+		machine.Chats = removeString(machine.Chats, conversationID)
+		machine.UpdatedAt = now
+		st.Machines[key] = machine
+	}
+}
+
+func removeString(values []string, target string) []string {
+	target = strings.TrimSpace(target)
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || value == target {
+			continue
+		}
+		out = append(out, value)
+	}
+	return uniqueSortedStrings(out)
 }
 
 func uniqueSortedStrings(values []string) []string {

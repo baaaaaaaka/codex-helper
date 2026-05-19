@@ -23,6 +23,7 @@ type WorkerRegistrationInput struct {
 	Host            string
 	State           LeaseState
 	Doctor          WorkerDoctor
+	Bootstrap       BootstrapDiagnostics
 	MembershipProof string
 }
 
@@ -96,6 +97,7 @@ func RegisterWorkerMachineForAllocation(st *State, requestID string, in WorkerRe
 	machine.Isolation = isolation
 	machine.State = string(state)
 	machine.Doctor = in.Doctor
+	machine.Bootstrap = in.Bootstrap
 	machine.DoctorBlockers = nil
 	if !workerDoctorIsZero(in.Doctor) {
 		machine.DoctorBlockers = WorkerDoctorBlockers(in.Doctor)
@@ -275,6 +277,47 @@ func DrainStaleWorkerMachines(st *State, staleAfter time.Duration, now time.Time
 			continue
 		}
 		if machine.LastHeartbeat.IsZero() || now.Sub(machine.LastHeartbeat) <= staleAfter {
+			continue
+		}
+		machine.State = string(LeaseDraining)
+		machine.UpdatedAt = now
+		st.Machines[key] = machine
+		drained = append(drained, machine)
+	}
+	sort.Slice(drained, func(i, j int) bool { return drained[i].ID < drained[j].ID })
+	return drained
+}
+
+func DrainIdleWorkerMachines(st *State, idleAfter time.Duration, now time.Time) []Machine {
+	if st == nil {
+		return nil
+	}
+	st.normalize()
+	if idleAfter <= 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var drained []Machine
+	for key, machine := range st.Machines {
+		if strings.ToLower(strings.TrimSpace(machine.State)) != string(LeaseAccepting) {
+			continue
+		}
+		if machine.ExternalOwned {
+			continue
+		}
+		if len(machine.Chats) > 0 || len(machine.Jobs) > 0 {
+			continue
+		}
+		lastActive := machine.UpdatedAt
+		if lastActive.IsZero() || (!machine.LastHeartbeat.IsZero() && machine.LastHeartbeat.After(lastActive)) {
+			lastActive = machine.LastHeartbeat
+		}
+		if lastActive.IsZero() || (!machine.StartedAt.IsZero() && machine.StartedAt.After(lastActive)) {
+			lastActive = machine.StartedAt
+		}
+		if lastActive.IsZero() || now.Sub(lastActive) <= idleAfter {
 			continue
 		}
 		machine.State = string(LeaseDraining)

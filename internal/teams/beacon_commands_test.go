@@ -30,7 +30,7 @@ func TestTeamsBeaconControlProfileLifecycleAndList(t *testing.T) {
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessageWithText("beacon-create", create), create); err != nil {
 		t.Fatalf("create profile: %v", err)
 	}
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessageWithText("beacon-doctor", "beacon profile doctor gpu"), "beacon profile doctor gpu"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessageWithText("beacon-doctor", "beacon profile doctor gpu --smoke"), "beacon profile doctor gpu --smoke"); err != nil {
 		t.Fatalf("doctor profile: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessageWithText("beacon-confirm", "beacon profile confirm gpu"), "beacon profile confirm gpu"); err != nil {
@@ -41,7 +41,7 @@ func TestTeamsBeaconControlProfileLifecycleAndList(t *testing.T) {
 	}
 
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Created beacon profile \"gpu\"", "Profile gpu doctor passed", "Confirmed beacon profile \"gpu\"", "Beacon list", "Profiles:", "gpu: ready", "Machines:"} {
+	for _, want := range []string{"Created beacon profile \"gpu\"", "Profile gpu doctor passed", "Smoke test:", "smoke_submit", "Confirmed beacon profile \"gpu\"", "Beacon list", "Profiles:", "gpu: ready", "Machines:"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon output missing %q:\n%s", want, joined)
 		}
@@ -597,7 +597,7 @@ func TestTeamsBeaconWorkSwitchLocalImmediateAndPending(t *testing.T) {
 	}
 }
 
-func TestTeamsBeaconWorkReleaseSharedResourceRequiresPreviewConfirmation(t *testing.T) {
+func TestTeamsBeaconWorkReleaseSharedResourceDetachesCurrentChat(t *testing.T) {
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	seedTeamsBeaconProfile(t, "gpu")
@@ -629,14 +629,17 @@ func TestTeamsBeaconWorkReleaseSharedResourceRequiresPreviewConfirmation(t *test
 		t.Fatalf("work release shared: %v", err)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Beacon release preview", "affected chats: s001,s002", "confirm RELEASE-"} {
+	for _, want := range []string{"Beacon release", "Detached this Work chat from shared beacon resources", "detached allocations: " + requestID} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("shared release preview missing %q:\n%s", want, joined)
+			t.Fatalf("shared release detach output missing %q:\n%s", want, joined)
 		}
 	}
 	st := loadTeamsBeaconState(t)
-	if st.Allocations[requestID].State == beacon.AllocationCanceled {
-		t.Fatalf("shared release without confirmation should not cancel allocation: %#v", st.Allocations[requestID])
+	if st.Allocations[requestID].State != beacon.AllocationCanceled {
+		t.Fatalf("shared release should detach/cancel this chat allocation: %#v", st.Allocations[requestID])
+	}
+	if got := strings.Join(st.Machines["shared-a"].Chats, ","); got != "s002" {
+		t.Fatalf("shared machine chats = %q, want s002", got)
 	}
 }
 
@@ -673,6 +676,118 @@ func TestTeamsBeaconReconcileReleasesAllocationWithNoConversationDemand(t *testi
 	}
 	if st.Allocations[requestID].State != beacon.AllocationCanceled {
 		t.Fatalf("allocation state = %s, want canceled", st.Allocations[requestID].State)
+	}
+}
+
+type beaconCancelIntentAdapter struct {
+	cancels int
+}
+
+func (a *beaconCancelIntentAdapter) QueryAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
+	return beacon.SchedulerQueryResult{RawState: "R", Reason: "running"}, nil
+}
+
+func (a *beaconCancelIntentAdapter) SubmitAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
+	return beacon.SchedulerQueryResult{}, nil
+}
+
+func (a *beaconCancelIntentAdapter) CancelAllocation(_ context.Context, req beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
+	a.cancels++
+	return beacon.SchedulerQueryResult{ProviderJobID: req.ProviderIdentity.ProviderJobID, RawState: "CA", Reason: "cancel_requested"}, nil
+}
+
+func TestTeamsBeaconReconcileRetriesPendingCancelIntent(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		st.Allocations["req-1"] = beacon.AllocationRequest{
+			ID:                "req-1",
+			ConversationID:    "s001",
+			TurnID:            "turn-1",
+			Profile:           "gpu",
+			Provider:          beacon.ProviderSlurm,
+			State:             beacon.AllocationNeedsAttention,
+			DeterministicName: "cxp-req-1",
+			ProviderIdentity:  beacon.ProviderIdentity{ProviderJobID: "slurm-1"},
+			CancelRequestedAt: time.Unix(1, 0),
+			CancelReason:      "adapter was missing earlier",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed cancel intent: %v", err)
+	}
+	adapter := &beaconCancelIntentAdapter{}
+	bridge := newBridgeTestBridge(nil, newBridgeTestStore(t), &recordingExecutor{})
+	if err := bridge.reconcileBeaconState(context.Background(), store, adapter, time.Unix(2, 0)); err != nil {
+		t.Fatalf("reconcile beacon state: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load beacon state: %v", err)
+	}
+	if adapter.cancels != 1 || st.Allocations["req-1"].State != beacon.AllocationCanceled {
+		t.Fatalf("cancel intent was not retried cleanly: cancels=%d allocation=%#v", adapter.cancels, st.Allocations["req-1"])
+	}
+}
+
+func TestTeamsBeaconReconcileDoesNotCancelSharedDetachWhileJobStarted(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	now := time.Unix(2, 0)
+	if err := store.Update(func(st *beacon.State) error {
+		st.Conversations["s001"] = beacon.Conversation{ID: "s001", Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}}
+		st.Conversations["s002"] = beacon.Conversation{ID: "s002", Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}}
+		st.Allocations["req-a"] = beacon.AllocationRequest{
+			ID:                "req-a",
+			ConversationID:    "s001",
+			TurnID:            "turn-a",
+			Profile:           "gpu",
+			Provider:          beacon.ProviderSlurm,
+			State:             beacon.AllocationRunning,
+			DeterministicName: "cxp-req-a",
+			ProviderIdentity:  beacon.ProviderIdentity{ProviderJobID: "slurm-1"},
+			DetachRequestedAt: now,
+			DetachReason:      "released from Teams Work chat",
+		}
+		st.Allocations["req-b"] = beacon.AllocationRequest{
+			ID:                "req-b",
+			ConversationID:    "s002",
+			TurnID:            "turn-b",
+			Profile:           "gpu",
+			Provider:          beacon.ProviderSlurm,
+			State:             beacon.AllocationRunning,
+			DeterministicName: "cxp-req-b",
+			ProviderIdentity:  beacon.ProviderIdentity{ProviderJobID: "slurm-1"},
+		}
+		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(beacon.LeaseAccepting), Chats: []string{"s001", "s002"}, Jobs: []string{"job-a"}}
+		st.JobAttempts["job-a"] = beacon.JobAttempt{ID: "job-a", RequestID: "req-a", TurnID: "turn-a", Phase: beacon.JobStarted}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed detach intent: %v", err)
+	}
+	adapter := &beaconCancelIntentAdapter{}
+	bridge := newBridgeTestBridge(nil, newBridgeTestStore(t), &recordingExecutor{})
+	if err := bridge.reconcileBeaconState(context.Background(), store, adapter, now.Add(time.Minute)); err != nil {
+		t.Fatalf("reconcile beacon state: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load beacon state: %v", err)
+	}
+	if adapter.cancels != 0 {
+		t.Fatalf("shared detach with started work must not cancel provider job, cancels=%d", adapter.cancels)
+	}
+	if req := st.Allocations["req-a"]; req.State != beacon.AllocationRunning || !req.CancelRequestedAt.IsZero() || req.DetachRequestedAt.IsZero() {
+		t.Fatalf("detach allocation mutated incorrectly: %#v", req)
+	}
+	if got := strings.Join(st.Machines["machine-1"].Chats, ","); got != "s001,s002" {
+		t.Fatalf("active detach should not remove chat before job drains, got %q", got)
 	}
 }
 

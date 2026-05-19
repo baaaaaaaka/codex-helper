@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -578,6 +579,29 @@ func MachineStatusNotice(m Machine) BeaconNotice {
 	if len(p.Jobs) > 0 {
 		what = append(what, fmt.Sprintf("Jobs currently associated with this machine: %s.", strings.Join(p.Jobs, ", ")))
 	}
+	if strings.TrimSpace(m.Bootstrap.NodeList) != "" {
+		what = append(what, "Scheduler node list: `"+m.Bootstrap.NodeList+"`.")
+	}
+	details := []NoticeDetail{
+		{"machine", firstNonEmpty(p.MachineID, m.ID)},
+		{"lease", p.LeaseID},
+		{"provider_job", p.ProviderJobID},
+		{"profile", m.Profile},
+		{"state", m.State},
+		{"host", m.Host},
+		{"chats", strings.Join(p.Chats, ",")},
+		{"jobs", strings.Join(p.Jobs, ",")},
+		{"node_list", m.Bootstrap.NodeList},
+		{"bootstrap_stdout", m.Bootstrap.StdoutPath},
+		{"bootstrap_stderr", m.Bootstrap.StderrPath},
+		{"shared_store", m.Bootstrap.SharedStorePath},
+		{"codex_path", m.Bootstrap.CodexPath},
+		{"cxp_path", m.Bootstrap.CXPPath},
+		{"worker_protocol", m.Bootstrap.ProtocolVersion},
+		{"last_heartbeat", formatNoticeTime(m.LastHeartbeat)},
+		{"lease_expires", formatNoticeTime(m.LeaseExpiresAt)},
+		{"kill_confirmation", p.Confirmation},
+	}
 	return BeaconNotice{
 		Title:        title,
 		WhatHappened: what,
@@ -588,21 +612,20 @@ func MachineStatusNotice(m Machine) BeaconNotice {
 			{"state", m.State},
 			{"provider_job", p.ProviderJobID},
 			{"host", m.Host},
+			{"node_list", m.Bootstrap.NodeList},
+			{"last_heartbeat", formatNoticeTime(m.LastHeartbeat)},
 		},
-		Doing: []string{"Keeping release safe by draining by default; hard kill requires explicit confirmation."},
-		Next:  []string{"Release drains by default. Hard kill requires the confirmation token shown in Details."},
-		Details: []NoticeDetail{
-			{"machine", firstNonEmpty(p.MachineID, m.ID)},
-			{"lease", p.LeaseID},
-			{"provider_job", p.ProviderJobID},
-			{"profile", m.Profile},
-			{"state", m.State},
-			{"host", m.Host},
-			{"chats", strings.Join(p.Chats, ",")},
-			{"jobs", strings.Join(p.Jobs, ",")},
-			{"kill_confirmation", p.Confirmation},
-		},
+		Doing:   []string{"Keeping release safe by draining by default; hard kill requires explicit confirmation."},
+		Next:    []string{"Release drains by default. Hard kill requires the confirmation token shown in Details."},
+		Details: details,
 	}
+}
+
+func formatNoticeTime(ts time.Time) string {
+	if ts.IsZero() {
+		return ""
+	}
+	return ts.Format(time.RFC3339)
 }
 
 func AllocationSummaryLines(st State) []string {
