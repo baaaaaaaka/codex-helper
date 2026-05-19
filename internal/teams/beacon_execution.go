@@ -143,6 +143,18 @@ func (b *Bridge) reconcileBeaconState(ctx context.Context, store *beacon.Store, 
 			return err
 		}
 	}
+	if cancelAdapter, ok := adapter.(beacon.AllocationCancelAdapter); ok {
+		current, err := store.Load()
+		if err != nil {
+			return err
+		}
+		for _, req := range beaconAllocationsWithoutDemand(current) {
+			_, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, cancelAdapter, "released automatically after beacon demand ended", false, now)
+			if cancelErr != nil && !beacon.IsProviderCommandNotConfigured(cancelErr) {
+				return cancelErr
+			}
+		}
+	}
 	return store.Update(func(st *beacon.State) error {
 		beacon.DrainStaleWorkerMachines(st, beaconReconcileStaleWorkerAfter, now)
 		beacon.RecoverStaleJobAttempts(st, beaconReconcileStaleJobAfter, now)
@@ -241,6 +253,65 @@ func beaconAllocationCannotProgress(plan beacon.TurnExecutionPlan) bool {
 		return true
 	}
 	return false
+}
+
+func beaconAllocationsWithoutDemand(st beacon.State) []beacon.AllocationRequest {
+	var out []beacon.AllocationRequest
+	for _, req := range st.Allocations {
+		if beaconAllocationStateDone(req.State) {
+			continue
+		}
+		if !beaconAllocationHasConversationDemand(st, req) {
+			out = append(out, req)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func beaconAllocationHasConversationDemand(st beacon.State, req beacon.AllocationRequest) bool {
+	profile := strings.TrimSpace(req.Profile)
+	revision := req.ProfileSnapshot.Revision
+	if revision <= 0 {
+		revision = req.Target.ProfileRevision
+	}
+	matches := func(snap beacon.TargetSnapshot) bool {
+		if strings.TrimSpace(snap.Target) != beacon.TargetBeacon {
+			return false
+		}
+		if strings.TrimSpace(snap.Profile) != profile {
+			return false
+		}
+		return revision <= 0 || snap.ProfileRevision <= 0 || snap.ProfileRevision == revision
+	}
+	for _, conv := range st.Conversations {
+		if matches(conv.Current) {
+			return true
+		}
+		if conv.Pending != nil && matches(*conv.Pending) {
+			return true
+		}
+		for _, queued := range conv.Queued {
+			if matches(queued.Snapshot) {
+				return true
+			}
+		}
+	}
+	for _, snap := range st.TurnTargets {
+		if matches(snap) {
+			return true
+		}
+	}
+	return false
+}
+
+func beaconAllocationStateDone(state beacon.AllocationState) bool {
+	switch state {
+	case beacon.AllocationCanceled, beacon.AllocationExpired, beacon.AllocationFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Bridge) reconcileBeaconTurnAllocation(ctx context.Context, store *beacon.Store, plan beacon.TurnExecutionPlan) (beacon.TurnExecutionPlan, error) {

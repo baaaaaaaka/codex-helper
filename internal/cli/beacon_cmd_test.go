@@ -15,6 +15,7 @@ import (
 func TestBeaconProfileCLIWorkflow(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	configPath := filepath.Join(t.TempDir(), "config.json")
+	adapter := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-doctor raw_state=PD reason=doctor`)
 
 	out, err := runBeaconRootCommand(t,
 		"--config", configPath,
@@ -26,6 +27,10 @@ func TestBeaconProfileCLIWorkflow(t *testing.T) {
 		"--partition", "interactive",
 		"--image", "image.sqsh",
 		"--duration", "4",
+		"--query-command", adapter,
+		"--submit-command", adapter,
+		"--cancel-command", adapter,
+		"--renew-command", adapter,
 	)
 	if err != nil {
 		t.Fatalf("profile create: %v\n%s", err, out)
@@ -113,7 +118,8 @@ func TestBeaconCLIRejectsDraftSwitchAndShowsStatus(t *testing.T) {
 func TestBeaconCLILSFQueueOnlyProfileCanBecomeReady(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	configPath := filepath.Join(t.TempDir(), "config.json")
-	if _, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "create", "lsf", "--provider", "lsf", "--queue", "o_pri_interactive"); err != nil {
+	adapter := writeBeaconCLIProviderFixture(t, `provider_job_id=lsf-doctor raw_state=PEND reason=doctor`)
+	if _, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "create", "lsf", "--provider", "lsf", "--queue", "o_pri_interactive", "--query-command", adapter, "--submit-command", adapter, "--cancel-command", adapter, "--renew-command", adapter); err != nil {
 		t.Fatalf("create lsf profile: %v", err)
 	}
 	if _, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "doctor", "lsf"); err != nil {
@@ -279,6 +285,7 @@ func TestBeaconCLIProfileListResolvesExistingProxyProfile(t *testing.T) {
 	if err := cfgStore.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{{ID: "jump-a", Name: "jump-a"}}}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
+	adapter := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-doctor raw_state=PD reason=doctor`)
 	if _, err := runBeaconRootCommand(t,
 		"--config", configPath,
 		"beacon", "--store", storePath,
@@ -291,6 +298,10 @@ func TestBeaconCLIProfileListResolvesExistingProxyProfile(t *testing.T) {
 		"--partition", "interactive",
 		"--image", "image.sqsh",
 		"--duration", "4",
+		"--query-command", adapter,
+		"--submit-command", adapter,
+		"--cancel-command", adapter,
+		"--renew-command", adapter,
 	); err != nil {
 		t.Fatalf("create profile: %v", err)
 	}
@@ -332,7 +343,7 @@ func TestBeaconMachineCLIReleaseAndKillPreview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("machine status: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "kill_confirmation=KILL-lease-1") || !strings.Contains(out, "jobs=job-1") {
+	if !strings.Contains(out, "kill_confirmation: `KILL-lease-1`") || !strings.Contains(out, "jobs: `job-1`") {
 		t.Fatalf("machine status output = %s", out)
 	}
 	out, err = runBeaconRootCommand(t, "beacon", "--store", storePath, "machine", "release", "gpu-a")
@@ -418,7 +429,7 @@ func TestBeaconAllocationCLIListStatusAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocation status: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "Beacon allocation: "+req.ID) || !strings.Contains(out, "deterministic_name="+req.DeterministicName) {
+	if !strings.Contains(out, "Beacon allocation: "+req.ID) || !strings.Contains(out, "deterministic_name: `"+req.DeterministicName+"`") {
 		t.Fatalf("allocation status output = %s", out)
 	}
 
@@ -427,7 +438,7 @@ func TestBeaconAllocationCLIListStatusAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocation reconcile: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "Beacon allocation reconcile: adopt_existing") || !strings.Contains(out, "provider_job=slurm-777") {
+	if !strings.Contains(out, "Beacon allocation reconcile: adopt_existing") || !strings.Contains(out, "provider_job: `slurm-777`") {
 		t.Fatalf("allocation reconcile output = %s", out)
 	}
 	st, err = store.Load()
@@ -444,6 +455,8 @@ func TestBeaconProfileAdapterCommandsDriveAllocationReconcileWithoutHelperEnv(t 
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	query := writeBeaconCLIProviderFixture(t, `durable_negative=true`)
 	submit := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-profile raw_state=PD reason=submitted-from-profile`)
+	cancel := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-profile raw_state=CA reason=canceled`)
+	renew := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-profile raw_state=R reason=renewed`)
 
 	out, err := runBeaconRootCommand(t,
 		"--config", configPath,
@@ -457,6 +470,8 @@ func TestBeaconProfileAdapterCommandsDriveAllocationReconcileWithoutHelperEnv(t 
 		"--duration", "4",
 		"--query-command", query,
 		"--submit-command", submit,
+		"--cancel-command", cancel,
+		"--renew-command", renew,
 	)
 	if err != nil {
 		t.Fatalf("profile create: %v\n%s", err, out)
@@ -486,7 +501,7 @@ func TestBeaconProfileAdapterCommandsDriveAllocationReconcileWithoutHelperEnv(t 
 	if err != nil {
 		t.Fatalf("allocation reconcile with profile adapter: %v\n%s", err, out)
 	}
-	for _, want := range []string{"Beacon allocation reconcile: submit", "provider_job=slurm-profile"} {
+	for _, want := range []string{"Beacon allocation reconcile: submit", "provider_job: `slurm-profile`"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("reconcile output missing %q:\n%s", want, out)
 		}

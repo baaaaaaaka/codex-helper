@@ -120,11 +120,12 @@ Local cxp beacon commands:
 - cxp beacon profile history <name>, cxp beacon profile rollback <name> <revision>, and cxp beacon profile gc <name>: inspect, restore, and safely prune profile revisions
 - cxp beacon profile create <name> --provider lsf --queue <queue>: create an LSF draft profile
 - cxp beacon profile create <name> --provider local: create a local draft profile
-- cxp beacon profile doctor <name> then cxp beacon profile confirm <name>: make a draft profile ready
+- cxp beacon profile doctor <name>: validate profile fields and query/submit/cancel/renew adapters
+- cxp beacon profile confirm <name>: confirm a reviewed profile so it can be selected
 - cxp beacon profile status <name> and cxp beacon status --session <id>: inspect profile or target state
 - cxp beacon switch-profile <name> --session <id>: switch a conversation target after the profile is ready
 - cxp beacon switch-profile <name> --session <id> --after-current-turn: defer a switch so an active Codex turn can finish before future turns use the new profile
-- cxp beacon release <profile|allocation|provider-job|machine>: release a beacon resource without requiring the user to know its internal object type
+- cxp beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]: preview and release a beacon resource without requiring the user to know its internal object type
 
 Reply in the user's language. Keep the answer concise and practical.
 If the user appears to want one of the helper workflows, tell them the exact command to send.
@@ -215,11 +216,12 @@ func defaultControlFallbackHelpDigest() string {
 		"`cxp beacon profile update <name> ...` - create a new profile revision without breaking bound Work chats",
 		"`cxp beacon profile history <name>` / `rollback <name> <revision>` / `gc <name>` - inspect, restore, and prune profile revisions",
 		"`cxp beacon profile create <name> --provider lsf --queue <queue>` - create an LSF draft profile",
-		"`cxp beacon profile doctor <name>` then `cxp beacon profile confirm <name>` - mark a draft profile checked and ready",
+		"`cxp beacon profile doctor <name>` - validate profile fields and provider adapters",
+		"`cxp beacon profile confirm <name>` - confirm a reviewed profile",
 		"`cxp beacon profile status <name>` / `cxp beacon profile list` - inspect beacon profiles",
 		"`cxp beacon switch-profile <name> --session <id>` - switch a conversation target after the profile is ready",
 		"`cxp beacon switch-profile <name> --session <id> --after-current-turn` - defer a beacon switch until the active Codex turn finishes",
-		"`cxp beacon release <profile|allocation|provider-job|machine>` - release a beacon resource",
+		"`cxp beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]` - preview and release a beacon resource",
 		"Beacon execution profiles are separate from SSH proxy profiles; do not use `cxp proxy` for beacon profile setup.",
 		"",
 		"Work chat quick help:",

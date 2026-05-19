@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -59,6 +60,31 @@ type ReleaseResult struct {
 	Preview ReleasePreview
 }
 
+type AllocationReleasePreview struct {
+	Scope                string
+	Ref                  string
+	Force                bool
+	Allocations          []AllocationReleaseItem
+	AffectedChats        []string
+	QueuedTurns          []string
+	RunningTurns         []string
+	RequiresConfirmation bool
+	Confirmation         string
+}
+
+type AllocationReleaseItem struct {
+	AllocationID string
+	Profile      string
+	State        AllocationState
+	Provider     Provider
+	ProviderJob  string
+	Action       string
+	Machines     []string
+	Chats        []string
+	QueuedTurns  []string
+	RunningTurns []string
+}
+
 func PreviewRelease(m Machine) ReleasePreview {
 	token := "KILL-" + strings.TrimSpace(m.LeaseID)
 	return ReleasePreview{
@@ -90,6 +116,160 @@ func DecideRelease(m Machine, in ReleaseInput) (ReleaseResult, error) {
 		return ReleaseResult{Action: "reject_confirmation", Preview: preview}, nil
 	}
 	return ReleaseResult{Action: "kill_quarantine", Preview: preview}, nil
+}
+
+func PreviewAllocationRelease(st State, scope string, ref string, allocations []AllocationRequest, force bool) AllocationReleasePreview {
+	st.normalize()
+	preview := AllocationReleasePreview{
+		Scope: strings.TrimSpace(scope),
+		Ref:   strings.TrimSpace(ref),
+		Force: force,
+	}
+	for _, req := range allocations {
+		item := AllocationReleaseItem{
+			AllocationID: strings.TrimSpace(req.ID),
+			Profile:      strings.TrimSpace(req.Profile),
+			State:        req.State,
+			Provider:     req.Provider,
+			ProviderJob:  strings.TrimSpace(firstNonEmpty(req.ProviderIdentity.ProviderJobID, req.Target.ProviderJobID)),
+			Action:       allocationReleasePreviewAction(st, req, force),
+		}
+		item.Machines = allocationReleaseMachines(st, req)
+		item.Chats = allocationReleaseChats(st, req)
+		item.QueuedTurns, item.RunningTurns = allocationReleaseTurns(st, req)
+		preview.Allocations = append(preview.Allocations, item)
+		preview.AffectedChats = append(preview.AffectedChats, item.Chats...)
+		preview.QueuedTurns = append(preview.QueuedTurns, item.QueuedTurns...)
+		preview.RunningTurns = append(preview.RunningTurns, item.RunningTurns...)
+		if force || len(item.Chats) > 1 {
+			preview.RequiresConfirmation = true
+		}
+	}
+	preview.AffectedChats = uniqueSortedStrings(preview.AffectedChats)
+	preview.QueuedTurns = uniqueSortedStrings(preview.QueuedTurns)
+	preview.RunningTurns = uniqueSortedStrings(preview.RunningTurns)
+	if len(preview.AffectedChats) > 1 {
+		preview.RequiresConfirmation = true
+	}
+	if preview.RequiresConfirmation {
+		preview.Confirmation = AllocationReleaseConfirmationToken(preview)
+	}
+	return preview
+}
+
+func AllocationReleaseConfirmationToken(preview AllocationReleasePreview) string {
+	var parts []string
+	parts = append(parts,
+		"scope="+preview.Scope,
+		"ref="+preview.Ref,
+		"force="+strconv.FormatBool(preview.Force),
+	)
+	for i, item := range preview.Allocations {
+		prefix := "allocation[" + strconv.Itoa(i) + "]."
+		parts = append(parts,
+			prefix+"id="+item.AllocationID,
+			prefix+"profile="+item.Profile,
+			prefix+"state="+string(item.State),
+			prefix+"provider="+string(item.Provider),
+			prefix+"provider_job="+item.ProviderJob,
+			prefix+"action="+item.Action,
+			prefix+"machines="+strings.Join(item.Machines, ","),
+			prefix+"chats="+strings.Join(item.Chats, ","),
+			prefix+"queued="+strings.Join(item.QueuedTurns, ","),
+			prefix+"running="+strings.Join(item.RunningTurns, ","),
+		)
+	}
+	sort.Strings(parts)
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "RELEASE-" + strings.ToUpper(fmt.Sprintf("%x", sum[:6]))
+}
+
+func allocationReleasePreviewAction(st State, req AllocationRequest, force bool) string {
+	if allocationStateTerminal(req.State) {
+		return "none"
+	}
+	if allocationHasActiveStartedJob(st, req.ID) && !force {
+		return "drain"
+	}
+	if strings.TrimSpace(firstNonEmpty(req.ProviderIdentity.ProviderJobID, req.Target.ProviderJobID)) != "" && req.Provider != ProviderLocal {
+		return "cancel_provider_job"
+	}
+	return "cancel_allocation"
+}
+
+func allocationReleaseMachines(st State, req AllocationRequest) []string {
+	providerJobID, leaseID, ok := allocationMachineMatchKeys(req)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, machine := range st.Machines {
+		if strings.TrimSpace(providerJobID) != "" && strings.TrimSpace(machine.ProviderJobID) != strings.TrimSpace(providerJobID) {
+			continue
+		}
+		if strings.TrimSpace(providerJobID) == "" && strings.TrimSpace(machine.LeaseID) != leaseID {
+			continue
+		}
+		out = append(out, firstNonEmpty(machine.ID, machine.LeaseID, machine.ProviderJobID))
+	}
+	return uniqueSortedStrings(out)
+}
+
+func allocationReleaseChats(st State, req AllocationRequest) []string {
+	out := []string{strings.TrimSpace(req.ConversationID)}
+	providerJobID, leaseID, ok := allocationMachineMatchKeys(req)
+	if ok {
+		for _, machine := range st.Machines {
+			if strings.TrimSpace(providerJobID) != "" && strings.TrimSpace(machine.ProviderJobID) != strings.TrimSpace(providerJobID) {
+				continue
+			}
+			if strings.TrimSpace(providerJobID) == "" && strings.TrimSpace(machine.LeaseID) != leaseID {
+				continue
+			}
+			out = append(out, machine.Chats...)
+		}
+	}
+	return uniqueSortedStrings(out)
+}
+
+func allocationReleaseTurns(st State, req AllocationRequest) (queued []string, running []string) {
+	for _, job := range st.JobAttempts {
+		if strings.TrimSpace(job.RequestID) != strings.TrimSpace(req.ID) {
+			continue
+		}
+		id := firstNonEmpty(job.TurnID, job.ID)
+		switch job.Phase {
+		case JobQueued, JobClaimed, JobStartIntent:
+			queued = append(queued, id)
+		case JobStarted, JobAmbiguous:
+			running = append(running, id)
+		}
+	}
+	for _, conv := range st.Conversations {
+		for _, turn := range conv.Queued {
+			if strings.TrimSpace(turn.Snapshot.Profile) == strings.TrimSpace(req.Profile) {
+				queued = append(queued, turn.ID)
+			}
+		}
+	}
+	return uniqueSortedStrings(queued), uniqueSortedStrings(running)
+}
+
+func uniqueSortedStrings(values []string) []string {
+	set := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		set[value] = struct{}{}
+	}
+	out := make([]string, 0, len(set))
+	for value := range set {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type UpgradeOperation string

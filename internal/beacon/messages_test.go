@@ -20,16 +20,18 @@ func TestTurnStartFailureNoticeProviderAdapterMissingIsActionable(t *testing.T) 
 	msg := TurnStartFailureNotice(plan, err).Render()
 	for _, want := range []string{
 		"Beacon cannot start: Slurm provider adapter is not configured.",
-		"What happened:",
+		"Summary:",
 		"This Work chat targets `beacon:fgx_dev`.",
 		"explicit beacon targets disable local fallback",
-		"Next:",
+		"State:",
+		"allocation: `req-b7ae`",
+		"What cxp is doing:",
+		"Action needed:",
 		"CODEX_HELPER_BEACON_SLURM_QUERY",
 		"helper reload now",
 		"Details:",
-		"error_code=BEACON_PROVIDER_ADAPTER_NOT_CONFIGURED",
-		"allocation=req-b7ae",
-		"provider_job=<none>",
+		"error_code: `BEACON_PROVIDER_ADAPTER_NOT_CONFIGURED`",
+		"provider_job: `<none>`",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("notice missing %q:\n%s", want, msg)
@@ -38,8 +40,8 @@ func TestTurnStartFailureNoticeProviderAdapterMissingIsActionable(t *testing.T) 
 	if strings.Contains(msg, "beacon allocation is not ready") {
 		t.Fatalf("notice should not use vague legacy wording:\n%s", msg)
 	}
-	if strings.Index(msg, "Next:") > strings.Index(msg, "Details:") {
-		t.Fatalf("next steps should appear before technical details:\n%s", msg)
+	if strings.Index(msg, "Action needed:") > strings.Index(msg, "Details:") {
+		t.Fatalf("action steps should appear before technical details:\n%s", msg)
 	}
 }
 
@@ -69,8 +71,8 @@ func TestConversationStatusNoticePendingSchedulerSeparatesNextAndDetails(t *test
 		"Current target: `beacon:gpu`.",
 		"Allocation `req-1`, profile `gpu`, provider Slurm, state `submitted`, provider job `slurm-1`, provider state `PD`, reason `Resources`.",
 		"No action is needed yet.",
-		"status_code=BEACON_SCHEDULER_PENDING",
-		"provider_reason=Resources",
+		"status_code: `BEACON_SCHEDULER_PENDING`",
+		"provider_reason: `Resources`",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("status notice missing %q:\n%s", want, msg)
@@ -92,13 +94,13 @@ func TestRenderBeaconErrorUsesNoticeShape(t *testing.T) {
 	})
 	for _, want := range []string{
 		"Beacon needs attention: bootstrap.",
-		"What happened:",
-		"Next:",
-		"phase=bootstrap",
-		"target=beacon:gpu",
-		"provider_reason=missing shared root",
-		"retry=unsafe",
-		"next=beacon status --job job-1",
+		"Summary:",
+		"Action needed:",
+		"phase: `bootstrap`",
+		"target: `beacon:gpu`",
+		"provider_reason: `missing shared root`",
+		"retry: `unsafe`",
+		"next: `beacon status --job job-1`",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error notice missing %q:\n%s", want, msg)

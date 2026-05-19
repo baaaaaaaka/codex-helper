@@ -44,14 +44,14 @@ Beacon profiles describe where future Codex work executes. Create and confirm a 
 - `cxp beacon profile create <name> --provider local`: create a local draft profile.
 - `cxp beacon profile create <name> ... --proxy ssh_profile --proxy-profile <existing-proxy>`: attach an existing SSH proxy profile when the beacon job needs that network route.
 - `cxp beacon profile create <name> ... --isolation shared|exclusive`: set the default lease sharing mode.
-- `cxp beacon profile doctor <name>`: mark the profile's local doctor check successful.
+- `cxp beacon profile doctor <name>`: validate profile fields and the query/submit/cancel/renew adapter commands visible to cxp.
 - `cxp beacon profile confirm <name>`: confirm a reviewed profile so it can be used.
 - `cxp beacon profile status <name>`: inspect one profile.
 - `cxp beacon status --session <session-id>`: inspect a conversation's current, pending, and queued target state.
 - `cxp beacon switch-profile <name> --session <session-id>`: switch immediately when no Codex work is queued or running.
 - `cxp beacon switch-profile <name> --session <session-id> --after-current-turn`: defer the switch so the current Codex turn stays on its existing target and future turns use the new profile.
 - `cxp beacon switch-profile <name> --session <session-id> --fork`: fork when the target execution signature is incompatible and the user accepts the fork.
-- `cxp beacon release <profile|allocation|provider-job|machine>`: manually release a beacon resource. In Teams Work chat, `beacon release` releases the current chat's resource while leaving the profile binding unchanged.
+- `cxp beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]`: preview and release a beacon resource. In Teams Work chat, `beacon release` releases the current chat's resource when safe; shared resources show a confirmation preview.
 - `cxp beacon allocation list`: list managed allocation requests.
 - `cxp beacon allocation status <allocation-or-provider-job>`: inspect one allocation request.
 - `cxp beacon allocation cancel <allocation-or-provider-job>`: cancel one managed allocation through the configured provider adapter.

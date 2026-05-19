@@ -24,7 +24,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp beacon profile confirm <name>`",
 		"`cxp beacon switch-profile <name> --session <id>`",
 		"`cxp beacon switch-profile <name> --session <id> --after-current-turn`",
-		"`cxp beacon release <profile|allocation|provider-job|machine>`",
+		"`cxp beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]`",
 		"`cxp beacon allocation list|status|cancel|reconcile`",
 		"`cxp beacon allocation reconcile-all`",
 		"`cxp beacon provider template slurm|lsf`",

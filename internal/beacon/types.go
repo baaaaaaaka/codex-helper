@@ -39,8 +39,29 @@ type Profile struct {
 	Confirmed         bool                  `json:"confirmed"`
 	ProviderPreviewOK bool                  `json:"provider_preview_ok"`
 	DoctorOK          bool                  `json:"doctor_ok"`
+	DoctorReport      ProfileDoctorReport   `json:"doctor_report,omitempty"`
+	Archived          bool                  `json:"archived,omitempty"`
+	ArchivedAt        time.Time             `json:"archived_at,omitempty"`
 	CreatedAt         time.Time             `json:"created_at,omitempty"`
 	UpdatedAt         time.Time             `json:"updated_at,omitempty"`
+}
+
+type ProfileDoctorReport struct {
+	CheckedAt  time.Time                `json:"checked_at,omitempty"`
+	Provider   Provider                 `json:"provider,omitempty"`
+	Passed     bool                     `json:"passed"`
+	Issues     []string                 `json:"issues,omitempty"`
+	Operations []ProfileDoctorOperation `json:"operations,omitempty"`
+}
+
+type ProfileDoctorOperation struct {
+	Operation   string `json:"operation,omitempty"`
+	Source      string `json:"source,omitempty"`
+	Command     string `json:"command,omitempty"`
+	EnvName     string `json:"env_name,omitempty"`
+	ProfileFlag string `json:"profile_flag,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 type SlurmProfile struct {

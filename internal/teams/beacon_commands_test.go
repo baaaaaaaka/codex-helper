@@ -25,7 +25,9 @@ func TestTeamsBeaconControlProfileLifecycleAndList(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 
 	ctx := context.Background()
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessageWithText("beacon-create", "beacon profile create gpu --provider slurm --partition interactive --image image.sqsh --nodes 1 --gpu 1 --duration 4"), "beacon profile create gpu --provider slurm --partition interactive --image image.sqsh --nodes 1 --gpu 1 --duration 4"); err != nil {
+	adapter := writeBeaconProviderFixture(t, "provider_job_id=slurm-doctor raw_state=PD reason=doctor")
+	create := "beacon profile create gpu --provider slurm --partition interactive --image image.sqsh --nodes 1 --gpu 1 --duration 4 --query-command " + adapter + " --submit-command " + adapter + " --cancel-command " + adapter + " --renew-command " + adapter
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessageWithText("beacon-create", create), create); err != nil {
 		t.Fatalf("create profile: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessageWithText("beacon-doctor", "beacon profile doctor gpu"), "beacon profile doctor gpu"); err != nil {
@@ -39,7 +41,7 @@ func TestTeamsBeaconControlProfileLifecycleAndList(t *testing.T) {
 	}
 
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Created beacon profile \"gpu\"", "Confirmed beacon profile \"gpu\"", "Beacon list", "Profiles:", "gpu: ready", "Machines:"} {
+	for _, want := range []string{"Created beacon profile \"gpu\"", "Profile gpu doctor passed", "Confirmed beacon profile \"gpu\"", "Beacon list", "Profiles:", "gpu: ready", "Machines:"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon output missing %q:\n%s", want, joined)
 		}
@@ -72,7 +74,7 @@ func TestTeamsBeaconNewWorkChatAndWorkSwitch(t *testing.T) {
 	}
 
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Execution target: beacon:gpu", "Beacon status", "Current target: beacon:gpu", "profile=gpu", "Switched this Work chat to beacon:cpu"} {
+	for _, want := range []string{"Execution target: beacon:gpu", "Beacon status", "Current target: beacon:gpu", "profile: gpu", "Switched this Work chat to beacon:cpu"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon work output missing %q:\n%s", want, joined)
 		}
@@ -133,7 +135,7 @@ func TestTeamsBeaconTurnDoesNotFallBackToLocalExecutor(t *testing.T) {
 		t.Fatalf("failed pre-start beacon turn should not leave a queued turn snapshot, queued=%#v", queued)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Beacon cannot start", "Slurm provider adapter is not configured", "explicit beacon targets disable local fallback", "error_code=BEACON_PROVIDER_ADAPTER_NOT_CONFIGURED", "allocation=req-"} {
+	for _, want := range []string{"Beacon cannot start", "Slurm provider adapter is not configured", "explicit beacon targets disable local fallback", "error_code: `BEACON_PROVIDER_ADAPTER_NOT_CONFIGURED`", "allocation: `req-"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("beacon failure response missing %q:\n%s", want, joined)
 		}
@@ -525,6 +527,12 @@ func TestTeamsBeaconWorkSwitchLocalImmediateAndPending(t *testing.T) {
 	}
 	if err := beaconStore.Update(func(st *beacon.State) error {
 		st.Conversations["s001"] = beacon.Conversation{ID: "s001", Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}}
+		req, _, err := beacon.EnsureAllocationRequest(st, "s001", "turn-local-release", st.Conversations["s001"].Current, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.State = beacon.AllocationRunning
+		st.Allocations[req.ID] = req
 		return nil
 	}); err != nil {
 		t.Fatalf("seed beacon conversation: %v", err)
@@ -537,10 +545,28 @@ func TestTeamsBeaconWorkSwitchLocalImmediateAndPending(t *testing.T) {
 	if conv := st.Conversations["s001"]; conv.Current.Target != beacon.TargetLocal || conv.Pending != nil {
 		t.Fatalf("idle local switch conversation = %#v, want current local with no pending", conv)
 	}
+	var released bool
+	for _, req := range st.Allocations {
+		if req.ConversationID == "s001" && req.State == beacon.AllocationCanceled {
+			released = true
+		}
+	}
+	if !released {
+		t.Fatalf("switch local should release old allocation, allocations=%#v", st.Allocations)
+	}
 
 	pending := appendBridgeTestSession(t, bridge, store, "s002", "chat-2")
+	var runningReqID string
 	if err := beaconStore.Update(func(st *beacon.State) error {
-		st.Conversations[pending.ID] = beacon.Conversation{ID: pending.ID, Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}}
+		current := beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}
+		st.Conversations[pending.ID] = beacon.Conversation{ID: pending.ID, Current: current}
+		req, _, err := beacon.EnsureAllocationRequest(st, pending.ID, "turn-running-local", current, time.Unix(2, 0))
+		if err != nil {
+			return err
+		}
+		req.State = beacon.AllocationRunning
+		st.Allocations[req.ID] = req
+		runningReqID = req.ID
 		return nil
 	}); err != nil {
 		t.Fatalf("seed pending beacon conversation: %v", err)
@@ -565,6 +591,88 @@ func TestTeamsBeaconWorkSwitchLocalImmediateAndPending(t *testing.T) {
 	}
 	if conv.Pending == nil || conv.Pending.Target != beacon.TargetLocal {
 		t.Fatalf("running local switch pending target = %#v, want local", conv.Pending)
+	}
+	if st.Allocations[runningReqID].State != beacon.AllocationRunning {
+		t.Fatalf("pending local switch must not release the active allocation early: %#v", st.Allocations[runningReqID])
+	}
+}
+
+func TestTeamsBeaconWorkReleaseSharedResourceRequiresPreviewConfirmation(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	seedTeamsBeaconProfile(t, "gpu")
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	var requestID string
+	if err := store.Update(func(st *beacon.State) error {
+		conv := beacon.Conversation{ID: "s001", Current: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}}
+		st.Conversations["s001"] = conv
+		req, _, err := beacon.EnsureAllocationRequest(st, "s001", "turn-1", conv.Current, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.State = beacon.AllocationRunning
+		req.ProviderIdentity.ProviderJobID = "slurm-shared"
+		st.Allocations[req.ID] = req
+		requestID = req.ID
+		st.Machines["shared-a"] = beacon.Machine{ID: "shared-a", LeaseID: "lease-shared", ProviderJobID: "slurm-shared", Profile: "gpu", State: string(beacon.LeaseAccepting), Chats: []string{"s001", "s002"}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed shared allocation: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, newBridgeTestStore(t), &recordingExecutor{})
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("work-release-shared", "beacon release"), "beacon release"); err != nil {
+		t.Fatalf("work release shared: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Beacon release preview", "affected chats: s001,s002", "confirm RELEASE-"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("shared release preview missing %q:\n%s", want, joined)
+		}
+	}
+	st := loadTeamsBeaconState(t)
+	if st.Allocations[requestID].State == beacon.AllocationCanceled {
+		t.Fatalf("shared release without confirmation should not cancel allocation: %#v", st.Allocations[requestID])
+	}
+}
+
+func TestTeamsBeaconReconcileReleasesAllocationWithNoConversationDemand(t *testing.T) {
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
+	store, err := beacon.NewStore("")
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	var requestID string
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{Name: "gpu", Provider: beacon.ProviderLocal, ProxyMode: beacon.ProxyNone, ProviderPreviewOK: true, DoctorOK: true, Confirmed: true}
+		req, _, err := beacon.EnsureAllocationRequest(st, "s001", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.Provider = beacon.ProviderLocal
+		req.State = beacon.AllocationRunning
+		st.Allocations[req.ID] = req
+		requestID = req.ID
+		st.Conversations["s001"] = beacon.Conversation{ID: "s001", Current: beacon.TargetSnapshot{Target: beacon.TargetLocal}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale demand: %v", err)
+	}
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, newBridgeTestStore(t), &recordingExecutor{})
+	if err := bridge.reconcileBeaconState(context.Background(), store, beacon.NewCommandProviderAdapterFromEnv(nil), time.Unix(2, 0)); err != nil {
+		t.Fatalf("reconcile beacon state: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load beacon state: %v", err)
+	}
+	if st.Allocations[requestID].State != beacon.AllocationCanceled {
+		t.Fatalf("allocation state = %s, want canceled", st.Allocations[requestID].State)
 	}
 }
 
@@ -924,13 +1032,13 @@ func TestTeamsControlCommandFormatsBeaconProviderAdapterErrors(t *testing.T) {
 	})
 	for _, want := range []string{
 		"Beacon command failed: Slurm provider adapter is not configured.",
-		"What happened:",
+		"Summary:",
 		"Profile `gpu` does not define `--query-command`",
-		"Next:",
+		"Action needed:",
 		"beacon profile update gpu --provider slurm ... --query-command <adapter-script>",
 		"does not require a helper reload",
 		"Details:",
-		"error_code=BEACON_PROVIDER_ADAPTER_NOT_CONFIGURED",
+		"error_code: `BEACON_PROVIDER_ADAPTER_NOT_CONFIGURED`",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("formatted provider adapter error missing %q:\n%s", want, msg)

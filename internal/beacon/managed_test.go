@@ -474,6 +474,35 @@ func TestRenderStatusKeepsLatestAllocationAfterTurnSnapshotCleanup(t *testing.T)
 	}
 }
 
+func TestRemoveTurnSnapshotPromotesPendingAfterCurrentTargetDrains(t *testing.T) {
+	var st State
+	st.Conversations = map[string]Conversation{
+		"conv": {
+			ID:      "conv",
+			Current: TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProfileRevision: 1},
+			Pending: &TargetSnapshot{Target: TargetBeacon, Profile: "cpu", ProfileRevision: 2},
+			Queued: []QueuedTurn{
+				{ID: "old-1", Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProfileRevision: 1}},
+				{ID: "old-2", Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProfileRevision: 1}},
+				{ID: "new-1", Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: "cpu", ProfileRevision: 2}},
+			},
+		},
+	}
+
+	RemoveTurnSnapshot(&st, "conv", "old-1", time.Unix(1, 0))
+	if conv := st.Conversations["conv"]; conv.Current.Profile != "gpu" || conv.Pending == nil {
+		t.Fatalf("pending target should wait for all current-target turns to drain: %#v", conv)
+	}
+	RemoveTurnSnapshot(&st, "conv", "old-2", time.Unix(2, 0))
+	conv := st.Conversations["conv"]
+	if conv.Current.Profile != "cpu" || conv.Current.ProfileRevision != 2 || conv.Pending != nil {
+		t.Fatalf("pending target should promote after current-target turns drain: %#v", conv)
+	}
+	if len(conv.Queued) != 1 || conv.Queued[0].ID != "new-1" {
+		t.Fatalf("future queued turn should be preserved during promotion: %#v", conv.Queued)
+	}
+}
+
 func TestBeaconErrorMessageContainsActionableFields(t *testing.T) {
 	msg := RenderBeaconError(BeaconErrorContext{
 		Phase:          "bootstrap",
@@ -486,7 +515,7 @@ func TestBeaconErrorMessageContainsActionableFields(t *testing.T) {
 		Retry:          "unsafe",
 		Next:           "beacon status --job job-1",
 	})
-	for _, want := range []string{"phase=bootstrap", "target=beacon:gpu", "provider_job=slurm-123", "provider_state=R", "provider_reason=missing shared root", "conversation=conv", "job=job-1", "retry=unsafe", "next=beacon status --job job-1"} {
+	for _, want := range []string{"phase: `bootstrap`", "target: `beacon:gpu`", "provider_job: `slurm-123`", "provider_state: `R`", "provider_reason: `missing shared root`", "conversation: `conv`", "job: `job-1`", "retry: `unsafe`", "next: `beacon status --job job-1`"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("message %q missing %q", msg, want)
 		}

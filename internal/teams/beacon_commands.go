@@ -147,11 +147,15 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 		normalized := normalizedBeaconCommand("profile doctor " + name)
 		return b.updateBeaconStateFromTeams(msg, idempotencyScope, normalized, "", func(st *beacon.State) (string, error) {
 			proxyExists := b.beaconProxyResolver()
-			p, err := beacon.DoctorProfile(st, name, time.Now(), proxyExists)
+			p, report, err := beacon.DoctorProfileWithInput(st, name, beacon.DoctorProfileInput{
+				Now:                 time.Now(),
+				ProxyExists:         proxyExists,
+				EnvProviderCommands: beacon.ProviderCommandConfigFromEnv(nil),
+			})
 			if err != nil {
 				return "", err
 			}
-			return formatBeaconProfileMutation("Doctor passed for", p, proxyExists), nil
+			return formatBeaconProfileDoctorResult(p, report, proxyExists), nil
 		})
 	case "confirm":
 		name, err := singleBeaconNameArg("beacon profile confirm", words[1:])
@@ -240,7 +244,7 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 			if err := beacon.DeleteProfile(st, name); err != nil {
 				return "", err
 			}
-			return fmt.Sprintf("Deleted beacon profile %q.", name), nil
+			return fmt.Sprintf("Archived beacon profile %q. Existing pinned turns can drain, but new turns cannot select it.", name), nil
 		})
 	default:
 		return "", fmt.Errorf("unknown beacon profile command %q; use list, create, update, history, rollback, gc, status, doctor, confirm, or delete", words[0])
@@ -365,18 +369,9 @@ func (b *Bridge) handleBeaconAllocationCommand(ctx context.Context, words []stri
 }
 
 func (b *Bridge) handleBeaconControlRelease(ctx context.Context, words []string) (string, error) {
-	if len(words) == 0 {
-		return "", fmt.Errorf("usage: `beacon release <profile|allocation|provider-job|machine>`")
-	}
-	ref := strings.TrimSpace(words[0])
-	force := false
-	for _, word := range words[1:] {
-		switch strings.ToLower(strings.TrimSpace(word)) {
-		case "--force":
-			force = true
-		default:
-			return "", fmt.Errorf("unknown beacon release flag %q", word)
-		}
+	ref, force, confirm, err := parseBeaconControlReleaseArgs(words)
+	if err != nil {
+		return "", err
 	}
 	store, err := beacon.NewStore("")
 	if err != nil {
@@ -391,7 +386,12 @@ func (b *Bridge) handleBeaconControlRelease(ctx context.Context, words []string)
 		if len(allocations) == 0 {
 			return "Beacon release\n\nNo active allocations are using profile `" + ref + "`.", nil
 		}
+		preview := beacon.PreviewAllocationRelease(st, "profile", ref, allocations, force)
+		if releaseConfirmationRequired(preview, confirm) {
+			return formatBeaconAllocationReleasePreview(preview), nil
+		}
 		var lines []string
+		lines = append(lines, formatBeaconAllocationReleasePreview(preview))
 		for _, req := range allocations {
 			res, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released profile "+ref+" from Teams control chat", force, time.Now())
 			lines = append(lines, formatBeaconAllocationCancelResult(res))
@@ -402,11 +402,15 @@ func (b *Bridge) handleBeaconControlRelease(ctx context.Context, words []string)
 		return strings.Join(lines, "\n\n"), nil
 	}
 	if req, ok := beacon.FindAllocationByRef(st, ref); ok {
+		preview := beacon.PreviewAllocationRelease(st, "allocation", ref, []beacon.AllocationRequest{req}, force)
+		if releaseConfirmationRequired(preview, confirm) {
+			return formatBeaconAllocationReleasePreview(preview), nil
+		}
 		res, err := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released from Teams control chat", force, time.Now())
 		if err != nil && strings.TrimSpace(res.Request.ID) == "" {
 			return "", err
 		}
-		return formatBeaconAllocationCancelResultWithError(res, err), nil
+		return formatBeaconAllocationReleasePreview(preview) + "\n\n" + formatBeaconAllocationCancelResultWithError(res, err), nil
 	}
 	var res beacon.ReleaseResult
 	if err := store.Update(func(st *beacon.State) error {
@@ -431,6 +435,10 @@ func (b *Bridge) handleBeaconWorkRelease(ctx context.Context, session *Session, 
 	if len(words) > 0 {
 		return "", fmt.Errorf("usage: `beacon release`")
 	}
+	return releaseBeaconConversationAllocations(ctx, session.ID, "released from Teams Work chat")
+}
+
+func releaseBeaconConversationAllocations(ctx context.Context, sessionID string, reason string) (string, error) {
 	store, err := beacon.NewStore("")
 	if err != nil {
 		return "", err
@@ -439,13 +447,18 @@ func (b *Bridge) handleBeaconWorkRelease(ctx context.Context, session *Session, 
 	if err != nil {
 		return "", err
 	}
-	allocations := beacon.AllocationsForConversation(st, session.ID)
+	allocations := beacon.AllocationsForConversation(st, sessionID)
 	if len(allocations) == 0 {
 		return "Beacon release\n\nNo active beacon allocation is attached to this Work chat. The profile binding is unchanged.", nil
 	}
+	preview := beacon.PreviewAllocationRelease(st, "work-chat", sessionID, allocations, false)
+	if releaseConfirmationRequired(preview, "") {
+		return formatBeaconAllocationReleasePreview(preview) + "\n\nThis shared resource is used by more than one chat. Use the control chat with the confirmation token if you want to release it for everyone.", nil
+	}
 	var lines []string
+	lines = append(lines, formatBeaconAllocationReleasePreview(preview))
 	for _, req := range allocations {
-		res, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released from Teams Work chat", false, time.Now())
+		res, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), reason, false, time.Now())
 		lines = append(lines, formatBeaconAllocationCancelResult(res))
 		if cancelErr != nil {
 			lines = append(lines, "Error: "+cancelErr.Error())
@@ -491,7 +504,7 @@ func (b *Bridge) handleBeaconWorkSwitchLocal(ctx context.Context, msg ChatMessag
 	if err != nil {
 		return "", err
 	}
-	return b.updateBeaconStateFromTeams(msg, session.ChatID, normalizedBeaconCommand("switch local"), "", func(st *beacon.State) (string, error) {
+	out, err := b.updateBeaconStateFromTeams(msg, session.ChatID, normalizedBeaconCommand("switch local"), "", func(st *beacon.State) (string, error) {
 		if st.Conversations == nil {
 			st.Conversations = map[string]beacon.Conversation{}
 		}
@@ -511,6 +524,23 @@ func (b *Bridge) handleBeaconWorkSwitchLocal(ctx context.Context, msg ChatMessag
 		}
 		return "Switched this Work chat to local execution.\n\nFuture turns will use local.", nil
 	})
+	if err != nil {
+		return "", err
+	}
+	if queued {
+		return out, nil
+	}
+	releaseOut, releaseErr := releaseBeaconConversationAllocations(ctx, session.ID, "released automatically after Work chat switched to local")
+	if releaseErr != nil {
+		if releaseOut != "" {
+			return out + "\n\n" + releaseOut + "\n\nRelease warning: " + releaseErr.Error(), nil
+		}
+		return out + "\n\nRelease warning: " + releaseErr.Error(), nil
+	}
+	if releaseOut != "" {
+		return out + "\n\n" + releaseOut, nil
+	}
+	return out, nil
 }
 
 func (b *Bridge) updateBeaconStateFromTeams(msg ChatMessage, idempotencyScope string, normalized string, confirm string, fn func(*beacon.State) (string, error)) (string, error) {
@@ -957,6 +987,30 @@ func parseBeaconAllocationCancelArgs(words []string) (string, bool, error) {
 	return ref, force, nil
 }
 
+func parseBeaconControlReleaseArgs(words []string) (string, bool, string, error) {
+	if len(words) == 0 || strings.TrimSpace(words[0]) == "" {
+		return "", false, "", fmt.Errorf("usage: `beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]`")
+	}
+	ref := strings.TrimSpace(words[0])
+	force := false
+	var confirm string
+	for i := 1; i < len(words); i++ {
+		switch strings.ToLower(strings.TrimSpace(words[i])) {
+		case "--force":
+			force = true
+		case "--confirm":
+			if i+1 >= len(words) {
+				return "", false, "", fmt.Errorf("--confirm requires a token")
+			}
+			i++
+			confirm = strings.TrimSpace(words[i])
+		default:
+			return "", false, "", fmt.Errorf("unknown beacon release flag %q", words[i])
+		}
+	}
+	return ref, force, confirm, nil
+}
+
 func beaconStatusSessionArg(words []string) string {
 	if len(words) == 0 {
 		return ""
@@ -979,7 +1033,9 @@ func formatBeaconProfileListLines(st beacon.State, proxyExists func(string) bool
 	lines := make([]string, 0, len(profiles))
 	for _, p := range profiles {
 		state := "draft"
-		if p.Ready(proxyExists) {
+		if p.Archived {
+			state = "archived"
+		} else if p.Ready(proxyExists) {
 			state = "ready"
 		}
 		revision := p.Revision
@@ -1025,6 +1081,56 @@ func formatBeaconProfileMutation(action string, p beacon.Profile, proxyExists fu
 	return strings.Join(lines, "\n")
 }
 
+func formatBeaconProfileDoctorResult(p beacon.Profile, report beacon.ProfileDoctorReport, proxyExists func(string) bool) string {
+	state := "failed"
+	if report.Passed {
+		state = "passed"
+	}
+	lines := []string{
+		"Beacon profile doctor",
+		"",
+		"Summary:",
+		fmt.Sprintf("Profile `%s` doctor %s.", p.Name, state),
+		"",
+		"State:",
+		fmt.Sprintf("- profile: `%s`", p.Name),
+		fmt.Sprintf("- revision: `%d`", maxBeaconProfileRevision(p.Revision)),
+		fmt.Sprintf("- provider: `%s`", p.Provider),
+		fmt.Sprintf("- ready: `%t`", p.Ready(proxyExists)),
+		fmt.Sprintf("- adapter: `%s`", beaconProfileAdapterLabel(p)),
+	}
+	if len(report.Operations) > 0 {
+		lines = append(lines, "", "Adapter checks:")
+		for _, op := range report.Operations {
+			source := strings.TrimSpace(op.Source)
+			if source == "" {
+				source = "unknown"
+			}
+			line := fmt.Sprintf("- %s: `%s` via %s", op.Operation, firstNonEmptyString(op.Status, "unknown"), source)
+			if strings.TrimSpace(op.ProfileFlag) != "" {
+				line += " " + op.ProfileFlag
+			}
+			if strings.TrimSpace(op.EnvName) != "" {
+				line += " / `" + op.EnvName + "`"
+			}
+			if strings.TrimSpace(op.Error) != "" {
+				line += " - " + op.Error
+			}
+			lines = append(lines, line)
+		}
+	}
+	if len(report.Issues) > 0 {
+		lines = append(lines, "", "Action needed:")
+		for _, issue := range report.Issues {
+			lines = append(lines, "- "+issue)
+		}
+		lines = append(lines, "", "After fixing these items, run `beacon profile doctor "+p.Name+"` again, then `beacon profile confirm "+p.Name+"`.")
+	} else {
+		lines = append(lines, "", "Action needed:", "- Review the profile, then run `beacon profile confirm "+p.Name+"` if it is not confirmed yet.")
+	}
+	return strings.Join(lines, "\n")
+}
+
 func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) string {
 	lines := []string{
 		"Beacon profile",
@@ -1034,6 +1140,7 @@ func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) 
 		fmt.Sprintf("- ready: %t", p.Ready(proxyExists)),
 		fmt.Sprintf("- confirmed: %t", p.Confirmed),
 		fmt.Sprintf("- doctor: %t", p.DoctorOK),
+		fmt.Sprintf("- archived: %t", p.Archived),
 		fmt.Sprintf("- isolation: %s", p.IsolationDefault),
 		"- proxy route: " + profileProxyLabel(p),
 		"- adapter: " + beaconProfileAdapterLabel(p),
@@ -1048,6 +1155,22 @@ func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) 
 		lines = append(lines, "Draft reasons:")
 		for _, reason := range reasons {
 			lines = append(lines, "- "+reason)
+		}
+	}
+	if len(p.DoctorReport.Operations) > 0 || len(p.DoctorReport.Issues) > 0 {
+		lines = append(lines, "Doctor report:")
+		for _, op := range p.DoctorReport.Operations {
+			line := fmt.Sprintf("- %s: %s", op.Operation, firstNonEmptyString(op.Status, "unknown"))
+			if strings.TrimSpace(op.Source) != "" {
+				line += " via " + op.Source
+			}
+			if strings.TrimSpace(op.Error) != "" {
+				line += " - " + op.Error
+			}
+			lines = append(lines, line)
+		}
+		for _, issue := range p.DoctorReport.Issues {
+			lines = append(lines, "- issue: "+issue)
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -1065,7 +1188,9 @@ func formatBeaconProfileHistory(st beacon.State, name string, proxyExists func(s
 	lines := []string{"Beacon profile history", ""}
 	for _, p := range revisions {
 		state := "draft"
-		if p.Ready(proxyExists) {
+		if p.Archived {
+			state = "archived"
+		} else if p.Ready(proxyExists) {
 			state = "ready"
 		}
 		kind := "history"
@@ -1126,6 +1251,66 @@ func formatBeaconAllocationCancelResult(res beacon.AllocationCancelResult) strin
 		lines = append(lines, "", "Details:", req.ProviderReason)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func formatBeaconAllocationReleasePreview(preview beacon.AllocationReleasePreview) string {
+	lines := []string{
+		"Beacon release preview",
+		"",
+		"Summary:",
+		fmt.Sprintf("cxp will %s %d allocation(s) for `%s`.", releasePreviewVerb(preview), len(preview.Allocations), preview.Ref),
+		"",
+		"State:",
+		"- scope: `" + preview.Scope + "`",
+		"- ref: `" + preview.Ref + "`",
+		"- affected chats: `" + strings.Join(preview.AffectedChats, ",") + "`",
+		"- queued turns: `" + strings.Join(preview.QueuedTurns, ",") + "`",
+		"- running turns: `" + strings.Join(preview.RunningTurns, ",") + "`",
+	}
+	for _, item := range preview.Allocations {
+		lines = append(lines,
+			fmt.Sprintf("- allocation `%s`: action=`%s` profile=`%s` state=`%s` provider_job=`%s` machines=`%s`", item.AllocationID, item.Action, item.Profile, item.State, item.ProviderJob, strings.Join(item.Machines, ",")),
+		)
+	}
+	if preview.RequiresConfirmation {
+		lines = append(lines,
+			"",
+			"Action needed:",
+			"- This release can affect a shared or forced resource.",
+			"- Re-send the command with `--confirm "+preview.Confirmation+"` if this is intended.",
+		)
+	} else {
+		lines = append(lines,
+			"",
+			"Action needed:",
+			"- None. cxp can apply this release safely.",
+		)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func releasePreviewVerb(preview beacon.AllocationReleasePreview) string {
+	if preview.Force {
+		return "force release"
+	}
+	actions := map[string]struct{}{}
+	for _, item := range preview.Allocations {
+		actions[item.Action] = struct{}{}
+	}
+	if _, ok := actions["drain"]; ok {
+		return "drain"
+	}
+	if _, ok := actions["cancel_provider_job"]; ok {
+		return "cancel"
+	}
+	return "release"
+}
+
+func releaseConfirmationRequired(preview beacon.AllocationReleasePreview, provided string) bool {
+	if !preview.RequiresConfirmation {
+		return false
+	}
+	return strings.TrimSpace(provided) == "" || strings.TrimSpace(provided) != strings.TrimSpace(preview.Confirmation)
 }
 
 func formatBeaconAllocationCancelResultWithError(res beacon.AllocationCancelResult, err error) string {
@@ -1282,9 +1467,10 @@ func beaconControlHelpText() string {
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>`",
 		"- `beacon profile create <name> --provider lsf --queue <queue>`",
 		"- `beacon profile create <name> --provider local`",
-		"- `beacon profile doctor <name>` then `beacon profile confirm <name>`",
+		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",
+		"- `beacon profile confirm <name>` - confirm a profile after reviewing doctor output",
 		"- `beacon profile status <name>`",
-		"- `beacon release <profile|allocation|provider-job|machine>` - release a resource without knowing its internal object type",
+		"- `beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]` - preview and release a resource without internal object knowledge",
 		"- advanced: `beacon allocation list|status|cancel`, `beacon machine list|status|release|kill`",
 		"- provider adapter: `cxp beacon provider template slurm|lsf`",
 		"- worker process: `cxp beacon worker serve --allocation <request-id>`",
@@ -1293,8 +1479,8 @@ func beaconControlHelpText() string {
 		"Work chat:",
 		"- `beacon status`",
 		"- `beacon switch <profile>`",
-		"- `beacon switch local`",
-		"- `beacon release` - release this Work chat's current beacon resource; the profile binding stays unchanged",
+		"- `beacon switch local` - future turns run locally and cxp drains/releases this chat's old beacon resource when safe",
+		"- `beacon release` - release this Work chat's current beacon resource; shared resources show a confirmation preview",
 	}, "\n")
 }
 
@@ -1305,8 +1491,8 @@ func beaconWorkHelpText() string {
 		"- `beacon status` - show this Work chat target",
 		"- `beacon list` - list all profiles and machines",
 		"- `beacon switch <profile>` - switch future turns to a ready profile",
-		"- `beacon switch local` - switch future turns back to local execution",
-		"- `beacon release` - release this chat's current beacon resource; future turns may reacquire the same profile",
+		"- `beacon switch local` - switch future turns back to local execution and release old beacon resources when safe",
+		"- `beacon release` - release this chat's current beacon resource; shared resources show a confirmation preview",
 		"- `beacon fork <profile>` - fork when the execution signature is incompatible",
 		"",
 		"Profile and machine administration belongs in the control chat.",

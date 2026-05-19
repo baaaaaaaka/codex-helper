@@ -140,10 +140,10 @@ codex-proxy proxy doctor
 | `codex-proxy beacon profile history <name>` | List current and historical revisions for a beacon profile |
 | `codex-proxy beacon profile rollback <name> <revision>` | Publish a historical profile revision as a new latest revision |
 | `codex-proxy beacon profile gc <name>` | Prune historical revisions no active target/allocation still references |
-| `codex-proxy beacon profile doctor <name>` | Mark a beacon profile doctor check successful |
+| `codex-proxy beacon profile doctor <name>` | Validate profile fields and provider adapter commands |
 | `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review |
 | `codex-proxy beacon status [--session <id>]` | Show beacon target state |
-| `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | Release a beacon resource by profile, allocation id, provider job id, or machine id |
+| `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | Preview and release a beacon resource by profile, allocation id, provider job id, or machine id |
 | `codex-proxy beacon switch-profile <name> --session <id>` | Switch a conversation to a ready beacon profile |
 | `codex-proxy beacon switch-profile <name> --session <id> --after-current-turn` | Defer a beacon switch so the current Codex turn can finish |
 | `codex-proxy beacon allocation list` | List managed beacon allocation requests |
@@ -210,7 +210,9 @@ add `--proxy ssh_profile --proxy-profile <existing-profile>`. Add
 `--isolation shared` or `--isolation exclusive` to choose the default lease
 sharing mode.
 
-Profiles stay draft until checked and confirmed:
+Profiles stay draft until checked and confirmed. `profile doctor` validates the
+profile fields and the `query`/`submit`/`cancel`/`renew` adapter commands that
+future Teams turns will need:
 
 ```bash
 codex-proxy beacon profile doctor gpu
@@ -248,9 +250,16 @@ In Teams, use `beacon switch <profile>` from the Work chat. The helper then
 submits, queries, waits for the worker, renews, and cleans up the managed
 allocation automatically. If you need to manually free the current resource,
 send `beacon release` in the Work chat; the profile binding stays unchanged, so
-future turns may acquire a fresh worker for the same profile. From the CLI or
-Teams control chat, `codex-proxy beacon release <profile|allocation|provider-job|machine>`
-accepts the resource identifier you have and resolves the internal object type.
+future turns may acquire a fresh worker for the same profile. `beacon local`
+switches future turns back to local execution and asks the helper to drain or
+release this chat's old beacon resource when that is safe.
+
+From the CLI or Teams control chat,
+`codex-proxy beacon release <profile|allocation|provider-job|machine>` accepts
+the resource identifier you have and resolves the internal object type. Release
+commands show a preview with affected chats, queued/running turns, allocation
+ids, provider job ids, and the planned action. Shared or forced releases require
+the shown `--confirm <token>` value before they can affect other chats.
 
 When a Teams Work chat targets a beacon profile, each turn snapshots the target
 and records a managed allocation request before Codex can start. Explicit beacon

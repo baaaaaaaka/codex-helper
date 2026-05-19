@@ -76,7 +76,9 @@ func newBeaconProfileListCmd(root *rootOptions, storePath *string) *cobra.Comman
 			}
 			for _, p := range profiles {
 				state := "ready"
-				if reasons := p.DraftReasons(proxyExists); len(reasons) > 0 {
+				if p.Archived {
+					state = "archived"
+				} else if reasons := p.DraftReasons(proxyExists); len(reasons) > 0 {
 					state = "draft: " + strings.Join(reasons, "; ")
 				}
 				revision := p.Revision
@@ -274,7 +276,9 @@ func newBeaconProfileHistoryCmd(root *rootOptions, storePath *string) *cobra.Com
 			}
 			for _, p := range revisions {
 				state := "draft"
-				if p.Ready(proxyExists) {
+				if p.Archived {
+					state = "archived"
+				} else if p.Ready(proxyExists) {
 					state = "ready"
 				}
 				kind := "history"
@@ -401,7 +405,7 @@ func cliBeaconProfileRevision(revision int) int {
 func newBeaconProfileDoctorCmd(root *rootOptions, storePath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor <name>",
-		Short: "Mark a beacon profile doctor check successful",
+		Short: "Validate beacon profile scheduler adapter readiness",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := beacon.NewStore(*storePath)
@@ -413,14 +417,18 @@ func newBeaconProfileDoctorCmd(root *rootOptions, storePath *string) *cobra.Comm
 				return err
 			}
 			var p beacon.Profile
+			var report beacon.ProfileDoctorReport
 			if err := store.Update(func(st *beacon.State) error {
 				var err error
-				p, err = beacon.DoctorProfile(st, args[0], time.Time{}, proxyExists)
+				p, report, err = beacon.DoctorProfileWithInput(st, args[0], beacon.DoctorProfileInput{
+					ProxyExists:         proxyExists,
+					EnvProviderCommands: beacon.ProviderCommandConfigFromEnv(nil),
+				})
 				return err
 			}); err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Doctor passed for beacon profile %q.\n", p.Name)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), formatBeaconProfileDoctorResultCLI(p, report, proxyExists))
 			return nil
 		},
 	}
@@ -462,7 +470,7 @@ func newBeaconProfileConfirmCmd(root *rootOptions, storePath *string) *cobra.Com
 func newBeaconProfileDeleteCmd(storePath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "delete <name>",
-		Short: "Delete a beacon profile",
+		Short: "Archive a beacon profile without breaking pinned references",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := beacon.NewStore(*storePath)
@@ -472,7 +480,7 @@ func newBeaconProfileDeleteCmd(storePath *string) *cobra.Command {
 			if err := store.Update(func(st *beacon.State) error { return beacon.DeleteProfile(st, args[0]) }); err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Deleted beacon profile %q.\n", args[0])
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Archived beacon profile %q. Existing pinned turns can drain, but new turns cannot select it.\n", args[0])
 			return nil
 		},
 	}
@@ -499,12 +507,13 @@ func newBeaconStatusCmd(storePath *string) *cobra.Command {
 
 func newBeaconReleaseCmd(storePath *string) *cobra.Command {
 	var force bool
+	var confirm string
 	cmd := &cobra.Command{
 		Use:   "release <profile|allocation|provider-job|machine>",
 		Short: "Release beacon resources without requiring internal object knowledge",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			out, err := releaseBeaconResourceFromCLI(cmd.Context(), *storePath, args[0], force)
+			out, err := releaseBeaconResourceFromCLI(cmd.Context(), *storePath, args[0], force, confirm)
 			if out != "" {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), out)
 			}
@@ -512,6 +521,7 @@ func newBeaconReleaseCmd(storePath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Cancel even if a worker may have started work")
+	cmd.Flags().StringVar(&confirm, "confirm", "", "Confirmation token from the release preview")
 	return cmd
 }
 
@@ -1533,7 +1543,7 @@ func newBeaconMachineKillCmd(storePath *string) *cobra.Command {
 	return cmd
 }
 
-func releaseBeaconResourceFromCLI(ctx context.Context, storePath string, ref string, force bool) (string, error) {
+func releaseBeaconResourceFromCLI(ctx context.Context, storePath string, ref string, force bool, confirm string) (string, error) {
 	store, err := beacon.NewStore(storePath)
 	if err != nil {
 		return "", err
@@ -1547,7 +1557,12 @@ func releaseBeaconResourceFromCLI(ctx context.Context, storePath string, ref str
 		if len(allocations) == 0 {
 			return fmt.Sprintf("Beacon release: no active allocations are using profile %q.", ref), nil
 		}
+		preview := beacon.PreviewAllocationRelease(st, "profile", ref, allocations, force)
+		if cliReleaseConfirmationRequired(preview, confirm) {
+			return formatAllocationReleasePreviewCLI(preview), nil
+		}
 		var lines []string
+		lines = append(lines, formatAllocationReleasePreviewCLI(preview))
 		for _, req := range allocations {
 			res, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released profile "+ref+" by operator", force, time.Now())
 			lines = append(lines, formatAllocationCancelResult(res))
@@ -1558,8 +1573,12 @@ func releaseBeaconResourceFromCLI(ctx context.Context, storePath string, ref str
 		return strings.Join(lines, "\n"), nil
 	}
 	if req, ok := beacon.FindAllocationByRef(st, ref); ok {
+		preview := beacon.PreviewAllocationRelease(st, "allocation", ref, []beacon.AllocationRequest{req}, force)
+		if cliReleaseConfirmationRequired(preview, confirm) {
+			return formatAllocationReleasePreviewCLI(preview), nil
+		}
 		res, err := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released by operator", force, time.Now())
-		return formatAllocationCancelResult(res), err
+		return formatAllocationReleasePreviewCLI(preview) + "\n" + formatAllocationCancelResult(res), err
 	}
 	var res beacon.ReleaseResult
 	if err := store.Update(func(st *beacon.State) error {
@@ -1599,6 +1618,64 @@ func formatAllocationCancelResult(res beacon.AllocationCancelResult) string {
 		facts = append(facts, "reason="+req.ProviderReason)
 	}
 	return "Beacon allocation release: action=" + string(res.Action) + " state=" + string(req.State) + " - " + strings.Join(facts, ", ")
+}
+
+func formatAllocationReleasePreviewCLI(preview beacon.AllocationReleasePreview) string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Beacon release preview: scope=%s ref=%s allocations=%d force=%t affected_chats=%s queued_turns=%s running_turns=%s", preview.Scope, preview.Ref, len(preview.Allocations), preview.Force, strings.Join(preview.AffectedChats, ","), strings.Join(preview.QueuedTurns, ","), strings.Join(preview.RunningTurns, ",")))
+	for _, item := range preview.Allocations {
+		lines = append(lines, fmt.Sprintf("preview: allocation=%s action=%s profile=%s state=%s provider_job=%s machines=%s chats=%s", item.AllocationID, item.Action, item.Profile, item.State, item.ProviderJob, strings.Join(item.Machines, ","), strings.Join(item.Chats, ",")))
+	}
+	if preview.RequiresConfirmation {
+		lines = append(lines, "confirm: "+preview.Confirmation)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func cliReleaseConfirmationRequired(preview beacon.AllocationReleasePreview, provided string) bool {
+	if !preview.RequiresConfirmation {
+		return false
+	}
+	return strings.TrimSpace(provided) == "" || strings.TrimSpace(provided) != strings.TrimSpace(preview.Confirmation)
+}
+
+func formatBeaconProfileDoctorResultCLI(p beacon.Profile, report beacon.ProfileDoctorReport, proxyExists func(string) bool) string {
+	status := "failed"
+	if report.Passed {
+		status = "passed"
+	}
+	lines := []string{
+		fmt.Sprintf("Beacon profile doctor: profile=%s revision=%d status=%s ready=%t provider=%s", p.Name, maxProfileRevisionForCLI(p.Revision), status, p.Ready(proxyExists), p.Provider),
+	}
+	for _, op := range report.Operations {
+		var facts []string
+		facts = append(facts, "operation="+op.Operation)
+		facts = append(facts, "status="+firstNonEmptyString(op.Status, "unknown"))
+		if strings.TrimSpace(op.Source) != "" {
+			facts = append(facts, "source="+strings.ReplaceAll(op.Source, " ", "_"))
+		}
+		if strings.TrimSpace(op.ProfileFlag) != "" {
+			facts = append(facts, "profile_flag="+op.ProfileFlag)
+		}
+		if strings.TrimSpace(op.EnvName) != "" {
+			facts = append(facts, "env="+op.EnvName)
+		}
+		if strings.TrimSpace(op.Error) != "" {
+			facts = append(facts, "error="+op.Error)
+		}
+		lines = append(lines, "adapter: "+strings.Join(facts, " "))
+	}
+	for _, issue := range report.Issues {
+		lines = append(lines, "issue: "+issue)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func maxProfileRevisionForCLI(revision int) int {
+	if revision <= 0 {
+		return 1
+	}
+	return revision
 }
 
 func beaconAllocationsForProfileCLI(st beacon.State, profile string) []beacon.AllocationRequest {

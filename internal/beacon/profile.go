@@ -2,6 +2,9 @@ package beacon
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +25,14 @@ type CreateProfileInput struct {
 }
 
 type UpdateProfileInput = CreateProfileInput
+
+type DoctorProfileInput struct {
+	Now                      time.Time
+	ProxyExists              func(string) bool
+	EnvProviderCommands      ProviderCommandConfig
+	SkipProviderAdapterCheck bool
+	CheckExecutable          func(string) error
+}
 
 func CreateProfile(st *State, in CreateProfileInput) (Profile, error) {
 	if st == nil {
@@ -132,15 +143,15 @@ func ListProfileRevisions(st State, name string) []Profile {
 		return nil
 	}
 	byRevision := map[int]Profile{}
-	if p, ok := st.Profiles[name]; ok {
-		p = normalizeProfileRevision(p)
-		byRevision[p.Revision] = p
-	}
 	for key, p := range st.ProfileHistory {
 		p = normalizeProfileRevision(p)
 		if p.Name != name && !strings.HasPrefix(key, name+"@") {
 			continue
 		}
+		byRevision[p.Revision] = p
+	}
+	if p, ok := st.Profiles[name]; ok {
+		p = normalizeProfileRevision(p)
 		byRevision[p.Revision] = p
 	}
 	revisions := make([]int, 0, len(byRevision))
@@ -188,6 +199,8 @@ func RollbackProfileRevision(st *State, name string, revision int, now time.Time
 		target.CreatedAt = now
 	}
 	target.UpdatedAt = now
+	target.Archived = false
+	target.ArchivedAt = time.Time{}
 	target.ProviderPreviewOK = providerPreviewOK(target)
 	st.Profiles[name] = target
 	_, _ = AppendAudit(st, "profile_rollback", fmt.Sprintf("%s@%d->%d", name, revision, target.Revision), now)
@@ -234,15 +247,32 @@ func ConfirmProfile(st *State, name string, now time.Time, proxyExists func(stri
 }
 
 func DoctorProfile(st *State, name string, now time.Time, proxyExists func(string) bool) (Profile, error) {
+	p, _, err := DoctorProfileWithInput(st, name, DoctorProfileInput{
+		Now:                      now,
+		ProxyExists:              proxyExists,
+		SkipProviderAdapterCheck: true,
+	})
+	return p, err
+}
+
+func DoctorProfileWithInput(st *State, name string, in DoctorProfileInput) (Profile, ProfileDoctorReport, error) {
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	in.Now = now
+	var report ProfileDoctorReport
 	p, err := updateProfile(st, name, now, func(p *Profile) {
 		*p = normalizeProfileRevision(*p)
 		p.ProviderPreviewOK = providerPreviewOK(*p)
-		p.DoctorOK = true
-	}, proxyExists)
+		report = BuildProfileDoctorReport(*p, in)
+		p.DoctorOK = report.Passed
+		p.DoctorReport = report
+	}, in.ProxyExists)
 	if err == nil {
 		_, _ = AppendAudit(st, "profile_doctor", name, now)
 	}
-	return p, err
+	return p, report, err
 }
 
 func DeleteProfile(st *State, name string) error {
@@ -254,12 +284,175 @@ func DeleteProfile(st *State, name string) error {
 	if _, ok := st.Profiles[name]; !ok {
 		return fmt.Errorf("beacon profile %q not found", name)
 	}
-	if profileInUse(*st, name) {
-		return fmt.Errorf("beacon profile %q is in use", name)
+	if normalizeProfileRevision(st.Profiles[name]).Archived {
+		return nil
 	}
-	delete(st.Profiles, name)
-	_, _ = AppendAudit(st, "profile_delete", name, time.Time{})
+	now := time.Now()
+	if profileInUse(*st, name) {
+		p := normalizeProfileRevision(st.Profiles[name])
+		st.ProfileHistory[profileHistoryKey(p.Name, p.Revision)] = p
+		pinProfileReferences(st, p.Name, p.Revision)
+		p.Archived = true
+		p.ArchivedAt = now
+		p.UpdatedAt = now
+		st.Profiles[name] = p
+		_, _ = AppendAudit(st, "profile_archive", name, now)
+		return nil
+	}
+	p := normalizeProfileRevision(st.Profiles[name])
+	p.Archived = true
+	p.ArchivedAt = now
+	p.UpdatedAt = now
+	st.Profiles[name] = p
+	_, _ = AppendAudit(st, "profile_archive", name, now)
 	return nil
+}
+
+func BuildProfileDoctorReport(p Profile, in DoctorProfileInput) ProfileDoctorReport {
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	p = normalizeProfileRevision(p)
+	p.ProviderPreviewOK = providerPreviewOK(p)
+	report := ProfileDoctorReport{
+		CheckedAt: now,
+		Provider:  p.Provider,
+	}
+	report.Issues = append(report.Issues, profileDoctorConfigurationIssues(p, in.ProxyExists)...)
+	if !in.SkipProviderAdapterCheck {
+		report.Operations = profileDoctorAdapterOperations(p, in)
+		for _, op := range report.Operations {
+			if op.Status != "ok" {
+				report.Issues = append(report.Issues, fmt.Sprintf("%s adapter %s", op.Operation, firstNonEmpty(op.Error, op.Status)))
+			}
+		}
+	}
+	report.Passed = len(report.Issues) == 0
+	return report
+}
+
+func profileDoctorConfigurationIssues(p Profile, proxyExists func(string) bool) []string {
+	var issues []string
+	if strings.TrimSpace(p.Name) == "" {
+		issues = append(issues, "profile name is required")
+	}
+	switch p.Provider {
+	case ProviderSlurm:
+		if p.Slurm.Nodes <= 0 {
+			issues = append(issues, "slurm nodes must be > 0")
+		}
+		if p.Slurm.GPUCount < 0 {
+			issues = append(issues, "slurm gpu count must be >= 0")
+		}
+		if strings.TrimSpace(p.Slurm.Partition) == "" {
+			issues = append(issues, "slurm partition is required")
+		}
+		if strings.TrimSpace(p.Slurm.Image) == "" {
+			issues = append(issues, "slurm image is required")
+		}
+		if p.Slurm.Duration <= 0 {
+			issues = append(issues, "slurm duration must be > 0")
+		}
+	case ProviderLSF:
+		if strings.TrimSpace(p.LSF.QueueName) == "" {
+			issues = append(issues, "lsf queue name is required")
+		}
+	case ProviderLocal:
+	default:
+		issues = append(issues, "provider must be slurm, lsf, or local")
+	}
+	switch p.ProxyMode {
+	case ProxyNone:
+	case ProxySSHProfile:
+		if strings.TrimSpace(p.ProxyProfile) == "" {
+			issues = append(issues, "proxy profile is required")
+		} else if proxyExists != nil && !proxyExists(p.ProxyProfile) {
+			issues = append(issues, "proxy profile not found")
+		}
+	default:
+		issues = append(issues, "proxy mode must be none or ssh_profile")
+	}
+	if p.IsolationDefault != "" && p.IsolationDefault != IsolationShared && p.IsolationDefault != IsolationExclusive {
+		issues = append(issues, "isolation must be shared or exclusive")
+	}
+	if !p.ProviderPreviewOK {
+		issues = append(issues, "provider preview missing")
+	}
+	if p.Archived {
+		issues = append(issues, "profile is archived")
+	}
+	return issues
+}
+
+func profileDoctorAdapterOperations(p Profile, in DoctorProfileInput) []ProfileDoctorOperation {
+	switch p.Provider {
+	case ProviderSlurm, ProviderLSF:
+	default:
+		return nil
+	}
+	check := in.CheckExecutable
+	if check == nil {
+		check = defaultProviderCommandExecutableCheck
+	}
+	var out []ProfileDoctorOperation
+	for _, operation := range []string{"query", "submit", "cancel", "renew"} {
+		command, _, flag := providerCommandFromConfig(p.Adapter, p.Provider, operation)
+		envName := ""
+		source := "profile"
+		if strings.TrimSpace(command) == "" {
+			command, envName, flag = providerCommandFromConfig(in.EnvProviderCommands, p.Provider, operation)
+			source = "helper environment"
+		}
+		op := ProfileDoctorOperation{
+			Operation:   operation,
+			Source:      source,
+			Command:     strings.TrimSpace(command),
+			EnvName:     envName,
+			ProfileFlag: flag,
+		}
+		if strings.TrimSpace(op.Command) == "" {
+			op.Status = "missing"
+			if strings.TrimSpace(envName) != "" {
+				op.Error = fmt.Sprintf("set %s or %s", flag, envName)
+			} else {
+				op.Error = fmt.Sprintf("set %s", flag)
+			}
+			out = append(out, op)
+			continue
+		}
+		if err := check(op.Command); err != nil {
+			op.Status = "failed"
+			op.Error = err.Error()
+			out = append(out, op)
+			continue
+		}
+		op.Status = "ok"
+		out = append(out, op)
+	}
+	return out
+}
+
+func defaultProviderCommandExecutableCheck(command string) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return fmt.Errorf("command is empty")
+	}
+	if strings.Contains(command, string(os.PathSeparator)) {
+		info, err := os.Stat(command)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return fmt.Errorf("%s is a directory", command)
+		}
+		if runtime.GOOS != "windows" && info.Mode()&0111 == 0 {
+			return fmt.Errorf("%s is not executable", command)
+		}
+		return nil
+	}
+	_, err := exec.LookPath(command)
+	return err
 }
 
 func profileInUse(st State, name string) bool {
@@ -449,6 +642,9 @@ func (p Profile) Ready(proxyExists func(string) bool) bool {
 
 func (p Profile) DraftReasons(proxyExists func(string) bool) []string {
 	var reasons []string
+	if p.Archived {
+		reasons = append(reasons, "profile is archived")
+	}
 	if strings.TrimSpace(p.Name) == "" {
 		reasons = append(reasons, "profile name is required")
 	}

@@ -140,6 +140,7 @@ func RemoveTurnSnapshot(st *State, conversationID string, turnID string, now tim
 	if convID == "" {
 		for id, conv := range st.Conversations {
 			conv.Queued = queuedWithoutTurn(conv.Queued, turnID)
+			conv = promotePendingTargetIfCurrentDrained(conv)
 			if now.IsZero() {
 				now = time.Now()
 			}
@@ -150,6 +151,7 @@ func RemoveTurnSnapshot(st *State, conversationID string, turnID string, now tim
 	}
 	conv := st.Conversations[convID]
 	conv.Queued = queuedWithoutTurn(conv.Queued, turnID)
+	conv = promotePendingTargetIfCurrentDrained(conv)
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -165,6 +167,34 @@ func queuedWithoutTurn(in []QueuedTurn, turnID string) []QueuedTurn {
 		}
 	}
 	return out
+}
+
+func promotePendingTargetIfCurrentDrained(conv Conversation) Conversation {
+	if conv.Pending == nil {
+		return conv
+	}
+	for _, queued := range conv.Queued {
+		if sameTargetBinding(queued.Snapshot, conv.Current) {
+			return conv
+		}
+	}
+	conv.Current = *conv.Pending
+	conv.Pending = nil
+	return conv
+}
+
+func sameTargetBinding(a TargetSnapshot, b TargetSnapshot) bool {
+	leftTarget := strings.TrimSpace(a.Target)
+	rightTarget := strings.TrimSpace(b.Target)
+	if leftTarget == "" {
+		leftTarget = TargetLocal
+	}
+	if rightTarget == "" {
+		rightTarget = TargetLocal
+	}
+	return leftTarget == rightTarget &&
+		strings.TrimSpace(a.Profile) == strings.TrimSpace(b.Profile) &&
+		(a.ProfileRevision == b.ProfileRevision || a.ProfileRevision == 0 || b.ProfileRevision == 0)
 }
 
 func PlanTurnExecution(st *State, conversationID string, turnID string, now time.Time) (TurnExecutionPlan, error) {

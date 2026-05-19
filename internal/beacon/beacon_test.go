@@ -70,6 +70,37 @@ func TestLSFProfileQueueOnlyDraftNeedsOnlyDoctorAndConfirm(t *testing.T) {
 	}
 }
 
+func TestProfileDoctorReportChecksProviderAdapters(t *testing.T) {
+	var st State
+	if _, err := CreateProfile(&st, CreateProfileInput{
+		Name:      "gpu",
+		Provider:  ProviderSlurm,
+		ProxyMode: ProxyNone,
+		Slurm:     SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+	}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	p, report, err := DoctorProfileWithInput(&st, "gpu", DoctorProfileInput{Now: time.Unix(2, 0)})
+	if err != nil {
+		t.Fatalf("DoctorProfileWithInput: %v", err)
+	}
+	if p.DoctorOK || report.Passed || len(report.Operations) != 4 || !strings.Contains(strings.Join(report.Issues, ","), "query adapter") {
+		t.Fatalf("missing adapters should fail doctor: profile=%#v report=%#v", p, report)
+	}
+	adapterConfig := ProviderCommandConfigForProvider(ProviderSlurm, "/ok/query", "/ok/submit", "/ok/cancel", "/ok/renew")
+	p, report, err = DoctorProfileWithInput(&st, "gpu", DoctorProfileInput{
+		Now:                 time.Unix(3, 0),
+		EnvProviderCommands: adapterConfig,
+		CheckExecutable:     func(string) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("DoctorProfileWithInput env adapters: %v", err)
+	}
+	if !p.DoctorOK || !report.Passed {
+		t.Fatalf("configured adapters should pass doctor: profile=%#v report=%#v", p, report)
+	}
+}
+
 func TestNewTargetDefaultsLocalAndExplicitBeaconNeverFallsBack(t *testing.T) {
 	var st State
 	got := ResolveNewTarget(st, NewTargetInput{LegacyProxyRoute: "jump-a"}, nil)
@@ -250,7 +281,7 @@ func TestSwitchProfileSnapshotsFutureQueuedTurns(t *testing.T) {
 	}
 }
 
-func TestDeleteProfileRejectsProfilesInUse(t *testing.T) {
+func TestDeleteProfileArchivesProfilesInUse(t *testing.T) {
 	st := State{
 		Profiles: map[string]Profile{
 			"gpu": readyProfile("gpu"),
@@ -259,9 +290,13 @@ func TestDeleteProfileRejectsProfilesInUse(t *testing.T) {
 			"gpu-a": {ID: "gpu-a", Profile: "gpu", State: "accepting"},
 		},
 	}
-	if err := DeleteProfile(&st, "gpu"); err == nil || !strings.Contains(err.Error(), "in use") {
-		t.Fatalf("DeleteProfile active machine error = %v, want in-use rejection", err)
+	if err := DeleteProfile(&st, "gpu"); err != nil {
+		t.Fatalf("DeleteProfile active machine: %v", err)
 	}
+	if !st.Profiles["gpu"].Archived || st.Profiles["gpu"].Ready(nil) {
+		t.Fatalf("in-use profile should be archived and no longer ready: %#v", st.Profiles["gpu"])
+	}
+	st.Profiles["gpu"] = readyProfile("gpu")
 	delete(st.Machines, "gpu-a")
 	st.Conversations = map[string]Conversation{
 		"conv": {
@@ -270,12 +305,39 @@ func TestDeleteProfileRejectsProfilesInUse(t *testing.T) {
 			Queued:  []QueuedTurn{{ID: "turn-1", Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}}},
 		},
 	}
-	if err := DeleteProfile(&st, "gpu"); err == nil || !strings.Contains(err.Error(), "in use") {
-		t.Fatalf("DeleteProfile conversation error = %v, want in-use rejection", err)
+	if err := DeleteProfile(&st, "gpu"); err != nil {
+		t.Fatalf("DeleteProfile conversation: %v", err)
 	}
+	if !st.Profiles["gpu"].Archived || st.Conversations["conv"].Current.ProfileRevision != 1 || st.Conversations["conv"].Queued[0].Snapshot.ProfileRevision != 1 {
+		t.Fatalf("conversation archive should pin old references: profile=%#v conv=%#v", st.Profiles["gpu"], st.Conversations["conv"])
+	}
+	historyKey := profileHistoryKey("gpu", 1)
+	if st.ProfileHistory[historyKey].Archived {
+		t.Fatalf("archiving should keep a live historical snapshot for pinned work: %#v", st.ProfileHistory[historyKey])
+	}
+	if err := DeleteProfile(&st, "gpu"); err != nil {
+		t.Fatalf("repeated DeleteProfile should be idempotent: %v", err)
+	}
+	if st.ProfileHistory[historyKey].Archived {
+		t.Fatalf("repeated archive must not overwrite the live historical snapshot: %#v", st.ProfileHistory[historyKey])
+	}
+	if revisions := ListProfileRevisions(st, "gpu"); len(revisions) != 1 || !revisions[0].Archived {
+		t.Fatalf("profile revision list should show the latest profile as archived while history keeps the live snapshot: %#v", revisions)
+	}
+	st.Profiles["gpu"] = readyProfile("gpu")
 	st.Conversations = nil
 	if err := DeleteProfile(&st, "gpu"); err != nil {
 		t.Fatalf("unused DeleteProfile: %v", err)
+	}
+	if !st.Profiles["gpu"].Archived {
+		t.Fatalf("unused DeleteProfile should archive profile instead of removing it")
+	}
+	restored, err := RollbackProfileRevision(&st, "gpu", 1, time.Unix(10, 0))
+	if err != nil {
+		t.Fatalf("RollbackProfileRevision from archived profile: %v", err)
+	}
+	if restored.Archived || !restored.Ready(nil) || restored.Revision != 2 {
+		t.Fatalf("rollback should publish a live replacement revision, got %#v", restored)
 	}
 }
 
@@ -540,6 +602,19 @@ func TestReleasePreviewHardKillAndExternalProtection(t *testing.T) {
 	}
 	if res.Action != "reject_external" {
 		t.Fatalf("external BYO allocation should reject provider kill, got %#v", res)
+	}
+}
+
+func TestAllocationReleasePreviewRequiresConfirmationAcrossMultipleChats(t *testing.T) {
+	st := State{
+		Allocations: map[string]AllocationRequest{
+			"req-a": {ID: "req-a", ConversationID: "chat-a", Profile: "gpu", Provider: ProviderLocal, State: AllocationRunning},
+			"req-b": {ID: "req-b", ConversationID: "chat-b", Profile: "gpu", Provider: ProviderLocal, State: AllocationRunning},
+		},
+	}
+	preview := PreviewAllocationRelease(st, "profile", "gpu", []AllocationRequest{st.Allocations["req-a"], st.Allocations["req-b"]}, false)
+	if !preview.RequiresConfirmation || !strings.HasPrefix(preview.Confirmation, "RELEASE-") {
+		t.Fatalf("multi-chat profile release should require confirmation: %#v", preview)
 	}
 }
 

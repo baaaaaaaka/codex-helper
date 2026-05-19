@@ -26,6 +26,8 @@ type NoticeDetail struct {
 type BeaconNotice struct {
 	Title        string
 	WhatHappened []string
+	State        []NoticeDetail
+	Doing        []string
 	Next         []string
 	Details      []NoticeDetail
 }
@@ -38,7 +40,7 @@ func (n BeaconNotice) Render() string {
 	}
 	lines = append(lines, title)
 	if len(n.WhatHappened) > 0 {
-		lines = append(lines, "", "What happened:")
+		lines = append(lines, "", "Summary:")
 		for _, line := range n.WhatHappened {
 			line = strings.TrimSpace(line)
 			if line != "" {
@@ -46,23 +48,48 @@ func (n BeaconNotice) Render() string {
 			}
 		}
 	}
-	if len(n.Next) > 0 {
-		lines = append(lines, "", "Next:")
-		for _, line := range n.Next {
+	state := n.State
+	if len(state) == 0 {
+		state = n.Details
+	}
+	if len(state) > 0 {
+		lines = append(lines, "", "State:")
+		for _, detail := range state {
+			key := strings.TrimSpace(detail.Key)
+			if key == "" {
+				continue
+			}
+			lines = append(lines, "- "+key+": `"+detailValue(detail.Value)+"`")
+		}
+	}
+	if len(n.Doing) > 0 {
+		lines = append(lines, "", "What cxp is doing:")
+		for _, line := range n.Doing {
 			line = strings.TrimSpace(line)
 			if line != "" {
 				lines = append(lines, "- "+line)
 			}
 		}
 	}
-	if len(n.Details) > 0 {
+	lines = append(lines, "", "Action needed:")
+	if len(n.Next) > 0 {
+		for _, line := range n.Next {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				lines = append(lines, "- "+line)
+			}
+		}
+	} else {
+		lines = append(lines, "- None.")
+	}
+	if len(n.State) > 0 && len(n.Details) > 0 {
 		lines = append(lines, "", "Details:")
 		for _, detail := range n.Details {
 			key := strings.TrimSpace(detail.Key)
 			if key == "" {
 				continue
 			}
-			lines = append(lines, "- "+key+"="+detailValue(detail.Value))
+			lines = append(lines, "- "+key+": `"+detailValue(detail.Value)+"`")
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -139,6 +166,8 @@ func TurnStartFailureNotice(plan TurnExecutionPlan, cause error) BeaconNotice {
 	return BeaconNotice{
 		Title:        title,
 		WhatHappened: what,
+		State:        turnPlanStateDetails(plan),
+		Doing:        noticeDoing(code),
 		Next:         next,
 		Details:      turnPlanDetails(code, plan, cause),
 	}
@@ -160,7 +189,14 @@ func ProviderAdapterConfigurationNotice(notConfigured ProviderCommandNotConfigur
 	return BeaconNotice{
 		Title:        fmt.Sprintf("Beacon command failed: %s provider adapter is not configured.", providerLabel(notConfigured.Provider)),
 		WhatHappened: what,
-		Next:         turnStartFailureNextSteps(NoticeProviderAdapterNotConfigured, notConfigured, plan),
+		State: []NoticeDetail{
+			{"profile", profile},
+			{"provider", string(notConfigured.Provider)},
+			{"operation", operation},
+			{"env", notConfigured.EnvName},
+		},
+		Doing: []string{"Waiting for a profile-stored adapter or helper service environment setting before touching the scheduler."},
+		Next:  turnStartFailureNextSteps(NoticeProviderAdapterNotConfigured, notConfigured, plan),
 		Details: []NoticeDetail{
 			{"error_code", NoticeProviderAdapterNotConfigured},
 			{"profile", profile},
@@ -257,6 +293,36 @@ func turnPlanDetails(code string, plan TurnExecutionPlan, cause error) []NoticeD
 	return details
 }
 
+func turnPlanStateDetails(plan TurnExecutionPlan) []NoticeDetail {
+	return []NoticeDetail{
+		{"target", targetLabel(plan.Snapshot)},
+		{"profile", plan.Snapshot.Profile},
+		{"allocation", plan.AllocationRequestID},
+		{"allocation_state", string(plan.AllocationState)},
+		{"provider_job", plan.ProviderJobID},
+		{"provider_state", plan.ProviderState},
+		{"machine", plan.MachineID},
+		{"lease", plan.LeaseID},
+	}
+}
+
+func noticeDoing(code string) []string {
+	switch code {
+	case NoticeProviderAdapterNotConfigured:
+		return []string{"Waiting for the provider adapter configuration before starting Codex."}
+	case NoticeSchedulerPending:
+		return []string{"Checking scheduler status and waiting for a beacon worker to register."}
+	case NoticeAllocationNeedsAttention:
+		return []string{"Keeping the allocation visible while it avoids local fallback for this explicit beacon target."}
+	case NoticeReady:
+		return []string{"Using the ready beacon worker for new work."}
+	case NoticeLocalTarget:
+		return []string{"Running future turns locally until this Work chat is switched to a beacon profile."}
+	default:
+		return []string{"Tracking beacon state and waiting for a safe next step."}
+	}
+}
+
 func ConversationStatusNotice(st State, conversationID string) BeaconNotice {
 	st.normalize()
 	conversationID = strings.TrimSpace(conversationID)
@@ -311,6 +377,8 @@ func ConversationStatusNotice(st State, conversationID string) BeaconNotice {
 	return BeaconNotice{
 		Title:        title,
 		WhatHappened: what,
+		State:        statusNoticeStateDetails(conversationID, current, pending, turnSnapshot, req, hasAllocation),
+		Doing:        noticeDoing(code),
 		Next:         statusNoticeNext(code, req, hasAllocation),
 		Details:      statusNoticeDetails(code, conversationID, current, pending, turnSnapshot, req, hasAllocation),
 	}
@@ -387,6 +455,25 @@ func statusNoticeDetails(code string, conversationID string, current TargetSnaps
 	return details
 }
 
+func statusNoticeStateDetails(conversationID string, current TargetSnapshot, pending string, turnSnapshot string, req AllocationRequest, hasAllocation bool) []NoticeDetail {
+	details := []NoticeDetail{
+		{"conversation", conversationID},
+		{"current_target", targetSnapshotLabel(current)},
+		{"profile", current.Profile},
+		{"pending_target", pending},
+		{"turn_snapshot", turnSnapshot},
+	}
+	if hasAllocation {
+		details = append(details,
+			NoticeDetail{"allocation", req.ID},
+			NoticeDetail{"allocation_state", string(req.State)},
+			NoticeDetail{"provider_job", req.ProviderIdentity.ProviderJobID},
+			NoticeDetail{"provider_state", req.RawProviderState},
+		)
+	}
+	return details
+}
+
 func AllocationStatusNotice(req AllocationRequest) BeaconNotice {
 	code := statusNoticeCode(req, true)
 	title := "Beacon allocation: " + detailValue(req.ID)
@@ -403,6 +490,8 @@ func AllocationStatusNotice(req AllocationRequest) BeaconNotice {
 		WhatHappened: []string{
 			allocationSentence(req),
 		},
+		State:   allocationStateDetails(req),
+		Doing:   noticeDoing(code),
 		Next:    allocationNext(code, req),
 		Details: allocationDetails(code, req),
 	}
@@ -463,6 +552,17 @@ func allocationDetails(code string, req AllocationRequest) []NoticeDetail {
 	return details
 }
 
+func allocationStateDetails(req AllocationRequest) []NoticeDetail {
+	return []NoticeDetail{
+		{"allocation", req.ID},
+		{"profile", req.Profile},
+		{"provider", string(req.Provider)},
+		{"allocation_state", string(req.State)},
+		{"provider_job", req.ProviderIdentity.ProviderJobID},
+		{"provider_state", req.RawProviderState},
+	}
+}
+
 func MachineStatusNotice(m Machine) BeaconNotice {
 	p := PreviewRelease(m)
 	title := "Beacon machine: " + detailValue(firstNonEmpty(m.ID, p.MachineID))
@@ -481,7 +581,16 @@ func MachineStatusNotice(m Machine) BeaconNotice {
 	return BeaconNotice{
 		Title:        title,
 		WhatHappened: what,
-		Next:         []string{"Release drains by default. Hard kill requires the confirmation token shown in Details."},
+		State: []NoticeDetail{
+			{"machine", firstNonEmpty(p.MachineID, m.ID)},
+			{"lease", p.LeaseID},
+			{"profile", m.Profile},
+			{"state", m.State},
+			{"provider_job", p.ProviderJobID},
+			{"host", m.Host},
+		},
+		Doing: []string{"Keeping release safe by draining by default; hard kill requires explicit confirmation."},
+		Next:  []string{"Release drains by default. Hard kill requires the confirmation token shown in Details."},
 		Details: []NoticeDetail{
 			{"machine", firstNonEmpty(p.MachineID, m.ID)},
 			{"lease", p.LeaseID},
