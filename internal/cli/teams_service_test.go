@@ -107,6 +107,7 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"Environment=NO_COLOR=1",
+		"Environment=" + systemdQuoteArg(update.EnvInstallDir+"="+exePath),
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"[Install]",
 		"WantedBy=default.target",
@@ -131,6 +132,57 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "not enabled or started automatically") {
 		t.Fatalf("install output should state no auto enable/start:\n%s", out.String())
+	}
+}
+
+func TestTeamsServiceInstallUsesStablePathWhenExecutableIsNFSSillyRename(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("NFS silly rename handling is for Unix service units")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	unitDir := filepath.Join(tmp, "systemd")
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("create bin dir: %v", err)
+	}
+	stable := filepath.Join(binDir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable binary: %v", err)
+	}
+	running := filepath.Join(binDir, ".nfs802014de01c482a800000492")
+	cwd := filepath.Join(tmp, "work")
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     running,
+		cwd:     cwd,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	for _, want := range []string{
+		"ExecStart=" + systemdQuoteArg(stable) + " teams run --owner-stale-after 18s",
+		"Environment=" + systemdQuoteArg(update.EnvInstallDir+"="+stable),
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit missing %q:\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, running) {
+		t.Fatalf("unit should not retain NFS silly-renamed path %q:\n%s", running, unit)
 	}
 }
 

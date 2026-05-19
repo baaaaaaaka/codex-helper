@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
 const (
@@ -2156,6 +2157,7 @@ func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
+	exe = stableRestartExecutablePath(exe)
 	if err := validateTeamsServiceExecutable(exe); err != nil {
 		return teamsServiceSpec{}, err
 	}
@@ -2163,6 +2165,7 @@ func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
+	exe = stableRestartExecutablePath(exe)
 	cwd, err := teamsServiceGetwd()
 	if err != nil {
 		return teamsServiceSpec{}, err
@@ -2182,6 +2185,7 @@ func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
+	env[update.EnvInstallDir] = exe
 	return teamsServiceSpec{
 		Executable:   exe,
 		WorkingDir:   cwd,

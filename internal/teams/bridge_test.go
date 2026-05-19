@@ -7721,6 +7721,39 @@ func TestBridgeSessionMessageReferenceIsReadForCodexTurn(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionQuotedBeaconCommandIsCodexPrompt(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "looked at quoted beacon", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	msg := bridgeTestMessageWithText("quoted-beacon", `<p>看一下这个问题</p><blockquote><p>beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04</p></blockquote>`)
+	text := promptTextFromTeamsMessageHTML(msg.Body.Content)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, text); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 {
+		t.Fatalf("executor prompts = %#v, want one Codex prompt", got)
+	} else if !strings.Contains(got[0], "看一下这个问题") || !strings.Contains(got[0], "beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04") {
+		t.Fatalf("executor prompt should keep current text and quoted context:\n%s", got[0])
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, "unknown beacon") || strings.Contains(joined, "usage: `beacon release`") {
+		t.Fatalf("quoted beacon command should not be handled by helper:\n%s", joined)
+	}
+}
+
+func TestCommandRouteTextTreatsRenderedTranscriptAsContextOnly(t *testing.T) {
+	msg := bridgeTestMessageWithText("rendered-transcript", `<p><strong>🧑‍💻 User:</strong></p><p>beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04</p><p><strong>🔧 Helper:</strong></p><p>usage: <code>beacon release</code></p>`)
+	text := promptTextFromTeamsMessageHTML(msg.Body.Content)
+	if got := commandRouteTextFromTeamsMessage(msg, text); got != "" {
+		t.Fatalf("route text = %q, want rendered transcript excluded from helper command routing", got)
+	}
+	if !strings.Contains(text, "beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04") {
+		t.Fatalf("prompt text should retain transcript context, got %q", text)
+	}
+}
+
 func TestBridgeSessionMessageReferenceFallsBackToPreviewWhenGraphReadFails(t *testing.T) {
 	graph, _ := newBridgeMessageReferenceGraph(t, http.StatusNotFound)
 	store := newBridgeTestStore(t)
@@ -9095,6 +9128,29 @@ func TestBridgePollDropsRenderedHelperOrCodexOutputWithoutDurableMatch(t *testin
 	}
 	if got := len(state.InboundEvents); got != 0 {
 		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestBridgeShouldIgnoreFreshRenderedHelperEcho(t *testing.T) {
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	msg := bridgeTestMessage("fresh-helper-update")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = RenderTeamsHTML(TeamsRenderInput{
+		Kind: TeamsRenderHelper,
+		Text: "⬇️ Helper update scheduled\n\nTarget: v0.1.0-rc.112\n\nChannel: release/pre-release",
+	})
+
+	ignore, err := bridge.shouldIgnoreMessage(context.Background(), bridge.reg.ControlChatID, msg, inboundPollRoleControl, false)
+	if err != nil {
+		t.Fatalf("shouldIgnoreMessage error: %v", err)
+	}
+	if !ignore {
+		t.Fatal("fresh rendered helper echo should be ignored without legacy cursor fallback")
+	}
+	if !bridge.reg.HasSent(bridge.reg.ControlChatID, msg.ID) {
+		t.Fatal("ignored helper echo was not marked sent")
 	}
 }
 

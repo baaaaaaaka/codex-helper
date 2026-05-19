@@ -66,10 +66,14 @@ func restartSelf() error {
 
 func stableRestartExecutablePath(path string) string {
 	stable := stripReloadBackupSuffix(path)
-	if stable == path {
+	if stable != path {
+		if info, err := os.Stat(stable); err == nil && !info.IsDir() {
+			return stable
+		}
 		return path
 	}
-	if info, err := os.Stat(stable); err == nil && !info.IsDir() {
+	stable = update.StableInstallPathFromExecutable(path)
+	if stable != filepath.Clean(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))) {
 		return stable
 	}
 	return path

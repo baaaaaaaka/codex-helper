@@ -437,7 +437,7 @@ func (b *Bridge) handleBeaconControlRelease(ctx context.Context, words []string)
 
 func (b *Bridge) handleBeaconWorkRelease(ctx context.Context, session *Session, words []string) (string, error) {
 	if len(words) > 0 {
-		return "", fmt.Errorf("usage: `beacon release`")
+		return "Wrong chat.\n\n`beacon release` in a Work chat releases only this chat's current beacon resource. To release a specific profile, allocation, provider job, or machine, send `beacon release <id>` in the control chat.", nil
 	}
 	return releaseBeaconConversationAllocations(ctx, session.ID, "released from Teams Work chat")
 }

@@ -196,3 +196,57 @@ func TestRestartSelfUsesStablePathWhenRunningReloadBackup(t *testing.T) {
 		t.Fatalf("exec args = %#v, want %#v", gotArgs, wantArgs)
 	}
 }
+
+func TestRestartSelfUsesStablePathWhenRunningNFSSillyRename(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("NFS silly rename handling is for Unix service restarts")
+	}
+
+	prevExecutablePath := executablePath
+	prevExecSelf := execSelf
+	prevStartSelf := startSelf
+	t.Cleanup(func() {
+		executablePath = prevExecutablePath
+		execSelf = prevExecSelf
+		startSelf = prevStartSelf
+	})
+
+	dir := t.TempDir()
+	stable := filepath.Join(dir, "codex-proxy")
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable binary: %v", err)
+	}
+	running := filepath.Join(dir, ".nfs802014de01c482a800000492")
+	executablePath = func() (string, error) {
+		return running, nil
+	}
+	startSelf = func(string, []string) error {
+		t.Fatal("startSelf should not be used on non-Windows restart")
+		return nil
+	}
+
+	wantErr := errors.New("stop before real exec")
+	var gotExe string
+	var gotArgs []string
+	execSelf = func(exe string, args []string, env []string) error {
+		gotExe = exe
+		gotArgs = append([]string{}, args...)
+		return wantErr
+	}
+
+	prevArgs := os.Args
+	os.Args = []string{"old-codex-proxy", "teams", "run", "--auto-service=false"}
+	t.Cleanup(func() { os.Args = prevArgs })
+
+	err := restartSelf()
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("restartSelf error = %v, want %v", err, wantErr)
+	}
+	if gotExe != stable {
+		t.Fatalf("exec exe = %q, want stable path %q", gotExe, stable)
+	}
+	wantArgs := []string{stable, "teams", "run", "--auto-service=false"}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("exec args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}

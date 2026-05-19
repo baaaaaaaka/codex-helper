@@ -1731,6 +1731,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	plainText := PlainTextFromTeamsHTML(msg.Body.Content)
+	if messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperLifecycleOutputMessage(msg, plainText) {
+		b.markRegistrySent(chatID, msg.ID)
+		return true, nil
+	}
 	if legacyGeneratedOutputFallback && role == inboundPollRoleControl && looksLikeRenderedHelperOutputPlainText(plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
@@ -1825,6 +1829,7 @@ func looksLikeRenderedOutboxPlainText(text string) bool {
 		"🤖 ✅ Codex answer:",
 		"🤖 🛠️ Codex command:",
 		"🤖 Codex progress:",
+		"💻 Code:",
 		"🧑‍💻 User:",
 	} {
 		if strings.HasPrefix(text, prefix) {
@@ -1832,6 +1837,14 @@ func looksLikeRenderedOutboxPlainText(text string) bool {
 		}
 	}
 	return false
+}
+
+func looksLikeRenderedHelperLifecycleOutputMessage(msg ChatMessage, text string) bool {
+	if !looksLikeRenderedHelperOutputMessage(msg, text) {
+		return false
+	}
+	body, ok := renderedHelperOutputBodyPlainText(text)
+	return ok && looksLikeRenderedHelperLifecycleOutputPlainText(body)
 }
 
 func looksLikeRenderedHelperOutputPlainText(text string) bool {
@@ -1897,6 +1910,7 @@ func looksLikeRenderedHelperLifecycleOutputPlainText(text string) bool {
 	for _, prefix := range []string{
 		"⏳ Codex is working. Request accepted.",
 		"⏳ Codex received your question. Request accepted.",
+		"❓ Codex received your control-chat question.",
 		"⚠️ Your request is queued.",
 		"▶️ Codex is starting this queued request.",
 		"💬 Work chat is ready.",
@@ -2120,6 +2134,28 @@ func promptTextFromTeamsMessageHTML(content string) string {
 	return stripUserAnnotationPrefix(PlainTextFromTeamsHTML(content))
 }
 
+func commandRouteTextFromTeamsMessage(msg ChatMessage, fallbackText string) string {
+	if strings.TrimSpace(msg.Body.Content) != "" {
+		plainText := CommandRoutePlainTextFromTeamsHTML(msg.Body.Content)
+		if looksLikeRenderedOutboxPlainText(plainText) {
+			return ""
+		}
+		return commandRouteTextFromPlainText(stripUserAnnotationPrefix(plainText))
+	}
+	return commandRouteTextFromPlainText(fallbackText)
+}
+
+func commandRouteTextFromPlainText(text string) string {
+	text = stripUserAnnotationPrefix(strings.TrimSpace(text))
+	if text == "" {
+		return ""
+	}
+	if looksLikeRenderedOutboxPlainText(text) {
+		return ""
+	}
+	return text
+}
+
 func promptTextFromTeamsMessageOrFallback(msg ChatMessage, fallbackText string) (string, bool) {
 	if prompt := strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content)); prompt != "" && !IsHelperText(prompt) {
 		return prompt, true
@@ -2211,7 +2247,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 	if len(msg.Attachments) > 0 {
 		return b.sendControl(ctx, UnsupportedControlAttachmentMessage(msg.Attachments))
 	}
-	parsed := ParseDashboardCommand(ChatScopeControl, text)
+	routeText := commandRouteTextFromTeamsMessage(msg, text)
+	parsed := ParseDashboardCommand(ChatScopeControl, routeText)
 	if controlCommandConsumesDashboardView(parsed) {
 		defer func() { _ = b.clearControlDashboardView(context.Background()) }()
 	}
@@ -2320,11 +2357,11 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			}
 			return b.sendControl(ctx, controlHelpText())
 		default:
-			return b.sendControl(ctx, unknownControlCommandMessage(text))
+			return b.sendControl(ctx, unknownControlCommandMessage(routeText))
 		}
 	}
-	if looksLikeControlPath(text) {
-		return b.sendControl(ctx, controlPathHintMessage(text))
+	if looksLikeControlPath(routeText) {
+		return b.sendControl(ctx, controlPathHintMessage(routeText))
 	}
 	return b.runControlFallback(ctx, msg, text)
 }
@@ -4631,7 +4668,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		b.reg.MarkSeen(chatID, msg.ID)
 		return nil
 	}
-	if parsed := ParseDashboardCommand(ChatScopeWork, text); parsed.HelperCommand {
+	routeText := commandRouteTextFromTeamsMessage(msg, text)
+	if parsed := ParseDashboardCommand(ChatScopeWork, routeText); parsed.HelperCommand {
 		if !messageAuthoredByCurrentUser(msg, b.user) {
 			return b.rejectExternalWorkCommand(ctx, session, msg)
 		}
@@ -4677,7 +4715,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 			}
 			return b.sendToChat(ctx, chatID, sessionHelpText())
 		default:
-			return b.sendToChat(ctx, chatID, unknownWorkCommandMessage(text))
+			return b.sendToChat(ctx, chatID, unknownWorkCommandMessage(routeText))
 		}
 	}
 
@@ -7918,7 +7956,7 @@ func (b *Bridge) rejectSessionWork(ctx context.Context, session *Session, msg Ch
 		text := strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content))
 		if len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 {
 			source = "teams_session_attachment_deferred"
-		} else if ParseDashboardCommand(ChatScopeWork, text).HelperCommand {
+		} else if ParseDashboardCommand(ChatScopeWork, commandRouteTextFromTeamsMessage(msg, text)).HelperCommand {
 			source = "teams_session_command_deferred"
 		}
 	}

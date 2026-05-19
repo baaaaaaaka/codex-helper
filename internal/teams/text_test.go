@@ -35,6 +35,24 @@ func TestPlainTextFromTeamsHTML(t *testing.T) {
 	}
 }
 
+func TestCommandRoutePlainTextFromTeamsHTMLDropsQuotedBlocks(t *testing.T) {
+	html := `<p>这是什么意思？</p><blockquote><p>beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04</p></blockquote>`
+	got := CommandRoutePlainTextFromTeamsHTML(html)
+	if got != "这是什么意思？" {
+		t.Fatalf("route text = %q, want current message only", got)
+	}
+	if prompt := PlainTextFromTeamsHTML(html); !strings.Contains(prompt, "beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04") {
+		t.Fatalf("prompt text should retain quoted context, got %q", prompt)
+	}
+}
+
+func TestCommandRoutePlainTextFromTeamsHTMLDropsAttachmentPlaceholders(t *testing.T) {
+	got := CommandRoutePlainTextFromTeamsHTML(`<p>answer this</p><attachment id="quote-1"></attachment>`)
+	if got != "answer this" {
+		t.Fatalf("route text = %q, want attachment placeholder removed", got)
+	}
+}
+
 func TestHTMLMessageEscapesPrefixAndText(t *testing.T) {
 	got := HTMLMessage(`codex <ready>`, `hello <script>alert("x")</script> & goodbye`)
 	want := `<p><strong>codex &lt;ready&gt;:</strong> hello &lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; goodbye</p>`

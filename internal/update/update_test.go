@@ -123,6 +123,37 @@ func TestCheckForUpdateUnknownLocalVersion(t *testing.T) {
 	}
 }
 
+func TestResolveInstallPathUsesStableSiblingForNFSSillyRename(t *testing.T) {
+	t.Setenv(EnvInstallDir, "")
+	prevExecutablePath := executablePath
+	t.Cleanup(func() { executablePath = prevExecutablePath })
+
+	dir := t.TempDir()
+	stable := filepath.Join(dir, binaryName())
+	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
+		t.Fatalf("write stable binary: %v", err)
+	}
+	running := filepath.Join(dir, ".nfs802014de01c482a800000492")
+	executablePath = func() (string, error) {
+		return running, nil
+	}
+
+	got, err := ResolveInstallPath("")
+	if err != nil {
+		t.Fatalf("ResolveInstallPath error: %v", err)
+	}
+	if got != stable {
+		t.Fatalf("ResolveInstallPath = %q, want stable sibling %q", got, stable)
+	}
+}
+
+func TestStableInstallPathKeepsNFSSillyRenameWhenSiblingMissing(t *testing.T) {
+	running := filepath.Join(t.TempDir(), ".nfs802014de01c482a800000492")
+	if got := StableInstallPathFromExecutable(running); got != running {
+		t.Fatalf("StableInstallPathFromExecutable = %q, want original %q", got, running)
+	}
+}
+
 func TestPerformUpdateExplicitVersion(t *testing.T) {
 	requireRuntimeAsset(t)
 	tag := "v1.2.3"

@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
@@ -797,6 +798,113 @@ func TestCodexYoloArgsReturnsNilForUnknownHelp(t *testing.T) {
 	got := codexYoloArgs(script)
 	if got != nil {
 		t.Fatalf("codexYoloArgs = %v, want nil", got)
+	}
+}
+
+func TestCodexYoloArgsDetectsHiddenDangerouslyBypassFlag(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	script := writeProbeScript(t, dir, "codex",
+		`#!/bin/sh
+case "$1" in
+  --help)
+    echo 'usage codex [options]'
+    ;;
+  --codex-helper-unsupported-flag-probe)
+    echo "error: unknown option $1" >&2
+    exit 2
+    ;;
+  --dangerously-bypass-approvals-and-sandbox)
+    if [ "$2" = "--help" ]; then
+      echo 'usage codex [options]'
+      exit 0
+    fi
+    exit 0
+    ;;
+  *)
+    echo "error: unknown option $1" >&2
+    exit 2
+    ;;
+esac
+`)
+
+	got := codexYoloArgs(script)
+	want := []string{"--dangerously-bypass-approvals-and-sandbox"}
+	requireStringSlice(t, got, want)
+}
+
+func TestCodexYoloArgsDoesNotProbeHiddenFlagsWhenHelpAdvertisesYoloMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	dir := t.TempDir()
+	probeMarker := filepath.Join(dir, "hidden-probe-ran")
+	t.Setenv("HIDDEN_PROBE_MARKER", probeMarker)
+	script := writeProbeScript(t, dir, "codex",
+		`#!/bin/sh
+case "$1" in
+  --help)
+    echo 'usage codex --dangerously-bypass-approvals-and-sandbox'
+    exit 0
+    ;;
+  --codex-helper-unsupported-flag-probe)
+    echo probe > "$HIDDEN_PROBE_MARKER"
+    echo "error: unknown option $1" >&2
+    exit 2
+    ;;
+esac
+exit 0
+`)
+
+	got := codexYoloArgs(script)
+	want := []string{"--dangerously-bypass-approvals-and-sandbox"}
+	requireStringSlice(t, got, want)
+	if _, err := os.Stat(probeMarker); !os.IsNotExist(err) {
+		t.Fatalf("hidden probe marker stat error = %v, want file not created", err)
+	}
+}
+
+func TestCodexYoloArgsDoesNotTreatHungUnknownProbeAsSafe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell script test on windows")
+	}
+	prevTimeout := codexHiddenFlagProbeTimeout
+	codexHiddenFlagProbeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { codexHiddenFlagProbeTimeout = prevTimeout })
+
+	dir := t.TempDir()
+	acceptedMarker := filepath.Join(dir, "accepted-probe-ran")
+	t.Setenv("ACCEPTED_PROBE_MARKER", acceptedMarker)
+	script := writeProbeScript(t, dir, "codex",
+		`#!/bin/sh
+case "$1" in
+  --help)
+    echo 'usage codex [options]'
+    exit 0
+    ;;
+  --codex-helper-unsupported-flag-probe)
+    sleep 5
+    exit 0
+    ;;
+  --dangerously-bypass-approvals-and-sandbox)
+    echo probe > "$ACCEPTED_PROBE_MARKER"
+    exit 0
+    ;;
+esac
+exit 0
+`)
+
+	start := time.Now()
+	if got := codexYoloArgs(script); got != nil {
+		t.Fatalf("codexYoloArgs = %v, want nil when unknown-arg probe hangs", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("codexYoloArgs took %s, want hidden probe timeout to bound delay", elapsed)
+	}
+	if _, err := os.Stat(acceptedMarker); !os.IsNotExist(err) {
+		t.Fatalf("accepted probe marker stat error = %v, want file not created", err)
 	}
 }
 

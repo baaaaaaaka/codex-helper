@@ -10,12 +10,14 @@ import (
 )
 
 var (
-	tagPattern            = regexp.MustCompile(`(?s)<[^>]*>`)
-	horizontalRulePattern = regexp.MustCompile(`(?i)<hr\s*/?>`)
-	lineBreakPattern      = regexp.MustCompile(`(?i)<br\s*/?>`)
-	tableCellPattern      = regexp.MustCompile(`(?i)</(?:th|td)>`)
-	tableRowPattern       = regexp.MustCompile(`(?i)</tr>`)
-	blockClosePattern     = regexp.MustCompile(`(?i)</(?:p|div|li|pre|table|blockquote)>`)
+	tagPattern                 = regexp.MustCompile(`(?s)<[^>]*>`)
+	horizontalRulePattern      = regexp.MustCompile(`(?i)<hr\s*/?>`)
+	lineBreakPattern           = regexp.MustCompile(`(?i)<br\s*/?>`)
+	tableCellPattern           = regexp.MustCompile(`(?i)</(?:th|td)>`)
+	tableRowPattern            = regexp.MustCompile(`(?i)</tr>`)
+	blockClosePattern          = regexp.MustCompile(`(?i)</(?:p|div|li|pre|table|blockquote)>`)
+	commandRouteQuoteHTML      = regexp.MustCompile(`(?is)<blockquote\b[^>]*>.*?</blockquote>`)
+	commandRouteAttachmentHTML = regexp.MustCompile(`(?is)<attachment\b[^>]*(?:>.*?</attachment>|/?>)`)
 )
 
 func SanitizeTopic(topic string) string {
@@ -79,6 +81,19 @@ func PlainTextFromTeamsHTML(content string) string {
 		lines[i] = strings.TrimSpace(line)
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func CommandRoutePlainTextFromTeamsHTML(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	for {
+		next := commandRouteQuoteHTML.ReplaceAllString(content, "")
+		if next == content {
+			break
+		}
+		content = next
+	}
+	content = commandRouteAttachmentHTML.ReplaceAllString(content, "")
+	return PlainTextFromTeamsHTML(content)
 }
 
 func IsHelperText(text string) bool {

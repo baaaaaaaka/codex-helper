@@ -1206,6 +1206,21 @@ func TestTeamsBeaconWorkReleaseCancelsAllocationButKeepsProfileBinding(t *testin
 	}
 }
 
+func TestTeamsBeaconWorkReleaseWithTargetPointsToControlChat(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, newBridgeTestStore(t), &recordingExecutor{})
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("work-release-target", "beacon release gpu"), "beacon release gpu"); err != nil {
+		t.Fatalf("work release target: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Wrong chat.") ||
+		!strings.Contains(joined, "send beacon release <id> in the control chat") ||
+		strings.Contains(joined, "usage: `beacon release`") {
+		t.Fatalf("work release target response mismatch:\n%s", joined)
+	}
+}
+
 func TestTeamsBeaconControlReleaseResolvesProfileAllocations(t *testing.T) {
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())

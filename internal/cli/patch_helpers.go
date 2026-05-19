@@ -18,7 +18,10 @@ import (
 
 const windowsYoloSandboxConfigArg = `windows.sandbox="unelevated"`
 
-var codexYoloRuntimeGOOS = runtime.GOOS
+var (
+	codexYoloRuntimeGOOS        = runtime.GOOS
+	codexHiddenFlagProbeTimeout = 2 * time.Second
+)
 
 func currentProxyVersion() string {
 	v := strings.TrimSpace(version)
@@ -70,6 +73,15 @@ func extractVersion(output string) string {
 // Keep this behavior out of README; it is intentionally undocumented there.
 func codexYoloArgs(path string) []string {
 	out, _ := runCodexProbe(path, "--help")
+	var hiddenProbeOK bool
+	var hiddenProbeChecked bool
+	hiddenProbeAllowed := func() bool {
+		if !hiddenProbeChecked {
+			hiddenProbeOK = codexProbeRejectsUnknownArgs(path)
+			hiddenProbeChecked = true
+		}
+		return hiddenProbeOK
+	}
 	if strings.Contains(out, "--yolo") {
 		return []string{"--yolo"}
 	}
@@ -80,9 +92,22 @@ func codexYoloArgs(path string) []string {
 	if strings.Contains(out, "--dangerously-bypass-approvals-and-sandbox") {
 		return []string{"--dangerously-bypass-approvals-and-sandbox"}
 	}
+	if hiddenProbeAllowed() && codexProbeAcceptsArgs(path, out, "--yolo") {
+		return []string{"--yolo"}
+	}
+	if hiddenProbeAllowed() && codexProbeAcceptsArgs(path, out, "--dangerously-bypass-approvals-and-sandbox") {
+		return []string{"--dangerously-bypass-approvals-and-sandbox"}
+	}
 	if strings.Contains(out, "--ask-for-approval") {
 		args := []string{"--ask-for-approval", "never"}
 		if strings.Contains(out, "--sandbox") {
+			args = append(args, "--sandbox", "danger-full-access")
+		}
+		return args
+	}
+	if hiddenProbeAllowed() && codexProbeAcceptsArgs(path, out, "--ask-for-approval", "never") {
+		args := []string{"--ask-for-approval", "never"}
+		if codexProbeAcceptsArgs(path, out, "--sandbox", "danger-full-access") {
 			args = append(args, "--sandbox", "danger-full-access")
 		}
 		return args
@@ -114,12 +139,76 @@ func codexYoloLaunchArgsWithOptions(path string, opts yoloLaunchOptions) []strin
 	return out
 }
 
-func runCodexProbe(path string, arg string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func runCodexProbe(path string, args ...string) (string, error) {
+	return runCodexProbeWithTimeout(10*time.Second, path, args...)
+}
+
+func runCodexHiddenFlagProbe(path string, args ...string) (string, error) {
+	return runCodexProbeWithTimeout(codexHiddenFlagProbeTimeout, path, args...)
+}
+
+func runCodexProbeWithTimeout(timeout time.Duration, path string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, arg)
+	cmd := exec.CommandContext(ctx, path, args...)
+	configureCodexProbeCommand(cmd)
 	out, err := cmd.CombinedOutput()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return string(out), ctxErr
+	}
 	return string(out), err
+}
+
+func codexProbeAcceptsArgs(path string, helpOutput string, args ...string) bool {
+	if strings.TrimSpace(path) == "" || len(args) == 0 {
+		return false
+	}
+	probeArgs := append(append([]string{}, args...), "--help")
+	out, err := runCodexHiddenFlagProbe(path, probeArgs...)
+	if err != nil {
+		return false
+	}
+	out = strings.TrimSpace(out)
+	if out == "" && strings.TrimSpace(helpOutput) == "" {
+		return false
+	}
+	return !codexProbeOutputRejectsArgs(out, args...)
+}
+
+func codexProbeRejectsUnknownArgs(path string) bool {
+	const unknownArg = "--codex-helper-unsupported-flag-probe"
+	out, err := runCodexHiddenFlagProbe(path, unknownArg, "--help")
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return codexProbeOutputRejectsArgs(out, unknownArg)
+}
+
+func codexProbeOutputRejectsArgs(output string, args ...string) bool {
+	lower := strings.ToLower(output)
+	for _, arg := range args {
+		trimmed := strings.ToLower(strings.TrimSpace(arg))
+		if trimmed == "" || !strings.HasPrefix(trimmed, "-") {
+			continue
+		}
+		if !strings.Contains(lower, trimmed) {
+			continue
+		}
+		for _, marker := range []string{
+			"unknown",
+			"unrecognized",
+			"unexpected",
+			"invalid option",
+			"invalid argument",
+			"flag provided but not defined",
+			"not supported",
+		} {
+			if strings.Contains(lower, marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isYoloFailure(err error, output string) bool {
