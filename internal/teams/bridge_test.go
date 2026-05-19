@@ -9131,6 +9131,93 @@ func TestBridgePollDropsRenderedHelperOrCodexOutputWithoutDurableMatch(t *testin
 	}
 }
 
+func TestBridgePollTreatsLateHelperOutboxRaceAsIgnored(t *testing.T) {
+	msg := bridgePollMessage("late-helper-outbox-race", "2026-05-19T12:43:42Z", "plain text before provenance lands")
+	graph := newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{msg}}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 5, 19, 12, 40, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	attempts := 0
+	handled, err := bridge.pollChat(context.Background(), "chat-1", 50, func(context.Context, ChatMessage, string) error {
+		attempts++
+		return teamstore.ErrInboundMessageFromHelperOutbox
+	})
+	if err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if handled {
+		t.Fatal("pollChat handled helper outbox race as user work")
+	}
+	if attempts != 1 {
+		t.Fatalf("handler attempts = %d, want 1", attempts)
+	}
+	if !bridge.reg.HasSent("chat-1", msg.ID) || !bridge.reg.HasSeen("chat-1", msg.ID) {
+		t.Fatalf("helper outbox race was not marked sent/seen: %#v", bridge.reg.Chats["chat-1"])
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestTeamsHTMLFirstTextIsStrongLabel(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		label   string
+		want    bool
+	}{
+		{
+			name:    "strong exact label",
+			content: `<p><strong>🤖 ✅ Codex answer:</strong></p><p>done</p>`,
+			label:   "🤖 ✅ Codex answer",
+			want:    true,
+		},
+		{
+			name:    "b exact label",
+			content: `<p><b>🤖 🛠️ Codex command:</b></p><pre><code>go test</code></pre>`,
+			label:   "🤖 🛠️ Codex command",
+			want:    true,
+		},
+		{
+			name:    "part label",
+			content: `<p><strong>🤖 ✅ Codex answer [part 2/3]:</strong></p><p>chunk</p>`,
+			label:   "🤖 ✅ Codex answer",
+			want:    true,
+		},
+		{
+			name:    "plain current user text is not strong",
+			content: `<p>🤖 ✅ Codex answer: why did this appear?</p>`,
+			label:   "🤖 ✅ Codex answer",
+			want:    false,
+		},
+		{
+			name:    "strong label is not first text",
+			content: `<p>question before label</p><p><strong>🤖 ✅ Codex answer:</strong></p>`,
+			label:   "🤖 ✅ Codex answer",
+			want:    false,
+		},
+		{
+			name:    "wrong label",
+			content: `<p><strong>🤖 ✅ Codex answer:</strong></p><p>done</p>`,
+			label:   "🤖 ⏳ Codex status",
+			want:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := teamsHTMLFirstTextIsStrongLabel(tt.content, tt.label); got != tt.want {
+				t.Fatalf("teamsHTMLFirstTextIsStrongLabel() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBridgeShouldIgnoreFreshRenderedHelperEcho(t *testing.T) {
 	store := newBridgeTestStore(t)
 	graph, _ := newBridgeTestGraph(t)

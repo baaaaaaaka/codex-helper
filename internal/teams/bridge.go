@@ -747,8 +747,8 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.sendDeferredInterruptedTurnNotices(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams interrupted turn notice error: %v\n", err)
 		}
-		if err := b.Save(); err != nil {
-			return err
+		if err := b.Save(); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams registry projection save skipped: %v\n", err)
 		}
 		if opts.Once {
 			return nil
@@ -1110,6 +1110,15 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 			}
 		}
 		if err := handle(ctx, msg, text); err != nil {
+			if errors.Is(err, teamstore.ErrInboundMessageFromHelperOutbox) {
+				b.markRegistrySent(chatID, msg.ID)
+				b.reg.MarkSeen(chatID, msg.ID)
+				if completeErr := completeGlobalInbound(ctx, globalClaim); completeErr != nil {
+					_ = b.store.RecordChatPollError(ctx, chatID, completeErr.Error())
+					return handled, completeErr
+				}
+				continue
+			}
 			releaseGlobalInbound(ctx, globalClaim)
 			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 			return handled, err
@@ -1733,6 +1742,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	plainText := PlainTextFromTeamsHTML(msg.Body.Content)
+	if messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedOutboxOutputMessage(msg, plainText) {
+		b.markRegistrySent(chatID, msg.ID)
+		return true, nil
+	}
 	if messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperLifecycleOutputMessage(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
@@ -1835,6 +1848,25 @@ func looksLikeRenderedOutboxPlainText(text string) bool {
 		"🧑‍💻 User:",
 	} {
 		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRenderedOutboxOutputMessage(msg ChatMessage, text string) bool {
+	if !looksLikeRenderedOutboxPlainText(text) {
+		return false
+	}
+	for _, label := range []string{
+		"🤖 ⏳ Codex status",
+		"🤖 ✅ Codex answer",
+		"🤖 🛠️ Codex command",
+		"🤖 Codex progress",
+		"💻 Code",
+		"🧑‍💻 User",
+	} {
+		if teamsHTMLFirstTextIsStrongLabel(msg.Body.Content, label) {
 			return true
 		}
 	}
@@ -2573,6 +2605,7 @@ func sessionHelpText() string {
 		"Common commands:",
 		"`helper status` or `!status` - check progress",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
+		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding before retrying an interrupted turn",
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`helper details` or `!details` - show debug IDs and links",
 		"`beacon status` - show this Work chat execution target",
@@ -2594,6 +2627,7 @@ func sessionAdvancedHelpText() string {
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
+		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding; it never overwrites a different existing binding",
 		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
 		"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
 		"Other text, including unknown slash-prefixed text, is sent to Codex.",
@@ -4230,7 +4264,7 @@ func isWorkOnlyHelperCommand(text string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "file", "image", "send-file", "send-image", "retry", "cancel", "close", "rename", "publish-history", "sync-history", "import-history":
+	case "file", "image", "send-file", "send-image", "retry", "restore-thread", "restore", "cancel", "close", "rename", "publish-history", "sync-history", "import-history":
 		return true
 	default:
 		return false
@@ -4707,6 +4741,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 				return b.rejectSessionWork(ctx, session, msg, control)
 			}
 			return b.retryTurnCommand(ctx, session, strings.TrimSpace(parsed.Argument))
+		case DashboardCommandRestoreThread:
+			return b.restoreThreadCommand(ctx, session, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandCancel:
 			return b.cancelTurnCommand(ctx, session, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandSendFile:
@@ -6896,6 +6932,11 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		}
 		executor = BeaconJobExecutor{Plan: plan}
 	}
+	if blocked, err := b.resolveCodexThreadBeforeRun(ctx, session, turn); err != nil {
+		return err
+	} else if blocked {
+		return nil
+	}
 	if _, err := b.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, ""); err != nil {
 		return err
 	}
@@ -6923,12 +6964,18 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			}
 			return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "canceled", "Codex request canceled.")
 		}
+		var threadConflict codexThreadConflictError
+		if errors.As(err, &threadConflict) {
+			return b.interruptTurnForThreadRecovery(ctx, session, turn, codexThreadConflictKind, threadConflict.Error())
+		}
 		if IsAmbiguousExecutionError(err) {
-			if _, runningErr := b.store.MarkTurnRunning(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); runningErr != nil {
-				return runningErr
+			if blocked, bindErr := b.bindObservedCodexThreadOrInterrupt(ctx, session, turn, result.CodexThreadID, "runner_ambiguous"); bindErr != nil {
+				return bindErr
+			} else if blocked {
+				return nil
 			}
-			if result.CodexThreadID != "" {
-				session.CodexThreadID = result.CodexThreadID
+			if _, runningErr := b.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, result.CodexTurnID); runningErr != nil {
+				return runningErr
 			}
 			if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, "ambiguous Codex execution: "+err.Error()); markErr != nil {
 				return markErr
@@ -6937,6 +6984,11 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 				MentionOwner:     true,
 				NotificationKind: "needs_attention",
 			})
+		}
+		if blocked, bindErr := b.bindObservedCodexThreadOrInterrupt(ctx, session, turn, result.CodexThreadID, "runner_failed"); bindErr != nil {
+			return bindErr
+		} else if blocked {
+			return nil
 		}
 		if _, markErr := b.store.MarkTurnFailedWithCodexIDs(ctx, turn.ID, err.Error(), firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); markErr != nil {
 			return markErr
@@ -6982,8 +7034,10 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	} else if interrupted {
 		return nil
 	}
-	if result.CodexThreadID != "" {
-		session.CodexThreadID = result.CodexThreadID
+	if blocked, bindErr := b.bindObservedCodexThreadOrInterrupt(ctx, session, turn, result.CodexThreadID, "runner_completed"); bindErr != nil {
+		return bindErr
+	} else if blocked {
+		return nil
 	}
 	mentionOwner := true
 	visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
@@ -6998,7 +7052,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		return err
 	}
 	session.UpdatedAt = time.Now()
-	if _, err := b.store.MarkTurnCompleted(ctx, turn.ID, result.CodexThreadID, result.CodexTurnID); err != nil {
+	if _, err := b.store.MarkTurnCompleted(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); err != nil {
 		return err
 	}
 	if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
@@ -7289,11 +7343,15 @@ func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor
 	if streaming, ok := executor.(StreamingInputExecutor); ok {
 		forwarder := b.startCodexEventForwarder(ctx, session, turn, chatID)
 		result, runErr = streaming.RunInputWithEventHandler(ctx, session, input, forwarder.Handle)
-		forwarder.Close(result.Text)
+		if closeErr := forwarder.Close(result.Text); runErr == nil && closeErr != nil {
+			runErr = closeErr
+		}
 	} else if streaming, ok := executor.(StreamingExecutor); ok {
 		forwarder := b.startCodexEventForwarder(ctx, session, turn, chatID)
 		result, runErr = streaming.RunWithEventHandler(ctx, session, input.Prompt, forwarder.Handle)
-		forwarder.Close(result.Text)
+		if closeErr := forwarder.Close(result.Text); runErr == nil && closeErr != nil {
+			runErr = closeErr
+		}
 	} else if inputExecutor, ok := executor.(InputExecutor); ok {
 		result, runErr = inputExecutor.RunInput(ctx, session, input)
 	} else {
@@ -7320,6 +7378,7 @@ type codexEventForwarder struct {
 	ctx                     context.Context
 	bridge                  *Bridge
 	sessionID               string
+	expectedThreadID        string
 	turnID                  string
 	chatID                  string
 	events                  chan codexrunner.StreamEvent
@@ -7335,14 +7394,19 @@ func (b *Bridge) startCodexEventForwarder(ctx context.Context, session *Session,
 	if session != nil {
 		sessionID = session.ID
 	}
+	expectedThreadID := ""
+	if session != nil {
+		expectedThreadID = strings.TrimSpace(session.CodexThreadID)
+	}
 	f := &codexEventForwarder{
-		ctx:       ctx,
-		bridge:    b,
-		sessionID: sessionID,
-		turnID:    turn.ID,
-		chatID:    chatID,
-		events:    make(chan codexrunner.StreamEvent, 128),
-		done:      make(chan struct{}),
+		ctx:              ctx,
+		bridge:           b,
+		sessionID:        sessionID,
+		expectedThreadID: expectedThreadID,
+		turnID:           turn.ID,
+		chatID:           chatID,
+		events:           make(chan codexrunner.StreamEvent, 128),
+		done:             make(chan struct{}),
 	}
 	go f.run()
 	return f
@@ -7358,15 +7422,16 @@ func (f *codexEventForwarder) Handle(event codexrunner.StreamEvent) {
 	}
 }
 
-func (f *codexEventForwarder) Close(finalText string) {
+func (f *codexEventForwarder) Close(finalText string) error {
 	if f == nil {
-		return
+		return nil
 	}
 	close(f.events)
 	<-f.done
 	if strings.TrimSpace(f.pendingAgent) != "" && !sameCodexVisibleText(f.pendingAgent, finalText) {
 		_ = f.send("progress", f.pendingAgent)
 	}
+	return f.err
 }
 
 func (f *codexEventForwarder) run() {
@@ -7397,6 +7462,9 @@ func (f *codexEventForwarder) run() {
 }
 
 func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
+	if f.observeEventThread(event) {
+		return
+	}
 	switch event.Kind {
 	case codexrunner.StreamEventAgentMessage:
 		if strings.TrimSpace(f.pendingAgent) != "" {
@@ -7416,6 +7484,30 @@ func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
 			_ = f.send("status", "Codex turn failed: "+event.Failure.Message)
 		}
 	}
+}
+
+func (f *codexEventForwarder) observeEventThread(event codexrunner.StreamEvent) bool {
+	threadID := strings.TrimSpace(event.ThreadID)
+	if threadID == "" {
+		return false
+	}
+	if strings.TrimSpace(f.expectedThreadID) == "" {
+		f.expectedThreadID = threadID
+		return false
+	}
+	if f.expectedThreadID == threadID {
+		return false
+	}
+	if f.err == nil {
+		f.err = codexThreadConflictError{
+			SessionID: f.sessionID,
+			Existing:  f.expectedThreadID,
+			Observed:  threadID,
+			Source:    "stream_" + string(event.Kind),
+		}
+	}
+	f.pendingAgent = ""
+	return true
 }
 
 func (f *codexEventForwarder) flushPendingAgent() {
@@ -9273,6 +9365,8 @@ func firstNonZeroTime(values ...time.Time) time.Time {
 func renderKindForOutbox(kind string) TeamsRenderKind {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	switch {
+	case kind == "queued-status":
+		return TeamsRenderHelper
 	case kind == "final" || strings.HasPrefix(kind, "final-") || strings.Contains(kind, "assistant"):
 		return TeamsRenderAssistant
 	case strings.Contains(kind, "progress") || strings.Contains(kind, "status"):

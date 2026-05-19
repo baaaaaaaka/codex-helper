@@ -2245,6 +2245,199 @@ func TestMessageProvenanceRecordsHelperOutbox(t *testing.T) {
 	}
 }
 
+func TestMessageProvenanceDoesNotDowngradeHelperOutboxToInbound(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		OutboxID:       "outbox-1",
+		Kind:           "codex-progress-001",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance helper error: %v", err)
+	}
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginUserInbound,
+		InboundID:      "inbound-1",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance inbound error: %v", err)
+	}
+	got, ok, err := store.MessageProvenance(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance error: %v", err)
+	}
+	if !ok || got.Origin != MessageOriginHelperOutbox || got.OutboxID != "outbox-1" || got.InboundID != "" {
+		t.Fatalf("provenance was downgraded to inbound: %#v ok=%v", got, ok)
+	}
+	if !strings.Contains(got.Diagnostic, "ignored user_inbound") {
+		t.Fatalf("diagnostic = %q, want ignored user_inbound", got.Diagnostic)
+	}
+}
+
+func TestMessageProvenanceAllowsHelperOutboxToReplaceEarlyInbound(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginUserInbound,
+		InboundID:      "inbound-1",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance inbound error: %v", err)
+	}
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		OutboxID:       "outbox-1",
+		Kind:           "codex-progress-001",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance helper error: %v", err)
+	}
+	got, ok, err := store.MessageProvenance(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance error: %v", err)
+	}
+	if !ok || got.Origin != MessageOriginHelperOutbox || got.OutboxID != "outbox-1" {
+		t.Fatalf("helper provenance did not replace inbound: %#v ok=%v", got, ok)
+	}
+	if !strings.Contains(got.Diagnostic, "replaced user_inbound") {
+		t.Fatalf("diagnostic = %q, want replaced user_inbound", got.Diagnostic)
+	}
+}
+
+func TestPersistInboundRejectsHelperOutboxMessageID(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		OutboxID:       "outbox-1",
+		Kind:           "codex-status-001",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance helper error: %v", err)
+	}
+	if _, created, err := store.PersistInbound(ctx, InboundEvent{
+		SessionID:      "s1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Text:           "should not become a prompt",
+		Status:         InboundStatusQueued,
+	}); !errors.Is(err, ErrInboundMessageFromHelperOutbox) {
+		t.Fatalf("PersistInbound error = %v, want ErrInboundMessageFromHelperOutbox", err)
+	} else if created {
+		t.Fatal("PersistInbound created helper outbox as inbound")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+	record, ok, err := store.MessageProvenance(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance error: %v", err)
+	}
+	if !ok || record.Origin != MessageOriginHelperOutbox || record.InboundID != "" {
+		t.Fatalf("provenance = %#v ok=%v, want helper outbox only", record, ok)
+	}
+}
+
+func TestPersistInboundRejectsDeliveredOutboxWithoutProvenance(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:             "outbox-1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Kind:           "helper",
+		Body:           "sent before provenance write",
+		Status:         OutboxStatusSent,
+	}); err != nil {
+		t.Fatalf("QueueOutbox helper error: %v", err)
+	}
+	if _, created, err := store.PersistInbound(ctx, InboundEvent{
+		SessionID:      "s1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Text:           "should not become a prompt",
+		Status:         InboundStatusQueued,
+	}); !errors.Is(err, ErrInboundMessageFromHelperOutbox) {
+		t.Fatalf("PersistInbound error = %v, want ErrInboundMessageFromHelperOutbox", err)
+	} else if created {
+		t.Fatal("PersistInbound created delivered outbox as inbound")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestHelperOutboxProvenanceSuppressesEarlyQueuedInbound(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	inbound, created, err := store.PersistInbound(ctx, InboundEvent{
+		SessionID:      "s1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Text:           "should be suppressed",
+		Status:         InboundStatusQueued,
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound early error: %v", err)
+	}
+	if !created {
+		t.Fatal("early inbound created = false")
+	}
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: "s1", InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if !created {
+		t.Fatal("QueueTurn created = false")
+	}
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		OutboxID:       "outbox-1",
+		Kind:           "codex-status-001",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance helper error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.InboundEvents[inbound.ID].Status; got != InboundStatusIgnored {
+		t.Fatalf("inbound status = %q, want ignored", got)
+	}
+	if got := state.Turns[turn.ID].Status; got != TurnStatusInterrupted {
+		t.Fatalf("turn status = %q, want interrupted", got)
+	}
+	if reason := state.Turns[turn.ID].RecoveryReason; !strings.Contains(reason, "helper_outbox provenance") {
+		t.Fatalf("turn recovery reason = %q, want helper provenance reason", reason)
+	}
+	record, ok, err := store.MessageProvenance(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance error: %v", err)
+	}
+	if !ok || record.Origin != MessageOriginHelperOutbox || record.InboundID != "" || record.OutboxID != "outbox-1" {
+		t.Fatalf("provenance = %#v ok=%v, want helper outbox replacement", record, ok)
+	}
+}
+
 func TestRecoverInterruptsAmbiguousTurns(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -4245,6 +4438,97 @@ func TestClearOwnerIfSameDoesNotClearSameProcessDifferentInstance(t *testing.T) 
 		t.Fatalf("ReadOwner after different instance clear error: %v", err)
 	} else if !ok {
 		t.Fatal("owner missing after different instance clear")
+	}
+}
+
+func TestReplaceFileWithRetryRetriesRetryableErrors(t *testing.T) {
+	retryErr := errors.New("sharing violation")
+	attempts := 0
+	err := replaceFileWithRetry("tmp", "state.json", func(string, string) error {
+		attempts++
+		if attempts < 3 {
+			return retryErr
+		}
+		return nil
+	}, func(err error) bool {
+		return errors.Is(err, retryErr)
+	})
+	if err != nil {
+		t.Fatalf("replaceFileWithRetry error: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestReplaceFileWithRetryStopsOnPermanentError(t *testing.T) {
+	permanentErr := errors.New("permission denied")
+	attempts := 0
+	err := replaceFileWithRetry("tmp", "state.json", func(string, string) error {
+		attempts++
+		return permanentErr
+	}, func(error) bool { return false })
+	if !errors.Is(err, permanentErr) {
+		t.Fatalf("replaceFileWithRetry error = %v, want permanent error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 for permanent error", attempts)
+	}
+}
+
+func TestReplaceFileWithRetryBoundsRetryableErrors(t *testing.T) {
+	retryErr := errors.New("sharing violation")
+	attempts := 0
+	err := replaceFileWithRetry("tmp", "state.json", func(string, string) error {
+		attempts++
+		return retryErr
+	}, func(err error) bool {
+		return errors.Is(err, retryErr)
+	})
+	if !errors.Is(err, retryErr) {
+		t.Fatalf("replaceFileWithRetry error = %v, want retry error", err)
+	}
+	if attempts != durableReplaceAttempts {
+		t.Fatalf("attempts = %d, want bounded attempts %d", attempts, durableReplaceAttempts)
+	}
+}
+
+func TestAtomicWriteFileUsesTempAndCleansFailedReplace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	replaceErr := errors.New("replace failed")
+	prev := durableReplaceFile
+	t.Cleanup(func() { durableReplaceFile = prev })
+	var tempPath string
+	durableReplaceFile = func(src string, dst string) error {
+		tempPath = src
+		if dst != path {
+			t.Fatalf("replace dst = %q, want %q", dst, path)
+		}
+		if filepath.Dir(src) != filepath.Dir(path) {
+			t.Fatalf("replace src dir = %q, want %q", filepath.Dir(src), filepath.Dir(path))
+		}
+		data, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("read temp during replace: %v", err)
+		}
+		if string(data) != "new state" {
+			t.Fatalf("temp data = %q, want new state", data)
+		}
+		return replaceErr
+	}
+
+	err := atomicWriteFile(path, []byte("new state"), 0o600)
+	if !errors.Is(err, replaceErr) {
+		t.Fatalf("atomicWriteFile error = %v, want replace error", err)
+	}
+	if tempPath == "" {
+		t.Fatal("durableReplaceFile was not called")
+	}
+	if _, err := os.Stat(tempPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp file still exists after replace failure: stat err=%v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target should not exist after failed replace: stat err=%v", err)
 	}
 }
 

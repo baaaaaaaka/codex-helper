@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -127,7 +128,11 @@ func (e RunnerExecutor) RunInputWithEventHandler(ctx context.Context, session *S
 		}
 		return out, err
 	}
-	return successfulExecutionResultFromCodexTurn(result), nil
+	out := successfulExecutionResultFromCodexTurn(result)
+	if threadID != "" && out.CodexThreadID != "" && out.CodexThreadID != threadID {
+		return out, fmt.Errorf("resume emitted Codex thread %q, expected %q", out.CodexThreadID, threadID)
+	}
+	return out, nil
 }
 
 func codexTurnMayStillBeRunning(result codexrunner.TurnResult) bool {

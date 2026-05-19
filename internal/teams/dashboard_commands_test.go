@@ -231,6 +231,20 @@ func TestParseBeaconWorkDashboardCommands(t *testing.T) {
 	}
 }
 
+func TestParseRestoreThreadWorkCommand(t *testing.T) {
+	for _, text := range []string{
+		"helper restore-thread thread-123",
+		"helper restore thread-123",
+		"/restore-thread thread-123",
+		"!rs thread-123",
+	} {
+		cmd := ParseDashboardCommand(ChatScopeWork, text)
+		if !cmd.HelperCommand || cmd.Name != DashboardCommandRestoreThread || cmd.Argument != "thread-123" {
+			t.Fatalf("ParseDashboardCommand(%q) = %#v, want restore-thread thread-123", text, cmd)
+		}
+	}
+}
+
 func TestParseWorkChatUnknownSlashIsCodexInput(t *testing.T) {
 	for _, text := range []string{"/tmp/a.log 这个文件是什么", "/tmp/status should be checked", "/usr/bin/env bash -lc pwd", "codex explain this error", "codex h"} {
 		t.Run(text, func(t *testing.T) {

@@ -198,11 +198,7 @@ func writeControlChatHistoryEntries(path string, entries []controlChatHistoryEnt
 			return err
 		}
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return durableWriteFile(path, []byte(b.String()), 0o600)
 }
 
 func pruneControlChatHistoryEntries(entries []controlChatHistoryEntry) []controlChatHistoryEntry {

@@ -119,6 +119,33 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 	assertTextInput(t, writes[4], "continue")
 }
 
+func TestAppServerRunnerCapturesResumeThreadIDBeforeTurnStart(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-other"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-resume","status":"inProgress","items":[]}}}`,
+		`{"method":"turn/started","params":{"threadId":"thread-other","turn":{"id":"turn-resume"}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-other","turnId":"turn-resume","item":{"id":"item-1","type":"agentMessage","text":"resumed elsewhere"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-other","turn":{"id":"turn-resume","status":"completed","items":[]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	if err != nil {
+		t.Fatalf("ResumeThread error: %v", err)
+	}
+	if got.ThreadID != "thread-other" || got.TurnID != "turn-resume" || got.FinalAgentMessage != "resumed elsewhere" {
+		t.Fatalf("unexpected result: %#v", got)
+	}
+
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[3], "thread/resume")
+	assertParamString(t, writes[3], "threadId", "thread-existing")
+	assertMethod(t, writes[4], "turn/start")
+	assertParamString(t, writes[4], "threadId", "thread-other")
+}
+
 func TestAppServerRunnerEncodesLocalImageInputs(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,

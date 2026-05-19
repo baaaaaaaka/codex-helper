@@ -113,7 +113,14 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 		}
 		return out, err
 	}
-	return successfulTeamsExecutionResultFromCodexTurn(result), nil
+	out := successfulTeamsExecutionResultFromCodexTurn(result)
+	if session != nil {
+		expectedThreadID := strings.TrimSpace(session.CodexThreadID)
+		if expectedThreadID != "" && out.CodexThreadID != "" && out.CodexThreadID != expectedThreadID {
+			return out, fmt.Errorf("resume emitted Codex thread %q, expected %q", out.CodexThreadID, expectedThreadID)
+		}
+	}
+	return out, nil
 }
 
 func teamsCodexTurnMayStillBeRunning(result codexrunner.TurnResult) bool {

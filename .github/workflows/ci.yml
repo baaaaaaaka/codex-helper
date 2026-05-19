@@ -328,8 +328,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          adapter_pattern='Test(TeamsCodexExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|RunnerExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|BridgeSession(CodexFailureWithOnlyExistingThreadIDMarksFailed|TerminalCodexFailureWithTurnIDMarksFailed))$'
-          runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerProcess(TransportReadFailureIncludesLimitedStderr|DiagnosticWaitsForStderrDrainAfterExit))$'
+          adapter_pattern='Test(TeamsCodexExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|RejectsResumeThreadMismatch|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|RunnerExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|RejectsResumeThreadMismatch|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|BridgeSession(CodexFailureWithOnlyExistingThreadIDMarksFailed|TerminalCodexFailureWithTurnIDMarksFailed))$'
+          runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunner(CapturesResumeThreadIDBeforeTurnStart|ResumeThreadFailureKeepsExistingThreadIDOnly)|AppServerProcess(TransportReadFailureIncludesLimitedStderr|DiagnosticWaitsForStderrDrainAfterExit))$'
           helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater.*|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|PassesPrereleaseOptIn|QueuesPlainCompletionNotice|PendingReplacement(WaitsForVerifiedVersion|FailureNotifiesOnce)|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState)|BridgeControlHelperUpdate(PrereleaseRunsManualUpdate|WaitsForActiveWork))$'
           upgrade_pattern='Test(BridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork|BridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat|CodexErrorRequiresUpgradeHeuristics|UpgradeNotificationTargetsDeduplicate|UpgradeRescue(InterruptsRunningPreservesQueuedAndSkipsTransientOutbox|PreservesProtectedOutboxBlocker|FencesStaleOwnerButRefusesLiveOwner)|RunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner)$'
           upgrade_cmd_pattern='TestUpgradeCmd(AlreadyUpToDateRescuesStaleTeamsState|UsesAutoUpdateInstallLock|FallsBackToCacheLockWhenInstallPathLockUnavailable|AllowsOrphanQueuedTurn|RescuesOrphanRunningTurnAndTransientOutbox|RescuesStaleOwnerBeforeUpdate|PausesOnProtectedOutboxDuringRescue)$'
@@ -341,6 +341,15 @@ jobs:
           go test ./internal/teams ./internal/teams/store -count=1 -run "$upgrade_pattern" -v
           go test ./internal/cli -count=1 -run "$upgrade_cmd_pattern" -v
           go test ./internal/cli ./internal/teams ./internal/teams/store -count=1 -run "$helper_upgrade_handoff_pattern" -v
+
+      - name: Teams thread recovery and self-echo regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          thread_recovery_pattern='Test(RunQueuedTurn(BindsDurableThreadWhenRegistryIsStale|IgnoresWrongRegistryThreadWhenDurableThreadExists|BlocksRegistryOnlyThreadAsWeakHint|BlocksMissingThreadWhenPriorCodexTurnExists|BindsThreadFromJournalFallback|IgnoresJournalRecordsForOtherScopeOrChat|BindsThreadFromPriorTurnWhenSessionIsEmpty|BlocksDurableJournalThreadConflict|ConflictingObservedThreadInterruptsWithoutFinal|StreamThreadMismatchInterrupts|FreshFirstTurnCanStartNewThread|BlocksJournalReadErrorBeforeExecutor|StoreReadErrorDoesNotCallExecutor)|RestoreThreadCommand(FillsEmptyBindingAndRejectsUnsafeOverwrites|RejectsThreadBoundToOtherActiveSession)|Poll(DropsExactTeamsStatusSelfEchoWithoutDurableMatch|DropsFreshRenderedCodexOutputLabelsWithoutDurableMatch|DoesNotDropPlainCurrentUserStatusText|DoesNotDropCoworkerStrongStatusText|DropsFreshRenderedCodeAndUserTranscriptSelfEcho)|BridgePollTreatsLateHelperOutboxRaceAsIgnored|TeamsHTMLFirstTextIsStrongLabel|ReadThreadLinkJournal(SkipsCorruptPartialOversizedAndMismatchedLines|BudgetExceededFailsClosed)|ThreadLinkJournalConcurrentAppendAndHashedPath|Teams(ReplaceFileWithRetry(RetriesRetryableErrors|StopsOnPermanentError|BoundsRetryableErrors)|DurableWriteFileUsesTempAndCleansFailedReplace)|Windows(DurableWriteFileRetriesLockedTarget|ReplaceRetryableErrors))$'
+          store_recovery_pattern='Test(MessageProvenance(RecordsHelperOutbox|DoesNotDowngradeHelperOutboxToInbound|AllowsHelperOutboxToReplaceEarlyInbound)|PersistInboundRejects(HelperOutboxMessageID|DeliveredOutboxWithoutProvenance)|HelperOutboxProvenanceSuppressesEarlyQueuedInbound|HasDeliveredOutboxMessageStatusMatrix|ReplaceFileWithRetry(RetriesRetryableErrors|StopsOnPermanentError|BoundsRetryableErrors)|AtomicWriteFileUsesTempAndCleansFailedReplace|Windows(AtomicWriteFileRetriesLockedTarget|ReplaceRetryableErrors))$'
+          go test ./internal/teams -count=1 -run "$thread_recovery_pattern" -v
+          go test ./internal/teams/store -count=1 -run "$store_recovery_pattern" -v
 
       - name: Teams bridge scheduling and history sync regressions
         shell: bash

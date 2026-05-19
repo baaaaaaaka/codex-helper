@@ -652,6 +652,7 @@ type MessageProvenanceRecord struct {
 	InboundID      string    `json:"inbound_id,omitempty"`
 	Kind           string    `json:"kind,omitempty"`
 	RenderedHash   string    `json:"rendered_hash,omitempty"`
+	Diagnostic     string    `json:"diagnostic,omitempty"`
 	CreatedAt      time.Time `json:"created_at,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
@@ -695,6 +696,7 @@ var (
 )
 var ErrUnsupportedSchemaVersion = errors.New("unsupported Teams state schema version")
 var ErrControlLeaseNotHeld = errors.New("Teams control lease is not held by this machine")
+var ErrInboundMessageFromHelperOutbox = errors.New("Teams inbound message already recorded as helper outbox")
 
 type UnsupportedSchemaVersionError struct {
 	Version int
@@ -1685,6 +1687,9 @@ func (s *Store) PersistInbound(ctx context.Context, event InboundEvent) (Inbound
 				out = existing
 				return nil
 			}
+		}
+		if helperOutboxMessageLocked(state, event.TeamsChatID, event.TeamsMessageID) {
+			return ErrInboundMessageFromHelperOutbox
 		}
 		now := time.Now()
 		if event.Status == "" {
@@ -3289,8 +3294,27 @@ func recordMessageProvenanceLocked(state *State, record MessageProvenanceRecord,
 		record.Origin = "unknown"
 	}
 	record.ID = messageProvenanceID(record.TeamsChatID, record.TeamsMessageID)
-	if existing, ok := state.MessageProvenance[record.ID]; ok && !existing.CreatedAt.IsZero() && record.CreatedAt.IsZero() {
-		record.CreatedAt = existing.CreatedAt
+	if existing, ok := state.MessageProvenance[record.ID]; ok {
+		if !existing.CreatedAt.IsZero() && record.CreatedAt.IsZero() {
+			record.CreatedAt = existing.CreatedAt
+		}
+		switch {
+		case strings.TrimSpace(existing.Origin) == MessageOriginHelperOutbox && strings.TrimSpace(record.Origin) == MessageOriginUserInbound:
+			if record.UpdatedAt.IsZero() {
+				if !now.IsZero() {
+					record.UpdatedAt = now
+				} else {
+					record.UpdatedAt = existing.UpdatedAt
+				}
+			}
+			existing.UpdatedAt = record.UpdatedAt
+			existing.Diagnostic = "ignored user_inbound provenance for helper_outbox Teams message"
+			state.MessageProvenance[existing.ID] = existing
+			return existing
+		case strings.TrimSpace(existing.Origin) == MessageOriginUserInbound && strings.TrimSpace(record.Origin) == MessageOriginHelperOutbox:
+			record.Diagnostic = "replaced user_inbound provenance with helper_outbox Teams message"
+			suppressInboundExecutionForHelperOutboxLocked(state, existing, now)
+		}
 	}
 	if record.CreatedAt.IsZero() {
 		if !now.IsZero() {
@@ -3308,6 +3332,93 @@ func recordMessageProvenanceLocked(state *State, record MessageProvenanceRecord,
 	}
 	state.MessageProvenance[record.ID] = record
 	return record
+}
+
+func helperOutboxMessageLocked(state *State, chatID string, teamsMessageID string) bool {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if state == nil || chatID == "" || teamsMessageID == "" {
+		return false
+	}
+	if record, ok := state.MessageProvenance[messageProvenanceID(chatID, teamsMessageID)]; ok && strings.TrimSpace(record.Origin) == MessageOriginHelperOutbox {
+		return true
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.TrimSpace(msg.TeamsChatID) != chatID || strings.TrimSpace(msg.TeamsMessageID) != teamsMessageID {
+			continue
+		}
+		switch msg.Status {
+		case OutboxStatusAccepted, OutboxStatusSent:
+			return true
+		}
+	}
+	return false
+}
+
+func suppressInboundExecutionForHelperOutboxLocked(state *State, record MessageProvenanceRecord, now time.Time) {
+	if state == nil {
+		return
+	}
+	var inboundIDs []string
+	if id := strings.TrimSpace(record.InboundID); id != "" {
+		inboundIDs = append(inboundIDs, id)
+	}
+	for id, inbound := range state.InboundEvents {
+		if strings.TrimSpace(inbound.TeamsChatID) == strings.TrimSpace(record.TeamsChatID) &&
+			strings.TrimSpace(inbound.TeamsMessageID) == strings.TrimSpace(record.TeamsMessageID) &&
+			strings.TrimSpace(inbound.TeamsMessageID) != "" {
+			inboundIDs = appendUniqueStoreString(inboundIDs, id)
+		}
+	}
+	for _, id := range inboundIDs {
+		inbound := state.InboundEvents[id]
+		if inbound.ID == "" {
+			continue
+		}
+		inbound.Status = InboundStatusIgnored
+		if !now.IsZero() {
+			inbound.UpdatedAt = now
+		}
+		state.InboundEvents[id] = inbound
+	}
+	for id, turn := range state.Turns {
+		if turn.Status != TurnStatusQueued {
+			continue
+		}
+		matchesInbound := false
+		for _, inboundID := range inboundIDs {
+			if strings.TrimSpace(turn.InboundEventID) == strings.TrimSpace(inboundID) {
+				matchesInbound = true
+				break
+			}
+		}
+		if !matchesInbound && strings.TrimSpace(record.TurnID) != "" && strings.TrimSpace(turn.ID) == strings.TrimSpace(record.TurnID) {
+			matchesInbound = true
+		}
+		if !matchesInbound {
+			continue
+		}
+		turn.Status = TurnStatusInterrupted
+		turn.RecoveryReason = "helper_outbox provenance replaced user_inbound for the same Teams message"
+		if !now.IsZero() {
+			turn.InterruptedAt = now
+			turn.UpdatedAt = now
+		}
+		state.Turns[id] = turn
+	}
+}
+
+func appendUniqueStoreString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if strings.TrimSpace(existing) == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func messageProvenanceID(chatID string, teamsMessageID string) string {
@@ -3415,7 +3526,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := durableReplaceFile(tmpName, path); err != nil {
 		return err
 	}
 	cleanup = false

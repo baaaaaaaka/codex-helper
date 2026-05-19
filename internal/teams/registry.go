@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 const maxTrackedMessageIDs = 500
@@ -88,7 +90,17 @@ func SaveRegistry(path string, reg Registry) error {
 		}
 	}
 	reg.ensureMaps()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensurePrivateDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
+	lock := flock.New(path + ".lock")
+	if err := lock.Lock(); err != nil {
+		return err
+	}
+	defer func() { _ = lock.Unlock() }()
+	if existing, err := loadRegistryNoDefault(path); err == nil {
+		reg = mergeRegistryProjection(existing, reg)
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	data, err := json.MarshalIndent(reg, "", "  ")
@@ -98,11 +110,71 @@ func SaveRegistry(path string, reg Registry) error {
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(bytes.TrimSpace(existing), bytes.TrimSpace(data)) {
 		return nil
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	return durableWriteFile(path, data, 0o600)
+}
+
+func loadRegistryNoDefault(path string) (Registry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Registry{}, err
 	}
-	return os.Rename(tmp, path)
+	var reg Registry
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return Registry{}, err
+	}
+	if reg.Version == 0 {
+		reg.Version = 1
+	}
+	reg.ensureMaps()
+	return reg, nil
+}
+
+func mergeRegistryProjection(existing Registry, next Registry) Registry {
+	existing.ensureMaps()
+	next.ensureMaps()
+	for chatID, chat := range next.Chats {
+		existingChat, ok := existing.Chats[chatID]
+		if !ok {
+			continue
+		}
+		chat.SeenMessageIDs = mergeTrackedMessageIDs(existingChat.SeenMessageIDs, chat.SeenMessageIDs)
+		chat.SentMessageIDs = mergeTrackedMessageIDs(existingChat.SentMessageIDs, chat.SentMessageIDs)
+		next.Chats[chatID] = chat
+	}
+	next.Sessions = mergeRegistrySessions(existing.Sessions, next.Sessions)
+	return next
+}
+
+func mergeRegistrySessions(existing []Session, next []Session) []Session {
+	existingByID := make(map[string]Session, len(existing))
+	for _, session := range existing {
+		if id := strings.TrimSpace(session.ID); id != "" {
+			existingByID[id] = session
+		}
+	}
+	merged := make([]Session, 0, len(next))
+	for _, session := range next {
+		id := strings.TrimSpace(session.ID)
+		if id == "" {
+			merged = append(merged, session)
+			continue
+		}
+		if existingSession, ok := existingByID[id]; ok {
+			if strings.TrimSpace(session.CodexThreadID) == "" {
+				session.CodexThreadID = existingSession.CodexThreadID
+			}
+		}
+		merged = append(merged, session)
+	}
+	return merged
+}
+
+func mergeTrackedMessageIDs(existing []string, next []string) []string {
+	out := append([]string(nil), existing...)
+	for _, id := range next {
+		out = appendUniqueBounded(out, id, maxTrackedMessageIDs)
+	}
+	return out
 }
 
 func (r *Registry) ensureMaps() {

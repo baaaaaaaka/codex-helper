@@ -88,6 +88,30 @@ func TestRunnerExecutorDoesNotTreatExistingThreadIDErrorAsAccepted(t *testing.T)
 	}
 }
 
+func TestRunnerExecutorRejectsResumeThreadMismatch(t *testing.T) {
+	runner := &fakeCodexRunner{
+		result: codexrunner.TurnResult{
+			ThreadID:          "thread-other",
+			TurnID:            "turn-other",
+			FinalAgentMessage: "final from wrong thread",
+		},
+	}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if err == nil {
+		t.Fatal("Run error = nil, want resume thread mismatch")
+	}
+	if !strings.Contains(err.Error(), "expected \"thread-existing\"") || !strings.Contains(err.Error(), "thread-other") {
+		t.Fatalf("Run error = %v, want mismatch detail", err)
+	}
+	if got.CodexThreadID != "thread-other" || got.CodexTurnID != "turn-other" {
+		t.Fatalf("result = %#v, want observed wrong thread for recovery path", got)
+	}
+	if runner.input.ThreadID != "thread-existing" {
+		t.Fatalf("runner input thread = %q, want expected thread", runner.input.ThreadID)
+	}
+}
+
 func TestRunnerExecutorTreatsStartedTurnErrorAsAmbiguous(t *testing.T) {
 	runner := &fakeCodexRunner{
 		result: codexrunner.TurnResult{

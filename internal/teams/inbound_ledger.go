@@ -197,11 +197,7 @@ func writeGlobalInboundLedger(path string, ledger globalInboundLedger) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return durableWriteFile(path, data, 0o600)
 }
 
 func pruneGlobalInboundLedger(ledger *globalInboundLedger, now time.Time) {

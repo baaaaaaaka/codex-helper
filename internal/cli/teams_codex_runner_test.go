@@ -329,6 +329,31 @@ func TestTeamsCodexExecutorUsesSessionCwdForExistingThread(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexExecutorRejectsResumeThreadMismatch(t *testing.T) {
+	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
+		ThreadID:          "thread-other",
+		TurnID:            "turn-other",
+		FinalAgentMessage: "final from wrong thread",
+	}}
+	executor := teamsCodexExecutor{runner: runner, workDir: "/helper/default"}
+	got, err := executor.Run(context.Background(), &teams.Session{
+		CodexThreadID: "thread-existing",
+		Cwd:           "/workspace/project",
+	}, "continue")
+	if err == nil {
+		t.Fatal("Run error = nil, want resume thread mismatch")
+	}
+	if !strings.Contains(err.Error(), "expected \"thread-existing\"") || !strings.Contains(err.Error(), "thread-other") {
+		t.Fatalf("Run error = %v, want mismatch detail", err)
+	}
+	if got.CodexThreadID != "thread-other" || got.CodexTurnID != "turn-other" {
+		t.Fatalf("result = %#v, want observed wrong thread for recovery path", got)
+	}
+	if !runner.resumed || runner.threadID != "thread-existing" {
+		t.Fatalf("runner = %#v, want resume attempted with expected thread", runner)
+	}
+}
+
 func TestTeamsCodexExecutorFallsBackToDefaultWorkDirWhenSessionCwdEmpty(t *testing.T) {
 	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
 		ThreadID:          "thread-new",
