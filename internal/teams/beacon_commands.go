@@ -68,6 +68,8 @@ func (b *Bridge) runBeaconControlCommand(ctx context.Context, msg ChatMessage, a
 			return b.formatBeaconList()
 		}
 		return b.formatBeaconSessionStatus(sessionID)
+	case "release":
+		return b.handleBeaconControlRelease(ctx, words[1:])
 	case "switch", "switch-profile", "local", "fork":
 		return "Wrong chat.\n\n`beacon switch ...` changes one Work chat. Open the target Work chat and send `beacon switch <profile>` there.", nil
 	default:
@@ -93,6 +95,8 @@ func (b *Bridge) runBeaconWorkCommand(ctx context.Context, session *Session, msg
 		return b.handleBeaconWorkSwitch(ctx, msg, session, words[1:], true)
 	case "local":
 		return b.handleBeaconWorkSwitchLocal(ctx, msg, session)
+	case "release":
+		return b.handleBeaconWorkRelease(ctx, session, words[1:])
 	case "profile", "profiles", "machine", "machines", "allocation", "allocations":
 		return "Wrong chat.\n\nBeacon profile, allocation, and machine administration belongs in the control chat. Send `beacon list` there for the global view.", nil
 	default:
@@ -120,6 +124,20 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 				return "", err
 			}
 			return formatBeaconProfileMutation("Created", p, proxyExists), nil
+		})
+	case "update", "edit":
+		in, err := parseBeaconProfileCreateInput(words[1:])
+		if err != nil {
+			return "", fmt.Errorf("%s", strings.NewReplacer("create", "update").Replace(err.Error()))
+		}
+		normalized := normalizedBeaconCommand("profile update " + strings.Join(words[1:], " "))
+		return b.updateBeaconStateFromTeams(msg, idempotencyScope, normalized, "", func(st *beacon.State) (string, error) {
+			proxyExists := b.beaconProxyResolver()
+			p, err := beacon.UpdateProfileConfig(st, in.withProxyResolver(proxyExists))
+			if err != nil {
+				return "", err
+			}
+			return formatBeaconProfileMutation("Updated", p, proxyExists), nil
 		})
 	case "doctor":
 		name, err := singleBeaconNameArg("beacon profile doctor", words[1:])
@@ -167,6 +185,51 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 			return "", fmt.Errorf("beacon profile %q not found", name)
 		}
 		return formatBeaconProfileStatus(p, b.beaconProxyResolver()), nil
+	case "history":
+		name, err := singleBeaconNameArg("beacon profile history", words[1:])
+		if err != nil {
+			return "", err
+		}
+		store, err := beacon.NewStore("")
+		if err != nil {
+			return "", err
+		}
+		st, err := store.Load()
+		if err != nil {
+			return "", err
+		}
+		return formatBeaconProfileHistory(st, name, b.beaconProxyResolver())
+	case "rollback":
+		if len(words) != 3 {
+			return "", fmt.Errorf("usage: `beacon profile rollback <name> <revision>`")
+		}
+		name := strings.TrimSpace(words[1])
+		revision, err := strconv.Atoi(strings.TrimSpace(words[2]))
+		if err != nil || revision <= 0 {
+			return "", fmt.Errorf("profile revision must be a positive integer")
+		}
+		normalized := normalizedBeaconCommand("profile rollback " + name + " " + strconv.Itoa(revision))
+		return b.updateBeaconStateFromTeams(msg, idempotencyScope, normalized, "", func(st *beacon.State) (string, error) {
+			proxyExists := b.beaconProxyResolver()
+			p, err := beacon.RollbackProfileRevision(st, name, revision, time.Now())
+			if err != nil {
+				return "", err
+			}
+			return formatBeaconProfileMutation("Rolled back", p, proxyExists), nil
+		})
+	case "gc", "prune-history":
+		name, err := singleBeaconNameArg("beacon profile gc", words[1:])
+		if err != nil {
+			return "", err
+		}
+		normalized := normalizedBeaconCommand("profile gc " + name)
+		return b.updateBeaconStateFromTeams(msg, idempotencyScope, normalized, "", func(st *beacon.State) (string, error) {
+			removed, err := beacon.PruneProfileHistory(st, name)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Pruned %d unreferenced revisions for beacon profile %q.", removed, name), nil
+		})
 	case "delete", "remove", "rm":
 		name, err := singleBeaconNameArg("beacon profile delete", words[1:])
 		if err != nil {
@@ -180,7 +243,7 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 			return fmt.Sprintf("Deleted beacon profile %q.", name), nil
 		})
 	default:
-		return "", fmt.Errorf("unknown beacon profile command %q; use list, create, status, doctor, confirm, or delete", words[0])
+		return "", fmt.Errorf("unknown beacon profile command %q; use list, create, update, history, rollback, gc, status, doctor, confirm, or delete", words[0])
 	}
 }
 
@@ -282,9 +345,114 @@ func (b *Bridge) handleBeaconAllocationCommand(ctx context.Context, words []stri
 			return "", fmt.Errorf("beacon allocation %q not found", ref)
 		}
 		return formatBeaconAllocationStatus(req), nil
+	case "cancel", "release":
+		ref, force, err := parseBeaconAllocationCancelArgs(words[1:])
+		if err != nil {
+			return "", err
+		}
+		store, err := beacon.NewStore("")
+		if err != nil {
+			return "", err
+		}
+		res, err := beacon.CancelAllocationOutsideLock(ctx, store, ref, beacon.NewCommandProviderAdapterFromEnv(nil), "canceled from Teams control chat", force, time.Now())
+		if err != nil && strings.TrimSpace(res.Request.ID) == "" {
+			return "", err
+		}
+		return formatBeaconAllocationCancelResultWithError(res, err), nil
 	default:
-		return "", fmt.Errorf("unknown beacon allocation command %q; use list or status", words[0])
+		return "", fmt.Errorf("unknown beacon allocation command %q; use list, status, or cancel", words[0])
 	}
+}
+
+func (b *Bridge) handleBeaconControlRelease(ctx context.Context, words []string) (string, error) {
+	if len(words) == 0 {
+		return "", fmt.Errorf("usage: `beacon release <profile|allocation|provider-job|machine>`")
+	}
+	ref := strings.TrimSpace(words[0])
+	force := false
+	for _, word := range words[1:] {
+		switch strings.ToLower(strings.TrimSpace(word)) {
+		case "--force":
+			force = true
+		default:
+			return "", fmt.Errorf("unknown beacon release flag %q", word)
+		}
+	}
+	store, err := beacon.NewStore("")
+	if err != nil {
+		return "", err
+	}
+	st, err := store.Load()
+	if err != nil {
+		return "", err
+	}
+	if _, ok := st.Profiles[ref]; ok {
+		allocations := beaconAllocationsForProfile(st, ref)
+		if len(allocations) == 0 {
+			return "Beacon release\n\nNo active allocations are using profile `" + ref + "`.", nil
+		}
+		var lines []string
+		for _, req := range allocations {
+			res, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released profile "+ref+" from Teams control chat", force, time.Now())
+			lines = append(lines, formatBeaconAllocationCancelResult(res))
+			if cancelErr != nil {
+				lines = append(lines, "Error: "+cancelErr.Error())
+			}
+		}
+		return strings.Join(lines, "\n\n"), nil
+	}
+	if req, ok := beacon.FindAllocationByRef(st, ref); ok {
+		res, err := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released from Teams control chat", force, time.Now())
+		if err != nil && strings.TrimSpace(res.Request.ID) == "" {
+			return "", err
+		}
+		return formatBeaconAllocationCancelResultWithError(res, err), nil
+	}
+	var res beacon.ReleaseResult
+	if err := store.Update(func(st *beacon.State) error {
+		key, m, ok := findBeaconMachineEntry(*st, ref)
+		if !ok {
+			return fmt.Errorf("beacon resource %q not found", ref)
+		}
+		var err error
+		res, err = beacon.DecideRelease(m, beacon.ReleaseInput{})
+		if err != nil {
+			return err
+		}
+		applyBeaconMachineRelease(st, key, m, res.Action)
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	return formatBeaconReleaseResult(res), nil
+}
+
+func (b *Bridge) handleBeaconWorkRelease(ctx context.Context, session *Session, words []string) (string, error) {
+	if len(words) > 0 {
+		return "", fmt.Errorf("usage: `beacon release`")
+	}
+	store, err := beacon.NewStore("")
+	if err != nil {
+		return "", err
+	}
+	st, err := store.Load()
+	if err != nil {
+		return "", err
+	}
+	allocations := beacon.AllocationsForConversation(st, session.ID)
+	if len(allocations) == 0 {
+		return "Beacon release\n\nNo active beacon allocation is attached to this Work chat. The profile binding is unchanged.", nil
+	}
+	var lines []string
+	for _, req := range allocations {
+		res, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released from Teams Work chat", false, time.Now())
+		lines = append(lines, formatBeaconAllocationCancelResult(res))
+		if cancelErr != nil {
+			lines = append(lines, "Error: "+cancelErr.Error())
+		}
+	}
+	lines = append(lines, "Profile binding is unchanged. Future turns may acquire a new worker for the same profile.")
+	return strings.Join(lines, "\n\n"), nil
 }
 
 func (b *Bridge) handleBeaconWorkSwitch(ctx context.Context, msg ChatMessage, session *Session, words []string, fork bool) (string, error) {
@@ -574,6 +742,10 @@ func (b *Bridge) activateBeaconNewSession(sessionID string, req newSessionReques
 		if !ok {
 			return fmt.Errorf("beacon profile %q not found", profile)
 		}
+		revision := p.Revision
+		if revision <= 0 {
+			revision = 1
+		}
 		isolation := beacon.Isolation(strings.TrimSpace(req.BeaconIsolation))
 		if isolation == "" {
 			isolation = p.IsolationDefault
@@ -584,10 +756,11 @@ func (b *Bridge) activateBeaconNewSession(sessionID string, req newSessionReques
 		conv := st.Conversations[sessionID]
 		conv.ID = sessionID
 		conv.Current = beacon.TargetSnapshot{
-			Target:     beacon.TargetBeacon,
-			Profile:    profile,
-			ProxyRoute: beaconProfileProxyRoute(p),
-			Isolation:  isolation,
+			Target:          beacon.TargetBeacon,
+			Profile:         profile,
+			ProfileRevision: revision,
+			ProxyRoute:      beaconProfileProxyRoute(p),
+			Isolation:       isolation,
 		}
 		conv.Pending = nil
 		conv.UpdatedAt = time.Now()
@@ -617,6 +790,10 @@ func parseBeaconProfileCreateInput(words []string) (teamsBeaconProfileCreateInpu
 		ProxyMode:        beacon.ProxyNone,
 		IsolationDefault: beacon.IsolationShared,
 	}}
+	var queryCommand string
+	var submitCommand string
+	var cancelCommand string
+	var renewCommand string
 	for i := 1; i < len(words); i++ {
 		key := strings.ToLower(strings.TrimSpace(words[i]))
 		value := func() (string, error) {
@@ -687,6 +864,30 @@ func parseBeaconProfileCreateInput(words []string) (teamsBeaconProfileCreateInpu
 				return teamsBeaconProfileCreateInput{}, err
 			}
 			in.IsolationDefault = beacon.Isolation(v)
+		case "--query-command":
+			v, err := value()
+			if err != nil {
+				return teamsBeaconProfileCreateInput{}, err
+			}
+			queryCommand = v
+		case "--submit-command":
+			v, err := value()
+			if err != nil {
+				return teamsBeaconProfileCreateInput{}, err
+			}
+			submitCommand = v
+		case "--cancel-command":
+			v, err := value()
+			if err != nil {
+				return teamsBeaconProfileCreateInput{}, err
+			}
+			cancelCommand = v
+		case "--renew-command":
+			v, err := value()
+			if err != nil {
+				return teamsBeaconProfileCreateInput{}, err
+			}
+			renewCommand = v
 		case "--lsf-site-policy":
 			in.LSF.SitePolicyDerivesResources = true
 		case "--lsf-advanced-approved":
@@ -695,6 +896,7 @@ func parseBeaconProfileCreateInput(words []string) (teamsBeaconProfileCreateInpu
 			return teamsBeaconProfileCreateInput{}, fmt.Errorf("unknown beacon profile create flag %q", words[i])
 		}
 	}
+	in.Adapter = beacon.ProviderCommandConfigForProvider(in.Provider, queryCommand, submitCommand, cancelCommand, renewCommand)
 	return in, nil
 }
 
@@ -738,6 +940,23 @@ func parseBeaconMachineKillArgs(words []string) (string, string, error) {
 	return ref, confirm, nil
 }
 
+func parseBeaconAllocationCancelArgs(words []string) (string, bool, error) {
+	if len(words) == 0 || strings.TrimSpace(words[0]) == "" {
+		return "", false, fmt.Errorf("usage: `beacon allocation cancel <allocation-or-provider-job> [--force]`")
+	}
+	ref := strings.TrimSpace(words[0])
+	force := false
+	for _, word := range words[1:] {
+		switch strings.ToLower(strings.TrimSpace(word)) {
+		case "--force":
+			force = true
+		default:
+			return "", false, fmt.Errorf("unknown beacon allocation cancel flag %q", word)
+		}
+	}
+	return ref, force, nil
+}
+
 func beaconStatusSessionArg(words []string) string {
 	if len(words) == 0 {
 		return ""
@@ -763,7 +982,11 @@ func formatBeaconProfileListLines(st beacon.State, proxyExists func(string) bool
 		if p.Ready(proxyExists) {
 			state = "ready"
 		}
-		lines = append(lines, fmt.Sprintf("- %s: %s, provider=%s, isolation=%s, proxy=%s", p.Name, state, p.Provider, p.IsolationDefault, profileProxyLabel(p)))
+		revision := p.Revision
+		if revision <= 0 {
+			revision = 1
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s, rev=%d, provider=%s, isolation=%s, proxy=%s, adapter=%s", p.Name, state, revision, p.Provider, p.IsolationDefault, profileProxyLabel(p), beaconProfileAdapterLabel(p)))
 	}
 	return lines
 }
@@ -786,9 +1009,11 @@ func formatBeaconProfileMutation(action string, p beacon.Profile, proxyExists fu
 		"",
 		"Profile:",
 		fmt.Sprintf("- state: %s", state),
+		fmt.Sprintf("- revision: %d", maxBeaconProfileRevision(p.Revision)),
 		fmt.Sprintf("- provider: %s", p.Provider),
 		fmt.Sprintf("- isolation: %s", p.IsolationDefault),
 		fmt.Sprintf("- proxy route: %s", profileProxyLabel(p)),
+		fmt.Sprintf("- adapter: %s", beaconProfileAdapterLabel(p)),
 	}
 	if reasons := p.DraftReasons(proxyExists); len(reasons) > 0 {
 		lines = append(lines, "", "Missing or pending:")
@@ -804,12 +1029,14 @@ func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) 
 	lines := []string{
 		"Beacon profile",
 		"- name: " + p.Name,
+		fmt.Sprintf("- revision: %d", maxBeaconProfileRevision(p.Revision)),
 		fmt.Sprintf("- provider: %s", p.Provider),
 		fmt.Sprintf("- ready: %t", p.Ready(proxyExists)),
 		fmt.Sprintf("- confirmed: %t", p.Confirmed),
 		fmt.Sprintf("- doctor: %t", p.DoctorOK),
 		fmt.Sprintf("- isolation: %s", p.IsolationDefault),
 		"- proxy route: " + profileProxyLabel(p),
+		"- adapter: " + beaconProfileAdapterLabel(p),
 	}
 	switch p.Provider {
 	case beacon.ProviderSlurm:
@@ -824,6 +1051,37 @@ func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) 
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func formatBeaconProfileHistory(st beacon.State, name string, proxyExists func(string) bool) (string, error) {
+	revisions := beacon.ListProfileRevisions(st, name)
+	if len(revisions) == 0 {
+		return "", fmt.Errorf("beacon profile %q not found", name)
+	}
+	currentRevision := 0
+	if current, ok := st.Profiles[strings.TrimSpace(name)]; ok {
+		currentRevision = maxBeaconProfileRevision(current.Revision)
+	}
+	lines := []string{"Beacon profile history", ""}
+	for _, p := range revisions {
+		state := "draft"
+		if p.Ready(proxyExists) {
+			state = "ready"
+		}
+		kind := "history"
+		if maxBeaconProfileRevision(p.Revision) == currentRevision {
+			kind = "current"
+		}
+		lines = append(lines, fmt.Sprintf("- %s rev=%d: %s, provider=%s, isolation=%s, adapter=%s, state=%s", p.Name, maxBeaconProfileRevision(p.Revision), kind, p.Provider, p.IsolationDefault, beaconProfileAdapterLabel(p), state))
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func maxBeaconProfileRevision(revision int) int {
+	if revision <= 0 {
+		return 1
+	}
+	return revision
 }
 
 func formatBeaconMachineStatus(m beacon.Machine) string {
@@ -846,6 +1104,55 @@ func formatBeaconReleaseResult(res beacon.ReleaseResult) string {
 	}, "\n")
 }
 
+func formatBeaconAllocationCancelResult(res beacon.AllocationCancelResult) string {
+	req := res.Request
+	lines := []string{
+		"Beacon release",
+		"",
+		"Summary:",
+		fmt.Sprintf("Allocation `%s` is now `%s`.", req.ID, req.State),
+		"",
+		"State:",
+		"- action: `" + string(res.Action) + "`",
+		"- profile: `" + req.Profile + "`",
+	}
+	if strings.TrimSpace(req.ProviderIdentity.ProviderJobID) != "" {
+		lines = append(lines, "- provider job: `"+req.ProviderIdentity.ProviderJobID+"`")
+	}
+	if strings.TrimSpace(req.RawProviderState) != "" {
+		lines = append(lines, "- provider state: `"+req.RawProviderState+"`")
+	}
+	if strings.TrimSpace(req.ProviderReason) != "" {
+		lines = append(lines, "", "Details:", req.ProviderReason)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatBeaconAllocationCancelResultWithError(res beacon.AllocationCancelResult, err error) string {
+	out := formatBeaconAllocationCancelResult(res)
+	if err != nil {
+		out += "\n\nError:\n" + err.Error()
+	}
+	return out
+}
+
+func beaconAllocationsForProfile(st beacon.State, profile string) []beacon.AllocationRequest {
+	profile = strings.TrimSpace(profile)
+	var out []beacon.AllocationRequest
+	for _, req := range st.Allocations {
+		if strings.TrimSpace(req.Profile) != profile && strings.TrimSpace(req.Target.Profile) != profile {
+			continue
+		}
+		switch req.State {
+		case beacon.AllocationCanceled, beacon.AllocationExpired, beacon.AllocationFailed:
+			continue
+		}
+		out = append(out, req)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 func formatBeaconSwitchResult(res beacon.SwitchResult, queued bool, profile string) string {
 	target := "beacon:" + strings.TrimSpace(profile)
 	if res.Action == "require_fork" {
@@ -862,6 +1169,14 @@ func profileProxyLabel(p beacon.Profile) string {
 		return "ssh_profile:" + strings.TrimSpace(p.ProxyProfile)
 	}
 	return firstNonEmptyString(string(p.ProxyMode), string(beacon.ProxyNone))
+}
+
+func beaconProfileAdapterLabel(p beacon.Profile) string {
+	ops := beacon.ConfiguredProviderCommandOperations(p.Adapter, p.Provider)
+	if len(ops) == 0 {
+		return "helper environment"
+	}
+	return "profile:" + strings.Join(ops, ",")
 }
 
 func beaconProfileProxyRoute(p beacon.Profile) string {
@@ -962,12 +1277,15 @@ func beaconControlHelpText() string {
 		"Control chat:",
 		"- `beacon list` - list all profiles and machines",
 		"- `beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <hours>`",
+		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
+		"- `beacon profile update <name> ...` - create a new profile revision without breaking bound Work chats",
+		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>`",
 		"- `beacon profile create <name> --provider lsf --queue <queue>`",
 		"- `beacon profile create <name> --provider local`",
 		"- `beacon profile doctor <name>` then `beacon profile confirm <name>`",
 		"- `beacon profile status <name>`",
-		"- `beacon allocation list|status`",
-		"- `beacon machine list|status|release|kill`",
+		"- `beacon release <profile|allocation|provider-job|machine>` - release a resource without knowing its internal object type",
+		"- advanced: `beacon allocation list|status|cancel`, `beacon machine list|status|release|kill`",
 		"- provider adapter: `cxp beacon provider template slurm|lsf`",
 		"- worker process: `cxp beacon worker serve --allocation <request-id>`",
 		"- `new <directory> --beacon <profile>` - create a Work chat on a ready beacon profile",
@@ -976,6 +1294,7 @@ func beaconControlHelpText() string {
 		"- `beacon status`",
 		"- `beacon switch <profile>`",
 		"- `beacon switch local`",
+		"- `beacon release` - release this Work chat's current beacon resource; the profile binding stays unchanged",
 	}, "\n")
 }
 
@@ -987,6 +1306,7 @@ func beaconWorkHelpText() string {
 		"- `beacon list` - list all profiles and machines",
 		"- `beacon switch <profile>` - switch future turns to a ready profile",
 		"- `beacon switch local` - switch future turns back to local execution",
+		"- `beacon release` - release this chat's current beacon resource; future turns may reacquire the same profile",
 		"- `beacon fork <profile>` - fork when the execution signature is incompatible",
 		"",
 		"Profile and machine administration belongs in the control chat.",

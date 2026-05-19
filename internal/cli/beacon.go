@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ func newBeaconCmd(root *rootOptions) *cobra.Command {
 	cmd.AddCommand(
 		newBeaconProfileCmd(root, &storePath),
 		newBeaconStatusCmd(&storePath),
+		newBeaconReleaseCmd(&storePath),
 		newBeaconSwitchProfileCmd(root, &storePath),
 		newBeaconAllocationCmd(&storePath),
 		newBeaconMachineCmd(&storePath),
@@ -41,6 +43,10 @@ func newBeaconProfileCmd(root *rootOptions, storePath *string) *cobra.Command {
 	cmd.AddCommand(
 		newBeaconProfileListCmd(root, storePath),
 		newBeaconProfileCreateCmd(root, storePath),
+		newBeaconProfileUpdateCmd(root, storePath),
+		newBeaconProfileHistoryCmd(root, storePath),
+		newBeaconProfileRollbackCmd(root, storePath),
+		newBeaconProfileGCCmd(storePath),
 		newBeaconProfileStatusCmd(root, storePath),
 		newBeaconProfileDoctorCmd(root, storePath),
 		newBeaconProfileConfirmCmd(root, storePath),
@@ -73,7 +79,15 @@ func newBeaconProfileListCmd(root *rootOptions, storePath *string) *cobra.Comman
 				if reasons := p.DraftReasons(proxyExists); len(reasons) > 0 {
 					state = "draft: " + strings.Join(reasons, "; ")
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", p.Name, p.Provider, state)
+				revision := p.Revision
+				if revision <= 0 {
+					revision = 1
+				}
+				adapter := cliBeaconAdapterLabel(p)
+				if adapter != "" {
+					adapter = "\tadapter=" + adapter
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\trev=%d\t%s%s\n", p.Name, p.Provider, revision, state, adapter)
 			}
 			return nil
 		},
@@ -93,6 +107,10 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	var queue string
 	var lsfSitePolicy bool
 	var lsfAdvanced bool
+	var queryCommand string
+	var submitCommand string
+	var cancelCommand string
+	var renewCommand string
 
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -118,6 +136,7 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 					IsolationDefault:             beacon.Isolation(isolation),
 					Slurm:                        beacon.SlurmProfile{Nodes: nodes, GPUCount: gpuCount, Partition: partition, Image: image, Duration: duration},
 					LSF:                          beacon.LSFProfile{QueueName: queue, SitePolicyDerivesResources: lsfSitePolicy, AdvancedApproved: lsfAdvanced},
+					Adapter:                      beacon.ProviderCommandConfigForProvider(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand),
 					ExistingProxyProfileResolver: proxyExists,
 				})
 				return err
@@ -146,7 +165,189 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	cmd.Flags().StringVar(&queue, "queue", "", "LSF queue name")
 	cmd.Flags().BoolVar(&lsfSitePolicy, "lsf-site-policy", false, "Allow site policy to derive LSF resources")
 	cmd.Flags().BoolVar(&lsfAdvanced, "lsf-advanced-approved", false, "Mark advanced LSF resources locally approved")
+	cmd.Flags().StringVar(&queryCommand, "query-command", "", "Provider query adapter command stored on this profile")
+	cmd.Flags().StringVar(&submitCommand, "submit-command", "", "Provider submit adapter command stored on this profile")
+	cmd.Flags().StringVar(&cancelCommand, "cancel-command", "", "Provider cancel adapter command stored on this profile")
+	cmd.Flags().StringVar(&renewCommand, "renew-command", "", "Provider renew adapter command stored on this profile")
 	return cmd
+}
+
+func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Command {
+	var provider string
+	var proxyMode string
+	var proxyProfile string
+	var isolation string
+	var nodes int
+	var gpuCount int
+	var partition string
+	var image string
+	var duration int
+	var queue string
+	var lsfSitePolicy bool
+	var lsfAdvanced bool
+	var queryCommand string
+	var submitCommand string
+	var cancelCommand string
+	var renewCommand string
+
+	cmd := &cobra.Command{
+		Use:   "update <name>",
+		Short: "Update a beacon profile by creating a new revision",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			proxyExists, err := beaconProxyResolver(root)
+			if err != nil {
+				return err
+			}
+			var updated beacon.Profile
+			err = store.Update(func(st *beacon.State) error {
+				var err error
+				updated, err = beacon.UpdateProfileConfig(st, beacon.UpdateProfileInput{
+					Name:                         args[0],
+					Provider:                     beacon.Provider(provider),
+					ProxyMode:                    beacon.ProxyMode(proxyMode),
+					ProxyProfile:                 proxyProfile,
+					IsolationDefault:             beacon.Isolation(isolation),
+					Slurm:                        beacon.SlurmProfile{Nodes: nodes, GPUCount: gpuCount, Partition: partition, Image: image, Duration: duration},
+					LSF:                          beacon.LSFProfile{QueueName: queue, SitePolicyDerivesResources: lsfSitePolicy, AdvancedApproved: lsfAdvanced},
+					Adapter:                      beacon.ProviderCommandConfigForProvider(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand),
+					ExistingProxyProfileResolver: proxyExists,
+				})
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			reasons := updated.DraftReasons(proxyExists)
+			if len(reasons) == 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated ready beacon profile %q revision %d.\n", updated.Name, updated.Revision)
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated draft beacon profile %q revision %d: %s\n", updated.Name, updated.Revision, strings.Join(reasons, "; "))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&provider, "provider", "slurm", "Provider: slurm, lsf, or local")
+	cmd.Flags().StringVar(&proxyMode, "proxy", "none", "Proxy mode: none or ssh_profile")
+	cmd.Flags().StringVar(&proxyProfile, "proxy-profile", "", "Existing SSH proxy profile to use when --proxy=ssh_profile")
+	cmd.Flags().StringVar(&isolation, "isolation", string(beacon.IsolationShared), "Default isolation: shared or exclusive")
+	cmd.Flags().IntVar(&nodes, "nodes", 0, "Slurm node count")
+	cmd.Flags().IntVar(&gpuCount, "gpu", 0, "Slurm GPU count")
+	cmd.Flags().StringVar(&partition, "partition", "", "Slurm partition")
+	cmd.Flags().StringVar(&image, "image", "", "Slurm container image")
+	cmd.Flags().IntVar(&duration, "duration", 0, "Slurm duration")
+	cmd.Flags().StringVar(&queue, "queue", "", "LSF queue name")
+	cmd.Flags().BoolVar(&lsfSitePolicy, "lsf-site-policy", false, "Allow site policy to derive LSF resources")
+	cmd.Flags().BoolVar(&lsfAdvanced, "lsf-advanced-approved", false, "Mark advanced LSF resources locally approved")
+	cmd.Flags().StringVar(&queryCommand, "query-command", "", "Provider query adapter command stored on this profile")
+	cmd.Flags().StringVar(&submitCommand, "submit-command", "", "Provider submit adapter command stored on this profile")
+	cmd.Flags().StringVar(&cancelCommand, "cancel-command", "", "Provider cancel adapter command stored on this profile")
+	cmd.Flags().StringVar(&renewCommand, "renew-command", "", "Provider renew adapter command stored on this profile")
+	return cmd
+}
+
+func newBeaconProfileHistoryCmd(root *rootOptions, storePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "history <name>",
+		Short: "List revisions for a beacon profile",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st, err := loadBeaconState(*storePath)
+			if err != nil {
+				return err
+			}
+			proxyExists, err := beaconProxyResolver(root)
+			if err != nil {
+				return err
+			}
+			revisions := beacon.ListProfileRevisions(st, args[0])
+			if len(revisions) == 0 {
+				return fmt.Errorf("beacon profile %q not found", args[0])
+			}
+			currentRevision := 0
+			if current, ok := st.Profiles[strings.TrimSpace(args[0])]; ok {
+				currentRevision = cliBeaconProfileRevision(current.Revision)
+			}
+			for _, p := range revisions {
+				state := "draft"
+				if p.Ready(proxyExists) {
+					state = "ready"
+				}
+				kind := "history"
+				if cliBeaconProfileRevision(p.Revision) == currentRevision {
+					kind = "current"
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\trev=%d\t%s\tprovider=%s\tisolation=%s\tadapter=%s\t%s\n", p.Name, cliBeaconProfileRevision(p.Revision), kind, p.Provider, p.IsolationDefault, cliBeaconAdapterLabel(p), state)
+			}
+			return nil
+		},
+	}
+}
+
+func newBeaconProfileRollbackCmd(root *rootOptions, storePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "rollback <name> <revision>",
+		Short: "Publish an old beacon profile revision as a new revision",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			revision, err := strconv.Atoi(args[1])
+			if err != nil || revision <= 0 {
+				return fmt.Errorf("revision must be a positive integer")
+			}
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			proxyExists, err := beaconProxyResolver(root)
+			if err != nil {
+				return err
+			}
+			var rolledBack beacon.Profile
+			if err := store.Update(func(st *beacon.State) error {
+				var err error
+				rolledBack, err = beacon.RollbackProfileRevision(st, args[0], revision, time.Time{})
+				return err
+			}); err != nil {
+				return err
+			}
+			reasons := rolledBack.DraftReasons(proxyExists)
+			if len(reasons) == 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Rolled back ready beacon profile %q to revision %d.\n", rolledBack.Name, rolledBack.Revision)
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Rolled back draft beacon profile %q to revision %d: %s\n", rolledBack.Name, rolledBack.Revision, strings.Join(reasons, "; "))
+			}
+			return nil
+		},
+	}
+}
+
+func newBeaconProfileGCCmd(storePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:     "gc <name>",
+		Aliases: []string{"prune-history"},
+		Short:   "Prune unreferenced historical beacon profile revisions",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			removed := 0
+			if err := store.Update(func(st *beacon.State) error {
+				var err error
+				removed, err = beacon.PruneProfileHistory(st, args[0])
+				return err
+			}); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Pruned %d unreferenced revisions for beacon profile %q.\n", removed, args[0])
+			return nil
+		},
+	}
 }
 
 func newBeaconProfileStatusCmd(root *rootOptions, storePath *string) *cobra.Command {
@@ -172,10 +373,29 @@ func newBeaconProfileStatusCmd(root *rootOptions, storePath *string) *cobra.Comm
 			if len(reasons) > 0 {
 				status = "draft: " + strings.Join(reasons, "; ")
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "profile=%s provider=%s proxy=%s isolation=%s status=%s\n", p.Name, p.Provider, p.ProxyMode, p.IsolationDefault, status)
+			revision := p.Revision
+			if revision <= 0 {
+				revision = 1
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "profile=%s revision=%d provider=%s proxy=%s isolation=%s adapter=%s status=%s\n", p.Name, revision, p.Provider, p.ProxyMode, p.IsolationDefault, cliBeaconAdapterLabel(p), status)
 			return nil
 		},
 	}
+}
+
+func cliBeaconAdapterLabel(p beacon.Profile) string {
+	ops := beacon.ConfiguredProviderCommandOperations(p.Adapter, p.Provider)
+	if len(ops) == 0 {
+		return "env"
+	}
+	return "profile:" + strings.Join(ops, ",")
+}
+
+func cliBeaconProfileRevision(revision int) int {
+	if revision <= 0 {
+		return 1
+	}
+	return revision
 }
 
 func newBeaconProfileDoctorCmd(root *rootOptions, storePath *string) *cobra.Command {
@@ -274,6 +494,24 @@ func newBeaconStatusCmd(storePath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&session, "session", "", "Conversation/session id")
+	return cmd
+}
+
+func newBeaconReleaseCmd(storePath *string) *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "release <profile|allocation|provider-job|machine>",
+		Short: "Release beacon resources without requiring internal object knowledge",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out, err := releaseBeaconResourceFromCLI(cmd.Context(), *storePath, args[0], force)
+			if out != "" {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), out)
+			}
+			return err
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "Cancel even if a worker may have started work")
 	return cmd
 }
 
@@ -1008,7 +1246,7 @@ func runBeaconWorkerDoctor(codexPath string) beacon.WorkerDoctor {
 
 func newBeaconAllocationCmd(storePath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "allocation", Short: "Manage beacon allocation requests"}
-	cmd.AddCommand(newBeaconAllocationListCmd(storePath), newBeaconAllocationStatusCmd(storePath), newBeaconAllocationReconcileCmd(storePath), newBeaconAllocationReconcileAllCmd(storePath))
+	cmd.AddCommand(newBeaconAllocationListCmd(storePath), newBeaconAllocationStatusCmd(storePath), newBeaconAllocationCancelCmd(storePath), newBeaconAllocationReconcileCmd(storePath), newBeaconAllocationReconcileAllCmd(storePath))
 	return cmd
 }
 
@@ -1053,6 +1291,28 @@ func newBeaconAllocationStatusCmd(storePath *string) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newBeaconAllocationCancelCmd(storePath *string) *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "cancel <allocation-or-provider-job>",
+		Short: "Cancel a beacon allocation through the configured provider adapter",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := beacon.NewStore(*storePath)
+			if err != nil {
+				return err
+			}
+			res, err := beacon.CancelAllocationOutsideLock(cmd.Context(), store, args[0], beacon.NewCommandProviderAdapterFromEnv(nil), "canceled by operator", force, time.Now())
+			if res.Request.ID != "" {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), formatAllocationCancelResult(res))
+			}
+			return err
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "Cancel even if a worker may have started work")
+	return cmd
 }
 
 func newBeaconAllocationReconcileCmd(storePath *string) *cobra.Command {
@@ -1273,6 +1533,91 @@ func newBeaconMachineKillCmd(storePath *string) *cobra.Command {
 	return cmd
 }
 
+func releaseBeaconResourceFromCLI(ctx context.Context, storePath string, ref string, force bool) (string, error) {
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		return "", err
+	}
+	st, err := store.Load()
+	if err != nil {
+		return "", err
+	}
+	if _, ok := st.Profiles[ref]; ok {
+		allocations := beaconAllocationsForProfileCLI(st, ref)
+		if len(allocations) == 0 {
+			return fmt.Sprintf("Beacon release: no active allocations are using profile %q.", ref), nil
+		}
+		var lines []string
+		for _, req := range allocations {
+			res, cancelErr := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released profile "+ref+" by operator", force, time.Now())
+			lines = append(lines, formatAllocationCancelResult(res))
+			if cancelErr != nil {
+				lines = append(lines, "Error: "+cancelErr.Error())
+			}
+		}
+		return strings.Join(lines, "\n"), nil
+	}
+	if req, ok := beacon.FindAllocationByRef(st, ref); ok {
+		res, err := beacon.CancelAllocationOutsideLock(ctx, store, req.ID, beacon.NewCommandProviderAdapterFromEnv(nil), "released by operator", force, time.Now())
+		return formatAllocationCancelResult(res), err
+	}
+	var res beacon.ReleaseResult
+	if err := store.Update(func(st *beacon.State) error {
+		key, m, ok := findBeaconMachineEntry(*st, ref)
+		if !ok {
+			return fmt.Errorf("beacon resource %q not found", ref)
+		}
+		var err error
+		res, err = beacon.DecideRelease(m, beacon.ReleaseInput{})
+		if err != nil {
+			return err
+		}
+		applyBeaconMachineRelease(st, key, m, res.Action)
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Beacon release: action=%s machine=%s lease=%s chats=%s jobs=%s", res.Action, res.Preview.MachineID, res.Preview.LeaseID, strings.Join(res.Preview.Chats, ","), strings.Join(res.Preview.Jobs, ",")), nil
+}
+
+func formatAllocationCancelResult(res beacon.AllocationCancelResult) string {
+	req := res.Request
+	var facts []string
+	if strings.TrimSpace(req.ID) != "" {
+		facts = append(facts, "allocation="+req.ID)
+	}
+	if strings.TrimSpace(req.Profile) != "" {
+		facts = append(facts, "profile="+req.Profile)
+	}
+	if strings.TrimSpace(req.ProviderIdentity.ProviderJobID) != "" {
+		facts = append(facts, "provider_job="+req.ProviderIdentity.ProviderJobID)
+	}
+	if strings.TrimSpace(req.RawProviderState) != "" {
+		facts = append(facts, "provider_state="+req.RawProviderState)
+	}
+	if strings.TrimSpace(req.ProviderReason) != "" {
+		facts = append(facts, "reason="+req.ProviderReason)
+	}
+	return "Beacon allocation release: action=" + string(res.Action) + " state=" + string(req.State) + " - " + strings.Join(facts, ", ")
+}
+
+func beaconAllocationsForProfileCLI(st beacon.State, profile string) []beacon.AllocationRequest {
+	profile = strings.TrimSpace(profile)
+	var out []beacon.AllocationRequest
+	for _, req := range st.Allocations {
+		if strings.TrimSpace(req.Profile) != profile && strings.TrimSpace(req.Target.Profile) != profile {
+			continue
+		}
+		switch req.State {
+		case beacon.AllocationCanceled, beacon.AllocationExpired, beacon.AllocationFailed:
+			continue
+		}
+		out = append(out, req)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 func loadBeaconState(path string) (beacon.State, error) {
 	store, err := beacon.NewStore(path)
 	if err != nil {
@@ -1309,7 +1654,7 @@ func findBeaconMachine(st beacon.State, ref string) (beacon.Machine, bool) {
 func findBeaconMachineEntry(st beacon.State, ref string) (string, beacon.Machine, bool) {
 	ref = strings.TrimSpace(ref)
 	for key, m := range st.Machines {
-		if m.ID == ref || m.LeaseID == ref {
+		if m.ID == ref || m.LeaseID == ref || m.ProviderJobID == ref {
 			return key, m, true
 		}
 		for _, job := range m.Jobs {

@@ -70,16 +70,64 @@ func TestCommandProviderAdapterMissingCommandIsActionable(t *testing.T) {
 	adapter := CommandProviderAdapter{Config: ProviderCommandConfig{}, Runner: &recordingProviderRunner{}}
 
 	_, err := adapter.QueryAllocation(context.Background(), req)
-	if err == nil || !strings.Contains(err.Error(), BeaconSlurmQueryCommandEnv) || !strings.Contains(err.Error(), "not configured") {
+	if err == nil || !strings.Contains(err.Error(), BeaconSlurmQueryCommandEnv) || !strings.Contains(err.Error(), "--query-command") || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("missing query command error = %v", err)
 	}
 	_, err = adapter.SubmitAllocation(context.Background(), req)
-	if err == nil || !strings.Contains(err.Error(), BeaconSlurmSubmitCommandEnv) || !strings.Contains(err.Error(), "not configured") {
+	if err == nil || !strings.Contains(err.Error(), BeaconSlurmSubmitCommandEnv) || !strings.Contains(err.Error(), "--submit-command") || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("missing submit command error = %v", err)
 	}
 	_, err = adapter.CancelAllocation(context.Background(), req)
-	if err == nil || !IsProviderCommandNotConfigured(err) || !strings.Contains(err.Error(), BeaconSlurmCancelCommandEnv) {
+	if err == nil || !IsProviderCommandNotConfigured(err) || !strings.Contains(err.Error(), BeaconSlurmCancelCommandEnv) || !strings.Contains(err.Error(), "--cancel-command") {
 		t.Fatalf("missing cancel command error = %v", err)
+	}
+}
+
+func TestCommandProviderAdapterUsesProfileCommandsBeforeEnvironment(t *testing.T) {
+	req := slurmAllocationRequestForAdapter(t)
+	req.ProfileSnapshot.Adapter = ProviderCommandConfigForProvider(req.Provider, "/profile/query", "/profile/submit", "", "")
+	runner := &recordingProviderRunner{
+		outputByCommand: map[string]string{
+			"/profile/query":  `{"provider_job_id":"111","raw_state":"PD","reason":"profile query"}`,
+			"/profile/submit": `{"provider_job_id":"222","raw_state":"PD","reason":"profile submit"}`,
+		},
+	}
+	adapter := CommandProviderAdapter{
+		Config: ProviderCommandConfig{SlurmQueryCommand: "/env/query", SlurmSubmitCommand: "/env/submit"},
+		Runner: runner,
+	}
+
+	query, err := adapter.QueryAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("query allocation: %v", err)
+	}
+	submitted, err := adapter.SubmitAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("submit allocation: %v", err)
+	}
+	if query.ProviderJobID != "111" || submitted.ProviderJobID != "222" {
+		t.Fatalf("unexpected provider results: query=%#v submit=%#v", query, submitted)
+	}
+	got := []string{runner.calls[0].name, runner.calls[1].name}
+	want := []string{"/profile/query", "/profile/submit"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider commands = %v, want %v", got, want)
+	}
+}
+
+func TestCommandProviderAdapterFallsBackToEnvironmentCommands(t *testing.T) {
+	req := slurmAllocationRequestForAdapter(t)
+	runner := &recordingProviderRunner{output: "provider_job_id=333 raw_state=PD"}
+	adapter := CommandProviderAdapter{
+		Config: ProviderCommandConfig{SlurmQueryCommand: "/env/query"},
+		Runner: runner,
+	}
+	result, err := adapter.QueryAllocation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("query allocation: %v", err)
+	}
+	if result.ProviderJobID != "333" || len(runner.calls) != 1 || runner.calls[0].name != "/env/query" {
+		t.Fatalf("result=%#v calls=%#v", result, runner.calls)
 	}
 }
 

@@ -2164,6 +2164,80 @@ func TestDuplicateInboundIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestHasInboundMessage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.PersistInbound(ctx, testInbound()); err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	got, err := store.HasInboundMessage(ctx, "chat-1", "message-1")
+	if err != nil {
+		t.Fatalf("HasInboundMessage error: %v", err)
+	}
+	if !got {
+		t.Fatal("HasInboundMessage = false, want true")
+	}
+	got, err = store.HasInboundMessage(ctx, "chat-1", "message-missing")
+	if err != nil {
+		t.Fatalf("HasInboundMessage missing error: %v", err)
+	}
+	if got {
+		t.Fatal("HasInboundMessage missing = true, want false")
+	}
+	record, ok, err := store.MessageProvenance(ctx, "chat-1", "message-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance inbound error: %v", err)
+	}
+	if !ok || record.Origin != MessageOriginUserInbound || record.InboundID == "" {
+		t.Fatalf("inbound message provenance = %#v, ok=%v", record, ok)
+	}
+}
+
+func TestMessageProvenanceRecordsHelperOutbox(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	record, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		SessionID:      "s1",
+		TurnID:         "turn-1",
+		OutboxID:       "outbox-1",
+		Kind:           "helper",
+		RenderedHash:   "hash-1",
+	})
+	if err != nil {
+		t.Fatalf("RecordMessageProvenance error: %v", err)
+	}
+	if record.ID == "" || record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() {
+		t.Fatalf("record metadata was not initialized: %#v", record)
+	}
+	got, ok, err := store.MessageProvenance(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance error: %v", err)
+	}
+	if !ok || got.Origin != MessageOriginHelperOutbox || got.OutboxID != "outbox-1" || got.RenderedHash != "hash-1" {
+		t.Fatalf("message provenance = %#v, ok=%v", got, ok)
+	}
+	delivered, err := store.HasDeliveredOutboxMessage(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("HasDeliveredOutboxMessage error: %v", err)
+	}
+	if !delivered {
+		t.Fatal("HasDeliveredOutboxMessage should use helper provenance")
+	}
+	missing, ok, err := store.MessageProvenance(ctx, "chat-1", "missing")
+	if err != nil {
+		t.Fatalf("MessageProvenance missing error: %v", err)
+	}
+	if ok || missing.ID != "" {
+		t.Fatalf("missing provenance = %#v, ok=%v", missing, ok)
+	}
+}
+
 func TestRecoverInterruptsAmbiguousTurns(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2410,6 +2484,26 @@ func TestMarkOutboxSentIsIdempotent(t *testing.T) {
 	}
 	if got := len(state.OutboxMessages); got != 1 {
 		t.Fatalf("outbox count = %d, want 1", got)
+	}
+	record, ok, err := store.MessageProvenance(ctx, "chat-1", "teams-message-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance error: %v", err)
+	}
+	if !ok || record.Origin != MessageOriginHelperOutbox || record.OutboxID != msg.ID {
+		t.Fatalf("message provenance = %#v, ok=%v", record, ok)
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		delete(state.OutboxMessages, msg.ID)
+		return nil
+	}); err != nil {
+		t.Fatalf("delete outbox from state: %v", err)
+	}
+	delivered, err := store.HasDeliveredOutboxMessage(ctx, "chat-1", "teams-message-1")
+	if err != nil {
+		t.Fatalf("HasDeliveredOutboxMessage error: %v", err)
+	}
+	if !delivered {
+		t.Fatal("HasDeliveredOutboxMessage should use provenance after outbox pruning")
 	}
 }
 

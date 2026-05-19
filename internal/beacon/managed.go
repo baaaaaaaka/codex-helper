@@ -479,7 +479,7 @@ func EnsureAllocationRequest(st *State, conversationID string, turnID string, sn
 	if profileName == "" {
 		return AllocationRequest{}, false, fmt.Errorf("beacon profile is required")
 	}
-	profile, ok := st.Profiles[profileName]
+	profile, ok := profileForSnapshot(*st, snap)
 	if !ok {
 		return AllocationRequest{}, false, fmt.Errorf("beacon profile %q not found", profileName)
 	}
@@ -597,6 +597,22 @@ func DecideAllocationSubmit(req AllocationRequest, query SchedulerQueryResult) A
 	return AllocationSubmitNow
 }
 
+func allocationSubmitAuditAction(action AllocationSubmitAction, submitErr error) string {
+	switch action {
+	case AllocationSubmitAdopt:
+		return "allocation_submit_adopt"
+	case AllocationSubmitAttention:
+		return "allocation_submit_needs_attention"
+	case AllocationSubmitNow:
+		if submitErr != nil {
+			return "allocation_submit_failed"
+		}
+		return "allocation_submit_completed"
+	default:
+		return ""
+	}
+}
+
 type AllocationAdapter interface {
 	QueryAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
 	SubmitAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
@@ -604,6 +620,21 @@ type AllocationAdapter interface {
 
 type AllocationCancelAdapter interface {
 	CancelAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error)
+}
+
+type AllocationCancelAction string
+
+const (
+	AllocationCancelNone           AllocationCancelAction = "none"
+	AllocationCancelMarkCanceled   AllocationCancelAction = "mark_canceled"
+	AllocationCancelProviderCancel AllocationCancelAction = "provider_cancel"
+	AllocationCancelDrainStarted   AllocationCancelAction = "drain_started"
+	AllocationCancelNeedsAttention AllocationCancelAction = "needs_attention"
+)
+
+type AllocationCancelResult struct {
+	Request AllocationRequest
+	Action  AllocationCancelAction
 }
 
 type AllocationRenewAdapter interface {
@@ -634,6 +665,9 @@ func ReconcileAllocationSubmit(ctx context.Context, st *State, requestID string,
 	action := DecideAllocationSubmit(req, query)
 	switch action {
 	case AllocationSubmitAlreadyKnown:
+		req = applyAllocationSubmitResult(req, query, SchedulerQueryResult{}, action, nil, now)
+		st.Allocations[requestID] = req
+		req = applyAllocationProviderProjection(st, requestID, now)
 		return req, action, nil
 	case AllocationSubmitWait:
 		req.ProviderReason = strings.TrimSpace(query.Reason)
@@ -643,6 +677,7 @@ func ReconcileAllocationSubmit(ctx context.Context, st *State, requestID string,
 		}
 		req.UpdatedAt = now
 		st.Allocations[requestID] = req
+		req = applyAllocationProviderProjection(st, requestID, now)
 		return req, action, nil
 	case AllocationSubmitAttention:
 		req.State = AllocationNeedsAttention
@@ -664,6 +699,7 @@ func ReconcileAllocationSubmit(ctx context.Context, st *State, requestID string,
 		req.State = AllocationSubmitted
 		req.UpdatedAt = now
 		st.Allocations[requestID] = req
+		req = applyAllocationProviderProjection(st, requestID, now)
 		return req, action, nil
 	case AllocationSubmitNow:
 		submitted, err := adapter.SubmitAllocation(ctx, req)
@@ -686,6 +722,7 @@ func ReconcileAllocationSubmit(ctx context.Context, st *State, requestID string,
 		req.State = AllocationSubmitted
 		req.UpdatedAt = now
 		st.Allocations[requestID] = req
+		req = applyAllocationProviderProjection(st, requestID, now)
 		return req, action, nil
 	default:
 		return req, action, fmt.Errorf("unknown allocation submit action %q", action)
@@ -764,6 +801,12 @@ func ReconcileAllocationSubmitOutsideLock(ctx context.Context, store *Store, req
 		}
 		updated = applyAllocationSubmitResult(current, query, submitted, action, submitErr, now)
 		st.Allocations[requestID] = updated
+		if strings.TrimSpace(updated.ProviderIdentity.ProviderJobID) != "" && strings.TrimSpace(updated.RawProviderState) != "" {
+			updated = applyAllocationProviderProjection(st, requestID, now)
+		}
+		if auditAction := allocationSubmitAuditAction(action, submitErr); auditAction != "" {
+			_, _ = AppendAudit(st, auditAction, requestID, now)
+		}
 		return nil
 	})
 	if updateErr != nil {
@@ -807,12 +850,14 @@ func ReconcileAllocationRenewOutsideLock(ctx context.Context, store *Store, requ
 			current.RenewError = ""
 			current.UpdatedAt = now
 			st.Allocations[requestID] = current
+			_, _ = AppendAudit(st, "allocation_renew_start", requestID, now)
 			claimed = current
 		case AllocationRenewNeedsAttention:
 			current.State = AllocationNeedsAttention
 			current.ProviderReason = firstNonEmpty(current.ProviderReason, "beacon allocation lease is expiring and cannot be renewed automatically")
 			current.UpdatedAt = now
 			st.Allocations[requestID] = current
+			_, _ = AppendAudit(st, "allocation_renew_needs_attention", requestID, now)
 			claimed = current
 		}
 		return nil
@@ -838,6 +883,11 @@ func ReconcileAllocationRenewOutsideLock(ctx context.Context, store *Store, requ
 		updated = applyAllocationRenewResult(*st, current, renewed, renewErr, now)
 		st.Allocations[requestID] = updated
 		applyAllocationDeadlineToMachines(st, updated, now)
+		if renewErr != nil {
+			_, _ = AppendAudit(st, "allocation_renew_failed", requestID, now)
+		} else {
+			_, _ = AppendAudit(st, "allocation_renew_completed", requestID, now)
+		}
 		if strings.TrimSpace(updated.RawProviderState) != "" {
 			projection := ProjectRawProviderState(updated.Provider, updated.RawProviderState, updated.ProviderReason, AllocationHasStartedJob(*st, updated.ID), allocationHasEverRun(updated))
 			_, _ = UpdateAllocationProjection(st, updated.ID, projection, now)
@@ -852,6 +902,270 @@ func ReconcileAllocationRenewOutsideLock(ctx context.Context, store *Store, requ
 		return updated, action, renewErr
 	}
 	return updated, action, nil
+}
+
+func FindAllocationByRef(st State, ref string) (AllocationRequest, bool) {
+	st.normalize()
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return AllocationRequest{}, false
+	}
+	for _, req := range st.Allocations {
+		if strings.TrimSpace(req.ID) == ref ||
+			strings.TrimSpace(req.ProviderIdentity.ProviderJobID) == ref ||
+			strings.TrimSpace(req.Target.ProviderJobID) == ref {
+			return req, true
+		}
+	}
+	return AllocationRequest{}, false
+}
+
+func AllocationsForConversation(st State, conversationID string) []AllocationRequest {
+	st.normalize()
+	conversationID = strings.TrimSpace(conversationID)
+	var out []AllocationRequest
+	for _, req := range st.Allocations {
+		if strings.TrimSpace(req.ConversationID) != conversationID {
+			continue
+		}
+		if allocationStateTerminal(req.State) {
+			continue
+		}
+		out = append(out, req)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func CancelAllocationOutsideLock(ctx context.Context, store *Store, ref string, adapter AllocationCancelAdapter, reason string, force bool, now time.Time) (AllocationCancelResult, error) {
+	if store == nil {
+		return AllocationCancelResult{}, fmt.Errorf("nil beacon store")
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return AllocationCancelResult{}, fmt.Errorf("allocation reference is required")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reason = firstNonEmpty(reason, "released by user")
+	st, err := store.Load()
+	if err != nil {
+		return AllocationCancelResult{}, err
+	}
+	req, ok := FindAllocationByRef(st, ref)
+	if !ok {
+		return AllocationCancelResult{}, fmt.Errorf("allocation %q not found", ref)
+	}
+	if allocationStateTerminal(req.State) {
+		return AllocationCancelResult{Request: req, Action: AllocationCancelNone}, nil
+	}
+	var claimed AllocationRequest
+	var providerJobID string
+	var action AllocationCancelAction
+	var cancelErr error
+	if err := store.Update(func(st *State) error {
+		current, ok := st.Allocations[req.ID]
+		if !ok {
+			return fmt.Errorf("allocation request %q not found", req.ID)
+		}
+		if allocationStateTerminal(current.State) {
+			claimed = current
+			action = AllocationCancelNone
+			return nil
+		}
+		current.CancelRequestedAt = now
+		current.CancelReason = reason
+		current.UpdatedAt = now
+		if allocationHasActiveStartedJob(*st, current.ID) && !force {
+			current.ProviderReason = firstNonEmpty(current.ProviderReason, "release requested after worker started; draining instead of canceling")
+			st.Allocations[current.ID] = current
+			markAllocationMachinesDraining(st, current, now)
+			_, _ = AppendAudit(st, "allocation_release_drain_started", current.ID, now)
+			claimed = current
+			action = AllocationCancelDrainStarted
+			return nil
+		}
+		tombstoneAllocationJobs(st, current, reason, now)
+		st.Allocations[current.ID] = current
+		_, _ = AppendAudit(st, "allocation_release_request", current.ID, now)
+		claimed = current
+		providerJobID = firstNonEmpty(current.ProviderIdentity.ProviderJobID, current.Target.ProviderJobID)
+		if strings.TrimSpace(providerJobID) != "" && current.Provider != ProviderLocal {
+			if adapter != nil {
+				action = AllocationCancelProviderCancel
+			} else {
+				cancelErr = fmt.Errorf("beacon provider cancel adapter is not configured for %s allocation %s", current.Provider, current.ID)
+				current.State = AllocationNeedsAttention
+				current.ProviderReason = cancelErr.Error()
+				current.UpdatedAt = now
+				st.Allocations[current.ID] = current
+				markAllocationMachinesDraining(st, current, now)
+				claimed = current
+				action = AllocationCancelNeedsAttention
+			}
+		} else {
+			action = AllocationCancelMarkCanceled
+		}
+		return nil
+	}); err != nil {
+		return AllocationCancelResult{}, err
+	}
+	if action == AllocationCancelNone || action == AllocationCancelDrainStarted {
+		return AllocationCancelResult{Request: claimed, Action: action}, nil
+	}
+	if action == AllocationCancelNeedsAttention {
+		return AllocationCancelResult{Request: claimed, Action: action}, cancelErr
+	}
+
+	var cancelResult SchedulerQueryResult
+	if action == AllocationCancelProviderCancel {
+		cancelResult, cancelErr = adapter.CancelAllocation(ctx, claimed)
+	}
+	var updated AllocationRequest
+	updateErr := store.Update(func(st *State) error {
+		current, ok := st.Allocations[claimed.ID]
+		if !ok {
+			return fmt.Errorf("allocation request %q not found", claimed.ID)
+		}
+		if allocationStateTerminal(current.State) {
+			updated = current
+			return nil
+		}
+		current.CancelRequestedAt = now
+		current.CancelReason = reason
+		if cancelErr != nil {
+			current.State = AllocationNeedsAttention
+			current.ProviderReason = cancelErr.Error()
+			_, _ = AppendAudit(st, "allocation_cancel_failed", current.ID, now)
+		} else {
+			current.State = AllocationCanceled
+			current.ProviderReason = firstNonEmpty(strings.TrimSpace(cancelResult.Reason), reason)
+			_, _ = AppendAudit(st, "allocation_cancel_completed", current.ID, now)
+		}
+		if strings.TrimSpace(cancelResult.RawState) != "" {
+			current.RawProviderState = strings.TrimSpace(cancelResult.RawState)
+		}
+		if strings.TrimSpace(cancelResult.ProviderJobID) != "" {
+			current.ProviderIdentity.ProviderJobID = strings.TrimSpace(cancelResult.ProviderJobID)
+		}
+		if !cancelResult.ProviderDeadline.IsZero() {
+			current.ProviderDeadline = cancelResult.ProviderDeadline
+		}
+		current.UpdatedAt = now
+		st.Allocations[current.ID] = current
+		if cancelErr != nil {
+			markAllocationMachinesDraining(st, current, now)
+		} else {
+			tombstoneAllocationJobs(st, current, reason, now)
+			tombstoneAllocationMachines(st, current, now)
+		}
+		updated = current
+		return nil
+	})
+	if updateErr != nil {
+		return AllocationCancelResult{}, updateErr
+	}
+	if cancelErr != nil {
+		return AllocationCancelResult{Request: updated, Action: AllocationCancelNeedsAttention}, cancelErr
+	}
+	return AllocationCancelResult{Request: updated, Action: action}, nil
+}
+
+func markAllocationMachinesDraining(st *State, req AllocationRequest, now time.Time) {
+	if st == nil {
+		return
+	}
+	providerJobID, leaseID, ok := allocationMachineMatchKeys(req)
+	if !ok {
+		return
+	}
+	for key, machine := range st.Machines {
+		if strings.TrimSpace(providerJobID) != "" && strings.TrimSpace(machine.ProviderJobID) != strings.TrimSpace(providerJobID) {
+			continue
+		}
+		if strings.TrimSpace(providerJobID) == "" && strings.TrimSpace(machine.LeaseID) != leaseID {
+			continue
+		}
+		machine.State = string(LeaseDraining)
+		machine.UpdatedAt = now
+		st.Machines[key] = machine
+	}
+}
+
+func tombstoneAllocationMachines(st *State, req AllocationRequest, now time.Time) {
+	if st == nil {
+		return
+	}
+	providerJobID, leaseID, ok := allocationMachineMatchKeys(req)
+	if !ok {
+		return
+	}
+	for key, machine := range st.Machines {
+		if strings.TrimSpace(providerJobID) != "" && strings.TrimSpace(machine.ProviderJobID) != strings.TrimSpace(providerJobID) {
+			continue
+		}
+		if strings.TrimSpace(providerJobID) == "" && strings.TrimSpace(machine.LeaseID) != leaseID {
+			continue
+		}
+		if len(machine.Jobs) > 0 {
+			machine.State = string(LeaseDraining)
+			machine.UpdatedAt = now
+			st.Machines[key] = machine
+			continue
+		}
+		delete(st.Machines, key)
+	}
+}
+
+func allocationMachineMatchKeys(req AllocationRequest) (providerJobID string, leaseID string, ok bool) {
+	providerJobID = strings.TrimSpace(firstNonEmpty(req.ProviderIdentity.ProviderJobID, req.Target.ProviderJobID))
+	if providerJobID != "" {
+		return providerJobID, "", true
+	}
+	leaseID = strings.TrimSpace(req.Target.LeaseID)
+	if leaseID != "" {
+		return "", leaseID, true
+	}
+	return "", "", false
+}
+
+func allocationHasActiveStartedJob(st State, allocationID string) bool {
+	allocationID = strings.TrimSpace(allocationID)
+	if allocationID == "" {
+		return false
+	}
+	for _, job := range st.JobAttempts {
+		if strings.TrimSpace(job.RequestID) != allocationID {
+			continue
+		}
+		switch job.Phase {
+		case JobStartIntent, JobStarted, JobAmbiguous:
+			return true
+		}
+	}
+	return false
+}
+
+func tombstoneAllocationJobs(st *State, req AllocationRequest, reason string, now time.Time) {
+	if st == nil {
+		return
+	}
+	reason = firstNonEmpty(reason, "allocation released")
+	for id, attempt := range st.JobAttempts {
+		if strings.TrimSpace(attempt.RequestID) != strings.TrimSpace(req.ID) || jobAttemptTerminal(attempt.Phase) {
+			continue
+		}
+		switch attempt.Phase {
+		case JobStartIntent, JobStarted, JobAmbiguous:
+			continue
+		}
+		attempt.Phase = JobTombstoned
+		attempt.Reason = reason
+		attempt.UpdatedAt = now
+		st.JobAttempts[id] = attempt
+		removeJobFromMachines(st, attempt.ID)
+	}
 }
 
 func decideAllocationRenew(st State, req AllocationRequest, opts AllocationRenewOptions, now time.Time) AllocationRenewAction {
@@ -1160,10 +1474,41 @@ func UpdateAllocationProjection(st *State, requestID string, projection Provider
 	st.Allocations[requestID] = req
 	applyAllocationDeadlineToMachines(st, req, now)
 	applyProviderProjectionToMachinesAndJobs(st, req, projection, now)
+	if allocationProjectionAuditRequired(projection.Action) {
+		_, _ = AppendAudit(st, "allocation_projection_"+string(projection.Action), requestID, now)
+	}
 	if current, ok := st.Allocations[requestID]; ok {
 		return current, nil
 	}
 	return req, nil
+}
+
+func allocationProjectionAuditRequired(action ReconcileAction) bool {
+	switch action {
+	case ReconcileLost, ReconcileQuarantine, ReconcileSuspended, ReconcileDrain, ReconcileCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
+func applyAllocationProviderProjection(st *State, requestID string, now time.Time) AllocationRequest {
+	if st == nil {
+		return AllocationRequest{}
+	}
+	current, ok := st.Allocations[strings.TrimSpace(requestID)]
+	if !ok {
+		return AllocationRequest{}
+	}
+	if strings.TrimSpace(current.ProviderIdentity.ProviderJobID) == "" || strings.TrimSpace(current.RawProviderState) == "" {
+		return current
+	}
+	projection := ProjectRawProviderState(current.Provider, current.RawProviderState, current.ProviderReason, AllocationHasStartedJob(*st, current.ID), allocationHasEverRun(current))
+	updated, err := UpdateAllocationProjection(st, current.ID, projection, now)
+	if err != nil {
+		return current
+	}
+	return updated
 }
 
 func applyProviderProjectionToMachinesAndJobs(st *State, req AllocationRequest, projection ProviderProjection, now time.Time) {
@@ -1206,6 +1551,7 @@ func applyProviderProjectionToMachinesAndJobs(st *State, req AllocationRequest, 
 			st.JobAttempts[id] = attempt
 			removeJobFromMachines(st, attempt.ID)
 		}
+		_, _ = AppendAudit(st, "allocation_replacement_queued", req.ID, now)
 	}
 	for key, machine := range st.Machines {
 		if providerJobID == "" || strings.TrimSpace(machine.ProviderJobID) != providerJobID {

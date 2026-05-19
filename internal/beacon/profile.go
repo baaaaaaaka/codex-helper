@@ -3,6 +3,7 @@ package beacon
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,9 +16,12 @@ type CreateProfileInput struct {
 	IsolationDefault             Isolation
 	Slurm                        SlurmProfile
 	LSF                          LSFProfile
+	Adapter                      ProviderCommandConfig
 	Now                          time.Time
 	ExistingProxyProfileResolver func(string) bool
 }
+
+type UpdateProfileInput = CreateProfileInput
 
 func CreateProfile(st *State, in CreateProfileInput) (Profile, error) {
 	if st == nil {
@@ -45,36 +49,200 @@ func CreateProfile(st *State, in CreateProfileInput) (Profile, error) {
 	}
 	p := Profile{
 		Name:             name,
+		Revision:         1,
 		Provider:         in.Provider,
 		ProxyMode:        proxyMode,
 		ProxyProfile:     strings.TrimSpace(in.ProxyProfile),
 		IsolationDefault: isolation,
 		Slurm:            in.Slurm,
 		LSF:              in.LSF,
+		Adapter:          in.Adapter,
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
 	p.ProviderPreviewOK = providerPreviewOK(p)
 	if reasons := p.DraftReasons(in.ExistingProxyProfileResolver); hasFatalProfileReason(reasons) {
 		st.Profiles[name] = p
+		_, _ = AppendAudit(st, "profile_create", name, now)
 		return p, nil
 	}
 	st.Profiles[name] = p
+	_, _ = AppendAudit(st, "profile_create", name, now)
 	return p, nil
 }
 
+func UpdateProfileConfig(st *State, in UpdateProfileInput) (Profile, error) {
+	if st == nil {
+		return Profile{}, fmt.Errorf("nil beacon state")
+	}
+	st.normalize()
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return Profile{}, fmt.Errorf("profile name is required")
+	}
+	old, ok := st.Profiles[name]
+	if !ok {
+		return Profile{}, fmt.Errorf("beacon profile %q not found", name)
+	}
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	old = normalizeProfileRevision(old)
+	st.ProfileHistory[profileHistoryKey(old.Name, old.Revision)] = old
+	pinProfileReferences(st, old.Name, old.Revision)
+	proxyMode := in.ProxyMode
+	if proxyMode == "" {
+		proxyMode = ProxyNone
+	}
+	isolation := in.IsolationDefault
+	if isolation == "" {
+		isolation = IsolationShared
+	}
+	adapter := in.Adapter
+	if old.Provider == in.Provider {
+		adapter = MergeProviderCommandConfig(old.Adapter, in.Adapter)
+	}
+	p := Profile{
+		Name:             name,
+		Revision:         old.Revision + 1,
+		Provider:         in.Provider,
+		ProxyMode:        proxyMode,
+		ProxyProfile:     strings.TrimSpace(in.ProxyProfile),
+		IsolationDefault: isolation,
+		Slurm:            in.Slurm,
+		LSF:              in.LSF,
+		Adapter:          adapter,
+		CreatedAt:        old.CreatedAt,
+		UpdatedAt:        now,
+	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	p.ProviderPreviewOK = providerPreviewOK(p)
+	st.Profiles[name] = p
+	_, _ = AppendAudit(st, "profile_update", profileHistoryKey(name, p.Revision), now)
+	return p, nil
+}
+
+func ListProfileRevisions(st State, name string) []Profile {
+	st.normalize()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	byRevision := map[int]Profile{}
+	if p, ok := st.Profiles[name]; ok {
+		p = normalizeProfileRevision(p)
+		byRevision[p.Revision] = p
+	}
+	for key, p := range st.ProfileHistory {
+		p = normalizeProfileRevision(p)
+		if p.Name != name && !strings.HasPrefix(key, name+"@") {
+			continue
+		}
+		byRevision[p.Revision] = p
+	}
+	revisions := make([]int, 0, len(byRevision))
+	for revision := range byRevision {
+		revisions = append(revisions, revision)
+	}
+	sort.Ints(revisions)
+	out := make([]Profile, 0, len(revisions))
+	for _, revision := range revisions {
+		out = append(out, byRevision[revision])
+	}
+	return out
+}
+
+func RollbackProfileRevision(st *State, name string, revision int, now time.Time) (Profile, error) {
+	if st == nil {
+		return Profile{}, fmt.Errorf("nil beacon state")
+	}
+	st.normalize()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Profile{}, fmt.Errorf("profile name is required")
+	}
+	if revision <= 0 {
+		return Profile{}, fmt.Errorf("profile revision must be positive")
+	}
+	current, ok := st.Profiles[name]
+	if !ok {
+		return Profile{}, fmt.Errorf("beacon profile %q not found", name)
+	}
+	current = normalizeProfileRevision(current)
+	target, ok := profileForRevision(*st, name, revision)
+	if !ok {
+		return Profile{}, fmt.Errorf("beacon profile %q revision %d not found", name, revision)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	st.ProfileHistory[profileHistoryKey(current.Name, current.Revision)] = current
+	pinProfileReferences(st, current.Name, current.Revision)
+	target = normalizeProfileRevision(target)
+	target.Revision = current.Revision + 1
+	target.CreatedAt = current.CreatedAt
+	if target.CreatedAt.IsZero() {
+		target.CreatedAt = now
+	}
+	target.UpdatedAt = now
+	target.ProviderPreviewOK = providerPreviewOK(target)
+	st.Profiles[name] = target
+	_, _ = AppendAudit(st, "profile_rollback", fmt.Sprintf("%s@%d->%d", name, revision, target.Revision), now)
+	return target, nil
+}
+
+func PruneProfileHistory(st *State, name string) (int, error) {
+	if st == nil {
+		return 0, fmt.Errorf("nil beacon state")
+	}
+	st.normalize()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, fmt.Errorf("profile name is required")
+	}
+	removed := 0
+	for key, p := range st.ProfileHistory {
+		p = normalizeProfileRevision(p)
+		if p.Name != name && !strings.HasPrefix(key, name+"@") {
+			continue
+		}
+		if profileRevisionInUse(*st, name, p.Revision) {
+			continue
+		}
+		delete(st.ProfileHistory, key)
+		removed++
+	}
+	if removed > 0 {
+		_, _ = AppendAudit(st, "profile_history_prune", name, time.Time{})
+	}
+	return removed, nil
+}
+
 func ConfirmProfile(st *State, name string, now time.Time, proxyExists func(string) bool) (Profile, error) {
-	return updateProfile(st, name, now, func(p *Profile) {
+	p, err := updateProfile(st, name, now, func(p *Profile) {
+		*p = normalizeProfileRevision(*p)
 		p.Confirmed = true
 		p.ProviderPreviewOK = providerPreviewOK(*p)
 	}, proxyExists)
+	if err == nil {
+		_, _ = AppendAudit(st, "profile_confirm", name, now)
+	}
+	return p, err
 }
 
 func DoctorProfile(st *State, name string, now time.Time, proxyExists func(string) bool) (Profile, error) {
-	return updateProfile(st, name, now, func(p *Profile) {
+	p, err := updateProfile(st, name, now, func(p *Profile) {
+		*p = normalizeProfileRevision(*p)
 		p.ProviderPreviewOK = providerPreviewOK(*p)
 		p.DoctorOK = true
 	}, proxyExists)
+	if err == nil {
+		_, _ = AppendAudit(st, "profile_doctor", name, now)
+	}
+	return p, err
 }
 
 func DeleteProfile(st *State, name string) error {
@@ -90,6 +258,7 @@ func DeleteProfile(st *State, name string) error {
 		return fmt.Errorf("beacon profile %q is in use", name)
 	}
 	delete(st.Profiles, name)
+	_, _ = AppendAudit(st, "profile_delete", name, time.Time{})
 	return nil
 }
 
@@ -142,6 +311,126 @@ func updateProfile(st *State, name string, now time.Time, fn func(*Profile), pro
 	p.UpdatedAt = now
 	st.Profiles[name] = p
 	return p, nil
+}
+
+func profileForSnapshot(st State, snap TargetSnapshot) (Profile, bool) {
+	st.normalize()
+	name := strings.TrimSpace(snap.Profile)
+	if name == "" {
+		return Profile{}, false
+	}
+	if snap.ProfileRevision > 0 {
+		if p, ok := st.ProfileHistory[profileHistoryKey(name, snap.ProfileRevision)]; ok {
+			return normalizeProfileRevision(p), true
+		}
+		if p, ok := st.Profiles[name]; ok {
+			p = normalizeProfileRevision(p)
+			if p.Revision == snap.ProfileRevision {
+				return p, true
+			}
+		}
+	}
+	p, ok := st.Profiles[name]
+	if !ok {
+		return Profile{}, false
+	}
+	return normalizeProfileRevision(p), true
+}
+
+func profileForRevision(st State, name string, revision int) (Profile, bool) {
+	st.normalize()
+	name = strings.TrimSpace(name)
+	if name == "" || revision <= 0 {
+		return Profile{}, false
+	}
+	if p, ok := st.ProfileHistory[profileHistoryKey(name, revision)]; ok {
+		return normalizeProfileRevision(p), true
+	}
+	if p, ok := st.Profiles[name]; ok {
+		p = normalizeProfileRevision(p)
+		if p.Revision == revision {
+			return p, true
+		}
+	}
+	return Profile{}, false
+}
+
+func normalizeProfileRevision(p Profile) Profile {
+	if p.Revision <= 0 {
+		p.Revision = 1
+	}
+	return p
+}
+
+func profileHistoryKey(name string, revision int) string {
+	return strings.TrimSpace(name) + "@" + strconv.Itoa(revision)
+}
+
+func profileRevisionInUse(st State, name string, revision int) bool {
+	if strings.TrimSpace(name) == "" || revision <= 0 {
+		return false
+	}
+	check := func(snap TargetSnapshot) bool {
+		return strings.TrimSpace(snap.Profile) == name && snap.ProfileRevision == revision
+	}
+	for _, conv := range st.Conversations {
+		if check(conv.Current) {
+			return true
+		}
+		if conv.Pending != nil && check(*conv.Pending) {
+			return true
+		}
+		for _, queued := range conv.Queued {
+			if check(queued.Snapshot) {
+				return true
+			}
+		}
+	}
+	for _, snap := range st.TurnTargets {
+		if check(snap) {
+			return true
+		}
+	}
+	for _, req := range st.Allocations {
+		if check(req.Target) {
+			return true
+		}
+		if strings.TrimSpace(req.Profile) == name && normalizeProfileRevision(req.ProfileSnapshot).Revision == revision {
+			return true
+		}
+	}
+	return false
+}
+
+func pinProfileReferences(st *State, name string, revision int) {
+	if st == nil || strings.TrimSpace(name) == "" || revision <= 0 {
+		return
+	}
+	for id, conv := range st.Conversations {
+		conv.Current = pinTargetProfileRevision(conv.Current, name, revision)
+		if conv.Pending != nil {
+			pending := pinTargetProfileRevision(*conv.Pending, name, revision)
+			conv.Pending = &pending
+		}
+		for i := range conv.Queued {
+			conv.Queued[i].Snapshot = pinTargetProfileRevision(conv.Queued[i].Snapshot, name, revision)
+		}
+		st.Conversations[id] = conv
+	}
+	for id, snap := range st.TurnTargets {
+		st.TurnTargets[id] = pinTargetProfileRevision(snap, name, revision)
+	}
+	for id, req := range st.Allocations {
+		req.Target = pinTargetProfileRevision(req.Target, name, revision)
+		st.Allocations[id] = req
+	}
+}
+
+func pinTargetProfileRevision(snap TargetSnapshot, name string, revision int) TargetSnapshot {
+	if strings.TrimSpace(snap.Profile) == strings.TrimSpace(name) && snap.ProfileRevision == 0 {
+		snap.ProfileRevision = revision
+	}
+	return snap
 }
 
 func ListProfiles(st State) []Profile {

@@ -27,18 +27,20 @@ const (
 )
 
 type Profile struct {
-	Name              string       `json:"name"`
-	Provider          Provider     `json:"provider"`
-	ProxyMode         ProxyMode    `json:"proxy_mode"`
-	ProxyProfile      string       `json:"proxy_profile,omitempty"`
-	IsolationDefault  Isolation    `json:"isolation_default,omitempty"`
-	Slurm             SlurmProfile `json:"slurm,omitempty"`
-	LSF               LSFProfile   `json:"lsf,omitempty"`
-	Confirmed         bool         `json:"confirmed"`
-	ProviderPreviewOK bool         `json:"provider_preview_ok"`
-	DoctorOK          bool         `json:"doctor_ok"`
-	CreatedAt         time.Time    `json:"created_at,omitempty"`
-	UpdatedAt         time.Time    `json:"updated_at,omitempty"`
+	Name              string                `json:"name"`
+	Revision          int                   `json:"revision,omitempty"`
+	Provider          Provider              `json:"provider"`
+	ProxyMode         ProxyMode             `json:"proxy_mode"`
+	ProxyProfile      string                `json:"proxy_profile,omitempty"`
+	IsolationDefault  Isolation             `json:"isolation_default,omitempty"`
+	Slurm             SlurmProfile          `json:"slurm,omitempty"`
+	LSF               LSFProfile            `json:"lsf,omitempty"`
+	Adapter           ProviderCommandConfig `json:"adapter,omitempty"`
+	Confirmed         bool                  `json:"confirmed"`
+	ProviderPreviewOK bool                  `json:"provider_preview_ok"`
+	DoctorOK          bool                  `json:"doctor_ok"`
+	CreatedAt         time.Time             `json:"created_at,omitempty"`
+	UpdatedAt         time.Time             `json:"updated_at,omitempty"`
 }
 
 type SlurmProfile struct {
@@ -79,6 +81,7 @@ type ExecutionSignature struct {
 type TargetSnapshot struct {
 	Target           string              `json:"target"`
 	Profile          string              `json:"profile,omitempty"`
+	ProfileRevision  int                 `json:"profile_revision,omitempty"`
 	Signature        string              `json:"signature,omitempty"`
 	SignatureDetails *ExecutionSignature `json:"signature_details,omitempty"`
 	ProxyRoute       string              `json:"proxy_route,omitempty"`
@@ -259,17 +262,18 @@ type AuditHead struct {
 }
 
 type State struct {
-	Version       int                          `json:"version"`
-	Profiles      map[string]Profile           `json:"profiles,omitempty"`
-	Conversations map[string]Conversation      `json:"conversations,omitempty"`
-	TurnTargets   map[string]TargetSnapshot    `json:"turn_targets,omitempty"`
-	Allocations   map[string]AllocationRequest `json:"allocations,omitempty"`
-	Machines      map[string]Machine           `json:"machines,omitempty"`
-	JobAttempts   map[string]JobAttempt        `json:"job_attempts,omitempty"`
-	Idempotency   map[string]IdempotencyRecord `json:"idempotency,omitempty"`
-	Terminals     map[string]TerminalRecord    `json:"terminals,omitempty"`
-	Audit         []AuditRecord                `json:"audit,omitempty"`
-	AuditHead     AuditHead                    `json:"audit_head,omitempty"`
+	Version        int                          `json:"version"`
+	Profiles       map[string]Profile           `json:"profiles,omitempty"`
+	ProfileHistory map[string]Profile           `json:"profile_history,omitempty"`
+	Conversations  map[string]Conversation      `json:"conversations,omitempty"`
+	TurnTargets    map[string]TargetSnapshot    `json:"turn_targets,omitempty"`
+	Allocations    map[string]AllocationRequest `json:"allocations,omitempty"`
+	Machines       map[string]Machine           `json:"machines,omitempty"`
+	JobAttempts    map[string]JobAttempt        `json:"job_attempts,omitempty"`
+	Idempotency    map[string]IdempotencyRecord `json:"idempotency,omitempty"`
+	Terminals      map[string]TerminalRecord    `json:"terminals,omitempty"`
+	Audit          []AuditRecord                `json:"audit,omitempty"`
+	AuditHead      AuditHead                    `json:"audit_head,omitempty"`
 }
 
 func (s *State) normalize() {
@@ -278,6 +282,9 @@ func (s *State) normalize() {
 	}
 	if s.Profiles == nil {
 		s.Profiles = map[string]Profile{}
+	}
+	if s.ProfileHistory == nil {
+		s.ProfileHistory = map[string]Profile{}
 	}
 	if s.Conversations == nil {
 		s.Conversations = map[string]Conversation{}

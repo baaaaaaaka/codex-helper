@@ -136,13 +136,19 @@ codex-proxy proxy doctor
 | `codex-proxy skills remove <name>` | Remove a skill subscription and managed installed skills |
 | `codex-proxy beacon profile list` | List beacon execution profiles |
 | `codex-proxy beacon profile create <name>` | Create a draft beacon execution profile |
+| `codex-proxy beacon profile update <name>` | Create a new profile revision without breaking chats already bound to the old revision |
+| `codex-proxy beacon profile history <name>` | List current and historical revisions for a beacon profile |
+| `codex-proxy beacon profile rollback <name> <revision>` | Publish a historical profile revision as a new latest revision |
+| `codex-proxy beacon profile gc <name>` | Prune historical revisions no active target/allocation still references |
 | `codex-proxy beacon profile doctor <name>` | Mark a beacon profile doctor check successful |
 | `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review |
 | `codex-proxy beacon status [--session <id>]` | Show beacon target state |
+| `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | Release a beacon resource by profile, allocation id, provider job id, or machine id |
 | `codex-proxy beacon switch-profile <name> --session <id>` | Switch a conversation to a ready beacon profile |
 | `codex-proxy beacon switch-profile <name> --session <id> --after-current-turn` | Defer a beacon switch so the current Codex turn can finish |
 | `codex-proxy beacon allocation list` | List managed beacon allocation requests |
 | `codex-proxy beacon allocation status <allocation-or-provider-job>` | Show one managed allocation request |
+| `codex-proxy beacon allocation cancel <allocation-or-provider-job>` | Cancel one managed allocation through the configured provider adapter |
 | `codex-proxy beacon allocation reconcile <allocation>` | Query/adopt/submit through the configured provider adapter |
 | `codex-proxy beacon allocation reconcile-all` | Reconcile all allocations, drain stale workers, and recover stale claims |
 | `codex-proxy beacon provider template slurm` | Print a starter Slurm adapter script |
@@ -185,7 +191,11 @@ codex-proxy beacon profile create gpu \
   --image image.sqsh \
   --nodes 1 \
   --gpu 1 \
-  --duration 4
+  --duration 4 \
+  --query-command /path/to/query-slurm-allocation \
+  --submit-command /path/to/submit-slurm-allocation \
+  --cancel-command /path/to/cancel-slurm-allocation \
+  --renew-command /path/to/renew-slurm-allocation
 ```
 
 LSF and local drafts use smaller inputs:
@@ -208,6 +218,24 @@ codex-proxy beacon profile confirm gpu
 codex-proxy beacon profile status gpu
 ```
 
+To change a profile, update it in place. The helper records a new revision, while
+queued or running turns keep their existing target snapshot:
+
+```bash
+codex-proxy beacon profile update gpu \
+  --provider slurm \
+  --partition interactive \
+  --image new-image.sqsh \
+  --nodes 1 \
+  --gpu 1 \
+  --duration 4
+```
+
+Use `profile history` to inspect published revisions. If a new revision is bad,
+`profile rollback <name> <revision>` republishes the historical config as a new
+latest revision, and `profile gc <name>` removes only history entries that no
+conversation, queued turn, or allocation still references.
+
 After a profile is ready, inspect target state or switch an existing
 conversation explicitly:
 
@@ -216,21 +244,33 @@ codex-proxy beacon status --session <session-id>
 codex-proxy beacon switch-profile gpu --session <session-id>
 ```
 
+In Teams, use `beacon switch <profile>` from the Work chat. The helper then
+submits, queries, waits for the worker, renews, and cleans up the managed
+allocation automatically. If you need to manually free the current resource,
+send `beacon release` in the Work chat; the profile binding stays unchanged, so
+future turns may acquire a fresh worker for the same profile. From the CLI or
+Teams control chat, `codex-proxy beacon release <profile|allocation|provider-job|machine>`
+accepts the resource identifier you have and resolves the internal object type.
+
 When a Teams Work chat targets a beacon profile, each turn snapshots the target
 and records a managed allocation request before Codex can start. Explicit beacon
 turns do not fall back to local execution. If no accepting beacon worker/lease is
 available yet, `beacon status` shows the allocation id, allocation state,
 provider job id, provider state, and provider reason that need attention.
 
-Provider submission is adapter-based. To start from a site-editable Slurm or LSF
-wrapper, print a template:
+Provider submission is adapter-based. The least surprising Teams workflow is to
+store adapter commands on the beacon profile with `--query-command`,
+`--submit-command`, `--cancel-command`, and `--renew-command`; those profile
+changes apply to future turns without reloading the Teams helper. To start from a
+site-editable Slurm or LSF wrapper, print a template:
 
 ```bash
 codex-proxy beacon provider template slurm > ~/bin/cxp-beacon-slurm-adapter
 chmod +x ~/bin/cxp-beacon-slurm-adapter
 ```
 
-Then point managed beacon allocations at executable adapters:
+If you prefer one global adapter per provider, point managed beacon allocations
+at executable adapters through the helper service environment instead:
 
 ```bash
 export CODEX_HELPER_BEACON_SLURM_QUERY=/path/to/query-slurm-allocation
@@ -288,6 +328,12 @@ state with:
 ```bash
 codex-proxy beacon allocation reconcile-all
 ```
+
+Scheduler-capable CI can opt in to the real adapter path with
+`CODEX_HELPER_BEACON_LIVE=1`, `CODEX_HELPER_BEACON_LIVE_PROVIDER=slurm|lsf`,
+and the matching `CODEX_HELPER_BEACON_*_QUERY/SUBMIT/CANCEL` commands. The live
+test submits through the profile-stored adapter snapshot and cancels the
+provider job during cleanup.
 
 When issuing a beacon switch from inside an active Codex turn, prefer the
 deferred form so the current answer stays on its existing target and later

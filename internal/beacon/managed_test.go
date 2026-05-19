@@ -3,6 +3,7 @@ package beacon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -968,8 +969,11 @@ type fakeAllocationAdapter struct {
 	submitErr error
 	renew     SchedulerQueryResult
 	renewErr  error
+	cancel    SchedulerQueryResult
+	cancelErr error
 	submits   int
 	renews    int
+	cancels   int
 }
 
 func (a *fakeAllocationAdapter) QueryAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error) {
@@ -993,6 +997,14 @@ func (a *fakeAllocationAdapter) RenewAllocation(context.Context, AllocationReque
 		return SchedulerQueryResult{}, a.renewErr
 	}
 	return a.renew, nil
+}
+
+func (a *fakeAllocationAdapter) CancelAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error) {
+	a.cancels++
+	if a.cancelErr != nil {
+		return SchedulerQueryResult{}, a.cancelErr
+	}
+	return a.cancel, nil
 }
 
 func copyAllocation(in AllocationRequest, fn func(*AllocationRequest)) AllocationRequest {
@@ -1041,6 +1053,14 @@ func TestReconcileAllocationRenewOutsideLockRenewsDueLeaseAndUpdatesMachine(t *t
 	}
 	if got := st.Machines["machine-1"].LeaseExpiresAt; !got.Equal(renewedDeadline) {
 		t.Fatalf("machine deadline = %s, want %s", got, renewedDeadline)
+	}
+	if err := ValidateAudit(st); err != nil {
+		t.Fatalf("ValidateAudit after renew: %v", err)
+	}
+	for _, want := range []string{"allocation_renew_start", "allocation_renew_completed"} {
+		if !auditActionsContain(st, want) {
+			t.Fatalf("renew audit missing %s: %#v", want, st.Audit)
+		}
 	}
 }
 
@@ -1117,6 +1137,321 @@ func TestReconcileAllocationRenewOutsideLockStartedOnlySkipsQueuedJobs(t *testin
 	req, action, err = ReconcileAllocationRenewOutsideLock(context.Background(), store, "req-1", adapter, AllocationRenewOptions{StartedOnly: true}, now.Add(time.Second))
 	if err != nil || action != AllocationRenewNow || adapter.renews != 1 || req.RenewEpoch != 1 {
 		t.Fatalf("started-only renewal should protect possible-start jobs: action=%s renews=%d req=%#v err=%v", action, adapter.renews, req, err)
+	}
+}
+
+func TestCancelAllocationOutsideLockCancelsProviderWithoutMachine(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	if err := store.Update(func(st *State) error {
+		st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+			p.Provider = ProviderSlurm
+			p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+		})}
+		req, _, err := EnsureAllocationRequest(st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}, now)
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = AllocationRunning
+		st.Allocations[req.ID] = req
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{cancel: SchedulerQueryResult{ProviderJobID: "slurm-1", RawState: "CA", Reason: "canceled"}}
+	res, err := CancelAllocationOutsideLock(context.Background(), store, "slurm-1", adapter, "manual release", false, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("CancelAllocationOutsideLock: %v", err)
+	}
+	if res.Action != AllocationCancelProviderCancel || adapter.cancels != 1 || res.Request.State != AllocationCanceled {
+		t.Fatalf("cancel result action=%s cancels=%d req=%#v", res.Action, adapter.cancels, res.Request)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load after cancel: %v", err)
+	}
+	if err := ValidateAudit(st); err != nil {
+		t.Fatalf("ValidateAudit after cancel: %v", err)
+	}
+	for _, want := range []string{"allocation_release_request", "allocation_cancel_completed"} {
+		if !auditActionsContain(st, want) {
+			t.Fatalf("cancel audit missing %s: %#v", want, st.Audit)
+		}
+	}
+}
+
+func TestCancelAllocationOutsideLockRemoteProviderWithoutAdapterNeedsAttention(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	var req AllocationRequest
+	if err := store.Update(func(st *State) error {
+		st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+			p.Provider = ProviderSlurm
+			p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+		})}
+		var err error
+		req, _, err = EnsureAllocationRequest(st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProviderJobID: "slurm-1", MachineID: "machine-1", LeaseID: "lease-1"}, now)
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = AllocationRunning
+		st.Allocations[req.ID] = req
+		st.JobAttempts = map[string]JobAttempt{"job-queued": {ID: "job-queued", RequestID: req.ID, TurnID: "turn-1", Phase: JobQueued}}
+		st.Machines = map[string]Machine{"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(LeaseAccepting), Jobs: []string{"job-queued"}}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	res, err := CancelAllocationOutsideLock(context.Background(), store, "slurm-1", nil, "manual release", false, now.Add(time.Second))
+	if err == nil || !strings.Contains(err.Error(), "cancel adapter is not configured") {
+		t.Fatalf("CancelAllocationOutsideLock error = %v, want missing adapter", err)
+	}
+	loaded, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("Load: %v", loadErr)
+	}
+	if res.Action != AllocationCancelNeedsAttention || loaded.Allocations[req.ID].State != AllocationNeedsAttention {
+		t.Fatalf("missing adapter state action=%s allocation=%#v", res.Action, loaded.Allocations[req.ID])
+	}
+	if !strings.Contains(loaded.Allocations[req.ID].ProviderReason, "cancel adapter is not configured") {
+		t.Fatalf("provider reason = %q, want adapter diagnostic", loaded.Allocations[req.ID].ProviderReason)
+	}
+	if loaded.Machines["machine-1"].State != string(LeaseDraining) || loaded.JobAttempts["job-queued"].Phase != JobTombstoned {
+		t.Fatalf("missing adapter should drain/tombstone local work: machine=%#v job=%#v", loaded.Machines["machine-1"], loaded.JobAttempts["job-queued"])
+	}
+}
+
+func TestCancelAllocationOutsideLockDrainsStartedJobWithoutProviderCancel(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	if err := store.Update(func(st *State) error {
+		st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+			p.Provider = ProviderSlurm
+			p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+		})}
+		req, _, err := EnsureAllocationRequest(st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProviderJobID: "slurm-1", MachineID: "machine-1", LeaseID: "lease-1"}, now)
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = AllocationRunning
+		st.Allocations[req.ID] = req
+		st.JobAttempts = map[string]JobAttempt{"job-1": {ID: "job-1", RequestID: req.ID, TurnID: "turn-1", Phase: JobStarted}}
+		st.Machines = map[string]Machine{"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(LeaseAccepting)}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{cancel: SchedulerQueryResult{ProviderJobID: "slurm-1", RawState: "CA", Reason: "canceled"}}
+	res, err := CancelAllocationOutsideLock(context.Background(), store, "slurm-1", adapter, "manual release", false, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("CancelAllocationOutsideLock: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if res.Action != AllocationCancelDrainStarted || adapter.cancels != 0 || loaded.Allocations[res.Request.ID].State != AllocationRunning || loaded.Machines["machine-1"].State != string(LeaseDraining) {
+		t.Fatalf("drain result action=%s cancels=%d allocation=%#v machine=%#v", res.Action, adapter.cancels, loaded.Allocations[res.Request.ID], loaded.Machines["machine-1"])
+	}
+}
+
+func TestCancelAllocationOutsideLockCancelsAfterTerminalJob(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	if err := store.Update(func(st *State) error {
+		st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+			p.Provider = ProviderSlurm
+			p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+		})}
+		req, _, err := EnsureAllocationRequest(st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProviderJobID: "slurm-1", MachineID: "machine-1", LeaseID: "lease-1"}, now)
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = AllocationRunning
+		st.Allocations[req.ID] = req
+		st.JobAttempts = map[string]JobAttempt{"job-1": {ID: "job-1", RequestID: req.ID, TurnID: "turn-1", Phase: JobTerminal}}
+		st.Machines = map[string]Machine{"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(LeaseAccepting)}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{cancel: SchedulerQueryResult{ProviderJobID: "slurm-1", RawState: "CA", Reason: "canceled"}}
+	res, err := CancelAllocationOutsideLock(context.Background(), store, "slurm-1", adapter, "manual release", false, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("CancelAllocationOutsideLock: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if res.Action != AllocationCancelProviderCancel || adapter.cancels != 1 || loaded.Allocations[res.Request.ID].State != AllocationCanceled || len(loaded.Machines) != 0 {
+		t.Fatalf("terminal release action=%s cancels=%d allocation=%#v machines=%#v", res.Action, adapter.cancels, loaded.Allocations[res.Request.ID], loaded.Machines)
+	}
+}
+
+func TestCancelAllocationOutsideLockTombstonesQueuedAndClaimedJobs(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	if err := store.Update(func(st *State) error {
+		st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+			p.Provider = ProviderSlurm
+			p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+		})}
+		req, _, err := EnsureAllocationRequest(st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProviderJobID: "slurm-1", MachineID: "machine-1", LeaseID: "lease-1"}, now)
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = AllocationRunning
+		st.Allocations[req.ID] = req
+		st.JobAttempts = map[string]JobAttempt{
+			"job-queued":  {ID: "job-queued", RequestID: req.ID, TurnID: "turn-1", Phase: JobQueued},
+			"job-claimed": {ID: "job-claimed", RequestID: req.ID, TurnID: "turn-1", Phase: JobClaimed},
+		}
+		st.Machines = map[string]Machine{"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(LeaseAccepting), Jobs: []string{"job-queued", "job-claimed"}}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{cancel: SchedulerQueryResult{ProviderJobID: "slurm-1", RawState: "CA", Reason: "canceled"}}
+	res, err := CancelAllocationOutsideLock(context.Background(), store, "slurm-1", adapter, "manual release", false, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("CancelAllocationOutsideLock: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if res.Action != AllocationCancelProviderCancel || adapter.cancels != 1 || loaded.Allocations[res.Request.ID].State != AllocationCanceled {
+		t.Fatalf("cancel result action=%s cancels=%d allocation=%#v", res.Action, adapter.cancels, loaded.Allocations[res.Request.ID])
+	}
+	if loaded.JobAttempts["job-queued"].Phase != JobTombstoned || loaded.JobAttempts["job-claimed"].Phase != JobTombstoned || len(loaded.Machines) != 0 {
+		t.Fatalf("jobs/machines not tombstoned: jobs=%#v machines=%#v", loaded.JobAttempts, loaded.Machines)
+	}
+}
+
+func TestCancelAllocationOutsideLockDoesNotTouchMachinesWithoutStableMatchKey(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	var req AllocationRequest
+	if err := store.Update(func(st *State) error {
+		st.Profiles = map[string]Profile{"gpu": readyProfile("gpu")}
+		var err error
+		req, _, err = EnsureAllocationRequest(st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}, now)
+		if err != nil {
+			return err
+		}
+		req.State = AllocationRunning
+		st.Allocations[req.ID] = req
+		st.Machines = map[string]Machine{
+			"unrelated-empty-lease": {ID: "unrelated-empty-lease", State: string(LeaseAccepting)},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	res, err := CancelAllocationOutsideLock(context.Background(), store, req.ID, nil, "manual release", false, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("CancelAllocationOutsideLock: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if res.Action != AllocationCancelMarkCanceled || loaded.Allocations[req.ID].State != AllocationCanceled {
+		t.Fatalf("cancel result action=%s allocation=%#v", res.Action, loaded.Allocations[req.ID])
+	}
+	if _, ok := loaded.Machines["unrelated-empty-lease"]; !ok {
+		t.Fatalf("release without provider job or lease should not delete unrelated machines: %#v", loaded.Machines)
+	}
+}
+
+func TestCancelAllocationOutsideLockKeepsMachineWhenProviderCancelFails(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	if err := store.Update(func(st *State) error {
+		st.Profiles = map[string]Profile{"gpu": copyProfile(readyProfile("gpu"), func(p *Profile) {
+			p.Provider = ProviderSlurm
+			p.Slurm = SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 2}
+		})}
+		req, _, err := EnsureAllocationRequest(st, "conv", "turn-1", TargetSnapshot{Target: TargetBeacon, Profile: "gpu", ProviderJobID: "slurm-1", MachineID: "machine-1", LeaseID: "lease-1"}, now)
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = AllocationRunning
+		st.Allocations[req.ID] = req
+		st.JobAttempts = map[string]JobAttempt{"job-queued": {ID: "job-queued", RequestID: req.ID, TurnID: "turn-1", Phase: JobQueued}}
+		st.Machines = map[string]Machine{"machine-1": {ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(LeaseAccepting), Jobs: []string{"job-queued"}}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{cancelErr: fmt.Errorf("provider unavailable")}
+	res, err := CancelAllocationOutsideLock(context.Background(), store, "slurm-1", adapter, "manual release", false, now.Add(time.Second))
+	if err == nil {
+		t.Fatal("CancelAllocationOutsideLock error = nil, want provider error")
+	}
+	loaded, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("Load: %v", loadErr)
+	}
+	if res.Action != AllocationCancelNeedsAttention || loaded.Allocations[res.Request.ID].State != AllocationNeedsAttention || loaded.Machines["machine-1"].State != string(LeaseDraining) {
+		t.Fatalf("failed cancel state action=%s allocation=%#v machine=%#v", res.Action, loaded.Allocations[res.Request.ID], loaded.Machines["machine-1"])
+	}
+	if loaded.JobAttempts["job-queued"].Phase != JobTombstoned {
+		t.Fatalf("queued job phase = %s, want tombstoned", loaded.JobAttempts["job-queued"].Phase)
+	}
+}
+
+func TestReconcileAllocationSubmitOutsideLockProjectsKnownProviderState(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Unix(1, 0)
+	if err := store.Save(State{Allocations: map[string]AllocationRequest{
+		"req-1": {
+			ID:               "req-1",
+			State:            AllocationRunning,
+			Provider:         ProviderSlurm,
+			ProviderIdentity: ProviderIdentity{ProviderJobID: "slurm-1"},
+		},
+	}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	adapter := &fakeAllocationAdapter{query: SchedulerQueryResult{ProviderJobID: "slurm-1", RawState: "F", Reason: "node failed"}}
+	req, action, err := ReconcileAllocationSubmitOutsideLock(context.Background(), store, "req-1", adapter, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ReconcileAllocationSubmitOutsideLock: %v", err)
+	}
+	if action != AllocationSubmitAlreadyKnown || req.State != AllocationRequestPersisted || req.RawProviderState != "F" || req.ReplacementID != "slurm-1" {
+		t.Fatalf("known provider state was not projected: action=%s req=%#v", action, req)
 	}
 }
 
@@ -1222,4 +1557,13 @@ func (a *queryHookSubmitAdapter) QueryAllocation(context.Context, AllocationRequ
 func (a *queryHookSubmitAdapter) SubmitAllocation(context.Context, AllocationRequest) (SchedulerQueryResult, error) {
 	a.submits++
 	return SchedulerQueryResult{ProviderJobID: "slurm-unwanted"}, nil
+}
+
+func auditActionsContain(st State, action string) bool {
+	for _, rec := range st.Audit {
+		if rec.Action == action {
+			return true
+		}
+	}
+	return false
 }

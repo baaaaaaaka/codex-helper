@@ -86,11 +86,12 @@ func SwitchProfile(st *State, in SwitchInput, proxyExists func(string) bool) (Sw
 	conv := st.Conversations[convID]
 	conv.ID = convID
 	next := TargetSnapshot{
-		Target:     TargetBeacon,
-		Profile:    p.Name,
-		Signature:  strings.TrimSpace(in.Signature),
-		ProxyRoute: p.ProxyProfile,
-		Isolation:  p.IsolationDefault,
+		Target:          TargetBeacon,
+		Profile:         p.Name,
+		ProfileRevision: normalizeProfileRevision(p).Revision,
+		Signature:       strings.TrimSpace(in.Signature),
+		ProxyRoute:      p.ProxyProfile,
+		Isolation:       p.IsolationDefault,
 	}
 	if next.Isolation == "" {
 		next.Isolation = IsolationShared

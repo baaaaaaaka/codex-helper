@@ -6271,7 +6271,7 @@ func TestBridgePollIgnoresImportBatchBeforeAnnotatingUserPrefix(t *testing.T) {
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	if _, _, err := store.QueueOutbox(context.Background(), importBatch); err != nil {
@@ -8868,7 +8868,7 @@ func TestBridgePollIgnoresDurableDeliveredOutboxAfterRegistryLoss(t *testing.T) 
 	}})
 	store := newBridgeTestStore(t)
 	ctx := context.Background()
-	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
@@ -8919,6 +8919,50 @@ func TestBridgePollIgnoresDurableDeliveredOutboxAfterRegistryLoss(t *testing.T) 
 	}
 }
 
+func TestBridgePollDoesNotContentDedupeFreshUserPromptMatchingOutbox(t *testing.T) {
+	contentOnlyOutbox := teamstore.OutboxMessage{
+		ID:          "outbox:sent-helper-without-message-id",
+		TeamsChatID: "chat-1",
+		Kind:        "helper",
+		Body:        "Codex request canceled.",
+		Status:      teamstore.OutboxStatusSent,
+	}
+	msg := bridgePollMessage("fresh-user-matching-helper-outbox", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = renderOutboxHTML(contentOnlyOutbox)
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, contentOnlyOutbox); err != nil {
+		t.Fatalf("QueueOutbox content-only helper message error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(ctx, "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "Codex request canceled") {
+		t.Fatalf("handled = %#v, want fresh user prompt despite content match", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "fresh-user-matching-helper-outbox") {
+		t.Fatal("fresh content-matching user prompt should not be marked as sent helper output")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.OutboxMessages[contentOnlyOutbox.ID].TeamsMessageID; got != "" {
+		t.Fatalf("fresh content match should not bind outbox TeamsMessageID, got %q", got)
+	}
+}
+
 func TestBridgePollIgnoresMentionedDurableOutboxAfterRegistryLoss(t *testing.T) {
 	mentionedOutbox := teamstore.OutboxMessage{
 		ID:              "outbox:external-command:abc123",
@@ -8937,7 +8981,7 @@ func TestBridgePollIgnoresMentionedDurableOutboxAfterRegistryLoss(t *testing.T) 
 	}})
 	store := newBridgeTestStore(t)
 	ctx := context.Background()
-	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	if _, _, err := store.QueueOutbox(ctx, mentionedOutbox); err != nil {
@@ -8982,7 +9026,7 @@ func TestBridgePollDropsRenderedHelperOrCodexOutputWithoutDurableMatch(t *testin
 		messages: []ChatMessage{msg},
 	}})
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -9015,7 +9059,7 @@ func TestBridgePollDropsRenderedHelperLabelOutputInWorkChat(t *testing.T) {
 		messages: []ChatMessage{msg},
 	}})
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -9041,6 +9085,92 @@ func TestBridgePollDropsRenderedHelperLabelOutputInWorkChat(t *testing.T) {
 	}
 }
 
+func TestBridgePollDropsPlainHelperLabelCancelOutputInWorkChat(t *testing.T) {
+	messages := []ChatMessage{
+		bridgePollMessage("plain-helper-label-cancel-request", "2026-04-30T01:05:00Z", ""),
+		bridgePollMessage("plain-helper-label-canceled", "2026-04-30T01:05:01Z", ""),
+	}
+	messages[0].Body.Content = "<p>🔧 Helper:</p><p>cancel requested for running turn: turn:inbound:19</p><p>Prompt being canceled:</p><p>old prompt</p><p>No other prompts are queued.</p>"
+	messages[1].Body.Content = "<p>🔧 Helper:</p><p>Codex request canceled.</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: messages,
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled plain helper-label cancel output as inbound prompt: %#v", handled)
+	}
+	for _, msg := range messages {
+		if !bridge.reg.HasSent("chat-1", msg.ID) {
+			t.Fatalf("ignored plain helper-label cancel output %s was not marked sent", msg.ID)
+		}
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestBridgePollDropsPlainHelperLabelLifecycleOutputInWorkChat(t *testing.T) {
+	messages := []ChatMessage{
+		bridgePollMessage("plain-helper-label-ack", "2026-04-30T01:05:00Z", ""),
+		bridgePollMessage("plain-helper-label-queued", "2026-04-30T01:05:01Z", ""),
+		bridgePollMessage("plain-helper-label-starting", "2026-04-30T01:05:02Z", ""),
+		bridgePollMessage("plain-helper-label-ready", "2026-04-30T01:05:03Z", ""),
+		bridgePollMessage("plain-helper-label-reload", "2026-04-30T01:05:04Z", ""),
+		bridgePollMessage("plain-helper-label-finished", "2026-04-30T01:05:05Z", ""),
+	}
+	messages[0].Body.Content = "<p>🔧 Helper:</p><p>⏳ Codex is working. Request accepted.</p>"
+	messages[1].Body.Content = "<p>🔧 Helper:</p><p>⚠️ Your request is queued.</p><p>Another Codex request is already running.</p>"
+	messages[2].Body.Content = "<p>🔧 Helper:</p><p>▶️ Codex is starting this queued request.</p>"
+	messages[3].Body.Content = "<p>🔧 Helper:</p><p>💬 Work chat is ready.</p><p>Send a task in this chat.</p>"
+	messages[4].Body.Content = "<p>🔧 Helper:</p><p>🔁 Helper reload started</p><p>I am testing and rebuilding the helper.</p>"
+	messages[5].Body.Content = "<p>🔧 Helper:</p><p>✅ Codex finished responding.</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: messages,
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled plain helper-label lifecycle output as inbound prompt: %#v", handled)
+	}
+	for _, msg := range messages {
+		if !bridge.reg.HasSent("chat-1", msg.ID) {
+			t.Fatalf("ignored plain helper-label lifecycle output %s was not marked sent", msg.ID)
+		}
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
 func TestBridgePollDropsPlainHelperCancelOutputInWorkChat(t *testing.T) {
 	msg := bridgePollMessage("plain-helper-cancel", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = "<p>cancel requested for running turn: turn:inbound:19</p><p>Prompt being canceled:</p><p>Codex request canceled.</p>"
@@ -9048,7 +9178,7 @@ func TestBridgePollDropsPlainHelperCancelOutputInWorkChat(t *testing.T) {
 		messages: []ChatMessage{msg},
 	}})
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -9075,7 +9205,7 @@ func TestBridgePollDropsBeaconMaintenanceOutputWithoutDurableMatch(t *testing.T)
 	}
 	graph := newBridgePollGraph(t, []bridgePollPage{{messages: messages}})
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -9110,7 +9240,7 @@ func TestBridgePollDropsRenderedUserTranscriptEchoWithoutDurableMatch(t *testing
 		messages: []ChatMessage{msg},
 	}})
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -9133,6 +9263,54 @@ func TestBridgePollDropsRenderedUserTranscriptEchoWithoutDurableMatch(t *testing
 	}
 	if got := len(state.InboundEvents); got != 0 {
 		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
+func TestBridgePollDropsPersistedInboundAfterUserAnnotation(t *testing.T) {
+	msg := bridgePollMessage("persisted-annotated-user-message", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = "<p>🧑‍💻 User:</p><p>run the same request once</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	seedBridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	session := seedBridge.reg.SessionByChatID("chat-1")
+	if session == nil {
+		t.Fatal("test bridge missing chat-1 session")
+	}
+	if err := seedBridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if _, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		SessionID:      session.ID,
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: msg.ID,
+		Text:           "run the same request once",
+		Source:         "teams",
+		Status:         teamstore.InboundStatusQueued,
+	}); err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled already-persisted annotated user message as inbound prompt: %#v", handled)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 1 {
+		t.Fatalf("inbound events = %d, want only the persisted original: %#v", got, state.InboundEvents)
 	}
 }
 
@@ -9191,7 +9369,7 @@ func TestBridgeControlPollIgnoresHistoricalHelperOutputAndClearsContinuation(t *
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "control-chat", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, true, 20, "/chats/control-chat/messages?$skiptoken=old-history"); err != nil {
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "control-chat", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, true, 20, "/chats/control-chat/messages?$skiptoken=old-history"); err != nil {
 		t.Fatalf("RecordChatPollSuccessWithContinuation error: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -9228,6 +9406,33 @@ func TestBridgeControlPollIgnoresHistoricalHelperOutputAndClearsContinuation(t *
 	}
 }
 
+func TestBridgeControlPollAllowsFreshHelperPrefixedQuestion(t *testing.T) {
+	msg := bridgePollMessage("fresh-control-helper-question", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = "<p>🔧 Helper:<br>这个错误是什么意思？</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.reg.ControlChatID = "control-chat"
+	var handled []string
+	if _, err := bridge.pollChatWithRole(context.Background(), "control-chat", 50, inboundPollRoleControl, false, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("control poll error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "这个错误是什么意思") {
+		t.Fatalf("handled = %#v, want fresh helper-prefixed control question", handled)
+	}
+	if bridge.reg.HasSent("control-chat", "fresh-control-helper-question") {
+		t.Fatal("fresh helper-prefixed control question should not be marked as sent helper output")
+	}
+}
+
 func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 	msg := bridgePollMessage("stale-helper-artifact", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = `<p>Codex: artifact attached: stage5_small_error_report.md <attachment id="artifact-1"></attachment></p>`
@@ -9240,7 +9445,7 @@ func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 		messages: []ChatMessage{msg},
 	}})
 	store := newBridgeTestStore(t)
-	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -9365,6 +9570,37 @@ func TestBridgePollAllowsCodexPrefixedUserMessageWithAttachment(t *testing.T) {
 	}
 }
 
+func TestBridgePollAllowsFreshArtifactEchoShapedUserMessageWithAttachment(t *testing.T) {
+	msg := bridgePollMessage("fresh-artifact-echo-shaped-attachment", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p>Codex: artifact attached: input.txt <attachment id="file-1"></attachment></p>`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "file-1",
+		ContentType: "reference",
+		Name:        "input.txt",
+	}}
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "artifact attached") {
+		t.Fatalf("handled = %#v, want fresh artifact-echo-shaped user prompt", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "fresh-artifact-echo-shaped-attachment") {
+		t.Fatal("fresh artifact-echo-shaped prompt should not be marked as sent helper output")
+	}
+}
+
 func TestBridgePollAllowsOwnerMessageStartingWithHelperPrefix(t *testing.T) {
 	msg := bridgePollMessage("owner-helper-prefixed-question", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = "<p>🔧 Helper:<br>artifact manifest rejected; what should I do?</p>"
@@ -9388,6 +9624,88 @@ func TestBridgePollAllowsOwnerMessageStartingWithHelperPrefix(t *testing.T) {
 	}
 	if bridge.reg.HasSent("chat-1", "owner-helper-prefixed-question") {
 		t.Fatal("owner helper-prefixed prompt should not be marked as sent helper output")
+	}
+}
+
+func TestBridgePollAllowsFreshUserPromptStartingWithHelperLifecycleText(t *testing.T) {
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{bridgePollMessage("fresh-canceled-question", "2026-04-30T01:05:00Z", "Codex request canceled. 这是什么意思？")},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || handled[0] != "Codex request canceled. 这是什么意思？" {
+		t.Fatalf("handled = %#v, want fresh helper-lifecycle-looking user prompt", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "fresh-canceled-question") {
+		t.Fatal("fresh helper-lifecycle-looking prompt should not be marked as sent helper output")
+	}
+}
+
+func TestBridgePollAllowsFreshStrongHelperPrefixedUserPrompt(t *testing.T) {
+	msg := bridgePollMessage("fresh-strong-helper-question", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = "<p><strong>🔧 Helper:</strong></p><p>artifact manifest rejected; what should I do?</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "artifact manifest rejected") {
+		t.Fatalf("handled = %#v, want fresh strong helper-prefixed user prompt", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "fresh-strong-helper-question") {
+		t.Fatal("fresh strong helper-prefixed prompt should not be marked as sent helper output")
+	}
+}
+
+func TestBridgePollAllowsFreshHelperPrefixedUserPromptFromContinuation(t *testing.T) {
+	msg := bridgePollMessage("fresh-continuation-helper-question", "2026-04-30T01:12:00Z", "")
+	msg.Body.Content = "<p><strong>🔧 Helper:</strong></p><p>why did the previous helper output appear?</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if got := r.URL.Query().Get("$skiptoken"); got != "next-page" {
+				t.Fatalf("skiptoken = %q, want next-page", got)
+			}
+		},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, true, 50, "/chats/chat-1/messages?$skiptoken=next-page"); err != nil {
+		t.Fatalf("RecordChatPollSuccessWithContinuation error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "previous helper output") {
+		t.Fatalf("handled = %#v, want fresh continuation helper-prefixed user prompt", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "fresh-continuation-helper-question") {
+		t.Fatal("fresh continuation helper-prefixed prompt should not be marked as sent helper output")
 	}
 }
 

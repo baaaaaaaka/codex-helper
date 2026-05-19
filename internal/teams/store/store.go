@@ -27,6 +27,7 @@ const (
 
 	maxRetainedSentOutboxMessages      = 512
 	maxRetainedTranscriptLedgerRecords = 1024
+	maxRetainedMessageProvenance       = 8192
 )
 
 type SessionStatus string
@@ -66,6 +67,11 @@ const (
 	OutboxStatusSkipped  OutboxStatus = "skipped"
 )
 
+const (
+	MessageOriginHelperOutbox = "helper_outbox"
+	MessageOriginUserInbound  = "user_inbound"
+)
+
 var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
 var ErrUpgradeInProgress = errors.New("Teams upgrade already in progress")
 
@@ -80,36 +86,37 @@ const (
 )
 
 type State struct {
-	SchemaVersion     int                               `json:"schema_version"`
-	CreatedAt         time.Time                         `json:"created_at,omitempty"`
-	UpdatedAt         time.Time                         `json:"updated_at,omitempty"`
-	Scope             ScopeIdentity                     `json:"scope,omitempty"`
-	MachineIdentity   MachineIdentity                   `json:"machine_identity,omitempty"`
-	Machines          map[string]MachineRecord          `json:"machines,omitempty"`
-	ControlLease      ControlLease                      `json:"control_lease,omitempty"`
-	ControlChat       ControlChatBinding                `json:"control_chat,omitempty"`
-	ServiceOwner      *OwnerMetadata                    `json:"service_owner,omitempty"`
-	LockOwner         *OwnerMetadata                    `json:"lock_owner,omitempty"`
-	ServiceControl    ServiceControl                    `json:"service_control,omitempty"`
-	Upgrade           *UpgradeRequest                   `json:"upgrade,omitempty"`
-	Sessions          map[string]SessionContext         `json:"sessions,omitempty"`
-	Turns             map[string]Turn                   `json:"turns,omitempty"`
-	InboundEvents     map[string]InboundEvent           `json:"inbound_events,omitempty"`
-	OutboxMessages    map[string]OutboxMessage          `json:"outbox_messages,omitempty"`
-	ChatPolls         map[string]ChatPollState          `json:"chat_polls,omitempty"`
-	Workspaces        map[string]WorkspaceRecord        `json:"workspaces,omitempty"`
-	DashboardViews    map[string]DashboardViewRecord    `json:"dashboard_views,omitempty"`
-	DashboardNumbers  map[string]DashboardNumberRecord  `json:"dashboard_numbers,omitempty"`
-	TranscriptLedger  map[string]TranscriptLedgerRecord `json:"transcript_ledger,omitempty"`
-	ImportCheckpoints map[string]ImportCheckpoint       `json:"import_checkpoints,omitempty"`
-	HistoryWatch      map[string]HistoryWatchCheckpoint `json:"history_watch,omitempty"`
-	HistoryWatchReady time.Time                         `json:"history_watch_ready,omitempty"`
-	ChatSequences     map[string]ChatSequenceState      `json:"chat_sequences,omitempty"`
-	ChatRateLimits    map[string]ChatRateLimitState     `json:"chat_rate_limits,omitempty"`
-	ArtifactRecords   map[string]ArtifactRecord         `json:"artifact_records,omitempty"`
-	Notifications     map[string]NotificationRecord     `json:"notifications,omitempty"`
-	Workflow          WorkflowNotificationConfig        `json:"workflow,omitempty"`
-	AutoUpdate        AutoUpdateState                   `json:"auto_update,omitempty"`
+	SchemaVersion     int                                `json:"schema_version"`
+	CreatedAt         time.Time                          `json:"created_at,omitempty"`
+	UpdatedAt         time.Time                          `json:"updated_at,omitempty"`
+	Scope             ScopeIdentity                      `json:"scope,omitempty"`
+	MachineIdentity   MachineIdentity                    `json:"machine_identity,omitempty"`
+	Machines          map[string]MachineRecord           `json:"machines,omitempty"`
+	ControlLease      ControlLease                       `json:"control_lease,omitempty"`
+	ControlChat       ControlChatBinding                 `json:"control_chat,omitempty"`
+	ServiceOwner      *OwnerMetadata                     `json:"service_owner,omitempty"`
+	LockOwner         *OwnerMetadata                     `json:"lock_owner,omitempty"`
+	ServiceControl    ServiceControl                     `json:"service_control,omitempty"`
+	Upgrade           *UpgradeRequest                    `json:"upgrade,omitempty"`
+	Sessions          map[string]SessionContext          `json:"sessions,omitempty"`
+	Turns             map[string]Turn                    `json:"turns,omitempty"`
+	InboundEvents     map[string]InboundEvent            `json:"inbound_events,omitempty"`
+	OutboxMessages    map[string]OutboxMessage           `json:"outbox_messages,omitempty"`
+	MessageProvenance map[string]MessageProvenanceRecord `json:"message_provenance,omitempty"`
+	ChatPolls         map[string]ChatPollState           `json:"chat_polls,omitempty"`
+	Workspaces        map[string]WorkspaceRecord         `json:"workspaces,omitempty"`
+	DashboardViews    map[string]DashboardViewRecord     `json:"dashboard_views,omitempty"`
+	DashboardNumbers  map[string]DashboardNumberRecord   `json:"dashboard_numbers,omitempty"`
+	TranscriptLedger  map[string]TranscriptLedgerRecord  `json:"transcript_ledger,omitempty"`
+	ImportCheckpoints map[string]ImportCheckpoint        `json:"import_checkpoints,omitempty"`
+	HistoryWatch      map[string]HistoryWatchCheckpoint  `json:"history_watch,omitempty"`
+	HistoryWatchReady time.Time                          `json:"history_watch_ready,omitempty"`
+	ChatSequences     map[string]ChatSequenceState       `json:"chat_sequences,omitempty"`
+	ChatRateLimits    map[string]ChatRateLimitState      `json:"chat_rate_limits,omitempty"`
+	ArtifactRecords   map[string]ArtifactRecord          `json:"artifact_records,omitempty"`
+	Notifications     map[string]NotificationRecord      `json:"notifications,omitempty"`
+	Workflow          WorkflowNotificationConfig         `json:"workflow,omitempty"`
+	AutoUpdate        AutoUpdateState                    `json:"auto_update,omitempty"`
 }
 
 type ScopeIdentity struct {
@@ -621,6 +628,21 @@ type OutboxMessage struct {
 	SentAt                 time.Time    `json:"sent_at,omitempty"`
 	LastSendAttempt        time.Time    `json:"last_send_attempt,omitempty"`
 	LastSendError          string       `json:"last_send_error,omitempty"`
+}
+
+type MessageProvenanceRecord struct {
+	ID             string    `json:"id"`
+	TeamsChatID    string    `json:"teams_chat_id"`
+	TeamsMessageID string    `json:"teams_message_id"`
+	Origin         string    `json:"origin"`
+	SessionID      string    `json:"session_id,omitempty"`
+	TurnID         string    `json:"turn_id,omitempty"`
+	OutboxID       string    `json:"outbox_id,omitempty"`
+	InboundID      string    `json:"inbound_id,omitempty"`
+	Kind           string    `json:"kind,omitempty"`
+	RenderedHash   string    `json:"rendered_hash,omitempty"`
+	CreatedAt      time.Time `json:"created_at,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
 
 type RecoveryReport struct {
@@ -1648,11 +1670,98 @@ func (s *Store) PersistInbound(ctx context.Context, event InboundEvent) (Inbound
 			event.UpdatedAt = event.CreatedAt
 		}
 		state.InboundEvents[event.ID] = event
+		recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+			TeamsChatID:    event.TeamsChatID,
+			TeamsMessageID: event.TeamsMessageID,
+			Origin:         MessageOriginUserInbound,
+			SessionID:      event.SessionID,
+			TurnID:         event.TurnID,
+			InboundID:      event.ID,
+			Kind:           string(event.Status),
+			RenderedHash:   event.TextHash,
+			CreatedAt:      event.CreatedAt,
+			UpdatedAt:      event.UpdatedAt,
+		}, now)
 		out = event
 		created = true
 		return nil
 	})
 	return out, created, err
+}
+
+func (s *Store) RecordMessageProvenance(ctx context.Context, record MessageProvenanceRecord) (MessageProvenanceRecord, error) {
+	var out MessageProvenanceRecord
+	err := s.Update(ctx, func(state *State) error {
+		now := time.Now()
+		out = recordMessageProvenanceLocked(state, record, now)
+		return nil
+	})
+	return out, err
+}
+
+func recordOutboxProvenanceLocked(state *State, msg OutboxMessage, now time.Time) MessageProvenanceRecord {
+	if strings.TrimSpace(msg.TeamsChatID) == "" || strings.TrimSpace(msg.TeamsMessageID) == "" {
+		return MessageProvenanceRecord{}
+	}
+	return recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+		TeamsChatID:    msg.TeamsChatID,
+		TeamsMessageID: msg.TeamsMessageID,
+		Origin:         MessageOriginHelperOutbox,
+		SessionID:      msg.SessionID,
+		TurnID:         msg.TurnID,
+		OutboxID:       msg.ID,
+		Kind:           msg.Kind,
+		RenderedHash:   msg.RenderedHash,
+		CreatedAt:      msg.CreatedAt,
+		UpdatedAt:      firstStoreNonZeroTime(msg.SentAt, msg.UpdatedAt, msg.CreatedAt),
+	}, now)
+}
+
+func (s *Store) MessageProvenance(ctx context.Context, chatID string, teamsMessageID string) (MessageProvenanceRecord, bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if chatID == "" || teamsMessageID == "" {
+		return MessageProvenanceRecord{}, false, nil
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return MessageProvenanceRecord{}, false, err
+	}
+	id := messageProvenanceID(chatID, teamsMessageID)
+	if record, ok := state.MessageProvenance[id]; ok {
+		return record, true, nil
+	}
+	for _, record := range state.MessageProvenance {
+		if strings.TrimSpace(record.TeamsChatID) == chatID && strings.TrimSpace(record.TeamsMessageID) == teamsMessageID {
+			return record, true, nil
+		}
+	}
+	return MessageProvenanceRecord{}, false, nil
+}
+
+func (s *Store) HasInboundMessage(ctx context.Context, chatID string, teamsMessageID string) (bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if chatID == "" || teamsMessageID == "" {
+		return false, nil
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range state.InboundEvents {
+		if strings.TrimSpace(event.TeamsChatID) == chatID && strings.TrimSpace(event.TeamsMessageID) == teamsMessageID {
+			return true, nil
+		}
+	}
+	record, ok, err := s.MessageProvenance(ctx, chatID, teamsMessageID)
+	if err != nil {
+		return false, err
+	}
+	if ok && strings.TrimSpace(record.Origin) == MessageOriginUserInbound {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (s *Store) DeferredInbound(ctx context.Context) ([]InboundEvent, error) {
@@ -2025,7 +2134,7 @@ func (s *Store) QueueOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessa
 }
 
 func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		switch msg.Status {
 		case OutboxStatusSent:
 			return msg, ErrOutboxSendNotClaimed
@@ -2069,7 +2178,7 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 }
 
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.Status = OutboxStatusQueued
 		msg.LastSendError = trimDiagnostic(message, 240)
 		msg.LastSendAttempt = now
@@ -2078,7 +2187,7 @@ func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, messag
 }
 
 func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
 		msg.DriveItemETag = strings.TrimSpace(eTag)
@@ -2090,8 +2199,9 @@ func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID
 }
 
 func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if msg.Status == OutboxStatusSent {
+			recordOutboxProvenanceLocked(state, msg, now)
 			return msg, nil
 		}
 		msg.Status = OutboxStatusAccepted
@@ -2099,12 +2209,13 @@ func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMe
 			msg.TeamsMessageID = teamsMessageID
 		}
 		msg.LastSendError = ""
+		recordOutboxProvenanceLocked(state, msg, now)
 		return msg, nil
 	})
 }
 
 func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.Status = OutboxStatusSent
 		if msg.SentAt.IsZero() {
 			msg.SentAt = now
@@ -2112,6 +2223,7 @@ func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessag
 		if teamsMessageID != "" {
 			msg.TeamsMessageID = teamsMessageID
 		}
+		recordOutboxProvenanceLocked(state, msg, now)
 		return msg, nil
 	})
 }
@@ -2138,6 +2250,13 @@ func (s *Store) HasDeliveredOutboxMessage(ctx context.Context, chatID string, te
 		case OutboxStatusAccepted, OutboxStatusSent:
 			return true, nil
 		}
+	}
+	record, ok, err := s.MessageProvenance(ctx, chatID, teamsMessageID)
+	if err != nil {
+		return false, err
+	}
+	if ok && strings.TrimSpace(record.Origin) == MessageOriginHelperOutbox {
+		return true, nil
 	}
 	return false, nil
 }
@@ -2493,7 +2612,7 @@ func (s *Store) updateTurn(ctx context.Context, turnID string, fn func(*State, T
 	return out, err
 }
 
-func (s *Store) updateOutbox(ctx context.Context, outboxID string, fn func(OutboxMessage, time.Time) (OutboxMessage, error)) (OutboxMessage, error) {
+func (s *Store) updateOutbox(ctx context.Context, outboxID string, fn func(*State, OutboxMessage, time.Time) (OutboxMessage, error)) (OutboxMessage, error) {
 	if strings.TrimSpace(outboxID) == "" {
 		return OutboxMessage{}, fmt.Errorf("outbox id is required")
 	}
@@ -2518,7 +2637,7 @@ func (s *Store) updateOutbox(ctx context.Context, outboxID string, fn func(Outbo
 			return fmt.Errorf("outbox message %q not found", outboxID)
 		}
 		now := time.Now()
-		next, err := fn(current, now)
+		next, err := fn(state, current, now)
 		if err != nil {
 			return err
 		}
@@ -2577,6 +2696,7 @@ func (s *Store) loadUnlocked() (State, error) {
 		return State{}, &UnsupportedSchemaVersionError{Version: state.SchemaVersion}
 	}
 	state.ensure(time.Time{})
+	backfillMessageProvenance(&state)
 	return state, nil
 }
 
@@ -2584,6 +2704,7 @@ func (s *Store) saveUnlocked(state State) error {
 	state.ensure(time.Now())
 	pruneSentOutboxMessages(&state)
 	pruneTranscriptLedgerRecords(&state)
+	pruneMessageProvenanceRecords(&state)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -2661,6 +2782,49 @@ func pruneTranscriptLedgerRecords(state *State) {
 	}
 }
 
+func pruneMessageProvenanceRecords(state *State) {
+	if state == nil || len(state.MessageProvenance) <= maxRetainedMessageProvenance {
+		return
+	}
+	type candidate struct {
+		id     string
+		record MessageProvenanceRecord
+	}
+	records := make([]candidate, 0, len(state.MessageProvenance))
+	for id, record := range state.MessageProvenance {
+		records = append(records, candidate{id: id, record: record})
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		left := messageProvenanceRetentionTime(records[i].record)
+		right := messageProvenanceRetentionTime(records[j].record)
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return records[i].id > records[j].id
+	})
+	for _, item := range records[maxRetainedMessageProvenance:] {
+		delete(state.MessageProvenance, item.id)
+	}
+}
+
+func messageProvenanceRetentionTime(record MessageProvenanceRecord) time.Time {
+	for _, value := range []time.Time{record.UpdatedAt, record.CreatedAt} {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
+func firstStoreNonZeroTime(values ...time.Time) time.Time {
+	for _, value := range values {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
 func transcriptLedgerRetentionTime(record TranscriptLedgerRecord) time.Time {
 	for _, value := range []time.Time{record.UpdatedAt, record.ImportedAt, record.CreatedAt} {
 		if !value.IsZero() {
@@ -2733,6 +2897,7 @@ func newState() State {
 		Turns:             make(map[string]Turn),
 		InboundEvents:     make(map[string]InboundEvent),
 		OutboxMessages:    make(map[string]OutboxMessage),
+		MessageProvenance: make(map[string]MessageProvenanceRecord),
 		ChatPolls:         make(map[string]ChatPollState),
 		Workspaces:        make(map[string]WorkspaceRecord),
 		DashboardViews:    make(map[string]DashboardViewRecord),
@@ -2775,6 +2940,9 @@ func (s *State) ensure(now time.Time) {
 	}
 	if s.OutboxMessages == nil {
 		s.OutboxMessages = make(map[string]OutboxMessage)
+	}
+	if s.MessageProvenance == nil {
+		s.MessageProvenance = make(map[string]MessageProvenanceRecord)
 	}
 	if s.ChatPolls == nil {
 		s.ChatPolls = make(map[string]ChatPollState)
@@ -2850,7 +3018,54 @@ func migrateStateToCurrent(state State) State {
 		}
 		state.OutboxMessages[id] = msg
 	}
+	backfillMessageProvenance(&state)
 	return state
+}
+
+func backfillMessageProvenance(state *State) {
+	if state == nil {
+		return
+	}
+	state.ensure(time.Time{})
+	if len(state.MessageProvenance) > 0 {
+		return
+	}
+	for _, inbound := range state.InboundEvents {
+		recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+			TeamsChatID:    inbound.TeamsChatID,
+			TeamsMessageID: inbound.TeamsMessageID,
+			Origin:         MessageOriginUserInbound,
+			SessionID:      inbound.SessionID,
+			TurnID:         inbound.TurnID,
+			InboundID:      inbound.ID,
+			Kind:           string(inbound.Status),
+			RenderedHash:   inbound.TextHash,
+			CreatedAt:      inbound.CreatedAt,
+			UpdatedAt:      inbound.UpdatedAt,
+		}, time.Time{})
+	}
+	for _, msg := range state.OutboxMessages {
+		if msg.TeamsMessageID == "" {
+			continue
+		}
+		switch msg.Status {
+		case OutboxStatusAccepted, OutboxStatusSent:
+		default:
+			continue
+		}
+		recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+			TeamsChatID:    msg.TeamsChatID,
+			TeamsMessageID: msg.TeamsMessageID,
+			Origin:         MessageOriginHelperOutbox,
+			SessionID:      msg.SessionID,
+			TurnID:         msg.TurnID,
+			OutboxID:       msg.ID,
+			Kind:           msg.Kind,
+			RenderedHash:   msg.RenderedHash,
+			CreatedAt:      msg.CreatedAt,
+			UpdatedAt:      firstStoreNonZeroTime(msg.SentAt, msg.UpdatedAt, msg.CreatedAt),
+		}, time.Time{})
+	}
 }
 
 func activeUpgrade(req *UpgradeRequest) bool {
@@ -3039,6 +3254,48 @@ func allocateChatSequence(state *State, chatID string, now time.Time) int64 {
 	}
 	state.ChatSequences[chatID] = seq
 	return value
+}
+
+func recordMessageProvenanceLocked(state *State, record MessageProvenanceRecord, now time.Time) MessageProvenanceRecord {
+	state.ensure(time.Time{})
+	record.TeamsChatID = strings.TrimSpace(record.TeamsChatID)
+	record.TeamsMessageID = strings.TrimSpace(record.TeamsMessageID)
+	if record.TeamsChatID == "" || record.TeamsMessageID == "" {
+		return MessageProvenanceRecord{}
+	}
+	if strings.TrimSpace(record.Origin) == "" {
+		record.Origin = "unknown"
+	}
+	record.ID = messageProvenanceID(record.TeamsChatID, record.TeamsMessageID)
+	if existing, ok := state.MessageProvenance[record.ID]; ok && !existing.CreatedAt.IsZero() && record.CreatedAt.IsZero() {
+		record.CreatedAt = existing.CreatedAt
+	}
+	if record.CreatedAt.IsZero() {
+		if !now.IsZero() {
+			record.CreatedAt = now
+		} else if !record.UpdatedAt.IsZero() {
+			record.CreatedAt = record.UpdatedAt
+		}
+	}
+	if record.UpdatedAt.IsZero() {
+		if !now.IsZero() {
+			record.UpdatedAt = now
+		} else {
+			record.UpdatedAt = record.CreatedAt
+		}
+	}
+	state.MessageProvenance[record.ID] = record
+	return record
+}
+
+func messageProvenanceID(chatID string, teamsMessageID string) string {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if chatID == "" || teamsMessageID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(chatID + "\x00" + teamsMessageID))
+	return "teams-message:" + hex.EncodeToString(sum[:16])
 }
 
 func bodyHash(body string) string {

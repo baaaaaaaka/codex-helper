@@ -15,11 +15,17 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp teams doctor`",
 		"`cxp teams service bootstrap`",
 		"`cxp beacon profile create <name>",
+		"`cxp beacon profile update <name>",
+		"`cxp beacon profile history <name>`",
+		"`cxp beacon profile rollback <name> <revision>`",
+		"`cxp beacon profile gc <name>`",
+		"--query-command <script>",
 		"`cxp beacon profile doctor <name>`",
 		"`cxp beacon profile confirm <name>`",
 		"`cxp beacon switch-profile <name> --session <id>`",
 		"`cxp beacon switch-profile <name> --session <id> --after-current-turn`",
-		"`cxp beacon allocation list|status|reconcile`",
+		"`cxp beacon release <profile|allocation|provider-job|machine>`",
+		"`cxp beacon allocation list|status|cancel|reconcile`",
 		"`cxp beacon allocation reconcile-all`",
 		"`cxp beacon provider template slurm|lsf`",
 		"`cxp beacon worker run-once --machine <id>`",
@@ -71,8 +77,13 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 	}{
 		{
 			name:     "profile lifecycle",
-			fallback: []string{"beacon profile create <name>", "beacon profile doctor <name>", "beacon profile confirm <name>"},
-			docs:     []string{"beacon profile create <name>", "beacon profile doctor <name>", "beacon profile confirm <name>"},
+			fallback: []string{"beacon profile create <name>", "beacon profile update <name>", "beacon profile history <name>", "beacon profile rollback <name> <revision>", "beacon profile gc <name>", "beacon profile doctor <name>", "beacon profile confirm <name>"},
+			docs:     []string{"beacon profile create <name>", "beacon profile update <name>", "beacon profile history <name>", "beacon profile rollback <name> <revision>", "beacon profile gc <name>", "beacon profile doctor <name>", "beacon profile confirm <name>"},
+		},
+		{
+			name:     "profile adapter commands",
+			fallback: []string{"--query-command <script>", "--submit-command <script>", "--cancel-command <script>", "--renew-command <script>"},
+			docs:     []string{"--query-command", "--submit-command", "--cancel-command", "--renew-command"},
 		},
 		{
 			name:     "profile switching",
@@ -81,8 +92,8 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 		},
 		{
 			name:     "managed allocation",
-			fallback: []string{"beacon allocation list|status|reconcile", "beacon allocation reconcile-all"},
-			docs:     []string{"beacon allocation list", "beacon allocation status", "beacon allocation reconcile", "beacon allocation reconcile-all"},
+			fallback: []string{"beacon release <profile|allocation|provider-job|machine>", "beacon allocation list|status|cancel|reconcile", "beacon allocation reconcile-all"},
+			docs:     []string{"beacon release <profile|allocation|provider-job|machine>", "beacon allocation list", "beacon allocation status", "beacon allocation cancel", "beacon allocation reconcile", "beacon allocation reconcile-all"},
 		},
 		{
 			name:     "provider templates",

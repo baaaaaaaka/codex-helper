@@ -35,6 +35,11 @@ Beacon profiles describe where future Codex work executes. Create and confirm a 
 
 - `cxp beacon profile list`: list beacon profiles.
 - `cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration>`: create a Slurm draft profile.
+- `cxp beacon profile create <name> ... --query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>`: store Slurm/LSF adapter commands on the profile so future Teams turns can use them without a helper reload.
+- `cxp beacon profile update <name> ...`: create a new profile revision without breaking Work chats already bound to the old revision.
+- `cxp beacon profile history <name>`: list current and historical profile revisions.
+- `cxp beacon profile rollback <name> <revision>`: publish a historical revision as a new latest revision.
+- `cxp beacon profile gc <name>`: prune unreferenced historical revisions only.
 - `cxp beacon profile create <name> --provider lsf --queue <queue>`: create an LSF draft profile.
 - `cxp beacon profile create <name> --provider local`: create a local draft profile.
 - `cxp beacon profile create <name> ... --proxy ssh_profile --proxy-profile <existing-proxy>`: attach an existing SSH proxy profile when the beacon job needs that network route.
@@ -46,8 +51,10 @@ Beacon profiles describe where future Codex work executes. Create and confirm a 
 - `cxp beacon switch-profile <name> --session <session-id>`: switch immediately when no Codex work is queued or running.
 - `cxp beacon switch-profile <name> --session <session-id> --after-current-turn`: defer the switch so the current Codex turn stays on its existing target and future turns use the new profile.
 - `cxp beacon switch-profile <name> --session <session-id> --fork`: fork when the target execution signature is incompatible and the user accepts the fork.
+- `cxp beacon release <profile|allocation|provider-job|machine>`: manually release a beacon resource. In Teams Work chat, `beacon release` releases the current chat's resource while leaving the profile binding unchanged.
 - `cxp beacon allocation list`: list managed allocation requests.
 - `cxp beacon allocation status <allocation-or-provider-job>`: inspect one allocation request.
+- `cxp beacon allocation cancel <allocation-or-provider-job>`: cancel one managed allocation through the configured provider adapter.
 - `cxp beacon allocation reconcile <allocation>`: query/adopt/submit through the configured provider adapter.
 - `cxp beacon allocation reconcile-all`: reconcile all allocations, drain stale workers, and recover stale claims.
 - `cxp beacon provider template slurm|lsf`: print a starter scheduler adapter script that can be edited for the site.
@@ -63,11 +70,15 @@ From an active Codex turn, prefer `--after-current-turn` for profile switches. T
 
 Teams Work chat turns targeting beacon snapshot their target and record a managed allocation before Codex can start. Explicit beacon requests must not be answered by running local Codex. If no accepting worker or lease is available, inspect `cxp beacon status --session <session-id>` for `allocation`, `allocation_state`, `provider_job`, `provider_state`, and `provider_reason`.
 
-Managed provider submission uses explicit site adapters instead of guessing scheduler commands. Configure executable paths with `CODEX_HELPER_BEACON_SLURM_QUERY`, `CODEX_HELPER_BEACON_SLURM_SUBMIT`, `CODEX_HELPER_BEACON_SLURM_CANCEL`, `CODEX_HELPER_BEACON_SLURM_RENEW`, `CODEX_HELPER_BEACON_LSF_QUERY`, `CODEX_HELPER_BEACON_LSF_SUBMIT`, `CODEX_HELPER_BEACON_LSF_CANCEL`, and `CODEX_HELPER_BEACON_LSF_RENEW`. The adapter is executed directly without a shell and should print JSON fields such as `provider_job_id`, `raw_state`, `reason`, and optional `provider_deadline`, or equivalent `key=value` pairs. The generated Slurm/LSF templates include `query`, `submit`, `cancel`, and a site-policy `renew` stub that exits non-zero until edited. Query and renew should return `provider_deadline` when the scheduler exposes a walltime/deadline so Teams can renew before expiry.
+Managed provider submission uses explicit site adapters instead of guessing scheduler commands. Prefer storing executable adapter paths on each profile with `--query-command`, `--submit-command`, `--cancel-command`, and `--renew-command`; this is visible in `beacon profile status` and applies to future Teams turns without a helper reload. As a global fallback, configure executable paths with `CODEX_HELPER_BEACON_SLURM_QUERY`, `CODEX_HELPER_BEACON_SLURM_SUBMIT`, `CODEX_HELPER_BEACON_SLURM_CANCEL`, `CODEX_HELPER_BEACON_SLURM_RENEW`, `CODEX_HELPER_BEACON_LSF_QUERY`, `CODEX_HELPER_BEACON_LSF_SUBMIT`, `CODEX_HELPER_BEACON_LSF_CANCEL`, and `CODEX_HELPER_BEACON_LSF_RENEW`. Environment fallback changes require the Teams helper service to reload.
+
+The adapter is executed directly without a shell and should print JSON fields such as `provider_job_id`, `raw_state`, `reason`, and optional `provider_deadline`, or equivalent `key=value` pairs. The generated Slurm/LSF templates include `query`, `submit`, `cancel`, and a site-policy `renew` stub that exits non-zero until edited. Query and renew should return `provider_deadline` when the scheduler exposes a walltime/deadline so Teams can renew before expiry.
 
 The active Teams helper owner periodically queries existing provider jobs and renews due allocations through the configured `*_RENEW` adapter. Renewal is epoch-fenced and never updates a newer cancel, replacement, or provider job. During helper drain, renewal only protects allocations whose job may already have started; pre-start replacement is conservative and only resets a lost allocation when all jobs are still queued.
 
 For real remote execution, start from `cxp beacon provider template slurm` or `cxp beacon provider template lsf`, edit it for the site, and set the matching `CODEX_HELPER_BEACON_*_QUERY` / `*_SUBMIT` / `*_CANCEL` / `*_RENEW` environment variables. The scheduler job should run `cxp beacon worker serve --allocation <request-id>` for reusable workers, or `cxp beacon worker run-once --allocation <request-id> --wait 30m` for one-shot jobs. The worker derives `SLURM_JOB_ID` or `LSB_JOBID` when `--provider-job` is omitted, runs a doctor check, sends heartbeats, waits for the Teams turn to enqueue work, and publishes the terminal result. Teams waits through this path instead of falling back to local Codex.
+
+Scheduler-capable CI can opt in to the real adapter test with `CODEX_HELPER_BEACON_LIVE=1`, `CODEX_HELPER_BEACON_LIVE_PROVIDER=slurm|lsf`, and the matching query/submit/cancel commands. The live test submits through a profile-stored adapter snapshot and cancels the provider job during cleanup.
 
 ## Teams Helper
 

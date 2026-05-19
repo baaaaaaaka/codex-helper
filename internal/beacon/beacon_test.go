@@ -279,6 +279,123 @@ func TestDeleteProfileRejectsProfilesInUse(t *testing.T) {
 	}
 }
 
+func TestUpdateProfileCreatesRevisionAndPinsExistingTargets(t *testing.T) {
+	now := time.Unix(1, 0)
+	st := State{}
+	p, err := CreateProfile(&st, CreateProfileInput{
+		Name:             "gpu",
+		Provider:         ProviderSlurm,
+		IsolationDefault: IsolationShared,
+		Slurm:            SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "old", Image: "old.sqsh", Duration: 2},
+		Adapter:          ProviderCommandConfigForProvider(ProviderSlurm, "/old/query", "/old/submit", "", ""),
+		Now:              now,
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if p.Revision != 1 {
+		t.Fatalf("initial revision = %d, want 1", p.Revision)
+	}
+	if _, err := DoctorProfile(&st, "gpu", now.Add(time.Second), nil); err != nil {
+		t.Fatalf("DoctorProfile old: %v", err)
+	}
+	if _, err := ConfirmProfile(&st, "gpu", now.Add(2*time.Second), nil); err != nil {
+		t.Fatalf("ConfirmProfile old: %v", err)
+	}
+	st.Conversations = map[string]Conversation{
+		"conv": {ID: "conv", Current: TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}},
+	}
+	updated, err := UpdateProfileConfig(&st, UpdateProfileInput{
+		Name:             "gpu",
+		Provider:         ProviderSlurm,
+		IsolationDefault: IsolationShared,
+		Slurm:            SlurmProfile{Nodes: 2, GPUCount: 4, Partition: "new", Image: "new.sqsh", Duration: 4},
+		Now:              now.Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfileConfig: %v", err)
+	}
+	if updated.Revision != 2 || updated.Slurm.Image != "new.sqsh" || updated.Adapter.SlurmQueryCommand != "/old/query" || updated.Confirmed || updated.DoctorOK {
+		t.Fatalf("updated profile = %#v, want new draft revision", updated)
+	}
+	if got := st.Conversations["conv"].Current.ProfileRevision; got != 1 {
+		t.Fatalf("existing conversation revision = %d, want pinned old revision", got)
+	}
+	req, _, err := EnsureAllocationRequest(&st, "conv", "turn-1", st.Conversations["conv"].Current, now.Add(4*time.Second))
+	if err != nil {
+		t.Fatalf("EnsureAllocationRequest old revision: %v", err)
+	}
+	if req.ProfileSnapshot.Revision != 1 || req.ProfileSnapshot.Slurm.Image != "old.sqsh" {
+		t.Fatalf("allocation should use old snapshot, got revision=%d image=%q", req.ProfileSnapshot.Revision, req.ProfileSnapshot.Slurm.Image)
+	}
+}
+
+func TestRollbackProfileRevisionPublishesNewRevisionAndPruneKeepsPinnedHistory(t *testing.T) {
+	now := time.Unix(1, 0)
+	st := State{}
+	if _, err := CreateProfile(&st, CreateProfileInput{
+		Name:             "gpu",
+		Provider:         ProviderSlurm,
+		IsolationDefault: IsolationShared,
+		Slurm:            SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "old", Image: "old.sqsh", Duration: 2},
+		Adapter:          ProviderCommandConfigForProvider(ProviderSlurm, "/old/query", "/old/submit", "", ""),
+		Now:              now,
+	}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if _, err := DoctorProfile(&st, "gpu", now.Add(time.Second), nil); err != nil {
+		t.Fatalf("DoctorProfile old: %v", err)
+	}
+	if _, err := ConfirmProfile(&st, "gpu", now.Add(2*time.Second), nil); err != nil {
+		t.Fatalf("ConfirmProfile old: %v", err)
+	}
+	st.Conversations["conv-old"] = Conversation{ID: "conv-old", Current: TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}}
+	if _, err := UpdateProfileConfig(&st, UpdateProfileInput{
+		Name:             "gpu",
+		Provider:         ProviderSlurm,
+		IsolationDefault: IsolationShared,
+		Slurm:            SlurmProfile{Nodes: 2, GPUCount: 2, Partition: "new", Image: "new.sqsh", Duration: 4},
+		Adapter:          ProviderCommandConfigForProvider(ProviderSlurm, "/new/query", "/new/submit", "", ""),
+		Now:              now.Add(3 * time.Second),
+	}); err != nil {
+		t.Fatalf("UpdateProfileConfig: %v", err)
+	}
+	st.Conversations["conv-new"] = Conversation{ID: "conv-new", Current: TargetSnapshot{Target: TargetBeacon, Profile: "gpu"}}
+	rolledBack, err := RollbackProfileRevision(&st, "gpu", 1, now.Add(4*time.Second))
+	if err != nil {
+		t.Fatalf("RollbackProfileRevision: %v", err)
+	}
+	if rolledBack.Revision != 3 || rolledBack.Slurm.Image != "old.sqsh" || rolledBack.Adapter.SlurmQueryCommand != "/old/query" || !rolledBack.Ready(nil) {
+		t.Fatalf("rolled back profile = %#v", rolledBack)
+	}
+	if got := st.Conversations["conv-old"].Current.ProfileRevision; got != 1 {
+		t.Fatalf("old conversation revision = %d, want 1", got)
+	}
+	if got := st.Conversations["conv-new"].Current.ProfileRevision; got != 2 {
+		t.Fatalf("new conversation revision = %d, want 2", got)
+	}
+	revisions := ListProfileRevisions(st, "gpu")
+	if len(revisions) != 3 || revisions[0].Revision != 1 || revisions[1].Revision != 2 || revisions[2].Revision != 3 {
+		t.Fatalf("profile revisions = %#v", revisions)
+	}
+	removed, err := PruneProfileHistory(&st, "gpu")
+	if err != nil {
+		t.Fatalf("PruneProfileHistory: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("pruned referenced revisions = %d, want 0", removed)
+	}
+	delete(st.Conversations, "conv-old")
+	delete(st.Conversations, "conv-new")
+	removed, err = PruneProfileHistory(&st, "gpu")
+	if err != nil {
+		t.Fatalf("PruneProfileHistory after unpin: %v", err)
+	}
+	if removed != 2 || len(st.ProfileHistory) != 0 {
+		t.Fatalf("prune after unpin removed=%d history=%#v, want both historical revisions removed", removed, st.ProfileHistory)
+	}
+}
+
 func TestIdempotencySurvivesStoreReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "beacon.json")
 	store, err := NewStore(path)

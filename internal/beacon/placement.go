@@ -40,7 +40,8 @@ func DecidePlacement(st State, in PlacementInput, proxyExists func(string) bool)
 		return PlacementDecision{Action: "run_local", Target: target, Reason: "default local execution"}, nil
 	}
 
-	profile := st.Profiles[target.Profile]
+	profile := normalizeProfileRevision(st.Profiles[target.Profile])
+	target.ProfileRevision = profile.Revision
 	isolation := in.Isolation
 	if isolation == "" {
 		isolation = profile.IsolationDefault

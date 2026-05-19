@@ -144,6 +144,34 @@ func TurnStartFailureNotice(plan TurnExecutionPlan, cause error) BeaconNotice {
 	}
 }
 
+func ProviderAdapterConfigurationNotice(notConfigured ProviderCommandNotConfiguredError) BeaconNotice {
+	profile := strings.TrimSpace(notConfigured.ProfileName)
+	operation := strings.TrimSpace(notConfigured.Operation)
+	if operation == "" {
+		operation = "provider"
+	}
+	what := []string{
+		fmt.Sprintf("The %s adapter command for %s is missing.", operation, providerLabel(notConfigured.Provider)),
+	}
+	if profile != "" {
+		what = append(what, fmt.Sprintf("Profile `%s` does not define `%s`, and the helper environment fallback is not set.", profile, detailValue(notConfigured.ProfileFlag)))
+	}
+	plan := TurnExecutionPlan{Snapshot: TargetSnapshot{Target: TargetBeacon, Profile: profile}}
+	return BeaconNotice{
+		Title:        fmt.Sprintf("Beacon command failed: %s provider adapter is not configured.", providerLabel(notConfigured.Provider)),
+		WhatHappened: what,
+		Next:         turnStartFailureNextSteps(NoticeProviderAdapterNotConfigured, notConfigured, plan),
+		Details: []NoticeDetail{
+			{"error_code", NoticeProviderAdapterNotConfigured},
+			{"profile", profile},
+			{"provider", string(notConfigured.Provider)},
+			{"operation", operation},
+			{"profile_flag", notConfigured.ProfileFlag},
+			{"env", notConfigured.EnvName},
+		},
+	}
+}
+
 func causeString(err error) string {
 	if err == nil {
 		return ""
@@ -156,21 +184,25 @@ func turnStartFailureNextSteps(code string, notConfigured ProviderCommandNotConf
 	case NoticeProviderAdapterNotConfigured:
 		envName := strings.TrimSpace(notConfigured.EnvName)
 		provider := notConfigured.Provider
+		profile := strings.TrimSpace(firstNonEmpty(notConfigured.ProfileName, plan.Snapshot.Profile))
+		flag := strings.TrimSpace(notConfigured.ProfileFlag)
 		if envName == "" {
 			provider, envName = providerCommandHintFromPlan(plan)
 		}
 		if envName == "" {
 			envName = "CODEX_HELPER_BEACON_<PROVIDER>_QUERY"
 		}
-		next := []string{
-			fmt.Sprintf("Configure `%s` in the Teams helper environment, not only in an interactive shell.", envName),
+		next := []string{}
+		if profile != "" && flag != "" && provider != "" {
+			next = append(next, fmt.Sprintf("Run `beacon profile update %s --provider %s ... %s <adapter-script>` in the control chat to store the adapter on the profile. This does not require a helper reload.", profile, strings.ToLower(string(provider)), flag))
 		}
+		next = append(next, fmt.Sprintf("Or configure `%s` in the Teams helper service environment, not only in an interactive shell.", envName))
 		if provider != "" {
 			next = append(next, fmt.Sprintf("For a starter script, run `cxp beacon provider template %s` on the helper host.", strings.ToLower(string(provider))))
 		} else {
 			next = append(next, "For a starter script, run `cxp beacon provider template slurm` or `cxp beacon provider template lsf` on the helper host.")
 		}
-		next = append(next, "After changing the helper environment, send `helper reload now` in the Teams control chat.")
+		next = append(next, "Only the service-environment path requires `helper reload now`; profile-stored adapter changes apply to future turns directly.")
 		return next
 	case NoticeSchedulerPending:
 		return []string{

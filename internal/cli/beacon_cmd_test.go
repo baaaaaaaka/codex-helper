@@ -53,6 +53,46 @@ func TestBeaconProfileCLIWorkflow(t *testing.T) {
 	if !strings.Contains(out, "profile=gpu") || !strings.Contains(out, "status=ready") {
 		t.Fatalf("status output = %s", out)
 	}
+
+	out, err = runBeaconRootCommand(t,
+		"--config", configPath,
+		"beacon", "--store", storePath,
+		"profile", "update", "gpu",
+		"--provider", "slurm",
+		"--nodes", "2",
+		"--gpu", "4",
+		"--partition", "interactive",
+		"--image", "new.sqsh",
+		"--duration", "8",
+	)
+	if err != nil {
+		t.Fatalf("profile update: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "revision 2") || !strings.Contains(out, "doctor failed") {
+		t.Fatalf("update output = %s", out)
+	}
+
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "history", "gpu")
+	if err != nil {
+		t.Fatalf("profile history: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "rev=1") || !strings.Contains(out, "rev=2") || !strings.Contains(out, "current") {
+		t.Fatalf("history output = %s", out)
+	}
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "rollback", "gpu", "1")
+	if err != nil {
+		t.Fatalf("profile rollback: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "revision 3") || !strings.Contains(out, "ready") {
+		t.Fatalf("rollback output = %s", out)
+	}
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "gc", "gpu")
+	if err != nil {
+		t.Fatalf("profile gc: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Pruned 2") {
+		t.Fatalf("profile gc output = %s", out)
+	}
 }
 
 func TestBeaconCLIRejectsDraftSwitchAndShowsStatus(t *testing.T) {
@@ -264,7 +304,7 @@ func TestBeaconCLIProfileListResolvesExistingProxyProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list profile: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "gpu\tslurm\tready") {
+	if !strings.Contains(out, "gpu\tslurm\trev=1\tready") {
 		t.Fatalf("profile list output = %s", out)
 	}
 }
@@ -396,6 +436,112 @@ func TestBeaconAllocationCLIListStatusAndReconcile(t *testing.T) {
 	}
 	if got := st.Allocations[req.ID].ProviderIdentity.ProviderJobID; got != "slurm-777" {
 		t.Fatalf("provider job after reconcile = %q", got)
+	}
+}
+
+func TestBeaconProfileAdapterCommandsDriveAllocationReconcileWithoutHelperEnv(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	query := writeBeaconCLIProviderFixture(t, `durable_negative=true`)
+	submit := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-profile raw_state=PD reason=submitted-from-profile`)
+
+	out, err := runBeaconRootCommand(t,
+		"--config", configPath,
+		"beacon", "--store", storePath,
+		"profile", "create", "gpu",
+		"--provider", "slurm",
+		"--nodes", "1",
+		"--gpu", "1",
+		"--partition", "interactive",
+		"--image", "image.sqsh",
+		"--duration", "4",
+		"--query-command", query,
+		"--submit-command", submit,
+	)
+	if err != nil {
+		t.Fatalf("profile create: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{
+		{"beacon", "--store", storePath, "profile", "doctor", "gpu"},
+		{"beacon", "--store", storePath, "profile", "confirm", "gpu"},
+	} {
+		if out, err := runBeaconRootCommand(t, append([]string{"--config", configPath}, args...)...); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "conv-profile-adapter", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+		return err
+	}); err != nil {
+		t.Fatalf("seed allocation: %v", err)
+	}
+
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "allocation", "reconcile", req.ID)
+	if err != nil {
+		t.Fatalf("allocation reconcile with profile adapter: %v\n%s", err, out)
+	}
+	for _, want := range []string{"Beacon allocation reconcile: submit", "provider_job=slurm-profile"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("reconcile output missing %q:\n%s", want, out)
+		}
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after reconcile: %v", err)
+	}
+	if got := st.Allocations[req.ID].ProviderIdentity.ProviderJobID; got != "slurm-profile" {
+		t.Fatalf("provider job after reconcile = %q", got)
+	}
+}
+
+func TestBeaconReleaseCLIResolvesProfileAllocations(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderLocal,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "conv-1", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		req.State = beacon.AllocationRunning
+		st.Allocations[req.ID] = req
+		return nil
+	}); err != nil {
+		t.Fatalf("seed allocation: %v", err)
+	}
+
+	out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "release", "gpu")
+	if err != nil {
+		t.Fatalf("release profile: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "action=mark_canceled") || !strings.Contains(out, "profile=gpu") {
+		t.Fatalf("release output = %s", out)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after release: %v", err)
+	}
+	if st.Allocations[req.ID].State != beacon.AllocationCanceled {
+		t.Fatalf("allocation state = %s, want canceled", st.Allocations[req.ID].State)
 	}
 }
 

@@ -1044,7 +1044,8 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 	handled := false
 	var activityAt time.Time
 	for _, msg := range msgs {
-		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role)
+		legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
+		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
 		if err != nil {
 			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 			return handled, err
@@ -1108,6 +1109,17 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		activityAt = time.Now()
 	}
 	return handled, b.scheduleChatAfterPoll(ctx, chatID, role, running, updated, activityAt)
+}
+
+func legacyGeneratedMessageFallbackAllowed(msg ChatMessage, poll teamstore.ChatPollState, hasPoll bool) bool {
+	if !hasPoll || !poll.Seeded || poll.LastModifiedCursor.IsZero() {
+		return false
+	}
+	activity := chatMessageActivityTime(msg)
+	if activity.IsZero() {
+		return false
+	}
+	return !activity.After(poll.LastModifiedCursor)
 }
 
 func normalizedMessageTop(top int) int {
@@ -1630,7 +1642,7 @@ func parseGraphTime(value string) time.Time {
 	return t
 }
 
-func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg ChatMessage, role inboundPollRole) (bool, error) {
+func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg ChatMessage, role inboundPollRole, legacyGeneratedOutputFallback bool) (bool, error) {
 	if msg.ID == "" || b.reg.HasSeen(chatID, msg.ID) || b.reg.HasSent(chatID, msg.ID) {
 		return true, nil
 	}
@@ -1647,6 +1659,26 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	if b.store != nil {
+		provenance, ok, err := b.store.MessageProvenance(ctx, chatID, msg.ID)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			switch provenance.Origin {
+			case teamstore.MessageOriginHelperOutbox:
+				b.markRegistrySent(chatID, msg.ID)
+				return true, nil
+			case teamstore.MessageOriginUserInbound:
+				return true, nil
+			}
+		}
+		inbound, err := b.store.HasInboundMessage(ctx, chatID, msg.ID)
+		if err != nil {
+			return false, err
+		}
+		if inbound {
+			return true, nil
+		}
 		delivered, err := b.store.HasDeliveredOutboxMessage(ctx, chatID, msg.ID)
 		if err != nil {
 			return false, err
@@ -1655,25 +1687,27 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			b.markRegistrySent(chatID, msg.ID)
 			return true, nil
 		}
-		delivered, err = b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
-		if err != nil {
-			return false, err
-		}
-		if delivered {
-			b.markRegistrySent(chatID, msg.ID)
-			return true, nil
+		if legacyGeneratedOutputFallback {
+			delivered, err = b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
+			if err != nil {
+				return false, err
+			}
+			if delivered {
+				b.markRegistrySent(chatID, msg.ID)
+				return true, nil
+			}
 		}
 	}
-	if isHelperAttachmentEchoMessage(msg) {
+	if legacyGeneratedOutputFallback && isHelperAttachmentEchoMessage(msg) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
 	plainText := PlainTextFromTeamsHTML(msg.Body.Content)
-	if role == inboundPollRoleControl && looksLikeRenderedHelperOutputPlainText(plainText) {
+	if legacyGeneratedOutputFallback && role == inboundPollRoleControl && looksLikeRenderedHelperOutputPlainText(plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if looksLikeRenderedHelperOutputMessage(msg, plainText) || looksLikeRenderedHelperOrCodexOutputPlainText(plainText) || looksLikeRenderedUserTranscriptEchoMessage(msg, plainText) {
+	if legacyGeneratedOutputFallback && (looksLikeRenderedHelperOutputMessage(msg, plainText) || looksLikeRenderedHelperGeneratedOutputPlainText(plainText) || looksLikeRenderedHelperOrCodexOutputPlainText(plainText) || looksLikeRenderedUserTranscriptEchoMessage(msg, plainText)) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
@@ -1785,6 +1819,27 @@ func looksLikeRenderedHelperOutputMessage(msg ChatMessage, text string) bool {
 		teamsHTMLFirstTextIsStrongLabel(msg.Body.Content, "Helper")
 }
 
+func looksLikeRenderedHelperGeneratedOutputPlainText(text string) bool {
+	body, ok := renderedHelperOutputBodyPlainText(text)
+	if !ok {
+		return false
+	}
+	return looksLikeRenderedHelperOrCodexOutputPlainText(body) || looksLikeRenderedHelperLifecycleOutputPlainText(body)
+}
+
+func renderedHelperOutputBodyPlainText(text string) (string, bool) {
+	text = strings.TrimSpace(text)
+	for _, label := range []string{"🔧 Helper:", "Helper:"} {
+		if text == label {
+			return "", true
+		}
+		if strings.HasPrefix(text, label) {
+			return strings.TrimSpace(strings.TrimPrefix(text, label)), true
+		}
+	}
+	return "", false
+}
+
 func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
 	text = strings.TrimSpace(text)
 	for _, prefix := range []string{
@@ -1801,6 +1856,46 @@ func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
 		"Teams beacon reconcile error:",
 		"Teams beacon lease maintenance error:",
 		"Teams beacon lease renewed:",
+	} {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRenderedHelperLifecycleOutputPlainText(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, prefix := range []string{
+		"⏳ Codex is working. Request accepted.",
+		"⏳ Codex received your question. Request accepted.",
+		"⚠️ Your request is queued.",
+		"▶️ Codex is starting this queued request.",
+		"💬 Work chat is ready.",
+		"✅ Codex finished responding.",
+		"🔁 Helper reload started",
+		"🔄 Helper restart scheduled",
+		"⬇️ Helper update scheduled",
+		"✅ Helper reload completed",
+		"✅ Helper restart completed",
+		"✅ Helper update completed",
+		"⚠️ Helper reload failed",
+		"⚠️ Helper restart failed",
+		"⚠️ Helper update activation failed",
+		"⚠️ Helper restart is not available",
+		"⚠️ Helper reload is not available",
+		"⚠️ Helper restart was not started",
+		"⏳ Codex work is still active.",
+		"⏳ Helper upgrade recovery is waiting",
+		"⏳ Helper reload recovery is waiting",
+		"⏳ Helper reload is already in progress.",
+		"usage: `helper cancel last`",
+		"no running or queued turn is available to cancel in this session.",
+		"turn canceled:",
+		"cancel all requested for this Work chat.",
+		"cancel all could not cancel every running request",
+		"This Codex request is running, but this helper process does not own",
+		"turn not found in this session:",
 	} {
 		if strings.HasPrefix(text, prefix) {
 			return true
@@ -2377,8 +2472,12 @@ func controlAdvancedHelpText() string {
 		"Beacon commands:",
 		"- `beacon list` - list beacon profiles and machines",
 		"- `beacon profile create <name> ...` - create a draft beacon profile",
+		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
+		"- `beacon profile update <name> ...` - create a new profile revision",
+		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>` - inspect, restore, and prune revisions",
 		"- `beacon profile doctor <name>` then `beacon profile confirm <name>` - mark a profile ready",
-		"- `beacon machine list|status|release|kill` - inspect or manage beacon workers",
+		"- `beacon release <profile|allocation|provider-job|machine>` - release a beacon resource",
+		"- advanced: `beacon allocation ...` and `beacon machine ...` inspect internal state",
 		"- `new <directory> --beacon <profile>` - create a Work chat on a ready beacon profile",
 		"- Beacon execution profiles are separate from SSH proxy profiles managed by `cxp proxy`.",
 		"",
@@ -8641,11 +8740,37 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 }
 
 func (b *Bridge) recordSentOutboxSideEffect(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions) {
+	if err := b.recordOutboxMessageProvenance(ctx, outbox, msg); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams message provenance record error: %v\n", err)
+	}
 	if opts.SentSideEffects != nil {
 		*opts.SentSideEffects = append(*opts.SentSideEffects, sentOutboxSideEffect{Outbox: outbox, TeamsMessage: msg})
 		return
 	}
 	b.handleSentOutboxSideEffects(ctx, outbox, msg)
+}
+
+func (b *Bridge) recordOutboxMessageProvenance(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	messageID := strings.TrimSpace(firstNonEmptyString(msg.ID, outbox.TeamsMessageID))
+	if strings.TrimSpace(outbox.TeamsChatID) == "" || messageID == "" {
+		return nil
+	}
+	_, err := b.store.RecordMessageProvenance(ctx, teamstore.MessageProvenanceRecord{
+		TeamsChatID:    outbox.TeamsChatID,
+		TeamsMessageID: messageID,
+		Origin:         teamstore.MessageOriginHelperOutbox,
+		SessionID:      outbox.SessionID,
+		TurnID:         outbox.TurnID,
+		OutboxID:       outbox.ID,
+		Kind:           outbox.Kind,
+		RenderedHash:   outbox.RenderedHash,
+		CreatedAt:      outbox.CreatedAt,
+		UpdatedAt:      firstNonZeroTime(outbox.SentAt, outbox.UpdatedAt, outbox.CreatedAt),
+	})
+	return err
 }
 
 func (b *Bridge) handleSentOutboxSideEffects(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {
@@ -12446,6 +12571,7 @@ func splitTextChunksForHTMLMessage(prefix string, text string, limitBytes int) [
 }
 
 func controlCommandErrorMessage(err error) string {
+	var providerNotConfigured beacon.ProviderCommandNotConfiguredError
 	switch {
 	case err == nil:
 		return ""
@@ -12455,6 +12581,8 @@ func controlCommandErrorMessage(err error) string {
 		return "I do not have a current list yet. Send `projects` or `sessions` first, then choose a number."
 	case errors.Is(err, ErrDashboardNumberMissing):
 		return "That number is not in the current list. Send `projects` or `sessions` again, then choose one of the newly shown numbers."
+	case errors.As(err, &providerNotConfigured):
+		return beacon.ProviderAdapterConfigurationNotice(providerNotConfigured).Render()
 	default:
 		return err.Error()
 	}
