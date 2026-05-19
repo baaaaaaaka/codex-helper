@@ -2571,6 +2571,21 @@ func TestEnsureCodexInstalledIntegrationManagedNode(t *testing.T) {
 	npmPrefix := filepath.Join(root, "npm-global")
 	nodeRoot := filepath.Join(root, "node")
 	npmCache := filepath.Join(root, "npm-cache")
+	if runtime.GOOS == "windows" {
+		for _, dir := range []string{
+			filepath.Join(root, "localappdata"),
+			filepath.Join(root, "appdata"),
+			filepath.Join(root, "tmp"),
+		} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("mkdir isolated Windows env dir %s: %v", dir, err)
+			}
+		}
+		t.Setenv("LOCALAPPDATA", filepath.Join(root, "localappdata"))
+		t.Setenv("APPDATA", filepath.Join(root, "appdata"))
+		t.Setenv("TEMP", filepath.Join(root, "tmp"))
+		t.Setenv("TMP", filepath.Join(root, "tmp"))
+	}
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		t.Fatalf("mkdir home: %v", err)
 	}
