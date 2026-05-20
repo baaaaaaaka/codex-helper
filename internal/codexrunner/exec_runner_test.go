@@ -203,6 +203,26 @@ func TestExecRunnerSurfacesTimeoutAndCancelDistinctly(t *testing.T) {
 	}
 }
 
+func TestExecRunnerTreatsCompletedTurnWithCanceledLaunchAsSuccess(t *testing.T) {
+	launcher := &recordingLauncher{
+		result: LaunchResult{Stdout: []byte(strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-done"}`,
+			`{"type":"turn.started","turn_id":"turn-done"}`,
+			`{"type":"item.completed","item":{"id":"item-final","type":"agent_message","text":"done despite canceled context"}}`,
+			`{"type":"turn.completed"}`,
+		}, "\n"))},
+		err: context.Canceled,
+	}
+	runner := NewExecRunner(launcher)
+	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatalf("StartThread error = %v, want completed turn success", err)
+	}
+	if got.ThreadID != "thread-done" || got.TurnID != "turn-done" || got.FinalAgentMessage != "done despite canceled context" {
+		t.Fatalf("result = %#v, want completed turn metadata and final text", got)
+	}
+}
+
 func TestExecRunnerDistinguishesLaunchAndCodexFailures(t *testing.T) {
 	launchErr := errors.New("fork failed")
 	runner := NewExecRunner(&recordingLauncher{err: launchErr})

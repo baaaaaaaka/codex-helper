@@ -77,6 +77,9 @@ func (b *Bridge) recordControlChatHelperMessage(ctx context.Context, msg teamsto
 	if text == "" {
 		return
 	}
+	if isWorkflowFallbackOutboxKind(msg.Kind) && workflowFallbackBodyLooksHTML(text) {
+		text = PlainTextFromTeamsHTML(text)
+	}
 	_ = appendControlChatHistoryEntry(ctx, b.controlChatHistoryPath(), controlChatHistoryEntry{
 		ChatID:    msg.TeamsChatID,
 		MessageID: firstNonEmptyString(msg.TeamsMessageID, msg.ID),

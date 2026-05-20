@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -469,27 +470,88 @@ func (b *Bridge) queueWorkflowNotificationFallbackMentionOnly(ctx context.Contex
 }
 
 func workflowNotificationFallbackBody(event WorkflowNotificationEvent, reason string) string {
-	lines := []string{}
+	var out strings.Builder
+	appendParagraph := func(inner string) {
+		inner = strings.TrimSpace(inner)
+		if inner == "" {
+			return
+		}
+		out.WriteString("<p>")
+		out.WriteString(inner)
+		out.WriteString("</p>")
+	}
 	if title := strings.TrimSpace(event.Title); title != "" {
-		lines = append(lines, title)
+		appendParagraph("<strong>" + html.EscapeString(title) + "</strong>")
 	}
-	if chatTitle := strings.TrimSpace(event.ChatTitle); chatTitle != "" {
-		lines = append(lines, "", chatTitle)
+	chatTitle := workflowNotificationFallbackCompactChatTitle(event.ChatTitle)
+	summary := strings.TrimSpace(event.RequestSummary)
+	if workflowNotificationFallbackTextRedundant(summary, chatTitle) {
+		summary = ""
 	}
-	if summary := strings.TrimSpace(event.RequestSummary); summary != "" {
-		lines = append(lines, "", summary)
+	details := make([]string, 0, 2)
+	if chatTitle != "" {
+		details = append(details, "<strong>Chat:</strong> "+html.EscapeString(chatTitle))
+	}
+	if summary != "" {
+		details = append(details, "<strong>Request:</strong> "+html.EscapeString(summary))
+	}
+	if len(details) > 0 {
+		appendParagraph(strings.Join(details, "<br>"))
 	}
 	if hint := strings.TrimSpace(event.Hint); hint != "" {
-		lines = append(lines, "", hint)
+		appendParagraph("<strong>Next:</strong> " + html.EscapeString(hint))
 	}
 	if reason = strings.TrimSpace(reason); reason != "" {
-		lines = append(lines, "", reason)
+		appendParagraph("<strong>Notice:</strong> " + html.EscapeString(reason))
 	}
 	if url := strings.TrimSpace(event.ButtonURL); url != "" {
 		button := strings.TrimSpace(firstNonEmptyString(event.ButtonTitle, "Open chat"))
-		lines = append(lines, "", button+":", url)
+		if safeTeamsOpenURL(url) {
+			appendParagraph(`<strong>Open:</strong> <a href="` + html.EscapeString(url) + `">` + html.EscapeString(button) + `</a>`)
+		} else {
+			appendParagraph("<strong>" + html.EscapeString(button) + ":</strong> " + html.EscapeString(url))
+		}
 	}
-	return strings.TrimSpace(strings.Join(lines, "\n"))
+	return strings.TrimSpace(out.String())
+}
+
+func workflowNotificationFallbackCompactChatTitle(title string) string {
+	title = strings.Join(strings.Fields(strings.TrimSpace(title)), " ")
+	if title == "" {
+		return ""
+	}
+	for {
+		parts := strings.Split(title, " - ")
+		if len(parts) < 3 {
+			return title
+		}
+		first := strings.TrimSpace(parts[0])
+		second := strings.TrimSpace(parts[1])
+		if first == "" || first != second {
+			return title
+		}
+		next := append([]string{first}, parts[2:]...)
+		title = strings.Join(next, " - ")
+	}
+}
+
+func workflowNotificationFallbackTextRedundant(summary string, chatTitle string) bool {
+	summaryKey := workflowNotificationFallbackTextKey(summary)
+	if summaryKey == "" {
+		return true
+	}
+	chatKey := workflowNotificationFallbackTextKey(chatTitle)
+	if chatKey == "" {
+		return false
+	}
+	if summaryKey == chatKey {
+		return true
+	}
+	return len([]rune(summaryKey)) >= 8 && strings.Contains(chatKey, summaryKey)
+}
+
+func workflowNotificationFallbackTextKey(text string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(text)), " "))
 }
 
 func (b *Bridge) outboxAlreadyMentionedControlOwner(ctx context.Context, outbox teamstore.OutboxMessage) bool {

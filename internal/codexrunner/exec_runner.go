@@ -124,11 +124,14 @@ func (r *ExecRunner) run(ctx context.Context, input launchInput) (TurnResult, er
 	}
 	output, launchErr := launcher.Launch(ctx, req)
 	result, parseErr := ParseJSONL(bytes.NewReader(output.Stdout))
-	if launchErr != nil && (errors.Is(launchErr, context.DeadlineExceeded) || errors.Is(launchErr, context.Canceled)) {
-		return result, classifyLaunchError(launchErr)
-	}
 	if parseErr != nil {
 		return result, parseErr
+	}
+	if launchErr != nil && completedTurnDespiteCanceledLaunch(result, launchErr) {
+		return result, nil
+	}
+	if launchErr != nil && (errors.Is(launchErr, context.DeadlineExceeded) || errors.Is(launchErr, context.Canceled)) {
+		return result, classifyLaunchError(launchErr)
 	}
 	if launchErr != nil {
 		return result, classifyLaunchError(launchErr)
@@ -140,6 +143,13 @@ func (r *ExecRunner) run(ctx context.Context, input launchInput) (TurnResult, er
 		return result, &Error{Kind: ErrorCodex, Message: result.Failure.Message}
 	}
 	return result, nil
+}
+
+func completedTurnDespiteCanceledLaunch(result TurnResult, err error) bool {
+	return err != nil &&
+		errors.Is(err, context.Canceled) &&
+		result.Status == TurnStatusCompleted &&
+		result.Failure == nil
 }
 
 func (r *ExecRunner) startArgs(input TurnInput) ([]string, error) {

@@ -8,6 +8,8 @@ var teamsHelperPromptSuffixMarkers = []string{
 	"Then include this fenced manifest in your final answer:",
 }
 
+const teamsHelperUserMessageLead = "User message:"
+
 func shouldSkipFirstPrompt(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
@@ -33,6 +35,7 @@ func firstPromptTitleText(text string) string {
 	if text == "" {
 		return ""
 	}
+	strippedTeamsHelperSuffix := false
 	for _, marker := range teamsHelperPromptSuffixMarkers {
 		if strings.HasPrefix(text, marker) {
 			return ""
@@ -40,9 +43,24 @@ func firstPromptTitleText(text string) string {
 		for _, prefix := range []string{"\n\n", "\n"} {
 			if idx := strings.Index(text, prefix+marker); idx >= 0 {
 				text = strings.TrimSpace(text[:idx])
+				strippedTeamsHelperSuffix = true
 				break
 			}
 		}
 	}
+	if strippedTeamsHelperSuffix {
+		text = stripTeamsHelperUserMessageLead(text)
+	}
 	return text
+}
+
+func stripTeamsHelperUserMessageLead(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) < len(teamsHelperUserMessageLead) {
+		return text
+	}
+	if !strings.EqualFold(text[:len(teamsHelperUserMessageLead)], teamsHelperUserMessageLead) {
+		return text
+	}
+	return strings.TrimSpace(text[len(teamsHelperUserMessageLead):])
 }

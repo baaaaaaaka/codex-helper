@@ -850,9 +850,6 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 				return err
 			}
 		}
-		if controlDecision.State == inboundPollStateBlocked && controlDecision.BlockedUntil.After(time.Now()) {
-			return nil
-		}
 	} else {
 		controlHandled, err := b.pollChatWithRoleState(ctx, b.reg.ControlChatID, top, inboundPollRoleControl, false, controlPoll, hasControlPoll, b.handleControlMessage)
 		if err != nil {
@@ -2074,28 +2071,54 @@ func comparableTeamsPlainText(text string) string {
 }
 
 func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string, msg ChatMessage) {
-	if !b.annotateUserMessages || b.annotationDisabled || b.graph == nil {
+	if !b.annotateUserMessages {
 		return
 	}
-	if !messageAuthoredByCurrentUser(msg, b.user) {
+	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" || hasUserAnnotationPrefix(msg.Body.Content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
 		return
 	}
-	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
-		return
-	}
-	annotated, ok := userAnnotatedMessageHTML(msg, b.user)
-	if !ok {
-		return
-	}
-	if err := b.graph.UpdateChatMessageHTML(ctx, chatID, msg.ID, annotated); err != nil {
-		if shouldDisableUserMessageAnnotation(err) {
-			b.annotationDisabled = true
+	if messageAuthoredByCurrentUser(msg, b.user) && !b.annotationDisabled && b.graph != nil {
+		annotated, ok := userAnnotatedMessageHTML(msg, b.user)
+		if !ok {
+			return
 		}
-		if !b.annotationWarned && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams user message annotation disabled or unavailable: %v\n", err)
-			b.annotationWarned = true
+		if err := b.graph.UpdateChatMessageHTML(ctx, chatID, msg.ID, annotated); err == nil {
+			return
+		} else {
+			if shouldDisableUserMessageAnnotation(err) {
+				b.annotationDisabled = true
+			}
+			if !b.annotationWarned && b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams user message annotation disabled or unavailable: %v\n", err)
+				b.annotationWarned = true
+			}
 		}
 	}
+	if err := b.queueIncomingUserMarkerMirror(ctx, chatID, msg); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams user message marker fallback failed: %v\n", err)
+	}
+}
+
+func (b *Bridge) queueIncomingUserMarkerMirror(ctx context.Context, chatID string, msg ChatMessage) error {
+	if b == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" {
+		return nil
+	}
+	body := strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content))
+	if body == "" || hasUserAnnotationPrefix(msg.Body.Content) {
+		return nil
+	}
+	sessionID := ""
+	if session := b.reg.SessionByChatID(chatID); session != nil {
+		sessionID = session.ID
+	}
+	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
+		ID:             "outbox:user-marker:" + shortStableID(chatID+":"+msg.ID),
+		SessionID:      sessionID,
+		TeamsChatID:    chatID,
+		Kind:           "user",
+		Body:           body,
+		SourceTextHash: normalizedTextHash(body),
+	})
 }
 
 func shouldDisableUserMessageAnnotation(err error) bool {
@@ -2176,14 +2199,8 @@ func applyOutboxMentionUser(msg *teamstore.OutboxMessage, user User) {
 }
 
 func hasUserAnnotationPrefix(content string) bool {
-	firstLine := strings.TrimSpace(PlainTextFromTeamsHTML(content))
-	if firstLine == "" {
-		return false
-	}
-	if before, _, ok := strings.Cut(firstLine, "\n"); ok {
-		firstLine = strings.TrimSpace(before)
-	}
-	return isUserAnnotationLabel(firstLine)
+	_, ok := splitLeadingUserAnnotationPrefix(PlainTextFromTeamsHTML(content))
+	return ok
 }
 
 func promptTextFromTeamsMessageHTML(content string) string {
@@ -2193,10 +2210,10 @@ func promptTextFromTeamsMessageHTML(content string) string {
 func commandRouteTextFromTeamsMessage(msg ChatMessage, fallbackText string) string {
 	if strings.TrimSpace(msg.Body.Content) != "" {
 		plainText := CommandRoutePlainTextFromTeamsHTML(msg.Body.Content)
-		if looksLikeRenderedOutboxPlainText(plainText) {
+		if looksLikeRenderedOutboxOutputMessage(msg, plainText) {
 			return ""
 		}
-		return commandRouteTextFromPlainText(stripUserAnnotationPrefix(plainText))
+		return commandRouteTextFromPlainText(plainText)
 	}
 	return commandRouteTextFromPlainText(fallbackText)
 }
@@ -2228,20 +2245,44 @@ func stripUserAnnotationPrefix(text string) string {
 	if text == "" {
 		return ""
 	}
-	firstLine, rest, ok := strings.Cut(text, "\n")
-	firstLine = strings.TrimSpace(firstLine)
-	if !isUserAnnotationLabel(firstLine) {
-		return text
+	if rest, ok := splitLeadingUserAnnotationPrefix(text); ok {
+		return strings.TrimSpace(rest)
 	}
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(rest)
+	return text
 }
 
-func isUserAnnotationLabel(line string) bool {
-	line = strings.TrimSpace(line)
-	return strings.HasSuffix(line, ":") && (strings.HasPrefix(line, "🧑‍💻 ") || strings.HasPrefix(line, "👤 "))
+func splitLeadingUserAnnotationPrefix(text string) (string, bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", false
+	}
+	label := incomingUserLabel()
+	if text == label+":" {
+		return "", true
+	}
+	if strings.HasPrefix(text, label+":") {
+		return strings.TrimSpace(strings.TrimPrefix(text, label+":")), true
+	}
+	firstLine, rest, hasRest := strings.Cut(text, "\n")
+	firstLine = strings.TrimSpace(firstLine)
+	if !strings.HasPrefix(firstLine, label+" [part ") {
+		return "", false
+	}
+	idx := strings.Index(firstLine, "]:")
+	if idx < 0 {
+		return "", false
+	}
+	inline := strings.TrimSpace(firstLine[idx+2:])
+	if inline != "" && hasRest {
+		return inline + "\n" + rest, true
+	}
+	if inline != "" {
+		return inline, true
+	}
+	if hasRest {
+		return rest, true
+	}
+	return "", true
 }
 
 func incomingUserLabel() string {
@@ -9432,6 +9473,9 @@ func renderOutboxHTML(outbox teamstore.OutboxMessage) string {
 		rendered, _ := renderChatMovedOutboxHTML(outbox, User{}, false)
 		return rendered
 	}
+	if isWorkflowFallbackOutboxKind(outbox.Kind) {
+		return renderWorkflowFallbackOutboxHTML(outbox, "")
+	}
 	if strings.EqualFold(strings.TrimSpace(outbox.Kind), "freeze-notice") {
 		return outbox.Body
 	}
@@ -9467,6 +9511,13 @@ func renderOutboxMentionHTMLWithFallback(outbox teamstore.OutboxMessage, owner U
 	}
 	mentionText := strings.TrimSpace(firstNonEmptyString(owner.DisplayName, owner.UserPrincipalName, fallback))
 	mention := `<at id="0">` + html.EscapeString(mentionText) + `</at>`
+	if isWorkflowFallbackOutboxKind(outbox.Kind) {
+		return renderWorkflowFallbackOutboxHTML(outbox, mention), []ChatMention{{
+			ID:   0,
+			Text: mentionText,
+			User: owner,
+		}}
+	}
 	label := teamsRenderLabel(renderKindForOutbox(outbox.Kind), normalizedPartIndex(outbox), normalizedPartCount(outbox))
 	body := normalizeTeamsRenderTextForKind(renderKindForOutbox(outbox.Kind), outbox.Body)
 	rendered := renderTeamsHTMLParagraphs(label, body, mention)
@@ -9481,6 +9532,40 @@ func renderOutboxMentionHTMLWithFallback(outbox teamstore.OutboxMessage, owner U
 		Text: mentionText,
 		User: owner,
 	}}
+}
+
+func isWorkflowFallbackOutboxKind(kind string) bool {
+	return strings.EqualFold(strings.TrimSpace(kind), "workflow-fallback")
+}
+
+func renderWorkflowFallbackOutboxHTML(outbox teamstore.OutboxMessage, firstPrefixHTML string) string {
+	label := teamsRenderLabel(TeamsRenderHelper, normalizedPartIndex(outbox), normalizedPartCount(outbox))
+	var out strings.Builder
+	out.WriteString("<p><strong>")
+	out.WriteString(html.EscapeString(label))
+	out.WriteString(":</strong>")
+	if strings.TrimSpace(firstPrefixHTML) != "" {
+		out.WriteString(" ")
+		out.WriteString(firstPrefixHTML)
+	}
+	out.WriteString("</p>")
+	body := strings.TrimSpace(outbox.Body)
+	if body == "" {
+		return out.String()
+	}
+	if workflowFallbackBodyLooksHTML(body) {
+		out.WriteString(body)
+		return out.String()
+	}
+	for _, block := range parseTeamsMarkdownBlocks(body) {
+		out.WriteString(renderTeamsMarkdownBlockHTML(block))
+	}
+	return out.String()
+}
+
+func workflowFallbackBodyLooksHTML(body string) bool {
+	body = strings.TrimSpace(body)
+	return strings.HasPrefix(body, "<p><strong>")
 }
 
 func outboxMentionUser(outbox teamstore.OutboxMessage) (User, bool) {
@@ -9629,6 +9714,8 @@ func renderKindForOutbox(kind string) TeamsRenderKind {
 		return TeamsRenderHelper
 	case kind == "final" || strings.HasPrefix(kind, "final-") || strings.Contains(kind, "assistant"):
 		return TeamsRenderAssistant
+	case strings.Contains(kind, "compact"):
+		return TeamsRenderStatus
 	case strings.Contains(kind, "progress") || strings.Contains(kind, "status"):
 		return TeamsRenderProgress
 	case strings.Contains(kind, "command"):
@@ -11108,6 +11195,8 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 			continue
 		}
 		switch record.Kind {
+		case TranscriptKindCompact:
+			out.NeedsSync = true
 		case TranscriptKindUser, TranscriptKindStatus, TranscriptKindArtifact, TranscriptKindUnknown:
 			if !active {
 				out.setCheckpointBeforeActive(transcript.Records, i)
@@ -11330,6 +11419,8 @@ func transcriptRecordOutboxKind(prefix string, record TranscriptRecord, fallback
 		role = "tool"
 	case TranscriptKindStatus:
 		role = "status"
+	case TranscriptKindCompact:
+		role = "compact"
 	case TranscriptKindArtifact:
 		role = "artifact"
 	}
@@ -11617,9 +11708,11 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		return nil
 	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
+	teamsOriginDisplays := teamsOriginDisplayTexts(state, session.ID)
+	teamsOriginTerminalHashes := teamsOriginTerminalTextHashes(state, session.ID)
 	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
 	now := time.Now()
-	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, knownHashes, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
+	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, teamsOriginDisplays, teamsOriginTerminalHashes, knownHashes, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
 	if visibleBacklog > transcriptSyncMaxAutoBacklogRecords {
 		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, visibleBacklog)
 	}
@@ -11640,6 +11733,7 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
+		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
 		if strings.TrimSpace(body) == "" {
 			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
 				return err
@@ -11648,7 +11742,7 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		}
 		kind := transcriptRecordOutboxKind("sync", record, i+1)
 		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
-			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTerminalHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			dedupe.shouldSkip(record, body) {
 			if err := b.recordSkippedTranscriptDelivery(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
@@ -11893,7 +11987,7 @@ func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session 
 	return true, b.markTranscriptImportComplete(ctx, session, sourcePath, transcriptRecordCheckpointKey(recovered), recovered.SourceLine)
 }
 
-func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, local codexhistory.Session, records []TranscriptRecord, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool, recentTeamsMirror recentCompletedTeamsTranscriptMirrorSkipper) int {
+func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, local codexhistory.Session, records []TranscriptRecord, teamsOriginHashes map[string]bool, teamsOriginDisplays map[string]string, teamsOriginTerminalHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool, recentTeamsMirror recentCompletedTeamsTranscriptMirrorSkipper) int {
 	dedupe := newTranscriptDedupeState()
 	visible := 0
 	for i, record := range records {
@@ -11907,6 +12001,7 @@ func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, l
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
+		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
 		if strings.TrimSpace(body) == "" {
 			continue
 		}
@@ -11915,7 +12010,7 @@ func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, l
 			continue
 		}
 		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
-			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
+			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTerminalHashes) ||
 			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
 			dedupe.shouldSkip(record, body) {
 			continue
@@ -12015,6 +12110,47 @@ func teamsOriginTextHashes(state teamstore.State, sessionID string) map[string]b
 	return hashes
 }
 
+func teamsOriginDisplayTexts(state teamstore.State, sessionID string) map[string]string {
+	displays := make(map[string]string)
+	for _, inbound := range state.InboundEvents {
+		if inbound.SessionID != sessionID || inbound.TurnID == "" {
+			continue
+		}
+		if inbound.Source != "" && inbound.Source != "teams" {
+			continue
+		}
+		addTeamsOriginInboundDisplayTexts(displays, inbound)
+	}
+	return displays
+}
+
+func teamsOriginTerminalTextHashes(state teamstore.State, sessionID string) map[string]bool {
+	hashes := make(map[string]bool)
+	for _, inbound := range state.InboundEvents {
+		if inbound.SessionID != sessionID || inbound.TurnID == "" {
+			continue
+		}
+		if inbound.Source != "" && inbound.Source != "teams" {
+			continue
+		}
+		turn, ok := state.Turns[inbound.TurnID]
+		if ok && !teamsTurnStatusTerminal(turn.Status) {
+			continue
+		}
+		addTeamsOriginInboundTextHashes(hashes, inbound)
+	}
+	return hashes
+}
+
+func teamsTurnStatusTerminal(status teamstore.TurnStatus) bool {
+	switch status {
+	case teamstore.TurnStatusCompleted, teamstore.TurnStatusFailed, teamstore.TurnStatusInterrupted:
+		return true
+	default:
+		return false
+	}
+}
+
 func addTeamsOriginInboundTextHashes(hashes map[string]bool, inbound teamstore.InboundEvent) {
 	if hashes == nil {
 		return
@@ -12036,6 +12172,32 @@ func addTeamsOriginInboundTextHashes(hashes map[string]bool, inbound teamstore.I
 	}
 }
 
+func addTeamsOriginInboundDisplayTexts(displays map[string]string, inbound teamstore.InboundEvent) {
+	if displays == nil {
+		return
+	}
+	text := strings.TrimSpace(inbound.Text)
+	if text != "" {
+		addTeamsOriginDisplayText(displays, inbound.TextHash, text)
+		addTeamsOriginDisplayText(displays, normalizedTextHash(text), text)
+		return
+	}
+	for _, fallback := range []string{defaultReferencedTeamsMessagePrompt, defaultLocalAttachmentPrompt} {
+		addTeamsOriginDisplayText(displays, normalizedTextHash(fallback), fallback)
+	}
+}
+
+func addTeamsOriginDisplayText(displays map[string]string, hash string, text string) {
+	hash = strings.TrimSpace(hash)
+	text = strings.TrimSpace(text)
+	if displays == nil || hash == "" || text == "" {
+		return
+	}
+	if _, ok := displays[hash]; !ok {
+		displays[hash] = text
+	}
+}
+
 func shouldSkipTeamsOriginTranscriptRecord(record TranscriptRecord, body string, hashes map[string]bool) bool {
 	if record.Kind != TranscriptKindUser {
 		return false
@@ -12049,16 +12211,38 @@ func shouldSkipTeamsOriginTranscriptRecord(record TranscriptRecord, body string,
 	return false
 }
 
+func teamsOriginTranscriptUserDisplayBody(record TranscriptRecord, body string, displays map[string]string) string {
+	if record.Kind != TranscriptKindUser {
+		return body
+	}
+	for _, candidate := range teamsOriginTranscriptUserHashCandidates(body) {
+		hash := normalizedTextHash(candidate)
+		if display := strings.TrimSpace(displays[hash]); display != "" {
+			return display
+		}
+	}
+	return body
+}
+
 func teamsOriginTranscriptUserHashCandidates(body string) []string {
 	var candidates []string
 	seen := make(map[string]bool)
-	add := func(text string) {
+	addCandidate := func(text string) {
 		text = strings.TrimSpace(text)
 		if text == "" || seen[text] {
 			return
 		}
 		seen[text] = true
 		candidates = append(candidates, text)
+	}
+	add := func(text string) {
+		addCandidate(text)
+		unwrapped := stripTeamsUserMessageEnvelope(text)
+		addCandidate(unwrapped)
+		cleaned := strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(text)))
+		addCandidate(cleaned)
+		addCandidate(stripTeamsUserMessageEnvelope(cleaned))
+		addCandidate(StripHelperPromptEchoes(StripArtifactManifestBlocks(unwrapped)))
 	}
 
 	add(body)
@@ -12180,6 +12364,8 @@ func outboxCanDedupeTranscript(outbox teamstore.OutboxMessage) bool {
 func deliveredOutboxTranscriptKind(kind string) (TranscriptKind, bool) {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	switch {
+	case kind == "user" || strings.HasPrefix(kind, "user-") || strings.Contains(kind, "-user-"):
+		return TranscriptKindUser, true
 	case isFinalOutboxKind(kind) || strings.Contains(kind, "assistant"):
 		return TranscriptKindAssistant, true
 	case strings.Contains(kind, "progress") || strings.Contains(kind, "status"):
@@ -12198,7 +12384,16 @@ func formatKnownOutboxBodyForTranscriptDedupe(kind TranscriptKind, body string) 
 }
 
 func shouldSkipKnownTranscriptOutboxRecord(record TranscriptRecord, body string, hashes map[TranscriptKind]map[string]bool) bool {
-	if record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus {
+	if record.Kind != TranscriptKindUser && record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus {
+		return false
+	}
+	if record.Kind == TranscriptKindUser {
+		for _, candidate := range teamsOriginTranscriptUserHashCandidates(body) {
+			hash := normalizedTextHash(candidate)
+			if hash != "" && hashes[record.Kind][hash] {
+				return true
+			}
+		}
 		return false
 	}
 	hash := normalizedTextHash(body)
@@ -12261,6 +12456,12 @@ func (s *transcriptDedupeState) shouldSkip(record TranscriptRecord, body string)
 			transcriptUserDuplicateIsAdjacent(record.SourceLine, previousSourceLine) {
 			return true
 		}
+		if sourceKey != "" {
+			s.seenSourceText[sourceKey+"\x00"+string(record.Kind)+"\x00"+hash] = true
+		}
+		return false
+	}
+	if record.Kind == TranscriptKindCompact {
 		if sourceKey != "" {
 			s.seenSourceText[sourceKey+"\x00"+string(record.Kind)+"\x00"+hash] = true
 		}

@@ -22,9 +22,12 @@ const (
 	TranscriptKindAssistant TranscriptKind = "assistant"
 	TranscriptKindTool      TranscriptKind = "tool"
 	TranscriptKindStatus    TranscriptKind = "status"
+	TranscriptKindCompact   TranscriptKind = "compact"
 	TranscriptKindArtifact  TranscriptKind = "artifact"
 	TranscriptKindUnknown   TranscriptKind = "unknown"
 )
+
+const transcriptContextCompactMessage = "Context compacted. Earlier turns were summarized so Codex can continue the thread."
 
 type TranscriptParseOptions struct {
 	SourceName       string
@@ -310,9 +313,36 @@ func ParseCodexTranscript(r io.Reader, opts TranscriptParseOptions) (Transcript,
 	}
 
 	transcript.ThreadID = state.threadID
+	transcript.Records = compactTranscriptRecords(transcript.Records)
 	transcript.FileFingerprint = transcriptFileFingerprint(transcript.SourceName, state.sessionID, digest.Sum(nil))
 	finalizeTranscriptRecordIDs(&transcript)
 	return transcript, nil
+}
+
+func compactTranscriptRecords(records []TranscriptRecord) []TranscriptRecord {
+	if len(records) == 0 {
+		return records
+	}
+	out := records[:0]
+	for i := 0; i < len(records); i++ {
+		if compactedRecordIsShadowedByEvent(records, i) {
+			continue
+		}
+		out = append(out, records[i])
+	}
+	return out
+}
+
+func compactedRecordIsShadowedByEvent(records []TranscriptRecord, index int) bool {
+	if index < 0 || index+1 >= len(records) {
+		return false
+	}
+	current := records[index]
+	next := records[index+1]
+	return current.Kind == TranscriptKindCompact &&
+		strings.EqualFold(strings.TrimSpace(current.SourceType), "compacted") &&
+		next.Kind == TranscriptKindCompact &&
+		strings.EqualFold(strings.TrimSpace(next.SourceType), "context_compacted")
 }
 
 type transcriptParseState struct {
@@ -450,6 +480,9 @@ func parseTranscriptMethodLine(obj map[string]json.RawMessage, method string, li
 			return nil, nil
 		}
 		return []TranscriptRecord{record.toRecord()}, nil
+	case "thread/compacted":
+		record := contextCompactTranscriptRecord(params, method, lineNo, createdAt, threadID, turnID)
+		return []TranscriptRecord{record.toRecord()}, nil
 	case "turn/completed":
 		return turnCompletedMethodTranscriptRecords(params, lineNo, createdAt, threadID, turnID), nil
 	case "error", "configWarning":
@@ -495,6 +528,9 @@ func eventMsgTranscriptRecord(payload map[string]json.RawMessage, lineNo int, cr
 	}
 	if kind == TranscriptKindAssistant && strings.EqualFold(jsonStringField(payload, "phase"), "commentary") {
 		kind = TranscriptKindStatus
+	}
+	if kind == TranscriptKindCompact {
+		return contextCompactTranscriptRecord(payload, eventType, lineNo, createdAt, threadID, turnID), true
 	}
 	text := firstNonEmptyString(
 		jsonStringField(payload, "content", "text", "message"),
@@ -543,6 +579,9 @@ func completedItemTranscriptRecord(obj map[string]json.RawMessage, lineNo int, c
 		jsonStringField(item, "text", "content", "message", "output"),
 		textFromJSONRaw(item["content"]),
 	)
+	if kind == TranscriptKindCompact && strings.TrimSpace(text) == "" {
+		text = transcriptContextCompactMessage
+	}
 	if strings.TrimSpace(text) == "" {
 		return pendingTranscriptRecord{}, false
 	}
@@ -641,6 +680,9 @@ func genericTranscriptRecord(obj map[string]json.RawMessage, lineNo int, created
 		jsonStringField(obj, "text", "message", "output", "delta"),
 		textFromJSONRaw(obj["content"]),
 	)
+	if kind == TranscriptKindCompact && strings.TrimSpace(text) == "" {
+		text = transcriptContextCompactMessage
+	}
 	if strings.TrimSpace(text) == "" {
 		return pendingTranscriptRecord{}, false
 	}
@@ -704,6 +746,8 @@ func responseItemKindText(payload map[string]json.RawMessage) (TranscriptKind, s
 			return "", "", false
 		}
 		return TranscriptKindStatus, strings.TrimSpace(text), true
+	case "context_compaction", "context_compacted":
+		return TranscriptKindCompact, transcriptContextCompactMessage, true
 	case "artifact", "file", "image":
 		text := firstNonEmptyString(jsonStringField(payload, "text", "message", "path", "name"), textFromJSONRaw(payload["content"]))
 		if strings.TrimSpace(text) == "" {
@@ -716,6 +760,9 @@ func responseItemKindText(payload map[string]json.RawMessage) (TranscriptKind, s
 			textFromJSONRaw(payload["content"]),
 			jsonStringField(payload, "text", "message", "output"),
 		)
+		if kind == TranscriptKindCompact && strings.TrimSpace(text) == "" {
+			text = transcriptContextCompactMessage
+		}
 		if strings.TrimSpace(text) == "" {
 			return "", "", false
 		}
@@ -752,6 +799,19 @@ func transcriptCustomToolCallText(payload map[string]json.RawMessage) string {
 		text += "\n" + content
 	}
 	return text
+}
+
+func contextCompactTranscriptRecord(obj map[string]json.RawMessage, sourceType string, lineNo int, createdAt time.Time, threadID string, turnID string) pendingTranscriptRecord {
+	return pendingTranscriptRecord{
+		sourceItemID: jsonStringField(obj, "id", "item_id", "itemId", "compaction_id", "compactionId"),
+		threadID:     threadID,
+		turnID:       turnID,
+		kind:         TranscriptKindCompact,
+		text:         transcriptContextCompactMessage,
+		createdAt:    createdAt,
+		sourceLine:   lineNo,
+		sourceType:   sourceType,
+	}
 }
 
 func reasoningSummaryText(payload map[string]json.RawMessage) string {
@@ -869,6 +929,8 @@ func kindFromType(value string) TranscriptKind {
 		return TranscriptKindTool
 	case "status", "agent_status", "turn.started", "turn.completed", "turn.failed", "reasoning", "configwarning", "error":
 		return TranscriptKindStatus
+	case "context_compacted", "context_compaction", "thread/compacted", "compacted":
+		return TranscriptKindCompact
 	case "artifact", "file", "image":
 		return TranscriptKindArtifact
 	default:

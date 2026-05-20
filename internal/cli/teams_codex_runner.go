@@ -107,6 +107,16 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 		result, err = e.runner.StartThread(ctx, turnInput)
 	}
 	if err != nil {
+		if teamsCodexTurnCompletedDespiteCanceledError(result, err) {
+			out := successfulTeamsExecutionResultFromCodexTurn(result)
+			if session != nil {
+				expectedThreadID := strings.TrimSpace(session.CodexThreadID)
+				if expectedThreadID != "" && out.CodexThreadID != "" && out.CodexThreadID != expectedThreadID {
+					return out, fmt.Errorf("resume emitted Codex thread %q, expected %q", out.CodexThreadID, expectedThreadID)
+				}
+			}
+			return out, nil
+		}
 		out := teamsExecutionResultFromCodexTurn(result)
 		if teamsCodexTurnMayStillBeRunning(result) {
 			return out, &teams.AmbiguousExecutionError{ThreadID: result.ThreadID, TurnID: result.TurnID, Err: err}
@@ -121,6 +131,13 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 		}
 	}
 	return out, nil
+}
+
+func teamsCodexTurnCompletedDespiteCanceledError(result codexrunner.TurnResult, err error) bool {
+	return err != nil &&
+		(errors.Is(err, context.Canceled) || codexrunner.IsKind(err, codexrunner.ErrorCanceled)) &&
+		result.Status == codexrunner.TurnStatusCompleted &&
+		result.Failure == nil
 }
 
 func teamsCodexTurnMayStillBeRunning(result codexrunner.TurnResult) bool {

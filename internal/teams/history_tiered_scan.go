@@ -234,7 +234,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		transcript := Transcript{
 			SourceName:      path,
 			FileFingerprint: transcriptFileFingerprint(path, parseState.sessionID, nil),
-			Records:         result.Records,
+			Records:         compactTranscriptRecords(result.Records),
 		}
 		finalizeTranscriptRecordIDs(&transcript)
 		result.Records = transcript.Records

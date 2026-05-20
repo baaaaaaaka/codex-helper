@@ -73,6 +73,71 @@ func TestParseCodexTranscriptClassifiesEventCommentaryAsStatus(t *testing.T) {
 	assertTranscriptRecord(t, got.Records[1], "final-1", "source:final-1", TranscriptKindAssistant, "done", 2)
 }
 
+func TestParseCodexTranscriptRecordsContextCompactEvent(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-compact"}}`,
+		`{"timestamp":"2026-05-20T03:30:42.693Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"old prompt"}]}]}}`,
+		`{"timestamp":"2026-05-20T03:30:42.694Z","type":"turn_context","payload":{"turn_id":"turn-1"}}`,
+		`{"timestamp":"2026-05-20T03:30:42.695Z","type":"event_msg","payload":{"type":"context_compacted"}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 1 {
+		t.Fatalf("records = %#v, want one visible context compact record", got.Records)
+	}
+	wantID := "fallback:session:thread-compact:line:4:kind:compact"
+	assertTranscriptRecord(t, got.Records[0], wantID, wantID, TranscriptKindCompact, transcriptContextCompactMessage, 4)
+	if got.Records[0].SourceType != "context_compacted" {
+		t.Fatalf("SourceType = %q, want context_compacted", got.Records[0].SourceType)
+	}
+}
+
+func TestParseCodexTranscriptRecordsCompactOnlyLine(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-compact"}}`,
+		`{"timestamp":"2026-05-20T03:30:42.693Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"old prompt"}]}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 1 {
+		t.Fatalf("records = %#v, want one compact-only record", got.Records)
+	}
+	wantID := "fallback:session:thread-compact:line:2:kind:compact"
+	assertTranscriptRecord(t, got.Records[0], wantID, wantID, TranscriptKindCompact, transcriptContextCompactMessage, 2)
+	if got.Records[0].SourceType != "compacted" {
+		t.Fatalf("SourceType = %q, want compacted", got.Records[0].SourceType)
+	}
+	if strings.Contains(got.Records[0].Text, "old prompt") {
+		t.Fatalf("compact record leaked replacement history: %q", got.Records[0].Text)
+	}
+}
+
+func TestParseCodexTranscriptRecordsContextCompactCompletedItem(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-123"}`,
+		`{"type":"turn.started","turn_id":"turn-1"}`,
+		`{"type":"item.completed","item":{"id":"compact-1","type":"context_compaction"}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "exec.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 1 {
+		t.Fatalf("records = %#v, want one context compact item", got.Records)
+	}
+	assertTranscriptRecord(t, got.Records[0], "compact-1", "source:compact-1", TranscriptKindCompact, transcriptContextCompactMessage, 3)
+	if got.Records[0].ThreadID != "thread-123" || got.Records[0].TurnID != "turn-1" {
+		t.Fatalf("record ids = thread %q turn %q", got.Records[0].ThreadID, got.Records[0].TurnID)
+	}
+}
+
 func TestParseCodexTranscriptBadTailIsDiagnosticOnly(t *testing.T) {
 	input := strings.Join([]string{
 		`{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"session-1","cwd":"/work","source":"cli"}}`,

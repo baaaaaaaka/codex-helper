@@ -87,6 +87,9 @@ func TestControlFallbackPromptTruncatesUTF8ContextSafely(t *testing.T) {
 
 func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 	got := TeamsCodexPrompt("fix the helper")
+	if !strings.HasPrefix(got, "User message:\nfix the helper\n\nTeams helper safety:") {
+		t.Fatalf("TeamsCodexPrompt did not prefix the user message:\n%s", got)
+	}
 	for _, want := range []string{
 		"Teams helper safety:",
 		"Do not restart, reload, kill, replace, or background the Teams helper",
@@ -145,6 +148,11 @@ func TestStripHelperPromptEchoesRemovesHelperHistoryMarkers(t *testing.T) {
 		{
 			name: "teams helper safety echo",
 			in:   "use the control chat\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper.",
+			want: "use the control chat",
+		},
+		{
+			name: "teams helper safety echo with user message envelope",
+			in:   "User message:\nuse the control chat\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper.",
 			want: "use the control chat",
 		},
 	}

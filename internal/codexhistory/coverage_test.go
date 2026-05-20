@@ -290,6 +290,7 @@ func TestSessionDisplayTitle(t *testing.T) {
 		{"summary priority", Session{Summary: "sum", FirstPrompt: "fp", SessionID: "id"}, "sum"},
 		{"first prompt fallback", Session{FirstPrompt: "fp", SessionID: "id"}, "fp"},
 		{"teams helper safety stripped", Session{FirstPrompt: "fix the title\n\nTeams helper safety:\n- do not restart helper"}, "fix the title"},
+		{"teams helper user envelope stripped", Session{FirstPrompt: "User message:\nfix the title\n\nTeams helper safety:\n- do not restart helper"}, "fix the title"},
 		{"teams artifact instructions stripped", Session{FirstPrompt: "make artifact\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}, "make artifact"},
 		{"session id fallback", Session{SessionID: "id"}, "id"},
 		{"untitled", Session{}, "untitled"},
@@ -1019,7 +1020,7 @@ func TestLoadHistoryIndex_SkipsSystemInjected(t *testing.T) {
 func TestLoadHistoryIndex_StripsTeamsHelperSuffixFromFirstPrompt(t *testing.T) {
 	dir := t.TempDir()
 	entries := []string{
-		`{"session_id":"s1","ts":1770777540,"text":"fix current bug\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}`,
+		`{"session_id":"s1","ts":1770777540,"text":"User message:\nfix current bug\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}`,
 	}
 	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte(strings.Join(entries, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -1687,7 +1688,7 @@ func TestProcessMetaLine_SecondUserKeepsFirstPrompt(t *testing.T) {
 
 func TestProcessMetaLine_StripsTeamsHelperSuffixFromFirstPrompt(t *testing.T) {
 	var meta sessionFileMeta
-	processMetaLine([]byte(`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"review the title sync\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}]}}`), &meta)
+	processMetaLine([]byte(`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"User message:\nreview the title sync\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}]}}`), &meta)
 	if meta.FirstPrompt != "review the title sync" {
 		t.Errorf("FirstPrompt = %q, want review the title sync", meta.FirstPrompt)
 	}

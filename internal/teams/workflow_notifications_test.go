@@ -37,6 +37,89 @@ func TestWorkflowNotificationsDisabledByDefault(t *testing.T) {
 	if (*sent)[0].Mentions == 0 {
 		t.Fatalf("control fallback did not mention owner: %#v", *sent)
 	}
+	if !strings.Contains((*sent)[0].Content, `<a href="https://teams.microsoft.com/l/chat/`) || !strings.Contains((*sent)[0].Content, `>Open answer</a>`) {
+		t.Fatalf("control fallback should render a clickable open link:\n%s", (*sent)[0].Content)
+	}
+	if plain := PlainTextFromTeamsHTML((*sent)[0].Content); strings.Contains(plain, "teams.microsoft.com") {
+		t.Fatalf("control fallback plain text leaked raw URL:\n%s", plain)
+	}
+}
+
+func TestWorkflowFallbackFormatsLocalSessionMentionAsFocusedClickableMessage(t *testing.T) {
+	url := "https://teams.microsoft.com/l/chat/19%3Ameeting_ZWYyZjFlNmUtZTkwYi00YzRkLTliODQtODA1YjE3NzU1YmY2%40thread.v2/0?tenantId=tenant-1"
+	body := workflowNotificationFallbackBody(WorkflowNotificationEvent{
+		Title:          "💬 New local Codex chat detected",
+		ChatTitle:      "💬 ipp1-1551 - 💬 ipp1-1551 - 用 skill 里面的技能刷一下 vbios 试试",
+		RequestSummary: "💬 ipp1-1551 - 用 skill 里面的技能刷一下 vbios 试试",
+		Hint:           "Open this chat to watch the answer and continue from the full local context.",
+		ButtonTitle:    "Open chat",
+		ButtonURL:      url,
+	}, "")
+
+	if strings.Contains(body, "💬 ipp1-1551 - 💬 ipp1-1551") {
+		t.Fatalf("fallback body kept duplicated chat title:\n%s", body)
+	}
+	if got := strings.Count(body, "用 skill 里面的技能刷一下 vbios 试试"); got != 1 {
+		t.Fatalf("fallback body repeated request %d times:\n%s", got, body)
+	}
+	rendered, mentions := renderOutboxMentionHTML(teamstore.OutboxMessage{
+		Kind: "workflow-fallback",
+		Body: body,
+	}, User{ID: "owner-1", DisplayName: "Jason Wei"})
+	for _, want := range []string{
+		`<strong>🔧 Helper:</strong> <at id="0">Jason Wei</at>`,
+		`<strong>💬 New local Codex chat detected</strong>`,
+		`<strong>Chat:</strong> 💬 ipp1-1551 - 用 skill 里面的技能刷一下 vbios 试试`,
+		`<a href="` + url + `">Open chat</a>`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered fallback missing %q in:\n%s", want, rendered)
+		}
+	}
+	if len(mentions) != 1 || mentions[0].Text != "Jason Wei" {
+		t.Fatalf("mentions = %#v, want Jason Wei", mentions)
+	}
+	plain := PlainTextFromTeamsHTML(rendered)
+	if strings.Contains(plain, "teams.microsoft.com") {
+		t.Fatalf("rendered fallback plain text leaked raw URL:\n%s", plain)
+	}
+	requirePlainTextInOrder(t, plain,
+		"🔧 Helper: Jason Wei",
+		"💬 New local Codex chat detected",
+		"Chat: 💬 ipp1-1551 - 用 skill 里面的技能刷一下 vbios 试试",
+		"Open: Open chat",
+	)
+}
+
+func TestWorkflowFallbackEscapesTextAndDoesNotLinkUnsafeURL(t *testing.T) {
+	body := workflowNotificationFallbackBody(WorkflowNotificationEvent{
+		Title:          `<img src=x onerror=alert(1)>`,
+		ChatTitle:      `chat <b>bad</b>`,
+		RequestSummary: `fix <script>alert(1)</script>`,
+		Hint:           `open <a href="javascript:alert(1)">bad</a>`,
+		ButtonTitle:    `Open <bad>`,
+		ButtonURL:      `javascript:alert(1)`,
+	}, `reason <iframe src=x>`)
+
+	rendered, _ := renderOutboxMentionHTML(teamstore.OutboxMessage{
+		Kind: "workflow-fallback",
+		Body: body,
+	}, User{ID: "owner-1", DisplayName: "Jason Wei"})
+	for _, forbidden := range []string{`<img`, `<script`, `<iframe`, `<a href="javascript:`, `href="javascript:`} {
+		if strings.Contains(rendered, forbidden) {
+			t.Fatalf("rendered fallback contains unsafe raw HTML/URL %q:\n%s", forbidden, rendered)
+		}
+	}
+	for _, want := range []string{
+		`&lt;img src=x onerror=alert(1)&gt;`,
+		`fix &lt;script&gt;alert(1)&lt;/script&gt;`,
+		`Open &lt;bad&gt;`,
+		`javascript:alert(1)`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered fallback missing escaped text %q:\n%s", want, rendered)
+		}
+	}
 }
 
 func TestWorkflowNotificationSendsAfterDurableOutboxSent(t *testing.T) {

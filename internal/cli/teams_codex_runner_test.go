@@ -450,6 +450,27 @@ func TestTeamsCodexExecutorDoesNotTreatTerminalFailedTurnAsAmbiguous(t *testing.
 	}
 }
 
+func TestTeamsCodexExecutorTreatsCompletedTurnWithCanceledContextAsSuccess(t *testing.T) {
+	runner := &fakeTeamsRunner{
+		result: codexrunner.TurnResult{
+			ThreadID:          "thread-existing",
+			ThreadName:        "Existing thread title",
+			TurnID:            "turn-completed",
+			Status:            codexrunner.TurnStatusCompleted,
+			FinalAgentMessage: "final answer",
+		},
+		err: context.Canceled,
+	}
+	executor := teamsCodexExecutor{runner: runner}
+	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing"}, "continue")
+	if err != nil {
+		t.Fatalf("Run error = %v, want completed turn success", err)
+	}
+	if got.Text != "final answer" || got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-completed" || got.CodexThreadTitle != "Existing thread title" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
 func TestTeamsCodexExecutorPassesImageInputToRunner(t *testing.T) {
 	runner := &fakeTeamsRunner{
 		result: codexrunner.TurnResult{

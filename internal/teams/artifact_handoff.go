@@ -27,7 +27,7 @@ func CodexReasoningEffortConfigArg(effort string) string {
 func TeamsCodexPrompt(prompt string) string {
 	root, err := DefaultOutboundRoot()
 	if err != nil || strings.TrimSpace(root) == "" {
-		return prompt
+		return teamsUserMessagePrompt(prompt)
 	}
 	safety := strings.TrimSpace(`
 Teams helper safety:
@@ -48,7 +48,7 @@ Use only relative manifest paths under that directory. Keep your normal answer v
 	if strings.TrimSpace(prompt) == "" {
 		return instructions
 	}
-	return strings.TrimSpace(prompt) + "\n\n" + instructions
+	return teamsUserMessagePrompt(prompt) + "\n\n" + instructions
 }
 
 func ControlFallbackCodexPrompt(prompt string) string {
@@ -154,8 +154,17 @@ Do not claim that a helper command was executed unless you actually performed th
 }
 
 const controlFallbackInstructionLead = "You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper."
+const teamsUserMessageLead = "User message:"
 const teamsHelperSafetyInstructionLead = "Teams helper safety:"
 const artifactHandoffInstructionLead = "If you need to return generated files or images to the Teams user, write them under this local directory:"
+
+func teamsUserMessagePrompt(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+	return teamsUserMessageLead + "\n" + prompt
+}
 
 func controlFallbackStateContext(ctx ControlFallbackPromptContext) string {
 	var lines []string
@@ -379,7 +388,7 @@ func stripArtifactHandoffInstructionEcho(text string) string {
 	if idx < 0 {
 		return text
 	}
-	return strings.TrimSpace(text[:idx])
+	return stripTeamsUserMessageEnvelope(text[:idx])
 }
 
 func stripTeamsHelperSafetyInstructionEcho(text string) string {
@@ -387,7 +396,18 @@ func stripTeamsHelperSafetyInstructionEcho(text string) string {
 	if idx < 0 {
 		return text
 	}
-	return strings.TrimSpace(text[:idx])
+	return stripTeamsUserMessageEnvelope(text[:idx])
+}
+
+func stripTeamsUserMessageEnvelope(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) < len(teamsUserMessageLead) {
+		return text
+	}
+	if !strings.EqualFold(text[:len(teamsUserMessageLead)], teamsUserMessageLead) {
+		return text
+	}
+	return strings.TrimSpace(text[len(teamsUserMessageLead):])
 }
 
 func IsPlaceholderArtifactManifestBlock(block []byte) bool {

@@ -49,11 +49,13 @@ func BenchmarkTeamsTranscriptVisibleFilterLongMixed(b *testing.B) {
 		b.Fatalf("ReadSessionTranscript: %v", err)
 	}
 	teamsOriginHashes := map[string]bool{}
+	teamsOriginDisplays := map[string]string{}
+	teamsOriginTerminalHashes := map[string]bool{}
 	knownHashes := map[TranscriptKind]map[string]bool{}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if got := countVisibleTranscriptSyncRecords(teamstore.State{}, Session{ID: "s-bench"}, codexhistory.Session{SessionID: "thread-bench", FilePath: path}, transcript.Records, teamsOriginHashes, knownHashes, recentCompletedTeamsTranscriptMirrorSkipper{}); got == 0 {
+		if got := countVisibleTranscriptSyncRecords(teamstore.State{}, Session{ID: "s-bench"}, codexhistory.Session{SessionID: "thread-bench", FilePath: path}, transcript.Records, teamsOriginHashes, teamsOriginDisplays, teamsOriginTerminalHashes, knownHashes, recentCompletedTeamsTranscriptMirrorSkipper{}); got == 0 {
 			b.Fatal("expected visible records")
 		}
 	}
