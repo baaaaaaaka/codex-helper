@@ -1161,7 +1161,7 @@ func readyProfile(name string) Profile {
 		Provider:          ProviderLocal,
 		ProxyMode:         ProxyNone,
 		IsolationDefault:  IsolationShared,
-		SharedPath:        "/shared/cxp",
+		SharedPath:        filepath.Join(os.TempDir(), "codex-helper-beacon-test-shared", name),
 		Confirmed:         true,
 		ProviderPreviewOK: true,
 		DoctorOK:          true,

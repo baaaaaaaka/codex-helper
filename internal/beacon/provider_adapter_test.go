@@ -535,6 +535,7 @@ func TestProviderCommandArgsUseAllocationProfileSnapshotAfterProfileChanges(t *t
 }
 
 func TestCommandProviderAdapterPassesExplicitStorePathToWorkerAdapter(t *testing.T) {
+	sharedPath := filepath.Join(t.TempDir(), "shared-root")
 	req := AllocationRequest{
 		ID:                "req-1",
 		ConversationID:    "conv",
@@ -545,7 +546,7 @@ func TestCommandProviderAdapterPassesExplicitStorePathToWorkerAdapter(t *testing
 		ProfileSnapshot: Profile{
 			Name:       "gpu",
 			Provider:   ProviderSlurm,
-			SharedPath: "/shared/root",
+			SharedPath: sharedPath,
 			Slurm:      SlurmProfile{Nodes: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
 		},
 	}
@@ -556,7 +557,7 @@ func TestCommandProviderAdapterPassesExplicitStorePathToWorkerAdapter(t *testing
 	}
 	adapter.StorePath = ""
 	args = adapter.providerCommandArgs(req, "submit")
-	if !containsProviderArgPair(args, "--shared-store", SharedStorePath("/shared/root")) {
+	if !containsProviderArgPair(args, "--shared-store", SharedStorePath(sharedPath)) {
 		t.Fatalf("adapter should derive shared store from profile shared_path, args=%v", args)
 	}
 	queryArgs := adapter.providerCommandArgs(req, "query")
