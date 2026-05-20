@@ -22,6 +22,8 @@ type teamsGraph429StressScale struct {
 	Rounds   int
 }
 
+const teamsGraph429StressRetryAfterSeconds = "600"
+
 func loadTeamsGraph429StressScale() teamsGraph429StressScale {
 	scale := teamsGraph429StressScale{Chats: 12, Messages: 3, Rounds: 3}
 	if os.Getenv("CODEX_HELPER_TEAMS_GRAPH_429_STRESS") != "" {
@@ -72,7 +74,7 @@ func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *t
 		shouldBlock := blockedMode && blockedChats[chatID]
 		mu.Unlock()
 		if shouldBlock {
-			w.Header().Set("Retry-After", "60")
+			w.Header().Set("Retry-After", teamsGraph429StressRetryAfterSeconds)
 			http.Error(w, `{"error":{"code":"TooManyRequests","message":"stress rate limit"}}`, http.StatusTooManyRequests)
 			return
 		}
@@ -187,7 +189,7 @@ func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *tes
 		version := messageVersion[chatID]
 		mu.Unlock()
 		if shouldBlock {
-			w.Header().Set("Retry-After", "60")
+			w.Header().Set("Retry-After", teamsGraph429StressRetryAfterSeconds)
 			http.Error(w, `{"error":{"code":"TooManyRequests","message":"stress poll limit"}}`, http.StatusTooManyRequests)
 			return
 		}
