@@ -746,7 +746,7 @@ func markStaleWorkflowNotificationUnknownState(state *teamstore.State, rec teams
 func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL string, rec teamstore.NotificationRecord) error {
 	sendCtx, cancel := context.WithTimeout(ctx, workflowNotificationSendTimeout)
 	defer cancel()
-	_, err := PostWorkflowWebhook(sendCtx, b.httpClient, webhookURL, WorkflowWebhookMessage{
+	_, err := PostWorkflowWebhookWithoutRateLimitRetry(sendCtx, b.httpClient, webhookURL, WorkflowWebhookMessage{
 		Title:          rec.Title,
 		ChatTitle:      rec.ChatTitle,
 		RequestSummary: rec.RequestSummary,

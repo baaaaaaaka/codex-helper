@@ -292,6 +292,14 @@ func (g *GraphClient) ListChatMembers(ctx context.Context, chatID string) ([]Cha
 }
 
 func (g *GraphClient) SendHTML(ctx context.Context, chatID string, html string) (ChatMessage, error) {
+	return g.sendHTMLWithOptions(ctx, chatID, html, graphRequestOptions{})
+}
+
+func (g *GraphClient) SendHTMLWithoutRateLimitRetry(ctx context.Context, chatID string, html string) (ChatMessage, error) {
+	return g.sendHTMLWithOptions(ctx, chatID, html, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) sendHTMLWithOptions(ctx context.Context, chatID string, html string, opts graphRequestOptions) (ChatMessage, error) {
 	body := map[string]any{
 		"body": map[string]any{
 			"contentType": "html",
@@ -299,11 +307,19 @@ func (g *GraphClient) SendHTML(ctx context.Context, chatID string, html string) 
 		},
 	}
 	var msg ChatMessage
-	err := g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg)
+	err := g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg, opts)
 	return msg, err
 }
 
 func (g *GraphClient) SendHTMLWithMentions(ctx context.Context, chatID string, html string, mentions []ChatMention) (ChatMessage, error) {
+	return g.sendHTMLWithMentionsWithOptions(ctx, chatID, html, mentions, graphRequestOptions{})
+}
+
+func (g *GraphClient) SendHTMLWithMentionsWithoutRateLimitRetry(ctx context.Context, chatID string, html string, mentions []ChatMention) (ChatMessage, error) {
+	return g.sendHTMLWithMentionsWithOptions(ctx, chatID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) sendHTMLWithMentionsWithOptions(ctx context.Context, chatID string, html string, mentions []ChatMention, opts graphRequestOptions) (ChatMessage, error) {
 	body := map[string]any{
 		"body": map[string]any{
 			"contentType": "html",
@@ -335,7 +351,7 @@ func (g *GraphClient) SendHTMLWithMentions(ctx context.Context, chatID string, h
 		body["mentions"] = graphMentions
 	}
 	var msg ChatMessage
-	err := g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg)
+	err := g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg, opts)
 	return msg, err
 }
 
@@ -459,6 +475,14 @@ func (g *GraphClient) UnhideChatForUser(ctx context.Context, chatID string, user
 }
 
 func (g *GraphClient) MarkChatUnreadForUser(ctx context.Context, chatID string, user User, lastMessageReadDateTime time.Time) error {
+	return g.markChatUnreadForUserWithOptions(ctx, chatID, user, lastMessageReadDateTime, graphRequestOptions{})
+}
+
+func (g *GraphClient) MarkChatUnreadForUserWithoutRateLimitRetry(ctx context.Context, chatID string, user User, lastMessageReadDateTime time.Time) error {
+	return g.markChatUnreadForUserWithOptions(ctx, chatID, user, lastMessageReadDateTime, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) markChatUnreadForUserWithOptions(ctx context.Context, chatID string, user User, lastMessageReadDateTime time.Time, opts graphRequestOptions) error {
 	chatID = strings.TrimSpace(chatID)
 	userID := strings.TrimSpace(user.ID)
 	if chatID == "" {
@@ -479,7 +503,7 @@ func (g *GraphClient) MarkChatUnreadForUser(ctx context.Context, chatID string, 
 	if !lastMessageReadDateTime.IsZero() {
 		body["lastMessageReadDateTime"] = lastMessageReadDateTime.UTC().Format(time.RFC3339Nano)
 	}
-	return g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/markChatUnreadForUser", body, nil)
+	return g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/markChatUnreadForUser", body, nil, opts)
 }
 
 func HTMLMessageMentioningOwner(prefix string, text string, owner User) (string, []ChatMention) {
@@ -502,6 +526,14 @@ func HTMLMessageMentioningOwner(prefix string, text string, owner User) (string,
 }
 
 func (g *GraphClient) SendDriveItemAttachment(ctx context.Context, chatID string, item DriveItem, message string) (ChatMessage, error) {
+	return g.sendDriveItemAttachmentWithOptions(ctx, chatID, item, message, graphRequestOptions{})
+}
+
+func (g *GraphClient) SendDriveItemAttachmentWithoutRateLimitRetry(ctx context.Context, chatID string, item DriveItem, message string) (ChatMessage, error) {
+	return g.sendDriveItemAttachmentWithOptions(ctx, chatID, item, message, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) sendDriveItemAttachmentWithOptions(ctx context.Context, chatID string, item DriveItem, message string, opts graphRequestOptions) (ChatMessage, error) {
 	contentURL := strings.TrimSpace(firstNonEmptyString(item.WebDavURL, item.WebURL))
 	if contentURL == "" {
 		return ChatMessage{}, fmt.Errorf("drive item %q has no webDavUrl or webUrl", item.ID)
@@ -531,7 +563,7 @@ func (g *GraphClient) SendDriveItemAttachment(ctx context.Context, chatID string
 		}},
 	}
 	var msg ChatMessage
-	err := g.do(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg)
+	err := g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg, opts)
 	return msg, err
 }
 
@@ -547,14 +579,30 @@ func helperAttachmentMessage(message string) string {
 }
 
 func (g *GraphClient) GetMessage(ctx context.Context, chatID string, messageID string) (ChatMessage, error) {
+	return g.getMessageWithOptions(ctx, chatID, messageID, graphRequestOptions{})
+}
+
+func (g *GraphClient) GetMessageWithoutRateLimitRetry(ctx context.Context, chatID string, messageID string) (ChatMessage, error) {
+	return g.getMessageWithOptions(ctx, chatID, messageID, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) getMessageWithOptions(ctx context.Context, chatID string, messageID string, opts graphRequestOptions) (ChatMessage, error) {
 	var msg ChatMessage
-	err := g.do(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/messages/"+url.PathEscape(messageID), nil, &msg)
+	err := g.doWithOptions(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/messages/"+url.PathEscape(messageID), nil, &msg, opts)
 	return msg, err
 }
 
 func (g *GraphClient) GetHostedContentValue(ctx context.Context, chatID string, messageID string, hostedContentID string) (HostedContentValue, error) {
+	return g.getHostedContentValueWithOptions(ctx, chatID, messageID, hostedContentID, graphRequestOptions{})
+}
+
+func (g *GraphClient) GetHostedContentValueWithoutRateLimitRetry(ctx context.Context, chatID string, messageID string, hostedContentID string) (HostedContentValue, error) {
+	return g.getHostedContentValueWithOptions(ctx, chatID, messageID, hostedContentID, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) getHostedContentValueWithOptions(ctx context.Context, chatID string, messageID string, hostedContentID string, opts graphRequestOptions) (HostedContentValue, error) {
 	path := "/chats/" + url.PathEscape(chatID) + "/messages/" + url.PathEscape(messageID) + "/hostedContents/" + url.PathEscape(hostedContentID) + "/$value"
-	data, contentType, err := g.doRaw(ctx, http.MethodGet, path, maxHostedContentBytes)
+	data, contentType, err := g.doRawWithOptions(ctx, http.MethodGet, path, maxHostedContentBytes, opts)
 	if err != nil {
 		return HostedContentValue{}, err
 	}
@@ -562,11 +610,19 @@ func (g *GraphClient) GetHostedContentValue(ctx context.Context, chatID string, 
 }
 
 func (g *GraphClient) UploadSmallDriveItem(ctx context.Context, folder string, name string, data []byte, contentType string) (DriveItem, error) {
+	return g.uploadSmallDriveItemWithOptions(ctx, folder, name, data, contentType, graphRequestOptions{})
+}
+
+func (g *GraphClient) UploadSmallDriveItemWithoutRateLimitRetry(ctx context.Context, folder string, name string, data []byte, contentType string) (DriveItem, error) {
+	return g.uploadSmallDriveItemWithOptions(ctx, folder, name, data, contentType, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) uploadSmallDriveItemWithOptions(ctx context.Context, folder string, name string, data []byte, contentType string, opts graphRequestOptions) (DriveItem, error) {
 	path, err := meDriveRootContentPath(folder, name)
 	if err != nil {
 		return DriveItem{}, err
 	}
-	raw, err := g.doBytes(ctx, http.MethodPut, path, data, contentType, maxDriveItemJSONBytes)
+	raw, err := g.doBytesWithOptions(ctx, http.MethodPut, path, data, contentType, maxDriveItemJSONBytes, opts)
 	if err != nil {
 		return DriveItem{}, err
 	}
@@ -581,23 +637,39 @@ func (g *GraphClient) UploadSmallDriveItem(ctx context.Context, folder string, n
 }
 
 func (g *GraphClient) GetDriveItemMetadata(ctx context.Context, itemID string) (DriveItem, error) {
+	return g.getDriveItemMetadataWithOptions(ctx, itemID, graphRequestOptions{})
+}
+
+func (g *GraphClient) GetDriveItemMetadataWithoutRateLimitRetry(ctx context.Context, itemID string) (DriveItem, error) {
+	return g.getDriveItemMetadataWithOptions(ctx, itemID, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) getDriveItemMetadataWithOptions(ctx context.Context, itemID string, opts graphRequestOptions) (DriveItem, error) {
 	itemID = strings.TrimSpace(itemID)
 	if itemID == "" {
 		return DriveItem{}, fmt.Errorf("drive item id is required")
 	}
 	path := "/me/drive/items/" + url.PathEscape(itemID) + "?$select=id,name,eTag,webUrl,webDavUrl"
 	var item DriveItem
-	err := g.do(ctx, http.MethodGet, path, nil, &item)
+	err := g.doWithOptions(ctx, http.MethodGet, path, nil, &item, opts)
 	return item, err
 }
 
 func (g *GraphClient) GetSharedDriveItemContent(ctx context.Context, rawURL string) (HostedContentValue, error) {
+	return g.getSharedDriveItemContentWithOptions(ctx, rawURL, graphRequestOptions{})
+}
+
+func (g *GraphClient) GetSharedDriveItemContentWithoutRateLimitRetry(ctx context.Context, rawURL string) (HostedContentValue, error) {
+	return g.getSharedDriveItemContentWithOptions(ctx, rawURL, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) getSharedDriveItemContentWithOptions(ctx context.Context, rawURL string, opts graphRequestOptions) (HostedContentValue, error) {
 	shareID := graphShareID(rawURL)
 	if shareID == "" {
 		return HostedContentValue{}, fmt.Errorf("sharing URL is required")
 	}
 	path := "/shares/" + url.PathEscape(shareID) + "/driveItem/content"
-	data, contentType, err := g.doRaw(ctx, http.MethodGet, path, maxSharedFileBytes)
+	data, contentType, err := g.doRawWithOptions(ctx, http.MethodGet, path, maxSharedFileBytes, opts)
 	if err != nil {
 		return HostedContentValue{}, err
 	}
@@ -612,13 +684,34 @@ func (g *GraphClient) ListMessages(ctx context.Context, chatID string, top int) 
 	return window.Messages, nil
 }
 
+func (g *GraphClient) ListMessagesWithoutRateLimitRetry(ctx context.Context, chatID string, top int) ([]ChatMessage, error) {
+	window, err := g.ListMessagesWindowWithoutRateLimitRetry(ctx, chatID, top, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+	return window.Messages, nil
+}
+
 func (g *GraphClient) ListMessagesWindow(ctx context.Context, chatID string, top int, modifiedAfter time.Time) (MessageWindow, error) {
 	path := chatMessagesPath(chatID, top, modifiedAfter)
 	return g.ListMessagesWindowFromPath(ctx, path)
 }
 
+func (g *GraphClient) ListMessagesWindowWithoutRateLimitRetry(ctx context.Context, chatID string, top int, modifiedAfter time.Time) (MessageWindow, error) {
+	path := chatMessagesPath(chatID, top, modifiedAfter)
+	return g.ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, path)
+}
+
 func (g *GraphClient) ListMessagesWindowFromPath(ctx context.Context, path string) (MessageWindow, error) {
-	messages, next, err := g.listMessagesPage(ctx, path)
+	return g.listMessagesWindowFromPath(ctx, path, graphRequestOptions{})
+}
+
+func (g *GraphClient) ListMessagesWindowFromPathWithoutRateLimitRetry(ctx context.Context, path string) (MessageWindow, error) {
+	return g.listMessagesWindowFromPath(ctx, path, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) listMessagesWindowFromPath(ctx context.Context, path string, opts graphRequestOptions) (MessageWindow, error) {
+	messages, next, err := g.listMessagesPage(ctx, path, opts)
 	if err != nil {
 		return MessageWindow{}, err
 	}
@@ -635,12 +728,12 @@ func (g *GraphClient) ListMessagesWindowFromPath(ctx context.Context, path strin
 	return out, nil
 }
 
-func (g *GraphClient) listMessagesPage(ctx context.Context, path string) ([]ChatMessage, string, error) {
+func (g *GraphClient) listMessagesPage(ctx context.Context, path string, opts graphRequestOptions) ([]ChatMessage, string, error) {
 	var payload struct {
 		Value    []ChatMessage `json:"value"`
 		NextLink string        `json:"@odata.nextLink"`
 	}
-	if err := g.do(ctx, http.MethodGet, path, nil, &payload); err != nil {
+	if err := g.doWithOptions(ctx, http.MethodGet, path, nil, &payload, opts); err != nil {
 		return nil, "", err
 	}
 	return payload.Value, payload.NextLink, nil
@@ -720,7 +813,15 @@ func trimGraphBasePath(requestURI string, baseURL string) string {
 	return requestURI
 }
 
+type graphRequestOptions struct {
+	returnRateLimitWithoutRetry bool
+}
+
 func (g *GraphClient) do(ctx context.Context, method string, path string, body any, out any) error {
+	return g.doWithOptions(ctx, method, path, body, out, graphRequestOptions{})
+}
+
+func (g *GraphClient) doWithOptions(ctx context.Context, method string, path string, body any, out any, opts graphRequestOptions) error {
 	if !isAllowedGraphRequest(method, path) {
 		return fmt.Errorf("refusing non-allowlisted Graph request: %s %s", method, path)
 	}
@@ -761,7 +862,11 @@ func (g *GraphClient) do(ctx context.Context, method string, path string, body a
 			refreshedAfterUnauthorized = true
 			continue
 		}
-		if shouldRetryGraphRequest(method, resp.StatusCode) && retries < g.retryLimit() {
+		retryable := shouldRetryGraphRequest(method, resp.StatusCode)
+		if opts.returnRateLimitWithoutRetry && resp.StatusCode == http.StatusTooManyRequests {
+			retryable = false
+		}
+		if retryable && retries < g.retryLimit() {
 			delay := g.retryDelay(resp, retries)
 			discardAndClose(resp.Body)
 			if err := g.sleepFor(ctx, delay); err != nil {
@@ -789,6 +894,10 @@ func (g *GraphClient) do(ctx context.Context, method string, path string, body a
 }
 
 func (g *GraphClient) doRaw(ctx context.Context, method string, path string, maxBytes int64) ([]byte, string, error) {
+	return g.doRawWithOptions(ctx, method, path, maxBytes, graphRequestOptions{})
+}
+
+func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path string, maxBytes int64, opts graphRequestOptions) ([]byte, string, error) {
 	if !isAllowedGraphRequest(method, path) {
 		return nil, "", fmt.Errorf("refusing non-allowlisted Graph request: %s %s", method, path)
 	}
@@ -818,7 +927,11 @@ func (g *GraphClient) doRaw(ctx context.Context, method string, path string, max
 			refreshedAfterUnauthorized = true
 			continue
 		}
-		if shouldRetryGraphRequest(method, resp.StatusCode) && retries < g.retryLimit() {
+		retryable := shouldRetryGraphRequest(method, resp.StatusCode)
+		if opts.returnRateLimitWithoutRetry && resp.StatusCode == http.StatusTooManyRequests {
+			retryable = false
+		}
+		if retryable && retries < g.retryLimit() {
 			delay := g.retryDelay(resp, retries)
 			discardAndClose(resp.Body)
 			if err := g.sleepFor(ctx, delay); err != nil {
@@ -843,6 +956,10 @@ func (g *GraphClient) doRaw(ctx context.Context, method string, path string, max
 }
 
 func (g *GraphClient) doBytes(ctx context.Context, method string, path string, data []byte, contentType string, maxResponseBytes int64) ([]byte, error) {
+	return g.doBytesWithOptions(ctx, method, path, data, contentType, maxResponseBytes, graphRequestOptions{})
+}
+
+func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, path string, data []byte, contentType string, maxResponseBytes int64, opts graphRequestOptions) ([]byte, error) {
 	if !isAllowedGraphRequest(method, path) {
 		return nil, fmt.Errorf("refusing non-allowlisted Graph request: %s %s", method, path)
 	}
@@ -875,7 +992,11 @@ func (g *GraphClient) doBytes(ctx context.Context, method string, path string, d
 			refreshedAfterUnauthorized = true
 			continue
 		}
-		if shouldRetryGraphRequest(method, resp.StatusCode) && retries < g.retryLimit() {
+		retryable := shouldRetryGraphRequest(method, resp.StatusCode)
+		if opts.returnRateLimitWithoutRetry && resp.StatusCode == http.StatusTooManyRequests {
+			retryable = false
+		}
+		if retryable && retries < g.retryLimit() {
 			delay := g.retryDelay(resp, retries)
 			discardAndClose(resp.Body)
 			if err := g.sleepFor(ctx, delay); err != nil {

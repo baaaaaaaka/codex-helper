@@ -117,6 +117,34 @@ func TestPostWorkflowWebhookRetriesTooManyRequests(t *testing.T) {
 	}
 }
 
+func TestPostWorkflowWebhookWithoutRateLimitRetryReturnsBeforeRetryAfterSleep(t *testing.T) {
+	var attempts int
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{"Retry-After": []string{"60"}},
+			Body:       io.NopCloser(strings.NewReader("slow")),
+		}, nil
+	})}
+
+	start := time.Now()
+	_, err := PostWorkflowWebhookWithoutRateLimitRetry(context.Background(), client, "https://workflow.example.test/hook", WorkflowWebhookMessage{Text: "retry later"})
+	if err == nil {
+		t.Fatalf("expected rate-limit error")
+	}
+	if !workflowWebhookRetryable(err) || workflowWebhookDeliveryUncertain(err) {
+		t.Fatalf("error classification = retryable:%v deliveryUncertain:%v, want retryable only", workflowWebhookRetryable(err), workflowWebhookDeliveryUncertain(err))
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 without webhook Retry-After sleep", attempts)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("webhook no-retry rate limit took %s, want immediate return", elapsed)
+	}
+}
+
 func TestPostWorkflowWebhookClassifiesServerErrorAsDeliveryUncertain(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{

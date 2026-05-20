@@ -1147,18 +1147,11 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<RunLevel>LeastPrivilege</RunLevel>",
 		"<Enabled>false</Enabled>",
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
-		"<Command>powershell.exe</Command>",
-		"-WindowStyle Hidden",
-		"codex-helper\\teams",
-		"starting hidden Teams helper process",
-		"Start-Process -FilePath",
-		"-RedirectStandardOutput $stdoutLog",
-		"-RedirectStandardError $stderrLog",
+		"<Hidden>true</Hidden>",
+		"<Command>wscript.exe</Command>",
+		"//B //Nologo",
+		"codex-helper-teams-task.vbs",
 		"<WorkingDirectory>" + cwd + "</WorkingDirectory>",
-		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;run&apos; &apos;--owner-stale-after&apos; &apos;18s&apos; &apos;--registry&apos; &apos;` + registryPath + `&apos;`,
-		`$code = $LASTEXITCODE`,
-		`exit $code`,
-		`$env:CODEX_HELPER_TEAMS_SERVICE = &apos;1&apos;`,
 		"<RestartOnFailure>",
 		"<Count>999</Count>",
 	} {
@@ -1179,16 +1172,53 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<RestartOnFailure>",
 		"<Interval>PT1M</Interval>",
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
-		"<Command>powershell.exe</Command>",
-		"Start-Process -FilePath",
-		"-RedirectStandardOutput $stdoutLog",
-		"-RedirectStandardError $stderrLog",
-		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;service&apos; &apos;watchdog&apos; &apos;--loop&apos; &apos;--interval&apos; &apos;10s&apos; &apos;--quiet&apos;`,
-		`$env:CODEX_HELPER_TEAMS_SERVICE = &apos;1&apos;`,
+		"<Hidden>true</Hidden>",
+		"<Command>wscript.exe</Command>",
+		"//B //Nologo",
+		"codex-helper-teams-watchdog-task.vbs",
 	} {
 		if !strings.Contains(watchdogXML, want) {
 			t.Fatalf("watchdog task xml missing %q:\n%s", want, watchdogXML)
 		}
+	}
+	for _, unexpected := range []string{"<Command>powershell.exe</Command>", "-WindowStyle Hidden -Command"} {
+		if strings.Contains(taskXML, unexpected) || strings.Contains(watchdogXML, unexpected) {
+			t.Fatalf("task XML should use no-console wscript launchers, found %q:\nbridge=%s\nwatchdog=%s", unexpected, taskXML, watchdogXML)
+		}
+	}
+	launcherPS, err := os.ReadFile(filepath.Join(xmlDir, "codex-helper-teams-task.ps1"))
+	if err != nil {
+		t.Fatalf("read bridge launcher powershell: %v", err)
+	}
+	launcherVBS, err := os.ReadFile(filepath.Join(xmlDir, "codex-helper-teams-task.vbs"))
+	if err != nil {
+		t.Fatalf("read bridge launcher vbs: %v", err)
+	}
+	watchdogPS, err := os.ReadFile(filepath.Join(xmlDir, "codex-helper-teams-watchdog-task.ps1"))
+	if err != nil {
+		t.Fatalf("read watchdog launcher powershell: %v", err)
+	}
+	for _, want := range []string{
+		"codex-helper\\teams",
+		"starting hidden Teams helper process",
+		"Start-Process -FilePath",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
+		"& '" + exePath + "' 'teams' 'run' '--owner-stale-after' '18s' '--registry' '" + registryPath + "'",
+		"$code = $LASTEXITCODE",
+		"exit $code",
+		"$env:CODEX_HELPER_TEAMS_SERVICE = '1'",
+	} {
+		if !strings.Contains(string(launcherPS), want) {
+			t.Fatalf("bridge launcher powershell missing %q:\n%s", want, string(launcherPS))
+		}
+	}
+	if !strings.Contains(string(watchdogPS), "& '"+exePath+"' 'teams' 'service' 'watchdog' '--loop' '--interval' '10s' '--quiet'") ||
+		!strings.Contains(string(watchdogPS), "$env:CODEX_HELPER_TEAMS_SERVICE = '1'") {
+		t.Fatalf("watchdog launcher powershell missing expected command/env:\n%s", string(watchdogPS))
+	}
+	if !strings.Contains(string(launcherVBS), "shell.Run(cmd, 0, True)") || !strings.Contains(string(launcherVBS), "-WindowStyle Hidden -File") {
+		t.Fatalf("bridge launcher vbs should run PowerShell hidden:\n%s", string(launcherVBS))
 	}
 	if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" || !strings.Contains(strings.Join(runner.calls[0].args, " "), "Register-ScheduledTask") {
 		t.Fatalf("install should register task with powershell, calls=%#v", runner.calls)
@@ -1209,6 +1239,25 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 	}
 	if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, teamsServiceWindowsTaskName) || !strings.Contains(joined, teamsServiceWindowsWatchdogTaskName) {
 		t.Fatalf("enable should include main and watchdog tasks, call=%s", joined)
+	}
+
+	runner.calls = nil
+	cmd = newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetArgs([]string{"uninstall"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service uninstall: %v", err)
+	}
+	for _, path := range []string{
+		xmlPath,
+		watchdogXMLPath,
+		filepath.Join(xmlDir, "codex-helper-teams-task.ps1"),
+		filepath.Join(xmlDir, "codex-helper-teams-task.vbs"),
+		filepath.Join(xmlDir, "codex-helper-teams-watchdog-task.ps1"),
+		filepath.Join(xmlDir, "codex-helper-teams-watchdog-task.vbs"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("uninstall should remove %s, stat err=%v", path, err)
+		}
 	}
 }
 

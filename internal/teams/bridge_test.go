@@ -2014,7 +2014,8 @@ func TestBridgeMarkUnreadFailureDoesNotFailFinalAnswer(t *testing.T) {
 			_, _ = fmt.Fprint(w, `{"id":"sent-final","messageType":"message"}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/markChatUnreadForUser":
 			sawMarkUnread = true
-			http.Error(w, `{"error":{"code":"Forbidden","message":"no mark unread"}}`, http.StatusForbidden)
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
 		default:
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
@@ -2027,8 +2028,11 @@ func TestBridgeMarkUnreadFailureDoesNotFailFinalAnswer(t *testing.T) {
 		maxRetries: 1,
 		backoffMin: time.Millisecond,
 		backoffMax: time.Millisecond,
-		sleep:      func(context.Context, time.Duration) error { return nil },
-		jitter:     func(d time.Duration) time.Duration { return d },
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("mark-unread 429 should not enter Graph Retry-After sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
 	bridge.markAnswerChatsUnread = true
 
@@ -8125,6 +8129,128 @@ func TestBridgeSessionSendFileAttachmentUsesDurableOutboxOnRateLimit(t *testing.
 	}
 }
 
+func TestBridgeOutboxUploadRateLimitRecordsBlockWithoutRetrySleep(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	root, err := DefaultOutboundRoot()
+	if err != nil {
+		t.Fatalf("DefaultOutboundRoot error: %v", err)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir outbound root: %v", err)
+	}
+	path := filepath.Join(root, "report.txt")
+	if err := os.WriteFile(path, []byte("report"), 0o600); err != nil {
+		t.Fatalf("write outbound file: %v", err)
+	}
+	var uploadRequests int
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploadRequests++
+		if r.Method != http.MethodPut || !strings.HasSuffix(r.URL.EscapedPath(), ":/content") {
+			t.Fatalf("unexpected file Graph request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
+	}))
+	defer fileServer.Close()
+	chatGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(chatGraph, store, &recordingExecutor{})
+	bridge.fileGraph = &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     fileServer.Client(),
+		baseURL:    fileServer.URL,
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("outbox upload 429 should be recorded before any Graph Retry-After sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:upload-rate-limit",
+		TeamsChatID:    "chat-1",
+		Kind:           "attachment",
+		Body:           "attachment",
+		AttachmentPath: path,
+		AttachmentName: "report.txt",
+	}); err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+
+	err = bridge.flushPendingOutboxForChat(context.Background(), "chat-1")
+	if err == nil || !isGraphRateLimitError(err) {
+		t.Fatalf("flushPendingOutboxForChat error = %v, want upload 429", err)
+	}
+	if uploadRequests != 1 {
+		t.Fatalf("upload requests = %d, want 1 without Graph retry sleep", uploadRequests)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if got := state.OutboxMessages["outbox:upload-rate-limit"]; got.Status != teamstore.OutboxStatusQueued || got.LastSendError == "" {
+		t.Fatalf("outbox after upload rate limit = %#v, want queued with LastSendError", got)
+	}
+	if limit := state.ChatRateLimits["chat-1"]; !limit.BlockedUntil.After(time.Now()) || limit.PoisonOutboxID != "outbox:upload-rate-limit" {
+		t.Fatalf("chat rate limit after upload 429 = %#v", limit)
+	}
+}
+
+func TestBridgeAcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/chats/chat-1/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	chatGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(chatGraph, store, &recordingExecutor{})
+	bridge.readGraph = &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("accepted outbox recovery 429 should be recorded before any Graph Retry-After sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:accepted-recovery-rate-limit",
+		TeamsChatID: "chat-1",
+		Kind:        "helper",
+		Body:        "recover me",
+	}); err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+	outbox, err := store.MarkOutboxSendAttempt(context.Background(), "outbox:accepted-recovery-rate-limit")
+	if err != nil {
+		t.Fatalf("MarkOutboxSendAttempt: %v", err)
+	}
+
+	err = bridge.sendQueuedOutboxWithOptions(context.Background(), outbox, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true})
+	if err == nil || !isGraphRateLimitError(err) {
+		t.Fatalf("sendQueuedOutboxWithOptions error = %v, want recovery 429", err)
+	}
+	if requests != 1 {
+		t.Fatalf("accepted recovery requests = %d, want 1 without Graph retry sleep", requests)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if limit := state.ChatRateLimits["chat-1"]; !limit.BlockedUntil.After(time.Now()) || limit.PoisonOutboxID != "outbox:accepted-recovery-rate-limit" {
+		t.Fatalf("chat rate limit after accepted recovery 429 = %#v", limit)
+	}
+}
+
 func TestBridgeAttachmentSendFailureRestartReusesUploadedDriveItem(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
@@ -11850,12 +11976,16 @@ func TestBridgePollChatReadRateLimitBlocksOnlyThatChat(t *testing.T) {
 		http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
 	}))
 	t.Cleanup(server.Close)
+	var retrySleeps []time.Duration
 	readGraph := &GraphClient{
 		auth:    &fakeGraphAuth{token: "access"},
 		client:  server.Client(),
 		baseURL: server.URL,
-		sleep:   func(context.Context, time.Duration) error { return nil },
-		jitter:  func(d time.Duration) time.Duration { return d },
+		sleep: func(_ context.Context, delay time.Duration) error {
+			retrySleeps = append(retrySleeps, delay)
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
 	}
 	writeGraph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -11875,8 +12005,11 @@ func TestBridgePollChatReadRateLimitBlocksOnlyThatChat(t *testing.T) {
 	if poll.PollState != inboundPollStateBlocked || poll.BlockedUntil.Before(time.Now().Add(50*time.Second)) {
 		t.Fatalf("poll 429 did not block chat: %#v", poll)
 	}
-	if requests != defaultGraphRetries+1 {
-		t.Fatalf("requests = %d, want %d", requests, defaultGraphRetries+1)
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 because poll reads should not sleep/retry inside Graph on 429", requests)
+	}
+	if len(retrySleeps) != 0 {
+		t.Fatalf("poll read 429 should return before Retry-After sleep, got sleeps=%v", retrySleeps)
 	}
 
 	bridge.readGraph = newBridgePollGraph(t, nil)
@@ -11893,6 +12026,68 @@ func TestBridgePollChatReadRateLimitBlocksOnlyThatChat(t *testing.T) {
 	}
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("blocked pollOnce should skip chat-1 without reading it: %v", err)
+	}
+}
+
+func TestBridgeControlPollRateLimitRecordsBlockWithoutRetrySleep(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/chats/control-chat/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
+	}))
+	t.Cleanup(server.Close)
+	readGraph := &GraphClient{
+		auth:    &fakeGraphAuth{token: "access"},
+		client:  server.Client(),
+		baseURL: server.URL,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("control poll 429 should be persisted as blocked before any Retry-After sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatID = "control-chat"
+
+	if err := bridge.pollOnce(context.Background(), 20); err == nil || !isGraphRateLimitError(err) {
+		t.Fatalf("pollOnce error = %v, want Graph 429", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 because control poll should not retry 429 inside Graph", requests)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "control-chat")
+	if err != nil || !ok {
+		t.Fatalf("control ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateBlocked || poll.BlockedUntil.Before(time.Now().Add(50*time.Second)) {
+		t.Fatalf("control poll 429 did not record Retry-After block: %#v", poll)
+	}
+
+	now := time.Now()
+	bridge.reg.Sessions = []Session{{ID: "s001", ChatID: "chat-1", Status: "active", UpdatedAt: now}}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce during control Retry-After block = %v, want quiet skip", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests after control poll block = %d, want still 1 so work chats do not amplify Graph 429", requests)
 	}
 }
 
@@ -12113,8 +12308,11 @@ func TestBridgePollOnceContinuesOtherDueChatsAfterReadRateLimit(t *testing.T) {
 		client:     server.Client(),
 		baseURL:    server.URL,
 		maxRetries: 0,
-		sleep:      func(context.Context, time.Duration) error { return nil },
-		jitter:     func(d time.Duration) time.Duration { return d },
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("poll read 429 should not sleep inside Graph retry loop")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
 	}
 	writeGraph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -12156,9 +12354,6 @@ func TestBridgePollOnceContinuesOtherDueChatsAfterReadRateLimit(t *testing.T) {
 	}
 	for _, chatID := range []string{"chat-1", "chat-2", "chat-3"} {
 		want := 1
-		if chatID == "chat-1" {
-			want = defaultGraphRetries + 1
-		}
 		if requestsByChat[chatID] != want {
 			t.Fatalf("requests for %s = %d, want %d; all requests=%#v", chatID, requestsByChat[chatID], want, requestsByChat)
 		}
@@ -17145,11 +17340,13 @@ func TestBridgeFlushPendingOutboxSerializesConcurrentFlushes(t *testing.T) {
 func TestBridgeFlushPendingOutboxContinuesAfterRateLimitedChat(t *testing.T) {
 	store := newBridgeTestStore(t)
 	var sent []string
+	requestsByChat := make(map[string]int)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/messages") {
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
 		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		requestsByChat[chatID]++
 		if chatID == "chat-1" {
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
@@ -17167,8 +17364,11 @@ func TestBridgeFlushPendingOutboxContinuesAfterRateLimitedChat(t *testing.T) {
 		maxRetries: 0,
 		backoffMin: time.Millisecond,
 		backoffMax: time.Millisecond,
-		sleep:      func(context.Context, time.Duration) error { return nil },
-		jitter:     func(d time.Duration) time.Duration { return d },
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("outbox send 429 should be recorded before any Graph Retry-After sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
 	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{ID: "outbox:blocked", TeamsChatID: "chat-1", Kind: "helper", Body: "blocked"}); err != nil {
 		t.Fatalf("QueueOutbox blocked error: %v", err)
@@ -17183,6 +17383,9 @@ func TestBridgeFlushPendingOutboxContinuesAfterRateLimitedChat(t *testing.T) {
 	}
 	if len(sent) != 1 || sent[0] != "chat-2" {
 		t.Fatalf("sent chats = %#v, want chat-2 despite chat-1 rate limit", sent)
+	}
+	if requestsByChat["chat-1"] != 1 {
+		t.Fatalf("chat-1 send requests = %d, want 1 without Graph retry sleep", requestsByChat["chat-1"])
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -17290,12 +17493,14 @@ func TestBridgeFlushPendingOutboxContinuesOtherChatsAfterSendFailure(t *testing.
 func TestBridgeOutboxRateLimitRestartReplayPreservesPerChatFIFO(t *testing.T) {
 	store := newBridgeTestStore(t)
 	var sent []bridgeSentMessage
+	requestsByChat := make(map[string]int)
 	rateLimited := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
 		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		requestsByChat[chatID]++
 		var body struct {
 			Body struct {
 				Content string `json:"content"`
@@ -17322,8 +17527,11 @@ func TestBridgeOutboxRateLimitRestartReplayPreservesPerChatFIFO(t *testing.T) {
 			maxRetries: 0,
 			backoffMin: time.Millisecond,
 			backoffMax: time.Millisecond,
-			sleep:      func(context.Context, time.Duration) error { return nil },
-			jitter:     func(d time.Duration) time.Duration { return d },
+			sleep: func(context.Context, time.Duration) error {
+				t.Fatal("outbox send 429 should be recorded before any Graph Retry-After sleep")
+				return nil
+			},
+			jitter: func(d time.Duration) time.Duration { return d },
 		}, store, &recordingExecutor{})
 	}
 	for _, msg := range []teamstore.OutboxMessage{
@@ -17343,6 +17551,9 @@ func TestBridgeOutboxRateLimitRestartReplayPreservesPerChatFIFO(t *testing.T) {
 	}
 	if len(sent) != 1 || sent[0].ChatID != "chat-B" || !strings.Contains(sent[0].Content, "B1") {
 		t.Fatalf("first flush sent = %#v, want only chat-B B1", sent)
+	}
+	if requestsByChat["chat-A"] != 1 {
+		t.Fatalf("chat-A requests before Retry-After block = %d, want 1", requestsByChat["chat-A"])
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -17551,7 +17762,8 @@ func TestBridgeAckSendFailureDoesNotBlockCodexTurn(t *testing.T) {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
 		requests++
-		if requests <= 4 {
+		if requests == 1 {
+			w.Header().Set("Retry-After", "60")
 			http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
 			return
 		}
@@ -17576,8 +17788,11 @@ func TestBridgeAckSendFailureDoesNotBlockCodexTurn(t *testing.T) {
 		maxRetries: 0,
 		backoffMin: time.Millisecond,
 		backoffMax: time.Millisecond,
-		sleep:      sleepContext,
-		jitter:     func(d time.Duration) time.Duration { return d },
+		sleep: func(ctx context.Context, d time.Duration) error {
+			t.Fatalf("ack send 429 should be recorded as chat backoff, not hidden Graph sleep for %s", d)
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
 	}, store, executor)
 
 	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("ack-failure"), "run anyway"); err != nil {
@@ -17586,8 +17801,11 @@ func TestBridgeAckSendFailureDoesNotBlockCodexTurn(t *testing.T) {
 	if len(executor.prompts) != 1 {
 		t.Fatalf("executor prompts = %#v, want turn to run", executor.prompts)
 	}
-	if len(sent) != 2 || !strings.Contains(sent[0].Content, "Codex is working") || !strings.Contains(sent[1].Content, "final despite ack failure") {
-		t.Fatalf("ack/final response order mismatch after ack failure: %#v", sent)
+	if requests != 1 {
+		t.Fatalf("requests after first handling = %d, want one immediate 429 without hidden retry", requests)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("sent messages after first handling = %#v, want deferred outbox", sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -17602,11 +17820,42 @@ func TestBridgeAckSendFailureDoesNotBlockCodexTurn(t *testing.T) {
 			final = msg
 		}
 	}
-	if ack.Status != teamstore.OutboxStatusSent || ack.LastSendError != "" {
-		t.Fatalf("ack outbox should be sent before final after retry: %#v", ack)
+	if ack.Status != teamstore.OutboxStatusQueued || !strings.Contains(ack.LastSendError, "TooManyRequests") {
+		t.Fatalf("ack outbox should stay queued with rate-limit error: %#v", ack)
 	}
-	if final.Status != teamstore.OutboxStatusSent {
-		t.Fatalf("final outbox should be sent: %#v", final)
+	if final.Status != teamstore.OutboxStatusQueued || final.LastSendError != "" {
+		t.Fatalf("final outbox should stay queued behind ack: %#v", final)
+	}
+	if limit := state.ChatRateLimits["chat-1"]; !limit.BlockedUntil.After(time.Now()) || limit.PoisonOutboxID != ack.ID {
+		t.Fatalf("chat rate limit not recorded for ack: %#v", state.ChatRateLimits["chat-1"])
+	}
+
+	if err := store.ClearChatRateLimit(context.Background(), "chat-1"); err != nil {
+		t.Fatalf("ClearChatRateLimit error: %v", err)
+	}
+	if err := bridge.flushPendingOutboxForChat(context.Background(), "chat-1"); err != nil {
+		t.Fatalf("flushPendingOutboxForChat after unblock error: %v", err)
+	}
+	if len(sent) != 2 || !strings.Contains(sent[0].Content, "Codex is working") || !strings.Contains(sent[1].Content, "final despite ack failure") {
+		t.Fatalf("ack/final response order mismatch after unblock: %#v", sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after unblock error: %v", err)
+	}
+	for _, msg := range state.OutboxMessages {
+		switch msg.Kind {
+		case "ack":
+			ack = msg
+		case "final":
+			final = msg
+		}
+	}
+	if ack.Status != teamstore.OutboxStatusSent || ack.LastSendError != "" {
+		t.Fatalf("ack outbox should be sent after unblock: %#v", ack)
+	}
+	if final.Status != teamstore.OutboxStatusSent || final.LastSendError != "" {
+		t.Fatalf("final outbox should be sent after unblock: %#v", final)
 	}
 }
 

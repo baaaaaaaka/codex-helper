@@ -111,7 +111,7 @@ func (b *Bridge) downloadHostedContentAttachments(ctx context.Context, session *
 	}
 	var files []LocalAttachment
 	for i, id := range ids {
-		value, err := b.readClient().GetHostedContentValue(ctx, chatID, msg.ID, id)
+		value, err := b.readClient().GetHostedContentValueWithoutRateLimitRetry(ctx, chatID, msg.ID, id)
 		if err != nil {
 			cleanup()
 			return nil, func() {}, "", err
@@ -168,7 +168,7 @@ func (b *Bridge) downloadReferenceFileAttachments(ctx context.Context, session *
 	}
 	var files []LocalAttachment
 	for i, attachment := range refs {
-		value, err := b.readClient().GetSharedDriveItemContent(ctx, attachment.ContentURL)
+		value, err := b.readClient().GetSharedDriveItemContentWithoutRateLimitRetry(ctx, attachment.ContentURL)
 		if err != nil {
 			cleanup()
 			return nil, func() {}, "", err
@@ -213,7 +213,7 @@ func (b *Bridge) readMessageReferenceAttachments(ctx context.Context, chatID str
 		ref := referencedMessageFromAttachment(attachment)
 		if strings.EqualFold(strings.TrimSpace(attachment.ContentType), "messageReference") {
 			if id := strings.TrimSpace(firstNonEmptyString(ref.MessageID, attachment.ID)); id != "" {
-				if fetched, err := b.readClient().GetMessage(ctx, chatID, id); err != nil {
+				if fetched, err := b.readClient().GetMessageWithoutRateLimitRetry(ctx, chatID, id); err != nil {
 					if ref.Text == "" {
 						ref.Text = "Referenced message could not be read from Graph: " + err.Error()
 					}

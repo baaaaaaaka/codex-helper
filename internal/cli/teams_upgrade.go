@@ -594,6 +594,7 @@ func scheduleDelayedTeamsServiceStart(ctx context.Context, pendingReplacePath st
 
 func defaultTeamsServiceStartDetached(_ context.Context, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	configureTeamsServiceDetachedCommand(cmd)
 	return cmd.Start()
 }
 

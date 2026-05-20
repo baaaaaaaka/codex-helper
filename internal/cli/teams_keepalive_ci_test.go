@@ -235,6 +235,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<StartWhenAvailable>true</StartWhenAvailable>",
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
+		"<Hidden>true</Hidden>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
 		"<Interval>PT1M</Interval>",
@@ -285,6 +286,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<RestartOnFailure>",
 		"<Interval>PT1M</Interval>",
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+		"<Hidden>true</Hidden>",
 		spec.Executable,
 		"teams",
 		"service",
@@ -412,19 +414,38 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
 		},
 	}
+	xmlPath := filepath.Join(tmp, "codex-helper-teams-task.xml")
+	watchdogXMLPath := filepath.Join(tmp, "codex-helper-teams-watchdog-task.xml")
+	spec = teamsServiceSpecWithWindowsTaskLaunchers(spec, xmlPath, watchdogXMLPath)
+	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsTaskLauncherPath, spec, buildTeamsServiceRunArgs(spec)); err != nil {
+		t.Fatalf("write Windows task launcher files: %v", err)
+	}
+	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsWatchdogLauncherPath, spec, buildTeamsServiceWatchdogArgs()); err != nil {
+		t.Fatalf("write Windows watchdog launcher files: %v", err)
+	}
 	xml := buildTeamsServiceWindowsTaskXML(spec)
 	if strings.Contains(xml, "<?xml") || strings.Contains(strings.ToLower(xml), "encoding=") {
 		t.Fatalf("Windows Task Scheduler XML is passed as a PowerShell string and must not declare an encoding:\n%s", xml)
+	}
+	if !strings.Contains(xml, "<Hidden>true</Hidden>") || !strings.Contains(xml, "<Command>wscript.exe</Command>") || !strings.Contains(xml, "//B //Nologo") {
+		t.Fatalf("Windows Task Scheduler XML should use hidden wscript launcher:\n%s", xml)
+	}
+	if strings.Contains(xml, "<Command>powershell.exe</Command>") || strings.Contains(xml, "-WindowStyle Hidden -Command") {
+		t.Fatalf("Windows Task Scheduler XML should not run PowerShell directly:\n%s", xml)
 	}
 	watchdogXML := buildTeamsServiceWindowsWatchdogTaskXML(spec)
 	if strings.Contains(watchdogXML, "<?xml") || strings.Contains(strings.ToLower(watchdogXML), "encoding=") {
 		t.Fatalf("Windows watchdog Task Scheduler XML is passed as a PowerShell string and must not declare an encoding:\n%s", watchdogXML)
 	}
-	xmlPath := filepath.Join(tmp, "codex-helper-teams-task.xml")
+	if !strings.Contains(watchdogXML, "<Hidden>true</Hidden>") || !strings.Contains(watchdogXML, "<Command>wscript.exe</Command>") || !strings.Contains(watchdogXML, "//B //Nologo") {
+		t.Fatalf("Windows watchdog Task Scheduler XML should use hidden wscript launcher:\n%s", watchdogXML)
+	}
+	if strings.Contains(watchdogXML, "<Command>powershell.exe</Command>") || strings.Contains(watchdogXML, "-WindowStyle Hidden -Command") {
+		t.Fatalf("Windows watchdog Task Scheduler XML should not run PowerShell directly:\n%s", watchdogXML)
+	}
 	if err := os.WriteFile(xmlPath, []byte(xml), 0o600); err != nil {
 		t.Fatalf("write Windows task XML: %v", err)
 	}
-	watchdogXMLPath := filepath.Join(tmp, "codex-helper-teams-watchdog-task.xml")
 	if err := os.WriteFile(watchdogXMLPath, []byte(watchdogXML), 0o600); err != nil {
 		t.Fatalf("write Windows watchdog task XML: %v", err)
 	}
@@ -443,7 +464,15 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 		"$registered = Get-ScheduledTask -TaskName $task -ErrorAction Stop; " +
 		"$registeredWatchdog = Get-ScheduledTask -TaskName $watchdogTask -ErrorAction Stop; " +
 		"if ($registered.TaskName -ne $task) { throw 'registered task name mismatch' }; " +
-		"if ($registeredWatchdog.TaskName -ne $watchdogTask) { throw 'registered watchdog task name mismatch' } " +
+		"if ($registeredWatchdog.TaskName -ne $watchdogTask) { throw 'registered watchdog task name mismatch' }; " +
+		"if ($registered.Settings.Hidden -ne $true) { throw 'registered bridge task is not hidden' }; " +
+		"if ($registeredWatchdog.Settings.Hidden -ne $true) { throw 'registered watchdog task is not hidden' }; " +
+		"$action = @($registered.Actions)[0]; " +
+		"$watchdogAction = @($registeredWatchdog.Actions)[0]; " +
+		"if ($action.Execute -ne 'wscript.exe') { throw ('bridge action execute mismatch: ' + $action.Execute) }; " +
+		"if ($watchdogAction.Execute -ne 'wscript.exe') { throw ('watchdog action execute mismatch: ' + $watchdogAction.Execute) }; " +
+		"if ($action.Arguments -notlike '*//B*//Nologo*codex-helper-teams-task.vbs*') { throw ('bridge action arguments mismatch: ' + $action.Arguments) }; " +
+		"if ($watchdogAction.Arguments -notlike '*//B*//Nologo*codex-helper-teams-watchdog-task.vbs*') { throw ('watchdog action arguments mismatch: ' + $watchdogAction.Arguments) } " +
 		"} finally { " +
 		"Unregister-ScheduledTask -TaskName $watchdogTask -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; " +
 		"Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue | Out-Null " +
@@ -571,6 +600,7 @@ func TestTeamsBackgroundKeepaliveWindowsTaskXMLLogonAndSelfRecoveryCI(t *testing
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<StartWhenAvailable>true</StartWhenAvailable>",
 		"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
+		"<Hidden>true</Hidden>",
 		"<Enabled>false</Enabled>",
 		"<RestartOnFailure>",
 		"<Interval>PT1M</Interval>",
@@ -657,6 +687,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"$expectedActionExecute = " + powershellSingleQuote(actionExecute),
 		"$expectedActionExecute = " + powershellSingleQuote(watchdogExecute),
 		"New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument",
+		"-Hidden",
 		"$expectedActionArgument = '//B //Nologo",
 		"wscript.exe",
 		launcherStem + ".ps1",
@@ -679,6 +710,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"-RedirectStandardError $stderrLog",
 		"New-ScheduledTaskTrigger -AtLogOn",
 		"New-ScheduledTaskSettingsSet",
+		"-Hidden",
 		"MultipleInstances IgnoreNew",
 		"ExecutionTimeLimit (New-TimeSpan -Seconds 0)",
 		"RestartCount 999",
@@ -926,6 +958,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigMatchChecksFullTaskShapeCI(t *test
 		"$settings.RestartCount -ne 999",
 		"$settings.RestartInterval 1",
 		"$settings.ExecutionTimeLimit 0",
+		"$settings.Hidden -ne $true",
 		"$hasLogonTrigger",
 		"$className -like '*LogonTrigger*'",
 		"$hasRepeatingTrigger",

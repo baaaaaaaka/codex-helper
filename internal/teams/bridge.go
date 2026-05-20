@@ -850,6 +850,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 				return err
 			}
 		}
+		if controlDecision.State == inboundPollStateBlocked && controlDecision.BlockedUntil.After(time.Now()) {
+			return nil
+		}
 	} else {
 		controlHandled, err := b.pollChatWithRoleState(ctx, b.reg.ControlChatID, top, inboundPollRoleControl, false, controlPoll, hasControlPoll, b.handleControlMessage)
 		if err != nil {
@@ -1050,9 +1053,9 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 	)
 	useContinuation := seeded && role != inboundPollRoleControl && strings.TrimSpace(poll.ContinuationPath) != ""
 	if useContinuation {
-		window, err = b.readClient().ListMessagesWindowFromPath(ctx, poll.ContinuationPath)
+		window, err = b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, poll.ContinuationPath)
 	} else {
-		window, err = b.readClient().ListMessagesWindow(ctx, chatID, top, modifiedAfter)
+		window, err = b.readClient().ListMessagesWindowWithoutRateLimitRetry(ctx, chatID, top, modifiedAfter)
 	}
 	if err != nil {
 		_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
@@ -1084,7 +1087,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
 		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
 		if err != nil {
-			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return handled, err
 		}
 		if ignore {
@@ -1102,7 +1105,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		}
 		globalClaim, claimed, err := b.tryClaimGlobalInbound(ctx, chatID, msg.ID)
 		if err != nil {
-			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return handled, err
 		}
 		if !claimed {
@@ -1112,7 +1115,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		if b.currentLeaseGeneration() > 0 {
 			if err := b.ensureActiveControlLease(ctx); err != nil {
 				releaseGlobalInbound(ctx, globalClaim)
-				_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+				b.recordChatPollHandlerError(ctx, chatID, poll, err)
 				return handled, err
 			}
 		}
@@ -1127,12 +1130,12 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 				continue
 			}
 			releaseGlobalInbound(ctx, globalClaim)
-			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return handled, err
 		}
 		b.reg.MarkSeen(chatID, msg.ID)
 		if err := completeGlobalInbound(ctx, globalClaim); err != nil {
-			_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return handled, err
 		}
 		b.annotateIncomingUserMessage(ctx, chatID, msg)
@@ -1155,6 +1158,17 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		activityAt = time.Now()
 	}
 	return handled, b.scheduleChatAfterPoll(ctx, chatID, role, running, updated, activityAt)
+}
+
+func (b *Bridge) recordChatPollHandlerError(ctx context.Context, chatID string, poll teamstore.ChatPollState, err error) {
+	if b == nil || b.store == nil || err == nil {
+		return
+	}
+	if isGraphRateLimitError(err) {
+		_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
+		return
+	}
+	_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 }
 
 func legacyGeneratedMessageFallbackAllowed(msg ChatMessage, poll teamstore.ChatPollState, hasPoll bool) bool {
@@ -1496,7 +1510,7 @@ func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, chatID s
 	if b == nil || b.graph == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(noticeHTML) == "" {
 		return false, nil
 	}
-	messages, err := b.readGraph.ListMessages(ctx, chatID, 50)
+	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, 50)
 	if err != nil {
 		return false, err
 	}
@@ -1633,7 +1647,7 @@ func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID strin
 	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(resumeCommand) == "" {
 		return false
 	}
-	messages, err := b.readGraph.ListMessages(ctx, chatID, 50)
+	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, 50)
 	if err != nil {
 		return false
 	}
@@ -4440,7 +4454,7 @@ func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, 
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: false}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams control ACK send error: %v\n", err)
 	}
 	return nil
@@ -4980,7 +4994,7 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 	if !ok || inbound.TeamsMessageID == "" {
 		return b.sendToChat(ctx, session.ChatID, "retry cannot find the original Teams message for "+turn.ID)
 	}
-	msg, err := b.readClient().GetMessage(ctx, inbound.TeamsChatID, inbound.TeamsMessageID)
+	msg, err := b.readClient().GetMessageWithoutRateLimitRetry(ctx, inbound.TeamsChatID, inbound.TeamsMessageID)
 	if err != nil {
 		return b.sendToChat(ctx, session.ChatID, "retry failed while reading the original Teams message: "+err.Error())
 	}
@@ -5279,7 +5293,7 @@ func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, sess
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: false}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams ACK send error: %v\n", err)
 	}
 	return nil
@@ -5441,7 +5455,7 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 		runInput := ExecutionInput{}
 		cleanupPrompt := func() {}
 		if inbound.Source == "teams_session_import_deferred_attachment" && strings.TrimSpace(inbound.TeamsChatID) != "" && strings.TrimSpace(inbound.TeamsMessageID) != "" {
-			if msg, err := b.readClient().GetMessage(ctx, inbound.TeamsChatID, inbound.TeamsMessageID); err == nil {
+			if msg, err := b.readClient().GetMessageWithoutRateLimitRetry(ctx, inbound.TeamsChatID, inbound.TeamsMessageID); err == nil {
 				prepared, cleanup, warning, err := b.prepareSessionPromptFromTeamsMessage(ctx, session, inbound.TeamsChatID, msg, text)
 				if err != nil {
 					cleanup()
@@ -5858,7 +5872,7 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 			Body:        "queued turn could not be recovered because the original Teams message is missing: " + turn.ID,
 		})
 	}
-	msg, err := b.readClient().GetMessage(ctx, inbound.TeamsChatID, inbound.TeamsMessageID)
+	msg, err := b.readClient().GetMessageWithoutRateLimitRetry(ctx, inbound.TeamsChatID, inbound.TeamsMessageID)
 	if err != nil {
 		return err
 	}
@@ -7072,7 +7086,13 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	}
 	if len(queued) > 0 {
 		if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
-			return err
+			if isOutboxDeliveryDeferred(err) || isGraphRateLimitError(err) {
+				if b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams final outbox delivery deferred: %v\n", err)
+				}
+			} else {
+				return err
+			}
 		}
 		b.boostPolling(time.Now())
 	}
@@ -8057,7 +8077,7 @@ func (b *Bridge) sendExternalDeferredReceipt(ctx context.Context, chatID string,
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: false}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams external receipt send error: %v\n", err)
 	}
 	return nil
@@ -9048,6 +9068,9 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return err
 	}
 	if recovered, err := b.recoverAcceptedOutboxFromGraph(ctx, outbox, opts); recovered || err != nil {
+		if err != nil && opts.RecordRateLimit {
+			b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
+		}
 		return err
 	}
 	if opts.RespectRateLimitBlock {
@@ -9069,6 +9092,9 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		item, err := b.uploadQueuedOutboxAttachment(ctx, outbox)
 		if err != nil {
 			_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
+			if opts.RecordRateLimit {
+				b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
+			}
 			return err
 		}
 		outbox, err = b.store.MarkOutboxDriveItem(ctx, outbox.ID, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
@@ -9080,6 +9106,9 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		item, err := b.refreshOutboxDriveItemMetadata(ctx, outbox)
 		if err != nil {
 			_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
+			if opts.RecordRateLimit {
+				b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
+			}
 			return err
 		}
 		outbox, err = b.store.MarkOutboxDriveItem(ctx, outbox.ID, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
@@ -9090,15 +9119,15 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	var msg ChatMessage
 	var err error
 	if outbox.DriveItemID != "" {
-		msg, err = b.graph.SendDriveItemAttachment(ctx, outbox.TeamsChatID, driveItemFromOutbox(outbox), outbox.Body)
+		msg, err = b.graph.SendDriveItemAttachmentWithoutRateLimitRetry(ctx, outbox.TeamsChatID, driveItemFromOutbox(outbox), outbox.Body)
 	} else if outbox.MentionOwner {
 		body, mentions := renderOutboxMentionHTML(outbox, b.user)
-		msg, err = b.graph.SendHTMLWithMentions(ctx, outbox.TeamsChatID, body, mentions)
+		msg, err = b.graph.SendHTMLWithMentionsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions)
 	} else if user, ok := outboxMentionUser(outbox); ok {
 		body, mentions := renderOutboxUserMentionHTML(outbox, user)
-		msg, err = b.graph.SendHTMLWithMentions(ctx, outbox.TeamsChatID, body, mentions)
+		msg, err = b.graph.SendHTMLWithMentionsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions)
 	} else {
-		msg, err = b.graph.SendHTML(ctx, outbox.TeamsChatID, renderOutboxHTML(outbox))
+		msg, err = b.graph.SendHTMLWithoutRateLimitRetry(ctx, outbox.TeamsChatID, renderOutboxHTML(outbox))
 	}
 	if err != nil {
 		_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
@@ -9130,7 +9159,7 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 	if strings.TrimSpace(outbox.TeamsMessageID) != "" || outbox.LastSendAttempt.IsZero() {
 		return false, nil
 	}
-	messages, err := b.readClient().ListMessages(ctx, outbox.TeamsChatID, 50)
+	messages, err := b.readClient().ListMessagesWithoutRateLimitRetry(ctx, outbox.TeamsChatID, 50)
 	if err != nil {
 		return true, err
 	}
@@ -9208,7 +9237,7 @@ func (b *Bridge) markChatUnreadForSentAnswer(ctx context.Context, outbox teamsto
 	if !readAt.IsZero() {
 		readAt = readAt.Add(-time.Millisecond)
 	}
-	if err := b.graph.MarkChatUnreadForUser(ctx, outbox.TeamsChatID, b.user, readAt); err != nil {
+	if err := b.graph.MarkChatUnreadForUserWithoutRateLimitRetry(ctx, outbox.TeamsChatID, b.user, readAt); err != nil {
 		if b.out != nil && !b.markAnswerUnreadWarned {
 			_, _ = fmt.Fprintf(b.out, "Teams mark-unread after Codex answer failed: %v\n", err)
 			b.markAnswerUnreadWarned = true
@@ -9225,7 +9254,19 @@ func (b *Bridge) uploadQueuedOutboxAttachment(ctx context.Context, outbox teamst
 	if err != nil {
 		return DriveItem{}, err
 	}
-	return UploadOutboundAttachment(ctx, graph, file, opts)
+	uploadFolder := strings.TrimSpace(opts.UploadFolder)
+	if uploadFolder == "" {
+		uploadFolder = defaultOutboundUploadFolder
+	}
+	item, err := graph.UploadSmallDriveItemWithoutRateLimitRetry(ctx, uploadFolder, file.UploadName, file.Bytes, file.ContentType)
+	if err != nil {
+		return DriveItem{}, err
+	}
+	meta, err := graph.GetDriveItemMetadataWithoutRateLimitRetry(ctx, item.ID)
+	if err != nil {
+		return DriveItem{}, err
+	}
+	return meta, nil
 }
 
 func (b *Bridge) refreshOutboxDriveItemMetadata(ctx context.Context, outbox teamstore.OutboxMessage) (DriveItem, error) {
@@ -9233,7 +9274,7 @@ func (b *Bridge) refreshOutboxDriveItemMetadata(ctx context.Context, outbox team
 	if err != nil {
 		return DriveItem{}, fmt.Errorf("Teams file attachment metadata refresh failed: %w", err)
 	}
-	item, err := graph.GetDriveItemMetadata(ctx, strings.TrimSpace(outbox.DriveItemID))
+	item, err := graph.GetDriveItemMetadataWithoutRateLimitRetry(ctx, strings.TrimSpace(outbox.DriveItemID))
 	if err != nil {
 		return DriveItem{}, fmt.Errorf("Teams file attachment metadata refresh failed: %w", err)
 	}

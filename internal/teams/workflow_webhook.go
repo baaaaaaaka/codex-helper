@@ -56,6 +56,18 @@ func workflowWebhookDeliveryUncertain(err error) bool {
 }
 
 func PostWorkflowWebhook(ctx context.Context, client *http.Client, webhookURL string, msg WorkflowWebhookMessage) (WorkflowWebhookResult, error) {
+	return postWorkflowWebhookWithOptions(ctx, client, webhookURL, msg, workflowWebhookOptions{})
+}
+
+func PostWorkflowWebhookWithoutRateLimitRetry(ctx context.Context, client *http.Client, webhookURL string, msg WorkflowWebhookMessage) (WorkflowWebhookResult, error) {
+	return postWorkflowWebhookWithOptions(ctx, client, webhookURL, msg, workflowWebhookOptions{returnRateLimitWithoutRetry: true})
+}
+
+type workflowWebhookOptions struct {
+	returnRateLimitWithoutRetry bool
+}
+
+func postWorkflowWebhookWithOptions(ctx context.Context, client *http.Client, webhookURL string, msg WorkflowWebhookMessage, opts workflowWebhookOptions) (WorkflowWebhookResult, error) {
 	webhookURL = strings.TrimSpace(webhookURL)
 	if webhookURL == "" {
 		return WorkflowWebhookResult{}, fmt.Errorf("webhook URL is required")
@@ -91,7 +103,7 @@ func PostWorkflowWebhook(ctx context.Context, client *http.Client, webhookURL st
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return last, nil
 		}
-		if resp.StatusCode != http.StatusTooManyRequests || attempt == workflowWebhookRetries-1 {
+		if resp.StatusCode != http.StatusTooManyRequests || opts.returnRateLimitWithoutRetry || attempt == workflowWebhookRetries-1 {
 			retryable := resp.StatusCode == http.StatusTooManyRequests
 			uncertain := resp.StatusCode >= 500 && resp.StatusCode <= 599
 			return last, WorkflowWebhookError{

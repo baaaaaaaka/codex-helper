@@ -836,10 +836,12 @@ func uninstallTeamsService(ctx context.Context) (string, error) {
 }
 
 type teamsServiceSpec struct {
-	Executable   string
-	WorkingDir   string
-	RegistryPath string
-	Environment  map[string]string
+	Executable                  string
+	WorkingDir                  string
+	RegistryPath                string
+	Environment                 map[string]string
+	WindowsTaskLauncherPath     string
+	WindowsWatchdogLauncherPath string
 }
 
 type teamsServiceBackend interface {
@@ -1390,11 +1392,18 @@ func (b teamsServiceWindowsTaskBackend) Install(ctx context.Context, spec teamsS
 	if err := os.MkdirAll(filepath.Dir(xmlPath), 0o700); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(xmlPath, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
-		return "", err
-	}
 	watchdogXMLPath, err := teamsServiceWindowsWatchdogTaskXMLPath()
 	if err != nil {
+		return "", err
+	}
+	spec = teamsServiceSpecWithWindowsTaskLaunchers(spec, xmlPath, watchdogXMLPath)
+	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsTaskLauncherPath, spec, buildTeamsServiceRunArgs(spec)); err != nil {
+		return "", err
+	}
+	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsWatchdogLauncherPath, spec, buildTeamsServiceWatchdogArgs()); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(xmlPath, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(watchdogXMLPath, []byte(buildTeamsServiceWindowsWatchdogTaskXML(spec)), 0o600); err != nil {
@@ -1428,6 +1437,7 @@ func (b teamsServiceWindowsTaskBackend) Uninstall(ctx context.Context) (string, 
 			return "", err
 		}
 	}
+	removeTeamsServiceWindowsTaskLauncherFiles()
 	return xmlPath, nil
 }
 
@@ -2790,7 +2800,10 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 	args := buildTeamsServiceRunArgs(spec)
 	command := spec.Executable
 	arguments := windowsCommandLine(args)
-	if len(spec.Environment) > 0 {
+	if launcher := strings.TrimSpace(spec.WindowsTaskLauncherPath); launcher != "" {
+		command = "wscript.exe"
+		arguments = windowsCommandLine([]string{"//B", "//Nologo", launcher})
+	} else if len(spec.Environment) > 0 {
 		command = "powershell.exe"
 		arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command " + windowsQuoteArg(buildTeamsServiceWindowsPowerShell(spec, args))
 	}
@@ -2821,6 +2834,7 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n")
 	b.WriteString("    <StartWhenAvailable>true</StartWhenAvailable>\n")
 	b.WriteString("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n")
+	b.WriteString("    <Hidden>true</Hidden>\n")
 	b.WriteString("    <Enabled>false</Enabled>\n")
 	b.WriteString("    <RestartOnFailure>\n")
 	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "M</Interval>\n")
@@ -2842,7 +2856,10 @@ func buildTeamsServiceWindowsWatchdogTaskXML(spec teamsServiceSpec) string {
 	args := buildTeamsServiceWatchdogArgs()
 	command := spec.Executable
 	arguments := windowsCommandLine(args)
-	if len(spec.Environment) > 0 {
+	if launcher := strings.TrimSpace(spec.WindowsWatchdogLauncherPath); launcher != "" {
+		command = "wscript.exe"
+		arguments = windowsCommandLine([]string{"//B", "//Nologo", launcher})
+	} else if len(spec.Environment) > 0 {
 		command = "powershell.exe"
 		arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command " + windowsQuoteArg(buildTeamsServiceWindowsPowerShell(spec, args))
 	}
@@ -2882,6 +2899,7 @@ func buildTeamsServiceWindowsWatchdogTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n")
 	b.WriteString("    <StartWhenAvailable>true</StartWhenAvailable>\n")
 	b.WriteString("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n")
+	b.WriteString("    <Hidden>true</Hidden>\n")
 	b.WriteString("    <Enabled>false</Enabled>\n")
 	b.WriteString("    <RestartOnFailure>\n")
 	b.WriteString("      <Interval>PT" + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "M</Interval>\n")
@@ -2922,6 +2940,61 @@ func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
 		args = append(args, "--registry", spec.RegistryPath)
 	}
 	return args
+}
+
+func teamsServiceSpecWithWindowsTaskLaunchers(spec teamsServiceSpec, bridgeXMLPath string, watchdogXMLPath string) teamsServiceSpec {
+	if strings.TrimSpace(spec.WindowsTaskLauncherPath) == "" {
+		spec.WindowsTaskLauncherPath = strings.TrimSuffix(bridgeXMLPath, filepath.Ext(bridgeXMLPath)) + ".vbs"
+	}
+	if strings.TrimSpace(spec.WindowsWatchdogLauncherPath) == "" {
+		spec.WindowsWatchdogLauncherPath = strings.TrimSuffix(watchdogXMLPath, filepath.Ext(watchdogXMLPath)) + ".vbs"
+	}
+	return spec
+}
+
+func writeTeamsServiceWindowsTaskLauncherFiles(vbsPath string, spec teamsServiceSpec, args []string) error {
+	vbsPath = strings.TrimSpace(vbsPath)
+	if vbsPath == "" {
+		return nil
+	}
+	psPath := strings.TrimSuffix(vbsPath, filepath.Ext(vbsPath)) + ".ps1"
+	if err := os.MkdirAll(filepath.Dir(vbsPath), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(psPath, []byte(buildTeamsServiceWindowsPowerShell(spec, args)), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(vbsPath, []byte(buildTeamsServiceWindowsTaskLauncherVBS(psPath)), 0o600)
+}
+
+func removeTeamsServiceWindowsTaskLauncherFiles() {
+	dir, err := teamsServiceWindowsTaskXMLDir()
+	if err != nil {
+		return
+	}
+	for _, name := range []string{
+		"codex-helper-teams-task.ps1",
+		"codex-helper-teams-task.vbs",
+		"codex-helper-teams-watchdog-task.ps1",
+		"codex-helper-teams-watchdog-task.vbs",
+	} {
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
+func buildTeamsServiceWindowsTaskLauncherVBS(psPath string) string {
+	psPath = strings.ReplaceAll(psPath, `"`, `""`)
+	lines := []string{
+		"Function Q(s)",
+		"  Q = Chr(34) & s & Chr(34)",
+		"End Function",
+		"Set shell = CreateObject(\"WScript.Shell\")",
+		"ps = shell.ExpandEnvironmentStrings(\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\")",
+		"cmd = Q(ps) & \" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \" & Q(\"" + psPath + "\")",
+		"code = shell.Run(cmd, 0, True)",
+		"WScript.Quit code",
+	}
+	return strings.Join(lines, "\r\n")
 }
 
 func buildTeamsServiceWSLWatchdogArguments(spec teamsServiceSpec) []string {
@@ -2974,7 +3047,7 @@ func buildTeamsServiceWSLRegisterCommand(taskName string, args []string, opts te
 			buildTeamsServiceWSLTaskLauncherSetupPowerShell(taskName, args) +
 			"$action = New-ScheduledTaskAction -Execute $expectedActionExecute -Argument $expectedActionArgument; " +
 			"$logon = New-ScheduledTaskTrigger -AtLogOn; " +
-			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "); " +
+			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount " + strconv.Itoa(teamsServiceTaskRestartCount) + " -RestartInterval (New-TimeSpan -Minutes " + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + "); " +
 			"$principalUser = " + principalUser + "; " +
 			"$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited; " +
 			"Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $logon -Settings $settings -Principal $principal -Force | Out-Null; " +
@@ -3035,7 +3108,8 @@ func buildTeamsServiceWSLTaskConfigMatchesCommand(taskName string, args []string
 		"$settings = $task.Settings; " +
 		"if ($null -eq $settings -or $settings.MultipleInstances -ne 'IgnoreNew' -or $settings.RestartCount -ne " + strconv.Itoa(teamsServiceTaskRestartCount) +
 		" -or -not (Test-CodexHelperTaskDurationMinutes $settings.RestartInterval " + strconv.Itoa(teamsServiceTaskSchedulerRestartMinutes) + ")" +
-		" -or -not (Test-CodexHelperTaskDurationMinutes $settings.ExecutionTimeLimit 0)) { $allMatched = $false }; " +
+		" -or -not (Test-CodexHelperTaskDurationMinutes $settings.ExecutionTimeLimit 0)" +
+		" -or $settings.Hidden -ne $true) { $allMatched = $false }; " +
 		"$hasLogonTrigger = $false; $hasRepeatingTrigger = $false; " +
 		"foreach ($trigger in @($task.Triggers)) { " +
 		"$className = ''; if ($null -ne $trigger.CimClass) { $className = [string]$trigger.CimClass.CimClassName }; " +
