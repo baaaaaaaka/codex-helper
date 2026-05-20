@@ -320,7 +320,7 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 			event.Hint = "Open the work chat and retry the request when ready."
 		}
 		event.ButtonTitle = "Open chat"
-	case workflowOutboxNeedsAttention(kind):
+	case notificationKind == "needs_attention" || workflowOutboxNeedsAttention(kind):
 		event.Kind = "needs_attention"
 		event.Title = "⚠️ Codex needs attention"
 		event.Hint = "Open the work chat to retry or check what happened."
@@ -426,10 +426,39 @@ func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event Workf
 	if err := b.queueWorkflowNotification(ctx, event); err != nil {
 		return err
 	}
-	if err := b.flushPendingWorkflowNotifications(ctx); err != nil && b.out != nil {
-		_, _ = fmt.Fprintf(b.out, "Teams workflow notification send error: %v\n", err)
+	if err := b.flushPendingWorkflowNotifications(ctx); err != nil {
+		if fallbackErr := b.queueWorkflowNotificationFallbackForDefiniteSendFailure(ctx, event, err); fallbackErr != nil {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams workflow fallback queue error: %v\n", fallbackErr)
+			}
+		}
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow notification send error: %v\n", err)
+		}
 	}
 	return nil
+}
+
+func (b *Bridge) queueWorkflowNotificationFallbackForDefiniteSendFailure(ctx context.Context, event WorkflowNotificationEvent, sendErr error) error {
+	if b == nil || b.store == nil || strings.TrimSpace(event.ID) == "" {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	rec, ok := state.Notifications[event.ID]
+	if !ok || rec.Status != teamstore.NotificationStatusFailed || rec.LastErrorRetryable || rec.DeliveryUncertain {
+		return nil
+	}
+	reason := strings.TrimSpace(rec.LastError)
+	if reason == "" && sendErr != nil {
+		reason = redactWorkflowNotificationError(sendErr)
+	}
+	if reason != "" {
+		reason = "Workflow card send failed: " + reason
+	}
+	return b.queueWorkflowNotificationFallbackMention(ctx, state, event, reason)
 }
 
 func (b *Bridge) queueWorkflowNotificationFallbackMention(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent, reason string) error {

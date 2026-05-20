@@ -2450,6 +2450,13 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 	})
 }
 
+func (s *Store) SuppressOutboxOwnerMention(ctx context.Context, outboxID string) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		msg.MentionOwner = false
+		return msg, nil
+	})
+}
+
 func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, error) {
 	chatID := strings.TrimSpace(msg.TeamsChatID)
 	if chatID == "" || msg.Sequence <= 0 {

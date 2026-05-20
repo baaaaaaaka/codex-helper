@@ -291,8 +291,9 @@ changes apply to future turns without reloading the Teams helper. Managed
 Slurm/LSF adapters use your default user shell environment by default, so site
 setup from modules, `submit_job`, NSS, or `SUBMIT_ACCOUNT` is available without
 copying those variables into the helper service. Add `--adapter-shell direct`
-only when an adapter needs the older clean service environment. To start from a
-site-editable Slurm or LSF wrapper, print a template:
+when `$SHELL -lic` is incompatible (for example tcsh/csh) or an adapter needs
+the clean helper service environment. To start from a site-editable Slurm or LSF
+wrapper, print a template:
 
 ```bash
 codex-proxy beacon provider template slurm > ~/bin/cxp-beacon-slurm-adapter
@@ -329,6 +330,25 @@ or key-value output such as
 The generated Slurm/LSF templates include `query`, `submit`, `cancel`, and a
 site-policy `renew` stub that exits non-zero until edited; implement the renew
 case when the scheduler exposes walltime extension.
+
+Beacon adapter troubleshooting:
+
+- `exit 127` from the scheduler job often means the submitted command was
+  malformed or PATH is different inside the allocation. Keep exactly one `exec`
+  in the final worker command; if a site wrapper already prepends `exec`, remove
+  the extra one from the adapter.
+- `allocation request ... not found` inside the worker usually means the worker
+  is using the wrong state file. Custom Slurm/LSF submit adapters must accept
+  `--shared-store` and pass it to the worker as
+  `cxp beacon --store <shared-store> worker ...`.
+- If `$SHELL -lic` fails under tcsh/csh, update the profile with
+  `--adapter-shell direct`; profile revisions apply to future turns.
+- If worker doctor reports `missing codex`, set scheduler PATH or pass worker
+  `--codex-path <codex-or-wrapper>` from the adapter. A wrapper is the right
+  place to add Codex exec flags such as `--skip-git-repo-check`; Teams service
+  `--codex-arg` settings do not automatically reach remote beacon workers. The
+  generated templates honor `CXP_BEACON_CODEX_BIN` by passing it as worker
+  `--codex-path`.
 
 The active Teams helper owner periodically queries existing provider jobs,
 projects scheduler state back into beacon machines/jobs, and renews allocations

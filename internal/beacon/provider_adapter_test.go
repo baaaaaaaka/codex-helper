@@ -453,6 +453,7 @@ func TestBeaconProviderEnvironmentVariablesStayDocumented(t *testing.T) {
 		BeaconLSFCancelCommandEnv,
 		BeaconLSFRenewCommandEnv,
 		BeaconProviderShellModeEnv,
+		"CXP_BEACON_CODEX_BIN",
 	}
 	files := map[string]string{
 		"README":        filepath.Join("..", "..", "README.md"),

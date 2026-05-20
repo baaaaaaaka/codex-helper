@@ -805,8 +805,8 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 	for _, want := range []string{
 		"Codex is working. Request accepted.",
 		"⚠️ Your request is queued.",
-		"Running now:",
-		"Queued requests:",
+		"▶️ Running now:",
+		"⏳ Queued requests:",
 		"first prompt",
 		"second prompt",
 		"helper cancel last",
@@ -1260,14 +1260,14 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 	}
 	requirePlainTextInOrder(t, joined,
 		"Your request is queued.",
-		"Running now:",
+		"▶️ Running now:",
 		"first prompt",
-		"Queued requests:",
+		"⏳ Queued requests:",
 		"second prompt",
 		"Your request is queued.",
-		"Running now:",
+		"▶️ Running now:",
 		"first prompt",
-		"Queued requests:",
+		"⏳ Queued requests:",
 		"second prompt",
 		"third prompt",
 	)
@@ -1307,15 +1307,15 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 	}
 	requirePlainTextInOrder(t, joined,
 		"Codex is starting this queued request.",
-		"Now running:",
+		"▶️ Now running:",
 		"second prompt",
-		"Still queued:",
+		"⏳ Still queued:",
 		"third prompt",
 		"done 2",
 		"Codex is starting this queued request.",
-		"Now running:",
+		"▶️ Now running:",
 		"third prompt",
-		"Still queued:",
+		"⏳ Still queued:",
 		"No other queued requests.",
 		"done 3",
 	)
@@ -7657,10 +7657,10 @@ func TestBridgeSessionTurnQueueSnapshotListsRunningAndQueuedInExecutionOrder(t *
 
 	joined := strings.Join(formatSessionTurnQueueSnapshot(state, "s001", "fallback blocker"), "\n")
 	requirePlainTextInOrder(t, joined,
-		"Running now:",
+		"▶️ Running now:",
 		"running older prompt",
 		"running newer prompt",
-		"Queued requests:",
+		"⏳ Queued requests:",
 		"queued first prompt",
 		"queued second prompt",
 	)
@@ -7682,7 +7682,7 @@ func TestBridgeSessionTurnQueueSnapshotListsRunningAndQueuedInExecutionOrder(t *
 	requirePlainTextInOrder(t, joined,
 		"Currently blocking:",
 		"local CLI blocker",
-		"Queued requests:",
+		"⏳ Queued requests:",
 		"queued first prompt",
 		"queued second prompt",
 	)

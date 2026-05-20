@@ -2635,7 +2635,7 @@ func controlAdvancedHelpText() string {
 		"- `beacon list` - list beacon profiles and machines",
 		"- `beacon profile create <name> ...` - create a draft beacon profile",
 		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
-		"- Slurm/LSF adapters use your normal shell setup by default; add `--adapter-shell direct` only for a clean service environment",
+		"- Slurm/LSF adapters use your normal shell setup by default; add `--adapter-shell direct` when user-shell capture is incompatible or a clean service environment is required",
 		"- `beacon profile update <name> ...` - create a new profile revision",
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>` - inspect, restore, and prune revisions",
 		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",
@@ -5222,7 +5222,7 @@ func formatSessionTurnQueueSnapshot(state teamstore.State, sessionID string, blo
 	running := runningTurnsForSessionState(state, sessionID)
 	queued := queuedTurnsForSessionState(state, sessionID)
 	if len(running) > 0 {
-		lines = append(lines, "**Running now:**")
+		lines = append(lines, "**▶️ Running now:**")
 		lines = append(lines, formatTurnPromptList(state, running)...)
 	} else if strings.TrimSpace(blockingFallback) != "" {
 		lines = append(lines, "**Currently blocking:**", strings.TrimSpace(blockingFallback))
@@ -5231,7 +5231,7 @@ func formatSessionTurnQueueSnapshot(state teamstore.State, sessionID string, blo
 		if len(lines) > 0 {
 			lines = append(lines, "")
 		}
-		lines = append(lines, "**Queued requests:**")
+		lines = append(lines, "**⏳ Queued requests:**")
 		lines = append(lines, formatTurnPromptList(state, queued)...)
 	}
 	return lines
@@ -7323,12 +7323,12 @@ func (b *Bridge) formatQueuedTurnStartNotice(ctx context.Context, sessionID stri
 	lines := []string{
 		"▶️ **Codex is starting this queued request.**",
 		"",
-		"**Now running:**",
+		"**▶️ Now running:**",
 		current,
 		"",
 		"---",
 		"",
-		"**Still queued:**",
+		"**⏳ Still queued:**",
 	}
 	if len(remaining) == 0 {
 		lines = append(lines, "No other queued requests.")
@@ -8823,6 +8823,7 @@ func (b *Bridge) queueTranscriptDeliveryChunksWithOptions(ctx context.Context, s
 		if msg.NotificationKind == "" && msg.MentionOwner {
 			msg.NotificationKind = "owner_notification"
 		}
+		msg = b.prepareOutboxForQueue(ctx, msg)
 		queuedMsg, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
 			Message:  msg,
 			Delivery: delivery,
@@ -8867,6 +8868,18 @@ func (b *Bridge) queueOutbox(ctx context.Context, msg teamstore.OutboxMessage) (
 	if err := b.ensureStore(); err != nil {
 		return teamstore.OutboxMessage{}, err
 	}
+	msg = b.prepareOutboxForQueue(ctx, msg)
+	queued, created, err := b.store.QueueOutbox(ctx, msg)
+	if err != nil {
+		return teamstore.OutboxMessage{}, err
+	}
+	if created {
+		b.recordControlChatHelperMessage(ctx, queued)
+	}
+	return queued, nil
+}
+
+func (b *Bridge) prepareOutboxForQueue(ctx context.Context, msg teamstore.OutboxMessage) teamstore.OutboxMessage {
 	if msg.ScopeID == "" {
 		msg.ScopeID = b.scope.ID
 	}
@@ -8876,17 +8889,31 @@ func (b *Bridge) queueOutbox(ctx context.Context, msg teamstore.OutboxMessage) (
 	if msg.LeaseGeneration == 0 {
 		msg.LeaseGeneration = b.currentLeaseGeneration()
 	}
+	msg, _ = b.outboxWithWorkflowOwnerMentionSuppressed(ctx, msg)
+	return msg
+}
+
+func (b *Bridge) outboxWithWorkflowOwnerMentionSuppressed(ctx context.Context, msg teamstore.OutboxMessage) (teamstore.OutboxMessage, bool) {
 	if b.shouldSuppressOwnerMentionForWorkflow(ctx, msg) {
 		msg.MentionOwner = false
+		return msg, true
 	}
-	queued, created, err := b.store.QueueOutbox(ctx, msg)
+	return msg, false
+}
+
+func (b *Bridge) suppressQueuedOutboxOwnerMentionForWorkflow(ctx context.Context, msg teamstore.OutboxMessage) teamstore.OutboxMessage {
+	next, suppressed := b.outboxWithWorkflowOwnerMentionSuppressed(ctx, msg)
+	if !suppressed || b == nil || b.store == nil || strings.TrimSpace(msg.ID) == "" {
+		return next
+	}
+	updated, err := b.store.SuppressOutboxOwnerMention(ctx, msg.ID)
 	if err != nil {
-		return teamstore.OutboxMessage{}, err
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow mention suppression warning: %v\n", err)
+		}
+		return next
 	}
-	if created {
-		b.recordControlChatHelperMessage(ctx, queued)
-	}
-	return queued, nil
+	return updated
 }
 
 func (b *Bridge) shouldSuppressOwnerMentionForWorkflow(ctx context.Context, msg teamstore.OutboxMessage) bool {
@@ -8931,6 +8958,8 @@ func outboxHasWorkflowNotificationCandidate(outbox teamstore.OutboxMessage) bool
 	case notificationKind == "turn_completed":
 		return true
 	case notificationKind == "helper_upgrade_completed":
+		return true
+	case notificationKind == "needs_attention":
 		return true
 	case strings.Contains(kind, "reload-complete"):
 		return true
@@ -9124,11 +9153,13 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	} else if ok {
 		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(earlier.LastSendAttempt, earlier.CreatedAt)}
 	}
-	if _, err := b.store.MarkOutboxSendAttempt(ctx, outbox.ID); errors.Is(err, teamstore.ErrOutboxSendNotClaimed) {
+	claimed, err := b.store.MarkOutboxSendAttempt(ctx, outbox.ID)
+	if errors.Is(err, teamstore.ErrOutboxSendNotClaimed) {
 		return nil
 	} else if err != nil {
 		return err
 	}
+	outbox = b.suppressQueuedOutboxOwnerMentionForWorkflow(ctx, claimed)
 	if outbox.DriveItemID == "" && outbox.AttachmentPath != "" {
 		item, err := b.uploadQueuedOutboxAttachment(ctx, outbox)
 		if err != nil {
@@ -9158,7 +9189,6 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 	}
 	var msg ChatMessage
-	var err error
 	if outbox.DriveItemID != "" {
 		msg, err = b.graph.SendDriveItemAttachmentWithoutRateLimitRetry(ctx, outbox.TeamsChatID, driveItemFromOutbox(outbox), outbox.Body)
 	} else if outbox.MentionOwner {
@@ -10773,22 +10803,23 @@ func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, session S
 		return nil
 	}
 	delivery := transcriptImportBatchDeliveryRecord(session, sourcePath, checkpointID, turnID, kind, html, first, last)
+	msg := b.prepareOutboxForQueue(ctx, teamstore.OutboxMessage{
+		ID:              transcriptDeliveryOutboxID(delivery.ID),
+		SessionID:       session.ID,
+		TurnID:          turnID,
+		TeamsChatID:     session.ChatID,
+		ScopeID:         b.scope.ID,
+		MachineID:       b.machine.ID,
+		LeaseGeneration: b.currentLeaseGeneration(),
+		Kind:            kind,
+		Body:            html,
+		PartIndex:       1,
+		PartCount:       1,
+		RenderedBytes:   len(html),
+		SourceTextHash:  normalizedTextHash(html),
+	})
 	queued, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
-		Message: teamstore.OutboxMessage{
-			ID:              transcriptDeliveryOutboxID(delivery.ID),
-			SessionID:       session.ID,
-			TurnID:          turnID,
-			TeamsChatID:     session.ChatID,
-			ScopeID:         b.scope.ID,
-			MachineID:       b.machine.ID,
-			LeaseGeneration: b.currentLeaseGeneration(),
-			Kind:            kind,
-			Body:            html,
-			PartIndex:       1,
-			PartCount:       1,
-			RenderedBytes:   len(html),
-			SourceTextHash:  normalizedTextHash(html),
-		},
+		Message:  msg,
 		Delivery: delivery,
 	})
 	if err != nil || queueOnly || queued.ID == "" || queued.Status == teamstore.OutboxStatusSent {

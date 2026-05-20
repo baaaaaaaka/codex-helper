@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"gopkg.in/yaml.v3"
 )
 
 const manifestFilename = ".cxp-skill-manifest.json"
@@ -37,6 +38,11 @@ type skillTree struct {
 	SourceDir  string
 	ExportName string
 	Files      []treeFile
+}
+
+type skillFrontmatter struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
 }
 
 type exportManifest struct {
@@ -340,29 +346,14 @@ func parseSkillName(data []byte, sourceDir string) (string, error) {
 	if end < 0 {
 		return "", fmt.Errorf("SKILL.md frontmatter is not closed")
 	}
-	front := body[:end]
-	name := ""
-	description := ""
-	for _, line := range strings.Split(front, "\n") {
-		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		value = strings.Trim(strings.TrimSpace(value), `"'`)
-		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "name":
-			name = value
-		case "description":
-			description = value
-		}
+	var frontmatter skillFrontmatter
+	if err := yaml.Unmarshal([]byte(body[:end]), &frontmatter); err != nil {
+		return "", fmt.Errorf("SKILL.md frontmatter is invalid YAML: %w", err)
 	}
-	if strings.TrimSpace(description) == "" {
+	if strings.TrimSpace(frontmatter.Description) == "" {
 		return "", fmt.Errorf("SKILL.md frontmatter must contain a non-empty description")
 	}
+	name := frontmatter.Name
 	if strings.TrimSpace(name) == "" {
 		name = path.Base(sourceDir)
 	}

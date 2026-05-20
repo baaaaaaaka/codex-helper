@@ -1,6 +1,6 @@
 ---
 name: cxp
-description: Use when a user asks about cxp, codex-proxy, or codex-helper operations: proxy/SSH profiles, Teams helper/control/work chats, Codex history or skills, upgrades, beacon/execution target/profile switching, Slurm/LSF/GPU/local execution, and safe handoffs for operations that can interrupt Codex.
+description: "Use when a user asks about cxp, codex-proxy, or codex-helper operations: proxy/SSH profiles, Teams helper/control/work chats, Codex history or skills, upgrades, beacon/execution target/profile switching, Slurm/LSF/GPU/local execution, and safe handoffs for operations that can interrupt Codex."
 ---
 
 # cxp

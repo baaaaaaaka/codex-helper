@@ -30,6 +30,14 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp beacon provider template slurm|lsf`",
 		"`cxp beacon worker run-once --machine <id>`",
 		"`cxp beacon worker serve --allocation <request-id>`",
+		"--shared-store",
+		"--codex-path <codex-or-wrapper>",
+		"--skip-git-repo-check",
+		"CXP_BEACON_CODEX_BIN",
+		"Teams service `--codex-arg` does not automatically reach remote beacon workers",
+		"Keep exactly one `exec`",
+		"`--adapter-shell direct`",
+		"user-shell capture is incompatible",
 		"CODEX_HELPER_BEACON_SLURM_QUERY",
 		"Beacon execution profiles are separate from SSH proxy profiles",
 		"$CODEX_HELPER_CLI_PATH",
@@ -104,6 +112,11 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 			name:     "worker execution",
 			fallback: []string{"beacon worker run-once --machine", "beacon worker run-once --allocation", "beacon worker serve --allocation"},
 			docs:     []string{"beacon worker run-once --machine", "beacon worker run-once --allocation", "beacon worker serve --allocation"},
+		},
+		{
+			name:     "worker adapter troubleshooting",
+			fallback: []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "Keep exactly one `exec`", "`--adapter-shell direct`"},
+			docs:     []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "Keep exactly one `exec`", "`--adapter-shell direct`"},
 		},
 	}
 	for _, check := range checks {

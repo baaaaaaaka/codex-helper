@@ -29,6 +29,25 @@ func TestParseSkillNameRequiresFrontmatterDescription(t *testing.T) {
 	}
 }
 
+func TestParseSkillNameRejectsInvalidYAMLFrontmatter(t *testing.T) {
+	data := []byte("---\nname: review\ndescription: Use when operations: proxy profiles\n---\nbody")
+	_, err := parseSkillName(data, "skills/review")
+	if err == nil || !strings.Contains(err.Error(), "invalid YAML") {
+		t.Fatalf("parseSkillName invalid YAML error = %v, want invalid YAML", err)
+	}
+}
+
+func TestParseSkillNameSupportsQuotedDescriptionWithColon(t *testing.T) {
+	data := []byte("---\nname: review\ndescription: \"Use when operations: proxy profiles\"\n---\nbody")
+	name, err := parseSkillName(data, "skills/review")
+	if err != nil {
+		t.Fatalf("parseSkillName quoted description: %v", err)
+	}
+	if name != "review" {
+		t.Fatalf("name = %q", name)
+	}
+}
+
 func TestParseTreeListingRejectsUnsafePath(t *testing.T) {
 	data := []byte("100644 blob abcdef\t../SKILL.md\x00")
 	if _, err := parseTreeListing(data, ""); err == nil {

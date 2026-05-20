@@ -656,7 +656,7 @@ func TestBeaconProviderTemplateCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("provider template slurm: %v\n%s", err, out)
 	}
-	for _, want := range []string{"squeue", "sbatch", "scancel", "beacon worker serve --allocation", "--provider-job-id", "cancel)", "renew)", "renew_requires_site_policy", "exit 1"} {
+	for _, want := range []string{"squeue", "sbatch", "scancel", "beacon worker serve --allocation", "--provider-job-id", "--shared-store", "--codex-path", "CXP_BEACON_CODEX_BIN", "Keep exactly one exec", "cancel)", "renew)", "renew_requires_site_policy", "exit 1"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("slurm template missing %q:\n%s", want, out)
 		}
@@ -665,7 +665,7 @@ func TestBeaconProviderTemplateCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("provider template lsf: %v\n%s", err, out)
 	}
-	for _, want := range []string{"bjobs", "bsub", "bkill", "beacon worker serve --allocation", "--provider-job-id", "cancel)", "renew)", "renew_requires_site_policy", "exit 1"} {
+	for _, want := range []string{"bjobs", "bsub", "bkill", "beacon worker serve --allocation", "--provider-job-id", "--shared-store", "--codex-path", "CXP_BEACON_CODEX_BIN", "Keep exactly one exec", "cancel)", "renew)", "renew_requires_site_policy", "exit 1"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("lsf template missing %q:\n%s", want, out)
 		}

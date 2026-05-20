@@ -1730,7 +1730,7 @@ func beaconControlHelpText() string {
 		"- `beacon list` - list all profiles and machines",
 		"- `beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <hours>`",
 		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
-		"- Slurm/LSF adapters use your normal shell setup by default; add `--adapter-shell direct` only for a clean service environment",
+		"- Slurm/LSF adapters use your normal shell setup by default; add `--adapter-shell direct` when user-shell capture is incompatible or a clean service environment is required",
 		"- `beacon profile update <name> ...` - create a new profile revision without breaking bound Work chats",
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>`",
 		"- `beacon profile create <name> --provider lsf --queue <queue>`",

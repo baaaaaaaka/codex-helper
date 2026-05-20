@@ -671,11 +671,27 @@ func newBeaconWorkerCmd(storePath *string) *cobra.Command {
 }
 
 func newBeaconProviderCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "provider", Short: "Print beacon scheduler provider adapter templates"}
+	cmd := &cobra.Command{
+		Use:   "provider",
+		Short: "Print beacon scheduler provider adapter templates",
+		Long: strings.TrimSpace(`Print scheduler adapter templates for managed beacon allocations.
+
+Custom Slurm/LSF submit adapters must preserve the --shared-store argument and pass
+it to the worker with "cxp beacon --store <path> worker ..."; otherwise the worker
+can look in its default store and fail with "allocation request ... not found".
+Keep exactly one exec in the submitted worker command. If a site wrapper already
+prepends exec, remove the extra exec from the adapter.`),
+	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "template <slurm|lsf>",
 		Short: "Print a scheduler adapter template",
-		Args:  cobra.ExactArgs(1),
+		Long: strings.TrimSpace(`Print an editable scheduler adapter template.
+
+The generated template parses --shared-store, uses one exec in the submitted
+worker command, and honors CXP_BEACON_CXP_BIN plus CXP_BEACON_CODEX_BIN so a
+scheduler/container environment can point at the correct cxp and Codex/wrapper
+paths.`),
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			switch strings.ToLower(strings.TrimSpace(args[0])) {
 			case "slurm":
@@ -752,11 +768,18 @@ case "$operation" in
     ;;
   submit)
     cxp_bin=${CXP_BEACON_CXP_BIN:-cxp}
+    codex_bin=${CXP_BEACON_CODEX_BIN:-}
     worker_idle=${CXP_BEACON_WORKER_IDLE_TIMEOUT:-30m}
+    codex_arg=
+    if [ -n "$codex_bin" ]; then
+      codex_arg=" --codex-path \"$codex_bin\""
+    fi
+    # Preserve --shared-store so the worker uses the same beacon state as Teams.
+    # Keep exactly one exec in this submitted command.
     if [ -n "$shared_store" ]; then
-      wrap="exec \"$cxp_bin\" beacon --store \"$shared_store\" worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+      wrap="exec \"$cxp_bin\" beacon --store \"$shared_store\" worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\"$codex_arg"
     else
-      wrap="exec \"$cxp_bin\" beacon worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+      wrap="exec \"$cxp_bin\" beacon worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\"$codex_arg"
     fi
     args="--parsable --job-name=$name --nodes=$nodes"
     [ -n "$partition" ] && args="$args --partition=$partition"
@@ -844,11 +867,18 @@ case "$operation" in
     ;;
   submit)
     cxp_bin=${CXP_BEACON_CXP_BIN:-cxp}
+    codex_bin=${CXP_BEACON_CODEX_BIN:-}
     worker_idle=${CXP_BEACON_WORKER_IDLE_TIMEOUT:-30m}
+    codex_arg=
+    if [ -n "$codex_bin" ]; then
+      codex_arg=" --codex-path \"$codex_bin\""
+    fi
+    # Preserve --shared-store so the worker uses the same beacon state as Teams.
+    # Keep exactly one exec in this submitted command.
     if [ -n "$shared_store" ]; then
-      command="exec \"$cxp_bin\" beacon --store \"$shared_store\" worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+      command="exec \"$cxp_bin\" beacon --store \"$shared_store\" worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\"$codex_arg"
     else
-      command="exec \"$cxp_bin\" beacon worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+      command="exec \"$cxp_bin\" beacon worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\"$codex_arg"
     fi
     if [ -n "$queue" ]; then
       out=$(printf '%s\n' "$command" | bsub -J "$name" -q "$queue")
@@ -895,7 +925,15 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run-once",
 		Short: "Claim one queued beacon job, run Codex, and publish a terminal result",
-		Args:  cobra.NoArgs,
+		Long: strings.TrimSpace(`Claim one queued beacon job, run Codex, and publish a terminal result.
+
+When this runs inside Slurm/LSF, make sure the worker command uses the same beacon
+state as the Teams owner, normally by launching through "cxp beacon --store
+<shared-store> worker ...". If the scheduler/container PATH cannot find Codex,
+pass --codex-path to the real Codex executable or to a small wrapper. A wrapper is
+the right place to add Codex exec flags such as --skip-git-repo-check; Teams
+service --codex-arg settings do not automatically apply to remote beacon workers.`),
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(workerID) == "" {
 				workerID = defaultBeaconWorkerID()
@@ -992,7 +1030,7 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 	cmd.Flags().StringVar(&providerJobID, "provider-job", "", "Scheduler provider job id for this worker (default: SLURM_JOB_ID or LSB_JOBID)")
 	cmd.Flags().StringVar(&host, "host", "", "Worker hostname to register with --allocation")
 	cmd.Flags().StringVar(&workerID, "worker", "", "Worker id to stamp terminal output with")
-	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable path (default: codex)")
+	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable or wrapper path (default: codex)")
 	cmd.Flags().DurationVar(&waitDuration, "wait", 0, "Wait for a queued job before exiting, for example 30m")
 	return cmd
 }
@@ -1010,7 +1048,15 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Register a beacon worker and serve queued jobs until idle or stopped",
-		Args:  cobra.NoArgs,
+		Long: strings.TrimSpace(`Register a beacon worker and serve queued jobs until idle or stopped.
+
+When this runs inside Slurm/LSF, make sure the worker command uses the same beacon
+state as the Teams owner, normally by launching through "cxp beacon --store
+<shared-store> worker ...". If the scheduler/container PATH cannot find Codex,
+pass --codex-path to the real Codex executable or to a small wrapper. A wrapper is
+the right place to add Codex exec flags such as --skip-git-repo-check; Teams
+service --codex-arg settings do not automatically apply to remote beacon workers.`),
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(allocationID) == "" {
 				return fmt.Errorf("--allocation is required")
@@ -1083,7 +1129,7 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 	cmd.Flags().StringVar(&providerJobID, "provider-job", "", "Scheduler provider job id for this worker (default: SLURM_JOB_ID or LSB_JOBID)")
 	cmd.Flags().StringVar(&host, "host", "", "Worker hostname")
 	cmd.Flags().StringVar(&workerID, "worker", "", "Worker id to stamp terminal output with")
-	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable path (default: codex)")
+	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable or wrapper path (default: codex)")
 	cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 30*time.Minute, "Exit after this long without a queued job")
 	cmd.Flags().IntVar(&maxJobs, "max-jobs", 0, "Maximum jobs to serve before exiting (0 means unlimited until idle)")
 	return cmd

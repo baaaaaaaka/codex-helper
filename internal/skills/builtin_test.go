@@ -196,6 +196,18 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 			},
 		},
 		{
+			name: "beacon worker adapter troubleshooting",
+			required: []string{
+				"--shared-store",
+				"--codex-path <codex-or-wrapper>",
+				"--skip-git-repo-check",
+				"CXP_BEACON_CODEX_BIN",
+				"Keep exactly one `exec`",
+				"`--adapter-shell direct`",
+				"user-shell capture is incompatible",
+			},
+		},
+		{
 			name: "active codex beacon switch uses deferred pending target",
 			required: []string{
 				"Do not run these inline from an active Codex turn",

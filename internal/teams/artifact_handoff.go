@@ -116,7 +116,7 @@ Local cxp beacon commands:
 - cxp beacon profile list: list beacon profiles
 - cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration>: create a Slurm draft profile
 - Add --query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script> to store Slurm/LSF adapter commands on the profile without requiring a helper reload
-- Slurm/LSF adapters use the user's normal shell setup by default; add --adapter-shell direct only when an adapter needs the clean helper service environment
+- Slurm/LSF adapters use the user's normal shell setup by default; add --adapter-shell direct when user-shell capture is incompatible or an adapter needs the clean helper service environment
 - cxp beacon profile update <name> ...: create a new profile revision without breaking Work chats already bound to the old revision
 - cxp beacon profile history <name>, cxp beacon profile rollback <name> <revision>, and cxp beacon profile gc <name>: inspect, restore, and safely prune profile revisions
 - cxp beacon profile create <name> --provider lsf --queue <queue>: create an LSF draft profile
@@ -224,7 +224,7 @@ func defaultControlFallbackHelpDigest() string {
 		"Beacon CLI quick help:",
 		"`cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration>` - create a Slurm draft profile",
 		"`cxp beacon profile create <name> ... --query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` - store provider adapter commands on the profile",
-		"`cxp beacon profile create <name> ... --adapter-shell direct` - opt out of the default user shell environment for Slurm/LSF adapters",
+		"`cxp beacon profile create <name> ... --adapter-shell direct` - use direct adapter execution when user-shell capture is incompatible or a clean service environment is required",
 		"`cxp beacon profile update <name> ...` - create a new profile revision without breaking bound Work chats",
 		"`cxp beacon profile history <name>` / `rollback <name> <revision>` / `gc <name>` - inspect, restore, and prune profile revisions",
 		"`cxp beacon profile create <name> --provider lsf --queue <queue>` - create an LSF draft profile",

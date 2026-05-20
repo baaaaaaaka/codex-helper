@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -319,6 +320,73 @@ func TestWorkflowNotificationDoesNotDuplicateAfterAmbiguousFailure(t *testing.T)
 	rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
 	if rec.Status != teamstore.NotificationStatusUnknown || rec.Attempts != 1 || !rec.DeliveryUncertain || rec.LastErrorRetryable {
 		t.Fatalf("notification record after ambiguous failure = %#v, want unknown delivery with one attempt", rec)
+	}
+}
+
+func TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Fallback after definite webhook failure")
+	var workflowCalls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&workflowCalls, 1)
+		http.Error(w, "bad workflow payload", http.StatusBadRequest)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:definite-webhook-failure",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "final",
+		Body:             "done",
+		MentionOwner:     true,
+		NotificationKind: "turn_completed",
+	})
+	if err != nil {
+		t.Fatalf("queue outbox: %v", err)
+	}
+	if queued.MentionOwner {
+		t.Fatalf("queued MentionOwner = true, want false while workflow card is configured: %#v", queued)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+	if got := atomic.LoadInt32(&workflowCalls); got != 1 {
+		t.Fatalf("workflow webhook calls = %d, want 1", got)
+	}
+	var sawWorkChat bool
+	var sawFallback bool
+	for _, msg := range *sent {
+		switch msg.ChatID {
+		case "chat-1":
+			sawWorkChat = true
+			if msg.Mentions != 0 {
+				t.Fatalf("work chat mentions = %d, want 0: %#v", msg.Mentions, msg)
+			}
+		case "control-chat":
+			sawFallback = true
+			if msg.Mentions == 0 {
+				t.Fatalf("control fallback mentions = 0, want owner mention: %#v", msg)
+			}
+			plain := PlainTextFromTeamsHTML(msg.Content)
+			for _, want := range []string{"✅ Codex finished", "Workflow card send failed", "Open answer"} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("control fallback missing %q:\n%s", want, plain)
+				}
+			}
+		}
+	}
+	if !sawWorkChat || !sawFallback {
+		t.Fatalf("sent messages missing work or fallback message: %#v", *sent)
 	}
 }
 
@@ -895,6 +963,168 @@ func TestQueueOutboxSuppressesOwnerMentionWhenWorkflowNotificationEnabled(t *tes
 	}
 	if chunkedError.MentionOwner {
 		t.Fatalf("chunked error MentionOwner = true, want false when workflow card is enabled: %#v", chunkedError)
+	}
+	helperAttention, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:helper-needs-attention",
+		SessionID:        "s001",
+		TurnID:           "turn-helper-attention",
+		TeamsChatID:      "chat-1",
+		Kind:             "helper",
+		Body:             "helper needs attention",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("queue helper needs-attention outbox: %v", err)
+	}
+	if helperAttention.MentionOwner {
+		t.Fatalf("helper needs-attention MentionOwner = true, want false when workflow card is enabled: %#v", helperAttention)
+	}
+}
+
+func TestTranscriptDeliverySuppressesOwnerMentionWhenWorkflowNotificationEnabled(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Suppress transcript sync mention when webhook card will notify")
+	urlFile := writeWorkflowWebhookURLFile(t, "https://workflow.example.test/hook")
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	session := bridge.reg.Sessions[0]
+	record := TranscriptRecord{
+		ItemID:       "assistant-final-1",
+		ThreadID:     "thread-1",
+		Kind:         TranscriptKindAssistant,
+		Text:         "synced final answer",
+		SourceLine:   42,
+		SourceOffset: 4096,
+	}
+	queued, err := bridge.queueTranscriptDeliveryChunksWithOptions(ctx, session, codexhistory.Session{
+		SessionID: "thread-1",
+		FilePath:  filepath.Join(t.TempDir(), "session.jsonl"),
+	}, record, record.SourceLine, record.SourceOffset, "sync-assistant-b7a357a4d7f59c5d", record.Text, outboxQueueOptions{
+		MentionOwner:     true,
+		NotificationKind: "turn_completed",
+	}, "sync:"+session.ID)
+	if err != nil {
+		t.Fatalf("queueTranscriptDeliveryChunksWithOptions: %v", err)
+	}
+	if len(queued) != 1 {
+		t.Fatalf("queued transcript outbox len = %d, want 1: %#v", len(queued), queued)
+	}
+	outbox := queued[0]
+	if !strings.HasPrefix(outbox.ID, "outbox:transcript-delivery:"+session.ID+":") {
+		t.Fatalf("outbox id = %q, want transcript delivery outbox", outbox.ID)
+	}
+	if outbox.MentionOwner {
+		t.Fatalf("transcript delivery MentionOwner = true, want false when workflow card is enabled: %#v", outbox)
+	}
+	if outbox.NotificationKind != "turn_completed" {
+		t.Fatalf("NotificationKind = %q, want retained for workflow planning", outbox.NotificationKind)
+	}
+}
+
+func TestSendQueuedOutboxSuppressesPersistedOwnerMentionWhenWorkflowNotificationEnabled(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Suppress persisted mention when webhook card will notify")
+	var workflowCalls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&workflowCalls, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:transcript-delivery:s001:legacy",
+		SessionID:        "s001",
+		TurnID:           "sync:s001",
+		TeamsChatID:      "chat-1",
+		Kind:             "sync-assistant-b7a357a4d7f59c5d",
+		Body:             "legacy queued answer",
+		MentionOwner:     true,
+		NotificationKind: "turn_completed",
+	})
+	if err != nil {
+		t.Fatalf("seed legacy outbox: %v", err)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent Teams messages = %d, want 1: %#v", len(*sent), *sent)
+	}
+	if (*sent)[0].Mentions != 0 {
+		t.Fatalf("sent Teams mentions = %d, want 0: %#v", (*sent)[0].Mentions, *sent)
+	}
+	if got := atomic.LoadInt32(&workflowCalls); got != 1 {
+		t.Fatalf("workflow webhook calls = %d, want 1", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	stored := state.OutboxMessages[queued.ID]
+	if stored.MentionOwner {
+		t.Fatalf("stored MentionOwner = true, want false after send-time suppression: %#v", stored)
+	}
+}
+
+func TestHelperNeedsAttentionQueuesWorkflowCardWithoutOwnerMention(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Notify helper needs-attention via workflow card")
+	var workflowCalls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&workflowCalls, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:helper-attention",
+		SessionID:        "s001",
+		TurnID:           "turn-helper-attention",
+		TeamsChatID:      "chat-1",
+		Kind:             "helper",
+		Body:             "helper needs attention",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("queue helper needs-attention outbox: %v", err)
+	}
+	if queued.MentionOwner {
+		t.Fatalf("queued helper needs-attention MentionOwner = true, want false when workflow card is enabled: %#v", queued)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent Teams messages = %d, want 1: %#v", len(*sent), *sent)
+	}
+	if (*sent)[0].Mentions != 0 {
+		t.Fatalf("sent Teams mentions = %d, want 0: %#v", (*sent)[0].Mentions, *sent)
+	}
+	if got := atomic.LoadInt32(&workflowCalls); got != 1 {
+		t.Fatalf("workflow webhook calls = %d, want 1", got)
 	}
 }
 
