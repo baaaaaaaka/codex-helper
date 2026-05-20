@@ -189,6 +189,7 @@ func TestTeamsBeaconTurnReconcilesConfiguredProviderAdapter(t *testing.T) {
 			Host:          "worker-host",
 			State:         beacon.LeaseAccepting,
 			Doctor:        healthyTeamsBeaconDoctor(),
+			Bootstrap:     beacon.BootstrapDiagnostics{SharedStorePath: filepath.Clean(strings.TrimSpace(os.Getenv("CODEX_HELPER_BEACON_STORE")))},
 		}, time.Now())
 		return err
 	}); err != nil {
@@ -365,6 +366,7 @@ func TestBeaconJobExecutorRechecksMachineReadinessBeforeEnqueue(t *testing.T) {
 			Provider:          beacon.ProviderSlurm,
 			ProxyMode:         beacon.ProxyNone,
 			IsolationDefault:  beacon.IsolationShared,
+			SharedPath:        teamsBeaconSharedPathForTest(t),
 			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
 			Confirmed:         true,
 			ProviderPreviewOK: true,
@@ -1411,6 +1413,7 @@ func seedTeamsBeaconProfile(t *testing.T, name string) {
 			Provider:          beacon.ProviderSlurm,
 			ProxyMode:         beacon.ProxyNone,
 			IsolationDefault:  beacon.IsolationShared,
+			SharedPath:        teamsBeaconSharedPathForTest(t),
 			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
 			Confirmed:         true,
 			ProviderPreviewOK: true,
@@ -1553,6 +1556,14 @@ func loadTeamsBeaconState(t *testing.T) beacon.State {
 		t.Fatalf("load beacon state: %v", err)
 	}
 	return st
+}
+
+func teamsBeaconSharedPathForTest(t *testing.T) string {
+	t.Helper()
+	if storePath := strings.TrimSpace(os.Getenv("CODEX_HELPER_BEACON_STORE")); filepath.IsAbs(storePath) {
+		return filepath.Dir(storePath)
+	}
+	return t.TempDir()
 }
 
 func healthyTeamsBeaconDoctor() beacon.WorkerDoctor {

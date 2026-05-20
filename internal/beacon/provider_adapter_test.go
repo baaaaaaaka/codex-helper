@@ -534,6 +534,37 @@ func TestProviderCommandArgsUseAllocationProfileSnapshotAfterProfileChanges(t *t
 	}
 }
 
+func TestCommandProviderAdapterPassesExplicitStorePathToWorkerAdapter(t *testing.T) {
+	req := AllocationRequest{
+		ID:                "req-1",
+		ConversationID:    "conv",
+		TurnID:            "turn",
+		Profile:           "gpu",
+		Provider:          ProviderSlurm,
+		DeterministicName: "cxp-req-1",
+		ProfileSnapshot: Profile{
+			Name:       "gpu",
+			Provider:   ProviderSlurm,
+			SharedPath: "/shared/root",
+			Slurm:      SlurmProfile{Nodes: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+		},
+	}
+	adapter := CommandProviderAdapter{StorePath: "/explicit/beacon.json"}
+	args := adapter.providerCommandArgs(req, "submit")
+	if !containsProviderArgPair(args, "--shared-store", "/explicit/beacon.json") {
+		t.Fatalf("adapter should pass explicit store path to provider command, args=%v", args)
+	}
+	adapter.StorePath = ""
+	args = adapter.providerCommandArgs(req, "submit")
+	if !containsProviderArgPair(args, "--shared-store", SharedStorePath("/shared/root")) {
+		t.Fatalf("adapter should derive shared store from profile shared_path, args=%v", args)
+	}
+	queryArgs := adapter.providerCommandArgs(req, "query")
+	if containsProviderArg(queryArgs, "--shared-store") {
+		t.Fatalf("adapter should not pass worker-only shared store to query/cancel/renew operations, args=%v", queryArgs)
+	}
+}
+
 func TestCommandProviderAdapterLSFUsesQueueSnapshot(t *testing.T) {
 	req := AllocationRequest{
 		ID:                "req-lsf",

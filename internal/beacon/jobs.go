@@ -2,6 +2,7 @@ package beacon
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -96,13 +97,24 @@ func RegisterWorkerMachineForAllocation(st *State, requestID string, in WorkerRe
 	machine.Host = host
 	machine.Isolation = isolation
 	machine.State = string(state)
+	machine.Reason = ""
 	machine.Doctor = in.Doctor
 	machine.Bootstrap = in.Bootstrap
 	machine.DoctorBlockers = nil
+	if ManagedProviderRequiresSharedPath(req.Provider) && strings.TrimSpace(req.ProfileSnapshot.SharedPath) != "" {
+		if !workerSharedStoreMatchesProfile(req.ProfileSnapshot.SharedPath, machine.Bootstrap.SharedStorePath) {
+			machine.State = string(LeaseNeedsAttention)
+			machine.Reason = "worker shared store path does not match profile shared_path"
+			machine.DoctorBlockers = appendUniqueString(machine.DoctorBlockers, machine.Reason)
+		}
+	}
 	if !workerDoctorIsZero(in.Doctor) {
-		machine.DoctorBlockers = WorkerDoctorBlockers(in.Doctor)
+		for _, blocker := range WorkerDoctorBlockers(in.Doctor) {
+			machine.DoctorBlockers = appendUniqueString(machine.DoctorBlockers, blocker)
+		}
 		if len(machine.DoctorBlockers) > 0 {
 			machine.State = string(LeaseNeedsAttention)
+			machine.Reason = firstNonEmpty(machine.Reason, "worker doctor failed: "+strings.Join(machine.DoctorBlockers, "; "))
 		}
 	}
 	machine.MembershipProof = strings.TrimSpace(in.MembershipProof)
@@ -112,6 +124,7 @@ func RegisterWorkerMachineForAllocation(st *State, requestID string, in WorkerRe
 	if !workerMembershipProofOK(req, providerJobID, machine.MembershipProof) {
 		machine.State = string(LeaseNeedsAttention)
 		machine.DoctorBlockers = appendUniqueString(machine.DoctorBlockers, "provider membership proof failed")
+		machine.Reason = firstNonEmpty(machine.Reason, "provider membership proof failed")
 	}
 	if now.IsZero() {
 		now = time.Now()
@@ -280,6 +293,7 @@ func DrainStaleWorkerMachines(st *State, staleAfter time.Duration, now time.Time
 			continue
 		}
 		machine.State = string(LeaseDraining)
+		machine.Reason = "worker heartbeat stale"
 		machine.UpdatedAt = now
 		st.Machines[key] = machine
 		drained = append(drained, machine)
@@ -321,6 +335,7 @@ func DrainIdleWorkerMachines(st *State, idleAfter time.Duration, now time.Time) 
 			continue
 		}
 		machine.State = string(LeaseDraining)
+		machine.Reason = "worker idle timeout"
 		machine.UpdatedAt = now
 		st.Machines[key] = machine
 		drained = append(drained, machine)
@@ -388,6 +403,23 @@ func workerMembershipProofOK(req AllocationRequest, providerJobID string, proof 
 	default:
 		return true
 	}
+}
+
+func workerSharedStoreMatchesProfile(sharedPath string, workerStorePath string) bool {
+	sharedPath = NormalizeSharedPath(sharedPath)
+	workerStorePath = strings.TrimSpace(workerStorePath)
+	if sharedPath == "" || workerStorePath == "" {
+		return false
+	}
+	workerStorePath = filepath.Clean(workerStorePath)
+	if workerStorePath == SharedStorePath(sharedPath) {
+		return true
+	}
+	rel, err := filepath.Rel(sharedPath, workerStorePath)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != "" && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
 }
 
 func defaultManagedMachineID(req AllocationRequest, providerJobID string, host string) string {

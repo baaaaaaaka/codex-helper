@@ -22,11 +22,11 @@ func (e BeaconJobExecutor) Run(ctx context.Context, session *Session, prompt str
 }
 
 func (e BeaconJobExecutor) RunInput(ctx context.Context, session *Session, input ExecutionInput) (ExecutionResult, error) {
-	store, err := beacon.NewStore("")
+	plan := e.Plan
+	store, err := beacon.NewStore(plan.StorePath)
 	if err != nil {
 		return ExecutionResult{}, fmt.Errorf("beacon state unavailable: %w", err)
 	}
-	plan := e.Plan
 	if plan.Action == beacon.TurnWaitAllocation {
 		plan, err = waitBeaconAllocationReady(ctx, store, plan)
 		if err != nil {
@@ -87,6 +87,7 @@ func refreshBeaconAllocationPlan(ctx context.Context, store *beacon.Store, previ
 		if err != nil {
 			return err
 		}
+		next.StorePath = previous.StorePath
 		plan = next
 		return nil
 	})

@@ -277,6 +277,7 @@ func (DirectLauncher) Launch(ctx context.Context, req LaunchRequest) (LaunchResu
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, req.Command, req.Args...)
+	configureBackgroundProcess(cmd)
 	if req.Dir != "" {
 		cmd.Dir = req.Dir
 	}

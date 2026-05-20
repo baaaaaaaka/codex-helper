@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -21,7 +22,7 @@ func (b *Bridge) prepareBeaconTurnExecution(ctx context.Context, session *Sessio
 	if b == nil || session == nil || strings.TrimSpace(turn.ID) == "" {
 		return beacon.TurnExecutionPlan{}, false, nil
 	}
-	store, err := beacon.NewStore("")
+	store, err := b.beaconStoreForTurn(session.ID, turn.ID)
 	if err != nil {
 		return beacon.TurnExecutionPlan{}, true, fmt.Errorf("beacon state unavailable: %w", err)
 	}
@@ -49,6 +50,7 @@ func (b *Bridge) prepareBeaconTurnExecution(ctx context.Context, session *Sessio
 	if err != nil {
 		return beacon.TurnExecutionPlan{}, true, err
 	}
+	plan.StorePath = store.Path()
 	switch plan.Action {
 	case beacon.TurnRunLocal:
 		return plan, false, nil
@@ -57,6 +59,7 @@ func (b *Bridge) prepareBeaconTurnExecution(ctx context.Context, session *Sessio
 		if err != nil {
 			return plan, true, fmt.Errorf("%s", beacon.TurnStartFailureNotice(plan, err).Render())
 		}
+		plan.StorePath = store.Path()
 		if beaconAllocationCannotProgress(plan) {
 			return plan, true, fmt.Errorf("%s", beacon.TurnStartFailureNotice(plan, nil).Render())
 		}
@@ -85,7 +88,27 @@ func (b *Bridge) maybeRunBeaconReconcile(ctx context.Context, now time.Time) err
 	if err != nil {
 		return fmt.Errorf("beacon state unavailable: %w", err)
 	}
-	return b.reconcileBeaconState(ctx, store, beacon.NewCommandProviderAdapterFromEnv(nil), now)
+	adapter := beacon.NewCommandProviderAdapterFromEnv(nil)
+	if err := b.reconcileBeaconState(ctx, store, adapter, now); err != nil {
+		return err
+	}
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_BEACON_STORE")) != "" {
+		return nil
+	}
+	base, err := store.Load()
+	if err != nil {
+		return err
+	}
+	sharedStores, err := beaconSharedStoresForProfiles(base, store.Path())
+	if err != nil {
+		return err
+	}
+	for _, sharedStore := range sharedStores {
+		if err := b.reconcileBeaconState(ctx, sharedStore, adapter, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Bridge) reconcileBeaconState(ctx context.Context, store *beacon.Store, adapter beacon.AllocationAdapter, now time.Time) error {
@@ -172,12 +195,15 @@ func (b *Bridge) reconcileBeaconState(ctx context.Context, store *beacon.Store, 
 			}
 		}
 	}
-	return store.Update(func(st *beacon.State) error {
+	if err := store.Update(func(st *beacon.State) error {
 		beacon.DrainStaleWorkerMachines(st, beaconReconcileStaleWorkerAfter, now)
 		beacon.DrainIdleWorkerMachines(st, beaconReconcileIdleWorkerAfter, now)
 		beacon.RecoverStaleJobAttempts(st, beaconReconcileStaleJobAfter, now)
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	return b.queueBeaconLifecycleNotifications(ctx, store, now)
 }
 
 func (b *Bridge) maybeRunBeaconLeaseMaintenance(ctx context.Context, now time.Time) error {
@@ -205,7 +231,27 @@ func (b *Bridge) maybeRunBeaconLeaseMaintenance(ctx context.Context, now time.Ti
 			return nil
 		}
 	}
-	return b.renewDueBeaconAllocations(ctx, store, beacon.NewCommandProviderAdapterFromEnv(nil), opts, now)
+	adapter := beacon.NewCommandProviderAdapterFromEnv(nil)
+	if err := b.renewDueBeaconAllocations(ctx, store, adapter, opts, now); err != nil {
+		return err
+	}
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_BEACON_STORE")) != "" {
+		return nil
+	}
+	base, err := store.Load()
+	if err != nil {
+		return err
+	}
+	sharedStores, err := beaconSharedStoresForProfiles(base, store.Path())
+	if err != nil {
+		return err
+	}
+	for _, sharedStore := range sharedStores {
+		if err := b.renewDueBeaconAllocations(ctx, sharedStore, adapter, opts, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Bridge) renewDueBeaconAllocations(ctx context.Context, store *beacon.Store, adapter beacon.AllocationRenewAdapter, opts beacon.AllocationRenewOptions, now time.Time) error {

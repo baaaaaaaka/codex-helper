@@ -3094,6 +3094,18 @@ func teamsServiceWSLTaskRunLogName(taskName string) string {
 	return "codex-helper-teams-wsl-task-" + safeWindowsTaskNamePart(taskName, 56) + "-" + hex.EncodeToString(sum[:])[:12] + ".log"
 }
 
+func teamsServiceWindowsTaskRunLogName(args []string) string {
+	label := "teams"
+	if len(args) >= 3 && args[0] == "teams" && args[1] == "service" && args[2] == "watchdog" {
+		label = "teams-watchdog"
+	} else if len(args) >= 2 && args[0] == "teams" && args[1] == "run" {
+		label = "teams-run"
+	}
+	seed := strings.Join(args, "\x00")
+	sum := sha256.Sum256([]byte(label + "\x00" + seed))
+	return "codex-helper-teams-windows-task-" + safeWindowsTaskNamePart(label, 40) + "-" + hex.EncodeToString(sum[:])[:12] + ".log"
+}
+
 func teamsServiceWSLTaskLauncherStem(taskName string, args []string) string {
 	var b strings.Builder
 	b.WriteString(taskName)
@@ -3432,13 +3444,29 @@ func buildTeamsServiceWindowsPowerShell(spec teamsServiceSpec, args []string) st
 	for _, key := range sortedEnvironmentKeys(spec.Environment) {
 		parts = append(parts, "$env:"+key+" = "+powershellSingleQuote(spec.Environment[key]))
 	}
-	call := "& " + powershellSingleQuote(spec.Executable)
+	runLogName := teamsServiceWindowsTaskRunLogName(args)
+	argumentLine := windowsCommandLine(args)
+	parts = append(parts,
+		"$logBase = [Environment]::GetFolderPath('LocalApplicationData')",
+		"if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = [IO.Path]::GetTempPath() }",
+		"$logDir = Join-Path $logBase 'codex-helper\\teams'",
+		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null",
+		"$runLog = Join-Path $logDir "+powershellSingleQuote(runLogName),
+		"$stdoutLog = $runLog + '.stdout.log'",
+		"$stderrLog = $runLog + '.stderr.log'",
+		"Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' starting hidden Teams helper process; stdout ' + $stdoutLog + ' stderr ' + $stderrLog)",
+		"Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue",
+		"$argumentLine = "+powershellSingleQuote(argumentLine),
+	)
+	directCall := "& " + powershellSingleQuote(spec.Executable)
 	for _, arg := range args {
-		call += " " + powershellSingleQuote(arg)
+		directCall += " " + powershellSingleQuote(arg)
 	}
-	parts = append(parts, call)
-	parts = append(parts, "$code = $LASTEXITCODE")
+	parts = append(parts,
+		"if ($env:OS -eq 'Windows_NT') { $p = Start-Process -FilePath "+powershellSingleQuote(spec.Executable)+" -ArgumentList $argumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog; if ($null -ne $p) { $code = $p.ExitCode } else { $code = 1 } } else { "+directCall+" > $stdoutLog 2> $stderrLog; $code = $LASTEXITCODE }",
+	)
 	parts = append(parts, "if ($null -eq $code) { $code = 1 }")
+	parts = append(parts, "Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' exited ' + $code)")
 	parts = append(parts, "exit $code")
 	return strings.Join(parts, "; ")
 }

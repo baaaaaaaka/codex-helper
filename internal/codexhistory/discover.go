@@ -10,6 +10,12 @@ import (
 	"strings"
 )
 
+var ErrSessionsDirNotFound = errors.New("Codex sessions dir not found")
+
+func IsSessionsDirNotFound(err error) bool {
+	return errors.Is(err, ErrSessionsDirNotFound)
+}
+
 func DiscoverProjects(codexDir string) ([]Project, error) {
 	return DiscoverProjectsContext(context.Background(), codexDir)
 }
@@ -27,7 +33,7 @@ func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []P
 	}
 	sessionsDir := filepath.Join(root, "sessions")
 	if !isDir(sessionsDir) {
-		return nil, fmt.Errorf("Codex sessions dir not found: %s", sessionsDir)
+		return nil, fmt.Errorf("%w: %s", ErrSessionsDirNotFound, sessionsDir)
 	}
 
 	ctx, sessionMetaBatch := withSessionMetaPersistentBatch(ctx)

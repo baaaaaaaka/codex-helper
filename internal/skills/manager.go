@@ -262,7 +262,7 @@ func (m *Manager) syncOne(ctx context.Context, source Source, auto bool) SyncRes
 	if err != nil {
 		return m.recordSyncFailure(source, result, err, auto)
 	}
-	trees, err := scanSkillsFromGitTree(ctx, m.Git, mirror, source, commit)
+	trees, err := scanSkillsFromGitTree(ctx, m.Git, mirror, source, commit, filepath.Join(m.CacheDir, "tools"))
 	if err != nil {
 		return m.recordSyncFailure(source, result, err, auto)
 	}

@@ -629,10 +629,25 @@ func formatNoticeTime(ts time.Time) string {
 	return ts.Format(time.RFC3339)
 }
 
+type BeaconListOptions struct {
+	IncludeAll bool
+}
+
 func AllocationSummaryLines(st State) []string {
+	return AllocationSummaryLinesWithOptions(st, BeaconListOptions{IncludeAll: true})
+}
+
+func ActiveAllocationSummaryLines(st State) []string {
+	return AllocationSummaryLinesWithOptions(st, BeaconListOptions{})
+}
+
+func AllocationSummaryLinesWithOptions(st State, opts BeaconListOptions) []string {
 	st.normalize()
 	allocations := make([]AllocationRequest, 0, len(st.Allocations))
 	for _, req := range st.Allocations {
+		if !opts.IncludeAll && !allocationVisibleInDefaultList(st, req) {
+			continue
+		}
 		allocations = append(allocations, req)
 	}
 	sort.Slice(allocations, func(i, j int) bool {
@@ -664,6 +679,17 @@ func AllocationSummaryLines(st State) []string {
 	return lines
 }
 
+func allocationVisibleInDefaultList(st State, req AllocationRequest) bool {
+	switch req.State {
+	case AllocationFailed, AllocationNeedsAttention:
+		return !NotificationRecordedForAllocation(st, req.ID, LifecycleNotificationAllocationFailed)
+	case AllocationExpired, AllocationCanceled:
+		return !NotificationRecordedForAllocation(st, req.ID, LifecycleNotificationAllocationExpired)
+	default:
+		return true
+	}
+}
+
 func allocationSummaryReason(reason string) string {
 	reason = strings.Join(strings.Fields(strings.ReplaceAll(strings.TrimSpace(reason), ";", "; ")), " ")
 	if reason == "" {
@@ -693,9 +719,20 @@ func summarizeLongText(value string, limit int) string {
 }
 
 func MachineSummaryLines(st State) []string {
+	return MachineSummaryLinesWithOptions(st, BeaconListOptions{IncludeAll: true})
+}
+
+func ActiveMachineSummaryLines(st State) []string {
+	return MachineSummaryLinesWithOptions(st, BeaconListOptions{})
+}
+
+func MachineSummaryLinesWithOptions(st State, opts BeaconListOptions) []string {
 	st.normalize()
 	machines := make([]Machine, 0, len(st.Machines))
 	for _, m := range st.Machines {
+		if !opts.IncludeAll && !machineVisibleInDefaultList(st, m) {
+			continue
+		}
 		machines = append(machines, m)
 	}
 	sort.Slice(machines, func(i, j int) bool { return machines[i].ID < machines[j].ID })
@@ -722,7 +759,23 @@ func MachineSummaryLines(st State) []string {
 		if len(facts) > 0 {
 			line += " - " + strings.Join(facts, ", ")
 		}
+		if strings.TrimSpace(m.Reason) != "" {
+			line += " - reason=" + allocationSummaryReason(m.Reason)
+		}
 		lines = append(lines, line)
 	}
 	return lines
+}
+
+func machineVisibleInDefaultList(st State, m Machine) bool {
+	switch strings.ToLower(strings.TrimSpace(m.State)) {
+	case string(LeaseLost), string(LeaseNeedsAttention), string(LeaseAmbiguous):
+		return !NotificationRecordedForMachine(st, m.ID, LifecycleNotificationMachineFailed)
+	case string(LeaseDraining):
+		return !NotificationRecordedForMachine(st, m.ID, LifecycleNotificationMachineFailed)
+	case string(LeaseExpired), string(LeaseDrained):
+		return !NotificationRecordedForMachine(st, m.ID, LifecycleNotificationMachineExpired)
+	default:
+		return true
+	}
 }

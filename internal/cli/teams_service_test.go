@@ -1149,6 +1149,11 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<Command>powershell.exe</Command>",
 		"-WindowStyle Hidden",
+		"codex-helper\\teams",
+		"starting hidden Teams helper process",
+		"Start-Process -FilePath",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
 		"<WorkingDirectory>" + cwd + "</WorkingDirectory>",
 		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;run&apos; &apos;--owner-stale-after&apos; &apos;18s&apos; &apos;--registry&apos; &apos;` + registryPath + `&apos;`,
 		`$code = $LASTEXITCODE`,
@@ -1175,6 +1180,9 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<Interval>PT1M</Interval>",
 		"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
 		"<Command>powershell.exe</Command>",
+		"Start-Process -FilePath",
+		"-RedirectStandardOutput $stdoutLog",
+		"-RedirectStandardError $stderrLog",
 		`&amp; &apos;` + exePath + `&apos; &apos;teams&apos; &apos;service&apos; &apos;watchdog&apos; &apos;--loop&apos; &apos;--interval&apos; &apos;10s&apos; &apos;--quiet&apos;`,
 		`$env:CODEX_HELPER_TEAMS_SERVICE = &apos;1&apos;`,
 	} {
@@ -1217,11 +1225,11 @@ func TestTeamsServiceWindowsPowerShellPropagatesChildExitCodeCI(t *testing.T) {
 	child := filepath.Join(tmp, "exit-37")
 	if runtime.GOOS == "windows" {
 		child += ".cmd"
-		if err := os.WriteFile(child, []byte("@exit /b 37\r\n"), 0o700); err != nil {
+		if err := os.WriteFile(child, []byte("@echo visible stdout\r\n@echo visible stderr 1>&2\r\n@exit /b 37\r\n"), 0o700); err != nil {
 			t.Fatalf("write child command: %v", err)
 		}
 	} else {
-		if err := os.WriteFile(child, []byte("#!/bin/sh\nexit 37\n"), 0o700); err != nil {
+		if err := os.WriteFile(child, []byte("#!/bin/sh\necho visible stdout\necho visible stderr >&2\nexit 37\n"), 0o700); err != nil {
 			t.Fatalf("write child command: %v", err)
 		}
 	}
@@ -1230,13 +1238,16 @@ func TestTeamsServiceWindowsPowerShellPropagatesChildExitCodeCI(t *testing.T) {
 		Environment: map[string]string{"CODEX_HELPER_TEAMS_SERVICE": "1"},
 	}, []string{"teams", "run"})
 	cmd := exec.Command(shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
-	err = cmd.Run()
+	out, err := cmd.CombinedOutput()
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
-		t.Fatalf("PowerShell error = %T %v, want exit error", err, err)
+		t.Fatalf("PowerShell error = %T %v, want exit error\noutput:\n%s", err, err, string(out))
 	}
 	if got := exitErr.ExitCode(); got != 37 {
-		t.Fatalf("PowerShell exit code = %d, want child exit code 37", got)
+		t.Fatalf("PowerShell exit code = %d, want child exit code 37\noutput:\n%s", got, string(out))
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("PowerShell leaked child output instead of redirecting it:\n%s", string(out))
 	}
 }
 

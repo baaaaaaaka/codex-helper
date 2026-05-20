@@ -193,6 +193,7 @@ codex-proxy beacon profile create gpu \
   --nodes 1 \
   --gpu 1 \
   --duration 4 \
+  --shared-path /shared/cxp-beacon \
   --query-command /path/to/query-slurm-allocation \
   --submit-command /path/to/submit-slurm-allocation \
   --cancel-command /path/to/cancel-slurm-allocation \
@@ -202,7 +203,7 @@ codex-proxy beacon profile create gpu \
 LSF and local drafts use smaller inputs:
 
 ```bash
-codex-proxy beacon profile create batch --provider lsf --queue normal
+codex-proxy beacon profile create batch --provider lsf --queue normal --shared-path /shared/cxp-beacon
 codex-proxy beacon profile create local --provider local
 ```
 
@@ -211,9 +212,15 @@ add `--proxy ssh_profile --proxy-profile <existing-profile>`. Add
 `--isolation shared` or `--isolation exclusive` to choose the default lease
 sharing mode.
 
+For managed Slurm/LSF profiles, `--shared-path` must point at an absolute
+directory that both the control machine and allocated workers can read and write. If
+`CODEX_HELPER_BEACON_STORE` is explicitly configured, cxp preserves that store
+path for workers; otherwise it derives a store under `shared_path`.
+
 Profiles stay draft until checked and confirmed. `profile doctor` validates the
-profile fields and the `query`/`submit`/`cancel`/`renew` adapter commands that
-future Teams turns will need:
+profile fields, shared-path write/rename access, and the
+`query`/`submit`/`cancel`/`renew` adapter commands that future Teams turns will
+need:
 
 ```bash
 codex-proxy beacon profile doctor gpu

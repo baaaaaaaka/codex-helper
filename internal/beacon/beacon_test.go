@@ -38,6 +38,7 @@ func TestProfileLifecycleDraftDoctorConfirmAndProxy(t *testing.T) {
 		Provider:     ProviderSlurm,
 		ProxyMode:    ProxySSHProfile,
 		ProxyProfile: "jump-a",
+		SharedPath:   t.TempDir(),
 		Slurm:        SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
 		Now:          time.Unix(1, 0),
 	})
@@ -63,13 +64,35 @@ func TestProfileLifecycleDraftDoctorConfirmAndProxy(t *testing.T) {
 	}
 }
 
+func TestManagedProfileSharedPathMustBeAbsolute(t *testing.T) {
+	var st State
+	p, err := CreateProfile(&st, CreateProfileInput{
+		Name:       "gpu",
+		Provider:   ProviderSlurm,
+		ProxyMode:  ProxyNone,
+		SharedPath: "relative/shared",
+		Slurm:      SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	reasons := strings.Join(p.DraftReasons(nil), ",")
+	if !strings.Contains(reasons, "shared_path must be absolute") {
+		t.Fatalf("relative managed shared_path should keep profile draft, reasons=%q", reasons)
+	}
+	if p.ProviderPreviewOK {
+		t.Fatalf("relative shared_path should not produce a provider preview")
+	}
+}
+
 func TestLSFProfileQueueOnlyDraftNeedsOnlyDoctorAndConfirm(t *testing.T) {
 	var st State
 	p, err := CreateProfile(&st, CreateProfileInput{
-		Name:      "lsf",
-		Provider:  ProviderLSF,
-		ProxyMode: ProxyNone,
-		LSF:       LSFProfile{QueueName: "o_pri_interactive"},
+		Name:       "lsf",
+		Provider:   ProviderLSF,
+		ProxyMode:  ProxyNone,
+		SharedPath: t.TempDir(),
+		LSF:        LSFProfile{QueueName: "o_pri_interactive"},
 	})
 	if err != nil {
 		t.Fatalf("CreateProfile: %v", err)
@@ -93,10 +116,11 @@ func TestLSFProfileQueueOnlyDraftNeedsOnlyDoctorAndConfirm(t *testing.T) {
 func TestProfileDoctorReportChecksProviderAdapters(t *testing.T) {
 	var st State
 	if _, err := CreateProfile(&st, CreateProfileInput{
-		Name:      "gpu",
-		Provider:  ProviderSlurm,
-		ProxyMode: ProxyNone,
-		Slurm:     SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+		Name:       "gpu",
+		Provider:   ProviderSlurm,
+		ProxyMode:  ProxyNone,
+		SharedPath: t.TempDir(),
+		Slurm:      SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
 	}); err != nil {
 		t.Fatalf("CreateProfile: %v", err)
 	}
@@ -124,11 +148,12 @@ func TestProfileDoctorReportChecksProviderAdapters(t *testing.T) {
 func TestProfileDoctorSmokeSubmitQueryCancelAndPersistsReport(t *testing.T) {
 	var st State
 	p, err := CreateProfile(&st, CreateProfileInput{
-		Name:      "gpu",
-		Provider:  ProviderSlurm,
-		ProxyMode: ProxyNone,
-		Slurm:     SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
-		Adapter:   ProviderCommandConfigForProvider(ProviderSlurm, "/query", "/submit", "/cancel", "/renew"),
+		Name:       "gpu",
+		Provider:   ProviderSlurm,
+		ProxyMode:  ProxyNone,
+		SharedPath: t.TempDir(),
+		Slurm:      SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+		Adapter:    ProviderCommandConfigForProvider(ProviderSlurm, "/query", "/submit", "/cancel", "/renew"),
 	})
 	if err != nil {
 		t.Fatalf("CreateProfile: %v", err)
@@ -397,6 +422,7 @@ func TestUpdateProfileCreatesRevisionAndPinsExistingTargets(t *testing.T) {
 		Name:             "gpu",
 		Provider:         ProviderSlurm,
 		IsolationDefault: IsolationShared,
+		SharedPath:       t.TempDir(),
 		Slurm:            SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "old", Image: "old.sqsh", Duration: 2},
 		Adapter:          ProviderCommandConfigForProvider(ProviderSlurm, "/old/query", "/old/submit", "", ""),
 		Now:              now,
@@ -449,6 +475,7 @@ func TestUpdateProfileConfigPreservesExistingFieldsForPartialAdapterShellUpdate(
 		Provider:         ProviderSlurm,
 		ProxyMode:        ProxyNone,
 		IsolationDefault: IsolationExclusive,
+		SharedPath:       t.TempDir(),
 		Slurm:            SlurmProfile{Nodes: 2, GPUCount: 8, Partition: "interactive", Image: "image.sqsh", Duration: 6},
 		Adapter:          ProviderCommandConfigForProvider(ProviderSlurm, "/old/query", "/old/submit", "/old/cancel", "/old/renew"),
 		Now:              now,
@@ -482,6 +509,7 @@ func TestRollbackProfileRevisionPublishesNewRevisionAndPruneKeepsPinnedHistory(t
 		Name:             "gpu",
 		Provider:         ProviderSlurm,
 		IsolationDefault: IsolationShared,
+		SharedPath:       t.TempDir(),
 		Slurm:            SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "old", Image: "old.sqsh", Duration: 2},
 		Adapter:          ProviderCommandConfigForProvider(ProviderSlurm, "/old/query", "/old/submit", "", ""),
 		Now:              now,
@@ -1133,6 +1161,7 @@ func readyProfile(name string) Profile {
 		Provider:          ProviderLocal,
 		ProxyMode:         ProxyNone,
 		IsolationDefault:  IsolationShared,
+		SharedPath:        "/shared/cxp",
 		Confirmed:         true,
 		ProviderPreviewOK: true,
 		DoctorOK:          true,

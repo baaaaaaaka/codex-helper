@@ -34,18 +34,18 @@ Use `cxp proxy` only when the user is asking about SSH/network routing. If the u
 Beacon profiles describe where future Codex work executes. Create and confirm a profile before switching a conversation to it.
 
 - `cxp beacon profile list`: list beacon profiles.
-- `cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration>`: create a Slurm draft profile.
+- `cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration> --shared-path <path>`: create a Slurm draft profile. The shared path must be absolute and visible to the control machine and allocated workers.
 - `cxp beacon profile create <name> ... --query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>`: store Slurm/LSF adapter commands on the profile so future Teams turns can use them without a helper reload.
 - Managed Slurm/LSF adapters use `--adapter-shell user` by default, so scheduler setup from modules, `submit_job`, NSS, or `SUBMIT_ACCOUNT` is available unless the profile explicitly sets `--adapter-shell direct`.
 - `cxp beacon profile update <name> ...`: create a new profile revision without breaking Work chats already bound to the old revision.
 - `cxp beacon profile history <name>`: list current and historical profile revisions.
 - `cxp beacon profile rollback <name> <revision>`: publish a historical revision as a new latest revision.
 - `cxp beacon profile gc <name>`: prune unreferenced historical revisions only.
-- `cxp beacon profile create <name> --provider lsf --queue <queue>`: create an LSF draft profile.
+- `cxp beacon profile create <name> --provider lsf --queue <queue> --shared-path <path>`: create an LSF draft profile.
 - `cxp beacon profile create <name> --provider local`: create a local draft profile.
 - `cxp beacon profile create <name> ... --proxy ssh_profile --proxy-profile <existing-proxy>`: attach an existing SSH proxy profile when the beacon job needs that network route.
 - `cxp beacon profile create <name> ... --isolation shared|exclusive`: set the default lease sharing mode.
-- `cxp beacon profile doctor <name>`: validate profile fields and the query/submit/cancel/renew adapter commands visible to cxp without touching the scheduler.
+- `cxp beacon profile doctor <name>`: validate profile fields, shared-path access, and the query/submit/cancel/renew adapter commands visible to cxp without touching the scheduler.
 - `cxp beacon profile doctor <name> --smoke`: submit, query, and cancel one real scheduler allocation to verify adapter output and cleanup.
 - `cxp beacon profile confirm <name>`: confirm a reviewed profile so it can be used.
 - `cxp beacon profile status <name>`: inspect one profile.
@@ -78,7 +78,7 @@ For managed Slurm/LSF adapters, the default `user` shell mode invokes `$SHELL -l
 
 The active Teams helper owner periodically queries existing provider jobs and renews due allocations through the configured `*_RENEW` adapter. Renewal is epoch-fenced and never updates a newer cancel, replacement, or provider job. During helper drain, renewal only protects allocations whose job may already have started; pre-start replacement is conservative and only resets a lost allocation when all jobs are still queued.
 
-For real remote execution, start from `cxp beacon provider template slurm` or `cxp beacon provider template lsf`, edit it for the site, and set the matching `CODEX_HELPER_BEACON_*_QUERY` / `*_SUBMIT` / `*_CANCEL` / `*_RENEW` environment variables. The scheduler job should run `cxp beacon worker serve --allocation <request-id>` for reusable workers, or `cxp beacon worker run-once --allocation <request-id> --wait 30m` for one-shot jobs. The worker derives `SLURM_JOB_ID` or `LSB_JOBID` when `--provider-job` is omitted, runs a doctor check, sends heartbeats, waits for the Teams turn to enqueue work, and publishes the terminal result. Teams waits through this path instead of falling back to local Codex.
+For real remote execution, start from `cxp beacon provider template slurm` or `cxp beacon provider template lsf`, edit it for the site, and set the matching `CODEX_HELPER_BEACON_*_QUERY` / `*_SUBMIT` / `*_CANCEL` / `*_RENEW` environment variables. The scheduler job should run `cxp beacon worker serve --allocation <request-id>` for reusable workers, or `cxp beacon worker run-once --allocation <request-id> --wait 30m` for one-shot jobs. The provider template passes the explicit beacon store to the worker when configured, otherwise it passes the profile-derived shared store under `--shared-path`. The worker derives `SLURM_JOB_ID` or `LSB_JOBID` when `--provider-job` is omitted, runs a doctor check, sends heartbeats, waits for the Teams turn to enqueue work, and publishes the terminal result. Teams waits through this path instead of falling back to local Codex.
 
 Scheduler-capable CI can opt in to the real adapter test with `CODEX_HELPER_BEACON_LIVE=1`, `CODEX_HELPER_BEACON_LIVE_PROVIDER=slurm|lsf`, and the matching query/submit/cancel commands. The live test submits through a profile-stored adapter snapshot and cancels the provider job during cleanup.
 

@@ -51,8 +51,14 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	}
 	recentSet := historyWatchPathSet(recent)
 	paths = append(paths, recent...)
+	sessionsRootMissing := false
 	if reconcile {
 		reconciled, err := b.historyWatchReconcilePaths(ctx)
+		if codexhistory.IsSessionsDirNotFound(err) {
+			err = nil
+			reconciled = nil
+			sessionsRootMissing = true
+		}
 		if err != nil {
 			if !initialized {
 				return err
@@ -75,6 +81,9 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	}
 	paths = uniqueSortedCleanPaths(paths)
 	if !initialized {
+		if sessionsRootMissing {
+			return nil
+		}
 		return b.baselineCodexHistoryWatch(ctx, paths, now)
 	}
 	changes, err := historyWatchChangedPaths(paths, state)

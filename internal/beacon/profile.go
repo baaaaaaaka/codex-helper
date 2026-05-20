@@ -18,6 +18,7 @@ type CreateProfileInput struct {
 	ProxyMode                    ProxyMode
 	ProxyProfile                 string
 	IsolationDefault             Isolation
+	SharedPath                   string
 	Slurm                        SlurmProfile
 	LSF                          LSFProfile
 	Adapter                      ProviderCommandConfig
@@ -75,6 +76,7 @@ func CreateProfile(st *State, in CreateProfileInput) (Profile, error) {
 		ProxyMode:        proxyMode,
 		ProxyProfile:     strings.TrimSpace(in.ProxyProfile),
 		IsolationDefault: isolation,
+		SharedPath:       NormalizeSharedPath(in.SharedPath),
 		Slurm:            in.Slurm,
 		LSF:              in.LSF,
 		Adapter:          in.Adapter,
@@ -134,6 +136,10 @@ func UpdateProfileConfig(st *State, in UpdateProfileInput) (Profile, error) {
 	if isolation == "" {
 		isolation = IsolationShared
 	}
+	sharedPath := NormalizeSharedPath(in.SharedPath)
+	if sharedPath == "" {
+		sharedPath = old.SharedPath
+	}
 	slurm := in.Slurm
 	if provider == old.Provider && provider == ProviderSlurm && slurm == (SlurmProfile{}) {
 		slurm = old.Slurm
@@ -153,6 +159,7 @@ func UpdateProfileConfig(st *State, in UpdateProfileInput) (Profile, error) {
 		ProxyMode:        proxyMode,
 		ProxyProfile:     proxyProfile,
 		IsolationDefault: isolation,
+		SharedPath:       sharedPath,
 		Slurm:            slurm,
 		LSF:              lsf,
 		Adapter:          adapter,
@@ -490,6 +497,13 @@ func profileDoctorConfigurationIssues(p Profile, proxyExists func(string) bool) 
 	}
 	switch p.Provider {
 	case ProviderSlurm:
+		if strings.TrimSpace(p.SharedPath) == "" {
+			issues = append(issues, "shared_path is required for slurm profiles")
+		} else if !SharedPathIsAbsolute(p.SharedPath) {
+			issues = append(issues, "shared_path must be absolute")
+		} else if err := ProbeSharedPath(p.SharedPath); err != nil {
+			issues = append(issues, "shared_path probe failed: "+err.Error())
+		}
 		if p.Slurm.Nodes <= 0 {
 			issues = append(issues, "slurm nodes must be > 0")
 		}
@@ -506,6 +520,13 @@ func profileDoctorConfigurationIssues(p Profile, proxyExists func(string) bool) 
 			issues = append(issues, "slurm duration must be > 0")
 		}
 	case ProviderLSF:
+		if strings.TrimSpace(p.SharedPath) == "" {
+			issues = append(issues, "shared_path is required for lsf profiles")
+		} else if !SharedPathIsAbsolute(p.SharedPath) {
+			issues = append(issues, "shared_path must be absolute")
+		} else if err := ProbeSharedPath(p.SharedPath); err != nil {
+			issues = append(issues, "shared_path probe failed: "+err.Error())
+		}
 		if strings.TrimSpace(p.LSF.QueueName) == "" {
 			issues = append(issues, "lsf queue name is required")
 		}
@@ -804,6 +825,11 @@ func (p Profile) DraftReasons(proxyExists func(string) bool) []string {
 	}
 	switch p.Provider {
 	case ProviderSlurm:
+		if strings.TrimSpace(p.SharedPath) == "" {
+			reasons = append(reasons, "shared_path is required for slurm profiles")
+		} else if !SharedPathIsAbsolute(p.SharedPath) {
+			reasons = append(reasons, "shared_path must be absolute")
+		}
 		if p.Slurm.Nodes <= 0 {
 			reasons = append(reasons, "slurm nodes must be > 0")
 		}
@@ -820,6 +846,11 @@ func (p Profile) DraftReasons(proxyExists func(string) bool) []string {
 			reasons = append(reasons, "slurm duration must be > 0")
 		}
 	case ProviderLSF:
+		if strings.TrimSpace(p.SharedPath) == "" {
+			reasons = append(reasons, "shared_path is required for lsf profiles")
+		} else if !SharedPathIsAbsolute(p.SharedPath) {
+			reasons = append(reasons, "shared_path must be absolute")
+		}
 		if strings.TrimSpace(p.LSF.QueueName) == "" {
 			reasons = append(reasons, "lsf queue name is required")
 		}
@@ -859,13 +890,14 @@ func (p Profile) DraftReasons(proxyExists func(string) bool) []string {
 func providerPreviewOK(p Profile) bool {
 	switch p.Provider {
 	case ProviderSlurm:
-		return p.Slurm.Nodes > 0 &&
+		return SharedPathIsAbsolute(p.SharedPath) &&
+			p.Slurm.Nodes > 0 &&
 			p.Slurm.GPUCount >= 0 &&
 			strings.TrimSpace(p.Slurm.Partition) != "" &&
 			strings.TrimSpace(p.Slurm.Image) != "" &&
 			p.Slurm.Duration > 0
 	case ProviderLSF:
-		return strings.TrimSpace(p.LSF.QueueName) != ""
+		return SharedPathIsAbsolute(p.SharedPath) && strings.TrimSpace(p.LSF.QueueName) != ""
 	case ProviderLocal:
 		return true
 	default:

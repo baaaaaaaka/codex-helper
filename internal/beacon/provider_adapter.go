@@ -137,14 +137,19 @@ func ConfiguredProviderCommandOperations(config ProviderCommandConfig, provider 
 }
 
 type CommandProviderAdapter struct {
-	Config ProviderCommandConfig
-	Runner ProviderCommandRunner
+	Config    ProviderCommandConfig
+	Runner    ProviderCommandRunner
+	StorePath string
 }
 
 func NewCommandProviderAdapterFromEnv(getenv func(string) string) CommandProviderAdapter {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
 	return CommandProviderAdapter{
-		Config: ProviderCommandConfigFromEnv(getenv),
-		Runner: ExecProviderCommandRunner{},
+		Config:    ProviderCommandConfigFromEnv(getenv),
+		Runner:    ExecProviderCommandRunner{},
+		StorePath: strings.TrimSpace(getenv("CODEX_HELPER_BEACON_STORE")),
 	}
 }
 
@@ -153,7 +158,7 @@ func (a CommandProviderAdapter) QueryAllocation(ctx context.Context, req Allocat
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, req, command, providerCommandArgs(req, "query"))
+	out, err := a.run(ctx, req, command, a.providerCommandArgs(req, "query"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("query beacon provider allocation via %s: %w", source, err)
 	}
@@ -169,7 +174,7 @@ func (a CommandProviderAdapter) SubmitAllocation(ctx context.Context, req Alloca
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, req, command, providerCommandArgs(req, "submit"))
+	out, err := a.run(ctx, req, command, a.providerCommandArgs(req, "submit"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("submit beacon provider allocation via %s: %w", source, err)
 	}
@@ -185,7 +190,7 @@ func (a CommandProviderAdapter) CancelAllocation(ctx context.Context, req Alloca
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, req, command, providerCommandArgs(req, "cancel"))
+	out, err := a.run(ctx, req, command, a.providerCommandArgs(req, "cancel"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("cancel beacon provider allocation via %s: %w", source, err)
 	}
@@ -201,7 +206,7 @@ func (a CommandProviderAdapter) RenewAllocation(ctx context.Context, req Allocat
 	if err != nil {
 		return SchedulerQueryResult{}, err
 	}
-	out, err := a.run(ctx, req, command, providerCommandArgs(req, "renew"))
+	out, err := a.run(ctx, req, command, a.providerCommandArgs(req, "renew"))
 	if err != nil {
 		return SchedulerQueryResult{}, fmt.Errorf("renew beacon provider allocation via %s: %w", source, err)
 	}
@@ -673,6 +678,21 @@ func providerCommandArgs(req AllocationRequest, operation string) []string {
 		if profile.LSF.AdvancedApproved {
 			args = append(args, "--lsf-advanced-approved")
 		}
+	}
+	return args
+}
+
+func (a CommandProviderAdapter) providerCommandArgs(req AllocationRequest, operation string) []string {
+	args := providerCommandArgs(req, operation)
+	if !strings.EqualFold(strings.TrimSpace(operation), "submit") {
+		return args
+	}
+	sharedStore := strings.TrimSpace(a.StorePath)
+	if sharedStore == "" {
+		sharedStore = SharedStorePath(req.ProfileSnapshot.SharedPath)
+	}
+	if sharedStore != "" {
+		args = append(args, "--shared-store", sharedStore)
 	}
 	return args
 }

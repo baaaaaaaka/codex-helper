@@ -107,6 +107,55 @@ func TestAllocationSummaryLinesAreReadableForLongSubmitReason(t *testing.T) {
 	}
 }
 
+func TestDefaultBeaconSummariesHideTerminalItemsAfterNotification(t *testing.T) {
+	st := State{
+		Allocations: map[string]AllocationRequest{
+			"req-failed":          {ID: "req-failed", Profile: "gpu", Provider: ProviderSlurm, State: AllocationFailed, ProviderReason: "node failed"},
+			"req-needs-attention": {ID: "req-needs-attention", Profile: "gpu", Provider: ProviderSlurm, State: AllocationNeedsAttention, ProviderReason: "submit failed"},
+			"req-live":            {ID: "req-live", Profile: "gpu", Provider: ProviderSlurm, State: AllocationRunning},
+		},
+		Machines: map[string]Machine{
+			"machine-failed":   {ID: "machine-failed", LeaseID: "lease-failed", Profile: "gpu", State: string(LeaseLost), Reason: "node failed"},
+			"machine-draining": {ID: "machine-draining", LeaseID: "lease-draining", Profile: "gpu", State: string(LeaseDraining), Reason: "worker heartbeat stale"},
+			"machine-live":     {ID: "machine-live", LeaseID: "lease-live", Profile: "gpu", State: string(LeaseAccepting)},
+		},
+		Notifications: map[string]LifecycleNotificationRecord{},
+	}
+	RecordLifecycleNotification(&st, LifecycleNotificationRecord{
+		ID:           LifecycleNotificationID(LifecycleNotificationAllocationFailed, "req-failed", "", "", string(AllocationFailed), "node failed"),
+		Kind:         LifecycleNotificationAllocationFailed,
+		AllocationID: "req-failed",
+	}, time.Unix(1, 0))
+	RecordLifecycleNotification(&st, LifecycleNotificationRecord{
+		ID:           LifecycleNotificationID(LifecycleNotificationAllocationFailed, "req-needs-attention", "", "", string(AllocationNeedsAttention), "submit failed"),
+		Kind:         LifecycleNotificationAllocationFailed,
+		AllocationID: "req-needs-attention",
+	}, time.Unix(1, 0))
+	RecordLifecycleNotification(&st, LifecycleNotificationRecord{
+		ID:        LifecycleNotificationID(LifecycleNotificationMachineFailed, "", "machine-failed", "", string(LeaseLost), "node failed"),
+		Kind:      LifecycleNotificationMachineFailed,
+		MachineID: "machine-failed",
+	}, time.Unix(1, 0))
+	RecordLifecycleNotification(&st, LifecycleNotificationRecord{
+		ID:        LifecycleNotificationID(LifecycleNotificationMachineFailed, "", "machine-draining", "", string(LeaseDraining), "worker heartbeat stale"),
+		Kind:      LifecycleNotificationMachineFailed,
+		MachineID: "machine-draining",
+	}, time.Unix(1, 0))
+
+	allocLines := strings.Join(ActiveAllocationSummaryLines(st), "\n")
+	if strings.Contains(allocLines, "req-failed") || strings.Contains(allocLines, "req-needs-attention") || !strings.Contains(allocLines, "req-live") {
+		t.Fatalf("active allocation summary should hide reported terminal allocation:\n%s", allocLines)
+	}
+	machineLines := strings.Join(ActiveMachineSummaryLines(st), "\n")
+	if strings.Contains(machineLines, "machine-failed") || strings.Contains(machineLines, "machine-draining") || !strings.Contains(machineLines, "machine-live") {
+		t.Fatalf("active machine summary should hide reported terminal machine:\n%s", machineLines)
+	}
+	allLines := strings.Join(MachineSummaryLines(st), "\n")
+	if !strings.Contains(allLines, "machine-failed") {
+		t.Fatalf("--all machine summary should retain hidden history:\n%s", allLines)
+	}
+}
+
 func TestMachineStatusNoticeShowsBootstrapDiagnostics(t *testing.T) {
 	msg := MachineStatusNotice(Machine{
 		ID:            "machine-1",

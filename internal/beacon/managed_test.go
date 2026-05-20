@@ -747,6 +747,7 @@ func TestWorkerRegistrationHeartbeatAndRecoveryLifecycle(t *testing.T) {
 		Host:            "worker-host",
 		State:           LeaseAccepting,
 		Doctor:          healthyWorkerDoctor(),
+		Bootstrap:       BootstrapDiagnostics{SharedStorePath: SharedStorePath(req.ProfileSnapshot.SharedPath)},
 		MembershipProof: "slurm:slurm-1",
 	}, time.Unix(2, 0))
 	if err != nil {
@@ -782,6 +783,7 @@ func TestWorkerRegistrationHeartbeatAndRecoveryLifecycle(t *testing.T) {
 		ProviderJobID:   "slurm-1",
 		State:           LeaseAccepting,
 		Doctor:          copyDoctor(healthyWorkerDoctor(), func(in *WorkerDoctor) { in.CodexAvailable = false }),
+		Bootstrap:       BootstrapDiagnostics{SharedStorePath: SharedStorePath(req.ProfileSnapshot.SharedPath)},
 		MembershipProof: "slurm:slurm-1",
 	}, time.Unix(5, 0))
 	if err != nil {
@@ -874,6 +876,7 @@ func TestWorkerRegistrationRejectsStaleReplacementProviderJob(t *testing.T) {
 		ProviderJobID:   "slurm-new",
 		State:           LeaseAccepting,
 		Doctor:          healthyWorkerDoctor(),
+		Bootstrap:       BootstrapDiagnostics{SharedStorePath: SharedStorePath(req.ProfileSnapshot.SharedPath)},
 		MembershipProof: "slurm:slurm-new",
 	}, time.Unix(4, 0)); err != nil {
 		t.Fatalf("new replacement worker should be accepted: %v", err)

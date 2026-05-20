@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,13 +36,13 @@ func (b *Bridge) handleBeaconWorkCommand(ctx context.Context, session *Session, 
 func (b *Bridge) runBeaconControlCommand(ctx context.Context, msg ChatMessage, arg string) (string, error) {
 	words := strings.Fields(strings.TrimSpace(arg))
 	if len(words) == 0 {
-		return b.formatBeaconList()
+		return b.formatBeaconList(false)
 	}
 	switch strings.ToLower(words[0]) {
 	case "help", "h", "?":
 		return beaconControlHelpText(), nil
 	case "list", "ls":
-		return b.formatBeaconList()
+		return b.formatBeaconList(beaconListAll(words[1:]))
 	case "profiles":
 		if len(words) == 1 {
 			return b.formatBeaconProfiles()
@@ -51,14 +52,20 @@ func (b *Bridge) runBeaconControlCommand(ctx context.Context, msg ChatMessage, a
 		return b.handleBeaconProfileCommand(ctx, msg, b.reg.ControlChatID, words[1:])
 	case "machines":
 		if len(words) == 1 {
-			return b.formatBeaconMachines()
+			return b.formatBeaconMachines(false)
+		}
+		if beaconListAll(words[1:]) {
+			return b.formatBeaconMachines(true)
 		}
 		return b.handleBeaconMachineCommand(ctx, msg, b.reg.ControlChatID, words[1:])
 	case "machine":
 		return b.handleBeaconMachineCommand(ctx, msg, b.reg.ControlChatID, words[1:])
 	case "allocations":
 		if len(words) == 1 {
-			return b.formatBeaconAllocations()
+			return b.formatBeaconAllocations(false)
+		}
+		if beaconListAll(words[1:]) {
+			return b.formatBeaconAllocations(true)
 		}
 		return b.handleBeaconAllocationCommand(ctx, words[1:])
 	case "allocation":
@@ -66,7 +73,7 @@ func (b *Bridge) runBeaconControlCommand(ctx context.Context, msg ChatMessage, a
 	case "status":
 		sessionID := beaconStatusSessionArg(words[1:])
 		if sessionID == "" {
-			return b.formatBeaconList()
+			return b.formatBeaconList(false)
 		}
 		return b.formatBeaconSessionStatus(sessionID)
 	case "release":
@@ -87,7 +94,7 @@ func (b *Bridge) runBeaconWorkCommand(ctx context.Context, session *Session, msg
 	case "help", "h", "?":
 		return beaconWorkHelpText(), nil
 	case "list", "ls":
-		return b.formatBeaconList()
+		return b.formatBeaconList(beaconListAll(words[1:]))
 	case "status", "st":
 		return b.formatBeaconSessionStatus(session.ID)
 	case "switch", "switch-profile":
@@ -258,11 +265,11 @@ func (b *Bridge) handleBeaconProfileCommand(ctx context.Context, msg ChatMessage
 
 func (b *Bridge) handleBeaconMachineCommand(ctx context.Context, msg ChatMessage, idempotencyScope string, words []string) (string, error) {
 	if len(words) == 0 {
-		return b.formatBeaconMachines()
+		return b.formatBeaconMachines(false)
 	}
 	switch strings.ToLower(words[0]) {
 	case "list", "ls":
-		return b.formatBeaconMachines()
+		return b.formatBeaconMachines(beaconListAll(words[1:]))
 	case "status":
 		ref, err := singleBeaconNameArg("beacon machine status", words[1:])
 		if err != nil {
@@ -331,11 +338,11 @@ func (b *Bridge) handleBeaconMachineCommand(ctx context.Context, msg ChatMessage
 
 func (b *Bridge) handleBeaconAllocationCommand(ctx context.Context, words []string) (string, error) {
 	if len(words) == 0 {
-		return b.formatBeaconAllocations()
+		return b.formatBeaconAllocations(false)
 	}
 	switch strings.ToLower(words[0]) {
 	case "list", "ls":
-		return b.formatBeaconAllocations()
+		return b.formatBeaconAllocations(beaconListAll(words[1:]))
 	case "status":
 		ref, err := singleBeaconNameArg("beacon allocation status", words[1:])
 		if err != nil {
@@ -660,12 +667,18 @@ func scopedBeaconTeamsMessageID(scope string, messageID string) string {
 	return scope + ":" + messageID
 }
 
-func (b *Bridge) formatBeaconList() (string, error) {
-	store, err := beacon.NewStore("")
-	if err != nil {
-		return "", err
+func beaconListAll(words []string) bool {
+	for _, word := range words {
+		switch strings.ToLower(strings.TrimSpace(word)) {
+		case "--all", "all":
+			return true
+		}
 	}
-	st, err := store.Load()
+	return false
+}
+
+func (b *Bridge) formatBeaconList(all bool) (string, error) {
+	st, err := loadBeaconStateWithSharedProfiles()
 	if err != nil {
 		return "", err
 	}
@@ -673,9 +686,9 @@ func (b *Bridge) formatBeaconList() (string, error) {
 	lines := []string{"Beacon list", "", "Profiles:"}
 	lines = append(lines, formatBeaconProfileListLines(st, proxyExists)...)
 	lines = append(lines, "", "Allocations:")
-	lines = append(lines, formatBeaconAllocationListLines(st)...)
+	lines = append(lines, formatBeaconAllocationListLines(st, all)...)
 	lines = append(lines, "", "Machines:")
-	lines = append(lines, formatBeaconMachineListLines(st)...)
+	lines = append(lines, formatBeaconMachineListLines(st, all)...)
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -693,31 +706,23 @@ func (b *Bridge) formatBeaconProfiles() (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func (b *Bridge) formatBeaconMachines() (string, error) {
-	store, err := beacon.NewStore("")
-	if err != nil {
-		return "", err
-	}
-	st, err := store.Load()
+func (b *Bridge) formatBeaconMachines(all bool) (string, error) {
+	st, err := loadBeaconStateWithSharedProfiles()
 	if err != nil {
 		return "", err
 	}
 	lines := []string{"Beacon machines"}
-	lines = append(lines, formatBeaconMachineListLines(st)...)
+	lines = append(lines, formatBeaconMachineListLines(st, all)...)
 	return strings.Join(lines, "\n"), nil
 }
 
-func (b *Bridge) formatBeaconAllocations() (string, error) {
-	store, err := beacon.NewStore("")
-	if err != nil {
-		return "", err
-	}
-	st, err := store.Load()
+func (b *Bridge) formatBeaconAllocations(all bool) (string, error) {
+	st, err := loadBeaconStateWithSharedProfiles()
 	if err != nil {
 		return "", err
 	}
 	lines := []string{"Beacon allocations"}
-	lines = append(lines, formatBeaconAllocationListLines(st)...)
+	lines = append(lines, formatBeaconAllocationListLines(st, all)...)
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -888,6 +893,11 @@ type teamsBeaconProfileCreateInput struct {
 
 func (in teamsBeaconProfileCreateInput) withProxyResolver(proxyExists func(string) bool) beacon.CreateProfileInput {
 	out := in.CreateProfileInput
+	if strings.TrimSpace(out.SharedPath) == "" && beacon.ManagedProviderRequiresSharedPath(out.Provider) {
+		if storePath := strings.TrimSpace(os.Getenv("CODEX_HELPER_BEACON_STORE")); storePath != "" {
+			out.SharedPath = filepath.Dir(storePath)
+		}
+	}
 	out.ExistingProxyProfileResolver = proxyExists
 	out.Now = time.Now()
 	return out
@@ -986,6 +996,12 @@ func parseBeaconProfileInput(words []string, verb string, defaultProvider beacon
 				return teamsBeaconProfileCreateInput{}, err
 			}
 			in.IsolationDefault = beacon.Isolation(v)
+		case "--shared-path":
+			v, err := value()
+			if err != nil {
+				return teamsBeaconProfileCreateInput{}, err
+			}
+			in.SharedPath = v
 		case "--query-command":
 			v, err := value()
 			if err != nil {
@@ -1184,17 +1200,49 @@ func formatBeaconProfileListLines(st beacon.State, proxyExists func(string) bool
 		if revision <= 0 {
 			revision = 1
 		}
-		lines = append(lines, fmt.Sprintf("- %s: %s, rev=%d, provider=%s, isolation=%s, proxy=%s, adapter=%s", p.Name, state, revision, p.Provider, p.IsolationDefault, profileProxyLabel(p), beaconProfileAdapterLabel(p)))
+		facts := []string{
+			fmt.Sprintf("rev=%d", revision),
+			"provider=" + string(p.Provider),
+			"isolation=" + string(p.IsolationDefault),
+			"proxy=" + profileProxyLabel(p),
+			"adapter=" + beaconProfileAdapterLabel(p),
+		}
+		if strings.TrimSpace(p.SharedPath) != "" {
+			facts = append(facts, "shared_path="+p.SharedPath)
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s, %s", p.Name, state, strings.Join(facts, ", ")))
 	}
 	return lines
 }
 
-func formatBeaconMachineListLines(st beacon.State) []string {
-	return beacon.MachineSummaryLines(st)
+func formatBeaconMachineListLines(st beacon.State, all bool) []string {
+	if all {
+		lines := beacon.MachineSummaryLines(st)
+		if len(lines) == 0 {
+			return []string{"- none"}
+		}
+		return lines
+	}
+	lines := beacon.ActiveMachineSummaryLines(st)
+	if len(lines) == 0 {
+		return []string{"- none active"}
+	}
+	return lines
 }
 
-func formatBeaconAllocationListLines(st beacon.State) []string {
-	return beacon.AllocationSummaryLines(st)
+func formatBeaconAllocationListLines(st beacon.State, all bool) []string {
+	if all {
+		lines := beacon.AllocationSummaryLines(st)
+		if len(lines) == 0 {
+			return []string{"- none"}
+		}
+		return lines
+	}
+	lines := beacon.ActiveAllocationSummaryLines(st)
+	if len(lines) == 0 {
+		return []string{"- none active"}
+	}
+	return lines
 }
 
 func formatBeaconProfileMutation(action string, p beacon.Profile, proxyExists func(string) bool) string {
@@ -1210,6 +1258,7 @@ func formatBeaconProfileMutation(action string, p beacon.Profile, proxyExists fu
 		fmt.Sprintf("- revision: %d", maxBeaconProfileRevision(p.Revision)),
 		fmt.Sprintf("- provider: %s", p.Provider),
 		fmt.Sprintf("- isolation: %s", p.IsolationDefault),
+		fmt.Sprintf("- shared_path: %s", firstNonEmptyString(p.SharedPath, "<none>")),
 		fmt.Sprintf("- proxy route: %s", profileProxyLabel(p)),
 		fmt.Sprintf("- adapter: %s", beaconProfileAdapterLabel(p)),
 	}
@@ -1239,6 +1288,7 @@ func formatBeaconProfileDoctorResult(p beacon.Profile, report beacon.ProfileDoct
 		fmt.Sprintf("- revision: `%d`", maxBeaconProfileRevision(p.Revision)),
 		fmt.Sprintf("- provider: `%s`", p.Provider),
 		fmt.Sprintf("- ready: `%t`", p.Ready(proxyExists)),
+		fmt.Sprintf("- shared_path: `%s`", firstNonEmptyString(p.SharedPath, "<none>")),
 		fmt.Sprintf("- adapter: `%s`", beaconProfileAdapterLabel(p)),
 	}
 	if len(report.Operations) > 0 {
@@ -1303,6 +1353,7 @@ func formatBeaconProfileStatus(p beacon.Profile, proxyExists func(string) bool) 
 		fmt.Sprintf("- doctor: %t", p.DoctorOK),
 		fmt.Sprintf("- archived: %t", p.Archived),
 		fmt.Sprintf("- isolation: %s", p.IsolationDefault),
+		"- shared_path: " + firstNonEmptyString(p.SharedPath, "<none>"),
 		"- proxy route: " + profileProxyLabel(p),
 		"- adapter: " + beaconProfileAdapterLabel(p),
 	}

@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -123,11 +124,151 @@ func TestScanSkillsFromGitTreeRejectsUnsafeGitTreeEntries(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := scanSkillsFromGitTree(context.Background(), treeListingGitRunner{listing: []byte(tc.listing)}, "mirror", Source{Name: "acme", Path: "skills"}, "commit")
+			_, err := scanSkillsFromGitTree(context.Background(), treeListingGitRunner{listing: []byte(tc.listing)}, "mirror", Source{Name: "acme", Path: "skills"}, "commit", t.TempDir())
 			if err == nil || !containsString(err.Error(), tc.want) {
 				t.Fatalf("scan error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestScanSkillsFromGitTreeMaterializesGitLFSFiles(t *testing.T) {
+	payload := []byte("MZ real executable bytes")
+	sum := sha256.Sum256(payload)
+	oid := hex.EncodeToString(sum[:])
+	mirror := t.TempDir()
+	runner := &lfsTreeGitRunner{
+		listing: []byte("100644 blob skilloid\tskills/flash/SKILL.md\x00" +
+			"100644 blob assetoid\tskills/flash/assets/tools/nvflash_eng.exe\x00"),
+		blobs: map[string][]byte{
+			"skilloid": []byte("---\nname: flash\ndescription: Flash vBIOS\n---\nbody\n"),
+			"assetoid": []byte(fmt.Sprintf("%s\noid sha256:%s\nsize %d\n", gitLFSPointerVersion, oid, len(payload))),
+		},
+		lfsOID:  oid,
+		lfsData: payload,
+	}
+
+	trees, err := scanSkillsFromGitTree(context.Background(), runner, mirror, Source{Name: "fgx", RemoteURL: "ssh://git@gitlab.example.com/acme/skills.git"}, "commit", t.TempDir())
+	if err != nil {
+		t.Fatalf("scanSkillsFromGitTree: %v", err)
+	}
+	if runner.lfsFetches != 1 {
+		t.Fatalf("lfs fetches = %d, want 1", runner.lfsFetches)
+	}
+	if len(trees) != 1 {
+		t.Fatalf("trees len = %d, want 1", len(trees))
+	}
+	var got []byte
+	for _, file := range trees[0].Files {
+		if file.RelPath == "assets/tools/nvflash_eng.exe" {
+			got = file.Data
+		}
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("LFS asset data = %q, want %q", got, payload)
+	}
+}
+
+func TestScanSkillsFromGitTreeInstallsManagedGitLFSWhenMissing(t *testing.T) {
+	payload := []byte("MZ real executable bytes")
+	sum := sha256.Sum256(payload)
+	oid := hex.EncodeToString(sum[:])
+	managedDir := t.TempDir()
+	runner := &lfsTreeGitRunner{
+		listing: []byte("100644 blob skilloid\tskills/flash/SKILL.md\x00" +
+			"100644 blob assetoid\tskills/flash/assets/tools/nvflash_eng.exe\x00"),
+		blobs: map[string][]byte{
+			"skilloid": []byte("---\nname: flash\ndescription: Flash vBIOS\n---\nbody\n"),
+			"assetoid": []byte(fmt.Sprintf("%s\noid sha256:%s\nsize %d\n", gitLFSPointerVersion, oid, len(payload))),
+		},
+		lfsErr: &GitError{
+			Args:   []string{"lfs", "fetch", skillsLFSRemoteName, "commit"},
+			Output: "git: 'lfs' is not a git command. See 'git --help'.",
+			Err:    fmt.Errorf("exit status 1"),
+		},
+		managedDir: managedDir,
+		lfsOID:     oid,
+		lfsData:    payload,
+	}
+	restore := stubManagedGitLFSInstaller(t, managedDir, nil)
+	defer restore()
+
+	trees, err := scanSkillsFromGitTree(context.Background(), runner, t.TempDir(), Source{Name: "fgx", RemoteURL: "ssh://git@gitlab.example.com/acme/skills.git"}, "commit", t.TempDir())
+	if err != nil {
+		t.Fatalf("scanSkillsFromGitTree: %v", err)
+	}
+	if runner.lfsFetches != 2 {
+		t.Fatalf("lfs fetches = %d, want initial failure plus managed retry", runner.lfsFetches)
+	}
+	if !runner.usedManagedEnv {
+		t.Fatal("managed git-lfs dir was not added to retry PATH")
+	}
+	var got []byte
+	for _, file := range trees[0].Files {
+		if file.RelPath == "assets/tools/nvflash_eng.exe" {
+			got = file.Data
+		}
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("LFS asset data = %q, want %q", got, payload)
+	}
+}
+
+func TestScanSkillsFromGitTreeReportsManagedGitLFSInstallFailure(t *testing.T) {
+	payload := []byte("MZ real executable bytes")
+	sum := sha256.Sum256(payload)
+	oid := hex.EncodeToString(sum[:])
+	runner := &lfsTreeGitRunner{
+		listing: []byte("100644 blob skilloid\tskills/flash/SKILL.md\x00" +
+			"100644 blob assetoid\tskills/flash/assets/tools/nvflash_eng.exe\x00"),
+		blobs: map[string][]byte{
+			"skilloid": []byte("---\nname: flash\ndescription: Flash vBIOS\n---\nbody\n"),
+			"assetoid": []byte(fmt.Sprintf("%s\noid sha256:%s\nsize %d\n", gitLFSPointerVersion, oid, len(payload))),
+		},
+		lfsErr: &GitError{
+			Args:   []string{"lfs", "fetch", skillsLFSRemoteName, "commit"},
+			Output: "git: 'lfs' is not a git command. See 'git --help'.",
+			Err:    fmt.Errorf("exit status 1"),
+		},
+	}
+	restore := stubManagedGitLFSInstaller(t, "", fmt.Errorf("download failed"))
+	defer restore()
+
+	_, err := scanSkillsFromGitTree(context.Background(), runner, t.TempDir(), Source{Name: "fgx", RemoteURL: "ssh://git@gitlab.example.com/acme/skills.git"}, "commit", t.TempDir())
+	if err == nil {
+		t.Fatal("scanSkillsFromGitTree with unavailable git-lfs succeeded, want error")
+	}
+	for _, want := range []string{
+		"skills/flash/assets/tools/nvflash_eng.exe is a Git LFS pointer",
+		"install managed git-lfs",
+		"download failed",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestScanSkillsFromGitTreeRejectsMalformedGitLFSPointer(t *testing.T) {
+	runner := &lfsTreeGitRunner{
+		listing: []byte("100644 blob skilloid\tskills/flash/SKILL.md\x00" +
+			"100644 blob assetoid\tskills/flash/assets/tools/nvflash_eng.exe\x00"),
+		blobs: map[string][]byte{
+			"skilloid": []byte("---\nname: flash\ndescription: Flash vBIOS\n---\nbody\n"),
+			"assetoid": []byte(gitLFSPointerVersion + "\noid sha256:not-a-real-sha\nsize 12\n"),
+		},
+	}
+	_, err := scanSkillsFromGitTree(context.Background(), runner, t.TempDir(), Source{Name: "fgx", RemoteURL: "ssh://git@gitlab.example.com/acme/skills.git"}, "commit", t.TempDir())
+	if err == nil {
+		t.Fatal("scanSkillsFromGitTree with malformed LFS pointer succeeded, want error")
+	}
+	for _, want := range []string{
+		"skills/flash/assets/tools/nvflash_eng.exe has an invalid Git LFS pointer",
+		"invalid oid",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want %q", err, want)
+		}
 	}
 }
 
@@ -199,6 +340,83 @@ func (r treeListingGitRunner) Run(_ context.Context, _ string, _ []string, args 
 		}
 	}
 	return nil, fmt.Errorf("unexpected args: %v", args)
+}
+
+type lfsTreeGitRunner struct {
+	listing        []byte
+	blobs          map[string][]byte
+	lfsOID         string
+	lfsData        []byte
+	lfsErr         error
+	managedDir     string
+	lfsFetches     int
+	usedManagedEnv bool
+}
+
+func (r *lfsTreeGitRunner) Run(_ context.Context, dir string, env []string, args ...string) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("empty args")
+	}
+	switch args[0] {
+	case "ls-tree":
+		return r.listing, nil
+	case "cat-file":
+		if len(args) >= 3 {
+			return r.blobs[args[2]], nil
+		}
+	case "config":
+		return nil, nil
+	case "lfs":
+		if len(args) >= 2 && args[1] == "fetch" {
+			r.lfsFetches++
+			managed := r.managedDir != "" && envHasPathDir(env, r.managedDir)
+			if managed {
+				r.usedManagedEnv = true
+			}
+			if r.lfsErr != nil && !managed {
+				return nil, r.lfsErr
+			}
+			objectPath, err := gitLFSObjectPath(dir, r.lfsOID)
+			if err != nil {
+				return nil, err
+			}
+			if err := os.MkdirAll(filepath.Dir(objectPath), 0o700); err != nil {
+				return nil, err
+			}
+			return nil, os.WriteFile(objectPath, r.lfsData, 0o600)
+		}
+	}
+	return nil, fmt.Errorf("unexpected args: %v", args)
+}
+
+func stubManagedGitLFSInstaller(t *testing.T, managedDir string, installErr error) func() {
+	t.Helper()
+	previous := managedGitLFSInstaller
+	managedGitLFSInstaller = func(_ context.Context, toolsRoot string) (string, error) {
+		if strings.TrimSpace(toolsRoot) == "" {
+			t.Fatal("managed git-lfs installer got empty tools root")
+		}
+		return managedDir, installErr
+	}
+	return func() {
+		managedGitLFSInstaller = previous
+	}
+}
+
+func envHasPathDir(env []string, want string) bool {
+	want = filepath.Clean(want)
+	for _, kv := range env {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok || !strings.EqualFold(name, "PATH") {
+			continue
+		}
+		for _, dir := range filepath.SplitList(value) {
+			if filepath.Clean(dir) == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func containsString(s string, sub string) bool {

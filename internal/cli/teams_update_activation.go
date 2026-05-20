@@ -230,6 +230,8 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"$logDir=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\updates'; " +
 		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null; " +
 		"$log=Join-Path $logDir 'teams-helper-process-restart.log'; " +
+		"$stdoutLog=Join-Path $logDir 'teams-helper-process-restart.stdout.log'; " +
+		"$stderrLog=Join-Path $logDir 'teams-helper-process-restart.stderr.log'; " +
 		"function Log([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $m) } catch {} }; " +
 		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8; Move-Item -Force -LiteralPath $tmp -Destination $statusPath } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
 		"Log ('process restart starting src=' + $src + ' dest=' + $dest + ' want=' + $want + ' parent=' + $parent); " +
@@ -249,7 +251,7 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +
 		"catch { $lastErr='move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message; Log $lastErr; Start-Sleep -Milliseconds 500 } }; " +
 		"if ($ready) { $null = Test-DestVersion; Write-Status 'success' 'activated pending helper' } else { if ([string]::IsNullOrWhiteSpace($lastErr)) { $lastErr='process restart failed before start' }; Log $lastErr; Write-Status 'failed' $lastErr }; " +
-		"if (Test-Path -LiteralPath $dest) { try { Start-Process -FilePath $dest -ArgumentList $argList -WindowStyle Hidden | Out-Null; Log 'started helper process' } catch { Log ('start process failed: ' + $_.Exception.Message) } }"
+		"if (Test-Path -LiteralPath $dest) { try { Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue; Start-Process -FilePath $dest -ArgumentList $argList -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog | Out-Null; Log ('started helper process stdout=' + $stdoutLog + ' stderr=' + $stderrLog) } catch { Log ('start process failed: ' + $_.Exception.Message) } }"
 }
 
 func currentProcessID() int {

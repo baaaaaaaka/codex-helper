@@ -15127,6 +15127,59 @@ func TestBridgeHistoryWatchDoesNotMarkReadyWhenInitialReconcileFails(t *testing.
 	}
 }
 
+func TestBridgeHistoryWatchMissingSessionsRootWaitsForInitialBaseline(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("missing sessions root should be quiet, got error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("missing sessions root should not publish Teams messages, sent=%#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load missing-sessions state: %v", err)
+	}
+	if !state.HistoryWatchReady.IsZero() {
+		t.Fatalf("missing sessions root marked history watch ready before a baseline: %s", state.HistoryWatchReady)
+	}
+	if len(state.HistoryWatch) != 0 {
+		t.Fatalf("missing sessions root checkpoints = %#v, want none", state.HistoryWatch)
+	}
+
+	oldPath := filepath.Join(codexRoot, "sessions", "2026", "05", "10", "rollout-2026-05-10T09-00-00-thread-late-baseline.jsonl")
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0o700); err != nil {
+		t.Fatalf("mkdir late baseline transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":"thread-late-baseline"}}` + "\n" +
+		`{"thread_id":"thread-late-baseline","turn_id":"turn-1","id":"u1","role":"user","text":"late baseline prompt should not import"}` + "\n" +
+		`{"thread_id":"thread-late-baseline","turn_id":"turn-1","id":"a1","role":"assistant","text":"late baseline final should not import"}` + "\n" +
+		`{"type":"turn.completed","thread_id":"thread-late-baseline","turn_id":"turn-1"}` + "\n"
+	if err := os.WriteFile(oldPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write late baseline transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-late-baseline", oldPath)
+	defer restoreDiscover()
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(10*time.Second), true); err != nil {
+		t.Fatalf("late baseline sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("late baseline should not publish Teams messages, sent=%#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load late-baseline state: %v", err)
+	}
+	if state.HistoryWatchReady.IsZero() || len(state.HistoryWatch) != 1 {
+		t.Fatalf("late baseline did not mark ready with checkpoint: ready=%s checkpoints=%#v", state.HistoryWatchReady, state.HistoryWatch)
+	}
+}
+
 func TestBridgeHistoryWatchReconcileBaselinesMissingOldSessions(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
 	codexRoot := t.TempDir()

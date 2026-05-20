@@ -45,6 +45,7 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 
 	processCtx, cancelProcess := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(processCtx, command, req.Args...)
+	configureBackgroundProcess(cmd)
 	if req.WorkingDir != "" {
 		cmd.Dir = req.WorkingDir
 	}

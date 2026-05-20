@@ -372,7 +372,7 @@ jobs:
           set -euo pipefail
           go test ./internal/beacon -count=1 -v
           go test ./internal/cli -count=1 -run 'TestBeacon|TestRestartTeamsHelperFromTeamsBlocksOnBeaconJob|TestTeamsHelperReloadBeaconBlocker|TestUpgradeCmdBlocksOnActiveBeaconJobWithoutTeamsStore|TestUpgradeCmdReconcilesGoneBeaconAllocationBeforeBlocking|TestBeaconUpgradeBlockerLoaderMissingStateHasNoSideEffects|TestRunTeamsUpgradeCodexOnceRejectsBeaconTargetWork' -v
-          go test ./internal/teams -count=1 -run 'Test(TeamsBeacon.*|ParseBeaconWorkDashboardCommands|ParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle)$' -v
+          go test ./internal/teams -count=1 -run 'Test(TeamsBeacon.*|PendingBeaconLifecycle.*|MachineLifecycleDemand.*|LoadBeaconStateWithSharedProfiles.*|ParseBeaconWorkDashboardCommands|ParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle)$' -v
           go test ./internal/beacon/sim -count=1 -v
 
       - name: Teams control dashboard formatting regressions
@@ -504,6 +504,13 @@ jobs:
           CODEX_HELPER_BIN="$RUNNER_TEMP/codex-proxy-skills-smoke" bash scripts/ci/skills_smoke.sh
           cp "$RUNNER_TEMP/codex-proxy-skills-smoke" "$RUNNER_TEMP/cxp"
           CODEX_HELPER_BIN="$RUNNER_TEMP/cxp" bash scripts/ci/skills_smoke.sh
+
+      - name: Skills managed Git LFS download smoke (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/retry.sh 3 5 env CODEX_HELPER_GIT_LFS_DOWNLOAD_TEST=1 go test ./internal/skills -count=1 -run 'TestEnsureManagedGitLFSIntegrationDownload$' -v
 
       - name: Skills local git smoke (Windows)
         if: runner.os == 'Windows'

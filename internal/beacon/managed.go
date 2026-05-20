@@ -23,6 +23,7 @@ type TurnExecutionPlan struct {
 	Action              TurnExecutionAction    `json:"action"`
 	ConversationID      string                 `json:"conversation_id,omitempty"`
 	TurnID              string                 `json:"turn_id,omitempty"`
+	StorePath           string                 `json:"store_path,omitempty"`
 	Snapshot            TargetSnapshot         `json:"snapshot"`
 	AllocationRequestID string                 `json:"allocation_request_id,omitempty"`
 	AllocationState     AllocationState        `json:"allocation_state,omitempty"`
@@ -1753,21 +1754,28 @@ func applyProviderProjectionToMachinesAndJobs(st *State, req AllocationRequest, 
 		case ReconcileRunning:
 			if strings.TrimSpace(machine.State) == "" || strings.EqualFold(strings.TrimSpace(machine.State), string(LeaseStarting)) {
 				machine.State = string(LeaseAccepting)
+				machine.Reason = ""
 			}
 		case ReconcilePending:
 			if strings.TrimSpace(machine.State) == "" {
 				machine.State = string(LeaseStarting)
+				machine.Reason = ""
 			}
 		case ReconcileFinalizing:
 			machine.State = string(LeaseFinalizing)
+			machine.Reason = firstNonEmpty(projection.Reason, "provider job finalizing")
 		case ReconcileCompleted:
 			machine.State = string(LeaseExpired)
+			machine.Reason = firstNonEmpty(projection.Reason, "provider job completed")
 		case ReconcileLost:
 			machine.State = string(LeaseLost)
+			machine.Reason = firstNonEmpty(projection.Reason, "provider job lost")
 		case ReconcileQuarantine:
 			machine.State = string(LeaseNeedsAttention)
+			machine.Reason = firstNonEmpty(projection.Reason, "provider job needs attention")
 		case ReconcileSuspended, ReconcileDrain:
 			machine.State = string(LeaseDraining)
+			machine.Reason = firstNonEmpty(projection.Reason, "provider job draining")
 		}
 		machine.UpdatedAt = now
 		st.Machines[key] = machine

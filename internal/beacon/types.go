@@ -33,6 +33,7 @@ type Profile struct {
 	ProxyMode         ProxyMode             `json:"proxy_mode"`
 	ProxyProfile      string                `json:"proxy_profile,omitempty"`
 	IsolationDefault  Isolation             `json:"isolation_default,omitempty"`
+	SharedPath        string                `json:"shared_path,omitempty"`
 	Slurm             SlurmProfile          `json:"slurm,omitempty"`
 	LSF               LSFProfile            `json:"lsf,omitempty"`
 	Adapter           ProviderCommandConfig `json:"adapter,omitempty"`
@@ -198,6 +199,7 @@ type Machine struct {
 	Host            string               `json:"host,omitempty"`
 	Isolation       Isolation            `json:"isolation,omitempty"`
 	State           string               `json:"state,omitempty"`
+	Reason          string               `json:"reason,omitempty"`
 	ExternalOwned   bool                 `json:"external_owned,omitempty"`
 	Doctor          WorkerDoctor         `json:"doctor,omitempty"`
 	DoctorBlockers  []string             `json:"doctor_blockers,omitempty"`
@@ -284,6 +286,33 @@ type TerminalRecord struct {
 	AcceptedAt   time.Time `json:"accepted_at,omitempty"`
 }
 
+type LifecycleNotificationKind string
+
+const (
+	LifecycleNotificationMachineFailed     LifecycleNotificationKind = "machine_failed"
+	LifecycleNotificationMachineExpired    LifecycleNotificationKind = "machine_expired"
+	LifecycleNotificationAllocationFailed  LifecycleNotificationKind = "allocation_failed"
+	LifecycleNotificationAllocationExpired LifecycleNotificationKind = "allocation_expired"
+)
+
+type LifecycleNotificationRecord struct {
+	ID               string                    `json:"id"`
+	Kind             LifecycleNotificationKind `json:"kind"`
+	Severity         string                    `json:"severity,omitempty"`
+	AllocationID     string                    `json:"allocation_id,omitempty"`
+	MachineID        string                    `json:"machine_id,omitempty"`
+	ProviderJobID    string                    `json:"provider_job_id,omitempty"`
+	ConversationID   string                    `json:"conversation_id,omitempty"`
+	TurnID           string                    `json:"turn_id,omitempty"`
+	Profile          string                    `json:"profile,omitempty"`
+	State            string                    `json:"state,omitempty"`
+	RawProviderState string                    `json:"raw_provider_state,omitempty"`
+	Reason           string                    `json:"reason,omitempty"`
+	ControlOutboxID  string                    `json:"control_outbox_id,omitempty"`
+	WorkOutboxID     string                    `json:"work_outbox_id,omitempty"`
+	QueuedAt         time.Time                 `json:"queued_at,omitempty"`
+}
+
 type AuditRecord struct {
 	Seq      int       `json:"seq"`
 	PrevHash string    `json:"prev_hash,omitempty"`
@@ -300,18 +329,19 @@ type AuditHead struct {
 }
 
 type State struct {
-	Version        int                          `json:"version"`
-	Profiles       map[string]Profile           `json:"profiles,omitempty"`
-	ProfileHistory map[string]Profile           `json:"profile_history,omitempty"`
-	Conversations  map[string]Conversation      `json:"conversations,omitempty"`
-	TurnTargets    map[string]TargetSnapshot    `json:"turn_targets,omitempty"`
-	Allocations    map[string]AllocationRequest `json:"allocations,omitempty"`
-	Machines       map[string]Machine           `json:"machines,omitempty"`
-	JobAttempts    map[string]JobAttempt        `json:"job_attempts,omitempty"`
-	Idempotency    map[string]IdempotencyRecord `json:"idempotency,omitempty"`
-	Terminals      map[string]TerminalRecord    `json:"terminals,omitempty"`
-	Audit          []AuditRecord                `json:"audit,omitempty"`
-	AuditHead      AuditHead                    `json:"audit_head,omitempty"`
+	Version        int                                    `json:"version"`
+	Profiles       map[string]Profile                     `json:"profiles,omitempty"`
+	ProfileHistory map[string]Profile                     `json:"profile_history,omitempty"`
+	Conversations  map[string]Conversation                `json:"conversations,omitempty"`
+	TurnTargets    map[string]TargetSnapshot              `json:"turn_targets,omitempty"`
+	Allocations    map[string]AllocationRequest           `json:"allocations,omitempty"`
+	Machines       map[string]Machine                     `json:"machines,omitempty"`
+	JobAttempts    map[string]JobAttempt                  `json:"job_attempts,omitempty"`
+	Idempotency    map[string]IdempotencyRecord           `json:"idempotency,omitempty"`
+	Terminals      map[string]TerminalRecord              `json:"terminals,omitempty"`
+	Notifications  map[string]LifecycleNotificationRecord `json:"notifications,omitempty"`
+	Audit          []AuditRecord                          `json:"audit,omitempty"`
+	AuditHead      AuditHead                              `json:"audit_head,omitempty"`
 }
 
 func (s *State) normalize() {
@@ -344,5 +374,8 @@ func (s *State) normalize() {
 	}
 	if s.Terminals == nil {
 		s.Terminals = map[string]TerminalRecord{}
+	}
+	if s.Notifications == nil {
+		s.Notifications = map[string]LifecycleNotificationRecord{}
 	}
 }

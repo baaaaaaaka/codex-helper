@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,7 +93,11 @@ func newBeaconProfileListCmd(root *rootOptions, storePath *string) *cobra.Comman
 				if adapter != "" {
 					adapter = "\tadapter=" + adapter
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\trev=%d\t%s%s\n", p.Name, p.Provider, revision, state, adapter)
+				shared := ""
+				if strings.TrimSpace(p.SharedPath) != "" {
+					shared = "\tshared_path=" + p.SharedPath
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\trev=%d\t%s%s%s\n", p.Name, p.Provider, revision, state, adapter, shared)
 			}
 			return nil
 		},
@@ -104,6 +109,7 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	var proxyMode string
 	var proxyProfile string
 	var isolation string
+	var sharedPath string
 	var nodes int
 	var gpuCount int
 	var partition string
@@ -134,12 +140,16 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 			var created beacon.Profile
 			err = store.Update(func(st *beacon.State) error {
 				var err error
+				if strings.TrimSpace(sharedPath) == "" && beacon.ManagedProviderRequiresSharedPath(beacon.Provider(provider)) && strings.TrimSpace(*storePath) != "" {
+					sharedPath = filepath.Dir(*storePath)
+				}
 				created, err = beacon.CreateProfile(st, beacon.CreateProfileInput{
 					Name:                         args[0],
 					Provider:                     beacon.Provider(provider),
 					ProxyMode:                    beacon.ProxyMode(proxyMode),
 					ProxyProfile:                 proxyProfile,
 					IsolationDefault:             beacon.Isolation(isolation),
+					SharedPath:                   sharedPath,
 					Slurm:                        beacon.SlurmProfile{Nodes: nodes, GPUCount: gpuCount, Partition: partition, Image: image, Duration: duration},
 					LSF:                          beacon.LSFProfile{QueueName: queue, SitePolicyDerivesResources: lsfSitePolicy, AdvancedApproved: lsfAdvanced},
 					Adapter:                      providerCommandConfigForProfileInput(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand, adapterShell),
@@ -163,6 +173,7 @@ func newBeaconProfileCreateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	cmd.Flags().StringVar(&proxyMode, "proxy", "none", "Proxy mode: none or ssh_profile")
 	cmd.Flags().StringVar(&proxyProfile, "proxy-profile", "", "Existing SSH proxy profile to use when --proxy=ssh_profile")
 	cmd.Flags().StringVar(&isolation, "isolation", string(beacon.IsolationShared), "Default isolation: shared or exclusive")
+	cmd.Flags().StringVar(&sharedPath, "shared-path", "", "Directory visible to both the control machine and allocated workers")
 	cmd.Flags().IntVar(&nodes, "nodes", 0, "Slurm node count")
 	cmd.Flags().IntVar(&gpuCount, "gpu", 0, "Slurm GPU count")
 	cmd.Flags().StringVar(&partition, "partition", "", "Slurm partition")
@@ -184,6 +195,7 @@ func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	var proxyMode string
 	var proxyProfile string
 	var isolation string
+	var sharedPath string
 	var nodes int
 	var gpuCount int
 	var partition string
@@ -214,12 +226,16 @@ func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Comm
 			var updated beacon.Profile
 			err = store.Update(func(st *beacon.State) error {
 				var err error
+				if strings.TrimSpace(sharedPath) == "" && beacon.ManagedProviderRequiresSharedPath(beacon.Provider(provider)) && strings.TrimSpace(*storePath) != "" {
+					sharedPath = filepath.Dir(*storePath)
+				}
 				updated, err = beacon.UpdateProfileConfig(st, beacon.UpdateProfileInput{
 					Name:                         args[0],
 					Provider:                     beacon.Provider(provider),
 					ProxyMode:                    beacon.ProxyMode(proxyMode),
 					ProxyProfile:                 proxyProfile,
 					IsolationDefault:             beacon.Isolation(isolation),
+					SharedPath:                   sharedPath,
 					Slurm:                        beacon.SlurmProfile{Nodes: nodes, GPUCount: gpuCount, Partition: partition, Image: image, Duration: duration},
 					LSF:                          beacon.LSFProfile{QueueName: queue, SitePolicyDerivesResources: lsfSitePolicy, AdvancedApproved: lsfAdvanced},
 					Adapter:                      providerCommandConfigForProfileInput(beacon.Provider(provider), queryCommand, submitCommand, cancelCommand, renewCommand, adapterShell),
@@ -243,6 +259,7 @@ func newBeaconProfileUpdateCmd(root *rootOptions, storePath *string) *cobra.Comm
 	cmd.Flags().StringVar(&proxyMode, "proxy", "", "Proxy mode: none or ssh_profile")
 	cmd.Flags().StringVar(&proxyProfile, "proxy-profile", "", "Existing SSH proxy profile to use when --proxy=ssh_profile")
 	cmd.Flags().StringVar(&isolation, "isolation", "", "Default isolation: shared or exclusive")
+	cmd.Flags().StringVar(&sharedPath, "shared-path", "", "Directory visible to both the control machine and allocated workers")
 	cmd.Flags().IntVar(&nodes, "nodes", 0, "Slurm node count")
 	cmd.Flags().IntVar(&gpuCount, "gpu", 0, "Slurm GPU count")
 	cmd.Flags().StringVar(&partition, "partition", "", "Slurm partition")
@@ -408,7 +425,7 @@ func newBeaconProfileStatusCmd(root *rootOptions, storePath *string) *cobra.Comm
 			if revision <= 0 {
 				revision = 1
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "profile=%s revision=%d provider=%s proxy=%s isolation=%s adapter=%s status=%s\n", p.Name, revision, p.Provider, p.ProxyMode, p.IsolationDefault, cliBeaconAdapterLabel(p), status)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "profile=%s revision=%d provider=%s proxy=%s isolation=%s shared_path=%s adapter=%s status=%s\n", p.Name, revision, p.Provider, p.ProxyMode, p.IsolationDefault, firstNonEmptyString(p.SharedPath, "<none>"), cliBeaconAdapterLabel(p), status)
 			return nil
 		},
 	}
@@ -685,12 +702,14 @@ nodes=1
 gpu=0
 duration=
 provider_job_id=
+shared_store=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --operation) operation="$2"; shift 2 ;;
     --request-id) request_id="$2"; shift 2 ;;
     --name) name="$2"; shift 2 ;;
     --provider-job-id) provider_job_id="$2"; shift 2 ;;
+    --shared-store) shared_store="$2"; shift 2 ;;
     --partition) partition="$2"; shift 2 ;;
     --image) image="$2"; shift 2 ;;
     --nodes) nodes="$2"; shift 2 ;;
@@ -734,7 +753,11 @@ case "$operation" in
   submit)
     cxp_bin=${CXP_BEACON_CXP_BIN:-cxp}
     worker_idle=${CXP_BEACON_WORKER_IDLE_TIMEOUT:-30m}
-    wrap="exec $cxp_bin beacon worker serve --allocation $request_id --idle-timeout $worker_idle"
+    if [ -n "$shared_store" ]; then
+      wrap="exec \"$cxp_bin\" beacon --store \"$shared_store\" worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+    else
+      wrap="exec \"$cxp_bin\" beacon worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+    fi
     args="--parsable --job-name=$name --nodes=$nodes"
     [ -n "$partition" ] && args="$args --partition=$partition"
     [ -n "$duration" ] && args="$args --time=$duration"
@@ -775,12 +798,14 @@ request_id=
 name=
 queue=
 provider_job_id=
+shared_store=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --operation) operation="$2"; shift 2 ;;
     --request-id) request_id="$2"; shift 2 ;;
     --name) name="$2"; shift 2 ;;
     --provider-job-id) provider_job_id="$2"; shift 2 ;;
+    --shared-store) shared_store="$2"; shift 2 ;;
     --queue) queue="$2"; shift 2 ;;
     *) shift ;;
   esac
@@ -820,7 +845,11 @@ case "$operation" in
   submit)
     cxp_bin=${CXP_BEACON_CXP_BIN:-cxp}
     worker_idle=${CXP_BEACON_WORKER_IDLE_TIMEOUT:-30m}
-    command="exec $cxp_bin beacon worker serve --allocation $request_id --idle-timeout $worker_idle"
+    if [ -n "$shared_store" ]; then
+      command="exec \"$cxp_bin\" beacon --store \"$shared_store\" worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+    else
+      command="exec \"$cxp_bin\" beacon worker serve --allocation \"$request_id\" --idle-timeout \"$worker_idle\""
+    fi
     if [ -n "$queue" ]; then
       out=$(printf '%s\n' "$command" | bsub -J "$name" -q "$queue")
     else
@@ -892,7 +921,7 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 						WorkerID:        workerID,
 						Host:            host,
 						State:           beacon.LeaseAccepting,
-						Doctor:          runBeaconWorkerDoctor(codexPath),
+						Doctor:          runBeaconWorkerDoctor(codexPath, *storePath),
 						Bootstrap:       beaconWorkerBootstrapDiagnostics(codexPath, *storePath),
 						MembershipProof: defaultBeaconMembershipProof(providerJobID),
 					}, time.Now())
@@ -1012,7 +1041,7 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 					WorkerID:        workerID,
 					Host:            host,
 					State:           beacon.LeaseAccepting,
-					Doctor:          runBeaconWorkerDoctor(codexPath),
+					Doctor:          runBeaconWorkerDoctor(codexPath, *storePath),
 					Bootstrap:       beaconWorkerBootstrapDiagnostics(codexPath, *storePath),
 					MembershipProof: defaultBeaconMembershipProof(providerJobID),
 				}, time.Now())
@@ -1292,9 +1321,10 @@ func beaconWorkerBootstrapDiagnostics(codexPath string, storePath string) beacon
 	}
 }
 
-func runBeaconWorkerDoctor(codexPath string) beacon.WorkerDoctor {
+func runBeaconWorkerDoctor(codexPath string, storePath string) beacon.WorkerDoctor {
 	doctor := beacon.WorkerDoctor{
 		SharedRootMounted: true,
+		AtomicCreateOK:    true,
 		FreeBytesOK:       true,
 		FreeInodesOK:      true,
 		HomeOK:            true,
@@ -1336,28 +1366,59 @@ func runBeaconWorkerDoctor(codexPath string) beacon.WorkerDoctor {
 	if _, err := os.UserHomeDir(); err != nil {
 		doctor.HomeOK = false
 	}
+	if err := probeBeaconWorkerSharedStore(storePath); err != nil {
+		doctor.SharedRootMounted = false
+		doctor.AtomicCreateOK = false
+	}
 	tmp, err := os.CreateTemp("", "cxp-beacon-doctor-*")
 	if err != nil {
 		doctor.TmpWritable = false
-		doctor.AtomicCreateOK = false
 		return doctor
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write([]byte("ok")); err != nil {
-		doctor.AtomicCreateOK = false
+		doctor.TmpWritable = false
 	}
 	if err := tmp.Close(); err != nil {
-		doctor.AtomicCreateOK = false
+		doctor.TmpWritable = false
+	}
+	_ = os.Remove(tmpName)
+	return doctor
+}
+
+func probeBeaconWorkerSharedStore(storePath string) error {
+	storePath = strings.TrimSpace(storePath)
+	if storePath == "" {
+		var err error
+		storePath, err = beacon.DefaultStorePath()
+		if err != nil {
+			return err
+		}
+	}
+	dir := filepath.Dir(storePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".cxp-beacon-worker-shared-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write([]byte("ok")); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
 	}
 	renamed := tmpName + ".renamed"
 	if err := os.Rename(tmpName, renamed); err != nil {
-		doctor.AtomicCreateOK = false
 		_ = os.Remove(tmpName)
-	} else {
-		doctor.AtomicCreateOK = true
-		_ = os.Remove(renamed)
+		return err
 	}
-	return doctor
+	return os.Remove(renamed)
 }
 
 func newBeaconAllocationCmd(storePath *string) *cobra.Command {
@@ -1367,7 +1428,8 @@ func newBeaconAllocationCmd(storePath *string) *cobra.Command {
 }
 
 func newBeaconAllocationListCmd(storePath *string) *cobra.Command {
-	return &cobra.Command{
+	var all bool
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List beacon allocation requests",
 		Args:  cobra.NoArgs,
@@ -1376,17 +1438,25 @@ func newBeaconAllocationListCmd(storePath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			allocations := sortedBeaconAllocations(st)
-			if len(allocations) == 0 {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon allocations.")
+			lines := beacon.ActiveAllocationSummaryLines(st)
+			if all {
+				lines = beacon.AllocationSummaryLines(st)
+				if len(lines) == 0 {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon allocations.")
+					return nil
+				}
+			} else if len(lines) == 0 {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No active beacon allocations.")
 				return nil
 			}
-			for _, line := range beacon.AllocationSummaryLines(st) {
+			for _, line := range lines {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&all, "all", false, "Include terminal allocations that were already reported")
+	return cmd
 }
 
 func newBeaconAllocationStatusCmd(storePath *string) *cobra.Command {
@@ -1540,7 +1610,8 @@ func newBeaconAllocationReconcileAllCmd(storePath *string) *cobra.Command {
 }
 
 func newBeaconMachineListCmd(storePath *string) *cobra.Command {
-	return &cobra.Command{
+	var all bool
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List beacon machines",
 		Args:  cobra.NoArgs,
@@ -1549,16 +1620,25 @@ func newBeaconMachineListCmd(storePath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(st.Machines) == 0 {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon machines.")
+			lines := beacon.ActiveMachineSummaryLines(st)
+			if all {
+				lines = beacon.MachineSummaryLines(st)
+				if len(lines) == 0 {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No beacon machines.")
+					return nil
+				}
+			} else if len(lines) == 0 {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No active beacon machines.")
 				return nil
 			}
-			for _, line := range beacon.MachineSummaryLines(st) {
+			for _, line := range lines {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&all, "all", false, "Include terminal machines that were already reported")
+	return cmd
 }
 
 func newBeaconMachineStatusCmd(storePath *string) *cobra.Command {
@@ -1751,7 +1831,7 @@ func formatBeaconProfileDoctorResultCLI(p beacon.Profile, report beacon.ProfileD
 		status = "passed"
 	}
 	lines := []string{
-		fmt.Sprintf("Beacon profile doctor: profile=%s revision=%d status=%s ready=%t provider=%s", p.Name, maxProfileRevisionForCLI(p.Revision), status, p.Ready(proxyExists), p.Provider),
+		fmt.Sprintf("Beacon profile doctor: profile=%s revision=%d status=%s ready=%t provider=%s shared_path=%s", p.Name, maxProfileRevisionForCLI(p.Revision), status, p.Ready(proxyExists), p.Provider, firstNonEmptyString(p.SharedPath, "<none>")),
 	}
 	for _, op := range report.Operations {
 		var facts []string

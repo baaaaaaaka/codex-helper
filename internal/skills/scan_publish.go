@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 )
 
 const manifestFilename = ".cxp-skill-manifest.json"
+const gitLFSPointerVersion = "version https://git-lfs.github.com/spec/v1"
+const skillsLFSRemoteName = "cxp-skills-lfs"
 
 type treeFile struct {
 	RepoPath string
@@ -50,7 +53,7 @@ type exportManifest struct {
 	Files      []FileManifest `json:"files"`
 }
 
-func scanSkillsFromGitTree(ctx context.Context, git GitRunner, mirror string, source Source, commit string) ([]skillTree, error) {
+func scanSkillsFromGitTree(ctx context.Context, git GitRunner, mirror string, source Source, commit string, toolsRoot string) ([]skillTree, error) {
 	prefix := strings.Trim(strings.ReplaceAll(source.Path, "\\", "/"), "/")
 	args := []string{"ls-tree", "-rz", "-r", commit}
 	if prefix != "" {
@@ -70,6 +73,7 @@ func scanSkillsFromGitTree(ctx context.Context, git GitRunner, mirror string, so
 	if err := detectCaseFoldCollisions(files); err != nil {
 		return nil, err
 	}
+	lfsFetched := false
 	for i := range files {
 		if files[i].Mode != "100644" && files[i].Mode != "100755" {
 			return nil, fmt.Errorf("unsupported git mode %s at %s; symlinks and submodules are not installed", files[i].Mode, files[i].RepoPath)
@@ -81,9 +85,151 @@ func scanSkillsFromGitTree(ctx context.Context, git GitRunner, mirror string, so
 		if err != nil {
 			return nil, err
 		}
+		data, err = materializeGitLFSBlob(ctx, git, mirror, source, commit, toolsRoot, files[i], data, &lfsFetched)
+		if err != nil {
+			return nil, err
+		}
 		files[i].Data = data
 	}
 	return discoverSkillTrees(source, files)
+}
+
+type gitLFSPointer struct {
+	OID  string
+	Size int64
+}
+
+func materializeGitLFSBlob(ctx context.Context, git GitRunner, mirror string, source Source, commit string, toolsRoot string, file treeFile, data []byte, lfsFetched *bool) ([]byte, error) {
+	pointer, ok, err := parseGitLFSPointer(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s has an invalid Git LFS pointer: %w", file.RepoPath, err)
+	}
+	if !ok {
+		return data, nil
+	}
+	if !*lfsFetched {
+		if err := fetchGitLFSObjects(ctx, git, mirror, source, commit, toolsRoot); err != nil {
+			return nil, fmt.Errorf("%s is a Git LFS pointer but the real object could not be fetched: %w", file.RepoPath, err)
+		}
+		*lfsFetched = true
+	}
+	objectPath, err := gitLFSObjectPath(mirror, pointer.OID)
+	if err != nil {
+		return nil, fmt.Errorf("%s has an invalid Git LFS pointer: %w", file.RepoPath, err)
+	}
+	object, err := os.ReadFile(objectPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%s is a Git LFS pointer but object %s is missing after git lfs fetch", file.RepoPath, pointer.OID)
+		}
+		return nil, fmt.Errorf("read Git LFS object for %s: %w", file.RepoPath, err)
+	}
+	if int64(len(object)) != pointer.Size {
+		return nil, fmt.Errorf("%s Git LFS object size mismatch: pointer says %d bytes, fetched %d bytes", file.RepoPath, pointer.Size, len(object))
+	}
+	sum := sha256.Sum256(object)
+	if got := hex.EncodeToString(sum[:]); got != pointer.OID {
+		return nil, fmt.Errorf("%s Git LFS object checksum mismatch: pointer says %s, fetched %s", file.RepoPath, pointer.OID, got)
+	}
+	return object, nil
+}
+
+func parseGitLFSPointer(data []byte) (gitLFSPointer, bool, error) {
+	if len(data) == 0 || len(data) > 1024 {
+		return gitLFSPointer{}, false, nil
+	}
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	text = strings.TrimSpace(text)
+	lines := strings.Split(text, "\n")
+	if len(lines) < 3 || strings.TrimSpace(lines[0]) != gitLFSPointerVersion {
+		return gitLFSPointer{}, false, nil
+	}
+	var pointer gitLFSPointer
+	hasSize := false
+	for _, line := range lines[1:] {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "oid":
+			algo, oid, ok := strings.Cut(value, ":")
+			if !ok || algo != "sha256" || !isSHA256Hex(oid) {
+				return gitLFSPointer{}, false, fmt.Errorf("invalid oid")
+			}
+			pointer.OID = oid
+		case "size":
+			size, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || size < 0 {
+				return gitLFSPointer{}, false, fmt.Errorf("invalid size")
+			}
+			pointer.Size = size
+			hasSize = true
+		}
+	}
+	if pointer.OID == "" || !hasSize {
+		return gitLFSPointer{}, false, fmt.Errorf("missing oid or size")
+	}
+	return pointer, true, nil
+}
+
+func fetchGitLFSObjects(ctx context.Context, git GitRunner, mirror string, source Source, commit string, toolsRoot string) error {
+	remote := strings.TrimSpace(source.RemoteURL)
+	if remote == "" {
+		return fmt.Errorf("Git LFS remote URL is empty")
+	}
+	if _, err := git.Run(ctx, mirror, nil, "config", "remote."+skillsLFSRemoteName+".url", remote); err != nil {
+		return err
+	}
+	if _, err := git.Run(ctx, mirror, nil, "lfs", "fetch", skillsLFSRemoteName, commit); err != nil {
+		if isGitLFSUnavailable(err) {
+			managedDir, installErr := managedGitLFSInstaller(ctx, toolsRoot)
+			if installErr != nil {
+				return fmt.Errorf("install managed git-lfs: %w", installErr)
+			}
+			if _, retryErr := git.Run(ctx, mirror, envWithPathPrefix(managedDir), "lfs", "fetch", skillsLFSRemoteName, commit); retryErr != nil {
+				if isGitLFSUnavailable(retryErr) {
+					return fmt.Errorf("managed git-lfs was installed but git still could not find it: %w", retryErr)
+				}
+				return authHintError(source, retryErr)
+			}
+			return nil
+		}
+		return authHintError(source, err)
+	}
+	return nil
+}
+
+func gitLFSObjectPath(mirror string, oid string) (string, error) {
+	if !isSHA256Hex(oid) {
+		return "", fmt.Errorf("invalid sha256 oid %q", oid)
+	}
+	return filepath.Join(mirror, "lfs", "objects", oid[:2], oid[2:4], oid), nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, ch := range s {
+		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isGitLFSUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "git: 'lfs' is not a git command") ||
+		strings.Contains(text, "git: lfs is not a git command") ||
+		strings.Contains(text, "git-lfs: command not found") ||
+		strings.Contains(text, "git-lfs' is not recognized") ||
+		strings.Contains(text, "git lfs: command not found")
 }
 
 func parseTreeListing(data []byte, prefix string) ([]treeFile, error) {
