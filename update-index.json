@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-05-20T07:32:25Z",
+  "generated_at": "2026-05-20T12:38:07Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.131_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.131_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.131_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.0-rc.131_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.0-rc.131",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-05-20T12:37:03Z",
+      "tag_name": "v0.1.0-rc.131",
+      "version": "0.1.0-rc.131"
+    },
     {
       "assets": [
         {
@@ -3861,41 +3902,6 @@
       "published_at": "2026-05-10T04:54:29Z",
       "tag_name": "v0.1.0-rc.32",
       "version": "0.1.0-rc.32"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.31_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.31_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.31_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.31_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.0-rc.31",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-05-09T17:49:40Z",
-      "tag_name": "v0.1.0-rc.31",
-      "version": "0.1.0-rc.31"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
