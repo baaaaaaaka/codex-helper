@@ -324,6 +324,13 @@ jobs:
           $env:CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST = "1"
           go test ./internal/cli -count=1 -run 'TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI$' -v
 
+      - name: Teams Graph 429 stress (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/teams_graph_429_stress.sh
+
       - name: Teams Codex runner classification regressions
         shell: bash
         run: |
