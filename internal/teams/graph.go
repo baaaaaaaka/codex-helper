@@ -692,6 +692,15 @@ func (g *GraphClient) ListMessagesWithoutRateLimitRetry(ctx context.Context, cha
 	return window.Messages, nil
 }
 
+func (g *GraphClient) ListMessagesExactTopWithoutRateLimitRetry(ctx context.Context, chatID string, top int) ([]ChatMessage, error) {
+	path := chatMessagesExactTopPath(chatID, top, time.Time{})
+	window, err := g.ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	return window.Messages, nil
+}
+
 func (g *GraphClient) ListMessagesWindow(ctx context.Context, chatID string, top int, modifiedAfter time.Time) (MessageWindow, error) {
 	path := chatMessagesPath(chatID, top, modifiedAfter)
 	return g.ListMessagesWindowFromPath(ctx, path)
@@ -741,6 +750,15 @@ func (g *GraphClient) listMessagesPage(ctx context.Context, path string, opts gr
 
 func chatMessagesPath(chatID string, top int, modifiedAfter time.Time) string {
 	top = normalizedGraphMessagesTop(top)
+	return chatMessagesPathWithTop(chatID, top, modifiedAfter)
+}
+
+func chatMessagesExactTopPath(chatID string, top int, modifiedAfter time.Time) string {
+	top = normalizedGraphMessagesExactTop(top)
+	return chatMessagesPathWithTop(chatID, top, modifiedAfter)
+}
+
+func chatMessagesPathWithTop(chatID string, top int, modifiedAfter time.Time) string {
 	values := url.Values{}
 	values.Set("$top", strconv.Itoa(top))
 	if !modifiedAfter.IsZero() {
@@ -752,6 +770,23 @@ func chatMessagesPath(chatID string, top int, modifiedAfter time.Time) string {
 
 func normalizedGraphMessagesTop(top int) int {
 	const minTop = 10
+	const defaultTop = 20
+	const maxTop = 50
+	if top <= 0 {
+		return defaultTop
+	}
+	if top < minTop {
+		return minTop
+	}
+	if top > maxTop {
+		return maxTop
+	}
+	return top
+}
+
+// Park notice lookup can use a smaller page than the normal poll window.
+func normalizedGraphMessagesExactTop(top int) int {
+	const minTop = 1
 	const defaultTop = 20
 	const maxTop = 50
 	if top <= 0 {

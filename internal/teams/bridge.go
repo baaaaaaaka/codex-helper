@@ -51,6 +51,7 @@ const (
 	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
 	mainLoopOutboxFlushMaxMessages             = 2
 	mainLoopWorkflowFlushMaxNotifications      = 1
+	parkNoticeGraphFallbackLookupTTL           = 5 * time.Minute
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
 	// body content. Split far below that to reduce Teams client rendering
@@ -73,6 +74,8 @@ var codexSuspectedStuckMessage = "Codex has not produced any update for %s. It m
 var codexStreamRetryStatusRepeatDelay = 5 * time.Minute
 var queuedTurnAttentionDelay = 10 * time.Minute
 var queuedTurnAttentionRepeatDelay = 10 * time.Minute
+
+var parkNoticeGraphLookupTops = []int{20, 10, 5, 1}
 
 var errTranscriptCheckpointNotFound = errors.New("transcript checkpoint was not found")
 var errTranscriptImportBudgetExhausted = errors.New("transcript import batch budget exhausted")
@@ -303,6 +306,8 @@ type Bridge struct {
 	lastPollErrorLogAt           time.Time
 	persistentPollFailureFirstAt time.Time
 	persistentPollFailureCount   int
+	parkNoticeLookupMu           sync.Mutex
+	parkNoticeLookupPreferences  map[string]parkNoticeLookupPreference
 	lastTranscriptSync           time.Time
 	lastHistoryWatchSync         time.Time
 	lastHistoryWatchReconcile    time.Time
@@ -335,6 +340,11 @@ type runningTurnCancel struct {
 type acceptedOutboxRecovery struct {
 	TeamsMessageID string
 	AcceptedAt     time.Time
+}
+
+type parkNoticeLookupPreference struct {
+	Top   int
+	Until time.Time
 }
 
 func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer) (*Bridge, error) {
@@ -1183,10 +1193,17 @@ func (b *Bridge) recordChatPollHandlerError(ctx context.Context, chatID string, 
 		return
 	}
 	if isGraphRateLimitError(err) {
-		_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
+		b.recordChatPollBackoffError(ctx, chatID, poll, err)
 		return
 	}
 	_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
+}
+
+func (b *Bridge) recordChatPollBackoffError(ctx context.Context, chatID string, poll teamstore.ChatPollState, err error) {
+	if b == nil || b.store == nil || err == nil {
+		return
+	}
+	_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
 }
 
 func legacyGeneratedMessageFallbackAllowed(msg ChatMessage, poll teamstore.ChatPollState, hasPoll bool) bool {
@@ -1505,8 +1522,23 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 		resumeCommand,
 		"Your Codex work is safe. Paused after 48h idle.",
 	)
-	appended, _ := b.appendFreezeNoticeToLatestMessage(ctx, session.ChatID, resumeCommand, poll.ParkedAt, body)
-	if appended {
+	result, err := b.appendFreezeNoticeToLatestMessage(ctx, session, resumeCommand, decision.LastActivityAt, body)
+	if err != nil {
+		b.recordChatPollBackoffError(ctx, session.ChatID, poll, err)
+		return err
+	}
+	if result.DeferForNewActivity {
+		_, err = b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+			ChatID:            session.ChatID,
+			PollState:         inboundPollStateCatchup,
+			PreviousPollState: inboundPollStateParked,
+			NextPollAt:        time.Now(),
+			LastActivityAt:    result.ActivityAt,
+			ClearBlockedUntil: true,
+		})
+		return err
+	}
+	if result.Appended {
 		_, err = b.store.MarkChatPollParkNoticeSent(ctx, session.ChatID, time.Now())
 		return err
 	}
@@ -1524,18 +1556,53 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 	return err
 }
 
-func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, chatID string, resumeCommand string, since time.Time, noticeHTML string) (bool, error) {
-	if b == nil || b.graph == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(noticeHTML) == "" {
-		return false, nil
+type freezeNoticeAppendResult struct {
+	Appended            bool
+	DeferForNewActivity bool
+	ActivityAt          time.Time
+}
+
+func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, session Session, resumeCommand string, lastKnownActivity time.Time, noticeHTML string) (freezeNoticeAppendResult, error) {
+	if b == nil || b.graph == nil || b.readGraph == nil || strings.TrimSpace(session.ChatID) == "" || strings.TrimSpace(noticeHTML) == "" {
+		return freezeNoticeAppendResult{}, nil
 	}
-	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, outboxRecoveryMessageTop)
+	msg, ok, err := b.latestMessageForFreezeNotice(ctx, session)
 	if err != nil {
-		return false, err
+		return freezeNoticeAppendResult{}, err
 	}
-	for _, msg := range messages {
-		if graphMessageContainsFreezeNotice(msg, resumeCommand) && !chatMessageActivityTime(msg).Before(since) {
-			return true, nil
+	if !ok {
+		return freezeNoticeAppendResult{}, nil
+	}
+	if graphMessageContainsFreezeNotice(msg, resumeCommand) {
+		return freezeNoticeAppendResult{Appended: true}, nil
+	}
+	activity := chatMessageActivityTime(msg)
+	if !activity.IsZero() && activity.After(lastKnownActivity) && !messageAuthoredByCurrentUser(msg, b.user) {
+		return freezeNoticeAppendResult{DeferForNewActivity: true, ActivityAt: activity}, nil
+	}
+	if !editableFreezeNoticeTarget(msg, b.user) {
+		return freezeNoticeAppendResult{}, nil
+	}
+	updated, ok := appendFreezeNoticeToMessageHTML(msg, resumeCommand, noticeHTML)
+	if !ok {
+		return freezeNoticeAppendResult{}, nil
+	}
+	if err := b.graph.UpdateChatMessageHTML(ctx, session.ChatID, msg.ID, updated); err != nil {
+		if nonRetryableFreezeNoticePatchTargetError(err) {
+			return freezeNoticeAppendResult{}, nil
 		}
+		return freezeNoticeAppendResult{}, err
+	}
+	return freezeNoticeAppendResult{Appended: true}, nil
+}
+
+func (b *Bridge) latestMessageForFreezeNotice(ctx context.Context, session Session) (ChatMessage, bool, error) {
+	if b == nil || b.readGraph == nil || strings.TrimSpace(session.ChatID) == "" {
+		return ChatMessage{}, false, nil
+	}
+	messages, err := b.listParkNoticeMessages(ctx, session.ChatID)
+	if err != nil {
+		return ChatMessage{}, false, err
 	}
 	sort.SliceStable(messages, func(i, j int) bool {
 		left := messageSortTime(messages[i])
@@ -1546,22 +1613,91 @@ func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, chatID s
 		return left.After(right)
 	})
 	for _, msg := range messages {
-		if graphMessageContainsFreezeNotice(msg, resumeCommand) {
-			return true, nil
-		}
-		updated, ok := appendFreezeNoticeToMessageHTML(msg, resumeCommand, noticeHTML)
-		if !ok {
+		if !freezeNoticeVisibleMessage(msg) {
 			continue
 		}
-		if err := b.graph.UpdateChatMessageHTML(ctx, chatID, msg.ID, updated); err != nil {
-			if shouldTryOlderFreezeNoticePatchTarget(err) {
-				continue
-			}
-			return false, err
-		}
-		return true, nil
+		return msg, true, nil
 	}
-	return false, nil
+	return ChatMessage{}, false, nil
+}
+
+func (b *Bridge) listParkNoticeMessages(ctx context.Context, chatID string) ([]ChatMessage, error) {
+	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" {
+		return nil, nil
+	}
+	now := time.Now()
+	tops := b.parkNoticeLookupTopsForChat(chatID, now)
+	var lastErr error
+	for idx, top := range tops {
+		messages, err := b.readGraph.ListMessagesExactTopWithoutRateLimitRetry(ctx, chatID, top)
+		if err == nil {
+			return messages, nil
+		}
+		lastErr = err
+		if idx == len(tops)-1 || !retryParkNoticeLookupWithSmallerTop(err) {
+			break
+		}
+		b.rememberParkNoticeLookupTop(chatID, tops[idx+1], err, now)
+	}
+	return nil, lastErr
+}
+
+func (b *Bridge) parkNoticeLookupTopsForChat(chatID string, now time.Time) []int {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	chatID = strings.TrimSpace(chatID)
+	if b == nil || chatID == "" {
+		return parkNoticeGraphLookupTops
+	}
+	b.parkNoticeLookupMu.Lock()
+	defer b.parkNoticeLookupMu.Unlock()
+	pref, ok := b.parkNoticeLookupPreferences[chatID]
+	if !ok || pref.Top <= 0 || !pref.Until.After(now) {
+		return parkNoticeGraphLookupTops
+	}
+	for idx, top := range parkNoticeGraphLookupTops {
+		if top == pref.Top {
+			return parkNoticeGraphLookupTops[idx:]
+		}
+	}
+	return parkNoticeGraphLookupTops
+}
+
+func (b *Bridge) rememberParkNoticeLookupTop(chatID string, top int, err error, now time.Time) {
+	if b == nil || strings.TrimSpace(chatID) == "" || top <= 0 {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	ttl := parkNoticeGraphFallbackLookupTTL
+	var graphErr *GraphStatusError
+	if errors.As(err, &graphErr) && graphErr.RetryAfter > 0 {
+		ttl = graphErr.RetryAfter
+	}
+	b.parkNoticeLookupMu.Lock()
+	defer b.parkNoticeLookupMu.Unlock()
+	if b.parkNoticeLookupPreferences == nil {
+		b.parkNoticeLookupPreferences = make(map[string]parkNoticeLookupPreference)
+	}
+	b.parkNoticeLookupPreferences[strings.TrimSpace(chatID)] = parkNoticeLookupPreference{
+		Top:   top,
+		Until: now.Add(ttl),
+	}
+}
+
+func retryParkNoticeLookupWithSmallerTop(err error) bool {
+	var graphErr *GraphStatusError
+	if !errors.As(err, &graphErr) {
+		return false
+	}
+	switch graphErr.StatusCode {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 func appendFreezeNoticeToMessageHTML(msg ChatMessage, resumeCommand string, noticeHTML string) (string, bool) {
@@ -1584,7 +1720,21 @@ func appendFreezeNoticeToMessageHTML(msg ChatMessage, resumeCommand string, noti
 	return content + `<p>&nbsp;</p>` + noticeHTML, true
 }
 
-func shouldTryOlderFreezeNoticePatchTarget(err error) bool {
+func freezeNoticeVisibleMessage(msg ChatMessage) bool {
+	if msg.ID == "" || strings.TrimSpace(msg.DeletedDateTime) != "" {
+		return false
+	}
+	if msg.MessageType != "" && msg.MessageType != "message" {
+		return false
+	}
+	return strings.TrimSpace(msg.Body.Content) != ""
+}
+
+func editableFreezeNoticeTarget(msg ChatMessage, user User) bool {
+	return freezeNoticeVisibleMessage(msg) && messageAuthoredByCurrentUser(msg, user)
+}
+
+func nonRetryableFreezeNoticePatchTargetError(err error) bool {
 	var graphErr *GraphStatusError
 	if !errors.As(err, &graphErr) {
 		return false
@@ -1665,7 +1815,7 @@ func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID strin
 	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(resumeCommand) == "" {
 		return false
 	}
-	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, outboxRecoveryMessageTop)
+	messages, err := b.listParkNoticeMessages(ctx, chatID)
 	if err != nil {
 		return false
 	}
@@ -1781,6 +1931,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	plainText := PlainTextFromTeamsHTML(msg.Body.Content)
+	if messageAuthoredByCurrentUser(msg, b.user) && graphMessageContainsFreezeNotice(msg, "") {
+		b.markRegistrySent(chatID, msg.ID)
+		return true, nil
+	}
 	if messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedOutboxOutputMessage(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil

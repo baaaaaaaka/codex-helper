@@ -11764,20 +11764,23 @@ func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T
 	}
 }
 
-func TestBridgePollOnceParksIdleWorkChatAndAppendsFreezeNotice(t *testing.T) {
+func TestBridgePollOnceParksIdleWorkChatAndAppendsFreezeNoticeToLatestMessage(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-49 * time.Hour)
-	lastMessage := bridgePollMessage("last-before-park", oldActivity.Format(time.RFC3339Nano), "last answer before idle")
+	lastAnswer := bridgePollMessage("last-answer-before-park", oldActivity.Format(time.RFC3339Nano), "")
+	lastAnswer.Body.Content = renderFinalOutboxBodyHTML(teamstore.OutboxMessage{Kind: "final", Body: "last answer before idle"})
+	latestHelper := bridgePollMessage("latest-helper-before-park", oldActivity.Add(time.Minute).Format(time.RFC3339Nano), "")
+	latestHelper.Body.Content = renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderHelper, Text: "helper status before idle"}, 1, 1)
 	readGraph := newBridgePollGraph(t, []bridgePollPage{
-		{messages: []ChatMessage{lastMessage}},
-		{messages: []ChatMessage{lastMessage}},
+		{messages: []ChatMessage{latestHelper, lastAnswer}},
+		{messages: []ChatMessage{latestHelper, lastAnswer}},
 	})
 	patched := false
 	writeGraph := &GraphClient{
 		auth: &fakeGraphAuth{token: "access"},
 		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			w := httptest.NewRecorder()
-			if r.Method != http.MethodPatch || r.URL.Path != "/chats/chat-1/messages/last-before-park" {
+			if r.Method != http.MethodPatch || r.URL.Path != "/chats/chat-1/messages/latest-helper-before-park" {
 				t.Fatalf("unexpected Graph write request: %s %s", r.Method, r.URL.String())
 			}
 			patched = true
@@ -11790,7 +11793,7 @@ func TestBridgePollOnceParksIdleWorkChatAndAppendsFreezeNotice(t *testing.T) {
 				t.Fatalf("decode patch payload: %v", err)
 			}
 			plain := PlainTextFromTeamsHTML(payload.Body.Content)
-			for _, want := range []string{"last answer before idle", "This chat is paused", "Step 2: Send: r "} {
+			for _, want := range []string{"helper status before idle", "This chat is paused", "Step 2: Send: r "} {
 				if !strings.Contains(plain, want) {
 					t.Fatalf("patched freeze notice missing %q in:\n%s", want, plain)
 				}
@@ -11855,7 +11858,73 @@ func TestBridgePollOnceParksIdleWorkChatAndAppendsFreezeNotice(t *testing.T) {
 	}
 }
 
-func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenNoAppendTarget(t *testing.T) {
+func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenLatestMessagePatchRejected(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	newerAnswer := bridgePollMessage("newer-helper-before-park", oldActivity.Format(time.RFC3339Nano), "")
+	newerAnswer.Body.Content = renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderHelper, Text: "newer helper before idle"}, 1, 1)
+	olderAnswer := bridgePollMessage("older-answer-before-park", oldActivity.Add(-time.Minute).Format(time.RFC3339Nano), "")
+	olderAnswer.Body.Content = renderFinalOutboxBodyHTML(teamstore.OutboxMessage{Kind: "final", Body: "older answer before idle"})
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{messages: []ChatMessage{newerAnswer, olderAnswer}},
+		{messages: []ChatMessage{newerAnswer, olderAnswer}},
+	})
+	var patched []string
+	var sent []bridgeSentMessage
+	writeGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			switch {
+			case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/chats/chat-1/messages/"):
+				id := strings.TrimPrefix(r.URL.Path, "/chats/chat-1/messages/")
+				patched = append(patched, id)
+				if id != "newer-helper-before-park" {
+					t.Fatalf("unexpected patch target: %s", id)
+				}
+				http.Error(w, `{"error":{"code":"Forbidden","message":"not editable"}}`, http.StatusForbidden)
+				return w.Result(), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
+				var payload struct {
+					Body struct {
+						Content string `json:"content"`
+					} `json:"body"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode send payload: %v", err)
+				}
+				sent = append(sent, bridgeSentMessage{ChatID: "chat-1", Content: payload.Body.Content})
+				_, _ = fmt.Fprint(w, `{"id":"standalone-freeze-notice","messageType":"message"}`)
+				return w.Result(), nil
+			default:
+				t.Fatalf("unexpected Graph write request: %s %s", r.Method, r.URL.String())
+				return w.Result(), nil
+			}
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if got := strings.Join(patched, ","); got != "newer-helper-before-park" {
+		t.Fatalf("patched targets = %q", got)
+	}
+	if len(sent) != 1 || !strings.Contains(sent[0].Content, "This chat is paused") || !strings.Contains(sent[0].Content, "Step 2: Send: <code>r ") {
+		t.Fatalf("standalone freeze notice sent = %#v", sent)
+	}
+}
+
+func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenNoLatestMessageTarget(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-49 * time.Hour)
 	readGraph := newBridgePollGraph(t, []bridgePollPage{
@@ -11882,6 +11951,391 @@ func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenNoAppendTarget(t *testing.
 	}
 	if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() || poll.ParkNoticeSentAt.IsZero() {
 		t.Fatalf("work chat was not parked with fallback notice: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceDoesNotSendStandaloneFreezeNoticeWhenAppendReadRateLimited(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	readRequests := 0
+	readGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+				t.Fatalf("unexpected Graph read request: %s %s", r.Method, r.URL.String())
+			}
+			top := r.URL.Query().Get("$top")
+			if top != "20" && top != "10" && top != "5" && top != "1" {
+				t.Fatalf("park notice Graph lookup top = %q, want 20/10/5/1", top)
+			}
+			readRequests++
+			if readRequests == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"value":[]}`)
+				return w.Result(), nil
+			}
+			w.Header().Set("Retry-After", "600")
+			http.Error(w, `{"error":{"code":"TooManyRequests","message":"park append read limited"}}`, http.StatusTooManyRequests)
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("park append read 429 should not sleep inside Graph retry loop")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	err := bridge.pollOnce(context.Background(), 20)
+	if err == nil || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("pollOnce error = %v, want Graph 429", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("freeze notice should not fall back to standalone after append read 429: %#v", *sent)
+	}
+	if readRequests != 5 {
+		t.Fatalf("read requests = %d, want recent notice plus 20/10/5/1 append lookup", readRequests)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateBlocked || poll.PreviousPollState != inboundPollStateParked || poll.ParkedAt.IsZero() || !poll.ParkNoticeSentAt.IsZero() || poll.BlockedUntil.IsZero() {
+		t.Fatalf("work chat poll after append read 429 = %#v", poll)
+	}
+}
+
+func TestBridgePollOnceBacksOffStandaloneFreezeNoticeWhenAppendReadTemporarilyFails(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	readRequests := 0
+	readGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+				t.Fatalf("unexpected Graph read request: %s %s", r.Method, r.URL.String())
+			}
+			top := r.URL.Query().Get("$top")
+			if top != "20" && top != "10" && top != "5" && top != "1" {
+				t.Fatalf("park notice Graph lookup top = %q, want 20/10/5/1", top)
+			}
+			readRequests++
+			if readRequests == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"value":[]}`)
+				return w.Result(), nil
+			}
+			http.Error(w, `{"error":{"code":"ServiceUnavailable","message":"park append read temporarily failed"}}`, http.StatusServiceUnavailable)
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	start := time.Now()
+	err := bridge.pollOnce(context.Background(), 20)
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("pollOnce error = %v, want Graph 503", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("freeze notice should not fall back to standalone after append read 503: %#v", *sent)
+	}
+	if readRequests < 2 {
+		t.Fatalf("read requests = %d, want recent notice check plus append target read", readRequests)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateBlocked || poll.PreviousPollState != inboundPollStateParked || poll.ParkedAt.IsZero() || !poll.ParkNoticeSentAt.IsZero() || poll.BlockedUntil.IsZero() {
+		t.Fatalf("work chat poll after append read 503 = %#v", poll)
+	}
+	if poll.FailureCount != 1 || !poll.NextPollAt.Equal(poll.BlockedUntil) {
+		t.Fatalf("work chat poll backoff fields after append read 503 = %#v", poll)
+	}
+	if poll.BlockedUntil.Before(start) || poll.BlockedUntil.After(start.Add(15*time.Second)) {
+		t.Fatalf("blockedUntil = %s, want first backoff near 5s after %s", poll.BlockedUntil.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano))
+	}
+}
+
+func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenLatestMessageIsNotEditable(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	latestUser := bridgePollMessage("latest-user-before-park", oldActivity.Format(time.RFC3339Nano), "thanks")
+	latestUser.From.User.ID = "user-2"
+	latestUser.From.User.DisplayName = "Other User"
+	olderHelper := bridgePollMessage("older-helper-before-park", oldActivity.Add(-time.Minute).Format(time.RFC3339Nano), "")
+	olderHelper.Body.Content = renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderHelper, Text: "older helper before idle"}, 1, 1)
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{messages: []ChatMessage{latestUser, olderHelper}},
+		{messages: []ChatMessage{latestUser, olderHelper}},
+	})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" || !strings.Contains((*sent)[0].Content, "This chat is paused") || !strings.Contains((*sent)[0].Content, "Step 2: Send: <code>r ") {
+		t.Fatalf("freeze notice sent = %#v", *sent)
+	}
+}
+
+func TestBridgePollOnceRetriesSmallerFreezeNoticeLookupWhenTop20AndTop10RateLimited(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	latestHelper := bridgePollMessage("latest-helper-before-park", oldActivity.Format(time.RFC3339Nano), "")
+	latestHelper.Body.Content = renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderHelper, Text: "latest helper before idle"}, 1, 1)
+	var readTops []string
+	readGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+				t.Fatalf("unexpected Graph read request: %s %s", r.Method, r.URL.String())
+			}
+			top := r.URL.Query().Get("$top")
+			readTops = append(readTops, top)
+			switch len(readTops) {
+			case 1:
+				if top != "20" {
+					t.Fatalf("recent freeze notice lookup top = %q, want 20", top)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"value":[]}`)
+			case 2:
+				if top != "20" {
+					t.Fatalf("first append lookup top = %q, want 20", top)
+				}
+				w.Header().Set("Retry-After", "600")
+				http.Error(w, `{"error":{"code":"TooManyRequests","message":"top 20 limited"}}`, http.StatusTooManyRequests)
+			case 3:
+				if top != "10" {
+					t.Fatalf("second append lookup top = %q, want 10", top)
+				}
+				http.Error(w, `{"error":{"code":"TooManyRequests","message":"top 10 limited"}}`, http.StatusTooManyRequests)
+			case 4:
+				if top != "5" {
+					t.Fatalf("fallback append lookup top = %q, want 5", top)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(struct {
+					Value []ChatMessage `json:"value"`
+				}{Value: []ChatMessage{latestHelper}}); err != nil {
+					t.Fatalf("encode fallback messages: %v", err)
+				}
+			default:
+				t.Fatalf("unexpected extra Graph read request %d: %s", len(readTops), r.URL.String())
+			}
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("park append read 429 should not sleep inside Graph retry loop")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	patched := false
+	writeGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodPatch || r.URL.Path != "/chats/chat-1/messages/latest-helper-before-park" {
+				t.Fatalf("unexpected Graph write request: %s %s", r.Method, r.URL.String())
+			}
+			patched = true
+			w.WriteHeader(http.StatusNoContent)
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if !patched {
+		t.Fatal("freeze notice was not appended after fallback top lookup")
+	}
+	if got := strings.Join(readTops, ","); got != "20,20,10,5" {
+		t.Fatalf("read tops = %q", got)
+	}
+}
+
+func TestBridgePollOnceDefersParkNoticeWhenNewUserMessageArrivesAfterIdleDecision(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	newActivity := now.Add(-time.Minute)
+	latestUser := bridgePollMessage("new-user-before-park", newActivity.Format(time.RFC3339Nano), "new work before park notice")
+	latestUser.From.User.ID = "user-2"
+	latestUser.From.User.DisplayName = "Other User"
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{messages: []ChatMessage{latestUser}},
+		{messages: []ChatMessage{latestUser}},
+	})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("park notice should be deferred when newer user activity exists: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateCatchup || !poll.ParkNoticeSentAt.IsZero() || poll.LastActivityAt.Before(newActivity) {
+		t.Fatalf("work chat poll after newer user activity = %#v", poll)
+	}
+}
+
+func TestBridgeParkNoticeLookupRemembersSmallerTopAfterRateLimit(t *testing.T) {
+	var readTops []string
+	readGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			top := r.URL.Query().Get("$top")
+			readTops = append(readTops, top)
+			switch len(readTops) {
+			case 1:
+				if top != "20" {
+					t.Fatalf("first lookup top = %q, want 20", top)
+				}
+				http.Error(w, `{"error":{"code":"TooManyRequests","message":"top 20 limited"}}`, http.StatusTooManyRequests)
+			case 2, 3:
+				if top != "10" {
+					t.Fatalf("lookup %d top = %q, want 10", len(readTops), top)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"value":[]}`)
+			default:
+				t.Fatalf("unexpected extra Graph read request %d: %s", len(readTops), r.URL.String())
+			}
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	bridge := newBridgeTestBridge(&GraphClient{}, newBridgeTestStore(t), &recordingExecutor{})
+	bridge.readGraph = readGraph
+
+	if _, err := bridge.listParkNoticeMessages(context.Background(), "chat-1"); err != nil {
+		t.Fatalf("first listParkNoticeMessages error: %v", err)
+	}
+	if _, err := bridge.listParkNoticeMessages(context.Background(), "chat-1"); err != nil {
+		t.Fatalf("second listParkNoticeMessages error: %v", err)
+	}
+	if got := strings.Join(readTops, ","); got != "20,10,10" {
+		t.Fatalf("read tops = %q", got)
+	}
+}
+
+func TestBridgePollOnceDoesNotSendStandaloneFreezeNoticeWhenAppendReadAuthFails(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	readRequests := 0
+	var readTops []string
+	readGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			readTops = append(readTops, r.URL.Query().Get("$top"))
+			readRequests++
+			if readRequests == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"value":[]}`)
+				return w.Result(), nil
+			}
+			http.Error(w, `{"error":{"code":"InvalidAuthenticationToken","message":"auth failed"}}`, http.StatusUnauthorized)
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	err := bridge.pollOnce(context.Background(), 20)
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("pollOnce error = %v, want Graph 401", err)
+	}
+	for _, top := range readTops[1:] {
+		if top != "20" {
+			t.Fatalf("read tops = %q, want auth retry to avoid smaller-top fallback", strings.Join(readTops, ","))
+		}
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("freeze notice should not fall back to standalone after append read auth failure: %#v", *sent)
+	}
+}
+
+func TestBridgeEditedFreezeNoticeHelperMessageIsIgnoredByPoller(t *testing.T) {
+	bridge := newBridgeTestBridge(&GraphClient{}, newBridgeTestStore(t), &recordingExecutor{})
+	msg := bridgePollMessage("helper-with-freeze-notice", time.Now().Format(time.RFC3339Nano), "")
+	msg.Body.Content = renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderHelper, Text: "helper status before idle"}, 1, 1)
+	updated, ok := appendFreezeNoticeToMessageHTML(msg, "r abcdef12", renderTeamsFreezeNoticeHTML("https://teams.example/control", "r abcdef12", "Your Codex work is safe. Paused after 48h idle."))
+	if !ok {
+		t.Fatal("appendFreezeNoticeToMessageHTML returned false")
+	}
+	msg.Body.Content = updated
+
+	ignore, err := bridge.shouldIgnoreMessage(context.Background(), "chat-1", msg, inboundPollRoleWork, false)
+	if err != nil {
+		t.Fatalf("shouldIgnoreMessage error: %v", err)
+	}
+	if !ignore {
+		t.Fatal("edited helper freeze notice message should be ignored by poller")
 	}
 }
 
