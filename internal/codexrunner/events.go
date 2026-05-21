@@ -72,7 +72,9 @@ func ParseStreamEventJSONL(line []byte) (StreamEvent, bool, error) {
 		out.Kind = StreamEventContextCompacted
 	case "event_msg", "response_item":
 		if !applyContextCompactPayload(event.Payload, &out) {
-			return StreamEvent{}, false, nil
+			if !applyTranscriptPayloadStreamEvent(event, &out) {
+				return StreamEvent{}, false, nil
+			}
 		}
 	case "error":
 		out.Failure = failureFromEvent(event)
@@ -115,6 +117,52 @@ func ParseStreamEventJSONL(line []byte) (StreamEvent, bool, error) {
 		}
 	}
 	return out, true, nil
+}
+
+func applyTranscriptPayloadStreamEvent(event codexEvent, out *StreamEvent) bool {
+	payload, ok := parseTranscriptPayload(event.Payload)
+	if !ok {
+		return false
+	}
+	out.ThreadID = firstNonEmpty(out.ThreadID, payload.ThreadIDCamel, payload.ThreadID)
+	out.TurnID = firstNonEmpty(out.TurnID, transcriptPayloadTurnID(payload))
+	switch event.Type {
+	case "event_msg":
+		switch strings.ToLower(strings.TrimSpace(payload.Type)) {
+		case "agent_message":
+			if !isFinalAnswerPhase(payload.Phase) {
+				return false
+			}
+			text := strings.TrimSpace(payload.Message)
+			if text == "" {
+				return false
+			}
+			out.Kind = StreamEventAgentMessage
+			out.Text = text
+			return true
+		case "task_complete":
+			out.Kind = StreamEventTurnCompleted
+			out.Text = firstNonEmpty(payload.LastAgentMessage, payload.LastAgentMessageCamel)
+			return true
+		default:
+			return false
+		}
+	case "response_item":
+		if strings.ToLower(strings.TrimSpace(payload.Type)) != "message" ||
+			strings.ToLower(strings.TrimSpace(payload.Role)) != "assistant" ||
+			!isFinalAnswerPhase(payload.Phase) {
+			return false
+		}
+		text := strings.TrimSpace(agentMessageText(codexItem{Content: payload.Content}))
+		if text == "" {
+			return false
+		}
+		out.Kind = StreamEventAgentMessage
+		out.Text = text
+		return true
+	default:
+		return false
+	}
 }
 
 func applyContextCompactPayload(raw json.RawMessage, out *StreamEvent) bool {

@@ -110,8 +110,27 @@ type codexEventError struct {
 	CodexErrorInfo    json.RawMessage `json:"codexErrorInfo"`
 }
 
+type codexTranscriptPayload struct {
+	ID                    string         `json:"id"`
+	Type                  string         `json:"type"`
+	Phase                 string         `json:"phase"`
+	Role                  string         `json:"role"`
+	Message               string         `json:"message"`
+	LastAgentMessage      string         `json:"last_agent_message"`
+	LastAgentMessageCamel string         `json:"lastAgentMessage"`
+	ThreadID              string         `json:"thread_id"`
+	ThreadIDCamel         string         `json:"threadId"`
+	TurnID                string         `json:"turn_id"`
+	TurnIDCamel           string         `json:"turnId"`
+	Turn                  codexTurn      `json:"turn"`
+	Content               []codexContent `json:"content"`
+}
+
 func applyEvent(result *TurnResult, event codexEvent, raw []byte) {
 	switch event.Type {
+	case "session_meta":
+		applySessionMetaEvent(result, event)
+		mergeUsage(&result.Usage, event.Usage)
 	case "thread.started", "thread/started":
 		if id := firstNonEmpty(event.ThreadIDCamel, event.ThreadID, event.Thread.ThreadIDCamel, event.Thread.ThreadID, event.Thread.ID); id != "" {
 			result.ThreadID = id
@@ -141,9 +160,99 @@ func applyEvent(result *TurnResult, event codexEvent, raw []byte) {
 		setTurnID(result, event)
 		mergeUsage(&result.Usage, event.Usage)
 		result.Failure = failureFromEvent(event)
+	case "event_msg", "response_item":
+		applyTranscriptPayloadEvent(result, event, raw)
+		mergeUsage(&result.Usage, event.Usage)
 	default:
 		mergeUsage(&result.Usage, event.Usage)
 	}
+}
+
+func applySessionMetaEvent(result *TurnResult, event codexEvent) {
+	payload, ok := parseTranscriptPayload(event.Payload)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(result.ThreadID) == "" {
+		if id := firstNonEmpty(payload.ThreadIDCamel, payload.ThreadID, payload.ID); id != "" {
+			result.ThreadID = id
+		}
+	}
+}
+
+func applyTranscriptPayloadEvent(result *TurnResult, event codexEvent, raw []byte) bool {
+	payload, ok := parseTranscriptPayload(event.Payload)
+	if !ok {
+		return false
+	}
+	switch event.Type {
+	case "event_msg":
+		switch strings.ToLower(strings.TrimSpace(payload.Type)) {
+		case "agent_message":
+			if !isFinalAnswerPhase(payload.Phase) {
+				return false
+			}
+			text := strings.TrimSpace(payload.Message)
+			if text == "" {
+				return false
+			}
+			completeTurnFromTranscriptPayload(result, text, transcriptPayloadTurnID(payload), raw)
+			return true
+		case "task_complete":
+			text := firstNonEmpty(payload.LastAgentMessage, payload.LastAgentMessageCamel)
+			completeTurnFromTranscriptPayload(result, text, transcriptPayloadTurnID(payload), raw)
+			return true
+		default:
+			return false
+		}
+	case "response_item":
+		if strings.ToLower(strings.TrimSpace(payload.Type)) != "message" ||
+			strings.ToLower(strings.TrimSpace(payload.Role)) != "assistant" ||
+			!isFinalAnswerPhase(payload.Phase) {
+			return false
+		}
+		text := strings.TrimSpace(agentMessageText(codexItem{Content: payload.Content}))
+		if text == "" {
+			return false
+		}
+		completeTurnFromTranscriptPayload(result, text, transcriptPayloadTurnID(payload), raw)
+		return true
+	default:
+		return false
+	}
+}
+
+func parseTranscriptPayload(raw json.RawMessage) (codexTranscriptPayload, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return codexTranscriptPayload{}, false
+	}
+	var payload codexTranscriptPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return codexTranscriptPayload{}, false
+	}
+	return payload, true
+}
+
+func completeTurnFromTranscriptPayload(result *TurnResult, text string, turnID string, raw []byte) {
+	if text = strings.TrimSpace(text); text != "" {
+		result.FinalAgentMessage = text
+		result.RawCompletedMessage = append(result.RawCompletedMessage[:0], raw...)
+	}
+	if turnID = strings.TrimSpace(turnID); turnID != "" {
+		result.TurnID = turnID
+	}
+	if result.Failure == nil && result.Status != TurnStatusFailed {
+		result.Status = TurnStatusCompleted
+	}
+}
+
+func transcriptPayloadTurnID(payload codexTranscriptPayload) string {
+	return firstNonEmpty(payload.TurnIDCamel, payload.TurnID, payload.Turn.ID)
+}
+
+func isFinalAnswerPhase(phase string) bool {
+	return strings.EqualFold(strings.TrimSpace(phase), "final_answer")
 }
 
 func setThreadName(result *TurnResult, event codexEvent) {

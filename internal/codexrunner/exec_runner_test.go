@@ -223,6 +223,44 @@ func TestExecRunnerTreatsCompletedTurnWithCanceledLaunchAsSuccess(t *testing.T) 
 	}
 }
 
+func TestExecRunnerTreatsFinalAnswerWithCanceledLaunchAsSuccess(t *testing.T) {
+	launcher := &recordingLauncher{
+		result: LaunchResult{Stdout: []byte(strings.Join([]string{
+			`{"type":"session_meta","payload":{"id":"thread-done"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-done","phase":"final_answer","message":"done before canceled context"}}`,
+			`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-done","last_agent_message":"done before canceled context"}}`,
+		}, "\n"))},
+		err: context.Canceled,
+	}
+	runner := NewExecRunner(launcher)
+	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatalf("StartThread error = %v, want final_answer success", err)
+	}
+	if got.ThreadID != "thread-done" || got.TurnID != "turn-done" || got.FinalAgentMessage != "done before canceled context" {
+		t.Fatalf("result = %#v, want final_answer metadata and final text", got)
+	}
+}
+
+func TestExecRunnerDoesNotTreatFinalAnswerWithNonZeroExitAsSuccess(t *testing.T) {
+	launcher := &recordingLauncher{result: LaunchResult{
+		Stdout: []byte(strings.Join([]string{
+			`{"type":"session_meta","payload":{"id":"thread-done"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"final before bad exit"}}`,
+		}, "\n")),
+		Stderr:   []byte("codex exited badly"),
+		ExitCode: 1,
+	}}
+	runner := NewExecRunner(launcher)
+	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if !IsKind(err, ErrorCodex) {
+		t.Fatalf("StartThread error = %v, want codex failure", err)
+	}
+	if got.Status != TurnStatusCompleted || got.FinalAgentMessage != "final before bad exit" {
+		t.Fatalf("result = %#v, want parsed final metadata despite failure", got)
+	}
+}
+
 func TestExecRunnerDistinguishesLaunchAndCodexFailures(t *testing.T) {
 	launchErr := errors.New("fork failed")
 	runner := NewExecRunner(&recordingLauncher{err: launchErr})

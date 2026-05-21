@@ -42,6 +42,17 @@ func (e *recordingExecutor) Run(_ context.Context, session *Session, prompt stri
 	return e.result, e.err
 }
 
+type bridgeCodexLauncher struct {
+	result codexrunner.LaunchResult
+	err    error
+	req    codexrunner.LaunchRequest
+}
+
+func (l *bridgeCodexLauncher) Launch(_ context.Context, req codexrunner.LaunchRequest) (codexrunner.LaunchResult, error) {
+	l.req = req
+	return l.result, l.err
+}
+
 type streamingRecordingExecutor struct {
 	events []codexrunner.StreamEvent
 	result ExecutionResult
@@ -294,6 +305,60 @@ func TestBridgeSessionMessagePersistsTurnRunsAndSendsOutbox(t *testing.T) {
 	}
 	if got := bridge.reg.SessionByChatID("chat-1").CodexThreadID; got != "thread-1" {
 		t.Fatalf("registry CodexThreadID = %q, want thread-1", got)
+	}
+}
+
+func TestBridgeTreatsFinalAnswerCanceledLaunchAsCompleted(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	finalText := "final answer before canceled context"
+	launcher := &bridgeCodexLauncher{
+		result: codexrunner.LaunchResult{Stdout: []byte(strings.Join([]string{
+			`{"type":"session_meta","payload":{"id":"thread-final"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-final","phase":"final_answer","message":` + strconv.Quote(finalText) + `}}`,
+			`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-final","last_agent_message":` + strconv.Quote(finalText) + `}}`,
+		}, "\n"))},
+		err: context.Canceled,
+	}
+	executor := RunnerExecutor{Runner: &codexrunner.ExecRunner{Launcher: launcher}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-final-canceled"), "finish despite cancel"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, finalText) {
+		t.Fatalf("sent messages missing final text:\n%s", joined)
+	}
+	if strings.Contains(joined, "error: context canceled") {
+		t.Fatalf("completed final should not be reported as context canceled:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var turn teamstore.Turn
+	var finalOutbox teamstore.OutboxMessage
+	for _, item := range state.Turns {
+		turn = item
+	}
+	for _, item := range state.OutboxMessages {
+		if item.Kind == "final" {
+			finalOutbox = item
+		}
+		if item.Kind == "error" {
+			t.Fatalf("unexpected error outbox: %#v", item)
+		}
+	}
+	if turn.Status != teamstore.TurnStatusCompleted || turn.CodexThreadID != "thread-final" || turn.CodexTurnID != "turn-final" {
+		t.Fatalf("turn = %#v, want completed thread/turn ids", turn)
+	}
+	if finalOutbox.ID == "" || finalOutbox.NotificationKind != "turn_completed" {
+		t.Fatalf("final outbox = %#v, want turn_completed final", finalOutbox)
+	}
+	hashes := knownTranscriptOutboxHashes(state, turn.SessionID)
+	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant}, finalText, hashes) {
+		t.Fatal("delivered final should dedupe the later transcript final")
 	}
 }
 

@@ -80,6 +80,90 @@ func TestParseJSONLExtractsThreadNameUpdates(t *testing.T) {
 	}
 }
 
+func TestParseJSONLExtractsFinalAnswerEventMessage(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-session"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"final-1","turn_id":"turn-final","phase":"final_answer","message":"final from event msg"},"usage":{"cached_input_tokens":17}}`,
+	}, "\n")
+
+	got, err := ParseJSONL(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseJSONL error: %v", err)
+	}
+	if got.ThreadID != "thread-session" || got.TurnID != "turn-final" || got.Status != TurnStatusCompleted || got.FinalAgentMessage != "final from event msg" {
+		t.Fatalf("result = %#v, want completed final from event_msg", got)
+	}
+	if got.Usage.CachedInputTokens != 17 {
+		t.Fatalf("usage = %#v, want usage preserved from final event", got.Usage)
+	}
+	if len(got.RawCompletedMessage) == 0 {
+		t.Fatal("RawCompletedMessage was not captured")
+	}
+}
+
+func TestParseJSONLExtractsFinalAnswerResponseItem(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-1"}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"response "},{"type":"output_text","text":"final"}]}}`,
+	}, "\n")
+
+	got, err := ParseJSONL(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseJSONL error: %v", err)
+	}
+	if got.Status != TurnStatusCompleted || got.FinalAgentMessage != "response final" {
+		t.Fatalf("result = %#v, want completed final from response_item", got)
+	}
+}
+
+func TestParseJSONLExtractsTaskCompleteLastAgentMessage(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-1"}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"final from task complete"}}`,
+	}, "\n")
+
+	got, err := ParseJSONL(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseJSONL error: %v", err)
+	}
+	if got.Status != TurnStatusCompleted || got.TurnID != "turn-1" || got.FinalAgentMessage != "final from task complete" {
+		t.Fatalf("result = %#v, want completed task_complete", got)
+	}
+}
+
+func TestParseJSONLDoesNotTreatLiteralFinalAnswerAsCompletion(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"the literal word final_answer is not terminal"}]}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","message":"phase final_answer appears in text only"}}`,
+	}, "\n")
+
+	got, err := ParseJSONL(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseJSONL error: %v", err)
+	}
+	if got.Status != TurnStatusUnknown || got.FinalAgentMessage != "" {
+		t.Fatalf("result = %#v, want no completion", got)
+	}
+}
+
+func TestParseJSONLFailureAfterFinalAnswerStillWins(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"final before failure"}}`,
+		`{"type":"turn.failed","turn_id":"turn-1","error":{"code":"tool_error","message":"tool failed"}}`,
+	}, "\n")
+
+	got, err := ParseJSONL(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseJSONL error: %v", err)
+	}
+	if got.Status != TurnStatusFailed || got.Failure == nil || got.Failure.Message != "tool failed" {
+		t.Fatalf("result = %#v, want later failure to win", got)
+	}
+	if got.FinalAgentMessage != "final before failure" {
+		t.Fatalf("final message = %q", got.FinalAgentMessage)
+	}
+}
+
 func TestParseJSONLReturnsParseFailureForInvalidJSONEvent(t *testing.T) {
 	_, err := ParseJSONL(strings.NewReader("{bad json}\n"))
 	if !IsKind(err, ErrorParse) {

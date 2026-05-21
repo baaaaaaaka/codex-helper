@@ -33,6 +33,19 @@ func TestParseCodexJSONLExtractsThreadAndFinalAgentMessage(t *testing.T) {
 	}
 }
 
+func TestParseCodexJSONLExtractsFinalAnswerTerminalEvents(t *testing.T) {
+	output := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-new"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-new","phase":"final_answer","message":"final answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-new","last_agent_message":"final answer"}}`,
+	}, "\n")
+
+	got := parseCodexJSONL(output)
+	if got.Text != "final answer" || got.CodexThreadID != "thread-new" || got.CodexTurnID != "turn-new" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
 func TestCodexExecutorDoesNotDuplicateExtraArgs(t *testing.T) {
 	if os.PathSeparator != '/' {
 		t.Skip("shell stub test uses POSIX script")

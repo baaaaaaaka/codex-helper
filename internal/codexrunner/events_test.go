@@ -65,6 +65,57 @@ func TestParseStreamEventJSONLContextCompacted(t *testing.T) {
 	}
 }
 
+func TestParseStreamEventJSONLFinalAnswerAndTaskComplete(t *testing.T) {
+	lines := []struct {
+		line     []byte
+		wantKind StreamEventKind
+		wantText string
+		wantTurn string
+	}{
+		{
+			line:     []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","turn_id":"turn-1","message":"done from event"}}`),
+			wantKind: StreamEventAgentMessage,
+			wantText: "done from event",
+			wantTurn: "turn-1",
+		},
+		{
+			line:     []byte(`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","turnId":"turn-2","content":[{"type":"output_text","text":"done from response"}]}}`),
+			wantKind: StreamEventAgentMessage,
+			wantText: "done from response",
+			wantTurn: "turn-2",
+		},
+		{
+			line:     []byte(`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-3","last_agent_message":"done from task"}}`),
+			wantKind: StreamEventTurnCompleted,
+			wantText: "done from task",
+			wantTurn: "turn-3",
+		},
+	}
+	for i, tc := range lines {
+		event, ok, err := ParseStreamEventJSONL(tc.line)
+		if err != nil {
+			t.Fatalf("case %d ParseStreamEventJSONL error: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("case %d event was not recognized", i)
+		}
+		if event.Kind != tc.wantKind || event.Text != tc.wantText || event.TurnID != tc.wantTurn {
+			t.Fatalf("case %d event = %#v", i, event)
+		}
+	}
+}
+
+func TestParseStreamEventJSONLDoesNotTreatLiteralFinalAnswerAsCompletion(t *testing.T) {
+	line := []byte(`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"literal final_answer only"}]}}`)
+	event, ok, err := ParseStreamEventJSONL(line)
+	if err != nil {
+		t.Fatalf("ParseStreamEventJSONL error: %v", err)
+	}
+	if ok {
+		t.Fatalf("event = %#v, want unrecognized literal text", event)
+	}
+}
+
 func TestEventStreamWriterEmitsJSONEventsAcrossWrites(t *testing.T) {
 	var dst bytes.Buffer
 	var events []StreamEvent

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +14,64 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
+
+func TestRunBeaconWorkerJobTreatsFinalAnswerCanceledLaunchAsSuccess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture uses POSIX sh")
+	}
+	tempDir := t.TempDir()
+	readyPath := filepath.Join(tempDir, "ready")
+	codexPath := filepath.Join(tempDir, "codex")
+	finalText := "beacon final before canceled context"
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' '{"type":"session_meta","payload":{"id":"thread-beacon"}}'
+printf '%%s\n' '{"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-beacon","phase":"final_answer","message":%q}}'
+printf '%%s\n' '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-beacon","last_agent_message":%q}}'
+printf ready > %q
+exec sleep 30
+`, finalText, finalText, readyPath)
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write codex fixture: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type runResult struct {
+		payload beacon.JobTerminalPayload
+		err     error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		payload, err := runBeaconWorkerJob(ctx, beacon.JobAttempt{
+			Payload: beacon.JobPayload{
+				Prompt:     "run remotely",
+				WorkingDir: tempDir,
+			},
+		}, codexPath)
+		done <- runResult{payload: payload, err: err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for codex fixture to emit terminal JSON")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("runBeaconWorkerJob error = %v, want success", got.err)
+		}
+		if got.payload.Text != finalText || got.payload.CodexThreadID != "thread-beacon" || got.payload.CodexTurnID != "turn-beacon" || got.payload.Error != "" {
+			t.Fatalf("payload = %#v, want successful final terminal", got.payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for canceled worker job to return")
+	}
+}
 
 func TestBeaconProfileCLIWorkflow(t *testing.T) {
 	t.Setenv(beacon.BeaconProviderShellModeEnv, "")
