@@ -909,6 +909,24 @@ func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {
 			Usage:    usageFromEvent(codexEvent{Usage: params.Usage}),
 			Raw:      append([]byte(nil), bytes.TrimSpace(line)...),
 		}, true
+	case "thread/compacted", "context_compaction", "context_compacted":
+		var params struct {
+			ThreadID string `json:"threadId"`
+			TurnID   string `json:"turnId"`
+			Thread   struct {
+				ID string `json:"id"`
+			} `json:"thread"`
+			Turn codexTurn `json:"turn"`
+		}
+		if json.Unmarshal(msg.Params, &params) != nil {
+			return StreamEvent{}, false
+		}
+		return StreamEvent{
+			Kind:     StreamEventContextCompacted,
+			ThreadID: firstNonEmpty(params.ThreadID, params.Thread.ID),
+			TurnID:   firstNonEmpty(params.TurnID, params.Turn.ID),
+			Raw:      append([]byte(nil), bytes.TrimSpace(line)...),
+		}, true
 	case "thread/tokenUsage/updated":
 		var params struct {
 			ThreadID    string              `json:"threadId"`

@@ -205,6 +205,7 @@ func TestAppServerRunnerStreamsNotifications(t *testing.T) {
 		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage","text":"checking tests"}}}`,
 		`{"method":"item/started","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-2","type":"commandExecution","command":"go test ./..."}}}`,
 		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-2","type":"commandExecution","command":"go test ./...","aggregatedOutput":"PASS\n","exitCode":0,"status":"completed"}}}`,
+		`{"method":"thread/compacted","params":{"thread":{"id":"thread-new"},"turn":{"id":"turn-1"}}}`,
 		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-3","type":"agentMessage","text":"done"}}}`,
 		`{"method":"turn/completed","params":{"threadId":"thread-new","turnId":"turn-1","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
 	)
@@ -223,8 +224,8 @@ func TestAppServerRunnerStreamsNotifications(t *testing.T) {
 	if got.FinalAgentMessage != "done" {
 		t.Fatalf("final message = %q, want done", got.FinalAgentMessage)
 	}
-	if len(events) != 6 {
-		t.Fatalf("events len = %d, want 6: %#v", len(events), events)
+	if len(events) != 7 {
+		t.Fatalf("events len = %d, want 7: %#v", len(events), events)
 	}
 	if events[0].Kind != StreamEventTurnStarted || events[0].TurnID != "turn-1" {
 		t.Fatalf("turn event = %#v", events[0])
@@ -238,11 +239,14 @@ func TestAppServerRunnerStreamsNotifications(t *testing.T) {
 	if events[3].Kind != StreamEventCommandCompleted || events[3].AggregatedOutput != "PASS\n" || events[3].ExitCode == nil || *events[3].ExitCode != 0 {
 		t.Fatalf("command completed event = %#v", events[3])
 	}
-	if events[4].Kind != StreamEventAgentMessage || events[4].Text != "done" {
-		t.Fatalf("final agent event = %#v", events[4])
+	if events[4].Kind != StreamEventContextCompacted || events[4].ThreadID != "thread-new" || events[4].TurnID != "turn-1" {
+		t.Fatalf("compact event = %#v", events[4])
 	}
-	if events[5].Kind != StreamEventTurnCompleted || events[5].TurnID != "turn-1" {
-		t.Fatalf("turn completed event = %#v", events[5])
+	if events[5].Kind != StreamEventAgentMessage || events[5].Text != "done" {
+		t.Fatalf("final agent event = %#v", events[5])
+	}
+	if events[6].Kind != StreamEventTurnCompleted || events[6].TurnID != "turn-1" {
+		t.Fatalf("turn completed event = %#v", events[6])
 	}
 }
 

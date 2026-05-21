@@ -44,6 +44,7 @@ type codexEvent struct {
 	Turn          codexTurn       `json:"turn"`
 	Thread        codexThread     `json:"thread"`
 	Item          codexItem       `json:"item"`
+	Payload       json.RawMessage `json:"payload"`
 	Usage         codexUsage      `json:"usage"`
 	Error         codexEventError `json:"error"`
 	Message       string          `json:"message"`

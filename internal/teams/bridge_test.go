@@ -422,6 +422,7 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 			{Kind: codexrunner.StreamEventAgentMessage, Text: "I am checking the failing test first."},
 			{Kind: codexrunner.StreamEventCommandStarted, Command: "/usr/bin/zsh -lc 'go test ./...'"},
 			{Kind: codexrunner.StreamEventCommandCompleted, Command: "/usr/bin/zsh -lc 'go test ./...'", Status: "completed", ExitCode: &exitCode, AggregatedOutput: "--- FAIL: TestAdd\nFAIL\n"},
+			{Kind: codexrunner.StreamEventContextCompacted},
 			{Kind: codexrunner.StreamEventAgentMessage, Text: "FINAL MARKER\nFixed the bug."},
 			{Kind: codexrunner.StreamEventTurnCompleted},
 		},
@@ -440,6 +441,7 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	for _, want := range []string{
 		"Codex is working",
 		"🤖 ⏳ Codex status:\nI am checking the failing test first.",
+		"🤖 ⏳ Codex status:\n" + transcriptContextCompactMessage,
 		"🔧 Helper: ✅ Codex finished responding.",
 		"🤖 ✅ Codex answer:\nFINAL MARKER",
 	} {
@@ -449,6 +451,9 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	}
 	if strings.LastIndex(joined, "🔧 Helper: ✅ Codex finished responding.") < strings.LastIndex(joined, "🤖 ✅ Codex answer:\nFINAL MARKER") {
 		t.Fatalf("final helper completion should appear after the Codex reply:\n%s", joined)
+	}
+	if strings.Index(joined, transcriptContextCompactMessage) > strings.Index(joined, "🤖 ✅ Codex answer:\nFINAL MARKER") {
+		t.Fatalf("context compact status should be sent before the final answer:\n%s", joined)
 	}
 	for _, leaked := range []string{
 		"🤖 🛠️ Codex command",
@@ -14353,6 +14358,55 @@ func TestBridgeSyncLinkedTranscriptSendsContextCompactMarkersIndividually(t *tes
 		if msg.Mentions != 0 {
 			t.Fatalf("context compact sync should not mention owner: %#v", msg)
 		}
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptSkipsContextCompactAlreadySentLive(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-compact-live"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-compact-live", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-compact-live")
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:live-compact",
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		Kind:           "codex-compact-001",
+		Body:           transcriptContextCompactMessage,
+		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-live-compact",
+	}); err != nil {
+		t.Fatalf("QueueOutbox live compact error: %v", err)
+	}
+	*sent = nil
+
+	updated := initial +
+		`{"timestamp":"2026-05-20T03:30:42.693Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"old prompt"}]}]}}` + "\n" +
+		`{"timestamp":"2026-05-20T03:30:42.695Z","type":"event_msg","payload":{"type":"context_compacted"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write compact transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync compact transcript error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("transcript sync sent late duplicate compact status: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID == "old" || strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		t.Fatalf("checkpoint did not advance past live-sent compact record: %#v", checkpoint)
 	}
 }
 

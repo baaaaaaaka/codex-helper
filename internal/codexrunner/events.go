@@ -20,6 +20,7 @@ const (
 	StreamEventAgentMessage     StreamEventKind = "agent_message"
 	StreamEventCommandStarted   StreamEventKind = "command_started"
 	StreamEventCommandCompleted StreamEventKind = "command_completed"
+	StreamEventContextCompacted StreamEventKind = "context_compacted"
 	StreamEventStreamRetry      StreamEventKind = "stream_retry"
 	StreamEventUsage            StreamEventKind = "usage"
 )
@@ -67,6 +68,12 @@ func ParseStreamEventJSONL(line []byte) (StreamEvent, bool, error) {
 		out.Kind = StreamEventTurnFailed
 		out.Usage = usageFromEvent(event)
 		out.Failure = failureFromEvent(event)
+	case "context_compaction", "context_compacted", "thread.compacted", "thread/compacted", "compacted":
+		out.Kind = StreamEventContextCompacted
+	case "event_msg", "response_item":
+		if !applyContextCompactPayload(event.Payload, &out) {
+			return StreamEvent{}, false, nil
+		}
 	case "error":
 		out.Failure = failureFromEvent(event)
 		out.WillRetry = event.WillRetry
@@ -108,6 +115,40 @@ func ParseStreamEventJSONL(line []byte) (StreamEvent, bool, error) {
 		}
 	}
 	return out, true, nil
+}
+
+func applyContextCompactPayload(raw json.RawMessage, out *StreamEvent) bool {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return false
+	}
+	var payload struct {
+		Type          string    `json:"type"`
+		ThreadID      string    `json:"thread_id"`
+		ThreadIDCamel string    `json:"threadId"`
+		TurnID        string    `json:"turn_id"`
+		TurnIDCamel   string    `json:"turnId"`
+		Turn          codexTurn `json:"turn"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	if !isContextCompactStreamType(payload.Type) {
+		return false
+	}
+	out.Kind = StreamEventContextCompacted
+	out.ThreadID = firstNonEmpty(out.ThreadID, payload.ThreadIDCamel, payload.ThreadID)
+	out.TurnID = firstNonEmpty(out.TurnID, payload.TurnIDCamel, payload.TurnID, payload.Turn.ID)
+	return true
+}
+
+func isContextCompactStreamType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "context_compaction", "context_compacted", "thread.compacted", "thread/compacted", "compacted":
+		return true
+	default:
+		return false
+	}
 }
 
 func usageFromEvent(event codexEvent) Usage {

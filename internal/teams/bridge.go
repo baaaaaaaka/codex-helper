@@ -7547,6 +7547,9 @@ func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
 	case codexrunner.StreamEventStreamRetry:
 		f.flushPendingAgent()
 		f.sendStreamRetryStatus(event)
+	case codexrunner.StreamEventContextCompacted:
+		f.flushPendingAgent()
+		_ = f.send("compact", transcriptContextCompactMessage)
 	case codexrunner.StreamEventTurnFailed:
 		f.flushPendingAgent()
 		if event.Failure != nil && strings.TrimSpace(event.Failure.Message) != "" {
@@ -12399,6 +12402,8 @@ func deliveredOutboxTranscriptKind(kind string) (TranscriptKind, bool) {
 		return TranscriptKindUser, true
 	case isFinalOutboxKind(kind) || strings.Contains(kind, "assistant"):
 		return TranscriptKindAssistant, true
+	case strings.Contains(kind, "compact"):
+		return TranscriptKindCompact, true
 	case strings.Contains(kind, "progress") || strings.Contains(kind, "status"):
 		return TranscriptKindStatus, true
 	default:
@@ -12415,7 +12420,7 @@ func formatKnownOutboxBodyForTranscriptDedupe(kind TranscriptKind, body string) 
 }
 
 func shouldSkipKnownTranscriptOutboxRecord(record TranscriptRecord, body string, hashes map[TranscriptKind]map[string]bool) bool {
-	if record.Kind != TranscriptKindUser && record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus {
+	if record.Kind != TranscriptKindUser && record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus && record.Kind != TranscriptKindCompact {
 		return false
 	}
 	if record.Kind == TranscriptKindUser {

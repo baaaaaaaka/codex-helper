@@ -45,6 +45,26 @@ func TestParseStreamEventJSONLRetryableStreamError(t *testing.T) {
 	}
 }
 
+func TestParseStreamEventJSONLContextCompacted(t *testing.T) {
+	lines := [][]byte{
+		[]byte(`{"type":"context_compacted","thread_id":"thread-1","turn_id":"turn-1"}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"context_compacted","thread_id":"thread-2","turn_id":"turn-2"}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"context_compaction","threadId":"thread-3","turnId":"turn-3"}}`),
+	}
+	for i, line := range lines {
+		event, ok, err := ParseStreamEventJSONL(line)
+		if err != nil {
+			t.Fatalf("case %d ParseStreamEventJSONL error: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("case %d event was not recognized", i)
+		}
+		if event.Kind != StreamEventContextCompacted {
+			t.Fatalf("case %d kind = %q, want %q", i, event.Kind, StreamEventContextCompacted)
+		}
+	}
+}
+
 func TestEventStreamWriterEmitsJSONEventsAcrossWrites(t *testing.T) {
 	var dst bytes.Buffer
 	var events []StreamEvent
