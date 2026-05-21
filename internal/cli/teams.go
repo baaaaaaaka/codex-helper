@@ -2009,14 +2009,27 @@ func formatPollSummary(polls map[string]teamsstore.ChatPollState) string {
 		return "unavailable"
 	}
 	errorCount := 0
-	warningCount := 0
+	historicalWindowCount := 0
+	activeWindowCount := 0
+	activeContinuationCount := 0
+	activeReadBackoffCount := 0
 	var lastSuccess time.Time
+	now := time.Now()
 	for _, poll := range polls {
 		if poll.LastError != "" {
 			errorCount++
 		}
 		if !poll.LastWindowFullAt.IsZero() {
-			warningCount++
+			historicalWindowCount++
+		}
+		if poll.LastWindowFullMessage != "" {
+			activeWindowCount++
+		}
+		if poll.ContinuationPath != "" {
+			activeContinuationCount++
+		}
+		if poll.BlockedUntil.After(now) {
+			activeReadBackoffCount++
 		}
 		if poll.LastSuccessfulPollAt.After(lastSuccess) {
 			lastSuccess = poll.LastSuccessfulPollAt
@@ -2026,7 +2039,13 @@ func formatPollSummary(polls map[string]teamsstore.ChatPollState) string {
 	if !lastSuccess.IsZero() {
 		parts = append(parts, "last_success "+lastSuccess.Format(time.RFC3339))
 	}
-	parts = append(parts, fmt.Sprintf("%d errors", errorCount), fmt.Sprintf("%d window warnings", warningCount))
+	parts = append(parts,
+		fmt.Sprintf("%d errors", errorCount),
+		fmt.Sprintf("%d active window warnings", activeWindowCount),
+		fmt.Sprintf("%d historical window warnings", historicalWindowCount),
+		fmt.Sprintf("%d active continuations", activeContinuationCount),
+		fmt.Sprintf("%d active read backoffs", activeReadBackoffCount),
+	)
 	return strings.Join(parts, ", ")
 }
 

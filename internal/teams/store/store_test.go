@@ -212,7 +212,7 @@ func TestLoadMigratesV1StateToV2SemanticBackbone(t *testing.T) {
 	if state.ChatSequences["chat-1"].Next != 3 {
 		t.Fatalf("chat sequence next = %d, want 3", state.ChatSequences["chat-1"].Next)
 	}
-	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.TranscriptLedger == nil || state.ImportCheckpoints == nil || state.HistoryWatch == nil || state.ChatRateLimits == nil || state.ArtifactRecords == nil || state.Notifications == nil {
+	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.TranscriptLedger == nil || state.TranscriptDeliveries == nil || state.HelperDeliveries == nil || state.ImportCheckpoints == nil || state.HistoryWatch == nil || state.ChatRateLimits == nil || state.ArtifactRecords == nil || state.Notifications == nil {
 		t.Fatalf("semantic v2 maps were not initialized: %#v", state)
 	}
 	if state.ServiceOwner == nil || state.ServiceOwner.ActiveTurnID != "turn:legacy" {
@@ -307,7 +307,7 @@ func TestLoadMigratesLocalPOCV1StateShape(t *testing.T) {
 	if got := state.Turns["turn:inbound:19:work-chat@thread.v2:2"].Status; got != TurnStatusCompleted {
 		t.Fatalf("latest turn status = %q, want completed", got)
 	}
-	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.ChatSequences == nil || state.HistoryWatch == nil || state.ChatRateLimits == nil || state.Notifications == nil {
+	if state.Workspaces == nil || state.DashboardViews == nil || state.DashboardNumbers == nil || state.ChatSequences == nil || state.TranscriptDeliveries == nil || state.HelperDeliveries == nil || state.HistoryWatch == nil || state.ChatRateLimits == nil || state.Notifications == nil {
 		t.Fatalf("semantic maps were not initialized for local poc shape: %#v", state)
 	}
 	if state.ServiceControl.UpdatedAt.IsZero() {
@@ -518,6 +518,108 @@ func TestQueueOutboxAssignsPerChatSequenceAndMetadata(t *testing.T) {
 	}
 	if other.PartIndex != 1 || other.PartCount != 1 {
 		t.Fatalf("default part metadata mismatch: %#v", other)
+	}
+}
+
+func TestQueueOutboxRecordsHelperDeliveryLedger(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:status",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-progress-003",
+		Body:        "live status",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox status error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after queue error: %v", err)
+	}
+	if len(state.HelperDeliveries) != 1 {
+		t.Fatalf("helper deliveries after queue = %#v, want one", state.HelperDeliveries)
+	}
+	var delivery HelperDeliveryRecord
+	for _, record := range state.HelperDeliveries {
+		delivery = record
+	}
+	if delivery.Status != HelperDeliveryStatusQueued || delivery.KindFamily != "status" || delivery.VisibleHash != bodyHash("live status") || delivery.CodexThreadID != "thread-0" {
+		t.Fatalf("queued helper delivery mismatch: %#v", delivery)
+	}
+	if _, err := store.MarkOutboxSent(ctx, msg.ID, "teams-status"); err != nil {
+		t.Fatalf("MarkOutboxSent status error: %v", err)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after sent error: %v", err)
+	}
+	if len(state.HelperDeliveries) != 1 {
+		t.Fatalf("helper deliveries after sent = %#v, want one stable record", state.HelperDeliveries)
+	}
+	for _, record := range state.HelperDeliveries {
+		delivery = record
+	}
+	if delivery.Status != HelperDeliveryStatusSent || delivery.TeamsMessageID != "teams-status" || delivery.SentAt.IsZero() {
+		t.Fatalf("sent helper delivery mismatch: %#v", delivery)
+	}
+}
+
+func TestOutboxArtifactRecordsFollowOutboxSendState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, err := store.UpsertArtifactRecord(ctx, ArtifactRecord{
+		ID:         "artifact:one",
+		SessionID:  "s1",
+		TurnID:     "turn-1",
+		Path:       "artifact.txt",
+		UploadName: "codex-artifact.txt",
+		Status:     "queued",
+	}); err != nil {
+		t.Fatalf("UpsertArtifactRecord error: %v", err)
+	}
+	msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:                   "outbox:artifact",
+		SessionID:            "s1",
+		TurnID:               "turn-1",
+		TeamsChatID:          "chat-1",
+		Kind:                 "artifact",
+		Body:                 "artifact attached",
+		AttachmentName:       "artifact.txt",
+		AttachmentUploadName: "codex-artifact.txt",
+		ArtifactIDs:          []string{"artifact:one"},
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox artifact error: %v", err)
+	}
+	if _, err := store.MarkOutboxDriveItem(ctx, msg.ID, "drive-item-1", "codex-artifact.txt", "", "", ""); err != nil {
+		t.Fatalf("MarkOutboxDriveItem error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after drive item error: %v", err)
+	}
+	artifact := state.ArtifactRecords["artifact:one"]
+	if artifact.Status != "drive_uploaded" || artifact.OutboxID != msg.ID || artifact.DriveItemID != "drive-item-1" || artifact.UploadedAt.IsZero() {
+		t.Fatalf("artifact after drive upload mismatch: %#v", artifact)
+	}
+	if _, err := store.MarkOutboxSent(ctx, msg.ID, "teams-artifact"); err != nil {
+		t.Fatalf("MarkOutboxSent artifact error: %v", err)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after sent error: %v", err)
+	}
+	artifact = state.ArtifactRecords["artifact:one"]
+	if artifact.Status != "uploaded" || artifact.TeamsMessageID != "teams-artifact" || artifact.Error != "" || artifact.SentAt.IsZero() {
+		t.Fatalf("artifact after sent mismatch: %#v", artifact)
 	}
 }
 

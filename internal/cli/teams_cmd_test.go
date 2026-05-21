@@ -690,7 +690,10 @@ func TestTeamsStatusReportsPollDiagnostics(t *testing.T) {
 	}
 
 	out := executeRootForTeamsTest(t, "teams", "status")
-	if !strings.Contains(out, "Poll summary: 2 chats") || !strings.Contains(out, "1 errors") || !strings.Contains(out, "1 window warnings") {
+	if !strings.Contains(out, "Poll summary: 2 chats") ||
+		!strings.Contains(out, "1 errors") ||
+		!strings.Contains(out, "1 active window warnings") ||
+		!strings.Contains(out, "1 historical window warnings") {
 		t.Fatalf("status did not show poll diagnostics:\n%s", out)
 	}
 }

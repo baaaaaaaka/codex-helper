@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	SchemaVersion = 4
+	SchemaVersion = 5
 
 	dirMode  os.FileMode = 0o700
 	fileMode os.FileMode = 0o600
@@ -30,6 +30,7 @@ const (
 	maxRetainedTranscriptLedgerRecords = 1024
 	maxRetainedTranscriptDeliveries    = 65536
 	maxRetainedMessageProvenance       = 8192
+	maxRetainedHelperDeliveries        = 32768
 )
 
 type SessionStatus string
@@ -76,6 +77,17 @@ const (
 	TranscriptDeliveryStatusAccepted TranscriptDeliveryStatus = "accepted"
 	TranscriptDeliveryStatusSent     TranscriptDeliveryStatus = "sent"
 	TranscriptDeliveryStatusSkipped  TranscriptDeliveryStatus = "skipped"
+)
+
+type HelperDeliveryStatus string
+
+const (
+	HelperDeliveryStatusQueued   HelperDeliveryStatus = "queued"
+	HelperDeliveryStatusSending  HelperDeliveryStatus = "sending"
+	HelperDeliveryStatusAccepted HelperDeliveryStatus = "accepted"
+	HelperDeliveryStatusSent     HelperDeliveryStatus = "sent"
+	HelperDeliveryStatusFailed   HelperDeliveryStatus = "failed"
+	HelperDeliveryStatusSkipped  HelperDeliveryStatus = "skipped"
 )
 
 const (
@@ -130,6 +142,7 @@ type State struct {
 	DashboardNumbers     map[string]DashboardNumberRecord    `json:"dashboard_numbers,omitempty"`
 	TranscriptLedger     map[string]TranscriptLedgerRecord   `json:"transcript_ledger,omitempty"`
 	TranscriptDeliveries map[string]TranscriptDeliveryRecord `json:"transcript_deliveries,omitempty"`
+	HelperDeliveries     map[string]HelperDeliveryRecord     `json:"helper_deliveries,omitempty"`
 	ImportCheckpoints    map[string]ImportCheckpoint         `json:"import_checkpoints,omitempty"`
 	HistoryWatch         map[string]HistoryWatchCheckpoint   `json:"history_watch,omitempty"`
 	HistoryWatchReady    time.Time                           `json:"history_watch_ready,omitempty"`
@@ -358,6 +371,27 @@ type TranscriptDeliveryRecord struct {
 	SentAt         time.Time                `json:"sent_at,omitempty"`
 }
 
+type HelperDeliveryRecord struct {
+	ID             string               `json:"id"`
+	SessionID      string               `json:"session_id,omitempty"`
+	TeamsChatID    string               `json:"teams_chat_id,omitempty"`
+	CodexThreadID  string               `json:"codex_thread_id,omitempty"`
+	TurnID         string               `json:"turn_id,omitempty"`
+	Kind           string               `json:"kind,omitempty"`
+	KindFamily     string               `json:"kind_family,omitempty"`
+	SourceTextHash string               `json:"source_text_hash,omitempty"`
+	RenderedHash   string               `json:"rendered_hash,omitempty"`
+	VisibleHash    string               `json:"visible_hash,omitempty"`
+	OutboxID       string               `json:"outbox_id,omitempty"`
+	TeamsMessageID string               `json:"teams_message_id,omitempty"`
+	PartIndex      int                  `json:"part_index,omitempty"`
+	PartCount      int                  `json:"part_count,omitempty"`
+	Status         HelperDeliveryStatus `json:"status,omitempty"`
+	CreatedAt      time.Time            `json:"created_at,omitempty"`
+	UpdatedAt      time.Time            `json:"updated_at,omitempty"`
+	SentAt         time.Time            `json:"sent_at,omitempty"`
+}
+
 type ImportCheckpoint struct {
 	ID             string    `json:"id"`
 	SessionID      string    `json:"session_id"`
@@ -411,16 +445,21 @@ type HistoryWatchCheckpoint struct {
 }
 
 type ArtifactRecord struct {
-	ID          string    `json:"id"`
-	SessionID   string    `json:"session_id,omitempty"`
-	TurnID      string    `json:"turn_id,omitempty"`
-	Path        string    `json:"path,omitempty"`
-	UploadName  string    `json:"upload_name,omitempty"`
-	DriveItemID string    `json:"drive_item_id,omitempty"`
-	OutboxID    string    `json:"outbox_id,omitempty"`
-	Status      string    `json:"status,omitempty"`
-	CreatedAt   time.Time `json:"created_at,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
+	ID             string    `json:"id"`
+	SessionID      string    `json:"session_id,omitempty"`
+	TurnID         string    `json:"turn_id,omitempty"`
+	Path           string    `json:"path,omitempty"`
+	UploadName     string    `json:"upload_name,omitempty"`
+	DriveItemID    string    `json:"drive_item_id,omitempty"`
+	OutboxID       string    `json:"outbox_id,omitempty"`
+	TeamsMessageID string    `json:"teams_message_id,omitempty"`
+	Status         string    `json:"status,omitempty"`
+	StatusReason   string    `json:"status_reason,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	UploadedAt     time.Time `json:"uploaded_at,omitempty"`
+	SentAt         time.Time `json:"sent_at,omitempty"`
+	CreatedAt      time.Time `json:"created_at,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
 
 type NotificationRecord struct {
@@ -2196,6 +2235,7 @@ func skipTransientOutboxForTurnLocked(state *State, turnID string, reason string
 			msg.LastSendError = reason
 			msg.UpdatedAt = now
 			state.OutboxMessages[id] = msg
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
 		}
 	}
 }
@@ -2269,6 +2309,7 @@ func queueOutboxLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMe
 		msg.UpdatedAt = msg.CreatedAt
 	}
 	state.OutboxMessages[msg.ID] = msg
+	updateHelperDeliveryForOutboxLocked(state, msg, helperDeliveryStatusFromOutboxStatus(msg.Status), now)
 	return msg, true, nil
 }
 
@@ -2424,6 +2465,69 @@ func normalizeTranscriptDeliveryRecord(record TranscriptDeliveryRecord, now time
 	return record
 }
 
+func (s *Store) UpsertArtifactRecord(ctx context.Context, record ArtifactRecord) (ArtifactRecord, error) {
+	if strings.TrimSpace(record.ID) == "" {
+		return ArtifactRecord{}, fmt.Errorf("artifact id is required")
+	}
+	update := s.Update
+	if strings.TrimSpace(record.SessionID) != "" {
+		update = func(ctx context.Context, fn func(*State) error) error {
+			return s.UpdateSession(ctx, record.SessionID, fn)
+		}
+	}
+	var out ArtifactRecord
+	err := update(ctx, func(state *State) error {
+		now := time.Now()
+		record = normalizeArtifactRecord(record, now)
+		if existing, ok := state.ArtifactRecords[record.ID]; ok {
+			if !existing.CreatedAt.IsZero() {
+				record.CreatedAt = existing.CreatedAt
+			}
+			if record.OutboxID == "" {
+				record.OutboxID = existing.OutboxID
+			}
+			if record.DriveItemID == "" {
+				record.DriveItemID = existing.DriveItemID
+			}
+			if record.TeamsMessageID == "" {
+				record.TeamsMessageID = existing.TeamsMessageID
+			}
+			if record.UploadedAt.IsZero() {
+				record.UploadedAt = existing.UploadedAt
+			}
+			if record.SentAt.IsZero() {
+				record.SentAt = existing.SentAt
+			}
+		}
+		state.ArtifactRecords[record.ID] = record
+		out = record
+		return nil
+	})
+	return out, err
+}
+
+func normalizeArtifactRecord(record ArtifactRecord, now time.Time) ArtifactRecord {
+	record.ID = strings.TrimSpace(record.ID)
+	record.SessionID = strings.TrimSpace(record.SessionID)
+	record.TurnID = strings.TrimSpace(record.TurnID)
+	record.Path = strings.TrimSpace(record.Path)
+	record.UploadName = strings.TrimSpace(record.UploadName)
+	record.DriveItemID = strings.TrimSpace(record.DriveItemID)
+	record.OutboxID = strings.TrimSpace(record.OutboxID)
+	record.TeamsMessageID = strings.TrimSpace(record.TeamsMessageID)
+	record.Status = strings.TrimSpace(record.Status)
+	record.StatusReason = trimDiagnostic(record.StatusReason, 240)
+	record.Error = trimDiagnostic(record.Error, 240)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = now
+	}
+	record.UpdatedAt = now
+	return record
+}
+
 func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, now time.Time) {
 	if state == nil || strings.TrimSpace(checkpoint.ID) == "" || strings.TrimSpace(checkpoint.LastRecordID) == "" {
 		return
@@ -2469,7 +2573,7 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 }
 
 func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		switch msg.Status {
 		case OutboxStatusSent:
 			return msg, ErrOutboxSendNotClaimed
@@ -2481,6 +2585,7 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 		msg.Status = OutboxStatusSending
 		msg.LastSendAttempt = now
 		msg.LastSendError = ""
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
 		return msg, nil
 	})
 }
@@ -2520,22 +2625,25 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 }
 
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.Status = OutboxStatusQueued
 		msg.LastSendError = trimDiagnostic(message, 240)
 		msg.LastSendAttempt = now
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, artifactStatusForSendError(msg), "", msg.LastSendError)
 		return msg, nil
 	})
 }
 
 func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
-	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
 		msg.DriveItemETag = strings.TrimSpace(eTag)
 		msg.DriveItemWebURL = strings.TrimSpace(webURL)
 		msg.DriveItemWebDav = strings.TrimSpace(webDavURL)
 		msg.LastSendError = ""
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "drive_uploaded", "", "")
 		return msg, nil
 	})
 }
@@ -2544,6 +2652,8 @@ func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMe
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if msg.Status == OutboxStatusSent {
 			recordOutboxProvenanceLocked(state, msg, now)
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
+			updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
 			return msg, nil
 		}
 		msg.Status = OutboxStatusAccepted
@@ -2553,6 +2663,7 @@ func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMe
 		msg.LastSendError = ""
 		recordOutboxProvenanceLocked(state, msg, now)
 		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusAccepted, now)
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusAccepted, now)
 		return msg, nil
 	})
 }
@@ -2568,6 +2679,8 @@ func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessag
 		}
 		recordOutboxProvenanceLocked(state, msg, now)
 		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSent, now)
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
 		return msg, nil
 	})
 }
@@ -2588,6 +2701,202 @@ func markTranscriptDeliveryForOutboxLocked(state *State, msg OutboxMessage, stat
 		delivery.UpdatedAt = now
 		state.TranscriptDeliveries[id] = delivery
 	}
+}
+
+func updateHelperDeliveryForOutboxLocked(state *State, msg OutboxMessage, status HelperDeliveryStatus, now time.Time) {
+	if state == nil {
+		return
+	}
+	record, ok := helperDeliveryRecordFromOutboxLocked(state, msg, status, now)
+	if !ok {
+		return
+	}
+	if existing, ok := state.HelperDeliveries[record.ID]; ok {
+		if !existing.CreatedAt.IsZero() {
+			record.CreatedAt = existing.CreatedAt
+		}
+		if record.CodexThreadID == "" {
+			record.CodexThreadID = existing.CodexThreadID
+		}
+		if record.TeamsMessageID == "" {
+			record.TeamsMessageID = existing.TeamsMessageID
+		}
+		if record.SentAt.IsZero() {
+			record.SentAt = existing.SentAt
+		}
+	}
+	state.HelperDeliveries[record.ID] = record
+}
+
+func helperDeliveryRecordFromOutboxLocked(state *State, msg OutboxMessage, status HelperDeliveryStatus, now time.Time) (HelperDeliveryRecord, bool) {
+	kindFamily := helperDeliveryKindFamily(msg.Kind)
+	if kindFamily == "" || strings.TrimSpace(msg.TeamsChatID) == "" {
+		return HelperDeliveryRecord{}, false
+	}
+	if status == "" {
+		status = helperDeliveryStatusFromOutboxStatus(msg.Status)
+	}
+	sourceHash := strings.TrimSpace(msg.SourceTextHash)
+	renderedHash := strings.TrimSpace(msg.RenderedHash)
+	visibleHash := firstStoreNonEmptyString(sourceHash, renderedHash)
+	if visibleHash == "" && strings.TrimSpace(msg.Body) != "" {
+		visibleHash = bodyHash(msg.Body)
+	}
+	if sourceHash == "" && visibleHash != "" {
+		sourceHash = visibleHash
+	}
+	if renderedHash == "" && strings.TrimSpace(msg.Body) != "" {
+		renderedHash = bodyHash(msg.Body)
+	}
+	record := HelperDeliveryRecord{
+		SessionID:      strings.TrimSpace(msg.SessionID),
+		TeamsChatID:    strings.TrimSpace(msg.TeamsChatID),
+		CodexThreadID:  helperDeliveryCodexThreadIDLocked(state, msg),
+		TurnID:         strings.TrimSpace(msg.TurnID),
+		Kind:           strings.TrimSpace(msg.Kind),
+		KindFamily:     kindFamily,
+		SourceTextHash: sourceHash,
+		RenderedHash:   renderedHash,
+		VisibleHash:    visibleHash,
+		OutboxID:       strings.TrimSpace(msg.ID),
+		TeamsMessageID: strings.TrimSpace(msg.TeamsMessageID),
+		PartIndex:      msg.PartIndex,
+		PartCount:      msg.PartCount,
+		Status:         status,
+		CreatedAt:      msg.CreatedAt,
+		UpdatedAt:      now,
+		SentAt:         msg.SentAt,
+	}
+	if record.PartCount <= 0 {
+		record.PartCount = 1
+	}
+	if record.PartIndex <= 0 && record.PartCount == 1 {
+		record.PartIndex = 1
+	}
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = now
+	}
+	if record.Status == HelperDeliveryStatusSent && record.SentAt.IsZero() {
+		record.SentAt = firstStoreNonZeroTime(msg.SentAt, now)
+	}
+	record.ID = helperDeliveryID(record)
+	return record, record.ID != ""
+}
+
+func helperDeliveryCodexThreadIDLocked(state *State, msg OutboxMessage) string {
+	if state == nil {
+		return ""
+	}
+	if turnID := strings.TrimSpace(msg.TurnID); turnID != "" {
+		if turn, ok := state.Turns[turnID]; ok && strings.TrimSpace(turn.CodexThreadID) != "" {
+			return strings.TrimSpace(turn.CodexThreadID)
+		}
+	}
+	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" {
+		if session, ok := state.Sessions[sessionID]; ok {
+			return strings.TrimSpace(session.CodexThreadID)
+		}
+	}
+	return ""
+}
+
+func helperDeliveryID(record HelperDeliveryRecord) string {
+	keyHash := firstStoreNonEmptyString(record.SourceTextHash, record.VisibleHash, record.RenderedHash, record.OutboxID)
+	if strings.TrimSpace(record.TeamsChatID) == "" || strings.TrimSpace(record.KindFamily) == "" || keyHash == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		strings.TrimSpace(record.TeamsChatID),
+		strings.TrimSpace(record.SessionID),
+		strings.TrimSpace(record.CodexThreadID),
+		strings.TrimSpace(record.KindFamily),
+		keyHash,
+		fmt.Sprintf("%d/%d", record.PartIndex, record.PartCount),
+	}, "\x00")))
+	return "helper-delivery:" + hex.EncodeToString(sum[:])
+}
+
+func helperDeliveryKindFamily(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	switch {
+	case strings.Contains(kind, "compact"):
+		return "compact"
+	case strings.Contains(kind, "progress") || strings.Contains(kind, "status"):
+		return "status"
+	default:
+		return ""
+	}
+}
+
+func helperDeliveryStatusFromOutboxStatus(status OutboxStatus) HelperDeliveryStatus {
+	switch status {
+	case OutboxStatusSending:
+		return HelperDeliveryStatusSending
+	case OutboxStatusAccepted:
+		return HelperDeliveryStatusAccepted
+	case OutboxStatusSent:
+		return HelperDeliveryStatusSent
+	case OutboxStatusSkipped:
+		return HelperDeliveryStatusSkipped
+	default:
+		return HelperDeliveryStatusQueued
+	}
+}
+
+func updateArtifactRecordsForOutboxLocked(state *State, msg OutboxMessage, now time.Time, status string, reason string, errMessage string) {
+	if state == nil || strings.TrimSpace(msg.ID) == "" || len(msg.ArtifactIDs) == 0 {
+		return
+	}
+	for _, id := range msg.ArtifactIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		record := state.ArtifactRecords[id]
+		if record.ID == "" {
+			record.ID = id
+			record.SessionID = msg.SessionID
+			record.TurnID = msg.TurnID
+			record.Path = msg.AttachmentName
+			record.UploadName = msg.AttachmentUploadName
+			record.CreatedAt = firstStoreNonZeroTime(msg.CreatedAt, now)
+		}
+		record.OutboxID = firstStoreNonEmptyString(record.OutboxID, msg.ID)
+		record.DriveItemID = firstStoreNonEmptyString(msg.DriveItemID, record.DriveItemID)
+		record.TeamsMessageID = firstStoreNonEmptyString(msg.TeamsMessageID, record.TeamsMessageID)
+		if status != "" {
+			record.Status = status
+		}
+		if reason != "" {
+			record.StatusReason = trimDiagnostic(reason, 240)
+		}
+		if errMessage != "" {
+			record.Error = trimDiagnostic(errMessage, 240)
+		} else if status == "uploaded" {
+			record.Error = ""
+			record.StatusReason = ""
+		}
+		if status == "drive_uploaded" && record.UploadedAt.IsZero() {
+			record.UploadedAt = now
+		}
+		if status == "uploaded" {
+			if record.UploadedAt.IsZero() {
+				record.UploadedAt = firstStoreNonZeroTime(msg.SentAt, now)
+			}
+			if record.SentAt.IsZero() {
+				record.SentAt = firstStoreNonZeroTime(msg.SentAt, now)
+			}
+		}
+		record.UpdatedAt = now
+		state.ArtifactRecords[id] = record
+	}
+}
+
+func artifactStatusForSendError(msg OutboxMessage) string {
+	if strings.TrimSpace(msg.DriveItemID) != "" {
+		return "message_failed"
+	}
+	return "failed"
 }
 
 func (s *Store) PendingOutbox(ctx context.Context) ([]OutboxMessage, error) {
@@ -3059,6 +3368,8 @@ func (s *Store) loadUnlocked() (State, error) {
 	}
 	state.ensure(time.Time{})
 	backfillMessageProvenance(&state)
+	backfillHelperDeliveries(&state)
+	normalizeArtifactRecords(&state)
 	return state, nil
 }
 
@@ -3068,6 +3379,7 @@ func (s *Store) saveUnlocked(state State) error {
 	pruneTranscriptLedgerRecords(&state)
 	pruneTranscriptDeliveryRecords(&state)
 	pruneMessageProvenanceRecords(&state)
+	pruneHelperDeliveryRecords(&state)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -3195,6 +3507,40 @@ func pruneMessageProvenanceRecords(state *State) {
 	}
 }
 
+func pruneHelperDeliveryRecords(state *State) {
+	if state == nil || len(state.HelperDeliveries) <= maxRetainedHelperDeliveries {
+		return
+	}
+	type candidate struct {
+		id     string
+		record HelperDeliveryRecord
+	}
+	records := make([]candidate, 0, len(state.HelperDeliveries))
+	for id, record := range state.HelperDeliveries {
+		records = append(records, candidate{id: id, record: record})
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		left := helperDeliveryRetentionTime(records[i].record)
+		right := helperDeliveryRetentionTime(records[j].record)
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return records[i].id > records[j].id
+	})
+	for _, item := range records[maxRetainedHelperDeliveries:] {
+		delete(state.HelperDeliveries, item.id)
+	}
+}
+
+func helperDeliveryRetentionTime(record HelperDeliveryRecord) time.Time {
+	for _, value := range []time.Time{record.SentAt, record.UpdatedAt, record.CreatedAt} {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
 func messageProvenanceRetentionTime(record MessageProvenanceRecord) time.Time {
 	for _, value := range []time.Time{record.UpdatedAt, record.CreatedAt} {
 		if !value.IsZero() {
@@ -3310,6 +3656,7 @@ func newState() State {
 		DashboardNumbers:     make(map[string]DashboardNumberRecord),
 		TranscriptLedger:     make(map[string]TranscriptLedgerRecord),
 		TranscriptDeliveries: make(map[string]TranscriptDeliveryRecord),
+		HelperDeliveries:     make(map[string]HelperDeliveryRecord),
 		ImportCheckpoints:    make(map[string]ImportCheckpoint),
 		HistoryWatch:         make(map[string]HistoryWatchCheckpoint),
 		ChatSequences:        make(map[string]ChatSequenceState),
@@ -3369,6 +3716,9 @@ func (s *State) ensure(now time.Time) {
 	}
 	if s.TranscriptDeliveries == nil {
 		s.TranscriptDeliveries = make(map[string]TranscriptDeliveryRecord)
+	}
+	if s.HelperDeliveries == nil {
+		s.HelperDeliveries = make(map[string]HelperDeliveryRecord)
 	}
 	if s.ImportCheckpoints == nil {
 		s.ImportCheckpoints = make(map[string]ImportCheckpoint)
@@ -3433,6 +3783,8 @@ func migrateStateToCurrent(state State) State {
 		state.OutboxMessages[id] = msg
 	}
 	backfillMessageProvenance(&state)
+	backfillHelperDeliveries(&state)
+	normalizeArtifactRecords(&state)
 	return state
 }
 
@@ -3441,9 +3793,6 @@ func backfillMessageProvenance(state *State) {
 		return
 	}
 	state.ensure(time.Time{})
-	if len(state.MessageProvenance) > 0 {
-		return
-	}
 	for _, inbound := range state.InboundEvents {
 		recordMessageProvenanceLocked(state, MessageProvenanceRecord{
 			TeamsChatID:    inbound.TeamsChatID,
@@ -3479,6 +3828,121 @@ func backfillMessageProvenance(state *State) {
 			CreatedAt:      msg.CreatedAt,
 			UpdatedAt:      firstStoreNonZeroTime(msg.SentAt, msg.UpdatedAt, msg.CreatedAt),
 		}, time.Time{})
+	}
+}
+
+func backfillHelperDeliveries(state *State) {
+	if state == nil {
+		return
+	}
+	state.ensure(time.Time{})
+	for _, msg := range state.OutboxMessages {
+		updateHelperDeliveryForOutboxLocked(state, msg, helperDeliveryStatusFromOutboxStatus(msg.Status), firstStoreNonZeroTime(msg.UpdatedAt, msg.CreatedAt))
+	}
+	for _, delivery := range state.TranscriptDeliveries {
+		if helperDeliveryKindFamily(delivery.Kind) == "" || strings.TrimSpace(delivery.TextHash) == "" {
+			continue
+		}
+		status := helperDeliveryStatusFromTranscriptDeliveryStatus(delivery.Status)
+		if status == "" {
+			continue
+		}
+		session := state.Sessions[strings.TrimSpace(delivery.SessionID)]
+		record := HelperDeliveryRecord{
+			SessionID:      strings.TrimSpace(delivery.SessionID),
+			TeamsChatID:    strings.TrimSpace(session.TeamsChatID),
+			CodexThreadID:  firstStoreNonEmptyString(delivery.CodexThreadID, session.CodexThreadID),
+			Kind:           strings.TrimSpace(delivery.Kind),
+			KindFamily:     helperDeliveryKindFamily(delivery.Kind),
+			SourceTextHash: strings.TrimSpace(delivery.TextHash),
+			VisibleHash:    strings.TrimSpace(delivery.TextHash),
+			OutboxID:       strings.TrimSpace(delivery.OutboxID),
+			TeamsMessageID: strings.TrimSpace(delivery.TeamsMessageID),
+			PartIndex:      1,
+			PartCount:      1,
+			Status:         status,
+			CreatedAt:      delivery.CreatedAt,
+			UpdatedAt:      firstStoreNonZeroTime(delivery.UpdatedAt, delivery.CreatedAt),
+			SentAt:         delivery.SentAt,
+		}
+		record.ID = helperDeliveryID(record)
+		if record.ID != "" {
+			if existing, ok := state.HelperDeliveries[record.ID]; ok && !existing.CreatedAt.IsZero() {
+				record.CreatedAt = existing.CreatedAt
+			}
+			state.HelperDeliveries[record.ID] = record
+		}
+	}
+	for _, provenance := range state.MessageProvenance {
+		if strings.TrimSpace(provenance.Origin) != MessageOriginHelperOutbox || helperDeliveryKindFamily(provenance.Kind) == "" || strings.TrimSpace(provenance.RenderedHash) == "" {
+			continue
+		}
+		session := state.Sessions[strings.TrimSpace(provenance.SessionID)]
+		record := HelperDeliveryRecord{
+			SessionID:      strings.TrimSpace(provenance.SessionID),
+			TeamsChatID:    strings.TrimSpace(provenance.TeamsChatID),
+			CodexThreadID:  strings.TrimSpace(session.CodexThreadID),
+			TurnID:         strings.TrimSpace(provenance.TurnID),
+			Kind:           strings.TrimSpace(provenance.Kind),
+			KindFamily:     helperDeliveryKindFamily(provenance.Kind),
+			RenderedHash:   strings.TrimSpace(provenance.RenderedHash),
+			VisibleHash:    strings.TrimSpace(provenance.RenderedHash),
+			OutboxID:       strings.TrimSpace(provenance.OutboxID),
+			TeamsMessageID: strings.TrimSpace(provenance.TeamsMessageID),
+			PartIndex:      1,
+			PartCount:      1,
+			Status:         HelperDeliveryStatusSent,
+			CreatedAt:      provenance.CreatedAt,
+			UpdatedAt:      firstStoreNonZeroTime(provenance.UpdatedAt, provenance.CreatedAt),
+			SentAt:         provenance.UpdatedAt,
+		}
+		if record.TeamsChatID == "" {
+			record.TeamsChatID = strings.TrimSpace(session.TeamsChatID)
+		}
+		record.ID = helperDeliveryID(record)
+		if record.ID != "" {
+			if existing, ok := state.HelperDeliveries[record.ID]; ok && !existing.CreatedAt.IsZero() {
+				record.CreatedAt = existing.CreatedAt
+			}
+			state.HelperDeliveries[record.ID] = record
+		}
+	}
+}
+
+func helperDeliveryStatusFromTranscriptDeliveryStatus(status TranscriptDeliveryStatus) HelperDeliveryStatus {
+	switch status {
+	case TranscriptDeliveryStatusAccepted:
+		return HelperDeliveryStatusAccepted
+	case TranscriptDeliveryStatusSent:
+		return HelperDeliveryStatusSent
+	case TranscriptDeliveryStatusSkipped:
+		return HelperDeliveryStatusSkipped
+	case TranscriptDeliveryStatusQueued:
+		return HelperDeliveryStatusQueued
+	default:
+		return ""
+	}
+}
+
+func normalizeArtifactRecords(state *State) {
+	if state == nil {
+		return
+	}
+	state.ensure(time.Time{})
+	for id, record := range state.ArtifactRecords {
+		record.ID = firstStoreNonEmptyString(record.ID, id)
+		record.SessionID = strings.TrimSpace(record.SessionID)
+		record.TurnID = strings.TrimSpace(record.TurnID)
+		record.Path = strings.TrimSpace(record.Path)
+		record.UploadName = strings.TrimSpace(record.UploadName)
+		record.DriveItemID = strings.TrimSpace(record.DriveItemID)
+		record.OutboxID = strings.TrimSpace(record.OutboxID)
+		record.TeamsMessageID = strings.TrimSpace(record.TeamsMessageID)
+		if strings.TrimSpace(record.Status) == "uploaded" && (record.DriveItemID == "" || record.OutboxID == "") {
+			record.Status = "legacy_unknown"
+			record.StatusReason = "legacy uploaded artifact record did not include outbox or drive item metadata"
+		}
+		state.ArtifactRecords[id] = record
 	}
 }
 

@@ -26,6 +26,7 @@ type OutboundAttachmentOptions struct {
 	MaxBytes      int64
 	AllowedExts   map[string]bool
 	GeneratedName string
+	ArtifactIDs   []string
 }
 
 type OutboundAttachmentFile struct {

@@ -30,6 +30,8 @@ const (
 	pollCursorOverlap                    = 2 * time.Minute
 	fastPollInterval                     = time.Second
 	fastPollDuration                     = 90 * time.Second
+	ownerPollMessageTop                  = 20
+	outboxRecoveryMessageTop             = 20
 	transcriptSyncMinInterval            = 10 * time.Second
 	historyWatchSyncMinInterval          = 10 * time.Second
 	historyWatchReconcileInterval        = 5 * time.Minute
@@ -863,7 +865,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			}
 		}
 	} else {
-		controlHandled, err := b.pollChatWithRoleState(ctx, b.reg.ControlChatID, top, inboundPollRoleControl, false, controlPoll, hasControlPoll, b.handleControlMessage)
+		controlHandled, err := b.pollChatWithRoleState(ctx, b.reg.ControlChatID, effectiveOwnerPollTop(top), inboundPollRoleControl, false, controlPoll, hasControlPoll, b.handleControlMessage)
 		if err != nil {
 			return err
 		}
@@ -930,7 +932,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			continue
 		}
 		s := session
-		if _, err := b.pollChatWithRoleState(ctx, s.ChatID, top, inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], func(ctx context.Context, msg ChatMessage, text string) error {
+		if _, err := b.pollChatWithRoleState(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], func(ctx context.Context, msg ChatMessage, text string) error {
 			return b.handleSessionMessage(ctx, s.ChatID, msg, text)
 		}); err != nil {
 			if firstErr == nil {
@@ -940,6 +942,13 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 	}
 	return firstErr
+}
+
+func effectiveOwnerPollTop(top int) int {
+	if top <= 0 || top > ownerPollMessageTop {
+		return ownerPollMessageTop
+	}
+	return normalizedMessageTop(top)
 }
 
 func pollableWorkSessionFromRegistry(state teamstore.State, session Session, controlChatID string) (Session, bool) {
@@ -1519,7 +1528,7 @@ func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, chatID s
 	if b == nil || b.graph == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(noticeHTML) == "" {
 		return false, nil
 	}
-	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, 50)
+	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, outboxRecoveryMessageTop)
 	if err != nil {
 		return false, err
 	}
@@ -1656,7 +1665,7 @@ func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID strin
 	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(resumeCommand) == "" {
 		return false
 	}
-	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, 50)
+	messages, err := b.readGraph.ListMessagesWithoutRateLimitRetry(ctx, chatID, outboxRecoveryMessageTop)
 	if err != nil {
 		return false
 	}
@@ -6392,35 +6401,50 @@ func (b *Bridge) uploadArtifactsFromResult(ctx context.Context, session *Session
 	if err != nil {
 		return b.sendToChat(ctx, session.ChatID, "artifact upload skipped: cannot resolve Teams outbound root: "+err.Error())
 	}
-	_, ok, err := FileWriteAuthCacheAvailable()
-	if err != nil {
-		return b.sendToChat(ctx, session.ChatID, "artifact upload auth check failed: "+err.Error())
-	}
-	if !ok {
-		return b.sendToChat(ctx, session.ChatID, "artifact manifest detected, but Teams file upload is not authenticated. Run `codex-proxy teams auth file-write` locally, then retry with `helper file <relative-path>` if needed. Outbound root: "+root)
-	}
+	plans := make([]ArtifactManifestPlan, 0, len(blocks))
 	for blockIndex, block := range blocks {
 		plan, err := ParseArtifactManifest(block, ArtifactManifestOptions{
 			OutboundRoot: root,
 			SessionID:    session.ID,
 			TurnID:       turn.ID,
-			ValidateFile: validateArtifactManifestFile,
 		})
 		if err != nil {
 			return b.sendToChat(ctx, session.ChatID, fmt.Sprintf("artifact manifest %d rejected: %v", blockIndex+1, err))
 		}
+		plans = append(plans, plan)
+	}
+	_, ok, err := FileWriteAuthCacheAvailable()
+	if err != nil {
+		return b.sendToChat(ctx, session.ChatID, "artifact upload auth check failed: "+err.Error())
+	}
+	if !ok {
+		for _, plan := range plans {
+			for _, planned := range plan.Files {
+				artifactID := artifactRecordID(session.ID, turn.ID, planned.CleanPath, planned.UploadNameSeed)
+				if err := b.recordArtifactPlanned(ctx, session, turn, planned, planned.UploadNameSeed, artifactID, "", "auth_unavailable", "Teams file upload is not authenticated"); err != nil {
+					return err
+				}
+			}
+		}
+		return b.sendToChat(ctx, session.ChatID, "artifact manifest detected, but Teams file upload is not authenticated. Run `codex-proxy teams auth file-write` locally, then retry with `helper file <relative-path>` if needed. Outbound root: "+root)
+	}
+	for _, plan := range plans {
 		for _, planned := range plan.Files {
 			file, err := PrepareOutboundAttachment(planned.CleanPath, OutboundAttachmentOptions{Root: root})
 			if err != nil {
 				return b.sendToChat(ctx, session.ChatID, fmt.Sprintf("artifact upload rejected: %v", err))
 			}
 			file.UploadName = ArtifactUploadName(session.ID, turn.ID, file.Name, file.Bytes)
-			outbox, err := b.queueAndSendAttachmentUploadOutbox(ctx, session.ID, turn.ID, session.ChatID, "artifact", "artifact attached: "+file.Name, file, OutboundAttachmentOptions{})
-			if err != nil {
+			artifactID := artifactRecordID(session.ID, turn.ID, planned.CleanPath, file.UploadName)
+			if err := b.recordArtifactPlanned(ctx, session, turn, planned, file.UploadName, artifactID, "", "queued", ""); err != nil {
 				return err
 			}
-			result := OutboundAttachmentResult{File: file, Item: driveItemFromOutbox(outbox), Message: ChatMessage{ID: outbox.TeamsMessageID}}
-			if err := b.recordArtifactUpload(ctx, session, turn, planned, result); err != nil {
+			outbox, err := b.queueAndSendAttachmentUploadOutbox(ctx, session.ID, turn.ID, session.ChatID, "artifact", "artifact attached: "+file.Name, file, OutboundAttachmentOptions{ArtifactIDs: []string{artifactID}})
+			if err != nil {
+				_ = b.recordArtifactPlanned(ctx, session, turn, planned, file.UploadName, artifactID, "", "failed", err.Error())
+				return err
+			}
+			if err := b.recordArtifactOutboxState(ctx, session, turn, planned, file.UploadName, artifactID, outbox); err != nil {
 				return err
 			}
 		}
@@ -6451,6 +6475,7 @@ func (b *Bridge) queueAndSendAttachmentUploadOutbox(ctx context.Context, session
 		AttachmentUploadFolder: uploadFolder,
 		AttachmentSize:         staged.Size,
 		AttachmentHash:         attachmentContentHash(staged.Bytes),
+		ArtifactIDs:            append([]string(nil), opts.ArtifactIDs...),
 	})
 	if err != nil {
 		return teamstore.OutboxMessage{}, err
@@ -6625,26 +6650,86 @@ func validateArtifactManifestFile(req ArtifactManifestValidationRequest) (Artifa
 	}, nil
 }
 
-func (b *Bridge) recordArtifactUpload(ctx context.Context, session *Session, turn teamstore.Turn, planned ArtifactManifestFile, result OutboundAttachmentResult) error {
+func artifactRecordID(sessionID string, turnID string, cleanPath string, uploadName string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(sessionID) + "\x00" + strings.TrimSpace(turnID) + "\x00" + strings.TrimSpace(cleanPath) + "\x00" + strings.TrimSpace(uploadName)))
+	return "artifact:" + hex.EncodeToString(sum[:])
+}
+
+func (b *Bridge) recordArtifactPlanned(ctx context.Context, session *Session, turn teamstore.Turn, planned ArtifactManifestFile, uploadName string, artifactID string, outboxID string, status string, reason string) error {
 	if b.store == nil {
 		return nil
 	}
-	artifactID := "artifact:" + session.ID + ":" + turn.ID + ":" + transcriptRecordKey(TranscriptRecord{DedupeKey: planned.CleanPath + ":" + result.Item.ID}, 0)
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		now := time.Now()
-		state.ArtifactRecords[artifactID] = teamstore.ArtifactRecord{
-			ID:          artifactID,
-			SessionID:   session.ID,
-			TurnID:      turn.ID,
-			Path:        planned.CleanPath,
-			UploadName:  result.File.UploadName,
-			DriveItemID: result.Item.ID,
-			Status:      "uploaded",
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}
-		return nil
+	if strings.TrimSpace(artifactID) == "" {
+		artifactID = artifactRecordID(session.ID, turn.ID, planned.CleanPath, uploadName)
+	}
+	_, err := b.store.UpsertArtifactRecord(ctx, teamstore.ArtifactRecord{
+		ID:           artifactID,
+		SessionID:    session.ID,
+		TurnID:       turn.ID,
+		Path:         planned.CleanPath,
+		UploadName:   uploadName,
+		OutboxID:     outboxID,
+		Status:       status,
+		StatusReason: reason,
 	})
+	return err
+}
+
+func (b *Bridge) recordArtifactOutboxState(ctx context.Context, session *Session, turn teamstore.Turn, planned ArtifactManifestFile, uploadName string, artifactID string, outbox teamstore.OutboxMessage) error {
+	status := artifactStatusFromOutbox(outbox)
+	reason := strings.TrimSpace(outbox.LastSendError)
+	record := teamstore.ArtifactRecord{
+		ID:             artifactID,
+		SessionID:      session.ID,
+		TurnID:         turn.ID,
+		Path:           planned.CleanPath,
+		UploadName:     uploadName,
+		DriveItemID:    outbox.DriveItemID,
+		OutboxID:       outbox.ID,
+		TeamsMessageID: outbox.TeamsMessageID,
+		Status:         status,
+		StatusReason:   reason,
+		Error:          reason,
+	}
+	if status == "uploaded" {
+		record.Error = ""
+		record.SentAt = outbox.SentAt
+		record.UploadedAt = outbox.SentAt
+	} else if status == "drive_uploaded" {
+		record.UploadedAt = time.Now()
+	}
+	_, err := b.store.UpsertArtifactRecord(ctx, record)
+	return err
+}
+
+func artifactStatusFromOutbox(outbox teamstore.OutboxMessage) string {
+	switch outbox.Status {
+	case teamstore.OutboxStatusSent:
+		if strings.TrimSpace(outbox.DriveItemID) != "" && strings.TrimSpace(outbox.TeamsMessageID) != "" {
+			return "uploaded"
+		}
+	case teamstore.OutboxStatusAccepted:
+		if strings.TrimSpace(outbox.DriveItemID) != "" {
+			return "message_accepted"
+		}
+	case teamstore.OutboxStatusSending:
+		if strings.TrimSpace(outbox.DriveItemID) != "" {
+			return "drive_uploaded"
+		}
+		return "sending"
+	case teamstore.OutboxStatusSkipped:
+		return "skipped"
+	}
+	if strings.TrimSpace(outbox.LastSendError) != "" {
+		if strings.TrimSpace(outbox.DriveItemID) != "" {
+			return "message_failed"
+		}
+		return "failed"
+	}
+	if strings.TrimSpace(outbox.DriveItemID) != "" {
+		return "drive_uploaded"
+	}
+	return "queued"
 }
 
 func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title string) error {
@@ -9244,7 +9329,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	}
 	if recovered, err := b.recoverAcceptedOutboxFromGraph(ctx, outbox, opts); recovered || err != nil {
 		if err != nil && opts.RecordRateLimit {
-			b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
+			b.recordGraphReadRateLimit(context.Background(), outbox.TeamsChatID, err)
 		}
 		return err
 	}
@@ -9335,7 +9420,10 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 	if strings.TrimSpace(outbox.TeamsMessageID) != "" || outbox.LastSendAttempt.IsZero() {
 		return false, nil
 	}
-	messages, err := b.readClient().ListMessagesWithoutRateLimitRetry(ctx, outbox.TeamsChatID, 50)
+	if blockedUntil, ok := b.chatReadBlockedUntil(ctx, outbox.TeamsChatID); ok {
+		return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: blockedUntil}
+	}
+	messages, err := b.readClient().ListMessagesWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outboxRecoveryMessageTop)
 	if err != nil {
 		return true, err
 	}
@@ -9922,6 +10010,31 @@ func (b *Bridge) chatBlockedUntil(ctx context.Context, chatID string) (time.Time
 	}
 	_ = b.store.ClearChatRateLimit(context.Background(), chatID)
 	return time.Time{}, false
+}
+
+func (b *Bridge) chatReadBlockedUntil(ctx context.Context, chatID string) (time.Time, bool) {
+	if b.store == nil || strings.TrimSpace(chatID) == "" {
+		return time.Time{}, false
+	}
+	poll, ok, err := b.store.ChatPoll(ctx, chatID)
+	if err != nil || !ok || poll.BlockedUntil.IsZero() {
+		return time.Time{}, false
+	}
+	if time.Now().Before(poll.BlockedUntil) {
+		return poll.BlockedUntil, true
+	}
+	return time.Time{}, false
+}
+
+func (b *Bridge) recordGraphReadRateLimit(ctx context.Context, chatID string, err error) {
+	if b.store == nil || strings.TrimSpace(chatID) == "" || !isGraphRateLimitError(err) {
+		return
+	}
+	poll, _, pollErr := b.store.ChatPoll(ctx, chatID)
+	if pollErr != nil {
+		poll = teamstore.ChatPollState{ChatID: chatID}
+	}
+	_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
 }
 
 func (b *Bridge) recordGraphRateLimit(ctx context.Context, chatID string, outboxID string, err error) {
@@ -12541,6 +12654,16 @@ func knownTranscriptOutboxHashes(state teamstore.State, sessionID string) map[Tr
 
 func knownTranscriptOutboxHashesSince(state teamstore.State, sessionID string, since time.Time) map[TranscriptKind]map[string]bool {
 	hashes := make(map[TranscriptKind]map[string]bool)
+	addHash := func(kind TranscriptKind, hash string) {
+		hash = strings.TrimSpace(hash)
+		if kind == "" || hash == "" {
+			return
+		}
+		if hashes[kind] == nil {
+			hashes[kind] = make(map[string]bool)
+		}
+		hashes[kind][hash] = true
+	}
 	for _, outbox := range state.OutboxMessages {
 		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
 			continue
@@ -12557,17 +12680,34 @@ func knownTranscriptOutboxHashesSince(state teamstore.State, sessionID string, s
 		}
 		hash := normalizedTextHash(formatKnownOutboxBodyForTranscriptDedupe(kind, outbox.Body))
 		if hash != "" {
-			if hashes[kind] == nil {
-				hashes[kind] = make(map[string]bool)
-			}
-			hashes[kind][hash] = true
+			addHash(kind, hash)
 		}
 		if outbox.SourceTextHash != "" {
-			if hashes[kind] == nil {
-				hashes[kind] = make(map[string]bool)
-			}
-			hashes[kind][outbox.SourceTextHash] = true
+			addHash(kind, outbox.SourceTextHash)
 		}
+	}
+	for _, delivery := range state.HelperDeliveries {
+		if delivery.SessionID != sessionID {
+			continue
+		}
+		if delivery.OutboxID != "" {
+			if _, ok := state.OutboxMessages[delivery.OutboxID]; ok {
+				continue
+			}
+		}
+		if !since.IsZero() && !delivery.CreatedAt.IsZero() && delivery.CreatedAt.Before(since) {
+			continue
+		}
+		if !helperDeliveryCanDedupeTranscript(delivery) {
+			continue
+		}
+		kind, ok := helperDeliveryTranscriptKind(delivery)
+		if !ok {
+			continue
+		}
+		addHash(kind, delivery.SourceTextHash)
+		addHash(kind, delivery.VisibleHash)
+		addHash(kind, delivery.RenderedHash)
 	}
 	return hashes
 }
@@ -12582,6 +12722,12 @@ func newKnownTranscriptOutboxDedupeState(state teamstore.State, sessionID string
 	compactCounts := make(map[string]int)
 	for hash := range hashes[TranscriptKindCompact] {
 		compactCounts[hash] = 0
+	}
+	addCompactCount := func(hash string) {
+		hash = strings.TrimSpace(hash)
+		if hash != "" {
+			compactCounts[hash]++
+		}
 	}
 	for _, outbox := range state.OutboxMessages {
 		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
@@ -12601,9 +12747,28 @@ func newKnownTranscriptOutboxDedupeState(state teamstore.State, sessionID string
 		if hash == "" {
 			hash = outbox.SourceTextHash
 		}
-		if hash != "" {
-			compactCounts[hash]++
+		addCompactCount(hash)
+	}
+	for _, delivery := range state.HelperDeliveries {
+		if delivery.SessionID != sessionID {
+			continue
 		}
+		if delivery.OutboxID != "" {
+			if _, ok := state.OutboxMessages[delivery.OutboxID]; ok {
+				continue
+			}
+		}
+		if !since.IsZero() && !delivery.CreatedAt.IsZero() && delivery.CreatedAt.Before(since) {
+			continue
+		}
+		if !helperDeliveryCanDedupeTranscript(delivery) {
+			continue
+		}
+		kind, ok := helperDeliveryTranscriptKind(delivery)
+		if !ok || kind != TranscriptKindCompact {
+			continue
+		}
+		addCompactCount(firstNonEmptyString(delivery.SourceTextHash, delivery.VisibleHash, delivery.RenderedHash))
 	}
 	return &knownTranscriptOutboxDedupeState{hashes: hashes, compactCounts: compactCounts}
 }
@@ -12633,6 +12798,26 @@ func outboxCanDedupeTranscript(outbox teamstore.OutboxMessage) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func helperDeliveryCanDedupeTranscript(delivery teamstore.HelperDeliveryRecord) bool {
+	switch delivery.Status {
+	case teamstore.HelperDeliveryStatusQueued, teamstore.HelperDeliveryStatusSending, teamstore.HelperDeliveryStatusAccepted, teamstore.HelperDeliveryStatusSent:
+		return true
+	default:
+		return false
+	}
+}
+
+func helperDeliveryTranscriptKind(delivery teamstore.HelperDeliveryRecord) (TranscriptKind, bool) {
+	switch strings.TrimSpace(delivery.KindFamily) {
+	case "compact":
+		return TranscriptKindCompact, true
+	case "status":
+		return TranscriptKindStatus, true
+	default:
+		return deliveredOutboxTranscriptKind(delivery.Kind)
 	}
 }
 

@@ -123,8 +123,13 @@ func TestP1ArtifactManifestWithoutFileWriteAuthLeavesFinalVisibleAndWarns(t *tes
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if len(state.ArtifactRecords) != 0 {
-		t.Fatalf("artifact records = %#v, want none without file-write auth", state.ArtifactRecords)
+	if len(state.ArtifactRecords) != 1 {
+		t.Fatalf("artifact records = %#v, want auth diagnostic record", state.ArtifactRecords)
+	}
+	for _, artifact := range state.ArtifactRecords {
+		if artifact.Status != "auth_unavailable" || artifact.Path != "artifact.txt" || artifact.OutboxID != "" || artifact.DriveItemID != "" {
+			t.Fatalf("artifact auth diagnostic = %#v, want auth_unavailable without upload metadata", artifact)
+		}
 	}
 }
 

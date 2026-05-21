@@ -8546,6 +8546,9 @@ func TestBridgeAcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep(t *t
 		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/chats/chat-1/messages") {
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
+		if got := r.URL.Query().Get("$top"); got != "20" {
+			t.Fatalf("accepted recovery read top = %q, want 20", got)
+		}
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
 	}))
@@ -8588,8 +8591,12 @@ func TestBridgeAcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep(t *t
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	if limit := state.ChatRateLimits["chat-1"]; !limit.BlockedUntil.After(time.Now()) || limit.PoisonOutboxID != "outbox:accepted-recovery-rate-limit" {
-		t.Fatalf("chat rate limit after accepted recovery 429 = %#v", limit)
+	if limit := state.ChatRateLimits["chat-1"]; limit.BlockedUntil.After(time.Now()) || limit.PoisonOutboxID != "" {
+		t.Fatalf("accepted recovery read 429 should not poison send rate limits: %#v", limit)
+	}
+	poll := state.ChatPolls["chat-1"]
+	if !poll.BlockedUntil.After(time.Now()) || !strings.Contains(poll.LastError, "429") {
+		t.Fatalf("chat poll block after accepted recovery 429 = %#v", poll)
 	}
 }
 
@@ -12455,6 +12462,54 @@ func TestBridgeControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep(t *t
 	}
 }
 
+func TestBridgePollOnceClampsOwnerReadTop(t *testing.T) {
+	now := time.Now()
+	pages := []bridgePollPage{
+		{assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if r.URL.Path != "/chats/control-chat/messages" || r.URL.Query().Get("$top") != "20" {
+				t.Fatalf("control poll request = %s, want $top=20", r.URL.String())
+			}
+		}},
+		{assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if r.URL.Path != "/chats/chat-1/messages" || r.URL.Query().Get("$top") != "20" {
+				t.Fatalf("work poll request = %s, want $top=20", r.URL.String())
+			}
+		}},
+	}
+	readGraph := newBridgePollGraph(t, pages)
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if err := bridge.pollOnce(context.Background(), 60); err != nil {
+		t.Fatalf("pollOnce top clamp error: %v", err)
+	}
+}
+
 func TestBridgeTemporaryAuthPollErrorUsesLongerBackoffAndLogThrottle(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
 	err := &TemporaryAuthError{
@@ -13428,7 +13483,7 @@ func TestBridgeUploadsArtifactManifestFromCodexResult(t *testing.T) {
 		t.Fatalf("artifact records = %#v, want one", state.ArtifactRecords)
 	}
 	for _, artifact := range state.ArtifactRecords {
-		if artifact.Status != "uploaded" || artifact.Path != "artifact.txt" || !strings.Contains(artifact.UploadName, "codex-artifact") {
+		if artifact.Status != "uploaded" || artifact.Path != "artifact.txt" || !strings.Contains(artifact.UploadName, "codex-artifact") || artifact.OutboxID == "" || artifact.DriveItemID == "" || artifact.TeamsMessageID == "" {
 			t.Fatalf("artifact record mismatch: %#v", artifact)
 		}
 	}
@@ -14550,6 +14605,60 @@ func TestBridgeSyncLinkedTranscriptSkipsContextCompactAlreadySentLive(t *testing
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
 	if checkpoint.LastRecordID == "old" || strings.TrimSpace(checkpoint.LastRecordID) == "" {
 		t.Fatalf("checkpoint did not advance past live-sent compact record: %#v", checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptSkipsStatusAlreadySentLiveAfterOutboxPrune(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-status-live"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-status-live", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-status-live")
+	beforeState, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load before sync error: %v", err)
+	}
+	beforeCheckpoint := beforeState.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	statusText := "code shape and profiling numbers match: network_launch sends kernels serially"
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:live-status-pruned",
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		Kind:           "codex-progress-003",
+		Body:           statusText,
+		SourceTextHash: normalizedTextHash(statusText),
+		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-live-status",
+	}); err != nil {
+		t.Fatalf("QueueOutbox live status error: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = beforeCheckpoint
+		delete(state.OutboxMessages, "outbox:live-status-pruned")
+		return nil
+	}); err != nil {
+		t.Fatalf("simulate pruned live status outbox: %v", err)
+	}
+	*sent = nil
+
+	updated := initial +
+		`{"timestamp":"2026-05-21T07:21:50.000Z","type":"event_msg","payload":{"type":"agent_message","id":"s-live","message":` + strconv.Quote(statusText) + `,"phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write status transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync status transcript error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("transcript sync sent late duplicate live status: %#v", *sent)
 	}
 }
 
@@ -16930,6 +17039,36 @@ func TestKnownTranscriptOutboxHashesIncludeUserStatusAndFinal(t *testing.T) {
 	}
 	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "not delivered yet", hashes) {
 		t.Fatal("queued live status was not recognized as already known")
+	}
+}
+
+func TestKnownTranscriptOutboxHashesUseHelperDeliveryLedger(t *testing.T) {
+	statusText := "live status survived outbox pruning"
+	state := teamstore.State{HelperDeliveries: map[string]teamstore.HelperDeliveryRecord{
+		"status": {
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			KindFamily:     "status",
+			SourceTextHash: normalizedTextHash(statusText),
+			Status:         teamstore.HelperDeliveryStatusSent,
+			TeamsMessageID: "teams-status",
+			CreatedAt:      time.Now(),
+		},
+		"failed": {
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			KindFamily:     "status",
+			SourceTextHash: normalizedTextHash("failed status"),
+			Status:         teamstore.HelperDeliveryStatusFailed,
+			CreatedAt:      time.Now(),
+		},
+	}}
+	hashes := knownTranscriptOutboxHashes(state, "s001")
+	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, statusText, hashes) {
+		t.Fatal("helper delivery ledger was not recognized as already sent")
+	}
+	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "failed status", hashes) {
+		t.Fatal("failed helper delivery should not suppress transcript recovery")
 	}
 }
 
