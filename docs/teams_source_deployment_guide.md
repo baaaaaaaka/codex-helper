@@ -104,10 +104,32 @@ Windows PowerShell:
 
 The same scripts are also attached to GitHub releases for source-free setup.
 
-The script asks for the tenant ID and one Teams Graph public client ID, writes
-that client ID into the read, chat-write, file-write, and full auth slots, runs
-`codex-proxy teams auth full`, verifies the local full-token cache, and then
-runs `codex-proxy teams service bootstrap`.
+By default, the script asks for the tenant ID and one Teams Graph public client
+ID, writes that client ID into the read, chat-write, file-write, and full auth
+slots, runs `codex-proxy teams auth full`, verifies the local full-token cache,
+and then runs `codex-proxy teams service bootstrap`.
+
+To keep read-only polling on a separate app registration from write-capable
+Graph operations, pass split client IDs:
+
+```sh
+scripts/teams-auth-bootstrap.sh \
+  --tenant-id "<tenant-id>" \
+  --read-client-id "<teams-graph-read-client-id>" \
+  --write-client-id "<teams-graph-write-client-id>"
+```
+
+```powershell
+.\scripts\teams-auth-bootstrap.ps1 `
+  -TenantId "<tenant-id>" `
+  -ReadClientId "<teams-graph-read-client-id>" `
+  -WriteClientId "<teams-graph-write-client-id>"
+```
+
+When read and write client IDs differ, the script signs in once for the
+read-only cache and once for the write-capable full fallback cache. Chat sends,
+chat creation, meeting-chat carriers, and file uploads use the write-capable
+client ID; message polling prefers the dedicated read-only cache.
 
 Run one full auth first. This token is used for message polling, chat creation,
 message sends, meeting-chat carriers, and helper file/image uploads:

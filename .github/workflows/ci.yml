@@ -50,6 +50,13 @@ jobs:
           set -euo pipefail
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      - name: Teams auth bootstrap dry-run (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest scripts/tests/test_teams_auth_bootstrap_scripts.py
+
       - name: Script unit tests (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -57,6 +64,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           py -3 -m unittest discover -s scripts/tests -p "test_*.py"
+
+      - name: Teams auth bootstrap dry-run (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          py -3 -m unittest scripts/tests/test_teams_auth_bootstrap_scripts.py
 
       - name: gofmt (verify)
         shell: bash

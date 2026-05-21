@@ -11,7 +11,10 @@ the Teams helper service.
 Options:
   --codex-proxy PATH    codex-proxy/cxp executable to run
   --tenant-id ID        Microsoft Entra tenant ID
-  --client-id ID        Teams Graph public client ID
+  --client-id ID        Teams Graph public client ID for read and write
+  --read-client-id ID   Teams Graph read-only public client ID
+  --write-client-id ID  Teams Graph write-capable public client ID
+  --chat-client-id ID   alias for --write-client-id
   --no-open-control     pass --no-open-control to teams service bootstrap
   -h, --help            show this help
 
@@ -19,12 +22,17 @@ Environment defaults:
   CODEX_HELPER_TEAMS_SETUP_CXP
   CODEX_HELPER_TEAMS_SETUP_TENANT_ID or CODEX_HELPER_TEAMS_TENANT_ID
   CODEX_HELPER_TEAMS_SETUP_CLIENT_ID or CODEX_HELPER_TEAMS_CLIENT_ID
+  CODEX_HELPER_TEAMS_SETUP_READ_CLIENT_ID or CODEX_HELPER_TEAMS_READ_CLIENT_ID
+  CODEX_HELPER_TEAMS_SETUP_WRITE_CLIENT_ID,
+  CODEX_HELPER_TEAMS_SETUP_CHAT_CLIENT_ID, or CODEX_HELPER_TEAMS_CLIENT_ID
 EOF
 }
 
 codex_proxy="${CODEX_HELPER_TEAMS_SETUP_CXP:-}"
 tenant_id="${CODEX_HELPER_TEAMS_SETUP_TENANT_ID:-${CODEX_HELPER_TEAMS_TENANT_ID:-}}"
 client_id="${CODEX_HELPER_TEAMS_SETUP_CLIENT_ID:-${CODEX_HELPER_TEAMS_CLIENT_ID:-}}"
+read_client_id="${CODEX_HELPER_TEAMS_SETUP_READ_CLIENT_ID:-${CODEX_HELPER_TEAMS_READ_CLIENT_ID:-}}"
+write_client_id="${CODEX_HELPER_TEAMS_SETUP_WRITE_CLIENT_ID:-${CODEX_HELPER_TEAMS_SETUP_CHAT_CLIENT_ID:-${CODEX_HELPER_TEAMS_CLIENT_ID:-}}}"
 no_open_control=0
 
 while [ "$#" -gt 0 ]; do
@@ -42,6 +50,18 @@ while [ "$#" -gt 0 ]; do
     --client-id)
       [ "$#" -ge 2 ] || { echo "missing value for --client-id" >&2; exit 2; }
       client_id="$2"
+      read_client_id="$2"
+      write_client_id="$2"
+      shift 2
+      ;;
+    --read-client-id)
+      [ "$#" -ge 2 ] || { echo "missing value for --read-client-id" >&2; exit 2; }
+      read_client_id="$2"
+      shift 2
+      ;;
+    --write-client-id|--chat-client-id)
+      [ "$#" -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }
+      write_client_id="$2"
       shift 2
       ;;
     --no-open-control)
@@ -109,22 +129,51 @@ run_cxp() {
 section "STEP 1/4: Configure Teams Graph auth"
 resolve_codex_proxy
 tenant_id="$(prompt_required "tenant id" "Microsoft Entra tenant ID" "$tenant_id")"
-client_id="$(prompt_required "client id" "Teams Graph public client ID" "$client_id")"
+if [ -n "${client_id//[[:space:]]/}" ]; then
+  if [ -z "${read_client_id//[[:space:]]/}" ]; then
+    read_client_id="$client_id"
+  fi
+  if [ -z "${write_client_id//[[:space:]]/}" ]; then
+    write_client_id="$client_id"
+  fi
+fi
+if [ -z "${read_client_id//[[:space:]]/}" ] && [ -z "${write_client_id//[[:space:]]/}" ]; then
+  client_id="$(prompt_required "client id" "Teams Graph public client ID" "$client_id")"
+  read_client_id="$client_id"
+  write_client_id="$client_id"
+else
+  read_client_id="$(prompt_required "read client id" "Teams Graph read-only public client ID" "$read_client_id")"
+  write_client_id="$(prompt_required "write client id" "Teams Graph write-capable public client ID" "$write_client_id")"
+fi
 
 printf 'Using: %s\n' "$codex_proxy"
-printf 'This writes local auth metadata only. The client ID is not a secret.\n'
+printf 'This writes local auth metadata only. Client IDs are not secrets.\n'
 run_cxp teams auth config \
   --tenant-id "$tenant_id" \
-  --read-client-id "$client_id" \
-  --client-id "$client_id" \
-  --file-write-client-id "$client_id" \
-  --full-client-id "$client_id"
+  --read-client-id "$read_client_id" \
+  --client-id "$write_client_id" \
+  --file-write-client-id "$write_client_id" \
+  --full-client-id "$write_client_id"
+
+split_client_ids=0
+if [ "$read_client_id" != "$write_client_id" ]; then
+  split_client_ids=1
+fi
 
 section "STEP 2/4: Sign in with Microsoft device login"
-printf 'A device login code may appear next. Open the shown URL, enter the code, and finish SSO/MFA.\n'
+if [ "$split_client_ids" -eq 1 ]; then
+  printf 'Device login codes may appear next for read-only access and write-capable access.\n'
+  printf 'Open each shown URL, enter the code, and finish SSO/MFA.\n'
+  run_cxp teams auth read
+else
+  printf 'A device login code may appear next. Open the shown URL, enter the code, and finish SSO/MFA.\n'
+fi
 run_cxp teams auth full
 
 section "STEP 3/4: Verify local Teams auth cache"
+if [ "$split_client_ids" -eq 1 ]; then
+  run_cxp teams auth read-status
+fi
 run_cxp teams auth full-status
 
 section "STEP 4/4: Bootstrap the Teams helper service"
