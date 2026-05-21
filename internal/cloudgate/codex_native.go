@@ -135,15 +135,33 @@ func parseNpmCmdShim(cmdPath string) (string, error) {
 func findVendorBinary(vendorRoot string) (nativeBin string, pathDir string) {
 	triple := targetTriple()
 	binName := nativeBinaryName()
-	candidate := filepath.Join(vendorRoot, triple, "codex", binName)
-	if _, err := os.Stat(candidate); err != nil {
-		return "", ""
+
+	tripleRoot := filepath.Join(vendorRoot, triple)
+	candidates := []struct {
+		binaryPath string
+		pathDir    string
+	}{
+		{
+			binaryPath: filepath.Join(tripleRoot, "bin", binName),
+			pathDir:    filepath.Join(tripleRoot, "codex-path"),
+		},
+		{
+			binaryPath: filepath.Join(tripleRoot, "codex", binName),
+			pathDir:    filepath.Join(tripleRoot, "path"),
+		},
 	}
-	pathDir = filepath.Join(vendorRoot, triple, "path")
-	if _, err := os.Stat(pathDir); err != nil {
-		pathDir = ""
+
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate.binaryPath); err != nil {
+			continue
+		}
+		pathDir = candidate.pathDir
+		if _, err := os.Stat(pathDir); err != nil {
+			pathDir = ""
+		}
+		return candidate.binaryPath, pathDir
 	}
-	return candidate, pathDir
+	return "", ""
 }
 
 func dedupePaths(paths []string) []string {
@@ -210,7 +228,8 @@ func missingBinaryErrorForVendorRoot(triple string, vendorRoot string) error {
 // It handles:
 //   - Unix symlink resolution (wrapper → <pkg>/bin/codex.js)
 //   - Windows npm .cmd shim parsing
-//   - Vendor directory in the main package (<pkg>/vendor/<triple>/...)
+//   - Current vendor layout (<pkg>/vendor/<triple>/bin/... plus codex-path)
+//   - Legacy vendor layout (<pkg>/vendor/<triple>/codex/... plus path)
 //   - Platform-specific npm sub-packages (<pkg>/node_modules/@openai/codex-<plat>/vendor/...)
 //   - Ancestor node_modules roots used by npm global installs and sibling aliases
 func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string, err error) {
