@@ -2516,8 +2516,8 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 		return err
 	}
 	if b.asyncTurns {
-		if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
-			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, prompt)
+		if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
+			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), runSession, claimed, runSession.ChatID, prompt)
 		}); err != nil {
 			return err
 		}
@@ -4967,9 +4967,9 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	promptText := PromptWithReferencedMessages(text, referencedMessages)
 	if b.asyncTurns {
 		input := ExecutionInputWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles)
-		started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
+		started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
 			defer cleanupLocalFiles()
-			return b.runQueuedTurnInput(runCtx, session, claimed, chatID, input)
+			return b.runQueuedTurnInput(runCtx, runSession, claimed, runSession.ChatID, input)
 		})
 		if err != nil {
 			cleanupLocalFiles()
@@ -5557,9 +5557,9 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			return err
 		}
 		if b.asyncTurns {
-			started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
+			started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
 				defer cleanupPrompt()
-				return b.runQueuedTurnInput(runCtx, session, claimed, session.ChatID, runInput)
+				return b.runQueuedTurnInput(runCtx, runSession, claimed, runSession.ChatID, runInput)
 			})
 			if err != nil {
 				cleanupPrompt()
@@ -5821,8 +5821,8 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 			return err
 		}
 		if b.asyncTurns {
-			if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, claimed teamstore.Turn) error {
-				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), session, claimed, session.ChatID, prompt)
+			if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
+				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), runSession, claimed, runSession.ChatID, prompt)
 			}); err != nil {
 				return err
 			}
@@ -7223,7 +7223,7 @@ func (b *Bridge) rejectSessionAttachmentWithMessage(ctx context.Context, session
 	})
 }
 
-type queuedTurnRunner func(context.Context, teamstore.Turn) error
+type queuedTurnRunner func(context.Context, *Session, teamstore.Turn) error
 
 type sessionTurnQueueState struct {
 	Running bool
@@ -7344,7 +7344,7 @@ func (b *Bridge) formatQueuedTurnStartNotice(ctx context.Context, sessionID stri
 
 func (b *Bridge) runClaimedQueuedTurn(ctx context.Context, session *Session, claimed teamstore.Turn, preferredTurnID string, preferred queuedTurnRunner) error {
 	if strings.TrimSpace(preferredTurnID) != "" && claimed.ID == preferredTurnID && preferred != nil {
-		return preferred(ctx, claimed)
+		return preferred(ctx, session, claimed)
 	}
 	state, err := b.store.Load(ctx)
 	if err != nil {
