@@ -4740,7 +4740,7 @@ func TestBridgeDoesNotCompleteExpiredHelperUpgradeDrainWhenRunningVersionMissesT
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	bridge.helperVersion = "v0.1.0-rc.133"
 	seedExpiredHelperUpgradeDrain(t, store)
-	if _, err := store.RecordAutoUpdateAttempt(context.Background(), "v0.1.0", time.Now().Add(-time.Minute)); err != nil {
+	if _, err := store.RecordAutoUpdateAttempt(context.Background(), "v0.1.0", time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("RecordAutoUpdateAttempt error: %v", err)
 	}
 

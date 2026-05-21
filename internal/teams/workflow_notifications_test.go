@@ -255,7 +255,7 @@ func TestWorkflowNotificationSendsHelperActivationAttentionCard(t *testing.T) {
 		t.Fatalf("webhook calls = %d, want 1", got)
 	}
 	raw, _ := json.Marshal(seen)
-	for _, want := range []string{"⚠️ Helper update needs attention", "running helper version still does not match", "Open Control", "teams.microsoft.com"} {
+	for _, want := range []string{"⚠️ Helper update needs attention", "reports activation completed", "Open Control", "teams.microsoft.com"} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("workflow payload missing %q: %s", want, raw)
 		}
