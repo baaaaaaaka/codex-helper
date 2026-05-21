@@ -150,6 +150,10 @@ func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check te
 }
 
 func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.HelperAutoUpdateCandidate) (teams.HelperAutoUpdateApplyResult, error) {
+	return u.ApplyWithOptions(ctx, candidate, teams.HelperAutoUpdateApplyOptions{})
+}
+
+func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate teams.HelperAutoUpdateCandidate, applyOpts teams.HelperAutoUpdateApplyOptions) (teams.HelperAutoUpdateApplyResult, error) {
 	installPath, err := teamsAutoUpdateResolveInstallPath("")
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
@@ -164,11 +168,12 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 	defer func() { _ = lock.Unlock() }()
 	activationPending, activationReason := teamsAutoUpdateShouldDeferActivation(installPath)
 	res, err := performUpdate(ctx, update.UpdateOptions{
-		Repo:           u.repo,
-		Version:        candidate.TagName,
-		InstallPath:    installPath,
-		Timeout:        120 * time.Second,
-		ValidateBinary: true,
+		Repo:               u.repo,
+		Version:            candidate.TagName,
+		InstallPath:        installPath,
+		Timeout:            120 * time.Second,
+		ValidateBinary:     true,
+		PendingReplacement: teamsPendingReplacementMode(applyOpts),
 	})
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
@@ -181,6 +186,13 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 		ActivationPending:  activationPending,
 		ActivationReason:   activationReason,
 	}, nil
+}
+
+func teamsPendingReplacementMode(applyOpts teams.HelperAutoUpdateApplyOptions) update.PendingReplacementMode {
+	if applyOpts.OwnsPendingReplacement && teamsServiceGOOS() == "windows" {
+		return update.PendingReplacementReturnOnly
+	}
+	return update.PendingReplacementScheduleDeferredMove
 }
 
 func teamsAutoUpdateShouldDeferActivation(stableInstallPath string) (bool, string) {

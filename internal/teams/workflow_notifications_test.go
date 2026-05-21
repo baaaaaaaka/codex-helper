@@ -217,6 +217,51 @@ func TestWorkflowNotificationSendsManualHelperUpgradeCard(t *testing.T) {
 	}
 }
 
+func TestWorkflowNotificationSendsHelperActivationAttentionCard(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	bridge.reg.ControlChatID = "control-chat"
+	bridge.reg.ControlChatURL = TeamsChatURL("control-chat", "tenant-1")
+
+	var seen map[string]any
+	var calls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:control:helper-upgrade-activation-success:mismatch",
+		TeamsChatID:      "control-chat",
+		Kind:             "mismatched-helper-upgrade-activation",
+		NotificationKind: helperUpgradeActivationActionRequiredNotificationKind,
+		Body:             "helper activation mismatch",
+		MentionOwner:     true,
+		Status:           teamstore.OutboxStatusSent,
+	})
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("webhook calls = %d, want 1", got)
+	}
+	raw, _ := json.Marshal(seen)
+	for _, want := range []string{"⚠️ Helper update needs attention", "running helper version still does not match", "Open Control", "teams.microsoft.com"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("workflow payload missing %q: %s", want, raw)
+		}
+	}
+}
+
 func TestWorkflowNotificationSkipsPlainAutoHelperUpgradeNotice(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)

@@ -4734,6 +4734,59 @@ func TestBridgeDoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine(t *t
 	}
 }
 
+func TestBridgeDoesNotCompleteExpiredHelperUpgradeDrainWhenRunningVersionMissesTarget(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.helperVersion = "v0.1.0-rc.133"
+	seedExpiredHelperUpgradeDrain(t, store)
+	if _, err := store.RecordAutoUpdateAttempt(context.Background(), "v0.1.0", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("RecordAutoUpdateAttempt error: %v", err)
+	}
+
+	if err := bridge.completeExpiredHelperUpgradeDrainOnStart(context.Background()); err != nil {
+		t.Fatalf("completeExpiredHelperUpgradeDrainOnStart error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.ServiceControl.Draining {
+		t.Fatalf("ServiceControl still draining after aborting mismatched helper upgrade: %#v", state.ServiceControl)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, "v0.1.0") {
+		t.Fatalf("upgrade = %#v, want aborted with target mismatch", state.Upgrade)
+	}
+	if state.AutoUpdate.LastInstalledTag != "" {
+		t.Fatalf("LastInstalledTag = %q, want empty for mismatched helper version", state.AutoUpdate.LastInstalledTag)
+	}
+}
+
+func TestBridgeCompletesExpiredHelperUpgradeDrainWhenLastAttemptIsStale(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.helperVersion = "v0.1.0"
+	if _, err := store.RecordAutoUpdateAttempt(context.Background(), "v0.1.0-rc.133", time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("RecordAutoUpdateAttempt error: %v", err)
+	}
+	seedExpiredHelperUpgradeDrain(t, store)
+
+	if err := bridge.completeExpiredHelperUpgradeDrainOnStart(context.Background()); err != nil {
+		t.Fatalf("completeExpiredHelperUpgradeDrainOnStart error: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted || state.Upgrade.InstalledTag != "v0.1.0" {
+		t.Fatalf("upgrade = %#v, want completed with running helper version", state.Upgrade)
+	}
+	if state.ServiceControl.Draining {
+		t.Fatalf("ServiceControl still draining after completing expired helper upgrade: %#v", state.ServiceControl)
+	}
+}
+
 func seedExpiredHelperUpgradeDrain(t *testing.T, store *teamstore.Store) {
 	t.Helper()
 	req, err := store.BeginUpgrade(context.Background(), teamstore.HelperUpgradeReason, time.Hour)

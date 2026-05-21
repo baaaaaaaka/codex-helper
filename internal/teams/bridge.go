@@ -131,6 +131,9 @@ const (
 	helperRestartNoticeActionRestart = "restart"
 	helperRestartNoticeActionReload  = "reload"
 	helperRestartNoticeActionUpgrade = "upgrade"
+
+	helperUpgradeActivationFailedNotificationKind         = "helper_upgrade_activation_failed"
+	helperUpgradeActivationActionRequiredNotificationKind = "helper_upgrade_activation_action_required"
 )
 
 const (
@@ -192,6 +195,15 @@ type CodexUpgradeResult struct {
 type HelperAutoUpdater interface {
 	Check(context.Context, HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error)
 	Apply(context.Context, HelperAutoUpdateCandidate) (HelperAutoUpdateApplyResult, error)
+}
+
+type HelperAutoUpdaterWithApplyOptions interface {
+	Check(context.Context, HelperAutoUpdateCheck) (HelperAutoUpdateDecision, error)
+	ApplyWithOptions(context.Context, HelperAutoUpdateCandidate, HelperAutoUpdateApplyOptions) (HelperAutoUpdateApplyResult, error)
+}
+
+type HelperAutoUpdateApplyOptions struct {
+	OwnsPendingReplacement bool
 }
 
 type HelperReloadOptions struct {
@@ -1976,6 +1988,7 @@ func looksLikeRenderedHelperLifecycleOutputPlainText(text string) bool {
 		"⚠️ Helper reload failed",
 		"⚠️ Helper restart failed",
 		"⚠️ Helper update activation failed",
+		"⚠️ Helper update activation needs attention",
 		"⚠️ Helper restart is not available",
 		"⚠️ Helper reload is not available",
 		"⚠️ Helper restart was not started",
@@ -3304,11 +3317,44 @@ func (b *Bridge) completeExpiredHelperUpgradeDrainOnStart(ctx context.Context) e
 		}
 	}
 	if state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
+		targetTag := helperUpgradeTargetTagForExpiredDrain(state)
+		if targetTag != "" {
+			if !helperVersionMatchesTag(b.helperVersion, targetTag) {
+				reason := "helper upgrade drain expired before helper reached target " + targetTag
+				if _, err := b.store.AbortUpgrade(ctx, state.Upgrade.ID, reason); err != nil {
+					return err
+				}
+				_, err := b.store.ClearDrain(ctx)
+				return err
+			}
+			if _, err := b.store.RecordAutoUpdateInstalled(ctx, targetTag, now); err != nil {
+				return err
+			}
+			_, err := b.store.CompleteUpgrade(ctx, state.Upgrade.ID, targetTag)
+			return err
+		}
 		_, err := b.store.CompleteUpgrade(ctx, state.Upgrade.ID, b.helperVersion)
 		return err
 	}
 	_, err = b.store.ClearDrain(ctx)
 	return err
+}
+
+func helperUpgradeTargetTagForExpiredDrain(state teamstore.State) string {
+	if state.Upgrade == nil {
+		return ""
+	}
+	if tag := strings.TrimSpace(state.Upgrade.InstalledTag); tag != "" {
+		return tag
+	}
+	tag := strings.TrimSpace(state.AutoUpdate.LastAttemptTag)
+	if tag == "" || state.AutoUpdate.LastAttemptAt.IsZero() || state.Upgrade.StartedAt.IsZero() {
+		return ""
+	}
+	if state.AutoUpdate.LastAttemptAt.Before(state.Upgrade.StartedAt) {
+		return ""
+	}
+	return tag
 }
 
 func (b *Bridge) pendingHelperRestartNoticePath() (string, error) {
@@ -3450,12 +3496,8 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 			return nil
 		}
 		if tag == "" || !helperVersionMatchesTag(b.helperVersion, tag) {
-			if handled, err := b.queuePendingHelperActivationFailureNotice(ctx, notice); err != nil {
+			if _, err := b.queuePendingHelperActivationAttentionNotice(ctx, notice); err != nil {
 				return err
-			} else if handled {
-				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return err
-				}
 			}
 			return nil
 		}
@@ -3502,7 +3544,7 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 	return nil
 }
 
-func (b *Bridge) queuePendingHelperActivationFailureNotice(ctx context.Context, notice helperRestartNotice) (bool, error) {
+func (b *Bridge) queuePendingHelperActivationAttentionNotice(ctx context.Context, notice helperRestartNotice) (bool, error) {
 	status, ok, err := readHelperActivationStatus(notice.PendingReplacePath)
 	if err != nil {
 		if b != nil && b.out != nil {
@@ -3510,27 +3552,39 @@ func (b *Bridge) queuePendingHelperActivationFailureNotice(ctx context.Context, 
 		}
 		return false, nil
 	}
-	if !ok || !strings.EqualFold(strings.TrimSpace(status.Status), "failed") {
+	if !ok {
+		return false, nil
+	}
+	statusName := strings.ToLower(strings.TrimSpace(status.Status))
+	notificationKind := ""
+	kind := ""
+	switch statusName {
+	case "failed":
+		kind = "failed-helper-upgrade-activation"
+		notificationKind = helperUpgradeActivationFailedNotificationKind
+	case "success":
+		kind = "mismatched-helper-upgrade-activation"
+		notificationKind = helperUpgradeActivationActionRequiredNotificationKind
+	default:
 		return false, nil
 	}
 	chatID := strings.TrimSpace(firstNonEmptyString(notice.ControlChatID, b.reg.ControlChatID))
 	if chatID == "" {
-		return false, fmt.Errorf("pending helper activation failure notice has no control chat")
+		return false, fmt.Errorf("pending helper activation notice has no control chat")
 	}
 	seed := strings.Join([]string{
 		strings.TrimSpace(notice.CommandMessageID),
 		strings.TrimSpace(notice.Tag),
 		strings.TrimSpace(notice.PendingReplacePath),
-		status.UpdatedAt.Format(time.RFC3339Nano),
-		strings.TrimSpace(status.Message),
+		statusName,
 	}, "\x00")
 	msg := teamstore.OutboxMessage{
-		ID:               "outbox:control:helper-upgrade-activation-failed:" + shortStableID(seed),
+		ID:               "outbox:control:helper-upgrade-activation-" + statusName + ":" + shortStableID(seed),
 		TeamsChatID:      chatID,
-		Kind:             "failed-helper-upgrade-activation",
-		Body:             helperActivationFailureNoticeBody(notice, status),
+		Kind:             kind,
+		Body:             b.helperActivationAttentionNoticeBody(notice, status, notificationKind),
 		MentionOwner:     true,
-		NotificationKind: "needs_attention",
+		NotificationKind: notificationKind,
 	}
 	if err := b.queueAndBestEffortSendOutbox(ctx, msg); err != nil {
 		return false, err
@@ -3714,16 +3768,50 @@ func helperLifecycleCompletedNoticeBody(action string, tag string) string {
 	}
 }
 
-func helperActivationFailureNoticeBody(notice helperRestartNotice, status helperActivationStatus) string {
-	lines := []string{"⚠️ Helper update activation failed"}
+func (b *Bridge) helperActivationAttentionNoticeBody(notice helperRestartNotice, status helperActivationStatus, notificationKind string) string {
+	title := "⚠️ Helper update activation needs attention"
+	if notificationKind == helperUpgradeActivationFailedNotificationKind {
+		title = "⚠️ Helper update activation failed"
+	}
+	lines := []string{title}
 	if tag := strings.TrimSpace(notice.Tag); tag != "" {
 		lines = append(lines, "", "Target: `"+tag+"`")
 	}
-	if msg := strings.TrimSpace(status.Message); msg != "" {
+	if running := strings.TrimSpace(b.helperVersion); running != "" {
+		lines = append(lines, "", "Running helper: `"+running+"`")
+	}
+	if statusName := strings.TrimSpace(status.Status); statusName != "" {
+		lines = append(lines, "", "Activation status: `"+statusName+"`")
+	}
+	if msg := sanitizeHelperActivationStatusMessage(notice, status); msg != "" {
 		lines = append(lines, "", "Reason: "+msg)
 	}
-	lines = append(lines, "", "The helper may still be running the previous version. Send `st` to check the actual owner and entry versions.")
+	lines = append(lines, "", "The helper may still be running the previous version. Run `cxp teams status` on that machine to check the owner, formal entry, and pending replacement versions.")
 	return strings.Join(lines, "\n")
+}
+
+func sanitizeHelperActivationStatusMessage(notice helperRestartNotice, status helperActivationStatus) string {
+	msg := strings.TrimSpace(status.Message)
+	if msg == "" {
+		return ""
+	}
+	for _, replacement := range []struct {
+		raw   string
+		label string
+	}{
+		{status.Source, "`<pending helper>`"},
+		{notice.PendingReplacePath, "`<pending helper>`"},
+		{status.Dest, "`<formal helper>`"},
+		{notice.InstallPath, "`<formal helper>`"},
+	} {
+		raw := strings.TrimSpace(replacement.raw)
+		if raw != "" {
+			msg = strings.ReplaceAll(msg, raw, replacement.label)
+		}
+	}
+	msg = strings.ReplaceAll(msg, "\r", " ")
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	return strings.Join(strings.Fields(msg), " ")
 }
 
 func (b *Bridge) helperRestartBlockedMessage(ctx context.Context, force bool) (string, bool, error) {
@@ -4048,7 +4136,15 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
 		return err
 	}
-	res, err := opts.HelperAutoUpdater.Apply(ctx, candidate)
+	applyCapabilities := HelperAutoUpdateApplyOptions{
+		OwnsPendingReplacement: opts.HelperPendingRestarter != nil,
+	}
+	var res HelperAutoUpdateApplyResult
+	if updater, ok := opts.HelperAutoUpdater.(HelperAutoUpdaterWithApplyOptions); ok {
+		res, err = updater.ApplyWithOptions(ctx, candidate, applyCapabilities)
+	} else {
+		res, err = opts.HelperAutoUpdater.Apply(ctx, candidate)
+	}
 	if err != nil {
 		_, _ = b.store.RecordAutoUpdateCheck(context.Background(), teamstore.AutoUpdateRecord{
 			Now:                  time.Now(),
@@ -8965,6 +9061,8 @@ func outboxHasWorkflowNotificationCandidate(outbox teamstore.OutboxMessage) bool
 	case notificationKind == "turn_completed":
 		return true
 	case notificationKind == "helper_upgrade_completed":
+		return true
+	case notificationKind == helperUpgradeActivationFailedNotificationKind || notificationKind == helperUpgradeActivationActionRequiredNotificationKind:
 		return true
 	case notificationKind == "needs_attention":
 		return true

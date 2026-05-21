@@ -356,6 +356,23 @@ func TestPerformUpdateValidateBinaryRejectsInvalidPayload(t *testing.T) {
 	}
 }
 
+func TestValidateDownloadedBinaryRejectsRCWhenFinalRequested(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script validation fixture is POSIX-only")
+	}
+	path := filepath.Join(t.TempDir(), "codex-proxy")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho 'codex-proxy version 0.1.0-rc.133 (abc) 2026-05-13T00:00:00Z'\n"), 0o700); err != nil {
+		t.Fatalf("write validation fixture: %v", err)
+	}
+	err := validateDownloadedBinary(context.Background(), path, "v0.1.0", time.Second)
+	if err == nil {
+		t.Fatal("validateDownloadedBinary accepted rc output for final target")
+	}
+	if !strings.Contains(err.Error(), `parsed as "0.1.0-rc.133"`) || !strings.Contains(err.Error(), `want "0.1.0"`) {
+		t.Fatalf("validation error = %v, want parsed exact-version mismatch", err)
+	}
+}
+
 func TestPerformUpdateLatest(t *testing.T) {
 	requireRuntimeAsset(t)
 	tag := "v3.1.0"

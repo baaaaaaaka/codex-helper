@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,7 +23,15 @@ type teamsPendingHelperActivation struct {
 var (
 	teamsUpdateFindPendingReplacementsForPlatform = update.FindPendingReplacementsForPlatform
 	teamsUpdateProbeBinaryVersion                 = update.ProbeBinaryVersion
+	teamsUpdatePendingHelperActivationOwned       = teamsPendingHelperActivationOwnerMatches
 )
+
+type teamsPendingHelperActivationOwner struct {
+	Version       int       `json:"version"`
+	Kind          string    `json:"kind"`
+	TargetVersion string    `json:"target_version"`
+	CreatedAt     time.Time `json:"created_at"`
+}
 
 func discoverTeamsPendingHelperActivation(ctx context.Context, installPath string, targetVersion string) (teamsPendingHelperActivation, bool, error) {
 	if teamsServiceGOOS() != "windows" {
@@ -54,6 +63,9 @@ func discoverTeamsPendingHelperActivation(ctx context.Context, installPath strin
 			continue
 		}
 		if targetVersion != "" && !strings.EqualFold(version, targetVersion) {
+			continue
+		}
+		if targetVersion == "" && !teamsUpdatePendingHelperActivationOwned(candidate.Path, version) {
 			continue
 		}
 		if targetVersion == "" && formalProbeFailed {
@@ -102,6 +114,9 @@ func scheduleTeamsPendingHelperActivation(ctx context.Context, activation teamsP
 	if err != nil {
 		return err
 	}
+	if err := writeTeamsPendingHelperActivationOwner(activation.PendingPath, activation.Version); err != nil {
+		return err
+	}
 	command := windowsTeamsPendingHelperActivationPowerShell(activation.PendingPath, activation.InstallPath, activation.Version)
 	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
 }
@@ -129,6 +144,9 @@ func scheduleTeamsPendingHelperProcessRestart(ctx context.Context, pendingPath s
 	var err error
 	activation, err = normalizeTeamsPendingHelperActivation(activation)
 	if err != nil {
+		return err
+	}
+	if err := writeTeamsPendingHelperActivationOwner(activation.PendingPath, activation.Version); err != nil {
 		return err
 	}
 	command := windowsTeamsPendingHelperProcessRestartPowerShell(activation.PendingPath, activation.InstallPath, activation.Version, args)
@@ -185,6 +203,75 @@ func helperVersionFromPendingPath(pendingPath string) string {
 	return ""
 }
 
+func teamsPendingHelperActivationOwnerPath(pendingPath string) string {
+	pendingPath = strings.TrimSpace(pendingPath)
+	if pendingPath == "" {
+		return ""
+	}
+	return pendingPath + ".teams-activation.json"
+}
+
+func writeTeamsPendingHelperActivationOwner(pendingPath string, version string) error {
+	path := teamsPendingHelperActivationOwnerPath(pendingPath)
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if path == "" || version == "" {
+		return fmt.Errorf("pending helper activation owner requires path and version")
+	}
+	raw, err := json.Marshal(teamsPendingHelperActivationOwner{
+		Version:       1,
+		Kind:          "teams-helper-update",
+		TargetVersion: version,
+		CreatedAt:     time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func teamsPendingHelperActivationOwnerMatches(pendingPath string, version string) bool {
+	path := teamsPendingHelperActivationOwnerPath(pendingPath)
+	if path == "" {
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var owner teamsPendingHelperActivationOwner
+	if err := json.Unmarshal(raw, &owner); err != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(owner.Kind), "teams-helper-update") {
+		return false
+	}
+	return update.VersionMatchesTarget(owner.TargetVersion, version)
+}
+
+func windowsTeamsDestVersionProbePowerShell() string {
+	return "function Version-FromText([string]$text) { " +
+		"foreach ($field in ($text -split '\\s+')) { " +
+		"$candidate=$field.Trim(); if ($candidate.StartsWith('v')) { $candidate=$candidate.Substring(1) }; " +
+		"if ($candidate -ieq 'dev') { return $candidate }; " +
+		"$parts=$candidate -split '\\.',3; " +
+		"if ($parts.Length -ge 2 -and $parts[0] -match '^\\d+$' -and $parts[1] -match '^\\d+$') { return $candidate } " +
+		"}; return '' }; " +
+		"function Test-DestVersion { try { $v=& $dest --version 2>&1; $code=$LASTEXITCODE; $text=($v -join ' '); Log ('formal version: ' + $text); " +
+		"if ($null -ne $code -and $code -ne 0) { $script:lastErr='formal version probe exited with code ' + $code + ': ' + $text; return $false }; " +
+		"if ([string]::IsNullOrWhiteSpace($want)) { $script:lastErr='pending helper target version is unknown'; return $false }; " +
+		"$actual=Version-FromText $text; if ([string]::IsNullOrWhiteSpace($actual)) { if ([string]::IsNullOrWhiteSpace($text)) { $script:lastErr='could not parse formal entry version from empty output' } else { $script:lastErr='could not parse formal entry version from: ' + $text }; return $false }; " +
+		"if ($actual -ieq $want) { return $true }; $script:lastErr='formal entry version ' + $actual + ' did not match target ' + $want; return $false " +
+		"} catch { $script:lastErr='formal version probe failed: ' + $_.Exception.Message; Log $script:lastErr; return $false } }; "
+}
+
 func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPath string, version string) string {
 	return "$ErrorActionPreference='Continue'; " +
 		"$src=" + powershellSingleQuote(pendingPath) + "; " +
@@ -210,7 +297,7 @@ func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPa
 		"Start-Sleep -Milliseconds 500 }; " +
 		"$ready=$false; " +
 		"$lastErr=''; " +
-		"function Test-DestVersion { try { $v=& $dest --version 2>&1; $text=($v -join ' '); Log ('formal version: ' + $text); if ([string]::IsNullOrWhiteSpace($want)) { $script:lastErr='pending helper target version is unknown'; return $false }; if ($text -like ('*' + $want + '*')) { return $true }; $script:lastErr='formal entry version did not match target: ' + $text; return $false } catch { $script:lastErr='formal version probe failed: ' + $_.Exception.Message; Log $script:lastErr; return $false } }; " +
+		windowsTeamsDestVersionProbePowerShell() +
 		"for ($i=0; $i -lt 240; $i++) { " +
 		"if (-not (Test-Path -LiteralPath $src)) { Log ('source missing: ' + $src); if (Test-DestVersion) { $ready=$true; Log 'formal entry already matches pending target' }; break }; " +
 		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +
@@ -245,7 +332,7 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"Start-Sleep -Milliseconds 500 }; " +
 		"$ready=$false; " +
 		"$lastErr=''; " +
-		"function Test-DestVersion { try { $v=& $dest --version 2>&1; $text=($v -join ' '); Log ('formal version: ' + $text); if ([string]::IsNullOrWhiteSpace($want)) { $script:lastErr='pending helper target version is unknown'; return $false }; if ($text -like ('*' + $want + '*')) { return $true }; $script:lastErr='formal entry version did not match target: ' + $text; return $false } catch { $script:lastErr='formal version probe failed: ' + $_.Exception.Message; Log $script:lastErr; return $false } }; " +
+		windowsTeamsDestVersionProbePowerShell() +
 		"for ($i=0; $i -lt 240; $i++) { " +
 		"if (-not (Test-Path -LiteralPath $src)) { Log ('source missing: ' + $src); if (Test-DestVersion) { $ready=$true; Log 'formal entry already matches pending target' }; break }; " +
 		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +

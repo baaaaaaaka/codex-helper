@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-func replaceBinary(tmpPath, destPath string) (replaceResult, error) {
+func replaceBinary(tmpPath, destPath string, _ replaceOptions) (replaceResult, error) {
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		return replaceResult{}, err
 	}

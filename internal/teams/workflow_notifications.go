@@ -296,6 +296,20 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 		event.RequestSummary = ""
 		event.Hint = workflowMachineLabel(b) + " is back online and running the updated helper."
 		event.ButtonTitle = "Open Control"
+	case notificationKind == helperUpgradeActivationFailedNotificationKind:
+		event.Kind = helperUpgradeActivationFailedNotificationKind
+		event.Title = "⚠️ Helper update activation failed"
+		event.ChatTitle = workflowControlChatTitle(b, state)
+		event.RequestSummary = ""
+		event.Hint = workflowMachineLabel(b) + " could not activate the downloaded helper. Open Control for the diagnostic."
+		event.ButtonTitle = "Open Control"
+	case notificationKind == helperUpgradeActivationActionRequiredNotificationKind:
+		event.Kind = helperUpgradeActivationActionRequiredNotificationKind
+		event.Title = "⚠️ Helper update needs attention"
+		event.ChatTitle = workflowControlChatTitle(b, state)
+		event.RequestSummary = ""
+		event.Hint = workflowMachineLabel(b) + " reports activation completed, but the running helper version still does not match the target."
+		event.ButtonTitle = "Open Control"
 	case strings.Contains(kind, "reload-complete"):
 		event.Kind = "helper_reload_completed"
 		event.Title = "✅ Helper reload completed"
@@ -605,7 +619,10 @@ func shouldSkipWorkflowNotificationOutbox(outbox teamstore.OutboxMessage) bool {
 		return true
 	}
 	notificationKind := strings.ToLower(strings.TrimSpace(outbox.NotificationKind))
-	if notificationKind == "turn_completed" || notificationKind == "helper_upgrade_completed" {
+	if notificationKind == "turn_completed" ||
+		notificationKind == "helper_upgrade_completed" ||
+		notificationKind == helperUpgradeActivationFailedNotificationKind ||
+		notificationKind == helperUpgradeActivationActionRequiredNotificationKind {
 		return false
 	}
 	if strings.HasPrefix(kind, "import-") || strings.HasPrefix(kind, "sync-") || isTranscriptImportBatchOutboxKind(kind) {

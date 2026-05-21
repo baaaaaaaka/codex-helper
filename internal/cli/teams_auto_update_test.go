@@ -513,11 +513,58 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	if !got.ValidateBinary {
 		t.Fatal("auto-updater must validate the downloaded binary before restart")
 	}
+	if got.PendingReplacement != update.PendingReplacementScheduleDeferredMove {
+		t.Fatalf("PendingReplacement = %v, want default scheduled deferred move", got.PendingReplacement)
+	}
 	if res.Version != "1.2.4" {
 		t.Fatalf("result version = %q, want 1.2.4", res.Version)
 	}
 	if res.InstallPath != fakeInstallPath {
 		t.Fatalf("result install path = %q, want %q", res.InstallPath, fakeInstallPath)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterApplyWithOptionsReturnsWindowsPendingReplacementToCaller(t *testing.T) {
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	prevGOOS := teamsServiceGOOS
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevExecutable
+		teamsServiceGOOS = prevGOOS
+	})
+	teamsServiceGOOS = func() string { return "windows" }
+	fakeInstallPath := filepath.Join(t.TempDir(), "codex-proxy.exe")
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) {
+		return fakeInstallPath, nil
+	}
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return fakeInstallPath, nil
+	}
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		return update.ApplyResult{
+			Version:            "1.2.4",
+			InstallPath:        opts.InstallPath,
+			RestartRequired:    true,
+			PendingReplacePath: filepath.Join(filepath.Dir(opts.InstallPath), ".codex-proxy_1.2.4_windows_amd64.exe.123"),
+		}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.ApplyWithOptions(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"}, teams.HelperAutoUpdateApplyOptions{OwnsPendingReplacement: true})
+	if err != nil {
+		t.Fatalf("ApplyWithOptions error: %v", err)
+	}
+	if got.PendingReplacement != update.PendingReplacementReturnOnly {
+		t.Fatalf("PendingReplacement = %v, want caller-owned pending replacement", got.PendingReplacement)
+	}
+	if strings.TrimSpace(res.PendingReplacePath) == "" || !res.RestartRequired {
+		t.Fatalf("result = %#v, want pending replacement returned to Teams bridge", res)
 	}
 }
 

@@ -18,6 +18,8 @@ func TestFindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets(t 
 		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575",
 		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575.activation.json",
 		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575.activation.json.tmp",
+		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575.teams-activation.json",
+		".codex-proxy_0.1.0-rc.73_windows_amd64.exe.347704575.teams-activation.json.tmp",
 		".codex-proxy_0.1.0-rc.72_windows_amd64.exe.3261172515",
 		".codex-proxy_0.1.0-rc.71_linux_amd64.ignored",
 		"codex-proxy.exe",
@@ -48,6 +50,45 @@ func TestFindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets(t 
 	}
 	if got[0].Version != "0.1.0-rc.73" || got[1].Version != "0.1.0-rc.72" || got[2].Version != "0.1.0-rc.70" {
 		t.Fatalf("pending order = %#v, want highest comparable versions first", got)
+	}
+}
+
+func TestVersionOutputMatchesTargetRequiresExactVersionToken(t *testing.T) {
+	cases := []struct {
+		name   string
+		output string
+		target string
+		want   bool
+	}{
+		{
+			name:   "final does not match rc",
+			output: "codex-proxy version 0.1.0-rc.133 (abc) 2026-05-13T00:00:00Z",
+			target: "v0.1.0",
+		},
+		{
+			name:   "rc does not match final",
+			output: "codex-proxy version 0.1.0 (abc) 2026-05-13T00:00:00Z",
+			target: "v0.1.0-rc.133",
+		},
+		{
+			name:   "exact final",
+			output: "codex-proxy version 0.1.0 (abc) 2026-05-13T00:00:00Z",
+			target: "v0.1.0",
+			want:   true,
+		},
+		{
+			name:   "exact rc",
+			output: "codex-proxy version 0.1.0-rc.133 (abc) 2026-05-13T00:00:00Z",
+			target: "0.1.0-rc.133",
+			want:   true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VersionOutputMatchesTarget(tc.output, tc.target); got != tc.want {
+				t.Fatalf("VersionOutputMatchesTarget(%q, %q) = %v, want %v", tc.output, tc.target, got, tc.want)
+			}
+		})
 	}
 }
 

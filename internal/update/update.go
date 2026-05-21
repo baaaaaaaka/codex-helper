@@ -60,13 +60,21 @@ type CheckOptions struct {
 }
 
 type UpdateOptions struct {
-	Repo              string
-	Version           string
-	InstallPath       string
-	Timeout           time.Duration
-	ValidateBinary    bool
-	IncludePrerelease bool
+	Repo               string
+	Version            string
+	InstallPath        string
+	Timeout            time.Duration
+	ValidateBinary     bool
+	IncludePrerelease  bool
+	PendingReplacement PendingReplacementMode
 }
+
+type PendingReplacementMode int
+
+const (
+	PendingReplacementScheduleDeferredMove PendingReplacementMode = iota
+	PendingReplacementReturnOnly
+)
 
 type ApplyResult struct {
 	Repo               string
@@ -80,6 +88,10 @@ type ApplyResult struct {
 type replaceResult struct {
 	restartRequired    bool
 	pendingReplacePath string
+}
+
+type replaceOptions struct {
+	returnPendingOnly bool
 }
 
 type releaseInfo struct {
@@ -275,7 +287,9 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		}
 	}
 
-	rep, err := replaceBinary(tmpPath, installPath)
+	rep, err := replaceBinary(tmpPath, installPath, replaceOptions{
+		returnPendingOnly: opts.PendingReplacement == PendingReplacementReturnOnly,
+	})
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -596,11 +610,16 @@ func validateDownloadedBinary(ctx context.Context, path string, version string, 
 	}
 	defer cancel()
 	out, err := exec.CommandContext(cmdCtx, path, "--version").CombinedOutput()
+	output := trimValidationOutput(string(out))
 	if err != nil {
-		return fmt.Errorf("validate downloaded binary: %w: %s", err, trimValidationOutput(string(out)))
+		return fmt.Errorf("validate downloaded binary: %w: %s", err, output)
 	}
-	if version != "" && !strings.Contains(string(out), strings.TrimPrefix(version, "v")) {
-		return fmt.Errorf("validate downloaded binary: version output %q does not contain %q", trimValidationOutput(string(out)), strings.TrimPrefix(version, "v"))
+	if version != "" && !VersionOutputMatchesTarget(output, version) {
+		actual := VersionFromOutput(output)
+		if actual == "" {
+			return fmt.Errorf("validate downloaded binary: could not parse version from %q", output)
+		}
+		return fmt.Errorf("validate downloaded binary: version output %q parsed as %q, want %q", output, actual, strings.TrimPrefix(version, "v"))
 	}
 	return nil
 }

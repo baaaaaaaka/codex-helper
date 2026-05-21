@@ -11,7 +11,7 @@ import (
 func TestReplaceBinaryErrors(t *testing.T) {
 	t.Run("source missing", func(t *testing.T) {
 		dir := t.TempDir()
-		_, err := replaceBinary(filepath.Join(dir, "missing"), filepath.Join(dir, "dest"))
+		_, err := replaceBinary(filepath.Join(dir, "missing"), filepath.Join(dir, "dest"), replaceOptions{})
 		if err == nil {
 			t.Fatalf("expected error for missing source")
 		}
@@ -24,7 +24,7 @@ func TestReplaceBinaryErrors(t *testing.T) {
 			t.Fatalf("write src: %v", err)
 		}
 		dest := filepath.Join(dir, "missing", "dest")
-		if _, err := replaceBinary(src, dest); err == nil {
+		if _, err := replaceBinary(src, dest, replaceOptions{}); err == nil {
 			t.Fatalf("expected error for missing dest dir")
 		}
 	})

@@ -24,6 +24,7 @@ func lockCLITestHooks(t *testing.T) {
 	prevResolveInstallPathForCLI := resolveInstallPathForCLI
 	prevRestartArgv0 := restartArgv0
 	prevTeamsServiceArgv0 := teamsServiceArgv0
+	prevTeamsUpdatePendingHelperActivationOwned := teamsUpdatePendingHelperActivationOwned
 	resolveInstallPathForCLI = func(path string) (string, error) {
 		if path != "" {
 			return update.ResolveInstallPath(path)
@@ -32,10 +33,12 @@ func lockCLITestHooks(t *testing.T) {
 	}
 	restartArgv0 = func() string { return installPath }
 	teamsServiceArgv0 = func() string { return installPath }
+	teamsUpdatePendingHelperActivationOwned = func(string, string) bool { return true }
 	t.Cleanup(func() {
 		resolveInstallPathForCLI = prevResolveInstallPathForCLI
 		restartArgv0 = prevRestartArgv0
 		teamsServiceArgv0 = prevTeamsServiceArgv0
+		teamsUpdatePendingHelperActivationOwned = prevTeamsUpdatePendingHelperActivationOwned
 		cliTestHookGuard.Unlock()
 	})
 }

@@ -64,6 +64,19 @@ func VersionFromOutput(output string) string {
 	return ""
 }
 
+func VersionOutputMatchesTarget(output string, target string) bool {
+	return VersionMatchesTarget(VersionFromOutput(output), target)
+}
+
+func VersionMatchesTarget(actual string, target string) bool {
+	actual = strings.TrimPrefix(strings.TrimSpace(actual), "v")
+	target = strings.TrimPrefix(strings.TrimSpace(target), "v")
+	if actual == "" || target == "" {
+		return false
+	}
+	return strings.EqualFold(actual, target)
+}
+
 func looksLikeVersion(value string) bool {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -122,7 +135,10 @@ func FindPendingReplacementsForPlatform(installPath string, goos string, goarch 
 		if !strings.HasPrefix(name, "."+assetPrefix) {
 			continue
 		}
-		if strings.HasSuffix(name, ".activation.json") || strings.HasSuffix(name, ".activation.json.tmp") {
+		if strings.HasSuffix(name, ".activation.json") ||
+			strings.HasSuffix(name, ".activation.json.tmp") ||
+			strings.HasSuffix(name, ".teams-activation.json") ||
+			strings.HasSuffix(name, ".teams-activation.json.tmp") {
 			continue
 		}
 		rest := strings.TrimPrefix(name, "."+assetPrefix)

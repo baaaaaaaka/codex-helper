@@ -12,9 +12,12 @@ import (
 	"syscall"
 )
 
-func replaceBinary(tmpPath, destPath string) (replaceResult, error) {
+func replaceBinary(tmpPath, destPath string, opts replaceOptions) (replaceResult, error) {
 	if err := os.Rename(tmpPath, destPath); err == nil {
 		return replaceResult{restartRequired: false}, nil
+	}
+	if opts.returnPendingOnly {
+		return replaceResult{restartRequired: true, pendingReplacePath: tmpPath}, nil
 	}
 	if err := scheduleWindowsMove(tmpPath, destPath); err != nil {
 		return replaceResult{}, err
