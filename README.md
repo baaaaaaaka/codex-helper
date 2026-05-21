@@ -165,6 +165,7 @@ codex-proxy proxy doctor
 | `codex-proxy teams status` | Show Teams helper state, control chat, service, owner, and queue status |
 | `codex-proxy teams doctor` | Check local Teams helper auth and service readiness |
 | `codex-proxy teams service bootstrap` | Install or repair the background Teams helper service |
+| `codex-proxy teams service restart --force` | Recover local active Teams state, then force a service restart from a terminal |
 | `codex-proxy teams control --print` | Print the configured Teams control chat link |
 | `codex-proxy upgrade` | Self-update from GitHub Releases |
 

@@ -1954,7 +1954,9 @@ func outboxDeliveryTransient(msg OutboxMessage) bool {
 	}
 	return strings.HasPrefix(kind, "codex-status-") ||
 		strings.HasPrefix(kind, "codex-progress-") ||
+		strings.HasPrefix(kind, "codex-compact-") ||
 		strings.HasPrefix(kind, "status-") ||
+		strings.HasPrefix(kind, "compact-") ||
 		strings.HasPrefix(kind, "progress-") ||
 		strings.HasPrefix(kind, "interrupted-after-restart")
 }

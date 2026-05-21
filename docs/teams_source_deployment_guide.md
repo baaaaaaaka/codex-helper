@@ -377,6 +377,8 @@ codex-proxy teams service start
 ```
 
 Use `recover --force` only when you are sure the old helper process is gone.
+For a single command that intentionally interrupts local active state before
+restarting, use `codex-proxy teams service restart --force`.
 
 ## 13. Troubleshooting
 

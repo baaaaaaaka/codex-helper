@@ -61,6 +61,31 @@ func (e *streamingRecordingExecutor) RunWithEventHandler(_ context.Context, _ *S
 	return e.result, e.err
 }
 
+type transcriptWritingStreamingExecutor struct {
+	write  func() error
+	events []codexrunner.StreamEvent
+	result ExecutionResult
+	err    error
+}
+
+func (e *transcriptWritingStreamingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunWithEventHandler(ctx, session, prompt, nil)
+}
+
+func (e *transcriptWritingStreamingExecutor) RunWithEventHandler(_ context.Context, _ *Session, _ string, handler codexrunner.EventHandler) (ExecutionResult, error) {
+	for _, event := range e.events {
+		if handler != nil {
+			handler(event)
+		}
+	}
+	if e.write != nil {
+		if err := e.write(); err != nil {
+			return ExecutionResult{}, err
+		}
+	}
+	return e.result, e.err
+}
+
 type blockingStreamingExecutor struct {
 	started chan struct{}
 	release chan struct{}
@@ -14407,6 +14432,117 @@ func TestBridgeSyncLinkedTranscriptSkipsContextCompactAlreadySentLive(t *testing
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
 	if checkpoint.LastRecordID == "old" || strings.TrimSpace(checkpoint.LastRecordID) == "" {
 		t.Fatalf("checkpoint did not advance past live-sent compact record: %#v", checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptOnlySkipsDeliveredContextCompactCount(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-compact-count"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-compact-count", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-compact-count")
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:one-live-compact",
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		Kind:           "codex-compact-001",
+		Body:           transcriptContextCompactMessage,
+		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-live-compact",
+	}); err != nil {
+		t.Fatalf("QueueOutbox live compact error: %v", err)
+	}
+	*sent = nil
+
+	updated := initial +
+		`{"timestamp":"2026-05-20T03:30:42.695Z","type":"event_msg","payload":{"type":"context_compacted"}}` + "\n" +
+		`{"timestamp":"2026-05-20T03:40:42.695Z","type":"event_msg","payload":{"type":"context_compacted"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write compact transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync compact transcript error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %#v, want only the second compact that was not delivered live", *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(plain, "🤖 ⏳ Codex status:\n"+transcriptContextCompactMessage) {
+		t.Fatalf("sent compact = %q", plain)
+	}
+}
+
+func TestBridgeQueuesTranscriptOnlyContextCompactBeforeFinalAnswer(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-compact-pre-final"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-compact-pre-final", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	finalText := "FINAL FROM TRANSCRIPT"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			updated := initial +
+				`{"timestamp":"2026-05-21T02:52:08.706Z","type":"event_msg","payload":{"type":"context_compacted"}}` + "\n" +
+				`{"timestamp":"2026-05-21T02:53:46.102Z","type":"event_msg","payload":{"type":"agent_message","id":"final-1","message":` + strconv.Quote(finalText) + `,"phase":"final_answer"}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(updated), 0o600)
+		},
+		result: ExecutionResult{Text: finalText, CodexThreadID: "thread-compact-pre-final", CodexTurnID: "turn-compact-pre-final"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-compact-pre-final")
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-transcript-compact"), "fix compact ordering"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	compactIndex := strings.Index(joined, "🤖 ⏳ Codex status:\n"+transcriptContextCompactMessage)
+	answerIndex := strings.Index(joined, "🤖 ✅ Codex answer:\n"+finalText)
+	if compactIndex < 0 || answerIndex < 0 {
+		t.Fatalf("missing compact or final Teams message:\n%s", joined)
+	}
+	if compactIndex > answerIndex {
+		t.Fatalf("context compact status was sent after the final answer:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	var compactOutbox teamstore.OutboxMessage
+	for _, outbox := range state.OutboxMessages {
+		if strings.Contains(outbox.Kind, "compact") {
+			compactOutbox = outbox
+			break
+		}
+	}
+	if compactOutbox.ID == "" {
+		t.Fatalf("compact outbox not recorded: %#v", state.OutboxMessages)
+	}
+	if compactOutbox.TurnID == "sync:"+session.ID || compactOutbox.TurnID == "" {
+		t.Fatalf("compact outbox should belong to the active Teams turn, got %#v", compactOutbox)
+	}
+	if compactOutbox.MentionOwner {
+		t.Fatalf("compact outbox should not mention owner: %#v", compactOutbox)
+	}
+	sentCount := len(*sent)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("post-final sync error: %v", err)
+	}
+	if len(*sent) != sentCount {
+		t.Fatalf("post-final transcript sync sent duplicate compact/final messages: before=%d after=%d sent=%#v", sentCount, len(*sent), *sent)
 	}
 }
 

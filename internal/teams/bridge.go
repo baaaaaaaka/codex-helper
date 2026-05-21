@@ -7102,6 +7102,10 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	} else if blocked {
 		return nil
 	}
+	preFinalQueued, err := b.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	if err != nil {
+		return err
+	}
 	mentionOwner := true
 	visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
 	if visibleText == "" && len(ExtractArtifactManifestBlocks(result.Text)) > 0 {
@@ -7125,7 +7129,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			}
 		}
 	}
-	if len(queued) > 0 {
+	if preFinalQueued > 0 || len(queued) > 0 {
 		if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
 			if isOutboxDeliveryDeferred(err) || isGraphRateLimitError(err) {
 				if b.out != nil {
@@ -11202,7 +11206,7 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 		return out, nil
 	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
-	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
+	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	dedupe := newTranscriptDedupeState()
 	active := false
 	for i, record := range transcript.Records {
@@ -11211,7 +11215,7 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 			continue
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
-			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
+			known.shouldSkip(record, body) ||
 			dedupe.shouldSkip(record, body) {
 			continue
 		}
@@ -11283,7 +11287,7 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 		return false, nil
 	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
-	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
+	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	dedupe := newTranscriptDedupeState()
 	sawRecentTeamsTurnRecord := false
 	var lastKey string
@@ -11299,7 +11303,7 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 			sawRecentTeamsTurnRecord = true
 			skip = true
 		}
-		if !skip && shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) {
+		if !skip && known.shouldSkip(record, body) {
 			sawRecentTeamsTurnRecord = true
 			skip = true
 		}
@@ -11368,12 +11372,12 @@ func newRecentCompletedTeamsTranscriptMirrorSkipper(state teamstore.State, sessi
 	return recentCompletedTeamsTranscriptMirrorSkipper{enabled: ok}
 }
 
-func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record TranscriptRecord, body string, teamsOriginHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool) bool {
+func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record TranscriptRecord, body string, teamsOriginHashes map[string]bool, known *knownTranscriptOutboxDedupeState) bool {
 	if s == nil || !s.enabled {
 		return false
 	}
 	if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
-		shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) {
+		known.shouldSkip(record, body) {
 		s.seen = true
 		return true
 	}
@@ -11676,6 +11680,82 @@ func linkedTranscriptLocalFromCheckpoint(session Session, checkpoint teamstore.I
 	}, true
 }
 
+func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context, session *Session, turn teamstore.Turn) (int, error) {
+	if b == nil || session == nil || b.store == nil || strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.ChatID) == "" || strings.TrimSpace(turn.ID) == "" {
+		return 0, nil
+	}
+	if strings.TrimSpace(session.CodexThreadID) == "" {
+		return 0, nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return 0, err
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		return 0, nil
+	}
+	local, ok := linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
+	if !ok {
+		return 0, nil
+	}
+	switch checkpoint.Status {
+	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
+		return 0, nil
+	}
+	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") || len(transcript.Records) == 0 {
+		return 0, nil
+	}
+	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
+	teamsOriginDisplays := teamsOriginDisplayTexts(state, session.ID)
+	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
+	dedupe := newTranscriptDedupeState()
+	queued := 0
+	for i, record := range transcript.Records {
+		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
+		record.SourceLine = checkpointLine
+		record.SourceOffset = checkpointOffset
+		if record.Kind == TranscriptKindAssistant || transcriptRecordIsTerminal(record) {
+			break
+		}
+		body := formatTranscriptRecordForTeams(record)
+		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
+		if strings.TrimSpace(body) == "" || shouldSkipBackgroundTranscriptRecord(record) {
+			continue
+		}
+		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) || dedupe.shouldSkip(record, body) {
+			continue
+		}
+		kind := transcriptRecordOutboxKind("codex", record, i+1)
+		if known.shouldSkip(record, body) {
+			if record.Kind == TranscriptKindStatus || record.Kind == TranscriptKindCompact {
+				if err := b.recordSkippedTranscriptDelivery(ctx, *session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
+					return queued, err
+				}
+			}
+			continue
+		}
+		switch record.Kind {
+		case TranscriptKindStatus, TranscriptKindCompact:
+			if err := b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, *session, local, record, checkpointLine, checkpointOffset, kind, body, outboxQueueOptions{}, turn.ID, transcriptCheckpointID(session.ID), true); err != nil {
+				return queued, err
+			}
+			queued++
+			if queued >= transcriptSyncMaxRecordsPerSessionPerCycle {
+				return queued, nil
+			}
+		}
+	}
+	return queued, nil
+}
+
 func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, local codexhistory.Session) error {
 	checkpointID := transcriptCheckpointID(session.ID)
 	state, err := b.store.Load(ctx)
@@ -11744,13 +11824,14 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	teamsOriginDisplays := teamsOriginDisplayTexts(state, session.ID)
 	teamsOriginTerminalHashes := teamsOriginTerminalTextHashes(state, session.ID)
-	knownHashes := knownTranscriptOutboxHashes(state, session.ID)
+	knownForCount := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	now := time.Now()
-	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, teamsOriginDisplays, teamsOriginTerminalHashes, knownHashes, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
+	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, teamsOriginDisplays, teamsOriginTerminalHashes, knownForCount, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
 	if visibleBacklog > transcriptSyncMaxAutoBacklogRecords {
 		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, visibleBacklog)
 	}
 	dedupe := newTranscriptDedupeState()
+	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	recentTeamsMirror := newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now)
 	sent := 0
 	for i, record := range transcript.Records {
@@ -11775,9 +11856,9 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 			continue
 		}
 		kind := transcriptRecordOutboxKind("sync", record, i+1)
-		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
+		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, known) ||
 			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTerminalHashes) ||
-			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
+			known.shouldSkip(record, body) ||
 			dedupe.shouldSkip(record, body) {
 			if err := b.recordSkippedTranscriptDelivery(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
 				return err
@@ -12021,7 +12102,7 @@ func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session 
 	return true, b.markTranscriptImportComplete(ctx, session, sourcePath, transcriptRecordCheckpointKey(recovered), recovered.SourceLine)
 }
 
-func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, local codexhistory.Session, records []TranscriptRecord, teamsOriginHashes map[string]bool, teamsOriginDisplays map[string]string, teamsOriginTerminalHashes map[string]bool, knownHashes map[TranscriptKind]map[string]bool, recentTeamsMirror recentCompletedTeamsTranscriptMirrorSkipper) int {
+func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, local codexhistory.Session, records []TranscriptRecord, teamsOriginHashes map[string]bool, teamsOriginDisplays map[string]string, teamsOriginTerminalHashes map[string]bool, known *knownTranscriptOutboxDedupeState, recentTeamsMirror recentCompletedTeamsTranscriptMirrorSkipper) int {
 	dedupe := newTranscriptDedupeState()
 	visible := 0
 	for i, record := range records {
@@ -12043,9 +12124,9 @@ func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, l
 		if transcriptDeliveryKnown(state, session, local, record, kind, body) {
 			continue
 		}
-		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, knownHashes) ||
+		if recentTeamsMirror.shouldSkip(record, body, teamsOriginHashes, known) ||
 			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTerminalHashes) ||
-			shouldSkipKnownTranscriptOutboxRecord(record, body, knownHashes) ||
+			known.shouldSkip(record, body) ||
 			dedupe.shouldSkip(record, body) {
 			continue
 		}
@@ -12357,9 +12438,16 @@ func stripReferencedTeamsMessagePromptSection(text string) string {
 }
 
 func knownTranscriptOutboxHashes(state teamstore.State, sessionID string) map[TranscriptKind]map[string]bool {
+	return knownTranscriptOutboxHashesSince(state, sessionID, time.Time{})
+}
+
+func knownTranscriptOutboxHashesSince(state teamstore.State, sessionID string, since time.Time) map[TranscriptKind]map[string]bool {
 	hashes := make(map[TranscriptKind]map[string]bool)
 	for _, outbox := range state.OutboxMessages {
 		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
+			continue
+		}
+		if !since.IsZero() && !outbox.CreatedAt.IsZero() && outbox.CreatedAt.Before(since) {
 			continue
 		}
 		if !outboxCanDedupeTranscript(outbox) {
@@ -12384,6 +12472,61 @@ func knownTranscriptOutboxHashes(state teamstore.State, sessionID string) map[Tr
 		}
 	}
 	return hashes
+}
+
+type knownTranscriptOutboxDedupeState struct {
+	hashes        map[TranscriptKind]map[string]bool
+	compactCounts map[string]int
+}
+
+func newKnownTranscriptOutboxDedupeState(state teamstore.State, sessionID string, since time.Time) *knownTranscriptOutboxDedupeState {
+	hashes := knownTranscriptOutboxHashesSince(state, sessionID, since)
+	compactCounts := make(map[string]int)
+	for hash := range hashes[TranscriptKindCompact] {
+		compactCounts[hash] = 0
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
+			continue
+		}
+		if !since.IsZero() && !outbox.CreatedAt.IsZero() && outbox.CreatedAt.Before(since) {
+			continue
+		}
+		if !outboxCanDedupeTranscript(outbox) {
+			continue
+		}
+		kind, ok := deliveredOutboxTranscriptKind(outbox.Kind)
+		if !ok || kind != TranscriptKindCompact {
+			continue
+		}
+		hash := normalizedTextHash(formatKnownOutboxBodyForTranscriptDedupe(kind, outbox.Body))
+		if hash == "" {
+			hash = outbox.SourceTextHash
+		}
+		if hash != "" {
+			compactCounts[hash]++
+		}
+	}
+	return &knownTranscriptOutboxDedupeState{hashes: hashes, compactCounts: compactCounts}
+}
+
+func (s *knownTranscriptOutboxDedupeState) shouldSkip(record TranscriptRecord, body string) bool {
+	if s == nil {
+		return false
+	}
+	if record.Kind != TranscriptKindCompact {
+		return shouldSkipKnownTranscriptOutboxRecord(record, body, s.hashes)
+	}
+	hash := normalizedTextHash(body)
+	if hash == "" {
+		return false
+	}
+	count := s.compactCounts[hash]
+	if count <= 0 {
+		return false
+	}
+	s.compactCounts[hash] = count - 1
+	return true
 }
 
 func outboxCanDedupeTranscript(outbox teamstore.OutboxMessage) bool {

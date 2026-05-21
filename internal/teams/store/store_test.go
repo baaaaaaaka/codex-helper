@@ -1821,6 +1821,11 @@ func TestOutboxBlocksUpgradeStatusMatrix(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "queued codex compact status does not block",
+			msg:  OutboxMessage{ID: "queued-compact", TeamsChatID: "chat-1", Kind: "codex-compact-001", Status: OutboxStatusQueued},
+			want: false,
+		},
+		{
 			name: "legacy queued interrupted notice does not block",
 			msg:  OutboxMessage{ID: "queued-interrupted", TeamsChatID: "chat-1", Kind: "interrupted", Status: OutboxStatusQueued},
 			want: false,
@@ -1919,6 +1924,14 @@ func TestQueueOutboxMarksNotificationKindsUpgradeNonBlocking(t *testing.T) {
 		t.Fatalf("QueueOutbox status error: %v", err)
 	}
 	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:compact",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-compact-001",
+		Body:        "context compacted",
+	}); err != nil {
+		t.Fatalf("QueueOutbox compact error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
 		ID:          "outbox:final",
 		TeamsChatID: "chat-1",
 		Kind:        "final",
@@ -1932,6 +1945,9 @@ func TestQueueOutboxMarksNotificationKindsUpgradeNonBlocking(t *testing.T) {
 	}
 	if !state.OutboxMessages["outbox:status"].UpgradeNonBlocking {
 		t.Fatalf("status outbox should be upgrade non-blocking: %#v", state.OutboxMessages["outbox:status"])
+	}
+	if !state.OutboxMessages["outbox:compact"].UpgradeNonBlocking {
+		t.Fatalf("compact status outbox should be upgrade non-blocking: %#v", state.OutboxMessages["outbox:compact"])
 	}
 	if state.OutboxMessages["outbox:final"].UpgradeNonBlocking {
 		t.Fatalf("final outbox should still block upgrade: %#v", state.OutboxMessages["outbox:final"])

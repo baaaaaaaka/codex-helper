@@ -996,8 +996,35 @@ func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {
 			Raw:      append([]byte(nil), bytes.TrimSpace(line)...),
 		}, true
 	default:
+		if event, ok := appServerParamsStreamEvent(msg, line); ok {
+			return event, true
+		}
 		return StreamEvent{}, false
 	}
+}
+
+func appServerParamsStreamEvent(msg appServerMessage, line []byte) (StreamEvent, bool) {
+	if len(bytes.TrimSpace(msg.Params)) == 0 {
+		return StreamEvent{}, false
+	}
+	if event, ok, err := ParseStreamEventJSONL(msg.Params); err == nil && ok {
+		event.Raw = append([]byte(nil), bytes.TrimSpace(line)...)
+		return event, true
+	}
+	if !strings.EqualFold(strings.TrimSpace(msg.Method), "event_msg") &&
+		!strings.EqualFold(strings.TrimSpace(msg.Method), "response_item") {
+		return StreamEvent{}, false
+	}
+	wrapped, err := json.Marshal(codexEvent{Type: msg.Method, Payload: msg.Params})
+	if err != nil {
+		return StreamEvent{}, false
+	}
+	event, ok, err := ParseStreamEventJSONL(wrapped)
+	if err != nil || !ok {
+		return StreamEvent{}, false
+	}
+	event.Raw = append([]byte(nil), bytes.TrimSpace(line)...)
+	return event, true
 }
 
 func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {

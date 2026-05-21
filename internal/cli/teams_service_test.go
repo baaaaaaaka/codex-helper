@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -365,6 +366,64 @@ func TestTeamsServiceStartRequiresAuthPreflight(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("service start should not reach supervisor when auth preflight fails: %#v", runner.calls)
+	}
+}
+
+func TestTeamsServiceRestartForceRecoversActiveOwnerBeforeRestart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st := seedRecoverableTeamsState(t)
+	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn:manual", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  runner,
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"restart", "--force"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service restart --force: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Force recovering Teams state before service restart",
+		"Cleared stale owners: 1",
+		"Recovered interrupted turns: 1",
+		"Restarted Teams service",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("restart --force output missing %q:\n%s", want, got)
+		}
+	}
+	if !teamsServiceCallSeen(runner.calls, "restart") {
+		t.Fatalf("restart --force did not restart service, calls=%#v", runner.calls)
+	}
+	if _, ok, err := st.ReadOwner(context.Background()); err != nil {
+		t.Fatalf("ReadOwner error: %v", err)
+	} else if ok {
+		t.Fatal("owner should be cleared after forced service restart")
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns["turn:manual"].Status; got != teamsstore.TurnStatusInterrupted {
+		t.Fatalf("turn status = %q, want interrupted", got)
 	}
 }
 
@@ -2064,6 +2123,98 @@ func TestTeamsServiceStartAndRestartActivatePendingWindowsHelperBeforeOldEntry(t
 				}
 			}
 		})
+	}
+}
+
+func TestTeamsServiceRestartForceRecoversBeforePendingWindowsActivation(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st := seedRecoverableTeamsState(t)
+	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn:manual", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.75_windows_amd64.exe.123")
+	prevFind := teamsUpdateFindPendingReplacementsForPlatform
+	prevProbe := teamsUpdateProbeBinaryVersion
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() {
+		teamsUpdateFindPendingReplacementsForPlatform = prevFind
+		teamsUpdateProbeBinaryVersion = prevProbe
+		teamsServiceStartDetached = prevDetached
+	})
+	teamsUpdateFindPendingReplacementsForPlatform = func(path string, goos string, goarch string) ([]update.PendingReplacement, error) {
+		if filepath.Clean(path) != filepath.Clean(exe) || goos != "windows" {
+			t.Fatalf("FindPendingReplacements path/goos = %q/%q, want %q/windows", path, goos, exe)
+		}
+		return []update.PendingReplacement{{Path: pending, Version: "0.1.0-rc.75", ModTime: time.Now()}}, nil
+	}
+	teamsUpdateProbeBinaryVersion = func(_ context.Context, path string, _ time.Duration) (update.BinaryVersion, error) {
+		switch filepath.Clean(path) {
+		case filepath.Clean(exe):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.68"}, nil
+		case filepath.Clean(pending):
+			return update.BinaryVersion{Path: path, Version: "0.1.0-rc.75"}, nil
+		default:
+			t.Fatalf("unexpected probe path %q", path)
+			return update.BinaryVersion{}, nil
+		}
+	}
+	var detachedName string
+	var detachedArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		detachedName = name
+		detachedArgs = append([]string(nil), args...)
+		return nil
+	}
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            exe,
+		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		runner:         runner,
+	})
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"teams", "service", "restart", "--force"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("restart --force command error: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Force recovering Teams state before service restart",
+		"Recovered interrupted turns: 1",
+		"Scheduled Teams service restart after activating pending helper v0.1.0-rc.75.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("restart --force output missing %q:\n%s", want, got)
+		}
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("pending restart --force should not start old scheduled task directly, calls=%#v", runner.calls)
+	}
+	if detachedName != "powershell.exe" {
+		t.Fatalf("detached name = %q, want powershell.exe", detachedName)
+	}
+	joined := strings.Join(detachedArgs, " ")
+	for _, want := range []string{pending, exe, "$want='0.1.0-rc.75'", "Move-Item -Force", "Start-ScheduledTask"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("activation command missing %q:\n%s", want, joined)
+		}
+	}
+	if _, ok, err := st.ReadOwner(context.Background()); err != nil {
+		t.Fatalf("ReadOwner error: %v", err)
+	} else if ok {
+		t.Fatal("owner should be cleared before pending activation")
 	}
 }
 

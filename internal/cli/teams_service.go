@@ -334,7 +334,8 @@ func newTeamsServiceStopCmd() *cobra.Command {
 }
 
 func newTeamsServiceRestartCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+	cmd := &cobra.Command{
 		Use:   "restart",
 		Short: "Restart the Teams bridge service",
 		Args:  cobra.NoArgs,
@@ -344,6 +345,14 @@ func newTeamsServiceRestartCmd() *cobra.Command {
 			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
+			}
+			if force {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Force recovering Teams state before service restart...")
+				summary, err := recoverTeamsStores(cmd.Context(), true, 0)
+				if err != nil {
+					return fmt.Errorf("force recover Teams state before service restart: %w", err)
+				}
+				printTeamsRecoverSummary(cmd.OutOrStdout(), summary)
 			}
 			if scheduled, err := schedulePendingTeamsServiceActivationBeforeStart(cmd.Context(), cmd.OutOrStdout(), "restart"); err != nil {
 				return err
@@ -361,6 +370,8 @@ func newTeamsServiceRestartCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, "Recover active Teams state before restarting; may interrupt running work")
+	return cmd
 }
 
 func schedulePendingTeamsServiceActivationBeforeStart(ctx context.Context, out io.Writer, action string) (bool, error) {

@@ -116,6 +116,7 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp beacon profile create <name> --provider slurm",
 		"cxp beacon switch-profile <name> --session <session-id> --after-current-turn",
 		"cxp teams service bootstrap",
+		"cxp teams service restart --force",
 		"helper update prerelease",
 		"cxp skills install-builtin",
 		"cxp history tui",

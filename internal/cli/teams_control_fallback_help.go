@@ -60,6 +60,7 @@ func teamsControlFallbackHelpContext() string {
 		"- `cxp teams control --print`: print the bound Teams control chat.",
 		"- `cxp teams service bootstrap`: install or repair the background service/watchdog.",
 		"- `cxp teams service status`: show OS service/task state.",
+		"- `cxp teams service restart --force`: recover local active state, then force a service restart from a terminal.",
 		"- `cxp teams service doctor`: diagnose service backend readiness.",
 		"- `cxp teams auth full`: refresh full Teams auth locally.",
 		"- `cxp teams auth full-status`: inspect auth cache expiry without printing tokens.",

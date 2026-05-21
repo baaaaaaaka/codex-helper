@@ -1044,97 +1044,117 @@ func newTeamsRecoverCmd() *cobra.Command {
 		Short: "Mark ambiguous local Teams turns as interrupted",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			paths, err := existingTeamsStorePaths()
+			summary, err := recoverTeamsStores(cmd.Context(), force, staleAfter)
 			if err != nil {
 				return err
 			}
-			if len(paths) == 0 {
-				path, err := teamsStorePath()
-				if err != nil {
-					return err
-				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams state unavailable: %s\n", path)
-				return nil
-			}
-			var recovered []string
-			var supersededOutbox []string
-			var preservedOutbox []string
-			var clearedOwners []string
-			var remainingBlockers []string
-			for _, path := range paths {
-				st, err := teamsstore.Open(path)
-				if err != nil {
-					return err
-				}
-				owner, ok, err := st.ReadOwner(cmd.Context())
-				if err != nil {
-					return err
-				}
-				if ok && !force && !teamsstore.IsStale(owner, staleAfter, time.Now()) {
-					return fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s active_session=%s active_turn=%s; run `teams drain` first or use `teams recover --force` if the process is gone", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID)
-				}
-				if ok && (force || teamsstore.IsStale(owner, staleAfter, time.Now())) {
-					if err := st.ClearOwner(cmd.Context()); err != nil {
-						return err
-					}
-					clearedOwners = append(clearedOwners, fmt.Sprintf("%s pid=%d host=%s active_session=%s active_turn=%s", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID))
-				}
-				report, err := st.Recover(cmd.Context())
-				if err != nil {
-					return err
-				}
-				for _, id := range report.InterruptedTurnIDs {
-					recovered = append(recovered, path+" "+id)
-				}
-				for _, id := range report.SupersededOutboxIDs {
-					supersededOutbox = append(supersededOutbox, path+" "+id)
-				}
-				for _, id := range report.PreservedOutboxBlockerIDs {
-					preservedOutbox = append(preservedOutbox, path+" "+id)
-				}
-				state, err := st.Load(cmd.Context())
-				if err != nil {
-					return err
-				}
-				if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
-					remainingBlockers = append(remainingBlockers, path+" "+teamsUpgradeBlockerSummary(blockers))
-				}
-			}
-			sort.Strings(clearedOwners)
-			sort.Strings(recovered)
-			sort.Strings(supersededOutbox)
-			sort.Strings(preservedOutbox)
-			sort.Strings(remainingBlockers)
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Cleared stale owners: %d\n", len(clearedOwners))
-			for _, id := range clearedOwners {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
-			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Recovered interrupted turns: %d\n", len(recovered))
-			for _, id := range recovered {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
-			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Superseded transient outbox: %d\n", len(supersededOutbox))
-			for _, id := range supersededOutbox {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
-			}
-			if len(preservedOutbox) > 0 {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Preserved protected outbox: %d\n", len(preservedOutbox))
-				for _, id := range preservedOutbox {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
-				}
-			}
-			if len(remainingBlockers) > 0 {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Remaining upgrade blockers: %d\n", len(remainingBlockers))
-				for _, id := range remainingBlockers {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", id)
-				}
-			}
+			printTeamsRecoverSummary(cmd.OutOrStdout(), summary)
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Recover even when the Teams bridge owner still appears active")
 	cmd.Flags().DurationVar(&staleAfter, "stale-after", 2*time.Minute, "Owner heartbeat age after which recover may proceed without --force")
 	return cmd
+}
+
+type teamsRecoverSummary struct {
+	StateUnavailable  string
+	ClearedOwners     []string
+	RecoveredTurns    []string
+	SupersededOutbox  []string
+	PreservedOutbox   []string
+	RemainingBlockers []string
+}
+
+func recoverTeamsStores(ctx context.Context, force bool, staleAfter time.Duration) (teamsRecoverSummary, error) {
+	paths, err := existingTeamsStorePaths()
+	if err != nil {
+		return teamsRecoverSummary{}, err
+	}
+	if len(paths) == 0 {
+		path, err := teamsStorePath()
+		if err != nil {
+			return teamsRecoverSummary{}, err
+		}
+		return teamsRecoverSummary{StateUnavailable: path}, nil
+	}
+	var summary teamsRecoverSummary
+	for _, path := range paths {
+		st, err := teamsstore.Open(path)
+		if err != nil {
+			return teamsRecoverSummary{}, err
+		}
+		owner, ok, err := st.ReadOwner(ctx)
+		if err != nil {
+			return teamsRecoverSummary{}, err
+		}
+		if ok && !force && !teamsstore.IsStale(owner, staleAfter, time.Now()) {
+			return teamsRecoverSummary{}, fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s active_session=%s active_turn=%s; run `teams drain` first or use `teams recover --force` if the process is gone", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID)
+		}
+		if ok && (force || teamsstore.IsStale(owner, staleAfter, time.Now())) {
+			if err := st.ClearOwner(ctx); err != nil {
+				return teamsRecoverSummary{}, err
+			}
+			summary.ClearedOwners = append(summary.ClearedOwners, fmt.Sprintf("%s pid=%d host=%s active_session=%s active_turn=%s", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID))
+		}
+		report, err := st.Recover(ctx)
+		if err != nil {
+			return teamsRecoverSummary{}, err
+		}
+		for _, id := range report.InterruptedTurnIDs {
+			summary.RecoveredTurns = append(summary.RecoveredTurns, path+" "+id)
+		}
+		for _, id := range report.SupersededOutboxIDs {
+			summary.SupersededOutbox = append(summary.SupersededOutbox, path+" "+id)
+		}
+		for _, id := range report.PreservedOutboxBlockerIDs {
+			summary.PreservedOutbox = append(summary.PreservedOutbox, path+" "+id)
+		}
+		state, err := st.Load(ctx)
+		if err != nil {
+			return teamsRecoverSummary{}, err
+		}
+		if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
+			summary.RemainingBlockers = append(summary.RemainingBlockers, path+" "+teamsUpgradeBlockerSummary(blockers))
+		}
+	}
+	sort.Strings(summary.ClearedOwners)
+	sort.Strings(summary.RecoveredTurns)
+	sort.Strings(summary.SupersededOutbox)
+	sort.Strings(summary.PreservedOutbox)
+	sort.Strings(summary.RemainingBlockers)
+	return summary, nil
+}
+
+func printTeamsRecoverSummary(out io.Writer, summary teamsRecoverSummary) {
+	if strings.TrimSpace(summary.StateUnavailable) != "" {
+		_, _ = fmt.Fprintf(out, "Teams state unavailable: %s\n", summary.StateUnavailable)
+		return
+	}
+	_, _ = fmt.Fprintf(out, "Cleared stale owners: %d\n", len(summary.ClearedOwners))
+	for _, id := range summary.ClearedOwners {
+		_, _ = fmt.Fprintf(out, "- %s\n", id)
+	}
+	_, _ = fmt.Fprintf(out, "Recovered interrupted turns: %d\n", len(summary.RecoveredTurns))
+	for _, id := range summary.RecoveredTurns {
+		_, _ = fmt.Fprintf(out, "- %s\n", id)
+	}
+	_, _ = fmt.Fprintf(out, "Superseded transient outbox: %d\n", len(summary.SupersededOutbox))
+	for _, id := range summary.SupersededOutbox {
+		_, _ = fmt.Fprintf(out, "- %s\n", id)
+	}
+	if len(summary.PreservedOutbox) > 0 {
+		_, _ = fmt.Fprintf(out, "Preserved protected outbox: %d\n", len(summary.PreservedOutbox))
+		for _, id := range summary.PreservedOutbox {
+			_, _ = fmt.Fprintf(out, "- %s\n", id)
+		}
+	}
+	if len(summary.RemainingBlockers) > 0 {
+		_, _ = fmt.Fprintf(out, "Remaining upgrade blockers: %d\n", len(summary.RemainingBlockers))
+		for _, id := range summary.RemainingBlockers {
+			_, _ = fmt.Fprintf(out, "- %s\n", id)
+		}
+	}
 }
 
 func newTeamsAuthStatusCmd() *cobra.Command {

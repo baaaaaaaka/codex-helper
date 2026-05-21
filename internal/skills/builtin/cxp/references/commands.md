@@ -100,6 +100,7 @@ Scheduler-capable CI can opt in to the real adapter test with `CODEX_HELPER_BEAC
 - `cxp teams control --print`: print the bound Teams control chat.
 - `cxp teams service bootstrap`: install or repair the background service/watchdog.
 - `cxp teams service status`: inspect OS service/task state.
+- `cxp teams service restart --force`: recover active local Teams state, mark ambiguous turns interrupted, then restart or activate the pending helper. Use only from a local terminal when you accept interrupting active work.
 - `cxp teams service doctor`: diagnose service backend readiness.
 - `cxp teams auth full`: refresh full Teams auth locally.
 - `cxp teams auth full-status`: inspect auth cache expiry without printing tokens.
