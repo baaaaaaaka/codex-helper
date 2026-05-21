@@ -77,7 +77,7 @@ func teamsControlFallbackHelpContext() string {
 		"- `skills` / `helper skills list`: list installed skill subscriptions.",
 		"- `helper skills add <github/gitlab/git-url>`: install skills from a git source and keep them updated.",
 		"- `helper skills sync [name]`: sync one skill source, or all sources when no name is given.",
-		"- `helper skills push [name]`: push local skill edits with per-change confirmation.",
+		"- `helper skills push [name]`: review local skill edits; then use `helper skills push confirm` to push from Teams.",
 		"- `helper webhook setup`: show Teams Workflow webhook setup.",
 		"- `helper update now`: update to the latest stable helper release.",
 		"- `helper update prerelease`: update to the newest eligible release or prerelease.",

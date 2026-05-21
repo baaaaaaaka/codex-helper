@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -290,9 +289,9 @@ func TestDirectPushRefSpecRequiresExistingBranch(t *testing.T) {
 	ctx := context.Background()
 	runner := directRefGitRunner{heads: map[string]bool{"main": true, "feature/work": true}}
 	source := skills.Source{Name: "acme", RemoteURL: "repo", Ref: "main"}
-	refspec, err := directPushRefSpec(ctx, runner, source)
+	refspec, err := skills.DirectPushRefSpec(ctx, runner, source)
 	if err != nil {
-		t.Fatalf("directPushRefSpec main: %v", err)
+		t.Fatalf("DirectPushRefSpec main: %v", err)
 	}
 	if refspec != "HEAD:refs/heads/main" {
 		t.Fatalf("refspec = %q", refspec)
@@ -300,8 +299,8 @@ func TestDirectPushRefSpecRequiresExistingBranch(t *testing.T) {
 
 	for _, ref := range []string{"", "HEAD", "refs/tags/v1.0.0", "0123456789abcdef0123456789abcdef01234567", "-bad", "missing"} {
 		source.Ref = ref
-		if _, err := directPushRefSpec(ctx, runner, source); err == nil {
-			t.Fatalf("directPushRefSpec(%q) succeeded, want error", ref)
+		if _, err := skills.DirectPushRefSpec(ctx, runner, source); err == nil {
+			t.Fatalf("DirectPushRefSpec(%q) succeeded, want error", ref)
 		}
 	}
 }
@@ -381,70 +380,6 @@ func TestRunSkillsTextMenuAddListSyncAndBackCombo(t *testing.T) {
 	}
 	if len(matches) != 1 {
 		t.Fatalf("menu-installed skill matches = %v, want 1", matches)
-	}
-}
-
-func TestApplySkillChangeToRepoPreservesExecutableMode(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows git worktrees do not reliably preserve executable bits")
-	}
-	repo := t.TempDir()
-	target := t.TempDir()
-	writeCLIFile(t, filepath.Join(target, "scripts", "check.sh"), "#!/bin/sh\necho changed\n", 0o755)
-	change := skills.LocalChange{
-		Kind:       skills.ChangeModified,
-		RelPath:    "scripts/check.sh",
-		SourcePath: "skills/review/scripts/check.sh",
-		NewSHA256:  "",
-		Skill: skills.InstalledSkill{
-			TargetPath: target,
-			Files: []skills.FileManifest{{
-				RelPath: "scripts/check.sh",
-				Mode:    0o755,
-			}},
-		},
-	}
-	if err := applySkillChangeToRepo(change, repo); err != nil {
-		t.Fatalf("applySkillChangeToRepo: %v", err)
-	}
-	info, err := os.Stat(filepath.Join(repo, "skills", "review", "scripts", "check.sh"))
-	if err != nil {
-		t.Fatalf("stat applied file: %v", err)
-	}
-	if info.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("applied mode = %v, want executable bit", info.Mode().Perm())
-	}
-}
-
-func TestApplySkillChangeToRepoUsesReviewedLocalMode(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows git worktrees do not reliably preserve executable bits")
-	}
-	repo := t.TempDir()
-	target := t.TempDir()
-	writeCLIFile(t, filepath.Join(target, "scripts", "check.sh"), "#!/bin/sh\necho changed\n", 0o755)
-	change := skills.LocalChange{
-		Kind:       skills.ChangeModified,
-		RelPath:    "scripts/check.sh",
-		SourcePath: "skills/review/scripts/check.sh",
-		NewMode:    0o755,
-		Skill: skills.InstalledSkill{
-			TargetPath: target,
-			Files: []skills.FileManifest{{
-				RelPath: "scripts/check.sh",
-				Mode:    0o644,
-			}},
-		},
-	}
-	if err := applySkillChangeToRepo(change, repo); err != nil {
-		t.Fatalf("applySkillChangeToRepo: %v", err)
-	}
-	info, err := os.Stat(filepath.Join(repo, "skills", "review", "scripts", "check.sh"))
-	if err != nil {
-		t.Fatalf("stat applied file: %v", err)
-	}
-	if info.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("applied mode = %v, want reviewed executable bit", info.Mode().Perm())
 	}
 }
 

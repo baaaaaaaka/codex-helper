@@ -2629,7 +2629,7 @@ func controlAdvancedHelpText() string {
 		"- `helper webhook setup` - show a guided Workflow webhook setup flow",
 		"- `helper webhook <url>` - enable Workflow notification cards with a Teams Workflow webhook URL",
 		"- `helper webhook off` - disable Workflow notification cards",
-		"- `helper skills list` / `helper skills add <url>` / `helper skills sync [name]` / `helper skills push [name]` - inspect or sync skill subscriptions",
+		"- `helper skills list` / `helper skills add <url>` / `helper skills sync [name]` / `helper skills push [name]` / `helper skills push confirm` - inspect, sync, or push skill subscriptions",
 		"",
 		"Beacon commands:",
 		"- `beacon list` - list beacon profiles and machines",
@@ -2674,7 +2674,7 @@ func sessionHelpText() string {
 		"`beacon status` - show this Work chat execution target",
 		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
 		"`helper publish-history` - import a paused local Codex history backlog",
-		"`helper skills list` / `helper skills add <url>` / `helper skills push` - inspect skill subscriptions and local skill edits",
+		"`helper skills list` / `helper skills add <url>` / `helper skills push` / `helper skills push confirm` - inspect and push skill subscriptions",
 		"",
 		"Send `helper help advanced` for retry, cancel, and rename commands.",
 	}, "\n")

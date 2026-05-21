@@ -98,7 +98,7 @@ Control chat commands the helper understands:
 - skills or helper skills list: list installed skill subscriptions
 - helper skills add <github/gitlab/git-url>: install skills from a git source and keep them updated
 - helper skills sync [name]: sync one skill source, or all sources when no name is given
-- helper skills push [name]: push local skill edits with per-change confirmation
+- helper skills push [name], then helper skills push confirm: review and push local skill edits from Teams
 Desktop forms like !continue 1 and codex continue 1 are also accepted. Legacy slash commands still work if Teams sends them.
 
 Work chat helper commands:

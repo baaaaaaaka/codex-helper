@@ -3,12 +3,9 @@ package cli
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -619,162 +616,17 @@ func printSkillChange(out io.Writer, change skills.LocalChange) {
 }
 
 func pushConfirmedSkillChanges(ctx context.Context, mgr *skills.Manager, source skills.Source, changes []skills.LocalChange, direct bool, in io.Reader, out io.Writer) error {
-	baseCommit := changes[0].Commit
-	if baseCommit == "" {
-		return fmt.Errorf("source %s has no base commit in its skill manifest", source.Name)
-	}
-	for _, change := range changes[1:] {
-		if change.Commit != baseCommit {
-			return fmt.Errorf("source %s has changes from multiple base commits; sync or push one skill at a time", source.Name)
-		}
-	}
-	tempDir, err := os.MkdirTemp("", "cxp-skills-push-*")
-	if err != nil {
-		return fmt.Errorf("create push temp dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tempDir) }()
-	repoDir := filepath.Join(tempDir, "repo")
-	git := mgr.Git
-	if _, err := git.Run(ctx, "", nil, "clone", "--no-checkout", source.RemoteURL, repoDir); err != nil {
-		return skills.AnnotateGitAuthError(source, err)
-	}
-	_, _ = git.Run(ctx, repoDir, nil, "config", "core.hooksPath", "NUL")
-	if _, err := git.Run(ctx, repoDir, nil, "checkout", "--detach", baseCommit); err != nil {
-		return err
-	}
-	var stagePaths []string
-	for _, change := range changes {
-		if err := applySkillChangeToRepo(change, repoDir); err != nil {
-			return err
-		}
-		stagePaths = append(stagePaths, change.SourcePath)
-	}
-	args := append([]string{"add", "-A", "--"}, stagePaths...)
-	if _, err := git.Run(ctx, repoDir, nil, args...); err != nil {
-		return err
-	}
-	if _, err := git.Run(ctx, repoDir, nil, "diff", "--cached", "--quiet"); err == nil {
-		_, _ = fmt.Fprintf(out, "No staged changes for %s\n", source.Name)
-		return nil
-	}
-	summary, _ := git.Run(ctx, repoDir, nil, "diff", "--cached", "--stat")
-	_, _ = fmt.Fprintf(out, "\nFinal staged diff for %s:\n%s\n", source.Name, string(summary))
-	ok, err := promptSkillYesNo(in, out, "Create commit and push these confirmed changes?", false)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		_, _ = fmt.Fprintln(out, "Push cancelled.")
-		return nil
-	}
-	commitMessage := "Update Codex skills from cxp"
-	if _, err := git.Run(ctx, repoDir, nil,
-		"-c", "user.name=codex-helper",
-		"-c", "user.email=codex-helper@example.invalid",
-		"-c", "commit.gpgsign=false",
-		"commit", "-m", commitMessage,
-	); err != nil {
-		return err
-	}
-	branch := reviewBranchName(source, baseCommit)
-	refspec := "HEAD:refs/heads/" + branch
-	if direct {
-		refspec, err = directPushRefSpec(ctx, git, source)
-		if err != nil {
-			return err
-		}
-	}
-	_, _ = fmt.Fprintf(out, "Remote: %s\nRef: %s\n", skills.RedactURLSecrets(source.RemoteURL), refspec)
-	ok, err = promptSkillYesNo(in, out, "Push now?", false)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		_, _ = fmt.Fprintln(out, "Push cancelled.")
-		return nil
-	}
-	if _, err := git.Run(ctx, repoDir, nil, "push", "origin", refspec); err != nil {
-		return skills.AnnotateGitAuthError(source, err)
-	}
-	_, _ = fmt.Fprintf(out, "Pushed %s\n", refspec)
-	return nil
-}
-
-func directPushRefSpec(ctx context.Context, git skills.GitRunner, source skills.Source) (string, error) {
-	ref := strings.TrimSpace(source.Ref)
-	if ref == "" || strings.EqualFold(ref, "HEAD") {
-		return "", fmt.Errorf("--direct requires the subscription to use an explicit branch ref")
-	}
-	if strings.HasPrefix(ref, "refs/tags/") || looksLikeFullSHA(ref) {
-		return "", fmt.Errorf("--direct can only push to an existing branch, got %q", ref)
-	}
-	branch := strings.TrimPrefix(ref, "refs/heads/")
-	if strings.HasPrefix(branch, "-") {
-		return "", fmt.Errorf("--direct branch ref %q is not safe", ref)
-	}
-	if _, err := git.Run(ctx, "", nil, "check-ref-format", "--branch", branch); err != nil {
-		return "", fmt.Errorf("--direct branch ref %q is not valid: %w", ref, err)
-	}
-	out, err := git.Run(ctx, "", nil, "ls-remote", "--heads", source.RemoteURL, branch)
-	if err != nil {
-		return "", skills.AnnotateGitAuthError(source, err)
-	}
-	if strings.TrimSpace(string(out)) == "" {
-		return "", fmt.Errorf("--direct branch %q was not found on the remote", branch)
-	}
-	return "HEAD:refs/heads/" + branch, nil
-}
-
-func applySkillChangeToRepo(change skills.LocalChange, repoDir string) error {
-	target := filepath.Join(repoDir, filepath.FromSlash(change.SourcePath))
-	cleanRepo, err := filepath.Abs(repoDir)
-	if err != nil {
-		return err
-	}
-	cleanTarget, err := filepath.Abs(target)
-	if err != nil {
-		return err
-	}
-	if cleanTarget != cleanRepo && !strings.HasPrefix(cleanTarget, cleanRepo+string(filepath.Separator)) {
-		return fmt.Errorf("change path escapes repository: %s", change.SourcePath)
-	}
-	switch change.Kind {
-	case skills.ChangeDeleted:
-		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("delete %s: %w", change.SourcePath, err)
-		}
-	default:
-		data, err := os.ReadFile(filepath.Join(change.Skill.TargetPath, filepath.FromSlash(change.RelPath)))
-		if err != nil {
-			return fmt.Errorf("read local skill file %s: %w", change.RelPath, err)
-		}
-		sum := sha256.Sum256(data)
-		got := hex.EncodeToString(sum[:])
-		if change.NewSHA256 != "" && got != change.NewSHA256 {
-			return fmt.Errorf("%s changed during review; restart push", change.RelPath)
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return fmt.Errorf("create repo dir: %w", err)
-		}
-		mode := skillChangeFileMode(change)
-		if err := os.WriteFile(target, data, mode); err != nil {
-			return fmt.Errorf("write repo file %s: %w", change.SourcePath, err)
-		}
-		_ = os.Chmod(target, mode)
-	}
-	return nil
-}
-
-func skillChangeFileMode(change skills.LocalChange) fs.FileMode {
-	if change.NewMode != 0 {
-		return fs.FileMode(change.NewMode)
-	}
-	for _, file := range change.Skill.Files {
-		if file.RelPath == change.RelPath && file.Mode != 0 {
-			return fs.FileMode(file.Mode)
-		}
-	}
-	return 0o644
+	_, err := skills.PushConfirmedLocalChanges(ctx, mgr, source, changes, skills.PushLocalChangesOptions{
+		Direct: direct,
+		Out:    out,
+		ConfirmCommit: func(skills.Source, string) (bool, error) {
+			return promptSkillYesNo(in, out, "Create commit and push these confirmed changes?", false)
+		},
+		ConfirmPush: func(skills.Source, string) (bool, error) {
+			return promptSkillYesNo(in, out, "Push now?", false)
+		},
+	})
+	return err
 }
 
 func skillModeString(mode uint32) string {
@@ -782,31 +634,6 @@ func skillModeString(mode uint32) string {
 		return "unknown"
 	}
 	return fmt.Sprintf("%06o", mode)
-}
-
-func reviewBranchName(source skills.Source, baseCommit string) string {
-	short := shortSHA(baseCommit)
-	name := strings.Trim(source.Name, ".-_")
-	if name == "" {
-		name = "skills"
-	}
-	return "skill/" + name + "-" + time.Now().Format("20060102-150405") + "-" + short
-}
-
-func looksLikeFullSHA(v string) bool {
-	if len(v) != 40 {
-		return false
-	}
-	for _, r := range v {
-		switch {
-		case r >= '0' && r <= '9':
-		case r >= 'a' && r <= 'f':
-		case r >= 'A' && r <= 'F':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 func shortSHA(v string) string {

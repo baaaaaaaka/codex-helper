@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/skills"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
@@ -81,10 +83,77 @@ func TestHandleSkillsCommandQueuesListPushReviewAndLocalOnlyRefusal(t *testing.T
 		t.Fatalf("load teams state: %v", err)
 	}
 	body := joinedOutboxBodies(state.OutboxMessages)
-	for _, want := range []string{"Skills", "acme", "Skills Push Review", "cxp skills push", "Use local"} {
+	for _, want := range []string{"Skills", "acme", "Skills Push Review", "helper skills push confirm", "review target", "Use local"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("outbox missing %q:\n%s", want, body)
 		}
+	}
+	if _, ok := state.SkillPushReviews[teamsSkillPushReviewKey("chat-1")]; !ok {
+		t.Fatalf("pending skill push review was not recorded: %#v", state.SkillPushReviews)
+	}
+}
+
+func TestHandleSkillsCommandPushConfirmPushesReviewBranch(t *testing.T) {
+	repo := initTeamsSkillRepo(t)
+	mgr := newTeamsSkillsTestManager(t)
+	ctx := context.Background()
+	_, result, err := mgr.Add(ctx, repo, skills.AddOptions{Name: "acme", Ref: "HEAD", Path: "skills/review"})
+	if err != nil {
+		t.Fatalf("add source: %v", err)
+	}
+	if len(result.Installed) != 1 {
+		t.Fatalf("installed len = %d, want 1", len(result.Installed))
+	}
+	if err := os.WriteFile(filepath.Join(result.Installed[0].TargetPath, "SKILL.md"), []byte("---\nname: review\ndescription: Teams updated\n---\nfrom teams\n"), 0o644); err != nil {
+		t.Fatalf("modify skill: %v", err)
+	}
+
+	prev := newTeamsSkillsManagerForCommand
+	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
+
+	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
+	if err != nil {
+		t.Fatalf("open teams store: %v", err)
+	}
+	graphServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected graph request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m1"}`))
+	}))
+	t.Cleanup(graphServer.Close)
+	bridge := &Bridge{
+		graph:   newTestGraphClient(&fakeGraphAuth{token: "token"}, graphServer, nil),
+		store:   store,
+		scope:   teamstore.ScopeIdentity{ID: "scope"},
+		machine: teamstore.MachineRecord{ID: "machine"},
+	}
+	if err := bridge.handleSkillsCommand(ctx, "chat-1", "push"); err != nil {
+		t.Fatalf("handle skills push review: %v", err)
+	}
+	if err := bridge.handleSkillsCommand(ctx, "chat-1", "push confirm"); err != nil {
+		t.Fatalf("handle skills push confirm: %v", err)
+	}
+
+	branch := singleTeamsReviewBranch(t, repo)
+	gotSkill := teamsGitRun(t, repo, "show", branch+":skills/review/SKILL.md")
+	if !strings.Contains(gotSkill, "from teams") {
+		t.Fatalf("review branch SKILL.md was not updated:\n%s", gotSkill)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load teams state: %v", err)
+	}
+	body := joinedOutboxBodies(state.OutboxMessages)
+	for _, want := range []string{"Skills Push Review", "Skills Push", "pushed `HEAD:refs/heads/skill/"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("push confirm response missing %q:\n%s", want, body)
+		}
+	}
+	if _, ok := state.SkillPushReviews[teamsSkillPushReviewKey("chat-1")]; ok {
+		t.Fatalf("pending skill push review was not cleared: %#v", state.SkillPushReviews)
 	}
 }
 
@@ -302,14 +371,23 @@ func TestNewTeamsSkillsManagerUsesCodexProxyStoreAndCodexEnv(t *testing.T) {
 	}
 }
 
-func TestFormatTeamsSkillPushReviewKeepsPushInLocalTerminal(t *testing.T) {
-	body := formatTeamsSkillPushReview([]skills.LocalChange{{
-		Kind:       skills.ChangeModified,
-		SourcePath: "skills/review/SKILL.md",
-		Source:     skills.Source{Name: "acme"},
-	}})
+func TestFormatTeamsSkillPushReviewOffersTeamsConfirm(t *testing.T) {
+	body := formatTeamsSkillPushReview(teamstore.SkillPushReview{
+		Sources: []teamstore.SkillPushReviewSource{{
+			SourceName:    "acme",
+			RemoteURL:     "https://github.com/acme/skills.git",
+			Ref:           "main",
+			ReviewRefSpec: "HEAD:refs/heads/skill/acme-20260521-010203-0123456789ab",
+			Changes: []teamstore.SkillPushReviewChange{{
+				Kind:       string(skills.ChangeModified),
+				SourcePath: "skills/review/SKILL.md",
+			}},
+		}},
+	})
 	for _, want := range []string{
-		"Run `cxp skills push` locally.",
+		"helper skills push confirm",
+		"helper skills push --direct confirm",
+		"review target",
 		"MODIFIED",
 		"skills/review/SKILL.md",
 	} {
@@ -317,10 +395,58 @@ func TestFormatTeamsSkillPushReviewKeepsPushInLocalTerminal(t *testing.T) {
 			t.Fatalf("push review missing %q:\n%s", want, body)
 		}
 	}
-	for _, forbidden := range []string{"Push now?", "helper skills push --confirm", "pushed"} {
+	for _, forbidden := range []string{"Run `cxp skills push` locally.", "Push now?", "helper skills push --confirm", "pushed"} {
 		if strings.Contains(strings.ToLower(body), strings.ToLower(forbidden)) {
-			t.Fatalf("push review should not offer Teams push action %q:\n%s", forbidden, body)
+			t.Fatalf("push review contains forbidden text %q:\n%s", forbidden, body)
 		}
+	}
+}
+
+func TestParseTeamsSkillPushArgsRejectsNamedConfirm(t *testing.T) {
+	for _, input := range []string{"acme confirm", "confirm acme", "--direct acme confirm"} {
+		if _, err := parseTeamsSkillPushArgs(input); err == nil {
+			t.Fatalf("parseTeamsSkillPushArgs(%q) succeeded, want usage error", input)
+		}
+	}
+}
+
+func TestFilterTeamsSkillPushReviewChangesIgnoresUnreviewedSources(t *testing.T) {
+	now := time.Date(2026, 5, 21, 1, 2, 3, 0, time.UTC)
+	sourceA := skills.Source{ID: "source-a", Name: "alpha", RemoteURL: "repo-a"}
+	sourceB := skills.Source{ID: "source-b", Name: "bravo", RemoteURL: "repo-b"}
+	changeA := teamsSkillPushTestChange(sourceA, "skills/alpha/SKILL.md")
+	changeB := teamsSkillPushTestChange(sourceB, "skills/bravo/SKILL.md")
+	review, err := buildTeamsSkillPushReview("chat-1", "", false, []skills.LocalChange{changeB}, now)
+	if err != nil {
+		t.Fatalf("buildTeamsSkillPushReview: %v", err)
+	}
+
+	filtered := filterTeamsSkillPushReviewChanges(review, []skills.LocalChange{changeA, changeB})
+	if len(filtered) != 1 || filtered[0].Source.ID != sourceB.ID {
+		t.Fatalf("filtered changes = %#v, want only source-b", filtered)
+	}
+	if err := ensureTeamsSkillPushReviewStillMatches(review, filtered); err != nil {
+		t.Fatalf("review should still match filtered source changes: %v", err)
+	}
+}
+
+func teamsSkillPushTestChange(source skills.Source, sourcePath string) skills.LocalChange {
+	return skills.LocalChange{
+		Source: source,
+		Skill: skills.InstalledSkill{
+			Name:       "review",
+			ExportName: source.Name + "__review",
+			SourcePath: strings.TrimSuffix(sourcePath, "/SKILL.md"),
+		},
+		Kind:       skills.ChangeModified,
+		RelPath:    "SKILL.md",
+		SourcePath: sourcePath,
+		Commit:     "0123456789abcdef0123456789abcdef01234567",
+		OldSHA256:  "old",
+		NewSHA256:  "new",
+		OldMode:    0o644,
+		NewMode:    0o644,
+		Size:       10,
 	}
 }
 
@@ -373,6 +499,58 @@ func newTeamsSkillsTestManager(t *testing.T) *skills.Manager {
 		t.Fatalf("new skills manager: %v", err)
 	}
 	return mgr
+}
+
+func initTeamsSkillRepo(t *testing.T) string {
+	t.Helper()
+	requireTeamsGit(t)
+	repo := t.TempDir()
+	teamsGitRun(t, repo, "init")
+	teamsGitRun(t, repo, "config", "user.name", "Skill Test")
+	teamsGitRun(t, repo, "config", "user.email", "skill-test@example.invalid")
+	writeTeamsTestFile(t, filepath.Join(repo, "skills", "review", "SKILL.md"), "---\nname: review\ndescription: Review code\n---\nbody\n", 0o644)
+	writeTeamsTestFile(t, filepath.Join(repo, "skills", "review", "scripts", "check.sh"), "#!/bin/sh\necho ok\n", 0o755)
+	teamsGitRun(t, repo, "add", "-A")
+	teamsGitRun(t, repo, "commit", "-m", "initial skill")
+	return repo
+}
+
+func singleTeamsReviewBranch(t *testing.T, repo string) string {
+	t.Helper()
+	out := teamsGitRun(t, repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/skill")
+	lines := strings.Fields(out)
+	if len(lines) != 1 {
+		t.Fatalf("review branches = %v, want 1", lines)
+	}
+	return lines[0]
+}
+
+func teamsGitRun(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repo
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, string(out))
+	}
+	return string(out)
+}
+
+func requireTeamsGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+}
+
+func writeTeamsTestFile(t *testing.T, path string, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }
 
 func writeTeamsSkillExport(t *testing.T, target string, source skills.Source) {

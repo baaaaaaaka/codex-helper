@@ -137,6 +137,7 @@ type State struct {
 	ChatRateLimits       map[string]ChatRateLimitState       `json:"chat_rate_limits,omitempty"`
 	ArtifactRecords      map[string]ArtifactRecord           `json:"artifact_records,omitempty"`
 	Notifications        map[string]NotificationRecord       `json:"notifications,omitempty"`
+	SkillPushReviews     map[string]SkillPushReview          `json:"skill_push_reviews,omitempty"`
 	Workflow             WorkflowNotificationConfig          `json:"workflow,omitempty"`
 	AutoUpdate           AutoUpdateState                     `json:"auto_update,omitempty"`
 }
@@ -250,6 +251,38 @@ type ControlChatBinding struct {
 	TeamsChatTopic string    `json:"teams_chat_topic,omitempty"`
 	BoundAt        time.Time `json:"bound_at,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
+}
+
+type SkillPushReview struct {
+	ID          string                  `json:"id"`
+	TeamsChatID string                  `json:"teams_chat_id"`
+	Name        string                  `json:"name,omitempty"`
+	Direct      bool                    `json:"direct,omitempty"`
+	CreatedAt   time.Time               `json:"created_at,omitempty"`
+	ExpiresAt   time.Time               `json:"expires_at,omitempty"`
+	Sources     []SkillPushReviewSource `json:"sources,omitempty"`
+}
+
+type SkillPushReviewSource struct {
+	SourceID      string                  `json:"source_id"`
+	SourceName    string                  `json:"source_name"`
+	RemoteURL     string                  `json:"remote_url"`
+	Ref           string                  `json:"ref,omitempty"`
+	BaseCommit    string                  `json:"base_commit"`
+	ReviewRefSpec string                  `json:"review_refspec"`
+	Changes       []SkillPushReviewChange `json:"changes,omitempty"`
+}
+
+type SkillPushReviewChange struct {
+	Kind       string `json:"kind"`
+	RelPath    string `json:"rel_path"`
+	SourcePath string `json:"source_path"`
+	Commit     string `json:"commit"`
+	OldSHA256  string `json:"old_sha256,omitempty"`
+	NewSHA256  string `json:"new_sha256,omitempty"`
+	OldMode    uint32 `json:"old_mode,omitempty"`
+	NewMode    uint32 `json:"new_mode,omitempty"`
+	Size       int64  `json:"size,omitempty"`
 }
 
 type WorkspaceRecord struct {
@@ -3283,6 +3316,7 @@ func newState() State {
 		ChatRateLimits:       make(map[string]ChatRateLimitState),
 		ArtifactRecords:      make(map[string]ArtifactRecord),
 		Notifications:        make(map[string]NotificationRecord),
+		SkillPushReviews:     make(map[string]SkillPushReview),
 	}
 	return state
 }
@@ -3353,6 +3387,9 @@ func (s *State) ensure(now time.Time) {
 	}
 	if s.Notifications == nil {
 		s.Notifications = make(map[string]NotificationRecord)
+	}
+	if s.SkillPushReviews == nil {
+		s.SkillPushReviews = make(map[string]SkillPushReview)
 	}
 }
 
