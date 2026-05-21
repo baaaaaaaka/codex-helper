@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-05-21T13:09:03Z",
+  "generated_at": "2026-05-21T18:48:54Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.2-rc.1_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.2-rc.1_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.2-rc.1_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.2-rc.1_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.2-rc.1",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-05-21T18:47:39Z",
+      "tag_name": "v0.1.2-rc.1",
+      "version": "0.1.2-rc.1"
+    },
     {
       "assets": [
         {
@@ -3933,41 +3974,6 @@
       "published_at": "2026-05-11T07:45:22Z",
       "tag_name": "v0.1.0-rc.44",
       "version": "0.1.0-rc.44"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.43_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.43_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.43_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.43_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.0-rc.43",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-05-11T06:47:16Z",
-      "tag_name": "v0.1.0-rc.43",
-      "version": "0.1.0-rc.43"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
