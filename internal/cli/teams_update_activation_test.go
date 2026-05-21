@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -65,6 +66,145 @@ func TestWindowsTeamsPendingHelperActivationChecksExactParsedVersion(t *testing.
 				}
 			}
 		})
+	}
+}
+
+func TestWindowsTeamsPendingHelperActivationTreatsMoveFailuresAsFatal(t *testing.T) {
+	for name, script := range map[string]string{
+		"service activation": windowsTeamsPendingHelperActivationPowerShell(
+			`C:\Users\Alice\AppData\Local\Temp\codex-proxy.pending.exe`,
+			`C:\Users\Alice\AppData\Roaming\codex-proxy\codex-proxy.exe`,
+			"v1.2.3",
+		),
+		"process restart": windowsTeamsPendingHelperProcessRestartPowerShell(
+			`C:\Users\Alice\AppData\Local\Temp\codex-proxy.pending.exe`,
+			`C:\Users\Alice\AppData\Roaming\codex-proxy\codex-proxy.exe`,
+			"v1.2.3",
+			[]string{"teams", "run"},
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, want := range []string{
+				"Move-Item -Force -LiteralPath $src -Destination $dest -ErrorAction Stop",
+				"pending helper still exists after Move-Item",
+				"move attempt ' + ($i + 1) + ' failed",
+				"formal helper locked by process(es)",
+				"Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop",
+				"Move-Item -Force -LiteralPath $tmp -Destination $statusPath -ErrorAction Stop",
+			} {
+				if !strings.Contains(script, want) {
+					t.Fatalf("activation script missing fatal-move fragment %q:\n%s", want, script)
+				}
+			}
+		})
+	}
+}
+
+func TestWindowsTeamsPendingHelperActivationRetiresOldTeamsBlockers(t *testing.T) {
+	for name, script := range map[string]string{
+		"service activation": windowsTeamsPendingHelperActivationPowerShell(
+			`C:\Users\Alice\AppData\Local\Temp\codex-proxy.pending.exe`,
+			`C:\Users\Alice\AppData\Roaming\codex-proxy\codex-proxy.exe`,
+			"v1.2.3",
+		),
+		"process restart": windowsTeamsPendingHelperProcessRestartPowerShell(
+			`C:\Users\Alice\AppData\Local\Temp\codex-proxy.pending.exe`,
+			`C:\Users\Alice\AppData\Roaming\codex-proxy\codex-proxy.exe`,
+			"v1.2.3",
+			[]string{"teams", "run"},
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, want := range []string{
+				"function Stop-RetirableTeamsHelperBlockers",
+				"teams\\s+(run|listen)",
+				"teams\\s+service\\s+watchdog",
+				"Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop",
+				"stopped old Teams helper process pid=",
+			} {
+				if !strings.Contains(script, want) {
+					t.Fatalf("activation script missing blocker-retirement fragment %q:\n%s", want, script)
+				}
+			}
+		})
+	}
+}
+
+func TestWindowsTeamsPendingHelperActivationSafetyInvariantsStress(t *testing.T) {
+	versions := []string{"v0.1.0", "0.1.0-rc.134", "v1.2.3", "2.0.0-beta.1"}
+	argSets := [][]string{
+		{"teams", "run"},
+		{"teams", "run", "--auto-service=false"},
+		{"teams", "run", "--registry", `C:\Users\Alice\Teams Registry\registry.json`},
+		{"teams", "run", "--label", "quoted ' label"},
+	}
+	for i := 0; i < 128; i++ {
+		pending := fmt.Sprintf(`C:\Users\Alice\AppData\Local\Temp\codex helper stress %03d O'Brien\.codex-proxy_%s_windows_amd64.exe.%d`, i, strings.TrimPrefix(versions[i%len(versions)], "v"), i+1000)
+		install := fmt.Sprintf(`C:\Users\Alice\AppData\Roaming\codex helper stress %03d\codex-proxy.exe`, i)
+		version := versions[i%len(versions)]
+		scripts := map[string]string{
+			"service activation": windowsTeamsPendingHelperActivationPowerShell(pending, install, version),
+			"process restart":    windowsTeamsPendingHelperProcessRestartPowerShell(pending, install, version, argSets[i%len(argSets)]),
+		}
+		for name, script := range scripts {
+			t.Run(fmt.Sprintf("%s/%03d", name, i), func(t *testing.T) {
+				assertWindowsActivationScriptSafetyInvariants(t, script)
+			})
+		}
+	}
+}
+
+func assertWindowsActivationScriptSafetyInvariants(t *testing.T, script string) {
+	t.Helper()
+	commands := windowsPowerShellMoveItemCommands(script)
+	if len(commands) < 2 {
+		t.Fatalf("activation script Move-Item commands = %#v, want at least source and status moves", commands)
+	}
+	for _, command := range commands {
+		if !strings.Contains(command, "-ErrorAction Stop") {
+			t.Fatalf("Move-Item command is not terminating:\n%s\nscript:\n%s", command, script)
+		}
+	}
+	for _, want := range []string{
+		"if (Test-Path -LiteralPath $src) { throw 'pending helper still exists after Move-Item' }",
+		"if (Test-DestVersion) { $ready=$true } else { $lastErr=$script:lastErr }",
+		"Write-Status 'failed' $lastErr",
+		"formal helper locked by process(es)",
+		"Stop-RetirableTeamsHelperBlockers $procs",
+		"Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("activation script missing safety invariant %q:\n%s", want, script)
+		}
+	}
+	for _, forbidden := range []string{
+		"Move-Item -Force -LiteralPath $src -Destination $dest; ",
+		"Move-Item -Force -LiteralPath $tmp -Destination $statusPath }",
+		"-like ('*' + $want + '*')",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("activation script contains unsafe fragment %q:\n%s", forbidden, script)
+		}
+	}
+}
+
+func windowsPowerShellMoveItemCommands(script string) []string {
+	var commands []string
+	const marker = "Move-Item "
+	rest := script
+	for {
+		idx := strings.Index(rest, marker)
+		if idx < 0 {
+			return commands
+		}
+		command := rest[idx:]
+		next := idx + len(marker)
+		if end := strings.Index(command, ";"); end >= 0 {
+			command = command[:end]
+			next = idx + end + 1
+		}
+		commands = append(commands, strings.TrimSpace(command))
+		rest = rest[next:]
 	}
 }
 

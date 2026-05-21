@@ -272,6 +272,48 @@ func windowsTeamsDestVersionProbePowerShell() string {
 		"} catch { $script:lastErr='formal version probe failed: ' + $_.Exception.Message; Log $script:lastErr; return $false } }; "
 }
 
+func windowsTeamsHelperBlockerPowerShell() string {
+	return "function Get-HelperBlockers { " +
+		"try { @(" +
+		"Get-CimInstance Win32_Process -Filter \"Name = 'codex-proxy.exe'\" -ErrorAction SilentlyContinue | " +
+		"Where-Object { try { $_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $destFull) } catch { $false } }" +
+		") } catch { Log ('process scan failed: ' + $_.Exception.Message); @() } }; " +
+		"function Format-HelperBlockers($procs) { " +
+		"if ($null -eq $procs -or @($procs).Count -eq 0) { return 'none' }; " +
+		"return ((@($procs) | ForEach-Object { $cmd=[string]$_.CommandLine; if ($cmd.Length -gt 180) { $cmd=$cmd.Substring(0,180) + '...' }; ([string]$_.ProcessId) + ':' + $cmd }) -join '; ') }; " +
+		"function Test-RetirableTeamsHelperProcess($proc) { " +
+		"try { $cmd=[string]$proc.CommandLine; return ($cmd -match '(?i)(^|\\s)teams\\s+(run|listen)(\\s|$)' -or $cmd -match '(?i)(^|\\s)teams\\s+service\\s+watchdog(\\s|$)') } catch { return $false } }; " +
+		"function Stop-RetirableTeamsHelperBlockers($procs) { " +
+		"$stopped=0; foreach ($proc in @($procs)) { " +
+		"if (-not (Test-RetirableTeamsHelperProcess $proc)) { continue }; " +
+		"try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop; $stopped++; Log ('stopped old Teams helper process pid=' + $proc.ProcessId) } " +
+		"catch { Log ('stop old Teams helper process failed pid=' + $proc.ProcessId + ': ' + $_.Exception.Message) } }; " +
+		"return $stopped }; "
+}
+
+func windowsTeamsWaitForFormalHelperUnlockPowerShell() string {
+	return "$blockerSummary=''; " +
+		"for ($j=0; $j -lt 240; $j++) { " +
+		"$procs=@(Get-HelperBlockers); " +
+		"if ($procs.Count -eq 0) { $blockerSummary=''; break }; " +
+		"$blockerSummary=Format-HelperBlockers $procs; " +
+		"if (($j -eq 20) -or ($j -eq 60) -or ($j -eq 120)) { $stopped=Stop-RetirableTeamsHelperBlockers $procs; if ($stopped -gt 0) { Start-Sleep -Milliseconds 500; continue } }; " +
+		"if (($j % 10) -eq 0) { Log ('waiting for process(es): ' + $blockerSummary) }; " +
+		"Start-Sleep -Milliseconds 500 }; " +
+		"$procs=@(Get-HelperBlockers); " +
+		"if ($procs.Count -gt 0) { $blockerSummary=Format-HelperBlockers $procs; $lastErr='formal helper is still locked by process(es): ' + $blockerSummary; Log $lastErr } else { $blockerSummary='' }; "
+}
+
+func windowsTeamsMovePendingHelperPowerShell() string {
+	return "try { " +
+		"Move-Item -Force -LiteralPath $src -Destination $dest -ErrorAction Stop; " +
+		"if (Test-Path -LiteralPath $src) { throw 'pending helper still exists after Move-Item' }; " +
+		"Log ('moved pending helper to formal entry'); " +
+		"if (Test-DestVersion) { $ready=$true } else { $lastErr=$script:lastErr }; " +
+		"break } " +
+		"catch { $lastErr='move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message; if (-not [string]::IsNullOrWhiteSpace($blockerSummary)) { $lastErr=$lastErr + '; formal helper locked by process(es): ' + $blockerSummary }; Log $lastErr; Start-Sleep -Milliseconds 500 } }; "
+}
+
 func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPath string, version string) string {
 	return "$ErrorActionPreference='Continue'; " +
 		"$src=" + powershellSingleQuote(pendingPath) + "; " +
@@ -284,24 +326,20 @@ func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPa
 		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null; " +
 		"$log=Join-Path $logDir 'teams-helper-activation.log'; " +
 		"function Log([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $m) } catch {} }; " +
-		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8; Move-Item -Force -LiteralPath $tmp -Destination $statusPath } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
+		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop; Move-Item -Force -LiteralPath $tmp -Destination $statusPath -ErrorAction Stop } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
 		"Log ('activation starting src=' + $src + ' dest=' + $dest + ' want=' + $want + ' parent=' + $parent); " +
 		"Write-Status 'running' 'activation started'; " +
 		"try { Wait-Process -Id $parent -Timeout 120 -ErrorAction SilentlyContinue } catch { Log ('parent wait failed: ' + $_.Exception.Message) }; " +
 		"foreach ($task in $tasks) { try { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('stop task failed ' + $task + ': ' + $_.Exception.Message) } }; " +
 		"$destFull=[System.IO.Path]::GetFullPath($dest); " +
-		"for ($j=0; $j -lt 240; $j++) { " +
-		"$procs=@(); try { $procs=@(Get-CimInstance Win32_Process -Filter \"Name = 'codex-proxy.exe'\" -ErrorAction SilentlyContinue | Where-Object { try { $_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $destFull) } catch { $false } }) } catch { Log ('process scan failed: ' + $_.Exception.Message) }; " +
-		"if ($procs.Count -eq 0) { break }; " +
-		"if (($j % 10) -eq 0) { Log ('waiting for process(es): ' + (($procs | ForEach-Object { $_.ProcessId }) -join ',')) }; " +
-		"Start-Sleep -Milliseconds 500 }; " +
-		"$ready=$false; " +
 		"$lastErr=''; " +
+		windowsTeamsHelperBlockerPowerShell() +
+		windowsTeamsWaitForFormalHelperUnlockPowerShell() +
+		"$ready=$false; " +
 		windowsTeamsDestVersionProbePowerShell() +
 		"for ($i=0; $i -lt 240; $i++) { " +
 		"if (-not (Test-Path -LiteralPath $src)) { Log ('source missing: ' + $src); if (Test-DestVersion) { $ready=$true; Log 'formal entry already matches pending target' }; break }; " +
-		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +
-		"catch { $lastErr='move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message; Log $lastErr; Start-Sleep -Milliseconds 500 } }; " +
+		windowsTeamsMovePendingHelperPowerShell() +
 		"if ($ready) { Write-Status 'success' 'activated pending helper' } else { if ([string]::IsNullOrWhiteSpace($lastErr)) { $lastErr='activation failed before service start' }; Log ('activation failed before service start: ' + $lastErr); Write-Status 'failed' $lastErr }; " +
 		"foreach ($task in @(" + powershellSingleQuote(teamsServiceWindowsTaskName) + "," + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + ")) { try { Enable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null; Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('start task failed ' + $task + ': ' + $_.Exception.Message) } }"
 }
@@ -320,23 +358,19 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"$stdoutLog=Join-Path $logDir 'teams-helper-process-restart.stdout.log'; " +
 		"$stderrLog=Join-Path $logDir 'teams-helper-process-restart.stderr.log'; " +
 		"function Log([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $m) } catch {} }; " +
-		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8; Move-Item -Force -LiteralPath $tmp -Destination $statusPath } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
+		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop; Move-Item -Force -LiteralPath $tmp -Destination $statusPath -ErrorAction Stop } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
 		"Log ('process restart starting src=' + $src + ' dest=' + $dest + ' want=' + $want + ' parent=' + $parent); " +
 		"Write-Status 'running' 'activation started'; " +
 		"try { Wait-Process -Id $parent -Timeout 120 -ErrorAction SilentlyContinue } catch { Log ('parent wait failed: ' + $_.Exception.Message) }; " +
 		"$destFull=[System.IO.Path]::GetFullPath($dest); " +
-		"for ($j=0; $j -lt 240; $j++) { " +
-		"$procs=@(); try { $procs=@(Get-CimInstance Win32_Process -Filter \"Name = 'codex-proxy.exe'\" -ErrorAction SilentlyContinue | Where-Object { try { $_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $destFull) } catch { $false } }) } catch { Log ('process scan failed: ' + $_.Exception.Message) }; " +
-		"if ($procs.Count -eq 0) { break }; " +
-		"if (($j % 10) -eq 0) { Log ('waiting for process(es): ' + (($procs | ForEach-Object { $_.ProcessId }) -join ',')) }; " +
-		"Start-Sleep -Milliseconds 500 }; " +
-		"$ready=$false; " +
 		"$lastErr=''; " +
+		windowsTeamsHelperBlockerPowerShell() +
+		windowsTeamsWaitForFormalHelperUnlockPowerShell() +
+		"$ready=$false; " +
 		windowsTeamsDestVersionProbePowerShell() +
 		"for ($i=0; $i -lt 240; $i++) { " +
 		"if (-not (Test-Path -LiteralPath $src)) { Log ('source missing: ' + $src); if (Test-DestVersion) { $ready=$true; Log 'formal entry already matches pending target' }; break }; " +
-		"try { Move-Item -Force -LiteralPath $src -Destination $dest; Log ('moved pending helper to formal entry'); if (Test-DestVersion) { $ready=$true }; break } " +
-		"catch { $lastErr='move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message; Log $lastErr; Start-Sleep -Milliseconds 500 } }; " +
+		windowsTeamsMovePendingHelperPowerShell() +
 		"if ($ready) { $null = Test-DestVersion; Write-Status 'success' 'activated pending helper' } else { if ([string]::IsNullOrWhiteSpace($lastErr)) { $lastErr='process restart failed before start' }; Log $lastErr; Write-Status 'failed' $lastErr }; " +
 		"if (Test-Path -LiteralPath $dest) { try { Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue; Start-Process -FilePath $dest -ArgumentList $argList -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog | Out-Null; Log ('started helper process stdout=' + $stdoutLog + ' stderr=' + $stderrLog) } catch { Log ('start process failed: ' + $_.Exception.Message) } }"
 }

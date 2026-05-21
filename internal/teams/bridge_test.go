@@ -15116,6 +15116,261 @@ func TestBridgeSyncLinkedTranscriptSkipsStatusAlreadySentLiveAfterOutboxPrune(t 
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptStressSkipsLiveStatusesBeforeCheckpointWindow(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-status-stress"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-status-stress", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-status-stress")
+	now := time.Date(2026, 5, 22, 3, 0, 0, 0, time.UTC)
+	turnID := "turn-live-status-stress"
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	statusCount := transcriptSyncMaxAutoBacklogRecords + 5
+	for i := 0; i < statusCount; i++ {
+		text := fmt.Sprintf("already live status before checkpoint %03d", i)
+		updated.WriteString(`{"timestamp":"2026-05-22T03:00:00.000Z","type":"event_msg","payload":{"type":"agent_message","id":"s-live-` + fmt.Sprintf("%03d", i) + `","message":` + strconv.Quote(text) + `,"phase":"commentary"}}` + "\n")
+	}
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		checkpoint.UpdatedAt = now
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = checkpoint
+		state.Turns[turnID] = teamstore.Turn{
+			ID:          turnID,
+			SessionID:   session.ID,
+			Status:      teamstore.TurnStatusCompleted,
+			StartedAt:   now.Add(-30 * time.Minute),
+			CompletedAt: now,
+			CreatedAt:   now.Add(-30 * time.Minute),
+			UpdatedAt:   now,
+		}
+		for i := 0; i < statusCount; i++ {
+			text := fmt.Sprintf("already live status before checkpoint %03d", i)
+			state.HelperDeliveries[fmt.Sprintf("helper-live-status-%03d", i)] = teamstore.HelperDeliveryRecord{
+				SessionID:      session.ID,
+				TeamsChatID:    session.ChatID,
+				CodexThreadID:  session.CodexThreadID,
+				TurnID:         turnID,
+				Kind:           fmt.Sprintf("codex-progress-%03d", i+1),
+				KindFamily:     "status",
+				SourceTextHash: normalizedTextHash(text),
+				VisibleHash:    normalizedTextHash(text),
+				Status:         teamstore.HelperDeliveryStatusSent,
+				CreatedAt:      now.Add(-30 * time.Minute),
+				UpdatedAt:      now.Add(-30 * time.Minute),
+				SentAt:         now.Add(-30 * time.Minute),
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed old live status deliveries: %v", err)
+	}
+	*sent = nil
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync stress status transcript error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("old live status deliveries were replayed or backlog-blocked, sent=%#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if !strings.Contains(checkpoint.LastRecordID, fmt.Sprintf("s-live-%03d", statusCount-1)) || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint did not advance past known live status burst: %#v", checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptSkipsStatusAlreadySkippedByTextHash(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-status-split"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-status-split", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-status-split")
+	statusText := "split duplicate status should only appear once"
+	updated := initial +
+		`{"timestamp":"2026-05-22T03:10:00.000Z","type":"event_msg","payload":{"type":"agent_message","id":"s-split-1","message":` + strconv.Quote(statusText) + `,"phase":"commentary"}}` + "\n" +
+		`{"timestamp":"2026-05-22T03:10:00.001Z","type":"event_msg","payload":{"type":"agent_message","id":"s-split-2","message":` + strconv.Quote(statusText) + `,"phase":"commentary"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	transcript, err := ReadSessionTranscript(transcriptPath)
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	var first TranscriptRecord
+	for _, record := range transcript.Records {
+		if record.ItemID == "s-split-1" {
+			first = record
+			break
+		}
+	}
+	if first.ItemID == "" {
+		t.Fatalf("first split status not parsed: %#v", transcript.Records)
+	}
+	now := time.Date(2026, 5, 22, 3, 10, 30, 0, time.UTC)
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		checkpoint.LastRecordID = transcriptRecordCheckpointKey(first)
+		checkpoint.LastSourceLine = first.SourceLine
+		checkpoint.LastOffset = first.SourceOffset
+		checkpoint.SourcePath = transcriptPath
+		checkpoint.UpdatedAt = now
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = checkpoint
+		state.TranscriptDeliveries["skipped-split-status"] = teamstore.TranscriptDeliveryRecord{
+			ID:            "skipped-split-status",
+			SessionID:     session.ID,
+			CodexThreadID: session.CodexThreadID,
+			SourcePath:    transcriptPath,
+			SourceLine:    first.SourceLine,
+			SourceOffset:  first.SourceOffset,
+			Kind:          "sync-status-skipped",
+			TextHash:      normalizedTextHash(statusText),
+			Status:        teamstore.TranscriptDeliveryStatusSkipped,
+			CreatedAt:     now.Add(-time.Hour),
+			UpdatedAt:     now.Add(-time.Hour),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed skipped split status: %v", err)
+	}
+	*sent = nil
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync split status transcript error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("split duplicate status was replayed after skipped ledger record: %#v", *sent)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptSkipsFinalAlreadySentLiveBeforeCheckpoint(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-final-live"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-final-live", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-final-live")
+	finalText := "final answer already sent live before checkpoint"
+	updated := initial + `{"id":"a-live-final","role":"assistant","text":` + strconv.Quote(finalText) + `}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	now := time.Date(2026, 5, 22, 3, 20, 0, 0, time.UTC)
+	turnID := "turn-live-final"
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.Turns[turnID] = teamstore.Turn{
+			ID:          turnID,
+			SessionID:   session.ID,
+			Status:      teamstore.TurnStatusCompleted,
+			StartedAt:   now.Add(-20 * time.Minute),
+			CompletedAt: now,
+			CreatedAt:   now.Add(-20 * time.Minute),
+			UpdatedAt:   now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed final turn: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:live-final-before-checkpoint",
+		SessionID:      session.ID,
+		TurnID:         turnID,
+		TeamsChatID:    session.ChatID,
+		Kind:           "final",
+		Body:           finalText,
+		SourceTextHash: normalizedTextHash(finalText),
+		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-live-final",
+		CreatedAt:      now.Add(-20 * time.Minute),
+		UpdatedAt:      now.Add(-20 * time.Minute),
+		SentAt:         now.Add(-20 * time.Minute),
+	}); err != nil {
+		t.Fatalf("QueueOutbox live final error: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		checkpoint.UpdatedAt = now
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = checkpoint
+		return nil
+	}); err != nil {
+		t.Fatalf("move checkpoint after live final outbox: %v", err)
+	}
+	*sent = nil
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync final transcript error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("live final was replayed by transcript sync: %#v", *sent)
+	}
+}
+
+func TestKnownTranscriptOutboxDedupeStressCompactCountsOldLiveBeforeCheckpoint(t *testing.T) {
+	now := time.Date(2026, 5, 22, 3, 30, 0, 0, time.UTC)
+	turnID := "turn-live-compact"
+	state := teamstore.State{
+		Turns: map[string]teamstore.Turn{
+			turnID: {
+				ID:          turnID,
+				SessionID:   "s001",
+				Status:      teamstore.TurnStatusCompleted,
+				StartedAt:   now.Add(-30 * time.Minute),
+				CompletedAt: now,
+				CreatedAt:   now.Add(-30 * time.Minute),
+				UpdatedAt:   now,
+			},
+		},
+		OutboxMessages: map[string]teamstore.OutboxMessage{
+			"compact": {
+				SessionID:      "s001",
+				TurnID:         turnID,
+				TeamsChatID:    "chat-1",
+				Kind:           "codex-compact-001",
+				Body:           transcriptContextCompactMessage,
+				SourceTextHash: normalizedTextHash(transcriptContextCompactMessage),
+				Status:         teamstore.OutboxStatusSent,
+				TeamsMessageID: "teams-live-compact",
+				CreatedAt:      now.Add(-30 * time.Minute),
+			},
+		},
+	}
+	known := newKnownTranscriptOutboxDedupeState(state, "s001", now)
+	record := TranscriptRecord{Kind: TranscriptKindCompact}
+	if !known.shouldSkip(record, transcriptContextCompactMessage) {
+		t.Fatal("old live compact from the same completed turn did not consume one compact count")
+	}
+	if known.shouldSkip(record, transcriptContextCompactMessage) {
+		t.Fatal("one old live compact consumed more than one compact count")
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptOnlySkipsDeliveredContextCompactCount(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-compact-count"}}` + "\n" +

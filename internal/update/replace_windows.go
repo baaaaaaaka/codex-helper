@@ -66,7 +66,7 @@ func windowsDeferredMoveScript(src, dest string, parentPID int) string {
 			"}; "+
 			"for ($i = 0; $i -lt 240; $i++) { "+
 			"if (-not (Test-Path -LiteralPath $src)) { Write-UpdateLog ('source missing: ' + $src); exit 2 }; "+
-			"try { Move-Item -Force -LiteralPath $src -Destination $dest; Write-UpdateLog ('moved ' + $src + ' -> ' + $dest); try { $v = & $dest --version 2>&1; Write-UpdateLog ('installed version: ' + ($v -join ' ')) } catch { Write-UpdateLog ('installed version probe failed: ' + $_.Exception.Message) }; exit 0 } "+
+			"try { Move-Item -Force -LiteralPath $src -Destination $dest -ErrorAction Stop; if (Test-Path -LiteralPath $src) { throw 'pending helper still exists after Move-Item' }; Write-UpdateLog ('moved ' + $src + ' -> ' + $dest); try { $v = & $dest --version 2>&1; Write-UpdateLog ('installed version: ' + ($v -join ' ')) } catch { Write-UpdateLog ('installed version probe failed: ' + $_.Exception.Message) }; exit 0 } "+
 			"catch { Write-UpdateLog ('move attempt ' + ($i + 1) + ' failed: ' + $_.Exception.Message); Start-Sleep -Milliseconds 500 } "+
 			"}; "+
 			"Write-UpdateLog ('failed to move after retries: ' + $src + ' -> ' + $dest); exit 1",

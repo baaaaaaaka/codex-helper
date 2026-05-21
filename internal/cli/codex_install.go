@@ -1210,7 +1210,10 @@ function Install-LocalNode {
         New-Item -ItemType Directory -Force -Path $installParent | Out-Null
       }
       Invoke-DiskWrite "managed Node.js install directory" $installDir "failed to install managed Node.js" {
-        Move-Item -Path $expanded.FullName -Destination $installDir -Force
+        Move-Item -LiteralPath $expanded.FullName -Destination $installDir -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $expanded.FullName) {
+          throw "managed Node.js source still exists after Move-Item"
+        }
       }
     } finally {
       Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue

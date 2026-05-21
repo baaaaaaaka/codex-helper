@@ -12822,14 +12822,14 @@ func knownTranscriptOutboxHashesSince(state teamstore.State, sessionID string, s
 		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
 			continue
 		}
-		if !since.IsZero() && !outbox.CreatedAt.IsZero() && outbox.CreatedAt.Before(since) {
-			continue
-		}
 		if !outboxCanDedupeTranscript(outbox) {
 			continue
 		}
 		kind, ok := deliveredOutboxTranscriptKind(outbox.Kind)
 		if !ok {
+			continue
+		}
+		if !transcriptKnownDeliveryInDedupeWindow(state, sessionID, outbox.TurnID, outbox.CreatedAt, since, kind) {
 			continue
 		}
 		hash := normalizedTextHash(formatKnownOutboxBodyForTranscriptDedupe(kind, outbox.Body))
@@ -12849,9 +12849,6 @@ func knownTranscriptOutboxHashesSince(state teamstore.State, sessionID string, s
 				continue
 			}
 		}
-		if !since.IsZero() && !delivery.CreatedAt.IsZero() && delivery.CreatedAt.Before(since) {
-			continue
-		}
 		if !helperDeliveryCanDedupeTranscript(delivery) {
 			continue
 		}
@@ -12859,9 +12856,33 @@ func knownTranscriptOutboxHashesSince(state teamstore.State, sessionID string, s
 		if !ok {
 			continue
 		}
+		if !transcriptKnownDeliveryInDedupeWindow(state, sessionID, delivery.TurnID, delivery.CreatedAt, since, kind) {
+			continue
+		}
 		addHash(kind, delivery.SourceTextHash)
 		addHash(kind, delivery.VisibleHash)
 		addHash(kind, delivery.RenderedHash)
+	}
+	for _, delivery := range state.TranscriptDeliveries {
+		if delivery.SessionID != sessionID {
+			continue
+		}
+		if delivery.OutboxID != "" {
+			if _, ok := state.OutboxMessages[delivery.OutboxID]; ok {
+				continue
+			}
+		}
+		if !transcriptDeliveryCanDedupeByText(delivery) {
+			continue
+		}
+		kind, ok := deliveredOutboxTranscriptKind(delivery.Kind)
+		if !ok || kind == TranscriptKindUser || kind == TranscriptKindCompact {
+			continue
+		}
+		if !transcriptDeliveryTextDedupeInWindow(delivery, since, kind) {
+			continue
+		}
+		addHash(kind, delivery.TextHash)
 	}
 	return hashes
 }
@@ -12887,14 +12908,14 @@ func newKnownTranscriptOutboxDedupeState(state teamstore.State, sessionID string
 		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
 			continue
 		}
-		if !since.IsZero() && !outbox.CreatedAt.IsZero() && outbox.CreatedAt.Before(since) {
-			continue
-		}
 		if !outboxCanDedupeTranscript(outbox) {
 			continue
 		}
 		kind, ok := deliveredOutboxTranscriptKind(outbox.Kind)
 		if !ok || kind != TranscriptKindCompact {
+			continue
+		}
+		if !transcriptKnownDeliveryInDedupeWindow(state, sessionID, outbox.TurnID, outbox.CreatedAt, since, kind) {
 			continue
 		}
 		hash := normalizedTextHash(formatKnownOutboxBodyForTranscriptDedupe(kind, outbox.Body))
@@ -12912,9 +12933,6 @@ func newKnownTranscriptOutboxDedupeState(state teamstore.State, sessionID string
 				continue
 			}
 		}
-		if !since.IsZero() && !delivery.CreatedAt.IsZero() && delivery.CreatedAt.Before(since) {
-			continue
-		}
 		if !helperDeliveryCanDedupeTranscript(delivery) {
 			continue
 		}
@@ -12922,9 +12940,88 @@ func newKnownTranscriptOutboxDedupeState(state teamstore.State, sessionID string
 		if !ok || kind != TranscriptKindCompact {
 			continue
 		}
+		if !transcriptKnownDeliveryInDedupeWindow(state, sessionID, delivery.TurnID, delivery.CreatedAt, since, kind) {
+			continue
+		}
 		addCompactCount(firstNonEmptyString(delivery.SourceTextHash, delivery.VisibleHash, delivery.RenderedHash))
 	}
+	for _, delivery := range state.TranscriptDeliveries {
+		if delivery.SessionID != sessionID {
+			continue
+		}
+		if delivery.OutboxID != "" {
+			if _, ok := state.OutboxMessages[delivery.OutboxID]; ok {
+				continue
+			}
+		}
+		if !transcriptDeliveryCanDedupeByText(delivery) || delivery.Status == teamstore.TranscriptDeliveryStatusSkipped {
+			continue
+		}
+		kind, ok := deliveredOutboxTranscriptKind(delivery.Kind)
+		if !ok || kind != TranscriptKindCompact {
+			continue
+		}
+		if !transcriptDeliveryTextDedupeInWindow(delivery, since, kind) {
+			continue
+		}
+		addCompactCount(delivery.TextHash)
+	}
 	return &knownTranscriptOutboxDedupeState{hashes: hashes, compactCounts: compactCounts}
+}
+
+func transcriptKnownDeliveryInDedupeWindow(state teamstore.State, sessionID string, turnID string, createdAt time.Time, since time.Time, kind TranscriptKind) bool {
+	if since.IsZero() || createdAt.IsZero() || !createdAt.Before(since) {
+		return true
+	}
+	switch kind {
+	case TranscriptKindAssistant, TranscriptKindStatus, TranscriptKindCompact:
+		return transcriptKnownTurnOverlapsSince(state, sessionID, turnID, since) ||
+			since.Sub(createdAt) <= localTranscriptCompletedTurnSettleWindow
+	default:
+		return false
+	}
+}
+
+func transcriptKnownTurnOverlapsSince(state teamstore.State, sessionID string, turnID string, since time.Time) bool {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" || since.IsZero() {
+		return false
+	}
+	turn, ok := state.Turns[turnID]
+	if !ok || strings.TrimSpace(turn.SessionID) != strings.TrimSpace(sessionID) {
+		return false
+	}
+	threshold := since.Add(-localTranscriptCompletedTurnSettleWindow)
+	for _, at := range []time.Time{turn.CompletedAt, turn.UpdatedAt, turn.StartedAt, turn.CreatedAt} {
+		if !at.IsZero() && !at.Before(threshold) {
+			return true
+		}
+	}
+	return false
+}
+
+func transcriptDeliveryCanDedupeByText(delivery teamstore.TranscriptDeliveryRecord) bool {
+	if strings.TrimSpace(delivery.TextHash) == "" {
+		return false
+	}
+	switch delivery.Status {
+	case teamstore.TranscriptDeliveryStatusSent, teamstore.TranscriptDeliveryStatusSkipped:
+		return true
+	case teamstore.TranscriptDeliveryStatusAccepted:
+		return strings.TrimSpace(delivery.TeamsMessageID) != ""
+	default:
+		return false
+	}
+}
+
+func transcriptDeliveryTextDedupeInWindow(delivery teamstore.TranscriptDeliveryRecord, since time.Time, kind TranscriptKind) bool {
+	if since.IsZero() || delivery.CreatedAt.IsZero() || !delivery.CreatedAt.Before(since) {
+		return true
+	}
+	if kind == TranscriptKindStatus {
+		return true
+	}
+	return since.Sub(delivery.CreatedAt) <= localTranscriptCompletedTurnSettleWindow
 }
 
 func (s *knownTranscriptOutboxDedupeState) shouldSkip(record TranscriptRecord, body string) bool {

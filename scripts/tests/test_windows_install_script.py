@@ -19,13 +19,14 @@ class WindowsInstallScriptTests(unittest.TestCase):
             "Codex Helper Teams Watchdog",
             "Codex Helper Teams Bridge",
             "Wait-CodexProxyInstallPathReleased $dst",
-            "Move-Item -Force -Path $tmp -Destination $dst",
+            "Move-Item -Force -LiteralPath $tmp -Destination $dst -ErrorAction Stop",
+            "Pending codex-proxy binary still exists after Move-Item",
         ]:
             self.assertIn(expected, script)
 
         self.assertLess(
             script.index("Wait-CodexProxyInstallPathReleased $dst"),
-            script.index("Move-Item -Force -Path $tmp -Destination $dst"),
+            script.index("Move-Item -Force -LiteralPath $tmp -Destination $dst -ErrorAction Stop"),
         )
 
 

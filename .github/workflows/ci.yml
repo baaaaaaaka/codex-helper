@@ -190,7 +190,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test . -count=1 -run 'TestInstallSh'
+          go test . -count=1 -run 'Test(InstallSh|WindowsPowerShell)'
 
       - name: Installer PATH/profile tests (Windows)
         if: runner.os == 'Windows'
@@ -198,7 +198,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          go test . -count=1 -run 'TestInstallPs1'
+          go test . -count=1 -run 'Test(InstallPs1|WindowsPowerShell)'
 
       - name: Recent install disk/npm regressions (Linux/macOS)
         if: runner.os != 'Windows'
@@ -298,7 +298,7 @@ jobs:
           teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|GlobalInbound|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|UpgradeBlockersDescribeBlockingWork|HasUpgradeBlockingWorkIgnoresImportCheckpointWithoutWork|PendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           go test ./internal/cli -count=1 -run "$teams_cli_keepalive" -v
           go test ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
-          go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScriptWaitsRetriesAndEscapesPaths|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
+          go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScript(WaitsRetriesAndEscapesPaths|SafetyInvariantsStress)|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
 
       - name: Teams background keepalive regressions (Windows)
         if: runner.os == 'Windows'
@@ -314,7 +314,7 @@ jobs:
           $teamsRuntimeKeepalive = 'Test(TeamsBackgroundKeepalive|TeamsStartupFallback|GlobalInbound|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|UpgradeBlockersDescribeBlockingWork|HasUpgradeBlockingWorkIgnoresImportCheckpointWithoutWork|PendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           go test ./internal/cli -count=1 -run $teamsCliKeepalive -v
           go test ./internal/teams ./internal/teams/store -count=1 -run $teamsRuntimeKeepalive -v
-          go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScriptWaitsRetriesAndEscapesPaths|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
+          go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScript(WaitsRetriesAndEscapesPaths|SafetyInvariantsStress)|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
 
       - name: Teams native supervisor validation (Linux)
         if: runner.os == 'Linux'
@@ -371,7 +371,7 @@ jobs:
           runner_pattern='TestExecRunnerTreatsCompletedTurnWithCanceledLaunchAsSuccess$'
           adapter_pattern='Test(TeamsCodexExecutorTreatsCompletedTurnWithCanceledContextAsSuccess|RunnerExecutorTreatsCompletedTurnWithCanceledContextAsSuccess)$'
           transcript_pattern='TestParseCodexTranscriptRecords(ContextCompactEvent|CompactOnlyLine|ContextCompactCompletedItem)$'
-          bridge_pattern='Test(StripUserAnnotationPrefixStripsExactlyOneHelperUserMarker|BridgeAnnotate(IncomingUserMessageFallsBackWhenGraphUpdateFails|ExternalUserMessageQueuesUserMirrorWithoutGraphPatch)|CommandRouteTextStripsPlainUserMarkerBeforeRouting|BridgePollHandlesPlainUserPromptWithExistingUserMarker|TranscriptDedupeKeepsRepeatedContextCompactMarkers|BridgeSyncLinkedTranscript(SendsContextCompactMarkersIndividually|SkipsContextCompactAlreadySentLive|OnlySkipsDeliveredContextCompactCount|MirrorsTeamsOriginUserPrompt|SkipsTerminalTeamsOriginUserPrompt|MirrorsTeamsOriginUserPromptWithoutImagePlaceholder|MirrorsTeamsOriginUserPromptWithoutReferencedMessageContext)|BridgeQueuesTranscriptOnlyContextCompactBeforeFinalAnswer|BridgeClassifyLocalTranscriptCompactOnlyDoesNotBlockTeamsTurn|KnownTranscriptOutboxHashesIncludeUserStatusAndFinal|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOriginTranscriptUserDisplayBodyUsesOriginalTeamsPrompt|BridgeControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep)$'
+          bridge_pattern='Test(StripUserAnnotationPrefixStripsExactlyOneHelperUserMarker|BridgeAnnotate(IncomingUserMessageFallsBackWhenGraphUpdateFails|ExternalUserMessageQueuesUserMirrorWithoutGraphPatch)|CommandRouteTextStripsPlainUserMarkerBeforeRouting|BridgePollHandlesPlainUserPromptWithExistingUserMarker|TranscriptDedupeKeepsRepeatedContextCompactMarkers|BridgeSyncLinkedTranscript(SendsContextCompactMarkersIndividually|SkipsContextCompactAlreadySentLive|OnlySkipsDeliveredContextCompactCount|StressSkipsLiveStatusesBeforeCheckpointWindow|SkipsStatusAlreadySkippedByTextHash|SkipsFinalAlreadySentLiveBeforeCheckpoint|MirrorsTeamsOriginUserPrompt|SkipsTerminalTeamsOriginUserPrompt|MirrorsTeamsOriginUserPromptWithoutImagePlaceholder|MirrorsTeamsOriginUserPromptWithoutReferencedMessageContext)|BridgeQueuesTranscriptOnlyContextCompactBeforeFinalAnswer|BridgeClassifyLocalTranscriptCompactOnlyDoesNotBlockTeamsTurn|KnownTranscriptOutbox(HashesIncludeUserStatusAndFinal|DedupeStressCompactCountsOldLiveBeforeCheckpoint)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOriginTranscriptUserDisplayBodyUsesOriginalTeamsPrompt|BridgeControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep)$'
           workflow_pattern='Test(WorkflowFallback(FormatsLocalSessionMentionAsFocusedClickableMessage|EscapesTextAndDoesNotLinkUnsafeURL)|WorkflowNotificationsDisabledByDefault)$'
           history_pattern='Test(SessionDisplayTitle|LoadHistoryIndex_StripsTeamsHelperSuffixFromFirstPrompt|ProcessMetaLine_StripsTeamsHelperSuffixFromFirstPrompt)$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
@@ -954,7 +954,7 @@ jobs:
         run: |
           set -euo pipefail
           teams_resource_pattern='Test(BridgePollDrops(HelperAttachmentEchoWithoutDurableMatch|RenderedHelperLabelOutputInWorkChat)|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
-          teams_replay_fencing_pattern='Test(Bridge(InterruptedTurnDropsLateStreamingStatus|ShouldIgnoreFreshRenderedHelperCanceledEcho|TranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|SyncLinkedTranscript(DeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|MultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|DeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression)|Flush(RecoversGraphMessageIDAfterAcceptedPersistFailure|RecoversAcceptedOutboxFromGraphAfterRestart|DefersGraphRecoveryWhenListMessagesFails|DoesNotGraphRecoverOrdinaryQueuedSendError))|MarkTurnInterruptedSkipsPendingTransientOutbox|RecordTranscriptDeliveryAdvancesCheckpointPosition)$'
+          teams_replay_fencing_pattern='Test(Bridge(InterruptedTurnDropsLateStreamingStatus|ShouldIgnoreFreshRenderedHelperCanceledEcho|TranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|SyncLinkedTranscript(DeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|MultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|DeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression|StressSkipsLiveStatusesBeforeCheckpointWindow|SkipsStatusAlreadySkippedByTextHash|SkipsFinalAlreadySentLiveBeforeCheckpoint)|Flush(RecoversGraphMessageIDAfterAcceptedPersistFailure|RecoversAcceptedOutboxFromGraphAfterRestart|DefersGraphRecoveryWhenListMessagesFails|DoesNotGraphRecoverOrdinaryQueuedSendError))|KnownTranscriptOutboxDedupeStressCompactCountsOldLiveBeforeCheckpoint|MarkTurnInterruptedSkipsPendingTransientOutbox|RecordTranscriptDeliveryAdvancesCheckpointPosition)$'
           img="$DISTRO_IMAGE"
           echo "==> $img (cloudgate tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \

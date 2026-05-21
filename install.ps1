@@ -490,7 +490,10 @@ if (@(Get-CodexProxyProcessesForPath $dst).Count -gt 0) {
   Wait-CodexProxyInstallPathReleased $dst
 }
 Invoke-DiskWrite -Label "codex-proxy binary install" -PathValue $dst -DefaultReason "Failed to move codex-proxy into $dst" -Action {
-  Move-Item -Force -Path $tmp -Destination $dst
+  Move-Item -Force -LiteralPath $tmp -Destination $dst -ErrorAction Stop
+  if (Test-Path -LiteralPath $tmp) {
+    throw "Pending codex-proxy binary still exists after Move-Item: $tmp"
+  }
 }
 
 $cxpCmd = Join-Path $installDirResolved "cxp.cmd"
