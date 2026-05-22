@@ -16,11 +16,13 @@ import (
 )
 
 const (
-	codexPathCacheFile      = "codex_path"
-	codexInstallLockName    = "codex_install.lock"
-	codexProbeTimeout       = 5 * time.Second
-	codexInstallDiskExit    = 75
-	codexInstallFailureExit = 76
+	codexPathCacheFile                         = "codex_path"
+	codexInstallLockName                       = "codex_install.lock"
+	codexProbeTimeout                          = 5 * time.Second
+	codexInstallDiskExit                       = 75
+	codexInstallFailureExit                    = 76
+	nativeWindowsCodexInstallerStartMessage    = "installing codex with native Windows managed installer..."
+	nativeWindowsCodexInstallerFallbackMessage = "native Windows managed installer failed; trying PowerShell fallback:"
 )
 
 var (
@@ -974,10 +976,24 @@ function Set-CodexManagedNodeShims {
       '@echo off',
       'setlocal',
       ('rem "%~dp0{0}"' -f $codexJsRel),
-      'set "_codex_ps=%~dp0codex.ps1"',
-      'set "_powershell=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"',
-      'if not exist "%_powershell%" set "_powershell=powershell"',
-      '"%_powershell%" -NoProfile -ExecutionPolicy Bypass -File "%_codex_ps%" %*',
+      'set "_nodeRoot=%CODEX_NODE_INSTALL_ROOT%"',
+      'if "%_nodeRoot%"=="" if not "%LOCALAPPDATA%"=="" set "_nodeRoot=%LOCALAPPDATA%\codex-proxy\node"',
+      'if "%_nodeRoot%"=="" set "_nodeRoot=%~dp0..\node"',
+      ('set "_nodePath=%_nodeRoot%\{0}\node.exe"' -f $nodeLeaf),
+      'if not exist "%_nodePath%" (',
+      ('  set "_fallbackNodePath=%~dp0..\node\{0}\node.exe"' -f $nodeLeaf),
+      '  if exist "%_fallbackNodePath%" set "_nodePath=%_fallbackNodePath%"',
+      ')',
+      'if not exist "%_nodePath%" (',
+      '  echo Managed Node.js not found: %_nodePath% 1>&2',
+      '  exit /b 1',
+      ')',
+      ('set "_scriptPath=%~dp0{0}"' -f $codexJsRel),
+      'if not exist "%_scriptPath%" (',
+      '  echo Codex JS entrypoint not found: %_scriptPath% 1>&2',
+      '  exit /b 1',
+      ')',
+      '"%_nodePath%" "%_scriptPath%" %*',
       'exit /b %ERRORLEVEL%'
     )
     Invoke-DiskWrite "codex command shim" $codexCmd "failed to update codex command shim" {
@@ -2153,7 +2169,21 @@ func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string
 		return fmt.Errorf("no supported installer available for %s", runtime.GOOS)
 	}
 
-	attemptErrors := make([]string, 0, len(candidates))
+	attemptErrors := make([]string, 0, len(candidates)+1)
+	if runtime.GOOS == "windows" {
+		if out != nil {
+			_, _ = fmt.Fprintln(out, nativeWindowsCodexInstallerStartMessage)
+		}
+		if err := runNativeWindowsCodexInstaller(ctx, out, installerEnv); err == nil {
+			return nil
+		} else {
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "%s %v\n", nativeWindowsCodexInstallerFallbackMessage, err)
+			}
+			attemptErrors = append(attemptErrors, fmt.Sprintf("native windows managed installer: %v", err))
+		}
+	}
+
 	for _, candidate := range candidates {
 		if _, err := exec.LookPath(candidate.path); err != nil {
 			attemptErrors = append(attemptErrors, fmt.Sprintf("%s: not found in PATH", installerAttemptLabel(candidate)))
@@ -2214,7 +2244,7 @@ func codexInstallerCandidates(goos string) []codexInstallCmd {
 			seen[key] = struct{}{}
 			out = append(out, codexInstallCmd{
 				path: path,
-				args: []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", codexInstallBootstrapWindows},
+				args: []string{"-NoProfile", "-Command", codexInstallBootstrapWindows},
 			})
 		}
 		if systemRoot := strings.TrimSpace(os.Getenv("SystemRoot")); systemRoot != "" {

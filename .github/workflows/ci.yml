@@ -862,7 +862,7 @@ jobs:
           set -euo pipefail
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
-      - name: Managed-node install integration (Windows)
+      - name: Native managed-node install integration (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:

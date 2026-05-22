@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"errors"
@@ -94,13 +95,17 @@ func TestCodexInstallerCandidatesWindows(t *testing.T) {
 		t.Fatalf("unexpected windows installer order: %q, %q, %q", cmds[0].path, cmds[1].path, cmds[2].path)
 	}
 	for i, cmd := range cmds {
-		if len(cmd.args) < 5 {
+		if len(cmd.args) < 3 {
 			t.Fatalf("expected powershell args for candidate %d, got %v", i, cmd.args)
 		}
-		if cmd.args[3] != "-Command" {
-			t.Fatalf("expected -Command for candidate %d, got %q", i, cmd.args[3])
+		if cmd.args[1] != "-Command" {
+			t.Fatalf("expected -Command for candidate %d, got %q", i, cmd.args[1])
 		}
-		if !strings.Contains(cmd.args[4], "@openai/codex") {
+		if strings.Contains(strings.Join(cmd.args, " "), "ExecutionPolicy") ||
+			strings.Contains(strings.Join(cmd.args, " "), "Bypass") {
+			t.Fatalf("Windows installer fallback should avoid execution-policy bypass args, got %v", cmd.args)
+		}
+		if !strings.Contains(cmd.args[2], "@openai/codex") {
 			t.Fatalf("expected codex npm install in candidate %d", i)
 		}
 	}
@@ -2484,6 +2489,52 @@ func TestBootstrapWindowsScriptContainsSelfValidation(t *testing.T) {
 	}
 }
 
+func TestWindowsManagedCodexCmdShimAvoidsPowerShell(t *testing.T) {
+	shim := buildWindowsManagedCodexCmdShim("v22-win-x64", `node_modules\@openai\codex\bin\codex.js`)
+	for _, want := range []string{
+		`rem "%~dp0node_modules\@openai\codex\bin\codex.js"`,
+		`set "_nodeRoot=%CODEX_NODE_INSTALL_ROOT%"`,
+		`node.exe`,
+		`set "_fallbackNodePath=%~dp0..\node\v22-win-x64\node.exe"`,
+		`"%_nodePath%" "%_scriptPath%" %*`,
+	} {
+		if !strings.Contains(shim, want) {
+			t.Fatalf("managed codex.cmd shim missing %q:\n%s", want, shim)
+		}
+	}
+	for _, forbidden := range []string{"powershell", "codex.ps1", "node.cmd"} {
+		if strings.Contains(strings.ToLower(shim), forbidden) {
+			t.Fatalf("managed codex.cmd shim must not contain %q:\n%s", forbidden, shim)
+		}
+	}
+}
+
+func TestWriteWindowsManagedCodexShimsPreservesNativeDiscoveryHint(t *testing.T) {
+	npmPrefix := t.TempDir()
+	codexCmd := filepath.Join(npmPrefix, "codex.cmd")
+	if err := os.WriteFile(codexCmd, []byte(`@"%~dp0node_modules\@openai\codex\bin\codex.js" %*`), 0o644); err != nil {
+		t.Fatalf("write codex.cmd: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(npmPrefix, "codex.ps1"), []byte("old"), 0o644); err != nil {
+		t.Fatalf("write codex.ps1: %v", err)
+	}
+
+	if err := writeWindowsManagedCodexShims(npmPrefix, filepath.Join(t.TempDir(), "v22-win-x64")); err != nil {
+		t.Fatalf("writeWindowsManagedCodexShims error: %v", err)
+	}
+	shimData, err := os.ReadFile(codexCmd)
+	if err != nil {
+		t.Fatalf("read codex.cmd: %v", err)
+	}
+	shim := string(shimData)
+	if !strings.Contains(shim, `node_modules\@openai\codex\bin\codex.js`) {
+		t.Fatalf("expected native discovery hint to be preserved:\n%s", shim)
+	}
+	if strings.Contains(strings.ToLower(shim), "powershell") || strings.Contains(strings.ToLower(shim), "codex.ps1") {
+		t.Fatalf("managed codex.cmd should not spawn PowerShell:\n%s", shim)
+	}
+}
+
 func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
 	for _, want := range []string{
 		"CODEX_PROXY_CODEX_INSTALL_MIN_FREE_KB",
@@ -2503,6 +2554,42 @@ func TestBootstrapWindowsScriptContainsDiskAndNpmChecks(t *testing.T) {
 		if !strings.Contains(codexInstallBootstrapWindows, want) {
 			t.Fatalf("Windows bootstrap script missing %q", want)
 		}
+	}
+}
+
+func TestNativeWindowsResolveNodeZip(t *testing.T) {
+	shasums := filepath.Join(t.TempDir(), "SHASUMS256.txt")
+	content := strings.Join([]string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  node-v22.1.0-linux-x64.tar.xz",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  node-v22.3.4-win-x64.zip",
+		"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  node-v22.3.4-win-arm64.zip",
+	}, "\n")
+	if err := os.WriteFile(shasums, []byte(content), 0o644); err != nil {
+		t.Fatalf("write shasums: %v", err)
+	}
+	sha, zipName, err := nativeWindowsResolveNodeZip(shasums, 22, "x64")
+	if err != nil {
+		t.Fatalf("nativeWindowsResolveNodeZip error: %v", err)
+	}
+	if sha != strings.Repeat("b", 64) || zipName != "node-v22.3.4-win-x64.zip" {
+		t.Fatalf("unexpected resolved zip: sha=%s zip=%s", sha, zipName)
+	}
+}
+
+func TestExtractSingleRootZipRejectsDotDotComponents(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "node.zip")
+	writeTestZip(t, zipPath, map[string]string{
+		"node-v22.3.4-win-x64/bin/node.exe":  "node",
+		"node-v22.3.4-win-x64/../escape.txt": "escape",
+	})
+
+	dest := filepath.Join(dir, "extract")
+	if _, err := extractSingleRootZip(zipPath, dest); err == nil || !strings.Contains(err.Error(), "unsafe zip entry") {
+		t.Fatalf("extractSingleRootZip error = %v, want unsafe zip entry", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "escape.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unsafe entry escaped root, stat err=%v", err)
 	}
 }
 
@@ -2546,6 +2633,35 @@ func TestBootstrapWindowsScriptContainsNativeDllFailureHint(t *testing.T) {
 		if !strings.Contains(codexInstallBootstrapWindows, want) {
 			t.Fatalf("Windows bootstrap script missing %q", want)
 		}
+	}
+}
+
+func writeTestZip(t *testing.T, path string, entries map[string]string) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create zip: %v", err)
+	}
+	zw := zip.NewWriter(file)
+	for name, body := range entries {
+		w, err := zw.Create(name)
+		if err != nil {
+			_ = zw.Close()
+			_ = file.Close()
+			t.Fatalf("create zip entry %q: %v", name, err)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			_ = zw.Close()
+			_ = file.Close()
+			t.Fatalf("write zip entry %q: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		_ = file.Close()
+		t.Fatalf("close zip writer: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close zip file: %v", err)
 	}
 }
 
@@ -2719,6 +2835,13 @@ func managedNodeIntegrationNodePaths(nodeRoot string, arch string) (nodeBin stri
 func assertWindowsManagedCodexInstall(t *testing.T, npmPrefix string, installerOutput string) {
 	t.Helper()
 
+	if !strings.Contains(installerOutput, nativeWindowsCodexInstallerStartMessage) {
+		t.Fatalf("Windows managed install integration did not exercise native installer flow; output:\n%s", installerOutput)
+	}
+	if strings.Contains(installerOutput, nativeWindowsCodexInstallerFallbackMessage) {
+		t.Fatalf("Windows managed install integration must not fall back to PowerShell; output:\n%s", installerOutput)
+	}
+
 	for _, forbidden := range []string{
 		filepath.Join(npmPrefix, "node.cmd"),
 		filepath.Join(npmPrefix, "node.exe"),
@@ -2742,8 +2865,12 @@ func assertWindowsManagedCodexInstall(t *testing.T, npmPrefix string, installerO
 	if !strings.Contains(shimText, `node_modules\@openai\codex\bin\codex.js`) {
 		t.Fatalf("expected codex.cmd to preserve native binary discovery hint, got:\n%s", shimText)
 	}
-	if !strings.Contains(shimText, "codex.ps1") {
-		t.Fatalf("expected codex.cmd to delegate to codex.ps1, got:\n%s", shimText)
+	if !strings.Contains(shimText, `node.exe`) {
+		t.Fatalf("expected codex.cmd to call managed node.exe directly, got:\n%s", shimText)
+	}
+	if strings.Contains(strings.ToLower(shimText), "powershell") ||
+		strings.Contains(strings.ToLower(shimText), "codex.ps1") {
+		t.Fatalf("codex.cmd must not spawn PowerShell, got:\n%s", shimText)
 	}
 	if strings.Contains(strings.ToLower(shimText), "node.cmd") {
 		t.Fatalf("codex.cmd must not depend on a public node.cmd shim, got:\n%s", shimText)
