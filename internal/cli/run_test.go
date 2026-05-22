@@ -712,11 +712,9 @@ func TestRunLikeYoloFlagEnablesManagedYoloInDirectMode(t *testing.T) {
 	}
 
 	codexDir := t.TempDir()
-	codexPath := filepath.Join(codexDir, "codex")
-	script := "#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; --version) echo 'codex 0.0.0' ;; *) exit 0 ;; esac\n"
-	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
+	writeStub(t, codexDir, "codex",
+		"#!/bin/sh\ncase \"$1\" in --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; --version) echo 'codex 0.0.0' ;; *) exit 0 ;; esac\n",
+		"@echo off\r\nif \"%~1\"==\"--help\" (\r\n  echo usage codex --dangerously-bypass-approvals-and-sandbox\r\n  exit /b 0\r\n)\r\nif \"%~1\"==\"--version\" (\r\n  echo codex 0.0.0\r\n  exit /b 0\r\n)\r\nexit /b 0\r\n")
 	t.Setenv("PATH", codexDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CODEX_HOME", t.TempDir())
 
@@ -1028,10 +1026,7 @@ func TestRunLikePropagatesCodexHomeEnv(t *testing.T) {
 	}
 
 	codexDir := t.TempDir()
-	codexPath := filepath.Join(t.TempDir(), "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
+	codexPath := writeProbeableCodex(t, t.TempDir(), true)
 	t.Setenv("PATH", filepath.Dir(codexPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CODEX_HOME", codexDir)
 	t.Setenv("CODEX_DIR", "")
