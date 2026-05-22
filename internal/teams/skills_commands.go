@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/skills"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	xhtml "golang.org/x/net/html"
 )
 
 var newTeamsSkillsManagerForCommand = newTeamsSkillsManager
@@ -17,6 +19,10 @@ var newTeamsSkillsManagerForCommand = newTeamsSkillsManager
 const teamsSkillPushReviewTTL = 30 * time.Minute
 
 func (b *Bridge) handleSkillsCommand(ctx context.Context, chatID string, arg string) error {
+	return b.handleSkillsCommandFromMessage(ctx, chatID, ChatMessage{}, arg)
+}
+
+func (b *Bridge) handleSkillsCommandFromMessage(ctx context.Context, chatID string, msg ChatMessage, arg string) error {
 	mgr, err := newTeamsSkillsManagerForCommand()
 	if err != nil {
 		return b.sendToChat(ctx, chatID, "skills setup failed: "+err.Error())
@@ -33,7 +39,7 @@ func (b *Bridge) handleSkillsCommand(ctx context.Context, chatID string, arg str
 		}
 		return b.sendToChat(ctx, chatID, formatTeamsSkillEntries(entries))
 	case "add":
-		rawURL := cleanTeamsSkillURL(rest)
+		rawURL := teamsSkillAddURLFromTeamsMessage(msg, rest)
 		if rawURL == "" {
 			return b.sendToChat(ctx, chatID, "usage: `helper skills add <github/gitlab/git-url>`")
 		}
@@ -190,6 +196,159 @@ func cleanTeamsSkillURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	raw = strings.Trim(raw, "<>")
 	return strings.TrimSpace(raw)
+}
+
+type teamsHTMLAnchor struct {
+	Href string
+	Text string
+}
+
+func teamsSkillAddURLFromTeamsMessage(msg ChatMessage, raw string) string {
+	cleaned := cleanTeamsSkillURL(raw)
+	if cleaned == "" {
+		return ""
+	}
+	anchors := safeTeamsSkillAnchorsFromTeamsHTML(msg.Body.Content)
+	if len(anchors) == 0 {
+		return cleaned
+	}
+	normalizedRaw := normalizeTeamsSkillAnchorText(cleaned)
+	explicitRaw := looksLikeExplicitTeamsSkillURL(cleaned)
+	for _, anchor := range anchors {
+		text := normalizeTeamsSkillAnchorText(cleanTeamsSkillURL(anchor.Text))
+		if text == "" {
+			continue
+		}
+		if normalizedRaw == text || (!explicitRaw && strings.Contains(normalizedRaw, text)) {
+			return anchor.Href
+		}
+	}
+	if len(anchors) == 1 && !explicitRaw {
+		return anchors[0].Href
+	}
+	return cleaned
+}
+
+func safeTeamsSkillAnchorsFromTeamsHTML(content string) []teamsHTMLAnchor {
+	content = commandRouteHTMLForTeamsSkillAnchors(content)
+	if content == "" {
+		return nil
+	}
+	root, err := xhtml.Parse(strings.NewReader("<html><body>" + content + "</body></html>"))
+	if err != nil {
+		return nil
+	}
+	var out []teamsHTMLAnchor
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.EqualFold(n.Data, "a") {
+			href, ok := normalizeSafeTeamsSkillHref(teamsHTMLNodeAttr(n, "href"))
+			if ok {
+				out = append(out, teamsHTMLAnchor{Href: href, Text: teamsHTMLNodeText(n)})
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return out
+}
+
+func commandRouteHTMLForTeamsSkillAnchors(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	for {
+		next := commandRouteQuoteHTML.ReplaceAllString(content, "")
+		if next == content {
+			break
+		}
+		content = next
+	}
+	content = commandRouteAttachmentHTML.ReplaceAllString(content, "")
+	return strings.TrimSpace(content)
+}
+
+func teamsHTMLNodeAttr(n *xhtml.Node, key string) string {
+	for _, attr := range n.Attr {
+		if strings.EqualFold(attr.Key, key) {
+			return strings.TrimSpace(attr.Val)
+		}
+	}
+	return ""
+}
+
+func teamsHTMLNodeText(n *xhtml.Node) string {
+	var b strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(node *xhtml.Node) {
+		if node == nil {
+			return
+		}
+		if node.Type == xhtml.TextNode {
+			b.WriteString(node.Data)
+			return
+		}
+		if node.Type == xhtml.ElementNode && strings.EqualFold(node.Data, "br") {
+			b.WriteByte(' ')
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(strings.Join(strings.Fields(b.String()), " "))
+}
+
+func normalizeSafeTeamsSkillHref(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" {
+		return "", false
+	}
+	if isTeamsSafeLinkHost(parsed.Hostname()) {
+		raw = strings.TrimSpace(parsed.Query().Get("url"))
+		if raw == "" {
+			return "", false
+		}
+		parsed, err = url.Parse(raw)
+		if err != nil || parsed.Scheme == "" {
+			return "", false
+		}
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "ssh":
+		if strings.TrimSpace(parsed.Hostname()) == "" {
+			return "", false
+		}
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
+func isTeamsSafeLinkHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	return host == "safelinks.protection.outlook.com" || strings.HasSuffix(host, ".safelinks.protection.outlook.com")
+}
+
+func normalizeTeamsSkillAnchorText(text string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+}
+
+func looksLikeExplicitTeamsSkillURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.Contains(raw, "://") {
+		return true
+	}
+	at := strings.Index(raw, "@")
+	colon := strings.Index(raw, ":")
+	return at > 0 && colon > at+1
 }
 
 func newTeamsSkillsManager() (*skills.Manager, error) {

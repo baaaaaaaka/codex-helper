@@ -427,6 +427,13 @@ jobs:
           go test ./internal/teams -count=1 -run "$teams_pattern" -v
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
 
+      - name: Teams skills command regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          skills_pattern='Test(HandleSkillsCommandAddUsesTeamsHyperlinkHref|TeamsSkillAddURLFromTeamsMessagePrefersSafeMatchingHref)$'
+          go test ./internal/teams -count=1 -run "$skills_pattern" -v
+
       - name: Teams background keepalive race regressions (Linux only)
         if: runner.os == 'Linux'
         shell: bash

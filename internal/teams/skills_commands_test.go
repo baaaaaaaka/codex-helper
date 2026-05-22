@@ -2,8 +2,10 @@ package teams
 
 import (
 	"context"
+	stdhtml "html"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -202,6 +204,90 @@ func TestHandleSkillsCommandAddsSourceAndInstallsSkills(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Source.Name != "acme-skills" || len(entries[0].State.InstalledSkills) != 1 {
 		t.Fatalf("entries after add = %#v", entries)
+	}
+}
+
+func TestHandleSkillsCommandAddUsesTeamsHyperlinkHref(t *testing.T) {
+	mgr := newTeamsSkillsTestManager(t)
+	mgr.Git = teamsSkillsAddGitRunner{}
+	prev := newTeamsSkillsManagerForCommand
+	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
+
+	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
+	if err != nil {
+		t.Fatalf("open teams store: %v", err)
+	}
+	graphServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected graph request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m1"}`))
+	}))
+	t.Cleanup(graphServer.Close)
+	bridge := &Bridge{
+		graph:   newTestGraphClient(&fakeGraphAuth{token: "token"}, graphServer, nil),
+		store:   store,
+		reg:     Registry{ControlChatID: "chat-1"},
+		user:    User{ID: "user-1", DisplayName: "Test User"},
+		scope:   teamstore.ScopeIdentity{ID: "scope"},
+		machine: teamstore.MachineRecord{ID: "machine"},
+	}
+
+	rawURL := "https://github.com/acme/skills/tree/main/skills/review"
+	displayURL := "https://github.com/acme/skills/tree/main/skills/..."
+	msg := teamsSkillHTMLCommandMessage("control-add-href", "user-1", `<p>helper skills add <a href="`+stdhtml.EscapeString(rawURL)+`">`+stdhtml.EscapeString(displayURL)+`</a></p>`)
+	if err := bridge.handleControlMessage(context.Background(), msg, "helper skills add "+displayURL); err != nil {
+		t.Fatalf("handle skills add href: %v", err)
+	}
+
+	entries, err := mgr.List(context.Background())
+	if err != nil {
+		t.Fatalf("list after add: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries len = %d, want 1: %#v", len(entries), entries)
+	}
+	source := entries[0].Source
+	if source.Name != "acme-skills" || source.RemoteURL != "https://github.com/acme/skills.git" || source.Ref != "main" || source.Path != "skills/review" {
+		t.Fatalf("source = %#v, want parsed href source", source)
+	}
+	if len(entries[0].State.InstalledSkills) != 1 {
+		t.Fatalf("installed skills = %#v, want one skill from href source", entries[0].State.InstalledSkills)
+	}
+}
+
+func TestTeamsSkillAddURLFromTeamsMessagePrefersSafeMatchingHref(t *testing.T) {
+	msg := teamsSkillHTMLCommandMessage("m1", "user-1", `<p>helper skills add <a href="https://github.com/acme/skills/tree/main/skills/review">Open source</a></p>`)
+	if got, want := teamsSkillAddURLFromTeamsMessage(msg, "Open source"), "https://github.com/acme/skills/tree/main/skills/review"; got != want {
+		t.Fatalf("href URL = %q, want %q", got, want)
+	}
+
+	msg.Body.Content = `<p>helper skills add <a href="mailto:owner@example.test">Open source</a></p>`
+	if got, want := teamsSkillAddURLFromTeamsMessage(msg, "Open source"), "Open source"; got != want {
+		t.Fatalf("unsafe href URL = %q, want visible text %q", got, want)
+	}
+
+	safeLinked := "https://github.com/acme/skills/tree/main/skills/review"
+	msg.Body.Content = `<p>helper skills add <a href="https://nam12.safelinks.protection.outlook.com/?url=` + stdhtml.EscapeString(url.QueryEscape(safeLinked)) + `&amp;data=ignored">Open source</a></p>`
+	if got, want := teamsSkillAddURLFromTeamsMessage(msg, "Open source"), safeLinked; got != want {
+		t.Fatalf("safelink href URL = %q, want unwrapped %q", got, want)
+	}
+
+	msg.Body.Content = `<p>helper skills add <a href="https://nam12.safelinks.protection.outlook.com/?url=mailto%3Aowner%40example.test">Open source</a></p>`
+	if got, want := teamsSkillAddURLFromTeamsMessage(msg, "Open source"), "Open source"; got != want {
+		t.Fatalf("unsafe safelink URL = %q, want visible text %q", got, want)
+	}
+
+	msg.Body.Content = `<blockquote><a href="https://github.com/quoted/skills.git">Open source</a></blockquote><p>helper skills add Open source</p>`
+	if got, want := teamsSkillAddURLFromTeamsMessage(msg, "Open source"), "Open source"; got != want {
+		t.Fatalf("quoted href URL = %q, want visible text %q", got, want)
+	}
+
+	msg.Body.Content = `<p>helper skills add https://github.com/plain/skills.git <a href="https://github.com/acme/skills/tree/main/skills/review">github.com</a></p>`
+	if got, want := teamsSkillAddURLFromTeamsMessage(msg, "https://github.com/plain/skills.git"), "https://github.com/plain/skills.git"; got != want {
+		t.Fatalf("explicit raw URL = %q, want %q", got, want)
 	}
 }
 
@@ -483,6 +569,13 @@ func teamsSkillCommandMessage(id string, userID string, text string) ChatMessage
 	}{ID: userID, DisplayName: "Test User"}
 	msg.Body.ContentType = "text"
 	msg.Body.Content = text
+	return msg
+}
+
+func teamsSkillHTMLCommandMessage(id string, userID string, content string) ChatMessage {
+	msg := teamsSkillCommandMessage(id, userID, "")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = content
 	return msg
 }
 

@@ -2678,7 +2678,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		case DashboardCommandStatus:
 			return b.sendControl(ctx, b.formatSessionList())
 		case DashboardCommandSkills:
-			return b.handleSkillsCommand(ctx, b.reg.ControlChatID, parsed.Argument)
+			return b.handleSkillsCommandFromMessage(ctx, b.reg.ControlChatID, msg, parsed.Argument)
 		case DashboardCommandBeacon:
 			return b.handleBeaconControlCommand(ctx, msg, parsed.Argument)
 		case DashboardCommandRestart:
@@ -5314,7 +5314,7 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 		case DashboardCommandPublishHistory:
 			return b.publishWorkSessionHistory(ctx, session)
 		case DashboardCommandSkills:
-			return b.handleSkillsCommand(ctx, chatID, parsed.Argument)
+			return b.handleSkillsCommandFromMessage(ctx, chatID, msg, parsed.Argument)
 		case DashboardCommandBeacon:
 			return b.handleBeaconWorkCommand(ctx, session, msg, parsed.Argument)
 		case DashboardCommandHelp:
