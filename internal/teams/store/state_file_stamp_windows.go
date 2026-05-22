@@ -16,7 +16,15 @@ type windowsFileBasicInfo struct {
 	LastWriteTime  windows.Filetime
 	ChangeTime     windows.Filetime
 	FileAttributes uint32
+	_              uint32
 }
+
+const windowsFileBasicInfoSize = 40
+
+var (
+	_ [windowsFileBasicInfoSize - int(unsafe.Sizeof(windowsFileBasicInfo{}))]byte
+	_ [int(unsafe.Sizeof(windowsFileBasicInfo{})) - windowsFileBasicInfoSize]byte
+)
 
 func stateFileStampRevision(path string, _ os.FileInfo) (string, error) {
 	pathPtr, err := windows.UTF16PtrFromString(path)
