@@ -7439,6 +7439,23 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			}
 			return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "canceled", "Codex request canceled.")
 		}
+		if isCanceledExecutionError(err) {
+			notifyCtx := ctx
+			if notifyCtx == nil || notifyCtx.Err() != nil {
+				notifyCtx = context.Background()
+			}
+			if recovered, ok := b.completedTurnResultFromCodexHistory(notifyCtx, session, turn, result); ok {
+				return b.completeQueuedTurnWithResult(notifyCtx, session, turn, chatID, plan, recovered)
+			}
+			reason := "helper context canceled before Codex result could be verified"
+			if _, markErr := b.store.MarkTurnInterrupted(notifyCtx, turn.ID, reason); markErr != nil {
+				return markErr
+			}
+			return b.queueAndSendOutboxChunksWithOptions(notifyCtx, session.ID, turn.ID, chatID, "interrupted", "Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.\n\nCheck recent messages and changed files first. If no final answer appears, resend the message or use `helper retry last`.", outboxQueueOptions{
+				MentionOwner:     true,
+				NotificationKind: "needs_attention",
+			})
+		}
 		var threadConflict codexThreadConflictError
 		if errors.As(err, &threadConflict) {
 			return b.interruptTurnForThreadRecovery(ctx, session, turn, codexThreadConflictKind, threadConflict.Error())
@@ -7509,6 +7526,10 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	} else if interrupted {
 		return nil
 	}
+	return b.completeQueuedTurnWithResult(ctx, session, turn, chatID, plan, result)
+}
+
+func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, plan beacon.TurnExecutionPlan, result ExecutionResult) error {
 	if blocked, bindErr := b.bindObservedCodexThreadOrInterrupt(ctx, session, turn, result.CodexThreadID, "runner_completed"); bindErr != nil {
 		return bindErr
 	} else if blocked {
@@ -7569,6 +7590,63 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		}
 	}
 	return b.uploadArtifactsFromResult(ctx, session, turn, result.Text)
+}
+
+func (b *Bridge) completedTurnResultFromCodexHistory(ctx context.Context, session *Session, turn teamstore.Turn, observed ExecutionResult) (ExecutionResult, bool) {
+	if b == nil || session == nil {
+		return ExecutionResult{}, false
+	}
+	threadID := firstNonEmptyString(observed.CodexThreadID, turn.CodexThreadID, session.CodexThreadID)
+	if strings.TrimSpace(threadID) == "" {
+		return ExecutionResult{}, false
+	}
+	projects, err := discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
+	if err != nil {
+		return ExecutionResult{}, false
+	}
+	local, _, ok := findCodexSession(projects, threadID)
+	if !ok || strings.TrimSpace(local.FilePath) == "" {
+		return ExecutionResult{}, false
+	}
+	scan, err := historyTieredScanTail(local.FilePath, historyTieredFileState{}, historyTieredMaxTailBytes)
+	if err != nil {
+		return ExecutionResult{}, false
+	}
+	if scan.TooLarge {
+		scan, err = historyTieredScanTail(local.FilePath, historyTieredFileState{}, 0)
+		if err != nil {
+			return ExecutionResult{}, false
+		}
+	}
+	var threshold time.Time
+	if !turn.StartedAt.IsZero() {
+		threshold = turn.StartedAt.Add(-2 * time.Second)
+	} else if !turn.QueuedAt.IsZero() {
+		threshold = turn.QueuedAt.Add(-2 * time.Second)
+	}
+	var selected historyTieredFinal
+	for _, final := range scan.Finals {
+		if strings.TrimSpace(final.Record.Text) == "" {
+			continue
+		}
+		if strings.TrimSpace(final.Record.ThreadID) != "" && strings.TrimSpace(final.Record.ThreadID) != strings.TrimSpace(threadID) {
+			continue
+		}
+		if !threshold.IsZero() {
+			if final.Record.CreatedAt.IsZero() || final.Record.CreatedAt.Before(threshold) {
+				continue
+			}
+		}
+		selected = final
+	}
+	if strings.TrimSpace(selected.Record.Text) == "" {
+		return ExecutionResult{}, false
+	}
+	return ExecutionResult{
+		Text:          strings.TrimSpace(selected.Record.Text),
+		CodexThreadID: firstNonEmptyString(selected.Record.ThreadID, observed.CodexThreadID, turn.CodexThreadID, session.CodexThreadID),
+		CodexTurnID:   firstNonEmptyString(selected.Record.TurnID, observed.CodexTurnID, turn.CodexTurnID),
+	}, true
 }
 
 func (b *Bridge) turnInterrupted(ctx context.Context, turnID string) (bool, error) {
@@ -10397,7 +10475,7 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 		lines = append(lines, "Codex status: "+userFacingCodexActivity(latest.Status))
 		lines = append(lines, "Last request: "+userFacingTurnStatus(latest.Status))
 		if strings.TrimSpace(latest.FailureMessage) != "" {
-			lines = append(lines, "Latest error: "+latest.FailureMessage)
+			lines = append(lines, "Latest error: "+userFacingFailureMessage(latest.FailureMessage))
 		}
 		switch latest.Status {
 		case teamstore.TurnStatusQueued:
@@ -10471,6 +10549,17 @@ func userFacingTurnStatus(status teamstore.TurnStatus) string {
 	default:
 		return firstNonEmptyString(string(status), "unknown")
 	}
+}
+
+func userFacingFailureMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	if message == "context canceled" {
+		return "helper lost its execution context before it could verify the Codex result"
+	}
+	return message
 }
 
 func (b *Bridge) formatOpenSession(sessionID string) string {

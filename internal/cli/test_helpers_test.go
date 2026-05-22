@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -8,6 +9,21 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
+
+func TestMain(m *testing.M) {
+	tmp, err := os.MkdirTemp("", "codex-helper-cli-tests-")
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "create CLI test temp dir: %v\n", err)
+		os.Exit(2)
+	}
+	_ = os.Setenv("HOME", filepath.Join(tmp, "home"))
+	_ = os.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	_ = os.Setenv("LOCALAPPDATA", filepath.Join(tmp, "localappdata"))
+
+	code := m.Run()
+	_ = os.RemoveAll(tmp)
+	os.Exit(code)
+}
 
 func newTempStore(t *testing.T) *config.Store {
 	t.Helper()

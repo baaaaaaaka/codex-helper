@@ -230,6 +230,50 @@ func TestEnsureCodexInstalledPrefersPathOverCachedPath(t *testing.T) {
 	}
 }
 
+func TestEnsureCodexInstalledDoesNotCacheProvidedPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip provided-path cache test on windows")
+	}
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	codexPath := writeProbeableCodex(t, t.TempDir(), true)
+	got, err := ensureCodexInstalled(context.Background(), codexPath, io.Discard)
+	if err != nil {
+		t.Fatalf("ensureCodexInstalled error: %v", err)
+	}
+	if got != codexPath {
+		t.Fatalf("expected provided codex path %q, got %q", codexPath, got)
+	}
+	if cached := readCachedCodexPath(); cached != "" {
+		t.Fatalf("provided codex path should not be cached, got %q", cached)
+	}
+}
+
+func TestEnsureCodexInstalledDoesNotOverwriteCachedPathWithProvidedPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip provided-path cache test on windows")
+	}
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	cachedCodex := writeProbeableCodex(t, t.TempDir(), true)
+	writeCachedCodexPath(cachedCodex)
+	providedCodex := writeProbeableCodex(t, t.TempDir(), true)
+	got, err := ensureCodexInstalled(context.Background(), providedCodex, io.Discard)
+	if err != nil {
+		t.Fatalf("ensureCodexInstalled error: %v", err)
+	}
+	if got != providedCodex {
+		t.Fatalf("expected provided codex path %q, got %q", providedCodex, got)
+	}
+	if cached := readCachedCodexPath(); cached != cachedCodex {
+		t.Fatalf("provided codex path should not overwrite cached path %q, got %q", cachedCodex, cached)
+	}
+}
+
 func TestEnsureCodexInstalledUsesCachedPathWhenPathIsBroken(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip cache fallback test on windows")

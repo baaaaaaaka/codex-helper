@@ -362,6 +362,261 @@ func TestBridgeTreatsFinalAnswerCanceledLaunchAsCompleted(t *testing.T) {
 	}
 }
 
+func TestBridgeRecoversCompletedHistoryFinalAfterCanceledExecution(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{
+		result: ExecutionResult{Text: "initial answer", CodexThreadID: "thread-history", CodexTurnID: "turn-initial"},
+	})
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-history-initial"), "initial"); err != nil {
+		t.Fatalf("handleSessionMessage initial error: %v", err)
+	}
+
+	finalText := "history final after canceled execution"
+	historyPath := filepath.Join(t.TempDir(), "rollout-2026-05-22T15-59-00-thread-history.jsonl")
+	stamp := time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
+	lines := []string{
+		`{"timestamp":` + strconv.Quote(stamp) + `,"type":"session_meta","payload":{"id":"thread-history"}}`,
+		`{"timestamp":` + strconv.Quote(stamp) + `,"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-history","phase":"final_answer","message":` + strconv.Quote(finalText) + `}}`,
+		`{"timestamp":` + strconv.Quote(stamp) + `,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-history","last_agent_message":` + strconv.Quote(finalText) + `}}`,
+	}
+	if err := os.WriteFile(historyPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write history file: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Path: "/workspace",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-history",
+				ProjectPath: "/workspace",
+				FilePath:    historyPath,
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	bridge.executor = &recordingExecutor{err: context.Canceled}
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-history-canceled"), "finish from history"); err != nil {
+		t.Fatalf("handleSessionMessage canceled error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, finalText) {
+		t.Fatalf("sent messages missing recovered final:\n%s", joined)
+	}
+	if strings.Contains(joined, "error: context canceled") || strings.Contains(joined, "Teams helper stopped") {
+		t.Fatalf("completed history final should not produce cancellation notice:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var completed teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.CodexTurnID == "turn-history" {
+			completed = turn
+			break
+		}
+	}
+	if completed.Status != teamstore.TurnStatusCompleted || completed.CodexThreadID != "thread-history" {
+		t.Fatalf("recovered turn = %#v, want completed thread-history/turn-history", completed)
+	}
+	for _, msg := range state.OutboxMessages {
+		if msg.TurnID == completed.ID && (msg.Kind == "error" || msg.Kind == "interrupted") {
+			t.Fatalf("unexpected cancellation outbox for recovered turn: %#v", msg)
+		}
+	}
+}
+
+func TestBridgeDoesNotRecoverStaleHistoryFinalAfterCanceledExecution(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{
+		result: ExecutionResult{Text: "initial answer", CodexThreadID: "thread-stale", CodexTurnID: "turn-initial"},
+	})
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-stale-initial"), "initial"); err != nil {
+		t.Fatalf("handleSessionMessage initial error: %v", err)
+	}
+
+	oldFinalText := "old history final that should not be reused"
+	historyPath := filepath.Join(t.TempDir(), "rollout-2026-05-22T15-00-00-thread-stale.jsonl")
+	oldStamp := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	lines := []string{
+		`{"timestamp":` + strconv.Quote(oldStamp) + `,"type":"session_meta","payload":{"id":"thread-stale"}}`,
+		`{"timestamp":` + strconv.Quote(oldStamp) + `,"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-old","phase":"final_answer","message":` + strconv.Quote(oldFinalText) + `}}`,
+		`{"timestamp":` + strconv.Quote(oldStamp) + `,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-old","last_agent_message":` + strconv.Quote(oldFinalText) + `}}`,
+	}
+	if err := os.WriteFile(historyPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write history file: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Path: "/workspace",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-stale",
+				ProjectPath: "/workspace",
+				FilePath:    historyPath,
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	bridge.executor = &recordingExecutor{err: context.Canceled}
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-stale-canceled"), "finish from stale history"); err != nil {
+		t.Fatalf("handleSessionMessage canceled error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, oldFinalText) {
+		t.Fatalf("stale history final was incorrectly sent:\n%s", joined)
+	}
+	if !strings.Contains(joined, "before it could verify a final Codex result") {
+		t.Fatalf("missing interruption notice after stale history was ignored:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var interrupted teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID == "s001" && turn.Status == teamstore.TurnStatusInterrupted {
+			interrupted = turn
+			break
+		}
+	}
+	if interrupted.ID == "" {
+		t.Fatalf("expected canceled turn to remain interrupted, got %#v", state.Turns)
+	}
+	if interrupted.CodexTurnID == "turn-old" {
+		t.Fatalf("stale Codex turn was bound to interrupted turn: %#v", interrupted)
+	}
+}
+
+func TestBridgeDoesNotRecoverUndatedHistoryFinalAfterCanceledExecution(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{
+		result: ExecutionResult{Text: "initial answer", CodexThreadID: "thread-undated", CodexTurnID: "turn-initial"},
+	})
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-undated-initial"), "initial"); err != nil {
+		t.Fatalf("handleSessionMessage initial error: %v", err)
+	}
+
+	undatedFinalText := "undated history final that should not be reused"
+	historyPath := filepath.Join(t.TempDir(), "rollout-thread-undated.jsonl")
+	lines := []string{
+		`{"type":"session_meta","payload":{"id":"thread-undated"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-undated","phase":"final_answer","message":` + strconv.Quote(undatedFinalText) + `}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-undated","last_agent_message":` + strconv.Quote(undatedFinalText) + `}}`,
+	}
+	if err := os.WriteFile(historyPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write history file: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Path: "/workspace",
+			Sessions: []codexhistory.Session{{
+				SessionID:   "thread-undated",
+				ProjectPath: "/workspace",
+				FilePath:    historyPath,
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	bridge.executor = &recordingExecutor{err: context.Canceled}
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-undated-canceled"), "finish from undated history"); err != nil {
+		t.Fatalf("handleSessionMessage canceled error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, undatedFinalText) {
+		t.Fatalf("undated history final was incorrectly sent:\n%s", joined)
+	}
+	if !strings.Contains(joined, "before it could verify a final Codex result") {
+		t.Fatalf("missing interruption notice after undated history was ignored:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var interrupted teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID == "s001" && turn.Status == teamstore.TurnStatusInterrupted {
+			interrupted = turn
+			break
+		}
+	}
+	if interrupted.ID == "" {
+		t.Fatalf("expected canceled turn to remain interrupted, got %#v", state.Turns)
+	}
+	if interrupted.CodexTurnID == "turn-undated" {
+		t.Fatalf("undated Codex turn was bound to interrupted turn: %#v", interrupted)
+	}
+}
+
+func TestBridgeTreatsUnrequestedCanceledExecutionAsInterrupted(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "should not finish"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("helper-context-cancel", "2026-05-03T01:00:00Z", "long task"), "long task"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Codex turn did not start")
+	}
+	cancel()
+
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var interrupted teamstore.Turn
+	for _, turn := range state.Turns {
+		if turn.SessionID == "s001" && turn.Status == teamstore.TurnStatusInterrupted {
+			interrupted = turn
+			break
+		}
+	}
+	if interrupted.ID == "" {
+		t.Fatalf("expected interrupted turn, got %#v", state.Turns)
+	}
+	if got := strings.TrimSpace(interrupted.RecoveryReason); got != "helper context canceled before Codex result could be verified" {
+		t.Fatalf("interrupted reason = %q", got)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Teams helper stopped, restarted, or lost its execution context") ||
+		!strings.Contains(joined, "before it could verify a final Codex result") {
+		t.Fatalf("interruption notice missing context-cancel explanation:\n%s", joined)
+	}
+	if !strings.Contains(joined, "helper retry last") {
+		t.Fatalf("interruption notice should include explicit retry guidance:\n%s", joined)
+	}
+	if strings.Contains(joined, "before Codex completed") {
+		t.Fatalf("interruption notice should not assert Codex failed to complete:\n%s", joined)
+	}
+	if strings.Contains(joined, "error: context canceled") {
+		t.Fatalf("unrequested context cancel should not be reported as raw execution error:\n%s", joined)
+	}
+}
+
 func TestBridgeWorkChatBareHelpAdvancedDoesNotRunCodex(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -5555,6 +5810,73 @@ func TestBridgeWorkHelperCommandPrefixDoesNotRunCodex(t *testing.T) {
 	}
 	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "STATUS: Work chat") {
 		t.Fatalf("helper status response = %#v", *sent)
+	}
+}
+
+func TestBridgeWorkStatusMapsContextCanceledFailure(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:context-canceled", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if _, err := store.MarkTurnFailed(context.Background(), turn.ID, "context canceled"); err != nil {
+		t.Fatalf("MarkTurnFailed error: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("helper-status-context-canceled", "helper status"), "helper status"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if strings.Contains(got, "Latest error: context canceled") {
+		t.Fatalf("helper status leaked raw context canceled:\n%s", got)
+	}
+	if !strings.Contains(got, "Latest error: helper lost its execution context before it could verify the Codex result") {
+		t.Fatalf("helper status missing user-facing context-cancel error:\n%s", got)
+	}
+}
+
+func TestUserFacingFailureMessageMapsOnlyExactContextCanceled(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "exact context canceled",
+			in:   "context canceled",
+			want: "helper lost its execution context before it could verify the Codex result",
+		},
+		{
+			name: "trimmed exact context canceled",
+			in:   "  context canceled\n",
+			want: "helper lost its execution context before it could verify the Codex result",
+		},
+		{
+			name: "launch failure keeps diagnostic",
+			in:   "launch_failure: failed to install codex CLI for linux (bash -c: context canceled; sh -c: context canceled)",
+			want: "launch_failure: failed to install codex CLI for linux (bash -c: context canceled; sh -c: context canceled)",
+		},
+		{
+			name: "model failure unchanged",
+			in:   "codex_failure: Selected model is at capacity. Please try a different model.",
+			want: "codex_failure: Selected model is at capacity. Please try a different model.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := userFacingFailureMessage(tt.in); got != tt.want {
+				t.Fatalf("userFacingFailureMessage(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 

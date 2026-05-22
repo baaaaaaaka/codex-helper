@@ -1396,7 +1396,6 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 		resolvedPath := normalizeExecutablePath(codexPath)
 		if executableExists(resolvedPath) {
 			if err := probeCodexVersion(ctx, resolvedPath); err == nil {
-				writeCachedCodexPath(resolvedPath)
 				return resolvedPath, nil
 			} else {
 				return "", fmt.Errorf("codex at %s is not functional: %w", resolvedPath, err)
