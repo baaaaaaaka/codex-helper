@@ -99,6 +99,7 @@ var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
 var ErrUpgradeInProgress = errors.New("Teams upgrade already in progress")
 
 var errStoreNoChange = errors.New("teams store no change")
+var loadUnlockedTestHook func()
 
 var (
 	currentOwnerExecutable = helperpath.RawExecutable
@@ -758,6 +759,29 @@ type MessageProvenanceRecord struct {
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
 
+type MessageLookup struct {
+	Provenance         MessageProvenanceRecord
+	HasProvenance      bool
+	HasInbound         bool
+	HasDeliveredOutbox bool
+}
+
+type stateFileStamp struct {
+	Exists  bool
+	Size    int64
+	ModTime time.Time
+	Info    os.FileInfo
+}
+
+type messageLookupCache struct {
+	Valid               bool
+	Stamp               stateFileStamp
+	Provenance          map[string]MessageProvenanceRecord
+	ProvenanceCanonical map[string]bool
+	Inbound             map[string]bool
+	DeliveredOutbox     map[string]bool
+}
+
 type RecoveryReport struct {
 	InterruptedTurnIDs        []string
 	SupersededOutboxIDs       []string
@@ -843,9 +867,10 @@ func (e *OwnerConflictError) Is(target error) bool {
 }
 
 type Store struct {
-	path string
-	mu   sync.Mutex
-	lock *flock.Flock
+	path          string
+	mu            sync.Mutex
+	lock          *flock.Flock
+	messageLookup messageLookupCache
 }
 
 func DefaultPath() (string, error) {
@@ -897,7 +922,14 @@ func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
 			return err
 		}
 		state.ensure(time.Now())
-		return s.saveUnlocked(state)
+		if err := s.saveUnlocked(state); err != nil {
+			s.invalidateMessageLookupCacheLocked()
+			return err
+		}
+		if s.messageLookup.Valid {
+			s.replaceMessageLookupCacheFromStateLocked(state)
+		}
+		return nil
 	})
 }
 
@@ -1781,13 +1813,11 @@ func (s *Store) PersistInbound(ctx context.Context, event InboundEvent) (Inbound
 	err := update(ctx, func(state *State) error {
 		if existing, ok := state.InboundEvents[event.ID]; ok {
 			out = existing
-			return nil
+			return errStoreNoChange
 		}
-		for _, existing := range state.InboundEvents {
-			if existing.TeamsChatID == event.TeamsChatID && existing.TeamsMessageID == event.TeamsMessageID && event.TeamsMessageID != "" {
-				out = existing
-				return nil
-			}
+		if existing, ok := inboundEventByTeamsMessageLocked(state, event.TeamsChatID, event.TeamsMessageID); ok {
+			out = existing
+			return errStoreNoChange
 		}
 		if helperOutboxMessageLocked(state, event.TeamsChatID, event.TeamsMessageID) {
 			return ErrInboundMessageFromHelperOutbox
@@ -1859,20 +1889,56 @@ func (s *Store) MessageProvenance(ctx context.Context, chatID string, teamsMessa
 	if chatID == "" || teamsMessageID == "" {
 		return MessageProvenanceRecord{}, false, nil
 	}
-	state, err := s.Load(ctx)
+	lookup, err := s.MessageLookup(ctx, chatID, teamsMessageID)
 	if err != nil {
 		return MessageProvenanceRecord{}, false, err
 	}
-	id := messageProvenanceID(chatID, teamsMessageID)
-	if record, ok := state.MessageProvenance[id]; ok {
-		return record, true, nil
+	return lookup.Provenance, lookup.HasProvenance, nil
+}
+
+func (s *Store) MessageLookup(ctx context.Context, chatID string, teamsMessageID string) (MessageLookup, error) {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if chatID == "" || teamsMessageID == "" {
+		return MessageLookup{}, nil
 	}
-	for _, record := range state.MessageProvenance {
-		if strings.TrimSpace(record.TeamsChatID) == chatID && strings.TrimSpace(record.TeamsMessageID) == teamsMessageID {
-			return record, true, nil
+	stamp, err := stateFileStampForPath(s.path)
+	if err != nil {
+		return MessageLookup{}, err
+	}
+	s.mu.Lock()
+	if lookup, ok := s.messageLookup.lookup(stamp, chatID, teamsMessageID); ok {
+		s.mu.Unlock()
+		return lookup, nil
+	}
+	s.mu.Unlock()
+	var out MessageLookup
+	err = s.withStateLock(ctx, func() error {
+		stamp, err := stateFileStampForPath(s.path)
+		if err != nil {
+			return err
 		}
+		if lookup, ok := s.messageLookup.lookup(stamp, chatID, teamsMessageID); ok {
+			out = lookup
+			return nil
+		}
+		state, err := s.loadUnlocked()
+		if err != nil {
+			s.invalidateMessageLookupCacheLocked()
+			return err
+		}
+		s.replaceMessageLookupCacheFromStateLocked(state)
+		if lookup, ok := s.messageLookup.lookup(s.messageLookup.Stamp, chatID, teamsMessageID); ok {
+			out = lookup
+			return nil
+		}
+		out = messageLookupLocked(&state, chatID, teamsMessageID)
+		return nil
+	})
+	if err != nil {
+		return MessageLookup{}, err
 	}
-	return MessageProvenanceRecord{}, false, nil
+	return out, nil
 }
 
 func (s *Store) HasInboundMessage(ctx context.Context, chatID string, teamsMessageID string) (bool, error) {
@@ -1881,23 +1947,11 @@ func (s *Store) HasInboundMessage(ctx context.Context, chatID string, teamsMessa
 	if chatID == "" || teamsMessageID == "" {
 		return false, nil
 	}
-	state, err := s.Load(ctx)
+	lookup, err := s.MessageLookup(ctx, chatID, teamsMessageID)
 	if err != nil {
 		return false, err
 	}
-	for _, event := range state.InboundEvents {
-		if strings.TrimSpace(event.TeamsChatID) == chatID && strings.TrimSpace(event.TeamsMessageID) == teamsMessageID {
-			return true, nil
-		}
-	}
-	record, ok, err := s.MessageProvenance(ctx, chatID, teamsMessageID)
-	if err != nil {
-		return false, err
-	}
-	if ok && strings.TrimSpace(record.Origin) == MessageOriginUserInbound {
-		return true, nil
-	}
-	return false, nil
+	return lookup.HasInbound, nil
 }
 
 func (s *Store) DeferredInbound(ctx context.Context) ([]InboundEvent, error) {
@@ -2909,27 +2963,11 @@ func (s *Store) HasDeliveredOutboxMessage(ctx context.Context, chatID string, te
 	if chatID == "" || teamsMessageID == "" {
 		return false, nil
 	}
-	state, err := s.Load(ctx)
+	lookup, err := s.MessageLookup(ctx, chatID, teamsMessageID)
 	if err != nil {
 		return false, err
 	}
-	for _, msg := range state.OutboxMessages {
-		if msg.TeamsChatID != chatID || msg.TeamsMessageID != teamsMessageID {
-			continue
-		}
-		switch msg.Status {
-		case OutboxStatusAccepted, OutboxStatusSent:
-			return true, nil
-		}
-	}
-	record, ok, err := s.MessageProvenance(ctx, chatID, teamsMessageID)
-	if err != nil {
-		return false, err
-	}
-	if ok && strings.TrimSpace(record.Origin) == MessageOriginHelperOutbox {
-		return true, nil
-	}
-	return false, nil
+	return lookup.HasDeliveredOutbox, nil
 }
 
 func (s *Store) PendingOutboxAt(ctx context.Context, now time.Time) ([]OutboxMessage, error) {
@@ -3347,6 +3385,9 @@ func (s *Store) updateUpgrade(ctx context.Context, upgradeID string, fn func(Upg
 }
 
 func (s *Store) loadUnlocked() (State, error) {
+	if loadUnlockedTestHook != nil {
+		loadUnlockedTestHook()
+	}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		state := newState()
@@ -4183,8 +4224,188 @@ func helperOutboxMessageLocked(state *State, chatID string, teamsMessageID strin
 	if state == nil || chatID == "" || teamsMessageID == "" {
 		return false
 	}
-	if record, ok := state.MessageProvenance[messageProvenanceID(chatID, teamsMessageID)]; ok && strings.TrimSpace(record.Origin) == MessageOriginHelperOutbox {
+	return messageLookupLocked(state, chatID, teamsMessageID).HasDeliveredOutbox
+}
+
+func (s *Store) invalidateMessageLookupCacheLocked() {
+	s.messageLookup = messageLookupCache{}
+}
+
+func (s *Store) replaceMessageLookupCacheFromStateLocked(state State) {
+	stamp, err := stateFileStampForPath(s.path)
+	if err != nil {
+		s.invalidateMessageLookupCacheLocked()
+		return
+	}
+	state.ensure(time.Time{})
+	backfillMessageProvenance(&state)
+	s.messageLookup = buildMessageLookupCache(state, stamp)
+}
+
+func stateFileStampForPath(path string) (stateFileStamp, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return stateFileStamp{}, nil
+	}
+	if err != nil {
+		return stateFileStamp{}, err
+	}
+	return stateFileStamp{
+		Exists:  true,
+		Size:    info.Size(),
+		ModTime: info.ModTime(),
+		Info:    info,
+	}, nil
+}
+
+func buildMessageLookupCache(state State, stamp stateFileStamp) messageLookupCache {
+	cache := messageLookupCache{
+		Valid:               true,
+		Stamp:               stamp,
+		Provenance:          make(map[string]MessageProvenanceRecord, len(state.MessageProvenance)),
+		ProvenanceCanonical: make(map[string]bool, len(state.MessageProvenance)),
+		Inbound:             make(map[string]bool, len(state.InboundEvents)+len(state.MessageProvenance)),
+		DeliveredOutbox:     make(map[string]bool, len(state.OutboxMessages)+len(state.MessageProvenance)),
+	}
+	for id, record := range state.MessageProvenance {
+		key := messageLookupKey(record.TeamsChatID, record.TeamsMessageID)
+		if key == "" {
+			continue
+		}
+		canonical := id == messageProvenanceID(record.TeamsChatID, record.TeamsMessageID)
+		if _, ok := cache.Provenance[key]; !ok || (canonical && !cache.ProvenanceCanonical[key]) {
+			cache.Provenance[key] = record
+			cache.ProvenanceCanonical[key] = canonical
+		}
+	}
+	for key, record := range cache.Provenance {
+		switch strings.TrimSpace(record.Origin) {
+		case MessageOriginUserInbound:
+			cache.Inbound[key] = true
+		case MessageOriginHelperOutbox:
+			cache.DeliveredOutbox[key] = true
+		}
+	}
+	for _, event := range state.InboundEvents {
+		key := messageLookupKey(event.TeamsChatID, event.TeamsMessageID)
+		if key != "" {
+			cache.Inbound[key] = true
+		}
+	}
+	for _, msg := range state.OutboxMessages {
+		key := messageLookupKey(msg.TeamsChatID, msg.TeamsMessageID)
+		if key == "" {
+			continue
+		}
+		switch msg.Status {
+		case OutboxStatusAccepted, OutboxStatusSent:
+			cache.DeliveredOutbox[key] = true
+		}
+	}
+	return cache
+}
+
+func (c messageLookupCache) lookup(stamp stateFileStamp, chatID string, teamsMessageID string) (MessageLookup, bool) {
+	if !c.Valid || !c.Stamp.equal(stamp) {
+		return MessageLookup{}, false
+	}
+	key := messageLookupKey(chatID, teamsMessageID)
+	if key == "" {
+		return MessageLookup{}, true
+	}
+	var out MessageLookup
+	if record, ok := c.Provenance[key]; ok {
+		out.Provenance = record
+		out.HasProvenance = true
+	}
+	out.HasInbound = c.Inbound[key]
+	out.HasDeliveredOutbox = c.DeliveredOutbox[key]
+	return out, true
+}
+
+func (stamp stateFileStamp) equal(other stateFileStamp) bool {
+	if stamp.Exists != other.Exists {
+		return false
+	}
+	if !stamp.Exists {
 		return true
+	}
+	if stamp.Size != other.Size || !stamp.ModTime.Equal(other.ModTime) {
+		return false
+	}
+	if stamp.Info != nil && other.Info != nil && !os.SameFile(stamp.Info, other.Info) {
+		return false
+	}
+	return true
+}
+
+func messageLookupLocked(state *State, chatID string, teamsMessageID string) MessageLookup {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if state == nil || chatID == "" || teamsMessageID == "" {
+		return MessageLookup{}
+	}
+	var out MessageLookup
+	if record, ok := messageProvenanceLocked(state, chatID, teamsMessageID); ok {
+		out.Provenance = record
+		out.HasProvenance = true
+		switch strings.TrimSpace(record.Origin) {
+		case MessageOriginUserInbound:
+			out.HasInbound = true
+		case MessageOriginHelperOutbox:
+			out.HasDeliveredOutbox = true
+		}
+	}
+	if _, ok := inboundEventByTeamsMessageLocked(state, chatID, teamsMessageID); ok {
+		out.HasInbound = true
+	}
+	if deliveredOutboxMessageLocked(state, chatID, teamsMessageID) {
+		out.HasDeliveredOutbox = true
+	}
+	return out
+}
+
+func messageProvenanceLocked(state *State, chatID string, teamsMessageID string) (MessageProvenanceRecord, bool) {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if state == nil || chatID == "" || teamsMessageID == "" {
+		return MessageProvenanceRecord{}, false
+	}
+	id := messageProvenanceID(chatID, teamsMessageID)
+	if record, ok := state.MessageProvenance[id]; ok {
+		return record, true
+	}
+	for _, record := range state.MessageProvenance {
+		if strings.TrimSpace(record.TeamsChatID) == chatID && strings.TrimSpace(record.TeamsMessageID) == teamsMessageID {
+			return record, true
+		}
+	}
+	return MessageProvenanceRecord{}, false
+}
+
+func inboundEventByTeamsMessageLocked(state *State, chatID string, teamsMessageID string) (InboundEvent, bool) {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if state == nil || chatID == "" || teamsMessageID == "" {
+		return InboundEvent{}, false
+	}
+	id := inboundID(chatID, teamsMessageID)
+	if event, ok := state.InboundEvents[id]; ok {
+		return event, true
+	}
+	for _, event := range state.InboundEvents {
+		if strings.TrimSpace(event.TeamsChatID) == chatID && strings.TrimSpace(event.TeamsMessageID) == teamsMessageID {
+			return event, true
+		}
+	}
+	return InboundEvent{}, false
+}
+
+func deliveredOutboxMessageLocked(state *State, chatID string, teamsMessageID string) bool {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if state == nil || chatID == "" || teamsMessageID == "" {
+		return false
 	}
 	for _, msg := range state.OutboxMessages {
 		if strings.TrimSpace(msg.TeamsChatID) != chatID || strings.TrimSpace(msg.TeamsMessageID) != teamsMessageID {
@@ -4272,6 +4493,15 @@ func messageProvenanceID(chatID string, teamsMessageID string) string {
 	}
 	sum := sha256.Sum256([]byte(chatID + "\x00" + teamsMessageID))
 	return "teams-message:" + hex.EncodeToString(sum[:16])
+}
+
+func messageLookupKey(chatID string, teamsMessageID string) string {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if chatID == "" || teamsMessageID == "" {
+		return ""
+	}
+	return chatID + "\x00" + teamsMessageID
 }
 
 func bodyHash(body string) string {

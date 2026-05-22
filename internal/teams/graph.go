@@ -98,6 +98,7 @@ type ChatMessage struct {
 		Content     string `json:"content"`
 	} `json:"body"`
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
+	Mentions    []json.RawMessage   `json:"mentions,omitempty"`
 }
 
 type MessageAttachment struct {
@@ -442,6 +443,26 @@ func (g *GraphClient) UpdateChatMessageHTML(ctx context.Context, chatID string, 
 			"contentType": "html",
 			"content":     html,
 		},
+	}
+	return g.do(ctx, http.MethodPatch, "/chats/"+url.PathEscape(chatID)+"/messages/"+url.PathEscape(messageID), body, nil)
+}
+
+func (g *GraphClient) UpdateChatMessageHTMLPreservingAttachments(ctx context.Context, chatID string, msg ChatMessage, html string) error {
+	messageID := strings.TrimSpace(msg.ID)
+	if messageID == "" {
+		return fmt.Errorf("message id is required")
+	}
+	body := map[string]any{
+		"body": map[string]any{
+			"contentType": "html",
+			"content":     html,
+		},
+	}
+	if len(msg.Attachments) > 0 {
+		body["attachments"] = msg.Attachments
+	}
+	if len(msg.Mentions) > 0 {
+		body["mentions"] = msg.Mentions
 	}
 	return g.do(ctx, http.MethodPatch, "/chats/"+url.PathEscape(chatID)+"/messages/"+url.PathEscape(messageID), body, nil)
 }

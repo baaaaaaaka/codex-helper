@@ -1970,6 +1970,117 @@ func TestUserAnnotatedMessageHTMLPrefixesSenderOnSeparateLine(t *testing.T) {
 	}
 }
 
+func TestUserAnnotatedMessageHTMLSkipsTeamsAttachmentContext(t *testing.T) {
+	quoted := bridgeTestMessageWithText("quoted-message", `<p>look</p><attachment id="quote-1"></attachment>`)
+	quoted.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"quoted body"}`,
+	}}
+	if _, ok := userAnnotatedMessageHTML(quoted, User{ID: "user-1"}); ok {
+		t.Fatal("messageReference message should not use body-only patch")
+	}
+	if got, ok := userAnnotatedAttachmentMessageHTML(quoted, User{ID: "user-1"}); !ok || !strings.Contains(got, `<attachment id="quote-1"></attachment>`) || !strings.Contains(PlainTextFromTeamsHTML(got), "🧑‍💻 User:") {
+		t.Fatalf("messageReference attachment-preserving annotation = %q,%v", got, ok)
+	}
+
+	file := bridgeTestMessageWithText("file-message", `<p>look</p><attachment id="file-1"></attachment>`)
+	file.Attachments = []MessageAttachment{{
+		ID:          "file-1",
+		ContentType: "reference",
+		Name:        "report.pdf",
+	}}
+	if _, ok := userAnnotatedMessageHTML(file, User{ID: "user-1"}); ok {
+		t.Fatal("file attachment message should not use body-only patch")
+	}
+	if got, ok := userAnnotatedAttachmentMessageHTML(file, User{ID: "user-1"}); !ok || !strings.Contains(got, `<attachment id="file-1"></attachment>`) || !strings.Contains(PlainTextFromTeamsHTML(got), "🧑‍💻 User:") {
+		t.Fatalf("file attachment-preserving annotation = %q,%v", got, ok)
+	}
+
+	hosted := bridgeTestMessageWithText("hosted-message", `<p>look</p><img src="https://graph.example/chats/chat-1/messages/hosted-message/hostedContents/img-1/$value">`)
+	if _, ok := userAnnotatedAttachmentMessageHTML(hosted, User{ID: "user-1"}); ok {
+		t.Fatal("hosted inline content should remain skipped until live lossless patch coverage exists")
+	}
+}
+
+func TestUserAnnotatedAttachmentMessageHTMLPreservesComplexBodyShape(t *testing.T) {
+	body := strings.Join([]string{
+		`<p><strong>Heading</strong> with <em>emphasis</em>, <s>strike</s>, <code>x|y &amp; z</code>, and <a href="https://example.com/a?x=1&amp;y=2">safe link</a>.</p>`,
+		`<blockquote><p>quoted block before attachment</p><attachment id="quote-1"></attachment></blockquote>`,
+		`<ul><li>bullet alpha</li><li>bullet beta with <code>&lt;tag&gt;</code></li></ul>`,
+		`<ol><li>ordered one</li><li>ordered two</li></ol>`,
+		`<pre><code>line 1&#10;line 2 with | and &lt;xml&gt;</code></pre>`,
+		`<table><thead><tr><th>Column</th><th>Value</th></tr></thead><tbody><tr><td>A</td><td>1 &amp; 2</td></tr><tr><td>B</td><td><code>cell|code</code></td></tr></tbody></table>`,
+		`<p>file follows</p><attachment id="file-1"></attachment>`,
+	}, "")
+	msg := bridgeTestMessageWithText("complex-attachment", body)
+	msg.Attachments = []MessageAttachment{
+		{
+			ID:          "quote-1",
+			ContentType: "messageReference",
+			Content:     `{"messageId":"source-1","messagePreview":"preview"}`,
+		},
+		{
+			ID:          "file-1",
+			ContentType: "reference",
+			Name:        "report.txt",
+		},
+	}
+
+	got, ok := userAnnotatedAttachmentMessageHTML(msg, User{ID: "user-1"})
+	if !ok {
+		t.Fatal("complex attachment message should be attachment-preserving patchable")
+	}
+	if !strings.HasSuffix(got, body) {
+		t.Fatalf("annotated body should only prepend User marker:\n%s", got)
+	}
+	if want, got := attachmentPlaceholderIDsInOrder(body), attachmentPlaceholderIDsInOrder(got); !sameStringList(want, got) {
+		t.Fatalf("placeholder order changed: before=%v after=%v", want, got)
+	}
+	if plain := stripUserAnnotationPrefix(PlainTextFromTeamsHTML(got)); plain != PlainTextFromTeamsHTML(body) {
+		t.Fatalf("plain body changed:\nbefore=%q\nafter=%q", PlainTextFromTeamsHTML(body), plain)
+	}
+
+	upperTag := bridgeTestMessageWithText("upper-attachment", `<p>upper</p><ATTACHMENT ID='file-1'></ATTACHMENT>`)
+	upperTag.Attachments = []MessageAttachment{{ID: "file-1", ContentType: "reference", Name: "report.txt"}}
+	if got, ok := userAnnotatedAttachmentMessageHTML(upperTag, User{ID: "user-1"}); !ok || !strings.Contains(got, `<ATTACHMENT ID='file-1'></ATTACHMENT>`) {
+		t.Fatalf("uppercase/single-quoted attachment tag should remain patchable, got %q ok=%v", got, ok)
+	}
+
+	mismatched := msg
+	mismatched.Attachments = append([]MessageAttachment(nil), msg.Attachments...)
+	mismatched.Attachments[1].ID = "missing-file"
+	if _, ok := userAnnotatedAttachmentMessageHTML(mismatched, User{ID: "user-1"}); ok {
+		t.Fatal("mismatched attachment id should not be considered lossless patchable")
+	}
+
+	extraPlaceholder := msg
+	extraPlaceholder.Body.Content += `<p>orphan</p><attachment id="orphan-1"></attachment>`
+	if _, ok := userAnnotatedAttachmentMessageHTML(extraPlaceholder, User{ID: "user-1"}); ok {
+		t.Fatal("extra placeholder without a matching attachment should not be considered lossless patchable")
+	}
+
+	duplicateAttachment := msg
+	duplicateAttachment.Attachments = append([]MessageAttachment(nil), msg.Attachments...)
+	duplicateAttachment.Attachments = append(duplicateAttachment.Attachments, MessageAttachment{ID: "file-1", ContentType: "reference", Name: "copy.txt"})
+	if _, ok := userAnnotatedAttachmentMessageHTML(duplicateAttachment, User{ID: "user-1"}); ok {
+		t.Fatal("duplicate attachment id should not be considered lossless patchable")
+	}
+
+	adaptive := msg
+	adaptive.Attachments = append([]MessageAttachment(nil), msg.Attachments...)
+	adaptive.Attachments = append(adaptive.Attachments, MessageAttachment{ID: "card-1", ContentType: "application/vnd.microsoft.card.adaptive"})
+	if _, ok := userAnnotatedAttachmentMessageHTML(adaptive, User{ID: "user-1"}); ok {
+		t.Fatal("adaptive card attachment should remain skipped")
+	}
+
+	plainContent := msg
+	plainContent.Body.ContentType = "text"
+	if _, ok := userAnnotatedAttachmentMessageHTML(plainContent, User{ID: "user-1"}); ok {
+		t.Fatal("non-HTML attachment messages should remain skipped")
+	}
+}
+
 func TestStripUserAnnotationPrefixStripsExactlyOneHelperUserMarker(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2071,6 +2182,193 @@ func TestBridgeAnnotateIncomingUserMessageFallsBackWhenGraphUpdateFails(t *testi
 	if mirrored.Kind != "user" || mirrored.SessionID != "s001" || mirrored.SourceTextHash != normalizedTextHash("fix this") {
 		t.Fatalf("mirrored outbox = %#v, want user mirror with source hash", mirrored)
 	}
+}
+
+func TestBridgeAnnotateMessageReferencePatchesWithAttachmentsAndNoMirror(t *testing.T) {
+	graph, patches := newAttachmentPreservingAnnotationGraph(t, "quote-1", "messageReference")
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.annotateUserMessages = true
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	msg := bridgeTestMessageWithText("quoted-message", `<p>please check</p><attachment id="quote-1"></attachment>`)
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"quoted body","messageSender":{"user":{"displayName":"Preview Sender"}}}`,
+	}}
+
+	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", msg)
+
+	if *patches != 1 {
+		t.Fatalf("patch requests = %d, want one attachment-preserving patch", *patches)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if strings.HasPrefix(outbox.ID, "outbox:user-marker:") {
+			t.Fatalf("unexpected user marker mirror for messageReference: %#v", outbox)
+		}
+	}
+}
+
+func TestBridgeAnnotateFileAttachmentPatchesWithAttachmentsAndNoMirror(t *testing.T) {
+	graph, patches := newAttachmentPreservingAnnotationGraph(t, "file-1", "reference")
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.annotateUserMessages = true
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	msg := bridgeTestMessageWithText("file-message", `<p>see file</p><attachment id="file-1"></attachment>`)
+	msg.Attachments = []MessageAttachment{{
+		ID:          "file-1",
+		ContentType: "reference",
+		Name:        "report.pdf",
+	}}
+
+	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", msg)
+
+	if *patches != 1 {
+		t.Fatalf("patch requests = %d, want one attachment-preserving patch", *patches)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if strings.HasPrefix(outbox.ID, "outbox:user-marker:") {
+			t.Fatalf("unexpected user marker mirror for file attachment: %#v", outbox)
+		}
+	}
+}
+
+func TestBridgeAnnotateAttachmentPatchBadRequestDoesNotDisableTextAnnotationsOrMirror(t *testing.T) {
+	var attachmentPatchAttempts int
+	var textPatchAttempts int
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			switch {
+			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/quoted-message":
+				attachmentPatchAttempts++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"code":"BadRequest","message":"attachment payload rejected for this message"}}`))
+			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/text-message":
+				textPatchAttempts++
+				var payload struct {
+					Body struct {
+						Content string `json:"content"`
+					} `json:"body"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode text patch: %v", err)
+				}
+				if !strings.Contains(PlainTextFromTeamsHTML(payload.Body.Content), "🧑‍💻 User:") || !strings.Contains(payload.Body.Content, "plain follow-up") {
+					t.Fatalf("unexpected text patch body: %#v", payload.Body)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
+				t.Fatalf("attachment annotation failure should not queue a visible mirror: %s", r.URL.String())
+			default:
+				t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			}
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.annotateUserMessages = true
+
+	quoted := bridgeTestMessageWithText("quoted-message", `<p>please check</p><attachment id="quote-1"></attachment>`)
+	quoted.Attachments = []MessageAttachment{{ID: "quote-1", ContentType: "messageReference", Content: `{"messageId":"source-1","messagePreview":"preview"}`}}
+	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", quoted)
+
+	text := bridgeTestMessageWithText("text-message", `<p>plain follow-up</p>`)
+	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", text)
+
+	if attachmentPatchAttempts != 1 || textPatchAttempts != 1 {
+		t.Fatalf("patch attempts attachment=%d text=%d, want 1/1", attachmentPatchAttempts, textPatchAttempts)
+	}
+}
+
+func TestShouldDisableAttachmentPreservingAnnotationOnlyForCapabilityErrors(t *testing.T) {
+	tests := []struct {
+		status int
+		want   bool
+	}{
+		{status: http.StatusBadRequest, want: false},
+		{status: http.StatusUnauthorized, want: true},
+		{status: http.StatusForbidden, want: true},
+		{status: http.StatusNotFound, want: false},
+		{status: http.StatusMethodNotAllowed, want: true},
+		{status: http.StatusTooManyRequests, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(strconv.Itoa(tt.status), func(t *testing.T) {
+			err := &GraphStatusError{StatusCode: tt.status}
+			if got := shouldDisableAttachmentPreservingUserMessageAnnotation(err); got != tt.want {
+				t.Fatalf("shouldDisableAttachmentPreservingUserMessageAnnotation(%d) = %v, want %v", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
+func newAttachmentPreservingAnnotationGraph(t *testing.T, wantAttachmentID string, wantContentType string) (*GraphClient, *int) {
+	t.Helper()
+	patches := 0
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			switch {
+			case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/chats/chat-1/messages/"):
+				patches++
+				var payload struct {
+					Body struct {
+						ContentType string `json:"contentType"`
+						Content     string `json:"content"`
+					} `json:"body"`
+					Attachments []MessageAttachment `json:"attachments"`
+					Mentions    []json.RawMessage   `json:"mentions"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode attachment-preserving patch: %v", err)
+				}
+				if payload.Body.ContentType != "html" || !strings.Contains(PlainTextFromTeamsHTML(payload.Body.Content), "🧑‍💻 User:") || !strings.Contains(payload.Body.Content, `<attachment id="`+wantAttachmentID+`"></attachment>`) {
+					t.Fatalf("unexpected attachment-preserving body: %#v", payload.Body)
+				}
+				if len(payload.Attachments) != 1 || payload.Attachments[0].ID != wantAttachmentID || payload.Attachments[0].ContentType != wantContentType {
+					t.Fatalf("attachment-preserving patch attachments = %#v", payload.Attachments)
+				}
+				if len(payload.Mentions) != 0 {
+					t.Fatalf("attachment-preserving patch mentions = %#v, want none", payload.Mentions)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
+				t.Fatalf("message with Teams attachment context should not queue a visible mirror: %s", r.URL.String())
+			default:
+				t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			}
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	return graph, &patches
 }
 
 func TestBridgeAnnotateExternalUserMessageQueuesUserMirrorWithoutGraphPatch(t *testing.T) {
@@ -4003,6 +4301,130 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	}
 	if durable.Model != DefaultControlFallbackModel || durable.RunnerKind != "control_fallback" {
 		t.Fatalf("durable control fallback metadata mismatch: %#v", durable)
+	}
+}
+
+func TestBridgeControlMessageReferenceFallsBackToCodex(t *testing.T) {
+	graph, sent := newBridgeMessageReferenceGraph(t, http.StatusOK)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "fallback answer",
+		CodexThreadID: "control-thread-1",
+		CodexTurnID:   "control-turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-message-quote", `<p>看一下这个</p><attachment id="quote-1"></attachment>`)
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote","messageSender":{"user":{"displayName":"Preview Sender"}}}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "看一下这个"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 {
+		t.Fatalf("executor prompts = %#v, want one control fallback prompt", got)
+	} else {
+		prompt := got[0]
+		for _, want := range []string{
+			"User message:\n看一下这个",
+			"Referenced Teams message for this turn",
+			"full quoted body",
+			"Source: Graph full message",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("control fallback prompt missing %q:\n%s", want, prompt)
+			}
+		}
+	}
+	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "fallback answer") {
+		t.Fatalf("unexpected control fallback transcript:\n%s", got)
+	}
+}
+
+func TestBridgeControlAskMessageReferenceIncludesQuoteContext(t *testing.T) {
+	graph, sent := newBridgeMessageReferenceGraph(t, http.StatusOK)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "ask answer",
+		CodexThreadID: "control-thread-1",
+		CodexTurnID:   "control-turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-ask-quote", `<p>ask summarize this</p><attachment id="quote-1"></attachment>`)
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote","messageSender":{"user":{"displayName":"Preview Sender"}}}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "ask summarize this"); err != nil {
+		t.Fatalf("handleControlMessage ask error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 {
+		t.Fatalf("executor prompts = %#v, want one control ask prompt", got)
+	} else if !strings.Contains(got[0], "User message:\nsummarize this") || !strings.Contains(got[0], "full quoted body") {
+		t.Fatalf("control ask prompt missing quote context:\n%s", got[0])
+	}
+	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "ask answer") {
+		t.Fatalf("unexpected control ask transcript:\n%s", got)
+	}
+}
+
+func TestBridgeControlMixedMessageReferenceAndFileIsRejectedWithoutCodex(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-mixed-attachments", `<p>look</p><attachment id="quote-1"></attachment><attachment id="file-1"></attachment>`)
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{
+		{
+			ID:          "quote-1",
+			ContentType: "messageReference",
+			Content:     `{"messageId":"quote-1","messagePreview":"preview quote"}`,
+		},
+		{
+			ID:          "file-1",
+			ContentType: "reference",
+			ContentURL:  "https://contoso.example/file.txt",
+			Name:        "file.txt",
+		},
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "look"); err != nil {
+		t.Fatalf("handleControlMessage mixed attachments error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none for unsupported mixed control attachments", executor.prompts)
+	}
+	if got := sentPlainJoined(*sent); !strings.Contains(got, "I could not process") || !strings.Contains(got, "reference") || strings.Contains(got, "messageReference") {
+		t.Fatalf("mixed control attachment response = %q", got)
+	}
+}
+
+func TestBridgeControlInlineHostedContentGetsExplicitUnsupportedResponse(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-inline-image", `<p>look</p><img src="https://graph.example/chats/control-chat/messages/control-inline-image/hostedContents/img-1/$value">`)
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "look"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none for control inline image", executor.prompts)
+	}
+	if got := sentPlainJoined(*sent); !strings.Contains(got, "I could not process") || !strings.Contains(got, "Teams-hosted inline content") || !strings.Contains(got, "Files and images belong") {
+		t.Fatalf("inline hosted content response = %q", got)
 	}
 }
 
@@ -5997,6 +6419,54 @@ func TestBridgeUpgradeDrainDefersAndReplaysControlFallbackOnce(t *testing.T) {
 	}
 	if len(executor.prompts) != 1 || len(*sent) != 3 {
 		t.Fatalf("deferred control fallback replayed more than once, prompts=%#v sent=%#v", executor.prompts, *sent)
+	}
+}
+
+func TestBridgeUpgradeDrainDefersControlFallbackMessageReferenceContext(t *testing.T) {
+	graph, sent := newBridgeMessageReferenceGraph(t, http.StatusOK)
+	store := newBridgeTestStore(t)
+	if _, err := store.SetDraining(context.Background(), teamstore.HelperUpgradeReason); err != nil {
+		t.Fatalf("SetDraining error: %v", err)
+	}
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "replayed quoted fallback",
+		CodexThreadID: "control-thread-1",
+		CodexTurnID:   "control-turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-deferred-quote", `<p>看一下这个</p><attachment id="quote-1"></attachment>`)
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote"}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "看一下这个"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts during drain = %#v, want none", executor.prompts)
+	}
+	deferred, err := store.DeferredInbound(context.Background())
+	if err != nil {
+		t.Fatalf("DeferredInbound error: %v", err)
+	}
+	if len(deferred) != 1 || deferred[0].Source != "teams_control_fallback" || !strings.Contains(deferred[0].Text, "full quoted body") {
+		t.Fatalf("deferred quoted control fallback inbound = %#v", deferred)
+	}
+	if _, err := store.ClearDrain(context.Background()); err != nil {
+		t.Fatalf("ClearDrain error: %v", err)
+	}
+	if err := bridge.processDeferredInbound(context.Background()); err != nil {
+		t.Fatalf("processDeferredInbound error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "User message:\n看一下这个") || !strings.Contains(got[0], "full quoted body") {
+		t.Fatalf("executor prompts after drain = %#v, want replayed quoted fallback", got)
+	}
+	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "replayed quoted fallback") {
+		t.Fatalf("unexpected sent transcript:\n%s", got)
 	}
 }
 
@@ -21143,13 +21613,17 @@ func newBridgeMessageReferenceGraph(t *testing.T, getStatus int) (*GraphClient, 
 			_, _ = fmt.Fprint(w, `{"id":"original-with-quote","chatId":"chat-1","createdDateTime":"2026-05-03T01:00:00Z","messageType":"message","from":{"user":{"id":"user-1","displayName":"User"}},"body":{"contentType":"html","content":"<p>retry this</p><attachment id=\"quote-1\"></attachment>"},"attachments":[{"id":"quote-1","contentType":"messageReference","content":"{\"messageId\":\"quote-1\",\"messagePreview\":\"preview quote\",\"messageSender\":{\"user\":{\"displayName\":\"Preview Sender\"}}}"}]}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/during-import-quote":
 			_, _ = fmt.Fprint(w, `{"id":"during-import-quote","chatId":"chat-1","createdDateTime":"2026-05-03T01:00:00Z","messageType":"message","from":{"user":{"id":"user-1","displayName":"User"}},"body":{"contentType":"html","content":"<p>run after import</p><attachment id=\"quote-1\"></attachment>"},"attachments":[{"id":"quote-1","contentType":"messageReference","content":"{\"messageId\":\"quote-1\",\"messagePreview\":\"preview quote\",\"messageSender\":{\"user\":{\"displayName\":\"Preview Sender\"}}}"}]}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/quote-1":
+		case r.Method == http.MethodGet && (r.URL.Path == "/chats/chat-1/messages/quote-1" || r.URL.Path == "/chats/control-chat/messages/quote-1"):
 			if getStatus != http.StatusOK {
 				w.WriteHeader(getStatus)
 				_, _ = fmt.Fprint(w, `{"error":{"message":"not found"}}`)
 				return
 			}
-			_, _ = fmt.Fprint(w, `{"id":"quote-1","chatId":"chat-1","createdDateTime":"2026-05-03T01:02:03Z","messageType":"message","from":{"user":{"id":"alex-id","displayName":"Alex"}},"body":{"contentType":"html","content":"<p>full quoted <strong>body</strong></p>"}}`)
+			chatID := "chat-1"
+			if strings.Contains(r.URL.Path, "/chats/control-chat/") {
+				chatID = "control-chat"
+			}
+			_, _ = fmt.Fprintf(w, `{"id":"quote-1","chatId":%q,"createdDateTime":"2026-05-03T01:02:03Z","messageType":"message","from":{"user":{"id":"alex-id","displayName":"Alex"}},"body":{"contentType":"html","content":"<p>full quoted <strong>body</strong></p>"}}`, chatID)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
 			var body struct {
 				Body struct {

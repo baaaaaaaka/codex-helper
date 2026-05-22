@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -2346,6 +2348,10 @@ func TestDuplicateInboundIsIdempotent(t *testing.T) {
 	if !created {
 		t.Fatal("first inbound created = false")
 	}
+	beforeDuplicate, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before duplicate inbound: %v", err)
+	}
 	second, created, err := store.PersistInbound(ctx, InboundEvent{
 		SessionID:      "s1",
 		TeamsChatID:    "chat-1",
@@ -2360,6 +2366,13 @@ func TestDuplicateInboundIsIdempotent(t *testing.T) {
 	}
 	if second.ID != first.ID {
 		t.Fatalf("duplicate inbound ID = %q, want %q", second.ID, first.ID)
+	}
+	afterDuplicate, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after duplicate inbound: %v", err)
+	}
+	if !bytes.Equal(beforeDuplicate, afterDuplicate) {
+		t.Fatal("duplicate PersistInbound rewrote state file")
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
@@ -2400,6 +2413,13 @@ func TestHasInboundMessage(t *testing.T) {
 	if !ok || record.Origin != MessageOriginUserInbound || record.InboundID == "" {
 		t.Fatalf("inbound message provenance = %#v, ok=%v", record, ok)
 	}
+	lookup, err := store.MessageLookup(ctx, "chat-1", "message-1")
+	if err != nil {
+		t.Fatalf("MessageLookup inbound error: %v", err)
+	}
+	if !lookup.HasInbound || !lookup.HasProvenance || lookup.Provenance.Origin != MessageOriginUserInbound || lookup.HasDeliveredOutbox {
+		t.Fatalf("MessageLookup inbound = %#v", lookup)
+	}
 }
 
 func TestMessageProvenanceRecordsHelperOutbox(t *testing.T) {
@@ -2435,12 +2455,533 @@ func TestMessageProvenanceRecordsHelperOutbox(t *testing.T) {
 	if !delivered {
 		t.Fatal("HasDeliveredOutboxMessage should use helper provenance")
 	}
+	lookup, err := store.MessageLookup(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MessageLookup helper error: %v", err)
+	}
+	if !lookup.HasDeliveredOutbox || !lookup.HasProvenance || lookup.Provenance.Origin != MessageOriginHelperOutbox || lookup.HasInbound {
+		t.Fatalf("MessageLookup helper = %#v", lookup)
+	}
 	missing, ok, err := store.MessageProvenance(ctx, "chat-1", "missing")
 	if err != nil {
 		t.Fatalf("MessageProvenance missing error: %v", err)
 	}
 	if ok || missing.ID != "" {
 		t.Fatalf("missing provenance = %#v, ok=%v", missing, ok)
+	}
+}
+
+func TestLargeMessageLookupPressureMatchesStateSemantics(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLargeMessageLookupState(t, store, 14000, 9000, 512)
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load large state: %v", err)
+	}
+	cases := []struct {
+		name      string
+		chatID    string
+		messageID string
+	}{
+		{name: "direct inbound", chatID: largeInboundChatID(13999), messageID: largeInboundMessageID(13999)},
+		{name: "helper provenance", chatID: "provenance-helper-chat", messageID: largeHelperProvenanceMessageID(8999)},
+		{name: "user provenance", chatID: "provenance-user-chat", messageID: largeUserProvenanceMessageID(8998)},
+		{name: "sent outbox", chatID: "outbox-chat", messageID: largeOutboxMessageID(511)},
+		{name: "queued outbox", chatID: "outbox-chat", messageID: largeOutboxMessageID(510)},
+		{name: "missing", chatID: "missing-chat", messageID: "missing-message"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := legacyMessageLookupFromState(state, tc.chatID, tc.messageID)
+			got, err := store.MessageLookup(ctx, tc.chatID, tc.messageID)
+			if err != nil {
+				t.Fatalf("MessageLookup error: %v", err)
+			}
+			if !messageLookupEqual(got, want) {
+				t.Fatalf("MessageLookup = %#v, want %#v", got, want)
+			}
+			inbound, err := store.HasInboundMessage(ctx, tc.chatID, tc.messageID)
+			if err != nil {
+				t.Fatalf("HasInboundMessage error: %v", err)
+			}
+			if inbound != want.HasInbound {
+				t.Fatalf("HasInboundMessage = %v, want %v", inbound, want.HasInbound)
+			}
+			delivered, err := store.HasDeliveredOutboxMessage(ctx, tc.chatID, tc.messageID)
+			if err != nil {
+				t.Fatalf("HasDeliveredOutboxMessage error: %v", err)
+			}
+			if delivered != want.HasDeliveredOutbox {
+				t.Fatalf("HasDeliveredOutboxMessage = %v, want %v", delivered, want.HasDeliveredOutbox)
+			}
+			provenance, ok, err := store.MessageProvenance(ctx, tc.chatID, tc.messageID)
+			if err != nil {
+				t.Fatalf("MessageProvenance error: %v", err)
+			}
+			if ok != want.HasProvenance || provenance.ID != want.Provenance.ID || provenance.Origin != want.Provenance.Origin {
+				t.Fatalf("MessageProvenance = %#v ok=%v, want %#v ok=%v", provenance, ok, want.Provenance, want.HasProvenance)
+			}
+		})
+	}
+}
+
+func TestLargeDuplicateInboundPressureDoesNotRewriteState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLargeMessageLookupState(t, store, 14000, 9000, 512)
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read large state before duplicate: %v", err)
+	}
+	inbound, created, err := store.PersistInbound(ctx, InboundEvent{
+		TeamsChatID:    largeInboundChatID(13999),
+		TeamsMessageID: largeInboundMessageID(13999),
+		Source:         "teams",
+	})
+	if err != nil {
+		t.Fatalf("duplicate PersistInbound error: %v", err)
+	}
+	if created {
+		t.Fatal("duplicate PersistInbound created = true")
+	}
+	if inbound.ID == "" || inbound.TeamsMessageID != largeInboundMessageID(13999) {
+		t.Fatalf("duplicate inbound mismatch: %#v", inbound)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read large state after duplicate: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("large duplicate PersistInbound rewrote state file")
+	}
+}
+
+func TestMessageLookupCacheTracksSameStoreUpdates(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	missing, err := store.MessageLookup(ctx, "chat-1", "message-1")
+	if err != nil {
+		t.Fatalf("warm missing MessageLookup error: %v", err)
+	}
+	if missing.HasInbound || missing.HasProvenance || missing.HasDeliveredOutbox {
+		t.Fatalf("warm missing MessageLookup = %#v", missing)
+	}
+	if _, created, err := store.PersistInbound(ctx, InboundEvent{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Source:         "teams",
+	}); err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	} else if !created {
+		t.Fatal("PersistInbound created = false")
+	}
+	lookup, err := store.MessageLookup(ctx, "chat-1", "message-1")
+	if err != nil {
+		t.Fatalf("MessageLookup after same-store update error: %v", err)
+	}
+	if !lookup.HasInbound || !lookup.HasProvenance || lookup.Provenance.Origin != MessageOriginUserInbound || lookup.HasDeliveredOutbox {
+		t.Fatalf("MessageLookup after same-store update = %#v", lookup)
+	}
+}
+
+func TestMessageLookupCacheIsLazyBeforeFirstLookup(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, created, err := store.PersistInbound(ctx, InboundEvent{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Source:         "teams",
+	}); err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	} else if !created {
+		t.Fatal("PersistInbound created = false")
+	}
+	store.mu.Lock()
+	valid := store.messageLookup.Valid
+	store.mu.Unlock()
+	if valid {
+		t.Fatal("message lookup cache was built before the first MessageLookup")
+	}
+}
+
+func TestMessageLookupCacheTracksExternalStoreUpdates(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	lookup, err := store.MessageLookup(ctx, "chat-1", "message-1")
+	if err != nil {
+		t.Fatalf("warm MessageLookup error: %v", err)
+	}
+	if lookup.HasDeliveredOutbox {
+		t.Fatalf("warm MessageLookup = %#v", lookup)
+	}
+	other, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("Open second store: %v", err)
+	}
+	if _, err := other.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Origin:         MessageOriginHelperOutbox,
+		OutboxID:       "outbox-1",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance through second store: %v", err)
+	}
+	lookup, err = store.MessageLookup(ctx, "chat-1", "message-1")
+	if err != nil {
+		t.Fatalf("MessageLookup after external update error: %v", err)
+	}
+	if !lookup.HasDeliveredOutbox || !lookup.HasProvenance || lookup.Provenance.Origin != MessageOriginHelperOutbox || lookup.HasInbound {
+		t.Fatalf("MessageLookup after external update = %#v", lookup)
+	}
+}
+
+func TestMessageLookupCacheRefreshesOutboxBackfillAfterSameStoreUpdate(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	lookup, err := store.MessageLookup(ctx, "chat-1", "teams-outbox-1")
+	if err != nil {
+		t.Fatalf("warm MessageLookup error: %v", err)
+	}
+	if lookup.HasProvenance || lookup.HasDeliveredOutbox || lookup.HasInbound {
+		t.Fatalf("warm MessageLookup = %#v", lookup)
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages["outbox-1"] = OutboxMessage{
+			ID:             "outbox-1",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "teams-outbox-1",
+			Kind:           "answer",
+			Status:         OutboxStatusSent,
+			CreatedAt:      time.Now(),
+			UpdatedAt:      time.Now(),
+			SentAt:         time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Update outbox error: %v", err)
+	}
+	lookup, err = store.MessageLookup(ctx, "chat-1", "teams-outbox-1")
+	if err != nil {
+		t.Fatalf("MessageLookup after outbox update error: %v", err)
+	}
+	if !lookup.HasProvenance || lookup.Provenance.Origin != MessageOriginHelperOutbox || !lookup.HasDeliveredOutbox || lookup.HasInbound {
+		t.Fatalf("MessageLookup after outbox update = %#v", lookup)
+	}
+}
+
+func TestMessageLookupCachePrefersCanonicalProvenanceForFlags(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	chatID := "chat-1"
+	messageID := "message-1"
+	canonicalID := messageProvenanceID(chatID, messageID)
+	if err := store.Update(ctx, func(state *State) error {
+		state.MessageProvenance["legacy-user-record"] = MessageProvenanceRecord{
+			ID:             "legacy-user-record",
+			TeamsChatID:    chatID,
+			TeamsMessageID: messageID,
+			Origin:         MessageOriginUserInbound,
+			InboundID:      "legacy-inbound",
+		}
+		state.MessageProvenance[canonicalID] = MessageProvenanceRecord{
+			ID:             canonicalID,
+			TeamsChatID:    chatID,
+			TeamsMessageID: messageID,
+			Origin:         MessageOriginHelperOutbox,
+			OutboxID:       "canonical-outbox",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Update provenance records error: %v", err)
+	}
+	lookup, err := store.MessageLookup(ctx, chatID, messageID)
+	if err != nil {
+		t.Fatalf("MessageLookup error: %v", err)
+	}
+	if !lookup.HasProvenance || lookup.Provenance.ID != canonicalID || lookup.Provenance.Origin != MessageOriginHelperOutbox {
+		t.Fatalf("MessageLookup provenance = %#v", lookup)
+	}
+	if lookup.HasInbound || !lookup.HasDeliveredOutbox {
+		t.Fatalf("MessageLookup flags = inbound:%v delivered:%v, want inbound:false delivered:true", lookup.HasInbound, lookup.HasDeliveredOutbox)
+	}
+	inbound, err := store.HasInboundMessage(ctx, chatID, messageID)
+	if err != nil {
+		t.Fatalf("HasInboundMessage error: %v", err)
+	}
+	if inbound {
+		t.Fatal("HasInboundMessage used non-canonical user provenance")
+	}
+}
+
+func TestMessageLookupCachePreservesUnknownProvenanceWithoutFlags(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	chatID := "chat-1"
+	messageID := "message-unknown"
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    chatID,
+		TeamsMessageID: messageID,
+		Origin:         "unknown",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance error: %v", err)
+	}
+	lookup, err := store.MessageLookup(ctx, chatID, messageID)
+	if err != nil {
+		t.Fatalf("MessageLookup error: %v", err)
+	}
+	if !lookup.HasProvenance || lookup.Provenance.Origin != "unknown" || lookup.HasInbound || lookup.HasDeliveredOutbox {
+		t.Fatalf("MessageLookup unknown provenance = %#v", lookup)
+	}
+}
+
+func TestMessageLookupCacheInvalidatesSameSizeSameModTimeReplace(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	chatID := "chat-1"
+	firstMessageID := "message-a"
+	secondMessageID := "message-b"
+	firstData := stateJSONWithProvenance(t, chatID, firstMessageID, MessageOriginHelperOutbox)
+	secondData := stateJSONWithProvenance(t, chatID, secondMessageID, MessageOriginHelperOutbox)
+	if len(firstData) != len(secondData) {
+		t.Fatalf("test state sizes differ: %d != %d", len(firstData), len(secondData))
+	}
+	fixedTime := time.Unix(1_700_000_100, 987_654_321)
+	if err := ensurePrivateDir(filepath.Dir(store.Path())); err != nil {
+		t.Fatalf("ensure state dir: %v", err)
+	}
+	if err := os.WriteFile(store.Path(), firstData, fileMode); err != nil {
+		t.Fatalf("write first state: %v", err)
+	}
+	if err := os.Chtimes(store.Path(), fixedTime, fixedTime); err != nil {
+		t.Fatalf("chtimes first state: %v", err)
+	}
+	lookup, err := store.MessageLookup(ctx, chatID, firstMessageID)
+	if err != nil {
+		t.Fatalf("warm MessageLookup error: %v", err)
+	}
+	if !lookup.HasDeliveredOutbox {
+		t.Fatalf("warm MessageLookup = %#v", lookup)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(store.Path()), ".state.json.tmp-*")
+	if err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(secondData); err != nil {
+		_ = tmp.Close()
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close replacement: %v", err)
+	}
+	if err := os.Chmod(tmpName, fileMode); err != nil {
+		t.Fatalf("chmod replacement: %v", err)
+	}
+	if err := os.Chtimes(tmpName, fixedTime, fixedTime); err != nil {
+		t.Fatalf("chtimes replacement: %v", err)
+	}
+	if err := durableReplaceFile(tmpName, store.Path()); err != nil {
+		t.Fatalf("durableReplaceFile: %v", err)
+	}
+	if err := os.Chtimes(store.Path(), fixedTime, fixedTime); err != nil {
+		t.Fatalf("chtimes replaced state: %v", err)
+	}
+	lookup, err = store.MessageLookup(ctx, chatID, firstMessageID)
+	if err != nil {
+		t.Fatalf("MessageLookup first after replace error: %v", err)
+	}
+	if lookup.HasProvenance || lookup.HasDeliveredOutbox || lookup.HasInbound {
+		t.Fatalf("first message lookup after replace = %#v, want missing", lookup)
+	}
+	lookup, err = store.MessageLookup(ctx, chatID, secondMessageID)
+	if err != nil {
+		t.Fatalf("MessageLookup second after replace error: %v", err)
+	}
+	if !lookup.HasProvenance || lookup.Provenance.TeamsMessageID != secondMessageID || !lookup.HasDeliveredOutbox {
+		t.Fatalf("second message lookup after replace = %#v", lookup)
+	}
+}
+
+func TestLargeMessageLookupHotCacheDoesNotReloadState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLargeMessageLookupState(t, store, 14000, 9000, 512)
+	queries := largeMessageLookupQueries()
+	if _, err := store.MessageLookup(ctx, queries[0].chatID, queries[0].messageID); err != nil {
+		t.Fatalf("warm MessageLookup error: %v", err)
+	}
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+	for i := 0; i < 1000; i++ {
+		query := queries[i%len(queries)]
+		if _, err := store.MessageLookup(ctx, query.chatID, query.messageID); err != nil {
+			t.Fatalf("hot MessageLookup %d error: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("hot MessageLookup reloaded state %d times", got)
+	}
+}
+
+func TestLargeMessageLookupHotCacheAllocationPressure(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLargeMessageLookupState(t, store, 14000, 9000, 512)
+	queries := largeMessageLookupQueries()
+	if _, err := store.MessageLookup(ctx, queries[0].chatID, queries[0].messageID); err != nil {
+		t.Fatalf("warm MessageLookup error: %v", err)
+	}
+	var lookupErr error
+	allocsPerRun := testing.AllocsPerRun(1000, func() {
+		for _, query := range queries {
+			if _, err := store.MessageLookup(ctx, query.chatID, query.messageID); err != nil {
+				lookupErr = err
+				return
+			}
+		}
+	})
+	if lookupErr != nil {
+		t.Fatalf("MessageLookup error: %v", lookupErr)
+	}
+	allocsPerLookup := allocsPerRun / float64(len(queries))
+	if allocsPerLookup > 8 {
+		t.Fatalf("hot MessageLookup allocations = %.2f per lookup, want <= 8", allocsPerLookup)
+	}
+}
+
+func TestStateFileStampDetectsSameSizeSameModTimeReplace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	firstData := []byte("alpha\n")
+	secondData := []byte("bravo\n")
+	if len(firstData) != len(secondData) {
+		t.Fatalf("test data size mismatch: %d != %d", len(firstData), len(secondData))
+	}
+	fixedTime := time.Unix(1_700_000_000, 123_456_789)
+	if err := os.WriteFile(path, firstData, fileMode); err != nil {
+		t.Fatalf("write first file: %v", err)
+	}
+	if err := os.Chtimes(path, fixedTime, fixedTime); err != nil {
+		t.Fatalf("chtimes first file: %v", err)
+	}
+	firstStamp, err := stateFileStampForPath(path)
+	if err != nil {
+		t.Fatalf("first stateFileStampForPath: %v", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".state.json.tmp-*")
+	if err != nil {
+		t.Fatalf("create temp replacement: %v", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(secondData); err != nil {
+		_ = tmp.Close()
+		t.Fatalf("write temp replacement: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close temp replacement: %v", err)
+	}
+	if err := os.Chmod(tmpName, fileMode); err != nil {
+		t.Fatalf("chmod temp replacement: %v", err)
+	}
+	if err := os.Chtimes(tmpName, fixedTime, fixedTime); err != nil {
+		t.Fatalf("chtimes temp replacement: %v", err)
+	}
+	if err := durableReplaceFile(tmpName, path); err != nil {
+		t.Fatalf("durableReplaceFile: %v", err)
+	}
+	if err := os.Chtimes(path, fixedTime, fixedTime); err != nil {
+		t.Fatalf("chtimes replaced file: %v", err)
+	}
+	secondStamp, err := stateFileStampForPath(path)
+	if err != nil {
+		t.Fatalf("second stateFileStampForPath: %v", err)
+	}
+	if firstStamp.Size != secondStamp.Size {
+		t.Fatalf("replacement size = %d, want %d", secondStamp.Size, firstStamp.Size)
+	}
+	if !firstStamp.ModTime.Equal(secondStamp.ModTime) {
+		t.Fatalf("replacement modtime = %s, want %s", secondStamp.ModTime, firstStamp.ModTime)
+	}
+	if firstStamp.equal(secondStamp) {
+		t.Fatal("state file stamp treated same-size same-mtime replacement as unchanged")
+	}
+}
+
+func largeMessageLookupQueries() []struct {
+	chatID    string
+	messageID string
+} {
+	return []struct {
+		chatID    string
+		messageID string
+	}{
+		{chatID: largeInboundChatID(13999), messageID: largeInboundMessageID(13999)},
+		{chatID: "provenance-helper-chat", messageID: largeHelperProvenanceMessageID(8999)},
+		{chatID: "provenance-user-chat", messageID: largeUserProvenanceMessageID(8998)},
+		{chatID: "outbox-chat", messageID: largeOutboxMessageID(511)},
+		{chatID: "outbox-chat", messageID: largeOutboxMessageID(510)},
+		{chatID: "missing-chat", messageID: "missing-message"},
+	}
+}
+
+func stateJSONWithProvenance(t *testing.T, chatID string, messageID string, origin string) []byte {
+	t.Helper()
+	state := newState()
+	fixed := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
+	state.CreatedAt = fixed
+	state.UpdatedAt = fixed
+	recordMessageProvenanceLocked(&state, MessageProvenanceRecord{
+		TeamsChatID:    chatID,
+		TeamsMessageID: messageID,
+		Origin:         origin,
+		OutboxID:       "outbox-1",
+	}, time.Time{})
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent state: %v", err)
+	}
+	return append(data, '\n')
+}
+
+func BenchmarkLargeMessageLookup(b *testing.B) {
+	store := newBenchmarkStore(b)
+	ctx := context.Background()
+	seedLargeMessageLookupState(b, store, 14000, 9000, 512)
+	if _, err := store.MessageLookup(ctx, largeInboundChatID(13999), largeInboundMessageID(13999)); err != nil {
+		b.Fatalf("warm MessageLookup error: %v", err)
+	}
+	queries := largeMessageLookupQueries()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		query := queries[i%len(queries)]
+		if _, err := store.MessageLookup(ctx, query.chatID, query.messageID); err != nil {
+			b.Fatalf("MessageLookup error: %v", err)
+		}
+	}
+}
+
+func BenchmarkLargeMessageLookupCacheRefresh(b *testing.B) {
+	store := newBenchmarkStore(b)
+	ctx := context.Background()
+	seedLargeMessageLookupState(b, store, 14000, 9000, 512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.mu.Lock()
+		store.invalidateMessageLookupCacheLocked()
+		store.mu.Unlock()
+		if _, err := store.MessageLookup(ctx, largeInboundChatID(13999), largeInboundMessageID(13999)); err != nil {
+			b.Fatalf("MessageLookup error: %v", err)
+		}
 	}
 }
 
@@ -4731,11 +5272,170 @@ func TestAtomicWriteFileUsesTempAndCleansFailedReplace(t *testing.T) {
 	}
 }
 
+func seedLargeMessageLookupState(t testing.TB, store *Store, inboundCount int, provenanceCount int, outboxCount int) {
+	t.Helper()
+	ctx := context.Background()
+	base := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < inboundCount; i++ {
+			chatID := largeInboundChatID(i)
+			messageID := largeInboundMessageID(i)
+			event := InboundEvent{
+				ID:             inboundID(chatID, messageID),
+				SessionID:      fmt.Sprintf("session-%03d", i%128),
+				TeamsChatID:    chatID,
+				TeamsMessageID: messageID,
+				Text:           fmt.Sprintf("inbound body %05d", i),
+				TextHash:       fmt.Sprintf("inbound-hash-%05d", i),
+				Source:         "teams",
+				Status:         InboundStatusPersisted,
+				ReceivedAt:     base.Add(time.Duration(i) * time.Second),
+				CreatedAt:      base.Add(time.Duration(i) * time.Second),
+				UpdatedAt:      base.Add(time.Duration(i) * time.Second),
+			}
+			state.InboundEvents[event.ID] = event
+			recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+				TeamsChatID:    event.TeamsChatID,
+				TeamsMessageID: event.TeamsMessageID,
+				Origin:         MessageOriginUserInbound,
+				SessionID:      event.SessionID,
+				InboundID:      event.ID,
+				Kind:           string(event.Status),
+				RenderedHash:   event.TextHash,
+				CreatedAt:      event.CreatedAt,
+				UpdatedAt:      event.UpdatedAt,
+			}, time.Time{})
+		}
+		for i := 0; i < provenanceCount; i++ {
+			origin := MessageOriginUserInbound
+			chatID := "provenance-user-chat"
+			messageID := largeUserProvenanceMessageID(i)
+			if i%2 == 1 {
+				origin = MessageOriginHelperOutbox
+				chatID = "provenance-helper-chat"
+				messageID = largeHelperProvenanceMessageID(i)
+			}
+			recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+				TeamsChatID:    chatID,
+				TeamsMessageID: messageID,
+				Origin:         origin,
+				SessionID:      fmt.Sprintf("provenance-session-%03d", i%128),
+				TurnID:         fmt.Sprintf("provenance-turn-%05d", i),
+				OutboxID:       fmt.Sprintf("provenance-outbox-%05d", i),
+				InboundID:      fmt.Sprintf("provenance-inbound-%05d", i),
+				Kind:           fmt.Sprintf("kind-%03d", i%32),
+				RenderedHash:   fmt.Sprintf("provenance-hash-%05d", i),
+				CreatedAt:      base.Add(2*time.Hour + time.Duration(i)*time.Second),
+				UpdatedAt:      base.Add(2*time.Hour + time.Duration(i)*time.Second),
+			}, time.Time{})
+		}
+		for i := 0; i < outboxCount; i++ {
+			status := OutboxStatusSent
+			if i%2 == 0 {
+				status = OutboxStatusQueued
+			}
+			id := fmt.Sprintf("large-outbox-%05d", i)
+			state.OutboxMessages[id] = OutboxMessage{
+				ID:             id,
+				TeamsChatID:    "outbox-chat",
+				TeamsMessageID: largeOutboxMessageID(i),
+				Kind:           "answer",
+				Body:           fmt.Sprintf("outbox body %05d", i),
+				Status:         status,
+				CreatedAt:      base.Add(4*time.Hour + time.Duration(i)*time.Second),
+				UpdatedAt:      base.Add(4*time.Hour + time.Duration(i)*time.Second),
+				SentAt:         base.Add(4*time.Hour + time.Duration(i)*time.Second),
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed large message lookup state: %v", err)
+	}
+}
+
+func largeInboundChatID(i int) string {
+	return fmt.Sprintf("inbound-chat-%03d", i%97)
+}
+
+func largeInboundMessageID(i int) string {
+	return fmt.Sprintf("inbound-message-%05d", i)
+}
+
+func largeUserProvenanceMessageID(i int) string {
+	return fmt.Sprintf("user-provenance-message-%05d", i)
+}
+
+func largeHelperProvenanceMessageID(i int) string {
+	return fmt.Sprintf("helper-provenance-message-%05d", i)
+}
+
+func largeOutboxMessageID(i int) string {
+	return fmt.Sprintf("outbox-message-%05d", i)
+}
+
+func legacyMessageLookupFromState(state State, chatID string, teamsMessageID string) MessageLookup {
+	chatID = strings.TrimSpace(chatID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	var out MessageLookup
+	for _, record := range state.MessageProvenance {
+		if strings.TrimSpace(record.TeamsChatID) != chatID || strings.TrimSpace(record.TeamsMessageID) != teamsMessageID {
+			continue
+		}
+		out.Provenance = record
+		out.HasProvenance = true
+		switch strings.TrimSpace(record.Origin) {
+		case MessageOriginUserInbound:
+			out.HasInbound = true
+		case MessageOriginHelperOutbox:
+			out.HasDeliveredOutbox = true
+		}
+		break
+	}
+	for _, event := range state.InboundEvents {
+		if strings.TrimSpace(event.TeamsChatID) == chatID && strings.TrimSpace(event.TeamsMessageID) == teamsMessageID {
+			out.HasInbound = true
+			break
+		}
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.TrimSpace(msg.TeamsChatID) != chatID || strings.TrimSpace(msg.TeamsMessageID) != teamsMessageID {
+			continue
+		}
+		switch msg.Status {
+		case OutboxStatusAccepted, OutboxStatusSent:
+			out.HasDeliveredOutbox = true
+		}
+		break
+	}
+	return out
+}
+
+func messageLookupEqual(left MessageLookup, right MessageLookup) bool {
+	return left.HasProvenance == right.HasProvenance &&
+		left.HasInbound == right.HasInbound &&
+		left.HasDeliveredOutbox == right.HasDeliveredOutbox &&
+		left.Provenance.ID == right.Provenance.ID &&
+		left.Provenance.TeamsChatID == right.Provenance.TeamsChatID &&
+		left.Provenance.TeamsMessageID == right.Provenance.TeamsMessageID &&
+		left.Provenance.Origin == right.Provenance.Origin &&
+		left.Provenance.InboundID == right.Provenance.InboundID &&
+		left.Provenance.OutboxID == right.Provenance.OutboxID
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "teams-state", "state.json"))
 	if err != nil {
 		t.Fatalf("Open error: %v", err)
+	}
+	return store
+}
+
+func newBenchmarkStore(b *testing.B) *Store {
+	b.Helper()
+	store, err := Open(filepath.Join(b.TempDir(), "teams-state", "state.json"))
+	if err != nil {
+		b.Fatalf("Open error: %v", err)
 	}
 	return store
 }

@@ -1894,12 +1894,12 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	if b.store != nil {
-		provenance, ok, err := b.store.MessageProvenance(ctx, chatID, msg.ID)
+		lookup, err := b.store.MessageLookup(ctx, chatID, msg.ID)
 		if err != nil {
 			return false, err
 		}
-		if ok {
-			switch provenance.Origin {
+		if lookup.HasProvenance {
+			switch lookup.Provenance.Origin {
 			case teamstore.MessageOriginHelperOutbox:
 				b.markRegistrySent(chatID, msg.ID)
 				return true, nil
@@ -1907,23 +1907,15 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 				return true, nil
 			}
 		}
-		inbound, err := b.store.HasInboundMessage(ctx, chatID, msg.ID)
-		if err != nil {
-			return false, err
-		}
-		if inbound {
+		if lookup.HasInbound {
 			return true, nil
 		}
-		delivered, err := b.store.HasDeliveredOutboxMessage(ctx, chatID, msg.ID)
-		if err != nil {
-			return false, err
-		}
-		if delivered {
+		if lookup.HasDeliveredOutbox {
 			b.markRegistrySent(chatID, msg.ID)
 			return true, nil
 		}
 		if legacyGeneratedOutputFallback {
-			delivered, err = b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
+			delivered, err := b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
 			if err != nil {
 				return false, err
 			}
@@ -2257,7 +2249,14 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	if !b.annotateUserMessages {
 		return
 	}
-	if msg.ID == "" || strings.TrimSpace(msg.Body.Content) == "" || hasUserAnnotationPrefix(msg.Body.Content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
+	if msg.ID == "" || hasUserAnnotationPrefix(msg.Body.Content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
+		return
+	}
+	if strings.TrimSpace(msg.Body.Content) == "" && !messageHasTeamsAttachmentContext(msg) {
+		return
+	}
+	if messageHasTeamsAttachmentContext(msg) {
+		b.annotateIncomingUserMessageWithAttachmentContext(ctx, chatID, msg)
 		return
 	}
 	if messageAuthoredByCurrentUser(msg, b.user) && !b.annotationDisabled && b.graph != nil {
@@ -2279,6 +2278,25 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	}
 	if err := b.queueIncomingUserMarkerMirror(ctx, chatID, msg); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams user message marker fallback failed: %v\n", err)
+	}
+}
+
+func (b *Bridge) annotateIncomingUserMessageWithAttachmentContext(ctx context.Context, chatID string, msg ChatMessage) {
+	if b == nil || b.graph == nil || b.annotationDisabled || !messageAuthoredByCurrentUser(msg, b.user) {
+		return
+	}
+	annotated, ok := userAnnotatedAttachmentMessageHTML(msg, b.user)
+	if !ok {
+		return
+	}
+	if err := b.graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, msg, annotated); err != nil {
+		if shouldDisableAttachmentPreservingUserMessageAnnotation(err) {
+			b.annotationDisabled = true
+		}
+		if !b.annotationWarned && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams user message attachment-preserving annotation disabled or unavailable: %v\n", err)
+			b.annotationWarned = true
+		}
 	}
 }
 
@@ -2304,6 +2322,69 @@ func (b *Bridge) queueIncomingUserMarkerMirror(ctx context.Context, chatID strin
 	})
 }
 
+func messageHasTeamsAttachmentContext(msg ChatMessage) bool {
+	return len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 || hasTeamsAttachmentPlaceholder(msg.Body.Content)
+}
+
+func messageAttachmentContextLosslessPatchable(msg ChatMessage) bool {
+	if len(msg.Attachments) == 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 || hasAdaptiveCardAttachment(msg.Attachments) {
+		return false
+	}
+	ids := teamsAttachmentPlaceholderIDSet(msg.Body.Content)
+	if len(ids) == 0 {
+		return false
+	}
+	if len(ids) != len(msg.Attachments) {
+		return false
+	}
+	for _, attachment := range msg.Attachments {
+		id := strings.TrimSpace(attachment.ID)
+		if id == "" || !ids[id] || strings.TrimSpace(attachment.ContentType) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func teamsAttachmentPlaceholderIDSet(content string) map[string]bool {
+	ids := make(map[string]bool)
+	root, err := xhtml.Parse(strings.NewReader("<div>" + content + "</div>"))
+	if err != nil {
+		return ids
+	}
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.EqualFold(n.Data, "attachment") {
+			for _, attr := range n.Attr {
+				if strings.EqualFold(attr.Key, "id") && strings.TrimSpace(attr.Val) != "" {
+					ids[strings.TrimSpace(attr.Val)] = true
+				}
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return ids
+}
+
+func shouldDisableAttachmentPreservingUserMessageAnnotation(err error) bool {
+	var graphErr *GraphStatusError
+	if !errors.As(err, &graphErr) {
+		return false
+	}
+	switch graphErr.StatusCode {
+	case 401, 403, 405:
+		return true
+	default:
+		return false
+	}
+}
+
 func shouldDisableUserMessageAnnotation(err error) bool {
 	var graphErr *GraphStatusError
 	if !errors.As(err, &graphErr) {
@@ -2319,13 +2400,25 @@ func shouldDisableUserMessageAnnotation(err error) bool {
 
 func userAnnotatedMessageHTML(msg ChatMessage, _ User) (string, bool) {
 	content := strings.TrimSpace(msg.Body.Content)
-	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
+	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) || messageHasTeamsAttachmentContext(msg) {
 		return "", false
 	}
 	label := incomingUserLabel()
 	if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
 		content = "<p>" + html.EscapeString(PlainTextFromTeamsHTML(content)) + "</p>"
 	}
+	return `<p><strong>` + html.EscapeString(label) + `:</strong></p>` + content, true
+}
+
+func userAnnotatedAttachmentMessageHTML(msg ChatMessage, _ User) (string, bool) {
+	content := strings.TrimSpace(msg.Body.Content)
+	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) || !messageAttachmentContextLosslessPatchable(msg) {
+		return "", false
+	}
+	if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
+		return "", false
+	}
+	label := incomingUserLabel()
 	return `<p><strong>` + html.EscapeString(label) + `:</strong></p>` + content, true
 }
 
@@ -2524,8 +2617,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		msg.Body.Content = text
 	}
 	b.recordControlChatUserMessage(ctx, msg, text)
-	if len(msg.Attachments) > 0 {
-		return b.sendControl(ctx, UnsupportedControlAttachmentMessage(msg.Attachments))
+	if unsupported := unsupportedControlAttachments(msg); len(unsupported) > 0 {
+		return b.sendControl(ctx, UnsupportedControlAttachmentMessage(unsupported))
 	}
 	routeText := commandRouteTextFromTeamsMessage(msg, text)
 	parsed := ParseDashboardCommand(ChatScopeControl, routeText)
@@ -2544,7 +2637,14 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			askMsg := msg
 			askMsg.Body.ContentType = "html"
 			askMsg.Body.Content = html.EscapeString(arg)
-			return b.runControlFallback(ctx, askMsg, arg)
+			prompt, warning, err := b.controlFallbackPromptWithMessageReferences(ctx, askMsg, arg)
+			if err != nil {
+				return err
+			}
+			if warning != "" {
+				return b.sendControl(ctx, warning)
+			}
+			return b.runControlFallback(ctx, controlFallbackMessageWithPromptBody(askMsg, prompt, arg), prompt)
 		case DashboardCommandWorkspaces:
 			message, err := b.formatWorkspaceDashboard(ctx)
 			if err != nil {
@@ -2643,7 +2743,58 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 	if looksLikeControlPath(routeText) {
 		return b.sendControl(ctx, controlPathHintMessage(routeText))
 	}
-	return b.runControlFallback(ctx, msg, text)
+	prompt, warning, err := b.controlFallbackPromptWithMessageReferences(ctx, msg, text)
+	if err != nil {
+		return err
+	}
+	if warning != "" {
+		return b.sendControl(ctx, warning)
+	}
+	return b.runControlFallback(ctx, controlFallbackMessageWithPromptBody(msg, prompt, text), prompt)
+}
+
+func unsupportedControlAttachments(msg ChatMessage) []MessageAttachment {
+	var unsupported []MessageAttachment
+	for _, attachment := range msg.Attachments {
+		if isMessageReferenceAttachment(attachment) {
+			continue
+		}
+		unsupported = append(unsupported, attachment)
+	}
+	for _, id := range HostedContentIDsFromHTML(msg.Body.Content) {
+		unsupported = append(unsupported, MessageAttachment{
+			ID:          id,
+			ContentType: "Teams-hosted inline content",
+		})
+	}
+	if len(msg.Attachments) == 0 && len(unsupported) == 0 && hasTeamsAttachmentPlaceholder(msg.Body.Content) {
+		unsupported = append(unsupported, MessageAttachment{ContentType: "Teams attachment placeholder"})
+	}
+	return unsupported
+}
+
+func (b *Bridge) controlFallbackPromptWithMessageReferences(ctx context.Context, msg ChatMessage, text string) (string, string, error) {
+	chatID := strings.TrimSpace(msg.ChatID)
+	if chatID == "" {
+		chatID = strings.TrimSpace(b.reg.ControlChatID)
+	}
+	referencedMessages, warning, err := b.readMessageReferenceAttachments(ctx, chatID, msg)
+	if err != nil {
+		return "", "", err
+	}
+	if warning != "" {
+		return "", warning, nil
+	}
+	return PromptWithReferencedMessages(text, referencedMessages), "", nil
+}
+
+func controlFallbackMessageWithPromptBody(msg ChatMessage, prompt string, originalText string) ChatMessage {
+	if strings.TrimSpace(prompt) == "" || strings.TrimSpace(prompt) == strings.TrimSpace(originalText) {
+		return msg
+	}
+	msg.Body.ContentType = "html"
+	msg.Body.Content = html.EscapeString(prompt)
+	return msg
 }
 
 func controlCommandConsumesDashboardView(parsed ParsedDashboardCommand) bool {

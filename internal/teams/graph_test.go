@@ -1054,6 +1054,59 @@ func TestGraphUpdateChatMessageHTML(t *testing.T) {
 	}
 }
 
+func TestGraphUpdateChatMessageHTMLPreservingAttachments(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var sawPatch bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/chats/chat-1/messages/message-1" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		sawPatch = true
+		var payload struct {
+			Body struct {
+				ContentType string `json:"contentType"`
+				Content     string `json:"content"`
+			} `json:"body"`
+			Attachments []MessageAttachment `json:"attachments"`
+			Mentions    []json.RawMessage   `json:"mentions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode update payload: %v", err)
+		}
+		if payload.Body.ContentType != "html" || payload.Body.Content != `<p>updated</p><attachment id="file-1"></attachment>` {
+			t.Fatalf("unexpected update body: %#v", payload.Body)
+		}
+		if len(payload.Attachments) != 2 ||
+			payload.Attachments[0].ID != "file-1" ||
+			payload.Attachments[0].ContentType != "reference" ||
+			payload.Attachments[0].Name != "report.txt" ||
+			payload.Attachments[1].ID != "quote-1" ||
+			payload.Attachments[1].ContentType != "messageReference" ||
+			!strings.Contains(payload.Attachments[1].Content, `"messageId":"source-1"`) {
+			t.Fatalf("unexpected update attachments: %#v", payload.Attachments)
+		}
+		if len(payload.Mentions) != 1 || string(payload.Mentions[0]) != `{"id":0}` {
+			t.Fatalf("unexpected update mentions: %#v", payload.Mentions)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	msg := ChatMessage{ID: "message-1"}
+	msg.Attachments = []MessageAttachment{
+		{ID: "file-1", ContentType: "reference", Name: "report.txt"},
+		{ID: "quote-1", ContentType: "messageReference", Content: `{"messageId":"source-1","messagePreview":"preview"}`},
+	}
+	msg.Mentions = []json.RawMessage{json.RawMessage(`{"id":0}`)}
+	if err := graph.UpdateChatMessageHTMLPreservingAttachments(context.Background(), "chat-1", msg, `<p>updated</p><attachment id="file-1"></attachment>`); err != nil {
+		t.Fatalf("UpdateChatMessageHTMLPreservingAttachments error: %v", err)
+	}
+	if !sawPatch {
+		t.Fatal("missing PATCH request")
+	}
+}
+
 func TestGraphUnhideChatForUser(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access", tenantID: "tenant-1"}
 	var sawUnhide bool
