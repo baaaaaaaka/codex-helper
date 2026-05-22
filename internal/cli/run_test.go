@@ -654,10 +654,7 @@ func TestRunLikeUsesDefaultCodexCommandInDirectMode(t *testing.T) {
 	}
 
 	codexDir := t.TempDir()
-	codexPath := filepath.Join(codexDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
+	_ = writeProbeableCodex(t, codexDir, true)
 	t.Setenv("PATH", codexDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	prevRunWithProfile := runWithProfileFn
