@@ -778,10 +778,11 @@ type MessageLookup struct {
 }
 
 type stateFileStamp struct {
-	Exists  bool
-	Size    int64
-	ModTime time.Time
-	Info    os.FileInfo
+	Exists   bool
+	Size     int64
+	ModTime  time.Time
+	Revision string
+	Info     os.FileInfo
 }
 
 type messageLookupCache struct {
@@ -4261,11 +4262,16 @@ func stateFileStampForPath(path string) (stateFileStamp, error) {
 	if err != nil {
 		return stateFileStamp{}, err
 	}
+	revision, err := stateFileStampRevision(path, info)
+	if err != nil {
+		return stateFileStamp{}, err
+	}
 	return stateFileStamp{
-		Exists:  true,
-		Size:    info.Size(),
-		ModTime: info.ModTime(),
-		Info:    info,
+		Exists:   true,
+		Size:     info.Size(),
+		ModTime:  info.ModTime(),
+		Revision: revision,
+		Info:     info,
 	}, nil
 }
 
@@ -4342,6 +4348,9 @@ func (stamp stateFileStamp) equal(other stateFileStamp) bool {
 		return true
 	}
 	if stamp.Size != other.Size || !stamp.ModTime.Equal(other.ModTime) {
+		return false
+	}
+	if stamp.Revision != "" && other.Revision != "" && stamp.Revision != other.Revision {
 		return false
 	}
 	if stamp.Info != nil && other.Info != nil && !os.SameFile(stamp.Info, other.Info) {
