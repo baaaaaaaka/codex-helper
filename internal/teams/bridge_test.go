@@ -4376,6 +4376,73 @@ func TestBridgeControlAskMessageReferenceIncludesQuoteContext(t *testing.T) {
 	}
 }
 
+func TestBridgeControlExplicitCommandRejectsMessageReference(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-status-quote", `<p>status</p><attachment id="quote-1"></attachment>`)
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote"}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "status"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none for explicit control command quote", executor.prompts)
+	}
+	got := sentPlainJoined(*sent)
+	if !strings.Contains(got, "I could not process") || !strings.Contains(got, "only supported with ask <question>") {
+		t.Fatalf("explicit control command quote response = %q", got)
+	}
+}
+
+func TestPersistInboundStoresOnlyControlFallbackMessageReferenceContext(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+
+	session := bridge.reg.SessionByChatID("chat-1")
+	fileMsg := bridgeTestMessageWithText("work-file-context", `<p>use this file</p><attachment id="file-1"></attachment>`)
+	fileMsg.Attachments = []MessageAttachment{{
+		ID:          "file-1",
+		ContentType: "reference",
+		ContentURL:  "https://contoso.sharepoint.com/sites/team/file.txt",
+		Name:        "file.txt",
+	}}
+	fileInbound, _, err := bridge.persistInbound(context.Background(), session, fileMsg)
+	if err != nil {
+		t.Fatalf("persist work file inbound error: %v", err)
+	}
+	if len(fileInbound.TeamsAttachments) != 0 || fileInbound.TeamsBodyHTML != "" {
+		t.Fatalf("work file inbound stored attachment context: %#v", fileInbound)
+	}
+
+	controlSession, err := bridge.ensureControlFallbackSession(context.Background())
+	if err != nil {
+		t.Fatalf("ensureControlFallbackSession error: %v", err)
+	}
+	refMsg := bridgeTestMessageWithText("control-ref-context", `<p>ask about quote</p><attachment id="quote-1"></attachment>`)
+	refMsg.ChatID = "control-chat"
+	refMsg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-source","messagePreview":"preview quote"}`,
+	}}
+	refInbound, _, err := bridge.persistInbound(context.Background(), controlSession, refMsg)
+	if err != nil {
+		t.Fatalf("persist control reference inbound error: %v", err)
+	}
+	if len(refInbound.TeamsAttachments) != 1 || refInbound.TeamsAttachments[0].ID != "quote-1" || refInbound.TeamsBodyHTML == "" {
+		t.Fatalf("control reference inbound did not store message reference context: %#v", refInbound)
+	}
+}
+
 func TestBridgeControlMixedMessageReferenceAndFileIsRejectedWithoutCodex(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -6453,8 +6520,11 @@ func TestBridgeUpgradeDrainDefersControlFallbackMessageReferenceContext(t *testi
 	if err != nil {
 		t.Fatalf("DeferredInbound error: %v", err)
 	}
-	if len(deferred) != 1 || deferred[0].Source != "teams_control_fallback" || !strings.Contains(deferred[0].Text, "full quoted body") {
+	if len(deferred) != 1 || deferred[0].Source != "teams_control_fallback" || deferred[0].Text != "看一下这个" {
 		t.Fatalf("deferred quoted control fallback inbound = %#v", deferred)
+	}
+	if len(deferred[0].TeamsAttachments) != 1 || deferred[0].TeamsAttachments[0].ID != "quote-1" || deferred[0].TeamsAttachments[0].ContentType != "messageReference" || !strings.Contains(deferred[0].TeamsBodyHTML, `<attachment id="quote-1"></attachment>`) {
+		t.Fatalf("deferred quoted control fallback did not preserve reference context: %#v", deferred[0])
 	}
 	if _, err := store.ClearDrain(context.Background()); err != nil {
 		t.Fatalf("ClearDrain error: %v", err)
@@ -9204,6 +9274,36 @@ func TestBridgeSessionMessageReferenceIsReadForCodexTurn(t *testing.T) {
 	}
 	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "used quote") {
 		t.Fatalf("unexpected sent transcript:\n%s", got)
+	}
+}
+
+func TestBridgeExternalUserMessageReferenceRunsWithoutUserMirror(t *testing.T) {
+	graph, sent := newBridgeMessageReferenceGraph(t, http.StatusOK)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "external quote answer", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.annotateUserMessages = true
+	msg := bridgeTestMessageWithText("external-message-quote", `<p>please use this quote</p><attachment id="quote-1"></attachment>`)
+	msg.From.User.ID = "user-2"
+	msg.From.User.DisplayName = "Alex Kim"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote","messageSender":{"user":{"displayName":"Preview Sender"}}}`,
+	}}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "please use this quote"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "please use this quote") || !strings.Contains(got[0], "full quoted body") {
+		t.Fatalf("executor prompts = %#v, want external quoted prompt", got)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, "🧑‍💻 User:") {
+		t.Fatalf("external attachment-context message should not queue a visible user mirror:\n%s", joined)
+	}
+	if strings.Contains(joined, "I could not process") || !strings.Contains(joined, "external quote answer") {
+		t.Fatalf("unexpected sent transcript:\n%s", joined)
 	}
 }
 

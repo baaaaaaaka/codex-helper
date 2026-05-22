@@ -2617,11 +2617,15 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		msg.Body.Content = text
 	}
 	b.recordControlChatUserMessage(ctx, msg, text)
-	if unsupported := unsupportedControlAttachments(msg); len(unsupported) > 0 {
-		return b.sendControl(ctx, UnsupportedControlAttachmentMessage(unsupported))
-	}
 	routeText := commandRouteTextFromTeamsMessage(msg, text)
 	parsed := ParseDashboardCommand(ChatScopeControl, routeText)
+	allowMessageReferences := controlInputAllowsMessageReferences(parsed, routeText)
+	if unsupported := unsupportedControlAttachments(msg, allowMessageReferences); len(unsupported) > 0 {
+		if !allowMessageReferences && hasMessageReferenceAttachment(unsupported) {
+			return b.sendControl(ctx, UnsupportedExplicitControlAttachmentMessage(unsupported))
+		}
+		return b.sendControl(ctx, UnsupportedControlAttachmentMessage(unsupported))
+	}
 	if controlCommandConsumesDashboardView(parsed) {
 		defer func() { _ = b.clearControlDashboardView(context.Background()) }()
 	}
@@ -2637,14 +2641,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			askMsg := msg
 			askMsg.Body.ContentType = "html"
 			askMsg.Body.Content = html.EscapeString(arg)
-			prompt, warning, err := b.controlFallbackPromptWithMessageReferences(ctx, askMsg, arg)
-			if err != nil {
-				return err
-			}
-			if warning != "" {
-				return b.sendControl(ctx, warning)
-			}
-			return b.runControlFallback(ctx, controlFallbackMessageWithPromptBody(askMsg, prompt, arg), prompt)
+			return b.runControlFallback(ctx, askMsg, arg)
 		case DashboardCommandWorkspaces:
 			message, err := b.formatWorkspaceDashboard(ctx)
 			if err != nil {
@@ -2743,20 +2740,20 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 	if looksLikeControlPath(routeText) {
 		return b.sendControl(ctx, controlPathHintMessage(routeText))
 	}
-	prompt, warning, err := b.controlFallbackPromptWithMessageReferences(ctx, msg, text)
-	if err != nil {
-		return err
-	}
-	if warning != "" {
-		return b.sendControl(ctx, warning)
-	}
-	return b.runControlFallback(ctx, controlFallbackMessageWithPromptBody(msg, prompt, text), prompt)
+	return b.runControlFallback(ctx, msg, text)
 }
 
-func unsupportedControlAttachments(msg ChatMessage) []MessageAttachment {
+func controlInputAllowsMessageReferences(parsed ParsedDashboardCommand, routeText string) bool {
+	if parsed.HelperCommand {
+		return parsed.Name == DashboardCommandAsk
+	}
+	return !looksLikeControlPath(routeText)
+}
+
+func unsupportedControlAttachments(msg ChatMessage, allowMessageReferences bool) []MessageAttachment {
 	var unsupported []MessageAttachment
 	for _, attachment := range msg.Attachments {
-		if isMessageReferenceAttachment(attachment) {
+		if allowMessageReferences && isMessageReferenceAttachment(attachment) {
 			continue
 		}
 		unsupported = append(unsupported, attachment)
@@ -2833,7 +2830,15 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 	if err != nil {
 		return err
 	}
-	inbound, created, err := b.persistInbound(ctx, session, msg)
+	promptText, warning, err := b.controlFallbackPromptWithMessageReferences(ctx, msg, text)
+	if err != nil {
+		return err
+	}
+	if warning != "" {
+		return b.sendControl(ctx, warning)
+	}
+	persistMsg := controlFallbackMessageWithPromptBody(msg, promptText, text)
+	inbound, created, err := b.persistInbound(ctx, session, persistMsg)
 	if err != nil {
 		return err
 	}
@@ -2845,7 +2850,7 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 		return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 	}
 	session.UpdatedAt = time.Now()
-	prompt := b.controlFallbackCodexPromptForMessage(ctx, text, msg.ID)
+	prompt := b.controlFallbackCodexPromptForMessage(ctx, promptText, msg.ID)
 	if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 		return err
 	}
@@ -6296,6 +6301,16 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 		if err != nil {
 			return err
 		}
+		promptText, warning, err := b.controlFallbackPromptForDeferredInbound(ctx, inbound, text)
+		if err != nil {
+			return err
+		}
+		if warning != "" {
+			if markErr := b.markDeferredInboundIgnored(ctx, inbound.ID, warning); markErr != nil {
+				return markErr
+			}
+			return b.sendControl(ctx, warning)
+		}
 		turn, turnCreated, err := b.queueTurn(ctx, session, inbound)
 		if err != nil {
 			return err
@@ -6303,7 +6318,7 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 		if !turnCreated {
 			return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 		}
-		prompt := b.controlFallbackCodexPromptForMessage(ctx, text, inbound.TeamsMessageID)
+		prompt := b.controlFallbackCodexPromptForMessage(ctx, promptText, inbound.TeamsMessageID)
 		if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 			return err
 		}
@@ -6320,6 +6335,17 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 	default:
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "unsupported deferred control input")
 	}
+}
+
+func (b *Bridge) controlFallbackPromptForDeferredInbound(ctx context.Context, inbound teamstore.InboundEvent, text string) (string, string, error) {
+	msg, ok := chatMessageFromInboundContext(inbound)
+	if !ok || !hasMessageReferenceAttachment(msg.Attachments) {
+		return text, "", nil
+	}
+	if msg.ChatID == "" {
+		msg.ChatID = strings.TrimSpace(b.reg.ControlChatID)
+	}
+	return b.controlFallbackPromptWithMessageReferences(ctx, msg, text)
 }
 
 func controlNewSessionArgument(text string) (string, error) {
@@ -6402,7 +6428,14 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 	}
 	msg, err := b.readClient().GetMessageWithoutRateLimitRetry(ctx, inbound.TeamsChatID, inbound.TeamsMessageID)
 	if err != nil {
-		return err
+		if session.ID != controlFallbackSessionID {
+			return err
+		}
+		var ok bool
+		msg, ok = chatMessageFromInboundContext(inbound)
+		if !ok {
+			return err
+		}
 	}
 	localFiles, cleanup, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, inbound.TeamsChatID, msg)
 	if err != nil {
@@ -9245,7 +9278,7 @@ func (b *Bridge) persistInboundWithStatusAndSource(ctx context.Context, session 
 		source = "teams"
 	}
 	leaseGeneration := b.currentLeaseGeneration()
-	return b.store.PersistInbound(ctx, teamstore.InboundEvent{
+	event := teamstore.InboundEvent{
 		SessionID:       session.ID,
 		TeamsChatID:     session.ChatID,
 		TeamsMessageID:  msg.ID,
@@ -9258,7 +9291,64 @@ func (b *Bridge) persistInboundWithStatusAndSource(ctx context.Context, session 
 		TextHash:        inboundTextHashForTeamsMessage(text, msg),
 		Source:          source,
 		Status:          status,
-	})
+	}
+	if shouldPersistInboundMessageReferenceContext(session, msg) {
+		event.TeamsBodyType = strings.TrimSpace(msg.Body.ContentType)
+		event.TeamsBodyHTML = msg.Body.Content
+		event.TeamsAttachments = inboundMessageReferenceContextsFromMessage(msg)
+	}
+	return b.store.PersistInbound(ctx, event)
+}
+
+func shouldPersistInboundMessageReferenceContext(session *Session, msg ChatMessage) bool {
+	return session != nil && session.ID == controlFallbackSessionID && hasMessageReferenceAttachment(msg.Attachments)
+}
+
+func inboundMessageReferenceContextsFromMessage(msg ChatMessage) []teamstore.InboundAttachmentContext {
+	if len(msg.Attachments) == 0 {
+		return nil
+	}
+	out := make([]teamstore.InboundAttachmentContext, 0, len(msg.Attachments))
+	for _, attachment := range msg.Attachments {
+		if !isMessageReferenceAttachment(attachment) {
+			continue
+		}
+		out = append(out, teamstore.InboundAttachmentContext{
+			ID:          strings.TrimSpace(attachment.ID),
+			ContentType: strings.TrimSpace(attachment.ContentType),
+			ContentURL:  strings.TrimSpace(attachment.ContentURL),
+			Content:     attachment.Content,
+			Name:        strings.TrimSpace(attachment.Name),
+		})
+	}
+	return out
+}
+
+func chatMessageFromInboundContext(inbound teamstore.InboundEvent) (ChatMessage, bool) {
+	msg := ChatMessage{
+		ID:              strings.TrimSpace(inbound.TeamsMessageID),
+		ChatID:          strings.TrimSpace(inbound.TeamsChatID),
+		CreatedDateTime: inbound.ReceivedAt.Format(time.RFC3339),
+	}
+	msg.Body.ContentType = strings.TrimSpace(inbound.TeamsBodyType)
+	msg.Body.Content = inbound.TeamsBodyHTML
+	if msg.Body.Content == "" && strings.TrimSpace(inbound.Text) != "" {
+		msg.Body.ContentType = "html"
+		msg.Body.Content = html.EscapeString(inbound.Text)
+	}
+	if len(inbound.TeamsAttachments) > 0 {
+		msg.Attachments = make([]MessageAttachment, 0, len(inbound.TeamsAttachments))
+		for _, attachment := range inbound.TeamsAttachments {
+			msg.Attachments = append(msg.Attachments, MessageAttachment{
+				ID:          strings.TrimSpace(attachment.ID),
+				ContentType: strings.TrimSpace(attachment.ContentType),
+				ContentURL:  strings.TrimSpace(attachment.ContentURL),
+				Content:     attachment.Content,
+				Name:        strings.TrimSpace(attachment.Name),
+			})
+		}
+	}
+	return msg, strings.TrimSpace(msg.Body.Content) != "" || len(msg.Attachments) > 0
 }
 
 func inboundTextHashForTeamsMessage(text string, msg ChatMessage) string {

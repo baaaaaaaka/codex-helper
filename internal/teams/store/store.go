@@ -659,23 +659,34 @@ type SessionContext struct {
 }
 
 type InboundEvent struct {
-	ID              string        `json:"id"`
-	SessionID       string        `json:"session_id,omitempty"`
-	TeamsChatID     string        `json:"teams_chat_id"`
-	TeamsMessageID  string        `json:"teams_message_id"`
-	AuthorUserID    string        `json:"author_user_id,omitempty"`
-	AuthorName      string        `json:"author_name,omitempty"`
-	ScopeID         string        `json:"scope_id,omitempty"`
-	MachineID       string        `json:"machine_id,omitempty"`
-	LeaseGeneration int64         `json:"lease_generation,omitempty"`
-	Text            string        `json:"text,omitempty"`
-	TextHash        string        `json:"text_hash,omitempty"`
-	Source          string        `json:"source,omitempty"`
-	Status          InboundStatus `json:"status"`
-	TurnID          string        `json:"turn_id,omitempty"`
-	ReceivedAt      time.Time     `json:"received_at,omitempty"`
-	CreatedAt       time.Time     `json:"created_at,omitempty"`
-	UpdatedAt       time.Time     `json:"updated_at,omitempty"`
+	ID               string                     `json:"id"`
+	SessionID        string                     `json:"session_id,omitempty"`
+	TeamsChatID      string                     `json:"teams_chat_id"`
+	TeamsMessageID   string                     `json:"teams_message_id"`
+	AuthorUserID     string                     `json:"author_user_id,omitempty"`
+	AuthorName       string                     `json:"author_name,omitempty"`
+	ScopeID          string                     `json:"scope_id,omitempty"`
+	MachineID        string                     `json:"machine_id,omitempty"`
+	LeaseGeneration  int64                      `json:"lease_generation,omitempty"`
+	Text             string                     `json:"text,omitempty"`
+	TextHash         string                     `json:"text_hash,omitempty"`
+	Source           string                     `json:"source,omitempty"`
+	Status           InboundStatus              `json:"status"`
+	TurnID           string                     `json:"turn_id,omitempty"`
+	TeamsBodyType    string                     `json:"teams_body_type,omitempty"`
+	TeamsBodyHTML    string                     `json:"teams_body_html,omitempty"`
+	TeamsAttachments []InboundAttachmentContext `json:"teams_attachments,omitempty"`
+	ReceivedAt       time.Time                  `json:"received_at,omitempty"`
+	CreatedAt        time.Time                  `json:"created_at,omitempty"`
+	UpdatedAt        time.Time                  `json:"updated_at,omitempty"`
+}
+
+type InboundAttachmentContext struct {
+	ID          string `json:"id,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	ContentURL  string `json:"content_url,omitempty"`
+	Content     string `json:"content,omitempty"`
+	Name        string `json:"name,omitempty"`
 }
 
 type Turn struct {

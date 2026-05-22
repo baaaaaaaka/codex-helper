@@ -133,3 +133,11 @@ func UnsupportedControlAttachmentMessage(attachments []MessageAttachment) string
 	}
 	return UnsupportedAttachmentMessage(attachments) + " Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like `projects`, `new <directory>`, `continue <number>`, and `status`."
 }
+
+func UnsupportedExplicitControlAttachmentMessage(attachments []MessageAttachment) string {
+	count := len(attachments)
+	if count == 0 {
+		return ""
+	}
+	return UnsupportedAttachmentMessage(attachments) + " Quoted Teams messages in the 🏠 control chat are only supported with `ask <question>` or natural-language fallback prompts; explicit control commands do not consume quoted context."
+}
