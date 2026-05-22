@@ -45,6 +45,47 @@ func (f *fakeHelperAutoUpdater) ApplyWithOptions(_ context.Context, candidate He
 	return f.applyResult, nil
 }
 
+func deleteOutboxByID(t *testing.T, st *teamstore.Store, outboxID string) {
+	t.Helper()
+	if strings.TrimSpace(outboxID) == "" {
+		t.Fatal("outbox id is required")
+	}
+	err := st.Update(context.Background(), func(state *teamstore.State) error {
+		delete(state.OutboxMessages, outboxID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("delete outbox %q: %v", outboxID, err)
+	}
+}
+
+func deleteOutboxByKind(t *testing.T, st *teamstore.Store, kind string) string {
+	t.Helper()
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		t.Fatal("outbox kind is required")
+	}
+	var deleted string
+	err := st.Update(context.Background(), func(state *teamstore.State) error {
+		for id, msg := range state.OutboxMessages {
+			if strings.TrimSpace(msg.Kind) != kind {
+				continue
+			}
+			delete(state.OutboxMessages, id)
+			deleted = id
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("delete outbox kind %q: %v", kind, err)
+	}
+	if deleted == "" {
+		t.Fatalf("outbox kind %q not found", kind)
+	}
+	return deleted
+}
+
 func TestBridgeHelperAutoUpdateAppliesEligibleCandidate(t *testing.T) {
 	st, bridge := newBridgeAutoUpdateTest(t)
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
@@ -456,6 +497,17 @@ func TestBridgeCompletedHelperUpgradeNoticeAutoIsPlainAndDedupes(t *testing.T) {
 	if outbox.MentionOwner || outbox.NotificationKind != "" {
 		t.Fatalf("auto completion outbox = %#v, want plain Teams message", outbox)
 	}
+	deleteOutboxByID(t, st, state.Upgrade.CompletionNoticeID)
+	handled, err := bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx)
+	if err != nil {
+		t.Fatalf("queueCompletedHelperUpgradeNoticeIfNeeded after pruned outbox error: %v", err)
+	}
+	if !handled {
+		t.Fatal("queueCompletedHelperUpgradeNoticeIfNeeded after pruned outbox handled=false, want true")
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("pruned sent completion notice was resent %d times, want once", len(*sent))
+	}
 }
 
 func TestBridgePendingUpgradeNoticeDoesNotDuplicateDurableCompletionNotice(t *testing.T) {
@@ -493,7 +545,7 @@ func TestBridgePendingUpgradeNoticeDoesNotDuplicateDurableCompletionNotice(t *te
 	}
 }
 
-func TestBridgePendingUpgradeNoticeRepairsMissingDurableCompletionOutbox(t *testing.T) {
+func TestBridgePendingUpgradeNoticeDoesNotResendMissingDurableCompletionOutbox(t *testing.T) {
 	st := newBridgeTestStore(t)
 	graph, sent := newBridgeTestGraph(t)
 	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
@@ -517,20 +569,27 @@ func TestBridgePendingUpgradeNoticeRepairsMissingDurableCompletionOutbox(t *test
 	if err := bridge.queuePendingHelperRestartNotice(ctx); err != nil {
 		t.Fatalf("queuePendingHelperRestartNotice error: %v", err)
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("pending repair sent %d completion messages, want one", len(*sent))
+	if len(*sent) != 0 {
+		t.Fatalf("durable missing completion outbox was resent, sent=%#v", *sent)
 	}
 	state, err := st.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if outbox := state.OutboxMessages[durableID]; outbox.ID != durableID {
-		t.Fatalf("missing durable outbox was not repaired: %#v", state.OutboxMessages)
+	if outbox := state.OutboxMessages[durableID]; outbox.ID != "" {
+		t.Fatalf("missing durable completion outbox should not be repaired after pruning: %#v", outbox)
 	}
 	for id := range state.OutboxMessages {
 		if strings.Contains(id, shortStableID("control-message-1")) {
-			t.Fatalf("legacy pending completion outbox should not be created when durable record can be repaired: %s", id)
+			t.Fatalf("legacy pending completion outbox should not be created when durable completion was already recorded: %s", id)
 		}
+	}
+	noticePath, err := bridge.pendingHelperRestartNoticePath()
+	if err != nil {
+		t.Fatalf("pending helper restart notice path: %v", err)
+	}
+	if _, err := os.Stat(noticePath); !os.IsNotExist(err) {
+		t.Fatalf("pending helper restart notice should be cleared after durable completion skip, err=%v", err)
 	}
 }
 
@@ -810,6 +869,16 @@ func TestBridgeHelperAutoUpdatePendingReplacementFailureNotifiesOnce(t *testing.
 	if got := strings.Count(sentPlainJoined(*sent), "Helper update activation failed"); got != 1 {
 		t.Fatalf("activation failure notice duplicated, count = %d in:\n%s", got, sentPlainJoined(*sent))
 	}
+	deleteOutboxByKind(t, st, "failed-helper-upgrade-activation")
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("third queuePendingHelperRestartNotice with pruned failed activation notice error: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("third flush pending failure outbox: %v", err)
+	}
+	if got := strings.Count(sentPlainJoined(*sent), "Helper update activation failed"); got != 1 {
+		t.Fatalf("pruned activation failure notice duplicated, count = %d in:\n%s", got, sentPlainJoined(*sent))
+	}
 }
 
 func TestBridgeHelperAutoUpdateSuccessfulActivationWithOldRunningVersionNeedsAttention(t *testing.T) {
@@ -868,6 +937,16 @@ func TestBridgeHelperAutoUpdateSuccessfulActivationWithOldRunningVersionNeedsAtt
 	}
 	if _, err := os.Stat(noticePath); err != nil {
 		t.Fatalf("pending helper restart notice should remain for later verified activation: %v", err)
+	}
+	deleteOutboxByKind(t, st, "mismatched-helper-upgrade-activation")
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("second queuePendingHelperRestartNotice with pruned mismatch activation notice error: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("second flush pending mismatch outbox: %v", err)
+	}
+	if got := strings.Count(sentPlainJoined(*sent), "Helper update activation needs attention"); got != 1 {
+		t.Fatalf("pruned activation mismatch notice duplicated, count = %d in:\n%s", got, sentPlainJoined(*sent))
 	}
 }
 

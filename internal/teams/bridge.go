@@ -111,15 +111,22 @@ const (
 )
 
 type helperRestartNotice struct {
-	Version            int       `json:"version"`
-	Action             string    `json:"action,omitempty"`
-	Tag                string    `json:"tag,omitempty"`
-	Manual             bool      `json:"manual,omitempty"`
-	ControlChatID      string    `json:"control_chat_id,omitempty"`
-	CommandMessageID   string    `json:"command_message_id,omitempty"`
-	PendingReplacePath string    `json:"pending_replace_path,omitempty"`
-	InstallPath        string    `json:"install_path,omitempty"`
-	RequestedAt        time.Time `json:"requested_at,omitempty"`
+	Version            int                                     `json:"version"`
+	Action             string                                  `json:"action,omitempty"`
+	Tag                string                                  `json:"tag,omitempty"`
+	Manual             bool                                    `json:"manual,omitempty"`
+	ControlChatID      string                                  `json:"control_chat_id,omitempty"`
+	CommandMessageID   string                                  `json:"command_message_id,omitempty"`
+	PendingReplacePath string                                  `json:"pending_replace_path,omitempty"`
+	InstallPath        string                                  `json:"install_path,omitempty"`
+	RequestedAt        time.Time                               `json:"requested_at,omitempty"`
+	ActivationNotices  map[string]helperActivationNoticeRecord `json:"activation_notices,omitempty"`
+}
+
+type helperActivationNoticeRecord struct {
+	Status   string    `json:"status,omitempty"`
+	OutboxID string    `json:"outbox_id,omitempty"`
+	QueuedAt time.Time `json:"queued_at,omitempty"`
 }
 
 type helperActivationStatus struct {
@@ -3749,10 +3756,67 @@ func (b *Bridge) queuePendingHelperActivationAttentionNotice(ctx context.Context
 		MentionOwner:     true,
 		NotificationKind: notificationKind,
 	}
-	if err := b.queueAndBestEffortSendOutbox(ctx, msg); err != nil {
+	if helperActivationNoticeAlreadyQueued(notice, statusName, msg.ID) {
+		if err := b.flushExistingOutboxIfPending(ctx, msg.ID, chatID); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
+		}
+		return true, nil
+	}
+	queued, err := b.queueOutbox(ctx, msg)
+	if err != nil {
 		return false, err
 	}
+	if err := b.markPendingHelperActivationNoticeQueued(notice, statusName, queued.ID); err != nil {
+		return false, err
+	}
+	if queued.Status != teamstore.OutboxStatusSent {
+		if err := b.flushPendingOutboxForChat(ctx, queued.TeamsChatID); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
+		}
+	}
 	return true, nil
+}
+
+func helperActivationNoticeAlreadyQueued(notice helperRestartNotice, statusName string, outboxID string) bool {
+	key := helperActivationNoticeKey(statusName)
+	if key == "" || strings.TrimSpace(outboxID) == "" || notice.ActivationNotices == nil {
+		return false
+	}
+	record, ok := notice.ActivationNotices[key]
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(record.OutboxID) == strings.TrimSpace(outboxID) && !record.QueuedAt.IsZero()
+}
+
+func (b *Bridge) markPendingHelperActivationNoticeQueued(notice helperRestartNotice, statusName string, outboxID string) error {
+	key := helperActivationNoticeKey(statusName)
+	outboxID = strings.TrimSpace(outboxID)
+	if key == "" || outboxID == "" {
+		return nil
+	}
+	if notice.ActivationNotices == nil {
+		notice.ActivationNotices = make(map[string]helperActivationNoticeRecord)
+	}
+	record := notice.ActivationNotices[key]
+	record.Status = key
+	record.OutboxID = outboxID
+	if record.QueuedAt.IsZero() {
+		record.QueuedAt = time.Now()
+	}
+	notice.ActivationNotices[key] = record
+	return b.writePendingHelperLifecycleNoticeWithOptions(notice)
+}
+
+func helperActivationNoticeKey(statusName string) string {
+	switch strings.ToLower(strings.TrimSpace(statusName)) {
+	case "failed":
+		return "failed"
+	case "success":
+		return "success"
+	default:
+		return ""
+	}
 }
 
 func readHelperActivationStatus(pendingPath string) (helperActivationStatus, bool, error) {
@@ -3837,13 +3901,26 @@ func (b *Bridge) queueCompletedHelperUpgradeNoticeIfNeeded(ctx context.Context) 
 		}
 		return true, nil
 	}
-	if err := b.queueAndBestEffortSendOutbox(ctx, msg); err != nil {
+	if helperUpgradeCompletionNoticeDurablyQueued(*req) {
+		return true, nil
+	}
+	queued, err := b.queueOutbox(ctx, msg)
+	if err != nil {
 		return false, err
 	}
-	if _, err := b.store.MarkUpgradeCompletionNoticeQueued(ctx, req.ID, msg.ID); err != nil {
+	if _, err := b.store.MarkUpgradeCompletionNoticeQueued(ctx, req.ID, queued.ID); err != nil {
 		return false, err
+	}
+	if queued.Status != teamstore.OutboxStatusSent {
+		if err := b.flushPendingOutboxForChat(ctx, queued.TeamsChatID); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
+		}
 	}
 	return true, nil
+}
+
+func helperUpgradeCompletionNoticeDurablyQueued(req teamstore.UpgradeRequest) bool {
+	return strings.TrimSpace(req.CompletionNoticeID) != "" && !req.CompletionNoticeAt.IsZero()
 }
 
 func (b *Bridge) completedHelperUpgradeNoticeMessage(state teamstore.State, req teamstore.UpgradeRequest) (teamstore.OutboxMessage, bool) {
@@ -9204,6 +9281,26 @@ func (b *Bridge) queueAndBestEffortSendOutbox(ctx context.Context, msg teamstore
 		_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
 	}
 	return nil
+}
+
+func (b *Bridge) flushExistingOutboxIfPending(ctx context.Context, outboxID string, chatID string) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	outboxID = strings.TrimSpace(outboxID)
+	chatID = strings.TrimSpace(chatID)
+	if outboxID == "" || chatID == "" {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	existing, ok := state.OutboxMessages[outboxID]
+	if !ok || existing.Status == teamstore.OutboxStatusSent {
+		return nil
+	}
+	return b.flushPendingOutboxForChat(ctx, chatID)
 }
 
 func (b *Bridge) queueOutbox(ctx context.Context, msg teamstore.OutboxMessage) (teamstore.OutboxMessage, error) {
