@@ -3,7 +3,6 @@
 package store
 
 import (
-	"fmt"
 	"os"
 	"unsafe"
 
@@ -26,10 +25,10 @@ var (
 	_ [int(unsafe.Sizeof(windowsFileBasicInfo{})) - windowsFileBasicInfoSize]byte
 )
 
-func stateFileStampRevision(path string, _ os.FileInfo) (string, error) {
+func stateFileStampRevision(path string, _ os.FileInfo) (stateFileRevision, error) {
 	pathPtr, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return "", err
+		return stateFileRevision{}, err
 	}
 	handle, err := windows.CreateFile(
 		pathPtr,
@@ -41,13 +40,13 @@ func stateFileStampRevision(path string, _ os.FileInfo) (string, error) {
 		0,
 	)
 	if err != nil {
-		return "", err
+		return stateFileRevision{}, err
 	}
 	defer windows.CloseHandle(handle)
 
 	var handleInfo windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(handle, &handleInfo); err != nil {
-		return "", err
+		return stateFileRevision{}, err
 	}
 	var basicInfo windowsFileBasicInfo
 	if err := windows.GetFileInformationByHandleEx(
@@ -56,14 +55,14 @@ func stateFileStampRevision(path string, _ os.FileInfo) (string, error) {
 		(*byte)(unsafe.Pointer(&basicInfo)),
 		uint32(unsafe.Sizeof(basicInfo)),
 	); err != nil {
-		return "", err
+		return stateFileRevision{}, err
 	}
-	return fmt.Sprintf(
-		"%d:%d:%d:%d:%d",
-		handleInfo.VolumeSerialNumber,
-		handleInfo.FileIndexHigh,
-		handleInfo.FileIndexLow,
-		basicInfo.CreationTime.Nanoseconds(),
-		basicInfo.ChangeTime.Nanoseconds(),
-	), nil
+	return stateFileRevision{
+		Valid:             true,
+		VolumeSerial:      handleInfo.VolumeSerialNumber,
+		FileIndexHigh:     handleInfo.FileIndexHigh,
+		FileIndexLow:      handleInfo.FileIndexLow,
+		CreationTimeNanos: basicInfo.CreationTime.Nanoseconds(),
+		ChangeTimeNanos:   basicInfo.ChangeTime.Nanoseconds(),
+	}, nil
 }

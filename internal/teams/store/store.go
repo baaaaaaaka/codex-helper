@@ -781,8 +781,17 @@ type stateFileStamp struct {
 	Exists   bool
 	Size     int64
 	ModTime  time.Time
-	Revision string
+	Revision stateFileRevision
 	Info     os.FileInfo
+}
+
+type stateFileRevision struct {
+	Valid             bool
+	VolumeSerial      uint32
+	FileIndexHigh     uint32
+	FileIndexLow      uint32
+	CreationTimeNanos int64
+	ChangeTimeNanos   int64
 }
 
 type messageLookupCache struct {
@@ -4350,8 +4359,8 @@ func (stamp stateFileStamp) equal(other stateFileStamp) bool {
 	if stamp.Size != other.Size || !stamp.ModTime.Equal(other.ModTime) {
 		return false
 	}
-	if stamp.Revision != "" && other.Revision != "" && stamp.Revision != other.Revision {
-		return false
+	if stamp.Revision.Valid && other.Revision.Valid {
+		return stamp.Revision == other.Revision
 	}
 	if stamp.Info != nil && other.Info != nil && !os.SameFile(stamp.Info, other.Info) {
 		return false
