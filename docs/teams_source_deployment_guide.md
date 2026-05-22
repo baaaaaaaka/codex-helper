@@ -422,7 +422,8 @@ codex-proxy teams status
 
 Check poll summary, blocked chats, and Graph window warnings. Hot chats should
 poll faster after a user message or final answer. Parked chats do not poll until
-resumed from the control chat.
+resumed from the control chat, either with `r <resume-key>` or by opening or
+continuing the linked work chat from the control chat.
 
 Queued or interrupted turn:
 

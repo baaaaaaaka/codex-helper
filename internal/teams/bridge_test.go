@@ -2910,6 +2910,227 @@ func TestBridgeControlOpenRawLocalSessionSuggestsPublish(t *testing.T) {
 	}
 }
 
+func TestBridgeControlOpenParkedLinkedSessionResumesPolling(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	oldActivity := time.Now().Add(-49 * time.Hour)
+	session.UpdatedAt = oldActivity
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), session.ChatID, oldActivity, true, true, 50, "/chats/chat-1/messages?$skiptoken=stale"); err != nil {
+		t.Fatalf("seed stale continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-open-parked", "2026-05-02T01:05:00Z", "/open s001"), "/open s001"); err != nil {
+		t.Fatalf("/open parked session error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 1 {
+		t.Fatalf("work-chat resume notice = %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "This parked work chat was resumed") != 1 {
+		t.Fatalf("control open response = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || poll.LastActivityAt.IsZero() || !poll.ParkedAt.IsZero() || poll.ContinuationPath != "" {
+		t.Fatalf("open did not resume parked chat cleanly: %#v", poll)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if durable := state.Sessions[session.ID]; !durable.UpdatedAt.After(oldActivity) {
+		t.Fatalf("durable session UpdatedAt was not refreshed on resume: %#v", durable)
+	}
+}
+
+func TestBridgeControlOpenNumberParkedLinkedSessionResumesPolling(t *testing.T) {
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-alpha", "")
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-alpha"
+	oldActivity := time.Now().Add(-49 * time.Hour)
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-projects"), "projects"); err != nil {
+		t.Fatalf("projects error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-workspace"), "project 1"); err != nil {
+		t.Fatalf("project 1 error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-open-number"), "open 1"); err != nil {
+		t.Fatalf("open 1 error: %v", err)
+	}
+
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 1 {
+		t.Fatalf("work-chat resume notice = %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "This parked work chat was resumed") != 1 {
+		t.Fatalf("control open response = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || !poll.ParkedAt.IsZero() {
+		t.Fatalf("open number did not resume parked chat: %#v", poll)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if _, ok := state.DashboardViews["control-chat"]; ok {
+		t.Fatalf("dashboard view should be consumed by open: %#v", state.DashboardViews)
+	}
+}
+
+func TestBridgeControlSelectExistingParkedSessionResumesPolling(t *testing.T) {
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-alpha", "")
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-alpha"
+	oldActivity := time.Now().Add(-49 * time.Hour)
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-projects"), "projects"); err != nil {
+		t.Fatalf("projects error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-workspace"), "project 1"); err != nil {
+		t.Fatalf("project 1 error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-select-session"), "1"); err != nil {
+		t.Fatalf("select session error: %v", err)
+	}
+
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 1 {
+		t.Fatalf("work-chat resume notice = %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "The parked Work chat was resumed") != 1 {
+		t.Fatalf("control select response = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || !poll.ParkedAt.IsZero() {
+		t.Fatalf("select did not resume parked chat: %#v", poll)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if _, ok := state.DashboardViews["control-chat"]; ok {
+		t.Fatalf("dashboard view should be consumed by select: %#v", state.DashboardViews)
+	}
+}
+
+func TestBridgeControlOpenNonParkedLinkedSessionDoesNotResumeAgain(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	oldActivity := time.Now().Add(-10 * time.Minute)
+	nextPoll := time.Now().Add(5 * time.Minute)
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     nextPoll,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule warm chat: %v", err)
+	}
+	before, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll before ok=%v err=%v", ok, err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-open-warm", "2026-05-02T01:05:00Z", "/open s001"), "/open s001"); err != nil {
+		t.Fatalf("/open warm session error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 0 {
+		t.Fatalf("warm open should not send resume notice: %#v", *sent)
+	}
+	after, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll after ok=%v err=%v", ok, err)
+	}
+	if after.PollState != before.PollState || !after.LastActivityAt.Equal(before.LastActivityAt) || !after.NextPollAt.Equal(before.NextPollAt) || !after.ParkedAt.Equal(before.ParkedAt) {
+		t.Fatalf("warm open mutated poll schedule: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestBridgeControlOpenClosedLinkedSessionDoesNotResumeParkedPoll(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	session.Status = "closed"
+	oldActivity := time.Now().Add(-49 * time.Hour)
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-open-closed", "2026-05-02T01:05:00Z", "/open s001"), "/open s001"); err != nil {
+		t.Fatalf("/open closed session error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 0 {
+		t.Fatalf("closed open should not send resume notice: %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "This work chat is closed") != 1 {
+		t.Fatalf("control closed response = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() {
+		t.Fatalf("closed open should keep parked poll: %#v", poll)
+	}
+}
+
 func TestBridgeControlWorkspaceListDoesNotShowWorkspaceFingerprint(t *testing.T) {
 	prevDiscover := discoverCodexProjectsForTeams
 	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
@@ -5893,6 +6114,102 @@ func TestBridgePublishExistingBlockedSessionDoesNotRawErrorOnMissingCheckpoint(t
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
 	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
 		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	}
+}
+
+func TestBridgePublishExistingParkedSessionResumesPolling(t *testing.T) {
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-alpha", "")
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-alpha"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	oldActivity := time.Now().Add(-49 * time.Hour)
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+
+	message, err := bridge.publishCodexSession(context.Background(), DashboardCommandTarget{Raw: "thread-alpha"})
+	if err != nil {
+		t.Fatalf("publish existing parked session error: %v", err)
+	}
+	for _, want := range []string{
+		"Already published as s001",
+		"The parked Work chat was resumed",
+		"Open this Teams work chat",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("publish message missing %q in:\n%s", want, message)
+		}
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 1 {
+		t.Fatalf("work-chat resume notice = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || !poll.ParkedAt.IsZero() {
+		t.Fatalf("publish did not resume parked chat: %#v", poll)
+	}
+}
+
+func TestBridgePublishExistingParkedSessionWithActiveImportDoesNotResumePolling(t *testing.T) {
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-alpha", "")
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-alpha"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	oldActivity := time.Now().Add(-49 * time.Hour)
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:         transcriptCheckpointID(session.ID),
+			SessionID:  session.ID,
+			SourcePath: "/tmp/session.jsonl",
+			Status:     importCheckpointStatusImporting,
+			UpdatedAt:  time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed active import: %v", err)
+	}
+
+	message, err := bridge.publishCodexSession(context.Background(), DashboardCommandTarget{Raw: "thread-alpha"})
+	if err != nil {
+		t.Fatalf("publish existing import-in-progress session error: %v", err)
+	}
+	if !strings.Contains(message, "History import is still running") {
+		t.Fatalf("publish response = %q, want import-in-progress guidance", message)
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 0 {
+		t.Fatalf("active import should not send resume notice: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() {
+		t.Fatalf("active import should keep parked poll: %#v", poll)
 	}
 }
 

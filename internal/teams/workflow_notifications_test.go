@@ -1198,6 +1198,64 @@ func TestQueueOutboxRedirectsOwnerMentionToControlFallbackWhenWorkflowNotificati
 	}
 }
 
+func TestSendQueuedOutboxRedirectsOwnerMentionToControlFallbackWhenWorkflowNotificationDisabled(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Use control chat fallback without webhook card")
+
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:legacy-work-mention",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "final",
+		Body:             "done",
+		MentionOwner:     true,
+		NotificationKind: "turn_completed",
+	})
+	if err != nil {
+		t.Fatalf("seed legacy outbox: %v", err)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+
+	var sawWorkChat bool
+	var sawControlFallback bool
+	for _, msg := range *sent {
+		switch msg.ChatID {
+		case "chat-1":
+			sawWorkChat = true
+			if msg.Mentions != 0 {
+				t.Fatalf("work chat mentions = %d, want 0: %#v", msg.Mentions, msg)
+			}
+		case "control-chat":
+			sawControlFallback = true
+			if msg.Mentions == 0 {
+				t.Fatalf("control fallback mentions = 0, want owner mention: %#v", msg)
+			}
+			plain := PlainTextFromTeamsHTML(msg.Content)
+			for _, want := range []string{"✅ Codex finished", "Open answer"} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("control fallback missing %q:\n%s", want, plain)
+				}
+			}
+		}
+	}
+	if !sawWorkChat || !sawControlFallback {
+		t.Fatalf("sent messages missing work or fallback message: %#v", *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if stored := state.OutboxMessages[queued.ID]; stored.MentionOwner {
+		t.Fatalf("stored MentionOwner = true, want false after fallback suppression: %#v", stored)
+	}
+}
+
 func TestQueueOutboxKeepsOwnerMentionWhenNoCardOrControlFallbackExists(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)

@@ -334,8 +334,9 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
   - `warm`: recent conversation; poll every `10s` until `15 min` idle.
   - `cool`: quiet conversation; poll every `30s` until `2h` idle.
   - `cold`: old conversation; poll every `120s` until `48h` idle.
-  - `parked`: after `48h` idle or explicit close/park; do not poll. Resume only
-    from the control chat with stable `r <hash>`.
+  - `parked`: after `48h` idle or explicit close/park; do not poll. Resume
+    from the control chat with stable `r <hash>`, or automatically when the
+    linked work chat is opened or continued from the control chat.
   - `catchup`: startup/reconnect/resume/continuation; poll budgeted ASAP with
     larger windows, then return by latest activity.
   - `blocked`: Graph 429/transport backoff; do not poll until `Retry-After`.

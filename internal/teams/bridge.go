@@ -10388,13 +10388,24 @@ func (b *Bridge) formatOpenSession(sessionID string) string {
 	if session == nil {
 		return "session not found: " + sessionID
 	}
+	return b.formatOpenSessionMessage(session, false)
+}
+
+func (b *Bridge) formatOpenSessionMessage(session *Session, resumed bool) string {
+	if session == nil {
+		return "session not found"
+	}
 	var lines []string
 	lines = append(lines, fmt.Sprintf("%s [%s] %s", session.ID, session.Status, session.Topic))
 	if session.ChatURL != "" {
 		lines = append(lines, session.ChatURL)
 	}
 	if isActiveSessionStatus(session.Status) {
-		lines = append(lines, "Next: open this Teams work chat and send a message there to continue. `open` only shows the linked chat; it does not import local history.")
+		if resumed {
+			lines = append(lines, "This parked work chat was resumed. Next: open this Teams work chat and send a message there to continue.")
+		} else {
+			lines = append(lines, "Next: open this Teams work chat and send a message there to continue. `open` only shows the linked chat; it does not import local history.")
+		}
 	} else {
 		lines = append(lines, "This work chat is closed, so the helper no longer reads or responds there. Use `sessions` then `continue <number>` to continue the local Codex session in a new work chat.")
 	}
@@ -10615,7 +10626,11 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 			if err := b.importCodexTranscriptToTeamsWithOptions(ctx, *existing, local, importOpts); err != nil {
 				if isTranscriptCheckpointNotFoundError(err) {
 					importStatus = transcriptCheckpointNeedsAttentionMessage()
-					return fmt.Sprintf("Already published as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus), nil
+					resumed, err := b.resumeWorkChatIfParked(ctx, existing)
+					if err != nil {
+						return "", err
+					}
+					return fmt.Sprintf("Already published as %s: %s\n\n%s%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus, publishedSessionResumeStatus(resumed)), nil
 				}
 				return "", fmt.Errorf("resume history import for %s: %w", existing.ID, err)
 			}
@@ -10625,7 +10640,11 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 				importStatus = "New local history was imported."
 			}
 		}
-		return fmt.Sprintf("Already published as %s: %s\n\n%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus), nil
+		resumed, err := b.resumeWorkChatIfParked(ctx, existing)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Already published as %s: %s\n\n%s%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus, publishedSessionResumeStatus(resumed)), nil
 	}
 	newSessionID := b.reg.NextSessionID()
 	title := WorkChatTitle(ChatTitleOptions{
@@ -10729,6 +10748,13 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		}
 	}
 	return fmt.Sprintf("Published local Codex session as %s: %s\n\nOpen this Teams work chat and send a message there to continue.", session.ID, session.ChatURL), nil
+}
+
+func publishedSessionResumeStatus(resumed bool) string {
+	if !resumed {
+		return ""
+	}
+	return " The parked Work chat was resumed."
 }
 
 func publishHistoryPreparingMessage(sessionID string, chatURL string, existing bool) string {
@@ -13795,15 +13821,77 @@ func (b *Bridge) formatOpenControlTarget(ctx context.Context, target DashboardCo
 		if selection.Kind != DashboardSelectionSession {
 			return "", fmt.Errorf("number %d is a workspace in the current dashboard view; send `project %d` to list its sessions", target.Number, target.Number)
 		}
-		return b.formatSessionSelection(selection), nil
+		return b.formatSessionSelection(ctx, selection)
 	}
 	if session := b.linkedSessionForLocalSessionID(target.Raw); session != nil {
-		return b.formatOpenSession(session.ID), nil
+		resumed, err := b.resumeWorkChatIfParked(ctx, session)
+		if err != nil {
+			return "", err
+		}
+		return b.formatOpenSessionMessage(session, resumed), nil
 	}
 	if b.localCodexSessionExists(ctx, target.Raw) {
 		return b.localSessionNotInTeamsMessage(0, strings.TrimSpace(target.Raw)), nil
 	}
 	return b.formatOpenSession(target.Raw), nil
+}
+
+func (b *Bridge) resumeWorkChatIfParked(ctx context.Context, session *Session) (bool, error) {
+	if b == nil || b.store == nil || session == nil || !isActiveSessionStatus(session.Status) || strings.TrimSpace(session.ChatID) == "" {
+		return false, nil
+	}
+	poll, ok, err := b.store.ChatPoll(ctx, session.ChatID)
+	if err != nil {
+		return false, err
+	}
+	if !ok || poll.PollState != inboundPollStateParked {
+		return false, nil
+	}
+	if err := b.resumeWorkChat(ctx, session, time.Now()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (b *Bridge) resumeWorkChat(ctx context.Context, session *Session, now time.Time) error {
+	if session == nil {
+		return fmt.Errorf("session is required")
+	}
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if _, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:                session.ChatID,
+		PollState:             inboundPollStateHot,
+		PreviousPollState:     "",
+		NextPollAt:            now,
+		LastActivityAt:        now,
+		ClearBlockedUntil:     true,
+		ClearContinuationPath: true,
+		ResetFailures:         true,
+	}); err != nil {
+		return err
+	}
+	session.UpdatedAt = now
+	if err := b.ensureDurableSession(ctx, session); err != nil {
+		return err
+	}
+	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+		current := state.Sessions[session.ID]
+		current.UpdatedAt = now
+		state.Sessions[session.ID] = current
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := b.sendWorkChatResumeNotice(ctx, *session, now); err != nil {
+		return err
+	}
+	b.boostPolling(now)
+	return nil
 }
 
 func (b *Bridge) resumeParkedWorkChat(ctx context.Context, arg string) (string, error) {
@@ -13826,24 +13914,9 @@ func (b *Bridge) resumeParkedWorkChat(ctx context.Context, arg string) (string, 
 		return "", fmt.Errorf("resume key not found: %s", key)
 	}
 	now := time.Now()
-	if _, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
-		ChatID:                match.ChatID,
-		PollState:             inboundPollStateHot,
-		PreviousPollState:     "",
-		NextPollAt:            now,
-		LastActivityAt:        now,
-		ClearBlockedUntil:     true,
-		ClearContinuationPath: true,
-		ResetFailures:         true,
-	}); err != nil {
+	if err := b.resumeWorkChat(ctx, match, now); err != nil {
 		return "", err
 	}
-	match.UpdatedAt = now
-	_ = b.ensureDurableSession(ctx, match)
-	if err := b.sendWorkChatResumeNotice(ctx, *match, now); err != nil {
-		return "", err
-	}
-	b.boostPolling(now)
 	if match.ChatURL != "" {
 		return fmt.Sprintf("Resumed %s.\n\nOpen Work chat: %s\n\nMessages in that chat will be read again.", match.ID, match.ChatURL), nil
 	}
@@ -13947,15 +14020,19 @@ func dashboardWorkspaceVisibleInProjects(projects []codexhistory.Project, worksp
 	return false
 }
 
-func (b *Bridge) formatSessionSelection(selection DashboardSelection) string {
+func (b *Bridge) formatSessionSelection(ctx context.Context, selection DashboardSelection) (string, error) {
 	session := b.linkedSessionForLocalSessionID(selection.SessionID)
 	if session == nil {
-		return b.localSessionNotInTeamsMessage(selection.Number, selection.SessionID)
+		return b.localSessionNotInTeamsMessage(selection.Number, selection.SessionID), nil
 	}
 	if !isActiveSessionStatus(session.Status) {
-		return fmt.Sprintf("This Codex session has a closed Teams work chat. The helper no longer polls that chat.\nNext: send `continue %d` to create a new work chat and continue from local history.\nUse `details %d` to show technical IDs.", selection.Number, selection.Number)
+		return fmt.Sprintf("This Codex session has a closed Teams work chat. The helper no longer polls that chat.\nNext: send `continue %d` to create a new work chat and continue from local history.\nUse `details %d` to show technical IDs.", selection.Number, selection.Number), nil
 	}
-	return b.formatOpenSession(session.ID)
+	resumed, err := b.resumeWorkChatIfParked(ctx, session)
+	if err != nil {
+		return "", err
+	}
+	return b.formatOpenSessionMessage(session, resumed), nil
 }
 
 func (b *Bridge) linkedSessionForLocalSessionID(sessionID string) *Session {
