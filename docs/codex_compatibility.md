@@ -11,7 +11,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.133.0-alpha.4 | pass | pass | pass | pass | pass | pass | 2026-05-21T07:39:53Z |
 | 0.133.0-alpha.3 | fail | fail | fail | fail | fail | fail | 2026-05-21T02:01:16Z |
 | 0.133.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-20T18:40:09Z |
-| 0.132.0 | pass | pass | fail | pass | pass | pass | 2026-05-23T08:04:28Z |
+| 0.132.0 | pass | pass | pass | pass | pass | pass | 2026-05-23T10:11:01Z |
 | 0.132.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-18T22:54:07Z |
 | 0.131.0 | pass | pass | pass | pass | pass | pass | 2026-05-21T20:30:39Z |
 | 0.131.0-alpha.22 | pass | pass | pass | pass | pass | pass | 2026-05-16T01:48:39Z |
