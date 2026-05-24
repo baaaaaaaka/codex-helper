@@ -292,18 +292,20 @@ func stopTeamsServiceForHelperUpgrade(ctx context.Context, in io.Reader, out io.
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "Stopping Teams service before upgrade...")
 	}
-	if err := stopTeamsService(ctx); err != nil {
+	backend, backendErr := teamsServiceBackendForCurrentPlatform()
+	if backendErr != nil {
+		return nil, backendErr
+	}
+	if err := stopTeamsServiceRaw(ctx, backend); err != nil {
 		return nil, err
 	}
-	if backend, backendErr := teamsServiceBackendForCurrentPlatform(); backendErr == nil {
-		if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
-			spec, specErr := buildTeamsServiceSpec(registryPath)
-			if specErr != nil {
-				return nil, specErr
-			}
-			if _, retireErr := teamsServiceRetireLocalDuplicateProcesses(ctx, spec); retireErr != nil {
-				return nil, fmt.Errorf("could not stop old local Teams helper process(es) before upgrade restart: %w", retireErr)
-			}
+	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+		spec, specErr := buildTeamsServiceSpec(registryPath)
+		if specErr != nil {
+			return nil, specErr
+		}
+		if _, retireErr := teamsServiceRetireLocalDuplicateProcesses(ctx, spec); retireErr != nil {
+			return nil, fmt.Errorf("could not stop old local Teams helper process(es) before upgrade restart: %w", retireErr)
 		}
 	}
 	return func(ctx context.Context, opts teamsUpgradeFinishOptions) error {

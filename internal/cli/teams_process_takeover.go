@@ -29,6 +29,14 @@ var (
 )
 
 func teamsServiceRetireLocalDuplicateProcesses(ctx context.Context, spec teamsServiceSpec) (teamsServiceLocalProcessRetireResult, error) {
+	return teamsServiceRetireLocalProcesses(ctx, spec, map[string]bool{"run": true, "watchdog": true})
+}
+
+func teamsServiceRetireLocalBridgeProcesses(ctx context.Context, spec teamsServiceSpec) (teamsServiceLocalProcessRetireResult, error) {
+	return teamsServiceRetireLocalProcesses(ctx, spec, map[string]bool{"run": true})
+}
+
+func teamsServiceRetireLocalProcesses(ctx context.Context, spec teamsServiceSpec, kinds map[string]bool) (teamsServiceLocalProcessRetireResult, error) {
 	var result teamsServiceLocalProcessRetireResult
 	if ctx == nil {
 		ctx = context.Background()
@@ -45,7 +53,7 @@ func teamsServiceRetireLocalDuplicateProcesses(ctx context.Context, spec teamsSe
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		if !teamsServiceShouldRetireLocalProcess(proc, spec) {
+		if !teamsServiceShouldRetireLocalProcess(proc, spec, kinds) {
 			continue
 		}
 		result.Matched++
@@ -61,12 +69,12 @@ func teamsServiceRetireLocalDuplicateProcesses(ctx context.Context, spec teamsSe
 	return result, nil
 }
 
-func teamsServiceShouldRetireLocalProcess(proc teamsServiceLocalProcess, spec teamsServiceSpec) bool {
+func teamsServiceShouldRetireLocalProcess(proc teamsServiceLocalProcess, spec teamsServiceSpec, kinds map[string]bool) bool {
 	if proc.PID <= 0 || proc.PID == os.Getpid() {
 		return false
 	}
 	kind := teamsServiceLocalProcessKind(proc.Args)
-	if kind == "" {
+	if kind == "" || !kinds[kind] {
 		return false
 	}
 	if teamsServiceArgsContainFlag(proc.Args, "--once") {

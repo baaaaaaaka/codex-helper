@@ -46,9 +46,9 @@ const (
 	teamsServiceTaskSchedulerRestartMinutes  = 1
 	teamsServiceWatchdogMinutes              = 1
 	teamsServiceWatchdogDays                 = 3650
-	teamsServiceRunOwnerStaleAfter           = 18 * time.Second
+	teamsServiceRunOwnerStaleAfter           = 90 * time.Second
 	teamsServiceExternalWatchdogInterval     = 10 * time.Second
-	teamsServiceExternalWatchdogCheckTimeout = 20 * time.Second
+	teamsServiceExternalWatchdogCheckTimeout = 45 * time.Second
 	teamsServiceExternalWatchdogSeconds      = int(teamsServiceExternalWatchdogInterval / time.Second)
 	teamsServiceExternalWatchdogMinutes      = 1
 )
@@ -302,7 +302,7 @@ func newTeamsServiceStartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := runTeamsServiceCommand(cmd.Context(), cmd.OutOrStdout(), backend, "start"); err != nil {
+			if err := startTeamsServiceWithOutput(cmd.Context(), false, cmd.OutOrStdout()); err != nil {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Started Teams service: %s\n", backend.Name())
@@ -324,7 +324,7 @@ func newTeamsServiceStopCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := runTeamsServiceCommand(cmd.Context(), cmd.OutOrStdout(), backend, "stop"); err != nil {
+			if err := stopTeamsServiceWithOutput(cmd.Context(), cmd.OutOrStdout()); err != nil {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Stopped Teams service: %s\n", backend.Name())
@@ -359,7 +359,7 @@ func newTeamsServiceRestartCmd() *cobra.Command {
 			} else if scheduled {
 				return nil
 			}
-			if err := startTeamsService(cmd.Context(), true); err != nil {
+			if err := startTeamsServiceWithOutput(cmd.Context(), true, cmd.OutOrStdout()); err != nil {
 				return err
 			}
 			backend, err := teamsServiceBackendForCurrentPlatform()
@@ -471,6 +471,9 @@ func installTeamsService(ctx context.Context, registryPath *string) (string, err
 	if err != nil {
 		return "", err
 	}
+	if err := cleanupTeamsServiceBeforeTaskRewrite(ctx, backend); err != nil {
+		return "", err
+	}
 	return backend.Install(ctx, spec)
 }
 
@@ -481,6 +484,9 @@ func repairTeamsService(ctx context.Context, registryPath *string, opts teamsSer
 	}
 	spec, err := buildTeamsServiceSpec(registryPath)
 	if err != nil {
+		return "", err
+	}
+	if err := cleanupTeamsServiceBeforeTaskRewrite(ctx, backend); err != nil {
 		return "", err
 	}
 	if repairer, ok := backend.(teamsServiceRepairBackend); ok {
@@ -501,6 +507,17 @@ func repairTeamsService(ctx context.Context, registryPath *string, opts teamsSer
 		}
 	}
 	return path, nil
+}
+
+func cleanupTeamsServiceBeforeTaskRewrite(ctx context.Context, backend teamsServiceBackend) error {
+	if _, ok := backend.(teamsServiceWindowsTaskBackend); !ok {
+		return nil
+	}
+	task := powershellSingleQuote(teamsServiceWindowsTaskName)
+	if _, err := teamsServiceRunPowerShell(ctx, teamsServiceWindowsStopBridgeChildrenPowerShell(task)); err != nil {
+		return fmt.Errorf("cleanup old Teams bridge process(es) before Task Scheduler rewrite: %w", err)
+	}
+	return nil
 }
 
 func printTeamsServiceDryRun(ctx context.Context, out io.Writer, registryPath *string) error {
@@ -1012,14 +1029,45 @@ func teamsServiceActive(ctx context.Context) (bool, error) {
 }
 
 func stopTeamsService(ctx context.Context) error {
+	return stopTeamsServiceWithOutput(ctx, io.Discard)
+}
+
+func stopTeamsServiceWithOutput(ctx context.Context, out io.Writer) error {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return err
 	}
-	return runTeamsServiceCommand(ctx, io.Discard, backend, "stop")
+	if err := stopTeamsServiceRawWithOutput(ctx, backend, out); err != nil {
+		return err
+	}
+	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+		return retireWSLTeamsBridgeProcesses(ctx, nil)
+	}
+	return nil
+}
+
+func stopTeamsServiceRaw(ctx context.Context, backend teamsServiceBackend) error {
+	return stopTeamsServiceRawWithOutput(ctx, backend, io.Discard)
+}
+
+func stopTeamsServiceRawWithOutput(ctx context.Context, backend teamsServiceBackend, out io.Writer) error {
+	if backend == nil {
+		return fmt.Errorf("Teams service backend is required")
+	}
+	if out == nil {
+		out = io.Discard
+	}
+	return runTeamsServiceCommand(ctx, out, backend, "stop")
 }
 
 func startTeamsService(ctx context.Context, restart bool) error {
+	return startTeamsServiceWithOutput(ctx, restart, io.Discard)
+}
+
+func startTeamsServiceWithOutput(ctx context.Context, restart bool, out io.Writer) error {
+	if out == nil {
+		out = io.Discard
+	}
 	action := "start"
 	if restart {
 		action = "restart"
@@ -1028,7 +1076,31 @@ func startTeamsService(ctx context.Context, restart bool) error {
 	if err != nil {
 		return err
 	}
-	return runTeamsServiceCommand(ctx, io.Discard, backend, action)
+	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+		if restart {
+			if err := runTeamsServiceCommand(ctx, out, backend, "stop"); err != nil {
+				return err
+			}
+			if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+				return err
+			}
+			return runTeamsServiceCommand(ctx, out, backend, "start")
+		}
+		active, activeErr := backend.Active(ctx)
+		if activeErr != nil {
+			return activeErr
+		}
+		if active {
+			if teamsServiceWSLStartupFallbackInstalled(backend) {
+				return nil
+			}
+		} else {
+			if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return runTeamsServiceCommand(ctx, out, backend, action)
 }
 
 type teamsServicePrimaryRunner interface {
@@ -1045,10 +1117,55 @@ func startTeamsPrimaryService(ctx context.Context, restart bool) error {
 		return err
 	}
 	if primary, ok := backend.(teamsServicePrimaryRunner); ok {
+		if _, wsl := backend.(teamsServiceWSLWindowsTaskBackend); wsl {
+			if restart {
+				if _, err := primary.RunPrimary(ctx, "stop"); err != nil {
+					return err
+				}
+				if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+					return err
+				}
+				_, err := primary.RunPrimary(ctx, "start")
+				return err
+			}
+			active, activeErr := backend.Active(ctx)
+			if activeErr != nil {
+				return activeErr
+			}
+			if active {
+				if teamsServiceWSLStartupFallbackInstalled(backend) {
+					return nil
+				}
+			} else {
+				if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+					return err
+				}
+			}
+		}
 		_, err := primary.RunPrimary(ctx, action)
 		return err
 	}
 	return runTeamsServiceCommand(ctx, io.Discard, backend, action)
+}
+
+func teamsServiceWSLStartupFallbackInstalled(backend teamsServiceBackend) bool {
+	wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
+	if !ok {
+		return false
+	}
+	installed, err := wslBackend.startupFallbackMarkerInstalled()
+	return err == nil && installed
+}
+
+func retireWSLTeamsBridgeProcesses(ctx context.Context, registryPath *string) error {
+	spec, err := buildTeamsServiceSpec(registryPath)
+	if err != nil {
+		return err
+	}
+	if _, err := teamsServiceRetireLocalBridgeProcesses(ctx, spec); err != nil {
+		return fmt.Errorf("could not stop old local Teams bridge process(es): %w", err)
+	}
+	return nil
 }
 
 type teamsServiceSystemdBackend struct{}
@@ -1456,6 +1573,7 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
 	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
 	resolveWatchdog := "$watchdogTask = Get-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction SilentlyContinue; "
+	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 	switch action {
 	case "enable":
 		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }")
@@ -1464,11 +1582,11 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 	case "status":
 		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; "+resolveWatchdog+"if ($null -ne $watchdogTask) { $watchdogInfo = Get-ScheduledTaskInfo -TaskName "+watchdogTask+"; $watchdogTask | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime } else { Write-Output 'Watchdog task not installed' }")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-ScheduledTask -TaskName "+task+"; if ($null -ne $watchdogTask) { Start-ScheduledTask -TaskName "+watchdogTask+" }")
+		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; $bridgeTask = Get-ScheduledTask -TaskName "+task+"; if ($bridgeTask.State -ne 'Running') { "+cleanupBridgeChildren+"Start-ScheduledTask -TaskName "+task+" }; if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask -TaskName "+watchdogTask+" }")
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction SilentlyContinue; Stop-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction SilentlyContinue; Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren)
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-ScheduledTask -TaskName "+task+"; if ($null -ne $watchdogTask) { Start-ScheduledTask -TaskName "+watchdogTask+" }")
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-ScheduledTask -TaskName "+task+"; if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask -TaskName "+watchdogTask+" }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
 	}
@@ -1476,6 +1594,7 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 
 func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action string) ([]byte, error) {
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
+	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 	switch action {
 	case "enable":
 		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null")
@@ -1484,14 +1603,32 @@ func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action str
 	case "status":
 		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; Start-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; $bridgeTask = Get-ScheduledTask -TaskName "+task+"; if ($bridgeTask.State -ne 'Running') { "+cleanupBridgeChildren+"Start-ScheduledTask -TaskName "+task+" }")
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren)
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; Enable-ScheduledTask -TaskName "+task+" | Out-Null; Start-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; Start-ScheduledTask -TaskName "+task)
 	default:
 		return nil, fmt.Errorf("unsupported primary Teams service action for Task Scheduler: %s", action)
 	}
+}
+
+func teamsServiceWindowsStopBridgeChildrenPowerShell(taskNameExpr string) string {
+	taskNameExpr = strings.TrimSpace(taskNameExpr)
+	if taskNameExpr == "" {
+		taskNameExpr = "$null"
+	}
+	parts := []string{
+		`function Convert-CodexHelperSingleQuotedPowerShellLiteral([string]$value) { if ($null -eq $value) { return '' }; return $value.Replace("''", "'") };`,
+		`function Convert-CodexHelperCommandForMatch([string]$value) { if ([string]::IsNullOrWhiteSpace($value)) { return '' }; $norm = $value.Replace([char]34, ' ').Replace([char]39, ' '); $norm = [regex]::Replace($norm, '\s+', ' ').Trim(); return ' ' + $norm + ' ' };`,
+		`function Test-CodexHelperTeamsBridgeCommand([string]$cmd, [string]$expectedArgs) { if ([string]::IsNullOrWhiteSpace($cmd) -or [string]::IsNullOrWhiteSpace($expectedArgs)) { return $false }; $norm = Convert-CodexHelperCommandForMatch $cmd; $expected = Convert-CodexHelperCommandForMatch $expectedArgs; return ($norm -match '(?i)\steams\s+(run|listen)\s' -and $norm -notmatch '(?i)\s--once\s' -and $norm.IndexOf($expected, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) };`,
+		`function Set-CodexHelperCleanupExeCandidate($identity, [string]$candidate) { if ([string]::IsNullOrWhiteSpace($candidate) -or -not [string]::IsNullOrWhiteSpace([string]$identity['Exe'])) { return }; try { $full = [IO.Path]::GetFullPath($candidate); $leaf = [IO.Path]::GetFileName($full); if (($leaf -ieq 'codex-proxy.exe' -or $leaf -ieq 'cxp.exe') -and (Test-Path -LiteralPath $full)) { $identity['Exe'] = $full } } catch { } };`,
+		`function Add-CodexHelperCleanupIdentity($identity, [string]$text) { if ([string]::IsNullOrWhiteSpace($text)) { return }; foreach ($pattern in @("Start-Process\s+-FilePath\s+'((?:''|[^'])*)'", "&\s+'((?:''|[^'])*)'")) { foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { Set-CodexHelperCleanupExeCandidate $identity (Convert-CodexHelperSingleQuotedPowerShellLiteral $m.Groups[1].Value) } }; foreach ($m in [regex]::Matches($text, ([string][char]36 + "argumentLine\s*=\s+'((?:''|[^'])*)'"), 'IgnoreCase')) { $identity['Args'] = Convert-CodexHelperSingleQuotedPowerShellLiteral $m.Groups[1].Value; break } };`,
+		`function Get-CodexHelperBridgeTaskIdentity([string]$taskName) { $identity = @{ Exe = ''; Args = '' }; try { $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; if ($null -eq $task) { return $identity }; foreach ($action in @($task.Actions)) { Set-CodexHelperCleanupExeCandidate $identity ([string]$action.Execute); $arguments = [string]$action.Arguments; Add-CodexHelperCleanupIdentity $identity $arguments; foreach ($m in [regex]::Matches($arguments, '"([^"]+\.vbs)"')) { $vbs = $m.Groups[1].Value; try { $ps1 = [IO.Path]::ChangeExtension($vbs, '.ps1'); if (Test-Path -LiteralPath $ps1) { Add-CodexHelperCleanupIdentity $identity (Get-Content -LiteralPath $ps1 -Raw -ErrorAction SilentlyContinue) } } catch { } } } } catch { }; return $identity };`,
+		`$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity $bridgeTaskNameForCleanup; $expectedBridgeExeForCleanup = [string]$bridgeIdentityForCleanup['Exe']; $expectedBridgeArgsForCleanup = [string]$bridgeIdentityForCleanup['Args'];`,
+		`if (-not [string]::IsNullOrWhiteSpace($expectedBridgeExeForCleanup) -and -not [string]::IsNullOrWhiteSpace($expectedBridgeArgsForCleanup)) { try { Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { $proc = $_; $cmd = [string]$proc.CommandLine; if ($proc.ProcessId -ne $PID -and (Test-CodexHelperTeamsBridgeCommand $cmd $expectedBridgeArgsForCleanup)) { $matchesBridgeExeForCleanup = $false; try { $matchesBridgeExeForCleanup = ([IO.Path]::GetFullPath([string]$proc.ExecutablePath) -ieq $expectedBridgeExeForCleanup) } catch { $matchesBridgeExeForCleanup = $false }; if ($matchesBridgeExeForCleanup) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } } } } catch { } };`,
+	}
+	return "$bridgeTaskNameForCleanup = " + taskNameExpr + "; " + strings.Join(parts, " ")
 }
 
 func (b teamsServiceWindowsTaskBackend) Installed() (bool, error) {
@@ -2010,7 +2147,7 @@ func (b teamsServiceWSLWindowsTaskBackend) Run(ctx context.Context, action strin
 	case "start":
 		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLEnableStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLEnableStartTaskIfStoppedAndVerifyPowerShell()+" }")
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $task) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }; "+resolve+"Stop-ScheduledTask -TaskName $taskName")
+		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $task) { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }; "+resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue")
 	case "restart":
 		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLEnableStartTaskAndVerifyPowerShell()+"; "+resolveWatchdog+"if ($null -ne $task) { "+teamsServiceWSLEnableStartTaskIfStoppedAndVerifyPowerShell()+" }")
 	default:
@@ -2052,7 +2189,7 @@ func (b teamsServiceWSLWindowsTaskBackend) RunPrimary(ctx context.Context, actio
 	case "start":
 		return teamsServiceRunPowerShell(ctx, resolve+teamsServiceWSLEnableStartTaskAndVerifyPowerShell())
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName")
+		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue")
 	case "restart":
 		return teamsServiceRunPowerShell(ctx, resolve+"Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "+teamsServiceWSLEnableStartTaskAndVerifyPowerShell())
 	default:
@@ -2650,6 +2787,7 @@ func buildTeamsServiceRunArgs(spec teamsServiceSpec) []string {
 		"run",
 		"--owner-stale-after",
 		teamsServiceRunOwnerStaleAfter.String(),
+		"--auto-service=false",
 	}
 	if spec.RegistryPath != "" {
 		args = append(args, "--registry", spec.RegistryPath)

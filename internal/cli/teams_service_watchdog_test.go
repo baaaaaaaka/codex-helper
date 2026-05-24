@@ -13,18 +13,24 @@ import (
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
-func TestTeamsServiceWatchdogDefaultsFitThirtySecondRecoveryBudget(t *testing.T) {
-	if got := defaultTeamsServiceWatchdogOwnerStaleAfter + teamsServiceExternalWatchdogInterval; got > 30*time.Second {
-		t.Fatalf("owner stale recovery budget = %s, want <= 30s", got)
+func TestTeamsServiceWatchdogDefaultsAvoidTransientRestartLoops(t *testing.T) {
+	if defaultTeamsServiceWatchdogOwnerStaleAfter != 90*time.Second {
+		t.Fatalf("owner stale threshold = %s, want 90s", defaultTeamsServiceWatchdogOwnerStaleAfter)
 	}
-	if got := defaultTeamsServiceWatchdogPollStaleAfter + teamsServiceExternalWatchdogInterval; got > 30*time.Second {
-		t.Fatalf("poll stale recovery budget = %s, want <= 30s", got)
+	if defaultTeamsServiceWatchdogPollStaleAfter != 2*time.Minute {
+		t.Fatalf("poll stale threshold = %s, want 2m", defaultTeamsServiceWatchdogPollStaleAfter)
+	}
+	if defaultTeamsServiceWatchdogConsecutiveStale != 3 {
+		t.Fatalf("consecutive stale threshold = %d, want 3", defaultTeamsServiceWatchdogConsecutiveStale)
+	}
+	if defaultTeamsServiceWatchdogCooldown != 2*time.Minute {
+		t.Fatalf("restart cooldown = %s, want 2m", defaultTeamsServiceWatchdogCooldown)
 	}
 	if teamsServiceExternalWatchdogInterval != 10*time.Second {
 		t.Fatalf("watchdog interval = %s, want 10s", teamsServiceExternalWatchdogInterval)
 	}
-	if teamsServiceExternalWatchdogCheckTimeout > 20*time.Second {
-		t.Fatalf("watchdog check timeout = %s, want <= 20s", teamsServiceExternalWatchdogCheckTimeout)
+	if teamsServiceExternalWatchdogCheckTimeout != 45*time.Second {
+		t.Fatalf("watchdog check timeout = %s, want 45s", teamsServiceExternalWatchdogCheckTimeout)
 	}
 }
 
@@ -47,7 +53,7 @@ func TestTeamsServiceWatchdogStartsInactiveService(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceWatchdogRestartsOnFirstStaleSample(t *testing.T) {
+func TestTeamsServiceWatchdogWaitsForConsecutiveStaleSamples(t *testing.T) {
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -55,12 +61,17 @@ func TestTeamsServiceWatchdogRestartsOnFirstStaleSample(t *testing.T) {
 		Active:             true,
 		StateFiles:         1,
 		OwnerFound:         true,
-		LastOwnerHeartbeat: now.Add(-19 * time.Second),
+		LastOwnerHeartbeat: now.Add(-2 * time.Minute),
 	}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
-	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale || decision.ConsecutiveStale != 1 {
-		t.Fatalf("stale decision = %+v, want immediate restart stale count 1", decision)
+	if decision.Action != teamsServiceWatchdogActionNoop || !decision.Stale || decision.ConsecutiveStale != 1 {
+		t.Fatalf("stale decision = %+v, want first stale sample without restart", decision)
+	}
+
+	decision = evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale || decision.ConsecutiveStale != 3 {
+		t.Fatalf("stale decision = %+v, want restart on third consecutive stale sample", decision)
 	}
 }
 
@@ -96,10 +107,10 @@ func TestTeamsServiceWatchdogRestartsWhenControlPollStaleDespiteFreshOwner(t *te
 		LastOwnerHeartbeat:  now.Add(-5 * time.Second),
 		FreshOwnerStartedAt: now.Add(-30 * time.Minute),
 		PollActivityFound:   true,
-		PollActivityAt:      now.Add(-21 * time.Second),
+		PollActivityAt:      now.Add(-3 * time.Minute),
 	}
 
-	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
 	if decision.Action != teamsServiceWatchdogActionRestart {
 		t.Fatalf("decision = %+v, want restart for stale control polling", decision)
 	}
@@ -179,7 +190,7 @@ func TestTeamsServiceWatchdogRestartsExpiredHelperUpgradeDrainWithLocalOwner(t *
 		LastOwnerHeartbeat:                now.Add(-5 * time.Second),
 	}
 
-	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
 	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
 		t.Fatalf("decision = %+v, want restart for expired helper upgrade drain", decision)
 	}
@@ -286,7 +297,7 @@ func TestTeamsServiceWatchdogExpiredHelperUpgradeDrainRespectsRestartCooldown(t 
 		OwnerFresh:                        true,
 		LastOwnerHeartbeat:                now.Add(-5 * time.Second),
 	}
-	state := teamsServiceWatchdogState{LastActionAt: now.Add(-10 * time.Second)}
+	state := teamsServiceWatchdogState{ConsecutiveStale: 2, LastActionAt: now.Add(-10 * time.Second)}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, state, opts)
 	if decision.Action != teamsServiceWatchdogActionNoop || decision.CooldownUntil.IsZero() {
@@ -309,7 +320,7 @@ func TestTeamsServiceWatchdogRestartsStaleHelperReloadDrainWithLocalOwner(t *tes
 		LastOwnerHeartbeat:               now.Add(-5 * time.Second),
 	}
 
-	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
 	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
 		t.Fatalf("decision = %+v, want restart for stale helper reload drain", decision)
 	}
@@ -372,7 +383,7 @@ func TestTeamsServiceWatchdogStaleHelperReloadDrainRespectsRestartCooldown(t *te
 		OwnerFresh:                       true,
 		LastOwnerHeartbeat:               now.Add(-5 * time.Second),
 	}
-	state := teamsServiceWatchdogState{LastActionAt: now.Add(-10 * time.Second)}
+	state := teamsServiceWatchdogState{ConsecutiveStale: 2, LastActionAt: now.Add(-10 * time.Second)}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, state, opts)
 	if decision.Action != teamsServiceWatchdogActionNoop || decision.CooldownUntil.IsZero() {
@@ -595,7 +606,7 @@ func TestTeamsServiceWatchdogRecoverableDrainWinsOverSeparatePausedState(t *test
 	if !snapshot.ServicePaused || !snapshot.HelperReloadDrainStale || !snapshot.HelperReloadDrainLocalOwnerFresh {
 		t.Fatalf("snapshot did not retain both paused and recoverable drain evidence: %+v", snapshot)
 	}
-	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
 	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
 		t.Fatalf("decision = %+v, want restart for recoverable drain despite separate paused state", decision)
 	}
@@ -684,7 +695,7 @@ func TestTeamsServiceWatchdogManyStateFilesRecoveryMatrix(t *testing.T) {
 				merge(staleReloadState(remoteOwner))
 			}
 
-			decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+			decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
 			if decision.Action != tc.wantAction || !strings.Contains(decision.Reason, tc.wantReasonSubstr) {
 				t.Fatalf("decision = %+v snapshot=%+v, want action=%s reason containing %q", decision, snapshot, tc.wantAction, tc.wantReasonSubstr)
 			}
@@ -812,6 +823,285 @@ func TestRunTeamsServiceWatchdogOnceStartsServiceAndDryRunDoesNot(t *testing.T) 
 	}
 	if stored.LastAction != teamsServiceWatchdogActionStart || !stored.LastActionAt.Equal(now) {
 		t.Fatalf("stored state = %+v, want start at %s", stored, now)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceRestartsAfterConsecutiveStaleState(t *testing.T) {
+	lockCLITestHooks(t)
+
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "watchdog.json")
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:           true,
+			Active:              true,
+			StateFiles:          1,
+			OwnerFound:          true,
+			OwnerFresh:          true,
+			LastOwnerHeartbeat:  now.Add(-5 * time.Second),
+			FreshOwnerStartedAt: now.Add(-30 * time.Minute),
+			PollActivityFound:   true,
+			PollActivityAt:      now.Add(-3 * time.Minute),
+		}, nil
+	}
+	if err := saveTeamsServiceWatchdogState(teamsServiceWatchdogState{ConsecutiveStale: 2, LastReason: "previous stale", UpdatedAt: now.Add(-10 * time.Second)}); err != nil {
+		t.Fatalf("seed watchdog state: %v", err)
+	}
+
+	restartCalls := 0
+	restartArg := false
+	teamsServiceWatchdogStartService = func(_ context.Context, restart bool) error {
+		restartCalls++
+		restartArg = restart
+		return nil
+	}
+
+	result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now, DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run watchdog: %v", err)
+	}
+	if result.Decision.Action != teamsServiceWatchdogActionRestart {
+		t.Fatalf("dry-run action = %q, want restart", result.Decision.Action)
+	}
+	if restartCalls != 0 {
+		t.Fatalf("dry-run restart calls = %d, want 0", restartCalls)
+	}
+
+	result, err = runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+	if err != nil {
+		t.Fatalf("watchdog: %v", err)
+	}
+	if result.Decision.Action != teamsServiceWatchdogActionRestart {
+		t.Fatalf("action = %q, want restart", result.Decision.Action)
+	}
+	if restartCalls != 1 || !restartArg {
+		t.Fatalf("restart calls = %d restart=%t, want one restart", restartCalls, restartArg)
+	}
+	stored, err := loadTeamsServiceWatchdogState()
+	if err != nil {
+		t.Fatalf("load stored watchdog state: %v", err)
+	}
+	if stored.LastAction != teamsServiceWatchdogActionRestart || !stored.LastActionAt.Equal(now) || stored.ConsecutiveStale != 3 {
+		t.Fatalf("stored state = %+v, want restart action at %s with consecutive stale 3", stored, now)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceRequiresPersistentStaleAndResetsOnFreshPoll(t *testing.T) {
+	lockCLITestHooks(t)
+
+	start := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "watchdog.json")
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
+	staleSamples := []bool{true, true, false, true, true, true}
+	sample := 0
+	teamsServiceWatchdogCollectSnapshot = func(_ context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		if sample >= len(staleSamples) {
+			t.Fatalf("unexpected watchdog snapshot collection %d", sample)
+		}
+		stale := staleSamples[sample]
+		sample++
+		pollAt := opts.Now.Add(-10 * time.Second)
+		if stale {
+			pollAt = opts.Now.Add(-3 * time.Minute)
+		}
+		return teamsServiceWatchdogSnapshot{
+			Installed:           true,
+			Active:              true,
+			StateFiles:          1,
+			OwnerFound:          true,
+			OwnerFresh:          true,
+			LastOwnerHeartbeat:  opts.Now.Add(-5 * time.Second),
+			FreshOwnerStartedAt: opts.Now.Add(-30 * time.Minute),
+			PollActivityFound:   true,
+			PollActivityAt:      pollAt,
+		}, nil
+	}
+	restartCalls := 0
+	teamsServiceWatchdogStartService = func(_ context.Context, restart bool) error {
+		restartCalls++
+		if !restart {
+			t.Fatalf("restart flag = false, want true")
+		}
+		return nil
+	}
+
+	wantActions := []string{
+		teamsServiceWatchdogActionNoop,
+		teamsServiceWatchdogActionNoop,
+		teamsServiceWatchdogActionNoop,
+		teamsServiceWatchdogActionNoop,
+		teamsServiceWatchdogActionNoop,
+		teamsServiceWatchdogActionRestart,
+	}
+	for i, wantAction := range wantActions {
+		now := start.Add(time.Duration(i) * teamsServiceExternalWatchdogInterval)
+		result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+		if err != nil {
+			t.Fatalf("watchdog sample %d: %v", i, err)
+		}
+		if result.Decision.Action != wantAction {
+			t.Fatalf("sample %d action = %q, want %q decision=%+v", i, result.Decision.Action, wantAction, result.Decision)
+		}
+	}
+	if restartCalls != 1 {
+		t.Fatalf("restart calls = %d, want one restart after fresh sample reset and three stale samples", restartCalls)
+	}
+	stored, err := loadTeamsServiceWatchdogState()
+	if err != nil {
+		t.Fatalf("load stored watchdog state: %v", err)
+	}
+	if stored.ConsecutiveStale != 3 || stored.LastAction != teamsServiceWatchdogActionRestart {
+		t.Fatalf("stored state = %+v, want restarted third stale generation", stored)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceSuccessfulRestartCooldownSuppressesRestartStorm(t *testing.T) {
+	lockCLITestHooks(t)
+
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "watchdog.json")
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
+	teamsServiceWatchdogCollectSnapshot = func(_ context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:           true,
+			Active:              true,
+			StateFiles:          1,
+			OwnerFound:          true,
+			OwnerFresh:          true,
+			LastOwnerHeartbeat:  opts.Now.Add(-5 * time.Second),
+			FreshOwnerStartedAt: opts.Now.Add(-30 * time.Minute),
+			PollActivityFound:   true,
+			PollActivityAt:      opts.Now.Add(-3 * time.Minute),
+		}, nil
+	}
+	if err := saveTeamsServiceWatchdogState(teamsServiceWatchdogState{ConsecutiveStale: 2, LastReason: "previous stale", UpdatedAt: now.Add(-10 * time.Second)}); err != nil {
+		t.Fatalf("seed watchdog state: %v", err)
+	}
+	restartCalls := 0
+	teamsServiceWatchdogStartService = func(_ context.Context, restart bool) error {
+		restartCalls++
+		if !restart {
+			t.Fatalf("restart flag = false, want true")
+		}
+		return nil
+	}
+
+	first, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+	if err != nil {
+		t.Fatalf("first watchdog: %v", err)
+	}
+	if first.Decision.Action != teamsServiceWatchdogActionRestart || restartCalls != 1 {
+		t.Fatalf("first decision=%+v restartCalls=%d, want restart", first.Decision, restartCalls)
+	}
+	second, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now.Add(10 * time.Second)})
+	if err != nil {
+		t.Fatalf("second watchdog: %v", err)
+	}
+	if second.Decision.Action != teamsServiceWatchdogActionNoop || second.Decision.CooldownUntil.IsZero() {
+		t.Fatalf("second decision=%+v, want cooldown noop", second.Decision)
+	}
+	if restartCalls != 1 {
+		t.Fatalf("restart calls = %d, want cooldown to suppress second restart", restartCalls)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceDoesNotCooldownFailedRestart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "watchdog.json")
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:           true,
+			Active:              true,
+			StateFiles:          1,
+			OwnerFound:          true,
+			OwnerFresh:          true,
+			LastOwnerHeartbeat:  now.Add(-5 * time.Second),
+			FreshOwnerStartedAt: now.Add(-30 * time.Minute),
+			PollActivityFound:   true,
+			PollActivityAt:      now.Add(-3 * time.Minute),
+		}, nil
+	}
+	if err := saveTeamsServiceWatchdogState(teamsServiceWatchdogState{ConsecutiveStale: 2, LastReason: "previous stale", UpdatedAt: now.Add(-10 * time.Second)}); err != nil {
+		t.Fatalf("seed watchdog state: %v", err)
+	}
+
+	restartCalls := 0
+	restartErr := errors.New("restart timed out")
+	teamsServiceWatchdogStartService = func(_ context.Context, restart bool) error {
+		restartCalls++
+		if !restart {
+			t.Fatalf("restart flag = false, want true")
+		}
+		if restartCalls == 1 {
+			return restartErr
+		}
+		return nil
+	}
+
+	result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+	if !errors.Is(err, restartErr) {
+		t.Fatalf("watchdog err = %v, want %v", err, restartErr)
+	}
+	if result.State.LastActionAt.IsZero() == false || result.State.LastAction != "" {
+		t.Fatalf("failed restart result state = %+v, want no action cooldown marker", result.State)
+	}
+	stored, err := loadTeamsServiceWatchdogState()
+	if err != nil {
+		t.Fatalf("load failed-restart state: %v", err)
+	}
+	if stored.ConsecutiveStale != 3 || stored.LastAction != "" || !stored.LastActionAt.IsZero() {
+		t.Fatalf("failed-restart stored state = %+v, want consecutive stale without cooldown action", stored)
+	}
+
+	result, err = runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now.Add(10 * time.Second)})
+	if err != nil {
+		t.Fatalf("retry watchdog: %v", err)
+	}
+	if restartCalls != 2 || result.Decision.Action != teamsServiceWatchdogActionRestart {
+		t.Fatalf("retry calls=%d decision=%+v, want immediate restart retry", restartCalls, result.Decision)
+	}
+	stored, err = loadTeamsServiceWatchdogState()
+	if err != nil {
+		t.Fatalf("load retry state: %v", err)
+	}
+	if stored.LastAction != teamsServiceWatchdogActionRestart || !stored.LastActionAt.Equal(now.Add(10*time.Second)) {
+		t.Fatalf("retry stored state = %+v, want successful restart marker", stored)
 	}
 }
 

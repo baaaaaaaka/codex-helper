@@ -105,7 +105,7 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		"[Unit]",
 		"Description=Codex Helper Teams bridge",
 		"WorkingDirectory=" + strconv.Quote(cwd),
-		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 18s --registry " + strconv.Quote(registryPath),
+		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + strconv.Quote(registryPath),
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"Environment=NO_COLOR=1",
@@ -176,7 +176,7 @@ func TestTeamsServiceInstallUsesStablePathWhenExecutableIsNFSSillyRename(t *test
 	}
 	unit := string(data)
 	for _, want := range []string{
-		"ExecStart=" + systemdQuoteArg(stable) + " teams run --owner-stale-after 18s",
+		"ExecStart=" + systemdQuoteArg(stable) + " teams run --owner-stale-after 1m30s --auto-service=false",
 		"Environment=" + systemdQuoteArg(update.EnvInstallDir+"="+stable),
 	} {
 		if !strings.Contains(unit, want) {
@@ -1115,7 +1115,8 @@ func TestTeamsServiceInstallWritesMacOSLaunchAgentPlist(t *testing.T) {
 		"<string>teams</string>",
 		"<string>run</string>",
 		"<string>--owner-stale-after</string>",
-		"<string>18s</string>",
+		"<string>1m30s</string>",
+		"<string>--auto-service=false</string>",
 		"<string>--registry</string>",
 		"<string>" + registryPath + "</string>",
 		"<key>KeepAlive</key>",
@@ -1263,7 +1264,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"Start-Process -FilePath",
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
-		"& '" + exePath + "' 'teams' 'run' '--owner-stale-after' '18s' '--registry' '" + registryPath + "'",
+		"& '" + exePath + "' 'teams' 'run' '--owner-stale-after' '1m30s' '--auto-service=false' '--registry' '" + registryPath + "'",
 		"$code = $LASTEXITCODE",
 		"exit $code",
 		"$env:CODEX_HELPER_TEAMS_SERVICE = '1'",
@@ -1279,10 +1280,20 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 	if !strings.Contains(string(launcherVBS), "shell.Run(cmd, 0, True)") || !strings.Contains(string(launcherVBS), "-WindowStyle Hidden -File") {
 		t.Fatalf("bridge launcher vbs should run PowerShell hidden:\n%s", string(launcherVBS))
 	}
-	if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" || !strings.Contains(strings.Join(runner.calls[0].args, " "), "Register-ScheduledTask") {
+	if len(runner.calls) != 2 || runner.calls[0].name != "powershell.exe" || runner.calls[1].name != "powershell.exe" {
+		t.Fatalf("install should cleanup then register task with powershell, calls=%#v", runner.calls)
+	}
+	cleanup := strings.Join(runner.calls[0].args, " ")
+	if !strings.Contains(cleanup, "$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity") ||
+		!strings.Contains(cleanup, "Stop-Process -Id $proc.ProcessId -Force") ||
+		strings.Contains(cleanup, "Register-ScheduledTask") {
+		t.Fatalf("install should cleanup old bridge children before registering task, cleanup=%s", cleanup)
+	}
+	joined := strings.Join(runner.calls[1].args, " ")
+	if !strings.Contains(joined, "Register-ScheduledTask") {
 		t.Fatalf("install should register task with powershell, calls=%#v", runner.calls)
 	}
-	if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, teamsServiceWindowsWatchdogTaskName) {
+	if !strings.Contains(joined, teamsServiceWindowsWatchdogTaskName) {
 		t.Fatalf("install should register watchdog task too, call=%s", joined)
 	}
 	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Start-ScheduledTask", "Enable-ScheduledTask")
@@ -1318,6 +1329,49 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 			t.Fatalf("uninstall should remove %s, stat err=%v", path, err)
 		}
 	}
+}
+
+func TestTeamsServiceRepairCleansWindowsBridgeChildrenBeforeTaskRewrite(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "windows",
+		exe:            filepath.Join(tmp, "bin", "codex-proxy.exe"),
+		cwd:            filepath.Join(tmp, "work dir"),
+		windowsTaskDir: filepath.Join(tmp, "windows-task"),
+		runner:         runner,
+	})
+
+	if _, err := repairTeamsService(context.Background(), stringPtr(filepath.Join(tmp, "teams registry.json")), teamsServiceRepairOptions{Enable: true}); err != nil {
+		t.Fatalf("repairTeamsService error: %v", err)
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("repair calls = %#v, want cleanup, register, enable", runner.calls)
+	}
+	cleanup := strings.Join(runner.calls[0].args, " ")
+	for _, want := range []string{
+		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
+		"$expectedBridgeArgsForCleanup",
+		"Get-CimInstance Win32_Process",
+		"$proc.ProcessId -ne $PID",
+		"Stop-Process -Id $proc.ProcessId -Force",
+	} {
+		if !strings.Contains(cleanup, want) {
+			t.Fatalf("repair cleanup command missing %q:\n%s", want, cleanup)
+		}
+	}
+	if strings.Contains(cleanup, "Register-ScheduledTask") || strings.Contains(cleanup, "$name -ieq 'codex-proxy.exe'") || strings.Contains(cleanup, "$name -ieq 'cxp.exe'") {
+		t.Fatalf("repair cleanup should use old task identity and fail closed:\n%s", cleanup)
+	}
+	allJoined := teamsServiceJoinedCalls(runner.calls)
+	requireSubstringsInOrder(t, allJoined,
+		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
+		"Register-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsTaskName),
+		"Register-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsWatchdogTaskName),
+		"Enable-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsTaskName),
+	)
 }
 
 func TestTeamsServiceWindowsPowerShellPropagatesChildExitCodeCI(t *testing.T) {
@@ -1769,10 +1823,16 @@ func TestTeamsServiceBootstrapSchedulesPendingHelperActivationBeforeStartingOldW
 	if result.Mode != "windows-pending-helper-activation" || !strings.HasSuffix(result.Path, teamsServiceWindowsTaskXMLName) {
 		t.Fatalf("bootstrap result = %#v, want pending activation", result)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("PowerShell calls = %#v, want install/register and enable only before activation", runner.calls)
+	if len(runner.calls) != 3 {
+		t.Fatalf("PowerShell calls = %#v, want cleanup, install/register, and enable only before activation", runner.calls)
 	}
-	if joinedCalls := strings.Join([]string{strings.Join(runner.calls[0].args, " "), strings.Join(runner.calls[1].args, " ")}, "\n"); !strings.Contains(joinedCalls, "Register-ScheduledTask") || !strings.Contains(joinedCalls, "Enable-ScheduledTask") {
+	joinedCalls := teamsServiceJoinedCalls(runner.calls)
+	requireSubstringsInOrder(t, joinedCalls,
+		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
+		"Register-ScheduledTask",
+		"Enable-ScheduledTask",
+	)
+	if !strings.Contains(joinedCalls, "Register-ScheduledTask") || !strings.Contains(joinedCalls, "Enable-ScheduledTask") {
 		t.Fatalf("bootstrap should repair and enable tasks before pending activation, calls=%#v", runner.calls)
 	}
 	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Start-ScheduledTask")
@@ -2442,7 +2502,7 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex-home"),
-		wantExe + " teams run --owner-stale-after 18s --auto-service=false --registry",
+		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {

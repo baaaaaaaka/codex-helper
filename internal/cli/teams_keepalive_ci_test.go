@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 func requireSubstringsInOrder(t *testing.T, text string, wants ...string) {
@@ -99,7 +101,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 	for _, want := range []string{
 		"Type=simple",
 		"WorkingDirectory=" + strconv.Quote(spec.WorkingDir),
-		"ExecStart=" + spec.Executable + " teams run --owner-stale-after 18s --registry " + strconv.Quote(spec.RegistryPath),
+		"ExecStart=" + spec.Executable + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + strconv.Quote(spec.RegistryPath),
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"Environment=CODEX_HELPER_TEAMS_SERVICE_MODE=background",
 		"Environment=HTTP_PROXY=http://127.0.0.1:38471",
@@ -167,7 +169,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"<string>teams</string>",
 		"<string>run</string>",
 		"<string>--owner-stale-after</string>",
-		"<string>18s</string>",
+		"<string>1m30s</string>",
+		"<string>--auto-service=false</string>",
 		"<string>--registry</string>",
 		"<string>" + spec.RegistryPath + "</string>",
 		"<key>WorkingDirectory</key>",
@@ -248,7 +251,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"teams",
 		"run",
 		"--owner-stale-after",
-		"18s",
+		"1m30s",
+		"--auto-service=false",
 		"--registry",
 		"<WorkingDirectory>" + spec.WorkingDir + "</WorkingDirectory>",
 	} {
@@ -402,8 +406,16 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	exe := filepath.Join(tmp, "codex-proxy.exe")
-	if err := os.WriteFile(exe, []byte{}, 0o755); err != nil {
-		t.Fatalf("write fake executable: %v", err)
+	testExe, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+	testExeData, err := os.ReadFile(testExe)
+	if err != nil {
+		t.Fatalf("read test executable: %v", err)
+	}
+	if err := os.WriteFile(exe, testExeData, 0o755); err != nil {
+		t.Fatalf("write fake codex-proxy executable: %v", err)
 	}
 	spec := teamsServiceSpec{
 		Executable:   exe,
@@ -451,11 +463,25 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 	}
 	taskName := "Codex Helper Teams Bridge CI " + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	watchdogTaskName := "Codex Helper Teams Watchdog CI " + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	helperArgs := []string{
+		"-test.run=TestTeamsServiceWindowsTaskCleanupHelperProcess",
+		"--",
+		"teams",
+		"run",
+		"--owner-stale-after",
+		"1m30s",
+		"--auto-service=false",
+		"--registry",
+		spec.RegistryPath,
+	}
+	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell("$task")
 	script := "$ErrorActionPreference = 'Stop'; " +
 		"$task = " + powershellSingleQuote(taskName) + "; " +
 		"$watchdogTask = " + powershellSingleQuote(watchdogTaskName) + "; " +
 		"$xmlPath = " + powershellSingleQuote(xmlPath) + "; " +
 		"$watchdogXmlPath = " + powershellSingleQuote(watchdogXMLPath) + "; " +
+		"$helperExe = " + powershellSingleQuote(exe) + "; " +
+		"$helperArgLine = " + powershellSingleQuote(windowsCommandLine(helperArgs)) + "; " +
 		"try { " +
 		"$xml = Get-Content -LiteralPath $xmlPath -Raw; " +
 		"Register-ScheduledTask -TaskName $task -Xml $xml -Force -ErrorAction Stop | Out-Null; " +
@@ -472,7 +498,19 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 		"if ($action.Execute -ne 'wscript.exe') { throw ('bridge action execute mismatch: ' + $action.Execute) }; " +
 		"if ($watchdogAction.Execute -ne 'wscript.exe') { throw ('watchdog action execute mismatch: ' + $watchdogAction.Execute) }; " +
 		"if ($action.Arguments -notlike '*//B*//Nologo*codex-helper-teams-task.vbs*') { throw ('bridge action arguments mismatch: ' + $action.Arguments) }; " +
-		"if ($watchdogAction.Arguments -notlike '*//B*//Nologo*codex-helper-teams-watchdog-task.vbs*') { throw ('watchdog action arguments mismatch: ' + $watchdogAction.Arguments) } " +
+		"if ($watchdogAction.Arguments -notlike '*//B*//Nologo*codex-helper-teams-watchdog-task.vbs*') { throw ('watchdog action arguments mismatch: ' + $watchdogAction.Arguments) }; " +
+		"$env:CODEX_HELPER_WINDOWS_CLEANUP_HELPER_PROCESS = '1'; " +
+		"$child = Start-Process -FilePath $helperExe -ArgumentList $helperArgLine -PassThru -WindowStyle Hidden; " +
+		"try { " +
+		"Start-Sleep -Seconds 1; " +
+		cleanupBridgeChildren +
+		"$deadline = (Get-Date).AddSeconds(10); " +
+		"while ((Get-Date) -lt $deadline -and $null -ne (Get-Process -Id $child.Id -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 200 }; " +
+		"if ($null -ne (Get-Process -Id $child.Id -ErrorAction SilentlyContinue)) { throw 'native bridge cleanup did not stop matching task child process' } " +
+		"} finally { " +
+		"if ($null -ne $child -and $null -ne (Get-Process -Id $child.Id -ErrorAction SilentlyContinue)) { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }; " +
+		"Remove-Item Env:CODEX_HELPER_WINDOWS_CLEANUP_HELPER_PROCESS -ErrorAction SilentlyContinue " +
+		"} " +
 		"} finally { " +
 		"Unregister-ScheduledTask -TaskName $watchdogTask -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; " +
 		"Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue | Out-Null " +
@@ -481,6 +519,15 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Register-ScheduledTask smoke failed: %v\n%s", err, out)
+	}
+}
+
+func TestTeamsServiceWindowsTaskCleanupHelperProcess(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_WINDOWS_CLEANUP_HELPER_PROCESS") != "1" || teamsServiceLocalProcessKind(os.Args) != "run" {
+		return
+	}
+	for {
+		time.Sleep(time.Second)
 	}
 }
 
@@ -770,7 +817,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex home"),
-		wantExe + " teams run --owner-stale-after 18s --auto-service=false --registry",
+		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
@@ -1627,6 +1674,118 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackStopFileRetiresMarkerCI(t *te
 	}
 	if installed {
 		t.Fatalf("Startup fallback marker with a stop file should not block Scheduled Task repair")
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceStartNoopsWhenActiveCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{err: errTeamsKeepaliveScheduledTaskFailureForTest{}}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte("Fallback=Windows Startup watchdog\n"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if err := startTeamsService(context.Background(), false); err != nil {
+		t.Fatalf("startTeamsService start: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("startup fallback start calls = %#v, want only the Scheduled Task active probe", runner.calls)
+	}
+	joined := strings.Join(runner.calls[0].args, " ")
+	if !strings.Contains(joined, "if ($task.State -ne 'Running') { exit 3 }") {
+		t.Fatalf("startup fallback active start should only probe active state:\n%s", joined)
+	}
+	for _, forbidden := range []string{"Start-Process", "Start-ScheduledTask", "Enable-ScheduledTask"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("startup fallback active start should not start another wrapper via %q:\n%s", forbidden, joined)
+		}
+	}
+
+	runner.calls = nil
+	if err := startTeamsPrimaryService(context.Background(), false); err != nil {
+		t.Fatalf("startTeamsPrimaryService start: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("startup fallback primary start calls = %#v, want only the Scheduled Task active probe", runner.calls)
+	}
+	joined = strings.Join(runner.calls[0].args, " ")
+	if !strings.Contains(joined, "if ($task.State -ne 'Running') { exit 3 }") {
+		t.Fatalf("startup fallback active primary start should only probe active state:\n%s", joined)
+	}
+	for _, forbidden := range []string{"Start-Process", "Start-ScheduledTask", "Enable-ScheduledTask"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("startup fallback active primary start should not start another wrapper via %q:\n%s", forbidden, joined)
+		}
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceStartPreservesOutputCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{nil, []byte("hidden launcher started\n")},
+		errs:    []error{errTeamsKeepaliveScheduledTaskFailureForTest{}, nil},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		return nil, nil
+	}
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte("Fallback=Windows Startup watchdog\n"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	if err := os.WriteFile(teamsServiceWSLStartupFallbackStopPath(markerPath), []byte("stop\n"), 0o600); err != nil {
+		t.Fatalf("write stop marker: %v", err)
+	}
+
+	var out strings.Builder
+	if err := startTeamsServiceWithOutput(context.Background(), false, &out); err != nil {
+		t.Fatalf("startTeamsServiceWithOutput start: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "hidden launcher started") ||
+		!strings.Contains(got, "Startup watchdog fallback: started") ||
+		!strings.Contains(got, markerPath) {
+		t.Fatalf("startup fallback start output was not preserved:\n%s", got)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("startup fallback start calls = %#v, want active probe then fallback start", runner.calls)
 	}
 }
 
@@ -2545,6 +2704,27 @@ func TestTeamsBackgroundKeepaliveWindowsTaskStartRestartEnablesDisabledTasksCI(t
 		runner:         runner,
 	})
 	backend := teamsServiceWindowsTaskBackend{}
+	requireNativeBridgeCleanup := func(t *testing.T, action string, joined string) {
+		t.Helper()
+		for _, want := range []string{
+			"Get-CodexHelperBridgeTaskIdentity",
+			"$expectedBridgeExeForCleanup",
+			"$expectedBridgeArgsForCleanup",
+			"Test-CodexHelperTeamsBridgeCommand",
+			"$proc.ProcessId -ne $PID",
+			"[string]$proc.ExecutablePath",
+			"--once",
+			"Stop-Process -Id $proc.ProcessId -Force",
+			"if (-not [string]::IsNullOrWhiteSpace($expectedBridgeExeForCleanup) -and -not [string]::IsNullOrWhiteSpace($expectedBridgeArgsForCleanup))",
+		} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("%s should include native bridge cleanup fragment %q:\n%s", action, want, joined)
+			}
+		}
+		if strings.Contains(joined, "$name -ieq 'codex-proxy.exe'") || strings.Contains(joined, "$name -ieq 'cxp.exe'") {
+			t.Fatalf("%s should fail closed instead of falling back to process-name-only cleanup:\n%s", action, joined)
+		}
+	}
 	for _, action := range []string{"start", "restart"} {
 		t.Run(action, func(t *testing.T) {
 			runner.calls = nil
@@ -2563,11 +2743,32 @@ func TestTeamsBackgroundKeepaliveWindowsTaskStartRestartEnablesDisabledTasksCI(t
 				"Start-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsWatchdogTaskName),
 			)
 			if !strings.Contains(joined, "if ($null -ne $watchdogTask) { Enable-ScheduledTask") ||
-				!strings.Contains(joined, "if ($null -ne $watchdogTask) { Start-ScheduledTask") {
+				!strings.Contains(joined, "if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask") {
 				t.Fatalf("Run(%s) should treat the watchdog task as optional for old installs:\n%s", action, joined)
+			}
+			requireNativeBridgeCleanup(t, "Run("+action+")", joined)
+			bridgeStart := "Start-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsTaskName)
+			if strings.Index(joined, "$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity") > strings.Index(joined, bridgeStart) {
+				t.Fatalf("Run(%s) should clean stale bridge child processes before starting:\n%s", action, joined)
 			}
 		})
 	}
+	t.Run("stop", func(t *testing.T) {
+		runner.calls = nil
+		if _, err := backend.Run(context.Background(), "stop"); err != nil {
+			t.Fatalf("Run(stop) error: %v", err)
+		}
+		if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" {
+			t.Fatalf("Run(stop) calls = %#v, want powershell.exe", runner.calls)
+		}
+		joined := strings.Join(runner.calls[0].args, " ")
+		requireSubstringsInOrder(t, joined,
+			"Stop-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsWatchdogTaskName),
+			"Stop-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsTaskName),
+			"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
+		)
+		requireNativeBridgeCleanup(t, "Run(stop)", joined)
+	})
 	for _, action := range []string{"start", "restart"} {
 		t.Run("primary_"+action, func(t *testing.T) {
 			runner.calls = nil
@@ -2585,8 +2786,31 @@ func TestTeamsBackgroundKeepaliveWindowsTaskStartRestartEnablesDisabledTasksCI(t
 			if strings.Contains(joined, teamsServiceWindowsWatchdogTaskName) {
 				t.Fatalf("RunPrimary(%s) should only target the bridge task:\n%s", action, joined)
 			}
+			requireNativeBridgeCleanup(t, "RunPrimary("+action+")", joined)
+			bridgeStart := "Start-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsTaskName)
+			if strings.Index(joined, "$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity") > strings.Index(joined, bridgeStart) {
+				t.Fatalf("RunPrimary(%s) should clean stale bridge child processes before starting:\n%s", action, joined)
+			}
 		})
 	}
+	t.Run("primary_stop", func(t *testing.T) {
+		runner.calls = nil
+		if _, err := backend.RunPrimary(context.Background(), "stop"); err != nil {
+			t.Fatalf("RunPrimary(stop) error: %v", err)
+		}
+		if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" {
+			t.Fatalf("RunPrimary(stop) calls = %#v, want powershell.exe", runner.calls)
+		}
+		joined := strings.Join(runner.calls[0].args, " ")
+		if strings.Contains(joined, teamsServiceWindowsWatchdogTaskName) {
+			t.Fatalf("RunPrimary(stop) should only target the bridge task:\n%s", joined)
+		}
+		requireSubstringsInOrder(t, joined,
+			"Stop-ScheduledTask -TaskName "+powershellSingleQuote(teamsServiceWindowsTaskName),
+			"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
+		)
+		requireNativeBridgeCleanup(t, "RunPrimary(stop)", joined)
+	})
 }
 
 func TestTeamsBackgroundKeepaliveWindowsTaskOptionalWatchdogActionsCI(t *testing.T) {
@@ -2654,39 +2878,50 @@ func TestTeamsBackgroundKeepaliveWSLServiceActionsCI(t *testing.T) {
 			if err := cmd.Execute(); err != nil {
 				t.Fatalf("service %s error: %v", tt.action, err)
 			}
-			if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" {
-				t.Fatalf("service %s calls = %#v, want one powershell.exe call", tt.action, runner.calls)
+			wantCalls := 1
+			if tt.action == "start" || tt.action == "restart" {
+				wantCalls = 2
 			}
-			if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, tt.want) || !strings.Contains(joined, "$legacyPrefix") {
-				t.Fatalf("service %s command missing %q:\n%s", tt.action, tt.want, joined)
+			if len(runner.calls) != wantCalls || runner.calls[0].name != "powershell.exe" {
+				t.Fatalf("service %s calls = %#v, want %d powershell.exe call(s)", tt.action, runner.calls, wantCalls)
+			}
+			joined := strings.Join(runner.calls[0].args, " ")
+			allJoined := teamsServiceJoinedCalls(runner.calls)
+			commandForAction := joined
+			if tt.action == "start" || tt.action == "restart" {
+				commandForAction = allJoined
+			}
+			if !strings.Contains(commandForAction, tt.want) || !strings.Contains(commandForAction, "$legacyPrefix") {
+				t.Fatalf("service %s command missing %q:\n%s", tt.action, tt.want, commandForAction)
 			} else if tt.action == "restart" {
-				requireSubstringsInOrder(t, joined,
+				requireSubstringsInOrder(t, allJoined,
 					"Stop-ScheduledTask -TaskName $taskName",
 					"-ErrorAction SilentlyContinue",
 					"Enable-ScheduledTask -TaskName $taskName",
 					"Start-ScheduledTask -TaskName $taskName",
 					"Teams WSL Scheduled Task did not stay running after start",
 				)
-				if strings.Count(joined, "Teams WSL Scheduled Task did not stay running after start") != 2 {
-					t.Fatalf("service restart should verify both bridge and watchdog tasks:\n%s", joined)
+				if strings.Count(allJoined, "Teams WSL Scheduled Task did not stay running after start") != 2 {
+					t.Fatalf("service restart should verify both bridge and watchdog tasks:\n%s", allJoined)
 				}
-				if !strings.Contains(joined, "if ($null -ne $task) { if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName") ||
-					!strings.Contains(joined, "if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName") {
-					t.Fatalf("service restart should enable disabled watchdog tasks without re-starting an already running watchdog task:\n%s", joined)
+				if !strings.Contains(allJoined, "if ($null -ne $task) { if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName") ||
+					!strings.Contains(allJoined, "if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName") {
+					t.Fatalf("service restart should enable disabled watchdog tasks without re-starting an already running watchdog task:\n%s", allJoined)
 				}
 			} else if tt.action == "start" {
-				requireSubstringsInOrder(t, joined,
+				requireSubstringsInOrder(t, allJoined,
+					"if ($task.State -ne 'Running') { exit 3 }",
 					"Enable-ScheduledTask -TaskName $taskName",
 					"Start-ScheduledTask -TaskName $taskName",
 					"Start-Sleep -Seconds 2",
 					"Teams WSL Scheduled Task did not stay running after start",
 				)
-				if strings.Count(joined, "Teams WSL Scheduled Task did not stay running after start") != 2 {
-					t.Fatalf("service start should verify both bridge and watchdog tasks:\n%s", joined)
+				if strings.Count(allJoined, "Teams WSL Scheduled Task did not stay running after start") != 2 {
+					t.Fatalf("service start should verify both bridge and watchdog tasks:\n%s", allJoined)
 				}
-				if !strings.Contains(joined, "if ($null -ne $task) { if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName") ||
-					!strings.Contains(joined, "if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName") {
-					t.Fatalf("service start should enable disabled watchdog tasks without re-starting an already running watchdog task:\n%s", joined)
+				if !strings.Contains(allJoined, "if ($null -ne $task) { if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName") ||
+					!strings.Contains(allJoined, "if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName") {
+					t.Fatalf("service start should enable disabled watchdog tasks without re-starting an already running watchdog task:\n%s", allJoined)
 				}
 			}
 		})
@@ -2772,6 +3007,22 @@ func TestTeamsBackgroundKeepaliveWSLPrimaryStartRestartEnablesDisabledTasksCI(t 
 			}
 		})
 	}
+	t.Run("stop", func(t *testing.T) {
+		runner.calls = nil
+		if _, err := backend.RunPrimary(context.Background(), "stop"); err != nil {
+			t.Fatalf("RunPrimary(stop) error: %v", err)
+		}
+		if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" {
+			t.Fatalf("RunPrimary(stop) calls = %#v, want one powershell.exe call", runner.calls)
+		}
+		joined := strings.Join(runner.calls[0].args, " ")
+		if !strings.Contains(joined, "Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue") {
+			t.Fatalf("RunPrimary(stop) should tolerate an already stopped bridge task:\n%s", joined)
+		}
+		if strings.Contains(joined, "Codex Helper Teams Watchdog") {
+			t.Fatalf("RunPrimary(stop) should only target the bridge task:\n%s", joined)
+		}
+	})
 }
 
 func TestTeamsBackgroundKeepaliveWSLInstalledActiveProbeUsesTaskSchedulerCI(t *testing.T) {

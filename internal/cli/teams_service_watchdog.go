@@ -22,10 +22,10 @@ const (
 	teamsServiceWatchdogActionStart   = "start"
 	teamsServiceWatchdogActionRestart = "restart"
 
-	defaultTeamsServiceWatchdogOwnerStaleAfter    = 18 * time.Second
-	defaultTeamsServiceWatchdogPollStaleAfter     = 20 * time.Second
-	defaultTeamsServiceWatchdogCooldown           = 30 * time.Second
-	defaultTeamsServiceWatchdogConsecutiveStale   = 1
+	defaultTeamsServiceWatchdogOwnerStaleAfter    = 90 * time.Second
+	defaultTeamsServiceWatchdogPollStaleAfter     = 2 * time.Minute
+	defaultTeamsServiceWatchdogCooldown           = 2 * time.Minute
+	defaultTeamsServiceWatchdogConsecutiveStale   = 3
 	defaultTeamsServiceWatchdogMissingStateReason = "no Teams state evidence yet"
 	defaultTeamsServiceWatchdogReloadStaleAfter   = 6 * time.Minute
 )
@@ -159,11 +159,17 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 		return result, nil
 	}
 	if decision.Action == teamsServiceWatchdogActionStart || decision.Action == teamsServiceWatchdogActionRestart {
-		if err := saveTeamsServiceWatchdogState(next); err != nil {
+		pending := teamsServiceWatchdogPendingActionState(next)
+		if err := saveTeamsServiceWatchdogState(pending); err != nil {
 			return teamsServiceWatchdogResult{}, err
 		}
 		if err := teamsServiceWatchdogStartService(ctx, decision.Action == teamsServiceWatchdogActionRestart); err != nil {
+			result.State = pending
 			return result, err
+		}
+		result.State = next
+		if err := saveTeamsServiceWatchdogState(next); err != nil {
+			return teamsServiceWatchdogResult{}, err
 		}
 		return result, nil
 	}
@@ -464,6 +470,12 @@ func nextTeamsServiceWatchdogState(prev teamsServiceWatchdogState, decision team
 		next.LastActionAt = now
 	}
 	return next
+}
+
+func teamsServiceWatchdogPendingActionState(state teamsServiceWatchdogState) teamsServiceWatchdogState {
+	state.LastAction = ""
+	state.LastActionAt = time.Time{}
+	return state
 }
 
 func loadTeamsServiceWatchdogState() (teamsServiceWatchdogState, error) {
