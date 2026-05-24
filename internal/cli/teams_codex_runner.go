@@ -184,8 +184,8 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 		command = "codex"
 	}
 	cmdArgs := append([]string{command}, req.Args...)
-	var stdout bytes.Buffer
 	var stderr bytes.Buffer
+	stdout := codexrunner.NewLaunchOutputRecorderWithOptions(req.EventHandler, codexrunner.LaunchOutputOptions{IncludeCommandOutput: false})
 
 	log := l.log
 	if log == nil {
@@ -200,7 +200,7 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 		return codexrunner.LaunchResult{}, err
 	}
 
-	stdoutWriter := codexrunner.NewEventStreamWriter(&stdout, req.EventHandler)
+	stdoutWriter := stdout.StdoutWriter()
 	opts := runTargetOptions{
 		Cwd:         strings.TrimSpace(req.Dir),
 		ExtraEnv:    teamsCodexChildEnv(),
@@ -217,14 +217,14 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 	if useProxy {
 		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, "", true, log)
 		if err != nil {
-			return codexrunner.LaunchResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
+			return stdout.LaunchResult(stderr.Bytes(), 0), err
 		}
 		runErr = runWithProfileOptions(ctx, store, profile, cfgWithProfile.Instances, cmdArgs, opts)
 	} else {
 		runErr = runTeamsCodexDirect(ctx, store, cmdArgs, log, stdoutWriter, &stderr, opts)
 	}
 
-	result := codexrunner.LaunchResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+	result := stdout.LaunchResult(stderr.Bytes(), 0)
 	if runErr == nil {
 		return result, nil
 	}

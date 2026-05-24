@@ -51,10 +51,20 @@ func ParseStreamEventJSONL(line []byte) (StreamEvent, bool, error) {
 	if err := json.Unmarshal(line, &event); err != nil {
 		return StreamEvent{}, false, err
 	}
+	return streamEventFromCodexEvent(event, line)
+}
+
+func streamEventFromCodexEvent(event codexEvent, raw []byte) (StreamEvent, bool, error) {
+	return streamEventFromCodexEventWithOptions(event, raw, true)
+}
+
+func streamEventFromCodexEventWithOptions(event codexEvent, raw []byte, includeRaw bool) (StreamEvent, bool, error) {
 	out := StreamEvent{
 		ThreadID: firstNonEmpty(event.ThreadIDCamel, event.ThreadID),
 		TurnID:   firstNonEmpty(event.TurnID, event.Turn.ID),
-		Raw:      append([]byte(nil), line...),
+	}
+	if includeRaw {
+		out.Raw = append([]byte(nil), raw...)
 	}
 	switch event.Type {
 	case "thread.started", "thread/started":
@@ -206,38 +216,114 @@ func usageFromEvent(event codexEvent) Usage {
 }
 
 type EventStreamWriter struct {
-	dst     io.Writer
-	handler EventHandler
-	mu      sync.Mutex
-	pending []byte
+	dst                  io.Writer
+	handler              EventHandler
+	includeCommandOutput bool
+	includeRawEvent      bool
+	mu                   sync.Mutex
+	pending              []byte
+	lineNo               int
+	result               TurnResult
+	err                  error
+	done                 bool
 }
 
 func NewEventStreamWriter(dst io.Writer, handler EventHandler) io.Writer {
 	if handler == nil {
 		return dst
 	}
-	return &EventStreamWriter{dst: dst, handler: handler}
+	return NewEventStreamCollector(dst, handler)
+}
+
+type EventStreamOptions struct {
+	IncludeCommandOutput bool
+	IncludeRawEvent      bool
+}
+
+func NewEventStreamCollector(dst io.Writer, handler EventHandler) *EventStreamWriter {
+	return NewEventStreamCollectorWithOptions(dst, handler, EventStreamOptions{IncludeCommandOutput: true, IncludeRawEvent: true})
+}
+
+func NewEventStreamCollectorWithOptions(dst io.Writer, handler EventHandler, options EventStreamOptions) *EventStreamWriter {
+	return &EventStreamWriter{
+		dst:                  dst,
+		handler:              handler,
+		includeCommandOutput: options.IncludeCommandOutput,
+		includeRawEvent:      options.IncludeRawEvent,
+	}
 }
 
 func (w *EventStreamWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.done {
+		return 0, io.ErrClosedPipe
+	}
 	if w.dst != nil {
 		if _, err := w.dst.Write(p); err != nil {
 			return 0, err
 		}
 	}
 	w.pending = append(w.pending, p...)
+	w.processCompleteLinesLocked()
+	return len(p), nil
+}
+
+func (w *EventStreamWriter) Finish() (TurnResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
+		return w.result, w.err
+	}
+	w.done = true
+	if len(bytes.TrimSpace(w.pending)) > 0 {
+		w.processLineLocked(w.pending)
+	}
+	w.pending = nil
+	return w.result, w.err
+}
+
+func (w *EventStreamWriter) Result() (TurnResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.result, w.err
+}
+
+func (w *EventStreamWriter) processCompleteLinesLocked() {
+	start := 0
 	for {
-		idx := bytes.IndexByte(w.pending, '\n')
+		idx := bytes.IndexByte(w.pending[start:], '\n')
 		if idx < 0 {
 			break
 		}
-		line := append([]byte(nil), w.pending[:idx]...)
-		w.pending = append(w.pending[:0], w.pending[idx+1:]...)
-		if event, ok, err := ParseStreamEventJSONL(line); err == nil && ok {
-			w.handler(event)
-		}
+		lineEnd := start + idx
+		w.processLineLocked(w.pending[start:lineEnd])
+		start = lineEnd + 1
 	}
-	return len(p), nil
+	if start > 0 {
+		copy(w.pending, w.pending[start:])
+		w.pending = w.pending[:len(w.pending)-start]
+	}
+}
+
+func (w *EventStreamWriter) processLineLocked(line []byte) {
+	if w.err != nil {
+		return
+	}
+	w.lineNo++
+	event, trimmed, ok, err := parseCodexEventJSONLLineWithOptions(line, w.lineNo, w.includeCommandOutput)
+	if err != nil {
+		w.err = err
+		return
+	}
+	if !ok {
+		return
+	}
+	applyEvent(&w.result, event, trimmed)
+	if w.handler == nil {
+		return
+	}
+	if streamEvent, ok, err := streamEventFromCodexEventWithOptions(event, trimmed, w.includeRawEvent); err == nil && ok {
+		w.handler(streamEvent)
+	}
 }

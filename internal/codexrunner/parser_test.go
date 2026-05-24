@@ -170,3 +170,10 @@ func TestParseJSONLReturnsParseFailureForInvalidJSONEvent(t *testing.T) {
 		t.Fatalf("expected parse failure, got %v", err)
 	}
 }
+
+func TestParseJSONLValidatesCommandExecutionEvents(t *testing.T) {
+	_, err := ParseJSONL(strings.NewReader(`{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"unterminated` + "\n"))
+	if !IsKind(err, ErrorParse) {
+		t.Fatalf("expected parse failure, got %v", err)
+	}
+}

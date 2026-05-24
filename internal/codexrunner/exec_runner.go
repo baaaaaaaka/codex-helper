@@ -123,7 +123,7 @@ func (r *ExecRunner) run(ctx context.Context, input launchInput) (TurnResult, er
 		EventHandler: input.eventHandler,
 	}
 	output, launchErr := launcher.Launch(ctx, req)
-	result, parseErr := ParseJSONL(bytes.NewReader(output.Stdout))
+	result, parseErr := parseLaunchResult(output)
 	if parseErr != nil {
 		return result, parseErr
 	}
@@ -150,6 +150,13 @@ func completedTurnDespiteCanceledLaunch(result TurnResult, err error) bool {
 		errors.Is(err, context.Canceled) &&
 		result.Status == TurnStatusCompleted &&
 		result.Failure == nil
+}
+
+func parseLaunchResult(output LaunchResult) (TurnResult, error) {
+	if output.ParsedResult != nil {
+		return *output.ParsedResult, output.ParseErr
+	}
+	return ParseJSONL(bytes.NewReader(output.Stdout))
 }
 
 func (r *ExecRunner) startArgs(input TurnInput) ([]string, error) {
@@ -262,6 +269,9 @@ func codexFailure(output LaunchResult, result TurnResult) error {
 	message := strings.TrimSpace(string(output.Stderr))
 	if message == "" {
 		message = strings.TrimSpace(string(output.Stdout))
+		if message != "" && output.StdoutTruncated {
+			message = "(stdout truncated to last 1048576 bytes)\n" + message
+		}
 	}
 	if message == "" {
 		message = fmt.Sprintf("codex exited with status %d", output.ExitCode)
@@ -294,12 +304,12 @@ func (DirectLauncher) Launch(ctx context.Context, req LaunchRequest) (LaunchResu
 	if req.Stdin != "" {
 		cmd.Stdin = strings.NewReader(req.Stdin)
 	}
-	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	cmd.Stdout = NewEventStreamWriter(&stdout, req.EventHandler)
+	stdout := NewLaunchOutputRecorder(req.EventHandler)
+	cmd.Stdout = stdout.StdoutWriter()
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	result := LaunchResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+	result := stdout.LaunchResult(stderr.Bytes(), 0)
 	if err == nil {
 		return result, nil
 	}

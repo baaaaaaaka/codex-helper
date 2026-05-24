@@ -13231,7 +13231,7 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 		return Transcript{SourceName: filePath}, nil
 	}
 	if checkpoint.LastOffset > 0 && strings.TrimSpace(checkpoint.SourcePath) == strings.TrimSpace(filePath) {
-		result, err := historyTieredScanTail(filePath, historyTieredFileState{
+		previous := historyTieredFileState{
 			Path:        filePath,
 			Size:        checkpoint.SourceSize,
 			ModTime:     checkpoint.SourceModTime,
@@ -13240,9 +13240,16 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			SessionID:   strings.TrimSpace(sessionID),
 			ThreadID:    strings.TrimSpace(threadID),
 			LastFinalID: strings.TrimSpace(checkpoint.LastRecordID),
-		}, historyTieredMaxTailBytes)
+		}
+		result, err := historyTieredScanTail(filePath, previous, historyTieredMaxTailBytes)
 		if err != nil {
 			return Transcript{}, err
+		}
+		if result.TooLarge {
+			result, err = historyTieredScanTail(filePath, previous, 0)
+			if err != nil {
+				return Transcript{}, err
+			}
 		}
 		if !result.TooLarge && !result.Truncated {
 			return Transcript{SourceName: filePath, Records: filterTranscriptRecordsAfterCheckpoint(result.Records, checkpoint.LastRecordID)}, nil

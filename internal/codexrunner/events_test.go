@@ -3,6 +3,8 @@ package codexrunner
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"runtime"
 	"strings"
 	"testing"
@@ -137,6 +139,29 @@ func TestEventStreamWriterEmitsJSONEventsAcrossWrites(t *testing.T) {
 	}
 	if events[1].Kind != StreamEventAgentMessage || events[1].Text != "hello" {
 		t.Fatalf("agent event = %#v", events[1])
+	}
+}
+
+func TestEventStreamCollectorFinishesPartialFinalLine(t *testing.T) {
+	var events []StreamEvent
+	collector := NewEventStreamCollector(nil, func(event StreamEvent) {
+		events = append(events, event)
+	})
+
+	_, _ = collector.Write([]byte(`{"type":"thread.started","thread_id":"thread-partial"}` + "\n"))
+	_, _ = collector.Write([]byte(`{"type":"item.completed","item":{"type":"agent_message","text":"done without trailing newline"}}`))
+	result, err := collector.Finish()
+	if err != nil {
+		t.Fatalf("Finish error: %v", err)
+	}
+	if result.ThreadID != "thread-partial" || result.FinalAgentMessage != "done without trailing newline" {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(events) != 2 || events[1].Text != "done without trailing newline" {
+		t.Fatalf("stream events = %#v", events)
+	}
+	if _, err := collector.Write([]byte(`{"type":"turn.completed"}` + "\n")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Write after Finish error = %v, want ErrClosedPipe", err)
 	}
 }
 

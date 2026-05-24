@@ -16999,6 +16999,60 @@ func TestBridgeSyncLinkedTranscriptDeliveredLedgerDoesNotTriggerBacklogBlockAfte
 	}
 }
 
+func TestBridgeReadLinkedTranscriptDeltaLargeTailUsesCheckpointOffset(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-large-linked-tail"}}` + "\n" +
+		`{"id":"old","thread_id":"thread-large-linked-tail","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-large-linked-tail", transcriptPath)
+	defer restoreDiscover()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-large-linked-tail")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load seeded state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	checkpoint.LastRecordID = "checkpoint-only-in-store"
+
+	var updated strings.Builder
+	updated.WriteString(initial)
+	updated.WriteString(`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":`)
+	updated.WriteString(strconv.Quote(strings.Repeat("x", int(historyTieredMaxTailBytes)+1024)))
+	updated.WriteString(`}}` + "\n")
+	updated.WriteString(`{"type":"event_msg","payload":{"type":"agent_message","id":"large-linked-final","turn_id":"turn-large","phase":"final_answer","message":"large linked final"}}` + "\n")
+	if err := os.WriteFile(transcriptPath, []byte(updated.String()), 0o600); err != nil {
+		t.Fatalf("write large linked transcript: %v", err)
+	}
+
+	delta, err := bridge.readLinkedTranscriptDelta(transcriptPath, checkpoint, "thread-large-linked-tail", "thread-large-linked-tail")
+	if err != nil {
+		t.Fatalf("read linked transcript delta: %v", err)
+	}
+	if len(delta.Diagnostics) != 0 {
+		t.Fatalf("delta diagnostics = %#v, want none", delta.Diagnostics)
+	}
+	if !transcriptRecordsContainText(delta.Records, "large linked final") {
+		t.Fatalf("delta records = %#v, want large linked final from checkpoint offset", delta.Records)
+	}
+	if transcriptRecordsContainText(delta.Records, "old answer") {
+		t.Fatalf("delta records included checkpoint prefix: %#v", delta.Records)
+	}
+}
+
+func transcriptRecordsContainText(records []TranscriptRecord, text string) bool {
+	for _, record := range records {
+		if strings.Contains(record.Text, text) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBridgeTranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	body := strings.Join([]string{

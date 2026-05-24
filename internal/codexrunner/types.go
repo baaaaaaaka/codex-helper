@@ -94,9 +94,12 @@ type LaunchRequest struct {
 }
 
 type LaunchResult struct {
-	Stdout   []byte
-	Stderr   []byte
-	ExitCode int
+	Stdout          []byte
+	StdoutTruncated bool
+	Stderr          []byte
+	ExitCode        int
+	ParsedResult    *TurnResult
+	ParseErr        error
 }
 
 type ErrorKind string

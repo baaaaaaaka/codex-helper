@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -16,13 +17,12 @@ func ParseJSONL(r io.Reader) (TurnResult, error) {
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 || line[0] != '{' {
-			continue
+		event, line, ok, err := parseCodexEventJSONLLine(scanner.Bytes(), lineNo)
+		if err != nil {
+			return result, err
 		}
-		var event codexEvent
-		if err := json.Unmarshal(line, &event); err != nil {
-			return result, &Error{Kind: ErrorParse, Message: fmt.Sprintf("invalid JSON event on line %d", lineNo), Err: err}
+		if !ok {
+			continue
 		}
 		applyEvent(&result, event, line)
 	}
@@ -30,6 +30,33 @@ func ParseJSONL(r io.Reader) (TurnResult, error) {
 		return result, &Error{Kind: ErrorParse, Message: "failed to read JSONL events", Err: err}
 	}
 	return result, nil
+}
+
+func parseCodexEventJSONLLine(line []byte, lineNo int) (codexEvent, []byte, bool, error) {
+	return parseCodexEventJSONLLineWithOptions(line, lineNo, true)
+}
+
+func parseCodexEventJSONLLineWithOptions(line []byte, lineNo int, includeCommandOutput bool) (codexEvent, []byte, bool, error) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || line[0] != '{' {
+		return codexEvent{}, nil, false, nil
+	}
+	if !includeCommandOutput {
+		event, err := unmarshalCodexEventWithoutCommandOutput(line)
+		if err != nil {
+			return codexEvent{}, nil, false, newJSONLParseError(lineNo, err)
+		}
+		return event, line, true, nil
+	}
+	var event codexEvent
+	if err := json.Unmarshal(line, &event); err != nil {
+		return codexEvent{}, nil, false, newJSONLParseError(lineNo, err)
+	}
+	return event, line, true, nil
+}
+
+func newJSONLParseError(lineNo int, err error) error {
+	return &Error{Kind: ErrorParse, Message: fmt.Sprintf("invalid JSON event on line %d", lineNo), Err: err}
 }
 
 type codexEvent struct {
@@ -78,6 +105,181 @@ type codexItem struct {
 	ExitCode              *int           `json:"exit_code"`
 	ExitCodeCamel         *int           `json:"exitCode"`
 	Status                string         `json:"status"`
+}
+
+type codexItemWithoutCommandOutput struct {
+	ID            string         `json:"id"`
+	Type          string         `json:"type"`
+	Text          string         `json:"text"`
+	Content       []codexContent `json:"content"`
+	Command       string         `json:"command"`
+	ExitCode      *int           `json:"exit_code"`
+	ExitCodeCamel *int           `json:"exitCode"`
+	Status        string         `json:"status"`
+}
+
+func (item codexItemWithoutCommandOutput) toCodexItem() codexItem {
+	return codexItem{
+		ID:            item.ID,
+		Type:          item.Type,
+		Text:          item.Text,
+		Content:       item.Content,
+		Command:       item.Command,
+		ExitCode:      item.ExitCode,
+		ExitCodeCamel: item.ExitCodeCamel,
+		Status:        item.Status,
+	}
+}
+
+func unmarshalCodexEventWithoutCommandOutput(line []byte) (codexEvent, error) {
+	if event, ok := fastCommandExecutionEvent(line); ok {
+		return event, nil
+	}
+	var lite struct {
+		Type          string                        `json:"type"`
+		ThreadID      string                        `json:"thread_id"`
+		ThreadIDCamel string                        `json:"threadId"`
+		ThreadName    string                        `json:"thread_name"`
+		ThreadName2   string                        `json:"threadName"`
+		Name          string                        `json:"name"`
+		Title         string                        `json:"title"`
+		TurnID        string                        `json:"turn_id"`
+		Turn          codexTurn                     `json:"turn"`
+		Thread        codexThread                   `json:"thread"`
+		Item          codexItemWithoutCommandOutput `json:"item"`
+		Payload       json.RawMessage               `json:"payload"`
+		Usage         codexUsage                    `json:"usage"`
+		Error         codexEventError               `json:"error"`
+		Message       string                        `json:"message"`
+		Code          string                        `json:"code"`
+		WillRetry     bool                          `json:"willRetry"`
+	}
+	if err := json.Unmarshal(line, &lite); err != nil {
+		return codexEvent{}, err
+	}
+	return codexEvent{
+		Type:          lite.Type,
+		ThreadID:      lite.ThreadID,
+		ThreadIDCamel: lite.ThreadIDCamel,
+		ThreadName:    lite.ThreadName,
+		ThreadName2:   lite.ThreadName2,
+		Name:          lite.Name,
+		Title:         lite.Title,
+		TurnID:        lite.TurnID,
+		Turn:          lite.Turn,
+		Thread:        lite.Thread,
+		Item:          lite.Item.toCodexItem(),
+		Payload:       lite.Payload,
+		Usage:         lite.Usage,
+		Error:         lite.Error,
+		Message:       lite.Message,
+		Code:          lite.Code,
+		WillRetry:     lite.WillRetry,
+	}, nil
+}
+
+func fastCommandExecutionEvent(line []byte) (codexEvent, bool) {
+	eventType, ok := jsonStringFieldValue(line, "type")
+	if !ok {
+		return codexEvent{}, false
+	}
+	switch eventType {
+	case "item.started", "item/started", "item.completed", "item/completed":
+	default:
+		return codexEvent{}, false
+	}
+	if !jsonStringFieldValueExists(line, "type", "command_execution") {
+		return codexEvent{}, false
+	}
+	if !json.Valid(line) {
+		return codexEvent{}, false
+	}
+	prefix := line
+	if idx := bytes.Index(line, []byte(`"item"`)); idx > 0 {
+		prefix = line[:idx]
+	}
+	return codexEvent{
+		Type:          eventType,
+		ThreadID:      firstJSONStringField(prefix, "thread_id"),
+		ThreadIDCamel: firstJSONStringField(prefix, "threadId"),
+		TurnID:        firstJSONStringField(prefix, "turn_id"),
+		Item:          codexItem{Type: "command_execution"},
+	}, true
+}
+
+func firstJSONStringField(line []byte, key string) string {
+	value, _ := jsonStringFieldValue(line, key)
+	return value
+}
+
+func jsonStringFieldValueExists(line []byte, key string, want string) bool {
+	pos := 0
+	for pos < len(line) {
+		value, next, ok := nextJSONStringFieldValue(line[pos:], key)
+		if !ok {
+			return false
+		}
+		if value == want {
+			return true
+		}
+		pos += next
+	}
+	return false
+}
+
+func jsonStringFieldValue(line []byte, key string) (string, bool) {
+	value, _, ok := nextJSONStringFieldValue(line, key)
+	return value, ok
+}
+
+func nextJSONStringFieldValue(line []byte, key string) (string, int, bool) {
+	pattern := []byte(strconv.Quote(key))
+	idx := bytes.Index(line, pattern)
+	if idx < 0 {
+		return "", len(line), false
+	}
+	i := idx + len(pattern)
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == '\n') {
+		i++
+	}
+	if i >= len(line) || line[i] != ':' {
+		return "", idx + len(pattern), false
+	}
+	i++
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == '\n') {
+		i++
+	}
+	if i >= len(line) || line[i] != '"' {
+		return "", idx + len(pattern), false
+	}
+	i++
+	start := i
+	escaped := false
+	for i < len(line) {
+		c := line[i]
+		if escaped {
+			escaped = false
+			i++
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			i++
+			continue
+		}
+		if c == '"' {
+			if bytes.IndexByte(line[start:i], '\\') >= 0 {
+				var decoded string
+				if err := json.Unmarshal(line[start-1:i+1], &decoded); err != nil {
+					return "", i + 1, false
+				}
+				return decoded, i + 1, true
+			}
+			return string(line[start:i]), i + 1, true
+		}
+		i++
+	}
+	return "", len(line), false
 }
 
 type codexContent struct {
