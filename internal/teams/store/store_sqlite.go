@@ -593,6 +593,7 @@ func validateSQLiteRequiredTables(db *sql.DB) error {
 func ensureSQLiteSchema(db *sql.DB) error {
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, teams_chat_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS sessions_chat_idx ON sessions(teams_chat_id)`,
 		`CREATE TABLE IF NOT EXISTS inbound_events (id TEXT PRIMARY KEY, session_id TEXT, teams_chat_id TEXT, teams_message_id TEXT, status TEXT, created_at INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
@@ -608,6 +609,18 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS message_provenance_lookup_idx ON message_provenance(teams_chat_id, teams_message_id, origin)`,
 		`CREATE TABLE IF NOT EXISTS chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, poll_state TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS chat_rate_limits (chat_id TEXT PRIMARY KEY, blocked_until INTEGER, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS import_checkpoints (id TEXT PRIMARY KEY, session_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS import_checkpoints_session_idx ON import_checkpoints(session_id, status, updated_at, id)`,
+		`CREATE TABLE IF NOT EXISTS transcript_ledger (id TEXT PRIMARY KEY, session_id TEXT, imported_at INTEGER, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS transcript_ledger_session_idx ON transcript_ledger(session_id, imported_at, id)`,
+		`CREATE TABLE IF NOT EXISTS transcript_deliveries (id TEXT PRIMARY KEY, session_id TEXT, outbox_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS transcript_deliveries_session_idx ON transcript_deliveries(session_id, status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS helper_deliveries (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, outbox_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS helper_deliveries_session_idx ON helper_deliveries(session_id, status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS artifact_records (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, outbox_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS artifact_records_session_idx ON artifact_records(session_id, status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS notifications_session_idx ON notifications(session_id, status, created_at, id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
@@ -639,6 +652,12 @@ func coldSQLiteState(state State) State {
 	cold.MessageProvenance = nil
 	cold.ChatPolls = nil
 	cold.ChatRateLimits = nil
+	cold.TranscriptLedger = nil
+	cold.TranscriptDeliveries = nil
+	cold.HelperDeliveries = nil
+	cold.ImportCheckpoints = nil
+	cold.ArtifactRecords = nil
+	cold.Notifications = nil
 	return cold
 }
 
@@ -649,7 +668,7 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"state_meta", "sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "chat_polls", "chat_rate_limits"} {
+	for _, table := range []string{"state_meta", "runtime_state", "sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "chat_polls", "chat_rate_limits", "import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			return err
 		}
@@ -659,6 +678,9 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, cold); err != nil {
+		return err
+	}
+	if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
 		return err
 	}
 	if err := writeSQLiteMap(ctx, tx, `INSERT INTO sessions(id, teams_chat_id, status, updated_at, json) VALUES (?, ?, ?, ?, ?)`, state.Sessions, func(v SessionContext) []any {
@@ -696,6 +718,36 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	}); err != nil {
 		return err
 	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO import_checkpoints(id, session_id, status, updated_at, json) VALUES (?, ?, ?, ?, ?)`, state.ImportCheckpoints, func(v ImportCheckpoint) []any {
+		return []any{v.ID, v.SessionID, v.Status, sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO transcript_ledger(id, session_id, imported_at, created_at, json) VALUES (?, ?, ?, ?, ?)`, state.TranscriptLedger, func(v TranscriptLedgerRecord) []any {
+		return []any{v.ID, v.SessionID, sqliteTime(v.ImportedAt), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO transcript_deliveries(id, session_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?)`, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) []any {
+		return []any{v.ID, v.SessionID, v.OutboxID, string(v.Status), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO helper_deliveries(id, session_id, turn_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)`, state.HelperDeliveries, func(v HelperDeliveryRecord) []any {
+		return []any{v.ID, v.SessionID, v.TurnID, v.OutboxID, string(v.Status), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO artifact_records(id, session_id, turn_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)`, state.ArtifactRecords, func(v ArtifactRecord) []any {
+		return []any{v.ID, v.SessionID, v.TurnID, v.OutboxID, v.Status, sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO notifications(id, session_id, turn_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?)`, state.Notifications, func(v NotificationRecord) []any {
+		return []any{v.ID, v.SessionID, v.TurnID, string(v.Status), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -729,6 +781,9 @@ func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
 	if err != nil {
 		return State{}, err
 	}
+	if err := overlaySQLiteRuntimeState(ctx, db, &state); err != nil {
+		return State{}, err
+	}
 	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM sessions`, state.Sessions, func(v SessionContext) string { return v.ID }); err != nil {
 		return State{}, err
 	}
@@ -750,6 +805,24 @@ func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
 	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM chat_rate_limits`, state.ChatRateLimits, func(v ChatRateLimitState) string { return v.ChatID }); err != nil {
 		return State{}, err
 	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM import_checkpoints`, state.ImportCheckpoints, func(v ImportCheckpoint) string { return v.ID }); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM transcript_ledger`, state.TranscriptLedger, func(v TranscriptLedgerRecord) string { return v.ID }); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM transcript_deliveries`, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM helper_deliveries`, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM artifact_records`, state.ArtifactRecords, func(v ArtifactRecord) string { return v.ID }); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM notifications`, state.Notifications, func(v NotificationRecord) string { return v.ID }); err != nil {
+		return State{}, err
+	}
 	normalizeLoadedState(&state)
 	return state, nil
 }
@@ -760,6 +833,9 @@ func loadSQLiteSelectedState(ctx context.Context, db *sql.DB, wanted map[string]
 	}
 	state, err := loadSQLiteColdState(ctx, db)
 	if err != nil {
+		return State{}, err
+	}
+	if err := overlaySQLiteRuntimeState(ctx, db, &state); err != nil {
 		return State{}, err
 	}
 	if _, ok := wanted["sessions"]; ok {
@@ -794,6 +870,36 @@ func loadSQLiteSelectedState(ctx context.Context, db *sql.DB, wanted map[string]
 	}
 	if _, ok := wanted["chat_rate_limits"]; ok {
 		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM chat_rate_limits`, state.ChatRateLimits, func(v ChatRateLimitState) string { return v.ChatID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["import_checkpoints"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM import_checkpoints`, state.ImportCheckpoints, func(v ImportCheckpoint) string { return v.ID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["transcript_ledger"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM transcript_ledger`, state.TranscriptLedger, func(v TranscriptLedgerRecord) string { return v.ID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["transcript_deliveries"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM transcript_deliveries`, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["helper_deliveries"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM helper_deliveries`, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["artifact_records"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM artifact_records`, state.ArtifactRecords, func(v ArtifactRecord) string { return v.ID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["notifications"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM notifications`, state.Notifications, func(v NotificationRecord) string { return v.ID }); err != nil {
 			return State{}, err
 		}
 	}
@@ -883,6 +989,9 @@ func loadSQLiteJSONRow[T any](ctx context.Context, q interface {
 }
 
 func saveSQLiteColdStateTx(ctx context.Context, tx *sql.Tx, state State) error {
+	if err := upsertSQLiteSplitStateTx(ctx, tx, state); err != nil {
+		return err
+	}
 	cold, err := json.Marshal(coldSQLiteState(state))
 	if err != nil {
 		return err
@@ -890,6 +999,306 @@ func saveSQLiteColdStateTx(ctx context.Context, tx *sql.Tx, state State) error {
 	_, err = tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cold)
 	return err
+}
+
+const (
+	sqliteRuntimeKeyScope           = "scope"
+	sqliteRuntimeKeyMachineIdentity = "machine_identity"
+	sqliteRuntimeKeyMachines        = "machines"
+	sqliteRuntimeKeyControlLease    = "control_lease"
+	sqliteRuntimeKeyServiceOwner    = "service_owner"
+	sqliteRuntimeKeyLockOwner       = "lock_owner"
+)
+
+var sqliteRuntimeRequiredKeys = []string{
+	sqliteRuntimeKeyScope,
+	sqliteRuntimeKeyMachineIdentity,
+	sqliteRuntimeKeyMachines,
+	sqliteRuntimeKeyControlLease,
+	sqliteRuntimeKeyServiceOwner,
+	sqliteRuntimeKeyLockOwner,
+}
+
+func saveSQLiteRuntimeStateTx(ctx context.Context, tx *sql.Tx, state State) error {
+	values := map[string]any{
+		sqliteRuntimeKeyScope:           state.Scope,
+		sqliteRuntimeKeyMachineIdentity: state.MachineIdentity,
+		sqliteRuntimeKeyMachines:        state.Machines,
+		sqliteRuntimeKeyControlLease:    state.ControlLease,
+		sqliteRuntimeKeyServiceOwner:    state.ServiceOwner,
+		sqliteRuntimeKeyLockOwner:       state.LockOwner,
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO runtime_state(key, json) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET json = excluded.json`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, key := range sqliteRuntimeRequiredKeys {
+		data, err := json.Marshal(values[key])
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.ExecContext(ctx, key, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadSQLiteRuntimeState(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (State, map[string]bool, error) {
+	state := State{
+		SchemaVersion: SchemaVersion,
+		Machines:      map[string]MachineRecord{},
+	}
+	seen := make(map[string]bool)
+	rows, err := q.QueryContext(ctx, `SELECT key, json FROM runtime_state`)
+	if err != nil {
+		return State{}, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var raw []byte
+		if err := rows.Scan(&key, &raw); err != nil {
+			return State{}, nil, err
+		}
+		seen[key] = true
+		switch key {
+		case sqliteRuntimeKeyScope:
+			if err := json.Unmarshal(raw, &state.Scope); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyMachineIdentity:
+			if err := json.Unmarshal(raw, &state.MachineIdentity); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyMachines:
+			if err := json.Unmarshal(raw, &state.Machines); err != nil {
+				return State{}, nil, err
+			}
+			if state.Machines == nil {
+				state.Machines = map[string]MachineRecord{}
+			}
+		case sqliteRuntimeKeyControlLease:
+			if err := json.Unmarshal(raw, &state.ControlLease); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyServiceOwner:
+			if err := json.Unmarshal(raw, &state.ServiceOwner); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyLockOwner:
+			if err := json.Unmarshal(raw, &state.LockOwner); err != nil {
+				return State{}, nil, err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return State{}, nil, err
+	}
+	state.ensure(time.Time{})
+	return state, seen, nil
+}
+
+func sqliteRuntimeStateUsable(seen map[string]bool) bool {
+	for _, key := range sqliteRuntimeRequiredKeys {
+		if !seen[key] {
+			return false
+		}
+	}
+	return true
+}
+
+func overlaySQLiteRuntimeState(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, state *State) error {
+	runtimeState, seen, err := loadSQLiteRuntimeState(ctx, q)
+	if err != nil {
+		return err
+	}
+	if !sqliteRuntimeStateUsable(seen) {
+		return nil
+	}
+	state.Scope = runtimeState.Scope
+	state.MachineIdentity = runtimeState.MachineIdentity
+	state.Machines = runtimeState.Machines
+	state.ControlLease = runtimeState.ControlLease
+	state.ServiceOwner = runtimeState.ServiceOwner
+	state.LockOwner = runtimeState.LockOwner
+	state.ensure(time.Time{})
+	return nil
+}
+
+func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) error) (bool, error) {
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state, seen, err := loadSQLiteRuntimeState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		seedRuntime := !sqliteRuntimeStateUsable(seen)
+		if seedRuntime {
+			state, err = loadSQLiteColdState(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
+		if err := fn(&state); err != nil {
+			if errors.Is(err, errStoreNoChange) && seedRuntime {
+				state.ensure(time.Now())
+				if saveErr := saveSQLiteRuntimeStateTx(ctx, tx, state); saveErr != nil {
+					return saveErr
+				}
+				return tx.Commit()
+			}
+			return err
+		}
+		state.ensure(time.Now())
+		if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	if errors.Is(err, errStoreNoChange) {
+		return handled, nil
+	}
+	return handled, err
+}
+
+func (s *Store) updateSQLiteColdState(ctx context.Context, fn func(*State) error) (bool, error) {
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state, err := loadSQLiteColdState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if err := fn(&state); err != nil {
+			return err
+		}
+		state.ensure(time.Now())
+		if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	if errors.Is(err, errStoreNoChange) {
+		return handled, nil
+	}
+	return handled, err
+}
+
+func (s *Store) claimControlLeaseSQLite(ctx context.Context, claim ControlLeaseClaim) (ControlLeaseDecision, bool, error) {
+	var out ControlLeaseDecision
+	handled, err := s.updateSQLiteRuntimeState(ctx, func(state *State) error {
+		decision, err := claimControlLeaseInState(state, claim)
+		out = decision
+		return err
+	})
+	return out, handled, err
+}
+
+func (s *Store) validateControlLeaseSQLite(ctx context.Context, machineID string, generation int64, now time.Time) (ControlLease, bool, error) {
+	var out ControlLease
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		state, seen, err := loadSQLiteRuntimeState(ctx, db)
+		if err != nil {
+			return err
+		}
+		if !sqliteRuntimeStateUsable(seen) {
+			state, err = loadSQLiteColdState(ctx, db)
+			if err != nil {
+				return err
+			}
+		}
+		lease := state.ControlLease
+		out = lease
+		if lease.HolderMachineID != machineID || lease.Generation != generation || !lease.LeaseUntil.After(now) {
+			return ErrControlLeaseNotHeld
+		}
+		return nil
+	})
+	return out, handled, err
+}
+
+func (s *Store) recordOwnerHeartbeatSQLite(ctx context.Context, owner OwnerMetadata, staleAfter time.Duration, now time.Time) (OwnerMetadata, bool, error) {
+	var out OwnerMetadata
+	handled, err := s.updateSQLiteRuntimeState(ctx, func(state *State) error {
+		next, err := recordOwnerHeartbeatInState(state, owner, staleAfter, now)
+		out = next
+		return err
+	})
+	return out, handled, err
+}
+
+func (s *Store) readOwnerSQLite(ctx context.Context) (OwnerMetadata, bool, bool, error) {
+	var out OwnerMetadata
+	found := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		state, seen, err := loadSQLiteRuntimeState(ctx, db)
+		if err != nil {
+			return err
+		}
+		if !sqliteRuntimeStateUsable(seen) {
+			state, err = loadSQLiteColdState(ctx, db)
+			if err != nil {
+				return err
+			}
+		}
+		out, found = state.readOwner()
+		return nil
+	})
+	return out, found, handled, err
 }
 
 func upsertSQLiteSessionTx(ctx context.Context, tx *sql.Tx, v SessionContext) error {
@@ -967,6 +1376,151 @@ func upsertSQLiteChatRateLimitTx(ctx context.Context, tx *sql.Tx, v ChatRateLimi
 ON CONFLICT(chat_id) DO UPDATE SET blocked_until = excluded.blocked_until, json = excluded.json`,
 		v.ChatID, sqliteTime(v.BlockedUntil), data)
 	return err
+}
+
+func upsertSQLiteImportCheckpointTx(ctx context.Context, tx *sql.Tx, v ImportCheckpoint) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO import_checkpoints(id, session_id, status, updated_at, json) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, status = excluded.status, updated_at = excluded.updated_at, json = excluded.json`,
+		v.ID, v.SessionID, v.Status, sqliteTime(v.UpdatedAt), data)
+	return err
+}
+
+func upsertSQLiteTranscriptLedgerTx(ctx context.Context, tx *sql.Tx, v TranscriptLedgerRecord) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO transcript_ledger(id, session_id, imported_at, created_at, json) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, imported_at = excluded.imported_at, created_at = excluded.created_at, json = excluded.json`,
+		v.ID, v.SessionID, sqliteTime(v.ImportedAt), sqliteTime(v.CreatedAt), data)
+	return err
+}
+
+func upsertSQLiteTranscriptDeliveryTx(ctx context.Context, tx *sql.Tx, v TranscriptDeliveryRecord) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO transcript_deliveries(id, session_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, outbox_id = excluded.outbox_id, status = excluded.status, created_at = excluded.created_at, json = excluded.json`,
+		v.ID, v.SessionID, v.OutboxID, string(v.Status), sqliteTime(v.CreatedAt), data)
+	return err
+}
+
+func upsertSQLiteHelperDeliveryTx(ctx context.Context, tx *sql.Tx, v HelperDeliveryRecord) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO helper_deliveries(id, session_id, turn_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, turn_id = excluded.turn_id, outbox_id = excluded.outbox_id, status = excluded.status, created_at = excluded.created_at, json = excluded.json`,
+		v.ID, v.SessionID, v.TurnID, v.OutboxID, string(v.Status), sqliteTime(v.CreatedAt), data)
+	return err
+}
+
+func upsertSQLiteArtifactRecordTx(ctx context.Context, tx *sql.Tx, v ArtifactRecord) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO artifact_records(id, session_id, turn_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, turn_id = excluded.turn_id, outbox_id = excluded.outbox_id, status = excluded.status, created_at = excluded.created_at, json = excluded.json`,
+		v.ID, v.SessionID, v.TurnID, v.OutboxID, v.Status, sqliteTime(v.CreatedAt), data)
+	return err
+}
+
+func upsertSQLiteNotificationTx(ctx context.Context, tx *sql.Tx, v NotificationRecord) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO notifications(id, session_id, turn_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, turn_id = excluded.turn_id, status = excluded.status, created_at = excluded.created_at, json = excluded.json`,
+		v.ID, v.SessionID, v.TurnID, string(v.Status), sqliteTime(v.CreatedAt), data)
+	return err
+}
+
+func upsertSQLiteSplitStateTx(ctx context.Context, tx *sql.Tx, state State) error {
+	for _, checkpoint := range state.ImportCheckpoints {
+		if err := upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint); err != nil {
+			return err
+		}
+	}
+	for _, record := range state.TranscriptLedger {
+		if err := upsertSQLiteTranscriptLedgerTx(ctx, tx, record); err != nil {
+			return err
+		}
+	}
+	for _, delivery := range state.TranscriptDeliveries {
+		if err := upsertSQLiteTranscriptDeliveryTx(ctx, tx, delivery); err != nil {
+			return err
+		}
+	}
+	for _, delivery := range state.HelperDeliveries {
+		if err := upsertSQLiteHelperDeliveryTx(ctx, tx, delivery); err != nil {
+			return err
+		}
+	}
+	for _, record := range state.ArtifactRecords {
+		if err := upsertSQLiteArtifactRecordTx(ctx, tx, record); err != nil {
+			return err
+		}
+	}
+	for _, notification := range state.Notifications {
+		if err := upsertSQLiteNotificationTx(ctx, tx, notification); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadSQLiteOutboxLinkedRecordsTx(ctx context.Context, tx *sql.Tx, state *State, outboxID string) error {
+	outboxID = strings.TrimSpace(outboxID)
+	if outboxID == "" {
+		return nil
+	}
+	if state.TranscriptDeliveries == nil {
+		state.TranscriptDeliveries = map[string]TranscriptDeliveryRecord{}
+	}
+	if state.HelperDeliveries == nil {
+		state.HelperDeliveries = map[string]HelperDeliveryRecord{}
+	}
+	if state.ArtifactRecords == nil {
+		state.ArtifactRecords = map[string]ArtifactRecord{}
+	}
+	if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM transcript_deliveries WHERE outbox_id = ?`, []any{outboxID}, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }); err != nil {
+		return err
+	}
+	if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM helper_deliveries WHERE outbox_id = ?`, []any{outboxID}, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }); err != nil {
+		return err
+	}
+	if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM artifact_records WHERE outbox_id = ?`, []any{outboxID}, state.ArtifactRecords, func(v ArtifactRecord) string { return v.ID }); err != nil {
+		return err
+	}
+	return nil
+}
+
+func upsertSQLiteOutboxLinkedRecordsTx(ctx context.Context, tx *sql.Tx, state State) error {
+	for _, delivery := range state.TranscriptDeliveries {
+		if err := upsertSQLiteTranscriptDeliveryTx(ctx, tx, delivery); err != nil {
+			return err
+		}
+	}
+	for _, delivery := range state.HelperDeliveries {
+		if err := upsertSQLiteHelperDeliveryTx(ctx, tx, delivery); err != nil {
+			return err
+		}
+	}
+	for _, record := range state.ArtifactRecords {
+		if err := upsertSQLiteArtifactRecordTx(ctx, tx, record); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) turnByIDSQLite(ctx context.Context, turnID string) (Turn, bool, bool, error) {
@@ -1952,6 +2506,11 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 					state.Sessions[sessionID] = session
 				}
 			}
+			if loadCold {
+				if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
+					return err
+				}
+			}
 			now := time.Now()
 			next, err := fn(&state, current, now)
 			if err != nil {
@@ -1963,6 +2522,9 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 				return err
 			}
 			if loadCold {
+				if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
+					return err
+				}
 				if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
 					return err
 				}
@@ -2071,6 +2633,9 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 					state.MessageProvenance[id] = existing
 				}
 			}
+			if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
+				return err
+			}
 			now := time.Now()
 			msg := current
 			if sent {
@@ -2104,6 +2669,9 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 				if err := upsertSQLiteProvenanceTx(ctx, tx, record); err != nil {
 					return err
 				}
+			}
+			if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
+				return err
 			}
 			if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
 				return err

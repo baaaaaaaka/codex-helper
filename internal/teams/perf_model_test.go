@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -608,6 +609,170 @@ func benchmarkCXPPerfModelDaemonOutboxFlushProfilesWithBackend(b *testing.B, bac
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteMainLoopIdleTickProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		profile.MessagesPerPoll = 0
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			graph := newCXPPerfGraph(profile)
+			bridge := newCXPPerfBridge(store, graph, profile)
+			bridge.asyncTurns = true
+			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			cxpPerfPrepareActiveOwner(b, bridge)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+			opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := cxpPerfRunMainLoopIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*11*time.Second)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+					b.Fatalf("main loop idle tick: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteLeaseOwnerHeartbeatProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+			cxpPerfPrepareActiveOwner(b, bridge)
+			ctx := context.Background()
+			b.Run("lease-refresh", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					active, err := bridge.refreshControlLease(ctx)
+					if err != nil {
+						b.Fatalf("refresh control lease: %v", err)
+					}
+					if !active {
+						b.Fatal("control lease unexpectedly inactive")
+					}
+				}
+			})
+			b.Run("owner-heartbeat", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := bridge.recordCurrentOwnerHeartbeat(ctx); err != nil {
+						b.Fatalf("owner heartbeat: %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfQueuePendingOutbox(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			ctx := context.Background()
+			benchState := func(name string, fn func(context.Context) (teamstore.State, error)) {
+				b.Run(name, func(b *testing.B) {
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						if _, err := fn(ctx); err != nil {
+							b.Fatalf("%s: %v", name, err)
+						}
+					}
+				})
+			}
+			benchState("poll-schedule", store.PollScheduleSnapshot)
+			benchState("queued-turns", store.QueuedTurnStateSnapshot)
+			benchState("workflow-notifications", store.WorkflowNotificationStateSnapshot)
+			b.Run("pending-outbox", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := store.PendingOutbox(ctx); err != nil {
+						b.Fatalf("pending outbox: %v", err)
+					}
+				}
+			})
+			b.Run("deferred-inbound", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := store.DeferredInbound(ctx); err != nil {
+						b.Fatalf("deferred inbound: %v", err)
+					}
+				}
+			})
+			b.Run("read-owner", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, _, err := store.ReadOwner(ctx); err != nil {
+						b.Fatalf("read owner: %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelLinkedTranscriptIdleManySessions(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		profile.MessagesPerPoll = 0
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 23, 10, 30, 0, 0, time.UTC)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				bridge.lastTranscriptSync = time.Time{}
+				if err := bridge.syncLinkedTranscriptsIfDue(ctx, now.Add(time.Duration(i)*transcriptSyncMinInterval)); err != nil {
+					b.Fatalf("linked transcript idle sync: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteQueuedTurnsBlockedNoProgressProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedQueuedTurns(b, store, profile)
+			cxpPerfSeedBlockedTranscriptImports(b, store, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+			bridge.asyncTurns = true
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := bridge.processQueuedTurns(ctx); err != nil {
+					b.Fatalf("blocked queued turns: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkCXPPerfModelListenOnceProfiles(b *testing.B) {
 	for _, profile := range cxpPerfProfiles {
 		profile := profile
@@ -855,6 +1020,304 @@ func cxpPerfSeedQueuedTurns(tb testing.TB, store *teamstore.Store, profile cxpPe
 	}); err != nil {
 		tb.Fatalf("seed queued turns: %v", err)
 	}
+}
+
+func cxpPerfSeedBlockedTranscriptImports(tb testing.TB, store *teamstore.Store, profile cxpPerfProfile) {
+	tb.Helper()
+	now := time.Date(2026, 5, 23, 8, 50, 0, 0, time.UTC)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		for chat := 0; chat < profile.WorkChats; chat++ {
+			sessionID := cxpPerfSessionID(chat)
+			state.ImportCheckpoints[transcriptCheckpointID(sessionID)] = teamstore.ImportCheckpoint{
+				ID:        transcriptCheckpointID(sessionID),
+				SessionID: sessionID,
+				Status:    importCheckpointStatusImporting,
+				UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed blocked transcript imports: %v", err)
+	}
+}
+
+func cxpPerfSeedColdRuntimeMetadata(tb testing.TB, store *teamstore.Store, profile cxpPerfProfile) {
+	tb.Helper()
+	count := cxpPerfColdRuntimeRecordCount(profile)
+	if count <= 0 {
+		return
+	}
+	now := time.Date(2026, 5, 23, 8, 55, 0, 0, time.UTC)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		for i := 0; i < count; i++ {
+			sessionID := cxpPerfSessionID(i % max(1, profile.WorkChats))
+			chatID := cxpPerfChatID(i % max(1, profile.WorkChats))
+			turnID := fmt.Sprintf("perf-cold-turn-%05d", i)
+			sourcePath := fmt.Sprintf("/tmp/cxp-perf/history/session-%05d.jsonl", i%max(1, profile.HistoryFiles))
+			text := cxpPerfText(max(32, min(profile.MessageBytes, 512)))
+			hash := normalizedTextHash(text)
+			state.TranscriptLedger[fmt.Sprintf("perf-ledger-%05d", i)] = teamstore.TranscriptLedgerRecord{
+				ID:             fmt.Sprintf("perf-ledger-%05d", i),
+				SessionID:      sessionID,
+				CodexThreadID:  fmt.Sprintf("perf-thread-%03d", i%max(1, profile.WorkChats)),
+				SourcePath:     sourcePath,
+				SourceLine:     i + 1,
+				SourceRecordID: fmt.Sprintf("perf-record-%05d", i),
+				Kind:           "assistant",
+				OutboxID:       fmt.Sprintf("perf-outbox-cold-%05d", i),
+				ImportedAt:     now.Add(time.Duration(i) * time.Millisecond),
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			state.TranscriptDeliveries[fmt.Sprintf("perf-delivery-%05d", i)] = teamstore.TranscriptDeliveryRecord{
+				ID:             fmt.Sprintf("perf-delivery-%05d", i),
+				SessionID:      sessionID,
+				CodexThreadID:  fmt.Sprintf("perf-thread-%03d", i%max(1, profile.WorkChats)),
+				SourcePath:     sourcePath,
+				SourceLine:     i + 1,
+				SourceOffset:   int64(i * 128),
+				SourceRecordID: fmt.Sprintf("perf-record-%05d", i),
+				Kind:           "assistant",
+				TextHash:       hash,
+				OutboxID:       fmt.Sprintf("perf-outbox-cold-%05d", i),
+				Status:         teamstore.TranscriptDeliveryStatusSent,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				SentAt:         now,
+			}
+			state.HelperDeliveries[fmt.Sprintf("perf-helper-delivery-%05d", i)] = teamstore.HelperDeliveryRecord{
+				ID:             fmt.Sprintf("perf-helper-delivery-%05d", i),
+				SessionID:      sessionID,
+				TeamsChatID:    chatID,
+				CodexThreadID:  fmt.Sprintf("perf-thread-%03d", i%max(1, profile.WorkChats)),
+				TurnID:         turnID,
+				Kind:           "final",
+				KindFamily:     "answer",
+				SourceTextHash: hash,
+				RenderedHash:   hash,
+				VisibleHash:    hash,
+				OutboxID:       fmt.Sprintf("perf-outbox-cold-%05d", i),
+				TeamsMessageID: fmt.Sprintf("perf-teams-helper-%05d", i),
+				PartIndex:      1,
+				PartCount:      1,
+				Status:         teamstore.HelperDeliveryStatusSent,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				SentAt:         now,
+			}
+			state.Notifications[fmt.Sprintf("perf-notification-%05d", i)] = teamstore.NotificationRecord{
+				ID:             fmt.Sprintf("perf-notification-%05d", i),
+				SessionID:      sessionID,
+				TurnID:         turnID,
+				Kind:           "turn_completed",
+				OutboxID:       fmt.Sprintf("perf-outbox-cold-%05d", i),
+				Status:         teamstore.NotificationStatusSent,
+				Title:          "perf notification",
+				ChatTitle:      "perf chat",
+				RequestSummary: text,
+				SentAt:         now,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			state.ArtifactRecords[fmt.Sprintf("perf-artifact-%05d", i)] = teamstore.ArtifactRecord{
+				ID:             fmt.Sprintf("perf-artifact-%05d", i),
+				SessionID:      sessionID,
+				TurnID:         turnID,
+				Path:           fmt.Sprintf("reports/perf-%05d.txt", i),
+				UploadName:     fmt.Sprintf("perf-%05d.txt", i),
+				DriveItemID:    fmt.Sprintf("drive-item-%05d", i),
+				OutboxID:       fmt.Sprintf("perf-outbox-cold-%05d", i),
+				TeamsMessageID: fmt.Sprintf("perf-teams-artifact-%05d", i),
+				Status:         "uploaded",
+				UploadedAt:     now,
+				SentAt:         now,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+		}
+		state.HistoryWatchReady = now
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed cold runtime metadata: %v", err)
+	}
+}
+
+func cxpPerfColdRuntimeRecordCount(profile cxpPerfProfile) int {
+	fromTurns := profile.WorkChats * max(1, profile.TurnsPerChat) / 4
+	fromHistory := profile.HistoryFiles * max(1, profile.HistoryLines) / 8
+	count := max(profile.WorkChats*4, max(fromTurns, fromHistory))
+	return max(0, min(count, 4096))
+}
+
+func cxpPerfSeedLinkedTranscriptFiles(tb testing.TB, store *teamstore.Store, bridge *Bridge, profile cxpPerfProfile) {
+	tb.Helper()
+	root := filepath.Join(tb.TempDir(), "codex-home")
+	transcriptRoot := filepath.Join(root, "sessions", "2026", "05", "23")
+	if err := os.MkdirAll(transcriptRoot, 0o700); err != nil {
+		tb.Fatalf("mkdir transcript root: %v", err)
+	}
+	now := time.Date(2026, 5, 23, 9, 15, 0, 0, time.UTC)
+	if bridge != nil {
+		bridge.scope.CodexHome = root
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Scope.CodexHome = root
+		lineCount := max(1, min(profile.HistoryLines, 256))
+		for chat := 0; chat < profile.WorkChats; chat++ {
+			sessionID := cxpPerfSessionID(chat)
+			threadID := fmt.Sprintf("perf-thread-%03d", chat)
+			path := filepath.Join(transcriptRoot, threadID+".jsonl")
+			data := cxpPerfTranscriptContent(threadID, lineCount, profile.MessageBytes)
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				return err
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				return err
+			}
+			if session, ok := state.Sessions[sessionID]; ok {
+				session.CodexThreadID = threadID
+				session.CodexHome = root
+				state.Sessions[sessionID] = session
+			}
+			if bridge != nil {
+				for i := range bridge.reg.Sessions {
+					if bridge.reg.Sessions[i].ID == sessionID {
+						bridge.reg.Sessions[i].CodexThreadID = threadID
+						break
+					}
+				}
+			}
+			state.ImportCheckpoints[transcriptCheckpointID(sessionID)] = teamstore.ImportCheckpoint{
+				ID:             transcriptCheckpointID(sessionID),
+				SessionID:      sessionID,
+				SourcePath:     path,
+				LastRecordID:   fmt.Sprintf("record-%s-%04d", threadID, lineCount-1),
+				LastSourceLine: lineCount + 1,
+				LastOffset:     int64(len(data)),
+				SourceSize:     info.Size(),
+				SourceModTime:  info.ModTime(),
+				Status:         importCheckpointStatusComplete,
+				UpdatedAt:      now,
+			}
+			state.HistoryWatch[historyWatchCheckpointID(path)] = teamstore.HistoryWatchCheckpoint{
+				ID:        historyWatchCheckpointID(path),
+				Path:      path,
+				Size:      info.Size(),
+				ModTime:   info.ModTime(),
+				Offset:    int64(len(data)),
+				Line:      lineCount + 1,
+				SessionID: sessionID,
+				ThreadID:  threadID,
+				TurnID:    fmt.Sprintf("perf-watch-turn-%03d", chat),
+				UpdatedAt: now,
+			}
+		}
+		state.HistoryWatchReady = now
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed linked transcript files: %v", err)
+	}
+}
+
+func cxpPerfTranscriptContent(threadID string, lines int, messageBytes int) string {
+	var b strings.Builder
+	b.WriteString(`{"type":"session_meta","payload":{"id":`)
+	b.WriteString(strconv.Quote(threadID))
+	b.WriteString("}}\n")
+	text := cxpPerfText(max(16, min(messageBytes, 512)))
+	base := time.Date(2026, 5, 23, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < lines; i++ {
+		b.WriteString(`{"timestamp":`)
+		b.WriteString(strconv.Quote(base.Add(time.Duration(i) * time.Millisecond).Format(time.RFC3339Nano)))
+		b.WriteString(`,"type":"event_msg","payload":{"type":"agent_message","id":`)
+		b.WriteString(strconv.Quote(fmt.Sprintf("record-%s-%04d", threadID, i)))
+		b.WriteString(`,"turn_id":`)
+		b.WriteString(strconv.Quote(fmt.Sprintf("turn-%s-%04d", threadID, i)))
+		b.WriteString(`,"phase":"final_answer","message":`)
+		b.WriteString(strconv.Quote(text))
+		b.WriteString("}}\n")
+	}
+	return b.String()
+}
+
+func cxpPerfPrepareActiveOwner(tb testing.TB, bridge *Bridge) {
+	tb.Helper()
+	ctx := context.Background()
+	active, err := bridge.claimControlLease(ctx)
+	if err != nil {
+		tb.Fatalf("claim control lease: %v", err)
+	}
+	if !active {
+		tb.Fatal("control lease unexpectedly inactive")
+	}
+	owner, err := teamstore.CurrentOwner("", "", "", time.Date(2026, 5, 23, 9, 30, 0, 0, time.UTC))
+	if err != nil {
+		tb.Fatalf("current owner: %v", err)
+	}
+	bridge.setOwner(owner, 18*time.Second)
+	if err := bridge.recordCurrentOwnerHeartbeat(ctx); err != nil {
+		tb.Fatalf("initial owner heartbeat: %v", err)
+	}
+}
+
+func cxpPerfRunMainLoopIdleTick(ctx context.Context, bridge *Bridge, opts BridgeOptions, now time.Time) error {
+	bridge.lastTranscriptSync = time.Time{}
+	bridge.lastHistoryWatchSync = time.Time{}
+	bridge.lastHistoryWatchReconcile = now
+	bridge.lastBeaconReconcile = time.Time{}
+	bridge.lastBeaconLeaseMaintenance = time.Time{}
+	if active, err := bridge.refreshControlLease(ctx); err != nil {
+		return err
+	} else if !active {
+		return teamstore.ErrControlLeaseNotHeld
+	}
+	if err := bridge.recordCurrentOwnerHeartbeat(ctx); err != nil {
+		return err
+	}
+	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil && !isOutboxDeliveryDeferred(err) {
+		return err
+	}
+	if err := bridge.flushPendingWorkflowNotificationsWithLimit(ctx, mainLoopWorkflowFlushMaxNotifications); err != nil {
+		return err
+	}
+	if err := bridge.pollOnce(ctx, opts.Top); err != nil && !isGraphRateLimitError(err) {
+		return err
+	}
+	if err := bridge.syncLinkedTranscriptsIfDue(ctx, now); err != nil {
+		return err
+	}
+	if err := bridge.syncCodexHistoryFinalsIfDue(ctx, now); err != nil {
+		return err
+	}
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+		return err
+	}
+	if _, err := bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil {
+		return err
+	}
+	if err := bridge.maybeRunPendingCodexUpgrade(ctx); err != nil {
+		return err
+	}
+	if err := bridge.maybeRunBeaconReconcile(ctx, now); err != nil {
+		return err
+	}
+	if err := bridge.maybeRunBeaconLeaseMaintenance(ctx, now); err != nil {
+		return err
+	}
+	if _, err := bridge.drainComplete(ctx); err != nil {
+		return err
+	}
+	if err := bridge.processDeferredInbound(ctx); err != nil {
+		return err
+	}
+	if err := bridge.processQueuedTurns(ctx); err != nil {
+		return err
+	}
+	if err := bridge.sendDeferredInterruptedTurnNotices(ctx); err != nil {
+		return err
+	}
+	return bridge.Save()
 }
 
 func cxpPerfDrainAsyncTurns(ctx context.Context, bridge *Bridge) error {

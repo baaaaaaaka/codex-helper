@@ -8019,7 +8019,6 @@ func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, se
 		Line:      checkpoint.LastSourceLine,
 		SessionID: firstNonEmptyString(local.SessionID, session.CodexThreadID),
 		ThreadID:  firstNonEmptyString(observed.CodexThreadID, turn.CodexThreadID, local.SessionID, session.CodexThreadID),
-		TurnID:    firstNonEmptyString(observed.CodexTurnID, turn.CodexTurnID),
 	}
 	return b.completedTurnResultFromLocalCodexHistorySince(ctx, session, turn, observed, local, previous)
 }
@@ -8036,8 +8035,12 @@ func executionResultWithTranscriptFinal(observed ExecutionResult, transcriptResu
 }
 
 func mergeObservedArtifactManifestsIntoTranscriptFinal(transcriptText string, observedText string) string {
-	if len(ExtractArtifactManifestBlocks(transcriptText)) > 0 {
+	transcriptBlocks := ExtractArtifactManifestBlocks(transcriptText)
+	if hasUsableArtifactManifestBlock(transcriptBlocks) {
 		return transcriptText
+	}
+	if len(transcriptBlocks) > 0 {
+		transcriptText = StripArtifactManifestBlocks(transcriptText)
 	}
 	blocks := ExtractArtifactManifestBlocks(observedText)
 	if len(blocks) == 0 {
@@ -8054,6 +8057,19 @@ func mergeObservedArtifactManifestsIntoTranscriptFinal(transcriptText string, ob
 		text += "```" + ArtifactManifestFenceInfo + "\n" + strings.TrimSpace(string(block)) + "\n```"
 	}
 	return text
+}
+
+func hasUsableArtifactManifestBlock(blocks [][]byte) bool {
+	for _, block := range blocks {
+		if IsPlaceholderArtifactManifestBlock(block) {
+			continue
+		}
+		plan, err := ParseArtifactManifest(block, ArtifactManifestOptions{})
+		if err == nil && len(plan.Files) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) completedTurnResultFromCodexHistory(ctx context.Context, session *Session, turn teamstore.Turn, observed ExecutionResult) (ExecutionResult, bool) {
@@ -8093,6 +8109,9 @@ func (b *Bridge) completedTurnResultFromLocalCodexHistorySince(ctx context.Conte
 		return ExecutionResult{}, false
 	}
 	if scan.TooLarge {
+		if observedTurnID != "" {
+			return ExecutionResult{}, false
+		}
 		scan, err = historyTieredScanTail(local.FilePath, previous, 0)
 		if err != nil {
 			return ExecutionResult{}, false
@@ -8112,8 +8131,10 @@ func (b *Bridge) completedTurnResultFromLocalCodexHistorySince(ctx context.Conte
 		if strings.TrimSpace(final.Record.ThreadID) != "" && strings.TrimSpace(final.Record.ThreadID) != strings.TrimSpace(threadID) {
 			continue
 		}
-		if observedTurnID != "" && strings.TrimSpace(final.Record.TurnID) != "" && strings.TrimSpace(final.Record.TurnID) != observedTurnID {
-			continue
+		if observedTurnID != "" {
+			if strings.TrimSpace(final.Record.TurnID) != observedTurnID {
+				continue
+			}
 		}
 		if !threshold.IsZero() {
 			if final.Record.CreatedAt.IsZero() || final.Record.CreatedAt.Before(threshold) {
@@ -12915,7 +12936,11 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 		if activeTeamsTurns[session.ID] {
 			continue
 		}
-		if local, ok := linkedTranscriptLocalFromCheckpoint(session, state.ImportCheckpoints[transcriptCheckpointID(session.ID)]); ok {
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		if local, ok := linkedTranscriptLocalFromCheckpoint(session, checkpoint); ok {
+			if linkedTranscriptCheckpointIdleUnchanged(local.FilePath, checkpoint) {
+				continue
+			}
 			if err := b.syncSessionTranscript(ctx, session, local); err != nil {
 				return err
 			}
@@ -13244,6 +13269,19 @@ func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportC
 		return false
 	}
 	return info.Size() == checkpoint.SourceSize && info.ModTime().Equal(checkpoint.SourceModTime)
+}
+
+func linkedTranscriptCheckpointIdleUnchanged(filePath string, checkpoint teamstore.ImportCheckpoint) bool {
+	if checkpoint.Status != importCheckpointStatusComplete {
+		return false
+	}
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		return false
+	}
+	if transcriptImportCheckpointNeedsBudgetedResume(checkpoint, filePath) {
+		return false
+	}
+	return linkedCheckpointFileUnchanged(filePath, checkpoint)
 }
 
 func transcriptImportCheckpointNeedsBudgetedResume(checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {

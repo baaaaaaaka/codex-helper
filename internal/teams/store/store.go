@@ -1466,109 +1466,120 @@ func (s *Store) ClaimControlLease(ctx context.Context, claim ControlLeaseClaim) 
 	if now.IsZero() {
 		now = time.Now()
 	}
+	claim.Now = now
+	if out, handled, err := s.claimControlLeaseSQLite(ctx, claim); handled || err != nil {
+		return out, err
+	}
 	var out ControlLeaseDecision
 	err := s.Update(ctx, func(state *State) error {
-		storedScope := state.Scope
-		if state.Scope.ID != "" && state.Scope.ID != claim.Scope.ID {
-			return fmt.Errorf("Teams state belongs to scope %q, not %q", state.Scope.ID, claim.Scope.ID)
-		}
-		if state.Scope.ID == "" {
-			claim.Scope.CreatedAt = now
-		} else if !state.Scope.CreatedAt.IsZero() {
-			claim.Scope.CreatedAt = state.Scope.CreatedAt
-		}
-		claim.Scope.UpdatedAt = now
-		state.Scope = claim.Scope
-
-		machine := claim.Machine
-		existingMachine := state.Machines[machine.ID]
-		if !existingMachine.CreatedAt.IsZero() {
-			machine.CreatedAt = existingMachine.CreatedAt
-		}
-		if machine.CreatedAt.IsZero() {
-			machine.CreatedAt = now
-		}
-		machine.LastSeen = now
-		machine.UpdatedAt = now
-
-		existing := state.ControlLease
-		existingLive := existing.HolderMachineID != "" && existing.ScopeID == claim.Scope.ID && existing.LeaseUntil.After(now)
-		sameHolder := existingLive && existing.HolderMachineID == machine.ID
-		liveLeaseOwner := false
-		sameOwner := false
-		protectedActiveTurn := false
-		if owner, ok := state.readOwner(); ok {
-			sameOwner = sameOwnerProcess(owner, claim.Owner)
-			liveLeaseOwner = existingLive &&
-				owner.MachineID == existing.HolderMachineID &&
-				owner.LeaseGeneration == existing.Generation &&
-				!IsStale(owner, claim.Duration, now) &&
-				!OwnerAppearsLocallyDead(owner)
-			protectedActiveTurn = liveLeaseOwner && owner.ActiveTurnID != ""
-		}
-		canClaim := !existingLive || sameHolder && (!liveLeaseOwner || sameOwner) || machine.Priority > existing.Priority && !liveLeaseOwner && !protectedActiveTurn
-		if canClaim {
-			if sameHolder && sameOwner && existing.Generation > 0 && existing.LeaseUntil.After(now.Add(claim.Duration/2)) &&
-				scopeClaimMatchesStored(storedScope, claim.Scope) &&
-				existingMachine.Status == MachineStatusActive &&
-				machineClaimMatchesStored(existingMachine, machine) {
-				holder := existingMachine
-				if holder.ID == "" {
-					holder = machine
-				}
-				holder.Status = MachineStatusActive
-				out = ControlLeaseDecision{Mode: LeaseModeActive, Lease: existing, Holder: holder}
-				return errStoreNoChange
-			}
-			if sameHolder {
-				if existing.Generation <= 0 {
-					existing.Generation = 1
-				}
-			} else {
-				if previous := state.Machines[existing.HolderMachineID]; previous.ID != "" {
-					previous.Status = MachineStatusStandby
-					previous.UpdatedAt = now
-					state.Machines[previous.ID] = previous
-				}
-				existing.Generation++
-				if existing.Generation <= 0 {
-					existing.Generation = 1
-				}
-			}
-			existing.ScopeID = claim.Scope.ID
-			existing.HolderMachineID = machine.ID
-			existing.HolderKind = machine.Kind
-			existing.Priority = machine.Priority
-			existing.Status = ControlLeaseStatusActive
-			existing.LeaseUntil = now.Add(claim.Duration)
-			existing.LastHeartbeat = now
-			existing.UpdatedAt = now
-			state.ControlLease = existing
-			machine.Status = MachineStatusActive
-			state.Machines[machine.ID] = machine
-			state.MachineIdentity = machine.toMachineIdentity()
-			out = ControlLeaseDecision{Mode: LeaseModeActive, Lease: existing, Holder: machine}
-			return nil
-		}
-
-		machine.Status = MachineStatusStandby
-		state.Machines[machine.ID] = machine
-		holder := state.Machines[existing.HolderMachineID]
-		if holder.ID == "" {
-			holder.ID = existing.HolderMachineID
-			holder.Kind = existing.HolderKind
-			holder.Priority = existing.Priority
-			holder.Status = MachineStatusActive
-		}
-		out = ControlLeaseDecision{
-			Mode:   LeaseModeStandby,
-			Lease:  existing,
-			Holder: holder,
-			Reason: fmt.Sprintf("control lease is held by %s (%s)", existing.HolderMachineID, existing.HolderKind),
-		}
-		return nil
+		decision, err := claimControlLeaseInState(state, claim)
+		out = decision
+		return err
 	})
 	return out, err
+}
+
+func claimControlLeaseInState(state *State, claim ControlLeaseClaim) (ControlLeaseDecision, error) {
+	now := claim.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	storedScope := state.Scope
+	if state.Scope.ID != "" && state.Scope.ID != claim.Scope.ID {
+		return ControlLeaseDecision{}, fmt.Errorf("Teams state belongs to scope %q, not %q", state.Scope.ID, claim.Scope.ID)
+	}
+	if state.Scope.ID == "" {
+		claim.Scope.CreatedAt = now
+	} else if !state.Scope.CreatedAt.IsZero() {
+		claim.Scope.CreatedAt = state.Scope.CreatedAt
+	}
+	claim.Scope.UpdatedAt = now
+	state.Scope = claim.Scope
+
+	machine := claim.Machine
+	existingMachine := state.Machines[machine.ID]
+	if !existingMachine.CreatedAt.IsZero() {
+		machine.CreatedAt = existingMachine.CreatedAt
+	}
+	if machine.CreatedAt.IsZero() {
+		machine.CreatedAt = now
+	}
+	machine.LastSeen = now
+	machine.UpdatedAt = now
+
+	existing := state.ControlLease
+	existingLive := existing.HolderMachineID != "" && existing.ScopeID == claim.Scope.ID && existing.LeaseUntil.After(now)
+	sameHolder := existingLive && existing.HolderMachineID == machine.ID
+	liveLeaseOwner := false
+	sameOwner := false
+	protectedActiveTurn := false
+	if owner, ok := state.readOwner(); ok {
+		sameOwner = sameOwnerProcess(owner, claim.Owner)
+		liveLeaseOwner = existingLive &&
+			owner.MachineID == existing.HolderMachineID &&
+			owner.LeaseGeneration == existing.Generation &&
+			!IsStale(owner, claim.Duration, now) &&
+			!OwnerAppearsLocallyDead(owner)
+		protectedActiveTurn = liveLeaseOwner && owner.ActiveTurnID != ""
+	}
+	canClaim := !existingLive || sameHolder && (!liveLeaseOwner || sameOwner) || machine.Priority > existing.Priority && !liveLeaseOwner && !protectedActiveTurn
+	if canClaim {
+		if sameHolder && sameOwner && existing.Generation > 0 && existing.LeaseUntil.After(now.Add(claim.Duration/2)) &&
+			scopeClaimMatchesStored(storedScope, claim.Scope) &&
+			existingMachine.Status == MachineStatusActive &&
+			machineClaimMatchesStored(existingMachine, machine) {
+			holder := existingMachine
+			if holder.ID == "" {
+				holder = machine
+			}
+			holder.Status = MachineStatusActive
+			return ControlLeaseDecision{Mode: LeaseModeActive, Lease: existing, Holder: holder}, errStoreNoChange
+		}
+		if sameHolder {
+			if existing.Generation <= 0 {
+				existing.Generation = 1
+			}
+		} else {
+			if previous := state.Machines[existing.HolderMachineID]; previous.ID != "" {
+				previous.Status = MachineStatusStandby
+				previous.UpdatedAt = now
+				state.Machines[previous.ID] = previous
+			}
+			existing.Generation++
+			if existing.Generation <= 0 {
+				existing.Generation = 1
+			}
+		}
+		existing.ScopeID = claim.Scope.ID
+		existing.HolderMachineID = machine.ID
+		existing.HolderKind = machine.Kind
+		existing.Priority = machine.Priority
+		existing.Status = ControlLeaseStatusActive
+		existing.LeaseUntil = now.Add(claim.Duration)
+		existing.LastHeartbeat = now
+		existing.UpdatedAt = now
+		state.ControlLease = existing
+		machine.Status = MachineStatusActive
+		state.Machines[machine.ID] = machine
+		state.MachineIdentity = machine.toMachineIdentity()
+		return ControlLeaseDecision{Mode: LeaseModeActive, Lease: existing, Holder: machine}, nil
+	}
+
+	machine.Status = MachineStatusStandby
+	state.Machines[machine.ID] = machine
+	holder := state.Machines[existing.HolderMachineID]
+	if holder.ID == "" {
+		holder.ID = existing.HolderMachineID
+		holder.Kind = existing.HolderKind
+		holder.Priority = existing.Priority
+		holder.Status = MachineStatusActive
+	}
+	return ControlLeaseDecision{
+		Mode:   LeaseModeStandby,
+		Lease:  existing,
+		Holder: holder,
+		Reason: fmt.Sprintf("control lease is held by %s (%s)", existing.HolderMachineID, existing.HolderKind),
+	}, nil
 }
 
 func scopeClaimMatchesStored(existing ScopeIdentity, claim ScopeIdentity) bool {
@@ -1601,6 +1612,9 @@ func (s *Store) ValidateControlLease(ctx context.Context, machineID string, gene
 	}
 	if now.IsZero() {
 		now = time.Now()
+	}
+	if lease, handled, err := s.validateControlLeaseSQLite(ctx, machineID, generation, now); handled || err != nil {
+		return lease, err
 	}
 	state, err := s.Load(ctx)
 	if err != nil {
@@ -2043,36 +2057,47 @@ func allowUnresolvedGoTestOwnerExecutable(class helperpath.Classification) bool 
 }
 
 func (s *Store) RecordOwnerHeartbeat(ctx context.Context, owner OwnerMetadata, staleAfter time.Duration, now time.Time) (OwnerMetadata, error) {
+	if out, handled, err := s.recordOwnerHeartbeatSQLite(ctx, owner, staleAfter, now); handled || err != nil {
+		return out, err
+	}
 	var out OwnerMetadata
 	err := s.Update(ctx, func(state *State) error {
-		if now.IsZero() {
-			now = time.Now()
-		}
-		next, err := owner.withHeartbeat(now)
-		if err != nil {
-			return err
-		}
-		if existing, ok := state.readOwner(); ok {
-			if sameOwnerProcess(existing, next) {
-				if !existing.StartedAt.IsZero() {
-					next.StartedAt = existing.StartedAt
-				}
-			} else if !IsStale(existing, staleAfter, now) && !OwnerAppearsLocallyDead(existing) {
-				return &OwnerConflictError{
-					Existing:   existing,
-					Now:        now,
-					StaleAfter: staleAfter,
-				}
-			}
-		}
-		state.writeOwner(next)
+		next, err := recordOwnerHeartbeatInState(state, owner, staleAfter, now)
 		out = next
-		return nil
+		return err
 	})
 	return out, err
 }
 
+func recordOwnerHeartbeatInState(state *State, owner OwnerMetadata, staleAfter time.Duration, now time.Time) (OwnerMetadata, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	next, err := owner.withHeartbeat(now)
+	if err != nil {
+		return OwnerMetadata{}, err
+	}
+	if existing, ok := state.readOwner(); ok {
+		if sameOwnerProcess(existing, next) {
+			if !existing.StartedAt.IsZero() {
+				next.StartedAt = existing.StartedAt
+			}
+		} else if !IsStale(existing, staleAfter, now) && !OwnerAppearsLocallyDead(existing) {
+			return OwnerMetadata{}, &OwnerConflictError{
+				Existing:   existing,
+				Now:        now,
+				StaleAfter: staleAfter,
+			}
+		}
+	}
+	state.writeOwner(next)
+	return next, nil
+}
+
 func (s *Store) ReadOwner(ctx context.Context) (OwnerMetadata, bool, error) {
+	if owner, ok, handled, err := s.readOwnerSQLite(ctx); handled || err != nil {
+		return owner, ok, err
+	}
 	state, err := s.Load(ctx)
 	if err != nil {
 		return OwnerMetadata{}, false, err

@@ -17513,6 +17513,42 @@ func TestBridgeCompletesTurnWithTranscriptFinalForCanonicalDedupe(t *testing.T) 
 	}
 }
 
+func TestBridgeCompletesNonStreamingTurnWithTranscriptFinalForCanonicalDedupe(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-final-nonstreaming"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-canonical-final-nonstreaming", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	liveFinal := "runner final from non-streaming executor"
+	transcriptFinal := "canonical non-streaming final from transcript"
+	codexTurnID := "codex-turn-canonical-final-nonstreaming"
+	executor := &recordingExecutor{result: ExecutionResult{Text: liveFinal, CodexThreadID: "thread-canonical-final-nonstreaming", CodexTurnID: codexTurnID}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-canonical-final-nonstreaming")
+	line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-1","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(transcriptFinal) + `}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial+line), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	_ = session
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-canonical-final-nonstreaming"), "produce final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, transcriptFinal) {
+		t.Fatalf("non-streaming final did not use transcript canonical text:\n%s", joined)
+	}
+	if strings.Contains(joined, liveFinal) {
+		t.Fatalf("non-streaming runner-only final leaked despite transcript final:\n%s", joined)
+	}
+}
+
 func TestBridgeStreamingFinalUsesTranscriptCanonicalBeforeClosingForwarder(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-stream-canonical-final"}}` + "\n" +
@@ -17677,6 +17713,93 @@ func TestBridgeTranscriptCanonicalFinalPreservesObservedArtifactManifest(t *test
 	}
 }
 
+func TestBridgeTranscriptCanonicalFinalPreservesObservedArtifactManifestWhenTranscriptManifestIsPlaceholder(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	cfg, err := DefaultFileWriteAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
+	}
+	if err := writeTokenCache(cfg.CachePath, TokenCache{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("write token cache: %v", err)
+	}
+	root, err := DefaultOutboundRoot()
+	if err != nil {
+		t.Fatalf("DefaultOutboundRoot error: %v", err)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir outbound root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "artifact.txt"), []byte("artifact-data"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	transcriptPath := filepath.Join(tmp, "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-placeholder-artifact"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-canonical-placeholder-artifact", transcriptPath)
+	defer restoreDiscover()
+	chatGraph, chatSent := newBridgeTestGraph(t)
+	fileGraph, _ := newOutboundAttachmentGraph(t)
+	store := newBridgeTestStore(t)
+	transcriptFinal := "canonical visible final with placeholder\n```" + ArtifactManifestFenceInfo + "\n" + `{"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}` + "\n```"
+	observedFinal := "runner visible fallback\n```" + ArtifactManifestFenceInfo + "\n" + `{"version":1,"files":[{"path":"artifact.txt","name":"artifact.txt"}]}` + "\n```"
+	codexTurnID := "codex-turn-canonical-placeholder-artifact"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-1","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(transcriptFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: observedFinal, CodexThreadID: "thread-canonical-placeholder-artifact", CodexTurnID: codexTurnID},
+	}
+	bridge := newBridgeTestBridge(chatGraph, store, executor)
+	bridge.fileGraph = fileGraph
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-canonical-placeholder-artifact")
+	_ = session
+	*chatSent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-canonical-placeholder-artifact"), "produce artifact final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*chatSent)
+	if !strings.Contains(joined, "canonical visible final with placeholder") || strings.Contains(joined, "runner visible fallback") || strings.Contains(joined, ArtifactManifestFenceInfo) {
+		t.Fatalf("final should use transcript visible text while hiding artifact manifests:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if len(state.ArtifactRecords) != 1 {
+		t.Fatalf("artifact records = %#v, want observed artifact preserved", state.ArtifactRecords)
+	}
+	for _, artifact := range state.ArtifactRecords {
+		if artifact.Status != "uploaded" || artifact.Path != "artifact.txt" {
+			t.Fatalf("artifact record mismatch: %#v", artifact)
+		}
+	}
+}
+
+func TestMergeObservedArtifactManifestsUsesObservedWhenTranscriptManifestMalformed(t *testing.T) {
+	transcriptText := "canonical visible final\n```" + ArtifactManifestFenceInfo + "\n" + `{"files":[` + "\n```"
+	observedText := "runner fallback\n```" + ArtifactManifestFenceInfo + "\n" + `{"version":1,"files":[{"path":"artifact.txt","name":"artifact.txt"}]}` + "\n```"
+	got := mergeObservedArtifactManifestsIntoTranscriptFinal(transcriptText, observedText)
+	if !strings.Contains(got, "canonical visible final") {
+		t.Fatalf("transcript visible text missing:\n%s", got)
+	}
+	if strings.Contains(got, `{"files":[`) {
+		t.Fatalf("malformed transcript manifest should not poison merged final:\n%s", got)
+	}
+	if !strings.Contains(got, `"path":"artifact.txt"`) {
+		t.Fatalf("observed artifact manifest was not merged:\n%s", got)
+	}
+}
+
 func TestBridgeTranscriptCanonicalFinalRequiresSameCodexTurn(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-turn-filter"}}` + "\n" +
@@ -17710,6 +17833,81 @@ func TestBridgeTranscriptCanonicalFinalRequiresSameCodexTurn(t *testing.T) {
 	}
 	if strings.Contains(joined, otherTurnFinal) {
 		t.Fatalf("used transcript final from a different turn:\n%s", joined)
+	}
+}
+
+func TestBridgeTranscriptCanonicalFinalRejectsMissingCodexTurnWhenObservedTurnKnown(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-missing-turn-filter"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-canonical-missing-turn-filter", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	liveFinal := "current runner final with known codex turn"
+	missingTurnFinal := "missing turn transcript final must not replace current final"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"missing-turn-final","phase":"final_answer","message":` + strconv.Quote(missingTurnFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: liveFinal, CodexThreadID: "thread-canonical-missing-turn-filter", CodexTurnID: "current-codex-turn"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-canonical-missing-turn-filter")
+	_ = session
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-canonical-missing-turn-filter"), "produce current final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, liveFinal) {
+		t.Fatalf("current runner final missing:\n%s", joined)
+	}
+	if strings.Contains(joined, missingTurnFinal) {
+		t.Fatalf("used transcript final without matching turn id:\n%s", joined)
+	}
+}
+
+func TestBridgeTranscriptCanonicalFinalSkipsOversizedTailWhenObservedTurnKnown(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-large-tail"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-canonical-large-tail", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	liveFinal := "runner final should be used when transcript tail is too large"
+	transcriptFinal := "oversized transcript final " + strings.Repeat("x", int(historyTieredMaxTailBytes)+1024)
+	codexTurnID := "current-large-tail-turn"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"large-tail-final","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(transcriptFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: liveFinal, CodexThreadID: "thread-canonical-large-tail", CodexTurnID: codexTurnID},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-canonical-large-tail")
+	_ = session
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-canonical-large-tail"), "produce current final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, liveFinal) {
+		t.Fatalf("runner final missing after oversized transcript tail:\n%s", joined)
+	}
+	if strings.Contains(joined, "oversized transcript final") {
+		t.Fatalf("oversized transcript tail should not replace runner final:\n%s", joined)
 	}
 }
 
@@ -18478,6 +18676,77 @@ func TestLinkedCheckpointFileUnchangedRequiresFullyProcessedOffset(t *testing.T)
 	checkpoint.LastOffset = info.Size()
 	if !linkedCheckpointFileUnchanged(transcriptPath, checkpoint) {
 		t.Fatal("checkpoint at EOF with unchanged stat was not treated as unchanged")
+	}
+}
+
+func TestLinkedTranscriptCheckpointIdleUnchangedOnlySkipsSafeCompleteEOF(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	base := teamstore.ImportCheckpoint{
+		SourcePath:     transcriptPath,
+		LastRecordID:   "old",
+		LastOffset:     info.Size(),
+		SourceSize:     info.Size(),
+		SourceModTime:  info.ModTime(),
+		Status:         importCheckpointStatusComplete,
+		LastSourceLine: 1,
+	}
+	if !linkedTranscriptCheckpointIdleUnchanged(transcriptPath, base) {
+		t.Fatal("complete EOF checkpoint should be skippable when transcript stat is unchanged")
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(teamstore.ImportCheckpoint) teamstore.ImportCheckpoint
+	}{
+		{
+			name: "missing last record",
+			mutate: func(checkpoint teamstore.ImportCheckpoint) teamstore.ImportCheckpoint {
+				checkpoint.LastRecordID = ""
+				return checkpoint
+			},
+		},
+		{
+			name: "failed checkpoint",
+			mutate: func(checkpoint teamstore.ImportCheckpoint) teamstore.ImportCheckpoint {
+				checkpoint.Status = importCheckpointStatusFailed
+				return checkpoint
+			},
+		},
+		{
+			name: "importing checkpoint",
+			mutate: func(checkpoint teamstore.ImportCheckpoint) teamstore.ImportCheckpoint {
+				checkpoint.Status = importCheckpointStatusImporting
+				return checkpoint
+			},
+		},
+		{
+			name: "unprocessed tail",
+			mutate: func(checkpoint teamstore.ImportCheckpoint) teamstore.ImportCheckpoint {
+				checkpoint.LastOffset = checkpoint.SourceSize - 1
+				return checkpoint
+			},
+		},
+		{
+			name: "budgeted resume marker",
+			mutate: func(checkpoint teamstore.ImportCheckpoint) teamstore.ImportCheckpoint {
+				checkpoint.ImportTurnID = "import-bg:session-1"
+				checkpoint.KindPrefix = "import"
+				return checkpoint
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if linkedTranscriptCheckpointIdleUnchanged(transcriptPath, tc.mutate(base)) {
+				t.Fatalf("%s checkpoint was incorrectly treated as idle unchanged", tc.name)
+			}
+		})
 	}
 }
 

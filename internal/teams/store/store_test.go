@@ -7616,6 +7616,166 @@ func TestTeamsBackgroundKeepaliveSameHolderRefreshPreservesGenerationCI(t *testi
 	}
 }
 
+func TestSQLiteOwnerLeaseColdUpdatesPreserveHotTables(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 9, 30, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-1"] = SessionContext{ID: "session-1", TeamsChatID: "chat-1", Status: SessionStatusActive, LatestTurnID: "turn-1", CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-1"] = Turn{ID: "turn-1", SessionID: "session-1", Status: TurnStatusQueued, CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages["outbox-1"] = OutboxMessage{ID: "outbox-1", SessionID: "session-1", TurnID: "turn-1", TeamsChatID: "chat-1", Status: OutboxStatusQueued, Body: "queued message", CreatedAt: now, UpdatedAt: now}
+		state.MessageProvenance["prov-1"] = MessageProvenanceRecord{ID: "prov-1", TeamsChatID: "chat-1", TeamsMessageID: "msg-1", Origin: MessageOriginHelperOutbox, SessionID: "session-1", OutboxID: "outbox-1", CreatedAt: now, UpdatedAt: now}
+		state.ImportCheckpoints["transcript:session-1"] = ImportCheckpoint{ID: "transcript:session-1", SessionID: "session-1", SourcePath: "/tmp/session.jsonl", LastRecordID: "record-1", Status: "complete", UpdatedAt: now}
+		state.TranscriptLedger["ledger-1"] = TranscriptLedgerRecord{ID: "ledger-1", SessionID: "session-1", SourceRecordID: "record-1", CreatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	scope := ScopeIdentity{ID: "scope-1", AccountID: "user-1", OSUser: "alice", Profile: "default"}
+	machine := MachineRecord{ID: "machine-1", ScopeID: scope.ID, Kind: MachineKindPrimary, Hostname: "host-a", Priority: 10}
+	owner := testOwner("session-1", "turn-1", now)
+	owner.ScopeID = scope.ID
+	owner.MachineID = machine.ID
+	decision, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now})
+	if err != nil {
+		t.Fatalf("ClaimControlLease error: %v", err)
+	}
+	if decision.Mode != LeaseModeActive || decision.Lease.HolderMachineID != machine.ID {
+		t.Fatalf("ClaimControlLease decision = %#v, want active machine", decision)
+	}
+	owner.LeaseGeneration = decision.Lease.Generation
+	heartbeatAt := now.Add(10 * time.Second)
+	updated, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, heartbeatAt)
+	if err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	if !updated.LastHeartbeat.Equal(heartbeatAt) || updated.MachineID != machine.ID || updated.LeaseGeneration != decision.Lease.Generation {
+		t.Fatalf("updated owner = %#v", updated)
+	}
+	read, ok, err := store.ReadOwner(ctx)
+	if err != nil {
+		t.Fatalf("ReadOwner error: %v", err)
+	}
+	if !ok || read.MachineID != machine.ID || read.ActiveTurnID != "turn-1" {
+		t.Fatalf("ReadOwner = %#v ok=%v", read, ok)
+	}
+	if _, err := store.ValidateControlLease(ctx, machine.ID, decision.Lease.Generation, now.Add(20*time.Second)); err != nil {
+		t.Fatalf("ValidateControlLease error: %v", err)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if _, ok := state.Sessions["session-1"]; !ok {
+		t.Fatalf("session hot table row was lost: %#v", state.Sessions)
+	}
+	if _, ok := state.Turns["turn-1"]; !ok {
+		t.Fatalf("turn hot table row was lost: %#v", state.Turns)
+	}
+	if outbox := state.OutboxMessages["outbox-1"]; outbox.Body != "queued message" || outbox.Status != OutboxStatusQueued {
+		t.Fatalf("outbox hot table row mutated: %#v", outbox)
+	}
+	if _, ok := state.MessageProvenance["prov-1"]; !ok {
+		t.Fatalf("provenance hot table row was lost: %#v", state.MessageProvenance)
+	}
+	if checkpoint := state.ImportCheckpoints["transcript:session-1"]; checkpoint.LastRecordID != "record-1" || checkpoint.Status != "complete" {
+		t.Fatalf("cold checkpoint mutated unexpectedly: %#v", checkpoint)
+	}
+	if owner, ok := state.readOwner(); !ok || owner.MachineID != machine.ID || !owner.LastHeartbeat.Equal(heartbeatAt) {
+		t.Fatalf("loaded owner = %#v ok=%v", owner, ok)
+	}
+}
+
+func TestSQLiteColdSaveBackfillsSplitTablesFromLegacyStateJSON(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 10, 15, 0, 0, time.UTC)
+	var helperDeliveryID string
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-1"] = SessionContext{ID: "session-1", TeamsChatID: "chat-1", Status: SessionStatusActive, CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-1"] = Turn{ID: "turn-1", SessionID: "session-1", Status: TurnStatusQueued, CreatedAt: now, UpdatedAt: now}
+		msg := OutboxMessage{ID: "outbox-1", SessionID: "session-1", TurnID: "turn-1", TeamsChatID: "chat-1", Kind: "codex-status-001", Status: OutboxStatusQueued, Body: "queued message", CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages[msg.ID] = msg
+		state.ImportCheckpoints["transcript:session-1"] = ImportCheckpoint{ID: "transcript:session-1", SessionID: "session-1", SourcePath: "/tmp/session.jsonl", LastRecordID: "record-1", Status: "complete", UpdatedAt: now}
+		state.TranscriptLedger["ledger-1"] = TranscriptLedgerRecord{ID: "ledger-1", SessionID: "session-1", SourceRecordID: "record-1", CreatedAt: now}
+		state.TranscriptDeliveries["delivery-1"] = TranscriptDeliveryRecord{ID: "delivery-1", SessionID: "session-1", OutboxID: "outbox-1", Status: TranscriptDeliveryStatusQueued, CreatedAt: now}
+		helperDelivery, ok := helperDeliveryRecordFromOutboxLocked(state, msg, HelperDeliveryStatusQueued, now)
+		if !ok {
+			return errors.New("helper delivery could not be derived from seeded outbox")
+		}
+		helperDeliveryID = helperDelivery.ID
+		state.HelperDeliveries[helperDelivery.ID] = helperDelivery
+		state.ArtifactRecords["artifact-1"] = ArtifactRecord{ID: "artifact-1", SessionID: "session-1", TurnID: "turn-1", OutboxID: "outbox-1", Status: "queued", CreatedAt: now}
+		state.Notifications["notification-1"] = NotificationRecord{ID: "notification-1", SessionID: "session-1", TurnID: "turn-1", Status: NotificationStatusQueued, CreatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	migrated := migrateStoreToSQLiteForTest(t, store).State
+	legacyJSON, err := json.Marshal(migrated)
+	if err != nil {
+		t.Fatalf("marshal legacy state json: %v", err)
+	}
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("sqlite pointer missing")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		for _, table := range []string{"import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications"} {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, legacyJSON); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}); err != nil {
+		t.Fatalf("simulate legacy sqlite state json: %v", err)
+	}
+
+	if _, err := store.MarkOutboxSendAttempt(ctx, "outbox-1"); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if _, ok := state.ImportCheckpoints["transcript:session-1"]; !ok {
+		t.Fatalf("import checkpoint was not preserved: %#v", state.ImportCheckpoints)
+	}
+	if _, ok := state.TranscriptLedger["ledger-1"]; !ok {
+		t.Fatalf("transcript ledger was not preserved: %#v", state.TranscriptLedger)
+	}
+	if delivery := state.TranscriptDeliveries["delivery-1"]; delivery.ID == "" || delivery.Status != TranscriptDeliveryStatusQueued {
+		t.Fatalf("transcript delivery mismatch: %#v", delivery)
+	}
+	if delivery := state.HelperDeliveries[helperDeliveryID]; delivery.ID == "" || delivery.Status != HelperDeliveryStatusSending {
+		t.Fatalf("helper delivery mismatch: %#v", delivery)
+	}
+	if _, ok := state.ArtifactRecords["artifact-1"]; !ok {
+		t.Fatalf("artifact record was not preserved: %#v", state.ArtifactRecords)
+	}
+	if _, ok := state.Notifications["notification-1"]; !ok {
+		t.Fatalf("notification was not preserved: %#v", state.Notifications)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveScopeIsolationRejectsSharedStateReuseCI(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
