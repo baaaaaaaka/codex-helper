@@ -701,7 +701,7 @@ func (b *Bridge) flushPendingWorkflowNotificationsWithLimit(ctx context.Context,
 	if b == nil || b.store == nil {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -717,6 +717,32 @@ func (b *Bridge) flushPendingWorkflowNotificationsWithLimit(ctx context.Context,
 		return nil
 	}
 	webhookURL, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
+	if err != nil {
+		return err
+	}
+	hasPending, err := b.store.HasPendingWorkflowNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	if !hasPending {
+		return nil
+	}
+	state, err = b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	cfg, err = b.effectiveWorkflowNotificationConfig(state)
+	if err != nil {
+		return err
+	}
+	if !cfg.Enabled {
+		return nil
+	}
+	currentControlChatID = strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	if strings.TrimSpace(cfg.ControlChatID) != "" && currentControlChatID != "" && strings.TrimSpace(cfg.ControlChatID) != currentControlChatID {
+		return nil
+	}
+	webhookURL, err = readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
 	if err != nil {
 		return err
 	}

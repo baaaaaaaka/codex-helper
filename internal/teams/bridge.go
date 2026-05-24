@@ -955,6 +955,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			Now:              time.Now(),
 		})
 		if decision.ShouldPark {
+			if !decision.ShouldNotifyPark && !poll.ParkedAt.IsZero() && inboundPollDecisionAlreadyPersisted(poll, hasPoll, decision) {
+				continue
+			}
 			if err := flushPendingScheduleUpdates(); err != nil {
 				return err
 			}
@@ -4120,20 +4123,27 @@ func (b *Bridge) queueCompletedHelperUpgradeNoticeIfNeeded(ctx context.Context) 
 	if b == nil || b.store == nil {
 		return false, nil
 	}
+	req, ok, err := b.store.ReadUpgrade(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !ok || req.Phase != teamstore.UpgradePhaseCompleted || strings.TrimSpace(req.Reason) != teamstore.HelperUpgradeReason {
+		return false, nil
+	}
 	state, err := b.store.Load(ctx)
 	if err != nil {
 		return false, err
 	}
-	req := state.Upgrade
-	if req == nil || req.Phase != teamstore.UpgradePhaseCompleted || strings.TrimSpace(req.Reason) != teamstore.HelperUpgradeReason {
+	if state.Upgrade == nil || state.Upgrade.ID != req.ID {
 		return false, nil
 	}
-	msg, ok := b.completedHelperUpgradeNoticeMessage(state, *req)
+	req = *state.Upgrade
+	msg, ok := b.completedHelperUpgradeNoticeMessage(state, req)
 	if !ok {
 		return false, nil
 	}
 	if strings.TrimSpace(req.CompletionNoticeID) == "" {
-		if existing, ok := existingHelperUpgradeCompletionOutbox(state, *req, msg); ok {
+		if existing, ok := existingHelperUpgradeCompletionOutbox(state, req, msg); ok {
 			msg.ID = existing.ID
 		}
 	}
@@ -4150,7 +4160,7 @@ func (b *Bridge) queueCompletedHelperUpgradeNoticeIfNeeded(ctx context.Context) 
 		}
 		return true, nil
 	}
-	if helperUpgradeCompletionNoticeDurablyQueued(*req) {
+	if helperUpgradeCompletionNoticeDurablyQueued(req) {
 		return true, nil
 	}
 	queued, err := b.queueOutbox(ctx, msg)
@@ -6235,6 +6245,13 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 	}
 	if err := b.ensureStore(); err != nil {
 		return err
+	}
+	hasQueued, err := b.store.HasQueuedTurns(ctx)
+	if err != nil {
+		return err
+	}
+	if !hasQueued {
+		return nil
 	}
 	state, err := b.store.QueuedTurnStateSnapshot(ctx)
 	if err != nil {
@@ -9297,6 +9314,13 @@ func (b *Bridge) rejectSessionWork(ctx context.Context, session *Session, msg Ch
 func (b *Bridge) drainComplete(ctx context.Context) (bool, error) {
 	if err := b.ensureStore(); err != nil {
 		return false, err
+	}
+	control, err := b.store.ReadControl(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !control.Draining {
+		return false, nil
 	}
 	state, err := b.store.Load(ctx)
 	if err != nil {
@@ -12923,11 +12947,14 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.TranscriptImportStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	activeTeamsTurns := runningTurnSessions(state)
+	activeTeamsTurns, err := b.store.RunningTurnSessionIDs(ctx)
+	if err != nil {
+		return err
+	}
 	var needsDiscovery []Session
 	for _, session := range b.reg.ActiveSessions() {
 		if session.CodexThreadID == "" {

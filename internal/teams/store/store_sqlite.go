@@ -622,6 +622,7 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS artifact_records_session_idx ON artifact_records(session_id, status, created_at, id)`,
 		`CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS notifications_session_idx ON notifications(session_id, status, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS notifications_status_idx ON notifications(status, created_at, id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
@@ -1631,6 +1632,94 @@ func (s *Store) deferredInboundSQLite(ctx context.Context) ([]InboundEvent, bool
 		return rows.Err()
 	})
 	return out, handled, err
+}
+
+func (s *Store) hasQueuedTurnsSQLite(ctx context.Context) (bool, bool, error) {
+	hasQueued := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		var exists int
+		err = db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE status = ? LIMIT 1`, string(TurnStatusQueued)).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		hasQueued = exists == 1
+		return nil
+	})
+	return hasQueued, handled, err
+}
+
+func (s *Store) runningTurnSessionIDsSQLite(ctx context.Context) (map[string]bool, bool, error) {
+	running := make(map[string]bool)
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		rows, err := db.QueryContext(ctx, `SELECT DISTINCT session_id FROM turns WHERE status = ? AND session_id != ''`, string(TurnStatusRunning))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sessionID string
+			if err := rows.Scan(&sessionID); err != nil {
+				return err
+			}
+			sessionID = strings.TrimSpace(sessionID)
+			if sessionID != "" {
+				running[sessionID] = true
+			}
+		}
+		return rows.Err()
+	})
+	return running, handled, err
+}
+
+func (s *Store) hasPendingWorkflowNotificationsSQLite(ctx context.Context) (bool, bool, error) {
+	hasPending := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		var exists int
+		err = db.QueryRowContext(ctx, `SELECT 1 FROM notifications WHERE status IS NULL OR status = '' OR status IN (?, ?, ?) LIMIT 1`,
+			string(NotificationStatusQueued), string(NotificationStatusFailed), string(NotificationStatusSending)).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		hasPending = exists == 1
+		return nil
+	})
+	return hasPending, handled, err
 }
 
 func (s *Store) createSessionSQLite(ctx context.Context, session SessionContext) (SessionContext, bool, bool, error) {

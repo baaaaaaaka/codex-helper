@@ -671,6 +671,51 @@ func BenchmarkCXPPerfModelSQLiteMainLoopIdleTickProfiles(b *testing.B) {
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteActiveParkedMainLoopProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		profile.MessagesPerPoll = 0
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			graph := newCXPPerfGraph(profile)
+			bridge := newCXPPerfBridge(store, graph, profile)
+			bridge.asyncTurns = true
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfSeedActiveParkedSessions(b, store, bridge)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			cxpPerfPrepareActiveOwner(b, bridge)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+			opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := cxpPerfRunMainLoopIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*11*time.Second)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+					b.Fatalf("active parked main loop idle tick: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications(t *testing.T) {
+	profile := cxpPerfProfileByNameForTest(t, "many-long-chats")
+	profile.MessagesPerPoll = 0
+	store := newCXPPerfStore(t, profile)
+	bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+	cxpPerfSeedColdRuntimeMetadata(t, store, profile)
+	cxpPerfSeedActiveParkedSessions(t, store, bridge)
+	cxpPerfMigrateStoreToSQLite(t, store)
+	hasPending, err := store.HasPendingWorkflowNotifications(context.Background())
+	if err != nil {
+		t.Fatalf("HasPendingWorkflowNotifications error: %v", err)
+	}
+	if hasPending {
+		t.Fatal("active parked fixture unexpectedly has pending workflow notifications")
+	}
+}
+
 func BenchmarkCXPPerfModelSQLiteLeaseOwnerHeartbeatProfiles(b *testing.B) {
 	for _, profile := range cxpPerfProfiles {
 		profile := profile
@@ -962,6 +1007,17 @@ func cxpPerfSmokeProfile(profile cxpPerfProfile) cxpPerfProfile {
 	profile.HistoryFiles = max(1, min(profile.HistoryFiles, 4))
 	profile.HistoryLines = max(1, min(profile.HistoryLines, 16))
 	return profile
+}
+
+func cxpPerfProfileByNameForTest(t testing.TB, name string) cxpPerfProfile {
+	t.Helper()
+	for _, profile := range cxpPerfProfiles {
+		if profile.Name == name {
+			return profile
+		}
+	}
+	t.Fatalf("cxp perf profile %q not found", name)
+	return cxpPerfProfile{}
 }
 
 func cxpPerfExternalBaseProfile() cxpPerfProfile {
@@ -1670,6 +1726,53 @@ func cxpPerfSeedState(state *teamstore.State, profile cxpPerfProfile) {
 			messageID := fmt.Sprintf("perf-helper-message-%03d-%03d", chat, outbox)
 			state.OutboxMessages[outboxID] = teamstore.OutboxMessage{ID: outboxID, SessionID: sessionID, TeamsChatID: chatID, Kind: "answer", Body: cxpPerfText(profile.MessageBytes), Sequence: int64(outbox + 1), PartIndex: 1, PartCount: 1, RenderedHash: normalizedTextHash(cxpPerfText(profile.MessageBytes)), Status: teamstore.OutboxStatusSent, TeamsMessageID: messageID, CreatedAt: created, UpdatedAt: created, SentAt: created}
 		}
+	}
+}
+
+func cxpPerfSeedActiveParkedSessions(b testing.TB, store *teamstore.Store, bridge *Bridge) {
+	b.Helper()
+	now := time.Now().UTC()
+	oldActivity := now.Add(-49 * time.Hour)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ChatPolls[bridge.reg.ControlChatID] = teamstore.ChatPollState{
+			ChatID:               bridge.reg.ControlChatID,
+			Seeded:               true,
+			PollState:            inboundPollStateWarm,
+			NextPollAt:           now.Add(time.Hour),
+			LastActivityAt:       now.Add(-time.Minute),
+			LastModifiedCursor:   now.Add(-time.Minute),
+			LastSuccessfulPollAt: now.Add(-time.Minute),
+			UpdatedAt:            now,
+		}
+		for i := range bridge.reg.Sessions {
+			session := &bridge.reg.Sessions[i]
+			session.CreatedAt = oldActivity
+			session.UpdatedAt = oldActivity
+			state.Sessions[session.ID] = teamstore.SessionContext{
+				ID:           session.ID,
+				Status:       teamstore.SessionStatusActive,
+				TeamsChatID:  session.ChatID,
+				TeamsChatURL: session.ChatURL,
+				TeamsTopic:   session.Topic,
+				Cwd:          fmt.Sprintf("/workspace/%s", session.ID),
+				CreatedAt:    oldActivity,
+				UpdatedAt:    oldActivity,
+			}
+			state.ChatPolls[session.ChatID] = teamstore.ChatPollState{
+				ChatID:               session.ChatID,
+				Seeded:               true,
+				PollState:            inboundPollStateParked,
+				LastActivityAt:       oldActivity,
+				LastModifiedCursor:   oldActivity,
+				LastSuccessfulPollAt: oldActivity,
+				ParkedAt:             oldActivity.Add(48 * time.Hour),
+				ParkNoticeSentAt:     oldActivity.Add(48*time.Hour + time.Minute),
+				UpdatedAt:            now.Add(-time.Minute),
+			}
+		}
+		return nil
+	}); err != nil {
+		b.Fatalf("seed active parked sessions: %v", err)
 	}
 }
 

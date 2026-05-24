@@ -14448,6 +14448,141 @@ func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromSentOutbox(t *testing.T) {
 	}
 }
 
+func TestBridgePollOnceSkipsAlreadyParkedNoticeSentWithoutGraphOrRewrite(t *testing.T) {
+	now := time.Now()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	oldActivity := now.Add(-49 * time.Hour)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:           session.ID,
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  session.ChatID,
+		TeamsChatURL: session.ChatURL,
+		TeamsTopic:   session.Topic,
+		CreatedAt:    oldActivity,
+		UpdatedAt:    oldActivity,
+	}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park work poll: %v", err)
+	}
+	if _, err := store.MarkChatPollParkNoticeSent(context.Background(), session.ChatID, oldActivity.Add(48*time.Hour+time.Minute)); err != nil {
+		t.Fatalf("mark park notice sent: %v", err)
+	}
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+	before, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll before ok=%v err=%v", ok, err)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("already parked chat triggered Graph send: %#v", *sent)
+	}
+	after, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll after ok=%v err=%v", ok, err)
+	}
+	if !after.UpdatedAt.Equal(before.UpdatedAt) || !after.ParkedAt.Equal(before.ParkedAt) || !after.ParkNoticeSentAt.Equal(before.ParkNoticeSentAt) {
+		t.Fatalf("already parked chat was rewritten: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestBridgePollOnceRepairsAlreadyNotifiedParkedPollMissingParkedAt(t *testing.T) {
+	now := time.Now()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	oldActivity := now.Add(-49 * time.Hour)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:           session.ID,
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  session.ChatID,
+		TeamsChatURL: session.ChatURL,
+		TeamsTopic:   session.Topic,
+		CreatedAt:    oldActivity,
+		UpdatedAt:    oldActivity,
+	}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("park work poll: %v", err)
+	}
+	if _, err := store.MarkChatPollParkNoticeSent(context.Background(), session.ChatID, oldActivity.Add(48*time.Hour+time.Minute)); err != nil {
+		t.Fatalf("mark park notice sent: %v", err)
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		poll := state.ChatPolls[session.ChatID]
+		poll.ParkedAt = time.Time{}
+		state.ChatPolls[session.ChatID] = poll
+		return nil
+	}); err != nil {
+		t.Fatalf("clear parked_at: %v", err)
+	}
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("repairing already notified parked chat triggered Graph send: %#v", *sent)
+	}
+	after, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll after ok=%v err=%v", ok, err)
+	}
+	if after.ParkedAt.IsZero() {
+		t.Fatalf("ParkedAt was not repaired: %#v", after)
+	}
+	if after.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("ParkNoticeSentAt was cleared while repairing ParkedAt: %#v", after)
+	}
+}
+
 func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromGraphHistory(t *testing.T) {
 	now := time.Now()
 	writeGraph, sent := newBridgeTestGraph(t)

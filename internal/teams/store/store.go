@@ -988,6 +988,9 @@ var (
 	controlStateFields = stateFieldSet(
 		"service_control",
 	)
+	upgradeStateFields = stateFieldSet(
+		"upgrade",
+	)
 	pollStateSnapshotFields = stateFieldSet(
 		"sessions",
 		"turns",
@@ -1016,6 +1019,9 @@ var (
 	workflowNotificationStateSnapshotFields = stateFieldSet(
 		"control_chat",
 		"workflow",
+	)
+	workflowNotificationPendingStateFields = stateFieldSet(
+		"notifications",
 	)
 	workflowEventStateSnapshotFields = stateFieldSet(
 		"sessions",
@@ -1121,6 +1127,59 @@ func (s *Store) PollScheduleSnapshot(ctx context.Context) (State, error) {
 
 func (s *Store) QueuedTurnStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, queuedTurnStateSnapshotFields)
+}
+
+func (s *Store) HasQueuedTurns(ctx context.Context) (bool, error) {
+	if hasQueued, handled, err := s.hasQueuedTurnsSQLite(ctx); handled || err != nil {
+		return hasQueued, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("turns"))
+	if err != nil {
+		return false, err
+	}
+	for _, turn := range state.Turns {
+		if turn.Status == TurnStatusQueued {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Store) RunningTurnSessionIDs(ctx context.Context) (map[string]bool, error) {
+	if running, handled, err := s.runningTurnSessionIDsSQLite(ctx); handled || err != nil {
+		return running, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("turns"))
+	if err != nil {
+		return nil, err
+	}
+	running := make(map[string]bool)
+	for _, turn := range state.Turns {
+		sessionID := strings.TrimSpace(turn.SessionID)
+		if turn.Status == TurnStatusRunning && sessionID != "" {
+			running[sessionID] = true
+		}
+	}
+	return running, nil
+}
+
+func (s *Store) HasPendingWorkflowNotifications(ctx context.Context) (bool, error) {
+	if hasPending, handled, err := s.hasPendingWorkflowNotificationsSQLite(ctx); handled || err != nil {
+		return hasPending, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, workflowNotificationPendingStateFields)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range state.Notifications {
+		switch rec.Status {
+		case NotificationStatusSent, NotificationStatusUnknown:
+			continue
+		default:
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Store) TranscriptImportStateSnapshot(ctx context.Context) (State, error) {
@@ -1860,7 +1919,7 @@ func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions)
 }
 
 func (s *Store) ReadUpgrade(ctx context.Context) (UpgradeRequest, bool, error) {
-	state, err := s.Load(ctx)
+	state, err := s.loadStateFieldsOrFull(ctx, upgradeStateFields)
 	if err != nil {
 		return UpgradeRequest{}, false, err
 	}

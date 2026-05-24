@@ -3778,6 +3778,107 @@ func TestSQLiteDeferredInboundFiltersAndSortsLargeTable(t *testing.T) {
 	}
 }
 
+func TestHasQueuedTurnsAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		sqlite := sqlite
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions["s1"] = SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1", CreatedAt: now, UpdatedAt: now}
+				for i := 0; i < 1200; i++ {
+					status := TurnStatusCompleted
+					if i%257 == 0 {
+						status = TurnStatusRunning
+					}
+					id := fmt.Sprintf("turn:%04d", i)
+					state.Turns[id] = Turn{ID: id, SessionID: "s1", Status: status, CreatedAt: now.Add(time.Duration(i) * time.Millisecond), UpdatedAt: now}
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed turns: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			hasQueued, err := store.HasQueuedTurns(ctx)
+			if err != nil {
+				t.Fatalf("HasQueuedTurns without queued turn error: %v", err)
+			}
+			if hasQueued {
+				t.Fatal("HasQueuedTurns returned true without queued turns")
+			}
+			running, err := store.RunningTurnSessionIDs(ctx)
+			if err != nil {
+				t.Fatalf("RunningTurnSessionIDs error: %v", err)
+			}
+			if !running["s1"] || len(running) != 1 {
+				t.Fatalf("RunningTurnSessionIDs = %#v, want only s1", running)
+			}
+
+			if _, _, err := store.QueueTurn(ctx, Turn{ID: "turn:queued", SessionID: "s1", Status: TurnStatusQueued, QueuedAt: now.Add(time.Hour)}); err != nil {
+				t.Fatalf("QueueTurn queued error: %v", err)
+			}
+			hasQueued, err = store.HasQueuedTurns(ctx)
+			if err != nil {
+				t.Fatalf("HasQueuedTurns with queued turn error: %v", err)
+			}
+			if !hasQueued {
+				t.Fatal("HasQueuedTurns returned false with a queued turn")
+			}
+		})
+	}
+}
+
+func TestHasPendingWorkflowNotificationsAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		sqlite := sqlite
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 24, 13, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				for i := 0; i < 1200; i++ {
+					status := NotificationStatusSent
+					if i%113 == 0 {
+						status = NotificationStatusUnknown
+					}
+					id := fmt.Sprintf("notification:%04d", i)
+					state.Notifications[id] = NotificationRecord{ID: id, Status: status, CreatedAt: now.Add(time.Duration(i) * time.Millisecond), UpdatedAt: now}
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed sent notifications: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			hasPending, err := store.HasPendingWorkflowNotifications(ctx)
+			if err != nil {
+				t.Fatalf("HasPendingWorkflowNotifications without pending error: %v", err)
+			}
+			if hasPending {
+				t.Fatal("HasPendingWorkflowNotifications returned true for sent/unknown notifications")
+			}
+
+			if err := store.Update(ctx, func(state *State) error {
+				state.Notifications["notification:queued"] = NotificationRecord{ID: "notification:queued", Status: NotificationStatusQueued, CreatedAt: now.Add(time.Hour), UpdatedAt: now}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed queued notification: %v", err)
+			}
+			hasPending, err = store.HasPendingWorkflowNotifications(ctx)
+			if err != nil {
+				t.Fatalf("HasPendingWorkflowNotifications with pending error: %v", err)
+			}
+			if !hasPending {
+				t.Fatal("HasPendingWorkflowNotifications returned false with a queued notification")
+			}
+		})
+	}
+}
+
 func TestHasUpgradeBlockingWorkAllowsDeferredAndRateLimitedOutbox(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

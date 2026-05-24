@@ -195,6 +195,7 @@ class CXPPerfModelScriptTests(unittest.TestCase):
             ("sqlite-deferred-inbound", "BenchmarkCXPPerfModelSQLiteDeferredInboundNoDeferredProfiles/many-long-chats$"),
             ("sqlite-history-watch-checkpoint", "BenchmarkCXPPerfModelSQLiteHistoryWatchCheckpointUpdateProfiles/many-long-chats$"),
             ("sqlite-history-watch-active", "BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles/many-long-chats$"),
+            ("sqlite-active-parked-main-loop", "BenchmarkCXPPerfModelSQLiteActiveParkedMainLoopProfiles/many-long-chats$"),
         ]:
             with self.subTest(target=target):
                 with mock.patch.object(model.subprocess, "run", return_value=completed) as run:

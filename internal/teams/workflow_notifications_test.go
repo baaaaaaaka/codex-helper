@@ -435,6 +435,60 @@ func TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailure(t 
 	}
 }
 
+func TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Fallback after definite webhook failure")
+	var workflowCalls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&workflowCalls, 1)
+		http.Error(w, "bad workflow payload", http.StatusBadRequest)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+
+	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:definite-webhook-failure-sqlite",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "final",
+		Body:             "done",
+		MentionOwner:     true,
+		NotificationKind: "turn_completed",
+	})
+	if err != nil {
+		t.Fatalf("queue outbox: %v", err)
+	}
+	if queued.MentionOwner {
+		t.Fatalf("queued MentionOwner = true, want false while workflow card is configured: %#v", queued)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+	if got := atomic.LoadInt32(&workflowCalls); got != 1 {
+		t.Fatalf("workflow webhook calls = %d, want 1", got)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"done", "Workflow card send failed", "Open answer"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("sqlite fallback missing %q:\n%s\nsent=%#v", want, joined, *sent)
+		}
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "Workflow card send failed"); got != 1 {
+		t.Fatalf("control fallback messages = %d, want 1; sent=%#v", got, *sent)
+	}
+}
+
 func TestWorkflowNotificationConcurrentFlushClaimsOnce(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)

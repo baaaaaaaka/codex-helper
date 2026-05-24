@@ -358,8 +358,10 @@ jobs:
           sqlite_bridge_pattern='TestBridge(SQLiteMigration(UpgradeStateMatrix|FailureFallsBackToLegacyAndNotifiesControl|FallbackNoticeIsDeduped|FallbackFailsClosedForMissingPointerDB|FallbackFailsClosedForUnsupportedBackend)|DefersSQLiteMigrationWhileHelperUpgradeActivationIsPending)$'
           sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths)$'
           go test ./internal/teams/store -count=1 -run "$sqlite_store_pattern" -v
+          go test ./internal/teams/store -count=1 -run 'TestHas(QueuedTurns|PendingWorkflowNotifications)AcrossBackends$' -v
           go test ./internal/teams -count=1 -run "$sqlite_bridge_pattern" -v
           go test ./internal/teams -count=1 -run "$sqlite_perf_pattern" -v
+          go test ./internal/teams -count=1 -run 'TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications$' -v
 
       - name: Teams Codex runner classification regressions
         shell: bash
@@ -418,10 +420,12 @@ jobs:
           workflow_pattern='Test(WorkflowNotificationsDisabledByDefault|WorkflowNotification(SendsAfterDurableOutboxSent|SendsDetectedCodexAnswerOnce|FlushLimitSendsOneQueuedCard|SendsManualHelperUpgradeCard|SkipsPlainAutoHelperUpgradeNotice|FallsBackToSidecarConfigWhenOldHelperErasesState|DoesNotDuplicateAfterAmbiguousFailure|ConcurrentFlushClaimsOnce|StaleSendingBecomesUnknown|RetriesOnlyRetryableFailuresWithBackoff|SuppressesAfterControlChatRebind|SkipsHistoricalImportsAndNotifiesDetectedSyncFinals|SupportsRecreatedChatMovedNotice)|QueueOutbox(SuppressesOwnerMentionWhenWorkflowNotificationEnabled|KeepsOwnerMentionWhenWorkflowNotificationDisabled)|TranscriptDeliverySuppressesOwnerMentionWhenWorkflowNotificationEnabled|SendQueuedOutbox(FallsBackToControlMentionAfterDefiniteWebhookFailure|RedirectsOwnerMentionToControlFallbackWhenWorkflowNotificationDisabled|SuppressesPersistedOwnerMentionWhenWorkflowNotificationEnabled)|HelperNeedsAttentionQueuesWorkflowCardWithoutOwnerMention|WorkflowWebhookURLFileSafety|ConfigureWorkflowNotificationsFromWebhookURLWritesPrivateSecret|BridgeControlWebhook(CommandConfiguresWorkflowWithoutRunningCodex|RejectsInvalidURLWithoutRunningCodex)|PostWorkflowWebhook(SendsAdaptiveCard|RejectsUnsafeActionURL|RejectsNonAbsoluteWebhookURL|RejectsOversizedPayload|RetriesTooManyRequests|WithoutRateLimitRetryReturnsBeforeRetryAfterSleep|ClassifiesServerErrorAsDeliveryUncertain|ClassifiesTransportErrorAsDeliveryUncertain|ClassifiesInterruptedRateLimitWaitAsRetryable))$'
           workflow_cli_pattern='TestTeamsWorkflowStatus(RedactsWebhookURL|ReadsSidecarConfig)$'
           go test ./internal/teams ./internal/teams/store -count=1 -run "$bridge_pattern" -v
+          go test ./internal/teams -count=1 -run 'TestBridgePollOnce(SkipsAlreadyParkedNoticeSentWithoutGraphOrRewrite|RepairsAlreadyNotifiedParkedPollMissingParkedAt)$' -v
           go test ./internal/teams -count=1 -run "$message_reference_pattern" -v
           go test ./internal/teams -count=1 -run "$transcript_pattern" -v
           go test ./internal/teams -count=1 -run "$render_artifact_pattern" -v
           go test ./internal/teams -count=1 -run "$workflow_pattern" -v
+          go test ./internal/teams -count=1 -run 'TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite$' -v
           go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
 
       - name: Beacon mode simulation regressions
