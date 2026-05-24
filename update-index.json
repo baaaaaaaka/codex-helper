@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-05-24T04:39:42Z",
+  "generated_at": "2026-05-24T06:08:49Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.3-rc.13_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.3-rc.13_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.3-rc.13_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.3-rc.13_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.3-rc.13",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-05-24T06:07:57Z",
+      "tag_name": "v0.1.3-rc.13",
+      "version": "0.1.3-rc.13"
+    },
     {
       "assets": [
         {
@@ -4017,41 +4058,6 @@
       "published_at": "2026-05-12T05:19:51Z",
       "tag_name": "v0.1.0-rc.58",
       "version": "0.1.0-rc.58"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.57_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.57_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.57_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.57_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.0-rc.57",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-05-12T03:27:47Z",
-      "tag_name": "v0.1.0-rc.57",
-      "version": "0.1.0-rc.57"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
