@@ -307,6 +307,109 @@ func TestSelectAutoUpdateCandidateStableBeatsSameVersionPrerelease(t *testing.T)
 	}
 }
 
+func TestCompareVersionsReleasePrereleaseBoundaries(t *testing.T) {
+	cases := []struct {
+		name     string
+		left     string
+		right    string
+		wantSign int
+		wantOK   bool
+	}{
+		{name: "stable beats same base rc", left: "1.2.4", right: "1.2.4-rc.1", wantSign: 1, wantOK: true},
+		{name: "same base rc is older than stable", left: "1.2.4-rc.2", right: "1.2.4", wantSign: -1, wantOK: true},
+		{name: "newer base rc beats older stable", left: "1.2.5-rc.1", right: "1.2.4", wantSign: 1, wantOK: true},
+		{name: "rc numeric identifiers sort numerically", left: "1.2.4-rc.10", right: "1.2.4-rc.2", wantSign: 1, wantOK: true},
+		{name: "higher base rc stays newer than lower stable", left: "1.3.0-rc.1", right: "1.2.9", wantSign: 1, wantOK: true},
+		{name: "build metadata does not affect ordering", left: "1.2.4+local", right: "1.2.4", wantSign: 0, wantOK: true},
+		{name: "invalid versions fail closed", left: "dev", right: "1.2.4", wantSign: versionCompareInvalid, wantOK: false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := CompareVersions(tt.left, tt.right)
+			if ok != tt.wantOK {
+				t.Fatalf("CompareVersions ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !tt.wantOK {
+				if got != versionCompareInvalid {
+					t.Fatalf("CompareVersions(%q, %q) = %d, want invalid sentinel %d", tt.left, tt.right, got, versionCompareInvalid)
+				}
+				return
+			}
+			if sign := compareSign(got); sign != tt.wantSign {
+				t.Fatalf("CompareVersions(%q, %q) = %d (sign %d), want sign %d", tt.left, tt.right, got, sign, tt.wantSign)
+			}
+		})
+	}
+}
+
+func TestSelectAutoUpdateCandidateReleasePrereleaseChannelMatrix(t *testing.T) {
+	now := time.Date(2026, 5, 22, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name              string
+		installed         string
+		includePrerelease bool
+		releases          []GitHubRelease
+		wantTag           string
+	}{
+		{
+			name:      "stable to newer stable works by default",
+			installed: "1.2.3",
+			releases:  []GitHubRelease{releaseForAutoTest("v1.2.4", AutoUpdatePriorityP0, now.Add(-time.Hour), false)},
+			wantTag:   "v1.2.4",
+		},
+		{
+			name:      "stable to newer prerelease is skipped by default",
+			installed: "1.2.3",
+			releases:  []GitHubRelease{releaseForAutoTest("v1.2.4-rc.1", AutoUpdatePriorityP0, now.Add(-time.Hour), true)},
+		},
+		{
+			name:              "stable to newer prerelease works with opt in",
+			installed:         "1.2.3",
+			includePrerelease: true,
+			releases:          []GitHubRelease{releaseForAutoTest("v1.2.4-rc.1", AutoUpdatePriorityP0, now.Add(-time.Hour), true)},
+			wantTag:           "v1.2.4-rc.1",
+		},
+		{
+			name:      "prerelease to same base stable works by default",
+			installed: "1.2.4-rc.1",
+			releases:  []GitHubRelease{releaseForAutoTest("v1.2.4", AutoUpdatePriorityP0, now.Add(-time.Hour), false)},
+			wantTag:   "v1.2.4",
+		},
+		{
+			name:              "stable to same base prerelease is not an upgrade even with opt in",
+			installed:         "1.2.4",
+			includePrerelease: true,
+			releases:          []GitHubRelease{releaseForAutoTest("v1.2.4-rc.2", AutoUpdatePriorityP0, now.Add(-time.Hour), true)},
+		},
+		{
+			name:      "high prerelease does not move to lower stable",
+			installed: "1.3.0-rc.1",
+			releases:  []GitHubRelease{releaseForAutoTest("v1.2.9", AutoUpdatePriorityP0, now.Add(-time.Hour), false)},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SelectAutoUpdateCandidate(tt.releases, AutoUpdateSelectionOptions{
+				InstalledVersion:  tt.installed,
+				Now:               now,
+				GOOS:              "linux",
+				GOARCH:            "amd64",
+				IncludePrerelease: tt.includePrerelease,
+			})
+			if tt.wantTag == "" {
+				if got.Candidate != nil {
+					t.Fatalf("candidate = %#v, want nil", got.Candidate)
+				}
+				return
+			}
+			if got.Candidate == nil || got.Candidate.TagName != tt.wantTag {
+				t.Fatalf("candidate = %#v, want %s", got.Candidate, tt.wantTag)
+			}
+		})
+	}
+}
+
 func TestSelectAutoUpdateCandidateManualIgnoresPriorityButStillNeedsOptInForPrerelease(t *testing.T) {
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	releases := []GitHubRelease{
@@ -390,6 +493,17 @@ func releaseForAutoTest(tag string, priority AutoUpdatePriority, published time.
 		Assets: []struct {
 			Name string `json:"name"`
 		}{{Name: asset}},
+	}
+}
+
+func compareSign(value int) int {
+	switch {
+	case value > 0:
+		return 1
+	case value < 0:
+		return -1
+	default:
+		return 0
 	}
 }
 

@@ -106,6 +106,33 @@ func TestCheckForUpdateIncludePrereleaseTreatsStableSameVersionAsNewer(t *testin
 	}
 }
 
+func TestCheckForUpdateStableLatestDoesNotDowngradeHigherPrerelease(t *testing.T) {
+	requireRuntimeAsset(t)
+	tag := "v1.2.9"
+	ver := "1.2.9"
+	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("assetName error: %v", err)
+	}
+	payload := []byte("stable-binary")
+	server := newReleaseServer(t, tag, asset, payload)
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+
+	st := CheckForUpdate(context.Background(), CheckOptions{
+		Repo:             "owner/name",
+		InstalledVersion: "1.3.0-rc.1",
+		Timeout:          time.Second,
+	})
+	if !st.Supported {
+		t.Fatalf("expected supported update check, got error=%q", st.Error)
+	}
+	if st.UpdateAvailable || st.RemoteVersion != ver {
+		t.Fatalf("status = %#v, want stable %s not newer than installed 1.3.0-rc.1", st, ver)
+	}
+}
+
 func TestCheckForUpdateRejectsDev(t *testing.T) {
 	st := CheckForUpdate(context.Background(), CheckOptions{InstalledVersion: "dev"})
 	if st.Supported {
