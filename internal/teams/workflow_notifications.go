@@ -46,7 +46,7 @@ func (b *Bridge) SendWorkflowNotificationTest(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -212,7 +212,7 @@ func (b *Bridge) queueDetectedCodexAnswerNotification(ctx context.Context, event
 	if b == nil || b.store == nil {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -233,7 +233,7 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 	if outbox.ID == "" || outbox.TeamsChatID == "" {
 		return WorkflowNotificationEvent{}, false, nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.SessionWorkflowEventSnapshot(ctx, outbox.SessionID)
 	if err != nil {
 		return WorkflowNotificationEvent{}, false, err
 	}
@@ -355,7 +355,7 @@ func (b *Bridge) workflowNotificationsEnabled(ctx context.Context) bool {
 	if b == nil || b.store == nil {
 		return false
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return false
 	}
@@ -370,7 +370,7 @@ func (b *Bridge) workflowUserAttentionAvailable(ctx context.Context) bool {
 	if b == nil || b.store == nil {
 		return false
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return false
 	}
@@ -390,7 +390,7 @@ func (b *Bridge) workflowCardAvailable(ctx context.Context) bool {
 	if b == nil || b.store == nil {
 		return false
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return false
 	}
@@ -419,7 +419,7 @@ func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event Workf
 	if b == nil || b.store == nil {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -601,7 +601,7 @@ func (b *Bridge) outboxAlreadyMentionedControlOwner(ctx context.Context, outbox 
 	if b == nil || b.store == nil || !outbox.MentionOwner {
 		return false
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return false
 	}

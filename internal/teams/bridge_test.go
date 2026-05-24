@@ -1203,6 +1203,71 @@ func TestBridgeSessionSuppressesRecentDuplicatePromptWithDifferentMessageID(t *t
 	}
 }
 
+func TestBridgePollOnceSQLiteSuppressesRecentDuplicatePromptWithLightPollSnapshot(t *testing.T) {
+	initialGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "done", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}}
+	bridge := newBridgeTestBridge(initialGraph, store, executor)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	first := bridgePollMessage("message-duplicate-a", now.Add(-10*time.Second).Format(time.RFC3339Nano), "repeat this exact task")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", first, "repeat this exact task"); err != nil {
+		t.Fatalf("first handleSessionMessage error: %v", err)
+	}
+	if got := len(executor.prompts); got != 1 {
+		t.Fatalf("executor prompt count after first = %d, want 1", got)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "control-chat", now, true, false, 0); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("park control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", now.Add(-time.Minute), true, false, 0); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+
+	duplicate := bridgePollMessage("message-duplicate-b", now.Format(time.RFC3339Nano), "repeat this exact task")
+	pollGraph, sent := newBridgePollAndSendGraph(t, []bridgePollPage{{messages: []ChatMessage{duplicate}}})
+	bridge.graph = pollGraph
+	bridge.readGraph = pollGraph
+	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
+		t.Fatalf("pollOnce duplicate error: %v", err)
+	}
+	if got := len(executor.prompts); got != 1 {
+		t.Fatalf("executor prompt count after duplicate poll = %d, want duplicate suppressed: %#v", got, executor.prompts)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Duplicate request ignored") || !strings.Contains(joined, "message-duplicate-b") {
+		t.Fatalf("duplicate notice missing expected details:\n%s", joined)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	ignored := state.InboundEvents["inbound:chat-1:message-duplicate-b"]
+	if ignored.Status != teamstore.InboundStatusIgnored || ignored.TurnID != "" || ignored.Source != "teams_duplicate_prompt" {
+		t.Fatalf("duplicate inbound = %#v, want ignored duplicate without turn", ignored)
+	}
+}
+
 func TestBridgeSessionAllowsSamePromptAfterDuplicateWindow(t *testing.T) {
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -1368,6 +1433,183 @@ func TestBridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession(t *testi
 	if got := executor.promptCount("s001"); got != 2 {
 		t.Fatalf("s001 prompt count = %d, want 2", got)
 	}
+}
+
+func TestBridgeProcessQueuedTurnsLimitsStartsPerCycle(t *testing.T) {
+	prompts := map[string]string{
+		"message-s001": "queued prompt for s001",
+		"message-s002": "queued prompt for s002",
+		"message-s003": "queued prompt for s003",
+		"message-s004": "queued prompt for s004",
+	}
+	graph, _ := newBridgeQueuedTurnGraph(t, prompts)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 10),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	bridge.maxQueuedTurnStartsPerCycle = 2
+	baseSession := bridge.reg.SessionByID("s001")
+	if baseSession == nil {
+		t.Fatal("missing base session s001")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), baseSession); err != nil {
+		t.Fatalf("ensure durable s001: %v", err)
+	}
+	sessions := []*Session{
+		baseSession,
+		appendBridgeTestSession(t, bridge, store, "s002", "chat-2"),
+		appendBridgeTestSession(t, bridge, store, "s003", "chat-3"),
+		appendBridgeTestSession(t, bridge, store, "s004", "chat-4"),
+	}
+	for _, session := range sessions {
+		messageID := "message-" + session.ID
+		queueBridgeTurnForTest(t, bridge, session, messageID, prompts[messageID], time.Time{})
+	}
+
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns first cycle error: %v", err)
+	}
+	firstCycle := map[string]bool{}
+	for len(firstCycle) < 2 {
+		select {
+		case got := <-executor.started:
+			firstCycle[got.SessionID] = true
+		case <-time.After(bridgeAsyncTestTimeout):
+			close(executor.release)
+			t.Fatalf("timed out waiting for first cycle starts; got %#v", firstCycle)
+		}
+	}
+	for _, sessionID := range []string{"s001", "s002"} {
+		if !firstCycle[sessionID] {
+			close(executor.release)
+			t.Fatalf("first cycle starts = %#v, want %s started", firstCycle, sessionID)
+		}
+	}
+	select {
+	case got := <-executor.started:
+		close(executor.release)
+		t.Fatalf("unexpected third start in capped cycle: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(executor.release)
+	waitForCompletedTurnCount(t, store, "s001", 1)
+	waitForCompletedTurnCount(t, store, "s002", 1)
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns second cycle error: %v", err)
+	}
+	secondCycle := map[string]bool{}
+	for len(secondCycle) < 2 {
+		select {
+		case got := <-executor.started:
+			secondCycle[got.SessionID] = true
+		case <-time.After(bridgeAsyncTestTimeout):
+			t.Fatalf("timed out waiting for second cycle starts; got %#v", secondCycle)
+		}
+	}
+	for _, sessionID := range []string{"s003", "s004"} {
+		if !secondCycle[sessionID] {
+			t.Fatalf("second cycle starts = %#v, want %s started", secondCycle, sessionID)
+		}
+	}
+	waitForCompletedTurnCount(t, store, "s003", 1)
+	waitForCompletedTurnCount(t, store, "s004", 1)
+	waitForBridgeAsyncTurns(t, bridge)
+}
+
+func TestBridgeQueuedTurnFollowUpStaysWithinCompletedSession(t *testing.T) {
+	prompts := map[string]string{
+		"s001-first":  "s001 first queued prompt",
+		"s001-second": "s001 second queued prompt",
+		"s002-first":  "s002 queued prompt",
+	}
+	graph, _ := newBridgeQueuedTurnGraph(t, prompts)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 10),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	bridge.maxQueuedTurnStartsPerCycle = 1
+	firstSession := bridge.reg.SessionByID("s001")
+	if firstSession == nil {
+		t.Fatal("missing base session s001")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), firstSession); err != nil {
+		t.Fatalf("ensure durable s001: %v", err)
+	}
+	secondSession := appendBridgeTestSession(t, bridge, store, "s002", "chat-2")
+	queueBridgeTurnForTest(t, bridge, firstSession, "s001-first", "s001 first queued prompt", time.Now().Add(-3*time.Minute))
+	queueBridgeTurnForTest(t, bridge, firstSession, "s001-second", "s001 second queued prompt", time.Now().Add(-2*time.Minute))
+	queueBridgeTurnForTest(t, bridge, secondSession, "s002-first", "s002 queued prompt", time.Now().Add(-time.Minute))
+
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns first cycle error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if got.SessionID != "s001" || !strings.Contains(got.Prompt, "s001 first queued prompt") {
+			close(executor.release)
+			t.Fatalf("first started turn = %#v, want s001 first prompt", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("first queued turn did not start")
+	}
+	select {
+	case got := <-executor.started:
+		close(executor.release)
+		t.Fatalf("unexpected second start before first completion: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if got.SessionID != "s001" || !strings.Contains(got.Prompt, "s001 second queued prompt") {
+			close(executor.release)
+			t.Fatalf("follow-up turn = %#v, want same-session s001 second prompt", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("same-session follow-up turn did not start")
+	}
+	select {
+	case got := <-executor.started:
+		close(executor.release)
+		t.Fatalf("follow-up unexpectedly started another session: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 2)
+	select {
+	case got := <-executor.started:
+		close(executor.release)
+		t.Fatalf("second session started without an explicit drain cycle: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		close(executor.release)
+		t.Fatalf("processQueuedTurns second cycle error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if got.SessionID != "s002" || !strings.Contains(got.Prompt, "s002 queued prompt") {
+			close(executor.release)
+			t.Fatalf("explicit second-cycle turn = %#v, want s002 prompt", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("s002 queued turn did not start on explicit drain")
+	}
+	close(executor.release)
+	waitForCompletedTurnCount(t, store, "s002", 1)
+	waitForBridgeAsyncTurns(t, bridge)
 }
 
 func TestBridgeStartupRecoveryFlushesControlNoticeBeforeQueuedWork(t *testing.T) {
@@ -1652,8 +1894,8 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 		t.Fatalf("executor prompts = %#v, want first, second, third", prompts)
 	}
 	joined = sentPlainJoined(*sent)
-	if got := strings.Count(joined, "Codex is starting this queued request."); got != 2 {
-		t.Fatalf("queued start notice count = %d, want 2 for second and third only:\n%s", got, joined)
+	if got := strings.Count(joined, "Codex is starting this queued request."); got != 1 {
+		t.Fatalf("queued start notice count = %d, want 1 while backlog remains:\n%s", got, joined)
 	}
 	requirePlainTextInOrder(t, joined,
 		"Codex is starting this queued request.",
@@ -1662,13 +1904,73 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 		"⏳ Still queued:",
 		"third prompt",
 		"done 2",
-		"Codex is starting this queued request.",
-		"▶️ Now running:",
-		"third prompt",
-		"⏳ Still queued:",
-		"No other queued requests.",
 		"done 3",
 	)
+}
+
+func TestBridgeFormatQueuedTurnStartNoticeUsesSessionSnapshot(t *testing.T) {
+	graph, _ := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	ctx := context.Background()
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	currentInbound, _, err := store.PersistInbound(ctx, teamstore.InboundEvent{
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: "queued-current",
+		Text:           "current queued prompt",
+		Status:         teamstore.InboundStatusPersisted,
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound current error: %v", err)
+	}
+	current, _, err := store.QueueTurn(ctx, teamstore.Turn{
+		ID:             "turn:queued-current",
+		SessionID:      session.ID,
+		InboundEventID: currentInbound.ID,
+	})
+	if err != nil {
+		t.Fatalf("QueueTurn current error: %v", err)
+	}
+	nextInbound, _, err := store.PersistInbound(ctx, teamstore.InboundEvent{
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: "queued-next",
+		Text:           "next queued prompt",
+		Status:         teamstore.InboundStatusPersisted,
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound next error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(ctx, teamstore.Turn{
+		ID:             "turn:queued-next",
+		SessionID:      session.ID,
+		InboundEventID: nextInbound.ID,
+	}); err != nil {
+		t.Fatalf("QueueTurn next error: %v", err)
+	}
+	claimed, ok, err := store.ClaimNextQueuedTurn(ctx, session.ID)
+	if err != nil || !ok {
+		t.Fatalf("ClaimNextQueuedTurn = ok %v err %v", ok, err)
+	}
+	if claimed.ID != current.ID {
+		t.Fatalf("claimed turn = %q, want %q", claimed.ID, current.ID)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+
+	body, ok, err := bridge.formatQueuedTurnStartNotice(ctx, session.ID, claimed)
+	if err != nil || !ok {
+		t.Fatalf("formatQueuedTurnStartNotice = ok %v err %v", ok, err)
+	}
+	plain := PlainTextFromTeamsHTML(body)
+	if !strings.Contains(plain, "current queued prompt") || !strings.Contains(plain, "next queued prompt") {
+		t.Fatalf("queued start notice missing prompts:\n%s", plain)
+	}
 }
 
 func TestBridgeAsyncTurnsMentionsCoworkerQueuedBehindActiveTurn(t *testing.T) {
@@ -3177,6 +3479,416 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 	}
 	if read.ActiveSessionID != "" || read.ActiveTurnID != "" {
 		t.Fatalf("owner active fields not cleared after turn: %#v", read)
+	}
+}
+
+func TestBridgeListenDoesNotMigrateLargeStateBeforeActiveOwner(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, EchoExecutor{})
+	ctx := context.Background()
+	now := time.Now()
+	oldMachine := bridge.machine
+	oldMachine.ID += "-old-owner"
+	oldOwner, err := teamstore.CurrentOwner("v0.1.0", "", "", now)
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	decision, err := store.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{
+		Scope:    bridge.scope,
+		Machine:  oldMachine,
+		Owner:    oldOwner,
+		Duration: time.Hour,
+		Now:      now,
+	})
+	if err != nil {
+		t.Fatalf("seed old owner control lease: %v", err)
+	}
+	if decision.Mode != teamstore.LeaseModeActive {
+		t.Fatalf("old owner lease mode = %q, want active", decision.Mode)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.InboundEvents["large-upgrade-boundary"] = teamstore.InboundEvent{
+			ID:             "large-upgrade-boundary",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "large-upgrade-boundary",
+			Text:           strings.Repeat("x", int(teamstore.DefaultSQLiteStateMigrationMinSize)+1024),
+			Status:         teamstore.InboundStatusPersisted,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed large legacy state: %v", err)
+	}
+
+	err = bridge.Listen(ctx, BridgeOptions{
+		Store:                    store,
+		RegistryPath:             filepath.Join(t.TempDir(), "registry.json"),
+		Interval:                 time.Millisecond,
+		Once:                     true,
+		MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle,
+		OwnerStaleAfter:          time.Hour,
+		Executor:                 EchoExecutor{},
+		HelperVersion:            "new-version",
+	})
+	if err != nil {
+		t.Fatalf("Listen standby error: %v", err)
+	}
+	raw, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after standby listen: %v", err)
+	}
+	if bytes.Contains(raw, []byte(`"storage_backend"`)) {
+		t.Fatalf("standby Listen migrated state before active ownership: %s", raw[:min(len(raw), 256)])
+	}
+}
+
+func TestBridgeSQLiteMigrationFailureFallsBackToLegacyAndNotifiesControl(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, EchoExecutor{})
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			TeamsChatID:  "control-chat",
+			TeamsChatURL: TeamsChatURL("control-chat", "tenant-1"),
+			UpdatedAt:    now,
+		}
+		state.InboundEvents["large-migration-fallback"] = teamstore.InboundEvent{
+			ID:             "large-migration-fallback",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "large-migration-fallback",
+			Text:           strings.Repeat("x", int(teamstore.DefaultSQLiteStateMigrationMinSize)+1024),
+			Status:         teamstore.InboundStatusPersisted,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), "store.sqlite")
+	if err := os.Mkdir(dbPath, 0o700); err != nil {
+		t.Fatalf("create blocking sqlite db directory: %v", err)
+	}
+
+	if err := bridge.migrateTeamsStoreToSQLiteOrFallback(ctx); err != nil {
+		t.Fatalf("migrateTeamsStoreToSQLiteOrFallback error: %v", err)
+	}
+	raw, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy state after fallback migration: %v", err)
+	}
+	if bytes.Contains(raw, []byte(`"storage_backend"`)) {
+		t.Fatalf("fallback migration wrote sqlite pointer: %s", raw[:min(len(raw), 256)])
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("legacy state should remain loadable after fallback: %v", err)
+	}
+	if _, ok := state.InboundEvents["large-migration-fallback"]; !ok {
+		t.Fatalf("legacy state lost seeded inbound event after fallback")
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "Teams state migration to SQLite failed"); got != 1 {
+		t.Fatalf("fallback notice count = %d, want 1; sent:\n%s", got, sentPlainJoined(*sent))
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "legacy JSON state store"); got != 1 {
+		t.Fatalf("fallback notice did not explain legacy JSON fallback, count=%d; sent:\n%s", got, sentPlainJoined(*sent))
+	}
+}
+
+func TestBridgeSQLiteMigrationFallbackNoticeIsDeduped(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, EchoExecutor{})
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{TeamsChatID: "control-chat"}
+		state.InboundEvents["large-migration-fallback"] = teamstore.InboundEvent{
+			ID:             "large-migration-fallback",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "large-migration-fallback",
+			Text:           strings.Repeat("x", int(teamstore.DefaultSQLiteStateMigrationMinSize)+1024),
+			Status:         teamstore.InboundStatusPersisted,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), "store.sqlite")
+	if err := os.Mkdir(dbPath, 0o700); err != nil {
+		t.Fatalf("create blocking sqlite db directory: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := bridge.migrateTeamsStoreToSQLiteOrFallback(ctx); err != nil {
+			t.Fatalf("migrateTeamsStoreToSQLiteOrFallback attempt %d error: %v", i+1, err)
+		}
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "Teams state migration to SQLite failed"); got != 1 {
+		t.Fatalf("fallback notice count after repeated failures = %d, want 1; sent:\n%s", got, sentPlainJoined(*sent))
+	}
+}
+
+func TestBridgeDefersSQLiteMigrationWhileHelperUpgradeActivationIsPending(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, EchoExecutor{})
+	bridge.helperVersion = "v0.1.0"
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.InboundEvents["large-pending-upgrade"] = teamstore.InboundEvent{
+			ID:             "large-pending-upgrade",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "large-pending-upgrade",
+			Text:           strings.Repeat("x", int(teamstore.DefaultSQLiteStateMigrationMinSize)+1024),
+			Status:         teamstore.InboundStatusPersisted,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	if err := bridge.writePendingHelperUpgradeNotice("control-chat", "command-upgrade", "v9.9.9", false); err != nil {
+		t.Fatalf("writePendingHelperUpgradeNotice error: %v", err)
+	}
+	deferMigration, err := bridge.shouldDeferTeamsStoreSQLiteMigration(ctx)
+	if err != nil {
+		t.Fatalf("shouldDeferTeamsStoreSQLiteMigration error: %v", err)
+	}
+	if !deferMigration {
+		t.Fatal("SQLite migration should defer while helper upgrade activation notice is pending")
+	}
+	raw, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after defer decision: %v", err)
+	}
+	if bytes.Contains(raw, []byte(`"storage_backend"`)) {
+		t.Fatalf("pending helper upgrade state was migrated to sqlite: %s", raw[:min(len(raw), 256)])
+	}
+	if _, err := legacyV5LoadTeamsStateForBridgeTest(raw); err != nil {
+		t.Fatalf("pending helper upgrade state should remain legacy-readable: %v", err)
+	}
+}
+
+func TestBridgeSQLiteMigrationUpgradeStateMatrix(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		setup     func(t *testing.T, bridge *Bridge, store *teamstore.Store)
+		wantDefer bool
+	}{
+		{
+			name: "no upgrade state migrates",
+		},
+		{
+			name: "pending helper restart notice defers",
+			setup: func(t *testing.T, bridge *Bridge, _ *teamstore.Store) {
+				t.Helper()
+				if err := bridge.writePendingHelperUpgradeNotice("control-chat", "command-upgrade", "v9.9.9", false); err != nil {
+					t.Fatalf("write pending helper upgrade notice: %v", err)
+				}
+			},
+			wantDefer: true,
+		},
+		{
+			name: "helper upgrade drain defers",
+			setup: func(t *testing.T, _ *Bridge, store *teamstore.Store) {
+				t.Helper()
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.ServiceControl = teamstore.ServiceControl{Draining: true, Reason: teamstore.HelperUpgradeReason, UpdatedAt: now}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed helper upgrade drain: %v", err)
+				}
+			},
+			wantDefer: true,
+		},
+		{
+			name: "helper reload drain defers",
+			setup: func(t *testing.T, _ *Bridge, store *teamstore.Store) {
+				t.Helper()
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.ServiceControl = teamstore.ServiceControl{Draining: true, Reason: teamstore.HelperReloadReason, UpdatedAt: now}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed helper reload drain: %v", err)
+				}
+			},
+			wantDefer: true,
+		},
+		{
+			name: "active helper upgrade request defers",
+			setup: func(t *testing.T, _ *Bridge, store *teamstore.Store) {
+				t.Helper()
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.Upgrade = &teamstore.UpgradeRequest{ID: "upgrade-active", Phase: teamstore.UpgradePhaseDraining, Reason: teamstore.HelperUpgradeReason, StartedAt: now, UpdatedAt: now}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed active helper upgrade request: %v", err)
+				}
+			},
+			wantDefer: true,
+		},
+		{
+			name: "completed helper upgrade request migrates",
+			setup: func(t *testing.T, _ *Bridge, store *teamstore.Store) {
+				t.Helper()
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.Upgrade = &teamstore.UpgradeRequest{ID: "upgrade-completed", Phase: teamstore.UpgradePhaseCompleted, Reason: teamstore.HelperUpgradeReason, CompletedAt: now, UpdatedAt: now}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed completed helper upgrade request: %v", err)
+				}
+			},
+		},
+		{
+			name: "aborted helper upgrade request migrates",
+			setup: func(t *testing.T, _ *Bridge, store *teamstore.Store) {
+				t.Helper()
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.Upgrade = &teamstore.UpgradeRequest{ID: "upgrade-aborted", Phase: teamstore.UpgradePhaseAborted, Reason: teamstore.HelperUpgradeReason, AbortedAt: now, UpdatedAt: now}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed aborted helper upgrade request: %v", err)
+				}
+			},
+		},
+		{
+			name: "codex upgrade request does not defer teams store migration",
+			setup: func(t *testing.T, _ *Bridge, store *teamstore.Store) {
+				t.Helper()
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.Upgrade = &teamstore.UpgradeRequest{ID: "codex-upgrade", Phase: teamstore.UpgradePhaseDraining, Reason: teamstore.CodexUpgradeReason, StartedAt: now, UpdatedAt: now}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed codex upgrade request: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, EchoExecutor{})
+			if err := seedBridgeSQLiteMigrationMatrixState(ctx, store, now); err != nil {
+				t.Fatalf("seed migration matrix state: %v", err)
+			}
+			if tc.setup != nil {
+				tc.setup(t, bridge, store)
+			}
+			deferMigration, err := bridge.shouldDeferTeamsStoreSQLiteMigration(ctx)
+			if err != nil {
+				t.Fatalf("shouldDeferTeamsStoreSQLiteMigration error: %v", err)
+			}
+			if deferMigration != tc.wantDefer {
+				t.Fatalf("defer decision = %v, want %v", deferMigration, tc.wantDefer)
+			}
+			if tc.wantDefer {
+				raw, err := os.ReadFile(store.Path())
+				if err != nil {
+					t.Fatalf("read state after deferred decision: %v", err)
+				}
+				if bytes.Contains(raw, []byte(`"storage_backend"`)) {
+					t.Fatalf("deferred migration wrote sqlite pointer: %s", raw[:min(len(raw), 256)])
+				}
+				if _, err := legacyV5LoadTeamsStateForBridgeTest(raw); err != nil {
+					t.Fatalf("deferred migration state should remain legacy-readable: %v", err)
+				}
+				return
+			}
+			if err := bridge.migrateTeamsStoreToSQLiteOrFallback(ctx); err != nil {
+				t.Fatalf("migrateTeamsStoreToSQLiteOrFallback error: %v", err)
+			}
+			raw, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read state after migration: %v", err)
+			}
+			if !bytes.Contains(raw, []byte(`"storage_backend":"store-sqlite"`)) {
+				t.Fatalf("non-deferred migration did not write sqlite pointer: %s", raw[:min(len(raw), 256)])
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load migrated state: %v", err)
+			}
+			if _, ok := state.InboundEvents["large-upgrade-matrix"]; !ok {
+				t.Fatalf("migrated state lost matrix inbound event")
+			}
+			if got := countSentPlainContainingForChat(*sent, "control-chat", "Teams state migration to SQLite failed"); got != 0 {
+				t.Fatalf("successful matrix migration sent fallback notice, got %d; sent:\n%s", got, sentPlainJoined(*sent))
+			}
+		})
+	}
+}
+
+func TestBridgeSQLiteMigrationFallbackFailsClosedForMissingPointerDB(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, EchoExecutor{})
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.InboundEvents["large-before-pointer"] = teamstore.InboundEvent{
+			ID:             "large-before-pointer",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "large-before-pointer",
+			Text:           strings.Repeat("x", int(teamstore.DefaultSQLiteStateMigrationMinSize)+1024),
+			Status:         teamstore.InboundStatusPersisted,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close migrated store: %v", err)
+	}
+	if err := os.Remove(result.Path); err != nil {
+		t.Fatalf("remove migrated sqlite db: %v", err)
+	}
+
+	err = bridge.migrateTeamsStoreToSQLiteOrFallback(ctx)
+	if err == nil || !strings.Contains(err.Error(), "migrate Teams store to sqlite") || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("migrateTeamsStoreToSQLiteOrFallback error = %v, want missing-db migration error", err)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "Teams state migration to SQLite failed"); got != 0 {
+		t.Fatalf("missing pointer DB should not send fallback notice, got %d; sent:\n%s", got, sentPlainJoined(*sent))
+	}
+	if _, statErr := os.Stat(result.Path); !os.IsNotExist(statErr) {
+		t.Fatalf("missing sqlite db was recreated, stat err = %v", statErr)
+	}
+}
+
+func TestBridgeSQLiteMigrationFallbackFailsClosedForUnsupportedBackend(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, EchoExecutor{})
+	ctx := context.Background()
+	raw := []byte(fmt.Sprintf(`{"schema_version":%d,"storage_backend":"future-store","storage_version":1,"path":"state.future"}`+"\n", teamstore.SchemaVersion))
+	if err := os.WriteFile(store.Path(), raw, 0o600); err != nil {
+		t.Fatalf("write unsupported backend state: %v", err)
+	}
+
+	err := bridge.migrateTeamsStoreToSQLiteOrFallback(ctx)
+	if err == nil || !strings.Contains(err.Error(), `unsupported teams store backend "future-store"`) {
+		t.Fatalf("migrateTeamsStoreToSQLiteOrFallback error = %v, want unsupported backend", err)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "Teams state migration to SQLite failed"); got != 0 {
+		t.Fatalf("unsupported backend should not send fallback notice, got %d; sent:\n%s", got, sentPlainJoined(*sent))
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read unsupported backend state after migration attempt: %v", err)
+	}
+	if !bytes.Equal(after, raw) {
+		t.Fatalf("unsupported backend state was modified")
 	}
 }
 
@@ -12791,6 +13503,72 @@ func TestBridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls(t *testing.T) 
 	}
 }
 
+func TestBridgePollOnceFlushesChangedNotDueWorkSchedulesBeforeDuePolls(t *testing.T) {
+	now := time.Now().UTC().Round(0)
+	oldActivity := now.Add(-10 * time.Minute)
+	recentActivity := now.Add(-30 * time.Second)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-not-due", oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed not-due poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-not-due",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule not-due poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-due", oldActivity, true, false, 1); err != nil {
+		t.Fatalf("seed due poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-due",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule due poll: %v", err)
+	}
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if r.URL.Path != "/chats/chat-due/messages" {
+				t.Fatalf("poll path = %s, want chat-due messages", r.URL.Path)
+			}
+			poll, ok, err := store.ChatPoll(context.Background(), "chat-not-due")
+			if err != nil || !ok {
+				t.Fatalf("ChatPoll chat-not-due during due poll ok=%v err=%v", ok, err)
+			}
+			if poll.PollState != inboundPollStateHot || !poll.LastActivityAt.Equal(recentActivity) {
+				t.Fatalf("not-due poll was not flushed before due poll: %#v", poll)
+			}
+		},
+	}})
+	writeGraph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions = []Session{
+		{ID: "s-not-due", ChatID: "chat-not-due", Status: "active", UpdatedAt: recentActivity},
+		{ID: "s-due", ChatID: "chat-due", Status: "active", UpdatedAt: oldActivity},
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+}
+
 func TestInboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch(t *testing.T) {
 	next := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
 	activity := next.Add(-time.Minute)
@@ -21288,6 +22066,9 @@ func TestBridgeRecoverUnfinishedRunningTurnDelaysNoticeUntilQueueIdle(t *testing
 	if len(*sent) != 0 {
 		t.Fatalf("interruption notice should wait behind queued work, sent = %#v", *sent)
 	}
+	if !bridge.deferredInterruptedNoticePending() {
+		t.Fatalf("deferred interruption notice pending flag was not retained while queue was busy")
+	}
 	if _, err := store.MarkTurnCompleted(context.Background(), queued.ID, "", ""); err != nil {
 		t.Fatalf("MarkTurnCompleted queued error: %v", err)
 	}
@@ -21311,6 +22092,9 @@ func TestBridgeRecoverUnfinishedRunningTurnDelaysNoticeUntilQueueIdle(t *testing
 	if got := state.Turns[running.ID].RecoveryReason; got != recoveryReasonAmbiguousAfterHelperRestartNoticeSent {
 		t.Fatalf("recovery reason after notice = %q, want notice sent marker", got)
 	}
+	if bridge.deferredInterruptedNoticePending() {
+		t.Fatalf("deferred interruption notice pending flag was not cleared after notice")
+	}
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
 		delete(state.OutboxMessages, interruptedAfterRestartOutboxID(running.ID))
 		return nil
@@ -21322,6 +22106,39 @@ func TestBridgeRecoverUnfinishedRunningTurnDelaysNoticeUntilQueueIdle(t *testing
 	}
 	if len(*sent) != 1 {
 		t.Fatalf("notice was resent after sent outbox pruning: %#v", *sent)
+	}
+}
+
+func TestBridgeDeferredInterruptedNoticesSkipUntilRecoveryMarksPending(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:pending-interrupted", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if _, err := store.MarkTurnRunning(context.Background(), turn.ID, "thread-1", "codex-turn-1"); err != nil {
+		t.Fatalf("MarkTurnRunning error: %v", err)
+	}
+	if _, err := store.MarkTurnInterrupted(context.Background(), turn.ID, recoveryReasonAmbiguousAfterHelperRestart); err != nil {
+		t.Fatalf("MarkTurnInterrupted error: %v", err)
+	}
+
+	if err := bridge.sendDeferredInterruptedTurnNotices(context.Background()); err != nil {
+		t.Fatalf("sendDeferredInterruptedTurnNotices error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("notice was sent without pending recovery marker: %#v", *sent)
+	}
+	if err := bridge.sendDeferredInterruptedTurnNoticesNow(context.Background()); err != nil {
+		t.Fatalf("sendDeferredInterruptedTurnNoticesNow error: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "helper retry "+turn.ID) {
+		t.Fatalf("forced interruption notice = %#v", *sent)
 	}
 }
 
@@ -21507,6 +22324,54 @@ func newBridgeRetryGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]b
 		auth:       &fakeGraphAuth{token: "access"},
 		client:     client,
 		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
+func newBridgeQueuedTurnGraph(t *testing.T, prompts map[string]string) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	var sentMu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.Contains(r.URL.Path, "/messages/"):
+			messageID := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			prompt, ok := prompts[messageID]
+			if !ok {
+				t.Fatalf("unexpected queued message fetch: %s", r.URL.String())
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(bridgePollMessage(messageID, "2026-05-03T01:00:05Z", prompt)); err != nil {
+				t.Fatalf("encode queued message %s: %v", messageID, err)
+			}
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sentMu.Lock()
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			id := len(sent)
+			sentMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, id)
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
 		maxRetries: 0,
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
@@ -21904,6 +22769,69 @@ func sentPlainJoined(messages []bridgeSentMessage) string {
 	return strings.Join(plain, "\n---\n")
 }
 
+func legacyV5LoadTeamsStateForBridgeTest(data []byte) (teamstore.State, error) {
+	var state teamstore.State
+	if err := json.Unmarshal(data, &state); err != nil {
+		return teamstore.State{}, err
+	}
+	if state.SchemaVersion != teamstore.SchemaVersion {
+		return teamstore.State{}, fmt.Errorf("unsupported Teams state schema version %d", state.SchemaVersion)
+	}
+	return state, nil
+}
+
+func seedBridgeSQLiteMigrationMatrixState(ctx context.Context, store *teamstore.Store, now time.Time) error {
+	return store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			TeamsChatID:    "control-chat",
+			TeamsChatURL:   TeamsChatURL("control-chat", "tenant-1"),
+			TeamsChatTopic: "control",
+			UpdatedAt:      now,
+		}
+		state.Sessions["s001"] = teamstore.SessionContext{
+			ID:           "s001",
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  "chat-1",
+			TeamsChatURL: TeamsChatURL("chat-1", "tenant-1"),
+			TeamsTopic:   "topic",
+			Cwd:          "/workspace/matrix",
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		state.InboundEvents["large-upgrade-matrix"] = teamstore.InboundEvent{
+			ID:             "large-upgrade-matrix",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "large-upgrade-matrix",
+			Text:           strings.Repeat("matrix ", int(teamstore.DefaultSQLiteStateMigrationMinSize/7)+1024),
+			Status:         teamstore.InboundStatusPersisted,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		state.Turns["turn-upgrade-matrix"] = teamstore.Turn{
+			ID:             "turn-upgrade-matrix",
+			SessionID:      "s001",
+			InboundEventID: "large-upgrade-matrix",
+			Status:         teamstore.TurnStatusQueued,
+			QueuedAt:       now,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		state.OutboxMessages["outbox-upgrade-matrix"] = teamstore.OutboxMessage{
+			ID:          "outbox-upgrade-matrix",
+			SessionID:   "s001",
+			TurnID:      "turn-upgrade-matrix",
+			TeamsChatID: "chat-1",
+			Kind:        "status",
+			Body:        "matrix queued",
+			Status:      teamstore.OutboxStatusQueued,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		return nil
+	})
+}
+
 func requirePlainTextInOrder(t *testing.T, text string, wants ...string) {
 	t.Helper()
 	offset := 0
@@ -22051,6 +22979,142 @@ func newBridgeCreateChatGraph(t *testing.T, createdTopic *string) (*GraphClient,
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}, &sent
+}
+
+func TestBridgeMigrateRegistryProjectionSkipsSaveWhenAlreadyMigrated(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("initial migrateRegistryProjectionToStore error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after initial migration: %v", err)
+	}
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("repeat migrateRegistryProjectionToStore error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after repeat migration: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("migrateRegistryProjectionToStore rewrote already migrated registry projection")
+	}
+
+	bridge.reg.Chats = map[string]ChatState{
+		"chat-1": {
+			SeenMessageIDs: []string{"message-new"},
+			SentMessageIDs: []string{"message-sent"},
+		},
+	}
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("migrateRegistryProjectionToStore with new registry chat state error: %v", err)
+	}
+	afterChange, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after registry chat migration: %v", err)
+	}
+	if bytes.Equal(afterChange, after) {
+		t.Fatal("migrateRegistryProjectionToStore did not persist new registry chat state")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load migrated state: %v", err)
+	}
+	if _, ok := state.InboundEvents["inbound:chat-1:message-new"]; !ok {
+		t.Fatalf("migrated inbound event missing: %#v", state.InboundEvents)
+	}
+	if _, ok := state.OutboxMessages[migratedSentOutboxID("chat-1", "message-sent")]; !ok {
+		t.Fatalf("migrated sent outbox missing: %#v", state.OutboxMessages)
+	}
+
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("repeat migrateRegistryProjectionToStore after registry chat migration error: %v", err)
+	}
+	afterRepeatChange, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after repeat registry chat migration: %v", err)
+	}
+	if !bytes.Equal(afterRepeatChange, afterChange) {
+		t.Fatal("migrateRegistryProjectionToStore rewrote already migrated registry chat state")
+	}
+}
+
+func TestBridgeRecordControlChatBindingSkipsSaveWhenUnchanged(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	ctx := context.Background()
+	chat := Chat{ID: "control-chat", WebURL: "https://teams.example/control", Topic: "control"}
+
+	if err := bridge.recordControlChatBinding(ctx, chat); err != nil {
+		t.Fatalf("initial recordControlChatBinding error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after initial control chat binding: %v", err)
+	}
+	if err := bridge.recordControlChatBinding(ctx, chat); err != nil {
+		t.Fatalf("repeat recordControlChatBinding error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after repeat control chat binding: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("recordControlChatBinding rewrote unchanged control chat binding")
+	}
+
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.MachineIdentity.UpdatedAt = time.Time{}
+		state.ControlChat.UpdatedAt = time.Time{}
+		return nil
+	}); err != nil {
+		t.Fatalf("clear control binding timestamps: %v", err)
+	}
+	legacyTimestamps, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store with missing control binding timestamps: %v", err)
+	}
+	if err := bridge.recordControlChatBinding(ctx, chat); err != nil {
+		t.Fatalf("recordControlChatBinding timestamp backfill error: %v", err)
+	}
+	afterBackfill, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after control binding timestamp backfill: %v", err)
+	}
+	if bytes.Equal(afterBackfill, legacyTimestamps) {
+		t.Fatal("recordControlChatBinding did not backfill missing timestamps")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load backfilled control chat binding: %v", err)
+	}
+	if state.MachineIdentity.UpdatedAt.IsZero() || state.ControlChat.UpdatedAt.IsZero() {
+		t.Fatalf("control binding timestamps were not backfilled: machine=%#v control=%#v", state.MachineIdentity, state.ControlChat)
+	}
+	after = afterBackfill
+
+	chat.Topic = "renamed control"
+	if err := bridge.recordControlChatBinding(ctx, chat); err != nil {
+		t.Fatalf("changed recordControlChatBinding error: %v", err)
+	}
+	afterChange, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after changed control chat binding: %v", err)
+	}
+	if bytes.Equal(afterChange, after) {
+		t.Fatal("recordControlChatBinding did not persist changed control chat binding")
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load changed control chat binding: %v", err)
+	}
+	if state.ControlChat.TeamsChatTopic != "renamed control" {
+		t.Fatalf("control chat topic = %q, want renamed control", state.ControlChat.TeamsChatTopic)
+	}
 }
 
 func newBridgeTestStore(t *testing.T) *teamstore.Store {

@@ -51,6 +51,7 @@ const (
 	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
 	mainLoopOutboxFlushMaxMessages             = 2
 	mainLoopWorkflowFlushMaxNotifications      = 1
+	maxQueuedTurnStartsPerCycle                = 16
 	parkNoticeGraphFallbackLookupTTL           = 5 * time.Minute
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
@@ -321,6 +322,7 @@ type Bridge struct {
 	lastBeaconReconcile          time.Time
 	lastBeaconLeaseMaintenance   time.Time
 	maxWorkChatPollsPerCycle     int
+	maxQueuedTurnStartsPerCycle  int
 	dashboardProjectsMu          sync.Mutex
 	dashboardProjectsCache       []codexhistory.Project
 	dashboardProjectsCachedAt    time.Time
@@ -334,6 +336,8 @@ type Bridge struct {
 	runningTurnCancels           map[string]*runningTurnCancel
 	acceptedOutboxMu             sync.Mutex
 	acceptedOutboxes             map[string]acceptedOutboxRecovery
+	deferredNoticeMu             sync.Mutex
+	deferredInterruptedPending   bool
 }
 
 type runningTurnCancel struct {
@@ -404,11 +408,17 @@ func (b *Bridge) readClient() *GraphClient {
 }
 
 func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
-	if err := b.migrateRegistryProjectionToStore(ctx); err != nil {
-		return Chat{}, err
-	}
-	if err := b.restoreRegistryFromStore(ctx); err != nil {
-		return Chat{}, err
+	return b.ensureControlChat(ctx, true)
+}
+
+func (b *Bridge) ensureControlChat(ctx context.Context, syncRegistry bool) (Chat, error) {
+	if syncRegistry {
+		if err := b.migrateRegistryProjectionToStore(ctx); err != nil {
+			return Chat{}, err
+		}
+		if err := b.restoreRegistryFromStore(ctx); err != nil {
+			return Chat{}, err
+		}
 	}
 	if b.reg.ControlChatID != "" {
 		desiredTopic := ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()), Profile: b.scope.Profile})
@@ -677,30 +687,35 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		return err
 	}
+	defer func() {
+		b.clearOwnerIfSame(context.Background())
+		_, _ = b.store.ReleaseControlLeaseIfHolder(context.Background(), b.machine.ID, b.currentLeaseGeneration())
+	}()
 	if err := b.clearStaleHelperReloadDrainOnStart(ctx); err != nil {
 		return err
 	}
 	if err := b.completeExpiredHelperUpgradeDrainOnStart(ctx); err != nil {
 		return err
 	}
-	ownerHeartbeatCtx, cancelOwnerHeartbeat := context.WithCancel(ctx)
-	ownerHeartbeatDone := b.startOwnerHeartbeat(ownerHeartbeatCtx)
-	stopOwnerHeartbeat := func() {
-		cancelOwnerHeartbeat()
-		if ownerHeartbeatDone != nil {
-			<-ownerHeartbeatDone
-			ownerHeartbeatDone = nil
-		}
-	}
-	defer func() {
-		stopOwnerHeartbeat()
-		b.clearOwnerIfSame(context.Background())
-		_, _ = b.store.ReleaseControlLeaseIfHolder(context.Background(), b.machine.ID, b.currentLeaseGeneration())
-	}()
-	chat, err := b.initializeControlChatAndRecovery(ctx)
+	chat, err := b.initializeControlChatAndRecoveryAfterRegistrySync(ctx)
 	if err != nil {
 		return err
 	}
+	if deferMigration, err := b.shouldDeferTeamsStoreSQLiteMigration(ctx); err != nil {
+		return err
+	} else if !deferMigration {
+		if err := b.migrateTeamsStoreToSQLiteOrFallback(ctx); err != nil {
+			return err
+		}
+	}
+	ownerHeartbeatCtx, cancelOwnerHeartbeat := context.WithCancel(ctx)
+	ownerHeartbeatDone := b.startOwnerHeartbeat(ownerHeartbeatCtx)
+	defer func() {
+		cancelOwnerHeartbeat()
+		if ownerHeartbeatDone != nil {
+			<-ownerHeartbeatDone
+		}
+	}()
 	if b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams control chat: %s\n", chat.WebURL)
 		_, _ = fmt.Fprintln(b.out, "Listening. Send `help`, `p`, or `n <directory>` in the control chat.")
@@ -801,7 +816,15 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 }
 
 func (b *Bridge) initializeControlChatAndRecovery(ctx context.Context) (Chat, error) {
-	chat, err := b.EnsureControlChat(ctx)
+	return b.initializeControlChatAndRecoveryWithRegistrySync(ctx, true)
+}
+
+func (b *Bridge) initializeControlChatAndRecoveryAfterRegistrySync(ctx context.Context) (Chat, error) {
+	return b.initializeControlChatAndRecoveryWithRegistrySync(ctx, false)
+}
+
+func (b *Bridge) initializeControlChatAndRecoveryWithRegistrySync(ctx context.Context, syncRegistry bool) (Chat, error) {
+	chat, err := b.ensureControlChat(ctx, syncRegistry)
 	if err != nil {
 		return Chat{}, err
 	}
@@ -863,7 +886,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			return err
 		}
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.PollScheduleSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -891,12 +914,21 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 	}
 
-	state, err = b.store.Load(ctx)
+	state, err = b.store.PollScheduleSnapshot(ctx)
 	if err != nil {
 		return err
 	}
 	runningBySession := runningPollSessions(state)
+	queueStateBySession := pollSessionTurnQueueStates(state)
 	var decisions []inboundPollDecision
+	var pendingScheduleUpdates []teamstore.ChatPollScheduleUpdate
+	flushPendingScheduleUpdates := func() error {
+		if err := b.persistInboundPollScheduleUpdates(ctx, pendingScheduleUpdates); err != nil {
+			return err
+		}
+		pendingScheduleUpdates = pendingScheduleUpdates[:0]
+		return nil
+	}
 	pollsByChat := make(map[string]teamstore.ChatPollState)
 	hasPollByChat := make(map[string]bool)
 	pollableByChat := make(map[string]Session)
@@ -923,6 +955,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			Now:              time.Now(),
 		})
 		if decision.ShouldPark {
+			if err := flushPendingScheduleUpdates(); err != nil {
+				return err
+			}
 			if err := b.parkIdleWorkChat(ctx, session, decision); err != nil {
 				return err
 			}
@@ -930,13 +965,16 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 		if !decision.Due {
 			if !inboundPollDecisionAlreadyPersisted(poll, hasPoll, decision) {
-				if err := b.persistInboundPollDecision(ctx, decision); err != nil {
-					return err
+				if update, ok := inboundPollDecisionScheduleUpdate(decision); ok {
+					pendingScheduleUpdates = append(pendingScheduleUpdates, update)
 				}
 			}
 			continue
 		}
 		decisions = append(decisions, decision)
+	}
+	if err := flushPendingScheduleUpdates(); err != nil {
+		return err
 	}
 	sortInboundPollDecisions(decisions)
 	if limit := b.effectiveMaxWorkChatPollsPerCycle(); len(decisions) > limit {
@@ -950,7 +988,8 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 		s := session
 		if _, err := b.pollChatWithRoleState(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], func(ctx context.Context, msg ChatMessage, text string) error {
-			return b.handleSessionMessage(ctx, s.ChatID, msg, text)
+			turns := queueStateBySession[s.ID]
+			return b.handleSessionMessageWithQueueState(ctx, s.ChatID, msg, text, &turns, nil)
 		}); err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -1106,15 +1145,14 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		for _, msg := range msgs {
 			b.reg.MarkSeen(chatID, msg.ID)
 		}
-		updated, err := b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), "")
+		_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, len(msgs), "", time.Time{})
 		if err != nil {
 			return false, err
 		}
 		if role == inboundPollRoleControl {
 			b.notePollSuccess(time.Now())
 		}
-		err = b.scheduleChatAfterPoll(ctx, chatID, role, running, updated, time.Time{})
-		return false, err
+		return false, nil
 	}
 	handled := false
 	var activityAt time.Time
@@ -1182,17 +1220,14 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 	if seeded && role != inboundPollRoleControl && window.Truncated {
 		continuationPath = window.NextPath
 	}
-	updated, err := b.store.RecordChatPollSuccessWithContinuation(ctx, chatID, maxModified, true, windowFull, len(msgs), continuationPath)
-	if err != nil {
-		return handled, err
-	}
 	if role == inboundPollRoleControl {
 		b.notePollSuccess(time.Now())
 	}
 	if handled && activityAt.IsZero() {
 		activityAt = time.Now()
 	}
-	return handled, b.scheduleChatAfterPoll(ctx, chatID, role, running, updated, activityAt)
+	_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, len(msgs), continuationPath, activityAt)
+	return handled, err
 }
 
 func (b *Bridge) recordChatPollHandlerError(ctx context.Context, chatID string, poll teamstore.ChatPollState, err error) {
@@ -1251,6 +1286,18 @@ func maxMessageModifiedTime(messages []ChatMessage) time.Time {
 
 func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time) error {
 	now := time.Now()
+	update := chatPollScheduleUpdateAfterPoll(chatID, role, running, poll, activityAt, now)
+	_, err := b.store.UpdateChatPollSchedule(ctx, update)
+	return err
+}
+
+func (b *Bridge) recordChatPollSuccessAndSchedule(ctx context.Context, chatID string, role inboundPollRole, running bool, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, activityAt time.Time) (teamstore.ChatPollState, error) {
+	return b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
+		return chatPollScheduleUpdateAfterPoll(chatID, role, running, poll, activityAt, time.Now()), nil
+	})
+}
+
+func chatPollScheduleUpdateAfterPoll(chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time, now time.Time) teamstore.ChatPollScheduleUpdate {
 	poll.NextPollAt = time.Time{}
 	decision := decideInboundPoll(inboundPollInput{
 		ChatID:          chatID,
@@ -1265,7 +1312,7 @@ func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role 
 	if decision.Interval > 0 {
 		next = nextInboundPollAt(now, decision.Interval)
 	}
-	_, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+	return teamstore.ChatPollScheduleUpdate{
 		ChatID:            chatID,
 		PollState:         decision.State,
 		PreviousPollState: decision.PreviousState,
@@ -1273,8 +1320,7 @@ func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role 
 		LastActivityAt:    activityAt,
 		ClearBlockedUntil: true,
 		ResetFailures:     true,
-	})
-	return err
+	}
 }
 
 func (b *Bridge) effectiveMaxWorkChatPollsPerCycle() int {
@@ -1284,11 +1330,40 @@ func (b *Bridge) effectiveMaxWorkChatPollsPerCycle() int {
 	return maxWorkChatPollsPerCycle
 }
 
+func (b *Bridge) effectiveMaxQueuedTurnStartsPerCycle() int {
+	if b != nil {
+		if b.maxQueuedTurnStartsPerCycle < 0 {
+			return 0
+		}
+		if b.maxQueuedTurnStartsPerCycle > 0 {
+			return b.maxQueuedTurnStartsPerCycle
+		}
+	}
+	return maxQueuedTurnStartsPerCycle
+}
+
 func (b *Bridge) persistInboundPollDecision(ctx context.Context, decision inboundPollDecision) error {
-	if strings.TrimSpace(decision.ChatID) == "" || strings.TrimSpace(decision.State) == "" {
+	update, ok := inboundPollDecisionScheduleUpdate(decision)
+	if !ok {
 		return nil
 	}
-	_, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+	_, err := b.store.UpdateChatPollSchedule(ctx, update)
+	return err
+}
+
+func (b *Bridge) persistInboundPollScheduleUpdates(ctx context.Context, updates []teamstore.ChatPollScheduleUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	_, err := b.store.UpdateChatPollSchedules(ctx, updates)
+	return err
+}
+
+func inboundPollDecisionScheduleUpdate(decision inboundPollDecision) (teamstore.ChatPollScheduleUpdate, bool) {
+	if strings.TrimSpace(decision.ChatID) == "" || strings.TrimSpace(decision.State) == "" {
+		return teamstore.ChatPollScheduleUpdate{}, false
+	}
+	return teamstore.ChatPollScheduleUpdate{
 		ChatID:            decision.ChatID,
 		PollState:         decision.State,
 		PreviousPollState: decision.PreviousState,
@@ -1296,8 +1371,7 @@ func (b *Bridge) persistInboundPollDecision(ctx context.Context, decision inboun
 		LastActivityAt:    decision.LastActivityAt,
 		BlockedUntil:      decision.BlockedUntil,
 		ClearBlockedUntil: decision.State != inboundPollStateBlocked,
-	})
-	return err
+	}, true
 }
 
 func inboundPollDecisionAlreadyPersisted(poll teamstore.ChatPollState, hasPoll bool, decision inboundPollDecision) bool {
@@ -1491,6 +1565,25 @@ func runningPollSessions(state teamstore.State) map[string]bool {
 		}
 	}
 	return running
+}
+
+func pollSessionTurnQueueStates(state teamstore.State) map[string]sessionTurnQueueState {
+	out := make(map[string]sessionTurnQueueState)
+	for _, turn := range state.Turns {
+		sessionID := strings.TrimSpace(turn.SessionID)
+		if sessionID == "" {
+			continue
+		}
+		current := out[sessionID]
+		switch turn.Status {
+		case teamstore.TurnStatusRunning:
+			current.Running = true
+		case teamstore.TurnStatusQueued:
+			current.Queued++
+		}
+		out[sessionID] = current
+	}
+	return out
 }
 
 func runningTurnSessions(state teamstore.State) map[string]bool {
@@ -1771,7 +1864,7 @@ func (b *Bridge) parkNoticeAlreadySent(ctx context.Context, session Session, not
 		return true, nil
 	}
 	parkedAt := poll.ParkedAt
-	state, err := b.store.Load(ctx)
+	state, err := b.store.OutboxStateSnapshot(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -1962,7 +2055,7 @@ func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context,
 	if incomingKey == "" {
 		return false, nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.OutboxStateSnapshot(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -3412,7 +3505,7 @@ func (b *Bridge) workflowWebhookControlStatus(ctx context.Context) string {
 	if err := b.ensureStore(); err != nil {
 		return "⚠️ Workflow webhook status failed.\n\n" + err.Error()
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return "⚠️ Workflow webhook status failed.\n\n" + err.Error()
 	}
@@ -5266,6 +5359,10 @@ func machineLabel() string {
 }
 
 func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg ChatMessage, text string) error {
+	return b.handleSessionMessageWithQueueState(ctx, chatID, msg, text, nil, nil)
+}
+
+func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID string, msg ChatMessage, text string, knownTurns *sessionTurnQueueState, knownQueueSnapshot *teamstore.State) error {
 	session := b.reg.SessionByChatID(chatID)
 	if session == nil {
 		return nil
@@ -5340,15 +5437,21 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 	} else if blocked {
 		return b.rejectSessionWork(ctx, session, msg, control)
 	}
-	if duplicate, err := b.ignoreRecentDuplicateSessionPrompt(ctx, session, msg, text); err != nil {
+	if duplicate, err := b.ignoreRecentDuplicateSessionPromptWithSnapshot(ctx, session, msg, text, knownQueueSnapshot); err != nil {
 		return err
 	} else if duplicate {
 		return nil
 	}
 	if b.asyncTurns {
-		turns, err := b.sessionTurnQueueState(ctx, session.ID)
-		if err != nil {
-			return err
+		var turns sessionTurnQueueState
+		if knownTurns != nil {
+			turns = *knownTurns
+		} else {
+			var err error
+			turns, err = b.sessionTurnQueueState(ctx, session.ID)
+			if err != nil {
+				return err
+			}
 		}
 		if turns.Running {
 			if err := b.ensureDurableSession(ctx, session); err != nil {
@@ -5366,7 +5469,11 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
 			session.UpdatedAt = time.Now()
-			if err := b.queueTeamsPromptAckForMessage(ctx, session, turn, msg, true); err != nil {
+			ackBody := b.formatBlockedTeamsPromptAckFromSnapshot(ctx, session, localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: "A Codex request is already running in this Work chat.",
+			}, knownQueueSnapshot)
+			if err := b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, ackBody, msg); err != nil {
 				return err
 			}
 			b.boostPolling(time.Now())
@@ -5391,7 +5498,8 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 			if !created || !turnCreated {
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
-			if err := b.queueTeamsPromptBlockedAckForMessage(ctx, session, turn, msg, gate); err != nil {
+			ackBody := b.formatBlockedTeamsPromptAckFromSnapshot(ctx, session, gate, knownQueueSnapshot)
+			if err := b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, ackBody, msg); err != nil {
 				return err
 			}
 			b.boostPolling(time.Now())
@@ -5637,6 +5745,10 @@ func (b *Bridge) queueTeamsPromptBlockedAckForMessage(ctx context.Context, sessi
 }
 
 func (b *Bridge) formatBlockedTeamsPromptAck(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) string {
+	return b.formatBlockedTeamsPromptAckFromSnapshot(ctx, session, gate, nil)
+}
+
+func (b *Bridge) formatBlockedTeamsPromptAckFromSnapshot(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate, snapshot *teamstore.State) string {
 	reason := blockedAckReason(gate)
 	lines := []string{
 		"⚠️ **Your request is queued.**",
@@ -5645,7 +5757,15 @@ func (b *Bridge) formatBlockedTeamsPromptAck(ctx context.Context, session *Sessi
 		"---",
 		"",
 	}
-	lines = append(lines, b.sessionTurnQueueSnapshotLines(ctx, session, gate)...)
+	if snapshot != nil && session != nil {
+		if queueLines := formatSessionTurnQueueSnapshot(*snapshot, session.ID, requestAheadFallbackSummary(gate)); len(queueLines) > 0 {
+			lines = append(lines, queueLines...)
+		} else {
+			lines = append(lines, b.sessionTurnQueueSnapshotLines(ctx, session, gate)...)
+		}
+	} else {
+		lines = append(lines, b.sessionTurnQueueSnapshotLines(ctx, session, gate)...)
+	}
 	lines = append(lines,
 		"",
 		"---",
@@ -5700,7 +5820,7 @@ func requestAheadFallbackSummary(gate localCodexBeforeTeamsGate) string {
 func (b *Bridge) sessionTurnQueueSnapshotLines(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) []string {
 	fallback := requestAheadFallbackSummary(gate)
 	if b != nil && b.store != nil && session != nil {
-		if state, err := b.store.Load(ctx); err == nil {
+		if state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, session.ID); err == nil {
 			if lines := formatSessionTurnQueueSnapshot(state, session.ID, fallback); len(lines) > 0 {
 				return lines
 			}
@@ -5836,7 +5956,7 @@ func (b *Bridge) recoverUnfinishedTurns(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.TurnQueueStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -5868,7 +5988,7 @@ func (b *Bridge) recoverUnfinishedTurns(ctx context.Context) error {
 			}
 		}
 	}
-	return b.sendDeferredInterruptedTurnNotices(ctx)
+	return b.sendDeferredInterruptedTurnNoticesNow(ctx)
 }
 
 func interruptedAfterRestartOutboxID(turnID string) string {
@@ -5879,16 +5999,28 @@ func (b *Bridge) sendDeferredInterruptedTurnNotices(ctx context.Context) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	if !b.deferredInterruptedNoticePending() {
+		return nil
+	}
+	return b.sendDeferredInterruptedTurnNoticesNow(ctx)
+}
+
+func (b *Bridge) sendDeferredInterruptedTurnNoticesNow(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	state, err := b.store.QueuedTurnStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
 	var turns []teamstore.Turn
+	pendingAfterScan := false
 	for _, turn := range state.Turns {
 		if turn.Status != teamstore.TurnStatusInterrupted || strings.TrimSpace(turn.RecoveryReason) != recoveryReasonAmbiguousAfterHelperRestart {
 			continue
 		}
 		if sessionHasQueuedOrRunningTurnState(state, turn.SessionID) {
+			pendingAfterScan = true
 			continue
 		}
 		turns = append(turns, turn)
@@ -5901,9 +6033,15 @@ func (b *Bridge) sendDeferredInterruptedTurnNotices(ctx context.Context) error {
 		}
 		return turns[i].ID < turns[j].ID
 	})
+	if len(turns) == 0 {
+		b.setDeferredInterruptedNoticePending(pendingAfterScan)
+		return nil
+	}
+	b.setDeferredInterruptedNoticePending(true)
 	for _, turn := range turns {
 		session := b.sessionForTurnState(state, turn)
 		if session == nil || strings.TrimSpace(session.ChatID) == "" {
+			pendingAfterScan = true
 			continue
 		}
 		if err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
@@ -5922,7 +6060,26 @@ func (b *Bridge) sendDeferredInterruptedTurnNotices(ctx context.Context) error {
 			return err
 		}
 	}
+	b.setDeferredInterruptedNoticePending(pendingAfterScan)
 	return nil
+}
+
+func (b *Bridge) deferredInterruptedNoticePending() bool {
+	if b == nil {
+		return false
+	}
+	b.deferredNoticeMu.Lock()
+	defer b.deferredNoticeMu.Unlock()
+	return b.deferredInterruptedPending
+}
+
+func (b *Bridge) setDeferredInterruptedNoticePending(pending bool) {
+	if b == nil {
+		return
+	}
+	b.deferredNoticeMu.Lock()
+	b.deferredInterruptedPending = pending
+	b.deferredNoticeMu.Unlock()
 }
 
 func (b *Bridge) markInterruptedAfterRestartNoticeSent(ctx context.Context, turn teamstore.Turn) error {
@@ -6079,7 +6236,7 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.QueuedTurnStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -6103,6 +6260,8 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 		}
 	}
 	sort.Strings(sessionIDs)
+	startLimit := b.effectiveMaxQueuedTurnStartsPerCycle()
+	started := 0
 	var firstErr error
 	recordSessionErr := func(session *Session, stage string, err error) {
 		if err == nil {
@@ -6116,6 +6275,9 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 		}
 	}
 	for _, sessionID := range sessionIDs {
+		if startLimit > 0 && started >= startLimit {
+			break
+		}
 		session := b.sessionForIDState(state, sessionID)
 		if session == nil {
 			continue
@@ -6133,12 +6295,50 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 			}
 			continue
 		}
-		if _, err := b.startQueuedTurn(ctx, session, "", nil); err != nil {
+		if startedNow, err := b.startQueuedTurn(ctx, session, "", nil); err != nil {
 			recordSessionErr(session, "start", err)
 			continue
+		} else if startedNow {
+			started++
 		}
 	}
 	return firstErr
+}
+
+func (b *Bridge) processQueuedTurnsForSession(ctx context.Context, session *Session) error {
+	if b == nil || !b.asyncTurns || session == nil || strings.TrimSpace(session.ID) == "" {
+		return nil
+	}
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
+		return err
+	} else if importing {
+		return nil
+	}
+	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, session.ID)
+	if err != nil {
+		return err
+	}
+	for _, turn := range state.Turns {
+		if turn.SessionID == session.ID && turn.Status == teamstore.TurnStatusRunning {
+			return nil
+		}
+	}
+	queued, ok := oldestQueuedTurnForSessionState(state, session.ID)
+	if !ok {
+		return nil
+	}
+	gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+	if err != nil {
+		return err
+	}
+	if gate.Block {
+		return b.sendQueuedTurnAttentionIfDue(ctx, session, queued, gate, time.Now())
+	}
+	_, err = b.startQueuedTurn(ctx, session, "", nil)
+	return err
 }
 
 func oldestQueuedTurnForSessionState(state teamstore.State, sessionID string) (teamstore.Turn, bool) {
@@ -7435,10 +7635,14 @@ type recentDuplicatePrompt struct {
 }
 
 func (b *Bridge) ignoreRecentDuplicateSessionPrompt(ctx context.Context, session *Session, msg ChatMessage, text string) (bool, error) {
+	return b.ignoreRecentDuplicateSessionPromptWithSnapshot(ctx, session, msg, text, nil)
+}
+
+func (b *Bridge) ignoreRecentDuplicateSessionPromptWithSnapshot(ctx context.Context, session *Session, msg ChatMessage, text string, snapshot *teamstore.State) (bool, error) {
 	if b == nil || session == nil || b.store == nil {
 		return false, nil
 	}
-	duplicate, ok, err := b.recentDuplicateSessionPrompt(ctx, session, msg, text, time.Now())
+	duplicate, ok, err := b.recentDuplicateSessionPromptWithSnapshot(ctx, session, msg, text, time.Now(), snapshot)
 	if err != nil || !ok {
 		return ok, err
 	}
@@ -7453,6 +7657,10 @@ func (b *Bridge) ignoreRecentDuplicateSessionPrompt(ctx context.Context, session
 }
 
 func (b *Bridge) recentDuplicateSessionPrompt(ctx context.Context, session *Session, msg ChatMessage, text string, now time.Time) (recentDuplicatePrompt, bool, error) {
+	return b.recentDuplicateSessionPromptWithSnapshot(ctx, session, msg, text, now, nil)
+}
+
+func (b *Bridge) recentDuplicateSessionPromptWithSnapshot(ctx context.Context, session *Session, msg ChatMessage, text string, now time.Time, snapshot *teamstore.State) (recentDuplicatePrompt, bool, error) {
 	if b == nil || session == nil || b.store == nil || messageHasPromptDedupUnsafeAttachments(msg) {
 		return recentDuplicatePrompt{}, false, nil
 	}
@@ -7464,9 +7672,15 @@ func (b *Bridge) recentDuplicateSessionPrompt(ctx context.Context, session *Sess
 	if hash == "" {
 		return recentDuplicatePrompt{}, false, nil
 	}
-	state, err := b.store.Load(ctx)
-	if err != nil {
-		return recentDuplicatePrompt{}, false, err
+	var state teamstore.State
+	if snapshot != nil {
+		state = *snapshot
+	} else {
+		var err error
+		state, err = b.store.SessionTurnQueueSnapshot(ctx, session.ID)
+		if err != nil {
+			return recentDuplicatePrompt{}, false, err
+		}
 	}
 	var best recentDuplicatePrompt
 	var bestAt time.Time
@@ -7837,11 +8051,10 @@ func (b *Bridge) turnInterrupted(ctx context.Context, turnID string) (bool, erro
 	if b == nil || b.store == nil || strings.TrimSpace(turnID) == "" {
 		return false, nil
 	}
-	state, err := b.store.Load(ctx)
+	turn, ok, err := b.store.TurnByID(ctx, turnID)
 	if err != nil {
 		return false, err
 	}
-	turn, ok := state.Turns[turnID]
 	return ok && turn.Status == teamstore.TurnStatusInterrupted, nil
 }
 
@@ -7908,7 +8121,7 @@ func (b *Bridge) sessionTurnQueueState(ctx context.Context, sessionID string) (s
 	if strings.TrimSpace(sessionID) == "" {
 		return sessionTurnQueueState{}, nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, sessionID)
 	if err != nil {
 		return sessionTurnQueueState{}, err
 	}
@@ -7941,8 +8154,18 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		return ok, err
 	}
 	if strings.TrimSpace(preferredTurnID) == "" || claimed.ID != preferredTurnID {
-		if err := b.queueAndBestEffortQueuedTurnStartNotice(ctx, session, claimed); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice error: %v\n", err)
+		sendNotice := true
+		if needed, noticeErr := b.queuedTurnStartNoticeNeeded(ctx, session.ID); noticeErr != nil {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice check error: %v\n", noticeErr)
+			}
+		} else {
+			sendNotice = needed
+		}
+		if sendNotice {
+			if err := b.queueAndBestEffortQueuedTurnStartNotice(ctx, session, claimed); err != nil && b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice error: %v\n", err)
+			}
 		}
 	}
 	sessionSnapshot := *session
@@ -7955,8 +8178,8 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		if err != nil {
 			b.handleClaimedQueuedTurnError(context.Background(), runSession, claimed, err)
 		}
-		if err := b.processQueuedTurns(context.Background()); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams queued turn follow-up error: %v\n", err)
+		if err := b.processQueuedTurnsForSession(context.Background(), runSession); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams queued turn session follow-up error: %v\n", err)
 		}
 		if err := b.sendDeferredInterruptedTurnNotices(context.Background()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams interrupted turn notice error: %v\n", err)
@@ -7964,6 +8187,18 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		b.boostPolling(time.Now())
 	}()
 	return true, nil
+}
+
+func (b *Bridge) queuedTurnStartNoticeNeeded(ctx context.Context, sessionID string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" {
+		return false, nil
+	}
+	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, sessionID)
+	if err != nil {
+		return true, err
+	}
+	remaining := queuedTurnsForSessionState(state, sessionID)
+	return len(remaining) > 0, nil
 }
 
 func queuedTurnStartOutboxID(turnID string) string {
@@ -7989,7 +8224,7 @@ func (b *Bridge) queueAndBestEffortQueuedTurnStartNotice(ctx context.Context, se
 }
 
 func (b *Bridge) formatQueuedTurnStartNotice(ctx context.Context, sessionID string, claimed teamstore.Turn) (string, bool, error) {
-	state, err := b.store.Load(ctx)
+	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, sessionID)
 	if err != nil {
 		return "", false, err
 	}
@@ -8020,9 +8255,13 @@ func (b *Bridge) runClaimedQueuedTurn(ctx context.Context, session *Session, cla
 	if strings.TrimSpace(preferredTurnID) != "" && claimed.ID == preferredTurnID && preferred != nil {
 		return preferred(ctx, session, claimed)
 	}
-	state, err := b.store.Load(ctx)
+	inbound, ok, err := b.store.InboundEventByID(ctx, claimed.InboundEventID)
 	if err != nil {
 		return err
+	}
+	state := teamstore.State{SchemaVersion: teamstore.SchemaVersion, InboundEvents: map[string]teamstore.InboundEvent{}}
+	if ok {
+		state.InboundEvents[inbound.ID] = inbound
 	}
 	return b.recoverQueuedTurn(ctx, session, claimed, state)
 }
@@ -8523,6 +8762,85 @@ func (b *Bridge) setControlLease(lease teamstore.ControlLease) {
 	b.ownerMu.Lock()
 	defer b.ownerMu.Unlock()
 	b.lease = lease
+}
+
+func (b *Bridge) migrateTeamsStoreToSQLiteOrFallback(ctx context.Context) error {
+	if _, err := b.store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("migrate Teams store to sqlite: %w", err)
+		}
+		if _, legacy, loadErr := b.store.LoadLegacyJSONState(ctx); loadErr != nil {
+			return fmt.Errorf("migrate Teams store to sqlite: %w; legacy fallback unavailable: %v", err, loadErr)
+		} else if !legacy {
+			return fmt.Errorf("migrate Teams store to sqlite: %w; legacy fallback unavailable: current state is not legacy JSON", err)
+		}
+		b.sendTeamsStoreSQLiteMigrationFallbackNotice(ctx, err)
+	}
+	return nil
+}
+
+func (b *Bridge) shouldDeferTeamsStoreSQLiteMigration(ctx context.Context) (bool, error) {
+	if b == nil || b.store == nil {
+		return false, nil
+	}
+	path, err := b.pendingHelperRestartNoticePath()
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return true, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	if state.ServiceControl.Draining {
+		switch strings.TrimSpace(state.ServiceControl.Reason) {
+		case teamstore.HelperUpgradeReason, teamstore.HelperReloadReason:
+			return true, nil
+		}
+	}
+	if state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
+		switch state.Upgrade.Phase {
+		case teamstore.UpgradePhaseCompleted, teamstore.UpgradePhaseAborted:
+		default:
+			if strings.TrimSpace(state.Upgrade.Reason) == teamstore.HelperUpgradeReason {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (b *Bridge) sendTeamsStoreSQLiteMigrationFallbackNotice(ctx context.Context, migrationErr error) {
+	if b == nil || b.store == nil || b.graph == nil || strings.TrimSpace(b.reg.ControlChatID) == "" {
+		return
+	}
+	chatID := strings.TrimSpace(b.reg.ControlChatID)
+	msg := teamstore.OutboxMessage{
+		ID:          teamsStoreSQLiteMigrationFallbackOutboxID(b.store.Path(), chatID),
+		TeamsChatID: chatID,
+		Kind:        "teams-store-sqlite-migration-fallback",
+		Body:        teamsStoreSQLiteMigrationFallbackNotice(migrationErr),
+	}
+	if err := b.queueAndBestEffortSendOutbox(ctx, msg); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams store SQLite migration fallback notice failed: %v\n", err)
+	}
+}
+
+func teamsStoreSQLiteMigrationFallbackOutboxID(storePath string, chatID string) string {
+	seed := strings.TrimSpace(chatID) + "\x00" + strings.TrimSpace(storePath)
+	return "outbox:control:teams-store-sqlite-migration-fallback:" + shortStableID(seed)
+}
+
+func teamsStoreSQLiteMigrationFallbackNotice(migrationErr error) string {
+	detail := "unknown error"
+	if migrationErr != nil && strings.TrimSpace(migrationErr.Error()) != "" {
+		detail = strings.TrimSpace(migrationErr.Error())
+	}
+	return "Teams state migration to SQLite failed. The helper will keep using the legacy JSON state store for this run, so functionality should continue, but the Teams state performance optimization is disabled until a later retry succeeds.\n\nError: " + detail
 }
 
 func (b *Bridge) runStandbyLoop(ctx context.Context, opts BridgeOptions) error {
@@ -9036,8 +9354,9 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 	if b.reg.ControlChatID == "" && len(b.reg.Sessions) == 0 && len(b.reg.Chats) == 0 {
 		return nil
 	}
-	return b.store.Update(ctx, func(state *teamstore.State) error {
+	return b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
 		now := time.Now()
+		changed := false
 		if b.user.ID != "" || b.user.UserPrincipalName != "" {
 			if b.scope.ID == "" {
 				b.scope = ScopeIdentityForUser(b.user)
@@ -9049,16 +9368,36 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 			if state.MachineIdentity.ID == "" {
 				state.MachineIdentity.ID = machineID
 				state.MachineIdentity.CreatedAt = now
+				changed = true
 			}
-			state.MachineIdentity.Label = b.machine.Label
-			state.MachineIdentity.Hostname = b.machine.Hostname
-			state.MachineIdentity.AccountID = b.user.ID
-			state.MachineIdentity.UserPrincipal = b.user.UserPrincipalName
-			state.MachineIdentity.Profile = b.scope.Profile
-			state.MachineIdentity.ScopeID = b.scope.ID
-			state.MachineIdentity.Kind = b.machine.Kind
-			state.MachineIdentity.Priority = b.machine.Priority
-			state.MachineIdentity.UpdatedAt = now
+			machineChanged := false
+			setMachineString := func(target *string, value string) {
+				if *target != value {
+					*target = value
+					machineChanged = true
+				}
+			}
+			setMachineString(&state.MachineIdentity.Label, b.machine.Label)
+			setMachineString(&state.MachineIdentity.Hostname, b.machine.Hostname)
+			setMachineString(&state.MachineIdentity.AccountID, b.user.ID)
+			setMachineString(&state.MachineIdentity.UserPrincipal, b.user.UserPrincipalName)
+			setMachineString(&state.MachineIdentity.Profile, b.scope.Profile)
+			setMachineString(&state.MachineIdentity.ScopeID, b.scope.ID)
+			if state.MachineIdentity.Kind != b.machine.Kind {
+				state.MachineIdentity.Kind = b.machine.Kind
+				machineChanged = true
+			}
+			if state.MachineIdentity.Priority != b.machine.Priority {
+				state.MachineIdentity.Priority = b.machine.Priority
+				machineChanged = true
+			}
+			if state.MachineIdentity.UpdatedAt.IsZero() {
+				machineChanged = true
+			}
+			if machineChanged {
+				state.MachineIdentity.UpdatedAt = now
+				changed = true
+			}
 		}
 		if state.ControlChat.TeamsChatID == "" && b.reg.ControlChatID != "" {
 			state.ControlChat.MachineID = state.MachineIdentity.ID
@@ -9068,6 +9407,7 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 			state.ControlChat.TeamsChatTopic = b.reg.ControlChatTopic
 			state.ControlChat.BoundAt = now
 			state.ControlChat.UpdatedAt = now
+			changed = true
 		}
 		for _, session := range b.reg.Sessions {
 			if isControlFallbackSessionID(session.ID) {
@@ -9104,10 +9444,12 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				CreatedAt:     created,
 				UpdatedAt:     updated,
 			}
+			changed = true
 		}
 		if fallback, ok := state.Sessions[controlFallbackSessionID]; ok {
 			if sanitizeControlFallbackSession(&fallback, "", now) {
 				state.Sessions[controlFallbackSessionID] = fallback
+				changed = true
 			}
 		}
 		for chatID, chatState := range b.reg.Chats {
@@ -9134,6 +9476,7 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 					CreatedAt:      now,
 					UpdatedAt:      now,
 				}
+				changed = true
 			}
 			for _, messageID := range chatState.SentMessageIDs {
 				messageID = strings.TrimSpace(messageID)
@@ -9154,9 +9497,10 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 					UpdatedAt:      now,
 					SentAt:         now,
 				}
+				changed = true
 			}
 		}
-		return nil
+		return changed, nil
 	})
 }
 
@@ -9180,32 +9524,68 @@ func (b *Bridge) recordControlChatBinding(ctx context.Context, chat Chat) error 
 	}
 	machineID := b.machine.ID
 	label := b.machine.Label
-	return b.store.Update(ctx, func(state *teamstore.State) error {
+	return b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
 		now := time.Now()
+		changed := false
+		machineChanged := false
 		if state.MachineIdentity.ID == "" {
 			state.MachineIdentity.ID = machineID
 			state.MachineIdentity.CreatedAt = now
+			changed = true
 		}
-		state.MachineIdentity.Label = label
-		state.MachineIdentity.Hostname = label
-		state.MachineIdentity.AccountID = b.user.ID
-		state.MachineIdentity.UserPrincipal = b.user.UserPrincipalName
-		state.MachineIdentity.Profile = b.scope.Profile
-		state.MachineIdentity.ScopeID = b.scope.ID
-		state.MachineIdentity.Kind = b.machine.Kind
-		state.MachineIdentity.Priority = b.machine.Priority
-		state.MachineIdentity.UpdatedAt = now
+		setMachineString := func(target *string, value string) {
+			if *target != value {
+				*target = value
+				machineChanged = true
+			}
+		}
+		setMachineString(&state.MachineIdentity.Label, label)
+		setMachineString(&state.MachineIdentity.Hostname, label)
+		setMachineString(&state.MachineIdentity.AccountID, b.user.ID)
+		setMachineString(&state.MachineIdentity.UserPrincipal, b.user.UserPrincipalName)
+		setMachineString(&state.MachineIdentity.Profile, b.scope.Profile)
+		setMachineString(&state.MachineIdentity.ScopeID, b.scope.ID)
+		if state.MachineIdentity.Kind != b.machine.Kind {
+			state.MachineIdentity.Kind = b.machine.Kind
+			machineChanged = true
+		}
+		if state.MachineIdentity.Priority != b.machine.Priority {
+			state.MachineIdentity.Priority = b.machine.Priority
+			machineChanged = true
+		}
+		if state.MachineIdentity.UpdatedAt.IsZero() {
+			machineChanged = true
+		}
+		if machineChanged {
+			state.MachineIdentity.UpdatedAt = now
+			changed = true
+		}
+
+		controlChanged := false
 		if state.ControlChat.BoundAt.IsZero() {
 			state.ControlChat.BoundAt = now
+			controlChanged = true
 		}
-		state.ControlChat.MachineID = machineID
-		state.ControlChat.ScopeID = b.scope.ID
-		state.ControlChat.AccountID = b.user.ID
-		state.ControlChat.TeamsChatID = chat.ID
-		state.ControlChat.TeamsChatURL = chat.WebURL
-		state.ControlChat.TeamsChatTopic = chat.Topic
-		state.ControlChat.UpdatedAt = now
-		return nil
+		if state.ControlChat.UpdatedAt.IsZero() {
+			controlChanged = true
+		}
+		setControlString := func(target *string, value string) {
+			if *target != value {
+				*target = value
+				controlChanged = true
+			}
+		}
+		setControlString(&state.ControlChat.MachineID, machineID)
+		setControlString(&state.ControlChat.ScopeID, b.scope.ID)
+		setControlString(&state.ControlChat.AccountID, b.user.ID)
+		setControlString(&state.ControlChat.TeamsChatID, chat.ID)
+		setControlString(&state.ControlChat.TeamsChatURL, chat.WebURL)
+		setControlString(&state.ControlChat.TeamsChatTopic, chat.Topic)
+		if controlChanged {
+			state.ControlChat.UpdatedAt = now
+			changed = true
+		}
+		return changed, nil
 	})
 }
 
@@ -9678,7 +10058,7 @@ func (b *Bridge) shouldSuppressOwnerMentionForWorkflow(ctx context.Context, msg 
 	if b == nil || b.store == nil || !msg.MentionOwner || !outboxHasWorkflowNotificationCandidate(msg) {
 		return false
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return false
 	}
@@ -13022,7 +13402,7 @@ func (b *Bridge) sessionTranscriptImportInProgress(ctx context.Context, sessionI
 	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" {
 		return false, nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.TranscriptImportStateSnapshot(ctx)
 	if err != nil {
 		return false, err
 	}

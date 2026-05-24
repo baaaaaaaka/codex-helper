@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,7 @@ const (
 	maxRetainedTranscriptDeliveries    = 65536
 	maxRetainedMessageProvenance       = 8192
 	maxRetainedHelperDeliveries        = 32768
+	maxStatePointerSize                = 4096
 )
 
 type SessionStatus string
@@ -112,6 +114,7 @@ var (
 )
 
 const outboxSendLease = 2 * time.Minute
+const chatPollSuccessHeartbeatWriteInterval = 30 * time.Second
 
 const (
 	HelperUpgradeReason = "codex-proxy upgrade"
@@ -714,6 +717,7 @@ type OutboxMessage struct {
 	ID                     string       `json:"id"`
 	SessionID              string       `json:"session_id,omitempty"`
 	TurnID                 string       `json:"turn_id,omitempty"`
+	CodexThreadID          string       `json:"codex_thread_id,omitempty"`
 	TeamsChatID            string       `json:"teams_chat_id"`
 	ScopeID                string       `json:"scope_id,omitempty"`
 	MachineID              string       `json:"machine_id,omitempty"`
@@ -786,12 +790,12 @@ type stateFileStamp struct {
 }
 
 type stateFileRevision struct {
-	Valid             bool
-	VolumeSerial      uint32
-	FileIndexHigh     uint32
-	FileIndexLow      uint32
-	CreationTimeNanos int64
-	ChangeTimeNanos   int64
+	Valid             bool   `json:"valid,omitempty"`
+	VolumeSerial      uint32 `json:"volume_serial,omitempty"`
+	FileIndexHigh     uint32 `json:"file_index_high,omitempty"`
+	FileIndexLow      uint32 `json:"file_index_low,omitempty"`
+	CreationTimeNanos int64  `json:"creation_time_nanos,omitempty"`
+	ChangeTimeNanos   int64  `json:"change_time_nanos,omitempty"`
 }
 
 type messageLookupCache struct {
@@ -892,6 +896,8 @@ type Store struct {
 	mu            sync.Mutex
 	lock          *flock.Flock
 	messageLookup messageLookupCache
+	sqliteDB      *sql.DB
+	sqliteDBPath  string
 }
 
 func DefaultPath() (string, error) {
@@ -916,6 +922,21 @@ func Open(path string) (*Store, error) {
 	}, nil
 }
 
+func (s *Store) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sqliteDB == nil {
+		return nil
+	}
+	err := s.sqliteDB.Close()
+	s.sqliteDB = nil
+	s.sqliteDBPath = ""
+	return err
+}
+
 func (s *Store) Path() string {
 	return s.path
 }
@@ -928,6 +949,357 @@ func (s *Store) Load(ctx context.Context) (State, error) {
 		return err
 	})
 	return state, err
+}
+
+func (s *Store) LoadLegacyJSONState(ctx context.Context) (State, bool, error) {
+	var state State
+	legacy := false
+	err := s.withStateLock(ctx, func() error {
+		data, err := os.ReadFile(s.path)
+		if errors.Is(err, os.ErrNotExist) {
+			state = newState()
+			legacy = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, ok, err := storeSQLitePointerFromData(data); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+			return err
+		} else if ok {
+			return fmt.Errorf("unsupported teams store backend %q", backend)
+		}
+		state, err = loadStateData(data)
+		if err != nil {
+			return err
+		}
+		legacy = true
+		return nil
+	})
+	return state, legacy, err
+}
+
+var (
+	controlStateFields = stateFieldSet(
+		"service_control",
+	)
+	pollStateSnapshotFields = stateFieldSet(
+		"sessions",
+		"turns",
+		"inbound_events",
+		"chat_polls",
+		"import_checkpoints",
+		"service_owner",
+	)
+	pollScheduleSnapshotFields = stateFieldSet(
+		"sessions",
+		"turns",
+		"chat_polls",
+		"import_checkpoints",
+		"service_owner",
+	)
+	queuedTurnStateSnapshotFields = stateFieldSet(
+		"sessions",
+		"turns",
+		"import_checkpoints",
+		"service_owner",
+	)
+	transcriptImportStateSnapshotFields = stateFieldSet(
+		"import_checkpoints",
+		"service_owner",
+	)
+	workflowNotificationStateSnapshotFields = stateFieldSet(
+		"control_chat",
+		"workflow",
+	)
+	workflowEventStateSnapshotFields = stateFieldSet(
+		"sessions",
+		"turns",
+		"inbound_events",
+	)
+	turnQueueStateSnapshotFields = stateFieldSet(
+		"turns",
+		"inbound_events",
+	)
+	deferredInboundStateFields = stateFieldSet(
+		"inbound_events",
+	)
+	pendingOutboxStateFields = stateFieldSet(
+		"outbox_messages",
+		"chat_rate_limits",
+	)
+	outboxStateSnapshotFields = stateFieldSet(
+		"outbox_messages",
+	)
+	chatPollStateFields = stateFieldSet(
+		"chat_polls",
+	)
+	chatRateLimitStateFields = stateFieldSet(
+		"chat_rate_limits",
+	)
+)
+
+func stateFieldSet(fields ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field != "" {
+			out[field] = struct{}{}
+		}
+	}
+	return out
+}
+
+func filterTurnQueueSnapshotForSession(state State, sessionID string) State {
+	sessionID = strings.TrimSpace(sessionID)
+	out := State{SchemaVersion: SchemaVersion, Turns: map[string]Turn{}, InboundEvents: map[string]InboundEvent{}}
+	for id, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) != sessionID {
+			continue
+		}
+		out.Turns[id] = turn
+		if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+			if inbound, ok := state.InboundEvents[inboundID]; ok {
+				out.InboundEvents[inboundID] = inbound
+			}
+		}
+	}
+	for id, inbound := range state.InboundEvents {
+		if strings.TrimSpace(inbound.SessionID) == sessionID {
+			out.InboundEvents[id] = inbound
+		}
+	}
+	out.ensure(time.Time{})
+	return out
+}
+
+func filterActiveTurnQueueSnapshotForSession(state State, sessionID string) State {
+	sessionID = strings.TrimSpace(sessionID)
+	out := State{SchemaVersion: SchemaVersion, Turns: map[string]Turn{}, InboundEvents: map[string]InboundEvent{}}
+	for id, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) != sessionID {
+			continue
+		}
+		switch turn.Status {
+		case TurnStatusQueued, TurnStatusRunning:
+		default:
+			continue
+		}
+		out.Turns[id] = turn
+		if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+			if inbound, ok := state.InboundEvents[inboundID]; ok {
+				out.InboundEvents[inboundID] = inbound
+			}
+		}
+	}
+	out.ensure(time.Time{})
+	return out
+}
+
+func filterWorkflowEventSnapshotForSession(state State, sessionID string) State {
+	out := filterTurnQueueSnapshotForSession(state, sessionID)
+	out.Sessions = map[string]SessionContext{}
+	if session, ok := state.Sessions[sessionID]; ok {
+		out.Sessions[sessionID] = session
+	}
+	out.ensure(time.Time{})
+	return out
+}
+
+func (s *Store) PollStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, pollStateSnapshotFields)
+}
+
+func (s *Store) PollScheduleSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, pollScheduleSnapshotFields)
+}
+
+func (s *Store) QueuedTurnStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, queuedTurnStateSnapshotFields)
+}
+
+func (s *Store) TranscriptImportStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, transcriptImportStateSnapshotFields)
+}
+
+func (s *Store) WorkflowNotificationStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, workflowNotificationStateSnapshotFields)
+}
+
+func (s *Store) WorkflowEventStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, workflowEventStateSnapshotFields)
+}
+
+func (s *Store) SessionWorkflowEventSnapshot(ctx context.Context, sessionID string) (State, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return s.WorkflowEventStateSnapshot(ctx)
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(pointer, sessionID, true)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(workflowEventStateSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = filterWorkflowEventSnapshotForSession(selected, sessionID)
+			return nil
+		}
+		var loadErr error
+		selected, loadErr = s.loadUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
+		state = filterWorkflowEventSnapshotForSession(selected, sessionID)
+		return nil
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) TurnQueueStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, turnQueueStateSnapshotFields)
+}
+
+func (s *Store) SessionTurnQueueSnapshot(ctx context.Context, sessionID string) (State, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return State{SchemaVersion: SchemaVersion}, nil
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(pointer, sessionID, false)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(turnQueueStateSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = filterTurnQueueSnapshotForSession(selected, sessionID)
+			return nil
+		}
+		var loadErr error
+		selected, loadErr = s.loadUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
+		state = filterTurnQueueSnapshotForSession(selected, sessionID)
+		return nil
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) SessionActiveTurnQueueSnapshot(ctx context.Context, sessionID string) (State, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return State{SchemaVersion: SchemaVersion}, nil
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteSessionActiveTurnQueueStateUnlocked(pointer, sessionID)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(turnQueueStateSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = filterActiveTurnQueueSnapshotForSession(selected, sessionID)
+			return nil
+		}
+		var loadErr error
+		selected, loadErr = s.loadUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
+		state = filterActiveTurnQueueSnapshotForSession(selected, sessionID)
+		return nil
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) TurnByID(ctx context.Context, turnID string) (Turn, bool, error) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return Turn{}, false, nil
+	}
+	if turn, ok, handled, err := s.turnByIDSQLite(ctx, turnID); handled || err != nil {
+		return turn, ok, err
+	}
+	state, err := s.TurnQueueStateSnapshot(ctx)
+	if err != nil {
+		return Turn{}, false, err
+	}
+	turn, ok := state.Turns[turnID]
+	return turn, ok, nil
+}
+
+func (s *Store) OutboxStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, outboxStateSnapshotFields)
+}
+
+func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[string]struct{}) (State, error) {
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(wantedFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = selected
+			return nil
+		}
+		var loadErr error
+		state, loadErr = s.loadUnlocked()
+		return loadErr
+	})
+	return state, err
+}
+
+func (s *Store) loadSelectedStateFieldsUnlocked(wantedFields map[string]struct{}) (State, bool, error) {
+	if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+		if err != nil {
+			return State{}, false, err
+		}
+		state, err := s.loadSQLiteSelectedStateFieldsUnlocked(pointer, wantedFields)
+		return state, true, err
+	}
+	return State{}, false, nil
 }
 
 func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
@@ -949,6 +1321,19 @@ func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
 		}
 		if s.messageLookup.Valid {
 			s.replaceMessageLookupCacheFromStateLocked(state)
+		}
+		return nil
+	})
+}
+
+func (s *Store) UpdateIfChanged(ctx context.Context, fn func(*State) (bool, error)) error {
+	return s.Update(ctx, func(state *State) error {
+		changed, err := fn(state)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errStoreNoChange
 		}
 		return nil
 	})
@@ -1022,7 +1407,7 @@ func (s *Store) ClearDrain(ctx context.Context) (ServiceControl, error) {
 }
 
 func (s *Store) ReadControl(ctx context.Context) (ServiceControl, error) {
-	state, err := s.Load(ctx)
+	state, err := s.loadStateFieldsOrFull(ctx, controlStateFields)
 	if err != nil {
 		return ServiceControl{}, err
 	}
@@ -1040,6 +1425,10 @@ func (s *Store) RecordScope(ctx context.Context, scope ScopeIdentity) (ScopeIden
 		current := state.Scope
 		if current.ID != "" && current.ID != scope.ID {
 			return fmt.Errorf("Teams state belongs to scope %q, not %q", current.ID, scope.ID)
+		}
+		if current.ID != "" && scopeClaimMatchesStored(current, scope) && !current.CreatedAt.IsZero() && !current.UpdatedAt.IsZero() {
+			out = current
+			return errStoreNoChange
 		}
 		if scope.CreatedAt.IsZero() {
 			scope.CreatedAt = current.CreatedAt
@@ -1079,6 +1468,7 @@ func (s *Store) ClaimControlLease(ctx context.Context, claim ControlLeaseClaim) 
 	}
 	var out ControlLeaseDecision
 	err := s.Update(ctx, func(state *State) error {
+		storedScope := state.Scope
 		if state.Scope.ID != "" && state.Scope.ID != claim.Scope.ID {
 			return fmt.Errorf("Teams state belongs to scope %q, not %q", state.Scope.ID, claim.Scope.ID)
 		}
@@ -1118,6 +1508,18 @@ func (s *Store) ClaimControlLease(ctx context.Context, claim ControlLeaseClaim) 
 		}
 		canClaim := !existingLive || sameHolder && (!liveLeaseOwner || sameOwner) || machine.Priority > existing.Priority && !liveLeaseOwner && !protectedActiveTurn
 		if canClaim {
+			if sameHolder && sameOwner && existing.Generation > 0 && existing.LeaseUntil.After(now.Add(claim.Duration/2)) &&
+				scopeClaimMatchesStored(storedScope, claim.Scope) &&
+				existingMachine.Status == MachineStatusActive &&
+				machineClaimMatchesStored(existingMachine, machine) {
+				holder := existingMachine
+				if holder.ID == "" {
+					holder = machine
+				}
+				holder.Status = MachineStatusActive
+				out = ControlLeaseDecision{Mode: LeaseModeActive, Lease: existing, Holder: holder}
+				return errStoreNoChange
+			}
 			if sameHolder {
 				if existing.Generation <= 0 {
 					existing.Generation = 1
@@ -1167,6 +1569,29 @@ func (s *Store) ClaimControlLease(ctx context.Context, claim ControlLeaseClaim) 
 		return nil
 	})
 	return out, err
+}
+
+func scopeClaimMatchesStored(existing ScopeIdentity, claim ScopeIdentity) bool {
+	return strings.TrimSpace(existing.ID) == strings.TrimSpace(claim.ID) &&
+		strings.TrimSpace(existing.AccountID) == strings.TrimSpace(claim.AccountID) &&
+		strings.TrimSpace(existing.UserPrincipal) == strings.TrimSpace(claim.UserPrincipal) &&
+		strings.TrimSpace(existing.OSUser) == strings.TrimSpace(claim.OSUser) &&
+		strings.TrimSpace(existing.Profile) == strings.TrimSpace(claim.Profile) &&
+		strings.TrimSpace(existing.ConfigPath) == strings.TrimSpace(claim.ConfigPath) &&
+		strings.TrimSpace(existing.CodexHome) == strings.TrimSpace(claim.CodexHome)
+}
+
+func machineClaimMatchesStored(existing MachineRecord, claim MachineRecord) bool {
+	return strings.TrimSpace(existing.ID) == strings.TrimSpace(claim.ID) &&
+		strings.TrimSpace(existing.ScopeID) == strings.TrimSpace(claim.ScopeID) &&
+		strings.TrimSpace(existing.Label) == strings.TrimSpace(claim.Label) &&
+		strings.TrimSpace(existing.Hostname) == strings.TrimSpace(claim.Hostname) &&
+		strings.TrimSpace(existing.OSUser) == strings.TrimSpace(claim.OSUser) &&
+		strings.TrimSpace(existing.AccountID) == strings.TrimSpace(claim.AccountID) &&
+		strings.TrimSpace(existing.UserPrincipal) == strings.TrimSpace(claim.UserPrincipal) &&
+		strings.TrimSpace(existing.Profile) == strings.TrimSpace(claim.Profile) &&
+		existing.Kind == claim.Kind &&
+		existing.Priority == claim.Priority
 }
 
 func (s *Store) ValidateControlLease(ctx context.Context, machineID string, generation int64, now time.Time) (ControlLease, error) {
@@ -1791,6 +2216,9 @@ func (s *Store) CreateSession(ctx context.Context, session SessionContext) (Sess
 	if strings.TrimSpace(session.ID) == "" {
 		return SessionContext{}, false, fmt.Errorf("session id is required")
 	}
+	if out, created, handled, err := s.createSessionSQLite(ctx, session); handled || err != nil {
+		return out, created, err
+	}
 	var out SessionContext
 	created := false
 	err := s.Update(ctx, func(state *State) error {
@@ -1822,6 +2250,9 @@ func (s *Store) PersistInbound(ctx context.Context, event InboundEvent) (Inbound
 	}
 	if strings.TrimSpace(event.ID) == "" {
 		return InboundEvent{}, false, fmt.Errorf("inbound id or Teams chat/message id is required")
+	}
+	if out, created, handled, err := s.persistInboundSQLite(ctx, event); handled || err != nil {
+		return out, created, err
 	}
 	update := s.Update
 	if event.SessionID != "" {
@@ -1877,13 +2308,44 @@ func (s *Store) PersistInbound(ctx context.Context, event InboundEvent) (Inbound
 }
 
 func (s *Store) RecordMessageProvenance(ctx context.Context, record MessageProvenanceRecord) (MessageProvenanceRecord, error) {
+	if out, handled, err := s.recordMessageProvenanceSQLite(ctx, record); handled || err != nil {
+		return out, err
+	}
 	var out MessageProvenanceRecord
 	err := s.Update(ctx, func(state *State) error {
 		now := time.Now()
+		record.TeamsChatID = strings.TrimSpace(record.TeamsChatID)
+		record.TeamsMessageID = strings.TrimSpace(record.TeamsMessageID)
+		id := messageProvenanceID(record.TeamsChatID, record.TeamsMessageID)
+		before, hadBefore := state.MessageProvenance[id]
 		out = recordMessageProvenanceLocked(state, record, now)
+		if out.ID == "" {
+			return errStoreNoChange
+		}
+		if hadBefore {
+			if after, ok := state.MessageProvenance[out.ID]; ok && messageProvenanceRecordEqual(after, before) {
+				return errStoreNoChange
+			}
+		}
 		return nil
 	})
 	return out, err
+}
+
+func messageProvenanceRecordEqual(left MessageProvenanceRecord, right MessageProvenanceRecord) bool {
+	return left.ID == right.ID &&
+		left.TeamsChatID == right.TeamsChatID &&
+		left.TeamsMessageID == right.TeamsMessageID &&
+		left.Origin == right.Origin &&
+		left.SessionID == right.SessionID &&
+		left.TurnID == right.TurnID &&
+		left.OutboxID == right.OutboxID &&
+		left.InboundID == right.InboundID &&
+		left.Kind == right.Kind &&
+		left.RenderedHash == right.RenderedHash &&
+		left.Diagnostic == right.Diagnostic &&
+		left.CreatedAt.Equal(right.CreatedAt) &&
+		left.UpdatedAt.Equal(right.UpdatedAt)
 }
 
 func recordOutboxProvenanceLocked(state *State, msg OutboxMessage, now time.Time) MessageProvenanceRecord {
@@ -1926,6 +2388,11 @@ func (s *Store) MessageLookup(ctx context.Context, chatID string, teamsMessageID
 	stamp, err := stateFileStampForPath(s.path)
 	if err != nil {
 		return MessageLookup{}, err
+	}
+	if stamp.Exists && stamp.Size <= maxStatePointerSize {
+		if out, handled, err := s.messageLookupSQLite(ctx, chatID, teamsMessageID); handled || err != nil {
+			return out, err
+		}
 	}
 	s.mu.Lock()
 	if lookup, ok := s.messageLookup.lookup(stamp, chatID, teamsMessageID); ok {
@@ -1976,7 +2443,7 @@ func (s *Store) HasInboundMessage(ctx context.Context, chatID string, teamsMessa
 }
 
 func (s *Store) DeferredInbound(ctx context.Context) ([]InboundEvent, error) {
-	state, err := s.Load(ctx)
+	state, err := s.loadStateFieldsOrFull(ctx, deferredInboundStateFields)
 	if err != nil {
 		return nil, err
 	}
@@ -2116,6 +2583,9 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 	if strings.TrimSpace(turn.SessionID) == "" {
 		return Turn{}, false, fmt.Errorf("session id is required")
 	}
+	if out, created, handled, err := s.queueTurnSQLite(ctx, turn); handled || err != nil {
+		return out, created, err
+	}
 	var out Turn
 	created := false
 	err := s.UpdateSession(ctx, turn.SessionID, func(state *State) error {
@@ -2176,6 +2646,22 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 }
 
 func (s *Store) MarkTurnRunning(ctx context.Context, turnID string, codexThreadID string, codexTurnID string) (Turn, error) {
+	if out, handled, err := s.updateTurnSQLite(ctx, strings.TrimSpace(turnID), false, func(state *State, turn Turn, now time.Time) (Turn, error) {
+		turn.Status = TurnStatusRunning
+		if turn.StartedAt.IsZero() {
+			turn.StartedAt = now
+		}
+		if codexThreadID != "" {
+			turn.CodexThreadID = codexThreadID
+		}
+		if codexTurnID != "" {
+			turn.CodexTurnID = codexTurnID
+		}
+		updateSessionFromTurn(state, turn, now)
+		return turn, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
 		turn.Status = TurnStatusRunning
 		if turn.StartedAt.IsZero() {
@@ -2196,6 +2682,9 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return Turn{}, false, fmt.Errorf("session id is required")
+	}
+	if out, claimed, handled, err := s.claimNextQueuedTurnSQLite(ctx, sessionID); handled || err != nil {
+		return out, claimed, err
 	}
 	var out Turn
 	claimed := false
@@ -2239,6 +2728,23 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 }
 
 func (s *Store) MarkTurnCompleted(ctx context.Context, turnID string, codexThreadID string, codexTurnID string) (Turn, error) {
+	if out, handled, err := s.updateTurnSQLite(ctx, strings.TrimSpace(turnID), false, func(state *State, turn Turn, now time.Time) (Turn, error) {
+		if turn.Status == TurnStatusInterrupted {
+			return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be completed", turn.ID)
+		}
+		turn.Status = TurnStatusCompleted
+		turn.CompletedAt = now
+		if codexThreadID != "" {
+			turn.CodexThreadID = codexThreadID
+		}
+		if codexTurnID != "" {
+			turn.CodexTurnID = codexTurnID
+		}
+		updateSessionFromTurn(state, turn, now)
+		return turn, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
 		if turn.Status == TurnStatusInterrupted {
 			return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be completed", turn.ID)
@@ -2261,6 +2767,24 @@ func (s *Store) MarkTurnFailed(ctx context.Context, turnID string, message strin
 }
 
 func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, message string, codexThreadID string, codexTurnID string) (Turn, error) {
+	if out, handled, err := s.updateTurnSQLite(ctx, strings.TrimSpace(turnID), false, func(state *State, turn Turn, now time.Time) (Turn, error) {
+		if turn.Status == TurnStatusInterrupted {
+			return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be failed", turn.ID)
+		}
+		turn.Status = TurnStatusFailed
+		turn.FailedAt = now
+		turn.FailureMessage = message
+		if codexThreadID != "" {
+			turn.CodexThreadID = codexThreadID
+		}
+		if codexTurnID != "" {
+			turn.CodexTurnID = codexTurnID
+		}
+		updateSessionFromTurn(state, turn, now)
+		return turn, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
 		if turn.Status == TurnStatusInterrupted {
 			return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be failed", turn.ID)
@@ -2280,6 +2804,16 @@ func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, m
 }
 
 func (s *Store) MarkTurnInterrupted(ctx context.Context, turnID string, reason string) (Turn, error) {
+	if out, handled, err := s.updateTurnSQLite(ctx, strings.TrimSpace(turnID), true, func(state *State, turn Turn, now time.Time) (Turn, error) {
+		turn.Status = TurnStatusInterrupted
+		turn.InterruptedAt = now
+		turn.RecoveryReason = reason
+		markInboundIgnoredForInterruptedTurn(state, turn, now)
+		skipTransientOutboxForTurnLocked(state, turn.ID, "superseded by interrupted turn", now)
+		return turn, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
 		turn.Status = TurnStatusInterrupted
 		turn.InterruptedAt = now
@@ -2321,6 +2855,9 @@ func (s *Store) QueueOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessa
 	}
 	if strings.TrimSpace(msg.ID) == "" {
 		return OutboxMessage{}, false, fmt.Errorf("outbox id is required")
+	}
+	if out, created, handled, err := s.queueOutboxSQLite(ctx, msg); handled || err != nil {
+		return out, created, err
 	}
 	update := s.Update
 	if msg.SessionID != "" {
@@ -2367,6 +2904,9 @@ func queueOutboxLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMe
 	}
 	if msg.Sequence <= 0 {
 		msg.Sequence = allocateChatSequence(state, msg.TeamsChatID, now)
+	}
+	if msg.CodexThreadID == "" {
+		msg.CodexThreadID = helperDeliveryCodexThreadIDLocked(state, msg)
 	}
 	if msg.PartCount <= 0 {
 		msg.PartCount = 1
@@ -2648,6 +3188,23 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 }
 
 func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		switch msg.Status {
+		case OutboxStatusSent:
+			return msg, ErrOutboxSendNotClaimed
+		case OutboxStatusSending:
+			if !msg.LastSendAttempt.IsZero() && now.Sub(msg.LastSendAttempt) <= outboxSendLease {
+				return msg, ErrOutboxSendNotClaimed
+			}
+		}
+		msg.Status = OutboxStatusSending
+		msg.LastSendAttempt = now
+		msg.LastSendError = ""
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
+		return msg, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		switch msg.Status {
 		case OutboxStatusSent:
@@ -2677,7 +3234,7 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 	if chatID == "" || msg.Sequence <= 0 {
 		return OutboxMessage{}, false, nil
 	}
-	state, err := s.Load(ctx)
+	state, err := s.OutboxStateSnapshot(ctx)
 	if err != nil {
 		return OutboxMessage{}, false, err
 	}
@@ -2700,6 +3257,16 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 }
 
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		msg.Status = OutboxStatusQueued
+		msg.LastSendError = trimDiagnostic(message, 240)
+		msg.LastSendAttempt = now
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, artifactStatusForSendError(msg), "", msg.LastSendError)
+		return msg, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.Status = OutboxStatusQueued
 		msg.LastSendError = trimDiagnostic(message, 240)
@@ -2711,6 +3278,18 @@ func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, messag
 }
 
 func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		msg.DriveItemID = strings.TrimSpace(itemID)
+		msg.DriveItemName = strings.TrimSpace(name)
+		msg.DriveItemETag = strings.TrimSpace(eTag)
+		msg.DriveItemWebURL = strings.TrimSpace(webURL)
+		msg.DriveItemWebDav = strings.TrimSpace(webDavURL)
+		msg.LastSendError = ""
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "drive_uploaded", "", "")
+		return msg, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
@@ -2724,6 +3303,9 @@ func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID
 }
 
 func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
+	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), teamsMessageID, false); handled || err != nil {
+		return out, err
+	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if msg.Status == OutboxStatusSent {
 			recordOutboxProvenanceLocked(state, msg, now)
@@ -2744,6 +3326,9 @@ func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMe
 }
 
 func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
+	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), teamsMessageID, true); handled || err != nil {
+		return out, err
+	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.Status = OutboxStatusSent
 		if msg.SentAt.IsZero() {
@@ -2859,6 +3444,9 @@ func helperDeliveryRecordFromOutboxLocked(state *State, msg OutboxMessage, statu
 }
 
 func helperDeliveryCodexThreadIDLocked(state *State, msg OutboxMessage) string {
+	if threadID := strings.TrimSpace(msg.CodexThreadID); threadID != "" {
+		return threadID
+	}
 	if state == nil {
 		return ""
 	}
@@ -2995,7 +3583,10 @@ func (s *Store) PendingOutboxAt(ctx context.Context, now time.Time) ([]OutboxMes
 	if now.IsZero() {
 		now = time.Now()
 	}
-	state, err := s.Load(ctx)
+	if pending, handled, err := s.pendingOutboxAtSQLite(ctx, now); handled || err != nil {
+		return pending, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, pendingOutboxStateFields)
 	if err != nil {
 		return nil, err
 	}
@@ -3021,7 +3612,7 @@ func (s *Store) ChatRateLimit(ctx context.Context, chatID string) (ChatRateLimit
 	if chatID == "" {
 		return ChatRateLimitState{}, false, fmt.Errorf("chat id is required")
 	}
-	state, err := s.Load(ctx)
+	state, err := s.loadStateFieldsOrFull(ctx, chatRateLimitStateFields)
 	if err != nil {
 		return ChatRateLimitState{}, false, err
 	}
@@ -3033,6 +3624,9 @@ func (s *Store) SetChatRateLimit(ctx context.Context, chatID string, blockedUnti
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return ChatRateLimitState{}, fmt.Errorf("chat id is required")
+	}
+	if out, handled, err := s.setChatRateLimitSQLite(ctx, chatID, blockedUntil, reason); handled || err != nil {
+		return out, err
 	}
 	var out ChatRateLimitState
 	err := s.Update(ctx, func(state *State) error {
@@ -3054,6 +3648,9 @@ func (s *Store) ClearChatRateLimit(ctx context.Context, chatID string) error {
 	if chatID == "" {
 		return fmt.Errorf("chat id is required")
 	}
+	if handled, err := s.clearChatRateLimitSQLite(ctx, chatID); handled || err != nil {
+		return err
+	}
 	return s.Update(ctx, func(state *State) error {
 		delete(state.ChatRateLimits, chatID)
 		return nil
@@ -3065,7 +3662,10 @@ func (s *Store) ChatPoll(ctx context.Context, chatID string) (ChatPollState, boo
 	if chatID == "" {
 		return ChatPollState{}, false, fmt.Errorf("chat id is required")
 	}
-	state, err := s.Load(ctx)
+	if poll, ok, handled, err := s.chatPollSQLite(ctx, chatID); handled || err != nil {
+		return poll, ok, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, chatPollStateFields)
 	if err != nil {
 		return ChatPollState{}, false, err
 	}
@@ -3083,33 +3683,117 @@ func (s *Store) RecordChatPollSuccessWithContinuation(ctx context.Context, chatI
 		return ChatPollState{}, fmt.Errorf("chat id is required")
 	}
 	continuationPath = strings.TrimSpace(continuationPath)
+	if out, handled, err := s.recordChatPollSuccessWithContinuationAndScheduleSQLite(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, nil); handled || err != nil {
+		return out, err
+	}
 	var out ChatPollState
 	err := s.Update(ctx, func(state *State) error {
 		now := time.Now()
-		poll := state.ChatPolls[chatID]
-		poll.ChatID = chatID
-		poll.Seeded = poll.Seeded || seeded
-		if lastModifiedCursor.After(poll.LastModifiedCursor) {
-			poll.LastModifiedCursor = lastModifiedCursor
-		}
-		poll.LastSuccessfulPollAt = now
-		poll.LastError = ""
-		poll.LastErrorAt = time.Time{}
-		poll.BlockedUntil = time.Time{}
-		poll.FailureCount = 0
-		poll.ContinuationPath = continuationPath
-		if windowFull {
-			poll.LastWindowFullAt = now
-			poll.LastWindowFullMessage = fmt.Sprintf("Graph returned a full message window (%d messages); older unprocessed messages may require a larger recovery pass", fetched)
-		} else {
-			poll.LastWindowFullMessage = ""
-		}
-		poll.UpdatedAt = now
-		state.ChatPolls[chatID] = poll
+		poll, changed := applyChatPollSuccessLocked(state, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, now)
 		out = poll
+		if !changed {
+			return errStoreNoChange
+		}
 		return nil
 	})
 	return out, err
+}
+
+// RecordChatPollSuccessWithContinuationAndSchedule applies a poll success and a
+// derived schedule update in one state transaction. The schedule callback runs
+// while the store update is locked, so it must be pure and must not call back
+// into Store methods.
+func (s *Store) RecordChatPollSuccessWithContinuationAndSchedule(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, schedule func(ChatPollState) (ChatPollScheduleUpdate, error)) (ChatPollState, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return ChatPollState{}, fmt.Errorf("chat id is required")
+	}
+	continuationPath = strings.TrimSpace(continuationPath)
+	if out, handled, err := s.recordChatPollSuccessWithContinuationAndScheduleSQLite(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, schedule); handled || err != nil {
+		return out, err
+	}
+	var out ChatPollState
+	err := s.Update(ctx, func(state *State) error {
+		now := time.Now()
+		poll, changed := applyChatPollSuccessLocked(state, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, now)
+		if schedule != nil {
+			update, err := schedule(poll)
+			if err != nil {
+				return err
+			}
+			update.ChatID = strings.TrimSpace(update.ChatID)
+			switch {
+			case update.ChatID == "":
+				update.ChatID = chatID
+			case update.ChatID != chatID:
+				return fmt.Errorf("chat poll schedule chat id %q does not match success chat id %q", update.ChatID, chatID)
+			}
+			var scheduleChanged bool
+			poll, scheduleChanged, err = applyChatPollScheduleUpdateLocked(state, update, time.Now())
+			if err != nil {
+				return err
+			}
+			changed = changed || scheduleChanged
+		}
+		out = poll
+		if !changed {
+			return errStoreNoChange
+		}
+		return nil
+	})
+	return out, err
+}
+
+func applyChatPollSuccessLocked(state *State, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, now time.Time) (ChatPollState, bool) {
+	poll := state.ChatPolls[chatID]
+	if chatPollSuccessIsTimestampOnlyNoop(poll, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, now) {
+		return poll, false
+	}
+	poll.ChatID = chatID
+	poll.Seeded = poll.Seeded || seeded
+	if lastModifiedCursor.After(poll.LastModifiedCursor) {
+		poll.LastModifiedCursor = lastModifiedCursor
+	}
+	poll.LastSuccessfulPollAt = now
+	poll.LastError = ""
+	poll.LastErrorAt = time.Time{}
+	poll.BlockedUntil = time.Time{}
+	poll.FailureCount = 0
+	poll.ContinuationPath = continuationPath
+	if windowFull {
+		poll.LastWindowFullAt = now
+		poll.LastWindowFullMessage = fmt.Sprintf("Graph returned a full message window (%d messages); older unprocessed messages may require a larger recovery pass", fetched)
+	} else {
+		poll.LastWindowFullMessage = ""
+	}
+	poll.UpdatedAt = now
+	state.ChatPolls[chatID] = poll
+	return poll, true
+}
+
+func chatPollSuccessIsTimestampOnlyNoop(poll ChatPollState, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, now time.Time) bool {
+	if poll.ChatID != chatID || fetched != 0 || windowFull {
+		return false
+	}
+	if !poll.Seeded && seeded {
+		return false
+	}
+	if lastModifiedCursor.After(poll.LastModifiedCursor) {
+		return false
+	}
+	if poll.LastError != "" || !poll.LastErrorAt.IsZero() || !poll.BlockedUntil.IsZero() || poll.FailureCount != 0 {
+		return false
+	}
+	if poll.ContinuationPath != continuationPath || poll.LastWindowFullMessage != "" {
+		return false
+	}
+	if poll.LastSuccessfulPollAt.IsZero() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return now.Sub(poll.LastSuccessfulPollAt) < chatPollSuccessHeartbeatWriteInterval
 }
 
 func (s *Store) RecordChatPollError(ctx context.Context, chatID string, message string) error {
@@ -3144,92 +3828,138 @@ func (s *Store) RecordChatPollErrorWithBlock(ctx context.Context, chatID string,
 }
 
 func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollScheduleUpdate) (ChatPollState, error) {
-	chatID := strings.TrimSpace(update.ChatID)
-	if chatID == "" {
-		return ChatPollState{}, fmt.Errorf("chat id is required")
+	if out, handled, err := s.updateChatPollSchedulesSQLite(ctx, []ChatPollScheduleUpdate{update}); handled || err != nil {
+		return out[strings.TrimSpace(update.ChatID)], err
 	}
 	var out ChatPollState
 	err := s.Update(ctx, func(state *State) error {
 		now := time.Now()
-		poll := state.ChatPolls[chatID]
-		changed := false
-		if poll.ChatID != chatID {
-			poll.ChatID = chatID
-			changed = true
-		}
-		if update.PollState != "" {
-			nextState := strings.TrimSpace(update.PollState)
-			nextPrevious := strings.TrimSpace(update.PreviousPollState)
-			if nextState == "blocked" {
-				if nextPrevious == "" && poll.PollState == "blocked" && poll.PreviousPollState != "" {
-					nextPrevious = poll.PreviousPollState
-				}
-				if nextPrevious == "" && poll.PollState != "" && poll.PollState != "blocked" {
-					nextPrevious = poll.PollState
-				}
-			}
-			if poll.PreviousPollState != nextPrevious {
-				poll.PreviousPollState = nextPrevious
-				changed = true
-			}
-			if poll.PollState != nextState {
-				poll.PollState = nextState
-				changed = true
-			}
-			if poll.PollState == "parked" && poll.ParkedAt.IsZero() {
-				poll.ParkedAt = now
-				changed = true
-			}
-			if poll.PollState != "parked" {
-				if !poll.ParkedAt.IsZero() {
-					poll.ParkedAt = time.Time{}
-					changed = true
-				}
-				if !poll.ParkNoticeSentAt.IsZero() {
-					poll.ParkNoticeSentAt = time.Time{}
-					changed = true
-				}
-			}
-		}
-		if !poll.NextPollAt.Equal(update.NextPollAt) {
-			poll.NextPollAt = update.NextPollAt
-			changed = true
-		}
-		if update.LastActivityAt.After(poll.LastActivityAt) {
-			poll.LastActivityAt = update.LastActivityAt
-			changed = true
-		}
-		if update.ClearBlockedUntil {
-			if !poll.BlockedUntil.IsZero() {
-				poll.BlockedUntil = time.Time{}
-				changed = true
-			}
-		} else if !update.BlockedUntil.IsZero() {
-			if !poll.BlockedUntil.Equal(update.BlockedUntil) {
-				poll.BlockedUntil = update.BlockedUntil
-				changed = true
-			}
-		}
-		if update.ClearContinuationPath && poll.ContinuationPath != "" {
-			poll.ContinuationPath = ""
-			changed = true
-		}
-		if update.ResetFailures {
-			if poll.FailureCount != 0 {
-				poll.FailureCount = 0
-				changed = true
-			}
+		poll, changed, err := applyChatPollScheduleUpdateLocked(state, update, now)
+		if err != nil {
+			return err
 		}
 		if !changed {
 			out = poll
 			return errStoreNoChange
 		}
-		poll.UpdatedAt = now
-		state.ChatPolls[chatID] = poll
 		out = poll
 		return nil
 	})
 	return out, err
+}
+
+func (s *Store) UpdateChatPollSchedules(ctx context.Context, updates []ChatPollScheduleUpdate) (map[string]ChatPollState, error) {
+	if len(updates) == 0 {
+		return map[string]ChatPollState{}, nil
+	}
+	if out, handled, err := s.updateChatPollSchedulesSQLite(ctx, updates); handled || err != nil {
+		return out, err
+	}
+	out := make(map[string]ChatPollState, len(updates))
+	err := s.Update(ctx, func(state *State) error {
+		now := time.Now()
+		nextOut := make(map[string]ChatPollState, len(updates))
+		changed := false
+		for _, update := range updates {
+			poll, updateChanged, err := applyChatPollScheduleUpdateLocked(state, update, now)
+			if err != nil {
+				return err
+			}
+			nextOut[poll.ChatID] = poll
+			changed = changed || updateChanged
+		}
+		out = nextOut
+		if !changed {
+			return errStoreNoChange
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpdate, now time.Time) (ChatPollState, bool, error) {
+	chatID := strings.TrimSpace(update.ChatID)
+	if chatID == "" {
+		return ChatPollState{}, false, fmt.Errorf("chat id is required")
+	}
+	poll := state.ChatPolls[chatID]
+	changed := false
+	if poll.ChatID != chatID {
+		poll.ChatID = chatID
+		changed = true
+	}
+	if update.PollState != "" {
+		nextState := strings.TrimSpace(update.PollState)
+		nextPrevious := strings.TrimSpace(update.PreviousPollState)
+		if nextState == "blocked" {
+			if nextPrevious == "" && poll.PollState == "blocked" && poll.PreviousPollState != "" {
+				nextPrevious = poll.PreviousPollState
+			}
+			if nextPrevious == "" && poll.PollState != "" && poll.PollState != "blocked" {
+				nextPrevious = poll.PollState
+			}
+		}
+		if poll.PreviousPollState != nextPrevious {
+			poll.PreviousPollState = nextPrevious
+			changed = true
+		}
+		if poll.PollState != nextState {
+			poll.PollState = nextState
+			changed = true
+		}
+		if poll.PollState == "parked" && poll.ParkedAt.IsZero() {
+			poll.ParkedAt = now
+			changed = true
+		}
+		if poll.PollState != "parked" {
+			if !poll.ParkedAt.IsZero() {
+				poll.ParkedAt = time.Time{}
+				changed = true
+			}
+			if !poll.ParkNoticeSentAt.IsZero() {
+				poll.ParkNoticeSentAt = time.Time{}
+				changed = true
+			}
+		}
+	}
+	if !poll.NextPollAt.Equal(update.NextPollAt) {
+		poll.NextPollAt = update.NextPollAt
+		changed = true
+	}
+	if update.LastActivityAt.After(poll.LastActivityAt) {
+		poll.LastActivityAt = update.LastActivityAt
+		changed = true
+	}
+	if update.ClearBlockedUntil {
+		if !poll.BlockedUntil.IsZero() {
+			poll.BlockedUntil = time.Time{}
+			changed = true
+		}
+	} else if !update.BlockedUntil.IsZero() {
+		if !poll.BlockedUntil.Equal(update.BlockedUntil) {
+			poll.BlockedUntil = update.BlockedUntil
+			changed = true
+		}
+	}
+	if update.ClearContinuationPath && poll.ContinuationPath != "" {
+		poll.ContinuationPath = ""
+		changed = true
+	}
+	if update.ResetFailures {
+		if poll.FailureCount != 0 {
+			poll.FailureCount = 0
+			changed = true
+		}
+	}
+	if !changed {
+		return poll, false, nil
+	}
+	poll.UpdatedAt = now
+	state.ChatPolls[chatID] = poll
+	return poll, true, nil
 }
 
 func (s *Store) MarkChatPollParkNoticeSent(ctx context.Context, chatID string, at time.Time) (ChatPollState, error) {
@@ -3255,8 +3985,9 @@ func (s *Store) MarkChatPollParkNoticeSent(ctx context.Context, chatID string, a
 
 func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
 	var report RecoveryReport
-	err := s.Update(ctx, func(state *State) error {
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
 		now := time.Now()
+		changed := false
 		for id, turn := range state.Turns {
 			if turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
 				continue
@@ -3268,6 +3999,7 @@ func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
 			state.Turns[id] = turn
 			markInboundIgnoredForInterruptedTurn(state, turn, now)
 			report.InterruptedTurnIDs = append(report.InterruptedTurnIDs, id)
+			changed = true
 		}
 		for id, msg := range state.OutboxMessages {
 			if outboxDeliveryProtected(msg) {
@@ -3286,12 +4018,13 @@ func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
 				msg.UpdatedAt = now
 				state.OutboxMessages[id] = msg
 				report.SupersededOutboxIDs = append(report.SupersededOutboxIDs, id)
+				changed = true
 			}
 		}
 		sort.Strings(report.InterruptedTurnIDs)
 		sort.Strings(report.SupersededOutboxIDs)
 		sort.Strings(report.PreservedOutboxBlockerIDs)
-		return nil
+		return changed, nil
 	})
 	return report, err
 }
@@ -3417,6 +4150,20 @@ func (s *Store) loadUnlocked() (State, error) {
 	if err != nil {
 		return State{}, err
 	}
+	if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		return s.loadSQLiteStateUnlocked(pointer)
+	}
+	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
+	}
+	return loadStateData(data)
+}
+
+func loadStateData(data []byte) (State, error) {
 	var state State
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, err
@@ -3428,10 +4175,7 @@ func (s *Store) loadUnlocked() (State, error) {
 	if state.SchemaVersion != SchemaVersion {
 		return State{}, &UnsupportedSchemaVersionError{Version: state.SchemaVersion}
 	}
-	state.ensure(time.Time{})
-	backfillMessageProvenance(&state)
-	backfillHelperDeliveries(&state)
-	normalizeArtifactRecords(&state)
+	normalizeLoadedState(&state)
 	return state, nil
 }
 
@@ -3442,12 +4186,66 @@ func (s *Store) saveUnlocked(state State) error {
 	pruneTranscriptDeliveryRecords(&state)
 	pruneMessageProvenanceRecords(&state)
 	pruneHelperDeliveryRecords(&state)
-	data, err := json.MarshalIndent(state, "", "  ")
+	if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil {
+		return err
+	} else if ok {
+		return s.saveSQLiteStateUnlocked(pointer, state)
+	}
+	if backend, ok, err := s.currentUnsupportedStateStorageBackendUnlocked(); err != nil {
+		return err
+	} else if ok {
+		return fmt.Errorf("unsupported teams store backend %q", backend)
+	}
+	data, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
 	return atomicWriteFile(s.path, data, fileMode)
+}
+
+func (s *Store) currentUnsupportedStateStorageBackendUnlocked() (string, bool, error) {
+	data, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return unsupportedStateStorageBackendFromData(data)
+}
+
+func unsupportedStateStorageBackendFromData(data []byte) (string, bool, error) {
+	if len(data) > maxStatePointerSize {
+		return "", false, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "", false, nil
+	}
+	backendRaw, ok := raw["storage_backend"]
+	if !ok {
+		return "", false, nil
+	}
+	var backend string
+	if err := json.Unmarshal(backendRaw, &backend); err != nil {
+		return "", true, err
+	}
+	backend = strings.TrimSpace(backend)
+	if backend == "" || backend == storeSQLiteBackend {
+		return "", false, nil
+	}
+	return backend, true, nil
+}
+
+func normalizeLoadedState(state *State) {
+	if state == nil {
+		return
+	}
+	state.ensure(time.Time{})
+	backfillMessageProvenance(state)
+	backfillHelperDeliveries(state)
+	normalizeArtifactRecords(state)
 }
 
 func pruneSentOutboxMessages(state *State) {
@@ -3855,8 +4653,11 @@ func backfillMessageProvenance(state *State) {
 		return
 	}
 	state.ensure(time.Time{})
-	for _, inbound := range state.InboundEvents {
-		recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+	checkCurrent := len(state.MessageProvenance) > 0
+	inboundIDs := sortedMapKeys(state.InboundEvents)
+	for _, inboundID := range inboundIDs {
+		inbound := state.InboundEvents[inboundID]
+		record := MessageProvenanceRecord{
 			TeamsChatID:    inbound.TeamsChatID,
 			TeamsMessageID: inbound.TeamsMessageID,
 			Origin:         MessageOriginUserInbound,
@@ -3867,9 +4668,15 @@ func backfillMessageProvenance(state *State) {
 			RenderedHash:   inbound.TextHash,
 			CreatedAt:      inbound.CreatedAt,
 			UpdatedAt:      inbound.UpdatedAt,
-		}, time.Time{})
+		}
+		if checkCurrent && messageProvenanceBackfillRecordCurrent(state, record) {
+			continue
+		}
+		recordMessageProvenanceLocked(state, record, time.Time{})
 	}
-	for _, msg := range state.OutboxMessages {
+	outboxIDs := sortedMapKeys(state.OutboxMessages)
+	for _, outboxID := range outboxIDs {
+		msg := state.OutboxMessages[outboxID]
 		if msg.TeamsMessageID == "" {
 			continue
 		}
@@ -3878,7 +4685,7 @@ func backfillMessageProvenance(state *State) {
 		default:
 			continue
 		}
-		recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+		record := MessageProvenanceRecord{
 			TeamsChatID:    msg.TeamsChatID,
 			TeamsMessageID: msg.TeamsMessageID,
 			Origin:         MessageOriginHelperOutbox,
@@ -3889,8 +4696,70 @@ func backfillMessageProvenance(state *State) {
 			RenderedHash:   msg.RenderedHash,
 			CreatedAt:      msg.CreatedAt,
 			UpdatedAt:      firstStoreNonZeroTime(msg.SentAt, msg.UpdatedAt, msg.CreatedAt),
-		}, time.Time{})
+		}
+		if checkCurrent && messageProvenanceBackfillRecordCurrent(state, record) {
+			continue
+		}
+		recordMessageProvenanceLocked(state, record, time.Time{})
 	}
+}
+
+func messageProvenanceBackfillRecordCurrent(state *State, record MessageProvenanceRecord) bool {
+	if state == nil {
+		return false
+	}
+	chatID := strings.TrimSpace(record.TeamsChatID)
+	teamsMessageID := strings.TrimSpace(record.TeamsMessageID)
+	if chatID == "" || teamsMessageID == "" {
+		return true
+	}
+	id := messageProvenanceID(chatID, teamsMessageID)
+	if id == "" {
+		return true
+	}
+	existing, ok := state.MessageProvenance[id]
+	if !ok {
+		return false
+	}
+	record.Origin = strings.TrimSpace(record.Origin)
+	existing.Origin = strings.TrimSpace(existing.Origin)
+	if existing.Origin == MessageOriginHelperOutbox && record.Origin == MessageOriginUserInbound {
+		return strings.Contains(existing.Diagnostic, "ignored user_inbound")
+	}
+	if existing.Origin != record.Origin {
+		return false
+	}
+	return messageProvenanceRecordCoversBackfill(existing, record)
+}
+
+func messageProvenanceRecordCoversBackfill(existing MessageProvenanceRecord, record MessageProvenanceRecord) bool {
+	if strings.TrimSpace(existing.TeamsChatID) != strings.TrimSpace(record.TeamsChatID) ||
+		strings.TrimSpace(existing.TeamsMessageID) != strings.TrimSpace(record.TeamsMessageID) {
+		return false
+	}
+	for _, pair := range []struct {
+		existing string
+		record   string
+	}{
+		{existing.SessionID, record.SessionID},
+		{existing.TurnID, record.TurnID},
+		{existing.OutboxID, record.OutboxID},
+		{existing.InboundID, record.InboundID},
+		{existing.Kind, record.Kind},
+		{existing.RenderedHash, record.RenderedHash},
+	} {
+		want := strings.TrimSpace(pair.record)
+		if want != "" && strings.TrimSpace(pair.existing) != want {
+			return false
+		}
+	}
+	if !record.CreatedAt.IsZero() && !existing.CreatedAt.Equal(record.CreatedAt) {
+		return false
+	}
+	if !record.UpdatedAt.IsZero() && !existing.UpdatedAt.Equal(record.UpdatedAt) {
+		return false
+	}
+	return true
 }
 
 func backfillHelperDeliveries(state *State) {
@@ -3898,10 +4767,14 @@ func backfillHelperDeliveries(state *State) {
 		return
 	}
 	state.ensure(time.Time{})
-	for _, msg := range state.OutboxMessages {
+	outboxIDs := sortedMapKeys(state.OutboxMessages)
+	for _, outboxID := range outboxIDs {
+		msg := state.OutboxMessages[outboxID]
 		updateHelperDeliveryForOutboxLocked(state, msg, helperDeliveryStatusFromOutboxStatus(msg.Status), firstStoreNonZeroTime(msg.UpdatedAt, msg.CreatedAt))
 	}
-	for _, delivery := range state.TranscriptDeliveries {
+	transcriptDeliveryIDs := sortedMapKeys(state.TranscriptDeliveries)
+	for _, deliveryID := range transcriptDeliveryIDs {
+		delivery := state.TranscriptDeliveries[deliveryID]
 		if helperDeliveryKindFamily(delivery.Kind) == "" || strings.TrimSpace(delivery.TextHash) == "" {
 			continue
 		}
@@ -3935,7 +4808,9 @@ func backfillHelperDeliveries(state *State) {
 			state.HelperDeliveries[record.ID] = record
 		}
 	}
-	for _, provenance := range state.MessageProvenance {
+	provenanceIDs := sortedMapKeys(state.MessageProvenance)
+	for _, provenanceID := range provenanceIDs {
+		provenance := state.MessageProvenance[provenanceID]
 		if strings.TrimSpace(provenance.Origin) != MessageOriginHelperOutbox || helperDeliveryKindFamily(provenance.Kind) == "" || strings.TrimSpace(provenance.RenderedHash) == "" {
 			continue
 		}
@@ -3969,6 +4844,18 @@ func backfillHelperDeliveries(state *State) {
 			state.HelperDeliveries[record.ID] = record
 		}
 	}
+}
+
+func sortedMapKeys[T any](values map[string]T) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func helperDeliveryStatusFromTranscriptDeliveryStatus(status TranscriptDeliveryStatus) HelperDeliveryStatus {
@@ -4453,14 +5340,33 @@ func suppressInboundExecutionForHelperOutboxLocked(state *State, record MessageP
 		return
 	}
 	var inboundIDs []string
+	matchedInbound := false
 	if id := strings.TrimSpace(record.InboundID); id != "" {
 		inboundIDs = append(inboundIDs, id)
+		if _, ok := state.InboundEvents[id]; ok {
+			matchedInbound = true
+		}
 	}
-	for id, inbound := range state.InboundEvents {
-		if strings.TrimSpace(inbound.TeamsChatID) == strings.TrimSpace(record.TeamsChatID) &&
-			strings.TrimSpace(inbound.TeamsMessageID) == strings.TrimSpace(record.TeamsMessageID) &&
-			strings.TrimSpace(inbound.TeamsMessageID) != "" {
-			inboundIDs = appendUniqueStoreString(inboundIDs, id)
+	chatID := strings.TrimSpace(record.TeamsChatID)
+	teamsMessageID := strings.TrimSpace(record.TeamsMessageID)
+	if chatID != "" && teamsMessageID != "" {
+		if id := inboundID(chatID, teamsMessageID); id != "" {
+			if inbound, ok := state.InboundEvents[id]; ok &&
+				strings.TrimSpace(inbound.TeamsChatID) == chatID &&
+				strings.TrimSpace(inbound.TeamsMessageID) == teamsMessageID {
+				inboundIDs = appendUniqueStoreString(inboundIDs, id)
+				matchedInbound = true
+			}
+		}
+		if !matchedInbound {
+			for id, inbound := range state.InboundEvents {
+				if strings.TrimSpace(inbound.TeamsChatID) == chatID &&
+					strings.TrimSpace(inbound.TeamsMessageID) == teamsMessageID &&
+					strings.TrimSpace(inbound.TeamsMessageID) != "" {
+					inboundIDs = appendUniqueStoreString(inboundIDs, id)
+					matchedInbound = true
+				}
+			}
 		}
 	}
 	for _, id := range inboundIDs {
@@ -4473,6 +5379,22 @@ func suppressInboundExecutionForHelperOutboxLocked(state *State, record MessageP
 			inbound.UpdatedAt = now
 		}
 		state.InboundEvents[id] = inbound
+	}
+	turnUpdated := false
+	if turnID := strings.TrimSpace(record.TurnID); turnID != "" {
+		if turn, ok := state.Turns[turnID]; ok && turn.Status == TurnStatusQueued {
+			turn.Status = TurnStatusInterrupted
+			turn.RecoveryReason = "helper_outbox provenance replaced user_inbound for the same Teams message"
+			if !now.IsZero() {
+				turn.InterruptedAt = now
+				turn.UpdatedAt = now
+			}
+			state.Turns[turnID] = turn
+			turnUpdated = true
+		}
+	}
+	if turnUpdated {
+		return
 	}
 	for id, turn := range state.Turns {
 		if turn.Status != TurnStatusQueued {

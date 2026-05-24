@@ -35,6 +35,35 @@ func TestLoadMissingReturnsEmptyState(t *testing.T) {
 	}
 }
 
+func TestSaveWritesCompactStateJSON(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Now(), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if !bytes.HasSuffix(data, []byte("\n")) {
+		t.Fatal("state JSON should keep a trailing newline")
+	}
+	if bytes.Contains(bytes.TrimSuffix(data, []byte("\n")), []byte("\n")) {
+		t.Fatalf("state JSON contains interior newlines; want compact JSON: %q", data[:min(len(data), 120)])
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("compact state JSON is not readable: %v", err)
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load compact state JSON error: %v", err)
+	}
+	if _, ok := loaded.ChatPolls["chat-1"]; !ok {
+		t.Fatalf("Load compact state JSON missed chat-1: %#v", loaded.ChatPolls)
+	}
+}
+
 func TestSaveLoadRoundTrip(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -107,6 +136,1624 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if state.ServiceControl.UpdatedAt.IsZero() {
 		t.Fatal("service control UpdatedAt is zero after roundtrip")
+	}
+}
+
+func TestSQLiteMigrationRoundTripAndHotPaths(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.SetPaused(ctx, true, "sqlite migration test"); err != nil {
+		t.Fatalf("SetPaused error: %v", err)
+	}
+	session := testSession()
+	if _, created, err := store.CreateSession(ctx, session); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	} else if !created {
+		t.Fatal("CreateSession created = false")
+	}
+	inbound, created, err := store.PersistInbound(ctx, testInbound())
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	if !created {
+		t.Fatal("PersistInbound created = false")
+	}
+	historical := testInbound()
+	historical.ID = "historical-inbound"
+	historical.TeamsMessageID = "historical-message"
+	historical.Text = "historical completed request"
+	historical, created, err = store.PersistInbound(ctx, historical)
+	if err != nil {
+		t.Fatalf("PersistInbound historical error: %v", err)
+	}
+	if !created {
+		t.Fatal("PersistInbound historical created = false")
+	}
+	historicalTurn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: historical.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn historical error: %v", err)
+	}
+	if !created {
+		t.Fatal("QueueTurn historical created = false")
+	}
+	if _, err := store.MarkTurnCompleted(ctx, historicalTurn.ID, "thread-historical", "codex-turn-historical"); err != nil {
+		t.Fatalf("MarkTurnCompleted historical error: %v", err)
+	}
+	for i := 0; i < 16; i++ {
+		other := testInbound()
+		other.ID = fmt.Sprintf("other-inbound-%02d", i)
+		other.SessionID = "other-session"
+		other.TeamsChatID = "other-chat"
+		other.TeamsMessageID = fmt.Sprintf("other-message-%02d", i)
+		other.Text = strings.Repeat("long-message-", 128)
+		if _, _, err := store.PersistInbound(ctx, other); err != nil {
+			t.Fatalf("PersistInbound other %d error: %v", i, err)
+		}
+	}
+	before, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load before migration error: %v", err)
+	}
+	result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	if !result.Migrated || result.Path == "" {
+		t.Fatalf("migration result = %#v, want migrated path", result)
+	}
+	after, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after migration error: %v", err)
+	}
+	if !stateLogicalEqual(before, after) {
+		t.Fatalf("sqlite migration changed logical state: %s", sqliteStateSummaryDiff(before, after))
+	}
+	again, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("idempotent MigrateLargeStateToSQLite error: %v", err)
+	}
+	if !again.AlreadyDB {
+		t.Fatalf("second migration result = %#v, want AlreadyDB", again)
+	}
+	loadedInbound, ok, err := store.InboundEventByID(ctx, inbound.ID)
+	if err != nil || !ok || loadedInbound.ID != inbound.ID {
+		t.Fatalf("InboundEventByID = %#v ok %v err %v, want %q", loadedInbound, ok, err, inbound.ID)
+	}
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn sqlite error: %v", err)
+	}
+	if !created {
+		t.Fatal("QueueTurn sqlite created = false")
+	}
+	claimed, ok, err := store.ClaimNextQueuedTurn(ctx, session.ID)
+	if err != nil || !ok {
+		t.Fatalf("ClaimNextQueuedTurn sqlite ok %v err %v", ok, err)
+	}
+	if claimed.ID != turn.ID || claimed.Status != TurnStatusRunning {
+		t.Fatalf("claimed turn = %#v, want running %q", claimed, turn.ID)
+	}
+	if again, ok, err := store.ClaimNextQueuedTurn(ctx, session.ID); err != nil || ok {
+		t.Fatalf("second ClaimNextQueuedTurn = %#v ok %v err %v, want no claim", again, ok, err)
+	}
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		SessionID:   session.ID,
+		TurnID:      turn.ID,
+		TeamsChatID: session.TeamsChatID,
+		Kind:        "final",
+		Body:        "done",
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox sqlite created %v err %v", created, err)
+	}
+	if _, err := store.MarkOutboxSendAttempt(ctx, msg.ID); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt sqlite error: %v", err)
+	}
+	accepted, err := store.MarkOutboxAccepted(ctx, msg.ID, "teams-reply-1")
+	if err != nil {
+		t.Fatalf("MarkOutboxAccepted sqlite error: %v", err)
+	}
+	if accepted.Status != OutboxStatusAccepted || accepted.TeamsMessageID != "teams-reply-1" {
+		t.Fatalf("accepted outbox = %#v", accepted)
+	}
+	pending, err := store.PendingOutboxAt(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("PendingOutboxAt sqlite error: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != msg.ID {
+		t.Fatalf("pending after accept = %#v, want accepted message", pending)
+	}
+	if _, err := store.MarkOutboxSent(ctx, msg.ID, "teams-reply-1"); err != nil {
+		t.Fatalf("MarkOutboxSent sqlite error: %v", err)
+	}
+	lookup, err := store.MessageLookup(ctx, session.TeamsChatID, "teams-reply-1")
+	if err != nil {
+		t.Fatalf("MessageLookup sqlite error: %v", err)
+	}
+	if !lookup.HasDeliveredOutbox || lookup.Provenance.OutboxID != msg.ID {
+		t.Fatalf("MessageLookup = %#v, want delivered outbox %q", lookup, msg.ID)
+	}
+	store.mu.Lock()
+	sqliteLookupBuiltFullCache := store.messageLookup.Valid
+	store.mu.Unlock()
+	if sqliteLookupBuiltFullCache {
+		t.Fatal("SQLite MessageLookup built the full state lookup cache")
+	}
+	inboundLookup, err := store.MessageLookup(ctx, inbound.TeamsChatID, inbound.TeamsMessageID)
+	if err != nil {
+		t.Fatalf("MessageLookup sqlite inbound error: %v", err)
+	}
+	if !inboundLookup.HasInbound || inboundLookup.Provenance.InboundID != inbound.ID {
+		t.Fatalf("MessageLookup inbound = %#v, want inbound %q", inboundLookup, inbound.ID)
+	}
+	activeQueueState, err := store.SessionActiveTurnQueueSnapshot(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("SessionActiveTurnQueueSnapshot sqlite error: %v", err)
+	}
+	if _, ok := activeQueueState.Turns[turn.ID]; !ok {
+		t.Fatalf("active session queue snapshot missing running turn %q", turn.ID)
+	}
+	if _, ok := activeQueueState.InboundEvents[inbound.ID]; !ok {
+		t.Fatalf("active session queue snapshot missing running inbound %q", inbound.ID)
+	}
+	if _, ok := activeQueueState.InboundEvents[historical.ID]; ok {
+		t.Fatal("active session queue snapshot included completed historical inbound")
+	}
+	fullQueueState, err := store.SessionTurnQueueSnapshot(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("SessionTurnQueueSnapshot sqlite full error: %v", err)
+	}
+	if _, ok := fullQueueState.InboundEvents[historical.ID]; !ok {
+		t.Fatal("full session queue snapshot lost historical inbound needed for duplicate detection")
+	}
+	if _, err := store.MarkTurnCompleted(ctx, turn.ID, "thread-sqlite", "codex-turn-sqlite"); err != nil {
+		t.Fatalf("MarkTurnCompleted sqlite error: %v", err)
+	}
+	queueState, err := store.SessionTurnQueueSnapshot(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("SessionTurnQueueSnapshot sqlite error: %v", err)
+	}
+	if _, ok := queueState.InboundEvents[inbound.ID]; !ok {
+		t.Fatalf("session queue snapshot missing inbound %q", inbound.ID)
+	}
+	if _, ok := queueState.InboundEvents["other-inbound-00"]; ok {
+		t.Fatal("session queue snapshot included unrelated inbound")
+	}
+	if _, err := store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, session.TeamsChatID, time.Now(), true, false, 1, "", func(ChatPollState) (ChatPollScheduleUpdate, error) {
+		return ChatPollScheduleUpdate{ChatID: session.TeamsChatID, PollState: "warm", NextPollAt: time.Now().Add(time.Second), ResetFailures: true, ClearBlockedUntil: true}, nil
+	}); err != nil {
+		t.Fatalf("RecordChatPollSuccessWithContinuationAndSchedule sqlite error: %v", err)
+	}
+	if limit, err := store.SetChatRateLimit(ctx, session.TeamsChatID, time.Now().Add(time.Minute), "429"); err != nil || limit.ChatID != session.TeamsChatID {
+		t.Fatalf("SetChatRateLimit sqlite = %#v err %v", limit, err)
+	}
+	if err := store.ClearChatRateLimit(ctx, session.TeamsChatID); err != nil {
+		t.Fatalf("ClearChatRateLimit sqlite error: %v", err)
+	}
+	finalState, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load final sqlite error: %v", err)
+	}
+	if got := finalState.Sessions[session.ID].CodexThreadID; got != "thread-sqlite" {
+		t.Fatalf("session CodexThreadID = %q, want thread-sqlite", got)
+	}
+}
+
+func TestSQLiteMigrationUpgradesLegacySchemaWithRecoverableBackup(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	source := []byte(`{
+		"schema_version": 1,
+		"created_at": "2026-04-30T01:00:00Z",
+		"updated_at": "2026-04-30T01:01:00Z",
+		"service_owner": {
+			"pid": 4242,
+			"hostname": "legacy-host",
+			"executable_path": "/usr/local/bin/codex-helper",
+			"helper_version": "v0.1.0",
+			"active_session_id": "s1",
+			"active_turn_id": "turn:legacy"
+		},
+		"sessions": {
+			"s1": {
+				"id": "s1",
+				"status": "active",
+				"teams_chat_id": "chat-1",
+				"teams_chat_url": "https://teams.example/chat-1",
+				"teams_topic": "legacy topic",
+				"codex_thread_id": "thread-legacy",
+				"latest_turn_id": "turn:legacy",
+				"cwd": "/workspace/legacy"
+			}
+		},
+		"turns": {
+			"turn:legacy": {
+				"id": "turn:legacy",
+				"session_id": "s1",
+				"inbound_event_id": "inbound:legacy",
+				"status": "completed",
+				"codex_thread_id": "thread-legacy"
+			}
+		},
+		"inbound_events": {
+			"inbound:legacy": {
+				"id": "inbound:legacy",
+				"session_id": "s1",
+				"teams_chat_id": "chat-1",
+				"teams_message_id": "message-legacy",
+				"source": "teams",
+				"status": "queued",
+				"turn_id": "turn:legacy",
+				"text": "legacy prompt"
+			}
+		},
+		"outbox_messages": {
+			"outbox:accepted": {
+				"id": "outbox:accepted",
+				"session_id": "s1",
+				"turn_id": "turn:legacy",
+				"teams_chat_id": "chat-1",
+				"kind": "final",
+				"body": "legacy answer",
+				"status": "accepted",
+				"teams_message_id": "message-helper"
+			}
+		},
+		"chat_polls": {
+			"chat-1": {
+				"chat_id": "chat-1",
+				"seeded": true
+			}
+		}
+	}`)
+	writeRawStoreStateForTest(t, store, source)
+
+	expected, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load expected migrated legacy state error: %v", err)
+	}
+	sourceOnDisk, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy source before migration: %v", err)
+	}
+	if !bytes.Equal(sourceOnDisk, source) {
+		t.Fatalf("Load should not rewrite legacy state before SQLite migration")
+	}
+
+	result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite legacy error: %v", err)
+	}
+	if !result.Migrated || result.AlreadyDB || result.Path == "" || result.MigrationID == "" {
+		t.Fatalf("migration result = %#v, want migrated SQLite store", result)
+	}
+	if !stateLogicalEqual(expected, result.State) {
+		t.Fatalf("migration result changed legacy state: %s", sqliteStateSummaryDiff(expected, result.State))
+	}
+	pointerData, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read sqlite pointer: %v", err)
+	}
+	pointer, ok, err := storeSQLitePointerFromData(pointerData)
+	if err != nil || !ok {
+		t.Fatalf("state file is not sqlite pointer: ok=%v err=%v data=%s", ok, err, string(pointerData))
+	}
+	if pointer.MigrationID != result.MigrationID {
+		t.Fatalf("pointer migration id = %q, want %q", pointer.MigrationID, result.MigrationID)
+	}
+	if pointer.SourceSchemaVersion != 1 {
+		t.Fatalf("source schema version = %d, want legacy version 1", pointer.SourceSchemaVersion)
+	}
+	if pointer.SourceSHA256 != sha256Bytes(sourceOnDisk) {
+		t.Fatalf("source sha = %q, want %q", pointer.SourceSHA256, sha256Bytes(sourceOnDisk))
+	}
+	backupData, err := os.ReadFile(store.Path() + ".bak.sqlite." + result.MigrationID)
+	if err != nil {
+		t.Fatalf("read migration backup: %v", err)
+	}
+	if !bytes.Equal(backupData, sourceOnDisk) {
+		t.Fatalf("migration backup differs from legacy source")
+	}
+	if _, err := os.Stat(result.Path); err != nil {
+		t.Fatalf("sqlite db was not created at %q: %v", result.Path, err)
+	}
+	dbState, err := loadSQLiteStateFile(result.Path)
+	if err != nil {
+		t.Fatalf("load sqlite db file directly: %v", err)
+	}
+	if !stateLogicalEqual(expected, dbState) {
+		t.Fatalf("sqlite db state differs from migrated legacy state: %s", sqliteStateSummaryDiff(expected, dbState))
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after legacy sqlite migration error: %v", err)
+	}
+	if !stateLogicalEqual(expected, loaded) {
+		t.Fatalf("loaded sqlite legacy state differs: %s", sqliteStateSummaryDiff(expected, loaded))
+	}
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("Open migrated sqlite store error: %v", err)
+	}
+	reopenedState, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load reopened migrated sqlite store error: %v", err)
+	}
+	if !stateLogicalEqual(expected, reopenedState) {
+		t.Fatalf("reopened sqlite legacy state differs: %s", sqliteStateSummaryDiff(expected, reopenedState))
+	}
+}
+
+func TestSQLiteMigrationThresholdSkipLeavesLegacyStateUntouched(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Now(), true, false, 1); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy state before threshold migration: %v", err)
+	}
+
+	result, err := store.MigrateLargeStateToSQLite(ctx, int64(len(before)+1))
+	if err != nil {
+		t.Fatalf("threshold MigrateLargeStateToSQLite error: %v", err)
+	}
+	if result.Migrated || result.AlreadyDB || result.Path != "" || result.MigrationID != "" {
+		t.Fatalf("threshold migration result = %#v, want no migration", result)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy state after threshold migration: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("threshold migration modified legacy state")
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)); !os.IsNotExist(err) {
+		t.Fatalf("threshold migration should not create sqlite db, stat err = %v", err)
+	}
+}
+
+func TestSQLiteMigrationMissingStateDoesNotCreatePointerOrDB(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("missing-state MigrateLargeStateToSQLite error: %v", err)
+	}
+	if result.Migrated || result.AlreadyDB || result.Path != "" || result.MigrationID != "" {
+		t.Fatalf("missing-state migration result = %#v, want no migration", result)
+	}
+	if result.State.SchemaVersion != SchemaVersion {
+		t.Fatalf("missing-state result schema = %d, want %d", result.State.SchemaVersion, SchemaVersion)
+	}
+	if _, err := os.Stat(store.Path()); !os.IsNotExist(err) {
+		t.Fatalf("missing-state migration should not create state pointer, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)); !os.IsNotExist(err) {
+		t.Fatalf("missing-state migration should not create sqlite db, stat err = %v", err)
+	}
+}
+
+func TestSQLiteMigrationUnsupportedFutureSchemaFailsClosed(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	source := []byte(`{"schema_version":999,"sessions":{"s1":{"id":"s1","teams_chat_id":"chat-1"}}}`)
+	writeRawStoreStateForTest(t, store, source)
+
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), "999") {
+		t.Fatalf("future schema migration error = %v, want unsupported schema version 999", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read future schema after failed migration: %v", err)
+	}
+	if !bytes.Equal(after, source) {
+		t.Fatalf("future schema was modified after failed migration")
+	}
+	backups, err := filepath.Glob(store.Path() + ".bak.sqlite.*")
+	if err != nil {
+		t.Fatalf("glob migration backups: %v", err)
+	}
+	if len(backups) != 0 {
+		t.Fatalf("failed migration wrote backups: %v", backups)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)); !os.IsNotExist(err) {
+		t.Fatalf("failed migration should not create sqlite db, stat err = %v", err)
+	}
+}
+
+func TestSQLiteMigrationRetryReplacesStaleDBAndSidecars(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	expected, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load expected stale-db migration state: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	if err := os.WriteFile(dbPath, []byte("stale sqlite from interrupted migration"), 0o600); err != nil {
+		t.Fatalf("write stale sqlite db: %v", err)
+	}
+	if err := os.WriteFile(dbPath+"-wal", []byte("stale wal"), 0o600); err != nil {
+		t.Fatalf("write stale sqlite wal: %v", err)
+	}
+	if err := os.WriteFile(dbPath+"-shm", []byte("stale shm"), 0o600); err != nil {
+		t.Fatalf("write stale sqlite shm: %v", err)
+	}
+
+	result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("retry MigrateLargeStateToSQLite with stale db error: %v", err)
+	}
+	if !result.Migrated || result.Path != dbPath {
+		t.Fatalf("retry migration result = %#v, want migrated stale db replacement", result)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(dbPath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("stale sqlite sidecar %s remained after migration, stat err = %v", suffix, err)
+		}
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after stale db retry migration: %v", err)
+	}
+	if !stateLogicalEqual(expected, loaded) {
+		t.Fatalf("stale db retry migration changed state: %s", sqliteStateSummaryDiff(expected, loaded))
+	}
+}
+
+func TestSQLiteMigrationFailureLeavesLegacyStateLoadableAndRetryable(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	expected, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load expected failure migration state: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy state before failed migration: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	if err := os.Mkdir(dbPath, 0o700); err != nil {
+		t.Fatalf("create blocking sqlite db directory: %v", err)
+	}
+
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err == nil {
+		t.Fatal("MigrateLargeStateToSQLite succeeded with sqlite db path blocked by directory")
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy state after failed migration: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("failed migration modified legacy state")
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after failed migration should still read legacy state: %v", err)
+	}
+	if !stateLogicalEqual(expected, loaded) {
+		t.Fatalf("failed migration changed loadable legacy state: %s", sqliteStateSummaryDiff(expected, loaded))
+	}
+	if err := os.RemoveAll(dbPath); err != nil {
+		t.Fatalf("remove blocking sqlite db directory: %v", err)
+	}
+	result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("retry MigrateLargeStateToSQLite after clearing failure: %v", err)
+	}
+	if !result.Migrated {
+		t.Fatalf("retry migration result = %#v, want migrated", result)
+	}
+	reloaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after retry migration: %v", err)
+	}
+	if !stateLogicalEqual(expected, reloaded) {
+		t.Fatalf("retry migration changed state: %s", sqliteStateSummaryDiff(expected, reloaded))
+	}
+}
+
+func TestSQLiteMigrationCrashStageMatrixLeavesLegacyStateRetryable(t *testing.T) {
+	stages := []string{
+		sqliteMigrationStageAfterBackup,
+		sqliteMigrationStageAfterTempVerified,
+		sqliteMigrationStageAfterDBReplace,
+	}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			seedComplexLegacyStateForSQLiteMigrationTest(t, store)
+			expected, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load expected state: %v", err)
+			}
+			before, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read legacy state before injected crash: %v", err)
+			}
+			withSQLiteMigrationTestHook(t, func(got string) error {
+				if got == stage {
+					return fmt.Errorf("injected sqlite migration crash at %s", stage)
+				}
+				return nil
+			})
+
+			if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err == nil || !strings.Contains(err.Error(), stage) {
+				t.Fatalf("MigrateLargeStateToSQLite error = %v, want injected stage %q", err, stage)
+			}
+			after, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read legacy state after injected crash: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("injected crash at %s modified state pointer/legacy json", stage)
+			}
+			legacyState, legacy, err := store.LoadLegacyJSONState(ctx)
+			if err != nil || !legacy {
+				t.Fatalf("LoadLegacyJSONState after injected crash = legacy %v err %v, want legacy", legacy, err)
+			}
+			if !stateLogicalEqual(expected, legacyState) {
+				t.Fatalf("legacy state changed after injected crash: %s", sqliteStateSummaryDiff(expected, legacyState))
+			}
+			if stage == sqliteMigrationStageAfterDBReplace {
+				dbState, err := loadSQLiteStateFile(filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+				if err != nil {
+					t.Fatalf("load sqlite db left by after-db-replace crash: %v", err)
+				}
+				if !stateLogicalEqual(expected, dbState) {
+					t.Fatalf("db left by after-db-replace crash differs: %s", sqliteStateSummaryDiff(expected, dbState))
+				}
+			}
+
+			sqliteMigrationTestHook = nil
+			result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+			if err != nil {
+				t.Fatalf("retry migration after injected crash: %v", err)
+			}
+			if !result.Migrated {
+				t.Fatalf("retry result = %#v, want migrated", result)
+			}
+			reloaded, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after retry migration: %v", err)
+			}
+			if !stateLogicalEqual(expected, reloaded) {
+				t.Fatalf("retry after injected crash changed state: %s", sqliteStateSummaryDiff(expected, reloaded))
+			}
+		})
+	}
+}
+
+func TestSQLiteMigrationProcessBoundaryStressAfterUpgrade(t *testing.T) {
+	store := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), storeConcurrentTestTimeout(30*time.Second))
+	defer cancel()
+	seedComplexLegacyStateForSQLiteMigrationTest(t, store)
+	result := migrateStoreToSQLiteForTest(t, store)
+	if result.Path == "" {
+		t.Fatalf("migration result missing sqlite path: %#v", result)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close original migrated store: %v", err)
+	}
+
+	const workers = 8
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			workerStore, err := Open(store.Path())
+			if err != nil {
+				errCh <- fmt.Errorf("open upgraded store worker %d: %w", worker, err)
+				return
+			}
+			defer workerStore.Close()
+			sessionID := fmt.Sprintf("upgrade-session-%02d", worker%4)
+			chatID := fmt.Sprintf("upgrade-chat-%02d", worker%4)
+			inbound, created, err := workerStore.PersistInbound(ctx, InboundEvent{
+				SessionID:      sessionID,
+				TeamsChatID:    chatID,
+				TeamsMessageID: fmt.Sprintf("upgrade-message-%02d", worker),
+				Source:         "teams",
+				Text:           fmt.Sprintf("prompt from upgraded worker %02d", worker),
+			})
+			if err != nil {
+				errCh <- fmt.Errorf("persist inbound worker %d: %w", worker, err)
+				return
+			}
+			if !created {
+				errCh <- fmt.Errorf("persist inbound worker %d was not created", worker)
+				return
+			}
+			turn, created, err := workerStore.QueueTurn(ctx, Turn{SessionID: sessionID, InboundEventID: inbound.ID})
+			if err != nil {
+				errCh <- fmt.Errorf("queue turn worker %d: %w", worker, err)
+				return
+			}
+			if !created {
+				errCh <- fmt.Errorf("queue turn worker %d was not created", worker)
+				return
+			}
+			outbox, created, err := workerStore.QueueOutbox(ctx, OutboxMessage{
+				ID:          fmt.Sprintf("upgrade-outbox-%02d", worker),
+				SessionID:   sessionID,
+				TurnID:      turn.ID,
+				TeamsChatID: chatID,
+				Kind:        "final",
+				Body:        fmt.Sprintf("answer from upgraded worker %02d", worker),
+			})
+			if err != nil {
+				errCh <- fmt.Errorf("queue outbox worker %d: %w", worker, err)
+				return
+			}
+			if !created {
+				errCh <- fmt.Errorf("queue outbox worker %d was not created", worker)
+				return
+			}
+			if _, err := workerStore.MarkTurnCompleted(ctx, turn.ID, "thread-upgrade", "codex-turn-upgrade"); err != nil {
+				errCh <- fmt.Errorf("mark turn completed worker %d: %w", worker, err)
+				return
+			}
+			if _, err := workerStore.MarkOutboxSent(ctx, outbox.ID, fmt.Sprintf("teams-upgrade-%02d", worker)); err != nil {
+				errCh <- fmt.Errorf("mark outbox sent worker %d: %w", worker, err)
+				return
+			}
+		}(worker)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("Open upgraded store after concurrent workers: %v", err)
+	}
+	defer reopened.Close()
+	state, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load upgraded store after concurrent workers: %v", err)
+	}
+	for worker := 0; worker < workers; worker++ {
+		messageID := fmt.Sprintf("upgrade-message-%02d", worker)
+		lookup, err := reopened.MessageLookup(ctx, fmt.Sprintf("upgrade-chat-%02d", worker%4), messageID)
+		if err != nil {
+			t.Fatalf("MessageLookup worker %d: %v", worker, err)
+		}
+		if !lookup.HasInbound {
+			t.Fatalf("MessageLookup worker %d missing inbound for %q: %#v", worker, messageID, lookup)
+		}
+		outboxID := fmt.Sprintf("upgrade-outbox-%02d", worker)
+		outbox, ok := state.OutboxMessages[outboxID]
+		if !ok || outbox.Status != OutboxStatusSent || outbox.TeamsMessageID == "" {
+			t.Fatalf("outbox %q after upgrade workers = %#v ok=%v", outboxID, outbox, ok)
+		}
+	}
+}
+
+func TestSQLitePointerMissingDBFailsClosedAndDoesNotCreateEmptyStore(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	result := migrateStoreToSQLiteForTest(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close migrated store: %v", err)
+	}
+	if err := removeSQLiteSidecarFiles(result.Path); err != nil {
+		t.Fatalf("remove sqlite sidecars: %v", err)
+	}
+	if err := os.Remove(result.Path); err != nil {
+		t.Fatalf("remove migrated sqlite db: %v", err)
+	}
+
+	if _, err := store.Load(ctx); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("Load missing sqlite db error = %v, want fail-closed missing-db error", err)
+	}
+	if _, err := store.PollStateSnapshot(ctx); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("PollStateSnapshot missing sqlite db error = %v, want fail-closed missing-db error", err)
+	}
+	if _, _, err := store.PersistInbound(ctx, testInbound()); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("PersistInbound missing sqlite db error = %v, want fail-closed missing-db error", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("MigrateLargeStateToSQLite missing sqlite db error = %v, want fail-closed missing-db error", err)
+	}
+	if _, err := os.Stat(result.Path); !os.IsNotExist(err) {
+		t.Fatalf("missing sqlite db was recreated, stat err = %v", err)
+	}
+}
+
+func TestSQLitePointerUninitializedOrCorruptDBFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, path string)
+		want string
+	}{
+		{
+			name: "empty file",
+			seed: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatalf("write empty sqlite db: %v", err)
+				}
+			},
+			want: "not initialized",
+		},
+		{
+			name: "schema without state_json",
+			seed: func(t *testing.T, path string) {
+				t.Helper()
+				db, err := openSQLiteStore(path, true)
+				if err != nil {
+					t.Fatalf("open sqlite db without state_json: %v", err)
+				}
+				defer db.Close()
+				if err := ensureSQLiteSchema(db); err != nil {
+					t.Fatalf("ensure sqlite schema without state_json: %v", err)
+				}
+			},
+			want: "state metadata",
+		},
+		{
+			name: "corrupt file",
+			seed: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {
+					t.Fatalf("write corrupt sqlite db: %v", err)
+				}
+			},
+			want: "database",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+			dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+			tc.seed(t, dbPath)
+			before, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read sqlite pointer before Load: %v", err)
+			}
+			if _, err := store.Load(ctx); err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.want)) {
+				t.Fatalf("Load %s error = %v, want substring %q", tc.name, err, tc.want)
+			}
+			after, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read sqlite pointer after Load: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("Load %s modified sqlite pointer", tc.name)
+			}
+		})
+	}
+}
+
+func TestSQLitePointerPathValidationFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "absolute", path: filepath.Join(t.TempDir(), "external.sqlite"), want: "absolute paths"},
+		{name: "parent", path: "../store.sqlite", want: "expected"},
+		{name: "subdir", path: "subdir/store.sqlite", want: "expected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			writeSQLitePointerForTest(t, store, tc.path)
+			before, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read invalid pointer before Load: %v", err)
+			}
+			if _, err := store.Load(context.Background()); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load invalid pointer path error = %v, want substring %q", err, tc.want)
+			}
+			if _, err := store.SetPaused(context.Background(), true, "must not write"); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("SetPaused invalid pointer path error = %v, want substring %q", err, tc.want)
+			}
+			after, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read invalid pointer after failed update: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("failed invalid-pointer update modified state pointer")
+			}
+		})
+	}
+}
+
+func TestSQLitePointerSchemaRejectsLegacyV5Loaders(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read sqlite pointer: %v", err)
+	}
+	var pointer storeSQLitePointer
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		t.Fatalf("unmarshal sqlite pointer: %v", err)
+	}
+	if pointer.SchemaVersion <= SchemaVersion {
+		t.Fatalf("sqlite pointer schema_version = %d, want greater than legacy schema %d", pointer.SchemaVersion, SchemaVersion)
+	}
+	if _, err := legacyV5LoadStateDataForTest(data); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(pointer.SchemaVersion)) {
+		t.Fatalf("legacy v5 loader error = %v, want unsupported pointer schema %d", err, pointer.SchemaVersion)
+	}
+	if _, err := store.Load(ctx); err != nil {
+		t.Fatalf("current loader should still read sqlite pointer: %v", err)
+	}
+}
+
+func TestSQLitePointerUnsupportedSchemaFailsClosed(t *testing.T) {
+	for _, schemaVersion := range []int{0, storeSQLitePointerSchemaVersion - 1, storeSQLitePointerSchemaVersion + 1} {
+		t.Run(fmt.Sprintf("schema=%d", schemaVersion), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			seedLegacyStateFileForSQLiteMigrationTest(t, store)
+			migrateStoreToSQLiteForTest(t, store)
+			data, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read sqlite pointer: %v", err)
+			}
+			var pointer map[string]any
+			if err := json.Unmarshal(data, &pointer); err != nil {
+				t.Fatalf("unmarshal sqlite pointer: %v", err)
+			}
+			pointer["schema_version"] = schemaVersion
+			data, err = json.Marshal(pointer)
+			if err != nil {
+				t.Fatalf("marshal sqlite pointer: %v", err)
+			}
+			data = append(data, '\n')
+			if err := os.WriteFile(store.Path(), data, 0o600); err != nil {
+				t.Fatalf("write unsupported sqlite pointer: %v", err)
+			}
+			before := append([]byte(nil), data...)
+			if _, err := store.Load(ctx); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(schemaVersion)) {
+				t.Fatalf("Load unsupported pointer schema error = %v, want schema %d", err, schemaVersion)
+			}
+			if _, err := store.SetPaused(ctx, true, "must not write"); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(schemaVersion)) {
+				t.Fatalf("SetPaused unsupported pointer schema error = %v, want schema %d", err, schemaVersion)
+			}
+			if _, err := store.MigrateLargeStateToSQLite(ctx, 0); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(schemaVersion)) {
+				t.Fatalf("MigrateLargeStateToSQLite unsupported pointer schema error = %v, want schema %d", err, schemaVersion)
+			}
+			after, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read unsupported sqlite pointer after failed updates: %v", err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatalf("unsupported pointer schema state was modified")
+			}
+		})
+	}
+}
+
+func TestSQLiteMigrationFailureOnStaleSidecarLeavesLegacyState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy state before sidecar failure: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	sidecarDir := dbPath + "-wal"
+	if err := os.Mkdir(sidecarDir, 0o700); err != nil {
+		t.Fatalf("create stale sidecar dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sidecarDir, "locked"), []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write stale sidecar child: %v", err)
+	}
+
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err == nil || !strings.Contains(err.Error(), "remove sqlite sidecar") {
+		t.Fatalf("MigrateLargeStateToSQLite stale sidecar error = %v, want sidecar removal error", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy state after sidecar failure: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("sidecar migration failure modified legacy state")
+	}
+	if _, legacy, err := store.LoadLegacyJSONState(ctx); err != nil || !legacy {
+		t.Fatalf("LoadLegacyJSONState after sidecar failure = legacy %v err %v, want legacy", legacy, err)
+	}
+}
+
+func TestSQLiteExistingDBMissingHotTablesFailsClosed(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("create sqlite dir: %v", err)
+	}
+	db, err := openSQLiteStore(dbPath, true)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE state_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create state_meta: %v", err)
+	}
+	cold, err := json.Marshal(coldSQLiteState(newState()))
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal cold state: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, cold); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert state_meta: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close partial sqlite db: %v", err)
+	}
+	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+
+	if _, err := store.Load(ctx); err == nil || !strings.Contains(err.Error(), `missing required table "sessions"`) {
+		t.Fatalf("Load partial sqlite db error = %v, want missing required table", err)
+	}
+	if _, err := store.SetPaused(ctx, true, "must not write"); err == nil || !strings.Contains(err.Error(), `missing required table "sessions"`) {
+		t.Fatalf("SetPaused partial sqlite db error = %v, want missing required table", err)
+	}
+}
+
+func TestSQLiteStoreUsesFullSynchronousMode(t *testing.T) {
+	store := newTestStore(t)
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	result := migrateStoreToSQLiteForTest(t, store)
+	db, err := openExistingSQLiteStore(result.Path)
+	if err != nil {
+		t.Fatalf("open migrated sqlite db: %v", err)
+	}
+	defer db.Close()
+	var synchronous string
+	if err := db.QueryRow(`PRAGMA synchronous`).Scan(&synchronous); err != nil {
+		t.Fatalf("read synchronous pragma: %v", err)
+	}
+	if synchronous != "2" && !strings.EqualFold(synchronous, "FULL") {
+		t.Fatalf("PRAGMA synchronous = %q, want FULL/2", synchronous)
+	}
+}
+
+func TestSQLiteRecordMessageProvenanceNoopMatchesLegacy(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if _, err := store.SetPaused(ctx, true, "seed no-op provenance"); err != nil {
+				t.Fatalf("seed no-op provenance state: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			before, _ := store.Load(ctx)
+			record, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+				TeamsChatID:    "  ",
+				TeamsMessageID: "\t",
+				Origin:         MessageOriginHelperOutbox,
+			})
+			if err != nil {
+				t.Fatalf("RecordMessageProvenance no-op error: %v", err)
+			}
+			if record.ID != "" {
+				t.Fatalf("no-op RecordMessageProvenance returned %#v, want zero record", record)
+			}
+			after, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after no-op provenance: %v", err)
+			}
+			if !stateLogicalEqual(before, after) {
+				t.Fatalf("no-op provenance changed state: %s", sqliteStateSummaryDiff(before, after))
+			}
+		})
+	}
+}
+
+func TestSQLiteTrimmedMessageIndexesMatchLegacyLookupSemantics(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.InboundEvents["inbound-spaced"] = InboundEvent{
+			ID:             "inbound-spaced",
+			SessionID:      "session-spaced",
+			TeamsChatID:    " chat-spaced ",
+			TeamsMessageID: " message-spaced ",
+			Status:         InboundStatusPersisted,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		state.OutboxMessages["outbox-spaced"] = OutboxMessage{
+			ID:             "outbox-spaced",
+			SessionID:      "session-spaced",
+			TeamsChatID:    " chat-outbox ",
+			TeamsMessageID: " message-outbox ",
+			Status:         OutboxStatusSent,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			SentAt:         now,
+		}
+		state.MessageProvenance["legacy-provenance-spaced"] = MessageProvenanceRecord{
+			ID:             "legacy-provenance-spaced",
+			TeamsChatID:    " chat-provenance ",
+			TeamsMessageID: " message-provenance ",
+			Origin:         MessageOriginUserInbound,
+			InboundID:      "inbound-provenance",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed spaced legacy state: %v", err)
+	}
+	legacyInbound, err := store.MessageLookup(ctx, "chat-spaced", "message-spaced")
+	if err != nil || !legacyInbound.HasInbound {
+		t.Fatalf("legacy spaced inbound lookup = %#v err=%v", legacyInbound, err)
+	}
+	legacyOutbox, err := store.MessageLookup(ctx, "chat-outbox", "message-outbox")
+	if err != nil || !legacyOutbox.HasDeliveredOutbox {
+		t.Fatalf("legacy spaced outbox lookup = %#v err=%v", legacyOutbox, err)
+	}
+	legacyProvenance, err := store.MessageLookup(ctx, "chat-provenance", "message-provenance")
+	if err != nil || !legacyProvenance.HasProvenance || legacyProvenance.Provenance.ID != "legacy-provenance-spaced" {
+		t.Fatalf("legacy spaced provenance lookup = %#v err=%v", legacyProvenance, err)
+	}
+
+	migrateStoreToSQLiteForTest(t, store)
+	sqliteInbound, err := store.MessageLookup(ctx, "chat-spaced", "message-spaced")
+	if err != nil || !messageLookupEqual(sqliteInbound, legacyInbound) {
+		t.Fatalf("sqlite spaced inbound lookup = %#v err=%v, want %#v", sqliteInbound, err, legacyInbound)
+	}
+	sqliteOutbox, err := store.MessageLookup(ctx, "chat-outbox", "message-outbox")
+	if err != nil || !messageLookupEqual(sqliteOutbox, legacyOutbox) {
+		t.Fatalf("sqlite spaced outbox lookup = %#v err=%v, want %#v", sqliteOutbox, err, legacyOutbox)
+	}
+	sqliteProvenance, err := store.MessageLookup(ctx, "chat-provenance", "message-provenance")
+	if err != nil || !messageLookupEqual(sqliteProvenance, legacyProvenance) {
+		t.Fatalf("sqlite spaced provenance lookup = %#v err=%v, want %#v", sqliteProvenance, err, legacyProvenance)
+	}
+	duplicate, created, err := store.PersistInbound(ctx, InboundEvent{
+		ID:             "new-duplicate-spaced",
+		SessionID:      "session-spaced",
+		TeamsChatID:    "chat-spaced",
+		TeamsMessageID: "message-spaced",
+		Text:           "duplicate after trim",
+	})
+	if err != nil || created || duplicate.ID != "inbound-spaced" {
+		t.Fatalf("sqlite trimmed duplicate inbound = %#v created=%v err=%v", duplicate, created, err)
+	}
+	if _, _, err := store.PersistInbound(ctx, InboundEvent{
+		ID:             "helper-echo",
+		SessionID:      "session-spaced",
+		TeamsChatID:    "chat-outbox",
+		TeamsMessageID: "message-outbox",
+		Text:           "helper echo",
+	}); !errors.Is(err, ErrInboundMessageFromHelperOutbox) {
+		t.Fatalf("sqlite trimmed helper echo PersistInbound error = %v, want ErrInboundMessageFromHelperOutbox", err)
+	}
+}
+
+func TestSQLiteHotPathCreatePersistAndTurnLifecycle(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+
+	session := testSession()
+	session.ID = "sqlite-session"
+	session.TeamsChatID = "sqlite-chat"
+	session.CodexThreadID = "thread-session"
+	createdSession, created, err := store.CreateSession(ctx, session)
+	if err != nil || !created {
+		t.Fatalf("CreateSession sqlite created=%v err=%v", created, err)
+	}
+	againSession, created, err := store.CreateSession(ctx, session)
+	if err != nil || created || againSession.ID != createdSession.ID {
+		t.Fatalf("duplicate CreateSession sqlite = %#v created=%v err=%v", againSession, created, err)
+	}
+
+	inbound := testInbound()
+	inbound.ID = "sqlite-inbound-1"
+	inbound.SessionID = session.ID
+	inbound.TeamsChatID = session.TeamsChatID
+	inbound.TeamsMessageID = "sqlite-message-1"
+	inbound.Text = "run sqlite lifecycle"
+	persisted, created, err := store.PersistInbound(ctx, inbound)
+	if err != nil || !created {
+		t.Fatalf("PersistInbound sqlite created=%v err=%v", created, err)
+	}
+	duplicateInbound, created, err := store.PersistInbound(ctx, inbound)
+	if err != nil || created || duplicateInbound.ID != persisted.ID {
+		t.Fatalf("duplicate PersistInbound sqlite = %#v created=%v err=%v", duplicateInbound, created, err)
+	}
+	if lookup, err := store.MessageLookup(ctx, session.TeamsChatID, inbound.TeamsMessageID); err != nil || !lookup.HasInbound || lookup.Provenance.InboundID != inbound.ID {
+		t.Fatalf("MessageLookup persisted inbound = %#v err=%v", lookup, err)
+	}
+
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil || !created {
+		t.Fatalf("QueueTurn sqlite created=%v err=%v", created, err)
+	}
+	duplicateTurn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil || created || duplicateTurn.ID != turn.ID {
+		t.Fatalf("duplicate QueueTurn sqlite = %#v created=%v err=%v", duplicateTurn, created, err)
+	}
+	running, err := store.MarkTurnRunning(ctx, turn.ID, "thread-running", "codex-running")
+	if err != nil {
+		t.Fatalf("MarkTurnRunning sqlite error: %v", err)
+	}
+	if running.Status != TurnStatusRunning || running.CodexThreadID != "thread-running" || running.CodexTurnID != "codex-running" {
+		t.Fatalf("running turn = %#v", running)
+	}
+	failed, err := store.MarkTurnFailedWithCodexIDs(ctx, turn.ID, "synthetic failure", "thread-failed", "codex-failed")
+	if err != nil {
+		t.Fatalf("MarkTurnFailedWithCodexIDs sqlite error: %v", err)
+	}
+	if failed.Status != TurnStatusFailed || failed.FailureMessage != "synthetic failure" || failed.CodexThreadID != "thread-failed" || failed.CodexTurnID != "codex-failed" {
+		t.Fatalf("failed turn = %#v", failed)
+	}
+	if byID, ok, err := store.TurnByID(ctx, turn.ID); err != nil || !ok || byID.Status != TurnStatusFailed {
+		t.Fatalf("TurnByID failed turn = %#v ok=%v err=%v", byID, ok, err)
+	}
+
+	interruptedInbound := inbound
+	interruptedInbound.ID = "sqlite-inbound-interrupted"
+	interruptedInbound.TeamsMessageID = "sqlite-message-interrupted"
+	interruptedInbound.Text = "interrupt me"
+	if _, created, err := store.PersistInbound(ctx, interruptedInbound); err != nil || !created {
+		t.Fatalf("PersistInbound interrupted created=%v err=%v", created, err)
+	}
+	interruptedTurn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: interruptedInbound.ID})
+	if err != nil || !created {
+		t.Fatalf("QueueTurn interrupted created=%v err=%v", created, err)
+	}
+	interrupted, err := store.MarkTurnInterrupted(ctx, interruptedTurn.ID, "operator stop")
+	if err != nil {
+		t.Fatalf("MarkTurnInterrupted sqlite error: %v", err)
+	}
+	if interrupted.Status != TurnStatusInterrupted || interrupted.RecoveryReason != "operator stop" {
+		t.Fatalf("interrupted turn = %#v", interrupted)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after sqlite lifecycle error: %v", err)
+	}
+	if state.InboundEvents[interruptedInbound.ID].Status != InboundStatusIgnored {
+		t.Fatalf("interrupted inbound status = %q, want ignored", state.InboundEvents[interruptedInbound.ID].Status)
+	}
+	if state.Sessions[session.ID].LatestTurnID != interruptedTurn.ID {
+		t.Fatalf("latest turn = %q, want %q", state.Sessions[session.ID].LatestTurnID, interruptedTurn.ID)
+	}
+}
+
+func TestSQLiteOutboxErrorDriveArtifactAndHelperSideEffects(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+	session := testSession()
+	session.ID = "sqlite-outbox-session"
+	session.TeamsChatID = "sqlite-outbox-chat"
+	session.CodexThreadID = "thread-outbox"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession sqlite outbox created=%v err=%v", created, err)
+	}
+	inbound := testInbound()
+	inbound.ID = "sqlite-outbox-inbound"
+	inbound.SessionID = session.ID
+	inbound.TeamsChatID = session.TeamsChatID
+	inbound.TeamsMessageID = "sqlite-outbox-user-message"
+	if _, created, err := store.PersistInbound(ctx, inbound); err != nil || !created {
+		t.Fatalf("PersistInbound sqlite outbox created=%v err=%v", created, err)
+	}
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil || !created {
+		t.Fatalf("QueueTurn sqlite outbox created=%v err=%v", created, err)
+	}
+	if _, err := store.MarkTurnRunning(ctx, turn.ID, "thread-outbox", "codex-outbox"); err != nil {
+		t.Fatalf("MarkTurnRunning sqlite outbox error: %v", err)
+	}
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:                     "sqlite-outbox-status",
+		SessionID:              session.ID,
+		TurnID:                 turn.ID,
+		TeamsChatID:            session.TeamsChatID,
+		Kind:                   "status-progress",
+		Body:                   "uploading artifact",
+		AttachmentName:         "report.txt",
+		AttachmentUploadName:   "report-upload.txt",
+		ArtifactIDs:            []string{"artifact:sqlite"},
+		Status:                 OutboxStatusQueued,
+		MentionOwner:           true,
+		AttachmentUploadFolder: "folder",
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox sqlite side-effect created=%v err=%v", created, err)
+	}
+	duplicate, created, err := store.QueueOutbox(ctx, msg)
+	if err != nil || created || duplicate.ID != msg.ID {
+		t.Fatalf("duplicate QueueOutbox sqlite = %#v created=%v err=%v", duplicate, created, err)
+	}
+	if _, err := store.MarkOutboxSendAttempt(ctx, msg.ID); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt sqlite side-effect error: %v", err)
+	}
+	uploaded, err := store.MarkOutboxDriveItem(ctx, msg.ID, " drive-item-1 ", " report.txt ", " etag-1 ", " https://sharepoint/report ", " dav://report ")
+	if err != nil {
+		t.Fatalf("MarkOutboxDriveItem sqlite side-effect error: %v", err)
+	}
+	if uploaded.DriveItemID != "drive-item-1" || uploaded.DriveItemName != "report.txt" || uploaded.LastSendError != "" {
+		t.Fatalf("uploaded outbox = %#v", uploaded)
+	}
+	errored, err := store.MarkOutboxSendError(ctx, msg.ID, "synthetic send failure")
+	if err != nil {
+		t.Fatalf("MarkOutboxSendError sqlite side-effect error: %v", err)
+	}
+	if errored.Status != OutboxStatusQueued || errored.LastSendError != "synthetic send failure" {
+		t.Fatalf("errored outbox = %#v", errored)
+	}
+	if _, err := store.MarkOutboxSendAttempt(ctx, msg.ID); err != nil {
+		t.Fatalf("second MarkOutboxSendAttempt sqlite side-effect error: %v", err)
+	}
+	sent, err := store.MarkOutboxSent(ctx, msg.ID, "teams-side-effect")
+	if err != nil {
+		t.Fatalf("MarkOutboxSent sqlite side-effect error: %v", err)
+	}
+	if sent.Status != OutboxStatusSent || sent.TeamsMessageID != "teams-side-effect" || sent.SentAt.IsZero() {
+		t.Fatalf("sent side-effect outbox = %#v", sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load sqlite side-effect state error: %v", err)
+	}
+	artifact := state.ArtifactRecords["artifact:sqlite"]
+	if artifact.Status != "uploaded" || artifact.OutboxID != msg.ID || artifact.DriveItemID != "drive-item-1" || artifact.TeamsMessageID != "teams-side-effect" || artifact.UploadedAt.IsZero() || artifact.SentAt.IsZero() {
+		t.Fatalf("artifact side effects = %#v", artifact)
+	}
+	if len(state.HelperDeliveries) != 1 {
+		t.Fatalf("helper deliveries = %#v, want one stable record", state.HelperDeliveries)
+	}
+	for _, delivery := range state.HelperDeliveries {
+		if delivery.OutboxID != msg.ID || delivery.Status != HelperDeliveryStatusSent || delivery.TeamsMessageID != "teams-side-effect" || delivery.SentAt.IsZero() {
+			t.Fatalf("helper delivery side effects = %#v", delivery)
+		}
+	}
+	if lookup, err := store.MessageLookup(ctx, session.TeamsChatID, "teams-side-effect"); err != nil || !lookup.HasDeliveredOutbox || lookup.Provenance.OutboxID != msg.ID {
+		t.Fatalf("MessageLookup sent side-effect = %#v err=%v", lookup, err)
+	}
+}
+
+func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 1, 2, 3, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceOwner = &OwnerMetadata{PID: 4242, Hostname: "host", HelperVersion: "v0.1.0", LastHeartbeat: now}
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-chat", UpdatedAt: now}
+		state.Workflow = WorkflowNotificationConfig{Enabled: true, ControlChatID: "control-chat", UpdatedAt: now}
+		state.Sessions["s1"] = SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1", LatestTurnID: "turn-running", CreatedAt: now, UpdatedAt: now}
+		state.Sessions["s2"] = SessionContext{ID: "s2", Status: SessionStatusActive, TeamsChatID: "chat-2", LatestTurnID: "turn-other", CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-queued"] = Turn{ID: "turn-queued", SessionID: "s1", InboundEventID: "inbound-queued", Status: TurnStatusQueued, QueuedAt: now, CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-running"] = Turn{ID: "turn-running", SessionID: "s1", InboundEventID: "inbound-running", Status: TurnStatusRunning, QueuedAt: now, StartedAt: now, CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-completed"] = Turn{ID: "turn-completed", SessionID: "s1", InboundEventID: "inbound-completed", Status: TurnStatusCompleted, QueuedAt: now, CompletedAt: now, CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-other"] = Turn{ID: "turn-other", SessionID: "s2", InboundEventID: "inbound-other", Status: TurnStatusQueued, QueuedAt: now, CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-queued"] = InboundEvent{ID: "inbound-queued", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "message-queued", Status: InboundStatusQueued, TurnID: "turn-queued", CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-running"] = InboundEvent{ID: "inbound-running", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "message-running", Status: InboundStatusQueued, TurnID: "turn-running", CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-completed"] = InboundEvent{ID: "inbound-completed", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "message-completed", Status: InboundStatusIgnored, TurnID: "turn-completed", CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-other"] = InboundEvent{ID: "inbound-other", SessionID: "s2", TeamsChatID: "chat-2", TeamsMessageID: "message-other", Status: InboundStatusQueued, TurnID: "turn-other", CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages["outbox-1"] = OutboxMessage{ID: "outbox-1", SessionID: "s1", TurnID: "turn-running", TeamsChatID: "chat-1", Kind: "final", Body: "pending", Status: OutboxStatusQueued, CreatedAt: now, UpdatedAt: now}
+		state.ImportCheckpoints["import-1"] = ImportCheckpoint{ID: "import-1", SessionID: "s1", LastRecordID: "record-1", Status: "complete", UpdatedAt: now}
+		state.ChatPolls["chat-1"] = ChatPollState{ChatID: "chat-1", Seeded: true, PollState: "warm", NextPollAt: now.Add(time.Minute), UpdatedAt: now}
+		state.ChatRateLimits["chat-1"] = ChatRateLimitState{ChatID: "chat-1", BlockedUntil: now.Add(time.Hour), Reason: "429", UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed selected snapshot state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	pollState, err := store.PollStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("PollStateSnapshot sqlite error: %v", err)
+	}
+	if len(pollState.Sessions) != 2 || len(pollState.Turns) != 4 || len(pollState.InboundEvents) != 4 || pollState.ChatPolls["chat-1"].PollState != "warm" || pollState.ServiceOwner == nil {
+		t.Fatalf("poll snapshot missing selected fields: %#v", pollState)
+	}
+	if len(pollState.OutboxMessages) != 0 || len(pollState.ChatRateLimits) != 0 {
+		t.Fatalf("poll snapshot included unselected fields: outbox=%d rate_limits=%d", len(pollState.OutboxMessages), len(pollState.ChatRateLimits))
+	}
+	active, err := store.SessionActiveTurnQueueSnapshot(ctx, "s1")
+	if err != nil {
+		t.Fatalf("SessionActiveTurnQueueSnapshot sqlite error: %v", err)
+	}
+	if len(active.Turns) != 2 || active.Turns["turn-queued"].ID == "" || active.Turns["turn-running"].ID == "" || active.Turns["turn-completed"].ID != "" || active.Turns["turn-other"].ID != "" {
+		t.Fatalf("active queue snapshot = %#v", active.Turns)
+	}
+	if len(active.InboundEvents) != 2 || active.InboundEvents["inbound-queued"].ID == "" || active.InboundEvents["inbound-running"].ID == "" {
+		t.Fatalf("active queue inbound snapshot = %#v", active.InboundEvents)
+	}
+	fullSession, err := store.SessionTurnQueueSnapshot(ctx, "s1")
+	if err != nil {
+		t.Fatalf("SessionTurnQueueSnapshot sqlite error: %v", err)
+	}
+	if len(fullSession.Turns) != 3 || fullSession.Turns["turn-other"].ID != "" || fullSession.InboundEvents["inbound-completed"].ID == "" {
+		t.Fatalf("full session queue snapshot = turns %#v inbound %#v", fullSession.Turns, fullSession.InboundEvents)
+	}
+	workflow, err := store.WorkflowNotificationStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("WorkflowNotificationStateSnapshot sqlite error: %v", err)
+	}
+	if workflow.ControlChat.TeamsChatID != "control-chat" || !workflow.Workflow.Enabled {
+		t.Fatalf("workflow notification snapshot = %#v", workflow)
+	}
+	outbox, err := store.OutboxStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("OutboxStateSnapshot sqlite error: %v", err)
+	}
+	if len(outbox.OutboxMessages) != 1 || outbox.OutboxMessages["outbox-1"].ID == "" || len(outbox.Turns) != 0 {
+		t.Fatalf("outbox snapshot = %#v", outbox)
+	}
+	if poll, ok, err := store.ChatPoll(ctx, "chat-1"); err != nil || !ok || poll.PollState != "warm" {
+		t.Fatalf("ChatPoll sqlite = %#v ok=%v err=%v", poll, ok, err)
+	}
+	if limit, ok, err := store.ChatRateLimit(ctx, "chat-1"); err != nil || !ok || limit.Reason != "429" {
+		t.Fatalf("ChatRateLimit sqlite = %#v ok=%v err=%v", limit, ok, err)
+	}
+}
+
+func TestSQLiteConcurrentDuplicateInboundAndTurnCreation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+	session := testSession()
+	session.ID = "sqlite-concurrent-session"
+	session.TeamsChatID = "sqlite-concurrent-chat"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession sqlite concurrent created=%v err=%v", created, err)
+	}
+	inbound := testInbound()
+	inbound.ID = "sqlite-concurrent-inbound"
+	inbound.SessionID = session.ID
+	inbound.TeamsChatID = session.TeamsChatID
+	inbound.TeamsMessageID = "sqlite-concurrent-message"
+	inbound.Text = "same message"
+
+	var inboundCreated int32
+	var turnCreated int32
+	errs := make(chan error, 32)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker, err := Open(store.Path())
+			if err != nil {
+				errs <- err
+				return
+			}
+			if _, created, err := worker.PersistInbound(ctx, inbound); err != nil {
+				errs <- err
+				return
+			} else if created {
+				atomic.AddInt32(&inboundCreated, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent PersistInbound sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt32(&inboundCreated); got != 1 {
+		t.Fatalf("concurrent PersistInbound created = %d, want 1", got)
+	}
+
+	errs = make(chan error, 32)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker, err := Open(store.Path())
+			if err != nil {
+				errs <- err
+				return
+			}
+			if _, created, err := worker.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil {
+				errs <- err
+				return
+			} else if created {
+				atomic.AddInt32(&turnCreated, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent QueueTurn sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt32(&turnCreated); got != 1 {
+		t.Fatalf("concurrent QueueTurn created = %d, want 1", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load concurrent sqlite state error: %v", err)
+	}
+	if len(state.InboundEvents) != 1 || state.InboundEvents[inbound.ID].ID == "" {
+		t.Fatalf("concurrent inbound state = %#v", state.InboundEvents)
+	}
+	var turnsForInbound int
+	for _, turn := range state.Turns {
+		if turn.InboundEventID == inbound.ID {
+			turnsForInbound++
+		}
+	}
+	if turnsForInbound != 1 {
+		t.Fatalf("turns for inbound = %d, want 1: %#v", turnsForInbound, state.Turns)
+	}
+}
+
+func TestSQLiteConcurrentClaimNextQueuedTurnAllowsOneRunner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+	session := testSession()
+	session.ID = "sqlite-claim-session"
+	session.TeamsChatID = "sqlite-claim-chat"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession sqlite claim created=%v err=%v", created, err)
+	}
+	for i := 0; i < 8; i++ {
+		inbound := testInbound()
+		inbound.ID = fmt.Sprintf("sqlite-claim-inbound-%02d", i)
+		inbound.SessionID = session.ID
+		inbound.TeamsChatID = session.TeamsChatID
+		inbound.TeamsMessageID = fmt.Sprintf("sqlite-claim-message-%02d", i)
+		if _, created, err := store.PersistInbound(ctx, inbound); err != nil || !created {
+			t.Fatalf("PersistInbound sqlite claim %d created=%v err=%v", i, created, err)
+		}
+		if _, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil || !created {
+			t.Fatalf("QueueTurn sqlite claim %d created=%v err=%v", i, created, err)
+		}
+	}
+
+	var claimed int32
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker, err := Open(store.Path())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer worker.Close()
+			turn, ok, err := worker.ClaimNextQueuedTurn(ctx, session.ID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if ok {
+				if turn.Status != TurnStatusRunning {
+					errs <- fmt.Errorf("claimed turn status = %q, want running", turn.Status)
+					return
+				}
+				atomic.AddInt32(&claimed, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent ClaimNextQueuedTurn sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt32(&claimed); got != 1 {
+		t.Fatalf("concurrent ClaimNextQueuedTurn claims = %d, want 1", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load concurrent claim state: %v", err)
+	}
+	var running, queued int
+	for _, turn := range state.Turns {
+		if turn.SessionID != session.ID {
+			continue
+		}
+		switch turn.Status {
+		case TurnStatusRunning:
+			running++
+		case TurnStatusQueued:
+			queued++
+		}
+	}
+	if running != 1 || queued != 7 {
+		t.Fatalf("turn statuses after concurrent claim: running=%d queued=%d turns=%#v", running, queued, state.Turns)
+	}
+}
+
+func TestSQLiteConcurrentQueueOutboxSequencesAreUnique(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+	session := testSession()
+	session.ID = "sqlite-outbox-sequence-session"
+	session.TeamsChatID = "sqlite-outbox-sequence-chat"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession sqlite outbox sequence created=%v err=%v", created, err)
+	}
+
+	const workers = 24
+	var created int32
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker, err := Open(store.Path())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer worker.Close()
+			_, ok, err := worker.QueueOutbox(ctx, OutboxMessage{
+				ID:          fmt.Sprintf("sqlite-concurrent-outbox-%02d", i),
+				SessionID:   session.ID,
+				TeamsChatID: session.TeamsChatID,
+				Kind:        "status",
+				Body:        fmt.Sprintf("concurrent outbox %02d", i),
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if ok {
+				atomic.AddInt32(&created, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent QueueOutbox sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt32(&created); got != workers {
+		t.Fatalf("concurrent QueueOutbox created = %d, want %d", got, workers)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load concurrent outbox sequence state: %v", err)
+	}
+	seen := map[int64]bool{}
+	for i := 0; i < workers; i++ {
+		msg := state.OutboxMessages[fmt.Sprintf("sqlite-concurrent-outbox-%02d", i)]
+		if msg.ID == "" {
+			t.Fatalf("missing concurrent outbox %02d", i)
+		}
+		if msg.Sequence <= 0 {
+			t.Fatalf("outbox %s sequence = %d, want positive", msg.ID, msg.Sequence)
+		}
+		if seen[msg.Sequence] {
+			t.Fatalf("duplicate outbox sequence %d in %#v", msg.Sequence, state.OutboxMessages)
+		}
+		seen[msg.Sequence] = true
 	}
 }
 
@@ -342,6 +1989,26 @@ func TestLoadUnsupportedFutureSchemaFailsClosed(t *testing.T) {
 	}
 }
 
+func TestUnsupportedStorageBackendFailsClosed(t *testing.T) {
+	store := newTestStore(t)
+	data := []byte(fmt.Sprintf(`{"schema_version":%d,"storage_backend":"store-v9","path":"state.v9"}`, SchemaVersion))
+	writeRawStoreStateForTest(t, store, data)
+
+	if _, err := store.Load(context.Background()); err == nil || !strings.Contains(err.Error(), `unsupported teams store backend "store-v9"`) {
+		t.Fatalf("Load unsupported backend error = %v, want unsupported backend", err)
+	}
+	if _, err := store.SetPaused(context.Background(), true, "should not write"); err == nil || !strings.Contains(err.Error(), `unsupported teams store backend "store-v9"`) {
+		t.Fatalf("SetPaused unsupported backend error = %v, want unsupported backend", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read unsupported backend state after failed update: %v", err)
+	}
+	if !bytes.Equal(after, data) {
+		t.Fatalf("unsupported backend state was modified after failed update:\n%s", string(after))
+	}
+}
+
 func TestAcceptedOutboxIsPromotedWithoutResend(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -374,6 +2041,182 @@ func TestAcceptedOutboxIsPromotedWithoutResend(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("pending after sent = %#v, want none", pending)
 	}
+}
+
+func TestOutboxStatusUpdateHonorsSessionLock(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, created, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	} else if !created {
+		t.Fatal("CreateSession created = false")
+	}
+	msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:single-load",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "helper",
+		Body:        "single load",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	release := holdSessionLockForTest(t, store, "s1")
+	defer release()
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, err := store.MarkOutboxSendAttempt(timeoutCtx, msg.ID); err == nil {
+		t.Fatal("MarkOutboxSendAttempt completed while session lock was held")
+	} else if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "was not acquired") {
+		t.Fatalf("MarkOutboxSendAttempt error = %v, want session lock wait failure", err)
+	}
+}
+
+func TestSQLiteOutboxStatusUpdatesHonorSessionLock(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, created, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	} else if !created {
+		t.Fatal("CreateSession created = false")
+	}
+	for _, id := range []string{"outbox:attempt", "outbox:accepted", "outbox:sent"} {
+		if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+			ID:          id,
+			SessionID:   "s1",
+			TeamsChatID: "chat-1",
+			Kind:        "helper",
+			Body:        id,
+		}); err != nil {
+			t.Fatalf("QueueOutbox %s error: %v", id, err)
+		}
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	release := holdSessionLockForTest(t, store, "s1")
+	defer release()
+
+	assertSessionLockWaitFailure := func(name string, fn func(context.Context) error) {
+		t.Helper()
+		timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		if err := fn(timeoutCtx); err == nil {
+			t.Fatalf("%s completed while session lock was held", name)
+		} else if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "was not acquired") {
+			t.Fatalf("%s error = %v, want session lock wait failure", name, err)
+		}
+	}
+	assertSessionLockWaitFailure("MarkOutboxSendAttempt", func(ctx context.Context) error {
+		_, err := store.MarkOutboxSendAttempt(ctx, "outbox:attempt")
+		return err
+	})
+	assertSessionLockWaitFailure("MarkOutboxAccepted", func(ctx context.Context) error {
+		_, err := store.MarkOutboxAccepted(ctx, "outbox:accepted", "teams-accepted")
+		return err
+	})
+	assertSessionLockWaitFailure("MarkOutboxSent", func(ctx context.Context) error {
+		_, err := store.MarkOutboxSent(ctx, "outbox:sent", "teams-sent")
+		return err
+	})
+}
+
+func TestTurnStatusUpdateHonorsSessionLockAcrossStoreInstances(t *testing.T) {
+	store := newTestStore(t)
+	other, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("Open second store error: %v", err)
+	}
+	ctx := context.Background()
+	if _, created, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	} else if !created {
+		t.Fatal("CreateSession created = false")
+	}
+	inbound, _, err := store.PersistInbound(ctx, testInbound())
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(ctx, Turn{SessionID: "s1", InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	release := holdSessionLockForTest(t, store, "s1")
+	defer release()
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, err := other.MarkTurnRunning(timeoutCtx, turn.ID, "thread-1", "codex-turn-1"); err == nil {
+		t.Fatal("MarkTurnRunning completed while session lock was held by another store instance")
+	} else if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "was not acquired") {
+		t.Fatalf("MarkTurnRunning error = %v, want session lock wait failure", err)
+	}
+}
+
+func TestSQLiteTurnStatusUpdatesHonorSessionLockAcrossStoreInstances(t *testing.T) {
+	store := newTestStore(t)
+	other, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("Open second store error: %v", err)
+	}
+	ctx := context.Background()
+	if _, created, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	} else if !created {
+		t.Fatal("CreateSession created = false")
+	}
+	makeTurn := func(id string) string {
+		t.Helper()
+		inbound, _, err := store.PersistInbound(ctx, InboundEvent{
+			ID:             "inbound:" + id,
+			SessionID:      "s1",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "message-" + id,
+			Text:           id,
+			Status:         InboundStatusPersisted,
+		})
+		if err != nil {
+			t.Fatalf("PersistInbound %s error: %v", id, err)
+		}
+		turn, _, err := store.QueueTurn(ctx, Turn{ID: "turn:" + id, SessionID: "s1", InboundEventID: inbound.ID})
+		if err != nil {
+			t.Fatalf("QueueTurn %s error: %v", id, err)
+		}
+		return turn.ID
+	}
+	runningID := makeTurn("running")
+	completedID := makeTurn("completed")
+	failedID := makeTurn("failed")
+	interruptedID := makeTurn("interrupted")
+	migrateStoreToSQLiteForTest(t, store)
+	release := holdSessionLockForTest(t, store, "s1")
+	defer release()
+
+	assertSessionLockWaitFailure := func(name string, fn func(context.Context) error) {
+		t.Helper()
+		timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		if err := fn(timeoutCtx); err == nil {
+			t.Fatalf("%s completed while session lock was held", name)
+		} else if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "was not acquired") {
+			t.Fatalf("%s error = %v, want session lock wait failure", name, err)
+		}
+	}
+	assertSessionLockWaitFailure("MarkTurnRunning", func(ctx context.Context) error {
+		_, err := other.MarkTurnRunning(ctx, runningID, "thread-1", "codex-turn-1")
+		return err
+	})
+	assertSessionLockWaitFailure("MarkTurnCompleted", func(ctx context.Context) error {
+		_, err := other.MarkTurnCompleted(ctx, completedID, "thread-1", "codex-turn-2")
+		return err
+	})
+	assertSessionLockWaitFailure("MarkTurnFailed", func(ctx context.Context) error {
+		_, err := other.MarkTurnFailed(ctx, failedID, "failed")
+		return err
+	})
+	assertSessionLockWaitFailure("MarkTurnInterrupted", func(ctx context.Context) error {
+		_, err := other.MarkTurnInterrupted(ctx, interruptedID, "interrupted")
+		return err
+	})
 }
 
 func TestPendingOutboxStatusMatrix(t *testing.T) {
@@ -2188,6 +4031,43 @@ func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testin
 	}
 }
 
+func TestRecoverSkipsSaveWhenOnlyProtectedOutboxReportsBlockers(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:                 "outbox:protected-final",
+		SessionID:          "s1",
+		TeamsChatID:        "chat-1",
+		Kind:               "final",
+		Status:             OutboxStatusQueued,
+		UpgradeNonBlocking: true,
+	}); err != nil {
+		t.Fatalf("QueueOutbox protected error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store before recover: %v", err)
+	}
+
+	report, err := store.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover error: %v", err)
+	}
+	if got, want := report.PreservedOutboxBlockerIDs, []string{"outbox:protected-final"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PreservedOutboxBlockerIDs = %#v, want %#v", got, want)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after recover: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("Recover rewrote state even though it only reported protected blockers")
+	}
+}
+
 func TestHasDeliveredOutboxMessageStatusMatrix(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2468,6 +4348,100 @@ func TestMessageProvenanceRecordsHelperOutbox(t *testing.T) {
 	}
 	if ok || missing.ID != "" {
 		t.Fatalf("missing provenance = %#v, ok=%v", missing, ok)
+	}
+}
+
+func TestDuplicateMessageProvenanceDoesNotRewriteState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	record := MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		SessionID:      "s1",
+		TurnID:         "turn-1",
+		OutboxID:       "outbox-1",
+		Kind:           "helper",
+		RenderedHash:   "hash-1",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if _, err := store.RecordMessageProvenance(ctx, record); err != nil {
+		t.Fatalf("initial RecordMessageProvenance error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before duplicate provenance: %v", err)
+	}
+	again, err := store.RecordMessageProvenance(ctx, record)
+	if err != nil {
+		t.Fatalf("duplicate RecordMessageProvenance error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after duplicate provenance: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("duplicate RecordMessageProvenance rewrote state")
+	}
+	if again.ID == "" || again.Origin != MessageOriginHelperOutbox || again.OutboxID != "outbox-1" {
+		t.Fatalf("duplicate provenance returned unexpected record: %#v", again)
+	}
+}
+
+func TestDuplicateMessageProvenanceFromSentOutboxDoesNotRewriteState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, created, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	} else if !created {
+		t.Fatal("CreateSession created = false")
+	}
+	msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:           "outbox:sent-provenance",
+		SessionID:    "s1",
+		TurnID:       "turn-1",
+		TeamsChatID:  "chat-1",
+		Kind:         "answer",
+		RenderedHash: "hash-1",
+		Body:         "sent provenance",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	sent, err := store.MarkOutboxSent(ctx, msg.ID, "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MarkOutboxSent error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before duplicate sent provenance: %v", err)
+	}
+	again, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    sent.TeamsChatID,
+		TeamsMessageID: sent.TeamsMessageID,
+		Origin:         MessageOriginHelperOutbox,
+		SessionID:      sent.SessionID,
+		TurnID:         sent.TurnID,
+		OutboxID:       sent.ID,
+		Kind:           sent.Kind,
+		RenderedHash:   sent.RenderedHash,
+		CreatedAt:      sent.CreatedAt,
+		UpdatedAt:      firstStoreNonZeroTime(sent.SentAt, sent.UpdatedAt, sent.CreatedAt),
+	})
+	if err != nil {
+		t.Fatalf("duplicate sent RecordMessageProvenance error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after duplicate sent provenance: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("duplicate sent RecordMessageProvenance rewrote state")
+	}
+	if again.OutboxID != sent.ID || again.Origin != MessageOriginHelperOutbox {
+		t.Fatalf("duplicate sent provenance returned unexpected record: %#v", again)
 	}
 }
 
@@ -2985,6 +4959,72 @@ func BenchmarkLargeMessageLookupCacheRefresh(b *testing.B) {
 	}
 }
 
+func BenchmarkHighChurnNoopStoreUpdates(b *testing.B) {
+	store := newBenchmarkStore(b)
+	ctx := context.Background()
+	seedLargeMessageLookupState(b, store, 4000, 3000, 256)
+	chatCount := 256
+	base := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	successAt := time.Now().Add(24 * time.Hour)
+	nextPollAt := successAt.Add(time.Minute)
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < chatCount; i++ {
+			chatID := fmt.Sprintf("bench-chat-%03d", i)
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID:               chatID,
+				Seeded:               true,
+				PollState:            "warm",
+				NextPollAt:           nextPollAt,
+				LastModifiedCursor:   base,
+				LastSuccessfulPollAt: successAt,
+				UpdatedAt:            successAt,
+			}
+			recordMessageProvenanceLocked(state, MessageProvenanceRecord{
+				TeamsChatID:    chatID,
+				TeamsMessageID: fmt.Sprintf("bench-message-%03d", i),
+				Origin:         MessageOriginHelperOutbox,
+				OutboxID:       fmt.Sprintf("bench-outbox-%03d", i),
+				CreatedAt:      base,
+				UpdatedAt:      base,
+			}, time.Time{})
+		}
+		return nil
+	}); err != nil {
+		b.Fatalf("seed high-churn no-op state: %v", err)
+	}
+	records := make([]MessageProvenanceRecord, 0, chatCount)
+	for i := 0; i < chatCount; i++ {
+		records = append(records, MessageProvenanceRecord{
+			TeamsChatID:    fmt.Sprintf("bench-chat-%03d", i),
+			TeamsMessageID: fmt.Sprintf("bench-message-%03d", i),
+			Origin:         MessageOriginHelperOutbox,
+			OutboxID:       fmt.Sprintf("bench-outbox-%03d", i),
+			CreatedAt:      base,
+			UpdatedAt:      base,
+		})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		record := records[i%len(records)]
+		if _, err := store.RecordChatPollSuccess(ctx, record.TeamsChatID, base, true, false, 0); err != nil {
+			b.Fatalf("RecordChatPollSuccess error: %v", err)
+		}
+		if _, err := store.RecordMessageProvenance(ctx, record); err != nil {
+			b.Fatalf("RecordMessageProvenance error: %v", err)
+		}
+		if _, err := store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, record.TeamsChatID, base, true, false, 0, "", func(ChatPollState) (ChatPollScheduleUpdate, error) {
+			return ChatPollScheduleUpdate{
+				ChatID:     record.TeamsChatID,
+				PollState:  "warm",
+				NextPollAt: nextPollAt,
+			}, nil
+		}); err != nil {
+			b.Fatalf("RecordChatPollSuccessWithContinuationAndSchedule error: %v", err)
+		}
+	}
+}
+
 func TestMessageProvenanceDoesNotDowngradeHelperOutboxToInbound(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -3175,6 +5215,248 @@ func TestHelperOutboxProvenanceSuppressesEarlyQueuedInbound(t *testing.T) {
 	}
 	if !ok || record.Origin != MessageOriginHelperOutbox || record.InboundID != "" || record.OutboxID != "outbox-1" {
 		t.Fatalf("provenance = %#v ok=%v, want helper outbox replacement", record, ok)
+	}
+}
+
+func TestSQLiteHelperOutboxProvenanceSuppressesEarlyQueuedInbound(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	inbound, created, err := store.PersistInbound(ctx, InboundEvent{
+		SessionID:      "s1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Text:           "should be suppressed",
+		Status:         InboundStatusQueued,
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound early error: %v", err)
+	}
+	if !created {
+		t.Fatal("early inbound created = false")
+	}
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: "s1", InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if !created {
+		t.Fatal("QueueTurn created = false")
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		OutboxID:       "outbox-1",
+		Kind:           "codex-status-001",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance helper error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.InboundEvents[inbound.ID].Status; got != InboundStatusIgnored {
+		t.Fatalf("inbound status = %q, want ignored", got)
+	}
+	if got := state.Turns[turn.ID].Status; got != TurnStatusInterrupted {
+		t.Fatalf("turn status = %q, want interrupted", got)
+	}
+	if reason := state.Turns[turn.ID].RecoveryReason; !strings.Contains(reason, "helper_outbox provenance") {
+		t.Fatalf("turn recovery reason = %q, want helper provenance reason", reason)
+	}
+	record, ok, err := store.MessageProvenance(ctx, "chat-1", "teams-helper-1")
+	if err != nil {
+		t.Fatalf("MessageProvenance error: %v", err)
+	}
+	if !ok || record.Origin != MessageOriginHelperOutbox || record.InboundID != "" || record.OutboxID != "outbox-1" {
+		t.Fatalf("provenance = %#v ok=%v, want helper outbox replacement", record, ok)
+	}
+}
+
+func TestBackfillMessageProvenancePreservesCurrentRecordsAndRefreshesChangedFields(t *testing.T) {
+	state := newState()
+	created := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	updated := created.Add(time.Minute)
+	inboundID := inboundID("chat-1", "message-1")
+	state.InboundEvents[inboundID] = InboundEvent{
+		ID:             inboundID,
+		SessionID:      "s1",
+		TurnID:         "turn-1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Status:         InboundStatusQueued,
+		TextHash:       "hash-1",
+		CreatedAt:      created,
+		UpdatedAt:      created,
+	}
+
+	backfillMessageProvenance(&state)
+	provenanceID := messageProvenanceID("chat-1", "message-1")
+	first := state.MessageProvenance[provenanceID]
+	backfillMessageProvenance(&state)
+	if got := state.MessageProvenance[provenanceID]; !reflect.DeepEqual(got, first) {
+		t.Fatalf("stable backfill changed provenance:\nbefore=%#v\nafter=%#v", first, got)
+	}
+
+	inbound := state.InboundEvents[inboundID]
+	inbound.UpdatedAt = updated
+	inbound.TextHash = "hash-2"
+	state.InboundEvents[inboundID] = inbound
+	backfillMessageProvenance(&state)
+	refreshed := state.MessageProvenance[provenanceID]
+	if !refreshed.UpdatedAt.Equal(updated) || refreshed.RenderedHash != "hash-2" {
+		t.Fatalf("changed inbound did not refresh provenance: %#v", refreshed)
+	}
+}
+
+func TestBackfillDerivedRecordsIsStableForDuplicateCandidates(t *testing.T) {
+	state := newState()
+	now := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	for _, item := range []struct {
+		id     string
+		status InboundStatus
+		hash   string
+	}{
+		{id: "inbound:b", status: InboundStatusPersisted, hash: "hash-b"},
+		{id: "inbound:a", status: InboundStatusQueued, hash: "hash-a"},
+	} {
+		state.InboundEvents[item.id] = InboundEvent{
+			ID:             item.id,
+			SessionID:      "s1",
+			TurnID:         "turn-1",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "message-1",
+			Status:         item.status,
+			TextHash:       item.hash,
+			CreatedAt:      now,
+			UpdatedAt:      now.Add(time.Duration(len(item.id)) * time.Second),
+		}
+	}
+	state.Sessions["s1"] = SessionContext{ID: "s1", TeamsChatID: "chat-1", CodexThreadID: "thread-1"}
+	for _, item := range []struct {
+		id   string
+		kind string
+		at   time.Time
+	}{
+		{id: "prov:b", kind: "sync-status-b", at: now.Add(2 * time.Second)},
+		{id: "prov:a", kind: "sync-status-a", at: now.Add(time.Second)},
+	} {
+		state.MessageProvenance[item.id] = MessageProvenanceRecord{
+			ID:             item.id,
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "helper-message-" + item.id,
+			Origin:         MessageOriginHelperOutbox,
+			SessionID:      "s1",
+			Kind:           item.kind,
+			RenderedHash:   "same-visible-hash",
+			CreatedAt:      item.at,
+			UpdatedAt:      item.at,
+		}
+	}
+
+	backfillMessageProvenance(&state)
+	backfillHelperDeliveries(&state)
+	firstProvenance := state.MessageProvenance[messageProvenanceID("chat-1", "message-1")]
+	firstHelpers, err := json.Marshal(state.HelperDeliveries)
+	if err != nil {
+		t.Fatalf("marshal helper deliveries: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		backfillMessageProvenance(&state)
+		backfillHelperDeliveries(&state)
+		if got := state.MessageProvenance[messageProvenanceID("chat-1", "message-1")]; !reflect.DeepEqual(got, firstProvenance) {
+			t.Fatalf("duplicate provenance backfill changed on iteration %d:\nbefore=%#v\nafter=%#v", i, firstProvenance, got)
+		}
+		gotHelpers, err := json.Marshal(state.HelperDeliveries)
+		if err != nil {
+			t.Fatalf("marshal helper deliveries after iteration %d: %v", i, err)
+		}
+		if string(gotHelpers) != string(firstHelpers) {
+			t.Fatalf("duplicate helper backfill changed on iteration %d", i)
+		}
+	}
+}
+
+func TestBackfillMessageProvenanceSuppressesHelperReplacementWithDirectIDs(t *testing.T) {
+	state := newState()
+	now := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	inboundID := inboundID("chat-1", "message-1")
+	state.InboundEvents[inboundID] = InboundEvent{
+		ID:             inboundID,
+		SessionID:      "s1",
+		TurnID:         "turn-1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Status:         InboundStatusQueued,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	state.Turns["turn-1"] = Turn{
+		ID:             "turn-1",
+		SessionID:      "s1",
+		InboundEventID: inboundID,
+		Status:         TurnStatusQueued,
+		CreatedAt:      now,
+	}
+
+	backfillMessageProvenance(&state)
+	state.OutboxMessages["outbox-1"] = OutboxMessage{
+		ID:             "outbox-1",
+		SessionID:      "s1",
+		TurnID:         "turn-1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Kind:           "codex-status-001",
+		Status:         OutboxStatusSent,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		SentAt:         now,
+	}
+	backfillMessageProvenance(&state)
+
+	if got := state.InboundEvents[inboundID].Status; got != InboundStatusIgnored {
+		t.Fatalf("inbound status = %q, want ignored", got)
+	}
+	if got := state.Turns["turn-1"].Status; got != TurnStatusInterrupted {
+		t.Fatalf("turn status = %q, want interrupted", got)
+	}
+	record := state.MessageProvenance[messageProvenanceID("chat-1", "message-1")]
+	if record.Origin != MessageOriginHelperOutbox || record.OutboxID != "outbox-1" || !strings.Contains(record.Diagnostic, "replaced user_inbound") {
+		t.Fatalf("replacement provenance = %#v", record)
+	}
+}
+
+func TestSuppressInboundExecutionForHelperOutboxFallsBackForLegacyInboundID(t *testing.T) {
+	state := newState()
+	now := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	state.InboundEvents["legacy-inbound-1"] = InboundEvent{
+		ID:             "legacy-inbound-1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Status:         InboundStatusQueued,
+		CreatedAt:      now,
+	}
+	state.Turns["turn-legacy"] = Turn{
+		ID:             "turn-legacy",
+		InboundEventID: "legacy-inbound-1",
+		Status:         TurnStatusQueued,
+		CreatedAt:      now,
+	}
+
+	suppressInboundExecutionForHelperOutboxLocked(&state, MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		InboundID:      "stale-inbound-id",
+	}, now.Add(time.Minute))
+
+	if got := state.InboundEvents["legacy-inbound-1"].Status; got != InboundStatusIgnored {
+		t.Fatalf("legacy inbound status = %q, want ignored", got)
+	}
+	if got := state.Turns["turn-legacy"].Status; got != TurnStatusInterrupted {
+		t.Fatalf("legacy turn status = %q, want interrupted", got)
 	}
 }
 
@@ -3832,6 +6114,232 @@ func TestChatPollStateTracksCursorAndErrors(t *testing.T) {
 	}
 }
 
+func TestChatPollSuccessTimestampOnlyNoopDoesNotRewriteState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	cursor := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", cursor, true, false, 0); err != nil {
+		t.Fatalf("initial RecordChatPollSuccess error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before timestamp-only success: %v", err)
+	}
+	pollBefore, ok, err := store.ChatPoll(ctx, "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll before timestamp-only success ok=%v err=%v", ok, err)
+	}
+	pollAfter, err := store.RecordChatPollSuccess(ctx, "chat-1", cursor, true, false, 0)
+	if err != nil {
+		t.Fatalf("timestamp-only RecordChatPollSuccess error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after timestamp-only success: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("timestamp-only RecordChatPollSuccess rewrote state")
+	}
+	if !pollAfter.LastSuccessfulPollAt.Equal(pollBefore.LastSuccessfulPollAt) {
+		t.Fatalf("timestamp-only success changed LastSuccessfulPollAt: before=%s after=%s", pollBefore.LastSuccessfulPollAt, pollAfter.LastSuccessfulPollAt)
+	}
+
+	if err := store.RecordChatPollError(ctx, "chat-1", "temporary graph error"); err != nil {
+		t.Fatalf("RecordChatPollError error: %v", err)
+	}
+	beforeRecovery, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before recovery success: %v", err)
+	}
+	recovered, err := store.RecordChatPollSuccess(ctx, "chat-1", cursor, true, false, 0)
+	if err != nil {
+		t.Fatalf("recovery RecordChatPollSuccess error: %v", err)
+	}
+	afterRecovery, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after recovery success: %v", err)
+	}
+	if bytes.Equal(beforeRecovery, afterRecovery) {
+		t.Fatal("RecordChatPollSuccess did not rewrite while clearing poll error")
+	}
+	if recovered.LastError != "" || recovered.FailureCount != 0 {
+		t.Fatalf("recovery success did not clear error state: %#v", recovered)
+	}
+}
+
+func TestChatPollSuccessHeartbeatBoundary(t *testing.T) {
+	cursor := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	lastSuccess := cursor.Add(time.Minute)
+	state := newState()
+	state.ChatPolls["chat-1"] = ChatPollState{
+		ChatID:               "chat-1",
+		Seeded:               true,
+		LastModifiedCursor:   cursor,
+		LastSuccessfulPollAt: lastSuccess,
+		UpdatedAt:            lastSuccess,
+	}
+	poll, changed := applyChatPollSuccessLocked(&state, "chat-1", cursor, true, false, 0, "", lastSuccess.Add(chatPollSuccessHeartbeatWriteInterval-time.Nanosecond))
+	if changed {
+		t.Fatal("poll success changed before heartbeat interval elapsed")
+	}
+	if !poll.LastSuccessfulPollAt.Equal(lastSuccess) {
+		t.Fatalf("pre-boundary LastSuccessfulPollAt = %s, want %s", poll.LastSuccessfulPollAt, lastSuccess)
+	}
+	poll, changed = applyChatPollSuccessLocked(&state, "chat-1", cursor, true, false, 0, "", lastSuccess.Add(chatPollSuccessHeartbeatWriteInterval))
+	if !changed {
+		t.Fatal("poll success did not refresh at heartbeat boundary")
+	}
+	if !poll.LastSuccessfulPollAt.Equal(lastSuccess.Add(chatPollSuccessHeartbeatWriteInterval)) {
+		t.Fatalf("boundary LastSuccessfulPollAt = %s, want %s", poll.LastSuccessfulPollAt, lastSuccess.Add(chatPollSuccessHeartbeatWriteInterval))
+	}
+}
+
+func TestChatPollSuccessAndScheduleUsesSingleStateLoad(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	cursor := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	next := cursor.Add(time.Minute)
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+	poll, err := store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, "chat-1", cursor, true, false, 0, "", func(poll ChatPollState) (ChatPollScheduleUpdate, error) {
+		if !poll.Seeded || !poll.LastModifiedCursor.Equal(cursor) || poll.LastSuccessfulPollAt.IsZero() {
+			t.Fatalf("schedule callback saw unexpected success poll: %#v", poll)
+		}
+		return ChatPollScheduleUpdate{
+			ChatID:            "chat-1",
+			PollState:         "warm",
+			NextPollAt:        next,
+			ClearBlockedUntil: true,
+			ResetFailures:     true,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("RecordChatPollSuccessWithContinuationAndSchedule error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 1 {
+		t.Fatalf("combined chat poll update loaded state %d times, want 1", got)
+	}
+	if poll.PollState != "warm" || !poll.NextPollAt.Equal(next) || !poll.LastModifiedCursor.Equal(cursor) {
+		t.Fatalf("combined chat poll state = %#v", poll)
+	}
+}
+
+func TestChatPollSuccessAndScheduleWritesWhenSuccessNoopButScheduleChanges(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	cursor := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", cursor, true, false, 0); err != nil {
+		t.Fatalf("initial RecordChatPollSuccess error: %v", err)
+	}
+	beforePoll, ok, err := store.ChatPoll(ctx, "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll before combined update ok=%v err=%v", ok, err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before schedule-only change: %v", err)
+	}
+	next := cursor.Add(2 * time.Minute)
+	poll, err := store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, "chat-1", cursor, true, false, 0, "", func(ChatPollState) (ChatPollScheduleUpdate, error) {
+		return ChatPollScheduleUpdate{
+			ChatID:     "chat-1",
+			PollState:  "warm",
+			NextPollAt: next,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("RecordChatPollSuccessWithContinuationAndSchedule error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after schedule-only change: %v", err)
+	}
+	if bytes.Equal(before, after) {
+		t.Fatal("schedule-only combined update did not rewrite state")
+	}
+	if !poll.LastSuccessfulPollAt.Equal(beforePoll.LastSuccessfulPollAt) {
+		t.Fatalf("schedule-only combined update changed LastSuccessfulPollAt: before=%s after=%s", beforePoll.LastSuccessfulPollAt, poll.LastSuccessfulPollAt)
+	}
+	if poll.PollState != "warm" || !poll.NextPollAt.Equal(next) {
+		t.Fatalf("schedule-only combined poll = %#v", poll)
+	}
+}
+
+func TestChatPollSuccessAndScheduleRejectsMismatchedChat(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	cursor := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", cursor, true, false, 0); err != nil {
+		t.Fatalf("initial RecordChatPollSuccess error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before mismatched schedule: %v", err)
+	}
+	_, err = store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, "chat-1", cursor.Add(time.Minute), true, false, 1, "", func(ChatPollState) (ChatPollScheduleUpdate, error) {
+		return ChatPollScheduleUpdate{
+			ChatID:     "chat-2",
+			PollState:  "warm",
+			NextPollAt: cursor.Add(time.Minute),
+		}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched schedule error = %v, want chat mismatch", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after mismatched schedule: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("mismatched combined schedule rewrote state")
+	}
+}
+
+func TestHighChurnNoopPressureDoesNotRewriteState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	cursor := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	record := MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-helper-1",
+		Origin:         MessageOriginHelperOutbox,
+		OutboxID:       "outbox-1",
+		CreatedAt:      cursor,
+		UpdatedAt:      cursor,
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", cursor, true, false, 0); err != nil {
+		t.Fatalf("initial RecordChatPollSuccess error: %v", err)
+	}
+	if _, err := store.RecordMessageProvenance(ctx, record); err != nil {
+		t.Fatalf("initial RecordMessageProvenance error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before pressure: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := store.RecordChatPollSuccess(ctx, "chat-1", cursor, true, false, 0); err != nil {
+			t.Fatalf("pressure RecordChatPollSuccess %d error: %v", i, err)
+		}
+		if _, err := store.RecordMessageProvenance(ctx, record); err != nil {
+			t.Fatalf("pressure RecordMessageProvenance %d error: %v", i, err)
+		}
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after pressure: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("high-churn no-op pressure rewrote state")
+	}
+}
+
 func TestChatPollScheduleCanClearContinuationPath(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -3955,6 +6463,202 @@ func TestChatPollScheduleNoopDoesNotRewriteState(t *testing.T) {
 	}
 	if !pollAfter.UpdatedAt.Equal(pollBefore.UpdatedAt) {
 		t.Fatalf("noop UpdateChatPollSchedule changed UpdatedAt: before=%s after=%s", pollBefore.UpdatedAt, pollAfter.UpdatedAt)
+	}
+}
+
+func TestUpdateChatPollSchedulesEmptyBatchDoesNotLoadState(t *testing.T) {
+	store := newTestStore(t)
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	polls, err := store.UpdateChatPollSchedules(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedules empty error: %v", err)
+	}
+	if len(polls) != 0 {
+		t.Fatalf("empty batch returned polls: %#v", polls)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("empty batch loaded state %d times, want 0", got)
+	}
+}
+
+func TestUpdateChatPollSchedulesBatchesInSingleLoad(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	polls, err := store.UpdateChatPollSchedules(ctx, []ChatPollScheduleUpdate{
+		{
+			ChatID:         "chat-1",
+			PollState:      "warm",
+			NextPollAt:     now.Add(time.Minute),
+			LastActivityAt: now.Add(-10 * time.Minute),
+		},
+		{
+			ChatID:         "chat-2",
+			PollState:      "hot",
+			NextPollAt:     now.Add(2 * time.Minute),
+			LastActivityAt: now.Add(-5 * time.Minute),
+		},
+		{
+			ChatID:         "chat-3",
+			PollState:      "blocked",
+			NextPollAt:     now.Add(5 * time.Minute),
+			LastActivityAt: now.Add(-time.Minute),
+			BlockedUntil:   now.Add(5 * time.Minute),
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedules error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 1 {
+		t.Fatalf("batch schedule update loaded state %d times, want 1", got)
+	}
+	if len(polls) != 3 {
+		t.Fatalf("batch returned %d polls, want 3: %#v", len(polls), polls)
+	}
+	if poll := polls["chat-1"]; poll.PollState != "warm" || !poll.NextPollAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("chat-1 poll = %#v", poll)
+	}
+	if poll := polls["chat-2"]; poll.PollState != "hot" || !poll.LastActivityAt.Equal(now.Add(-5*time.Minute)) {
+		t.Fatalf("chat-2 poll = %#v", poll)
+	}
+	if poll := polls["chat-3"]; poll.PollState != "blocked" || !poll.BlockedUntil.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("chat-3 poll = %#v", poll)
+	}
+}
+
+func TestUpdateChatPollSchedulesAppliesDuplicateChatInOrder(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+
+	polls, err := store.UpdateChatPollSchedules(ctx, []ChatPollScheduleUpdate{
+		{
+			ChatID:         "chat-1",
+			PollState:      "warm",
+			NextPollAt:     now.Add(time.Minute),
+			LastActivityAt: now.Add(-10 * time.Minute),
+		},
+		{
+			ChatID:         "chat-1",
+			PollState:      "blocked",
+			NextPollAt:     now.Add(5 * time.Minute),
+			BlockedUntil:   now.Add(5 * time.Minute),
+			LastActivityAt: now.Add(-10 * time.Minute),
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedules duplicate chat error: %v", err)
+	}
+	poll := polls["chat-1"]
+	if poll.PollState != "blocked" || poll.PreviousPollState != "warm" || !poll.BlockedUntil.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("duplicate chat final poll = %#v, want blocked with previous warm", poll)
+	}
+}
+
+func TestUpdateChatPollSchedulesNoopDoesNotRewriteState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	updates := []ChatPollScheduleUpdate{
+		{
+			ChatID:         "chat-1",
+			PollState:      "warm",
+			NextPollAt:     now.Add(time.Minute),
+			LastActivityAt: now.Add(-10 * time.Minute),
+		},
+		{
+			ChatID:         "chat-2",
+			PollState:      "hot",
+			NextPollAt:     now.Add(2 * time.Minute),
+			LastActivityAt: now.Add(-5 * time.Minute),
+		},
+	}
+	beforePolls, err := store.UpdateChatPollSchedules(ctx, updates)
+	if err != nil {
+		t.Fatalf("initial UpdateChatPollSchedules error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before noop batch: %v", err)
+	}
+
+	afterPolls, err := store.UpdateChatPollSchedules(ctx, updates)
+	if err != nil {
+		t.Fatalf("noop UpdateChatPollSchedules error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after noop batch: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("noop UpdateChatPollSchedules rewrote state file")
+	}
+	for _, chatID := range []string{"chat-1", "chat-2"} {
+		if !afterPolls[chatID].UpdatedAt.Equal(beforePolls[chatID].UpdatedAt) {
+			t.Fatalf("%s noop batch changed UpdatedAt: before=%s after=%s", chatID, beforePolls[chatID].UpdatedAt, afterPolls[chatID].UpdatedAt)
+		}
+	}
+}
+
+func TestUpdateChatPollSchedulesRejectsInvalidBatchAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      "warm",
+		NextPollAt:     now.Add(time.Minute),
+		LastActivityAt: now.Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("initial UpdateChatPollSchedule error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before invalid batch: %v", err)
+	}
+
+	_, err = store.UpdateChatPollSchedules(ctx, []ChatPollScheduleUpdate{
+		{
+			ChatID:         "chat-2",
+			PollState:      "hot",
+			NextPollAt:     now.Add(2 * time.Minute),
+			LastActivityAt: now.Add(-5 * time.Minute),
+		},
+		{
+			ChatID:     " ",
+			PollState:  "warm",
+			NextPollAt: now.Add(3 * time.Minute),
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "chat id is required") {
+		t.Fatalf("invalid batch error = %v, want chat id error", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after invalid batch: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("invalid UpdateChatPollSchedules batch partially rewrote state")
+	}
+	if _, ok, err := store.ChatPoll(ctx, "chat-2"); err != nil || ok {
+		t.Fatalf("chat-2 after invalid batch ok=%v err=%v, want absent", ok, err)
 	}
 }
 
@@ -4271,12 +6975,30 @@ func TestClaimControlLeaseSameMachineDuplicateStaysStandbyBehindLiveOwner(t *tes
 		t.Fatalf("duplicate decision = %#v, want standby behind existing owner", duplicate)
 	}
 
+	beforeRefresh, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before same owner refresh: %v", err)
+	}
 	refreshed, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now.Add(2 * time.Second)})
 	if err != nil {
 		t.Fatalf("same owner ClaimControlLease error: %v", err)
 	}
 	if refreshed.Mode != LeaseModeActive || refreshed.Lease.HolderMachineID != machine.ID {
 		t.Fatalf("same owner decision = %#v, want active refresh", refreshed)
+	}
+	afterRefresh, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after same owner refresh: %v", err)
+	}
+	if bytes.Equal(beforeRefresh, afterRefresh) {
+		t.Fatal("same owner refresh did not rewrite standby holder machine status")
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after same owner refresh: %v", err)
+	}
+	if got := loaded.Machines[machine.ID].Status; got != MachineStatusActive {
+		t.Fatalf("persisted holder machine status = %q, want %q", got, MachineStatusActive)
 	}
 }
 
@@ -4478,6 +7200,95 @@ func TestClaimControlLeaseDoesNotPreemptActiveTurn(t *testing.T) {
 	}
 	if primaryDecision.Mode != LeaseModeStandby || primaryDecision.Lease.HolderMachineID != ephemeral.ID {
 		t.Fatalf("primary decision during active turn = %#v, want standby behind active ephemeral turn", primaryDecision)
+	}
+}
+
+func TestClaimControlLeaseSameHolderEarlyRefreshDoesNotRewriteState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	scope := ScopeIdentity{ID: "scope-1", AccountID: "user-1", OSUser: "alice", Profile: "default"}
+	machine := MachineRecord{ID: "machine-primary", ScopeID: scope.ID, Kind: MachineKindPrimary}
+	owner := OwnerMetadata{PID: 123, Hostname: "remote-host", ExecutablePath: "/bin/helper", StartedAt: now}
+	first, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now})
+	if err != nil {
+		t.Fatalf("initial ClaimControlLease error: %v", err)
+	}
+	owner.MachineID = machine.ID
+	owner.LeaseGeneration = first.Lease.Generation
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before early refresh: %v", err)
+	}
+	refreshed, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now.Add(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("early refresh ClaimControlLease error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after early refresh: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("same-holder early ClaimControlLease refresh rewrote state")
+	}
+	if refreshed.Mode != LeaseModeActive || refreshed.Lease.Generation != first.Lease.Generation || !refreshed.Lease.LeaseUntil.Equal(first.Lease.LeaseUntil) {
+		t.Fatalf("early refresh decision = %#v, want unchanged active lease %#v", refreshed, first.Lease)
+	}
+
+	changedScope := scope
+	changedScope.Profile = "review"
+	beforeScopeChange, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before scope metadata refresh: %v", err)
+	}
+	if _, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: changedScope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now.Add(8 * time.Second)}); err != nil {
+		t.Fatalf("scope metadata refresh ClaimControlLease error: %v", err)
+	}
+	afterScopeChange, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after scope metadata refresh: %v", err)
+	}
+	if bytes.Equal(beforeScopeChange, afterScopeChange) {
+		t.Fatal("same-holder scope metadata refresh did not rewrite state")
+	}
+	loadedAfterScopeChange, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after scope metadata refresh: %v", err)
+	}
+	if loadedAfterScopeChange.Scope.Profile != "review" {
+		t.Fatalf("scope profile after metadata refresh = %q, want review", loadedAfterScopeChange.Scope.Profile)
+	}
+
+	changedMachine := machine
+	changedMachine.Label = "renamed-machine"
+	beforeMetadataChange, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state before metadata refresh: %v", err)
+	}
+	metadataRefresh, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: changedScope, Machine: changedMachine, Owner: owner, Duration: time.Minute, Now: now.Add(10 * time.Second)})
+	if err != nil {
+		t.Fatalf("metadata refresh ClaimControlLease error: %v", err)
+	}
+	afterMetadataChange, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read state after metadata refresh: %v", err)
+	}
+	if bytes.Equal(beforeMetadataChange, afterMetadataChange) {
+		t.Fatal("same-holder metadata refresh did not rewrite state")
+	}
+	if metadataRefresh.Holder.Label != "renamed-machine" {
+		t.Fatalf("metadata refresh holder label = %q, want renamed-machine", metadataRefresh.Holder.Label)
+	}
+
+	later, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: changedScope, Machine: changedMachine, Owner: owner, Duration: time.Minute, Now: now.Add(40 * time.Second)})
+	if err != nil {
+		t.Fatalf("late refresh ClaimControlLease error: %v", err)
+	}
+	if !later.Lease.LeaseUntil.After(metadataRefresh.Lease.LeaseUntil) {
+		t.Fatalf("late refresh did not extend lease: metadata=%s later=%s", metadataRefresh.Lease.LeaseUntil, later.Lease.LeaseUntil)
 	}
 }
 
@@ -4783,6 +7594,79 @@ func TestTeamsBackgroundKeepaliveScopeIsolationRejectsSharedStateReuseCI(t *test
 	}
 	if state.Scope.ID != scopeA.ID || len(state.Machines) != 0 {
 		t.Fatalf("scope isolation failure mutated state: %#v", state)
+	}
+}
+
+func TestRecordScopeSkipsSaveForUnchangedScope(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	scope := ScopeIdentity{ID: "scope-a", AccountID: "user-a", OSUser: "alice", Profile: "default"}
+	if _, err := store.RecordScope(ctx, scope); err != nil {
+		t.Fatalf("RecordScope initial error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store before unchanged scope: %v", err)
+	}
+	if _, err := store.RecordScope(ctx, scope); err != nil {
+		t.Fatalf("RecordScope unchanged error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after unchanged scope: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("RecordScope rewrote state for an unchanged scope claim")
+	}
+
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope.CreatedAt = time.Time{}
+		state.Scope.UpdatedAt = time.Time{}
+		return nil
+	}); err != nil {
+		t.Fatalf("clear scope timestamps: %v", err)
+	}
+	legacyTimestamps, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store with missing scope timestamps: %v", err)
+	}
+	if _, err := store.RecordScope(ctx, scope); err != nil {
+		t.Fatalf("RecordScope timestamp backfill error: %v", err)
+	}
+	backfilled, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after scope timestamp backfill: %v", err)
+	}
+	if bytes.Equal(backfilled, legacyTimestamps) {
+		t.Fatal("RecordScope did not rewrite state to backfill missing timestamps")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load backfilled scope: %v", err)
+	}
+	if state.Scope.CreatedAt.IsZero() || state.Scope.UpdatedAt.IsZero() {
+		t.Fatalf("scope timestamps were not backfilled: %#v", state.Scope)
+	}
+	after = backfilled
+
+	changed := scope
+	changed.Profile = "work"
+	if _, err := store.RecordScope(ctx, changed); err != nil {
+		t.Fatalf("RecordScope changed metadata error: %v", err)
+	}
+	afterChanged, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after changed scope: %v", err)
+	}
+	if bytes.Equal(afterChanged, after) {
+		t.Fatal("RecordScope did not rewrite state for changed scope metadata")
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load changed scope: %v", err)
+	}
+	if state.Scope.Profile != "work" {
+		t.Fatalf("scope profile = %q, want work", state.Scope.Profile)
 	}
 }
 
@@ -5428,7 +8312,216 @@ func newTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("Open error: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close test store: %v", err)
+		}
+	})
 	return store
+}
+
+func writeRawStoreStateForTest(t *testing.T, store *Store, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(store.Path()), 0o700); err != nil {
+		t.Fatalf("mkdir state dir: %v", err)
+	}
+	if err := os.WriteFile(store.Path(), data, 0o600); err != nil {
+		t.Fatalf("write raw state: %v", err)
+	}
+}
+
+func seedLegacyStateFileForSQLiteMigrationTest(t *testing.T, store *Store) {
+	t.Helper()
+	if _, err := store.SetPaused(context.Background(), true, "seed sqlite migration"); err != nil {
+		t.Fatalf("seed legacy state before sqlite migration: %v", err)
+	}
+}
+
+func seedComplexLegacyStateForSQLiteMigrationTest(t *testing.T, store *Store) {
+	t.Helper()
+	now := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.ServiceControl = ServiceControl{Paused: true, Draining: true, Reason: "upgrade", UpdatedAt: now}
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-chat", TeamsChatURL: "https://teams.example/control", TeamsChatTopic: "control", UpdatedAt: now}
+		for i := 0; i < 4; i++ {
+			sessionID := fmt.Sprintf("upgrade-session-%02d", i)
+			chatID := fmt.Sprintf("upgrade-chat-%02d", i)
+			state.Sessions[sessionID] = SessionContext{
+				ID:            sessionID,
+				Status:        SessionStatusActive,
+				TeamsChatID:   chatID,
+				TeamsChatURL:  "https://teams.example/" + chatID,
+				TeamsTopic:    "upgrade topic",
+				CodexThreadID: fmt.Sprintf("thread-upgrade-%02d", i),
+				Cwd:           fmt.Sprintf("/workspace/upgrade-%02d", i),
+				CreatedAt:     now,
+				UpdatedAt:     now,
+			}
+			state.ChatPolls[chatID] = ChatPollState{ChatID: chatID, Seeded: true, PollState: "warm", NextPollAt: now.Add(time.Minute), LastSuccessfulPollAt: now.Add(-time.Minute), UpdatedAt: now}
+			state.ChatRateLimits[chatID] = ChatRateLimitState{ChatID: chatID, BlockedUntil: now.Add(time.Minute), Reason: "seeded"}
+			for j := 0; j < 3; j++ {
+				inboundID := fmt.Sprintf("upgrade-inbound-%02d-%02d", i, j)
+				turnID := fmt.Sprintf("upgrade-turn-%02d-%02d", i, j)
+				messageID := fmt.Sprintf("upgrade-message-seed-%02d-%02d", i, j)
+				status := TurnStatusCompleted
+				if j == 2 {
+					status = TurnStatusQueued
+				}
+				state.InboundEvents[inboundID] = InboundEvent{
+					ID:             inboundID,
+					SessionID:      sessionID,
+					TeamsChatID:    chatID,
+					TeamsMessageID: messageID,
+					Source:         "teams",
+					Status:         InboundStatusQueued,
+					TurnID:         turnID,
+					Text:           strings.Repeat(fmt.Sprintf("seed prompt %02d %02d ", i, j), 16),
+					CreatedAt:      now.Add(time.Duration(i*10+j) * time.Second),
+					UpdatedAt:      now.Add(time.Duration(i*10+j) * time.Second),
+				}
+				state.Turns[turnID] = Turn{
+					ID:             turnID,
+					SessionID:      sessionID,
+					InboundEventID: inboundID,
+					Status:         status,
+					QueuedAt:       now.Add(time.Duration(i*10+j) * time.Second),
+					CreatedAt:      now.Add(time.Duration(i*10+j) * time.Second),
+					UpdatedAt:      now.Add(time.Duration(i*10+j) * time.Second),
+				}
+				state.MessageProvenance[fmt.Sprintf("upgrade-prov-in-%02d-%02d", i, j)] = MessageProvenanceRecord{
+					ID:             fmt.Sprintf("upgrade-prov-in-%02d-%02d", i, j),
+					TeamsChatID:    chatID,
+					TeamsMessageID: messageID,
+					Origin:         MessageOriginUserInbound,
+					SessionID:      sessionID,
+					InboundID:      inboundID,
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				}
+				if j < 2 {
+					outboxID := fmt.Sprintf("upgrade-seed-outbox-%02d-%02d", i, j)
+					teamsMessageID := fmt.Sprintf("upgrade-helper-message-%02d-%02d", i, j)
+					state.OutboxMessages[outboxID] = OutboxMessage{
+						ID:             outboxID,
+						SessionID:      sessionID,
+						TurnID:         turnID,
+						TeamsChatID:    chatID,
+						TeamsMessageID: teamsMessageID,
+						Kind:           "final",
+						Body:           strings.Repeat("seed answer ", 12),
+						Status:         OutboxStatusSent,
+						Sequence:       int64(j + 1),
+						CreatedAt:      now,
+						UpdatedAt:      now,
+						SentAt:         now,
+					}
+					state.MessageProvenance[fmt.Sprintf("upgrade-prov-out-%02d-%02d", i, j)] = MessageProvenanceRecord{
+						ID:             fmt.Sprintf("upgrade-prov-out-%02d-%02d", i, j),
+						TeamsChatID:    chatID,
+						TeamsMessageID: teamsMessageID,
+						Origin:         MessageOriginHelperOutbox,
+						SessionID:      sessionID,
+						OutboxID:       outboxID,
+						CreatedAt:      now,
+						UpdatedAt:      now,
+					}
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed complex legacy state before sqlite migration: %v", err)
+	}
+}
+
+func withSQLiteMigrationTestHook(t *testing.T, hook func(stage string) error) {
+	t.Helper()
+	prev := sqliteMigrationTestHook
+	sqliteMigrationTestHook = hook
+	t.Cleanup(func() {
+		sqliteMigrationTestHook = prev
+	})
+}
+
+func migrateStoreToSQLiteForTest(t *testing.T, store *Store) StoreSQLiteMigrationResult {
+	t.Helper()
+	result, err := store.MigrateLargeStateToSQLite(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	if !result.Migrated && !result.AlreadyDB {
+		t.Fatalf("MigrateLargeStateToSQLite result = %#v, want migrated or already DB", result)
+	}
+	return result
+}
+
+func writeSQLitePointerForTest(t *testing.T, store *Store, path string) {
+	t.Helper()
+	pointer := storeSQLitePointer{
+		SchemaVersion:       storeSQLitePointerSchemaVersion,
+		StorageBackend:      storeSQLiteBackend,
+		StorageVersion:      storeSQLiteVersion,
+		Path:                path,
+		MigrationID:         "test-migration",
+		SourceSchemaVersion: SchemaVersion,
+		CreatedAt:           time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC),
+	}
+	if err := store.writeSQLitePointerUnlocked(pointer); err != nil {
+		t.Fatalf("write sqlite pointer: %v", err)
+	}
+}
+
+func legacyV5LoadStateDataForTest(data []byte) (State, error) {
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		return State{}, err
+	}
+	if state.SchemaVersion >= 0 && state.SchemaVersion < SchemaVersion {
+		state = migrateStateToCurrent(state)
+		return state, nil
+	}
+	if state.SchemaVersion != SchemaVersion {
+		return State{}, &UnsupportedSchemaVersionError{Version: state.SchemaVersion}
+	}
+	normalizeLoadedState(&state)
+	return state, nil
+}
+
+func holdSessionLockForTest(t *testing.T, store *Store, sessionID string) func() {
+	t.Helper()
+	release := make(chan struct{})
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- store.withSessionLock(context.Background(), sessionID, func() error {
+			close(ready)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("hold session lock %q error: %v", sessionID, err)
+	case <-time.After(time.Second):
+		t.Fatalf("timed out acquiring session lock %q", sessionID)
+	}
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		close(release)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("release session lock %q error: %v", sessionID, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out releasing session lock %q", sessionID)
+		}
+	}
 }
 
 func newBenchmarkStore(b *testing.B) *Store {

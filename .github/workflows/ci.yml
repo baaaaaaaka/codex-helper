@@ -350,6 +350,17 @@ jobs:
           set -euo pipefail
           bash scripts/ci/teams_graph_429_stress.sh
 
+      - name: Teams SQLite store migration and perf regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          sqlite_store_pattern='TestSQLite(Migration(RoundTripAndHotPaths|UpgradesLegacySchemaWithRecoverableBackup|ThresholdSkipLeavesLegacyStateUntouched|MissingStateDoesNotCreatePointerOrDB|UnsupportedFutureSchemaFailsClosed|RetryReplacesStaleDBAndSidecars|FailureLeavesLegacyStateLoadableAndRetryable|CrashStageMatrixLeavesLegacyStateRetryable|FailureOnStaleSidecarLeavesLegacyState|ProcessBoundaryStressAfterUpgrade)|Pointer(MissingDBFailsClosedAndDoesNotCreateEmptyStore|UninitializedOrCorruptDBFailsClosed|PathValidationFailsClosed|SchemaRejectsLegacyV5Loaders|UnsupportedSchemaFailsClosed)|ExistingDBMissingHotTablesFailsClosed|StoreUsesFullSynchronousMode)$'
+          sqlite_bridge_pattern='TestBridge(SQLiteMigration(UpgradeStateMatrix|FailureFallsBackToLegacyAndNotifiesControl|FallbackNoticeIsDeduped|FallbackFailsClosedForMissingPointerDB|FallbackFailsClosedForUnsupportedBackend)|DefersSQLiteMigrationWhileHelperUpgradeActivationIsPending)$'
+          sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths)$'
+          go test ./internal/teams/store -count=1 -run "$sqlite_store_pattern" -v
+          go test ./internal/teams -count=1 -run "$sqlite_bridge_pattern" -v
+          go test ./internal/teams -count=1 -run "$sqlite_perf_pattern" -v
+
       - name: Teams Codex runner classification regressions
         shell: bash
         run: |

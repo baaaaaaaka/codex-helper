@@ -64,11 +64,11 @@ func (b *Bridge) resolveCodexThreadDecision(ctx context.Context, session *Sessio
 	if b == nil || b.store == nil || session == nil {
 		return threadResolveDecision{Action: threadResolveStartNew}, nil
 	}
-	state, err := b.store.Load(ctx)
+	sessionID := strings.TrimSpace(session.ID)
+	state, err := b.store.SessionWorkflowEventSnapshot(ctx, sessionID)
 	if err != nil {
 		return threadResolveDecision{}, err
 	}
-	sessionID := strings.TrimSpace(session.ID)
 	var candidates []string
 	if durable, ok := state.Sessions[sessionID]; ok {
 		if threadID := strings.TrimSpace(durable.CodexThreadID); threadID != "" {
