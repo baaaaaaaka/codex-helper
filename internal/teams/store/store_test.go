@@ -113,6 +113,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open error: %v", err)
 	}
+	defer reopened.Close()
 	state, err := reopened.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load reopened error: %v", err)
@@ -476,6 +477,7 @@ func TestSQLiteMigrationUpgradesLegacySchemaWithRecoverableBackup(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Open migrated sqlite store error: %v", err)
 	}
+	defer reopened.Close()
 	reopenedState, err := reopened.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load reopened migrated sqlite store error: %v", err)
@@ -2160,6 +2162,7 @@ func TestTurnStatusUpdateHonorsSessionLockAcrossStoreInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open second store error: %v", err)
 	}
+	defer other.Close()
 	ctx := context.Background()
 	if _, created, err := store.CreateSession(ctx, testSession()); err != nil {
 		t.Fatalf("CreateSession error: %v", err)
@@ -2192,6 +2195,7 @@ func TestSQLiteTurnStatusUpdatesHonorSessionLockAcrossStoreInstances(t *testing.
 	if err != nil {
 		t.Fatalf("Open second store error: %v", err)
 	}
+	defer other.Close()
 	ctx := context.Background()
 	if _, created, err := store.CreateSession(ctx, testSession()); err != nil {
 		t.Fatalf("CreateSession error: %v", err)
@@ -3629,6 +3633,7 @@ func TestAutoUpdateLifecyclePersistsCandidateAndClearsAfterInstall(t *testing.T)
 	if err != nil {
 		t.Fatalf("Open error: %v", err)
 	}
+	defer reopened.Close()
 	read, err := reopened.ReadAutoUpdate(ctx)
 	if err != nil {
 		t.Fatalf("ReadAutoUpdate error: %v", err)
@@ -3702,6 +3707,7 @@ func TestDeferredInboundIsDurableAndListed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open error: %v", err)
 	}
+	defer reopened.Close()
 	deferred, err = reopened.DeferredInbound(ctx)
 	if err != nil {
 		t.Fatalf("DeferredInbound reopened error: %v", err)
@@ -4628,6 +4634,7 @@ func TestMessageLookupCacheTracksExternalStoreUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open second store: %v", err)
 	}
+	defer other.Close()
 	if _, err := other.RecordMessageProvenance(ctx, MessageProvenanceRecord{
 		TeamsChatID:    "chat-1",
 		TeamsMessageID: "message-1",
@@ -5666,6 +5673,7 @@ func TestOutboxResendDoesNotCreateNewTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open error: %v", err)
 	}
+	defer reopened.Close()
 	duplicateInbound, created, err := reopened.PersistInbound(ctx, testInbound())
 	if err != nil {
 		t.Fatalf("duplicate PersistInbound error: %v", err)
