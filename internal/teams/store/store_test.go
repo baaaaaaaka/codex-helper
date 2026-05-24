@@ -1580,6 +1580,7 @@ func TestSQLiteConcurrentDuplicateInboundAndTurnCreation(t *testing.T) {
 				errs <- err
 				return
 			}
+			defer worker.Close()
 			if _, created, err := worker.PersistInbound(ctx, inbound); err != nil {
 				errs <- err
 				return
@@ -1607,6 +1608,7 @@ func TestSQLiteConcurrentDuplicateInboundAndTurnCreation(t *testing.T) {
 				errs <- err
 				return
 			}
+			defer worker.Close()
 			if _, created, err := worker.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil {
 				errs <- err
 				return
@@ -2527,6 +2529,7 @@ func TestStoreConcurrentSessionAndOutboxWritersPreserveState(t *testing.T) {
 				errCh <- fmt.Errorf("open worker store %d: %w", worker, err)
 				return
 			}
+			defer workerStore.Close()
 			for i := 0; i < perWorker; i++ {
 				idx := worker*perWorker + i
 				inbound, created, err := workerStore.PersistInbound(ctx, InboundEvent{
@@ -2692,6 +2695,7 @@ func TestStoreConcurrentDistinctSessionWritersDoNotCrossMutate(t *testing.T) {
 				errCh <- fmt.Errorf("open worker store %d: %w", i, err)
 				return
 			}
+			defer workerStore.Close()
 			sessionID := fmt.Sprintf("s%03d", i)
 			chatID := fmt.Sprintf("chat-%d", i)
 			for j := 0; j < perSession; j++ {
@@ -2811,6 +2815,7 @@ func TestStoreConcurrentInboundTurnDedupAcrossHandles(t *testing.T) {
 				errCh <- fmt.Errorf("open worker store %d: %w", worker, err)
 				return
 			}
+			defer workerStore.Close()
 			inbound, _, err := workerStore.PersistInbound(ctx, InboundEvent{
 				SessionID:      "s1",
 				TeamsChatID:    "chat-1",
