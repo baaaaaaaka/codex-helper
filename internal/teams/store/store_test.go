@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1126,6 +1127,39 @@ func TestSQLiteStoreUsesFullSynchronousMode(t *testing.T) {
 	}
 	if synchronous != "2" && !strings.EqualFold(synchronous, "FULL") {
 		t.Fatalf("PRAGMA synchronous = %q, want FULL/2", synchronous)
+	}
+}
+
+func TestSQLiteFileURIWindowsPaths(t *testing.T) {
+	query := url.Values{"mode": []string{"rwc"}}
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			name: "drive absolute",
+			path: `D:\a\codex helper\store.sqlite`,
+			want: "file:///D:/a/codex%20helper/store.sqlite?mode=rwc",
+		},
+		{
+			name: "unc path",
+			path: `\\server\share\codex helper\store.sqlite`,
+			want: "file://server/share/codex%20helper/store.sqlite?mode=rwc",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := sqliteWindowsFileURL(tc.path)
+			u.RawQuery = query.Encode()
+			got := u.String()
+			if got != tc.want {
+				t.Fatalf("sqliteWindowsFileURL(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+			if strings.Contains(got, `\`) || strings.Contains(got, "%5C") {
+				t.Fatalf("sqlite Windows file URI should not contain raw or escaped backslashes: %q", got)
+			}
+		})
 	}
 }
 

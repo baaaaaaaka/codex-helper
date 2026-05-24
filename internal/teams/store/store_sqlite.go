@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -480,14 +481,13 @@ func openSQLiteStore(path string, create bool) (*sql.DB, error) {
 }
 
 func openSQLiteHandle(path string, create bool) (*sql.DB, error) {
-	dsn := path
-	if !create {
-		u := url.URL{Scheme: "file", Path: path}
-		query := u.Query()
+	query := url.Values{}
+	if create {
+		query.Set("mode", "rwc")
+	} else {
 		query.Set("mode", "rw")
-		u.RawQuery = query.Encode()
-		dsn = u.String()
 	}
+	dsn := sqliteFileURI(path, query)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -495,6 +495,35 @@ func openSQLiteHandle(path string, create bool) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	return db, nil
+}
+
+func sqliteFileURI(path string, query url.Values) string {
+	u := url.URL{Scheme: "file"}
+	if runtime.GOOS == "windows" {
+		u = sqliteWindowsFileURL(path)
+	} else {
+		u.Path = path
+	}
+	if len(query) > 0 {
+		u.RawQuery = query.Encode()
+	}
+	return u.String()
+}
+
+func sqliteWindowsFileURL(path string) url.URL {
+	slash := strings.ReplaceAll(path, `\`, `/`)
+	if strings.HasPrefix(slash, "//") {
+		trimmed := strings.TrimLeft(slash, "/")
+		host, rest, ok := strings.Cut(trimmed, "/")
+		if ok {
+			return url.URL{Scheme: "file", Host: host, Path: "/" + rest}
+		}
+		return url.URL{Scheme: "file", Path: slash}
+	}
+	if len(slash) >= 2 && slash[1] == ':' {
+		slash = "/" + slash
+	}
+	return url.URL{Scheme: "file", Path: slash}
 }
 
 func configureSQLiteStore(db *sql.DB, path string) error {
