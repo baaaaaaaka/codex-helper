@@ -430,6 +430,9 @@ BENCH_TARGETS = {
     "sqlite-daemon-queued-drain": "BenchmarkCXPPerfModelSQLiteDaemonQueuedTurnDrainProfiles",
     "daemon-outbox-flush": "BenchmarkCXPPerfModelDaemonOutboxFlushProfiles",
     "sqlite-daemon-outbox-flush": "BenchmarkCXPPerfModelSQLiteDaemonOutboxFlushProfiles",
+    "sqlite-deferred-inbound": "BenchmarkCXPPerfModelSQLiteDeferredInboundNoDeferredProfiles",
+    "sqlite-history-watch-checkpoint": "BenchmarkCXPPerfModelSQLiteHistoryWatchCheckpointUpdateProfiles",
+    "sqlite-history-watch-active": "BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles",
     "listen-once": "BenchmarkCXPPerfModelListenOnceProfiles",
     "external": "BenchmarkCXPPerfModelExternalScenarios",
 }

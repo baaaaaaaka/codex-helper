@@ -189,6 +189,34 @@ class CXPPerfModelScriptTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("BenchmarkCXPPerfModelSQLiteDaemonOutboxFlushProfiles/ci-burst-user$", cmd)
 
+    def test_bench_supports_sqlite_hotspot_targets(self) -> None:
+        completed = subprocess.CompletedProcess(args=["go"], returncode=0)
+        for target, benchmark in [
+            ("sqlite-deferred-inbound", "BenchmarkCXPPerfModelSQLiteDeferredInboundNoDeferredProfiles/many-long-chats$"),
+            ("sqlite-history-watch-checkpoint", "BenchmarkCXPPerfModelSQLiteHistoryWatchCheckpointUpdateProfiles/many-long-chats$"),
+            ("sqlite-history-watch-active", "BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles/many-long-chats$"),
+        ]:
+            with self.subTest(target=target):
+                with mock.patch.object(model.subprocess, "run", return_value=completed) as run:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        code = model.main(
+                            [
+                                "bench",
+                                "--target",
+                                target,
+                                "--profile",
+                                "many-long-chats",
+                                "--benchtime",
+                                "1x",
+                                "--count",
+                                "1",
+                            ]
+                        )
+
+                cmd = run.call_args.args[0]
+                self.assertEqual(code, 0)
+                self.assertIn(benchmark, cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

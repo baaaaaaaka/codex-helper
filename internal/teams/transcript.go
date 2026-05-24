@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type TranscriptKind string
@@ -328,6 +329,9 @@ func compactTranscriptRecords(records []TranscriptRecord) []TranscriptRecord {
 		if compactedRecordIsShadowedByEvent(records, i) {
 			continue
 		}
+		if assistantRecordIsPrefixShadowedByLaterAssistant(records, i) {
+			continue
+		}
 		out = append(out, records[i])
 	}
 	return out
@@ -343,6 +347,61 @@ func compactedRecordIsShadowedByEvent(records []TranscriptRecord, index int) boo
 		strings.EqualFold(strings.TrimSpace(current.SourceType), "compacted") &&
 		next.Kind == TranscriptKindCompact &&
 		strings.EqualFold(strings.TrimSpace(next.SourceType), "context_compacted")
+}
+
+func assistantRecordIsPrefixShadowedByLaterAssistant(records []TranscriptRecord, index int) bool {
+	if index < 0 || index+1 >= len(records) {
+		return false
+	}
+	current := records[index]
+	currentText := strings.TrimSpace(current.Text)
+	if current.Kind != TranscriptKindAssistant || !transcriptRecordCanBeStreamingAssistantPrefix(current) || utf8.RuneCountInString(currentText) < 40 {
+		return false
+	}
+	for i := index + 1; i < len(records); i++ {
+		next := records[i]
+		if next.Kind == TranscriptKindUser {
+			return false
+		}
+		if next.Kind != TranscriptKindAssistant {
+			continue
+		}
+		if !transcriptRecordCanShadowStreamingAssistantPrefix(next) {
+			continue
+		}
+		if !transcriptRecordsCanShadowSameAssistant(current, next) {
+			continue
+		}
+		nextText := strings.TrimSpace(next.Text)
+		if len(nextText) > len(currentText) && strings.HasPrefix(nextText, currentText) {
+			return true
+		}
+	}
+	return false
+}
+
+func transcriptRecordsCanShadowSameAssistant(left TranscriptRecord, right TranscriptRecord) bool {
+	leftThread := strings.TrimSpace(left.ThreadID)
+	rightThread := strings.TrimSpace(right.ThreadID)
+	if leftThread != "" && rightThread != "" && leftThread != rightThread {
+		return false
+	}
+	leftTurn := strings.TrimSpace(left.TurnID)
+	rightTurn := strings.TrimSpace(right.TurnID)
+	if leftTurn != "" && rightTurn != "" && leftTurn != rightTurn {
+		return false
+	}
+	return true
+}
+
+func transcriptRecordCanBeStreamingAssistantPrefix(record TranscriptRecord) bool {
+	sourceType := strings.ToLower(strings.TrimSpace(record.SourceType))
+	return sourceType == "agent_message" || sourceType == "agentmessage" || sourceType == "assistant_message"
+}
+
+func transcriptRecordCanShadowStreamingAssistantPrefix(record TranscriptRecord) bool {
+	sourceType := strings.ToLower(strings.TrimSpace(record.SourceType))
+	return sourceType == "message" || sourceType == "agent_message" || sourceType == "agentmessage" || sourceType == "assistant_message"
 }
 
 type transcriptParseState struct {

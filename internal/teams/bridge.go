@@ -8754,7 +8754,7 @@ func stopCodexIdleStatusTimer(timer *time.Timer) {
 }
 
 func sameCodexVisibleText(left string, right string) bool {
-	return strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(left))) == strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(right)))
+	return strings.TrimSpace(StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(left)))) == strings.TrimSpace(StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(right))))
 }
 
 func formatCodexCommandStarted(event codexrunner.StreamEvent) string {

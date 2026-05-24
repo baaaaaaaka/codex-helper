@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -337,6 +338,40 @@ func TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations(t *testing.T) {
 					bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
 					if err := bridge.flushPendingOutboxMainLoop(context.Background()); err != nil && !isGraphRateLimitError(err) {
 						t.Fatalf("sqlite outbox flush: %v", err)
+					}
+				},
+			},
+			{
+				name: "deferred-inbound-no-deferred",
+				run: func(t *testing.T, profile cxpPerfProfile) {
+					t.Helper()
+					store := newCXPPerfStore(t, profile)
+					cxpPerfMigrateStoreToSQLite(t, store)
+					deferred, err := store.DeferredInbound(context.Background())
+					if err != nil {
+						t.Fatalf("sqlite deferred inbound: %v", err)
+					}
+					if len(deferred) != 0 {
+						t.Fatalf("sqlite deferred inbound returned %d events, want none", len(deferred))
+					}
+				},
+			},
+			{
+				name: "history-watch-active-append",
+				run: func(t *testing.T, profile cxpPerfProfile) {
+					t.Helper()
+					profile.MessagesPerPoll = 0
+					store := newCXPPerfStore(t, profile)
+					cxpPerfMigrateStoreToSQLite(t, store)
+					bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+					cxpPerfSeedLinkedTranscriptFiles(t, store, bridge, profile)
+					_, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(t, store)
+					now := time.Date(2026, 5, 23, 9, 45, 0, 0, time.UTC)
+					cxpPerfAppendHistoryCommentary(t, checkpoint.Path, 0, now)
+					bridge.lastHistoryWatchSync = time.Time{}
+					bridge.lastHistoryWatchReconcile = now
+					if err := bridge.syncCodexHistoryFinalsIfDue(context.Background(), now); err != nil {
+						t.Fatalf("sqlite history watch active append: %v", err)
 					}
 				},
 			},
@@ -722,6 +757,93 @@ func BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles(b *testin
 					}
 				}
 			})
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteDeferredInboundNoDeferredProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				deferred, err := store.DeferredInbound(ctx)
+				if err != nil {
+					b.Fatalf("deferred inbound: %v", err)
+				}
+				if len(deferred) != 0 {
+					b.Fatalf("deferred inbound returned %d events, want none", len(deferred))
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteHistoryWatchCheckpointUpdateProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		profile.MessagesPerPoll = 0
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			checkpointID, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(b, store)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 23, 10, 20, 0, 0, time.UTC)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := bridge.recordHistoryWatchCheckpoint(ctx, checkpointID, historyTieredFileState{
+					Path:        checkpoint.Path,
+					Size:        checkpoint.Size + int64(i+1),
+					ModTime:     now.Add(time.Duration(i) * time.Second),
+					Offset:      checkpoint.Offset + int64(i+1),
+					Line:        checkpoint.Line + i + 1,
+					SessionID:   checkpoint.SessionID,
+					ThreadID:    checkpoint.ThreadID,
+					TurnID:      checkpoint.TurnID,
+					LastFinalID: checkpoint.LastFinalID,
+				}, now.Add(time.Duration(i)*time.Second)); err != nil {
+					b.Fatalf("record history watch checkpoint: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		profile.MessagesPerPoll = 0
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			_, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(b, store)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 23, 10, 25, 0, 0, time.UTC)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				callNow := now.Add(time.Duration(i) * 11 * time.Second)
+				b.StopTimer()
+				cxpPerfAppendHistoryCommentary(b, checkpoint.Path, i, callNow)
+				b.StartTimer()
+				bridge.lastHistoryWatchSync = time.Time{}
+				bridge.lastHistoryWatchReconcile = callNow
+				if err := bridge.syncCodexHistoryFinalsIfDue(ctx, callNow); err != nil {
+					b.Fatalf("history watch active append: %v", err)
+				}
+			}
 		})
 	}
 }
@@ -1217,6 +1339,49 @@ func cxpPerfSeedLinkedTranscriptFiles(tb testing.TB, store *teamstore.Store, bri
 		return nil
 	}); err != nil {
 		tb.Fatalf("seed linked transcript files: %v", err)
+	}
+}
+
+func cxpPerfFirstHistoryWatchCheckpoint(tb testing.TB, store *teamstore.Store) (string, teamstore.HistoryWatchCheckpoint) {
+	tb.Helper()
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		tb.Fatalf("load history watch state: %v", err)
+	}
+	ids := make([]string, 0, len(state.HistoryWatch))
+	for id := range state.HistoryWatch {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		checkpoint := state.HistoryWatch[id]
+		if strings.TrimSpace(checkpoint.Path) != "" {
+			return id, checkpoint
+		}
+	}
+	tb.Fatal("perf store has no history watch checkpoint")
+	return "", teamstore.HistoryWatchCheckpoint{}
+}
+
+func cxpPerfAppendHistoryCommentary(tb testing.TB, path string, index int, when time.Time) {
+	tb.Helper()
+	line := fmt.Sprintf(
+		`{"timestamp":%q,"type":"event_msg","payload":{"type":"agent_message","id":%q,"turn_id":%q,"phase":"commentary","message":%q}}`+"\n",
+		when.Format(time.RFC3339Nano),
+		fmt.Sprintf("perf-status-%06d", index),
+		fmt.Sprintf("perf-turn-%06d", index),
+		"working",
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		tb.Fatalf("open history file for append: %v", err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		_ = f.Close()
+		tb.Fatalf("append history commentary: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		tb.Fatalf("close history commentary file: %v", err)
 	}
 }
 

@@ -39,7 +39,7 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	if err != nil {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.HistoryWatchState(ctx)
 	if err != nil {
 		return err
 	}
@@ -70,7 +70,7 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 					if err := b.baselineCodexHistoryWatch(ctx, baseline, now); err != nil {
 						return err
 					}
-					state, err = b.store.Load(ctx)
+					state, err = b.store.HistoryWatchState(ctx)
 					if err != nil {
 						return err
 					}
@@ -216,17 +216,14 @@ func uniqueSortedCleanPaths(paths []string) []string {
 }
 
 func (b *Bridge) baselineCodexHistoryWatch(ctx context.Context, paths []string, now time.Time) error {
-	return b.store.Update(ctx, func(state *teamstore.State) error {
-		if state.HistoryWatch == nil {
-			state.HistoryWatch = make(map[string]teamstore.HistoryWatchCheckpoint)
-		}
+	return b.store.UpdateHistoryWatch(ctx, func(historyWatch map[string]teamstore.HistoryWatchCheckpoint, ready *time.Time) error {
 		for _, path := range paths {
 			info, err := os.Stat(path)
 			if err != nil || info.IsDir() {
 				continue
 			}
 			id := historyWatchCheckpointID(path)
-			state.HistoryWatch[id] = teamstore.HistoryWatchCheckpoint{
+			historyWatch[id] = teamstore.HistoryWatchCheckpoint{
 				ID:        id,
 				Path:      path,
 				Size:      info.Size(),
@@ -235,7 +232,7 @@ func (b *Bridge) baselineCodexHistoryWatch(ctx context.Context, paths []string, 
 				UpdatedAt: now,
 			}
 		}
-		state.HistoryWatchReady = now
+		*ready = now
 		return nil
 	})
 }
@@ -246,7 +243,7 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		return nil
 	}
 	id := historyWatchCheckpointID(path)
-	state, err := b.store.Load(ctx)
+	state, err := b.store.HistoryWatchState(ctx)
 	if err != nil {
 		return err
 	}
@@ -315,10 +312,7 @@ func historyWatchCheckpointID(path string) string {
 }
 
 func (b *Bridge) recordHistoryWatchCheckpoint(ctx context.Context, id string, state historyTieredFileState, now time.Time) error {
-	return b.store.Update(ctx, func(storeState *teamstore.State) error {
-		if storeState.HistoryWatch == nil {
-			storeState.HistoryWatch = make(map[string]teamstore.HistoryWatchCheckpoint)
-		}
+	return b.store.UpdateHistoryWatch(ctx, func(historyWatch map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
 		checkpoint := teamstore.HistoryWatchCheckpoint{
 			ID:          id,
 			Path:        strings.TrimSpace(state.Path),
@@ -333,27 +327,27 @@ func (b *Bridge) recordHistoryWatchCheckpoint(ctx context.Context, id string, st
 			UpdatedAt:   now,
 		}
 		applyHistoryWatchPendingAssistant(&checkpoint, state.pendingAssistant)
-		storeState.HistoryWatch[id] = checkpoint
+		historyWatch[id] = checkpoint
 		return nil
 	})
 }
 
 func (b *Bridge) removeHistoryWatchCheckpoint(ctx context.Context, id string) error {
-	return b.store.Update(ctx, func(state *teamstore.State) error {
-		delete(state.HistoryWatch, id)
+	return b.store.UpdateHistoryWatch(ctx, func(historyWatch map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		delete(historyWatch, id)
 		return nil
 	})
 }
 
 func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path string, result historyTieredTailResult) (bool, bool, error) {
+	record, ok := historyTieredFirstVisibleUserPromptRecord(result.Records)
+	if !ok {
+		return false, false, nil
+	}
 	if isSubagent, err := codexhistory.SessionFileIsSubagentContext(ctx, path); err == nil && isSubagent {
 		return false, false, nil
 	} else if err != nil && !os.IsNotExist(err) {
 		return false, false, err
-	}
-	record, ok := historyTieredFirstVisibleUserPromptRecord(result.Records)
-	if !ok {
-		return false, false, nil
 	}
 	if b.historyWatchRecordLooksTeamsOrigin(ctx, record) {
 		return false, false, nil

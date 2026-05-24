@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -214,6 +216,78 @@ func TestHistoryTieredScanTailTreatsFinalAnswerPhaseAsComplete(t *testing.T) {
 	}
 	if result.Finals[0].Record.Text != "final answer from tui" {
 		t.Fatalf("final text = %q", result.Finals[0].Record.Text)
+	}
+}
+
+func TestHistoryTieredScanTailDropsPrefixFinalAnswerFragmentWhenFullResponseFollows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	partial := "final answer prefix from streamed event_msg before the response_item completes `"
+	full := partial + "<oai-mem-citation> literal tag explanation continues with the rest of the real answer"
+	lines := []string{
+		`{"type":"session_meta","payload":{"id":"thread-1"}}`,
+		`{"type":"turn.started","turn_id":"turn-1"}`,
+		`{"type":"event_msg","payload":{"id":"final-fragment","type":"agent_message","turn_id":"turn-1","phase":"final_answer","message":` + strconv.Quote(partial) + `}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","turn_id":"turn-1","phase":"final_answer","content":[{"type":"output_text","text":` + strconv.Quote(full) + `}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":` + strconv.Quote(partial) + `}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	var assistantRecords []TranscriptRecord
+	for _, record := range result.Records {
+		if record.Kind == TranscriptKindAssistant {
+			assistantRecords = append(assistantRecords, record)
+		}
+	}
+	if len(assistantRecords) != 1 || assistantRecords[0].Text != full {
+		t.Fatalf("assistant records = %#v, want only full response item", assistantRecords)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != full {
+		t.Fatalf("finals = %#v, want only full response item final", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailDropsPrefixFinalAnswerFragmentAfterIntermediateAssistant(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	partial := "final answer prefix from streamed event_msg before a later response_item `"
+	intermediate := "different assistant record in the same turn that is not a prefix and should stay"
+	full := partial + "<oai-mem-citation> literal tag explanation continues with the rest of the real answer"
+	lines := []string{
+		`{"type":"session_meta","payload":{"id":"thread-1"}}`,
+		`{"type":"turn.started","turn_id":"turn-1"}`,
+		`{"type":"event_msg","payload":{"id":"final-fragment","type":"agent_message","turn_id":"turn-1","phase":"final_answer","message":` + strconv.Quote(partial) + `}}`,
+		`{"type":"event_msg","payload":{"id":"other-final","type":"agent_message","turn_id":"turn-1","phase":"final_answer","message":` + strconv.Quote(intermediate) + `}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","turn_id":"turn-1","phase":"final_answer","content":[{"type":"output_text","text":` + strconv.Quote(full) + `}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	var gotRecords []string
+	for _, record := range result.Records {
+		if record.Kind == TranscriptKindAssistant {
+			gotRecords = append(gotRecords, record.Text)
+		}
+	}
+	wantRecords := []string{intermediate, full}
+	if !reflect.DeepEqual(gotRecords, wantRecords) {
+		t.Fatalf("assistant records = %#v, want %#v", gotRecords, wantRecords)
+	}
+	var gotFinals []string
+	for _, final := range result.Finals {
+		gotFinals = append(gotFinals, final.Record.Text)
+	}
+	if !reflect.DeepEqual(gotFinals, wantRecords) {
+		t.Fatalf("finals = %#v, want %#v", gotFinals, wantRecords)
 	}
 }
 

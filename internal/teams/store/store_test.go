@@ -3722,6 +3722,62 @@ func TestDeferredInboundIsDurableAndListed(t *testing.T) {
 	}
 }
 
+func TestSQLiteDeferredInboundFiltersAndSortsLargeTable(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 11, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s1"] = SessionContext{ID: "s1", TeamsChatID: "chat-a", Status: SessionStatusActive, CreatedAt: now, UpdatedAt: now}
+		state.Sessions["s2"] = SessionContext{ID: "s2", TeamsChatID: "chat-b", Status: SessionStatusActive, CreatedAt: now, UpdatedAt: now}
+		for i := 0; i < 1200; i++ {
+			status := InboundStatusPersisted
+			if i%5 == 0 {
+				status = InboundStatusIgnored
+			}
+			sessionID := "s1"
+			chatID := "chat-a"
+			if i%2 == 0 {
+				sessionID = "s2"
+				chatID = "chat-b"
+			}
+			id := fmt.Sprintf("non-deferred-%04d", i)
+			state.InboundEvents[id] = InboundEvent{
+				ID:             id,
+				SessionID:      sessionID,
+				TeamsChatID:    chatID,
+				TeamsMessageID: fmt.Sprintf("message-%04d", i),
+				Text:           "not deferred",
+				Status:         status,
+				CreatedAt:      now.Add(time.Duration(i) * time.Millisecond),
+				UpdatedAt:      now.Add(time.Duration(i) * time.Millisecond),
+			}
+		}
+		state.InboundEvents["deferred-b2"] = InboundEvent{ID: "deferred-b2", SessionID: "s2", TeamsChatID: "chat-b", TeamsMessageID: "b2", Status: InboundStatusDeferred, CreatedAt: now.Add(2 * time.Second), UpdatedAt: now}
+		state.InboundEvents["deferred-a2"] = InboundEvent{ID: "deferred-a2", SessionID: "s1", TeamsChatID: "chat-a", TeamsMessageID: "a2", Status: InboundStatusDeferred, CreatedAt: now.Add(2 * time.Second), UpdatedAt: now}
+		state.InboundEvents["deferred-a1"] = InboundEvent{ID: "deferred-a1", SessionID: "s1", TeamsChatID: "chat-a", TeamsMessageID: "a1", Status: InboundStatusDeferred, CreatedAt: now.Add(time.Second), UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed inbound events: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	deferred, err := store.DeferredInbound(ctx)
+	if err != nil {
+		t.Fatalf("DeferredInbound sqlite error: %v", err)
+	}
+	got := make([]string, 0, len(deferred))
+	for _, event := range deferred {
+		if event.Status != InboundStatusDeferred {
+			t.Fatalf("DeferredInbound returned non-deferred event: %#v", event)
+		}
+		got = append(got, event.ID)
+	}
+	want := []string{"deferred-a1", "deferred-a2", "deferred-b2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("deferred sqlite order = %#v, want %#v", got, want)
+	}
+}
+
 func TestHasUpgradeBlockingWorkAllowsDeferredAndRateLimitedOutbox(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -7689,6 +7745,76 @@ func TestSQLiteOwnerLeaseColdUpdatesPreserveHotTables(t *testing.T) {
 	}
 }
 
+func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+	checkpointID := "history-watch:test"
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-1"] = SessionContext{ID: "session-1", TeamsChatID: "chat-1", Status: SessionStatusActive, LatestTurnID: "turn-1", CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-1"] = InboundEvent{ID: "inbound-1", SessionID: "session-1", TeamsChatID: "chat-1", TeamsMessageID: "message-1", Status: InboundStatusPersisted, CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-1"] = Turn{ID: "turn-1", SessionID: "session-1", InboundEventID: "inbound-1", Status: TurnStatusQueued, CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages["outbox-1"] = OutboxMessage{ID: "outbox-1", SessionID: "session-1", TurnID: "turn-1", TeamsChatID: "chat-1", Status: OutboxStatusQueued, Body: "queued message", CreatedAt: now, UpdatedAt: now}
+		state.MessageProvenance["prov-1"] = MessageProvenanceRecord{ID: "prov-1", TeamsChatID: "chat-1", TeamsMessageID: "message-1", Origin: MessageOriginUserInbound, SessionID: "session-1", InboundID: "inbound-1", CreatedAt: now, UpdatedAt: now}
+		state.ImportCheckpoints["transcript:session-1"] = ImportCheckpoint{ID: "transcript:session-1", SessionID: "session-1", SourcePath: "/tmp/session.jsonl", LastRecordID: "record-1", Status: "complete", UpdatedAt: now}
+		state.TranscriptLedger["ledger-1"] = TranscriptLedgerRecord{ID: "ledger-1", SessionID: "session-1", SourceRecordID: "record-1", CreatedAt: now}
+		state.TranscriptDeliveries["delivery-1"] = TranscriptDeliveryRecord{ID: "delivery-1", SessionID: "session-1", OutboxID: "outbox-1", Status: TranscriptDeliveryStatusSent, CreatedAt: now}
+		state.HelperDeliveries["helper-1"] = HelperDeliveryRecord{ID: "helper-1", SessionID: "session-1", TurnID: "turn-1", OutboxID: "outbox-1", Status: HelperDeliveryStatusSent, CreatedAt: now}
+		state.ArtifactRecords["artifact-1"] = ArtifactRecord{ID: "artifact-1", SessionID: "session-1", TurnID: "turn-1", OutboxID: "outbox-1", Status: "uploaded", CreatedAt: now}
+		state.Notifications["notification-1"] = NotificationRecord{ID: "notification-1", SessionID: "session-1", TurnID: "turn-1", Status: NotificationStatusSent, CreatedAt: now}
+		state.HistoryWatch[checkpointID] = HistoryWatchCheckpoint{ID: checkpointID, Path: "/tmp/session.jsonl", Size: 100, Offset: 100, Line: 10, SessionID: "session-1", ThreadID: "thread-1", TurnID: "turn-1", UpdatedAt: now}
+		state.HistoryWatchReady = now
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	tables := []string{"sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications"}
+	beforeCounts := sqliteTableCountsForTest(t, store, tables...)
+	watchState, err := store.HistoryWatchState(ctx)
+	if err != nil {
+		t.Fatalf("HistoryWatchState sqlite error: %v", err)
+	}
+	if watchState.HistoryWatch[checkpointID].Path == "" || watchState.HistoryWatchReady.IsZero() {
+		t.Fatalf("HistoryWatchState missed checkpoint metadata: %#v", watchState)
+	}
+	if len(watchState.Sessions) != 0 || len(watchState.InboundEvents) != 0 || len(watchState.Turns) != 0 || len(watchState.OutboxMessages) != 0 {
+		t.Fatalf("HistoryWatchState should not load hot tables: sessions=%d inbound=%d turns=%d outbox=%d", len(watchState.Sessions), len(watchState.InboundEvents), len(watchState.Turns), len(watchState.OutboxMessages))
+	}
+
+	updatedAt := now.Add(2 * time.Minute)
+	if err := store.UpdateHistoryWatch(ctx, func(historyWatch map[string]HistoryWatchCheckpoint, ready *time.Time) error {
+		checkpoint := historyWatch[checkpointID]
+		checkpoint.Size = 128
+		checkpoint.Offset = 128
+		checkpoint.Line = 12
+		checkpoint.LastFinalID = "final-1"
+		checkpoint.UpdatedAt = updatedAt
+		historyWatch[checkpointID] = checkpoint
+		*ready = updatedAt
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateHistoryWatch sqlite error: %v", err)
+	}
+	afterCounts := sqliteTableCountsForTest(t, store, tables...)
+	if !reflect.DeepEqual(afterCounts, beforeCounts) {
+		t.Fatalf("split table counts changed after history watch update: before=%#v after=%#v", beforeCounts, afterCounts)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after history watch update: %v", err)
+	}
+	if checkpoint := state.HistoryWatch[checkpointID]; checkpoint.Offset != 128 || checkpoint.LastFinalID != "final-1" || !checkpoint.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("history watch checkpoint not updated: %#v", checkpoint)
+	}
+	if state.Sessions["session-1"].ID == "" || state.InboundEvents["inbound-1"].ID == "" || state.Turns["turn-1"].ID == "" || state.OutboxMessages["outbox-1"].ID == "" {
+		t.Fatalf("hot rows were lost: sessions=%#v inbound=%#v turns=%#v outbox=%#v", state.Sessions, state.InboundEvents, state.Turns, state.OutboxMessages)
+	}
+	if state.TranscriptDeliveries["delivery-1"].ID == "" || state.HelperDeliveries["helper-1"].ID == "" || state.Notifications["notification-1"].ID == "" {
+		t.Fatalf("split side tables were lost: transcript=%#v helper=%#v notifications=%#v", state.TranscriptDeliveries, state.HelperDeliveries, state.Notifications)
+	}
+}
+
 func TestSQLiteColdSaveBackfillsSplitTablesFromLegacyStateJSON(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -8511,6 +8637,52 @@ func messageLookupEqual(left MessageLookup, right MessageLookup) bool {
 		left.Provenance.Origin == right.Provenance.Origin &&
 		left.Provenance.InboundID == right.Provenance.InboundID &&
 		left.Provenance.OutboxID == right.Provenance.OutboxID
+}
+
+func sqliteTableCountsForTest(t *testing.T, store *Store, tables ...string) map[string]int {
+	t.Helper()
+	allowed := map[string]bool{
+		"sessions":              true,
+		"inbound_events":        true,
+		"turns":                 true,
+		"outbox_messages":       true,
+		"message_provenance":    true,
+		"import_checkpoints":    true,
+		"transcript_ledger":     true,
+		"transcript_deliveries": true,
+		"helper_deliveries":     true,
+		"artifact_records":      true,
+		"notifications":         true,
+	}
+	ctx := context.Background()
+	counts := make(map[string]int, len(tables))
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		for _, table := range tables {
+			if !allowed[table] {
+				return fmt.Errorf("sqlite table count test does not allow table %q", table)
+			}
+			var count int
+			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+				return err
+			}
+			counts[table] = count
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("count sqlite tables: %v", err)
+	}
+	return counts
 }
 
 func newTestStore(t *testing.T) *Store {

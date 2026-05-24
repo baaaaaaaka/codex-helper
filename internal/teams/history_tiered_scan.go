@@ -239,6 +239,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		finalizeTranscriptRecordIDs(&transcript)
 		result.Records = transcript.Records
 	}
+	result.Finals = compactHistoryTieredFinals(result.Finals)
 	result.State = next
 	return result, nil
 }
@@ -319,6 +320,48 @@ func historyTieredFinalFromCandidate(candidate historyTieredAssistantCandidate, 
 		TerminalLine: terminalLine,
 		TerminalKind: terminalKind,
 	}
+}
+
+func compactHistoryTieredFinals(finals []historyTieredFinal) []historyTieredFinal {
+	if len(finals) == 0 {
+		return finals
+	}
+	out := finals[:0]
+	for i := range finals {
+		if historyTieredFinalIsPrefixShadowed(finals, i) {
+			continue
+		}
+		out = append(out, finals[i])
+	}
+	return out
+}
+
+func historyTieredFinalIsPrefixShadowed(finals []historyTieredFinal, index int) bool {
+	if index < 0 || index+1 >= len(finals) {
+		return false
+	}
+	current := finals[index]
+	currentText := strings.TrimSpace(current.Record.Text)
+	if current.Record.Kind != TranscriptKindAssistant || !transcriptRecordCanBeStreamingAssistantPrefix(current.Record) || len([]rune(currentText)) < 40 {
+		return false
+	}
+	for i := index + 1; i < len(finals); i++ {
+		next := finals[i]
+		if next.Record.Kind != TranscriptKindAssistant {
+			continue
+		}
+		if !transcriptRecordCanShadowStreamingAssistantPrefix(next.Record) {
+			continue
+		}
+		if !transcriptRecordsCanShadowSameAssistant(current.Record, next.Record) {
+			continue
+		}
+		nextText := strings.TrimSpace(next.Record.Text)
+		if len(nextText) > len(currentText) && strings.HasPrefix(nextText, currentText) {
+			return true
+		}
+	}
+	return false
 }
 
 func historyTieredCompletionKey(record TranscriptRecord, terminalLine int, terminalKind string) string {

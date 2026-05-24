@@ -3,6 +3,7 @@ package teams
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -71,6 +72,46 @@ func TestParseCodexTranscriptClassifiesEventCommentaryAsStatus(t *testing.T) {
 	}
 	assertTranscriptRecord(t, got.Records[0], "commentary-1", "source:commentary-1", TranscriptKindStatus, "working", 1)
 	assertTranscriptRecord(t, got.Records[1], "final-1", "source:final-1", TranscriptKindAssistant, "done", 2)
+}
+
+func TestParseCodexTranscriptKeepsResponseItemAssistantPrefixRecords(t *testing.T) {
+	first := "long assistant response_item body that is a legitimate first message and should stay"
+	second := first + " with additional text in a separate response item"
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"assistant-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"` + first + `"}]}}`,
+		`{"type":"response_item","payload":{"id":"assistant-2","type":"message","role":"assistant","content":[{"type":"output_text","text":"` + second + `"}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 2 {
+		t.Fatalf("records = %#v, want both response_item assistant records", got.Records)
+	}
+	assertTranscriptRecord(t, got.Records[0], "assistant-1", "source:assistant-1", TranscriptKindAssistant, first, 1)
+	assertTranscriptRecord(t, got.Records[1], "assistant-2", "source:assistant-2", TranscriptKindAssistant, second, 2)
+}
+
+func TestParseCodexTranscriptDropsStreamingPrefixAfterIntermediateAssistant(t *testing.T) {
+	partial := "streamed final prefix that should be removed once the full response item appears `"
+	intermediate := "different assistant record in the same turn that is not a prefix and should stay"
+	full := partial + "<oai-mem-citation> literal tag explanation plus the rest of the complete answer"
+	input := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"stream-1","type":"agent_message","turn_id":"turn-1","phase":"final_answer","message":` + strconv.Quote(partial) + `}}`,
+		`{"type":"event_msg","payload":{"id":"stream-2","type":"agent_message","turn_id":"turn-1","phase":"final_answer","message":` + strconv.Quote(intermediate) + `}}`,
+		`{"type":"response_item","payload":{"id":"assistant-full","type":"message","role":"assistant","turn_id":"turn-1","phase":"final_answer","content":[{"type":"output_text","text":` + strconv.Quote(full) + `}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 2 {
+		t.Fatalf("records = %#v, want intermediate and full records only", got.Records)
+	}
+	assertTranscriptRecord(t, got.Records[0], "stream-2", "source:stream-2", TranscriptKindAssistant, intermediate, 2)
+	assertTranscriptRecord(t, got.Records[1], "assistant-full", "source:assistant-full", TranscriptKindAssistant, full, 3)
 }
 
 func TestParseCodexTranscriptRecordsContextCompactEvent(t *testing.T) {

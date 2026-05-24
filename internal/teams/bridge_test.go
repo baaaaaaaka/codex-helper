@@ -816,6 +816,54 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	}
 }
 
+func TestBridgeDoesNotSendFinalTextAsProgressWhenOnlyMemoryCitationDiffers(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &streamingRecordingExecutor{
+		events: []codexrunner.StreamEvent{
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "VISIBLE FINAL\nFixed the bug."},
+			{Kind: codexrunner.StreamEventTurnCompleted},
+		},
+		result: ExecutionResult{Text: strings.Join([]string{
+			"VISIBLE FINAL",
+			"Fixed the bug.",
+			"",
+			"<oai-mem-citation>",
+			"<citation_entries>",
+			"MEMORY.md:1-3|note=[confirmed codex-helper repo context]",
+			"</citation_entries>",
+			"<rollout_ids>",
+			"019d4393-5109-7b10-b5c2-05b2fe8635ba",
+			"</rollout_ids>",
+			"</oai-mem-citation>",
+		}, "\n"), CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-stream-memory-citation"), "fix it"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+	if strings.Contains(joined, "🤖 ⏳ Codex status:\nVISIBLE FINAL") {
+		t.Fatalf("final text was sent as progress/status:\n%s", joined)
+	}
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\nVISIBLE FINAL") {
+		t.Fatalf("final answer missing:\n%s", joined)
+	}
+	if strings.Count(joined, "VISIBLE FINAL") != 1 {
+		t.Fatalf("final visible text was duplicated:\n%s", joined)
+	}
+	for _, forbidden := range []string{"oai-mem-citation", "citation_entries", "MEMORY.md", "rollout_ids"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("final output leaked %q:\n%s", forbidden, joined)
+		}
+	}
+}
+
 func TestBridgeSendsCodexIdleStatusWhenStreamIsQuiet(t *testing.T) {
 	oldInitial := codexIdleStatusInitialDelay
 	oldRepeat := codexIdleStatusRepeatDelay
@@ -17510,6 +17558,51 @@ func TestBridgeCompletesTurnWithTranscriptFinalForCanonicalDedupe(t *testing.T) 
 	}
 	if len(*sent) != sentCount {
 		t.Fatalf("post-final transcript sync sent duplicate final: before=%d after=%d sent=%#v", sentCount, len(*sent), *sent)
+	}
+}
+
+func TestBridgeTranscriptSyncDoesNotSendPrefixFinalAnswerFragmentAfterFullFinal(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-prefix-final-fragment"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-prefix-final-fragment", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	partialFinal := "prefix final fragment from event_msg that should not be delivered as a second answer `"
+	fullFinal := partialFinal + "<oai-mem-citation> literal tag explanation continues with the complete final answer"
+	codexTurnID := "codex-turn-prefix-final-fragment"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			var updated strings.Builder
+			updated.WriteString(initial)
+			updated.WriteString(`{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-fragment","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(partialFinal) + `}}` + "\n")
+			updated.WriteString(`{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"response_item","payload":{"type":"message","role":"assistant","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","content":[{"type":"output_text","text":` + strconv.Quote(fullFinal) + `}]}}` + "\n")
+			updated.WriteString(`{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"task_complete","turn_id":` + strconv.Quote(codexTurnID) + `,"last_agent_message":` + strconv.Quote(partialFinal) + `}}` + "\n")
+			return os.WriteFile(transcriptPath, []byte(updated.String()), 0o600)
+		},
+		result: ExecutionResult{Text: fullFinal, CodexThreadID: "thread-prefix-final-fragment", CodexTurnID: codexTurnID},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-prefix-final-fragment")
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-prefix-final-fragment"), "produce final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Count(joined, partialFinal) != 1 || !strings.Contains(joined, fullFinal) {
+		t.Fatalf("full final should be delivered once, without prefix fragment duplicate:\n%s", joined)
+	}
+	sentCount := len(*sent)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("post-final sync error: %v", err)
+	}
+	if len(*sent) != sentCount {
+		t.Fatalf("post-final transcript sync sent duplicate prefix fragment: before=%d after=%d sent=%#v", sentCount, len(*sent), *sent)
 	}
 }
 

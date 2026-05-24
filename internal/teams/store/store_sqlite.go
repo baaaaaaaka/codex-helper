@@ -598,6 +598,7 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS sessions_chat_idx ON sessions(teams_chat_id)`,
 		`CREATE TABLE IF NOT EXISTS inbound_events (id TEXT PRIMARY KEY, session_id TEXT, teams_chat_id TEXT, teams_message_id TEXT, status TEXT, created_at INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS inbound_session_idx ON inbound_events(session_id, status, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS inbound_status_idx ON inbound_events(status, teams_chat_id, created_at, teams_message_id)`,
 		`CREATE INDEX IF NOT EXISTS inbound_message_idx ON inbound_events(teams_chat_id, teams_message_id)`,
 		`CREATE TABLE IF NOT EXISTS turns (id TEXT PRIMARY KEY, session_id TEXT, status TEXT, queued_at INTEGER, created_at INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS turns_ready_idx ON turns(status, session_id, queued_at, id)`,
@@ -1218,6 +1219,25 @@ func (s *Store) updateSQLiteColdState(ctx context.Context, fn func(*State) error
 	return handled, err
 }
 
+func (s *Store) historyWatchStateSQLite(ctx context.Context) (State, bool, error) {
+	var state State
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		state, err = loadSQLiteColdState(ctx, db)
+		handled = true
+		return err
+	})
+	return state, handled, err
+}
+
 func (s *Store) claimControlLeaseSQLite(ctx context.Context, claim ControlLeaseClaim) (ControlLeaseDecision, bool, error) {
 	var out ControlLeaseDecision
 	handled, err := s.updateSQLiteRuntimeState(ctx, func(state *State) error {
@@ -1577,6 +1597,40 @@ func (s *Store) inboundEventByIDSQLite(ctx context.Context, inboundID string) (I
 		return err
 	})
 	return out, found, handled, err
+}
+
+func (s *Store) deferredInboundSQLite(ctx context.Context) ([]InboundEvent, bool, error) {
+	var out []InboundEvent
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		rows, err := db.QueryContext(ctx, `SELECT json FROM inbound_events WHERE status = ? ORDER BY teams_chat_id, created_at, teams_message_id`, string(InboundStatusDeferred))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			var event InboundEvent
+			if err := json.Unmarshal(raw, &event); err != nil {
+				return err
+			}
+			out = append(out, event)
+		}
+		return rows.Err()
+	})
+	return out, handled, err
 }
 
 func (s *Store) createSessionSQLite(ctx context.Context, session SessionContext) (SessionContext, bool, bool, error) {

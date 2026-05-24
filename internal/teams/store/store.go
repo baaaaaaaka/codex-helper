@@ -1339,6 +1339,38 @@ func (s *Store) UpdateIfChanged(ctx context.Context, fn func(*State) (bool, erro
 	})
 }
 
+// UpdateHistoryWatch updates only cold history-watch metadata when the store is
+// backed by SQLite. Legacy JSON stores still use the normal full-state update.
+func (s *Store) UpdateHistoryWatch(ctx context.Context, fn func(map[string]HistoryWatchCheckpoint, *time.Time) error) error {
+	update := func(state *State) error {
+		if state.HistoryWatch == nil {
+			state.HistoryWatch = make(map[string]HistoryWatchCheckpoint)
+		}
+		return fn(state.HistoryWatch, &state.HistoryWatchReady)
+	}
+	if handled, err := s.updateSQLiteColdState(ctx, update); handled || err != nil {
+		return err
+	}
+	return s.Update(ctx, update)
+}
+
+// HistoryWatchState returns the state fields needed by the Codex history watch.
+// SQLite stores load only cold metadata instead of materializing hot tables.
+func (s *Store) HistoryWatchState(ctx context.Context) (State, error) {
+	if state, handled, err := s.historyWatchStateSQLite(ctx); handled || err != nil {
+		return state, err
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	return State{
+		SchemaVersion:     SchemaVersion,
+		HistoryWatch:      state.HistoryWatch,
+		HistoryWatchReady: state.HistoryWatchReady,
+	}, nil
+}
+
 func (s *Store) SetPaused(ctx context.Context, paused bool, reason string) (ServiceControl, error) {
 	var out ServiceControl
 	err := s.Update(ctx, func(state *State) error {
@@ -2468,6 +2500,9 @@ func (s *Store) HasInboundMessage(ctx context.Context, chatID string, teamsMessa
 }
 
 func (s *Store) DeferredInbound(ctx context.Context) ([]InboundEvent, error) {
+	if out, handled, err := s.deferredInboundSQLite(ctx); handled || err != nil {
+		return out, err
+	}
 	state, err := s.loadStateFieldsOrFull(ctx, deferredInboundStateFields)
 	if err != nil {
 		return nil, err
