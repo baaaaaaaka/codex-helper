@@ -17469,6 +17469,250 @@ func TestBridgeQueuesTranscriptOnlyContextCompactBeforeFinalAnswer(t *testing.T)
 	}
 }
 
+func TestBridgeCompletesTurnWithTranscriptFinalForCanonicalDedupe(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-final"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-canonical-final", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	liveFinal := "partial final from runner"
+	transcriptFinal := "complete final from transcript\n\nThis is the canonical Codex answer."
+	codexTurnID := "codex-turn-canonical-final"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-1","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(transcriptFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: liveFinal, CodexThreadID: "thread-canonical-final", CodexTurnID: codexTurnID},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-canonical-final")
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-canonical-final"), "produce final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "complete final from transcript") || !strings.Contains(joined, "This is the canonical Codex answer.") {
+		t.Fatalf("live final did not use transcript canonical text:\n%s", joined)
+	}
+	if strings.Contains(joined, liveFinal) {
+		t.Fatalf("live parser-only final leaked despite transcript final:\n%s", joined)
+	}
+	sentCount := len(*sent)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("post-final sync error: %v", err)
+	}
+	if len(*sent) != sentCount {
+		t.Fatalf("post-final transcript sync sent duplicate final: before=%d after=%d sent=%#v", sentCount, len(*sent), *sent)
+	}
+}
+
+func TestBridgeStreamingFinalUsesTranscriptCanonicalBeforeClosingForwarder(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-stream-canonical-final"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-stream-canonical-final", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	liveFinal := "partial streaming final from runner"
+	transcriptFinal := "complete streaming final from transcript"
+	codexTurnID := "codex-turn-stream-canonical-final"
+	executor := &transcriptWritingStreamingExecutor{
+		events: []codexrunner.StreamEvent{{
+			Kind:     codexrunner.StreamEventAgentMessage,
+			ThreadID: "thread-stream-canonical-final",
+			TurnID:   codexTurnID,
+			Text:     transcriptFinal,
+		}},
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-1","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(transcriptFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: liveFinal, CodexThreadID: "thread-stream-canonical-final", CodexTurnID: codexTurnID},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-stream-canonical-final")
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-stream-canonical-final"), "produce streaming final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Count(joined, transcriptFinal) != 1 {
+		t.Fatalf("streaming final should be delivered once as final, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "🤖 ⏳ Codex status:\n"+transcriptFinal) || strings.Contains(joined, liveFinal) {
+		t.Fatalf("streaming final leaked as progress or runner-only text:\n%s", joined)
+	}
+}
+
+func TestBridgeStreamingErrorDoesNotSuppressPendingFinalLikeProgress(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-stream-error-canonical-final"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-stream-error-canonical-final", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	liveFinal := "partial streaming final before error"
+	transcriptFinal := "complete streaming final emitted before error"
+	codexTurnID := "codex-turn-stream-error-canonical-final"
+	executor := &transcriptWritingStreamingExecutor{
+		events: []codexrunner.StreamEvent{{
+			Kind:     codexrunner.StreamEventAgentMessage,
+			ThreadID: "thread-stream-error-canonical-final",
+			TurnID:   codexTurnID,
+			Text:     transcriptFinal,
+		}},
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-1","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(transcriptFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: liveFinal, CodexThreadID: "thread-stream-error-canonical-final", CodexTurnID: codexTurnID},
+		err:    errors.New("runner failed after emitting final"),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-stream-error-canonical-final")
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-stream-error-canonical-final"), "produce streaming final then fail"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "🤖 ⏳ Codex status:\n"+transcriptFinal) {
+		t.Fatalf("pending final-like progress was suppressed on executor error:\n%s", joined)
+	}
+	if strings.Contains(joined, "🤖 ✅ Codex answer:\n"+transcriptFinal) {
+		t.Fatalf("executor error should not be delivered as a successful final:\n%s", joined)
+	}
+	if !strings.Contains(joined, "error: runner failed after emitting final") {
+		t.Fatalf("executor error was not delivered:\n%s", joined)
+	}
+}
+
+func TestBridgeTranscriptCanonicalFinalPreservesObservedArtifactManifest(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	cfg, err := DefaultFileWriteAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultFileWriteAuthConfig error: %v", err)
+	}
+	if err := writeTokenCache(cfg.CachePath, TokenCache{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("write token cache: %v", err)
+	}
+	root, err := DefaultOutboundRoot()
+	if err != nil {
+		t.Fatalf("DefaultOutboundRoot error: %v", err)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir outbound root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "artifact.txt"), []byte("artifact-data"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	transcriptPath := filepath.Join(tmp, "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-artifact"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-canonical-artifact", transcriptPath)
+	defer restoreDiscover()
+	chatGraph, chatSent := newBridgeTestGraph(t)
+	fileGraph, fileSent := newOutboundAttachmentGraph(t)
+	store := newBridgeTestStore(t)
+	transcriptFinal := "canonical visible final from transcript"
+	observedFinal := "runner visible fallback\n```" + ArtifactManifestFenceInfo + "\n" + `{"version":1,"files":[{"path":"artifact.txt","name":"artifact.txt"}]}` + "\n```"
+	codexTurnID := "codex-turn-canonical-artifact"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-1","turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(transcriptFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: observedFinal, CodexThreadID: "thread-canonical-artifact", CodexTurnID: codexTurnID},
+	}
+	bridge := newBridgeTestBridge(chatGraph, store, executor)
+	bridge.fileGraph = fileGraph
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-canonical-artifact")
+	*chatSent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-canonical-artifact"), "produce artifact final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*chatSent)
+	if !strings.Contains(joined, transcriptFinal) || strings.Contains(joined, "runner visible fallback") || strings.Contains(joined, ArtifactManifestFenceInfo) {
+		t.Fatalf("final should use transcript visible text while hiding artifact manifest:\n%s", joined)
+	}
+	if len(*fileSent) != 0 {
+		t.Fatalf("file graph should not send Teams messages: %#v", *fileSent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if len(state.ArtifactRecords) != 1 {
+		t.Fatalf("artifact records = %#v, want one preserved observed artifact", state.ArtifactRecords)
+	}
+	for _, artifact := range state.ArtifactRecords {
+		if artifact.Status != "uploaded" || artifact.Path != "artifact.txt" || artifact.OutboxID == "" || artifact.DriveItemID == "" || artifact.TeamsMessageID == "" {
+			t.Fatalf("artifact record mismatch: %#v", artifact)
+		}
+	}
+}
+
+func TestBridgeTranscriptCanonicalFinalRequiresSameCodexTurn(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-canonical-turn-filter"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-canonical-turn-filter", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	liveFinal := "current turn final from runner"
+	otherTurnFinal := "wrong turn transcript final"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"other-final","turn_id":"other-codex-turn","phase":"final_answer","message":` + strconv.Quote(otherTurnFinal) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{Text: liveFinal, CodexThreadID: "thread-canonical-turn-filter", CodexTurnID: "current-codex-turn"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-canonical-turn-filter")
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-canonical-turn-filter"), "produce current final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, liveFinal) {
+		t.Fatalf("current turn final missing:\n%s", joined)
+	}
+	if strings.Contains(joined, otherTurnFinal) {
+		t.Fatalf("used transcript final from a different turn:\n%s", joined)
+	}
+}
+
 func TestBridgeClassifyLocalTranscriptCompactOnlyDoesNotBlockTeamsTurn(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-compact-only"}}` + "\n" +

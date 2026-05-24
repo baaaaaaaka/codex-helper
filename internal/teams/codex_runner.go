@@ -36,6 +36,8 @@ type ExecutionResult struct {
 	CodexThreadID    string
 	CodexThreadTitle string
 	CodexTurnID      string
+
+	canonicalTranscriptFinal bool
 }
 
 type AmbiguousExecutionError struct {

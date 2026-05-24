@@ -7933,9 +7933,17 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 	} else if blocked {
 		return nil
 	}
+	if !result.canonicalTranscriptFinal {
+		if transcriptResult, ok := b.completedTurnResultFromLinkedTranscript(ctx, session, turn, result); ok {
+			result = executionResultWithTranscriptFinal(result, transcriptResult)
+		}
+	}
 	preFinalQueued, err := b.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
 	if err != nil {
-		return err
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams pre-final transcript status skipped: %v\n", err)
+		}
+		preFinalQueued = 0
 	}
 	mentionOwner := true
 	visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
@@ -7990,6 +7998,64 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 	return b.uploadArtifactsFromResult(ctx, session, turn, result.Text)
 }
 
+func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, session *Session, turn teamstore.Turn, observed ExecutionResult) (ExecutionResult, bool) {
+	if b == nil || session == nil || b.store == nil {
+		return ExecutionResult{}, false
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return ExecutionResult{}, false
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	local, ok := linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
+	if !ok {
+		return ExecutionResult{}, false
+	}
+	previous := historyTieredFileState{
+		Path:      local.FilePath,
+		Size:      checkpoint.SourceSize,
+		ModTime:   checkpoint.SourceModTime,
+		Offset:    checkpoint.LastOffset,
+		Line:      checkpoint.LastSourceLine,
+		SessionID: firstNonEmptyString(local.SessionID, session.CodexThreadID),
+		ThreadID:  firstNonEmptyString(observed.CodexThreadID, turn.CodexThreadID, local.SessionID, session.CodexThreadID),
+		TurnID:    firstNonEmptyString(observed.CodexTurnID, turn.CodexTurnID),
+	}
+	return b.completedTurnResultFromLocalCodexHistorySince(ctx, session, turn, observed, local, previous)
+}
+
+func executionResultWithTranscriptFinal(observed ExecutionResult, transcriptResult ExecutionResult) ExecutionResult {
+	text := mergeObservedArtifactManifestsIntoTranscriptFinal(transcriptResult.Text, observed.Text)
+	return ExecutionResult{
+		Text:                     text,
+		CodexThreadID:            firstNonEmptyString(transcriptResult.CodexThreadID, observed.CodexThreadID),
+		CodexThreadTitle:         firstNonEmptyString(observed.CodexThreadTitle, transcriptResult.CodexThreadTitle),
+		CodexTurnID:              firstNonEmptyString(transcriptResult.CodexTurnID, observed.CodexTurnID),
+		canonicalTranscriptFinal: true,
+	}
+}
+
+func mergeObservedArtifactManifestsIntoTranscriptFinal(transcriptText string, observedText string) string {
+	if len(ExtractArtifactManifestBlocks(transcriptText)) > 0 {
+		return transcriptText
+	}
+	blocks := ExtractArtifactManifestBlocks(observedText)
+	if len(blocks) == 0 {
+		return transcriptText
+	}
+	text := strings.TrimSpace(transcriptText)
+	for _, block := range blocks {
+		if IsPlaceholderArtifactManifestBlock(block) {
+			continue
+		}
+		if text != "" {
+			text += "\n\n"
+		}
+		text += "```" + ArtifactManifestFenceInfo + "\n" + strings.TrimSpace(string(block)) + "\n```"
+	}
+	return text
+}
+
 func (b *Bridge) completedTurnResultFromCodexHistory(ctx context.Context, session *Session, turn teamstore.Turn, observed ExecutionResult) (ExecutionResult, bool) {
 	if b == nil || session == nil {
 		return ExecutionResult{}, false
@@ -8006,12 +8072,28 @@ func (b *Bridge) completedTurnResultFromCodexHistory(ctx context.Context, sessio
 	if !ok || strings.TrimSpace(local.FilePath) == "" {
 		return ExecutionResult{}, false
 	}
-	scan, err := historyTieredScanTail(local.FilePath, historyTieredFileState{}, historyTieredMaxTailBytes)
+	return b.completedTurnResultFromLocalCodexHistory(ctx, session, turn, observed, local)
+}
+
+func (b *Bridge) completedTurnResultFromLocalCodexHistory(ctx context.Context, session *Session, turn teamstore.Turn, observed ExecutionResult, local codexhistory.Session) (ExecutionResult, bool) {
+	return b.completedTurnResultFromLocalCodexHistorySince(ctx, session, turn, observed, local, historyTieredFileState{})
+}
+
+func (b *Bridge) completedTurnResultFromLocalCodexHistorySince(ctx context.Context, session *Session, turn teamstore.Turn, observed ExecutionResult, local codexhistory.Session, previous historyTieredFileState) (ExecutionResult, bool) {
+	if b == nil || session == nil || strings.TrimSpace(local.FilePath) == "" {
+		return ExecutionResult{}, false
+	}
+	threadID := firstNonEmptyString(observed.CodexThreadID, turn.CodexThreadID, local.SessionID, session.CodexThreadID)
+	if strings.TrimSpace(threadID) == "" {
+		return ExecutionResult{}, false
+	}
+	observedTurnID := strings.TrimSpace(firstNonEmptyString(observed.CodexTurnID, turn.CodexTurnID))
+	scan, err := historyTieredScanTail(local.FilePath, previous, historyTieredMaxTailBytes)
 	if err != nil {
 		return ExecutionResult{}, false
 	}
 	if scan.TooLarge {
-		scan, err = historyTieredScanTail(local.FilePath, historyTieredFileState{}, 0)
+		scan, err = historyTieredScanTail(local.FilePath, previous, 0)
 		if err != nil {
 			return ExecutionResult{}, false
 		}
@@ -8030,6 +8112,9 @@ func (b *Bridge) completedTurnResultFromCodexHistory(ctx context.Context, sessio
 		if strings.TrimSpace(final.Record.ThreadID) != "" && strings.TrimSpace(final.Record.ThreadID) != strings.TrimSpace(threadID) {
 			continue
 		}
+		if observedTurnID != "" && strings.TrimSpace(final.Record.TurnID) != "" && strings.TrimSpace(final.Record.TurnID) != observedTurnID {
+			continue
+		}
 		if !threshold.IsZero() {
 			if final.Record.CreatedAt.IsZero() || final.Record.CreatedAt.Before(threshold) {
 				continue
@@ -8041,9 +8126,10 @@ func (b *Bridge) completedTurnResultFromCodexHistory(ctx context.Context, sessio
 		return ExecutionResult{}, false
 	}
 	return ExecutionResult{
-		Text:          strings.TrimSpace(selected.Record.Text),
-		CodexThreadID: firstNonEmptyString(selected.Record.ThreadID, observed.CodexThreadID, turn.CodexThreadID, session.CodexThreadID),
-		CodexTurnID:   firstNonEmptyString(selected.Record.TurnID, observed.CodexTurnID, turn.CodexTurnID),
+		Text:                     strings.TrimSpace(selected.Record.Text),
+		CodexThreadID:            firstNonEmptyString(selected.Record.ThreadID, observed.CodexThreadID, turn.CodexThreadID, session.CodexThreadID),
+		CodexTurnID:              firstNonEmptyString(selected.Record.TurnID, observed.CodexTurnID, turn.CodexTurnID),
+		canonicalTranscriptFinal: true,
 	}, true
 }
 
@@ -8329,12 +8415,22 @@ func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor
 	if streaming, ok := executor.(StreamingInputExecutor); ok {
 		forwarder := b.startCodexEventForwarder(ctx, session, turn, chatID)
 		result, runErr = streaming.RunInputWithEventHandler(ctx, session, input, forwarder.Handle)
+		if runErr == nil {
+			if transcriptResult, ok := b.completedTurnResultFromLinkedTranscript(ctx, session, turn, result); ok {
+				result = executionResultWithTranscriptFinal(result, transcriptResult)
+			}
+		}
 		if closeErr := forwarder.Close(result.Text); runErr == nil && closeErr != nil {
 			runErr = closeErr
 		}
 	} else if streaming, ok := executor.(StreamingExecutor); ok {
 		forwarder := b.startCodexEventForwarder(ctx, session, turn, chatID)
 		result, runErr = streaming.RunWithEventHandler(ctx, session, input.Prompt, forwarder.Handle)
+		if runErr == nil {
+			if transcriptResult, ok := b.completedTurnResultFromLinkedTranscript(ctx, session, turn, result); ok {
+				result = executionResultWithTranscriptFinal(result, transcriptResult)
+			}
+		}
 		if closeErr := forwarder.Close(result.Text); runErr == nil && closeErr != nil {
 			runErr = closeErr
 		}
