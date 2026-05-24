@@ -23123,6 +23123,11 @@ func newBridgeTestStore(t *testing.T) *teamstore.Store {
 	if err != nil {
 		t.Fatalf("Open store error: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close bridge test store: %v", err)
+		}
+	})
 	return store
 }
 

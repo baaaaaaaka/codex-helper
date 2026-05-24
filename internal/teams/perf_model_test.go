@@ -991,6 +991,11 @@ func newCXPPerfStore(b testing.TB, profile cxpPerfProfile) *teamstore.Store {
 	if err != nil {
 		b.Fatalf("open perf store: %v", err)
 	}
+	b.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			b.Fatalf("close perf store: %v", err)
+		}
+	})
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
 		cxpPerfSeedState(state, profile)
 		return nil
