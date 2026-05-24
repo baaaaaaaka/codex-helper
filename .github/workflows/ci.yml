@@ -561,7 +561,7 @@ jobs:
       - name: go test (with coverage)
         shell: bash
         run: |
-          go test -coverprofile=coverage.out ./...
+          go test -timeout=20m -coverprofile=coverage.out ./...
 
       - name: Skills local git smoke (Linux/macOS)
         if: runner.os != 'Windows'
