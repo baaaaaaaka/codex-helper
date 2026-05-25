@@ -197,6 +197,11 @@ class CXPPerfModelScriptTests(unittest.TestCase):
             ("sqlite-history-watch-active", "BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles/many-long-chats$"),
             ("sqlite-active-parked-main-loop", "BenchmarkCXPPerfModelSQLiteActiveParkedMainLoopProfiles/many-long-chats$"),
             ("sqlite-legacy-linked-transcript-backfilled-idle", "BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles/many-long-chats$"),
+            ("sqlite-invalid-workflow-notification-idle", "BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles/many-long-chats$"),
+            (
+                "sqlite-pending-workflow-notifications",
+                "BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/many-long-chats/pending-workflow-notifications$",
+            ),
         ]:
             with self.subTest(target=target):
                 with mock.patch.object(model.subprocess, "run", return_value=completed) as run:

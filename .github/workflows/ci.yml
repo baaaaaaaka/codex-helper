@@ -358,12 +358,15 @@ jobs:
           sqlite_bridge_pattern='TestBridge(SQLiteMigration(UpgradeStateMatrix|FailureFallsBackToLegacyAndNotifiesControl|FallbackNoticeIsDeduped|FallbackFailsClosedForMissingPointerDB|FallbackFailsClosedForUnsupportedBackend)|DefersSQLiteMigrationWhileHelperUpgradeActivationIsPending)$'
           sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths)$'
           go test ./internal/teams/store -count=1 -run "$sqlite_store_pattern" -v
-          go test ./internal/teams/store -count=1 -run 'TestHas(QueuedTurns|PendingWorkflowNotifications)AcrossBackends$' -v
+          go test ./internal/teams/store -count=1 -run 'Test(Has(QueuedTurns|PendingWorkflowNotifications)AcrossBackends|PendingWorkflowNotificationsAcrossBackendsFiltersAndOrders|UpdateNotificationAcrossBackendsTouchesOnlyNotification)$' -v
           go test ./internal/teams -count=1 -run "$sqlite_bridge_pattern" -v
           go test ./internal/teams -count=1 -run "$sqlite_perf_pattern" -v
+          go test ./internal/teams -count=1 -run 'TestWorkflowNotificationFlushInvalidPendingDoesNotLoadHotSQLiteTables$' -v
           go test ./internal/teams -count=1 -run 'TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications$' -v
           go test ./internal/teams -count=1 -run 'Test(BridgeSyncLinkedTranscriptLegacyBackfillPreservesDedupeWindow|BridgeSyncLinkedTranscriptsBackfillsLegacyCheckpoint(Metadata|ThenImportsTail)|FindTranscriptCheckpointPositionSupportsFallbackCheckpoint)$' -v
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles/light-user$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles/light-user$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/light-user/pending-workflow-notifications$' -benchtime=1x -count=1 -benchmem
 
       - name: Teams Codex runner classification regressions
         shell: bash

@@ -3879,6 +3879,119 @@ func TestHasPendingWorkflowNotificationsAcrossBackends(t *testing.T) {
 	}
 }
 
+func TestPendingWorkflowNotificationsAcrossBackendsFiltersAndOrders(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		sqlite := sqlite
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 25, 9, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Notifications["sent"] = NotificationRecord{ID: "sent", Status: NotificationStatusSent, CreatedAt: now}
+				state.Notifications["unknown"] = NotificationRecord{ID: "unknown", Status: NotificationStatusUnknown, CreatedAt: now}
+				state.Notifications["custom"] = NotificationRecord{ID: "custom", Status: "custom", CreatedAt: now}
+				state.Notifications["queued"] = NotificationRecord{ID: "queued", Status: NotificationStatusQueued, CreatedAt: now.Add(1 * time.Second)}
+				state.Notifications["empty"] = NotificationRecord{ID: "empty", CreatedAt: now.Add(2 * time.Second)}
+				state.Notifications["failed"] = NotificationRecord{ID: "failed", Status: NotificationStatusFailed, CreatedAt: now.Add(3 * time.Second)}
+				state.Notifications["sending"] = NotificationRecord{ID: "sending", Status: NotificationStatusSending, CreatedAt: now.Add(4 * time.Second)}
+				for i := 0; i < 500; i++ {
+					id := fmt.Sprintf("sent-bulk-%03d", i)
+					state.Notifications[id] = NotificationRecord{ID: id, Status: NotificationStatusSent, CreatedAt: now.Add(time.Duration(i) * time.Millisecond)}
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed notifications: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			pending, err := store.PendingWorkflowNotifications(ctx)
+			if err != nil {
+				t.Fatalf("PendingWorkflowNotifications error: %v", err)
+			}
+			var got []string
+			for _, rec := range pending {
+				got = append(got, rec.ID)
+			}
+			want := []string{"queued", "empty", "failed", "sending"}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("pending ids = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestUpdateNotificationAcrossBackendsTouchesOnlyNotification(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		sqlite := sqlite
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				state.InboundEvents["inbound-large"] = InboundEvent{
+					ID:        "inbound-large",
+					Text:      strings.Repeat("payload ", 4096),
+					Status:    InboundStatusPersisted,
+					CreatedAt: now,
+					UpdatedAt: now,
+				}
+				state.Notifications["existing"] = NotificationRecord{
+					ID:        "existing",
+					Status:    NotificationStatusQueued,
+					Title:     "old",
+					ButtonURL: "https://example.test/old",
+					CreatedAt: now,
+					UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			updated, changed, err := store.UpdateNotification(ctx, "existing", func(rec NotificationRecord, found bool, updateNow time.Time) (NotificationRecord, bool, error) {
+				if !found {
+					t.Fatal("existing notification was not found")
+				}
+				rec.Status = NotificationStatusSent
+				rec.SentAt = updateNow
+				rec.UpdatedAt = updateNow
+				return rec, true, nil
+			})
+			if err != nil {
+				t.Fatalf("UpdateNotification existing error: %v", err)
+			}
+			if !changed || updated.Status != NotificationStatusSent || updated.SentAt.IsZero() {
+				t.Fatalf("updated = %#v changed=%v, want sent", updated, changed)
+			}
+			created, changed, err := store.UpdateNotification(ctx, "created", func(rec NotificationRecord, found bool, updateNow time.Time) (NotificationRecord, bool, error) {
+				if found {
+					t.Fatal("created notification unexpectedly existed")
+				}
+				return NotificationRecord{ID: "created", Status: NotificationStatusQueued, CreatedAt: updateNow, UpdatedAt: updateNow}, true, nil
+			})
+			if err != nil {
+				t.Fatalf("UpdateNotification created error: %v", err)
+			}
+			if !changed || created.ID != "created" || created.Status != NotificationStatusQueued {
+				t.Fatalf("created = %#v changed=%v, want queued", created, changed)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after UpdateNotification: %v", err)
+			}
+			if state.InboundEvents["inbound-large"].Text == "" {
+				t.Fatalf("UpdateNotification lost unrelated inbound event: %#v", state.InboundEvents)
+			}
+			if state.Notifications["existing"].Status != NotificationStatusSent || state.Notifications["created"].Status != NotificationStatusQueued {
+				t.Fatalf("notifications after update = %#v", state.Notifications)
+			}
+		})
+	}
+}
+
 func TestHasUpgradeBlockingWorkAllowsDeferredAndRateLimitedOutbox(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

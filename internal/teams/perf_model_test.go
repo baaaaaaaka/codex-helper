@@ -699,6 +699,47 @@ func BenchmarkCXPPerfModelSQLiteActiveParkedMainLoopProfiles(b *testing.B) {
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		profile.MessagesPerPoll = 0
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			graph := newCXPPerfGraph(profile)
+			bridge := newCXPPerfBridge(store, graph, profile)
+			bridge.asyncTurns = true
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			cxpPerfPrepareActiveOwner(b, bridge)
+			cxpPerfEnableWorkflowNotifications(b, bridge)
+			if _, _, err := store.UpdateNotification(context.Background(), "perf-invalid-workflow-notification", func(rec teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
+				if !found {
+					rec.ID = "perf-invalid-workflow-notification"
+					rec.CreatedAt = now
+				}
+				rec.Status = ""
+				rec.Title = ""
+				rec.ButtonURL = ""
+				rec.UpdatedAt = now
+				return rec, true, nil
+			}); err != nil {
+				b.Fatalf("seed invalid workflow notification: %v", err)
+			}
+			ctx := context.Background()
+			now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+			opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := cxpPerfRunMainLoopIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*11*time.Second)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+					b.Fatalf("main loop invalid workflow notification tick: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications(t *testing.T) {
 	profile := cxpPerfProfileByNameForTest(t, "many-long-chats")
 	profile.MessagesPerPoll = 0
@@ -775,6 +816,26 @@ func BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles(b *testin
 			benchState("poll-schedule", store.PollScheduleSnapshot)
 			benchState("queued-turns", store.QueuedTurnStateSnapshot)
 			benchState("workflow-notifications", store.WorkflowNotificationStateSnapshot)
+			if _, _, err := store.UpdateNotification(ctx, "perf-invalid-workflow-notification", func(rec teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
+				if !found {
+					rec.ID = "perf-invalid-workflow-notification"
+					rec.CreatedAt = now
+				}
+				rec.Status = ""
+				rec.UpdatedAt = now
+				return rec, true, nil
+			}); err != nil {
+				b.Fatalf("seed invalid workflow notification: %v", err)
+			}
+			b.Run("pending-workflow-notifications", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := store.PendingWorkflowNotifications(ctx); err != nil {
+						b.Fatalf("pending workflow notifications: %v", err)
+					}
+				}
+			})
 			b.Run("pending-outbox", func(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
@@ -1526,6 +1587,26 @@ func cxpPerfPrepareActiveOwner(tb testing.TB, bridge *Bridge) {
 	bridge.setOwner(owner, 18*time.Second)
 	if err := bridge.recordCurrentOwnerHeartbeat(ctx); err != nil {
 		tb.Fatalf("initial owner heartbeat: %v", err)
+	}
+}
+
+func cxpPerfEnableWorkflowNotifications(tb testing.TB, bridge *Bridge) {
+	tb.Helper()
+	tb.Setenv("XDG_CONFIG_HOME", tb.TempDir())
+	path := filepath.Join(tb.TempDir(), "workflow-webhook-url")
+	if err := os.WriteFile(path, []byte("https://workflow.example.test/hook"), 0o600); err != nil {
+		tb.Fatalf("write workflow webhook url: %v", err)
+	}
+	if err := bridge.store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Workflow = teamstore.WorkflowNotificationConfig{
+			Enabled:               true,
+			ControlWebhookURLFile: path,
+			ControlChatID:         bridge.reg.ControlChatID,
+			UpdatedAt:             time.Now(),
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("configure workflow notifications in perf store: %v", err)
 	}
 }
 

@@ -1722,6 +1722,88 @@ func (s *Store) hasPendingWorkflowNotificationsSQLite(ctx context.Context) (bool
 	return hasPending, handled, err
 }
 
+func (s *Store) pendingWorkflowNotificationsSQLite(ctx context.Context) ([]NotificationRecord, bool, error) {
+	var out []NotificationRecord
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		rows, err := db.QueryContext(ctx, `SELECT json FROM notifications
+WHERE status IS NULL OR status = '' OR status IN (?, ?, ?)
+ORDER BY created_at, id`,
+			string(NotificationStatusQueued), string(NotificationStatusFailed), string(NotificationStatusSending))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			var rec NotificationRecord
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				return err
+			}
+			if isPendingWorkflowNotification(rec) {
+				out = append(out, rec)
+			}
+		}
+		return rows.Err()
+	})
+	return out, handled, err
+}
+
+func (s *Store) updateNotificationSQLite(ctx context.Context, id string, fn func(NotificationRecord, bool, time.Time) (NotificationRecord, bool, error)) (NotificationRecord, bool, bool, error) {
+	var out NotificationRecord
+	changed := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		current, found, err := loadSQLiteJSONRow[NotificationRecord](ctx, tx, `SELECT json FROM notifications WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		next, updateChanged, err := fn(current, found, now)
+		if err != nil {
+			return err
+		}
+		out = next
+		handled = true
+		if !updateChanged {
+			return tx.Commit()
+		}
+		next.ID = id
+		if err := upsertSQLiteNotificationTx(ctx, tx, next); err != nil {
+			return err
+		}
+		out = next
+		changed = true
+		return tx.Commit()
+	})
+	return out, changed, handled, err
+}
+
 func (s *Store) createSessionSQLite(ctx context.Context, session SessionContext) (SessionContext, bool, bool, error) {
 	var out SessionContext
 	created := false

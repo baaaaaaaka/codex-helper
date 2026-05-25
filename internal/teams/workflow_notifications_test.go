@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -169,6 +170,59 @@ func TestWorkflowNotificationSendsAfterDurableOutboxSent(t *testing.T) {
 	rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
 	if rec.Status != teamstore.NotificationStatusSent || rec.Attempts != 1 || rec.SentAt.IsZero() {
 		t.Fatalf("notification record = %#v, want sent with one attempt", rec)
+	}
+}
+
+func TestWorkflowNotificationFlushInvalidPendingDoesNotLoadHotSQLiteTables(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Keep workflow notification flush off hot tables")
+
+	now := time.Now()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		for i := 0; i < 256; i++ {
+			id := fmt.Sprintf("inbound-hot-%03d", i)
+			state.InboundEvents[id] = teamstore.InboundEvent{
+				ID:        id,
+				SessionID: "s001",
+				Text:      strings.Repeat("hot payload ", 512),
+				Status:    teamstore.InboundStatusPersisted,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+		}
+		state.Notifications["workflow:invalid-empty"] = teamstore.NotificationRecord{
+			ID:        "workflow:invalid-empty",
+			Status:    "",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed invalid pending notification: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	urlFile := writeWorkflowWebhookURLFile(t, "https://workflow.example.test/hook")
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+
+	dbPath := filepath.Join(filepath.Dir(store.Path()), "store.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"broken"`), "inbound-hot-000"); err != nil {
+		t.Fatalf("corrupt hot inbound row: %v", err)
+	}
+
+	if err := bridge.flushPendingWorkflowNotificationsWithLimit(ctx, 1); err != nil {
+		t.Fatalf("flushPendingWorkflowNotificationsWithLimit should not load corrupt hot inbound row: %v", err)
 	}
 }
 

@@ -1182,6 +1182,82 @@ func (s *Store) HasPendingWorkflowNotifications(ctx context.Context) (bool, erro
 	return false, nil
 }
 
+func (s *Store) PendingWorkflowNotifications(ctx context.Context) ([]NotificationRecord, error) {
+	if out, handled, err := s.pendingWorkflowNotificationsSQLite(ctx); handled || err != nil {
+		return out, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, workflowNotificationPendingStateFields)
+	if err != nil {
+		return nil, err
+	}
+	out := pendingWorkflowNotificationsFromState(state)
+	return out, nil
+}
+
+func pendingWorkflowNotificationsFromState(state State) []NotificationRecord {
+	var out []NotificationRecord
+	for _, rec := range state.Notifications {
+		if !isPendingWorkflowNotification(rec) {
+			continue
+		}
+		out = append(out, rec)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func isPendingWorkflowNotification(rec NotificationRecord) bool {
+	switch rec.Status {
+	case NotificationStatusSent, NotificationStatusUnknown:
+		return false
+	case "", NotificationStatusQueued, NotificationStatusFailed, NotificationStatusSending:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) UpdateNotification(ctx context.Context, id string, fn func(NotificationRecord, bool, time.Time) (NotificationRecord, bool, error)) (NotificationRecord, bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return NotificationRecord{}, false, fmt.Errorf("notification id is required")
+	}
+	if fn == nil {
+		return NotificationRecord{}, false, fmt.Errorf("notification update function is required")
+	}
+	if out, changed, handled, err := s.updateNotificationSQLite(ctx, id, fn); handled || err != nil {
+		return out, changed, err
+	}
+	var out NotificationRecord
+	changed := false
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		now := time.Now()
+		if state.Notifications == nil {
+			state.Notifications = make(map[string]NotificationRecord)
+		}
+		current, found := state.Notifications[id]
+		next, updateChanged, err := fn(current, found, now)
+		if err != nil {
+			return false, err
+		}
+		out = next
+		if !updateChanged {
+			return false, nil
+		}
+		next.ID = id
+		state.Notifications[next.ID] = next
+		out = next
+		changed = true
+		return true, nil
+	})
+	return out, changed, err
+}
+
 func (s *Store) TranscriptImportStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, transcriptImportStateSnapshotFields)
 }
