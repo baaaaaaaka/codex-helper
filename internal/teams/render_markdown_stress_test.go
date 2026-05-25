@@ -815,6 +815,7 @@ func TestRenderFinalOutboxCodexMarkdownStress(t *testing.T) {
 }
 
 func TestBridgeOutboxMarkdownStressActualGraphPayload(t *testing.T) {
+	t.Parallel()
 	graph, sent := newBridgeTestGraph(t)
 	stateStore := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, stateStore, &recordingExecutor{})

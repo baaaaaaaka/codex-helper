@@ -192,6 +192,7 @@ func TestTerminateProcess(t *testing.T) {
 }
 
 func TestRunTargetCancelTerminatesChildProcessGroup(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("skip process group signal test on windows")
 	}

@@ -7,6 +7,7 @@ import (
 )
 
 var durableReplaceFile = defaultDurableReplaceFile
+var durableReplaceSleep = time.Sleep
 
 const durableReplaceAttempts = 8
 
@@ -55,7 +56,7 @@ func replaceFileWithRetry(src string, dst string, replace func(string, string) e
 			if retryable == nil || !retryable(err) || attempt == durableReplaceAttempts-1 {
 				return err
 			}
-			time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+			durableReplaceSleep(time.Duration(attempt+1) * 25 * time.Millisecond)
 			continue
 		}
 		return nil

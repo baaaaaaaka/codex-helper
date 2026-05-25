@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestTeamsReplaceFileWithRetryRetriesRetryableErrors(t *testing.T) {
@@ -43,6 +44,13 @@ func TestTeamsReplaceFileWithRetryStopsOnPermanentError(t *testing.T) {
 }
 
 func TestTeamsReplaceFileWithRetryBoundsRetryableErrors(t *testing.T) {
+	prevSleep := durableReplaceSleep
+	var sleeps []time.Duration
+	durableReplaceSleep = func(delay time.Duration) {
+		sleeps = append(sleeps, delay)
+	}
+	t.Cleanup(func() { durableReplaceSleep = prevSleep })
+
 	retryErr := errors.New("sharing violation")
 	attempts := 0
 	err := replaceFileWithRetry("tmp", "registry.json", func(string, string) error {
@@ -56,6 +64,23 @@ func TestTeamsReplaceFileWithRetryBoundsRetryableErrors(t *testing.T) {
 	}
 	if attempts != durableReplaceAttempts {
 		t.Fatalf("attempts = %d, want bounded attempts %d", attempts, durableReplaceAttempts)
+	}
+	wantSleeps := []time.Duration{
+		25 * time.Millisecond,
+		50 * time.Millisecond,
+		75 * time.Millisecond,
+		100 * time.Millisecond,
+		125 * time.Millisecond,
+		150 * time.Millisecond,
+		175 * time.Millisecond,
+	}
+	if len(sleeps) != len(wantSleeps) {
+		t.Fatalf("retry sleeps = %v, want %v", sleeps, wantSleeps)
+	}
+	for i := range sleeps {
+		if sleeps[i] != wantSleeps[i] {
+			t.Fatalf("retry sleeps = %v, want %v", sleeps, wantSleeps)
+		}
 	}
 }
 

@@ -667,6 +667,7 @@ func TestReadThreadLinkJournalBudgetExceededFailsClosed(t *testing.T) {
 }
 
 func TestThreadLinkJournalConcurrentAppendAndHashedPath(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)

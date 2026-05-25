@@ -54,6 +54,7 @@ func positiveEnvInt(name string) int {
 }
 
 func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *testing.T) {
+	t.Parallel()
 	scale := loadTeamsGraph429StressScale()
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
@@ -167,6 +168,7 @@ func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *t
 }
 
 func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *testing.T) {
+	t.Parallel()
 	scale := loadTeamsGraph429StressScale()
 	ctx := context.Background()
 	now := time.Now()

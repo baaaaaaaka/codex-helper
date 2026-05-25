@@ -319,25 +319,26 @@ func TestTeamsServiceUpgradeRetiresLargeRunAndWatchdogPileBeforeRestart(t *testi
 		runner:         runner,
 	})
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		basePID := os.Getpid() + 10000
 		processes := make([]teamsServiceLocalProcess, 0, 183)
 		for i := 0; i < 150; i++ {
 			processes = append(processes, teamsServiceLocalProcess{
-				PID:  6000 + i,
+				PID:  basePID + i,
 				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--owner-stale-after", "18s"},
 				Env:  map[string]string{},
 			})
 		}
 		for i := 0; i < 30; i++ {
 			processes = append(processes, teamsServiceLocalProcess{
-				PID:  6200 + i,
+				PID:  basePID + 200 + i,
 				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"},
 				Env:  map[string]string{},
 			})
 		}
 		processes = append(processes,
-			teamsServiceLocalProcess{PID: 6301, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--once"}, Env: map[string]string{}},
-			teamsServiceLocalProcess{PID: 6302, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: map[string]string{"CODEX_HELPER_TEAMS_PROFILE": "work"}},
-			teamsServiceLocalProcess{PID: 6303, Args: []string{"/home/alice/bin/not-cxp", "teams", "run"}, Env: map[string]string{}},
+			teamsServiceLocalProcess{PID: basePID + 301, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--once"}, Env: map[string]string{}},
+			teamsServiceLocalProcess{PID: basePID + 302, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: map[string]string{"CODEX_HELPER_TEAMS_PROFILE": "work"}},
+			teamsServiceLocalProcess{PID: basePID + 303, Args: []string{"/home/alice/bin/not-cxp", "teams", "run"}, Env: map[string]string{}},
 		)
 		return processes, nil
 	}
@@ -361,8 +362,9 @@ func TestTeamsServiceUpgradeRetiresLargeRunAndWatchdogPileBeforeRestart(t *testi
 	if len(terminated) != 180 {
 		t.Fatalf("terminated %d processes, want 180 stale run/watchdog processes", len(terminated))
 	}
+	basePID := os.Getpid() + 10000
 	for _, pid := range terminated {
-		if pid == 6301 || pid == 6302 || pid == 6303 {
+		if pid == basePID+301 || pid == basePID+302 || pid == basePID+303 {
 			t.Fatalf("upgrade cleanup should ignore once, wrong profile, and non-helper processes: terminated=%#v", terminated)
 		}
 	}
@@ -564,18 +566,19 @@ func TestTeamsServiceRestartRetiresLargeLocalBridgePileBeforeStart(t *testing.T)
 		runner:         runner,
 	})
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		basePID := os.Getpid() + 20000
 		processes := make([]teamsServiceLocalProcess, 0, 183)
 		for i := 0; i < 180; i++ {
 			processes = append(processes, teamsServiceLocalProcess{
-				PID:  7000 + i,
+				PID:  basePID + i,
 				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--owner-stale-after", "18s"},
 				Env:  map[string]string{},
 			})
 		}
 		processes = append(processes,
-			teamsServiceLocalProcess{PID: 7201, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: map[string]string{}},
-			teamsServiceLocalProcess{PID: 7202, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--once"}, Env: map[string]string{}},
-			teamsServiceLocalProcess{PID: 7203, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: map[string]string{"CODEX_HELPER_TEAMS_PROFILE": "work"}},
+			teamsServiceLocalProcess{PID: basePID + 201, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: map[string]string{}},
+			teamsServiceLocalProcess{PID: basePID + 202, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--once"}, Env: map[string]string{}},
+			teamsServiceLocalProcess{PID: basePID + 203, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: map[string]string{"CODEX_HELPER_TEAMS_PROFILE": "work"}},
 		)
 		return processes, nil
 	}
@@ -595,8 +598,9 @@ func TestTeamsServiceRestartRetiresLargeLocalBridgePileBeforeStart(t *testing.T)
 	if len(terminated) != 180 {
 		t.Fatalf("terminated %d processes, want 180 stale bridge processes", len(terminated))
 	}
+	basePID := os.Getpid() + 20000
 	for _, pid := range terminated {
-		if pid == 7201 || pid == 7202 || pid == 7203 {
+		if pid == basePID+201 || pid == basePID+202 || pid == basePID+203 {
 			t.Fatalf("service restart should only retire bridge run processes, not watchdog/once/wrong profile: terminated=%#v", terminated)
 		}
 	}

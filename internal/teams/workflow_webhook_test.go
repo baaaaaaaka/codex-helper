@@ -85,6 +85,7 @@ func TestPostWorkflowWebhookRejectsOversizedPayload(t *testing.T) {
 }
 
 func TestPostWorkflowWebhookRetriesTooManyRequests(t *testing.T) {
+	t.Parallel()
 	var attempts int
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		attempts++
@@ -104,16 +105,21 @@ func TestPostWorkflowWebhookRetriesTooManyRequests(t *testing.T) {
 		}, nil
 	})}
 
-	start := time.Now()
-	_, err := PostWorkflowWebhook(context.Background(), client, "https://workflow.example.test/hook", WorkflowWebhookMessage{Text: "retry"})
+	var delays []time.Duration
+	_, err := postWorkflowWebhookWithOptions(context.Background(), client, "https://workflow.example.test/hook", WorkflowWebhookMessage{Text: "retry"}, workflowWebhookOptions{
+		sleep: func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	})
 	if err != nil {
 		t.Fatalf("PostWorkflowWebhook error: %v", err)
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
 	}
-	if time.Since(start) < 900*time.Millisecond {
-		t.Fatalf("Retry-After was not honored")
+	if len(delays) != 1 || delays[0] != time.Second {
+		t.Fatalf("retry delays = %v, want [1s]", delays)
 	}
 }
 

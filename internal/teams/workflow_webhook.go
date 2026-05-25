@@ -65,6 +65,7 @@ func PostWorkflowWebhookWithoutRateLimitRetry(ctx context.Context, client *http.
 
 type workflowWebhookOptions struct {
 	returnRateLimitWithoutRetry bool
+	sleep                       func(context.Context, time.Duration) error
 }
 
 func postWorkflowWebhookWithOptions(ctx context.Context, client *http.Client, webhookURL string, msg WorkflowWebhookMessage, opts workflowWebhookOptions) (WorkflowWebhookResult, error) {
@@ -81,6 +82,10 @@ func postWorkflowWebhookWithOptions(ctx context.Context, client *http.Client, we
 	}
 	if client == nil {
 		client = http.DefaultClient
+	}
+	sleep := opts.sleep
+	if sleep == nil {
+		sleep = sleepContext
 	}
 	var last WorkflowWebhookResult
 	for attempt := 0; attempt < workflowWebhookRetries; attempt++ {
@@ -113,7 +118,7 @@ func postWorkflowWebhookWithOptions(ctx context.Context, client *http.Client, we
 				Message:           fmt.Sprintf("Teams workflow webhook failed: HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode)),
 			}
 		}
-		if err := sleepContext(ctx, workflowWebhookRetryDelay(resp, attempt)); err != nil {
+		if err := sleep(ctx, workflowWebhookRetryDelay(resp, attempt)); err != nil {
 			return last, WorkflowWebhookError{
 				Result:    last,
 				Retryable: true,

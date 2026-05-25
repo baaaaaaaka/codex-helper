@@ -27,6 +27,8 @@ import (
 
 const bridgeAsyncTestTimeout = 30 * time.Second
 
+var discoverCodexSessionTestMu sync.Mutex
+
 type recordingExecutor struct {
 	prompts  []string
 	sessions []Session
@@ -1452,6 +1454,7 @@ func TestBridgeRecentDuplicatePromptSkipsMessagesWithAttachments(t *testing.T) {
 }
 
 func TestBridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession(t *testing.T) {
+	t.Parallel()
 	graph, _ := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
 	executor := &parallelBlockingExecutor{
@@ -1621,6 +1624,7 @@ func TestBridgeProcessQueuedTurnsLimitsStartsPerCycle(t *testing.T) {
 }
 
 func TestBridgeQueuedTurnFollowUpStaysWithinCompletedSession(t *testing.T) {
+	t.Parallel()
 	prompts := map[string]string{
 		"s001-first":  "s001 first queued prompt",
 		"s001-second": "s001 second queued prompt",
@@ -2996,6 +3000,7 @@ func TestBridgeSessionTerminalCodexFailureWithTurnIDMarksFailed(t *testing.T) {
 }
 
 func TestBridgeQueuesAllLongOutputPartsBeforeFirstSend(t *testing.T) {
+	t.Parallel()
 	store := newBridgeTestStore(t)
 	ctx := context.Background()
 	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{
@@ -3348,6 +3353,7 @@ func TestBridgeQueuedTurnErrorMentionsOwnerWhenWorkflowDisabled(t *testing.T) {
 }
 
 func TestBridgeChunkedNeedsAttentionMentionsOwnerOnlyOnLastPart(t *testing.T) {
+	t.Parallel()
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -3775,6 +3781,7 @@ func TestBridgeDefersSQLiteMigrationWhileHelperUpgradeActivationIsPending(t *tes
 }
 
 func TestBridgeSQLiteMigrationUpgradeStateMatrix(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
@@ -16918,6 +16925,7 @@ func TestBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneA
 }
 
 func TestBridgeSyncLinkedTranscriptMultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T) {
+	t.Parallel()
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -19666,6 +19674,7 @@ func TestBridgeHistoryWatchPublishLookupUsesScopedCodexHome(t *testing.T) {
 }
 
 func TestBridgeHistoryWatchFallsBackForLargeTail(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
 	codexRoot := t.TempDir()
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-04-thread-large-tail.jsonl")
@@ -22725,6 +22734,7 @@ func TestBridgeFlushRecoversAcceptedOutboxFromGraphAfterRestart(t *testing.T) {
 }
 
 func TestBridgeFlushDefersGraphRecoveryWhenListMessagesFails(t *testing.T) {
+	t.Parallel()
 	store := newBridgeTestStore(t)
 	queued, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
 		ID:          "outbox:accepted-persist-failure-list-error",
@@ -23667,6 +23677,7 @@ func bridgePollMessage(id string, timestamp string, text string) ChatMessage {
 
 func stubDiscoverCodexSession(t *testing.T, threadID string, transcriptPath string) func() {
 	t.Helper()
+	discoverCodexSessionTestMu.Lock()
 	prevDiscover := discoverCodexProjectsForTeams
 	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
 		return []codexhistory.Project{{
@@ -23682,6 +23693,7 @@ func stubDiscoverCodexSession(t *testing.T, threadID string, transcriptPath stri
 	}
 	return func() {
 		discoverCodexProjectsForTeams = prevDiscover
+		discoverCodexSessionTestMu.Unlock()
 	}
 }
 

@@ -132,6 +132,7 @@ func TestSimulatedLiveTeamsRenderCasesRoundTripThroughGraphCI(t *testing.T) {
 }
 
 func TestSimulatedLiveHelperE2EControlWorkAndStatusCI(t *testing.T) {
+	t.Parallel()
 	var createdTopic string
 	graph, sent := newBridgeCreateChatGraph(t, &createdTopic)
 	store := newBridgeTestStore(t)

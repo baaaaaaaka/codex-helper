@@ -224,6 +224,7 @@ func TestCXPPerfModelProfilesCanSeedStoreAndPoll(t *testing.T) {
 	for _, profile := range cxpPerfProfiles {
 		profile := cxpPerfSmokeProfile(profile)
 		t.Run(profile.Name, func(t *testing.T) {
+			t.Parallel()
 			store := newCXPPerfStore(t, profile)
 			ctx := context.Background()
 			queries := cxpPerfLookupQueries(profile)
@@ -264,6 +265,7 @@ func TestCXPPerfModelExternalScenariosCoverCommonPaths(t *testing.T) {
 	for _, scenario := range cxpPerfExternalScenarios {
 		scenario := scenario
 		t.Run(scenario.Name, func(t *testing.T) {
+			t.Parallel()
 			store, bridge, harness := newCXPPerfExternalBridge(t, scenario)
 			if err := cxpPerfRunListenOnce(context.Background(), bridge, store, scenario, harness); err != nil && !cxpPerfExpectedListenError(err, scenario) {
 				t.Fatalf("listen once external scenario error: %v", err)
@@ -378,6 +380,7 @@ func TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations(t *testing.T) {
 		} {
 			tc := tc
 			t.Run(profile.Name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
 				tc.run(t, profile)
 			})
 		}
@@ -389,6 +392,7 @@ func TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths(t *testing.T) {
 	for _, scenario := range cxpPerfExternalScenarios {
 		scenario := scenario
 		t.Run(scenario.Name, func(t *testing.T) {
+			t.Parallel()
 			store, bridge, harness := newCXPPerfExternalBridge(t, scenario)
 			cxpPerfMigrateStoreToSQLite(t, store)
 			if err := cxpPerfRunListenOnce(context.Background(), bridge, store, scenario, harness); err != nil && !cxpPerfExpectedListenError(err, scenario) {
@@ -763,6 +767,7 @@ func BenchmarkCXPPerfModelSQLiteWorkflowNotificationNoPendingFlushProfiles(b *te
 }
 
 func TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications(t *testing.T) {
+	t.Parallel()
 	profile := cxpPerfProfileByNameForTest(t, "many-long-chats")
 	profile.MessagesPerPoll = 0
 	store := newCXPPerfStore(t, profile)

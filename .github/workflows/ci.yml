@@ -568,10 +568,17 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go test (with coverage)
+      - name: go test (with coverage, Linux only)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          go test -timeout=20m -coverprofile=coverage.out ./...
+          go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./...
+
+      - name: go test (without coverage, non-Linux)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          go test -timeout=20m -parallel=16 ./...
 
       - name: Teams perf benchmark smoke
         if: runner.os == 'Linux'
