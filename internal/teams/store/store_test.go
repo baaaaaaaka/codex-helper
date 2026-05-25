@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3645,6 +3646,131 @@ func TestAutoUpdateLifecyclePersistsCandidateAndClearsAfterInstall(t *testing.T)
 	}
 	if read.LastInstalledTag != "v1.2.4" || read.LastAttemptTag != "v1.2.4" {
 		t.Fatalf("reopened auto-update state mismatch: %#v", read)
+	}
+}
+
+func TestReadAutoUpdateControlSQLiteDoesNotLoadHotTables(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now()
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceControl = ServiceControl{
+			Paused:    true,
+			Reason:    "maintenance",
+			UpdatedAt: now,
+		}
+		state.AutoUpdate = AutoUpdateState{
+			NextCheckAt: now.Add(30 * time.Minute),
+			LastCheckAt: now.Add(-time.Minute),
+		}
+		for i := 0; i < 128; i++ {
+			id := fmt.Sprintf("auto-update-hot-%03d", i)
+			state.InboundEvents[id] = InboundEvent{
+				ID:        id,
+				SessionID: "s001",
+				Text:      strings.Repeat("hot payload ", 256),
+				Status:    InboundStatusPersisted,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed auto-update state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	res, err := db.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"broken"`), "auto-update-hot-000")
+	if err != nil {
+		t.Fatalf("corrupt hot inbound row: %v", err)
+	}
+	if rows, err := res.RowsAffected(); err != nil || rows != 1 {
+		t.Fatalf("corrupt hot inbound rows affected = %d err=%v, want 1", rows, err)
+	}
+
+	auto, control, err := store.ReadAutoUpdateControl(ctx)
+	if err != nil {
+		t.Fatalf("ReadAutoUpdateControl should not load corrupt hot inbound row: %v", err)
+	}
+	if !auto.NextCheckAt.Equal(now.Add(30 * time.Minute)) {
+		t.Fatalf("NextCheckAt = %s, want %s", auto.NextCheckAt, now.Add(30*time.Minute))
+	}
+	if !control.Paused || control.Reason != "maintenance" {
+		t.Fatalf("control = %#v, want paused maintenance", control)
+	}
+	if _, err := store.ReadAutoUpdate(ctx); err != nil {
+		t.Fatalf("ReadAutoUpdate should not load corrupt hot inbound row: %v", err)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt hot inbound row")
+	}
+}
+
+func TestUpgradeBlockingStateSnapshotSQLiteDoesNotLoadUnneededHotTables(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now()
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceControl = ServiceControl{
+			Draining:  true,
+			Reason:    HelperReloadReason,
+			UpdatedAt: now,
+		}
+		state.Turns["turn-running"] = Turn{
+			ID:        "turn-running",
+			SessionID: "s001",
+			Status:    TurnStatusRunning,
+			StartedAt: now,
+			UpdatedAt: now,
+		}
+		for i := 0; i < 128; i++ {
+			id := fmt.Sprintf("upgrade-hot-inbound-%03d", i)
+			state.InboundEvents[id] = InboundEvent{
+				ID:        id,
+				SessionID: "s001",
+				Text:      strings.Repeat("hot payload ", 256),
+				Status:    InboundStatusPersisted,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed upgrade blocking state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	res, err := db.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"broken"`), "upgrade-hot-inbound-000")
+	if err != nil {
+		t.Fatalf("corrupt hot inbound row: %v", err)
+	}
+	if rows, err := res.RowsAffected(); err != nil || rows != 1 {
+		t.Fatalf("corrupt hot inbound rows affected = %d err=%v, want 1", rows, err)
+	}
+	state, err := store.UpgradeBlockingStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("UpgradeBlockingStateSnapshot should not load corrupt inbound row: %v", err)
+	}
+	if !HasUpgradeBlockingWork(state, now) {
+		t.Fatal("UpgradeBlockingStateSnapshot lost running turn blocker")
+	}
+	if !state.ServiceControl.Draining || state.ServiceControl.Reason != HelperReloadReason {
+		t.Fatalf("UpgradeBlockingStateSnapshot lost service control: %#v", state.ServiceControl)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt hot inbound row")
 	}
 }
 

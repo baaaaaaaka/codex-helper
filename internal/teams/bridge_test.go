@@ -650,6 +650,9 @@ func TestBridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork(t *testing.T) 
 		upgrades++
 		return CodexUpgradeResult{Path: "/managed/codex"}, nil
 	}
+	if err := bridge.maybeRunPendingCodexUpgrade(context.Background()); err != nil {
+		t.Fatalf("initial maybeRunPendingCodexUpgrade without pending upgrade: %v", err)
+	}
 
 	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s-other", Status: teamstore.SessionStatusActive}); err != nil {
 		t.Fatalf("CreateSession other: %v", err)
@@ -733,6 +736,55 @@ func TestBridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat(t *testing.T) {
 	}
 	if countSentPlainContainingForChat(*sent, "chat-1", "Codex CLI upgrade failed") != 1 {
 		t.Fatalf("work chat upgrade failure notice missing or duplicated: %#v", *sent)
+	}
+}
+
+func TestBridgePendingCodexUpgradeNoUpgradeSkipsHotSQLiteTablesAndUpgrade(t *testing.T) {
+	ctx := context.Background()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	upgrades := 0
+	bridge.codexUpgrader = func(context.Context) (CodexUpgradeResult, error) {
+		upgrades++
+		return CodexUpgradeResult{}, errors.New("unexpected codex upgrade")
+	}
+	now := time.Now()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		seedAutoUpdateHotInboundEvents(state, now)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed hot state: %v", err)
+	}
+	migrateAndCorruptAutoUpdateHotSQLiteInbound(t, store)
+	if err := bridge.maybeRunPendingCodexUpgrade(ctx); err != nil {
+		t.Fatalf("maybeRunPendingCodexUpgrade should not load corrupt hot inbound row: %v", err)
+	}
+	if upgrades != 0 {
+		t.Fatalf("codex upgrades = %d, want 0", upgrades)
+	}
+}
+
+func TestBridgeSaveRepairsMissingRegistryDuringThrottleWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "teams-registry.json")
+	bridge := &Bridge{
+		registryPath: path,
+		reg: Registry{
+			Version:       1,
+			ControlChatID: "control-chat",
+		},
+	}
+	if err := bridge.Save(); err != nil {
+		t.Fatalf("initial Save: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove registry: %v", err)
+	}
+	if err := bridge.Save(); err != nil {
+		t.Fatalf("Save should recreate missing registry inside throttle window: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("registry was not recreated: %v", err)
 	}
 }
 

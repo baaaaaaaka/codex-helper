@@ -816,6 +816,16 @@ func BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles(b *testin
 			benchState("poll-schedule", store.PollScheduleSnapshot)
 			benchState("queued-turns", store.QueuedTurnStateSnapshot)
 			benchState("workflow-notifications", store.WorkflowNotificationStateSnapshot)
+			benchState("upgrade-blocking", store.UpgradeBlockingStateSnapshot)
+			b.Run("auto-update-control", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, _, err := store.ReadAutoUpdateControl(ctx); err != nil {
+						b.Fatalf("auto-update control: %v", err)
+					}
+				}
+			})
 			if _, _, err := store.UpdateNotification(ctx, "perf-invalid-workflow-notification", func(rec teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
 				if !found {
 					rec.ID = "perf-invalid-workflow-notification"
@@ -860,6 +870,93 @@ func BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles(b *testin
 				for i := 0; i < b.N; i++ {
 					if _, _, err := store.ReadOwner(ctx); err != nil {
 						b.Fatalf("read owner: %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			if err := store.Update(context.Background(), func(state *teamstore.State) error {
+				state.AutoUpdate.NextCheckAt = time.Now().Add(time.Hour)
+				state.AutoUpdate.LastCheckAt = time.Now().Add(-time.Minute)
+				return nil
+			}); err != nil {
+				b.Fatalf("seed auto-update state: %v", err)
+			}
+			cxpPerfMigrateStoreToSQLite(b, store)
+			graph := newCXPPerfGraph(profile)
+			bridge := newCXPPerfBridge(store, graph, profile)
+			opts := BridgeOptions{
+				HelperVersion:     "v0.1.3",
+				HelperAutoUpdater: &fakeHelperAutoUpdater{},
+			}
+			ctx := context.Background()
+			b.Run("cold-state-refresh", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					bridge.clearHelperAutoUpdateProbeGate()
+					if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+						b.Fatalf("helper auto-update cold-state refresh: %v", err)
+					}
+				}
+			})
+			b.Run("cached-main-loop", func(b *testing.B) {
+				bridge.clearHelperAutoUpdateProbeGate()
+				if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+					b.Fatalf("warm helper auto-update cache: %v", err)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+						b.Fatalf("helper auto-update cached main loop: %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+			bridge.codexUpgrader = func(context.Context) (CodexUpgradeResult, error) {
+				return CodexUpgradeResult{Path: "/managed/codex"}, nil
+			}
+			ctx := context.Background()
+			b.Run("cold-state-refresh", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					bridge.clearPendingCodexUpgradeProbeGate()
+					if err := bridge.maybeRunPendingCodexUpgrade(ctx); err != nil {
+						b.Fatalf("codex upgrade cold-state refresh: %v", err)
+					}
+				}
+			})
+			b.Run("cached-main-loop", func(b *testing.B) {
+				bridge.clearPendingCodexUpgradeProbeGate()
+				if err := bridge.maybeRunPendingCodexUpgrade(ctx); err != nil {
+					b.Fatalf("warm codex upgrade cache: %v", err)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := bridge.maybeRunPendingCodexUpgrade(ctx); err != nil {
+						b.Fatalf("codex upgrade cached main loop: %v", err)
 					}
 				}
 			})
@@ -1620,9 +1717,6 @@ func cxpPerfRunMainLoopIdleTick(ctx context.Context, bridge *Bridge, opts Bridge
 		return err
 	} else if !active {
 		return teamstore.ErrControlLeaseNotHeld
-	}
-	if err := bridge.recordCurrentOwnerHeartbeat(ctx); err != nil {
-		return err
 	}
 	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil && !isOutboxDeliveryDeferred(err) {
 		return err

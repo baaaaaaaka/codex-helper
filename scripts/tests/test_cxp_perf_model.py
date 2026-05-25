@@ -198,6 +198,8 @@ class CXPPerfModelScriptTests(unittest.TestCase):
             ("sqlite-active-parked-main-loop", "BenchmarkCXPPerfModelSQLiteActiveParkedMainLoopProfiles/many-long-chats$"),
             ("sqlite-legacy-linked-transcript-backfilled-idle", "BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles/many-long-chats$"),
             ("sqlite-invalid-workflow-notification-idle", "BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles/many-long-chats$"),
+            ("sqlite-helper-auto-update-not-due", "BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles/many-long-chats$"),
+            ("sqlite-codex-upgrade-no-pending", "BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles/many-long-chats$"),
             (
                 "sqlite-pending-workflow-notifications",
                 "BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/many-long-chats/pending-workflow-notifications$",

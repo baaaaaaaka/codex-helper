@@ -991,7 +991,9 @@ var (
 	upgradeStateFields = stateFieldSet(
 		"upgrade",
 	)
-	pollStateSnapshotFields = stateFieldSet(
+	upgradeBlockingStateFields   = stateFieldSet("turns", "outbox_messages", "chat_rate_limits")
+	autoUpdateControlStateFields = stateFieldSet()
+	pollStateSnapshotFields      = stateFieldSet(
 		"sessions",
 		"turns",
 		"inbound_events",
@@ -2005,12 +2007,24 @@ func (s *Store) ReadUpgrade(ctx context.Context) (UpgradeRequest, bool, error) {
 	return *state.Upgrade, true, nil
 }
 
+func (s *Store) UpgradeBlockingStateSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, upgradeBlockingStateFields)
+}
+
 func (s *Store) ReadAutoUpdate(ctx context.Context) (AutoUpdateState, error) {
-	state, err := s.Load(ctx)
+	state, err := s.loadStateFieldsOrFull(ctx, autoUpdateControlStateFields)
 	if err != nil {
 		return AutoUpdateState{}, err
 	}
 	return state.AutoUpdate, nil
+}
+
+func (s *Store) ReadAutoUpdateControl(ctx context.Context) (AutoUpdateState, ServiceControl, error) {
+	state, err := s.loadStateFieldsOrFull(ctx, autoUpdateControlStateFields)
+	if err != nil {
+		return AutoUpdateState{}, ServiceControl{}, err
+	}
+	return state.AutoUpdate, state.ServiceControl, nil
 }
 
 func (s *Store) RecordAutoUpdateCheck(ctx context.Context, record AutoUpdateRecord) (AutoUpdateState, error) {

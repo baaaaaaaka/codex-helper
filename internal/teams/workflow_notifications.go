@@ -711,16 +711,16 @@ func (b *Bridge) flushPendingWorkflowNotificationsWithLimit(ctx context.Context,
 	if strings.TrimSpace(cfg.ControlChatID) != "" && currentControlChatID != "" && strings.TrimSpace(cfg.ControlChatID) != currentControlChatID {
 		return nil
 	}
-	webhookURL, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
-	if err != nil {
-		return err
-	}
 	pending, err := b.store.PendingWorkflowNotifications(ctx)
 	if err != nil {
 		return err
 	}
 	if len(pending) == 0 {
 		return nil
+	}
+	webhookURL, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
+	if err != nil {
+		return err
 	}
 	now := time.Now()
 	var firstErr error

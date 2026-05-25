@@ -2,9 +2,11 @@ package teams
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -264,6 +266,182 @@ func TestBridgeHelperAutoUpdateRecordsCheckWithoutCandidate(t *testing.T) {
 	}
 	if state.AutoUpdate.CandidateTag != "" {
 		t.Fatalf("CandidateTag = %q, want empty", state.AutoUpdate.CandidateTag)
+	}
+}
+
+func TestBridgeHelperAutoUpdateNotDueSkipsHotSQLiteTablesAndCheck(t *testing.T) {
+	ctx := context.Background()
+	st, bridge := newBridgeAutoUpdateTest(t)
+	now := time.Now()
+	if err := st.Update(ctx, func(state *teamstore.State) error {
+		state.AutoUpdate.NextCheckAt = now.Add(30 * time.Minute)
+		state.AutoUpdate.LastCheckAt = now.Add(-time.Minute)
+		seedAutoUpdateHotInboundEvents(state, now)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed not-due auto-update state: %v", err)
+	}
+	migrateAndCorruptAutoUpdateHotSQLiteInbound(t, st)
+
+	updater := &fakeHelperAutoUpdater{checkErr: errors.New("unexpected release check")}
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+	}); err != nil {
+		t.Fatalf("maybeRunHelperAutoUpdate should not load corrupt hot inbound row: %v", err)
+	}
+	if len(updater.checks) != 0 || updater.applyCalls != 0 {
+		t.Fatalf("checks=%d applyCalls=%d, want no release check or apply", len(updater.checks), updater.applyCalls)
+	}
+}
+
+func TestBridgeHelperAutoUpdateBackoffSkipsHotSQLiteTablesAndCheck(t *testing.T) {
+	ctx := context.Background()
+	st, bridge := newBridgeAutoUpdateTest(t)
+	now := time.Now()
+	if err := st.Update(ctx, func(state *teamstore.State) error {
+		state.AutoUpdate.NextCheckAt = now.Add(30 * time.Minute)
+		state.AutoUpdate.BackoffUntil = now.Add(10 * time.Minute)
+		state.AutoUpdate.LastError = "rate limited"
+		seedAutoUpdateHotInboundEvents(state, now)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed backoff auto-update state: %v", err)
+	}
+	migrateAndCorruptAutoUpdateHotSQLiteInbound(t, st)
+
+	updater := &fakeHelperAutoUpdater{checkErr: errors.New("unexpected release check")}
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+	}); err != nil {
+		t.Fatalf("maybeRunHelperAutoUpdate should not load corrupt hot inbound row in backoff: %v", err)
+	}
+	if len(updater.checks) != 0 || updater.applyCalls != 0 {
+		t.Fatalf("checks=%d applyCalls=%d, want no release check or apply", len(updater.checks), updater.applyCalls)
+	}
+}
+
+func TestBridgeHelperAutoUpdateNotDueCachesMainLoopProbe(t *testing.T) {
+	ctx := context.Background()
+	st, bridge := newBridgeAutoUpdateTest(t)
+	now := time.Now()
+	if err := st.Update(ctx, func(state *teamstore.State) error {
+		state.AutoUpdate.NextCheckAt = now.Add(30 * time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed not-due auto-update state: %v", err)
+	}
+	updater := &fakeHelperAutoUpdater{checkErr: errors.New("release check reached")}
+	opts := BridgeOptions{HelperVersion: "v1.2.3", HelperAutoUpdater: updater}
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+		t.Fatalf("initial maybeRunHelperAutoUpdate error: %v", err)
+	}
+	if len(updater.checks) != 0 {
+		t.Fatalf("initial checks = %d, want 0", len(updater.checks))
+	}
+	if err := st.Update(ctx, func(state *teamstore.State) error {
+		state.AutoUpdate.NextCheckAt = time.Time{}
+		return nil
+	}); err != nil {
+		t.Fatalf("make auto-update due: %v", err)
+	}
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+		t.Fatalf("cached not-due probe should skip immediate store re-read: %v", err)
+	}
+	if len(updater.checks) != 0 {
+		t.Fatalf("cached checks = %d, want 0 before probe refresh", len(updater.checks))
+	}
+	bridge.clearHelperAutoUpdateProbeGate()
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err == nil || !strings.Contains(err.Error(), "release check reached") {
+		t.Fatalf("forced probe error = %v, want release check reached", err)
+	}
+	if len(updater.checks) != 1 {
+		t.Fatalf("forced checks = %d, want 1", len(updater.checks))
+	}
+}
+
+func TestBridgeManualHelperUpdateClearsCachedAutoUpdateProbe(t *testing.T) {
+	ctx := context.Background()
+	st, bridge := newBridgeAutoUpdateTest(t)
+	now := time.Now()
+	if err := st.Update(ctx, func(state *teamstore.State) error {
+		state.AutoUpdate.NextCheckAt = now.Add(30 * time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed not-due auto-update state: %v", err)
+	}
+	updater := &fakeHelperAutoUpdater{checkErr: errors.New("unexpected automatic check")}
+	opts := BridgeOptions{HelperVersion: "v1.2.3", HelperAutoUpdater: updater}
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+		t.Fatalf("initial maybeRunHelperAutoUpdate error: %v", err)
+	}
+	if len(updater.checks) != 0 {
+		t.Fatalf("initial checks = %d, want 0", len(updater.checks))
+	}
+
+	candidate := HelperAutoUpdateCandidate{
+		TagName:     "v1.2.4",
+		Version:     "1.2.4",
+		Priority:    "p0",
+		PublishedAt: now.Add(-time.Minute),
+		EligibleAt:  now.Add(-time.Minute),
+		Asset:       "codex-proxy_1.2.4_linux_amd64",
+	}
+	if _, err := st.RecordAutoUpdateCheck(ctx, teamstore.AutoUpdateRecord{
+		Now:                  now,
+		NextCheckAt:          now.Add(30 * time.Minute),
+		CandidateTag:         candidate.TagName,
+		CandidateVersion:     candidate.Version,
+		CandidatePriority:    candidate.Priority,
+		CandidateAsset:       candidate.Asset,
+		CandidatePublishedAt: candidate.PublishedAt,
+		CandidateEligibleAt:  candidate.EligibleAt,
+	}); err != nil {
+		t.Fatalf("record manual candidate: %v", err)
+	}
+	if err := st.Update(ctx, func(state *teamstore.State) error {
+		state.Turns["turn-running"] = teamstore.Turn{
+			ID:        "turn-running",
+			SessionID: "session-1",
+			Status:    teamstore.TurnStatusRunning,
+			StartedAt: now,
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed running turn: %v", err)
+	}
+	if err := bridge.applyHelperAutoUpdateWhenDrainedWithOptions(ctx, opts, candidate, helperAutoUpdateApplyOptions{
+		Manual:           true,
+		ControlChatID:    "control-chat",
+		CommandMessageID: "manual-update-command",
+	}); err != nil {
+		t.Fatalf("manual apply while blocked: %v", err)
+	}
+	if updater.applyCalls != 0 {
+		t.Fatalf("applyCalls while blocked = %d, want 0", updater.applyCalls)
+	}
+	if err := st.Update(ctx, func(state *teamstore.State) error {
+		turn := state.Turns["turn-running"]
+		turn.Status = teamstore.TurnStatusCompleted
+		turn.CompletedAt = now.Add(time.Second)
+		turn.UpdatedAt = now.Add(time.Second)
+		state.Turns[turn.ID] = turn
+		return nil
+	}); err != nil {
+		t.Fatalf("complete running turn: %v", err)
+	}
+	updater.checkErr = nil
+	opts.HelperRestarter = func(context.Context) error { return nil }
+	if err := bridge.maybeRunHelperAutoUpdate(ctx, opts); err != nil {
+		t.Fatalf("maybeRunHelperAutoUpdate after manual drain: %v", err)
+	}
+	if updater.applyCalls != 1 {
+		t.Fatalf("applyCalls after drain = %d, want 1 without waiting for cached probe expiry", updater.applyCalls)
+	}
+	if len(updater.checks) != 0 {
+		t.Fatalf("automatic checks = %d, want 0 while continuing manual candidate", len(updater.checks))
 	}
 }
 
@@ -1094,4 +1272,39 @@ func newBridgeAutoUpdateTest(t *testing.T) (*teamstore.Store, *Bridge) {
 	}
 	bridge := &Bridge{store: st}
 	return st, bridge
+}
+
+func seedAutoUpdateHotInboundEvents(state *teamstore.State, now time.Time) {
+	for i := 0; i < 128; i++ {
+		id := "auto-update-hot-inbound-" + strconv.Itoa(i)
+		state.InboundEvents[id] = teamstore.InboundEvent{
+			ID:        id,
+			SessionID: "s001",
+			Text:      strings.Repeat("hot payload ", 256),
+			Status:    teamstore.InboundStatusPersisted,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+	}
+}
+
+func migrateAndCorruptAutoUpdateHotSQLiteInbound(t *testing.T, st *teamstore.Store) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(st.Path()), "store.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	res, err := db.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"broken"`), "auto-update-hot-inbound-0")
+	if err != nil {
+		t.Fatalf("corrupt hot inbound row: %v", err)
+	}
+	if rows, err := res.RowsAffected(); err != nil || rows != 1 {
+		t.Fatalf("corrupt hot inbound rows affected = %d err=%v, want 1", rows, err)
+	}
 }

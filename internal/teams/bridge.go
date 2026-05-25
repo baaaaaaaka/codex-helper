@@ -27,20 +27,24 @@ import (
 )
 
 const (
-	pollCursorOverlap                    = 2 * time.Minute
-	fastPollInterval                     = time.Second
-	fastPollDuration                     = 90 * time.Second
-	ownerPollMessageTop                  = 20
-	outboxRecoveryMessageTop             = 20
-	transcriptSyncMinInterval            = 10 * time.Second
-	historyWatchSyncMinInterval          = 10 * time.Second
-	historyWatchReconcileInterval        = 5 * time.Minute
-	historyWatchRecentDays               = 3
-	historyTieredMaxTailBytes            = 512 * 1024
-	dashboardProjectsCacheTTL            = 30 * time.Second
-	persistentPollFailureRestartAfter    = 10 * time.Minute
-	persistentPollFailureRestartMinCount = 3
-	recentDuplicateSessionPromptWindow   = 3 * time.Minute
+	pollCursorOverlap                       = 2 * time.Minute
+	fastPollInterval                        = time.Second
+	fastPollDuration                        = 90 * time.Second
+	ownerPollMessageTop                     = 20
+	outboxRecoveryMessageTop                = 20
+	transcriptSyncMinInterval               = 10 * time.Second
+	historyWatchSyncMinInterval             = 10 * time.Second
+	historyWatchReconcileInterval           = 5 * time.Minute
+	historyWatchRecentDays                  = 3
+	historyTieredMaxTailBytes               = 512 * 1024
+	helperAutoUpdateStateRefreshInterval    = time.Minute
+	pendingCodexUpgradeStateRefreshInterval = time.Minute
+	pendingUpgradeBlockedRetryInterval      = 5 * time.Second
+	registryProjectionSaveMinInterval       = time.Minute
+	dashboardProjectsCacheTTL               = 30 * time.Second
+	persistentPollFailureRestartAfter       = 10 * time.Minute
+	persistentPollFailureRestartMinCount    = 3
+	recentDuplicateSessionPromptWindow      = 3 * time.Minute
 
 	// Automatic transcript sync is for small local Codex CLI catch-up. Large
 	// history import must stay explicit, otherwise helper startup can flood a
@@ -277,67 +281,73 @@ func (e *PersistentPollFailureError) Unwrap() error {
 }
 
 type Bridge struct {
-	graph                        *GraphClient
-	readGraph                    *GraphClient
-	fileGraph                    *GraphClient
-	httpClient                   *http.Client
-	registryPath                 string
-	reg                          Registry
-	regMu                        sync.Mutex
-	user                         User
-	scope                        teamstore.ScopeIdentity
-	machine                      teamstore.MachineRecord
-	lease                        teamstore.ControlLease
-	leaseDuration                time.Duration
-	out                          io.Writer
-	executor                     Executor
-	controlFallbackExecutor      Executor
-	controlFallbackModel         string
-	helperRestarter              HelperRestarter
-	helperPendingRestarter       HelperPendingRestarter
-	helperReloader               HelperReloader
-	helperAutoUpdater            HelperAutoUpdater
-	helperVersion                string
-	helperAutoUpdatePrerelease   bool
-	codexUpgrader                CodexUpgrader
-	controlFallbackHelpContext   string
-	store                        *teamstore.Store
-	asyncTurns                   bool
-	ownerMu                      sync.Mutex
-	owner                        teamstore.OwnerMetadata
-	ownerStaleAfter              time.Duration
-	ownerHeartbeatInterval       time.Duration
-	outboxFlushMu                sync.Mutex
-	pollMu                       sync.Mutex
-	fastPollUntil                time.Time
-	lastPollErrorLog             string
-	lastPollErrorLogAt           time.Time
-	persistentPollFailureFirstAt time.Time
-	persistentPollFailureCount   int
-	parkNoticeLookupMu           sync.Mutex
-	parkNoticeLookupPreferences  map[string]parkNoticeLookupPreference
-	lastTranscriptSync           time.Time
-	lastHistoryWatchSync         time.Time
-	lastHistoryWatchReconcile    time.Time
-	lastBeaconReconcile          time.Time
-	lastBeaconLeaseMaintenance   time.Time
-	maxWorkChatPollsPerCycle     int
-	maxQueuedTurnStartsPerCycle  int
-	dashboardProjectsMu          sync.Mutex
-	dashboardProjectsCache       []codexhistory.Project
-	dashboardProjectsCachedAt    time.Time
-	annotateUserMessages         bool
-	annotationDisabled           bool
-	annotationWarned             bool
-	markAnswerChatsUnread        bool
-	markAnswerUnreadWarned       bool
-	asyncTurnWG                  sync.WaitGroup
-	runningTurnMu                sync.Mutex
-	runningTurnCancels           map[string]*runningTurnCancel
-	acceptedOutboxMu             sync.Mutex
-	acceptedOutboxes             map[string]acceptedOutboxRecovery
-	deferredNoticeMu             sync.Mutex
-	deferredInterruptedPending   bool
+	graph                             *GraphClient
+	readGraph                         *GraphClient
+	fileGraph                         *GraphClient
+	httpClient                        *http.Client
+	registryPath                      string
+	reg                               Registry
+	regMu                             sync.Mutex
+	registryProjectionLastFingerprint string
+	registryProjectionLastSavedAt     time.Time
+	user                              User
+	scope                             teamstore.ScopeIdentity
+	machine                           teamstore.MachineRecord
+	lease                             teamstore.ControlLease
+	leaseDuration                     time.Duration
+	out                               io.Writer
+	executor                          Executor
+	controlFallbackExecutor           Executor
+	controlFallbackModel              string
+	helperRestarter                   HelperRestarter
+	helperPendingRestarter            HelperPendingRestarter
+	helperReloader                    HelperReloader
+	helperAutoUpdater                 HelperAutoUpdater
+	helperVersion                     string
+	helperAutoUpdatePrerelease        bool
+	helperAutoUpdateMu                sync.Mutex
+	helperAutoUpdateNextProbeAt       time.Time
+	pendingCodexUpgradeMu             sync.Mutex
+	pendingCodexUpgradeNextProbeAt    time.Time
+	codexUpgrader                     CodexUpgrader
+	controlFallbackHelpContext        string
+	store                             *teamstore.Store
+	asyncTurns                        bool
+	ownerMu                           sync.Mutex
+	owner                             teamstore.OwnerMetadata
+	ownerStaleAfter                   time.Duration
+	ownerHeartbeatInterval            time.Duration
+	outboxFlushMu                     sync.Mutex
+	pollMu                            sync.Mutex
+	fastPollUntil                     time.Time
+	lastPollErrorLog                  string
+	lastPollErrorLogAt                time.Time
+	persistentPollFailureFirstAt      time.Time
+	persistentPollFailureCount        int
+	parkNoticeLookupMu                sync.Mutex
+	parkNoticeLookupPreferences       map[string]parkNoticeLookupPreference
+	lastTranscriptSync                time.Time
+	lastHistoryWatchSync              time.Time
+	lastHistoryWatchReconcile         time.Time
+	lastBeaconReconcile               time.Time
+	lastBeaconLeaseMaintenance        time.Time
+	maxWorkChatPollsPerCycle          int
+	maxQueuedTurnStartsPerCycle       int
+	dashboardProjectsMu               sync.Mutex
+	dashboardProjectsCache            []codexhistory.Project
+	dashboardProjectsCachedAt         time.Time
+	annotateUserMessages              bool
+	annotationDisabled                bool
+	annotationWarned                  bool
+	markAnswerChatsUnread             bool
+	markAnswerUnreadWarned            bool
+	asyncTurnWG                       sync.WaitGroup
+	runningTurnMu                     sync.Mutex
+	runningTurnCancels                map[string]*runningTurnCancel
+	acceptedOutboxMu                  sync.Mutex
+	acceptedOutboxes                  map[string]acceptedOutboxRecovery
+	deferredNoticeMu                  sync.Mutex
+	deferredInterruptedPending        bool
 }
 
 type runningTurnCancel struct {
@@ -582,7 +592,36 @@ func (b *Bridge) findExistingControlChat(ctx context.Context, topic string) (Cha
 func (b *Bridge) Save() error {
 	b.regMu.Lock()
 	defer b.regMu.Unlock()
-	return SaveRegistry(b.registryPath, b.reg)
+	data, err := json.Marshal(b.reg)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	fingerprint := hex.EncodeToString(sum[:])
+	now := time.Now()
+	if fingerprint == b.registryProjectionLastFingerprint &&
+		!b.registryProjectionLastSavedAt.IsZero() &&
+		now.Sub(b.registryProjectionLastSavedAt) < registryProjectionSaveMinInterval {
+		path := strings.TrimSpace(b.registryPath)
+		if path == "" {
+			var pathErr error
+			path, pathErr = DefaultRegistryPath()
+			if pathErr != nil {
+				return pathErr
+			}
+		}
+		if info, statErr := os.Stat(path); statErr == nil && !info.ModTime().After(b.registryProjectionLastSavedAt) {
+			return nil
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+	}
+	if err := SaveRegistry(b.registryPath, b.reg); err != nil {
+		return err
+	}
+	b.registryProjectionLastFingerprint = fingerprint
+	b.registryProjectionLastSavedAt = time.Now()
+	return nil
 }
 
 func (b *Bridge) markRegistrySent(chatID string, messageID string) {
@@ -743,9 +782,6 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 			b.clearOwnerIfSame(context.Background())
 			return b.runStandbyLoop(ctx, opts)
 		}
-		if err := b.recordCurrentOwnerHeartbeat(ctx); err != nil {
-			return err
-		}
 		if err := b.flushPendingOutboxMainLoop(ctx); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
@@ -878,6 +914,88 @@ func (b *Bridge) nextPollInterval(base time.Duration, now time.Time) time.Durati
 		return fastPollInterval
 	}
 	return base
+}
+
+func (b *Bridge) helperAutoUpdateProbeDue(now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.helperAutoUpdateMu.Lock()
+	defer b.helperAutoUpdateMu.Unlock()
+	return b.helperAutoUpdateNextProbeAt.IsZero() || !now.Before(b.helperAutoUpdateNextProbeAt)
+}
+
+func (b *Bridge) clearHelperAutoUpdateProbeGate() {
+	if b == nil {
+		return
+	}
+	b.helperAutoUpdateMu.Lock()
+	b.helperAutoUpdateNextProbeAt = time.Time{}
+	b.helperAutoUpdateMu.Unlock()
+}
+
+func (b *Bridge) scheduleHelperAutoUpdateProbe(now time.Time, candidates ...time.Time) {
+	if b == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	next := now.Add(helperAutoUpdateStateRefreshInterval)
+	for _, candidate := range candidates {
+		if candidate.IsZero() {
+			continue
+		}
+		if !candidate.After(now) {
+			next = now
+			break
+		}
+		if candidate.Before(next) {
+			next = candidate
+		}
+	}
+	b.helperAutoUpdateMu.Lock()
+	b.helperAutoUpdateNextProbeAt = next
+	b.helperAutoUpdateMu.Unlock()
+}
+
+func (b *Bridge) pendingCodexUpgradeProbeDue(now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.pendingCodexUpgradeMu.Lock()
+	defer b.pendingCodexUpgradeMu.Unlock()
+	return b.pendingCodexUpgradeNextProbeAt.IsZero() || !now.Before(b.pendingCodexUpgradeNextProbeAt)
+}
+
+func (b *Bridge) clearPendingCodexUpgradeProbeGate() {
+	if b == nil {
+		return
+	}
+	b.pendingCodexUpgradeMu.Lock()
+	b.pendingCodexUpgradeNextProbeAt = time.Time{}
+	b.pendingCodexUpgradeMu.Unlock()
+}
+
+func (b *Bridge) schedulePendingCodexUpgradeProbe(now time.Time, delay time.Duration) {
+	if b == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if delay <= 0 {
+		delay = pendingCodexUpgradeStateRefreshInterval
+	}
+	b.pendingCodexUpgradeMu.Lock()
+	b.pendingCodexUpgradeNextProbeAt = now.Add(delay)
+	b.pendingCodexUpgradeMu.Unlock()
 }
 
 func (b *Bridge) pollOnce(ctx context.Context, top int) error {
@@ -3716,7 +3834,7 @@ func (b *Bridge) completeExpiredHelperUpgradeDrainOnStart(ctx context.Context) e
 	if b == nil || b.store == nil {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.UpgradeBlockingStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -4130,7 +4248,7 @@ func (b *Bridge) queueCompletedHelperUpgradeNoticeIfNeeded(ctx context.Context) 
 	if !ok || req.Phase != teamstore.UpgradePhaseCompleted || strings.TrimSpace(req.Reason) != teamstore.HelperUpgradeReason {
 		return false, nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.UpgradeBlockingStateSnapshot(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -4525,12 +4643,15 @@ func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOption
 		return nil
 	}
 	now := time.Now()
-	state, err := b.store.Load(ctx)
+	if !b.helperAutoUpdateProbeDue(now) {
+		return nil
+	}
+	auto, control, err := b.store.ReadAutoUpdateControl(ctx)
 	if err != nil {
 		return err
 	}
-	auto := state.AutoUpdate
-	if state.ServiceControl.Draining && state.ServiceControl.Reason == teamstore.HelperUpgradeReason && strings.TrimSpace(auto.CandidateTag) != "" {
+	if control.Draining && control.Reason == teamstore.HelperUpgradeReason && strings.TrimSpace(auto.CandidateTag) != "" {
+		b.clearHelperAutoUpdateProbeGate()
 		return b.applyHelperAutoUpdateWhenDrained(ctx, opts, HelperAutoUpdateCandidate{
 			TagName:     auto.CandidateTag,
 			Version:     auto.CandidateVersion,
@@ -4541,9 +4662,11 @@ func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOption
 		})
 	}
 	if auto.BackoffUntil.After(now) {
+		b.scheduleHelperAutoUpdateProbe(now, auto.BackoffUntil, auto.NextCheckAt)
 		return nil
 	}
 	if auto.NextCheckAt.After(now) {
+		b.scheduleHelperAutoUpdateProbe(now, auto.NextCheckAt)
 		return nil
 	}
 	decision, err := opts.HelperAutoUpdater.Check(ctx, HelperAutoUpdateCheck{
@@ -4561,6 +4684,7 @@ func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOption
 		if recordErr != nil {
 			return recordErr
 		}
+		b.scheduleHelperAutoUpdateProbe(now, now.Add(30*time.Minute))
 		return err
 	}
 	record := teamstore.AutoUpdateRecord{
@@ -4584,8 +4708,10 @@ func (b *Bridge) maybeRunHelperAutoUpdate(ctx context.Context, opts BridgeOption
 		return err
 	}
 	if decision.Candidate == nil {
+		b.scheduleHelperAutoUpdateProbe(now, record.BackoffUntil, record.NextCheckAt)
 		return nil
 	}
+	b.clearHelperAutoUpdateProbeGate()
 	return b.applyHelperAutoUpdateWhenDrained(ctx, opts, *decision.Candidate)
 }
 
@@ -4600,10 +4726,12 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 	req, err := b.store.BeginUpgrade(ctx, teamstore.HelperUpgradeReason, 10*time.Minute)
 	if err != nil {
 		if errors.Is(err, teamstore.ErrUpgradeInProgress) {
+			b.clearHelperAutoUpdateProbeGate()
 			return nil
 		}
 		return err
 	}
+	b.clearHelperAutoUpdateProbeGate()
 	if applyOpts.Manual {
 		chatID := strings.TrimSpace(firstNonEmptyString(applyOpts.ControlChatID, b.reg.ControlChatID))
 		if chatID != "" {
@@ -4787,6 +4915,7 @@ func (b *Bridge) requestCodexUpgradeAfterFailure(ctx context.Context, session *S
 	if err != nil && !errors.Is(err, teamstore.ErrUpgradeInProgress) {
 		return err
 	}
+	b.clearPendingCodexUpgradeProbeGate()
 	if err == nil {
 		if _, targetErr := b.store.AddUpgradeNotificationTarget(ctx, req.ID, teamstore.UpgradeNotificationTarget{
 			SessionID:   sessionID,
@@ -4804,19 +4933,29 @@ func (b *Bridge) maybeRunPendingCodexUpgrade(ctx context.Context) error {
 	if b == nil || b.store == nil || b.codexUpgrader == nil {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	now := time.Now()
+	if !b.pendingCodexUpgradeProbeDue(now) {
+		return nil
+	}
+	req, ok, err := b.store.ReadUpgrade(ctx)
 	if err != nil {
 		return err
 	}
-	if state.Upgrade == nil || state.Upgrade.ID == "" || state.Upgrade.Reason != teamstore.CodexUpgradeReason {
+	if !ok || req.ID == "" || req.Reason != teamstore.CodexUpgradeReason {
+		b.schedulePendingCodexUpgradeProbe(now, pendingCodexUpgradeStateRefreshInterval)
 		return nil
 	}
-	req := *state.Upgrade
 	switch req.Phase {
 	case teamstore.UpgradePhaseCompleted, teamstore.UpgradePhaseAborted:
+		b.schedulePendingCodexUpgradeProbe(now, pendingCodexUpgradeStateRefreshInterval)
 		return nil
 	}
-	if teamstore.HasUpgradeBlockingWork(state, time.Now()) {
+	blockingState, err := b.store.UpgradeBlockingStateSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if teamstore.HasUpgradeBlockingWork(blockingState, now) {
+		b.schedulePendingCodexUpgradeProbe(now, pendingUpgradeBlockedRetryInterval)
 		return nil
 	}
 	if req.Phase == teamstore.UpgradePhaseDraining {
@@ -4829,6 +4968,7 @@ func (b *Bridge) maybeRunPendingCodexUpgrade(ctx context.Context) error {
 	result, err := b.codexUpgrader(ctx)
 	if err != nil {
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
+		b.schedulePendingCodexUpgradeProbe(now, pendingCodexUpgradeStateRefreshInterval)
 		_ = b.sendControl(context.Background(), "⚠️ Codex CLI upgrade failed\n\n"+err.Error())
 		if targetErr := b.notifyCodexUpgradeTargets(context.Background(), req.NotificationTargets, false, "", err); targetErr != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams Codex upgrade target notification error: %v\n", targetErr)
@@ -4839,6 +4979,7 @@ func (b *Bridge) maybeRunPendingCodexUpgrade(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	b.schedulePendingCodexUpgradeProbe(now, pendingCodexUpgradeStateRefreshInterval)
 	body := "✅ Codex CLI upgraded."
 	if strings.TrimSpace(result.Path) != "" {
 		body += "\n\nPath: `" + strings.TrimSpace(result.Path) + "`"
@@ -9322,7 +9463,7 @@ func (b *Bridge) drainComplete(ctx context.Context) (bool, error) {
 	if !control.Draining {
 		return false, nil
 	}
-	state, err := b.store.Load(ctx)
+	state, err := b.store.UpgradeBlockingStateSnapshot(ctx)
 	if err != nil {
 		return false, err
 	}

@@ -226,6 +226,29 @@ func TestWorkflowNotificationFlushInvalidPendingDoesNotLoadHotSQLiteTables(t *te
 	}
 }
 
+func TestWorkflowNotificationFlushEnabledNoPendingSkipsWebhookSecretRead(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	bridge.reg.ControlChatID = "control-chat"
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{TeamsChatID: "control-chat"}
+		state.Workflow = teamstore.WorkflowNotificationConfig{
+			Enabled:               true,
+			ControlChatID:         "control-chat",
+			ControlWebhookURLFile: filepath.Join(t.TempDir(), "missing-webhook-url"),
+			UpdatedAt:             time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed workflow config: %v", err)
+	}
+	if err := bridge.flushPendingWorkflowNotificationsWithLimit(ctx, 1); err != nil {
+		t.Fatalf("flush with no pending notifications should not read missing webhook secret: %v", err)
+	}
+}
+
 func TestWorkflowNotificationSendsManualHelperUpgradeCard(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)

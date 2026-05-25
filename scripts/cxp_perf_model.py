@@ -436,6 +436,8 @@ BENCH_TARGETS = {
     "sqlite-history-watch-active": "BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles",
     "sqlite-legacy-linked-transcript-backfilled-idle": "BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles",
     "sqlite-invalid-workflow-notification-idle": "BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles",
+    "sqlite-helper-auto-update-not-due": "BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles",
+    "sqlite-codex-upgrade-no-pending": "BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles",
     "sqlite-pending-workflow-notifications": "BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles",
     "listen-once": "BenchmarkCXPPerfModelListenOnceProfiles",
     "external": "BenchmarkCXPPerfModelExternalScenarios",
