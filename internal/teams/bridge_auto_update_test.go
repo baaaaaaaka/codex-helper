@@ -1270,6 +1270,11 @@ func newBridgeAutoUpdateTest(t *testing.T) (*teamstore.Store, *Bridge) {
 	if err != nil {
 		t.Fatalf("Open store: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("Close store: %v", err)
+		}
+	})
 	bridge := &Bridge{store: st}
 	return st, bridge
 }
