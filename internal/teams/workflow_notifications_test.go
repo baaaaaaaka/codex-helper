@@ -249,6 +249,26 @@ func TestWorkflowNotificationFlushEnabledNoPendingSkipsWebhookSecretRead(t *test
 	}
 }
 
+func TestWorkflowNotificationFlushNoPendingSkipsSidecarConfigRead(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	path, err := WorkflowNotificationConfigFilePathForScope(bridge.scope.ID)
+	if err != nil {
+		t.Fatalf("WorkflowNotificationConfigFilePathForScope: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir workflow sidecar dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"enabled":`), 0o600); err != nil {
+		t.Fatalf("write invalid workflow sidecar config: %v", err)
+	}
+	if err := bridge.flushPendingWorkflowNotificationsWithLimit(ctx, 1); err != nil {
+		t.Fatalf("flush with no pending notifications should not read invalid sidecar config: %v", err)
+	}
+}
+
 func TestWorkflowNotificationSendsManualHelperUpgradeCard(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)

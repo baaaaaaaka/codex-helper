@@ -892,12 +892,18 @@ func (e *OwnerConflictError) Is(target error) bool {
 }
 
 type Store struct {
-	path          string
-	mu            sync.Mutex
-	lock          *flock.Flock
-	messageLookup messageLookupCache
-	sqliteDB      *sql.DB
-	sqliteDBPath  string
+	path                 string
+	mu                   sync.Mutex
+	lock                 *flock.Flock
+	messageLookup        messageLookupCache
+	sqliteDB             *sql.DB
+	sqliteDBPath         string
+	sqlitePointerCached  bool
+	sqlitePointerTrusted bool
+	sqlitePointer        storeSQLitePointer
+	sqlitePointerSize    int64
+	sqlitePointerMod     time.Time
+	sqlitePointerChange  int64
 }
 
 func DefaultPath() (string, error) {
@@ -4353,6 +4359,7 @@ func (s *Store) loadUnlocked() (State, error) {
 	}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
+		s.clearSQLitePointerCacheUnlocked()
 		state := newState()
 		return state, nil
 	}
@@ -4360,10 +4367,17 @@ func (s *Store) loadUnlocked() (State, error) {
 		return State{}, err
 	}
 	if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+		s.clearSQLitePointerCacheUnlocked()
 		return State{}, err
 	} else if ok {
+		if info, statErr := os.Stat(s.path); statErr == nil {
+			s.cacheSQLitePointerUnlocked(pointer, info, false)
+		} else {
+			s.clearSQLitePointerCacheUnlocked()
+		}
 		return s.loadSQLiteStateUnlocked(pointer)
 	}
+	s.clearSQLitePointerCacheUnlocked()
 	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
 		return State{}, err
 	} else if ok {

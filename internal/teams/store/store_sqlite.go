@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -281,22 +282,28 @@ func stateSchemaVersionFromData(data []byte) (int, bool) {
 func (s *Store) currentSQLitePointerUnlocked() (storeSQLitePointer, bool, error) {
 	info, err := os.Stat(s.path)
 	if errors.Is(err, os.ErrNotExist) {
+		s.clearSQLitePointerCacheUnlocked()
 		return storeSQLitePointer{}, false, nil
 	}
 	if err != nil {
 		return storeSQLitePointer{}, false, err
 	}
+	if pointer, ok := s.cachedSQLitePointerUnlocked(info); ok {
+		return pointer, true, nil
+	}
+	s.clearSQLitePointerCacheUnlocked()
 	if info.Size() > maxStatePointerSize {
 		return storeSQLitePointer{}, false, nil
 	}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
+		s.clearSQLitePointerCacheUnlocked()
 		return storeSQLitePointer{}, false, nil
 	}
 	if err != nil {
 		return storeSQLitePointer{}, false, err
 	}
-	return storeSQLitePointerFromData(data)
+	return s.sqlitePointerFromDataUnlocked(data, info)
 }
 
 func (s *Store) writeSQLitePointerUnlocked(pointer storeSQLitePointer) error {
@@ -311,7 +318,129 @@ func (s *Store) writeSQLitePointerUnlocked(pointer storeSQLitePointer) error {
 		return err
 	}
 	data = append(data, '\n')
-	return atomicWriteFile(s.path, data, fileMode)
+	if err := atomicWriteFile(s.path, data, fileMode); err != nil {
+		return err
+	}
+	if info, err := os.Stat(s.path); err == nil {
+		s.cacheSQLitePointerUnlocked(pointer, info, false)
+	} else {
+		s.clearSQLitePointerCacheUnlocked()
+	}
+	return nil
+}
+
+func (s *Store) cacheSQLitePointerUnlocked(pointer storeSQLitePointer, info os.FileInfo, trusted bool) {
+	s.sqlitePointer = pointer
+	s.sqlitePointerCached = true
+	s.sqlitePointerTrusted = trusted
+	s.sqlitePointerSize = info.Size()
+	s.sqlitePointerMod = info.ModTime()
+	s.sqlitePointerChange = fileInfoChangeTimeUnixNano(info)
+}
+
+func (s *Store) cachedSQLitePointerUnlocked(info os.FileInfo) (storeSQLitePointer, bool) {
+	if !s.sqlitePointerCached {
+		return storeSQLitePointer{}, false
+	}
+	if !s.sqlitePointerTrusted {
+		return storeSQLitePointer{}, false
+	}
+	if info.Size() != s.sqlitePointerSize || !info.ModTime().Equal(s.sqlitePointerMod) {
+		return storeSQLitePointer{}, false
+	}
+	if change := fileInfoChangeTimeUnixNano(info); change != 0 || s.sqlitePointerChange != 0 {
+		if change == 0 || s.sqlitePointerChange == 0 || change != s.sqlitePointerChange {
+			return storeSQLitePointer{}, false
+		}
+	}
+	return s.sqlitePointer, true
+}
+
+func (s *Store) sqlitePointerFromDataUnlocked(data []byte, info os.FileInfo) (storeSQLitePointer, bool, error) {
+	pointer, ok, err := storeSQLitePointerFromData(data)
+	if err != nil || !ok {
+		return pointer, ok, err
+	}
+	s.cacheSQLitePointerUnlocked(pointer, info, true)
+	return pointer, true, nil
+}
+
+func (s *Store) clearSQLitePointerCacheUnlocked() {
+	s.sqlitePointer = storeSQLitePointer{}
+	s.sqlitePointerCached = false
+	s.sqlitePointerTrusted = false
+	s.sqlitePointerSize = 0
+	s.sqlitePointerMod = time.Time{}
+	s.sqlitePointerChange = 0
+}
+
+func fileInfoChangeTimeUnixNano(info os.FileInfo) int64 {
+	if info == nil || info.Sys() == nil {
+		return 0
+	}
+	v := reflect.ValueOf(info.Sys())
+	if !v.IsValid() {
+		return 0
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return 0
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return 0
+	}
+	for _, fieldName := range []string{"Ctim", "Ctimespec"} {
+		ts := v.FieldByName(fieldName)
+		if unixNano, ok := reflectedTimespecUnixNano(ts); ok {
+			return unixNano
+		}
+	}
+	return 0
+}
+
+func reflectedTimespecUnixNano(v reflect.Value) (int64, bool) {
+	if !v.IsValid() {
+		return 0, false
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return 0, false
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	sec, ok := reflectedInt64Field(v, "Sec")
+	if !ok {
+		return 0, false
+	}
+	nsec, ok := reflectedInt64Field(v, "Nsec")
+	if !ok {
+		return 0, false
+	}
+	return sec*int64(time.Second) + nsec, true
+}
+
+func reflectedInt64Field(v reflect.Value, name string) (int64, bool) {
+	field := v.FieldByName(name)
+	if !field.IsValid() {
+		return 0, false
+	}
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return field.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		value := field.Uint()
+		if value > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(value), true
+	default:
+		return 0, false
+	}
 }
 
 func (s *Store) storeSQLitePath(pointer storeSQLitePointer) (string, error) {

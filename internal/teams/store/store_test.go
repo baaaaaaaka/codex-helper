@@ -9162,6 +9162,97 @@ func withSQLiteMigrationTestHook(t *testing.T, hook func(stage string) error) {
 	})
 }
 
+func TestSQLitePointerCacheRefreshesWhenPointerFileChanges(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-chat"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	result := migrateStoreToSQLiteForTest(t, store)
+	if _, err := store.Load(ctx); err != nil {
+		t.Fatalf("initial cached sqlite load: %v", err)
+	}
+	if !store.sqlitePointerCached {
+		t.Fatal("sqlite pointer was not cached after migration/load")
+	}
+	if result.Path == "" {
+		t.Fatal("migration did not return sqlite path")
+	}
+
+	writeRawStoreStateForTest(t, store, []byte(`{"storage_backend":`+"\n"))
+	err := store.withStateLock(ctx, func() error {
+		_, ok, err := store.currentSQLitePointerUnlocked()
+		if ok {
+			t.Fatal("currentSQLitePointerUnlocked ok = true after pointer file changed to invalid JSON")
+		}
+		if err != nil {
+			t.Fatalf("currentSQLitePointerUnlocked error = %v, want invalid JSON treated as non-pointer", err)
+		}
+		if store.sqlitePointerCached {
+			t.Fatal("sqlite pointer cache was not cleared after pointer file changed")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withStateLock: %v", err)
+	}
+}
+
+func TestSQLitePointerCacheRevalidatesAfterLoadBeforeHotPath(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+	if _, err := store.Load(ctx); err != nil {
+		t.Fatalf("initial sqlite load: %v", err)
+	}
+	if !store.sqlitePointerCached {
+		t.Fatal("sqlite pointer was not cached after load")
+	}
+	if store.sqlitePointerTrusted {
+		t.Fatal("sqlite pointer cache should require hot-path revalidation after load")
+	}
+
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read sqlite pointer: %v", err)
+	}
+	var pointer map[string]any
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		t.Fatalf("unmarshal sqlite pointer: %v", err)
+	}
+	unsupportedSchemaVersion := storeSQLitePointerSchemaVersion + 1
+	pointer["schema_version"] = unsupportedSchemaVersion
+	data, err = json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("marshal sqlite pointer: %v", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(store.Path(), data, 0o600); err != nil {
+		t.Fatalf("write unsupported sqlite pointer: %v", err)
+	}
+
+	err = store.withStateLock(ctx, func() error {
+		_, ok, err := store.currentSQLitePointerUnlocked()
+		if ok {
+			t.Fatal("currentSQLitePointerUnlocked ok = true after same-size unsupported pointer rewrite")
+		}
+		if !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(unsupportedSchemaVersion)) {
+			t.Fatalf("currentSQLitePointerUnlocked error = %v, want unsupported schema %d", err, unsupportedSchemaVersion)
+		}
+		if store.sqlitePointerCached {
+			t.Fatal("sqlite pointer cache was not cleared after unsupported pointer rewrite")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withStateLock: %v", err)
+	}
+}
+
 func migrateStoreToSQLiteForTest(t *testing.T, store *Store) StoreSQLiteMigrationResult {
 	t.Helper()
 	result, err := store.MigrateLargeStateToSQLite(context.Background(), 0)

@@ -740,6 +740,28 @@ func BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles(b *t
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteWorkflowNotificationNoPendingFlushProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			graph := newCXPPerfGraph(profile)
+			bridge := newCXPPerfBridge(store, graph, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			cxpPerfEnableWorkflowNotifications(b, bridge)
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := bridge.flushPendingWorkflowNotificationsWithLimit(ctx, mainLoopWorkflowFlushMaxNotifications); err != nil {
+					b.Fatalf("workflow notification no-pending flush: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications(t *testing.T) {
 	profile := cxpPerfProfileByNameForTest(t, "many-long-chats")
 	profile.MessagesPerPoll = 0
@@ -843,6 +865,15 @@ func BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles(b *testin
 				for i := 0; i < b.N; i++ {
 					if _, err := store.PendingWorkflowNotifications(ctx); err != nil {
 						b.Fatalf("pending workflow notifications: %v", err)
+					}
+				}
+			})
+			b.Run("has-pending-workflow-notifications", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := store.HasPendingWorkflowNotifications(ctx); err != nil {
+						b.Fatalf("has pending workflow notifications: %v", err)
 					}
 				}
 			})

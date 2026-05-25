@@ -696,6 +696,13 @@ func (b *Bridge) flushPendingWorkflowNotificationsWithLimit(ctx context.Context,
 	if b == nil || b.store == nil {
 		return nil
 	}
+	hasPending, err := b.store.HasPendingWorkflowNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	if !hasPending {
+		return nil
+	}
 	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		return err

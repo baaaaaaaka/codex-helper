@@ -436,9 +436,11 @@ BENCH_TARGETS = {
     "sqlite-history-watch-active": "BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles",
     "sqlite-legacy-linked-transcript-backfilled-idle": "BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles",
     "sqlite-invalid-workflow-notification-idle": "BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles",
+    "sqlite-workflow-no-pending-flush": "BenchmarkCXPPerfModelSQLiteWorkflowNotificationNoPendingFlushProfiles",
     "sqlite-helper-auto-update-not-due": "BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles",
     "sqlite-codex-upgrade-no-pending": "BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles",
     "sqlite-pending-workflow-notifications": "BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles",
+    "sqlite-has-pending-workflow-notifications": "BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles",
     "listen-once": "BenchmarkCXPPerfModelListenOnceProfiles",
     "external": "BenchmarkCXPPerfModelExternalScenarios",
 }
@@ -454,6 +456,10 @@ def bench_regex(target: str, profile_name: str, scenario_name: str) -> str:
         if profile_name == "all":
             return f"{prefix}/.*/pending-workflow-notifications$"
         return f"{prefix}/{profile_name}/pending-workflow-notifications$"
+    if target == "sqlite-has-pending-workflow-notifications":
+        if profile_name == "all":
+            return f"{prefix}/.*/has-pending-workflow-notifications$"
+        return f"{prefix}/{profile_name}/has-pending-workflow-notifications$"
     if profile_name == "all":
         return prefix
     return f"{prefix}/{profile_name}$"
