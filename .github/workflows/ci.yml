@@ -362,6 +362,8 @@ jobs:
           go test ./internal/teams -count=1 -run "$sqlite_bridge_pattern" -v
           go test ./internal/teams -count=1 -run "$sqlite_perf_pattern" -v
           go test ./internal/teams -count=1 -run 'TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications$' -v
+          go test ./internal/teams -count=1 -run 'Test(BridgeSyncLinkedTranscriptLegacyBackfillPreservesDedupeWindow|BridgeSyncLinkedTranscriptsBackfillsLegacyCheckpoint(Metadata|ThenImportsTail)|FindTranscriptCheckpointPositionSupportsFallbackCheckpoint)$' -v
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles/light-user$' -benchtime=1x -count=1 -benchmem
 
       - name: Teams Codex runner classification regressions
         shell: bash

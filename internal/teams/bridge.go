@@ -12968,7 +12968,7 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 			if linkedTranscriptCheckpointIdleUnchanged(local.FilePath, checkpoint) {
 				continue
 			}
-			if err := b.syncSessionTranscript(ctx, session, local); err != nil {
+			if err := b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, checkpoint, true); err != nil {
 				return err
 			}
 			continue
@@ -13002,7 +13002,7 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 		if info, err := os.Stat(local.FilePath); err != nil || info.IsDir() {
 			continue
 		}
-		if err := b.syncSessionTranscript(ctx, session, local); err != nil {
+		if err := b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, teamstore.ImportCheckpoint{}, false); err != nil {
 			return err
 		}
 	}
@@ -13103,18 +13103,30 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 }
 
 func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, local codexhistory.Session) error {
-	checkpointID := transcriptCheckpointID(session.ID)
-	state, err := b.store.Load(ctx)
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	state, err := b.store.TranscriptImportStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if runningTurnSessions(state)[session.ID] {
+	activeTeamsTurns, err := b.store.RunningTurnSessionIDs(ctx)
+	if err != nil {
+		return err
+	}
+	if activeTeamsTurns[session.ID] {
 		return nil
 	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint, hasCheckpoint := state.ImportCheckpoints[checkpointID]
+	return b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, checkpoint, hasCheckpoint)
+}
+
+func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session Session, local codexhistory.Session, state teamstore.State, checkpoint teamstore.ImportCheckpoint, hasCheckpoint bool) error {
+	checkpointID := transcriptCheckpointID(session.ID)
 	if err := b.maybeUpdateWorkChatTitleFromLocalSession(ctx, &session, local); err != nil {
 		return err
 	}
-	checkpoint, hasCheckpoint := state.ImportCheckpoints[checkpointID]
 	if hasCheckpoint {
 		switch checkpoint.Status {
 		case importCheckpointStatusImporting:
@@ -13152,6 +13164,18 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		last := transcript.Records[len(transcript.Records)-1]
 		return b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset)
 	}
+	if hasCheckpoint && linkedTranscriptCheckpointNeedsPositionBackfill(checkpoint, local.FilePath) {
+		updated, ok, err := b.backfillLinkedTranscriptCheckpointPosition(ctx, session, local, checkpoint)
+		if err != nil {
+			return err
+		}
+		if ok {
+			checkpoint = updated
+			if linkedTranscriptCheckpointIdleUnchanged(local.FilePath, checkpoint) {
+				return nil
+			}
+		}
+	}
 	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, local.SessionID, session.CodexThreadID)
 	if err != nil {
 		return err
@@ -13166,6 +13190,22 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 		return err
 	} else if advanced {
 		return nil
+	}
+	state, err = b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if runningTurnSessions(state)[session.ID] {
+		return nil
+	}
+	if current := state.ImportCheckpoints[checkpointID]; strings.TrimSpace(current.LastRecordID) != "" {
+		switch current.Status {
+		case importCheckpointStatusImporting, importCheckpointStatusFailed:
+			return nil
+		}
+		if strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) {
+			return nil
+		}
 	}
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	teamsOriginDisplays := teamsOriginDisplayTexts(state, session.ID)
@@ -13303,6 +13343,79 @@ func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportC
 		return false
 	}
 	return info.Size() == checkpoint.SourceSize && info.ModTime().Equal(checkpoint.SourceModTime)
+}
+
+func linkedTranscriptCheckpointNeedsPositionBackfill(checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
+	if checkpoint.Status != importCheckpointStatusComplete {
+		return false
+	}
+	sourcePath = strings.TrimSpace(firstNonEmptyString(sourcePath, checkpoint.SourcePath))
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" || sourcePath == "" {
+		return false
+	}
+	if transcriptImportCheckpointNeedsBudgetedResume(checkpoint, sourcePath) {
+		return false
+	}
+	return checkpoint.LastOffset <= 0 || checkpoint.SourceSize <= 0 || checkpoint.SourceModTime.IsZero()
+}
+
+func (b *Bridge) backfillLinkedTranscriptCheckpointPosition(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) (teamstore.ImportCheckpoint, bool, error) {
+	sourcePath := strings.TrimSpace(firstNonEmptyString(local.FilePath, checkpoint.SourcePath))
+	if sourcePath == "" {
+		return checkpoint, false, nil
+	}
+	position, ok, err := findTranscriptCheckpointPosition(sourcePath, checkpoint.LastRecordID)
+	if err != nil || !ok {
+		return checkpoint, ok, err
+	}
+	updated := checkpoint
+	if strings.TrimSpace(updated.ID) == "" {
+		updated.ID = transcriptCheckpointID(session.ID)
+	}
+	if strings.TrimSpace(updated.SessionID) == "" {
+		updated.SessionID = session.ID
+	}
+	updated.SourcePath = sourcePath
+	updated.LastSourceLine = position.Line
+	updated.LastOffset = position.Offset
+	updated.SourceSize = position.SourceSize
+	updated.SourceModTime = position.SourceModTime
+	if strings.TrimSpace(updated.Status) == "" {
+		updated.Status = importCheckpointStatusComplete
+	}
+	applied := false
+	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+		current := state.ImportCheckpoints[updated.ID]
+		if strings.TrimSpace(current.LastRecordID) != "" && strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) {
+			updated = current
+			return nil
+		}
+		if current.LastOffset == updated.LastOffset &&
+			current.SourceSize == updated.SourceSize &&
+			current.SourceModTime.Equal(updated.SourceModTime) &&
+			current.LastSourceLine == updated.LastSourceLine {
+			updated = current
+			applied = true
+			return nil
+		}
+		if strings.TrimSpace(current.ID) != "" {
+			updated.UpdatedAt = current.UpdatedAt
+			if strings.TrimSpace(updated.ImportTurnID) == "" {
+				updated.ImportTurnID = current.ImportTurnID
+			}
+			if strings.TrimSpace(updated.KindPrefix) == "" {
+				updated.KindPrefix = current.KindPrefix
+			}
+		} else {
+			updated.UpdatedAt = checkpoint.UpdatedAt
+		}
+		state.ImportCheckpoints[updated.ID] = updated
+		applied = true
+		return nil
+	}); err != nil {
+		return checkpoint, false, err
+	}
+	return updated, applied, nil
 }
 
 func linkedTranscriptCheckpointIdleUnchanged(filePath string, checkpoint teamstore.ImportCheckpoint) bool {

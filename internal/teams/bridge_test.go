@@ -17556,6 +17556,81 @@ func TestBridgeSyncLinkedTranscriptSkipsFinalAlreadySentLiveBeforeCheckpoint(t *
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptLegacyBackfillPreservesDedupeWindow(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-final-legacy"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-final-legacy", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-final-legacy")
+	finalText := "legacy checkpoint final already sent live"
+	updated := initial + `{"id":"a-live-final","role":"assistant","text":` + strconv.Quote(finalText) + `}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+	oldCheckpointAt := time.Date(2026, 5, 22, 3, 0, 0, 0, time.UTC)
+	sentAt := oldCheckpointAt.Add(20 * time.Minute)
+	turnID := "turn-live-final-legacy"
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		checkpoint.LastOffset = 0
+		checkpoint.SourceSize = 0
+		checkpoint.SourceModTime = time.Time{}
+		checkpoint.UpdatedAt = oldCheckpointAt
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = checkpoint
+		state.Turns[turnID] = teamstore.Turn{
+			ID:          turnID,
+			SessionID:   session.ID,
+			Status:      teamstore.TurnStatusCompleted,
+			StartedAt:   sentAt.Add(-20 * time.Minute),
+			CompletedAt: sentAt,
+			CreatedAt:   sentAt.Add(-20 * time.Minute),
+			UpdatedAt:   sentAt,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy checkpoint and final turn: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:legacy-live-final-before-checkpoint",
+		SessionID:      session.ID,
+		TurnID:         turnID,
+		TeamsChatID:    session.ChatID,
+		Kind:           "final",
+		Body:           finalText,
+		SourceTextHash: normalizedTextHash(finalText),
+		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-legacy-live-final",
+		CreatedAt:      sentAt,
+		UpdatedAt:      sentAt,
+		SentAt:         sentAt,
+	}); err != nil {
+		t.Fatalf("QueueOutbox legacy live final error: %v", err)
+	}
+	*sent = nil
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync legacy final transcript error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("legacy backfill replayed live final: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "a-live-final" {
+		t.Fatalf("checkpoint = %#v, want advanced past deduped live final", checkpoint)
+	}
+}
+
 func TestKnownTranscriptOutboxDedupeStressCompactCountsOldLiveBeforeCheckpoint(t *testing.T) {
 	now := time.Date(2026, 5, 22, 3, 30, 0, 0, time.UTC)
 	turnID := "turn-live-compact"
@@ -19029,6 +19104,123 @@ func TestLinkedTranscriptCheckpointIdleUnchangedOnlySkipsSafeCompleteEOF(t *test
 				t.Fatalf("%s checkpoint was incorrectly treated as idle unchanged", tc.name)
 			}
 		})
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptsBackfillsLegacyCheckpointMetadata(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	legacyUpdatedAt := time.Date(2026, 5, 23, 9, 0, 0, 0, time.UTC)
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID:             checkpointID,
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "old",
+			LastSourceLine: 1,
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      legacyUpdatedAt,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy checkpoint: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync legacy checkpoint: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("legacy metadata backfill should not send transcript output: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID != "old" || checkpoint.LastOffset != info.Size() || checkpoint.SourceSize != info.Size() || checkpoint.SourceModTime.IsZero() {
+		t.Fatalf("backfilled checkpoint = %#v, want old at EOF size %d", checkpoint, info.Size())
+	}
+	backfilledUpdatedAt := checkpoint.UpdatedAt
+	if !backfilledUpdatedAt.Equal(legacyUpdatedAt) {
+		t.Fatalf("backfilled checkpoint updated_at = %v, want preserved %v", backfilledUpdatedAt, legacyUpdatedAt)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("repeat legacy checkpoint sync: %v", err)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load repeat state: %v", err)
+	}
+	if got := state.ImportCheckpoints[checkpointID].UpdatedAt; !got.Equal(backfilledUpdatedAt) {
+		t.Fatalf("repeat sync updated checkpoint at %v, want unchanged %v", got, backfilledUpdatedAt)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptsBackfillsLegacyCheckpointThenImportsTail(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := `{"id":"old","role":"assistant","text":"old answer"}` + "\n" +
+		`{"id":"new","role":"assistant","text":"new answer after legacy checkpoint"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID:             checkpointID,
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "old",
+			LastSourceLine: 1,
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      time.Date(2026, 5, 23, 9, 0, 0, 0, time.UTC),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy checkpoint: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync legacy checkpoint tail: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "new answer after legacy checkpoint") {
+		t.Fatalf("legacy checkpoint tail was not imported:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID != "new" || checkpoint.LastOffset != info.Size() || checkpoint.SourceSize != info.Size() {
+		t.Fatalf("checkpoint after tail import = %#v, want new at EOF %d", checkpoint, info.Size())
 	}
 }
 

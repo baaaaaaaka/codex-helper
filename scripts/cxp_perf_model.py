@@ -434,6 +434,7 @@ BENCH_TARGETS = {
     "sqlite-deferred-inbound": "BenchmarkCXPPerfModelSQLiteDeferredInboundNoDeferredProfiles",
     "sqlite-history-watch-checkpoint": "BenchmarkCXPPerfModelSQLiteHistoryWatchCheckpointUpdateProfiles",
     "sqlite-history-watch-active": "BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles",
+    "sqlite-legacy-linked-transcript-backfilled-idle": "BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles",
     "listen-once": "BenchmarkCXPPerfModelListenOnceProfiles",
     "external": "BenchmarkCXPPerfModelExternalScenarios",
 }

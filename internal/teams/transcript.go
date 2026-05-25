@@ -176,35 +176,119 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 }
 
 func checkpointLineMatches(line []byte, lineNo int, afterKey string, state transcriptParseState, sourceName string) bool {
+	_, _, ok := checkpointLineMatchRecords(line, lineNo, afterKey, state, sourceName)
+	return ok
+}
+
+func checkpointLineMatchRecords(line []byte, lineNo int, afterKey string, state transcriptParseState, sourceName string) ([]TranscriptRecord, int, bool) {
 	afterKey = strings.TrimSpace(afterKey)
 	if afterKey == "" {
-		return false
+		return nil, -1, false
 	}
 	lineKey, hasLineKey := transcriptCheckpointLineNumber(afterKey)
 	if hasLineKey && lineNo != lineKey {
-		return false
+		return nil, -1, false
 	}
 	probeKey := strings.TrimPrefix(afterKey, "source:")
 	if probeKey == "" {
-		return false
+		return nil, -1, false
 	}
 	if !hasLineKey && !bytes.Contains(line, []byte(afterKey)) && !bytes.Contains(line, []byte(probeKey)) {
-		return false
+		return nil, -1, false
 	}
 	probeState := state
 	records, _ := parseTranscriptLine(line, lineNo, &probeState)
-	for _, record := range records {
+	for i, record := range records {
 		sourceID := strings.TrimSpace(record.SourceItemID)
 		if sourceID != "" {
 			if afterKey == sourceID || afterKey == "source:"+sourceID || afterKey == sourceID+"#line:"+strconv.Itoa(record.SourceLine) {
-				return true
+				return records, i, true
 			}
 		}
 		if fallbackTranscriptItemID(transcriptFileFingerprint(sourceName, state.sessionID, nil), record.SourceLine, record.Kind) == afterKey {
-			return true
+			return records, i, true
 		}
 	}
-	return false
+	return records, -1, false
+}
+
+type transcriptCheckpointPosition struct {
+	Line          int
+	Offset        int64
+	SourceSize    int64
+	SourceModTime time.Time
+}
+
+func findTranscriptCheckpointPosition(filePath string, afterKey string) (transcriptCheckpointPosition, bool, error) {
+	afterKey = strings.TrimSpace(afterKey)
+	if strings.TrimSpace(filePath) == "" || afterKey == "" {
+		return transcriptCheckpointPosition{}, false, nil
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return transcriptCheckpointPosition{}, false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return transcriptCheckpointPosition{}, false, err
+	}
+	if info.IsDir() {
+		return transcriptCheckpointPosition{}, false, fmt.Errorf("transcript path %q is a directory", filePath)
+	}
+
+	sourceName := filePath
+	if abs, err := filepath.Abs(filePath); err == nil {
+		sourceName = abs
+	}
+
+	reader := bufio.NewReaderSize(f, 64*1024)
+	var state transcriptParseState
+	lineNo := 0
+	var offset int64
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNo++
+			lineStartOffset := offset
+			nextOffset := offset + int64(len(line))
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
+				records, index, ok := checkpointLineMatchRecords(trimmed, lineNo, afterKey, state, sourceName)
+				if ok {
+					pos := transcriptCheckpointPosition{
+						Line:          lineNo,
+						Offset:        nextOffset,
+						SourceSize:    info.Size(),
+						SourceModTime: info.ModTime(),
+					}
+					for i := index + 1; i < len(records); i++ {
+						if records[i].SourceLine != records[index].SourceLine {
+							break
+						}
+						if strings.TrimSpace(transcriptRecordCheckpointKey(records[i])) != "" {
+							pos.Line = lineNo
+							if pos.Line > 0 {
+								pos.Line--
+							}
+							pos.Offset = lineStartOffset
+							break
+						}
+					}
+					return pos, true, nil
+				}
+				advanceTranscriptScanState(trimmed, lineNo, &state)
+			}
+			offset = nextOffset
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return transcriptCheckpointPosition{}, false, err
+		}
+	}
+	return transcriptCheckpointPosition{}, false, nil
 }
 
 func transcriptCheckpointLineNumber(key string) (int, bool) {

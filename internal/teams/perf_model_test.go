@@ -917,6 +917,35 @@ func BenchmarkCXPPerfModelLinkedTranscriptIdleManySessions(b *testing.B) {
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles(b *testing.B) {
+	for _, profile := range cxpPerfProfiles {
+		profile := profile
+		profile.MessagesPerPoll = 0
+		b.Run(profile.Name, func(b *testing.B) {
+			store := newCXPPerfStore(b, profile)
+			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+			cxpPerfMigrateStoreToSQLite(b, store)
+			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			cxpPerfStripLinkedTranscriptCheckpointPositionMetadata(b, store)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 23, 10, 35, 0, 0, time.UTC)
+			bridge.lastTranscriptSync = time.Time{}
+			if err := bridge.syncLinkedTranscriptsIfDue(ctx, now); err != nil {
+				b.Fatalf("legacy linked transcript backfill: %v", err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				bridge.lastTranscriptSync = time.Time{}
+				if err := bridge.syncLinkedTranscriptsIfDue(ctx, now.Add(time.Duration(i+1)*transcriptSyncMinInterval)); err != nil {
+					b.Fatalf("legacy linked transcript backfilled idle sync: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkCXPPerfModelSQLiteQueuedTurnsBlockedNoProgressProfiles(b *testing.B) {
 	for _, profile := range cxpPerfProfiles {
 		profile := profile
@@ -1395,6 +1424,24 @@ func cxpPerfSeedLinkedTranscriptFiles(tb testing.TB, store *teamstore.Store, bri
 		return nil
 	}); err != nil {
 		tb.Fatalf("seed linked transcript files: %v", err)
+	}
+}
+
+func cxpPerfStripLinkedTranscriptCheckpointPositionMetadata(tb testing.TB, store *teamstore.Store) {
+	tb.Helper()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		for id, checkpoint := range state.ImportCheckpoints {
+			if !strings.HasPrefix(id, "transcript:") || strings.Contains(id, ":subagent:") {
+				continue
+			}
+			checkpoint.LastOffset = 0
+			checkpoint.SourceSize = 0
+			checkpoint.SourceModTime = time.Time{}
+			state.ImportCheckpoints[id] = checkpoint
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("strip linked transcript checkpoint metadata: %v", err)
 	}
 }
 

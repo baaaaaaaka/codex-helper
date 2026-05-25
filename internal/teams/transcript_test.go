@@ -362,6 +362,44 @@ func TestReadSessionTranscriptSinceMatchesFullTailForFallbackCheckpoint(t *testi
 	}
 }
 
+func TestFindTranscriptCheckpointPositionSupportsFallbackCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"session-1"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fallback checkpoint"}]}}`,
+		`{"type":"response_item","payload":{"id":"after","type":"message","role":"assistant","content":[{"type":"output_text","text":"after fallback"}]}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	full, err := ReadSessionTranscript(path)
+	if err != nil {
+		t.Fatalf("ReadSessionTranscript error: %v", err)
+	}
+	if len(full.Records) != 2 {
+		t.Fatalf("full records = %#v, want 2", full.Records)
+	}
+	position, ok, err := findTranscriptCheckpointPosition(path, full.Records[0].ItemID)
+	if err != nil {
+		t.Fatalf("findTranscriptCheckpointPosition error: %v", err)
+	}
+	if !ok {
+		t.Fatal("fallback checkpoint position was not found")
+	}
+	if position.Line != full.Records[0].SourceLine || position.Offset != full.Records[0].SourceOffset {
+		t.Fatalf("position = line %d offset %d, want line %d offset %d", position.Line, position.Offset, full.Records[0].SourceLine, full.Records[0].SourceOffset)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	if position.SourceSize != info.Size() || position.SourceModTime.IsZero() {
+		t.Fatalf("source position metadata = size %d mod %v, want size %d and mod time", position.SourceSize, position.SourceModTime, info.Size())
+	}
+}
+
 func TestReadSessionTranscriptSinceRefusesInvalidLineLikeCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
