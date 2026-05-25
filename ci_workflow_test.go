@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestCIWorkflowFullTestStepsDoNotSilentlySkipCoverageOrNonLinuxTests(t *testing.T) {
+func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *testing.T) {
 	data, err := os.ReadFile(".github/workflows/ci.yml")
 	if err != nil {
 		t.Fatalf("read ci workflow: %v", err)
@@ -16,14 +16,30 @@ func TestCIWorkflowFullTestStepsDoNotSilentlySkipCoverageOrNonLinuxTests(t *test
 		t.Fatal("old all-platform coverage step is still present")
 	}
 
-	linuxCoverage := workflowStepBlock(t, workflow, "go test (with coverage, Linux only)")
+	targetedJob := workflowJobBlock(t, workflow, "targeted-test")
+	requireStepContains(t, targetedJob, "name: Targeted test (${{ matrix.os }})")
+	requireStepNotContains(t, targetedJob,
+		"go test (with coverage, Linux only)",
+		"go test (without coverage, non-Linux)",
+		"go test -race (Linux only)",
+		"Coverage gate (Linux only)",
+		"Upload coverage artifact (Linux only)",
+	)
+
+	fullJob := workflowJobBlock(t, workflow, "full-go-test")
+	requireStepContains(t, fullJob,
+		"name: Full go test (${{ matrix.os }})",
+		"os: [ubuntu-latest, macos-latest, windows-latest]",
+	)
+
+	linuxCoverage := workflowStepBlock(t, fullJob, "go test (with coverage, Linux only)")
 	requireStepContains(t, linuxCoverage,
 		"if: runner.os == 'Linux'",
 		"shell: bash",
 		"go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./...",
 	)
 
-	nonLinuxTest := workflowStepBlock(t, workflow, "go test (without coverage, non-Linux)")
+	nonLinuxTest := workflowStepBlock(t, fullJob, "go test (without coverage, non-Linux)")
 	requireStepContains(t, nonLinuxTest,
 		"if: runner.os != 'Linux'",
 		"shell: bash",
@@ -33,10 +49,32 @@ func TestCIWorkflowFullTestStepsDoNotSilentlySkipCoverageOrNonLinuxTests(t *test
 		t.Fatal("non-Linux full test step should not generate coverage.out")
 	}
 
-	coverageGate := workflowStepBlock(t, workflow, "Coverage gate (Linux only)")
+	coverageGate := workflowStepBlock(t, fullJob, "Coverage gate (Linux only)")
 	requireStepContains(t, coverageGate,
 		"if: runner.os == 'Linux'",
 		"go tool cover -func=coverage.out",
+	)
+
+	raceJob := workflowJobBlock(t, workflow, "race-test")
+	requireStepContains(t, raceJob,
+		"name: Race test (ubuntu-latest)",
+		"go test -race ./...",
+	)
+
+	aggregateJob := workflowJobBlock(t, workflow, "test")
+	requireStepContains(t, aggregateJob,
+		"name: Test (${{ matrix.os }})",
+		"- targeted-test",
+		"- full-go-test",
+		"- race-test",
+		"- linux-distro-smoke-build",
+		"- linux-distro-smoke",
+		"if: ${{ always() }}",
+		"check targeted-test \"${{ needs.targeted-test.result }}\"",
+		"check full-go-test \"${{ needs.full-go-test.result }}\"",
+		"check race-test \"${{ needs.race-test.result }}\"",
+		"check linux-distro-smoke-build \"${{ needs.linux-distro-smoke-build.result }}\"",
+		"check linux-distro-smoke \"${{ needs.linux-distro-smoke.result }}\"",
 	)
 }
 
@@ -70,11 +108,45 @@ func workflowStepBlock(t *testing.T, workflow string, name string) string {
 	return rest[:len(marker)+next]
 }
 
+func workflowJobBlock(t *testing.T, workflow string, id string) string {
+	t.Helper()
+	marker := "  " + id + ":"
+	var builder strings.Builder
+	inJob := false
+	for _, line := range strings.SplitAfter(workflow, "\n") {
+		trimmed := strings.TrimRight(line, "\r\n")
+		if !inJob {
+			if trimmed == marker {
+				inJob = true
+				builder.WriteString(line)
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "  ") && len(line) > 2 && line[2] != ' ' && strings.TrimSpace(line) != "" {
+			break
+		}
+		builder.WriteString(line)
+	}
+	if !inJob {
+		t.Fatalf("workflow job %q not found", id)
+	}
+	return builder.String()
+}
+
 func requireStepContains(t *testing.T, text string, wants ...string) {
 	t.Helper()
 	for _, want := range wants {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+func requireStepNotContains(t *testing.T, text string, forbidden ...string) {
+	t.Helper()
+	for _, value := range forbidden {
+		if strings.Contains(text, value) {
+			t.Fatalf("unexpected %q in:\n%s", value, text)
 		}
 	}
 }

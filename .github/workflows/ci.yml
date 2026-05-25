@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
+  targeted-test:
+    name: Targeted test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -568,18 +568,6 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go test (with coverage, Linux only)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./...
-
-      - name: go test (without coverage, non-Linux)
-        if: runner.os != 'Linux'
-        shell: bash
-        run: |
-          go test -timeout=20m -parallel=16 ./...
-
       - name: Teams perf benchmark smoke
         if: runner.os == 'Linux'
         shell: bash
@@ -621,26 +609,6 @@ jobs:
           $env:CODEX_HELPER_BIN = $cxp
           .\scripts\ci\skills_smoke.ps1
           Remove-Item Env:\CODEX_HELPER_BIN
-
-      - name: go test -race (Linux only)
-        if: runner.os == 'Linux'
-        run: go test -race ./...
-
-      - name: Coverage gate (Linux only)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          threshold="40.0"
-          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$NF); print $NF}')"
-          echo "Total coverage: ${total}% (threshold ${threshold}%)"
-          awk -v total="$total" -v threshold="$threshold" 'BEGIN { if (total+0 < threshold+0) { printf("coverage %.2f%% < %.2f%%\n", total, threshold); exit 1 } }'
-
-      - name: Upload coverage artifact (Linux only)
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: coverage.out
 
       - name: Install Codex for integration (Linux/macOS)
         if: runner.os != 'Windows'
@@ -915,6 +883,69 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
+  full-go-test:
+    name: Full go test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: go test (with coverage, Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./...
+
+      - name: go test (without coverage, non-Linux)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          go test -timeout=20m -parallel=16 ./...
+
+      - name: Coverage gate (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          threshold="40.0"
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$NF); print $NF}')"
+          echo "Total coverage: ${total}% (threshold ${threshold}%)"
+          awk -v total="$total" -v threshold="$threshold" 'BEGIN { if (total+0 < threshold+0) { printf("coverage %.2f%% < %.2f%%\n", total, threshold); exit 1 } }'
+
+      - name: Upload coverage artifact (Linux only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  race-test:
+    name: Race test (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: go test -race (Linux only)
+        run: go test -race ./...
+
   linux-distro-smoke-build:
     name: Linux distro smoke build
     runs-on: ubuntu-latest
@@ -1142,3 +1173,42 @@ jobs:
                   ;;
               esac
             '
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ubuntu-latest
+    needs:
+      - targeted-test
+      - full-go-test
+      - race-test
+      - linux-distro-smoke-build
+      - linux-distro-smoke
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Verify parallel CI shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          failures=0
+          check() {
+            name="$1"
+            result="$2"
+            echo "$name: $result"
+            if [ "$result" != "success" ]; then
+              failures=$((failures + 1))
+            fi
+          }
+          check targeted-test "${{ needs.targeted-test.result }}"
+          check full-go-test "${{ needs.full-go-test.result }}"
+          check race-test "${{ needs.race-test.result }}"
+          check linux-distro-smoke-build "${{ needs.linux-distro-smoke-build.result }}"
+          check linux-distro-smoke "${{ needs.linux-distro-smoke.result }}"
+          if [ "$failures" -ne 0 ]; then
+            echo "$failures CI shard(s) failed or did not run"
+            exit 1
+          fi
