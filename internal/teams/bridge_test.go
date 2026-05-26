@@ -12190,6 +12190,173 @@ func TestBridgeControlPollAllowsFreshHelperPrefixedQuestion(t *testing.T) {
 	}
 }
 
+func TestBridgeShouldIgnoreFreshStrongHelperControlOutput(t *testing.T) {
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	msg := bridgeTestMessage("fresh-strong-helper-control-output")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p><strong>🔧 Helper:</strong></p><p>Active Work chats</p><p>s001</p>"
+
+	ignore, err := bridge.shouldIgnoreMessage(context.Background(), bridge.reg.ControlChatID, msg, inboundPollRoleControl, false)
+	if err != nil {
+		t.Fatalf("shouldIgnoreMessage error: %v", err)
+	}
+	if !ignore {
+		t.Fatal("fresh strong helper control output should be ignored")
+	}
+	if !bridge.reg.HasSent(bridge.reg.ControlChatID, msg.ID) {
+		t.Fatal("ignored strong helper control output was not marked sent")
+	}
+}
+
+func TestBridgeSendQueuedOutboxRecordsGlobalOutbound(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	store, err := teamstore.Open(filepath.Join(tmp, "teams", "scopes", "scope-current", "state.json"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close store: %v", err)
+		}
+	})
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(tmp, "teams", "scopes", "scope-current", "registry.json")
+	outbox, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:global-ledger-send",
+		ScopeID:     bridge.scope.ID,
+		TeamsChatID: "chat-1",
+		Kind:        "helper",
+		Body:        "global outbound ledger send path",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+
+	if err := bridge.sendQueuedOutbox(ctx, outbox); err != nil {
+		t.Fatalf("sendQueuedOutbox: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(*sent))
+	}
+	ledger, err := readGlobalOutboundLedger(filepath.Join(tmp, "teams", "global-outbound-ledger.json"))
+	if err != nil {
+		t.Fatalf("read global outbound ledger: %v", err)
+	}
+	item, ok := ledger.Items[globalOutboundKey("chat-1", "sent-1")]
+	if !ok {
+		t.Fatalf("global outbound ledger missing sent message: %#v", ledger.Items)
+	}
+	if item.OutboxID != outbox.ID || item.ScopeID == "" || item.Origin != teamstore.MessageOriginHelperOutbox {
+		t.Fatalf("global outbound ledger item = %#v", item)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	if got := state.OutboxMessages[outbox.ID]; got.Status != teamstore.OutboxStatusSent || got.TeamsMessageID != "sent-1" {
+		t.Fatalf("sent outbox = %#v", got)
+	}
+}
+
+func TestBridgePollDropsGlobalOutboundFromSiblingScope(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	oldStore, err := teamstore.Open(filepath.Join(tmp, "teams", "scopes", "scope-old", "state.json"))
+	if err != nil {
+		t.Fatalf("Open old store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := oldStore.Close(); err != nil {
+			t.Fatalf("Close old store: %v", err)
+		}
+	})
+	currentStore, err := teamstore.Open(filepath.Join(tmp, "teams", "scopes", "scope-current", "state.json"))
+	if err != nil {
+		t.Fatalf("Open current store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := currentStore.Close(); err != nil {
+			t.Fatalf("Close current store: %v", err)
+		}
+	})
+
+	user := User{ID: "user-1", UserPrincipalName: "user@example.test"}
+	oldScope := ScopeIdentityForUser(user)
+	oldScope.ID = "scope:old"
+	if _, err := oldStore.RecordScope(ctx, oldScope); err != nil {
+		t.Fatalf("Record old scope: %v", err)
+	}
+	if err := oldStore.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			ScopeID:     oldScope.ID,
+			AccountID:   user.ID,
+			Profile:     oldScope.Profile,
+			TeamsChatID: "control-chat",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Record old control chat: %v", err)
+	}
+	if _, _, err := oldStore.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:             "outbox:legacy-sent",
+		ScopeID:        oldScope.ID,
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "legacy-helper-message",
+		Kind:           "helper",
+		Body:           "this looks like a user prompt but was sent by helper",
+		Status:         teamstore.OutboxStatusSent,
+		SentAt:         time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("Queue old sent outbox: %v", err)
+	}
+	if _, err := currentStore.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 5, 22, 11, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("Record current poll: %v", err)
+	}
+
+	msg := bridgePollMessage("legacy-helper-message", "2026-05-22T12:00:00Z", "this looks like a user prompt but was sent by helper")
+	graph := newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{msg}}})
+	bridge := newBridgeTestBridge(graph, currentStore, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(tmp, "teams", "scopes", "scope-current", "registry.json")
+	var handled []string
+	if _, err := bridge.pollChat(ctx, "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("handled sibling-scope helper outbox as inbound prompt: %#v", handled)
+	}
+	if !bridge.reg.HasSent("chat-1", "legacy-helper-message") {
+		t.Fatal("global outbound suppression was not restored into registry")
+	}
+	ledger, err := readGlobalOutboundLedger(filepath.Join(tmp, "teams", "global-outbound-ledger.json"))
+	if err != nil {
+		t.Fatalf("read global outbound ledger: %v", err)
+	}
+	if _, ok := ledger.Items[globalOutboundKey("chat-1", "legacy-helper-message")]; !ok {
+		t.Fatalf("global outbound ledger missing backfilled message: %#v", ledger.Items)
+	}
+	state, err := currentStore.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load current store: %v", err)
+	}
+	lookup, err := currentStore.MessageLookup(ctx, "chat-1", "legacy-helper-message")
+	if err != nil {
+		t.Fatalf("MessageLookup current store: %v", err)
+	}
+	if !lookup.HasDeliveredOutbox {
+		t.Fatalf("current store did not record helper provenance after global suppression: state=%#v", state.MessageProvenance)
+	}
+	if got := len(state.InboundEvents); got != 0 {
+		t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+	}
+}
+
 func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 	msg := bridgePollMessage("stale-helper-artifact", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = `<p>Codex: artifact attached: stage5_small_error_report.md <attachment id="artifact-1"></attachment></p>`

@@ -346,6 +346,8 @@ type Bridge struct {
 	runningTurnCancels                map[string]*runningTurnCancel
 	acceptedOutboxMu                  sync.Mutex
 	acceptedOutboxes                  map[string]acceptedOutboxRecovery
+	globalOutboundMu                  sync.Mutex
+	globalOutboundBackfilled          bool
 	deferredNoticeMu                  sync.Mutex
 	deferredInterruptedPending        bool
 }
@@ -2128,6 +2130,17 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			b.markRegistrySent(chatID, msg.ID)
 			return true, nil
 		}
+		if messageAuthoredByCurrentUser(msg, b.user) {
+			delivered, err := b.hasGlobalOutboundMessage(ctx, chatID, msg.ID)
+			if err != nil {
+				return false, err
+			}
+			if delivered {
+				b.markRegistrySent(chatID, msg.ID)
+				b.recordGlobalOutboundSuppressionProvenance(ctx, chatID, msg.ID)
+				return true, nil
+			}
+		}
 		if legacyGeneratedOutputFallback {
 			delivered, err := b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
 			if err != nil {
@@ -2153,6 +2166,10 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	if role == inboundPollRoleControl && messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperLifecycleOutputMessage(msg, plainText) {
+		b.markRegistrySent(chatID, msg.ID)
+		return true, nil
+	}
+	if role == inboundPollRoleControl && messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperOutputMessage(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
@@ -10631,6 +10648,9 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	}
 	b.markRegistrySent(outbox.TeamsChatID, msg.ID)
 	b.rememberAcceptedOutbox(outbox.ID, msg.ID)
+	if err := b.recordGlobalOutboundMessage(ctx, outbox, msg); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
+	}
 	if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, msg.ID); err != nil {
 		return err
 	}
@@ -10687,6 +10707,9 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 }
 
 func (b *Bridge) recordSentOutboxSideEffect(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions) {
+	if err := b.recordGlobalOutboundMessage(ctx, outbox, msg); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
+	}
 	if err := b.recordOutboxMessageProvenance(ctx, outbox, msg); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams message provenance record error: %v\n", err)
 	}
