@@ -364,7 +364,14 @@ EOF
   fi
   wait_for_lines "$runs" 1
   wait_for_file_pattern "$child_env" 'CODEX_HELPER_TEAMS_SERVICE=1'
-  for forbidden_env in CODEX_PROXY_DEBUG CODEX_HELPER_TEAMS_CHILD DBUS_SESSION_BUS_ADDRESS HTTP_PROXY HTTPS_PROXY NO_PROXY XDG_RUNTIME_DIR; do
+  for expected_env in "HTTP_PROXY=http://127.0.0.1:9" "HTTPS_PROXY=http://127.0.0.1:9" "NO_PROXY=*"; do
+    if ! grep -qxF "$expected_env" "$child_env"; then
+      log "public lifecycle child did not preserve configured service env $expected_env"
+      sed 's/^/[public-child-env] /' "$child_env" || true
+      return 1
+    fi
+  done
+  for forbidden_env in CODEX_PROXY_DEBUG CODEX_HELPER_TEAMS_CHILD DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR; do
     if grep -q "^$forbidden_env=" "$child_env"; then
       log "public lifecycle child inherited forbidden env $forbidden_env"
       sed 's/^/[public-child-env] /' "$child_env" || true

@@ -1956,12 +1956,16 @@ func TestTeamsServiceLocalSupervisorProcessEnvUsesControlledEnvironment(t *testi
 	env := teamsServiceLocalSupervisorProcessEnv(map[string]string{
 		"CODEX_HOME":                 specHome,
 		"CODEX_HELPER_TEAMS_SERVICE": "1",
+		"HTTPS_PROXY":                "http://configured-proxy.example.test:8080",
 	})
 	if got, ok := testEnvValue(env, "CODEX_HOME"); !ok || got != specHome {
 		t.Fatalf("CODEX_HOME env = %q ok=%v, want %q", got, ok, specHome)
 	}
 	if got, ok := testEnvValue(env, "CODEX_HELPER_TEAMS_SERVICE"); !ok || got != "1" {
 		t.Fatalf("CODEX_HELPER_TEAMS_SERVICE env = %q ok=%v, want 1", got, ok)
+	}
+	if got, ok := testEnvValue(env, "HTTPS_PROXY"); !ok || got != "http://configured-proxy.example.test:8080" {
+		t.Fatalf("HTTPS_PROXY env = %q ok=%v, want configured service proxy", got, ok)
 	}
 	if _, ok := testEnvValue(env, "CODEX_PROXY_DEBUG"); ok {
 		t.Fatalf("unexpected non-service CODEX_PROXY_DEBUG in local supervisor env: %#v", env)
