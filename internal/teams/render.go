@@ -469,6 +469,7 @@ func teamsRenderLabel(kind TeamsRenderKind, partIndex int, partCount int) string
 }
 
 func normalizeTeamsRenderText(text string) string {
+	text = strings.ToValidUTF8(text, "\uFFFD")
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
 	return text

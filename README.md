@@ -566,6 +566,20 @@ disconnect, WSL session exit, sleep/wake, or helper upgrade. Service bootstrap
 chooses the native per-user service mechanism for the platform where possible
 and repairs old helper service definitions when it can do so safely.
 
+On non-WSL Linux, bootstrap uses `systemd --user` when the user manager is
+available. If `systemd --user` is not usable, it falls back to a local
+supervisor that detaches with `setsid`, uses a file lock to prevent duplicate
+instances, and restarts the Teams runner when it exits or local owner/poll
+evidence becomes stale. This fallback survives terminal close and helper
+crashes, but it does not provide restart after a machine or container reboot.
+Set `CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND=systemd` or
+`CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND=local-supervisor` to force a backend;
+leave it unset for auto selection. In auto mode, an enabled or currently active
+local-supervisor install remains on local-supervisor to avoid backend flapping.
+In WSL, the default backend remains the Windows Scheduled Task, but an enabled
+or active local-supervisor install is also sticky unless
+`CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND=windows-task` is set explicitly.
+
 ### Common Teams commands
 
 Run these locally when diagnosing setup:

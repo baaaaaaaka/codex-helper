@@ -386,8 +386,13 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
 
 - Service supervision is user-level and must not require root:
   - Linux `systemd --user` where the user manager is available
+  - Linux `local-supervisor` fallback where no user systemd manager is usable;
+    it survives terminal close and helper crashes, but not machine/container
+    reboot
   - WSL per-user Windows Scheduled Task by default, with optional
-    `systemd --user` when explicitly requested
+    `systemd --user` or `local-supervisor`; an enabled or active
+    local-supervisor install stays sticky unless Windows Task mode is explicitly
+    requested
   - Windows per-user Task Scheduler
   - macOS LaunchAgent
 - Upgrade protocol:
@@ -399,10 +404,13 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
   6. recover pending state
 - Foreground `teams run` is for testing and short sessions. Durable operation
   should use the service path so terminal close, SSH proxy disconnects, and
-  transient network failures recover from state. On Linux without linger, full
-  logout/reboot survival is an OS boundary outside this no-root helper; WSL
-  should prefer the Windows Scheduled Task backend when the goal is Windows
-  login based autostart.
+  transient network failures recover from state. On Linux, auto mode prefers
+  `systemd --user` and falls back to `local-supervisor` when the user manager is
+  not usable; an enabled or currently active local-supervisor install remains
+  sticky to avoid backend flapping. Explicit WSL `systemd` mode fails as systemd
+  instead of silently changing backend. On Linux without linger, full logout/reboot
+  survival is an OS boundary outside this no-root helper; WSL should prefer the
+  Windows Scheduled Task backend when the goal is Windows login based autostart.
 - Remote or Teams-triggered upgrade should require explicit confirmation or a
   local operator policy before replacing the helper binary. Upgrade must not
   start while the bridge owns an ambiguous active turn unless the user chooses a

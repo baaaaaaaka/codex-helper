@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -30,6 +33,7 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "AppData", "Local"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
 	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "chat-client")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client")
@@ -134,6 +138,2015 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "not enabled or started automatically") {
 		t.Fatalf("install output should state no auto enable/start:\n%s", out.String())
+	}
+}
+
+func TestTeamsServiceLinuxAutoFallsBackToLocalSupervisorWhenSystemdUserUnavailable(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+	})
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "local-supervisor" {
+		t.Fatalf("backend ID = %q, want local-supervisor", got)
+	}
+}
+
+func TestTeamsServiceLinuxAutoFailsClosedOnUnknownSystemdProbeError(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                    "linux",
+		exe:                     filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                     tmp,
+		unitDir:                 filepath.Join(tmp, "systemd", "user"),
+		runner:                  &recordingTeamsServiceRunner{},
+		systemdUserAvailableErr: errors.New("systemctl --user show-environment failed: exit status 1"),
+	})
+
+	_, err := teamsServiceBackendForCurrentPlatform()
+	if err == nil || !strings.Contains(err.Error(), "verify systemd --user availability") {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform err = %v, want fail-closed systemd probe error", err)
+	}
+}
+
+func TestTeamsServiceLinuxAutoUsesSystemdWhenOnlyDisabledLocalConfigExists(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	systemdAvailable := true
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdAvailable,
+	})
+	path, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("local supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(path, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: false,
+		Spec:    teamsServiceSpec{Executable: filepath.Join(tmp, "bin", "codex-proxy"), WorkingDir: tmp},
+	}); err != nil {
+		t.Fatalf("write disabled local config: %v", err)
+	}
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "systemd-user" {
+		t.Fatalf("backend ID = %q, want systemd-user", got)
+	}
+}
+
+func TestTeamsServiceLinuxAutoStickyCheckDoesNotCreateLocalSupervisorRuntimeDir(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	systemdAvailable := true
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdAvailable,
+	})
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "systemd-user" {
+		t.Fatalf("backend ID = %q, want systemd-user", got)
+	}
+	runDir := filepath.Join(configBase, "codex-helper", "teams", "run")
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("sticky check created runtime dir %s: %v", runDir, err)
+	}
+}
+
+func TestTeamsServiceLinuxAutoKeepsEnabledLocalSupervisorConfig(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	systemdAvailable := true
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdAvailable,
+	})
+	path, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("local supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(path, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec:    teamsServiceSpec{Executable: filepath.Join(tmp, "bin", "codex-proxy"), WorkingDir: tmp},
+	}); err != nil {
+		t.Fatalf("write enabled local config: %v", err)
+	}
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "local-supervisor" {
+		t.Fatalf("backend ID = %q, want local-supervisor", got)
+	}
+}
+
+func TestTeamsServiceLinuxAutoIgnoresStaleLocalSupervisorStatusIdentityMismatch(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	systemdAvailable := true
+	identityErr := errors.New("not the local supervisor")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdAvailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return identityErr
+		},
+	})
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("local supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: false,
+		Spec:    teamsServiceSpec{Executable: filepath.Join(tmp, "bin", "codex-proxy"), WorkingDir: tmp},
+	}); err != nil {
+		t.Fatalf("write disabled local config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:       teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:    configPath,
+		SupervisorPID: os.Getpid(),
+		State:         "running",
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("write stale local status: %v", err)
+	}
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "systemd-user" {
+		t.Fatalf("backend ID = %q, want systemd-user", got)
+	}
+}
+
+func TestTeamsServiceWSLExplicitSystemdDoesNotFallBackToLocalSupervisor(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND", "systemd")
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		isWSL:                true,
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+	})
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "systemd-user" {
+		t.Fatalf("backend ID = %q, want systemd-user", got)
+	}
+}
+
+func TestTeamsServiceWSLExplicitLocalSupervisorOptIn(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND", "local-supervisor")
+	systemdAvailable := true
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		isWSL:                true,
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdAvailable,
+	})
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "local-supervisor" {
+		t.Fatalf("backend ID = %q, want local-supervisor", got)
+	}
+}
+
+func TestTeamsServiceWSLHonorsLinuxLocalSupervisorWhenWSLModeUnset(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	systemdAvailable := true
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		isWSL:                true,
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdAvailable,
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND", "local-supervisor")
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "local-supervisor" {
+		t.Fatalf("backend ID = %q, want local-supervisor", got)
+	}
+}
+
+func TestTeamsServiceWSLSpecificModeWinsOverLinuxMode(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND", "systemd")
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		isWSL:                true,
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND", "local-supervisor")
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+	}
+	if got := backend.ID(); got != "systemd-user" {
+		t.Fatalf("backend ID = %q, want systemd-user", got)
+	}
+}
+
+func TestTeamsServiceWSLAutoKeepsEnabledLocalSupervisorConfig(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		isWSL:          true,
+		exe:            filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         &recordingTeamsServiceRunner{},
+	})
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec:    teamsServiceSpec{Executable: filepath.Join(tmp, "bin", "codex-proxy"), WorkingDir: tmp},
+	}); err != nil {
+		t.Fatalf("write local config: %v", err)
+	}
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	if got := backend.ID(); got != "local-supervisor" {
+		t.Fatalf("backend ID = %q, want local-supervisor sticky in WSL auto", got)
+	}
+}
+
+func TestTeamsServiceWSLExplicitWindowsTaskOverridesLocalSupervisorSticky(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND", "windows-task")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		isWSL:          true,
+		exe:            filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         &recordingTeamsServiceRunner{},
+	})
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec:    teamsServiceSpec{Executable: filepath.Join(tmp, "bin", "codex-proxy"), WorkingDir: tmp},
+	}); err != nil {
+		t.Fatalf("write local config: %v", err)
+	}
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	if got := backend.ID(); got != "wsl-windows-task-scheduler" {
+		t.Fatalf("backend ID = %q, want explicit Windows Task backend", got)
+	}
+}
+
+func TestTeamsServiceWSLInvalidSpecificModeFailsClosed(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND", "typo")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		isWSL:   true,
+		exe:     filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	_, err := teamsServiceBackendForCurrentPlatform()
+	if err == nil {
+		t.Fatal("teamsServiceBackendForCurrentPlatform error = nil, want unsupported WSL backend error")
+	}
+	if got := err.Error(); !strings.Contains(got, "unsupported WSL Teams service backend") ||
+		!strings.Contains(got, "CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND") {
+		t.Fatalf("error = %v, want WSL backend env error", err)
+	}
+}
+
+func TestTeamsServiceWSLInvalidLinuxModeFailsClosed(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		isWSL:   true,
+		exe:     filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND", "typo")
+
+	_, err := teamsServiceBackendForCurrentPlatform()
+	if err == nil {
+		t.Fatal("teamsServiceBackendForCurrentPlatform error = nil, want unsupported Linux backend error")
+	}
+	if got := err.Error(); !strings.Contains(got, "unsupported WSL Teams service backend") ||
+		!strings.Contains(got, "CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND") {
+		t.Fatalf("error = %v, want Linux backend env error", err)
+	}
+}
+
+func TestTeamsServiceInstallWritesLocalSupervisorConfigWhenSystemdUserUnavailable(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	cwd := filepath.Join(tmp, "work")
+	registryPath := filepath.Join(tmp, "teams-registry.json")
+	systemdUnavailable := false
+	runner := &recordingTeamsServiceRunner{}
+	systemdUnitDir := filepath.Join(tmp, "systemd", "user")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  cwd,
+		unitDir:              systemdUnitDir,
+		runner:               runner,
+		systemdUserAvailable: &systemdUnavailable,
+	})
+	for _, name := range []string{teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName} {
+		if err := os.MkdirAll(systemdUnitDir, 0o700); err != nil {
+			t.Fatalf("mkdir systemd unit dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(systemdUnitDir, name), []byte("stale systemd unit"), 0o600); err != nil {
+			t.Fatalf("write stale systemd unit: %v", err)
+		}
+	}
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetArgs([]string{"install"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	configPath := filepath.Join(configBase, "codex-helper", "teams", teamsServiceLocalSupervisorConfigName)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read local supervisor config: %v", err)
+	}
+	var cfg teamsServiceLocalSupervisorConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal local supervisor config: %v\n%s", err, data)
+	}
+	if cfg.Enabled {
+		t.Fatal("install should write local supervisor config disabled")
+	}
+	if cfg.Spec.Executable != exePath {
+		t.Fatalf("config executable = %q, want %q", cfg.Spec.Executable, exePath)
+	}
+	if cfg.Spec.WorkingDir != cwd {
+		t.Fatalf("config working dir = %q, want %q", cfg.Spec.WorkingDir, cwd)
+	}
+	if cfg.Spec.RegistryPath != registryPath {
+		t.Fatalf("config registry path = %q, want %q", cfg.Spec.RegistryPath, registryPath)
+	}
+	if cfg.Spec.Environment["CODEX_HELPER_TEAMS_SERVICE"] != "1" {
+		t.Fatalf("config environment missing Teams service marker: %#v", cfg.Spec.Environment)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("local supervisor install should not call systemctl, calls=%#v", runner.calls)
+	}
+	for _, name := range []string{teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName} {
+		if _, err := os.Stat(filepath.Join(systemdUnitDir, name)); err != nil {
+			t.Fatalf("install should not retire stale systemd unit %s before start, stat err=%v", name, err)
+		}
+	}
+	if got := out.String(); !strings.Contains(got, configPath) || !strings.Contains(got, "not enabled or started automatically") {
+		t.Fatalf("install output missing local config path or no-start text:\n%s", got)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRetireSystemdFailureBlocksStart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	retireErr := errors.New("systemd stop failed")
+	runner := &recordingTeamsServiceRunner{err: retireErr}
+	systemdAvailable := true
+	started := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               runner,
+		systemdUserAvailable: &systemdAvailable,
+		localStartDetached: func(context.Context, string, string, teamsServiceSpec) (int, error) {
+			started = true
+			return os.Getpid(), nil
+		},
+	})
+
+	path, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp})
+	if err != nil {
+		t.Fatalf("install should only write local supervisor config before retiring systemd: %v", err)
+	}
+	if strings.TrimSpace(path) == "" {
+		t.Fatalf("install path is empty")
+	}
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err == nil || !strings.Contains(err.Error(), "stop old systemd") {
+		t.Fatalf("start err = %v, want systemd retire failure", err)
+	}
+	if started {
+		t.Fatal("local supervisor started after systemd retire failure")
+	}
+}
+
+func TestTeamsServiceLocalSupervisorSystemdProbeUnknownBlocksFallbackStart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	started := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                    "linux",
+		exe:                     exePath,
+		cwd:                     tmp,
+		unitDir:                 filepath.Join(tmp, "systemd", "user"),
+		runner:                  &recordingTeamsServiceRunner{},
+		systemdUserAvailableErr: errors.New("systemctl --user show-environment failed: exit status 1"),
+		localStartDetached: func(context.Context, string, string, teamsServiceSpec) (int, error) {
+			started = true
+			return os.Getpid(), nil
+		},
+	})
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+		t.Fatalf("install local supervisor config: %v", err)
+	}
+	_, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start")
+	if err == nil || !strings.Contains(err.Error(), "verify systemd --user is unavailable") {
+		t.Fatalf("start err = %v, want fail-closed systemd probe error", err)
+	}
+	if started {
+		t.Fatal("local supervisor started after unknown systemd probe failure")
+	}
+}
+
+func TestTeamsServiceLocalSupervisorSystemdUnavailableProbeAllowsFallbackStart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	startedPID := 6123
+	started := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                    "linux",
+		exe:                     exePath,
+		cwd:                     tmp,
+		unitDir:                 filepath.Join(tmp, "systemd", "user"),
+		runner:                  &recordingTeamsServiceRunner{},
+		systemdUserAvailableErr: errors.New("systemctl --user show-environment failed: exit status 1: Failed to get D-Bus connection: Operation not permitted"),
+		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+			started = true
+			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				SupervisorPID:  startedPID,
+				SupervisorPGID: 7123,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == startedPID }
+	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+		t.Fatalf("install local supervisor config: %v", err)
+	}
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
+		t.Fatalf("start should allow confirmed unavailable systemd probe: %v", err)
+	}
+	if !started {
+		t.Fatal("local supervisor did not start after confirmed unavailable systemd probe")
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStartPreflightFailureDoesNotRetireSystemd(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	runner := &recordingTeamsServiceRunner{}
+	systemdAvailable := true
+	started := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               runner,
+		systemdUserAvailable: &systemdAvailable,
+		localStartDetached: func(context.Context, string, string, teamsServiceSpec) (int, error) {
+			started = true
+			return os.Getpid(), nil
+		},
+	})
+
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+		t.Fatalf("install local supervisor config: %v", err)
+	}
+	badCacheHome := filepath.Join(tmp, "cache-file")
+	if err := os.WriteFile(badCacheHome, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write bad cache home: %v", err)
+	}
+	t.Setenv("XDG_CACHE_HOME", badCacheHome)
+	_, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start")
+	if err == nil {
+		t.Fatal("start err = nil, want log preflight failure")
+	}
+	if started {
+		t.Fatal("local supervisor started after log preflight failure")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("start should not retire systemd before local preflight succeeds, calls=%#v", runner.calls)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStartRetiresExistingLinuxBridgeProcess(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	systemdUnavailable := false
+	startedPID := 6201
+	var terminated []int
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				SupervisorPID:  startedPID,
+				SupervisorPGID: 7201,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+	})
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		return []teamsServiceLocalProcess{
+			{PID: 6301, Args: []string{exePath, "teams", "run", "--registry", filepath.Join(tmp, "registry.json")}, Env: map[string]string{}},
+			{PID: 6302, Args: []string{exePath, "teams", "service", "watchdog", "--loop"}, Env: map[string]string{}},
+		}, nil
+	}
+	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
+		terminated = append(terminated, pid)
+		return nil
+	}
+	prevAlive := teamsLocalSupervisorProcessAlive
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == startedPID }
+	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
+
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
+		Executable:   exePath,
+		WorkingDir:   tmp,
+		RegistryPath: filepath.Join(tmp, "registry.json"),
+	}); err != nil {
+		t.Fatalf("install local supervisor config: %v", err)
+	}
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
+		t.Fatalf("start local supervisor: %v", err)
+	}
+	if !reflect.DeepEqual(terminated, []int{6301}) {
+		t.Fatalf("terminated = %#v, want only matching direct teams run", terminated)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorWSLStartRetiresScheduledTasks(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	startedPID := 6401
+	var events []string
+	runner := teamsServiceCommandRunnerFunc(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		events = append(events, name+" "+strings.Join(args, " "))
+		return nil, nil
+	})
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		isWSL:          true,
+		exe:            exePath,
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+			events = append(events, "start-local")
+			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				SupervisorPID:  startedPID,
+				SupervisorPGID: 7401,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == startedPID }
+	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
+
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+		t.Fatalf("install local supervisor config: %v", err)
+	}
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
+		t.Fatalf("start local supervisor: %v", err)
+	}
+	if len(events) < 2 || !strings.Contains(events[0], "Disable-ScheduledTask") || events[1] != "start-local" {
+		t.Fatalf("events = %#v, want WSL Scheduled Task retire before local start", events)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorEnableStartStatus(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	systemdUnavailable := false
+	var startedConfigPath string
+	var startedLogPath string
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localStartDetached: func(_ context.Context, configPath string, logPath string, _ teamsServiceSpec) (int, error) {
+			startedConfigPath = configPath
+			startedLogPath = logPath
+			return os.Getpid(), writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				LogPath:        logPath,
+				SupervisorPID:  os.Getpid(),
+				SupervisorPGID: teamsLocalSupervisorCurrentProcessGroupID(),
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("install local supervisor: %v", err)
+	}
+
+	cmd = newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"enable"})
+	var enableOut bytes.Buffer
+	cmd.SetOut(&enableOut)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("enable local supervisor: %v", err)
+	}
+	if !strings.Contains(enableOut.String(), "does not provide machine/container reboot autostart") {
+		t.Fatalf("enable output missing local fallback limitation:\n%s", enableOut.String())
+	}
+
+	cmd = newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"start"})
+	var startOut bytes.Buffer
+	cmd.SetOut(&startOut)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("start local supervisor: %v", err)
+	}
+	if startedConfigPath == "" || startedLogPath == "" {
+		t.Fatalf("start hook did not receive config/log paths: config=%q log=%q", startedConfigPath, startedLogPath)
+	}
+	if !strings.Contains(startOut.String(), "Started Teams service: Codex Helper Teams local supervisor") {
+		t.Fatalf("start output missing backend name:\n%s", startOut.String())
+	}
+
+	cmd = newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"status"})
+	var statusOut bytes.Buffer
+	cmd.SetOut(&statusOut)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("status local supervisor: %v", err)
+	}
+	for _, want := range []string{
+		"Active: true",
+		"SupervisorPID:",
+		"Autostart: not guaranteed after machine/container reboot",
+		filepath.Join(configBase, "codex-helper", "teams", "run", "local-supervisor", teamsServiceLocalSupervisorStatusName),
+	} {
+		if !strings.Contains(statusOut.String(), want) {
+			t.Fatalf("status output missing %q:\n%s", want, statusOut.String())
+		}
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRepairRestartsActiveForNewSpec(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	systemdUnavailable := false
+	stops := 0
+	starts := 0
+	activePID := 1111
+	activePGID := 2111
+	startedPID := 2222
+	startedPGID := 3222
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+			starts++
+			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				SupervisorPID:  startedPID,
+				SupervisorPGID: startedPGID,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	prevProcessGroupID := teamsLocalSupervisorProcessGroupID
+	prevCurrentProcessGroupID := teamsLocalSupervisorCurrentProcessGroupID
+	prevTerminate := teamsLocalSupervisorTerminateProcessGroup
+	teamsLocalSupervisorProcessAlive = func(pid int) bool {
+		return pid == activePID || pid == startedPID
+	}
+	teamsLocalSupervisorProcessGroupID = func(pid int) (int, error) {
+		switch pid {
+		case activePID:
+			return activePGID, nil
+		case startedPID:
+			return startedPGID, nil
+		default:
+			return 0, fmt.Errorf("unexpected pid %d", pid)
+		}
+	}
+	teamsLocalSupervisorCurrentProcessGroupID = func() int { return 999 }
+	teamsLocalSupervisorTerminateProcessGroup = func(int, int, time.Duration) error {
+		stops++
+		return nil
+	}
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsLocalSupervisorProcessGroupID = prevProcessGroupID
+		teamsLocalSupervisorCurrentProcessGroupID = prevCurrentProcessGroupID
+		teamsLocalSupervisorTerminateProcessGroup = prevTerminate
+	})
+
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec:    teamsServiceSpec{Executable: exePath, WorkingDir: tmp, RegistryPath: "old"},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     configPath,
+		SupervisorPID:  activePID,
+		SupervisorPGID: activePGID,
+		State:          "running",
+		UpdatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	path, err := (teamsServiceLocalSupervisorBackend{}).Repair(context.Background(), teamsServiceSpec{
+		Executable:   exePath,
+		WorkingDir:   tmp,
+		RegistryPath: "new",
+		Environment:  map[string]string{"CODEX_HELPER_TEAMS_SERVICE": "1"},
+	}, teamsServiceRepairOptions{Enable: true, Start: true})
+	if err != nil {
+		t.Fatalf("repair local supervisor: %v", err)
+	}
+	if path != configPath {
+		t.Fatalf("repair path = %q, want %q", path, configPath)
+	}
+	if stops != 1 || starts != 1 {
+		t.Fatalf("repair stops=%d starts=%d, want one restart", stops, starts)
+	}
+	cfg, err := readTeamsServiceLocalSupervisorConfig(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !cfg.Enabled || cfg.Spec.RegistryPath != "new" {
+		t.Fatalf("config after repair = %#v, want enabled new spec", cfg)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRepairStopsChildWithOldSpecBeforeWritingNewConfig(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	systemdUnavailable := false
+	activePID := 3101
+	activePGID := 4101
+	childPID := 3102
+	childPGID := 4102
+	startedPID := 3201
+	startedPGID := 4201
+	var verifiedChildRegistry string
+	var terminated []int
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+		localVerifyChildIdentity: func(pid int, spec teamsServiceSpec) error {
+			if pid != childPID {
+				t.Fatalf("verified child pid = %d, want %d", pid, childPID)
+			}
+			verifiedChildRegistry = spec.RegistryPath
+			return nil
+		},
+		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				SupervisorPID:  startedPID,
+				SupervisorPGID: startedPGID,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	prevProcessGroupID := teamsLocalSupervisorProcessGroupID
+	prevCurrentProcessGroupID := teamsLocalSupervisorCurrentProcessGroupID
+	prevTerminate := teamsLocalSupervisorTerminateProcessGroup
+	teamsLocalSupervisorProcessAlive = func(pid int) bool {
+		return pid == activePID || pid == childPID || pid == startedPID
+	}
+	teamsLocalSupervisorProcessGroupID = func(pid int) (int, error) {
+		switch pid {
+		case activePID:
+			return activePGID, nil
+		case childPID:
+			return childPGID, nil
+		case startedPID:
+			return startedPGID, nil
+		default:
+			return 0, fmt.Errorf("unexpected pid %d", pid)
+		}
+	}
+	teamsLocalSupervisorCurrentProcessGroupID = func() int { return 999 }
+	teamsLocalSupervisorTerminateProcessGroup = func(_ int, pid int, _ time.Duration) error {
+		terminated = append(terminated, pid)
+		return nil
+	}
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsLocalSupervisorProcessGroupID = prevProcessGroupID
+		teamsLocalSupervisorCurrentProcessGroupID = prevCurrentProcessGroupID
+		teamsLocalSupervisorTerminateProcessGroup = prevTerminate
+	})
+
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec:    teamsServiceSpec{Executable: exePath, WorkingDir: tmp, RegistryPath: "old"},
+	}); err != nil {
+		t.Fatalf("write old config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     configPath,
+		SupervisorPID:  activePID,
+		SupervisorPGID: activePGID,
+		ChildPID:       childPID,
+		ChildPGID:      childPGID,
+		State:          "running",
+		UpdatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Repair(context.Background(), teamsServiceSpec{
+		Executable:   exePath,
+		WorkingDir:   tmp,
+		RegistryPath: "new",
+	}, teamsServiceRepairOptions{Enable: true, Start: true}); err != nil {
+		t.Fatalf("repair local supervisor: %v", err)
+	}
+	if verifiedChildRegistry != "old" {
+		t.Fatalf("verified child registry = %q, want old config before rewrite", verifiedChildRegistry)
+	}
+	if !reflect.DeepEqual(terminated, []int{childPID, activePID}) {
+		t.Fatalf("terminated pids = %#v, want child then supervisor", terminated)
+	}
+	cfg, err := readTeamsServiceLocalSupervisorConfig(configPath)
+	if err != nil {
+		t.Fatalf("read new config: %v", err)
+	}
+	if cfg.Spec.RegistryPath != "new" {
+		t.Fatalf("config registry = %q, want new", cfg.Spec.RegistryPath)
+	}
+}
+
+func TestTeamsServiceHelperUpgradeRestartsActiveLocalSupervisorAfterConfigRefresh(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	systemdAvailable := true
+	activePID := 8101
+	activePGID := 9101
+	startedPID := 8102
+	startedPGID := 9102
+	stops := 0
+	starts := 0
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdAvailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+			starts++
+			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				SupervisorPID:  startedPID,
+				SupervisorPGID: startedPGID,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	prevProcessGroupID := teamsLocalSupervisorProcessGroupID
+	prevCurrentProcessGroupID := teamsLocalSupervisorCurrentProcessGroupID
+	prevTerminate := teamsLocalSupervisorTerminateProcessGroup
+	teamsLocalSupervisorProcessAlive = func(pid int) bool {
+		return pid == activePID || pid == startedPID
+	}
+	teamsLocalSupervisorProcessGroupID = func(pid int) (int, error) {
+		switch pid {
+		case activePID:
+			return activePGID, nil
+		case startedPID:
+			return startedPGID, nil
+		default:
+			return 0, fmt.Errorf("unexpected pid %d", pid)
+		}
+	}
+	teamsLocalSupervisorCurrentProcessGroupID = func() int { return 999 }
+	teamsLocalSupervisorTerminateProcessGroup = func(int, int, time.Duration) error {
+		stops++
+		return nil
+	}
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsLocalSupervisorProcessGroupID = prevProcessGroupID
+		teamsLocalSupervisorCurrentProcessGroupID = prevCurrentProcessGroupID
+		teamsLocalSupervisorTerminateProcessGroup = prevTerminate
+	})
+
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec:    teamsServiceSpec{Executable: exePath, WorkingDir: tmp, RegistryPath: "old"},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     configPath,
+		SupervisorPID:  activePID,
+		SupervisorPGID: activePGID,
+		State:          "running",
+		UpdatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	if _, err := refreshTeamsServiceForHelperUpgrade(context.Background(), stringPtr(filepath.Join(tmp, "registry.json")), strings.NewReader(""), io.Discard); err != nil {
+		t.Fatalf("refresh Teams service for helper upgrade: %v", err)
+	}
+	if stops != 1 || starts != 1 {
+		t.Fatalf("upgrade refresh stops=%d starts=%d, want active local supervisor restarted", stops, starts)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorActiveRejectsIdentityMismatch(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(tmp, "config", "codex-helper", "teams", teamsServiceLocalSupervisorConfigName)
+	systemdUnavailable := false
+	verifyErr := errors.New("identity mismatch")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return verifyErr
+		},
+	})
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: filepath.Join(tmp, "bin", "codex-proxy"),
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:       teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:    configPath,
+		SupervisorPID: os.Getpid(),
+		State:         "running",
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+	active, err := (teamsServiceLocalSupervisorBackend{}).Active(context.Background())
+	if err != nil {
+		t.Fatalf("active error: %v", err)
+	}
+	if active {
+		t.Fatal("Active returned true for a PID that failed local supervisor identity verification")
+	}
+}
+
+func TestTeamsServiceLocalSupervisorActiveRejectsCurrentStatusWithoutHeartbeat(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(tmp, "config", "codex-helper", "teams", teamsServiceLocalSupervisorConfigName)
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+	})
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec:    teamsServiceSpec{Executable: filepath.Join(tmp, "bin", "codex-proxy"), WorkingDir: tmp},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:       teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:    configPath,
+		SupervisorPID: os.Getpid(),
+		State:         "running",
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+	active, err := (teamsServiceLocalSupervisorBackend{}).Active(context.Background())
+	if err != nil {
+		t.Fatalf("active error: %v", err)
+	}
+	if active {
+		t.Fatal("Active returned true for current-version status without heartbeat UpdatedAt")
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRuntimeDirIgnoresXDGRuntimeDir(t *testing.T) {
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(tmp, "runtime"))
+
+	statusPath, err := teamsServiceLocalSupervisorStatusPath()
+	if err != nil {
+		t.Fatalf("status path: %v", err)
+	}
+	want := filepath.Join(configBase, "codex-helper", "teams", "run", "local-supervisor", teamsServiceLocalSupervisorStatusName)
+	if statusPath != want {
+		t.Fatalf("status path = %q, want stable config-root path %q", statusPath, want)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStartRequiresReadyStatus(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localReadyTimeout:    20 * time.Millisecond,
+		localStartDetached: func(context.Context, string, string, teamsServiceSpec) (int, error) {
+			return os.Getpid(), nil
+		},
+	})
+	path, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp})
+	if err != nil {
+		t.Fatalf("install local supervisor: %v", err)
+	}
+	_, err = (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start")
+	if err == nil || !strings.Contains(err.Error(), "did not report ready") {
+		t.Fatalf("start err = %v, want ready timeout", err)
+	}
+	if path == "" {
+		t.Fatal("install path should not be empty")
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStopRejectsIdentityMismatch(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(tmp, "config", "codex-helper", "teams", teamsServiceLocalSupervisorConfigName)
+	systemdUnavailable := false
+	verifyErr := errors.New("identity mismatch")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return verifyErr
+		},
+	})
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: filepath.Join(tmp, "bin", "codex-proxy"),
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     configPath,
+		SupervisorPID:  os.Getpid(),
+		SupervisorPGID: teamsLocalSupervisorCurrentProcessGroupID() + 100000,
+		State:          "running",
+		UpdatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+	_, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "stop")
+	if !errors.Is(err, verifyErr) {
+		t.Fatalf("stop err = %v, want %v", err, verifyErr)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStopRejectsStaleSupervisorPGID(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(tmp, "config", "codex-helper", "teams", teamsServiceLocalSupervisorConfigName)
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+	})
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: filepath.Join(tmp, "bin", "codex-proxy"),
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     configPath,
+		SupervisorPID:  os.Getpid(),
+		SupervisorPGID: teamsLocalSupervisorCurrentProcessGroupID() + 100000,
+		State:          "running",
+		UpdatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+	_, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "stop")
+	if err == nil || !strings.Contains(err.Error(), "stale local supervisor process group") {
+		t.Fatalf("stop err = %v, want stale PGID rejection", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorUninstallPropagatesStopError(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	systemdUnavailable := false
+	verifyErr := errors.New("identity mismatch")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return verifyErr
+		},
+	})
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: filepath.Join(tmp, "bin", "codex-proxy"),
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:       teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:    configPath,
+		SupervisorPID: os.Getpid(),
+		State:         "running",
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	_, err = (teamsServiceLocalSupervisorBackend{}).Uninstall(context.Background())
+	if !errors.Is(err, verifyErr) {
+		t.Fatalf("uninstall err = %v, want %v", err, verifyErr)
+	}
+	if _, err := os.Stat(configPath); err != nil {
+		t.Fatalf("config should remain after failed stop, stat err=%v", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRestartDoesNotStartAfterStopError(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	systemdUnavailable := false
+	verifyErr := errors.New("identity mismatch")
+	started := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyProcessIdentity: func(int, string) error {
+			return verifyErr
+		},
+		localStartDetached: func(context.Context, string, string, teamsServiceSpec) (int, error) {
+			started = true
+			return os.Getpid(), nil
+		},
+	})
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: filepath.Join(tmp, "bin", "codex-proxy"),
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:       teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:    configPath,
+		SupervisorPID: os.Getpid(),
+		State:         "running",
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	_, err = (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "restart")
+	if !errors.Is(err, verifyErr) {
+		t.Fatalf("restart err = %v, want %v", err, verifyErr)
+	}
+	if started {
+		t.Fatal("restart started local supervisor after stop failed")
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStopDeadSupervisorRejectsUnverifiedChild(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(tmp, "config", "codex-helper", "teams", teamsServiceLocalSupervisorConfigName)
+	systemdUnavailable := false
+	verifyErr := errors.New("child identity mismatch")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localVerifyChildIdentity: func(int, teamsServiceSpec) error {
+			return verifyErr
+		},
+	})
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: filepath.Join(tmp, "bin", "codex-proxy"),
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     configPath,
+		SupervisorPID:  99999999,
+		SupervisorPGID: 99999999,
+		ChildPID:       os.Getpid(),
+		ChildPGID:      teamsLocalSupervisorCurrentProcessGroupID() + 100000,
+		State:          "running",
+		UpdatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+	_, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "stop")
+	if !errors.Is(err, verifyErr) {
+		t.Fatalf("stop err = %v, want %v", err, verifyErr)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStopMalformedStatusFailsClosedWhenLockHeld(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	statusPath, err := teamsServiceLocalSupervisorStatusPath()
+	if err != nil {
+		t.Fatalf("status path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0o700); err != nil {
+		t.Fatalf("mkdir status dir: %v", err)
+	}
+	if err := os.WriteFile(statusPath, []byte("{"), 0o600); err != nil {
+		t.Fatalf("write malformed status: %v", err)
+	}
+	lockPath, err := teamsServiceLocalSupervisorLockPath()
+	if err != nil {
+		t.Fatalf("lock path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+	lock := flock.New(lockPath)
+	locked, err := lock.TryLock()
+	if err != nil || !locked {
+		t.Fatalf("acquire test lock locked=%v err=%v", locked, err)
+	}
+	defer lock.Unlock()
+
+	_, err = (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "stop")
+	if !errors.Is(err, errTeamsServiceLocalSupervisorStatusMalformed) {
+		t.Fatalf("stop err = %v, want malformed status error", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStopMalformedStatusWithoutLockTreatsStopped(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	statusPath, err := teamsServiceLocalSupervisorStatusPath()
+	if err != nil {
+		t.Fatalf("status path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0o700); err != nil {
+		t.Fatalf("mkdir status dir: %v", err)
+	}
+	if err := os.WriteFile(statusPath, []byte("{"), 0o600); err != nil {
+		t.Fatalf("write malformed status: %v", err)
+	}
+	out, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "stop")
+	if err != nil {
+		t.Fatalf("stop err = %v, want nil without held lock", err)
+	}
+	if !strings.Contains(string(out), "malformed status") {
+		t.Fatalf("stop output = %q, want malformed status note", out)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStartLockHeldWithoutReadyStatusFails(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localReadyTimeout:    20 * time.Millisecond,
+	})
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+		t.Fatalf("install local supervisor: %v", err)
+	}
+	lockPath, err := teamsServiceLocalSupervisorLockPath()
+	if err != nil {
+		t.Fatalf("lock path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+	lock := flock.New(lockPath)
+	locked, err := lock.TryLock()
+	if err != nil || !locked {
+		t.Fatalf("acquire test lock locked=%v err=%v", locked, err)
+	}
+	defer lock.Unlock()
+
+	_, err = (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start")
+	if err == nil || !strings.Contains(err.Error(), "lock is held but no verified supervisor status") {
+		t.Fatalf("start err = %v, want lock-held readiness failure", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorChildHealthRestartsChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local supervisor child process-group termination is Unix-only")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	fake := filepath.Join(tmp, "fake-cxp")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+		t.Fatalf("write fake executable: %v", err)
+	}
+	prevHeartbeat := teamsServiceLocalSupervisorHeartbeatEvery
+	prevTerminate := teamsServiceLocalSupervisorTerminationWait
+	prevHealth := teamsServiceLocalSupervisorCheckChildHealth
+	teamsServiceLocalSupervisorHeartbeatEvery = 10 * time.Millisecond
+	teamsServiceLocalSupervisorTerminationWait = 200 * time.Millisecond
+	teamsServiceLocalSupervisorCheckChildHealth = func(context.Context, *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: "test stale child"}, nil
+	}
+	t.Cleanup(func() {
+		teamsServiceLocalSupervisorHeartbeatEvery = prevHeartbeat
+		teamsServiceLocalSupervisorTerminationWait = prevTerminate
+		teamsServiceLocalSupervisorCheckChildHealth = prevHealth
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	status := teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     filepath.Join(tmp, "local-supervisor.json"),
+		SupervisorPID:  os.Getpid(),
+		SupervisorPGID: teamsLocalSupervisorCurrentProcessGroupID(),
+		UpdatedAt:      time.Now(),
+	}
+	err := runTeamsServiceLocalSupervisorChild(ctx, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: fake,
+			WorkingDir: tmp,
+		},
+	}, &status, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "health check restarted child") {
+		t.Fatalf("run child err = %v, want health restart", err)
+	}
+	if status.ChildPID != 0 || status.ChildPGID != 0 || status.State != "waiting" {
+		t.Fatalf("status after health restart = %#v, want cleared waiting child", status)
+	}
+	if status.LastHealthReason != "test stale child" || status.LastHealthAction != teamsServiceWatchdogActionRestart {
+		t.Fatalf("health status = reason %q action %q", status.LastHealthReason, status.LastHealthAction)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorChildHealthTerminateErrorReturns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local supervisor child process-group termination is Unix-only")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	fake := filepath.Join(tmp, "fake-cxp")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+		t.Fatalf("write fake executable: %v", err)
+	}
+	prevHeartbeat := teamsServiceLocalSupervisorHeartbeatEvery
+	prevTerminate := teamsServiceLocalSupervisorTerminationWait
+	prevHealth := teamsServiceLocalSupervisorCheckChildHealth
+	prevTerminateTarget := teamsServiceLocalSupervisorTerminateTarget
+	terminateErr := errors.New("test terminate failed")
+	var captured *exec.Cmd
+	teamsServiceLocalSupervisorHeartbeatEvery = 10 * time.Millisecond
+	teamsServiceLocalSupervisorTerminationWait = 50 * time.Millisecond
+	teamsServiceLocalSupervisorCheckChildHealth = func(context.Context, *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: "test stale child"}, nil
+	}
+	teamsServiceLocalSupervisorTerminateTarget = func(cmd *exec.Cmd, _ time.Duration) error {
+		captured = cmd
+		return terminateErr
+	}
+	t.Cleanup(func() {
+		if captured != nil {
+			_ = terminateTargetCommand(captured, 200*time.Millisecond)
+		}
+		teamsServiceLocalSupervisorHeartbeatEvery = prevHeartbeat
+		teamsServiceLocalSupervisorTerminationWait = prevTerminate
+		teamsServiceLocalSupervisorCheckChildHealth = prevHealth
+		teamsServiceLocalSupervisorTerminateTarget = prevTerminateTarget
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	status := teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     filepath.Join(tmp, "local-supervisor.json"),
+		SupervisorPID:  os.Getpid(),
+		SupervisorPGID: teamsLocalSupervisorCurrentProcessGroupID(),
+		UpdatedAt:      time.Now(),
+	}
+	err := runTeamsServiceLocalSupervisorChild(ctx, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: fake,
+			WorkingDir: tmp,
+		},
+	}, &status, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "could not terminate child") {
+		t.Fatalf("run child err = %v, want terminate failure", err)
+	}
+	if !strings.Contains(status.LastError, terminateErr.Error()) {
+		t.Fatalf("status LastError = %q, want terminate error", status.LastError)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorProcessEnvUsesControlledEnvironment(t *testing.T) {
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "parent-home"))
+	t.Setenv("CODEX_PROXY_DEBUG", "1")
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9999")
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "runtime"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	specHome := filepath.Join(t.TempDir(), "spec-home")
+	env := teamsServiceLocalSupervisorProcessEnv(map[string]string{
+		"CODEX_HOME":                 specHome,
+		"CODEX_HELPER_TEAMS_SERVICE": "1",
+	})
+	if got, ok := testEnvValue(env, "CODEX_HOME"); !ok || got != specHome {
+		t.Fatalf("CODEX_HOME env = %q ok=%v, want %q", got, ok, specHome)
+	}
+	if got, ok := testEnvValue(env, "CODEX_HELPER_TEAMS_SERVICE"); !ok || got != "1" {
+		t.Fatalf("CODEX_HELPER_TEAMS_SERVICE env = %q ok=%v, want 1", got, ok)
+	}
+	if _, ok := testEnvValue(env, "CODEX_PROXY_DEBUG"); ok {
+		t.Fatalf("unexpected non-service CODEX_PROXY_DEBUG in local supervisor env: %#v", env)
+	}
+	if _, ok := testEnvValue(env, "HTTP_PROXY"); ok {
+		t.Fatalf("unexpected parent HTTP_PROXY in local supervisor env: %#v", env)
+	}
+	if _, ok := testEnvValue(env, "XDG_RUNTIME_DIR"); ok {
+		t.Fatalf("unexpected XDG_RUNTIME_DIR in local supervisor env: %#v", env)
+	}
+	if got, ok := testEnvValue(env, "XDG_CONFIG_HOME"); !ok || got == "" {
+		t.Fatalf("XDG_CONFIG_HOME env = %q ok=%v, want preserved", got, ok)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRecordedIdentityChecksArgsStartTimeAndEnv(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:  tmp,
+		localProcessArgs: func(pid int) ([]string, error) {
+			if pid != 7001 {
+				t.Fatalf("args pid = %d, want 7001", pid)
+			}
+			return []string{filepath.Join(tmp, "bin", "codex-proxy"), "teams", "run", "--registry", filepath.Join(tmp, "registry.json")}, nil
+		},
+		localProcessStartTime: func(pid int) (string, error) {
+			if pid != 7001 {
+				t.Fatalf("start pid = %d, want 7001", pid)
+			}
+			return "12345", nil
+		},
+		localProcessEnvironment: func(pid int) (map[string]string, error) {
+			if pid != 7001 {
+				t.Fatalf("env pid = %d, want 7001", pid)
+			}
+			return map[string]string{
+				"CODEX_HELPER_TEAMS_SERVICE":      "1",
+				"CODEX_HELPER_TEAMS_PROFILE":      "work",
+				"CODEX_HELPER_TEAMS_MACHINE_ID":   "machine-a",
+				"CODEX_HELPER_TEAMS_AUTH_PROFILE": "auth",
+			}, nil
+		},
+	})
+	err := teamsServiceLocalSupervisorVerifyRecordedIdentity(7001, &teamsServiceLocalSupervisorProcessIdentity{
+		Executable:    filepath.Join(tmp, "bin", "codex-proxy"),
+		Args:          []string{"teams", "run", "--registry", filepath.Join(tmp, "registry.json")},
+		ProcStartTime: "12345",
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_PROFILE":      "work",
+			"CODEX_HELPER_TEAMS_MACHINE_ID":   "machine-a",
+			"CODEX_HELPER_TEAMS_AUTH_PROFILE": "auth",
+		},
+	}, "local supervisor child")
+	if err != nil {
+		t.Fatalf("verify recorded identity: %v", err)
+	}
+	err = teamsServiceLocalSupervisorVerifyRecordedIdentity(7001, &teamsServiceLocalSupervisorProcessIdentity{
+		Args:          []string{"teams", "run"},
+		ProcStartTime: "different",
+	}, "local supervisor child")
+	if err == nil || !strings.Contains(err.Error(), "start time changed") {
+		t.Fatalf("verify stale start time err = %v, want start time rejection", err)
+	}
+	err = teamsServiceLocalSupervisorVerifyRecordedIdentity(7001, &teamsServiceLocalSupervisorProcessIdentity{
+		Args: []string{"teams", "run"},
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_PROFILE": "other",
+		},
+	}, "local supervisor child")
+	if err == nil || !strings.Contains(err.Error(), "environment CODEX_HELPER_TEAMS_PROFILE") {
+		t.Fatalf("verify env mismatch err = %v, want env rejection", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorLogRotationFailureKeepsCurrentFile(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "local-supervisor.log")
+	large := bytes.Repeat([]byte("x"), teamsServiceLocalSupervisorMaxLogBytes+1)
+	if err := os.WriteFile(logPath, large, 0o600); err != nil {
+		t.Fatalf("write large log: %v", err)
+	}
+	current, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open current log: %v", err)
+	}
+	defer current.Close()
+	if err := os.WriteFile(logPath+".2", []byte("backup"), 0o600); err != nil {
+		t.Fatalf("write backup log: %v", err)
+	}
+	if err := os.Mkdir(logPath+".3", 0o700); err != nil {
+		t.Fatalf("mkdir conflicting backup path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(logPath+".3", "block"), []byte("block"), 0o600); err != nil {
+		t.Fatalf("write conflicting backup child: %v", err)
+	}
+
+	next, err := reopenTeamsServiceLocalSupervisorLogIfNeeded(logPath, current)
+	if err == nil {
+		t.Fatal("reopen log succeeded, want rotation error")
+	}
+	if next != current {
+		t.Fatalf("reopen returned different file after failure")
+	}
+	if _, err := current.Write([]byte("still-open\n")); err != nil {
+		t.Fatalf("current log file was closed after rotation failure: %v", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorLogWriterRotatesDuringLongRunningOutput(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "local-supervisor.log")
+	writer, err := openTeamsServiceLocalSupervisorLogWriter(logPath)
+	if err != nil {
+		t.Fatalf("open log writer: %v", err)
+	}
+	large := bytes.Repeat([]byte("x"), teamsServiceLocalSupervisorMaxLogBytes+1)
+	if _, err := writer.Write(large); err != nil {
+		t.Fatalf("write large log chunk: %v", err)
+	}
+	if _, err := writer.Write([]byte("next\n")); err != nil {
+		t.Fatalf("write post-rotation log chunk: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close log writer: %v", err)
+	}
+	current, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read current log: %v", err)
+	}
+	if string(current) != "next\n" {
+		t.Fatalf("current log = %q, want post-rotation chunk", current)
+	}
+	rotated, err := os.Stat(logPath + ".1")
+	if err != nil {
+		t.Fatalf("stat rotated log: %v", err)
+	}
+	if rotated.Size() <= teamsServiceLocalSupervisorMaxLogBytes {
+		t.Fatalf("rotated log size = %d, want > %d", rotated.Size(), teamsServiceLocalSupervisorMaxLogBytes)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorDirRejectsSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliably available on Windows test hosts")
+	}
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	link := filepath.Join(tmp, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	err := ensureTeamsServiceLocalSupervisorDir(link)
+	if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("ensure symlink dir err = %v, want symlink rejection", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRejectsSymlinkStatusLockAndLogFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliably available on Windows test hosts")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	statusPath, err := teamsServiceLocalSupervisorStatusPath()
+	if err != nil {
+		t.Fatalf("status path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0o700); err != nil {
+		t.Fatalf("mkdir status dir: %v", err)
+	}
+	statusTarget := filepath.Join(tmp, "status-target.json")
+	if err := os.WriteFile(statusTarget, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write status target: %v", err)
+	}
+	if err := os.Symlink(statusTarget, statusPath); err != nil {
+		t.Fatalf("status symlink: %v", err)
+	}
+	if _, _, err := readTeamsServiceLocalSupervisorStatus(); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("read symlink status err = %v, want symlink rejection", err)
+	}
+
+	lockPath, err := teamsServiceLocalSupervisorLockPath()
+	if err != nil {
+		t.Fatalf("lock path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+	lockTarget := filepath.Join(tmp, "lock-target")
+	if err := os.WriteFile(lockTarget, []byte("lock"), 0o600); err != nil {
+		t.Fatalf("write lock target: %v", err)
+	}
+	if err := os.Symlink(lockTarget, lockPath); err != nil {
+		t.Fatalf("lock symlink: %v", err)
+	}
+	if _, err := teamsServiceLocalSupervisorLockHeld(); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("lock symlink err = %v, want symlink rejection", err)
+	}
+
+	logPath, err := teamsServiceLocalSupervisorLogPath()
+	if err != nil {
+		t.Fatalf("log path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("mkdir log dir: %v", err)
+	}
+	logTarget := filepath.Join(tmp, "log-target")
+	if err := os.WriteFile(logTarget, []byte("log"), 0o600); err != nil {
+		t.Fatalf("write log target: %v", err)
+	}
+	if err := os.Symlink(logTarget, logPath); err != nil {
+		t.Fatalf("log symlink: %v", err)
+	}
+	if file, err := openTeamsServiceLocalSupervisorLog(logPath); err == nil {
+		_ = file.Close()
+		t.Fatal("open symlink log succeeded, want rejection")
+	} else if !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("log symlink err = %v, want symlink rejection", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorFileAtomicReplacesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorFileAtomic(path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("atomic write: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read replaced file: %v", err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("file content = %q, want new", data)
 	}
 }
 
@@ -2661,20 +4674,31 @@ func assertTeamsServiceCallsDoNotContain(t *testing.T, calls []teamsServiceComma
 }
 
 type teamsServiceTestHooks struct {
-	goos                 string
-	exe                  string
-	argv0                string
-	cwd                  string
-	unitDir              string
-	launchAgentDir       string
-	windowsTaskDir       string
-	userID               string
-	isWSL                bool
-	wslDistro            string
-	wslLinuxUser         string
-	powerShellExecutable string
-	runner               teamsServiceCommandRunner
-	bootstrapControlChat func(context.Context, *rootOptions, *string, bool, io.Writer) (teamsServiceBootstrapControlChatResult, error)
+	goos                       string
+	exe                        string
+	argv0                      string
+	cwd                        string
+	unitDir                    string
+	launchAgentDir             string
+	windowsTaskDir             string
+	userID                     string
+	isWSL                      bool
+	wslDistro                  string
+	wslLinuxUser               string
+	powerShellExecutable       string
+	systemdUserAvailable       *bool
+	systemdUserAvailableErr    error
+	runner                     teamsServiceCommandRunner
+	bootstrapControlChat       func(context.Context, *rootOptions, *string, bool, io.Writer) (teamsServiceBootstrapControlChatResult, error)
+	localStartDetached         func(context.Context, string, string, teamsServiceSpec) (int, error)
+	localVerifyProcessIdentity func(int, string) error
+	localVerifyChildIdentity   func(int, teamsServiceSpec) error
+	localProcessStartTime      func(int) (string, error)
+	localProcessArgs           func(int) ([]string, error)
+	localProcessEnvironment    func(int) (map[string]string, error)
+	localCheckChildHealth      func(context.Context, *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error)
+	localTerminateTarget       func(*exec.Cmd, time.Duration) error
+	localReadyTimeout          time.Duration
 }
 
 func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
@@ -2697,11 +4721,22 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevWSLLinuxUserName := teamsServiceWSLLinuxUserName
 	prevPowerShellExecutable := teamsServicePowerShellExecutable
 	prevSystemctl := teamsServiceSystemctl
+	prevSystemdUserAvailable := teamsServiceSystemdUserAvailable
 	prevAuthPreflight := teamsServiceAuthPreflight
 	prevBootstrapControlChat := teamsServiceBootstrapControlChat
+	prevLocalSupervisorStartDetached := teamsServiceLocalSupervisorStartDetached
+	prevLocalSupervisorCheckChildHealth := teamsServiceLocalSupervisorCheckChildHealth
+	prevLocalSupervisorTerminateTarget := teamsServiceLocalSupervisorTerminateTarget
+	prevLocalSupervisorReadyTimeout := teamsServiceLocalSupervisorReadyTimeout
+	prevLocalSupervisorVerifyProcessIdentity := teamsLocalSupervisorVerifyProcessIdentity
+	prevLocalSupervisorVerifyChildIdentity := teamsLocalSupervisorVerifyChildIdentity
+	prevLocalSupervisorProcessStartTime := teamsLocalSupervisorProcessStartTime
+	prevLocalSupervisorProcessArgs := teamsLocalSupervisorProcessArgs
+	prevLocalSupervisorProcessEnvironment := teamsLocalSupervisorProcessEnvironment
 	prevListLocalProcesses := teamsServiceListLocalProcesses
 	prevTerminateLocalProcess := teamsServiceTerminateLocalProcess
 	prevLocalProcessGraceDelay := teamsServiceLocalProcessGraceDelay
+	t.Setenv("CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND", "")
 	teamsServiceGOOS = func() string { return hooks.goos }
 	teamsServiceExecutable = func() (string, error) { return hooks.exe, nil }
 	teamsServiceArgv0 = func() string { return hooks.argv0 }
@@ -2720,6 +4755,15 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		return "powershell.exe"
 	}
 	teamsServiceSystemctl = hooks.runner
+	teamsServiceSystemdUserAvailable = func(context.Context) (bool, error) {
+		if hooks.systemdUserAvailableErr != nil {
+			return false, hooks.systemdUserAvailableErr
+		}
+		if hooks.systemdUserAvailable != nil {
+			return *hooks.systemdUserAvailable, nil
+		}
+		return true, nil
+	}
 	teamsServiceAuthPreflight = func() error { return nil }
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) { return nil, nil }
 	teamsServiceTerminateLocalProcess = func(int, time.Duration) error { return nil }
@@ -2729,6 +4773,57 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 			return hooks.bootstrapControlChat(ctx, root, registryPath, openControl, errOut)
 		}
 		return teamsServiceBootstrapControlChatResult{}, nil
+	}
+	teamsServiceLocalSupervisorStartDetached = func(ctx context.Context, configPath string, logPath string, spec teamsServiceSpec) (int, error) {
+		if hooks.localStartDetached != nil {
+			return hooks.localStartDetached(ctx, configPath, logPath, spec)
+		}
+		return 4242, nil
+	}
+	teamsLocalSupervisorVerifyProcessIdentity = func(pid int, configPath string) error {
+		if hooks.localVerifyProcessIdentity != nil {
+			return hooks.localVerifyProcessIdentity(pid, configPath)
+		}
+		return nil
+	}
+	teamsLocalSupervisorVerifyChildIdentity = func(pid int, spec teamsServiceSpec) error {
+		if hooks.localVerifyChildIdentity != nil {
+			return hooks.localVerifyChildIdentity(pid, spec)
+		}
+		return nil
+	}
+	teamsLocalSupervisorProcessStartTime = func(pid int) (string, error) {
+		if hooks.localProcessStartTime != nil {
+			return hooks.localProcessStartTime(pid)
+		}
+		return "", nil
+	}
+	teamsLocalSupervisorProcessArgs = func(pid int) ([]string, error) {
+		if hooks.localProcessArgs != nil {
+			return hooks.localProcessArgs(pid)
+		}
+		return nil, nil
+	}
+	teamsLocalSupervisorProcessEnvironment = func(pid int) (map[string]string, error) {
+		if hooks.localProcessEnvironment != nil {
+			return hooks.localProcessEnvironment(pid)
+		}
+		return nil, nil
+	}
+	teamsServiceLocalSupervisorCheckChildHealth = func(ctx context.Context, state *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
+		if hooks.localCheckChildHealth != nil {
+			return hooks.localCheckChildHealth(ctx, state)
+		}
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "test health check disabled"}, nil
+	}
+	teamsServiceLocalSupervisorTerminateTarget = func(cmd *exec.Cmd, grace time.Duration) error {
+		if hooks.localTerminateTarget != nil {
+			return hooks.localTerminateTarget(cmd, grace)
+		}
+		return terminateTargetCommand(cmd, grace)
+	}
+	if hooks.localReadyTimeout > 0 {
+		teamsServiceLocalSupervisorReadyTimeout = hooks.localReadyTimeout
 	}
 	t.Cleanup(func() {
 		teamsServiceGOOS = prevGOOS
@@ -2744,8 +4839,18 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServiceWSLLinuxUserName = prevWSLLinuxUserName
 		teamsServicePowerShellExecutable = prevPowerShellExecutable
 		teamsServiceSystemctl = prevSystemctl
+		teamsServiceSystemdUserAvailable = prevSystemdUserAvailable
 		teamsServiceAuthPreflight = prevAuthPreflight
 		teamsServiceBootstrapControlChat = prevBootstrapControlChat
+		teamsServiceLocalSupervisorStartDetached = prevLocalSupervisorStartDetached
+		teamsServiceLocalSupervisorCheckChildHealth = prevLocalSupervisorCheckChildHealth
+		teamsServiceLocalSupervisorTerminateTarget = prevLocalSupervisorTerminateTarget
+		teamsServiceLocalSupervisorReadyTimeout = prevLocalSupervisorReadyTimeout
+		teamsLocalSupervisorVerifyProcessIdentity = prevLocalSupervisorVerifyProcessIdentity
+		teamsLocalSupervisorVerifyChildIdentity = prevLocalSupervisorVerifyChildIdentity
+		teamsLocalSupervisorProcessStartTime = prevLocalSupervisorProcessStartTime
+		teamsLocalSupervisorProcessArgs = prevLocalSupervisorProcessArgs
+		teamsLocalSupervisorProcessEnvironment = prevLocalSupervisorProcessEnvironment
 		teamsServiceListLocalProcesses = prevListLocalProcesses
 		teamsServiceTerminateLocalProcess = prevTerminateLocalProcess
 		teamsServiceLocalProcessGraceDelay = prevLocalProcessGraceDelay
@@ -2754,4 +4859,17 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 
 func stringPtr(s string) *string {
 	return &s
+}
+
+func testEnvValue(env []string, key string) (string, bool) {
+	prefix := key + "="
+	var out string
+	ok := false
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			out = strings.TrimPrefix(entry, prefix)
+			ok = true
+		}
+	}
+	return out, ok
 }

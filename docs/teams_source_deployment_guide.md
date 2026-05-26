@@ -259,8 +259,11 @@ codex-proxy teams service doctor
 
 Typical backends:
 
-- Linux: `systemd --user`
-- WSL: per-user Windows Scheduled Task that launches `wsl.exe`
+- Linux: `systemd --user`, or `local-supervisor` when no user systemd manager is
+  usable; an enabled or active local-supervisor install stays sticky in auto mode
+- WSL: per-user Windows Scheduled Task that launches `wsl.exe`, unless an
+  enabled or active local-supervisor install is sticky or Windows Task mode is
+  explicitly forced
 - macOS: LaunchAgent
 - Windows: per-user Scheduled Task
 
@@ -279,12 +282,23 @@ automatically until you run `enable` and `start`.
 
 Platform notes:
 
-- Linux without user lingering: the service should survive terminal close while
+- Linux with `systemd --user`: the service should survive terminal close while
   the user session exists. A real logout may stop `systemd --user` unless the
   environment enables linger or keeps a user session alive.
+- Linux without a usable user systemd manager: `service bootstrap` falls back to
+  `local-supervisor`. It detaches with `setsid`, uses a config-root lock/status
+  file to prevent duplicate supervisors, and restarts the Teams runner after
+  crashes, but it cannot guarantee restart after a machine or container reboot.
+  Auto mode keeps an enabled or active local-supervisor install on that backend
+  to avoid backend flapping.
 - WSL: the helper installs a Windows Scheduled Task for the current Windows user
   and target distro/user. This is the preferred path for surviving terminal close
-  and WSL shell exit.
+  and WSL shell exit. Explicit WSL `systemd` mode fails as systemd when no user
+  manager is usable; explicit WSL `local-supervisor` mode is available for
+  no-Windows-task debugging, but it has the same no-reboot-autostart limit as
+  non-WSL local-supervisor. If local-supervisor is already enabled or active,
+  WSL auto mode keeps it sticky unless `CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND`
+  explicitly requests `windows-task`.
 - macOS: LaunchAgent starts when the user logs in. Sleep/wake should restart the
   process if needed.
 - Windows: Scheduled Task runs as the current user. Enterprise policy can block

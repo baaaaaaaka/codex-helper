@@ -103,6 +103,111 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 	}
 }
 
+func TestStripOAIMemoryCitationBlocksRemovesInlineClosedBlock(t *testing.T) {
+	text := strings.Join([]string{
+		"visible answer<oai-mem-citation>",
+		"<citation_entries>",
+		"MEMORY.md:1-3|note=[confirmed codex-helper repo context]",
+		"</citation_entries>",
+		"<rollout_ids>",
+		"019d4393-5109-7b10-b5c2-05b2fe8635ba",
+		"</rollout_ids>",
+		"</oai-mem-citation>",
+	}, "\n")
+	if got := StripOAIMemoryCitationBlocks(text); got != "visible answer" {
+		t.Fatalf("StripOAIMemoryCitationBlocks() = %q, want visible answer", got)
+	}
+	literal := "visible <oai-mem-citation> literal text without closing tag"
+	if got := StripOAIMemoryCitationBlocks(literal); got != literal {
+		t.Fatalf("StripOAIMemoryCitationBlocks() = %q, want literal text preserved", got)
+	}
+	withLiteralMention := strings.Join([]string{
+		"visible `<oai-mem-citation>` mention before metadata.",
+		"",
+		"<oai-mem-citation>",
+		"<citation_entries>",
+		"MEMORY.md:1-3|note=[confirmed codex-helper repo context]",
+		"</citation_entries>",
+		"</oai-mem-citation>",
+	}, "\n")
+	if got := StripOAIMemoryCitationBlocks(withLiteralMention); got != "visible `<oai-mem-citation>` mention before metadata." {
+		t.Fatalf("StripOAIMemoryCitationBlocks() = %q, want inline mention preserved", got)
+	}
+}
+
+func TestStripOAIMemoryCitationBlocksPreservesFencedExamples(t *testing.T) {
+	fenced := strings.Join([]string{
+		"visible before",
+		"```xml",
+		"<oai-mem-citation>",
+		"<citation_entries>",
+		"MEMORY.md:1-3|note=[example that must remain visible]",
+		"</citation_entries>",
+		"</oai-mem-citation>",
+		"```",
+		"visible after",
+		"<oai-mem-citation>",
+		"<citation_entries>",
+		"MEMORY.md:4-5|note=[hidden metadata]",
+		"</citation_entries>",
+		"</oai-mem-citation>",
+	}, "\n")
+	got := StripOAIMemoryCitationBlocks(fenced)
+	for _, want := range []string{
+		"visible before",
+		"```xml",
+		"MEMORY.md:1-3|note=[example that must remain visible]",
+		"</oai-mem-citation>",
+		"```",
+		"visible after",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("StripOAIMemoryCitationBlocks() missing fenced content %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "hidden metadata") || strings.Contains(got, "MEMORY.md:4-5") {
+		t.Fatalf("StripOAIMemoryCitationBlocks() leaked hidden metadata:\n%s", got)
+	}
+}
+
+func TestStripOAIMemoryCitationBlocksDoesNotTreatCitationStartAsFenceInfo(t *testing.T) {
+	text := strings.Join([]string{
+		"visible before",
+		"~~~<oai-mem-citation>",
+		"<citation_entries>",
+		"MEMORY.md:1-3|note=[hidden metadata]",
+		"</citation_entries>",
+		"</oai-mem-citation>",
+		"visible after",
+	}, "\n")
+	got := StripOAIMemoryCitationBlocks(text)
+	if !strings.Contains(got, "visible before") || !strings.Contains(got, "visible after") {
+		t.Fatalf("StripOAIMemoryCitationBlocks() lost visible text:\n%s", got)
+	}
+	if strings.Contains(got, "hidden metadata") || strings.Contains(got, "MEMORY.md") || strings.Contains(got, "citation_entries") {
+		t.Fatalf("StripOAIMemoryCitationBlocks() leaked hidden metadata:\n%s", got)
+	}
+}
+
+func TestStripOAIMemoryCitationBlocksCleansAfterUnclosedFence(t *testing.T) {
+	text := strings.Join([]string{
+		"visible before",
+		"~~~",
+		"<oai-mem-citation>",
+		"<citation_entries>",
+		"MEMORY.md:1-3|note=[hidden metadata]",
+		"</citation_entries>",
+		"</oai-mem-citation>",
+	}, "\n")
+	got := StripOAIMemoryCitationBlocks(text)
+	if !strings.Contains(got, "visible before") {
+		t.Fatalf("StripOAIMemoryCitationBlocks() lost visible text:\n%s", got)
+	}
+	if strings.Contains(got, "hidden metadata") || strings.Contains(got, "MEMORY.md") || strings.Contains(got, "citation_entries") {
+		t.Fatalf("StripOAIMemoryCitationBlocks() leaked hidden metadata:\n%s", got)
+	}
+}
+
 func TestStripHelperPromptEchoesRemovesGeneratedControlFallbackContext(t *testing.T) {
 	prompt := ControlFallbackCodexPromptWithContext("what can I do here", ControlFallbackPromptContext{
 		HelperVersion:     "v-test",

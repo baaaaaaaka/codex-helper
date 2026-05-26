@@ -148,9 +148,7 @@ func TestP1TranscriptFormattingStripsArtifactManifestBlocks(t *testing.T) {
 
 func TestP1TranscriptFormattingStripsOAIMemoryCitationBlocks(t *testing.T) {
 	text := strings.Join([]string{
-		"visible answer",
-		"",
-		"<oai-mem-citation>",
+		"visible answer<oai-mem-citation>",
 		"<citation_entries>",
 		"MEMORY.md:1-3|note=[confirmed codex-helper repo context]",
 		"</citation_entries>",

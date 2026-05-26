@@ -41,7 +41,7 @@ func teamsServiceRetireLocalProcesses(ctx context.Context, spec teamsServiceSpec
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if teamsServiceGOOS() != "linux" || !teamsServiceIsWSL() {
+	if teamsServiceGOOS() != "linux" {
 		return result, nil
 	}
 	processes, err := teamsServiceListLocalProcesses()

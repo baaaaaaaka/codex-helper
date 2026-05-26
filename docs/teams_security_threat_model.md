@@ -196,16 +196,23 @@ reuse the durable bridge state.
 
 - Foreground `teams run` is useful for testing, but it dies with the terminal or
   SSH session. Durable operation should use the explicit user-level service
-  backend for the platform: Linux `systemd --user`, WSL per-user Windows
+  backend for the platform: Linux `systemd --user` when a user manager is
+  usable, Linux `local-supervisor` fallback when it is not, WSL per-user Windows
   Scheduled Task by default, macOS LaunchAgent, or Windows per-user Task
-  Scheduler.
-- `teams service install` writes the unit but does not enable or start it.
+  Scheduler. `local-supervisor` uses a config-root lock/status file and detached
+  process group, survives terminal close and helper crashes, but does not
+  guarantee restart after a machine or container reboot. An enabled or active
+  local-supervisor install remains sticky in auto mode to avoid backend
+  flapping.
+- `teams service install` writes user-level service configuration (unit, task,
+  LaunchAgent, or local-supervisor metadata) but does not enable or start it.
   `teams service enable`, `start`, `stop`, `restart`, and `disable` are explicit
   operator actions.
-- On Linux systems where the user manager exits after logout, the operator may
-  need OS-level linger configuration outside this tool before expecting service
-  survival across full logout or reboot. Terminal close and ordinary SSH
-  disconnect are only reliable while the user service manager remains alive.
+- On Linux systems where the user manager exits after logout, `systemd --user`
+  may need OS-level linger configuration outside this tool before expecting
+  service survival across full logout or reboot. `local-supervisor` is the
+  no-user-manager fallback for terminal detach and helper crash recovery, not a
+  reboot/autostart mechanism.
 - Service supervisors restart failed processes, but clean operator stops and
   upgrade drains are allowed to stay stopped. Bridge lease validation and owner
   heartbeat let restarted or standby processes resume from durable state without

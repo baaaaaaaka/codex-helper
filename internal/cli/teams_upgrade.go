@@ -448,7 +448,17 @@ func refreshTeamsServiceForHelperUpgrade(ctx context.Context, registryPath *stri
 	if matches {
 		return teamsUpgradeServiceRefreshResult{}, nil
 	}
-	if _, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false}); err == nil {
+	repairOpts := teamsServiceRepairOptions{Enable: true, Start: false}
+	if backend, backendErr := teamsServiceBackendForCurrentPlatform(); backendErr != nil {
+		return teamsUpgradeServiceRefreshResult{}, backendErr
+	} else if backend.ID() == teamsServiceLocalSupervisorID {
+		active, activeErr := backend.Active(ctx)
+		if activeErr != nil {
+			return teamsUpgradeServiceRefreshResult{}, activeErr
+		}
+		repairOpts.Start = active
+	}
+	if _, err := repairTeamsService(ctx, registryPath, repairOpts); err == nil {
 		return teamsUpgradeServiceRefreshResult{}, nil
 	} else {
 		return recoverWSLTeamsServiceRefreshAccessDenied(ctx, registryPath, in, out, err)

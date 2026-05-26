@@ -63,6 +63,7 @@ func teamsControlFallbackHelpContext() string {
 		"- `cxp teams service status`: show OS service/task state.",
 		"- `cxp teams service restart --force`: recover local active state, then force a service restart from a terminal.",
 		"- `cxp teams service doctor`: diagnose service backend readiness.",
+		"- On Linux, service auto mode prefers `systemd --user`; if no user manager is usable, it falls back to `local-supervisor`, which survives terminal close and helper crashes but not machine/container reboot. Enabled or active local-supervisor installs stay sticky to avoid backend flapping; in WSL, the Windows Task backend remains preferred unless local-supervisor is sticky or explicitly selected.",
 		"- `cxp teams auth full`: refresh full Teams auth locally.",
 		"- `cxp teams auth full-status`: inspect auth cache expiry without printing tokens.",
 		"",

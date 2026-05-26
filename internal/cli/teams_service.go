@@ -41,6 +41,10 @@ const (
 	teamsServiceWindowsTaskXMLName           = "codex-helper-teams-task.xml"
 	teamsServiceWindowsWatchdogTaskXMLName   = "codex-helper-teams-watchdog-task.xml"
 	teamsServiceWSLTaskConfigName            = "codex-helper-teams-wsl-task.txt"
+	teamsServiceLocalSupervisorConfigName    = "local-supervisor.json"
+	teamsServiceLocalSupervisorStatusName    = "local-supervisor-status.json"
+	teamsServiceLocalSupervisorLockName      = "local-supervisor.lock"
+	teamsServiceLocalSupervisorLogName       = "local-supervisor.log"
 	teamsServiceTaskRestartCount             = 999
 	teamsServiceTaskRestartInterval          = 10
 	teamsServiceTaskSchedulerRestartMinutes  = 1
@@ -83,6 +87,7 @@ var (
 	teamsServiceWSLLinuxUserName                                      = defaultTeamsServiceWSLLinuxUserName
 	teamsServicePowerShellExecutable                                  = defaultTeamsServicePowerShellExecutable
 	teamsServiceSystemctl                   teamsServiceCommandRunner = teamsServiceExecRunner{}
+	teamsServiceSystemdUserAvailable                                  = defaultTeamsServiceSystemdUserAvailable
 	teamsServiceAuthPreflight                                         = defaultTeamsServiceAuthPreflight
 	teamsServiceBootstrapControlChat                                  = defaultTeamsServiceBootstrapControlChat
 	teamsServiceOpenURL                                               = defaultTeamsServiceOpenURL
@@ -107,6 +112,7 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 		newTeamsServiceRestartCmd(),
 		newTeamsServiceWatchdogCmd(),
 		newTeamsServiceDoctorCmd(),
+		newTeamsServiceLocalSupervisorCmd(),
 	)
 	return cmd
 }
@@ -450,12 +456,24 @@ func newTeamsServiceDoctorCmd() *cobra.Command {
 					if err := runTeamsServiceWSLReadinessCheck(cmd.Context(), cmd.OutOrStdout()); err != nil {
 						return err
 					}
+				} else if backend.ID() == "local-supervisor" {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "WSL: local-supervisor was explicitly selected. It survives terminal close and helper crashes inside the running WSL instance, but Windows-login autostart still requires the Windows Scheduled Task backend.")
 				} else {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "WSL: detected. systemd --user requires WSL systemd and a running user manager; for Windows-login autostart, unset CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND=systemd.")
 				}
+			} else if teamsServiceGOOS() == "linux" && backend.ID() == "local-supervisor" {
+				if teamsServiceLocalSupervisorSticky() {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: local-supervisor is selected because an enabled/active local-supervisor config or lock is present.")
+				} else {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: systemd --user is not available, so Teams service will use the local supervisor fallback.")
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: local-supervisor survives terminal close and helper crashes, but it cannot guarantee restart after a machine or container reboot.")
 			} else if teamsServiceGOOS() == "linux" && backend.ID() == "systemd-user" {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: systemd --user keeps the Teams bridge independent of the terminal while the user manager is alive.")
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: if lingering is disabled, a full logout may stop the user manager; without root/admin policy changes, no user service can guarantee survival after that boundary.")
+				if path, ok := teamsServiceDisabledLocalSupervisorConfigPath(); ok {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Linux: disabled local-supervisor config exists but is ignored while systemd --user is selected: %s\n", path)
+				}
 			}
 			return nil
 		},
@@ -565,6 +583,9 @@ func printTeamsServiceDryRun(ctx context.Context, out io.Writer, registryPath *s
 		_, _ = fmt.Fprint(out, buildTeamsServiceWSLTaskConfig(typed.Name(), args))
 		_, _ = fmt.Fprintln(out, "--- wsl watchdog task config ---")
 		_, _ = fmt.Fprint(out, buildTeamsServiceWSLTaskConfig(typed.watchdogName(), watchdogArgs))
+	case teamsServiceLocalSupervisorBackend:
+		_, _ = fmt.Fprintln(out, "--- local supervisor config ---")
+		_, _ = fmt.Fprint(out, renderTeamsServiceLocalSupervisorConfig(spec, false))
 	default:
 		_, _ = fmt.Fprintln(out, "Rendered config preview is not available for this backend.")
 	}
@@ -734,6 +755,9 @@ func printTeamsServiceBootstrapReady(out io.Writer, result teamsServiceBootstrap
 		_, _ = fmt.Fprintln(out, "The service will start after the staged helper replaces the old entry.")
 	} else {
 		_, _ = fmt.Fprintf(out, "Teams service bootstrap ready: %s\n", result.Mode)
+		if strings.HasPrefix(result.Mode, teamsServiceLocalSupervisorID) {
+			_, _ = fmt.Fprintln(out, "Linux local-supervisor survives terminal close and helper crashes, but it cannot guarantee restart after a machine or container reboot.")
+		}
 	}
 	if strings.TrimSpace(result.Path) != "" {
 		_, _ = fmt.Fprintf(out, "Teams service config: %s\n", result.Path)
@@ -860,7 +884,16 @@ func uninstallTeamsService(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return backend.Uninstall(ctx)
+	path, err := backend.Uninstall(ctx)
+	if err != nil {
+		return "", err
+	}
+	if backend.ID() != teamsServiceLocalSupervisorID {
+		if cleanupErr := removeDisabledTeamsServiceLocalSupervisorConfigIfInactive(); cleanupErr != nil {
+			return "", cleanupErr
+		}
+	}
+	return path, nil
 }
 
 type teamsServiceSpec struct {
@@ -895,10 +928,47 @@ type teamsServiceRepairBackend interface {
 func teamsServiceBackendForCurrentPlatform() (teamsServiceBackend, error) {
 	switch teamsServiceGOOS() {
 	case "linux":
-		if teamsServiceIsWSL() && strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND"))) != "systemd" {
-			return teamsServiceWSLWindowsTaskBackend{}, nil
+		if teamsServiceIsWSL() {
+			mode, source := teamsServiceWSLBackendMode()
+			switch mode {
+			case "", "auto":
+				if teamsServiceLocalSupervisorSticky() {
+					return teamsServiceLocalSupervisorBackend{}, nil
+				}
+				return teamsServiceWSLWindowsTaskBackend{}, nil
+			case "windows", "windows-task", "windows-task-scheduler", "wsl-windows-task-scheduler":
+				return teamsServiceWSLWindowsTaskBackend{}, nil
+			case "systemd", "systemd-user":
+				return teamsServiceSystemdBackend{}, nil
+			case "local", "local-supervisor":
+				return teamsServiceLocalSupervisorBackend{}, nil
+			default:
+				if source == "" {
+					source = "CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND"
+				}
+				return nil, fmt.Errorf("unsupported WSL Teams service backend %q from %s: use auto, windows-task, systemd, or local-supervisor", mode, source)
+			}
 		}
-		return teamsServiceSystemdBackend{}, nil
+		switch teamsServiceLinuxBackendMode() {
+		case "", "auto":
+			if teamsServiceLocalSupervisorSticky() {
+				return teamsServiceLocalSupervisorBackend{}, nil
+			}
+			available, err := teamsServiceSystemdUserAvailable(context.Background())
+			if err == nil && available {
+				return teamsServiceSystemdBackend{}, nil
+			}
+			if err != nil && !teamsServiceSystemdUserUnavailableError(err) {
+				return nil, fmt.Errorf("verify systemd --user availability for Linux Teams service auto backend: %w", err)
+			}
+			return teamsServiceLocalSupervisorBackend{}, nil
+		case "systemd", "systemd-user":
+			return teamsServiceSystemdBackend{}, nil
+		case "local", "local-supervisor":
+			return teamsServiceLocalSupervisorBackend{}, nil
+		default:
+			return nil, fmt.Errorf("unsupported Linux Teams service backend %q: use systemd, local-supervisor, or auto", teamsServiceLinuxBackendMode())
+		}
 	case "darwin":
 		return teamsServiceLaunchAgentBackend{}, nil
 	case "windows":
@@ -906,6 +976,36 @@ func teamsServiceBackendForCurrentPlatform() (teamsServiceBackend, error) {
 	default:
 		return nil, fmt.Errorf("unsupported platform %q: Teams service management supports Linux systemd --user, macOS LaunchAgent, and Windows per-user Task Scheduler", teamsServiceGOOS())
 	}
+}
+
+func teamsServiceWSLBackendMode() (string, string) {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND")))
+	if mode != "" {
+		return mode, "CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND"
+	}
+	if linuxMode := teamsServiceLinuxBackendMode(); linuxMode != "" {
+		return linuxMode, "CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND"
+	}
+	return "", ""
+}
+
+func teamsServiceLinuxBackendMode() string {
+	return strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND")))
+}
+
+func defaultTeamsServiceSystemdUserAvailable(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if data, err := teamsServiceRunSystemctl(checkCtx, "show-environment"); err != nil {
+		if detail := strings.TrimSpace(string(data)); detail != "" {
+			return false, fmt.Errorf("%w: %s", err, detail)
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func runTeamsServiceCommand(ctx context.Context, out io.Writer, backend teamsServiceBackend, action string) error {
@@ -2564,6 +2664,12 @@ func teamsServiceExistingEnvironment() map[string]string {
 		return parseTeamsServiceSystemdEnvironment(string(data))
 	case teamsServiceLaunchAgentBackend:
 		return parseTeamsServiceLaunchAgentEnvironment(string(data))
+	case teamsServiceLocalSupervisorBackend:
+		cfg, err := readTeamsServiceLocalSupervisorConfig(path)
+		if err != nil {
+			return nil
+		}
+		return cfg.Spec.Environment
 	default:
 		return nil
 	}

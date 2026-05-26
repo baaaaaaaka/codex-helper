@@ -474,12 +474,83 @@ func StripOAIMemoryCitationBlocks(text string) string {
 	}
 	lines := strings.Split(text, "\n")
 	out := make([]string, 0, len(lines))
+	plain := make([]string, 0, len(lines))
+	inFence := false
+	var fence byte
+	var fenceLen int
+	flushPlain := func() {
+		if len(plain) == 0 {
+			return
+		}
+		stripped := stripOAIMemoryCitationBlocksPlainText(strings.Join(plain, "\n"))
+		if stripped != "" {
+			out = append(out, strings.Split(stripped, "\n")...)
+		}
+		plain = plain[:0]
+	}
+	for i, line := range lines {
+		if inFence {
+			out = append(out, line)
+			if teamsMarkdownFenceEnd(line, fence, fenceLen) {
+				inFence = false
+			}
+			continue
+		}
+		if nextFence, nextFenceLen, ok := teamsMarkdownFenceStart(line); ok &&
+			!lineContainsOAIMemoryCitationStart(line) &&
+			remainingLinesCloseMarkdownFence(lines[i+1:], nextFence, nextFenceLen) {
+			flushPlain()
+			out = append(out, line)
+			inFence = true
+			fence = nextFence
+			fenceLen = nextFenceLen
+			continue
+		}
+		plain = append(plain, line)
+	}
+	flushPlain()
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func stripOAIMemoryCitationBlocksPlainText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	const startTag = "<oai-mem-citation>"
+	const endTag = "</oai-mem-citation>"
+	searchOffset := 0
+	for {
+		startRel := indexOAIMemoryCitationBlockStart(text[searchOffset:], startTag)
+		if startRel < 0 {
+			break
+		}
+		start := searchOffset + startRel
+		if start < 0 {
+			break
+		}
+		afterStart := start + len(startTag)
+		endRel := indexASCIIFold(text[afterStart:], endTag)
+		if endRel < 0 {
+			break
+		}
+		inner := text[afterStart : afterStart+endRel]
+		if !looksLikeOAIMemoryCitationPayload(inner) {
+			searchOffset = afterStart
+			continue
+		}
+		end := afterStart + endRel + len(endTag)
+		text = text[:start] + text[end:]
+		searchOffset = 0
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
 	inBlock := false
-	for _, line := range lines {
+	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		lower := strings.ToLower(trimmed)
 		if !inBlock {
-			if lower == "<oai-mem-citation>" {
+			if lower == "<oai-mem-citation>" && followingLinesLookLikeOAIMemoryCitationPayload(lines[i+1:]) {
 				inBlock = true
 				continue
 			}
@@ -491,6 +562,83 @@ func StripOAIMemoryCitationBlocks(text string) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func lineContainsOAIMemoryCitationStart(line string) bool {
+	return indexASCIIFold(line, "<oai-mem-citation>") >= 0
+}
+
+func remainingLinesCloseMarkdownFence(lines []string, fence byte, fenceLen int) bool {
+	for _, line := range lines {
+		if teamsMarkdownFenceEnd(line, fence, fenceLen) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeOAIMemoryCitationPayload(text string) bool {
+	return followingLinesLookLikeOAIMemoryCitationPayload(strings.Split(text, "\n"))
+}
+
+func followingLinesLookLikeOAIMemoryCitationPayload(lines []string) bool {
+	for _, line := range lines {
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "":
+			continue
+		case "<citation_entries>", "<rollout_ids>":
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func indexOAIMemoryCitationBlockStart(text string, tag string) int {
+	offset := 0
+	for offset <= len(text) {
+		idx := indexASCIIFold(text[offset:], tag)
+		if idx < 0 {
+			return -1
+		}
+		start := offset + idx
+		afterStart := start + len(tag)
+		if afterStart >= len(text) || text[afterStart] == '\n' || text[afterStart] == '\r' {
+			return start
+		}
+		offset = afterStart
+	}
+	return -1
+}
+
+func indexASCIIFold(text string, needle string) int {
+	if needle == "" {
+		return 0
+	}
+	if len(needle) > len(text) {
+		return -1
+	}
+	for i := 0; i <= len(text)-len(needle); i++ {
+		matched := true
+		for j := 0; j < len(needle); j++ {
+			if asciiFoldByte(text[i+j]) != asciiFoldByte(needle[j]) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return i
+		}
+	}
+	return -1
+}
+
+func asciiFoldByte(ch byte) byte {
+	if ch >= 'A' && ch <= 'Z' {
+		return ch + ('a' - 'A')
+	}
+	return ch
 }
 
 func ArtifactUploadName(sessionID string, turnID string, name string, data []byte) string {

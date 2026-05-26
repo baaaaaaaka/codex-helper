@@ -880,9 +880,7 @@ func TestBridgeDoesNotSendFinalTextAsProgressWhenOnlyMemoryCitationDiffers(t *te
 		},
 		result: ExecutionResult{Text: strings.Join([]string{
 			"VISIBLE FINAL",
-			"Fixed the bug.",
-			"",
-			"<oai-mem-citation>",
+			"Fixed the bug.<oai-mem-citation>",
 			"<citation_entries>",
 			"MEMORY.md:1-3|note=[confirmed codex-helper repo context]",
 			"</citation_entries>",

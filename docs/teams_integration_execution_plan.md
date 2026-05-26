@@ -89,9 +89,10 @@ P0 completed in the current implementation slice:
   of treating it as ignored. Deferred input keeps the original text and is
   replayed by the restarted bridge after drain clears.
 - User service management now has backend abstractions for Linux
-  `systemd --user`, macOS LaunchAgent, and Windows per-user Task Scheduler,
-  plus WSL doctor guidance. Default service units let the bridge choose scoped
-  registry/state paths instead of forcing a shared legacy registry path.
+  `systemd --user`, Linux `local-supervisor`, macOS LaunchAgent, and Windows
+  per-user Task Scheduler, plus WSL doctor guidance. Default service units let
+  the bridge choose scoped registry/state paths instead of forcing a shared
+  legacy registry path.
 - Non-mention outbox sends now use the Teams renderer path, so assistant,
   helper/status, imported, and error output are consistently labelled and HTML
   escaped at send time.
@@ -884,15 +885,17 @@ Status:
   `drain` reject new session work without invoking Codex and record durable
   control output; `teams recover` refuses live owners by default, allows stale
   owners, and requires `--force` for live-owner override.
-- Completed current P0/P1 service slice: Linux `systemd --user`, macOS
-  LaunchAgent, Windows per-user Task Scheduler, and WSL Windows Scheduled Task
-  service backends support install/uninstall/status/start/stop/restart plus
-  enable/disable where applicable. Install does not enable or start
-  automatically, and WSL task names are isolated by distro, Linux user, profile,
-  and stable short hash. WSL service doctor now checks Windows-side supervisor
-  readiness with a non-destructive PowerShell probe before declaring the backend
-  usable, and falls back to the standard Windows PowerShell path when the
-  executable is not exported into the WSL `PATH`.
+- Completed current P0/P1 service slice: Linux `systemd --user`, Linux
+  `local-supervisor`, macOS LaunchAgent, Windows per-user Task Scheduler, and
+  WSL Windows Scheduled Task service backends support
+  install/uninstall/status/start/stop/restart plus enable/disable where
+  applicable. Install does not enable or start automatically, local-supervisor
+  is sticky when enabled or active and cannot guarantee reboot autostart, and
+  WSL task names are isolated by distro, Linux user, profile, and stable short
+  hash. WSL service doctor now checks Windows-side supervisor readiness with a
+  non-destructive PowerShell probe before declaring the backend usable, and
+  falls back to the standard Windows PowerShell path when the executable is not
+  exported into the WSL `PATH`.
 - Completed current P0/P1 upgrade slice: helper `upgrade` asks active Teams
   bridges to drain before binary replacement, stops an active user service after
   drain to avoid supervisor restart races, restarts or schedules delayed restart
