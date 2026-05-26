@@ -774,7 +774,13 @@ func TestTeamsServiceLocalSupervisorStartPreflightFailureDoesNotRetireSystemd(t 
 	if err := os.WriteFile(badCacheHome, []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("write bad cache home: %v", err)
 	}
+	badHome := filepath.Join(tmp, "home-file")
+	if err := os.WriteFile(badHome, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write bad home: %v", err)
+	}
+	t.Setenv("HOME", badHome)
 	t.Setenv("XDG_CACHE_HOME", badCacheHome)
+	t.Setenv("LOCALAPPDATA", badCacheHome)
 	_, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start")
 	if err == nil {
 		t.Fatal("start err = nil, want log preflight failure")
@@ -2070,6 +2076,9 @@ func TestTeamsServiceLocalSupervisorLogRotationFailureKeepsCurrentFile(t *testin
 }
 
 func TestTeamsServiceLocalSupervisorLogWriterRotatesDuringLongRunningOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local-supervisor log rotation renames an open append handle; Windows uses the Task Scheduler backend")
+	}
 	tmp := t.TempDir()
 	logPath := filepath.Join(tmp, "local-supervisor.log")
 	writer, err := openTeamsServiceLocalSupervisorLogWriter(logPath)
@@ -2954,6 +2963,69 @@ func TestTeamsServiceWSLTaskNamePrefixIncludesTrailingSpaceBeforeSuffix(t *testi
 	want := "Codex Helper Teams Bridge (WSL Debian baka default "
 	if got != want {
 		t.Fatalf("prefix = %q, want %q", got, want)
+	}
+}
+
+func TestTeamsServiceIsWSLFromSignalsRequiresInteropForKernelOnlyMatch(t *testing.T) {
+	cases := []struct {
+		name             string
+		goos             string
+		procVersion      string
+		interopAvailable bool
+		want             bool
+	}{
+		{
+			name:             "real WSL signal with interop",
+			goos:             "linux",
+			procVersion:      "Linux version 6.6.87.2-microsoft-standard-WSL2",
+			interopAvailable: true,
+			want:             true,
+		},
+		{
+			name:             "docker container on WSL kernel without interop",
+			goos:             "linux",
+			procVersion:      "Linux version 6.6.87.2-microsoft-standard-WSL2",
+			interopAvailable: false,
+			want:             false,
+		},
+		{
+			name:             "ordinary linux",
+			goos:             "linux",
+			procVersion:      "Linux version 6.8.0-azure",
+			interopAvailable: true,
+			want:             false,
+		},
+		{
+			name:             "windows host",
+			goos:             "windows",
+			procVersion:      "Linux version 6.6.87.2-microsoft-standard-WSL2",
+			interopAvailable: true,
+			want:             false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := teamsServiceIsWSLFromSignals(tc.goos, tc.procVersion, tc.interopAvailable); got != tc.want {
+				t.Fatalf("isWSL = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDefaultTeamsServiceIsWSLRequiresLinuxBeforeEnv(t *testing.T) {
+	prevGOOS := teamsServiceGOOS
+	t.Cleanup(func() { teamsServiceGOOS = prevGOOS })
+	t.Setenv("WSL_DISTRO_NAME", "Ubuntu")
+	t.Setenv("WSL_INTEROP", "/run/WSL/1_interop")
+
+	teamsServiceGOOS = func() string { return "windows" }
+	if got := defaultTeamsServiceIsWSL(); got {
+		t.Fatalf("defaultTeamsServiceIsWSL on windows with WSL env = %t, want false", got)
+	}
+
+	teamsServiceGOOS = func() string { return "linux" }
+	if got := defaultTeamsServiceIsWSL(); !got {
+		t.Fatalf("defaultTeamsServiceIsWSL on linux with WSL env = %t, want true", got)
 	}
 }
 

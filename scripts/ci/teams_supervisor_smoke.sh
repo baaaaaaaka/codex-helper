@@ -103,6 +103,18 @@ wait_for_process_gone() {
   return 1
 }
 
+run_logged() {
+  local label="$1"
+  local log_file="$2"
+  shift 2
+  if "$@" >"$log_file" 2>&1; then
+    return 0
+  fi
+  log "$label failed"
+  sed "s/^/[$label] /" "$log_file" || true
+  return 1
+}
+
 write_token_cache() {
   local path="$1"
   local expires
@@ -332,10 +344,10 @@ EOF
     "CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=$cache_home/read-token.json"
   )
 
-  CODEX_PROXY_DEBUG=1 CODEX_HELPER_TEAMS_CHILD=1 HTTP_PROXY=http://127.0.0.1:9 env -i "${common_env[@]}" "$cxp" teams service install >"$smoke/install.log" 2>&1
+  run_logged "public-install" "$smoke/install.log" env -i "${common_env[@]}" "$cxp" teams service install
   replace_json_executable "$config" "$fake"
-  CODEX_PROXY_DEBUG=1 CODEX_HELPER_TEAMS_CHILD=1 HTTP_PROXY=http://127.0.0.1:9 env -i "${common_env[@]}" "$cxp" teams service enable >"$smoke/enable.log" 2>&1
-  CODEX_PROXY_DEBUG=1 CODEX_HELPER_TEAMS_CHILD=1 HTTP_PROXY=http://127.0.0.1:9 env -i "${common_env[@]}" "$cxp" teams service start >"$smoke/start.log" 2>&1
+  run_logged "public-enable" "$smoke/enable.log" env -i "${common_env[@]}" "$cxp" teams service enable
+  run_logged "public-start" "$smoke/start.log" env -i "${common_env[@]}" "$cxp" teams service start
   wait_for_file_pattern "$status" '"supervisor_pid"'
   local public_supervisor_pid
   public_supervisor_pid="$(sed -n 's/.*"supervisor_pid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
@@ -356,13 +368,13 @@ EOF
   if [ -n "$public_child_pid" ]; then
     cleanup_pids+=("$public_child_pid")
   fi
-  CODEX_PROXY_DEBUG=1 CODEX_HELPER_TEAMS_CHILD=1 HTTP_PROXY=http://127.0.0.1:9 env -i "${common_env[@]}" "$cxp" teams service status >"$smoke/status.log" 2>&1
+  run_logged "public-status" "$smoke/status.log" env -i "${common_env[@]}" "$cxp" teams service status
   if ! grep -q 'Active: true' "$smoke/status.log"; then
     log "public lifecycle status did not report active"
     sed 's/^/[public-status] /' "$smoke/status.log" || true
     return 1
   fi
-  CODEX_PROXY_DEBUG=1 CODEX_HELPER_TEAMS_CHILD=1 HTTP_PROXY=http://127.0.0.1:9 env -i "${common_env[@]}" "$cxp" teams service stop >"$smoke/stop.log" 2>&1
+  run_logged "public-stop" "$smoke/stop.log" env -i "${common_env[@]}" "$cxp" teams service stop
   if [ -n "$public_child_pid" ] && ! wait_for_pid_gone "$public_child_pid"; then
     log "public lifecycle child pid $public_child_pid remained after stop"
     return 1
@@ -371,7 +383,7 @@ EOF
     log "public lifecycle supervisor pid $public_supervisor_pid remained after stop"
     return 1
   fi
-  CODEX_PROXY_DEBUG=1 CODEX_HELPER_TEAMS_CHILD=1 HTTP_PROXY=http://127.0.0.1:9 env -i "${common_env[@]}" "$cxp" teams service status >"$smoke/status-after-stop.log" 2>&1
+  run_logged "public-status-after-stop" "$smoke/status-after-stop.log" env -i "${common_env[@]}" "$cxp" teams service status
   if ! grep -q 'Active: false' "$smoke/status-after-stop.log"; then
     log "public lifecycle status did not report inactive after stop"
     sed 's/^/[public-status-after-stop] /' "$smoke/status-after-stop.log" || true

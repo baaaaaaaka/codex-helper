@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 )
@@ -520,22 +521,21 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 	supervisorCtx, stop := teamsLocalSupervisorNotifyContext(ctx)
 	defer stop()
 
+	supervisorExecutable := cfg.Spec.Executable
+	if exe, err := helperpath.RawExecutable(); err == nil && strings.TrimSpace(exe) != "" {
+		supervisorExecutable = exe
+	}
 	status := teamsServiceLocalSupervisorStatus{
-		Version:        teamsServiceLocalSupervisorStatusVersion,
-		ConfigPath:     configPath,
-		LogPath:        logPath,
-		SupervisorPID:  os.Getpid(),
-		SupervisorPGID: teamsLocalSupervisorCurrentProcessGroupID(),
-		SupervisorIdentity: teamsServiceLocalSupervisorIdentityForProcess(
-			os.Getpid(),
-			cfg.Spec.Executable,
-			[]string{"teams", "service", "local-supervisor", "--config", configPath},
-			cfg.Spec.Environment,
-		),
-		State:     "starting",
-		Enabled:   cfg.Enabled,
-		StartedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		Version:            teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:         configPath,
+		LogPath:            logPath,
+		SupervisorPID:      os.Getpid(),
+		SupervisorPGID:     teamsLocalSupervisorCurrentProcessGroupID(),
+		SupervisorIdentity: teamsServiceLocalSupervisorIdentityForProcess(os.Getpid(), supervisorExecutable, []string{"teams", "service", "local-supervisor", "--config", configPath}, cfg.Spec.Environment),
+		State:              "starting",
+		Enabled:            cfg.Enabled,
+		StartedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
 	}
 	_ = writeTeamsServiceLocalSupervisorStatus(status)
 	defer func() {
@@ -1067,9 +1067,6 @@ func teamsServiceLocalSupervisorSticky() bool {
 		return true
 	}
 	if status, ok, err := readTeamsServiceLocalSupervisorStatus(); err == nil && ok && teamsServiceLocalSupervisorStatusActive(status, time.Now()) {
-		return true
-	}
-	if held, err := teamsServiceLocalSupervisorLockHeldExisting(); err == nil && held {
 		return true
 	}
 	return false

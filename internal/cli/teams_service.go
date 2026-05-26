@@ -463,7 +463,7 @@ func newTeamsServiceDoctorCmd() *cobra.Command {
 				}
 			} else if teamsServiceGOOS() == "linux" && backend.ID() == "local-supervisor" {
 				if teamsServiceLocalSupervisorSticky() {
-					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: local-supervisor is selected because an enabled/active local-supervisor config or lock is present.")
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: local-supervisor is selected because an enabled local-supervisor config or a verified active local-supervisor status is present.")
 				} else {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Linux: systemd --user is not available, so Teams service will use the local supervisor fallback.")
 				}
@@ -3980,12 +3980,28 @@ func defaultTeamsServiceIsWSL() bool {
 	if strings.TrimSpace(os.Getenv("WSL_DISTRO_NAME")) != "" || strings.TrimSpace(os.Getenv("WSL_INTEROP")) != "" {
 		return true
 	}
+	version := ""
 	data, err := os.ReadFile("/proc/version")
-	if err != nil {
+	if err == nil {
+		version = string(data)
+	}
+	return teamsServiceIsWSLFromSignals(teamsServiceGOOS(), version, teamsServiceWSLInteropAvailable())
+}
+
+func teamsServiceIsWSLFromSignals(goos string, procVersion string, interopAvailable bool) bool {
+	if goos != "linux" {
 		return false
 	}
-	version := strings.ToLower(string(data))
-	return strings.Contains(version, "microsoft") || strings.Contains(version, "wsl")
+	version := strings.ToLower(procVersion)
+	if !strings.Contains(version, "microsoft") && !strings.Contains(version, "wsl") {
+		return false
+	}
+	return interopAvailable
+}
+
+func teamsServiceWSLInteropAvailable() bool {
+	info, err := os.Stat("/proc/sys/fs/binfmt_misc/WSLInterop")
+	return err == nil && !info.IsDir()
 }
 
 func systemdQuoteArg(s string) string {

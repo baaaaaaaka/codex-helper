@@ -47,10 +47,17 @@ func teamsLocalSupervisorVerifiedProcessGroupID(pid int, statusPGID int) (int, e
 	if pid <= 0 {
 		return 0, fmt.Errorf("local supervisor pid is required to verify process group")
 	}
-	if statusPGID > 0 && statusPGID != pid {
-		return 0, fmt.Errorf("refusing to use stale local supervisor process group %d for pid %d", statusPGID, pid)
+	livePGID, err := teamsLocalSupervisorProcessGroupID(pid)
+	if err != nil {
+		return 0, fmt.Errorf("could not resolve process group for pid %d: %w", pid, err)
 	}
-	return pid, nil
+	if livePGID <= 0 {
+		return 0, fmt.Errorf("local supervisor process group is unknown for pid %d", pid)
+	}
+	if statusPGID > 0 && statusPGID != livePGID {
+		return 0, fmt.Errorf("refusing to use stale local supervisor process group %d for pid %d because live process group is %d", statusPGID, pid, livePGID)
+	}
+	return livePGID, nil
 }
 
 func defaultTeamsLocalSupervisorVerifyProcessIdentity(_ int, _ string) error {
