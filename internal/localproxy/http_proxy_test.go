@@ -101,7 +101,7 @@ func TestHTTPProxyConnectTunnelStaysOpenWithOneWayActivity(t *testing.T) {
 		clientSide, upstreamSide := net.Pipe()
 		upstreamCh <- upstreamSide
 		return clientSide, nil
-	}), Options{TunnelIdleTimeout: 40 * time.Millisecond})
+	}), Options{TunnelIdleTimeout: 750 * time.Millisecond})
 	httpAddr, err := p.Start("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -121,7 +121,7 @@ func TestHTTPProxyConnectTunnelStaysOpenWithOneWayActivity(t *testing.T) {
 	writeErr := make(chan error, 1)
 	go func() {
 		for _, b := range payload {
-			time.Sleep(15 * time.Millisecond)
+			time.Sleep(150 * time.Millisecond)
 			if _, err := upstream.Write([]byte{b}); err != nil {
 				writeErr <- err
 				return

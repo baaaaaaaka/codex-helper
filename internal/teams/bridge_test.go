@@ -2261,6 +2261,23 @@ func waitForBridgeAsyncTurns(t *testing.T, bridge *Bridge) {
 	}
 }
 
+func waitForBridgeHelperRestarts(t *testing.T, bridge *Bridge) {
+	t.Helper()
+	if bridge == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		bridge.helperRestartWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("timed out waiting for helper restart task to finish")
+	}
+}
+
 func TestBridgeSuppressesQueuedCodexCommandOutbox(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -6014,6 +6031,7 @@ func TestBridgeControlRestartFailureDoesNotSendCompletedNotice(t *testing.T) {
 	case <-time.After(bridgeAsyncTestTimeout):
 		t.Fatal("helper restart did not call failing restarter")
 	}
+	waitForBridgeHelperRestarts(t, bridge)
 	waitForOutboxBody(t, store, "Helper restart failed")
 	waitForNoActiveTurnsOrOutbox(t, store, "")
 

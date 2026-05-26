@@ -342,6 +342,7 @@ type Bridge struct {
 	markAnswerChatsUnread             bool
 	markAnswerUnreadWarned            bool
 	asyncTurnWG                       sync.WaitGroup
+	helperRestartWG                   sync.WaitGroup
 	runningTurnMu                     sync.Mutex
 	runningTurnCancels                map[string]*runningTurnCancel
 	acceptedOutboxMu                  sync.Mutex
@@ -3333,7 +3334,11 @@ func (b *Bridge) restartHelperFromControl(ctx context.Context, msg ChatMessage, 
 		return err
 	}
 	restarter := b.helperRestarter
-	go b.runDelayedHelperRestart(restarter)
+	b.helperRestartWG.Add(1)
+	go func() {
+		defer b.helperRestartWG.Done()
+		b.runDelayedHelperRestart(restarter)
+	}()
 	return nil
 }
 
