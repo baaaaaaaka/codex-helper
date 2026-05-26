@@ -74,6 +74,8 @@ var (
 	teamsServiceLocalSupervisorHeartbeatEvery   = 5 * time.Second
 	teamsServiceLocalSupervisorTerminationWait  = 5 * time.Second
 	teamsServiceLocalSupervisorReadyTimeout     = 5 * time.Second
+	teamsServiceLocalSupervisorReleaseWait      = 2 * time.Second
+	teamsServiceLocalSupervisorReleaseProcess   = func(process *os.Process) error { return process.Release() }
 	teamsServiceLocalSupervisorCheckChildHealth = defaultTeamsServiceLocalSupervisorCheckChildHealth
 	teamsServiceLocalSupervisorTerminateTarget  = terminateTargetCommand
 	teamsLocalSupervisorVerifyProcessIdentity   = defaultTeamsLocalSupervisorVerifyProcessIdentity
@@ -450,14 +452,30 @@ func defaultTeamsServiceLocalSupervisorStartDetached(_ context.Context, configPa
 		return 0, err
 	}
 	pid := cmd.Process.Pid
-	if err := cmd.Process.Release(); err != nil {
-		terminateErr := terminateStartedTeamsServiceLocalSupervisor(pid, configPath)
-		if terminateErr != nil {
-			return 0, fmt.Errorf("release detached local supervisor pid %d: %w; cleanup failed: %v", pid, err, terminateErr)
-		}
-		return 0, err
+	if err := teamsServiceLocalSupervisorReleaseProcess(cmd.Process); err != nil {
+		return 0, handleTeamsServiceLocalSupervisorReleaseFailure(pid, configPath, err, cmd.Wait)
 	}
 	return pid, nil
+}
+
+func handleTeamsServiceLocalSupervisorReleaseFailure(pid int, configPath string, releaseErr error, wait func() error) error {
+	terminateErr := terminateStartedTeamsServiceLocalSupervisor(pid, configPath)
+	if terminateErr != nil {
+		return fmt.Errorf("release detached local supervisor pid %d: %w; cleanup failed: %v", pid, releaseErr, terminateErr)
+	}
+	if wait != nil {
+		done := make(chan struct{})
+		go func() {
+			_ = wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(teamsServiceLocalSupervisorReleaseWait):
+			return fmt.Errorf("release detached local supervisor pid %d: %w; cleanup wait timed out", pid, releaseErr)
+		}
+	}
+	return releaseErr
 }
 
 func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) error {

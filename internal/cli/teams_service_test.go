@@ -1436,6 +1436,60 @@ func TestTeamsServiceLocalSupervisorStartRequiresReadyStatus(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceLocalSupervisorReleaseFailureTerminatesStartedSupervisor(t *testing.T) {
+	lockCLITestHooks(t)
+
+	releaseErr := errors.New("release failed")
+	configPath := filepath.Join(t.TempDir(), "local-supervisor.json")
+	prevVerify := teamsLocalSupervisorVerifyProcessIdentity
+	prevAlive := teamsLocalSupervisorProcessAlive
+	prevProcessGroupID := teamsLocalSupervisorProcessGroupID
+	prevCurrentProcessGroupID := teamsLocalSupervisorCurrentProcessGroupID
+	prevTerminate := teamsLocalSupervisorTerminateProcessGroup
+	teamsLocalSupervisorVerifyProcessIdentity = func(pid int, gotConfigPath string) error {
+		if pid != 8123 || gotConfigPath != configPath {
+			t.Fatalf("verify pid/config = %d %q, want 8123 %q", pid, gotConfigPath, configPath)
+		}
+		return nil
+	}
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == 8123 }
+	teamsLocalSupervisorProcessGroupID = func(pid int) (int, error) {
+		if pid != 8123 {
+			t.Fatalf("process group pid = %d, want 8123", pid)
+		}
+		return 9123, nil
+	}
+	teamsLocalSupervisorCurrentProcessGroupID = func() int { return 100 }
+	var terminatedPGID int
+	var terminatedPID int
+	teamsLocalSupervisorTerminateProcessGroup = func(pgid int, leaderPID int, _ time.Duration) error {
+		terminatedPGID = pgid
+		terminatedPID = leaderPID
+		return nil
+	}
+	t.Cleanup(func() {
+		teamsLocalSupervisorVerifyProcessIdentity = prevVerify
+		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsLocalSupervisorProcessGroupID = prevProcessGroupID
+		teamsLocalSupervisorCurrentProcessGroupID = prevCurrentProcessGroupID
+		teamsLocalSupervisorTerminateProcessGroup = prevTerminate
+	})
+	waited := false
+	err := handleTeamsServiceLocalSupervisorReleaseFailure(8123, configPath, releaseErr, func() error {
+		waited = true
+		return nil
+	})
+	if !errors.Is(err, releaseErr) {
+		t.Fatalf("release failure err = %v, want %v", err, releaseErr)
+	}
+	if terminatedPGID != 9123 || terminatedPID != 8123 {
+		t.Fatalf("terminated pgid/pid = %d/%d, want 9123/8123", terminatedPGID, terminatedPID)
+	}
+	if !waited {
+		t.Fatal("release failure cleanup did not wait after successful termination")
+	}
+}
+
 func TestTeamsServiceLocalSupervisorStopRejectsIdentityMismatch(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -4725,6 +4779,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevAuthPreflight := teamsServiceAuthPreflight
 	prevBootstrapControlChat := teamsServiceBootstrapControlChat
 	prevLocalSupervisorStartDetached := teamsServiceLocalSupervisorStartDetached
+	prevLocalSupervisorReleaseProcess := teamsServiceLocalSupervisorReleaseProcess
 	prevLocalSupervisorCheckChildHealth := teamsServiceLocalSupervisorCheckChildHealth
 	prevLocalSupervisorTerminateTarget := teamsServiceLocalSupervisorTerminateTarget
 	prevLocalSupervisorReadyTimeout := teamsServiceLocalSupervisorReadyTimeout
@@ -4843,6 +4898,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServiceAuthPreflight = prevAuthPreflight
 		teamsServiceBootstrapControlChat = prevBootstrapControlChat
 		teamsServiceLocalSupervisorStartDetached = prevLocalSupervisorStartDetached
+		teamsServiceLocalSupervisorReleaseProcess = prevLocalSupervisorReleaseProcess
 		teamsServiceLocalSupervisorCheckChildHealth = prevLocalSupervisorCheckChildHealth
 		teamsServiceLocalSupervisorTerminateTarget = prevLocalSupervisorTerminateTarget
 		teamsServiceLocalSupervisorReadyTimeout = prevLocalSupervisorReadyTimeout
