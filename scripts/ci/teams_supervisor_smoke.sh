@@ -21,7 +21,11 @@ remove_cleanup_pid() {
       next+=("$pid")
     fi
   done
-  cleanup_pids=("${next[@]}")
+  cleanup_pids=()
+  for pid in "${next[@]:-}"; do
+    [ -n "$pid" ] || continue
+    cleanup_pids+=("$pid")
+  done
 }
 
 cleanup() {
