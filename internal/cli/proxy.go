@@ -75,6 +75,7 @@ func newProxyCmd(root *rootOptions) *cobra.Command {
 		newProxyListCmd(root),
 		newProxyStopCmd(root),
 		newProxyPruneCmd(root),
+		newProxyResetCmd(root),
 		newProxyDoctorCmd(root),
 	)
 
@@ -423,6 +424,79 @@ func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 		},
 	}
 	return cmd
+}
+
+func newProxyResetCmd(root *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "reset",
+		Aliases: []string{"clear"},
+		Short:   "Clear saved proxy settings",
+		Long: "Clear saved SSH proxy profiles, the saved proxy preference, and known proxy instances, " +
+			"then attempt to stop any known running proxy daemons. The next Codex launch will ask whether to configure proxy mode again.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			store, _, err := newRootStore(root, "")
+			if err != nil {
+				return err
+			}
+
+			var oldInstances []config.Instance
+			profiles := 0
+			instances := 0
+			if err := store.Update(func(cfg *config.Config) error {
+				profiles = len(cfg.Profiles)
+				instances = len(cfg.Instances)
+				oldInstances = append([]config.Instance(nil), cfg.Instances...)
+				cfg.ProxyEnabled = nil
+				cfg.Profiles = nil
+				cfg.Instances = nil
+				return nil
+			}); err != nil {
+				return err
+			}
+
+			stopSummary := stopProxyInstances(oldInstances)
+			_, _ = fmt.Fprintf(
+				cmd.OutOrStdout(),
+				"Cleared proxy settings: profiles=%d instances=%d stopped=%d failed=%d\n",
+				profiles,
+				instances,
+				stopSummary.stopped,
+				stopSummary.failed,
+			)
+			if stopSummary.failed > 0 {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Some known proxy daemons could not be stopped; saved proxy settings were still cleared.")
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Next launch will ask whether to configure proxy mode.")
+			return nil
+		},
+	}
+	return cmd
+}
+
+type proxyStopSummary struct {
+	stopped int
+	failed  int
+}
+
+func stopProxyInstances(instances []config.Instance) proxyStopSummary {
+	var summary proxyStopSummary
+	for _, inst := range instances {
+		if inst.DaemonPID <= 0 || !proxyProcessAlive(inst.DaemonPID) {
+			continue
+		}
+		p, err := proxyFindProcess(inst.DaemonPID)
+		if err != nil {
+			summary.failed++
+			continue
+		}
+		if err := proxyTerminate(p, 2*time.Second); err != nil {
+			summary.failed++
+			continue
+		}
+		summary.stopped++
+	}
+	return summary
 }
 
 func newProxyDoctorCmd(root *rootOptions) *cobra.Command {

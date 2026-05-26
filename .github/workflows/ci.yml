@@ -236,6 +236,12 @@ jobs:
           go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
           go test . -count=1 -run 'TestInstallPs1(RemovesLegacyCodexClpExe|RemovesLegacyCodexClaudeProxyAndClpCmd|PreservesExternalClpCmdReferencingClaudeProxy)$'
 
+      - name: Proxy reset critical regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(ProxyReset.*|RunLikeAfterProxyResetPromptsForProxyPreference|TeamsGraphHTTPClientUsesDirectAfterProxyReset|BeaconCLIProfileUsingProxyBecomesNotReadyAfterProxyReset)$' -v
+
       - name: Recent codexhistory shared-cache regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

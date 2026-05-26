@@ -428,6 +428,64 @@ func TestBeaconCLIProfileListResolvesExistingProxyProfile(t *testing.T) {
 	}
 }
 
+func TestBeaconCLIProfileUsingProxyBecomesNotReadyAfterProxyReset(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfgStore, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("config.NewStore: %v", err)
+	}
+	if err := cfgStore.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{{ID: "jump-a", Name: "jump-a"}}}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	adapter := writeBeaconCLIProviderFixture(t, `provider_job_id=slurm-doctor raw_state=PD reason=doctor`)
+	if _, err := runBeaconRootCommand(t,
+		"--config", configPath,
+		"beacon", "--store", storePath,
+		"profile", "create", "gpu",
+		"--provider", "slurm",
+		"--proxy", "ssh_profile",
+		"--proxy-profile", "jump-a",
+		"--nodes", "1",
+		"--gpu", "1",
+		"--partition", "interactive",
+		"--image", "image.sqsh",
+		"--duration", "4",
+		"--query-command", adapter,
+		"--submit-command", adapter,
+		"--cancel-command", adapter,
+		"--renew-command", adapter,
+	); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	if _, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "doctor", "gpu"); err != nil {
+		t.Fatalf("doctor profile: %v", err)
+	}
+	if _, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "confirm", "gpu"); err != nil {
+		t.Fatalf("confirm profile: %v", err)
+	}
+
+	if out, err := runBeaconRootCommand(t, "--config", configPath, "proxy", "reset"); err != nil {
+		t.Fatalf("proxy reset: %v\n%s", err, out)
+	}
+
+	out, err := runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "profile", "list")
+	if err != nil {
+		t.Fatalf("list profile after reset: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "gpu\tslurm\trev=1\tdraft: proxy profile not found") {
+		t.Fatalf("profile should become draft after proxy reset, got:\n%s", out)
+	}
+
+	out, err = runBeaconRootCommand(t, "--config", configPath, "beacon", "--store", storePath, "switch-profile", "gpu", "--session", "conv-1")
+	if err == nil {
+		t.Fatalf("switch should fail after proxy reset, output:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "proxy profile not found") && !strings.Contains(out, "proxy profile not found") {
+		t.Fatalf("switch error should mention missing proxy profile, err=%v out=%s", err, out)
+	}
+}
+
 func TestBeaconMachineCLIReleaseAndKillPreview(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
 	store, err := beacon.NewStore(storePath)

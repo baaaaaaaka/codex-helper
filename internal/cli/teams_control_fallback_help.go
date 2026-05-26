@@ -8,6 +8,7 @@ func teamsControlFallbackHelpContext() string {
 		"- `cxp` or `codex-proxy`: open the local Codex history TUI.",
 		"- `cxp run`: launch Codex through codex-helper proxy/yolo handling.",
 		"- `cxp proxy`: manage the local proxy profile used by Codex.",
+		"- `cxp proxy reset`: clear saved proxy setup and attempt to stop known proxy daemons so the next launch asks whether to configure proxy mode again.",
 		"- `cxp beacon`: manage beacon execution profiles and worker leases.",
 		"- `cxp upgrade`: upgrade codex-helper itself; use `--version <tag>` for a specific release.",
 		"- `cxp history`: inspect local Codex history.",

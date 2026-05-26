@@ -113,6 +113,7 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp run [profile] -- <cmd args...>",
 		"cxp init",
 		"cxp proxy doctor",
+		"cxp proxy reset",
 		"cxp beacon profile create <name> --provider slurm",
 		"cxp beacon switch-profile <name> --session <session-id> --after-current-turn",
 		"cxp teams service bootstrap",

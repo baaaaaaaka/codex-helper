@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -459,6 +461,300 @@ func TestProxyPruneRemovesDeadAndUnhealthyInstances(t *testing.T) {
 	}
 	if len(cfg.Instances) != 1 || cfg.Instances[0].ID != "inst-ok" {
 		t.Fatalf("expected only healthy instance to remain, got %+v", cfg.Instances)
+	}
+}
+
+func TestProxyResetClearsSettingsAndPromptsOnNextLaunch(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	enabled := true
+	yolo := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		YoloEnabled:  &yolo,
+		Profiles: []config.Profile{{
+			ID:   "p1",
+			Name: "dev",
+			Host: "host",
+			Port: 22,
+			User: "alice",
+		}},
+		Instances: []config.Instance{{ID: "inst-1", ProfileID: "p1"}},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	cmd := newProxyResetCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy reset: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "profiles=1") || !strings.Contains(text, "instances=1") || !strings.Contains(text, "failed=0") {
+		t.Fatalf("unexpected reset output: %q", text)
+	}
+	if !strings.Contains(text, "Next launch will ask whether to configure proxy mode.") {
+		t.Fatalf("reset output should explain next prompt, got %q", text)
+	}
+
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ProxyEnabled != nil {
+		t.Fatalf("expected ProxyEnabled cleared, got %v", cfg.ProxyEnabled)
+	}
+	if len(cfg.Profiles) != 0 {
+		t.Fatalf("expected profiles cleared, got %+v", cfg.Profiles)
+	}
+	if len(cfg.Instances) != 0 {
+		t.Fatalf("expected instances cleared, got %+v", cfg.Instances)
+	}
+	if cfg.YoloEnabled == nil || !*cfg.YoloEnabled {
+		t.Fatalf("expected unrelated yolo preference preserved, got %v", cfg.YoloEnabled)
+	}
+
+	got, _, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("y\n")))
+	if err != nil {
+		t.Fatalf("ensureProxyPreference after reset: %v", err)
+	}
+	if !got {
+		t.Fatal("expected reset state to prompt and accept proxy setup")
+	}
+	cfg, err = store.Load()
+	if err != nil {
+		t.Fatalf("load config after prompt: %v", err)
+	}
+	if cfg.ProxyEnabled != nil {
+		t.Fatalf("expected ProxyEnabled to remain unset until profile setup completes, got %v", cfg.ProxyEnabled)
+	}
+}
+
+func TestProxyResetStopsRunningInstancesFromClearedConfig(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		Profiles: []config.Profile{{
+			ID:   "p1",
+			Name: "dev",
+		}},
+		Instances: []config.Instance{
+			{ID: "inst-alive", ProfileID: "p1", DaemonPID: 4242},
+			{ID: "inst-dead", ProfileID: "p1", DaemonPID: 5252},
+			{ID: "inst-empty", ProfileID: "p1"},
+		},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevAlive := proxyProcessAlive
+	prevFind := proxyFindProcess
+	prevTerminate := proxyTerminate
+	t.Cleanup(func() {
+		proxyProcessAlive = prevAlive
+		proxyFindProcess = prevFind
+		proxyTerminate = prevTerminate
+	})
+
+	proxyProcessAlive = func(pid int) bool { return pid == 4242 }
+	foundPID := 0
+	proxyFindProcess = func(pid int) (*os.Process, error) {
+		foundPID = pid
+		return &os.Process{Pid: pid}, nil
+	}
+	terminatedPID := 0
+	proxyTerminate = func(p *os.Process, _ time.Duration) error {
+		if p == nil {
+			t.Fatal("expected process")
+		}
+		terminatedPID = p.Pid
+		return nil
+	}
+
+	cmd := newProxyCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"clear"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy reset alias: %v", err)
+	}
+	if foundPID != 4242 || terminatedPID != 4242 {
+		t.Fatalf("expected only alive pid 4242 to be stopped, found=%d terminated=%d", foundPID, terminatedPID)
+	}
+	if !strings.Contains(out.String(), "stopped=1") || !strings.Contains(out.String(), "failed=0") {
+		t.Fatalf("expected stopped count in output, got %q", out.String())
+	}
+
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Profiles) != 0 || len(cfg.Instances) != 0 || cfg.ProxyEnabled != nil {
+		t.Fatalf("expected proxy state cleared, got %+v", cfg)
+	}
+}
+
+func TestProxyResetNoopEmptyConfigStillPromptsOnNextLaunch(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+
+	cmd := newProxyResetCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy reset: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "profiles=0") || !strings.Contains(text, "instances=0") || !strings.Contains(text, "stopped=0") || !strings.Contains(text, "failed=0") {
+		t.Fatalf("unexpected reset output: %q", text)
+	}
+
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ProxyEnabled != nil || len(cfg.Profiles) != 0 || len(cfg.Instances) != 0 {
+		t.Fatalf("expected empty promptable proxy state, got %+v", cfg)
+	}
+
+	got, _, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("y\n")))
+	if err != nil {
+		t.Fatalf("ensureProxyPreference after no-op reset: %v", err)
+	}
+	if !got {
+		t.Fatal("expected no-op reset state to prompt and accept proxy setup")
+	}
+}
+
+func TestProxyResetTerminateFailureStillClearsConfig(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{{ID: "p1", Name: "dev"}},
+		Instances:    []config.Instance{{ID: "inst-1", ProfileID: "p1", DaemonPID: 4242}},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevAlive := proxyProcessAlive
+	prevFind := proxyFindProcess
+	prevTerminate := proxyTerminate
+	t.Cleanup(func() {
+		proxyProcessAlive = prevAlive
+		proxyFindProcess = prevFind
+		proxyTerminate = prevTerminate
+	})
+
+	proxyProcessAlive = func(pid int) bool { return pid == 4242 }
+	proxyFindProcess = func(pid int) (*os.Process, error) { return &os.Process{Pid: pid}, nil }
+	proxyTerminate = func(*os.Process, time.Duration) error { return errors.New("terminate failed") }
+
+	cmd := newProxyResetCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy reset: %v", err)
+	}
+	if !strings.Contains(out.String(), "stopped=0") || !strings.Contains(out.String(), "failed=1") {
+		t.Fatalf("expected failed termination to report stopped=0 failed=1, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), "could not be stopped") {
+		t.Fatalf("expected failed termination warning, got %q", out.String())
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ProxyEnabled != nil || len(cfg.Profiles) != 0 || len(cfg.Instances) != 0 {
+		t.Fatalf("expected proxy config cleared despite terminate failure, got %+v", cfg)
+	}
+}
+
+func TestProxyResetClearsConfigBeforeStoppingInstances(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{{ID: "p1", Name: "dev"}},
+		Instances:    []config.Instance{{ID: "inst-1", ProfileID: "p1", DaemonPID: 4242}},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevAlive := proxyProcessAlive
+	prevFind := proxyFindProcess
+	prevTerminate := proxyTerminate
+	t.Cleanup(func() {
+		proxyProcessAlive = prevAlive
+		proxyFindProcess = prevFind
+		proxyTerminate = prevTerminate
+	})
+
+	proxyProcessAlive = func(pid int) bool { return pid == 4242 }
+	proxyFindProcess = func(pid int) (*os.Process, error) { return &os.Process{Pid: pid}, nil }
+	proxyTerminate = func(*os.Process, time.Duration) error {
+		cfg, err := store.Load()
+		if err != nil {
+			t.Fatalf("load config during terminate: %v", err)
+		}
+		if cfg.ProxyEnabled != nil || len(cfg.Profiles) != 0 || len(cfg.Instances) != 0 {
+			t.Fatalf("proxy config should be cleared before terminate, got %+v", cfg)
+		}
+		return nil
+	}
+
+	cmd := newProxyResetCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy reset: %v", err)
+	}
+	if !strings.Contains(out.String(), "stopped=1") || !strings.Contains(out.String(), "failed=0") {
+		t.Fatalf("expected stopped=1 after successful terminate, got %q", out.String())
+	}
+}
+
+func TestProxyResetHelpDocumentsDaemonStopAndPrompt(t *testing.T) {
+	cmd := newProxyResetCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--help"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute proxy reset help: %v", err)
+	}
+	text := out.String()
+	for _, want := range []string{
+		"Aliases:",
+		"reset, clear",
+		"stop any known running proxy daemons",
+		"next Codex launch will ask whether to configure proxy mode again",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("reset help missing %q:\n%s", want, text)
+		}
 	}
 }
 

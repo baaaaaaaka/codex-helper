@@ -11,6 +11,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 	got := teamsControlFallbackHelpContext()
 	for _, want := range []string{
 		"cxp / codex-proxy CLI digest:",
+		"`cxp proxy reset`",
 		"`cxp teams status`",
 		"`cxp teams doctor`",
 		"`cxp teams service bootstrap`",

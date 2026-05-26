@@ -25,6 +25,7 @@ Proxy profiles are SSH/network profiles for reaching another machine. They are n
 - `cxp proxy start <profile>`: start or reuse a proxy instance.
 - `cxp proxy stop <instance>`: stop a proxy instance.
 - `cxp proxy prune`: clean stale instances.
+- `cxp proxy reset` or `cxp proxy clear`: clear saved proxy profiles, preference, and known instances, then attempt to stop known proxy daemons so the next launch asks whether to configure proxy mode again.
 - `cxp proxy doctor`: diagnose local proxy dependencies and configuration.
 
 Use `cxp proxy` only when the user is asking about SSH/network routing. If the user asks for beacon mode or beacon profiles, use `cxp beacon ...`.

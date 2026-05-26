@@ -115,6 +115,10 @@ jobs:
           test -f "$HOME/.codex/skills/cxp/references/commands.md"
           grep -q -- "--after-current-turn" "$HOME/.codex/skills/cxp/references/commands.md"
           "$HOME/.local/bin/codex-proxy" proxy doctor || true
+          reset_out="$("$HOME/.local/bin/codex-proxy" --config "$RUNNER_TEMP/proxy-reset-smoke.json" proxy reset)"
+          printf '%s\n' "$reset_out"
+          grep -q 'profiles=0 instances=0 stopped=0 failed=0' <<<"$reset_out"
+          grep -q 'Next launch will ask whether to configure proxy mode.' <<<"$reset_out"
           CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash scripts/ci/skills_smoke.sh
           CODEX_HELPER_BIN="$HOME/.local/bin/cxp" bash scripts/ci/skills_smoke.sh
           upgrade_target="$RUNNER_TEMP/codex-proxy-upgrade-smoke/codex-proxy"
@@ -143,6 +147,11 @@ jobs:
           if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
           if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--after-current-turn") { throw "builtin cxp command reference missing deferred beacon switch guidance" }
           & $exe proxy doctor | Out-Default
+          $resetConfig = Join-Path $env:RUNNER_TEMP "proxy-reset-smoke.json"
+          $resetOut = (& $exe --config $resetConfig proxy reset | Out-String)
+          $resetOut | Out-Default
+          if ($resetOut -notmatch "profiles=0 instances=0 stopped=0 failed=0") { throw "proxy reset smoke did not report empty reset counts" }
+          if ($resetOut -notmatch "Next launch will ask whether to configure proxy mode.") { throw "proxy reset smoke did not mention next prompt" }
           $env:CODEX_HELPER_BIN = $exe
           .\scripts\ci\skills_smoke.ps1
           $env:CODEX_HELPER_BIN = $cxp

@@ -642,6 +642,89 @@ func TestRunLikeUsesDirectModeWhenProxyDisabled(t *testing.T) {
 	}
 }
 
+func TestRunLikeAfterProxyResetPromptsForProxyPreference(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{{ID: "p1", Name: "dev"}},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	resetCmd := newProxyResetCmd(&rootOptions{configPath: store.Path()})
+	resetCmd.SetOut(io.Discard)
+	resetCmd.SetArgs([]string{})
+	if err := resetCmd.Execute(); err != nil {
+		t.Fatalf("proxy reset: %v", err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+	})
+	if _, err := writer.Write([]byte("n\n")); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	_ = writer.Close()
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("runWithProfile should not be called when reset state is answered with direct mode")
+		return nil
+	}
+
+	var gotCmdArgs []string
+	var gotOpts runTargetOptions
+	runTargetWithFallbackWithOptionsFn = func(ctx context.Context, cmdArgs []string, proxyURL string, healthCheck func() error, fatalCh <-chan error, opts runTargetOptions) error {
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		gotOpts = opts
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{"--", "echo", "ok"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	if err := runLike(cmd, root, false); err != nil {
+		t.Fatalf("runLike: %v", err)
+	}
+
+	if gotOpts.UseProxy {
+		t.Fatal("expected direct mode after answering reset prompt with no")
+	}
+	wantCmdArgs := []string{"echo", "ok"}
+	if !reflect.DeepEqual(gotCmdArgs, wantCmdArgs) {
+		t.Fatalf("expected direct command %v, got %v", wantCmdArgs, gotCmdArgs)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ProxyEnabled == nil || *cfg.ProxyEnabled {
+		t.Fatalf("expected answer 'no' to persist ProxyEnabled=false, got %v", cfg.ProxyEnabled)
+	}
+}
+
 func TestRunLikeUsesDefaultCodexCommandInDirectMode(t *testing.T) {
 	lockCLITestHooks(t)
 

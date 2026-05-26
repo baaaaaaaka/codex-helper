@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,54 @@ func TestTeamsGraphHTTPClientDirectIgnoresInheritedProxyEnv(t *testing.T) {
 		t.Fatal("direct Teams Graph client must not inherit HTTP_PROXY/HTTPS_PROXY")
 	}
 	assertTeamsGraphTransportBounds(t, tr)
+}
+
+func TestTeamsGraphHTTPClientUsesDirectAfterProxyReset(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+
+	store := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles: []config.Profile{{
+			ID:        "p1",
+			Name:      "profile",
+			Host:      "example.com",
+			Port:      22,
+			User:      "alice",
+			CreatedAt: time.Now(),
+		}},
+	})
+	cmd := newProxyResetCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetArgs([]string{})
+	cmd.SetOut(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("proxy reset: %v", err)
+	}
+
+	origStackStart := stackStart
+	t.Cleanup(func() { stackStart = origStackStart })
+	stackStart = func(config.Profile, string, stack.Options) (*stack.Stack, error) {
+		t.Fatal("stackStart should not be called after proxy reset clears profiles")
+		return nil, errors.New("unexpected stack start")
+	}
+
+	lease, err := newTeamsGraphHTTPClientLease(context.Background(), &rootOptions{configPath: store.Path()}, nil)
+	if err != nil {
+		t.Fatalf("newTeamsGraphHTTPClientLease: %v", err)
+	}
+	defer lease.Close(context.Background())
+	if lease.Mode != "direct" {
+		t.Fatalf("mode = %q, want direct", lease.Mode)
+	}
+	tr, ok := lease.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", lease.Client.Transport)
+	}
+	if tr.Proxy != nil {
+		t.Fatal("direct Teams Graph client after reset must not inherit HTTP_PROXY/HTTPS_PROXY")
+	}
 }
 
 func TestTeamsGraphHTTPClientUsesConfiguredReusableProxy(t *testing.T) {

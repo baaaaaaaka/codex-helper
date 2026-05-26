@@ -40,6 +40,8 @@ On first run, if no proxy preference or profile has been saved yet, you'll be
 asked whether to use the SSH proxy. Choose **no** for direct connections.
 Choose **yes** to enter SSH host/port/user and let the tool create a dedicated
 key if needed. You can toggle proxy mode later with `Ctrl+P` in the TUI.
+To discard saved proxy setup, attempt to stop known proxy daemons, and see this prompt again, run
+`codex-proxy proxy reset`.
 
 ### 3) Optional: initialize Teams helper
 
@@ -161,6 +163,7 @@ codex-proxy proxy doctor
 | `codex-proxy proxy list` | List known proxy instances |
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
 | `codex-proxy proxy prune` | Remove dead/unhealthy instances |
+| `codex-proxy proxy reset` | Clear saved proxy setup and attempt to stop known daemons so the next launch asks again |
 | `codex-proxy proxy doctor` | Report environment issues and installation hints |
 | `codex-proxy teams status` | Show Teams helper state, control chat, service, owner, and queue status |
 | `codex-proxy teams doctor` | Check local Teams helper auth and service readiness |
@@ -668,6 +671,12 @@ Normal `run`, `history open`, and TUI-launched sessions use private proxy stacks
 Only instances started with `proxy start` are shared/reused across sessions.
 
 Use `--foreground` to keep the daemon attached to the current terminal.
+
+Clear saved proxy setup, attempt to stop known proxy daemons, and trigger the first-run proxy prompt again:
+
+```bash
+codex-proxy proxy reset
+```
 
 Stop an instance:
 
