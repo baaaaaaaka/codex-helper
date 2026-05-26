@@ -339,6 +339,10 @@ EOF
     "XDG_CACHE_HOME=$cache_home"
     "XDG_RUNTIME_DIR=$runtime_dir"
     "DBUS_SESSION_BUS_ADDRESS=unix:path=$smoke/no-user-bus"
+    "CODEX_PROXY_DEBUG=1"
+    "HTTP_PROXY=http://127.0.0.1:9"
+    "HTTPS_PROXY=http://127.0.0.1:9"
+    "NO_PROXY=*"
     "CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND=local-supervisor"
     "CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND=local-supervisor"
     "CODEX_HELPER_TEAMS_TENANT_ID=tenant"
@@ -360,7 +364,7 @@ EOF
   fi
   wait_for_lines "$runs" 1
   wait_for_file_pattern "$child_env" 'CODEX_HELPER_TEAMS_SERVICE=1'
-  for forbidden_env in CODEX_PROXY_DEBUG CODEX_HELPER_TEAMS_CHILD HTTP_PROXY; do
+  for forbidden_env in CODEX_PROXY_DEBUG CODEX_HELPER_TEAMS_CHILD DBUS_SESSION_BUS_ADDRESS HTTP_PROXY HTTPS_PROXY NO_PROXY XDG_RUNTIME_DIR; do
     if grep -q "^$forbidden_env=" "$child_env"; then
       log "public lifecycle child inherited forbidden env $forbidden_env"
       sed 's/^/[public-child-env] /' "$child_env" || true
