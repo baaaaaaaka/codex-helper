@@ -29,32 +29,33 @@ import (
 )
 
 const (
-	teamsServiceUnitName                     = "codex-helper-teams.service"
-	teamsServiceWatchdogUnitName             = "codex-helper-teams-watchdog.service"
-	teamsServiceWatchdogTimerName            = "codex-helper-teams-watchdog.timer"
-	teamsServiceLaunchAgentLabel             = "com.codex-helper.teams"
-	teamsServiceLaunchAgentPlistName         = teamsServiceLaunchAgentLabel + ".plist"
-	teamsServiceLaunchAgentWatchdogLabel     = teamsServiceLaunchAgentLabel + ".watchdog"
-	teamsServiceLaunchAgentWatchdogPlistName = teamsServiceLaunchAgentWatchdogLabel + ".plist"
-	teamsServiceWindowsTaskName              = "Codex Helper Teams Bridge"
-	teamsServiceWindowsWatchdogTaskName      = "Codex Helper Teams Watchdog"
-	teamsServiceWindowsTaskXMLName           = "codex-helper-teams-task.xml"
-	teamsServiceWindowsWatchdogTaskXMLName   = "codex-helper-teams-watchdog-task.xml"
-	teamsServiceWSLTaskConfigName            = "codex-helper-teams-wsl-task.txt"
-	teamsServiceLocalSupervisorConfigName    = "local-supervisor.json"
-	teamsServiceLocalSupervisorStatusName    = "local-supervisor-status.json"
-	teamsServiceLocalSupervisorLockName      = "local-supervisor.lock"
-	teamsServiceLocalSupervisorLogName       = "local-supervisor.log"
-	teamsServiceTaskRestartCount             = 999
-	teamsServiceTaskRestartInterval          = 10
-	teamsServiceTaskSchedulerRestartMinutes  = 1
-	teamsServiceWatchdogMinutes              = 1
-	teamsServiceWatchdogDays                 = 3650
-	teamsServiceRunOwnerStaleAfter           = 90 * time.Second
-	teamsServiceExternalWatchdogInterval     = 10 * time.Second
-	teamsServiceExternalWatchdogCheckTimeout = 45 * time.Second
-	teamsServiceExternalWatchdogSeconds      = int(teamsServiceExternalWatchdogInterval / time.Second)
-	teamsServiceExternalWatchdogMinutes      = 1
+	teamsServiceUnitName                      = "codex-helper-teams.service"
+	teamsServiceWatchdogUnitName              = "codex-helper-teams-watchdog.service"
+	teamsServiceWatchdogTimerName             = "codex-helper-teams-watchdog.timer"
+	teamsServiceLaunchAgentLabel              = "com.codex-helper.teams"
+	teamsServiceLaunchAgentPlistName          = teamsServiceLaunchAgentLabel + ".plist"
+	teamsServiceLaunchAgentWatchdogLabel      = teamsServiceLaunchAgentLabel + ".watchdog"
+	teamsServiceLaunchAgentWatchdogPlistName  = teamsServiceLaunchAgentWatchdogLabel + ".plist"
+	teamsServiceWindowsTaskName               = "Codex Helper Teams Bridge"
+	teamsServiceWindowsWatchdogTaskName       = "Codex Helper Teams Watchdog"
+	teamsServiceWindowsTaskXMLName            = "codex-helper-teams-task.xml"
+	teamsServiceWindowsWatchdogTaskXMLName    = "codex-helper-teams-watchdog-task.xml"
+	teamsServiceWSLTaskConfigName             = "codex-helper-teams-wsl-task.txt"
+	teamsServiceLocalSupervisorConfigName     = "local-supervisor.json"
+	teamsServiceLocalSupervisorStatusName     = "local-supervisor-status.json"
+	teamsServiceLocalSupervisorActivationName = "local-supervisor-activation.json"
+	teamsServiceLocalSupervisorLockName       = "local-supervisor.lock"
+	teamsServiceLocalSupervisorLogName        = "local-supervisor.log"
+	teamsServiceTaskRestartCount              = 999
+	teamsServiceTaskRestartInterval           = 10
+	teamsServiceTaskSchedulerRestartMinutes   = 1
+	teamsServiceWatchdogMinutes               = 1
+	teamsServiceWatchdogDays                  = 3650
+	teamsServiceRunOwnerStaleAfter            = 90 * time.Second
+	teamsServiceExternalWatchdogInterval      = 10 * time.Second
+	teamsServiceExternalWatchdogCheckTimeout  = 45 * time.Second
+	teamsServiceExternalWatchdogSeconds       = int(teamsServiceExternalWatchdogInterval / time.Second)
+	teamsServiceExternalWatchdogMinutes       = 1
 )
 
 type teamsServiceCommandRunner interface {

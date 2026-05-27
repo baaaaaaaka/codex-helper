@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -157,6 +158,84 @@ func TestRestartTeamsHelperFromTeamsWindowsServiceSchedulesTaskStart(t *testing.
 	}
 	if gotName != "powershell.exe" || !strings.Contains(strings.Join(gotArgs, " "), "Start-ScheduledTask") {
 		t.Fatalf("detached restart command = %q %#v, want scheduled task start", gotName, gotArgs)
+	}
+}
+
+func TestRestartTeamsHelperFromTeamsLinuxLocalSupervisorSchedulesServiceRestart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  exe,
+		cwd:  tmp,
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(tmp, "beacon.json"))
+	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
+
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("local supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec: teamsServiceSpec{
+			Executable: exe,
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write local supervisor config: %v", err)
+	}
+
+	prevDetached := teamsServiceStartDetached
+	prevExit := exitFunc
+	prevExec := execSelf
+	prevStart := startSelf
+	t.Cleanup(func() {
+		teamsServiceStartDetached = prevDetached
+		exitFunc = prevExit
+		execSelf = prevExec
+		startSelf = prevStart
+	})
+	var gotName string
+	var gotArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return nil
+	}
+	var exitCode int
+	var exited bool
+	exitFunc = func(code int) {
+		exited = true
+		exitCode = code
+	}
+	execSelf = func(string, []string, []string) error {
+		t.Fatal("local-supervisor service restart must not exec the current helper process")
+		return nil
+	}
+	startSelf = func(string, []string) error {
+		t.Fatal("local-supervisor service restart must not spawn teams run directly")
+		return nil
+	}
+
+	if err := restartTeamsHelperFromTeams(context.Background()); err != nil {
+		t.Fatalf("restartTeamsHelperFromTeams error: %v", err)
+	}
+	if !exited || exitCode != 0 {
+		t.Fatalf("exit = %v/%d, want true/0", exited, exitCode)
+	}
+	joined := strings.Join(gotArgs, " ")
+	if gotName != "sh" ||
+		!strings.Contains(joined, envTeamsLinuxServiceBackend+"=local-supervisor") ||
+		!strings.Contains(joined, envTeamsWSLServiceBackend+"=local-supervisor") ||
+		!strings.Contains(joined, shellQuote(exe)+" teams service restart") ||
+		strings.Contains(joined, "systemctl") {
+		t.Fatalf("detached restart command = %q %#v, want local-supervisor service restart", gotName, gotArgs)
 	}
 }
 

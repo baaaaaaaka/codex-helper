@@ -1870,6 +1870,60 @@ func TestScheduleDelayedTeamsServiceStartUsesWSLWindowsTask(t *testing.T) {
 	}
 }
 
+func TestDelayedTeamsServiceStartCommandUsesLocalSupervisor(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  exe,
+		cwd:  tmp,
+	})
+	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("local supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec: teamsServiceSpec{
+			Executable: exe,
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write local supervisor config: %v", err)
+	}
+
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("backend error: %v", err)
+	}
+	name, args, err := delayedTeamsServiceStartCommand(backend, "")
+	if err != nil {
+		t.Fatalf("delayedTeamsServiceStartCommand error: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if name != "sh" ||
+		!strings.Contains(joined, envTeamsLinuxServiceBackend+"=local-supervisor") ||
+		!strings.Contains(joined, envTeamsWSLServiceBackend+"=local-supervisor") ||
+		!strings.Contains(joined, shellQuote(exe)+" teams service start") ||
+		strings.Contains(joined, "systemctl") {
+		t.Fatalf("delayed start command = %q %#v, want local-supervisor start", name, args)
+	}
+
+	name, args, err = delayedLocalSupervisorServiceCommand(backend, "restart")
+	if err != nil {
+		t.Fatalf("delayedLocalSupervisorServiceCommand restart error: %v", err)
+	}
+	joined = strings.Join(args, " ")
+	if name != "sh" || !strings.Contains(joined, shellQuote(exe)+" teams service restart") || strings.Contains(joined, "systemctl") {
+		t.Fatalf("delayed restart command = %q %#v, want local-supervisor restart", name, args)
+	}
+}
+
 func TestScheduleDelayedTeamsServiceStartUsesConfiguredPowerShell(t *testing.T) {
 	lockCLITestHooks(t)
 

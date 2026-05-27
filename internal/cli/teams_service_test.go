@@ -1981,6 +1981,388 @@ func TestTeamsServiceLocalSupervisorProcessEnvUsesControlledEnvironment(t *testi
 	}
 }
 
+func TestTeamsServiceLocalSupervisorChildProcessEnvMarksSupervisorVersion(t *testing.T) {
+	env := teamsServiceLocalSupervisorChildProcessEnv(map[string]string{
+		"CODEX_HELPER_TEAMS_SERVICE": "1",
+	})
+	if got, ok := testEnvValue(env, envTeamsLocalSupervisorVersion); !ok || got != buildVersion() {
+		t.Fatalf("%s env = %q ok=%v, want %q", envTeamsLocalSupervisorVersion, got, ok, buildVersion())
+	}
+	if got, ok := testEnvValue(env, "CODEX_HELPER_TEAMS_SERVICE"); !ok || got != "1" {
+		t.Fatalf("CODEX_HELPER_TEAMS_SERVICE env = %q ok=%v, want 1", got, ok)
+	}
+}
+
+func TestMaybeScheduleLegacyLocalSupervisorRestartSchedulesForOldSupervisor(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  exe,
+		cwd:  tmp,
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
+	t.Setenv(envTeamsLocalSupervisorVersion, "")
+
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("local supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec: teamsServiceSpec{
+			Executable: exe,
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write local supervisor config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:       teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:    configPath,
+		SupervisorPID: os.Getppid(),
+		ChildPID:      os.Getpid(),
+		State:         "running",
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("write local supervisor status: %v", err)
+	}
+
+	prevAlive := teamsLocalSupervisorProcessAlive
+	prevDetached := teamsServiceStartDetached
+	prevWait := teamsLegacyLocalSupervisorActivationWait
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsServiceStartDetached = prevDetached
+		teamsLegacyLocalSupervisorActivationWait = prevWait
+		teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	})
+	teamsLegacyLocalSupervisorActivationWait = time.Minute
+	teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	teamsLocalSupervisorProcessAlive = func(pid int) bool {
+		return pid == os.Getppid() || pid == os.Getpid()
+	}
+	var gotName string
+	var gotArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return nil
+	}
+
+	scheduled, err := maybeScheduleLegacyLocalSupervisorRestart(context.Background())
+	if err != nil {
+		t.Fatalf("maybeScheduleLegacyLocalSupervisorRestart error: %v", err)
+	}
+	if !scheduled {
+		t.Fatal("scheduled = false, want true")
+	}
+	joined := strings.Join(gotArgs, " ")
+	if gotName != "sh" ||
+		!strings.Contains(joined, shellQuote(exe)+" teams service restart") ||
+		!strings.Contains(joined, envTeamsLinuxServiceBackend+"=local-supervisor") {
+		t.Fatalf("detached restart command = %q %#v, want local-supervisor restart", gotName, gotArgs)
+	}
+	activation, ok, err := readTeamsServiceLocalSupervisorActivation()
+	if err != nil || !ok {
+		t.Fatalf("read activation = ok %v err %v, want activation", ok, err)
+	}
+	if activation.Status != "scheduled" || activation.TargetVersion != buildVersion() || activation.ObservedSupervisorEnv != "" || activation.OldSupervisorPID != os.Getppid() || activation.OldChildPID != os.Getpid() {
+		t.Fatalf("activation = %#v, want scheduled current upgrade handoff", activation)
+	}
+	if activation.DeadlineAt.Sub(activation.ScheduledAt) != time.Minute {
+		t.Fatalf("activation deadline delta = %s, want 1m", activation.DeadlineAt.Sub(activation.ScheduledAt))
+	}
+
+	scheduled, err = maybeScheduleLegacyLocalSupervisorRestart(context.Background())
+	if err != nil {
+		t.Fatalf("second maybeScheduleLegacyLocalSupervisorRestart error: %v", err)
+	}
+	if scheduled {
+		t.Fatal("second scheduled = true, want false after one-shot guard")
+	}
+}
+
+func TestMaybeScheduleLegacyLocalSupervisorRestartFailureQueuesControlNotice(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  exe,
+		cwd:  tmp,
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
+	t.Setenv(envTeamsLocalSupervisorVersion, "")
+
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ControlChat.TeamsChatID = "control-chat"
+		return nil
+	}); err != nil {
+		t.Fatalf("seed control chat: %v", err)
+	}
+
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("local supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec: teamsServiceSpec{
+			Executable: exe,
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write local supervisor config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+		Version:       teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:    configPath,
+		SupervisorPID: os.Getppid(),
+		ChildPID:      os.Getpid(),
+		State:         "running",
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("write local supervisor status: %v", err)
+	}
+
+	prevAlive := teamsLocalSupervisorProcessAlive
+	prevDetached := teamsServiceStartDetached
+	prevWait := teamsLegacyLocalSupervisorActivationWait
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsServiceStartDetached = prevDetached
+		teamsLegacyLocalSupervisorActivationWait = prevWait
+		teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	})
+	teamsLegacyLocalSupervisorActivationWait = time.Minute
+	teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	teamsLocalSupervisorProcessAlive = func(pid int) bool {
+		return pid == os.Getppid() || pid == os.Getpid()
+	}
+	teamsServiceStartDetached = func(context.Context, string, ...string) error {
+		return errors.New("detached restart failed")
+	}
+
+	scheduled, err := maybeScheduleLegacyLocalSupervisorRestart(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "detached restart failed") {
+		t.Fatalf("maybeScheduleLegacyLocalSupervisorRestart error = %v, want detached failure", err)
+	}
+	if scheduled {
+		t.Fatal("scheduled = true, want false on detached failure")
+	}
+	for i := 0; i < 2; i++ {
+		if err := queueLegacyLocalSupervisorActivationAttentionNoticeFromDisk(context.Background(), ""); err != nil {
+			t.Fatalf("queue activation notice attempt %d: %v", i, err)
+		}
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	count := 0
+	for _, msg := range state.OutboxMessages {
+		if msg.Kind != "local-supervisor-activation-failed" {
+			continue
+		}
+		count++
+		if msg.TeamsChatID != "control-chat" || !msg.MentionOwner || !msg.UpgradeNonBlocking || !strings.Contains(msg.Body, "detached restart failed") {
+			t.Fatalf("queued failed activation notice = %#v, want control attention notice", msg)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("failed activation notices = %d, want exactly one", count)
+	}
+}
+
+func TestMaybeScheduleLegacyLocalSupervisorRestartSkipsCurrentSupervisorVersion(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:  tmp,
+	})
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
+	t.Setenv(envTeamsLocalSupervisorVersion, buildVersion())
+	if err := writeTeamsServiceLocalSupervisorActivation(teamsServiceLocalSupervisorActivation{
+		Version:       teamsServiceLocalSupervisorActivationVersion,
+		Status:        "scheduled",
+		TargetVersion: buildVersion(),
+		ScheduledAt:   time.Now().Add(-time.Minute),
+		DeadlineAt:    time.Now().Add(time.Minute),
+		UpdatedAt:     time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("write activation: %v", err)
+	}
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() {
+		teamsServiceStartDetached = prevDetached
+		teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	})
+	teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	teamsServiceStartDetached = func(context.Context, string, ...string) error {
+		t.Fatal("matching local-supervisor version marker must not schedule a restart")
+		return nil
+	}
+
+	scheduled, err := maybeScheduleLegacyLocalSupervisorRestart(context.Background())
+	if err != nil {
+		t.Fatalf("maybeScheduleLegacyLocalSupervisorRestart error: %v", err)
+	}
+	if scheduled {
+		t.Fatal("scheduled = true, want false")
+	}
+	activation, ok, err := readTeamsServiceLocalSupervisorActivation()
+	if err != nil || !ok {
+		t.Fatalf("read activation = ok %v err %v, want activation", ok, err)
+	}
+	if activation.Status != "success" || activation.ObservedSupervisorEnv != buildVersion() {
+		t.Fatalf("activation = %#v, want success with current marker", activation)
+	}
+}
+
+func TestWaitForLegacyLocalSupervisorActivationHandoffMarksExpired(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	prevWait := teamsLegacyLocalSupervisorActivationWait
+	t.Cleanup(func() {
+		teamsLegacyLocalSupervisorActivationWait = prevWait
+	})
+	teamsLegacyLocalSupervisorActivationWait = time.Nanosecond
+	now := time.Now().Add(-time.Minute)
+	if err := writeTeamsServiceLocalSupervisorActivation(teamsServiceLocalSupervisorActivation{
+		Version:       teamsServiceLocalSupervisorActivationVersion,
+		Status:        "scheduled",
+		TargetVersion: buildVersion(),
+		ScheduledAt:   now,
+		DeadlineAt:    now.Add(time.Nanosecond),
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatalf("write activation: %v", err)
+	}
+
+	if err := waitForLegacyLocalSupervisorActivationHandoff(context.Background()); err != nil {
+		t.Fatalf("waitForLegacyLocalSupervisorActivationHandoff error: %v", err)
+	}
+	activation, ok, err := readTeamsServiceLocalSupervisorActivation()
+	if err != nil || !ok {
+		t.Fatalf("read activation = ok %v err %v, want activation", ok, err)
+	}
+	if activation.Status != "expired" || !strings.Contains(activation.Message, "continuing under the existing supervisor") {
+		t.Fatalf("activation = %#v, want expired warning", activation)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorStatusReportsActivation(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:  tmp,
+	})
+	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
+	if err := writeTeamsServiceLocalSupervisorConfig(filepath.Join(tmp, "config", "codex-helper", "teams", teamsServiceLocalSupervisorConfigName), teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec: teamsServiceSpec{
+			Executable: filepath.Join(tmp, "bin", "codex-proxy"),
+			WorkingDir: tmp,
+		},
+	}); err != nil {
+		t.Fatalf("write local supervisor config: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorActivation(teamsServiceLocalSupervisorActivation{
+		Version:          teamsServiceLocalSupervisorActivationVersion,
+		Status:           "expired",
+		TargetVersion:    buildVersion(),
+		OldSupervisorPID: 1234,
+		Message:          "handoff timed out",
+		UpdatedAt:        time.Now(),
+	}); err != nil {
+		t.Fatalf("write activation: %v", err)
+	}
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	data, err := backend.Run(context.Background(), "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	got := string(data)
+	for _, want := range []string{"Activation: expired", "target=" + buildVersion(), "old_supervisor_pid=1234", "handoff timed out"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestQueueLegacyLocalSupervisorActivationAttentionNotice(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ControlChat.TeamsChatID = "control-chat"
+		return nil
+	}); err != nil {
+		t.Fatalf("seed control chat: %v", err)
+	}
+	activation := teamsServiceLocalSupervisorActivation{
+		Version:          teamsServiceLocalSupervisorActivationVersion,
+		Status:           "expired",
+		TargetVersion:    buildVersion(),
+		OldSupervisorPID: 1234,
+		Message:          "handoff timed out",
+	}
+	if err := queueLegacyLocalSupervisorActivationAttentionNotice(context.Background(), "", activation); err != nil {
+		t.Fatalf("queue notice: %v", err)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	found := false
+	for _, msg := range state.OutboxMessages {
+		if msg.Kind != "local-supervisor-activation-expired" {
+			continue
+		}
+		found = true
+		if msg.TeamsChatID != "control-chat" || !msg.MentionOwner || !msg.UpgradeNonBlocking || !strings.Contains(msg.Body, "handoff timed out") {
+			t.Fatalf("queued notice = %#v, want control attention notice", msg)
+		}
+	}
+	if !found {
+		t.Fatalf("local-supervisor activation notice was not queued: %#v", state.OutboxMessages)
+	}
+}
+
 func TestTeamsServiceLocalSupervisorRecordedIdentityChecksArgsStartTimeAndEnv(t *testing.T) {
 	lockCLITestHooks(t)
 

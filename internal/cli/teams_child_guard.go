@@ -11,10 +11,13 @@ import (
 )
 
 const (
-	envTeamsCodexChild     = "CODEX_HELPER_TEAMS_CHILD"
-	envTeamsCodexParentPID = "CODEX_HELPER_TEAMS_PARENT_PID"
-	envTeamsHelperCLIPath  = "CODEX_HELPER_CLI_PATH"
-	envTeamsHelperCLIDir   = "CODEX_HELPER_CLI_DIR"
+	envTeamsCodexChild             = "CODEX_HELPER_TEAMS_CHILD"
+	envTeamsCodexParentPID         = "CODEX_HELPER_TEAMS_PARENT_PID"
+	envTeamsHelperCLIPath          = "CODEX_HELPER_CLI_PATH"
+	envTeamsHelperCLIDir           = "CODEX_HELPER_CLI_DIR"
+	envTeamsLocalSupervisorVersion = "CODEX_HELPER_TEAMS_LOCAL_SUPERVISOR_VERSION"
+	envTeamsLinuxServiceBackend    = "CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND"
+	envTeamsWSLServiceBackend      = "CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND"
 )
 
 var teamsChildExecutablePath = helperpath.RawExecutable

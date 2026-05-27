@@ -371,6 +371,11 @@ EOF
       return 1
     fi
   done
+  if ! grep -q '^CODEX_HELPER_TEAMS_LOCAL_SUPERVISOR_VERSION=' "$child_env"; then
+    log "public lifecycle child did not receive local supervisor version marker"
+    sed 's/^/[public-child-env] /' "$child_env" || true
+    return 1
+  fi
   for forbidden_env in CODEX_PROXY_DEBUG CODEX_HELPER_TEAMS_CHILD DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR; do
     if grep -q "^$forbidden_env=" "$child_env"; then
       log "public lifecycle child inherited forbidden env $forbidden_env"
@@ -387,6 +392,35 @@ EOF
   if ! grep -q 'Active: true' "$smoke/status.log"; then
     log "public lifecycle status did not report active"
     sed 's/^/[public-status] /' "$smoke/status.log" || true
+    return 1
+  fi
+  rm -f "$child_env"
+  run_logged "public-restart" "$smoke/restart.log" env -i "${common_env[@]}" "$cxp" teams service restart
+  if [ -n "$public_child_pid" ] && ! wait_for_pid_gone "$public_child_pid"; then
+    log "public lifecycle child pid $public_child_pid remained after restart"
+    return 1
+  fi
+  if [ -n "$public_supervisor_pid" ] && ! wait_for_pid_gone "$public_supervisor_pid"; then
+    log "public lifecycle supervisor pid $public_supervisor_pid remained after restart"
+    return 1
+  fi
+  [ -n "$public_supervisor_pid" ] && remove_cleanup_pid "$public_supervisor_pid"
+  [ -n "$public_child_pid" ] && remove_cleanup_pid "$public_child_pid"
+  wait_for_lines "$runs" 2
+  wait_for_file_pattern "$status" '"supervisor_pid"'
+  public_supervisor_pid="$(sed -n 's/.*"supervisor_pid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
+  if [ -n "$public_supervisor_pid" ]; then
+    cleanup_pids+=("$public_supervisor_pid")
+  fi
+  public_child_pid="$(sed -n 's/.*"child_pid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
+  if [ -n "$public_child_pid" ]; then
+    cleanup_pids+=("$public_child_pid")
+  fi
+  wait_for_file_pattern "$child_env" '^CODEX_HELPER_TEAMS_LOCAL_SUPERVISOR_VERSION='
+  run_logged "public-status-after-restart" "$smoke/status-after-restart.log" env -i "${common_env[@]}" "$cxp" teams service status
+  if ! grep -q 'Active: true' "$smoke/status-after-restart.log"; then
+    log "public lifecycle status did not report active after restart"
+    sed 's/^/[public-status-after-restart] /' "$smoke/status-after-restart.log" || true
     return 1
   fi
   run_logged "public-stop" "$smoke/stop.log" env -i "${common_env[@]}" "$cxp" teams service stop

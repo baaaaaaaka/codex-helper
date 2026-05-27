@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/gofrs/flock"
 )
 
@@ -775,5 +776,344 @@ func TestTeamsServiceLocalSupervisorReleaseFailureStressCleanupErrors(t *testing
 	}
 	if len(terminateCalls) != 0 {
 		t.Fatalf("current process group terminate calls = %#v, want none", terminateCalls)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorActivationHandoffStressMatrix(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cases := []struct {
+		name             string
+		goos             string
+		service          string
+		backend          string
+		marker           string
+		writeStatus      bool
+		statusSupervisor int
+		statusChild      int
+		statusUpdatedAt  func() time.Time
+		detachedErr      error
+		preActivation    bool
+		wantScheduled    bool
+		wantErr          string
+		wantActivation   string
+		wantDetached     bool
+	}{
+		{
+			name:             "old supervisor schedules handoff",
+			goos:             "linux",
+			service:          "1",
+			backend:          "local-supervisor",
+			writeStatus:      true,
+			statusSupervisor: os.Getppid(),
+			statusChild:      os.Getpid(),
+			statusUpdatedAt:  time.Now,
+			wantScheduled:    true,
+			wantActivation:   "scheduled",
+			wantDetached:     true,
+		},
+		{
+			name:             "schedule failure is durable",
+			goos:             "linux",
+			service:          "1",
+			backend:          "local-supervisor",
+			writeStatus:      true,
+			statusSupervisor: os.Getppid(),
+			statusChild:      os.Getpid(),
+			statusUpdatedAt:  time.Now,
+			detachedErr:      errors.New("detached start failed"),
+			wantErr:          "detached start failed",
+			wantActivation:   "failed",
+			wantDetached:     true,
+		},
+		{
+			name:           "current supervisor marker completes previous handoff",
+			goos:           "linux",
+			service:        "1",
+			backend:        "local-supervisor",
+			marker:         buildVersion(),
+			preActivation:  true,
+			wantActivation: "success",
+		},
+		{
+			name:           "missing status skips",
+			goos:           "linux",
+			service:        "1",
+			backend:        "local-supervisor",
+			wantActivation: "",
+		},
+		{
+			name:             "identity mismatch skips",
+			goos:             "linux",
+			service:          "1",
+			backend:          "local-supervisor",
+			writeStatus:      true,
+			statusSupervisor: os.Getppid() + 1000,
+			statusChild:      os.Getpid(),
+			statusUpdatedAt:  time.Now,
+			wantActivation:   "",
+		},
+		{
+			name:             "stale status skips",
+			goos:             "linux",
+			service:          "1",
+			backend:          "local-supervisor",
+			writeStatus:      true,
+			statusSupervisor: os.Getppid(),
+			statusChild:      os.Getpid(),
+			statusUpdatedAt:  func() time.Time { return time.Now().Add(-teamsServiceLocalSupervisorStatusFreshness - time.Minute) },
+			wantActivation:   "",
+		},
+		{
+			name:           "systemd backend skips",
+			goos:           "linux",
+			service:        "1",
+			backend:        "systemd",
+			wantActivation: "",
+		},
+		{
+			name:           "non linux skips",
+			goos:           "darwin",
+			service:        "1",
+			backend:        "local-supervisor",
+			wantActivation: "",
+		},
+		{
+			name:           "non service skips",
+			goos:           "linux",
+			backend:        "local-supervisor",
+			wantActivation: "",
+		},
+	}
+
+	for round := 0; round < 6; round++ {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("round-%02d/%s", round, tc.name), func(t *testing.T) {
+				tmp := t.TempDir()
+				isolateTeamsUserDirsForTest(t, tmp)
+				exe := filepath.Join(tmp, "bin", "codex-proxy")
+				withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+					goos: firstNonEmptyCLI(tc.goos, "linux"),
+					exe:  exe,
+					cwd:  tmp,
+				})
+				t.Setenv("CODEX_HELPER_TEAMS_SERVICE", tc.service)
+				t.Setenv(envTeamsLinuxServiceBackend, tc.backend)
+				t.Setenv(envTeamsLocalSupervisorVersion, tc.marker)
+				configPath, err := teamsServiceLocalSupervisorConfigPath()
+				if err != nil {
+					t.Fatalf("config path: %v", err)
+				}
+				if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+					Version: teamsServiceLocalSupervisorConfigVersion,
+					Enabled: true,
+					Spec: teamsServiceSpec{
+						Executable: exe,
+						WorkingDir: tmp,
+					},
+				}); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+				if tc.writeStatus {
+					if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+						Version:       teamsServiceLocalSupervisorStatusVersion,
+						ConfigPath:    configPath,
+						SupervisorPID: tc.statusSupervisor,
+						ChildPID:      tc.statusChild,
+						State:         "running",
+						UpdatedAt:     tc.statusUpdatedAt(),
+					}); err != nil {
+						t.Fatalf("write status: %v", err)
+					}
+				}
+				if tc.preActivation {
+					if err := writeTeamsServiceLocalSupervisorActivation(teamsServiceLocalSupervisorActivation{
+						Version:       teamsServiceLocalSupervisorActivationVersion,
+						Status:        "scheduled",
+						TargetVersion: buildVersion(),
+						ScheduledAt:   time.Now().Add(-time.Minute),
+						UpdatedAt:     time.Now().Add(-time.Minute),
+					}); err != nil {
+						t.Fatalf("write activation: %v", err)
+					}
+				}
+
+				prevAlive := teamsLocalSupervisorProcessAlive
+				prevDetached := teamsServiceStartDetached
+				prevWait := teamsLegacyLocalSupervisorActivationWait
+				t.Cleanup(func() {
+					teamsLocalSupervisorProcessAlive = prevAlive
+					teamsServiceStartDetached = prevDetached
+					teamsLegacyLocalSupervisorActivationWait = prevWait
+					teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+				})
+				teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+				teamsLegacyLocalSupervisorActivationWait = time.Minute
+				teamsLocalSupervisorProcessAlive = func(pid int) bool {
+					return pid == os.Getppid() || pid == os.Getpid() || pid == tc.statusSupervisor || pid == tc.statusChild
+				}
+				detachedCalls := 0
+				teamsServiceStartDetached = func(context.Context, string, ...string) error {
+					detachedCalls++
+					return tc.detachedErr
+				}
+
+				scheduled, err := maybeScheduleLegacyLocalSupervisorRestart(context.Background())
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+					}
+				} else if err != nil {
+					t.Fatalf("unexpected err: %v", err)
+				}
+				if scheduled != tc.wantScheduled {
+					t.Fatalf("scheduled = %v, want %v", scheduled, tc.wantScheduled)
+				}
+				if (detachedCalls > 0) != tc.wantDetached {
+					t.Fatalf("detachedCalls = %d, want detached=%v", detachedCalls, tc.wantDetached)
+				}
+				activation, ok, readErr := readTeamsServiceLocalSupervisorActivation()
+				if readErr != nil {
+					t.Fatalf("read activation: %v", readErr)
+				}
+				if tc.wantActivation == "" {
+					if ok {
+						t.Fatalf("activation = %#v, want none", activation)
+					}
+					return
+				}
+				if !ok || activation.Status != tc.wantActivation {
+					t.Fatalf("activation = %#v ok=%v, want status %q", activation, ok, tc.wantActivation)
+				}
+			})
+		}
+	}
+}
+
+func TestTeamsServiceLocalSupervisorActivationWaitStressMatrix(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cases := []struct {
+		name       string
+		status     string
+		target     string
+		missing    bool
+		wantStatus string
+	}{
+		{name: "scheduled current expires", status: "scheduled", target: buildVersion(), wantStatus: "expired"},
+		{name: "scheduled other target stays", status: "scheduled", target: "v0.0.1", wantStatus: "scheduled"},
+		{name: "success stays", status: "success", target: buildVersion(), wantStatus: "success"},
+		{name: "failed stays", status: "failed", target: buildVersion(), wantStatus: "failed"},
+		{name: "missing activation is ignored", missing: true},
+	}
+	for round := 0; round < 8; round++ {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("round-%02d/%s", round, tc.name), func(t *testing.T) {
+				tmp := t.TempDir()
+				isolateTeamsUserDirsForTest(t, tmp)
+				prevWait := teamsLegacyLocalSupervisorActivationWait
+				t.Cleanup(func() {
+					teamsLegacyLocalSupervisorActivationWait = prevWait
+				})
+				teamsLegacyLocalSupervisorActivationWait = 0
+				if !tc.missing {
+					if err := writeTeamsServiceLocalSupervisorActivation(teamsServiceLocalSupervisorActivation{
+						Version:       teamsServiceLocalSupervisorActivationVersion,
+						Status:        tc.status,
+						TargetVersion: tc.target,
+						ScheduledAt:   time.Now().Add(-time.Minute),
+						DeadlineAt:    time.Now().Add(-time.Second),
+						UpdatedAt:     time.Now().Add(-time.Minute),
+					}); err != nil {
+						t.Fatalf("write activation: %v", err)
+					}
+				}
+				if err := waitForLegacyLocalSupervisorActivationHandoff(context.Background()); err != nil {
+					t.Fatalf("wait activation: %v", err)
+				}
+				activation, ok, err := readTeamsServiceLocalSupervisorActivation()
+				if err != nil {
+					t.Fatalf("read activation: %v", err)
+				}
+				if tc.missing {
+					if ok {
+						t.Fatalf("activation = %#v, want missing", activation)
+					}
+					return
+				}
+				if !ok || activation.Status != tc.wantStatus {
+					t.Fatalf("activation = %#v ok=%v, want status %q", activation, ok, tc.wantStatus)
+				}
+			})
+		}
+	}
+}
+
+func TestLegacyLocalSupervisorActivationNoticeStressMatrix(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cases := []struct {
+		name      string
+		status    string
+		chatID    string
+		wantQueue bool
+	}{
+		{name: "expired with control chat queues", status: "expired", chatID: "control-chat", wantQueue: true},
+		{name: "failed with control chat queues", status: "failed", chatID: "control-chat", wantQueue: true},
+		{name: "scheduled with control chat skips", status: "scheduled", chatID: "control-chat"},
+		{name: "success with control chat skips", status: "success", chatID: "control-chat"},
+		{name: "expired without control chat skips", status: "expired"},
+	}
+	for round := 0; round < 8; round++ {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("round-%02d/%s", round, tc.name), func(t *testing.T) {
+				tmp := t.TempDir()
+				isolateTeamsUserDirsForTest(t, tmp)
+				st, err := openTeamsStore()
+				if err != nil {
+					t.Fatalf("open store: %v", err)
+				}
+				if tc.chatID != "" {
+					if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+						state.ControlChat.TeamsChatID = tc.chatID
+						return nil
+					}); err != nil {
+						t.Fatalf("seed control chat: %v", err)
+					}
+				}
+				activation := teamsServiceLocalSupervisorActivation{
+					Version:          teamsServiceLocalSupervisorActivationVersion,
+					Status:           tc.status,
+					TargetVersion:    buildVersion(),
+					OldSupervisorPID: 1234,
+					Message:          "stress message",
+				}
+				for i := 0; i < 2; i++ {
+					if err := queueLegacyLocalSupervisorActivationAttentionNotice(context.Background(), "", activation); err != nil {
+						t.Fatalf("queue notice attempt %d: %v", i, err)
+					}
+				}
+				state, err := st.Load(context.Background())
+				if err != nil {
+					t.Fatalf("load store: %v", err)
+				}
+				count := 0
+				for _, msg := range state.OutboxMessages {
+					if strings.HasPrefix(msg.Kind, "local-supervisor-activation-") {
+						count++
+						if msg.TeamsChatID != tc.chatID || !msg.MentionOwner || !msg.UpgradeNonBlocking || !strings.Contains(msg.Body, "stress message") {
+							t.Fatalf("notice = %#v, want protected control notice", msg)
+						}
+					}
+				}
+				if tc.wantQueue {
+					if count != 1 {
+						t.Fatalf("queued notices = %d, want 1", count)
+					}
+				} else if count != 0 {
+					t.Fatalf("queued notices = %d, want 0", count)
+				}
+			})
+		}
 	}
 }

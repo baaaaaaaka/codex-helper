@@ -346,6 +346,14 @@ jobs:
           set -euo pipefail
           sudo env "PATH=$PATH" CODEX_HELPER_SYSTEMD_ANALYZE_TEST=1 go test ./internal/cli -count=1 -run 'TestTeamsServiceSystemdUnitVerifiesWithSystemdAnalyzeCI$' -v
 
+      - name: Teams local-supervisor upgrade activation regressions (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          activation_pattern='Test(ConfigureTeamsServiceDetachedCommandStartsNewSession|DelayedTeamsServiceStartCommandUsesLocalSupervisor|RestartTeamsHelperFromTeamsLinuxLocalSupervisorSchedulesServiceRestart|TeamsServiceLocalSupervisorChildProcessEnvMarksSupervisorVersion|MaybeScheduleLegacyLocalSupervisorRestart(SchedulesForOldSupervisor|FailureQueuesControlNotice|SkipsCurrentSupervisorVersion)|WaitForLegacyLocalSupervisorActivationHandoffMarksExpired|TeamsServiceLocalSupervisorStatusReportsActivation|QueueLegacyLocalSupervisorActivationAttentionNotice|TeamsServiceLocalSupervisorActivation(HandoffStressMatrix|WaitStressMatrix)|LegacyLocalSupervisorActivationNoticeStressMatrix)$'
+          go test ./internal/cli -count=1 -run "$activation_pattern" -v
+
       - name: Teams native supervisor validation (macOS)
         if: runner.os == 'macOS'
         shell: bash

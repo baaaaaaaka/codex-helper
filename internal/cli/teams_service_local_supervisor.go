@@ -20,13 +20,14 @@ import (
 )
 
 const (
-	teamsServiceLocalSupervisorID              = "local-supervisor"
-	teamsServiceLocalSupervisorConfigVersion   = 1
-	teamsServiceLocalSupervisorStatusVersion   = 1
-	teamsServiceLocalSupervisorStatusFreshness = 30 * time.Second
-	teamsServiceLocalSupervisorRetireTimeout   = 3 * time.Second
-	teamsServiceLocalSupervisorMaxLogBytes     = 5 * 1024 * 1024
-	teamsServiceLocalSupervisorLogBackups      = 3
+	teamsServiceLocalSupervisorID                = "local-supervisor"
+	teamsServiceLocalSupervisorConfigVersion     = 1
+	teamsServiceLocalSupervisorStatusVersion     = 1
+	teamsServiceLocalSupervisorActivationVersion = 1
+	teamsServiceLocalSupervisorStatusFreshness   = 30 * time.Second
+	teamsServiceLocalSupervisorRetireTimeout     = 3 * time.Second
+	teamsServiceLocalSupervisorMaxLogBytes       = 5 * 1024 * 1024
+	teamsServiceLocalSupervisorLogBackups        = 3
 )
 
 type teamsServiceLocalSupervisorBackend struct{}
@@ -67,6 +68,19 @@ type teamsServiceLocalSupervisorStatus struct {
 	LastHealthReason   string                                      `json:"last_health_reason,omitempty"`
 	LastHealthAction   string                                      `json:"last_health_action,omitempty"`
 	RestartCount       int                                         `json:"restart_count,omitempty"`
+}
+
+type teamsServiceLocalSupervisorActivation struct {
+	Version               int       `json:"version"`
+	Status                string    `json:"status,omitempty"`
+	TargetVersion         string    `json:"target_version,omitempty"`
+	ObservedSupervisorEnv string    `json:"observed_supervisor_env,omitempty"`
+	OldSupervisorPID      int       `json:"old_supervisor_pid,omitempty"`
+	OldChildPID           int       `json:"old_child_pid,omitempty"`
+	Message               string    `json:"message,omitempty"`
+	ScheduledAt           time.Time `json:"scheduled_at,omitempty"`
+	DeadlineAt            time.Time `json:"deadline_at,omitempty"`
+	UpdatedAt             time.Time `json:"updated_at,omitempty"`
 }
 
 var (
@@ -401,6 +415,7 @@ func (b teamsServiceLocalSupervisorBackend) status(_ context.Context) ([]byte, e
 	}
 	if !ok {
 		fmt.Fprintln(&out, "Active: false")
+		writeTeamsServiceLocalSupervisorActivationSummary(&out)
 		return out.Bytes(), nil
 	}
 	active := teamsServiceLocalSupervisorStatusActive(status, time.Now())
@@ -424,8 +439,45 @@ func (b teamsServiceLocalSupervisorBackend) status(_ context.Context) ([]byte, e
 	if status.LogPath != "" {
 		fmt.Fprintf(&out, "Log: %s\n", status.LogPath)
 	}
+	writeTeamsServiceLocalSupervisorActivationSummary(&out)
 	fmt.Fprintln(&out, "Autostart: not guaranteed after machine/container reboot")
 	return out.Bytes(), nil
+}
+
+func writeTeamsServiceLocalSupervisorActivationSummary(out *bytes.Buffer) {
+	if out == nil {
+		return
+	}
+	if activation, ok, activationErr := readTeamsServiceLocalSupervisorActivation(); activationErr != nil {
+		fmt.Fprintf(out, "Activation: unknown (%v)\n", activationErr)
+	} else if ok {
+		fmt.Fprintf(out, "Activation: %s\n", formatTeamsServiceLocalSupervisorActivation(activation))
+	}
+}
+
+func formatTeamsServiceLocalSupervisorActivation(activation teamsServiceLocalSupervisorActivation) string {
+	status := firstNonEmptyCLI(strings.TrimSpace(activation.Status), "unknown")
+	var parts []string
+	parts = append(parts, status)
+	if target := strings.TrimSpace(activation.TargetVersion); target != "" {
+		parts = append(parts, "target="+target)
+	}
+	if observed := strings.TrimSpace(activation.ObservedSupervisorEnv); observed != "" {
+		parts = append(parts, "observed="+observed)
+	}
+	if activation.OldSupervisorPID > 0 {
+		parts = append(parts, fmt.Sprintf("old_supervisor_pid=%d", activation.OldSupervisorPID))
+	}
+	if !activation.ScheduledAt.IsZero() {
+		parts = append(parts, "scheduled="+activation.ScheduledAt.Format(time.RFC3339))
+	}
+	if !activation.DeadlineAt.IsZero() && (status == "scheduled" || status == "expired") {
+		parts = append(parts, "deadline="+activation.DeadlineAt.Format(time.RFC3339))
+	}
+	if msg := strings.TrimSpace(activation.Message); msg != "" {
+		parts = append(parts, "message="+msg)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func defaultTeamsServiceLocalSupervisorStartDetached(_ context.Context, configPath string, logPath string, spec teamsServiceSpec) (int, error) {
@@ -575,7 +627,7 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 	args := buildTeamsServiceRunArgs(cfg.Spec)
 	cmd := exec.Command(cfg.Spec.Executable, args...)
 	cmd.Dir = cfg.Spec.WorkingDir
-	cmd.Env = teamsServiceLocalSupervisorProcessEnv(cfg.Spec.Environment)
+	cmd.Env = teamsServiceLocalSupervisorChildProcessEnv(cfg.Spec.Environment)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	configureTargetProcessGroup(cmd)
@@ -669,6 +721,15 @@ func defaultTeamsServiceLocalSupervisorCheckChildHealth(ctx context.Context, sta
 	decision := evaluateTeamsServiceWatchdog(snapshot, *state, opts)
 	*state = nextTeamsServiceWatchdogState(*state, decision, opts.Now)
 	return decision, nil
+}
+
+func teamsServiceLocalSupervisorChildProcessEnv(env map[string]string) []string {
+	childEnv := make(map[string]string, len(env)+1)
+	for key, value := range env {
+		childEnv[key] = value
+	}
+	childEnv[envTeamsLocalSupervisorVersion] = buildVersion()
+	return teamsServiceLocalSupervisorProcessEnv(childEnv)
 }
 
 func teamsServiceLocalSupervisorProcessEnv(env map[string]string) []string {
@@ -1280,6 +1341,57 @@ func writeTeamsServiceLocalSupervisorStatus(status teamsServiceLocalSupervisorSt
 	return writeTeamsServiceLocalSupervisorFileAtomic(path, data, 0o600)
 }
 
+func readTeamsServiceLocalSupervisorActivation() (teamsServiceLocalSupervisorActivation, bool, error) {
+	path, err := teamsServiceLocalSupervisorActivationPath()
+	if err != nil {
+		return teamsServiceLocalSupervisorActivation{}, false, err
+	}
+	if err := validateTeamsServiceLocalSupervisorRegularFile(path, "local supervisor activation", true); err != nil {
+		if os.IsNotExist(err) {
+			return teamsServiceLocalSupervisorActivation{}, false, nil
+		}
+		return teamsServiceLocalSupervisorActivation{}, false, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return teamsServiceLocalSupervisorActivation{}, false, nil
+		}
+		return teamsServiceLocalSupervisorActivation{}, false, err
+	}
+	var activation teamsServiceLocalSupervisorActivation
+	if err := json.Unmarshal(data, &activation); err != nil {
+		return teamsServiceLocalSupervisorActivation{}, false, fmt.Errorf("local supervisor activation is malformed: %s: %v", path, err)
+	}
+	return activation, true, nil
+}
+
+func writeTeamsServiceLocalSupervisorActivation(activation teamsServiceLocalSupervisorActivation) error {
+	path, err := teamsServiceLocalSupervisorActivationPath()
+	if err != nil {
+		return err
+	}
+	if err := ensureTeamsServiceLocalSupervisorDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	if activation.Version == 0 {
+		activation.Version = teamsServiceLocalSupervisorActivationVersion
+	}
+	activation.Status = strings.TrimSpace(activation.Status)
+	activation.TargetVersion = strings.TrimSpace(activation.TargetVersion)
+	activation.ObservedSupervisorEnv = strings.TrimSpace(activation.ObservedSupervisorEnv)
+	activation.Message = strings.TrimSpace(activation.Message)
+	if activation.UpdatedAt.IsZero() {
+		activation.UpdatedAt = time.Now()
+	}
+	data, err := json.MarshalIndent(activation, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return writeTeamsServiceLocalSupervisorFileAtomic(path, data, 0o600)
+}
+
 func writeTeamsServiceLocalSupervisorFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("local supervisor file path is required")
@@ -1442,6 +1554,14 @@ func teamsServiceLocalSupervisorStatusPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, teamsServiceLocalSupervisorStatusName), nil
+}
+
+func teamsServiceLocalSupervisorActivationPath() (string, error) {
+	dir, err := teamsServiceLocalSupervisorRuntimeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, teamsServiceLocalSupervisorActivationName), nil
 }
 
 func teamsServiceLocalSupervisorLockPath() (string, error) {

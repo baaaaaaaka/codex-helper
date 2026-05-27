@@ -2622,6 +2622,46 @@ func TestTeamsBackgroundKeepaliveDelayedRestartCommandsCI(t *testing.T) {
 			}
 		})
 	}
+	t.Run("linux local supervisor", func(t *testing.T) {
+		tmp := t.TempDir()
+		isolateTeamsUserDirsForTest(t, tmp)
+		exe := filepath.Join(tmp, "codex-proxy")
+		withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+			goos: "linux",
+			exe:  exe,
+			cwd:  tmp,
+		})
+		t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
+		configPath, err := teamsServiceLocalSupervisorConfigPath()
+		if err != nil {
+			t.Fatalf("local supervisor config path: %v", err)
+		}
+		if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+			Version: teamsServiceLocalSupervisorConfigVersion,
+			Enabled: true,
+			Spec: teamsServiceSpec{
+				Executable: exe,
+				WorkingDir: tmp,
+			},
+		}); err != nil {
+			t.Fatalf("write local supervisor config: %v", err)
+		}
+		backend, err := teamsServiceBackendForCurrentPlatform()
+		if err != nil {
+			t.Fatalf("backend error: %v", err)
+		}
+		name, args, err := delayedTeamsServiceStartCommand(backend, "")
+		if err != nil {
+			t.Fatalf("delayedTeamsServiceStartCommand error: %v", err)
+		}
+		joined := strings.Join(args, " ")
+		if name != "sh" ||
+			!strings.Contains(joined, shellQuote(exe)+" teams service start") ||
+			!strings.Contains(joined, envTeamsLinuxServiceBackend+"=local-supervisor") ||
+			strings.Contains(joined, "systemctl") {
+			t.Fatalf("restart command = %q %#v, want local-supervisor start", name, args)
+		}
+	})
 	t.Run("windows waits for pending replacement file", func(t *testing.T) {
 		tmp := t.TempDir()
 		withTeamsServiceTestHooks(t, teamsServiceTestHooks{

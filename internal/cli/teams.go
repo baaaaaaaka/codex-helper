@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -26,6 +27,11 @@ import (
 const (
 	defaultTeamsOwnerStaleAfter       = 5 * time.Minute
 	defaultTeamsChatRecreateDrainTime = 2 * time.Minute
+)
+
+var (
+	teamsLegacyLocalSupervisorRestartScheduled atomic.Bool
+	teamsLegacyLocalSupervisorActivationWait   = 20 * time.Second
 )
 
 func newTeamsCmd(root *rootOptions) *cobra.Command {
@@ -655,6 +661,22 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
 					}
 				}
+				if scheduled, err := maybeScheduleLegacyLocalSupervisorRestart(cmd.Context()); err != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation warning: %v\n", err)
+					if noticeErr := queueLegacyLocalSupervisorActivationAttentionNoticeFromDisk(cmd.Context(), *registryPath); noticeErr != nil {
+						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation notice warning: %v\n", noticeErr)
+					}
+				} else if scheduled {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation scheduled; waiting briefly for supervisor handoff.")
+					if err := waitForLegacyLocalSupervisorActivationHandoff(cmd.Context()); err != nil {
+						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation warning: %v\n", err)
+					} else {
+						_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation did not stop this helper within the handoff window; continuing under the existing supervisor.")
+						if err := queueLegacyLocalSupervisorActivationAttentionNoticeFromDisk(cmd.Context(), *registryPath); err != nil {
+							_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation notice warning: %v\n", err)
+						}
+					}
+				}
 				httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 				if err != nil {
 					return err
@@ -789,14 +811,197 @@ func restartTeamsHelperFromTeams(context.Context) error {
 	if err := helperRestartBeaconBlockerError(); err != nil {
 		return err
 	}
-	if teamsServiceGOOS() == "windows" && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
-		if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
-			return err
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+		if teamsServiceGOOS() == "windows" {
+			if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
+				return err
+			}
+			exitFunc(0)
+			return nil
 		}
-		exitFunc(0)
-		return nil
+		if teamsServiceGOOS() == "linux" {
+			if backend, err := teamsServiceBackendForCurrentPlatform(); err != nil {
+				return err
+			} else if backend.ID() == teamsServiceLocalSupervisorID {
+				if err := scheduleDelayedLocalSupervisorServiceRestart(context.Background()); err != nil {
+					return err
+				}
+				exitFunc(0)
+				return nil
+			}
+		}
 	}
 	return restartSelf()
+}
+
+func maybeScheduleLegacyLocalSupervisorRestart(ctx context.Context) (bool, error) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) == "" || teamsServiceGOOS() != "linux" {
+		return false, nil
+	}
+	observedSupervisorEnv := strings.TrimSpace(os.Getenv(envTeamsLocalSupervisorVersion))
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return false, err
+	}
+	if backend.ID() != teamsServiceLocalSupervisorID {
+		return false, nil
+	}
+	if observedSupervisorEnv == buildVersion() {
+		if err := markLegacyLocalSupervisorActivationSuccessIfPending(observedSupervisorEnv); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	status, ok, err := readTeamsServiceLocalSupervisorStatus()
+	if err != nil || !ok {
+		return false, err
+	}
+	if status.SupervisorPID != os.Getppid() || status.ChildPID != os.Getpid() {
+		return false, nil
+	}
+	if !teamsServiceLocalSupervisorStatusActive(status, time.Now()) {
+		return false, nil
+	}
+	if !teamsLegacyLocalSupervisorRestartScheduled.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	now := time.Now()
+	activation := teamsServiceLocalSupervisorActivation{
+		Version:               teamsServiceLocalSupervisorActivationVersion,
+		Status:                "scheduled",
+		TargetVersion:         buildVersion(),
+		ObservedSupervisorEnv: observedSupervisorEnv,
+		OldSupervisorPID:      status.SupervisorPID,
+		OldChildPID:           status.ChildPID,
+		Message:               "scheduled local-supervisor restart; waiting for supervisor handoff",
+		ScheduledAt:           now,
+		DeadlineAt:            now.Add(teamsLegacyLocalSupervisorActivationWait),
+		UpdatedAt:             now,
+	}
+	if err := writeTeamsServiceLocalSupervisorActivation(activation); err != nil {
+		teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+		return false, err
+	}
+	if err := scheduleDelayedLocalSupervisorServiceRestart(ctx); err != nil {
+		teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+		activation.Status = "failed"
+		activation.Message = "schedule local-supervisor restart: " + err.Error()
+		activation.UpdatedAt = time.Now()
+		writeErr := writeTeamsServiceLocalSupervisorActivation(activation)
+		return false, errors.Join(err, writeErr)
+	}
+	return true, nil
+}
+
+func waitForLegacyLocalSupervisorActivationHandoff(ctx context.Context) error {
+	wait := teamsLegacyLocalSupervisorActivationWait
+	if wait > 0 {
+		if err := sleepContext(ctx, wait); err != nil {
+			return err
+		}
+	}
+	activation, ok, err := readTeamsServiceLocalSupervisorActivation()
+	if err != nil || !ok {
+		return err
+	}
+	if activation.Status != "scheduled" || strings.TrimSpace(activation.TargetVersion) != buildVersion() {
+		return nil
+	}
+	activation.Status = "expired"
+	activation.Message = fmt.Sprintf("scheduled local-supervisor restart did not stop this helper within %s; continuing under the existing supervisor", wait)
+	activation.UpdatedAt = time.Now()
+	return writeTeamsServiceLocalSupervisorActivation(activation)
+}
+
+func markLegacyLocalSupervisorActivationSuccessIfPending(observedSupervisorEnv string) error {
+	activation, ok, err := readTeamsServiceLocalSupervisorActivation()
+	if err != nil || !ok {
+		return err
+	}
+	if strings.TrimSpace(activation.TargetVersion) != "" && strings.TrimSpace(activation.TargetVersion) != buildVersion() {
+		return nil
+	}
+	if activation.Status == "success" {
+		return nil
+	}
+	activation.Status = "success"
+	activation.TargetVersion = buildVersion()
+	activation.ObservedSupervisorEnv = strings.TrimSpace(observedSupervisorEnv)
+	activation.Message = "local-supervisor launched this helper with the current supervisor version marker"
+	activation.UpdatedAt = time.Now()
+	return writeTeamsServiceLocalSupervisorActivation(activation)
+}
+
+func queueLegacyLocalSupervisorActivationAttentionNotice(ctx context.Context, registryPath string, activation teamsServiceLocalSupervisorActivation) error {
+	status := strings.TrimSpace(activation.Status)
+	if status != "failed" && status != "expired" {
+		return nil
+	}
+	reg, err := loadTeamsStatusRegistry(registryPath)
+	if err != nil {
+		return err
+	}
+	st, err := openTeamsStore()
+	if err != nil {
+		return err
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		return err
+	}
+	chatID := strings.TrimSpace(firstNonEmptyCLI(reg.ControlChatID, state.ControlChat.TeamsChatID))
+	if chatID == "" {
+		return nil
+	}
+	body := localSupervisorActivationAttentionBody(activation)
+	msg := teamsstore.OutboxMessage{
+		ID:                 localSupervisorActivationNoticeID(activation),
+		TeamsChatID:        chatID,
+		Kind:               "local-supervisor-activation-" + status,
+		Body:               body,
+		NotificationKind:   "local_supervisor_activation_" + status,
+		MentionOwner:       true,
+		UpgradeNonBlocking: true,
+	}
+	_, _, err = st.QueueOutbox(ctx, msg)
+	return err
+}
+
+func queueLegacyLocalSupervisorActivationAttentionNoticeFromDisk(ctx context.Context, registryPath string) error {
+	activation, ok, err := readTeamsServiceLocalSupervisorActivation()
+	if err != nil || !ok {
+		return err
+	}
+	return queueLegacyLocalSupervisorActivationAttentionNotice(ctx, registryPath, activation)
+}
+
+func localSupervisorActivationNoticeID(activation teamsServiceLocalSupervisorActivation) string {
+	status := firstNonEmptyCLI(strings.TrimSpace(activation.Status), "unknown")
+	target := firstNonEmptyCLI(strings.TrimSpace(activation.TargetVersion), "unknown")
+	seed := fmt.Sprintf("%s:%s:%d", status, target, activation.OldSupervisorPID)
+	seed = strings.NewReplacer(" ", "_", "/", "_", "\\", "_").Replace(seed)
+	return "outbox:control:local-supervisor-activation:" + seed
+}
+
+func localSupervisorActivationAttentionBody(activation teamsServiceLocalSupervisorActivation) string {
+	lines := []string{"Helper local-supervisor activation needs attention"}
+	if status := strings.TrimSpace(activation.Status); status != "" {
+		lines = append(lines, "", "Status: `"+status+"`")
+	}
+	if target := strings.TrimSpace(activation.TargetVersion); target != "" {
+		lines = append(lines, "Target helper: `"+target+"`")
+	}
+	if observed := strings.TrimSpace(activation.ObservedSupervisorEnv); observed != "" {
+		lines = append(lines, "Observed supervisor marker: `"+observed+"`")
+	}
+	if activation.OldSupervisorPID > 0 {
+		lines = append(lines, fmt.Sprintf("Old supervisor pid: `%d`", activation.OldSupervisorPID))
+	}
+	if msg := strings.TrimSpace(activation.Message); msg != "" {
+		lines = append(lines, "", "Reason: "+msg)
+	}
+	lines = append(lines, "", "The helper may be running the new child under the previous local-supervisor. Run `cxp teams status` on that machine to inspect activation state.")
+	return strings.Join(lines, "\n")
 }
 
 func restartTeamsHelperFromTeamsAfterPendingReplacement(ctx context.Context, pendingReplacePath string, installPath string) error {
@@ -1726,6 +1931,11 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		_, _ = fmt.Fprintf(out, "Helper path warning: %s\n", pathStatus.Warning)
 	}
 	_, _ = fmt.Fprintf(out, "OS service: %s\n", formatTeamsOSServiceStatus(cmd.Context()))
+	if activation, ok, activationErr := readTeamsServiceLocalSupervisorActivation(); activationErr != nil {
+		_, _ = fmt.Fprintf(out, "Local supervisor activation: unknown (%v)\n", activationErr)
+	} else if ok {
+		_, _ = fmt.Fprintf(out, "Local supervisor activation: %s\n", formatTeamsServiceLocalSupervisorActivation(activation))
+	}
 	_, _ = fmt.Fprintf(out, "Helper version: %s\n", formatTeamsHelperVersionStatus(cmd.Context(), owners))
 	if len(statePaths) == 0 {
 		_, _ = fmt.Fprintln(out, "Bridge: not running")

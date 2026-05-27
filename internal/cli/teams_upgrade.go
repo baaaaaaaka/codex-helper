@@ -604,6 +604,21 @@ func scheduleDelayedTeamsServiceStart(ctx context.Context, pendingReplacePath st
 	return teamsServiceStartDetached(ctx, name, args...)
 }
 
+func scheduleDelayedLocalSupervisorServiceRestart(ctx context.Context) error {
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return err
+	}
+	if backend.ID() != teamsServiceLocalSupervisorID {
+		return fmt.Errorf("local-supervisor restart requested for Teams service backend %s", backend.ID())
+	}
+	name, args, err := delayedLocalSupervisorServiceCommand(backend, "restart")
+	if err != nil {
+		return err
+	}
+	return teamsServiceStartDetached(ctx, name, args...)
+}
+
 func defaultTeamsServiceStartDetached(_ context.Context, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	configureTeamsServiceDetachedCommand(cmd)
@@ -611,6 +626,9 @@ func defaultTeamsServiceStartDetached(_ context.Context, name string, args ...st
 }
 
 func delayedTeamsServiceStartCommand(backend teamsServiceBackend, pendingReplacePath string) (string, []string, error) {
+	if backend.ID() == teamsServiceLocalSupervisorID {
+		return delayedLocalSupervisorServiceCommand(backend, "start")
+	}
 	if backend.ID() == "wsl-windows-task-scheduler" {
 		wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
 		if !ok {
@@ -637,6 +655,32 @@ func delayedTeamsServiceStartCommand(backend teamsServiceBackend, pendingReplace
 		script := "sleep 3; systemctl --user start " + shellQuote(backend.Name()) + " >/dev/null 2>&1"
 		return "sh", []string{"-c", script}, nil
 	}
+}
+
+func delayedLocalSupervisorServiceCommand(backend teamsServiceBackend, action string) (string, []string, error) {
+	action = strings.TrimSpace(action)
+	switch action {
+	case "start", "restart":
+	default:
+		return "", nil, fmt.Errorf("unsupported delayed local-supervisor action %q", action)
+	}
+	path, err := backend.Path()
+	if err != nil {
+		return "", nil, err
+	}
+	cfg, err := readTeamsServiceLocalSupervisorConfig(path)
+	if err != nil {
+		return "", nil, err
+	}
+	exe := strings.TrimSpace(cfg.Spec.Executable)
+	if exe == "" {
+		return "", nil, fmt.Errorf("local-supervisor executable is required for delayed Teams service %s", action)
+	}
+	script := "sleep 3; " +
+		envTeamsLinuxServiceBackend + "=local-supervisor " +
+		envTeamsWSLServiceBackend + "=local-supervisor " +
+		shellQuote(exe) + " teams service " + action + " >/dev/null 2>&1"
+	return "sh", []string{"-c", script}, nil
 }
 
 func delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath string) string {
