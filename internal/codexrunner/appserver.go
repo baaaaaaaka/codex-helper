@@ -1347,10 +1347,11 @@ type appServerTokenBreakdown struct {
 	OutputTokens          int64 `json:"outputTokens"`
 	ReasoningOutputTokens int64 `json:"reasoningOutputTokens"`
 
-	TotalTokensSnake       int64 `json:"total_tokens"`
-	InputTokensSnake       int64 `json:"input_tokens"`
-	CachedInputTokensSnake int64 `json:"cached_input_tokens"`
-	OutputTokensSnake      int64 `json:"output_tokens"`
+	TotalTokensSnake           int64 `json:"total_tokens"`
+	InputTokensSnake           int64 `json:"input_tokens"`
+	CachedInputTokensSnake     int64 `json:"cached_input_tokens"`
+	OutputTokensSnake          int64 `json:"output_tokens"`
+	ReasoningOutputTokensSnake int64 `json:"reasoning_output_tokens"`
 }
 
 func (b appServerTokenBreakdown) isZero() bool {
@@ -1362,7 +1363,8 @@ func (b appServerTokenBreakdown) isZero() bool {
 		b.TotalTokensSnake == 0 &&
 		b.InputTokensSnake == 0 &&
 		b.CachedInputTokensSnake == 0 &&
-		b.OutputTokensSnake == 0
+		b.OutputTokensSnake == 0 &&
+		b.ReasoningOutputTokensSnake == 0
 }
 
 func mergeAppServerUsage(dst *Usage, src appServerTokenUsage) {
@@ -1375,6 +1377,9 @@ func mergeAppServerUsage(dst *Usage, src appServerTokenUsage) {
 	}
 	if value := firstNonZeroInt64(breakdown.OutputTokens, breakdown.OutputTokensSnake); value != 0 {
 		dst.OutputTokens = value
+	}
+	if value := firstNonZeroInt64(breakdown.ReasoningOutputTokens, breakdown.ReasoningOutputTokensSnake); value != 0 {
+		dst.ReasoningOutputTokens = value
 	}
 	if value := firstNonZeroInt64(breakdown.TotalTokens, breakdown.TotalTokensSnake); value != 0 {
 		dst.TotalTokens = value

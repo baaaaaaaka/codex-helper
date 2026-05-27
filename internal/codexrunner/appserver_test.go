@@ -56,7 +56,7 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 		`{"method":"thread/name/updated","params":{"threadId":"thread-new","threadName":"Generated helper title"}}`,
 		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-new","turnId":"turn-1","itemId":"item-1","delta":"do"}}`,
 		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-new","turnId":"turn-1","itemId":"item-1","delta":"ne"}}`,
-		`{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-new","turnId":"turn-1","tokenUsage":{"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":20,"outputTokens":20,"reasoningOutputTokens":0},"last":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":7,"outputTokens":10,"reasoningOutputTokens":0}}}}`,
+		`{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-new","turnId":"turn-1","tokenUsage":{"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":20,"outputTokens":20,"reasoningOutputTokens":4},"last":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":7,"outputTokens":10,"reasoningOutputTokens":3}}}}`,
 		`{"method":"turn/completed","params":{"threadId":"thread-new","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
 	)
 	runner := &AppServerRunner{
@@ -73,7 +73,7 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	if got.ThreadID != "thread-new" || got.TurnID != "turn-1" || got.Status != TurnStatusCompleted {
 		t.Fatalf("unexpected result: %#v", got)
 	}
-	if got.FinalAgentMessage != "done" || got.Usage.CachedInputTokens != 7 {
+	if got.FinalAgentMessage != "done" || got.Usage.CachedInputTokens != 7 || got.Usage.ReasoningOutputTokens != 3 {
 		t.Fatalf("notification result not parsed: %#v", got)
 	}
 	if got.ThreadName != "Generated helper title" {

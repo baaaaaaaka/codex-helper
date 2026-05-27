@@ -5720,18 +5720,22 @@ func TestBridgeControlWorkOnlyHelperCommandExplainsCorrectChat(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, executor)
 	bridge.controlFallbackExecutor = executor
 
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessageWithText("control-helper-file", "helper file report.md"), "helper file report.md"); err != nil {
-		t.Fatalf("handleControlMessage error: %v", err)
+	for _, text := range []string{"helper file report.md", "helper stats"} {
+		if err := bridge.handleControlMessage(context.Background(), bridgeTestMessageWithText("control-"+shortStableID(text), text), text); err != nil {
+			t.Fatalf("handleControlMessage(%q) error: %v", text, err)
+		}
 	}
 	if len(executor.prompts) != 0 {
 		t.Fatalf("executor prompts = %#v, want none", executor.prompts)
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	if len(*sent) != 2 {
+		t.Fatalf("sent message count = %d, want 2", len(*sent))
 	}
-	got := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if !strings.Contains(got, "control chat") || !strings.Contains(got, "helper ...") || !strings.Contains(got, "Work chat") || !strings.Contains(got, "new <directory>") {
-		t.Fatalf("wrong-chat helper response = %q", got)
+	for _, message := range *sent {
+		got := PlainTextFromTeamsHTML(message.Content)
+		if !strings.Contains(got, "control chat") || !strings.Contains(got, "helper ...") || !strings.Contains(got, "Work chat") || !strings.Contains(got, "new <directory>") {
+			t.Fatalf("wrong-chat helper response = %q", got)
+		}
 	}
 }
 

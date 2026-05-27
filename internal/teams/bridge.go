@@ -3230,7 +3230,7 @@ func controlAdvancedHelpText() string {
 		"- `cxp skills install-builtin` - install or repair bundled local skills",
 		"",
 		"work chat commands:",
-		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
+		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper stats`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
 		"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
 		"If this chat stops replying for about a minute, send `helper status`. From the control chat, `helper reload now` loads the latest helper code and `helper restart now` restarts the helper.",
 		"",
@@ -3248,6 +3248,7 @@ func sessionHelpText() string {
 		"",
 		"Common commands:",
 		"`helper status` or `!status` - check progress",
+		"`helper stats` or `!stats` - show Codex token usage from the linked local history",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding before retrying an interrupted turn",
 		"`helper close` or `!close` - close this Codex session in Teams",
@@ -3265,6 +3266,7 @@ func sessionAdvancedHelpText() string {
 	return strings.Join([]string{
 		"💬 Work chat advanced help",
 		"`helper status` or `!status` - check progress",
+		"`helper stats` or `!stats` - show Codex token usage, cache/context analysis, and rate-limit metadata when Codex recorded it",
 		"`helper details` or `!details` - show IDs and debug details",
 		"`beacon status`, `beacon list`, `beacon switch <profile>`, or `beacon switch local` - inspect or switch this Work chat execution target",
 		"`helper rename <title>` or `!rename <title>` - rename this Teams chat",
@@ -5095,7 +5097,7 @@ func isWorkOnlyHelperCommand(text string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "file", "image", "send-file", "send-image", "retry", "restore-thread", "restore", "cancel", "close", "publish-history", "sync-history", "import-history":
+	case "file", "image", "send-file", "send-image", "retry", "restore-thread", "restore", "cancel", "close", "rename", "publish-history", "sync-history", "import-history", "stats", "usage", "tokens":
 		return true
 	default:
 		return false
@@ -5504,7 +5506,7 @@ func sessionReadyMessage(session Session, prompt string, target ...string) strin
 	if len(target) > 0 && strings.TrimSpace(target[0]) != "" {
 		lines = append(lines, "Execution target: "+strings.TrimSpace(target[0]))
 	}
-	lines = append(lines, "Commands: `helper status` or `!status`, `helper help`, `helper close` to close this Codex session in Teams.")
+	lines = append(lines, "Commands: `helper status` or `!status`, `helper stats`, `helper help`, `helper close` to close this Codex session in Teams.")
 	lines = append(lines, "Need the full path? Send `helper status`.")
 	return strings.Join(lines, "\n")
 }
@@ -5569,6 +5571,8 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 			return b.sendToChat(ctx, chatID, "Session closed. The helper will no longer read or respond in this Teams chat.\n\nThis chat remains visible in Teams. Use the 🏠 control chat to open or create another work chat.")
 		case DashboardCommandStatus:
 			return b.sendToChat(ctx, chatID, b.formatWorkSessionStatus(session))
+		case DashboardCommandStats:
+			return b.sendStatsToChat(ctx, chatID, b.formatWorkSessionStats(ctx, session))
 		case DashboardCommandRetry:
 			if control, blocked, err := b.serviceControlBlocksNewWork(ctx); err != nil {
 				return err
@@ -10977,6 +10981,28 @@ func (b *Bridge) sendToChat(ctx context.Context, chatID string, text string) err
 	return b.flushPendingOutboxForChat(ctx, chatID)
 }
 
+func (b *Bridge) sendStatsToChat(ctx context.Context, chatID string, text string) error {
+	body := renderCodexTokenStatsHTML(text)
+	msg := teamstore.OutboxMessage{
+		ID:             directOutboxID(chatID, "helper-stats", body),
+		TeamsChatID:    chatID,
+		Kind:           "helper-stats",
+		Body:           body,
+		PartIndex:      1,
+		PartCount:      1,
+		SourceTextHash: normalizedTextHash(text),
+		RenderedBytes:  len(body),
+	}
+	queued, err := b.queueOutbox(ctx, msg)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(queued.ID) == "" {
+		return nil
+	}
+	return b.flushPendingOutboxForChat(ctx, chatID)
+}
+
 func (b *Bridge) sendSingleToChat(ctx context.Context, chatID string, text string) error {
 	return b.sendToChat(ctx, chatID, text)
 }
@@ -11042,6 +11068,9 @@ func renderOutboxHTML(outbox teamstore.OutboxMessage) string {
 	if isWorkflowFallbackOutboxKind(outbox.Kind) {
 		return renderWorkflowFallbackOutboxHTML(outbox, "")
 	}
+	if isHelperStatsOutboxKind(outbox.Kind) {
+		return outbox.Body
+	}
 	if strings.EqualFold(strings.TrimSpace(outbox.Kind), "freeze-notice") {
 		return outbox.Body
 	}
@@ -11102,6 +11131,10 @@ func renderOutboxMentionHTMLWithFallback(outbox teamstore.OutboxMessage, owner U
 
 func isWorkflowFallbackOutboxKind(kind string) bool {
 	return strings.EqualFold(strings.TrimSpace(kind), "workflow-fallback")
+}
+
+func isHelperStatsOutboxKind(kind string) bool {
+	return strings.EqualFold(strings.TrimSpace(kind), "helper-stats")
 }
 
 func renderWorkflowFallbackOutboxHTML(outbox teamstore.OutboxMessage, firstPrefixHTML string) string {

@@ -74,10 +74,11 @@ type TurnFailure struct {
 }
 
 type Usage struct {
-	InputTokens       int64
-	OutputTokens      int64
-	TotalTokens       int64
-	CachedInputTokens int64
+	InputTokens           int64
+	OutputTokens          int64
+	TotalTokens           int64
+	CachedInputTokens     int64
+	ReasoningOutputTokens int64
 }
 
 type CommandLauncher interface {

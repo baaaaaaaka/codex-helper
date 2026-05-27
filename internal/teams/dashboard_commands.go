@@ -32,6 +32,7 @@ const (
 	DashboardCommandDetails        DashboardCommandName = "details"
 	DashboardCommandHelp           DashboardCommandName = "help"
 	DashboardCommandStatus         DashboardCommandName = "status"
+	DashboardCommandStats          DashboardCommandName = "stats"
 	DashboardCommandRestart        DashboardCommandName = "restart"
 	DashboardCommandReload         DashboardCommandName = "reload"
 	DashboardCommandUpdate         DashboardCommandName = "update"
@@ -132,7 +133,7 @@ func helperPrefixedControlTextShouldStayHelperUnknown(name string, arg string) b
 
 func helperPrefixedControlNameIsWorkOnly(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "close", "retry", "restore-thread", "restore", "cancel", "stop", "send-file", "send-image", "file", "image", "publish-history", "sync-history", "import-history":
+	case "close", "retry", "restore-thread", "restore", "cancel", "stop", "send-file", "send-image", "file", "image", "publish-history", "sync-history", "import-history", "stats", "usage", "tokens":
 		return true
 	default:
 		return false
@@ -430,6 +431,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandHelp, true
 	case "status":
 		return DashboardCommandStatus, true
+	case "stats", "usage", "tokens":
+		return DashboardCommandStats, true
 	case "close":
 		return DashboardCommandClose, true
 	case "retry":
@@ -464,6 +467,8 @@ func workLegacyCommandName(name string, arg string) (DashboardCommandName, bool)
 		return DashboardCommandHelp, true
 	case "st":
 		return DashboardCommandStatus, true
+	case "stats", "usage", "tokens":
+		return DashboardCommandStats, true
 	case "cl":
 		return DashboardCommandClose, true
 	case "rt":

@@ -11,7 +11,7 @@ func TestParseJSONLExtractsThreadTurnMessageFailureAndCachedTokens(t *testing.T)
 		`{"type":"thread.started","thread_id":"thread-123"}`,
 		`{"type":"turn.started"}`,
 		`{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"first"}}`,
-		`{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":12,"total_tokens":112,"cached_input_tokens":34}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":12,"reasoning_output_tokens":5,"total_tokens":112,"cached_input_tokens":34}}`,
 		`{"type":"item.completed","item":{"id":"item-2","type":"agent_message","text":"final"}}`,
 		`{"type":"turn.failed","turn_id":"turn-2","error":{"code":"tool_error","message":"tool failed"},"usage":{"cached_input_tokens":55}}`,
 	}, "\n")
@@ -37,6 +37,9 @@ func TestParseJSONLExtractsThreadTurnMessageFailureAndCachedTokens(t *testing.T)
 	}
 	if got.Usage.CachedInputTokens != 55 {
 		t.Fatalf("cached input tokens = %d", got.Usage.CachedInputTokens)
+	}
+	if got.Usage.ReasoningOutputTokens != 5 {
+		t.Fatalf("reasoning output tokens = %d", got.Usage.ReasoningOutputTokens)
 	}
 }
 

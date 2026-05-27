@@ -176,7 +176,7 @@ func TestParseControlUnknownInputForwardsOnlyPlainTextToCodex(t *testing.T) {
 }
 
 func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
-	for _, text := range []string{"1", "status", "details", "close", "rename this chat", "retry the failed test", "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗", "helper webhook 能不能一键配置"} {
+	for _, text := range []string{"1", "status", "stats", "details", "close", "rename this chat", "retry the failed test", "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗", "helper webhook 能不能一键配置"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if cmd.HelperCommand {
@@ -188,7 +188,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/close", "/help", "/details", "!status", "!file report.txt", "!ph", "helper status", "helper retry turn-1", "helper file report.txt", "helper publish-history", "helper skills push", "codex status", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper file report.txt", "helper publish-history", "helper skills push", "codex status", "codex stats", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {
@@ -201,6 +201,9 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 	}
 	if cmd := ParseDashboardCommand(ChatScopeWork, "help advanced"); cmd.Name != DashboardCommandHelp || cmd.Argument != "advanced" {
 		t.Fatalf("help advanced parse = %#v, want help with advanced arg", cmd)
+	}
+	if cmd := ParseDashboardCommand(ChatScopeWork, "helper stats"); cmd.Name != DashboardCommandStats {
+		t.Fatalf("helper stats parse = %#v, want stats", cmd)
 	}
 }
 

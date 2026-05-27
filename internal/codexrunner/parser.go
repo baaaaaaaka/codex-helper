@@ -288,12 +288,13 @@ type codexContent struct {
 }
 
 type codexUsage struct {
-	InputTokens        int64                   `json:"input_tokens"`
-	OutputTokens       int64                   `json:"output_tokens"`
-	TotalTokens        int64                   `json:"total_tokens"`
-	CachedInputTokens  int64                   `json:"cached_input_tokens"`
-	InputTokensDetails codexInputTokenDetails  `json:"input_tokens_details"`
-	PromptTokenDetails codexPromptTokenDetails `json:"prompt_tokens_details"`
+	InputTokens           int64                   `json:"input_tokens"`
+	OutputTokens          int64                   `json:"output_tokens"`
+	ReasoningOutputTokens int64                   `json:"reasoning_output_tokens"`
+	TotalTokens           int64                   `json:"total_tokens"`
+	CachedInputTokens     int64                   `json:"cached_input_tokens"`
+	InputTokensDetails    codexInputTokenDetails  `json:"input_tokens_details"`
+	PromptTokenDetails    codexPromptTokenDetails `json:"prompt_tokens_details"`
 }
 
 type codexInputTokenDetails struct {
@@ -503,6 +504,9 @@ func mergeUsage(dst *Usage, src codexUsage) {
 	}
 	if src.OutputTokens != 0 {
 		dst.OutputTokens = src.OutputTokens
+	}
+	if src.ReasoningOutputTokens != 0 {
+		dst.ReasoningOutputTokens = src.ReasoningOutputTokens
 	}
 	if src.TotalTokens != 0 {
 		dst.TotalTokens = src.TotalTokens
