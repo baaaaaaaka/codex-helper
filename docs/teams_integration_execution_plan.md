@@ -642,6 +642,8 @@ Responsibilities:
   - work chat: `helper status`, `helper close`, `helper retry <turn-id>`,
     `helper cancel <turn-id>`, `helper file <relative-path>`, and
     `helper rename <title>`; `!` aliases are accepted for desktop use
+  - control chat: `helper rename <title>` updates the control chat title while
+    preserving the control marker
   - legacy `/...`, `cx ...`, and `codex ...` forms stay compatible where
     possible but are not the primary user-facing path
 
@@ -976,8 +978,9 @@ Responsibilities:
 - Title each work chat with a work/session marker, stable helper session id, and
   sanitized topic or cwd basename. The default shape should be equivalent to
   `💬 Codex Work - {machine_label} - {session_id} - {topic_or_cwd}`.
-- Provide `helper rename <title>` so the user can replace a sanitized title without
-  exposing raw prompts or full paths.
+- Provide `helper rename <title>` so the user can replace a sanitized work-chat
+  title without exposing raw prompts or full paths. In the control chat, the same
+  command renames the control chat while preserving the control marker.
 - Build a helper-owned control-chat index:
   - known work directories
   - sessions under a selected directory
@@ -1050,6 +1053,8 @@ Status:
   - `new <directory>` creates the directory, binds the session cwd,
     and routes Codex turns from that work chat in the selected directory
   - `mkdir <directory>` creates operator-requested work directories
+  - control-chat `helper rename <title>` updates the Teams control-chat topic and
+    durable control-chat metadata
   - work-chat `helper rename <title>` updates the Teams group-chat topic and durable
     session metadata
   - `details` and work-chat `helper details` provide session state, cwd, Teams URL,

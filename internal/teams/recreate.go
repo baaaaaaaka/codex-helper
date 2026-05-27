@@ -30,7 +30,7 @@ func (b *Bridge) RecreateControlChat(ctx context.Context) (RecreatedChat, error)
 		return RecreatedChat{}, err
 	}
 	old := Chat{ID: b.reg.ControlChatID, Topic: b.reg.ControlChatTopic, WebURL: b.reg.ControlChatURL, ChatType: "meeting"}
-	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()), Profile: b.scope.Profile})
+	topic := b.desiredControlChatTopic()
 	chat, err := b.createMeetingChat(ctx, topic)
 	if err != nil {
 		return RecreatedChat{}, err
@@ -241,6 +241,8 @@ func (b *Bridge) resetRecreatedControlChatState(ctx context.Context, oldChatID s
 		state.ControlChat.TeamsChatID = chat.ID
 		state.ControlChat.TeamsChatURL = chat.WebURL
 		state.ControlChat.TeamsChatTopic = chat.Topic
+		state.ControlChat.UserTitle = b.reg.ControlChatUserTitle
+		state.ControlChat.TitleSource = b.reg.ControlChatTitleSource
 		state.ControlChat.BoundAt = now
 		state.ControlChat.UpdatedAt = now
 		if current := state.Sessions[controlFallbackSessionID]; current.ID != "" {

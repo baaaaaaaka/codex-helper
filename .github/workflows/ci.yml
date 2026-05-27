@@ -99,6 +99,12 @@ jobs:
           set -euo pipefail
           go test ./internal/localproxy -count=1 -run 'TestHTTPProxy(RejectsSelfLoopTargets|ServeHTTPRejectsSelfLoopTargets|SelfTargetDetection)$' -v
 
+      - name: Teams control and work chat rename regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'Test(ChatTitlesUseDistinctLeadingEmoji|ParseControlDashboardCommandsDoNotRequireCodex|Bridge(ControlRenameUpdatesTeamsTopicAndDurableState|EnsureControlChat(PreservesUserControlTitle|RestoresPersistedUserControlTitle|BackfillsUserControlTitleIntoPartialDurableBinding|RenamesOldControlTopic)|SessionRenameUpdatesTeamsTopicAndDurableState))$' -v
+
       - name: Cross-compile check (Linux only)
         if: runner.os == 'Linux'
         shell: bash

@@ -434,7 +434,7 @@ func (b *Bridge) ensureControlChat(ctx context.Context, syncRegistry bool) (Chat
 		}
 	}
 	if b.reg.ControlChatID != "" {
-		desiredTopic := ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()), Profile: b.scope.Profile})
+		desiredTopic := b.desiredControlChatTopic()
 		if desiredTopic != "" && b.reg.ControlChatTopic != desiredTopic {
 			if err := b.graph.UpdateChatTopic(ctx, b.reg.ControlChatID, desiredTopic); err == nil {
 				b.reg.ControlChatTopic = SanitizeTopic(desiredTopic)
@@ -481,6 +481,14 @@ func (b *Bridge) ensureControlChat(ctx context.Context, syncRegistry bool) (Chat
 		Body:        "control chat is ready.\n\n" + controlHelpText(),
 	})
 	return chat, err
+}
+
+func (b *Bridge) desiredControlChatTopic() string {
+	return ControlChatTitle(ChatTitleOptions{
+		MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()),
+		Profile:      b.scope.Profile,
+		UserTitle:    b.reg.ControlChatUserTitle,
+	})
 }
 
 func (b *Bridge) createMeetingChat(ctx context.Context, topic string) (Chat, error) {
@@ -2953,7 +2961,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		case DashboardCommandMkdir:
 			return b.createWorkspaceDirectory(ctx, parsed.Argument)
 		case DashboardCommandRename:
-			return b.sendControl(ctx, "use `helper rename <title>` or `!rename <title>` inside a work chat to update that Teams chat title.")
+			return b.renameControlChat(ctx, parsed.Argument)
 		case DashboardCommandDetails:
 			message, err := b.formatDetailsControlTarget(ctx, parsed.Target)
 			if err != nil {
@@ -3163,6 +3171,7 @@ func controlHelpText() string {
 		"- `s` / `sessions` - show sessions in the selected workspace",
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
 		"- `st` / `status` - show active Work chats",
+		"- `helper rename <title>` - rename this Control chat",
 		"- `skills` - list installed skill subscriptions",
 		"",
 		"After `p`, reply with a number such as `1` to open that workspace. On a workspace page, send `new` to create a Work chat in that workspace.",
@@ -3192,6 +3201,7 @@ func controlAdvancedHelpText() string {
 		"- `d <number>` / `details <number>` - show technical IDs and details",
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
+		"- `helper rename <title>` - rename this Control chat",
 		"- `h` / `help` / `menu` - show short help",
 		"- `helper restart` - show the safe restart confirmation",
 		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
@@ -3284,7 +3294,7 @@ func unknownControlCommandMessage(text string) string {
 		return controlHelpText()
 	}
 	if isWorkOnlyHelperCommand(text) {
-		return "⚠️ Wrong chat\n\nThis is the 🏠 control chat. `helper ...` commands like `helper file`, `helper retry`, `helper close`, and `helper rename` work inside a 💬 Work chat.\n\nTo start project work, send `new <directory>` here, then open the new Work chat and send the task there."
+		return "⚠️ Wrong chat\n\nThis is the 🏠 control chat. `helper ...` commands like `helper file`, `helper retry`, and `helper close` work inside a 💬 Work chat.\n\nTo start project work, send `new <directory>` here, then open the new Work chat and send the task there."
 	}
 	if strings.Contains(name, "/") || strings.HasPrefix(name, ".") {
 		return controlPathHintMessage(text)
@@ -5085,7 +5095,7 @@ func isWorkOnlyHelperCommand(text string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "file", "image", "send-file", "send-image", "retry", "restore-thread", "restore", "cancel", "close", "rename", "publish-history", "sync-history", "import-history":
+	case "file", "image", "send-file", "send-image", "retry", "restore-thread", "restore", "cancel", "close", "publish-history", "sync-history", "import-history":
 		return true
 	default:
 		return false
@@ -7564,6 +7574,36 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 	return b.sendToChat(ctx, session.ChatID, "Work chat renamed.\n\nNew title:\n"+shortenTeamsLine(topic, 96)+"\n\nUse `helper details` to see the full Teams title and link.")
 }
 
+func (b *Bridge) renameControlChat(ctx context.Context, title string) error {
+	title = SanitizeDashboardTitle(title)
+	if title == "" {
+		return b.sendControl(ctx, "usage: `helper rename <title>` or `rename <title>`")
+	}
+	if strings.TrimSpace(b.reg.ControlChatID) == "" {
+		return b.sendControl(ctx, "rename failed: control chat is not bound yet")
+	}
+	topic := ControlChatTitle(ChatTitleOptions{
+		MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()),
+		Profile:      b.scope.Profile,
+		UserTitle:    title,
+	})
+	if err := b.graph.UpdateChatTopic(ctx, b.reg.ControlChatID, topic); err != nil {
+		return b.sendControl(ctx, "rename failed: "+err.Error())
+	}
+	topic = SanitizeTopic(topic)
+	b.reg.ControlChatTopic = topic
+	b.reg.ControlChatUserTitle = title
+	b.reg.ControlChatTitleSource = sessionTitleSourceUser
+	chat := Chat{ID: b.reg.ControlChatID, Topic: topic, WebURL: b.reg.ControlChatURL, ChatType: "meeting"}
+	if err := b.recordControlChatBindingWithTitle(ctx, chat, title, sessionTitleSourceUser); err != nil {
+		return err
+	}
+	if err := b.Save(); err != nil {
+		return err
+	}
+	return b.sendControl(ctx, "Control chat renamed.\n\nNew title:\n"+shortenTeamsLine(topic, 96))
+}
+
 func (b *Bridge) refreshWorkChatTitleFromCodexHistory(ctx context.Context, session *Session) error {
 	if b == nil || session == nil || !sessionAllowsAutoTitleUpdate(*session) || strings.TrimSpace(session.CodexThreadID) == "" {
 		return nil
@@ -9531,11 +9571,24 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 		b.reg.UserPrincipal = b.user.UserPrincipalName
 		changed = true
 	}
-	if b.reg.ControlChatID == "" && state.ControlChat.TeamsChatID != "" {
-		b.reg.ControlChatID = state.ControlChat.TeamsChatID
-		b.reg.ControlChatURL = state.ControlChat.TeamsChatURL
-		b.reg.ControlChatTopic = state.ControlChat.TeamsChatTopic
-		changed = true
+	if state.ControlChat.TeamsChatID != "" {
+		setRegistryControlString := func(target *string, value string) {
+			if *target != value {
+				*target = value
+				changed = true
+			}
+		}
+		setRegistryControlStringIfPresent := func(target *string, value string) {
+			if strings.TrimSpace(value) == "" && strings.TrimSpace(*target) != "" {
+				return
+			}
+			setRegistryControlString(target, value)
+		}
+		setRegistryControlString(&b.reg.ControlChatID, state.ControlChat.TeamsChatID)
+		setRegistryControlStringIfPresent(&b.reg.ControlChatURL, state.ControlChat.TeamsChatURL)
+		setRegistryControlStringIfPresent(&b.reg.ControlChatTopic, state.ControlChat.TeamsChatTopic)
+		setRegistryControlStringIfPresent(&b.reg.ControlChatUserTitle, state.ControlChat.UserTitle)
+		setRegistryControlStringIfPresent(&b.reg.ControlChatTitleSource, state.ControlChat.TitleSource)
 	}
 	if reconcileRegistrySessionsFromStore(&b.reg, state) {
 		changed = true
@@ -9705,13 +9758,33 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 		}
 		if state.ControlChat.TeamsChatID == "" && b.reg.ControlChatID != "" {
 			state.ControlChat.MachineID = state.MachineIdentity.ID
+			state.ControlChat.ScopeID = b.scope.ID
 			state.ControlChat.AccountID = b.user.ID
+			state.ControlChat.Profile = b.scope.Profile
 			state.ControlChat.TeamsChatID = b.reg.ControlChatID
 			state.ControlChat.TeamsChatURL = b.reg.ControlChatURL
 			state.ControlChat.TeamsChatTopic = b.reg.ControlChatTopic
+			state.ControlChat.UserTitle = b.reg.ControlChatUserTitle
+			state.ControlChat.TitleSource = b.reg.ControlChatTitleSource
 			state.ControlChat.BoundAt = now
 			state.ControlChat.UpdatedAt = now
 			changed = true
+		} else if state.ControlChat.TeamsChatID == b.reg.ControlChatID && b.reg.ControlChatID != "" {
+			controlChanged := false
+			setControlString := func(target *string, value string) {
+				if strings.TrimSpace(value) != "" && *target != value {
+					*target = value
+					controlChanged = true
+				}
+			}
+			setControlString(&state.ControlChat.TeamsChatURL, b.reg.ControlChatURL)
+			setControlString(&state.ControlChat.TeamsChatTopic, b.reg.ControlChatTopic)
+			setControlString(&state.ControlChat.UserTitle, b.reg.ControlChatUserTitle)
+			setControlString(&state.ControlChat.TitleSource, b.reg.ControlChatTitleSource)
+			if controlChanged {
+				state.ControlChat.UpdatedAt = now
+				changed = true
+			}
 		}
 		for _, session := range b.reg.Sessions {
 			if isControlFallbackSessionID(session.ID) {
@@ -9814,6 +9887,10 @@ func migratedSentOutboxID(chatID string, messageID string) string {
 }
 
 func (b *Bridge) recordControlChatBinding(ctx context.Context, chat Chat) error {
+	return b.recordControlChatBindingWithTitle(ctx, chat, "", "")
+}
+
+func (b *Bridge) recordControlChatBindingWithTitle(ctx context.Context, chat Chat, userTitle string, titleSource string) error {
 	if chat.ID == "" {
 		return nil
 	}
@@ -9828,6 +9905,8 @@ func (b *Bridge) recordControlChatBinding(ctx context.Context, chat Chat) error 
 	}
 	machineID := b.machine.ID
 	label := b.machine.Label
+	userTitle = SanitizeDashboardTitle(userTitle)
+	titleSource = strings.TrimSpace(titleSource)
 	return b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
 		now := time.Now()
 		changed := false
@@ -9885,6 +9964,10 @@ func (b *Bridge) recordControlChatBinding(ctx context.Context, chat Chat) error 
 		setControlString(&state.ControlChat.TeamsChatID, chat.ID)
 		setControlString(&state.ControlChat.TeamsChatURL, chat.WebURL)
 		setControlString(&state.ControlChat.TeamsChatTopic, chat.Topic)
+		if userTitle != "" || titleSource != "" {
+			setControlString(&state.ControlChat.UserTitle, userTitle)
+			setControlString(&state.ControlChat.TitleSource, titleSource)
+		}
 		if controlChanged {
 			state.ControlChat.UpdatedAt = now
 			changed = true

@@ -57,6 +57,9 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
   - `helper close` / `!close`
   - `helper retry <turn-id>` / `!retry <turn-id>`
   - `helper cancel <turn-id>` / `!cancel <turn-id>`
+  - `helper rename <title>` / `!rename <title>`
+- Let the control chat accept `helper rename <title>` to update its own Teams
+  chat title while preserving the helper control marker.
 - Keep service-level controls such as `/pause`, `/resume`, and `/drain` in the
   control chat or local CLI. They are high-impact operations and should not be
   accepted as accidental session-chat text.

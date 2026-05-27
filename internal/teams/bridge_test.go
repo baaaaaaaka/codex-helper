@@ -15795,6 +15795,239 @@ func TestBridgeEnsureControlChatRenamesOldControlTopic(t *testing.T) {
 	}
 }
 
+func TestBridgeControlRenameUpdatesTeamsTopicAndDurableState(t *testing.T) {
+	var patchedTopic string
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/chats/control-chat":
+			var payload struct {
+				Topic string `json:"topic"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+			patchedTopic = payload.Topic
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/chats/control-chat/messages":
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode message: %v", err)
+			}
+			sent = append(sent, bridgeSentMessage{ChatID: "control-chat", Content: body.Body.Content})
+			_, _ = fmt.Fprint(w, `{"id":"sent-1","messageType":"message"}`)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.machine.Label = "qa-host"
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatURL = "https://teams.example/control"
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-rename"), "helper rename release control"); err != nil {
+		t.Fatalf("control rename error: %v", err)
+	}
+	if !strings.Contains(patchedTopic, DefaultControlChatMarker) || !strings.Contains(patchedTopic, "qa-host") || !strings.Contains(patchedTopic, "release control") {
+		t.Fatalf("patched topic = %q, want control marker, machine label, and user title", patchedTopic)
+	}
+	if got := bridge.reg.ControlChatTopic; got != patchedTopic {
+		t.Fatalf("registry control topic = %q, want %q", got, patchedTopic)
+	}
+	if got := bridge.reg.ControlChatUserTitle; got != "release control" {
+		t.Fatalf("registry control user title = %q, want release control", got)
+	}
+	if got := bridge.reg.ControlChatTitleSource; got != sessionTitleSourceUser {
+		t.Fatalf("registry control title source = %q, want user", got)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.ControlChat.TeamsChatTopic; got != patchedTopic {
+		t.Fatalf("durable control topic = %q, want %q", got, patchedTopic)
+	}
+	if got := state.ControlChat.UserTitle; got != "release control" {
+		t.Fatalf("durable control user title = %q, want release control", got)
+	}
+	if got := state.ControlChat.TitleSource; got != sessionTitleSourceUser {
+		t.Fatalf("durable control title source = %q, want user", got)
+	}
+	if len(sent) != 1 || !strings.Contains(sent[0].Content, "Control chat renamed") {
+		t.Fatalf("rename ack = %#v", sent)
+	}
+}
+
+func TestBridgeEnsureControlChatPreservesUserControlTitle(t *testing.T) {
+	var patchedTopic string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/chats/control-chat" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		var payload struct {
+			Topic string `json:"topic"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode patch: %v", err)
+		}
+		patchedTopic = payload.Topic
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.machine.Label = "qa-host"
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatTopic = "old default control"
+	bridge.reg.ControlChatUserTitle = "release control"
+	bridge.reg.ControlChatTitleSource = sessionTitleSourceUser
+
+	chat, err := bridge.EnsureControlChat(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureControlChat error: %v", err)
+	}
+	if !strings.Contains(patchedTopic, "release control") || strings.Contains(patchedTopic, "old default control") {
+		t.Fatalf("patched topic = %q, want user control title", patchedTopic)
+	}
+	if chat.Topic != patchedTopic || bridge.reg.ControlChatTopic != patchedTopic {
+		t.Fatalf("control topic not updated to user title: chat=%q reg=%q patched=%q", chat.Topic, bridge.reg.ControlChatTopic, patchedTopic)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.ControlChat.UserTitle; got != "release control" {
+		t.Fatalf("durable control user title = %q, want release control", got)
+	}
+	if got := state.ControlChat.TitleSource; got != sessionTitleSourceUser {
+		t.Fatalf("durable control title source = %q, want user", got)
+	}
+}
+
+func TestBridgeEnsureControlChatRestoresPersistedUserControlTitle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected Graph request while restoring persisted control title: %s %s", r.Method, r.URL.String())
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: "qa-host", UserTitle: "release control"})
+	now := time.Now()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			MachineID:      "machine-1",
+			ScopeID:        "scope-1",
+			AccountID:      "user-1",
+			Profile:        "default",
+			TeamsChatID:    "control-chat",
+			TeamsChatURL:   "https://teams.example/control",
+			TeamsChatTopic: topic,
+			UserTitle:      "release control",
+			TitleSource:    sessionTitleSourceUser,
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed control binding: %v", err)
+	}
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.machine.Label = "qa-host"
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatID = ""
+	bridge.reg.ControlChatURL = ""
+	bridge.reg.ControlChatTopic = ""
+	bridge.reg.ControlChatUserTitle = ""
+	bridge.reg.ControlChatTitleSource = ""
+
+	chat, err := bridge.EnsureControlChat(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureControlChat error: %v", err)
+	}
+	if chat.Topic != topic {
+		t.Fatalf("restored control topic = %q, want %q", chat.Topic, topic)
+	}
+	if bridge.reg.ControlChatTopic != topic || bridge.reg.ControlChatUserTitle != "release control" || bridge.reg.ControlChatTitleSource != sessionTitleSourceUser {
+		t.Fatalf("registry control title not restored: %#v", bridge.reg)
+	}
+}
+
+func TestBridgeEnsureControlChatBackfillsUserControlTitleIntoPartialDurableBinding(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected Graph request while backfilling partial control binding: %s %s", r.Method, r.URL.String())
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	now := time.Now()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			TeamsChatID: "control-chat",
+			BoundAt:     now,
+			UpdatedAt:   now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed partial control binding: %v", err)
+	}
+	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: "qa-host", UserTitle: "release control"})
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.machine.Label = "qa-host"
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatURL = "https://teams.example/control"
+	bridge.reg.ControlChatTopic = topic
+	bridge.reg.ControlChatUserTitle = "release control"
+	bridge.reg.ControlChatTitleSource = sessionTitleSourceUser
+
+	chat, err := bridge.EnsureControlChat(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureControlChat error: %v", err)
+	}
+	if chat.Topic != topic {
+		t.Fatalf("control topic = %q, want %q", chat.Topic, topic)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.ControlChat.TeamsChatURL != "https://teams.example/control" || state.ControlChat.TeamsChatTopic != topic || state.ControlChat.UserTitle != "release control" || state.ControlChat.TitleSource != sessionTitleSourceUser {
+		t.Fatalf("durable control binding was not backfilled: %#v", state.ControlChat)
+	}
+}
+
 func TestBridgeEnsureControlChatQueuesReadyMessageDurably(t *testing.T) {
 	var sent []bridgeSentMessage
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

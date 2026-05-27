@@ -74,6 +74,10 @@ func TestChatTitlesUseDistinctLeadingEmoji(t *testing.T) {
 	if !strings.HasPrefix(control, "🏠 ") || !strings.Contains(control, "Codex Control") || !strings.Contains(control, "devbox") {
 		t.Fatalf("control title = %q, want leading main-chat emoji, marker, and machine label", control)
 	}
+	renamedControl := ControlChatTitle(ChatTitleOptions{MachineLabel: "devbox", UserTitle: "Release Room"})
+	if !strings.Contains(renamedControl, "Codex Control") || !strings.Contains(renamedControl, "devbox") || !strings.Contains(renamedControl, "Release Room") {
+		t.Fatalf("renamed control title = %q, want control marker, machine label, and user title", renamedControl)
+	}
 	work := WorkChatTitle(ChatTitleOptions{
 		MachineLabel: "devbox",
 		SessionID:    "s001",

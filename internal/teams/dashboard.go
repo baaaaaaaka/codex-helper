@@ -66,7 +66,7 @@ func MachineChatTitle(opts ChatTitleOptions) string {
 
 func ControlChatTitle(opts ChatTitleOptions) string {
 	marker := sanitizedTitlePart(opts.Marker, DefaultControlChatMarker)
-	return joinTitleParts(marker, machineTitlePart(opts.MachineLabel), profileTitlePart(opts.Profile))
+	return joinTitleParts(marker, machineTitlePart(opts.MachineLabel), profileTitlePart(opts.Profile), SanitizeDashboardTitle(opts.UserTitle))
 }
 
 func WorkChatTitle(opts ChatTitleOptions) string {

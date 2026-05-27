@@ -266,6 +266,8 @@ type ControlChatBinding struct {
 	TeamsChatID    string    `json:"teams_chat_id,omitempty"`
 	TeamsChatURL   string    `json:"teams_chat_url,omitempty"`
 	TeamsChatTopic string    `json:"teams_chat_topic,omitempty"`
+	UserTitle      string    `json:"user_title,omitempty"`
+	TitleSource    string    `json:"title_source,omitempty"`
 	BoundAt        time.Time `json:"bound_at,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }

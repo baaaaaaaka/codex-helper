@@ -23,6 +23,7 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "/ask what can this control chat do", name: DashboardCommandAsk, raw: "what can this control chat do"},
 		{text: "/mkdir /tmp/new-work", name: DashboardCommandMkdir, raw: "/tmp/new-work"},
 		{text: "/rename Better Title", name: DashboardCommandRename, raw: "Better Title"},
+		{text: "helper rename Better Title", name: DashboardCommandRename, raw: "Better Title"},
 		{text: "/details session-abc", name: DashboardCommandDetails, raw: "session-abc"},
 		{text: "/help", name: DashboardCommandHelp},
 		{text: "/status", name: DashboardCommandStatus},
