@@ -57,7 +57,7 @@ func runNativeWindowsCodexInstaller(ctx context.Context, out io.Writer, installe
 	}
 
 	codexCmd := filepath.Join(cfg.npmPrefix, "codex.cmd")
-	probeErr := probeCodexVersion(ctx, codexCmd)
+	probeErr := probeCodexVersionWithTimeout(ctx, codexCmd, codexInstallProbeTimeout)
 	if probeErr == nil {
 		return nil
 	}
@@ -75,7 +75,7 @@ func runNativeWindowsCodexInstaller(ctx context.Context, out io.Writer, installe
 		if err := writeWindowsManagedCodexShims(cfg.npmPrefix, nodeDir); err != nil {
 			return err
 		}
-		probeErr = probeCodexVersion(ctx, codexCmd)
+		probeErr = probeCodexVersionWithTimeout(ctx, codexCmd, codexInstallProbeTimeout)
 		if probeErr == nil {
 			return nil
 		}

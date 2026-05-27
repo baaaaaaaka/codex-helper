@@ -19,6 +19,7 @@ const (
 	codexPathCacheFile                         = "codex_path"
 	codexInstallLockName                       = "codex_install.lock"
 	codexProbeTimeout                          = 5 * time.Second
+	codexInstallProbeTimeout                   = 30 * time.Second
 	codexInstallDiskExit                       = 75
 	codexInstallFailureExit                    = 76
 	nativeWindowsCodexInstallerStartMessage    = "installing codex with native Windows managed installer..."
@@ -1336,12 +1337,16 @@ func probeCodex(ctx context.Context, codexPath string) bool {
 }
 
 func probeCodexVersion(ctx context.Context, codexPath string) error {
-	ctx, cancel := context.WithTimeout(ctx, codexProbeTimeout)
+	return probeCodexVersionWithTimeout(ctx, codexPath, codexProbeTimeout)
+}
+
+func probeCodexVersionWithTimeout(ctx context.Context, codexPath string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, codexPath, "--version")
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
-		return fmt.Errorf("--version timed out after %s", codexProbeTimeout)
+		return fmt.Errorf("--version timed out after %s", timeout)
 	}
 	if err != nil {
 		output := summarizeProbeOutput(out)

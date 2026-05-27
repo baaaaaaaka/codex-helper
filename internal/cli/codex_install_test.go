@@ -2200,6 +2200,24 @@ func TestProbeCodexFailure(t *testing.T) {
 	}
 }
 
+func TestProbeCodexVersionWithTimeoutReportsConfiguredTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell probe test on windows")
+	}
+	binDir := t.TempDir()
+	codexPath := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nsleep 1\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write codex: %v", err)
+	}
+	err := probeCodexVersionWithTimeout(context.Background(), codexPath, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected probe timeout")
+	}
+	if !strings.Contains(err.Error(), "--version timed out after 10ms") {
+		t.Fatalf("expected configured timeout in error, got %v", err)
+	}
+}
+
 func TestEnsureCodexInstalledSkipsBrokenInPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell script test on windows")
