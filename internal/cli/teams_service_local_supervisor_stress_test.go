@@ -782,6 +782,8 @@ func TestTeamsServiceLocalSupervisorReleaseFailureStressCleanupErrors(t *testing
 func TestTeamsServiceLocalSupervisorActivationHandoffStressMatrix(t *testing.T) {
 	lockCLITestHooks(t)
 
+	currentSupervisorPID := 8001
+	currentChildPID := 8002
 	cases := []struct {
 		name             string
 		goos             string
@@ -805,8 +807,8 @@ func TestTeamsServiceLocalSupervisorActivationHandoffStressMatrix(t *testing.T) 
 			service:          "1",
 			backend:          "local-supervisor",
 			writeStatus:      true,
-			statusSupervisor: os.Getppid(),
-			statusChild:      os.Getpid(),
+			statusSupervisor: currentSupervisorPID,
+			statusChild:      currentChildPID,
 			statusUpdatedAt:  time.Now,
 			wantScheduled:    true,
 			wantActivation:   "scheduled",
@@ -818,8 +820,8 @@ func TestTeamsServiceLocalSupervisorActivationHandoffStressMatrix(t *testing.T) 
 			service:          "1",
 			backend:          "local-supervisor",
 			writeStatus:      true,
-			statusSupervisor: os.Getppid(),
-			statusChild:      os.Getpid(),
+			statusSupervisor: currentSupervisorPID,
+			statusChild:      currentChildPID,
 			statusUpdatedAt:  time.Now,
 			detachedErr:      errors.New("detached start failed"),
 			wantErr:          "detached start failed",
@@ -848,8 +850,8 @@ func TestTeamsServiceLocalSupervisorActivationHandoffStressMatrix(t *testing.T) 
 			service:          "1",
 			backend:          "local-supervisor",
 			writeStatus:      true,
-			statusSupervisor: os.Getppid() + 1000,
-			statusChild:      os.Getpid(),
+			statusSupervisor: currentSupervisorPID + 1000,
+			statusChild:      currentChildPID,
 			statusUpdatedAt:  time.Now,
 			wantActivation:   "",
 		},
@@ -859,8 +861,8 @@ func TestTeamsServiceLocalSupervisorActivationHandoffStressMatrix(t *testing.T) 
 			service:          "1",
 			backend:          "local-supervisor",
 			writeStatus:      true,
-			statusSupervisor: os.Getppid(),
-			statusChild:      os.Getpid(),
+			statusSupervisor: currentSupervisorPID,
+			statusChild:      currentChildPID,
 			statusUpdatedAt:  func() time.Time { return time.Now().Add(-teamsServiceLocalSupervisorStatusFreshness - time.Minute) },
 			wantActivation:   "",
 		},
@@ -939,18 +941,32 @@ func TestTeamsServiceLocalSupervisorActivationHandoffStressMatrix(t *testing.T) 
 				}
 
 				prevAlive := teamsLocalSupervisorProcessAlive
+				prevVerify := teamsLocalSupervisorVerifyProcessIdentity
 				prevDetached := teamsServiceStartDetached
 				prevWait := teamsLegacyLocalSupervisorActivationWait
+				prevCurrentProcessID := teamsCurrentProcessID
+				prevParentProcessID := teamsParentProcessID
 				t.Cleanup(func() {
 					teamsLocalSupervisorProcessAlive = prevAlive
+					teamsLocalSupervisorVerifyProcessIdentity = prevVerify
 					teamsServiceStartDetached = prevDetached
 					teamsLegacyLocalSupervisorActivationWait = prevWait
+					teamsCurrentProcessID = prevCurrentProcessID
+					teamsParentProcessID = prevParentProcessID
 					teamsLegacyLocalSupervisorRestartScheduled.Store(false)
 				})
 				teamsLegacyLocalSupervisorRestartScheduled.Store(false)
 				teamsLegacyLocalSupervisorActivationWait = time.Minute
+				teamsCurrentProcessID = func() int { return currentChildPID }
+				teamsParentProcessID = func() int { return currentSupervisorPID }
 				teamsLocalSupervisorProcessAlive = func(pid int) bool {
-					return pid == os.Getppid() || pid == os.Getpid() || pid == tc.statusSupervisor || pid == tc.statusChild
+					return pid == currentSupervisorPID || pid == currentChildPID || pid == tc.statusSupervisor || pid == tc.statusChild
+				}
+				teamsLocalSupervisorVerifyProcessIdentity = func(pid int, gotConfigPath string) error {
+					if pid != tc.statusSupervisor || gotConfigPath != configPath {
+						return fmt.Errorf("unexpected supervisor identity probe pid=%d config=%q", pid, gotConfigPath)
+					}
+					return nil
 				}
 				detachedCalls := 0
 				teamsServiceStartDetached = func(context.Context, string, ...string) error {

@@ -32,6 +32,8 @@ const (
 var (
 	teamsLegacyLocalSupervisorRestartScheduled atomic.Bool
 	teamsLegacyLocalSupervisorActivationWait   = 20 * time.Second
+	teamsCurrentProcessID                      = os.Getpid
+	teamsParentProcessID                       = os.Getppid
 )
 
 func newTeamsCmd(root *rootOptions) *cobra.Command {
@@ -856,7 +858,9 @@ func maybeScheduleLegacyLocalSupervisorRestart(ctx context.Context) (bool, error
 	if err != nil || !ok {
 		return false, err
 	}
-	if status.SupervisorPID != os.Getppid() || status.ChildPID != os.Getpid() {
+	parentPID := teamsParentProcessID()
+	childPID := teamsCurrentProcessID()
+	if status.SupervisorPID != parentPID || status.ChildPID != childPID {
 		return false, nil
 	}
 	if !teamsServiceLocalSupervisorStatusActive(status, time.Now()) {

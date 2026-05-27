@@ -1999,6 +1999,8 @@ func TestMaybeScheduleLegacyLocalSupervisorRestartSchedulesForOldSupervisor(t *t
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
 	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	supervisorPID := 7001
+	childPID := 7002
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos: "linux",
 		exe:  exe,
@@ -2025,8 +2027,8 @@ func TestMaybeScheduleLegacyLocalSupervisorRestartSchedulesForOldSupervisor(t *t
 	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
 		Version:       teamsServiceLocalSupervisorStatusVersion,
 		ConfigPath:    configPath,
-		SupervisorPID: os.Getppid(),
-		ChildPID:      os.Getpid(),
+		SupervisorPID: supervisorPID,
+		ChildPID:      childPID,
 		State:         "running",
 		UpdatedAt:     time.Now(),
 	}); err != nil {
@@ -2034,18 +2036,32 @@ func TestMaybeScheduleLegacyLocalSupervisorRestartSchedulesForOldSupervisor(t *t
 	}
 
 	prevAlive := teamsLocalSupervisorProcessAlive
+	prevVerify := teamsLocalSupervisorVerifyProcessIdentity
 	prevDetached := teamsServiceStartDetached
 	prevWait := teamsLegacyLocalSupervisorActivationWait
+	prevCurrentProcessID := teamsCurrentProcessID
+	prevParentProcessID := teamsParentProcessID
 	t.Cleanup(func() {
 		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsLocalSupervisorVerifyProcessIdentity = prevVerify
 		teamsServiceStartDetached = prevDetached
 		teamsLegacyLocalSupervisorActivationWait = prevWait
+		teamsCurrentProcessID = prevCurrentProcessID
+		teamsParentProcessID = prevParentProcessID
 		teamsLegacyLocalSupervisorRestartScheduled.Store(false)
 	})
 	teamsLegacyLocalSupervisorActivationWait = time.Minute
 	teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	teamsCurrentProcessID = func() int { return childPID }
+	teamsParentProcessID = func() int { return supervisorPID }
 	teamsLocalSupervisorProcessAlive = func(pid int) bool {
-		return pid == os.Getppid() || pid == os.Getpid()
+		return pid == supervisorPID || pid == childPID
+	}
+	teamsLocalSupervisorVerifyProcessIdentity = func(pid int, gotConfigPath string) error {
+		if pid != supervisorPID || gotConfigPath != configPath {
+			return fmt.Errorf("unexpected supervisor identity probe pid=%d config=%q", pid, gotConfigPath)
+		}
+		return nil
 	}
 	var gotName string
 	var gotArgs []string
@@ -2072,7 +2088,7 @@ func TestMaybeScheduleLegacyLocalSupervisorRestartSchedulesForOldSupervisor(t *t
 	if err != nil || !ok {
 		t.Fatalf("read activation = ok %v err %v, want activation", ok, err)
 	}
-	if activation.Status != "scheduled" || activation.TargetVersion != buildVersion() || activation.ObservedSupervisorEnv != "" || activation.OldSupervisorPID != os.Getppid() || activation.OldChildPID != os.Getpid() {
+	if activation.Status != "scheduled" || activation.TargetVersion != buildVersion() || activation.ObservedSupervisorEnv != "" || activation.OldSupervisorPID != supervisorPID || activation.OldChildPID != childPID {
 		t.Fatalf("activation = %#v, want scheduled current upgrade handoff", activation)
 	}
 	if activation.DeadlineAt.Sub(activation.ScheduledAt) != time.Minute {
@@ -2094,6 +2110,8 @@ func TestMaybeScheduleLegacyLocalSupervisorRestartFailureQueuesControlNotice(t *
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
 	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	supervisorPID := 7101
+	childPID := 7102
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos: "linux",
 		exe:  exe,
@@ -2131,8 +2149,8 @@ func TestMaybeScheduleLegacyLocalSupervisorRestartFailureQueuesControlNotice(t *
 	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
 		Version:       teamsServiceLocalSupervisorStatusVersion,
 		ConfigPath:    configPath,
-		SupervisorPID: os.Getppid(),
-		ChildPID:      os.Getpid(),
+		SupervisorPID: supervisorPID,
+		ChildPID:      childPID,
 		State:         "running",
 		UpdatedAt:     time.Now(),
 	}); err != nil {
@@ -2140,18 +2158,32 @@ func TestMaybeScheduleLegacyLocalSupervisorRestartFailureQueuesControlNotice(t *
 	}
 
 	prevAlive := teamsLocalSupervisorProcessAlive
+	prevVerify := teamsLocalSupervisorVerifyProcessIdentity
 	prevDetached := teamsServiceStartDetached
 	prevWait := teamsLegacyLocalSupervisorActivationWait
+	prevCurrentProcessID := teamsCurrentProcessID
+	prevParentProcessID := teamsParentProcessID
 	t.Cleanup(func() {
 		teamsLocalSupervisorProcessAlive = prevAlive
+		teamsLocalSupervisorVerifyProcessIdentity = prevVerify
 		teamsServiceStartDetached = prevDetached
 		teamsLegacyLocalSupervisorActivationWait = prevWait
+		teamsCurrentProcessID = prevCurrentProcessID
+		teamsParentProcessID = prevParentProcessID
 		teamsLegacyLocalSupervisorRestartScheduled.Store(false)
 	})
 	teamsLegacyLocalSupervisorActivationWait = time.Minute
 	teamsLegacyLocalSupervisorRestartScheduled.Store(false)
+	teamsCurrentProcessID = func() int { return childPID }
+	teamsParentProcessID = func() int { return supervisorPID }
 	teamsLocalSupervisorProcessAlive = func(pid int) bool {
-		return pid == os.Getppid() || pid == os.Getpid()
+		return pid == supervisorPID || pid == childPID
+	}
+	teamsLocalSupervisorVerifyProcessIdentity = func(pid int, gotConfigPath string) error {
+		if pid != supervisorPID || gotConfigPath != configPath {
+			return fmt.Errorf("unexpected supervisor identity probe pid=%d config=%q", pid, gotConfigPath)
+		}
+		return nil
 	}
 	teamsServiceStartDetached = func(context.Context, string, ...string) error {
 		return errors.New("detached restart failed")
@@ -5249,7 +5281,11 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevListLocalProcesses := teamsServiceListLocalProcesses
 	prevTerminateLocalProcess := teamsServiceTerminateLocalProcess
 	prevLocalProcessGraceDelay := teamsServiceLocalProcessGraceDelay
+	prevCurrentProcessID := teamsCurrentProcessID
+	prevParentProcessID := teamsParentProcessID
 	t.Setenv("CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND", "")
+	teamsCurrentProcessID = os.Getpid
+	teamsParentProcessID = os.Getppid
 	teamsServiceGOOS = func() string { return hooks.goos }
 	teamsServiceExecutable = func() (string, error) { return hooks.exe, nil }
 	teamsServiceArgv0 = func() string { return hooks.argv0 }
@@ -5368,6 +5404,8 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServiceListLocalProcesses = prevListLocalProcesses
 		teamsServiceTerminateLocalProcess = prevTerminateLocalProcess
 		teamsServiceLocalProcessGraceDelay = prevLocalProcessGraceDelay
+		teamsCurrentProcessID = prevCurrentProcessID
+		teamsParentProcessID = prevParentProcessID
 	})
 }
 
