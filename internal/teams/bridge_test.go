@@ -1269,6 +1269,138 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 	}
 }
 
+func TestBridgePollBatchQueuesLaterMessageAfterStartingFirst(t *testing.T) {
+	first := bridgePollMessage("first", "2026-05-03T01:00:00Z", "first prompt")
+	second := bridgePollMessage("second", "2026-05-03T01:00:05Z", "second prompt")
+	var sent []bridgeSentMessage
+	nextPage := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages":
+			if nextPage != 0 {
+				t.Fatalf("unexpected extra Graph poll: %s", r.URL.String())
+			}
+			nextPage++
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{first, second}}); err != nil {
+				t.Fatalf("encode poll response: %v", err)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/second":
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(second); err != nil {
+				t.Fatalf("encode queued message: %v", err)
+			}
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		return w.Result(), nil
+	})}
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     client,
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	t.Cleanup(func() {
+		if nextPage != 1 {
+			t.Fatalf("Graph poll count = %d, want 1", nextPage)
+		}
+	})
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+	now := time.Now()
+	if _, err := store.RecordChatPollSuccess(ctx, "control-chat", now, true, false, 0); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", now.Add(-time.Minute), true, false, 0); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+
+	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "first prompt") {
+			t.Fatalf("first started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("first Codex turn did not start")
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("second Codex turn started before first finished: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	joined := sentPlainJoined(sent)
+	if got := strings.Count(joined, "Codex is working. Request accepted."); got != 1 {
+		t.Fatalf("working ack count = %d, want only first request accepted immediately:\n%s", got, joined)
+	}
+	if got := strings.Count(joined, "Your request is queued."); got != 1 {
+		t.Fatalf("queued ack count = %d, want second request queued in same poll batch:\n%s", got, joined)
+	}
+	requirePlainTextInOrder(t, joined,
+		"Codex is working. Request accepted.",
+		"Your request is queued.",
+		"▶️ Running now:",
+		"first prompt",
+		"⏳ Queued requests:",
+		"second prompt",
+	)
+
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "second prompt") {
+			t.Fatalf("second started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("queued second Codex turn did not start after first finished")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 2)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+}
+
 func TestBridgeSessionSuppressesRecentDuplicatePromptWithDifferentMessageID(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -1996,8 +2128,8 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 		t.Fatalf("executor prompts = %#v, want first, second, third", prompts)
 	}
 	joined = sentPlainJoined(*sent)
-	if got := strings.Count(joined, "Codex is starting this queued request."); got != 1 {
-		t.Fatalf("queued start notice count = %d, want 1 while backlog remains:\n%s", got, joined)
+	if got := strings.Count(joined, "Codex is starting this queued request."); got != 2 {
+		t.Fatalf("queued start notice count = %d, want 2 for second and third only:\n%s", got, joined)
 	}
 	requirePlainTextInOrder(t, joined,
 		"Codex is starting this queued request.",
@@ -2006,6 +2138,11 @@ func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T
 		"⏳ Still queued:",
 		"third prompt",
 		"done 2",
+		"Codex is starting this queued request.",
+		"▶️ Now running:",
+		"third prompt",
+		"⏳ Still queued:",
+		"No other queued requests.",
 		"done 3",
 	)
 }

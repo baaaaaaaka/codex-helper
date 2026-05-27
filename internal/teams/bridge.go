@@ -1119,15 +1119,17 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			continue
 		}
 		s := session
+		turns := queueStateBySession[s.ID]
 		if _, err := b.pollChatWithRoleState(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], func(ctx context.Context, msg ChatMessage, text string) error {
-			turns := queueStateBySession[s.ID]
 			return b.handleSessionMessageWithQueueState(ctx, s.ChatID, msg, text, &turns, nil)
 		}); err != nil {
+			queueStateBySession[s.ID] = turns
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
+		queueStateBySession[s.ID] = turns
 	}
 	return firstErr
 }
@@ -5762,6 +5764,9 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 			cleanupLocalFiles()
 			return err
 		}
+		if started && knownTurns != nil {
+			knownTurns.Running = true
+		}
 		if !started {
 			cleanupLocalFiles()
 		}
@@ -8485,18 +8490,8 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		return ok, err
 	}
 	if strings.TrimSpace(preferredTurnID) == "" || claimed.ID != preferredTurnID {
-		sendNotice := true
-		if needed, noticeErr := b.queuedTurnStartNoticeNeeded(ctx, session.ID); noticeErr != nil {
-			if b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice check error: %v\n", noticeErr)
-			}
-		} else {
-			sendNotice = needed
-		}
-		if sendNotice {
-			if err := b.queueAndBestEffortQueuedTurnStartNotice(ctx, session, claimed); err != nil && b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice error: %v\n", err)
-			}
+		if err := b.queueAndBestEffortQueuedTurnStartNotice(ctx, session, claimed); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams queued turn start notice error: %v\n", err)
 		}
 	}
 	sessionSnapshot := *session
@@ -8518,18 +8513,6 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		b.boostPolling(time.Now())
 	}()
 	return true, nil
-}
-
-func (b *Bridge) queuedTurnStartNoticeNeeded(ctx context.Context, sessionID string) (bool, error) {
-	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" {
-		return false, nil
-	}
-	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, sessionID)
-	if err != nil {
-		return true, err
-	}
-	remaining := queuedTurnsForSessionState(state, sessionID)
-	return len(remaining) > 0, nil
 }
 
 func queuedTurnStartOutboxID(turnID string) string {
