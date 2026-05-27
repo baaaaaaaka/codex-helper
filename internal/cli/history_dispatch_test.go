@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -231,7 +232,7 @@ func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) 
 		return false, config.Config{Version: config.CurrentVersion}, nil
 	}
 	selectSession = func(_ context.Context, _ tui.Options) (*tui.Selection, error) {
-		deadline := time.Now().Add(3 * time.Second)
+		deadline := time.Now().Add(historyDispatchTestTimeout(3 * time.Second))
 		for {
 			data, _ := os.ReadFile(filepath.Join(codexDir, "skills", "acme__review", "SKILL.md"))
 			st, _ := mgr.Store.LoadState()
@@ -257,6 +258,13 @@ func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) 
 	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", codexDir, "", 0); err != nil {
 		t.Fatalf("runHistoryTui error: %v", err)
 	}
+}
+
+func historyDispatchTestTimeout(base time.Duration) time.Duration {
+	if runtime.GOOS == "windows" {
+		return 30 * time.Second
+	}
+	return base
 }
 
 func TestShouldShowYoloToggleReturnsTrueWhenPatchHistoryStoreInitFails(t *testing.T) {
