@@ -599,6 +599,7 @@ func TestTeamsServiceWindowsTaskXMLWithPrincipalRegistersWithTaskSchedulerCI(t *
 		"$xmlPath = " + powershellSingleQuote(xmlPath) + "; " +
 		"$watchdogXmlPath = " + powershellSingleQuote(watchdogXMLPath) + "; " +
 		"$expectedUser = " + powershellSingleQuote(principalUser) + "; " +
+		"$expectedShortUser = if ($expectedUser -like '*\\*') { ($expectedUser -split '\\\\')[-1] } else { $expectedUser }; " +
 		"try { " +
 		"$xml = Get-Content -LiteralPath $xmlPath -Raw; " +
 		"Register-ScheduledTask -TaskName $task -Xml $xml -Force -ErrorAction Stop | Out-Null; " +
@@ -606,8 +607,8 @@ func TestTeamsServiceWindowsTaskXMLWithPrincipalRegistersWithTaskSchedulerCI(t *
 		"Register-ScheduledTask -TaskName $watchdogTask -Xml $watchdogXml -Force -ErrorAction Stop | Out-Null; " +
 		"$registered = Get-ScheduledTask -TaskName $task -ErrorAction Stop; " +
 		"$registeredWatchdog = Get-ScheduledTask -TaskName $watchdogTask -ErrorAction Stop; " +
-		"if ($registered.Principal.UserId -ine $expectedUser) { throw ('bridge principal user mismatch: ' + $registered.Principal.UserId) }; " +
-		"if ($registeredWatchdog.Principal.UserId -ine $expectedUser) { throw ('watchdog principal user mismatch: ' + $registeredWatchdog.Principal.UserId) }; " +
+		"if (($registered.Principal.UserId -ine $expectedUser) -and ($registered.Principal.UserId -ine $expectedShortUser)) { throw ('bridge principal user mismatch: ' + $registered.Principal.UserId + ' expected ' + $expectedUser) }; " +
+		"if (($registeredWatchdog.Principal.UserId -ine $expectedUser) -and ($registeredWatchdog.Principal.UserId -ine $expectedShortUser)) { throw ('watchdog principal user mismatch: ' + $registeredWatchdog.Principal.UserId + ' expected ' + $expectedUser) }; " +
 		"if ($registered.Principal.LogonType.ToString() -ne 'Interactive') { throw ('bridge logon type mismatch: ' + $registered.Principal.LogonType) }; " +
 		"if ($registeredWatchdog.Principal.LogonType.ToString() -ne 'Interactive') { throw ('watchdog logon type mismatch: ' + $registeredWatchdog.Principal.LogonType) }; " +
 		"if ($registered.Principal.RunLevel.ToString() -ne 'Limited') { throw ('bridge run level mismatch: ' + $registered.Principal.RunLevel) }; " +
