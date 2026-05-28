@@ -523,6 +523,110 @@ func TestTeamsServiceWindowsTaskXMLRegistersWithTaskSchedulerCI(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceWindowsTaskXMLWithPrincipalRegistersWithTaskSchedulerCI(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Task Scheduler registration is Windows-only")
+	}
+	if os.Getenv("CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST") != "1" {
+		t.Skip("set CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST=1 to run native Task Scheduler registration")
+	}
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "codex-proxy.exe")
+	testExe, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+	testExeData, err := os.ReadFile(testExe)
+	if err != nil {
+		t.Fatalf("read test executable: %v", err)
+	}
+	if err := os.WriteFile(exe, testExeData, 0o755); err != nil {
+		t.Fatalf("write fake codex-proxy executable: %v", err)
+	}
+	spec := teamsServiceSpec{
+		Executable:   exe,
+		WorkingDir:   tmp,
+		RegistryPath: filepath.Join(tmp, "teams registry.json"),
+		Environment: map[string]string{
+			"CODEX_HELPER_TEAMS_SERVICE":      "1",
+			"CODEX_HELPER_TEAMS_SERVICE_MODE": "background",
+		},
+	}
+	xmlPath := filepath.Join(tmp, "codex-helper-teams-task-principal.xml")
+	watchdogXMLPath := filepath.Join(tmp, "codex-helper-teams-watchdog-task-principal.xml")
+	spec = teamsServiceSpecWithWindowsTaskLaunchers(spec, xmlPath, watchdogXMLPath)
+	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsTaskLauncherPath, spec, buildTeamsServiceRunArgs(spec)); err != nil {
+		t.Fatalf("write Windows task launcher files: %v", err)
+	}
+	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsWatchdogLauncherPath, spec, buildTeamsServiceWatchdogArgs()); err != nil {
+		t.Fatalf("write Windows watchdog task launcher files: %v", err)
+	}
+	principalUser, err := teamsServiceCurrentWindowsUser(context.Background())
+	if err != nil {
+		t.Fatalf("resolve current Windows user: %v", err)
+	}
+	xml := buildTeamsServiceWindowsTaskXMLWithPrincipalUser(spec, principalUser)
+	watchdogXML := buildTeamsServiceWindowsWatchdogTaskXMLWithPrincipalUser(spec, principalUser)
+	for label, data := range map[string]string{"bridge": xml, "watchdog": watchdogXML} {
+		for _, want := range []string{
+			"<UserId>" + xmlEscape(principalUser) + "</UserId>",
+			"<LogonType>InteractiveToken</LogonType>",
+			"<RunLevel>LeastPrivilege</RunLevel>",
+			"<Command>wscript.exe</Command>",
+			"//B //Nologo",
+		} {
+			if !strings.Contains(data, want) {
+				t.Fatalf("%s task XML missing %q:\n%s", label, want, data)
+			}
+		}
+		for _, forbidden := range []string{"HighestAvailable", "RunLevel>Highest", "LogonType>Password", "NT AUTHORITY\\SYSTEM"} {
+			if strings.Contains(data, forbidden) {
+				t.Fatalf("%s task XML must not contain %q:\n%s", label, forbidden, data)
+			}
+		}
+	}
+	if err := os.WriteFile(xmlPath, []byte(xml), 0o600); err != nil {
+		t.Fatalf("write Windows task XML: %v", err)
+	}
+	if err := os.WriteFile(watchdogXMLPath, []byte(watchdogXML), 0o600); err != nil {
+		t.Fatalf("write Windows watchdog task XML: %v", err)
+	}
+	taskName := "Codex Helper Teams Bridge Principal CI " + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	watchdogTaskName := "Codex Helper Teams Watchdog Principal CI " + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	script := "$ErrorActionPreference = 'Stop'; " +
+		"$task = " + powershellSingleQuote(taskName) + "; " +
+		"$watchdogTask = " + powershellSingleQuote(watchdogTaskName) + "; " +
+		"$xmlPath = " + powershellSingleQuote(xmlPath) + "; " +
+		"$watchdogXmlPath = " + powershellSingleQuote(watchdogXMLPath) + "; " +
+		"$expectedUser = " + powershellSingleQuote(principalUser) + "; " +
+		"try { " +
+		"$xml = Get-Content -LiteralPath $xmlPath -Raw; " +
+		"Register-ScheduledTask -TaskName $task -Xml $xml -Force -ErrorAction Stop | Out-Null; " +
+		"$watchdogXml = Get-Content -LiteralPath $watchdogXmlPath -Raw; " +
+		"Register-ScheduledTask -TaskName $watchdogTask -Xml $watchdogXml -Force -ErrorAction Stop | Out-Null; " +
+		"$registered = Get-ScheduledTask -TaskName $task -ErrorAction Stop; " +
+		"$registeredWatchdog = Get-ScheduledTask -TaskName $watchdogTask -ErrorAction Stop; " +
+		"if ($registered.Principal.UserId -ine $expectedUser) { throw ('bridge principal user mismatch: ' + $registered.Principal.UserId) }; " +
+		"if ($registeredWatchdog.Principal.UserId -ine $expectedUser) { throw ('watchdog principal user mismatch: ' + $registeredWatchdog.Principal.UserId) }; " +
+		"if ($registered.Principal.LogonType.ToString() -ne 'Interactive') { throw ('bridge logon type mismatch: ' + $registered.Principal.LogonType) }; " +
+		"if ($registeredWatchdog.Principal.LogonType.ToString() -ne 'Interactive') { throw ('watchdog logon type mismatch: ' + $registeredWatchdog.Principal.LogonType) }; " +
+		"if ($registered.Principal.RunLevel.ToString() -ne 'Limited') { throw ('bridge run level mismatch: ' + $registered.Principal.RunLevel) }; " +
+		"if ($registeredWatchdog.Principal.RunLevel.ToString() -ne 'Limited') { throw ('watchdog run level mismatch: ' + $registeredWatchdog.Principal.RunLevel) }; " +
+		"$action = @($registered.Actions)[0]; " +
+		"$watchdogAction = @($registeredWatchdog.Actions)[0]; " +
+		"if ($action.Execute -ne 'wscript.exe') { throw ('bridge action execute mismatch: ' + $action.Execute) }; " +
+		"if ($watchdogAction.Execute -ne 'wscript.exe') { throw ('watchdog action execute mismatch: ' + $watchdogAction.Execute) } " +
+		"} finally { " +
+		"Unregister-ScheduledTask -TaskName $watchdogTask -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; " +
+		"Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue | Out-Null " +
+		"}"
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Register-ScheduledTask principal smoke failed: %v\n%s", err, out)
+	}
+}
+
 func TestTeamsServiceWindowsTaskCleanupHelperProcess(t *testing.T) {
 	if os.Getenv("CODEX_HELPER_WINDOWS_CLEANUP_HELPER_PROCESS") != "1" || teamsServiceLocalProcessKind(os.Args) != "run" {
 		return

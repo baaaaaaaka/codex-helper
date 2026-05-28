@@ -177,8 +177,8 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&yes, "yes", false, "Approve the Windows UAC prompt if the WSL Scheduled Task needs elevation")
-	cmd.Flags().BoolVar(&noUAC, "no-uac", false, "Do not open a Windows UAC prompt; use the current-user Startup fallback if needed")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Approve the Windows UAC prompt if Scheduled Task setup needs elevation")
+	cmd.Flags().BoolVar(&noUAC, "no-uac", false, "Do not open a Windows UAC prompt if Scheduled Task setup needs elevation")
 	cmd.Flags().BoolVar(&fallbackOnly, "fallback-only", false, "Install the current-user Startup watchdog instead of trying Windows Task Scheduler")
 	cmd.Flags().BoolVar(&noOpenControl, "no-open-control", false, "Do not try to open the Teams control chat link automatically")
 	cmd.Flags().BoolVar(&noStart, "no-start", false, "Repair the service config and enable it without starting the service or preparing the control chat")
@@ -187,7 +187,9 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 }
 
 func newTeamsServiceInstallCmd(registryPath *string) *cobra.Command {
-	return &cobra.Command{
+	var yes bool
+	var noUAC bool
+	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install the Teams bridge user service",
 		Args:  cobra.NoArgs,
@@ -195,7 +197,12 @@ func newTeamsServiceInstallCmd(registryPath *string) *cobra.Command {
 			if err := rejectTeamsHelperSelfManagementFromChild("install the Teams service", "helper reload now"); err != nil {
 				return err
 			}
-			path, err := installTeamsService(cmd.Context(), registryPath)
+			path, err := installTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
+				AssumeYes: yes,
+				NoUAC:     noUAC,
+				In:        cmd.InOrStdin(),
+				Out:       cmd.OutOrStdout(),
+			})
 			if err != nil {
 				return err
 			}
@@ -204,6 +211,9 @@ func newTeamsServiceInstallCmd(registryPath *string) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Approve the Windows UAC prompt if Scheduled Task setup needs elevation")
+	cmd.Flags().BoolVar(&noUAC, "no-uac", false, "Do not open a Windows UAC prompt if Scheduled Task setup needs elevation")
+	return cmd
 }
 
 func newTeamsServiceUninstallCmd() *cobra.Command {
@@ -481,7 +491,7 @@ func newTeamsServiceDoctorCmd() *cobra.Command {
 	}
 }
 
-func installTeamsService(ctx context.Context, registryPath *string) (string, error) {
+func installTeamsService(ctx context.Context, registryPath *string, opts teamsServiceBootstrapOptions) (string, error) {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return "", err
@@ -491,9 +501,19 @@ func installTeamsService(ctx context.Context, registryPath *string) (string, err
 		return "", err
 	}
 	if err := cleanupTeamsServiceBeforeTaskRewrite(ctx, backend); err != nil {
+		if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
+			return repairWindowsTaskBackendWithUAC(ctx, windowsBackend, spec, teamsServiceRepairOptions{}, err, opts)
+		}
 		return "", err
 	}
-	return backend.Install(ctx, spec)
+	path, err := backend.Install(ctx, spec)
+	if err != nil {
+		if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
+			return repairWindowsTaskBackendWithUAC(ctx, windowsBackend, spec, teamsServiceRepairOptions{}, err, opts)
+		}
+		return "", err
+	}
+	return path, nil
 }
 
 func repairTeamsService(ctx context.Context, registryPath *string, opts teamsServiceRepairOptions, buildOptions ...teamsServiceSpecBuildOption) (string, error) {
@@ -767,6 +787,36 @@ func printTeamsServiceBootstrapReady(out io.Writer, result teamsServiceBootstrap
 	_, _ = fmt.Fprintln(out)
 }
 
+func repairWindowsTaskBackendWithUACForBootstrap(ctx context.Context, backend teamsServiceWindowsTaskBackend, spec teamsServiceSpec, repairOpts teamsServiceRepairOptions, failure error, opts teamsServiceBootstrapOptions) (string, bool, error) {
+	path, err := repairWindowsTaskBackendWithUAC(ctx, backend, spec, repairOpts, failure, opts)
+	return path, err == nil, err
+}
+
+func repairWindowsTaskBackendWithUAC(ctx context.Context, backend teamsServiceWindowsTaskBackend, spec teamsServiceSpec, repairOpts teamsServiceRepairOptions, failure error, opts teamsServiceBootstrapOptions) (string, error) {
+	if !isTeamsServiceWindowsAccessDeniedError(failure) {
+		return "", failure
+	}
+	if opts.NoUAC {
+		return "", fmt.Errorf("Windows Scheduled Task setup failed: Windows denied permission to create or repair the Scheduled Task, and UAC is disabled by --no-uac")
+	}
+	out := opts.Out
+	if out == nil {
+		out = io.Discard
+	}
+	if !confirmTeamsServiceUACPrompt(opts.In, out, opts.AssumeYes) {
+		return "", fmt.Errorf("Windows Scheduled Task setup failed: %s", teamsServiceBootstrapErrorSummary(failure))
+	}
+	principalUser, userErr := teamsServiceCurrentWindowsUser(ctx)
+	if userErr != nil {
+		return "", fmt.Errorf("could not identify the current Windows user for UAC setup: %w", userErr)
+	}
+	path, elevatedErr := backend.RepairElevated(ctx, spec, repairOpts, principalUser)
+	if elevatedErr != nil {
+		return "", fmt.Errorf("UAC Scheduled Task setup failed: %s", teamsServiceBootstrapErrorSummary(elevatedErr))
+	}
+	return path, nil
+}
+
 func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teamsServiceBootstrapOptions) (teamsServiceBootstrapResult, error) {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
@@ -779,20 +829,43 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	if activation, ok, err := discoverTeamsPendingHelperActivation(ctx, spec.Executable, ""); err != nil {
 		return teamsServiceBootstrapResult{}, fmt.Errorf("check pending helper activation: %w", err)
 	} else if ok {
+		usedUAC := false
 		path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false})
 		if err != nil {
-			return teamsServiceBootstrapResult{}, fmt.Errorf("repair Teams service before pending helper activation: %w", err)
+			if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
+				path, usedUAC, err = repairWindowsTaskBackendWithUACForBootstrap(ctx, windowsBackend, spec, teamsServiceRepairOptions{Enable: true, Start: false}, err, opts)
+			}
+			if err != nil {
+				return teamsServiceBootstrapResult{}, fmt.Errorf("repair Teams service before pending helper activation: %w", err)
+			}
 		}
 		if opts.NoStart {
-			return teamsServiceBootstrapResult{Mode: backend.ID() + "-no-start", Path: path}, nil
+			mode := backend.ID() + "-no-start"
+			if usedUAC {
+				mode = "windows-task-scheduler-uac-no-start"
+			}
+			return teamsServiceBootstrapResult{Mode: mode, Path: path}, nil
 		}
 		if err := scheduleTeamsPendingHelperActivation(ctx, activation); err != nil {
 			return teamsServiceBootstrapResult{}, fmt.Errorf("schedule pending helper activation: %w", err)
 		}
-		return teamsServiceBootstrapResult{Mode: "windows-pending-helper-activation", Path: path}, nil
+		mode := "windows-pending-helper-activation"
+		if usedUAC {
+			mode = "windows-pending-helper-activation-uac"
+		}
+		return teamsServiceBootstrapResult{Mode: mode, Path: path}, nil
 	}
 	if opts.NoStart {
 		path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false})
+		if err != nil {
+			if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
+				if elevatedPath, _, elevatedErr := repairWindowsTaskBackendWithUACForBootstrap(ctx, windowsBackend, spec, teamsServiceRepairOptions{Enable: true, Start: false}, err, opts); elevatedErr == nil {
+					return teamsServiceBootstrapResult{Mode: "windows-task-scheduler-uac-no-start", Path: elevatedPath}, nil
+				} else {
+					err = elevatedErr
+				}
+			}
+		}
 		return teamsServiceBootstrapResult{Mode: backend.ID() + "-no-start", Path: path}, err
 	}
 	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
@@ -823,6 +896,13 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		} else {
 			return teamsServiceBootstrapResult{Mode: backend.ID(), Path: path}, nil
 		}
+	}
+	if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
+		path, _, elevatedErr := repairWindowsTaskBackendWithUACForBootstrap(ctx, windowsBackend, spec, teamsServiceRepairOptions{Enable: true, Start: true}, err, opts)
+		if elevatedErr != nil {
+			return teamsServiceBootstrapResult{}, elevatedErr
+		}
+		return teamsServiceBootstrapResult{Mode: "windows-task-scheduler-uac", Path: path}, nil
 	}
 	wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
 	if !ok {
@@ -1650,34 +1730,65 @@ func teamsServiceWindowsWatchdogTaskXMLPath() (string, error) {
 	return filepath.Join(dir, teamsServiceWindowsWatchdogTaskXMLName), nil
 }
 
-func (b teamsServiceWindowsTaskBackend) Install(ctx context.Context, spec teamsServiceSpec) (string, error) {
+func (b teamsServiceWindowsTaskBackend) writeTaskFiles(spec teamsServiceSpec, principalUser string) (string, string, error) {
 	xmlPath, err := b.Path()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(xmlPath), 0o700); err != nil {
-		return "", err
+		return "", "", err
 	}
 	watchdogXMLPath, err := teamsServiceWindowsWatchdogTaskXMLPath()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	spec = teamsServiceSpecWithWindowsTaskLaunchers(spec, xmlPath, watchdogXMLPath)
 	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsTaskLauncherPath, spec, buildTeamsServiceRunArgs(spec)); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsWatchdogLauncherPath, spec, buildTeamsServiceWatchdogArgs()); err != nil {
-		return "", err
+		return "", "", err
 	}
-	if err := os.WriteFile(xmlPath, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
-		return "", err
+	if err := os.WriteFile(xmlPath, []byte(buildTeamsServiceWindowsTaskXMLWithPrincipalUser(spec, principalUser)), 0o600); err != nil {
+		return "", "", err
 	}
-	if err := os.WriteFile(watchdogXMLPath, []byte(buildTeamsServiceWindowsWatchdogTaskXML(spec)), 0o600); err != nil {
-		return "", err
+	if err := os.WriteFile(watchdogXMLPath, []byte(buildTeamsServiceWindowsWatchdogTaskXMLWithPrincipalUser(spec, principalUser)), 0o600); err != nil {
+		return "", "", err
 	}
+	return xmlPath, watchdogXMLPath, nil
+}
+
+func buildTeamsServiceWindowsTaskRegisterCommand(xmlPath string, watchdogXMLPath string) string {
 	cmd := "$xml = Get-Content -LiteralPath " + powershellSingleQuote(xmlPath) + " -Raw; Register-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsTaskName) + " -Xml $xml -Force | Out-Null"
 	cmd += "; $watchdogXml = Get-Content -LiteralPath " + powershellSingleQuote(watchdogXMLPath) + " -Raw; Register-ScheduledTask -TaskName " + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + " -Xml $watchdogXml -Force | Out-Null"
-	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
+	return cmd
+}
+
+func (b teamsServiceWindowsTaskBackend) Install(ctx context.Context, spec teamsServiceSpec) (string, error) {
+	xmlPath, watchdogXMLPath, err := b.writeTaskFiles(spec, "")
+	if err != nil {
+		return "", err
+	}
+	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWindowsTaskRegisterCommand(xmlPath, watchdogXMLPath)); err != nil {
+		return "", err
+	}
+	return xmlPath, nil
+}
+
+func (b teamsServiceWindowsTaskBackend) RepairElevated(ctx context.Context, spec teamsServiceSpec, opts teamsServiceRepairOptions, principalUser string) (string, error) {
+	xmlPath, watchdogXMLPath, err := b.writeTaskFiles(spec, principalUser)
+	if err != nil {
+		return "", err
+	}
+	task := powershellSingleQuote(teamsServiceWindowsTaskName)
+	cmd := teamsServiceWindowsStopBridgeChildrenPowerShell(task) + "; " + buildTeamsServiceWindowsTaskRegisterCommand(xmlPath, watchdogXMLPath)
+	switch {
+	case opts.Start:
+		cmd += "; " + teamsServiceWindowsStartTasksPowerShell()
+	case opts.Enable:
+		cmd += "; " + teamsServiceWindowsEnableTasksPowerShell()
+	}
+	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWindowsElevatedCommand(cmd)); err != nil {
 		return "", err
 	}
 	return xmlPath, nil
@@ -1710,20 +1821,23 @@ func (b teamsServiceWindowsTaskBackend) Uninstall(ctx context.Context) (string, 
 func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([]byte, error) {
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
 	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
-	resolveWatchdog := "$watchdogTask = Get-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction SilentlyContinue; "
-	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 	switch action {
 	case "enable":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }")
+		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsEnableTasksPowerShell())
 	case "disable":
+		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
 		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $watchdogTask) { Disable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Disable-ScheduledTask -TaskName "+task+" | Out-Null")
 	case "status":
+		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
 		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; "+resolveWatchdog+"if ($null -ne $watchdogTask) { $watchdogInfo = Get-ScheduledTaskInfo -TaskName "+watchdogTask+"; $watchdogTask | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime } else { Write-Output 'Watchdog task not installed' }")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; $bridgeTask = Get-ScheduledTask -TaskName "+task+"; if ($bridgeTask.State -ne 'Running') { "+cleanupBridgeChildren+"Start-ScheduledTask -TaskName "+task+" }; if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask -TaskName "+watchdogTask+" }")
+		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsStartTasksPowerShell())
 	case "stop":
+		cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction SilentlyContinue; Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren)
 	case "restart":
+		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
+		cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-ScheduledTask -TaskName "+task+"; if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask -TaskName "+watchdogTask+" }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
@@ -1749,6 +1863,26 @@ func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action str
 	default:
 		return nil, fmt.Errorf("unsupported primary Teams service action for Task Scheduler: %s", action)
 	}
+}
+
+func teamsServiceWindowsResolveWatchdogTaskPowerShell() string {
+	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
+	return "$watchdogTask = Get-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction SilentlyContinue; "
+}
+
+func teamsServiceWindowsEnableTasksPowerShell() string {
+	task := powershellSingleQuote(teamsServiceWindowsTaskName)
+	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
+	resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
+	return "Enable-ScheduledTask -TaskName " + task + " | Out-Null; " + resolveWatchdog + "if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " | Out-Null }"
+}
+
+func teamsServiceWindowsStartTasksPowerShell() string {
+	task := powershellSingleQuote(teamsServiceWindowsTaskName)
+	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
+	resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
+	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
+	return "Enable-ScheduledTask -TaskName " + task + " | Out-Null; " + resolveWatchdog + "if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " | Out-Null }; $bridgeTask = Get-ScheduledTask -TaskName " + task + "; if ($bridgeTask.State -ne 'Running') { " + cleanupBridgeChildren + "Start-ScheduledTask -TaskName " + task + " }; if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask -TaskName " + watchdogTask + " }"
 }
 
 func teamsServiceWindowsStopBridgeChildrenPowerShell(taskNameExpr string) string {
@@ -3164,6 +3298,10 @@ func buildTeamsServiceWatchdogLaunchAgentPlist(spec teamsServiceSpec) string {
 }
 
 func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
+	return buildTeamsServiceWindowsTaskXMLWithPrincipalUser(spec, "")
+}
+
+func buildTeamsServiceWindowsTaskXMLWithPrincipalUser(spec teamsServiceSpec, principalUser string) string {
 	args := buildTeamsServiceRunArgs(spec)
 	command := spec.Executable
 	arguments := windowsCommandLine(args)
@@ -3189,6 +3327,9 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("  </Triggers>\n")
 	b.WriteString("  <Principals>\n")
 	b.WriteString("    <Principal id=\"Author\">\n")
+	if principalUser = strings.TrimSpace(principalUser); principalUser != "" {
+		b.WriteString("      <UserId>" + xmlEscape(principalUser) + "</UserId>\n")
+	}
 	b.WriteString("      <LogonType>InteractiveToken</LogonType>\n")
 	b.WriteString("      <RunLevel>LeastPrivilege</RunLevel>\n")
 	b.WriteString("    </Principal>\n")
@@ -3220,6 +3361,10 @@ func buildTeamsServiceWindowsTaskXML(spec teamsServiceSpec) string {
 }
 
 func buildTeamsServiceWindowsWatchdogTaskXML(spec teamsServiceSpec) string {
+	return buildTeamsServiceWindowsWatchdogTaskXMLWithPrincipalUser(spec, "")
+}
+
+func buildTeamsServiceWindowsWatchdogTaskXMLWithPrincipalUser(spec teamsServiceSpec, principalUser string) string {
 	args := buildTeamsServiceWatchdogArgs()
 	command := spec.Executable
 	arguments := windowsCommandLine(args)
@@ -3254,6 +3399,9 @@ func buildTeamsServiceWindowsWatchdogTaskXML(spec teamsServiceSpec) string {
 	b.WriteString("  </Triggers>\n")
 	b.WriteString("  <Principals>\n")
 	b.WriteString("    <Principal id=\"Author\">\n")
+	if principalUser = strings.TrimSpace(principalUser); principalUser != "" {
+		b.WriteString("      <UserId>" + xmlEscape(principalUser) + "</UserId>\n")
+	}
 	b.WriteString("      <LogonType>InteractiveToken</LogonType>\n")
 	b.WriteString("      <RunLevel>LeastPrivilege</RunLevel>\n")
 	b.WriteString("    </Principal>\n")
@@ -3657,6 +3805,10 @@ func teamsServiceWSLResolveTaskPowerShellRequired(taskName string, required bool
 }
 
 func buildTeamsServiceWSLElevatedCommand(command string) string {
+	return buildTeamsServiceWindowsElevatedCommand(command)
+}
+
+func buildTeamsServiceWindowsElevatedCommand(command string) string {
 	inner := "$ErrorActionPreference = 'Stop'; " + strings.TrimSpace(command)
 	args := "@('-NoProfile','-ExecutionPolicy','Bypass','-Command'," + powershellSingleQuote(inner) + ")"
 	return "$uacArgs = " + args + "; " +
