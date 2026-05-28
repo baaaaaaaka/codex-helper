@@ -1,12 +1,18 @@
 package teams
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +20,9 @@ import (
 
 func TestManagedQwenASRTranscriberInvokesIsolatedRuntimeWithDefaults(t *testing.T) {
 	cacheRoot := t.TempDir()
+	t.Setenv("PYTHONHOME", "/bad-python-home")
+	t.Setenv("PYTHONPATH", "/bad-python-path")
+	t.Setenv("VIRTUAL_ENV", "/bad-venv")
 	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
 		CacheRoot:    cacheRoot,
 		ModelID:      DefaultManagedASRModelID,
@@ -78,8 +87,14 @@ func TestManagedQwenASRTranscriberInvokesIsolatedRuntimeWithDefaults(t *testing.
 		env["CODEX_HELPER_TEAMS_ASR_TMP"] != filepath.Join(cacheRoot, "tmp") ||
 		env["TMPDIR"] != filepath.Join(cacheRoot, "tmp") ||
 		env["PYTHONIOENCODING"] != "utf-8" ||
+		env["PYTHONNOUSERSITE"] != "1" ||
 		env["CUSTOM_ASR_ENV"] != "1" {
 		t.Fatalf("managed cache/env not isolated: %#v", env)
+	}
+	for _, key := range []string{"PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("managed ASR env leaked %s: %#v", key, env)
+		}
 	}
 }
 
@@ -192,10 +207,44 @@ func TestManagedASRPackageInstallPlanIncludesTorchAndPinnedRuntimeTools(t *testi
 		"pip",
 		"install",
 		"--upgrade",
+		"--only-binary=:all:",
 		"qwen-asr==0.0.6",
 		"imageio-ffmpeg==0.6.0",
 		"torch>=2.4,<2.13",
 	)
+}
+
+func TestManagedASRBootstrapFallsBackToManagedStandalonePython(t *testing.T) {
+	cacheRoot := t.TempDir()
+	prevLookPath := managedASRLookPath
+	prevValidate := validateManagedASRBootstrapPythonFn
+	prevEnsureStandalone := ensureManagedASRStandalonePythonFn
+	t.Cleanup(func() {
+		managedASRLookPath = prevLookPath
+		validateManagedASRBootstrapPythonFn = prevValidate
+		ensureManagedASRStandalonePythonFn = prevEnsureStandalone
+	})
+
+	managedASRLookPath = func(command string) (string, error) {
+		return filepath.Join("/usr/bin", command), nil
+	}
+	validateManagedASRBootstrapPythonFn = func(python managedASRBootstrapPython) error {
+		return errors.New(python.Display + " has no venv module")
+	}
+	ensureManagedASRStandalonePythonFn = func(_ context.Context, gotCacheRoot string) (managedASRBootstrapPython, error) {
+		if gotCacheRoot != cacheRoot {
+			t.Fatalf("standalone cacheRoot = %q, want %q", gotCacheRoot, cacheRoot)
+		}
+		return managedASRBootstrapPython{Command: filepath.Join(cacheRoot, "python", "python"), Display: "managed Python"}, nil
+	}
+
+	python, err := findManagedASRBootstrapPython(context.Background(), cacheRoot)
+	if err != nil {
+		t.Fatalf("findManagedASRBootstrapPython error: %v", err)
+	}
+	if !strings.Contains(python.Command, filepath.Join(cacheRoot, "python")) || python.Display != "managed Python" {
+		t.Fatalf("bootstrap python = %#v, want managed fallback", python)
+	}
 }
 
 func TestManagedASRBootstrapPythonCandidatesArePlatformSpecific(t *testing.T) {
@@ -212,4 +261,169 @@ func TestManagedASRBootstrapPythonCandidatesArePlatformSpecific(t *testing.T) {
 		len(unixCandidates[0].Args) != 0 {
 		t.Fatalf("unix bootstrap candidates = %#v", unixCandidates)
 	}
+}
+
+func TestManagedASRStandalonePythonTargetCommonPlatforms(t *testing.T) {
+	cases := map[string]struct {
+		goos   string
+		goarch string
+		want   string
+	}{
+		"linux amd64":   {goos: "linux", goarch: "amd64", want: "x86_64-unknown-linux-gnu"},
+		"linux arm64":   {goos: "linux", goarch: "arm64", want: "aarch64-unknown-linux-gnu"},
+		"darwin amd64":  {goos: "darwin", goarch: "amd64", want: "x86_64-apple-darwin"},
+		"darwin arm64":  {goos: "darwin", goarch: "arm64", want: "aarch64-apple-darwin"},
+		"windows amd64": {goos: "windows", goarch: "amd64", want: "x86_64-pc-windows-msvc"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := managedASRStandalonePythonTarget(tc.goos, tc.goarch)
+			if err != nil {
+				t.Fatalf("managedASRStandalonePythonTarget error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("target = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if _, err := managedASRStandalonePythonTarget("linux", "386"); err == nil {
+		t.Fatal("unsupported platform should return an error")
+	}
+	if _, err := managedASRStandalonePythonTarget("windows", "arm64"); err == nil {
+		t.Fatal("windows/arm64 has no pinned managed Python asset and should return an error")
+	}
+}
+
+func TestManagedASRStandalonePythonPinnedAssetUsesDirectDownloadURL(t *testing.T) {
+	got, err := resolveManagedASRStandalonePythonAsset(context.Background(), "linux", "amd64")
+	if err != nil {
+		t.Fatalf("resolveManagedASRStandalonePythonAsset error: %v", err)
+	}
+	for _, want := range []string{
+		managedASRStandalonePythonReleaseTag,
+		"cpython-" + managedASRStandalonePythonVersion + "+" + managedASRStandalonePythonReleaseTag,
+		"x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+		managedASRStandalonePythonDownloadBase,
+	} {
+		if !strings.Contains(got.ReleaseTag+" "+got.Name+" "+got.URL, want) {
+			t.Fatalf("asset = %#v, missing %q", got, want)
+		}
+	}
+}
+
+func TestManagedASRStandalonePythonDownloadsExtractsAndMarksRuntime(t *testing.T) {
+	cacheRoot := t.TempDir()
+	target, err := managedASRStandalonePythonTarget(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Skipf("platform has no managed standalone Python target: %v", err)
+	}
+	archive := buildManagedASRStandalonePythonTestArchive(t)
+	downloads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/asset.tar.gz":
+			downloads++
+			_, _ = w.Write(archive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	prevHTTPClient := managedASRStandalonePythonHTTPClient
+	prevValidate := validateManagedASRBootstrapPythonFn
+	t.Cleanup(func() {
+		managedASRStandalonePythonHTTPClient = prevHTTPClient
+		validateManagedASRBootstrapPythonFn = prevValidate
+	})
+	managedASRStandalonePythonHTTPClient = server.Client()
+	var validated []string
+	validateManagedASRBootstrapPythonFn = func(python managedASRBootstrapPython) error {
+		validated = append(validated, python.Command)
+		return nil
+	}
+
+	python, err := installManagedASRStandalonePython(context.Background(), filepath.Join(cacheRoot, "python", managedASRStandalonePythonDirName), managedASRStandalonePythonAsset{
+		ReleaseTag: managedASRStandalonePythonReleaseTag,
+		Name:       "cpython-" + managedASRStandalonePythonVersion + "+" + managedASRStandalonePythonReleaseTag + "-" + target + "-install_only_stripped.tar.gz",
+		URL:        server.URL + "/asset.tar.gz",
+		Target:     target,
+	})
+	if err != nil {
+		t.Fatalf("installManagedASRStandalonePython error: %v", err)
+	}
+	if downloads != 1 {
+		t.Fatalf("downloads = %d, want 1", downloads)
+	}
+	if !strings.Contains(python.Command, filepath.Join(cacheRoot, "python", managedASRStandalonePythonDirName)) {
+		t.Fatalf("python command = %q, want cache-local standalone Python", python.Command)
+	}
+	if _, err := os.Stat(filepath.Join(cacheRoot, "python", managedASRStandalonePythonDirName, "runtime.json")); err != nil {
+		t.Fatalf("runtime marker missing: %v", err)
+	}
+	again, err := ensureManagedASRStandalonePython(context.Background(), cacheRoot)
+	if err != nil {
+		t.Fatalf("second ensureManagedASRStandalonePython error: %v", err)
+	}
+	if downloads != 1 {
+		t.Fatalf("second ensure downloaded again: downloads=%d", downloads)
+	}
+	if again.Command != python.Command {
+		t.Fatalf("second python = %q, want %q", again.Command, python.Command)
+	}
+	if len(validated) < 2 {
+		t.Fatalf("validated calls = %#v, want install and marker validation", validated)
+	}
+}
+
+func TestManagedASRStandalonePythonDownloadIntegration(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_TEST_MANAGED_ASR_PYTHON_DOWNLOAD") != "1" {
+		t.Skip("set CODEX_HELPER_TEST_MANAGED_ASR_PYTHON_DOWNLOAD=1 to download and validate the pinned managed Python archive")
+	}
+	cacheRoot := t.TempDir()
+	python, err := ensureManagedASRStandalonePython(context.Background(), cacheRoot)
+	if err != nil {
+		t.Fatalf("ensureManagedASRStandalonePython error: %v", err)
+	}
+	out, err := exec.Command(python.Command, "-c", "import sys, venv, ensurepip; print(sys.version)").CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed Python validation failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "3.10.") {
+		t.Fatalf("managed Python version output = %q, want 3.10.x", string(out))
+	}
+}
+
+func buildManagedASRStandalonePythonTestArchive(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	exeName := "python/bin/python3"
+	if runtime.GOOS == "windows" {
+		exeName = "python/python.exe"
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "python/", Mode: 0o700, Typeflag: tar.TypeDir}); err != nil {
+		t.Fatalf("write dir header: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: filepath.ToSlash(filepath.Dir(exeName)) + "/", Mode: 0o700, Typeflag: tar.TypeDir}); err != nil {
+		t.Fatalf("write bin dir header: %v", err)
+	}
+	body := []byte("#!/bin/sh\nexit 0\n")
+	if runtime.GOOS == "windows" {
+		body = []byte("fake exe")
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: exeName, Mode: 0o700, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatalf("write exe header: %v", err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatalf("write exe body: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	return buf.Bytes()
 }

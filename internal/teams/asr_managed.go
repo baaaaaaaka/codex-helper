@@ -33,6 +33,12 @@ var managedASRRuntimePackages = []string{
 	"torch>=2.4,<2.13",
 }
 
+var (
+	managedASRLookPath                  = exec.LookPath
+	validateManagedASRBootstrapPythonFn = validateManagedASRBootstrapPython
+	ensureManagedASRStandalonePythonFn  = ensureManagedASRStandalonePython
+)
+
 type ManagedASRConfig struct {
 	CacheRoot    string
 	ModelID      string
@@ -176,8 +182,8 @@ func managedASREnv(runtime managedASRRuntime, input ASRTranscribeInput) []string
 			"TMP="+tmpRoot,
 		)
 	}
-	extra = append(extra, "PYTHONIOENCODING=utf-8")
-	return asrCommandEnv(os.Environ(), extra, input)
+	extra = append(extra, "PYTHONIOENCODING=utf-8", "PYTHONNOUSERSITE=1")
+	return asrCommandEnv(managedASRSetupBaseEnv(), extra, input)
 }
 
 func runManagedASRCommand(ctx context.Context, command string, args []string, env []string, stdout *bytes.Buffer, stderr *bytes.Buffer) error {
@@ -312,7 +318,7 @@ func ensureManagedASRRunnerScript(cacheRoot string) (string, error) {
 }
 
 func createManagedASRVenv(ctx context.Context, cacheRoot string) error {
-	python, err := findManagedASRBootstrapPython()
+	python, err := findManagedASRBootstrapPython(ctx, cacheRoot)
 	if err != nil {
 		return err
 	}
@@ -323,7 +329,7 @@ func createManagedASRVenv(ctx context.Context, cacheRoot string) error {
 	}
 	defer func() { _ = os.RemoveAll(staging) }()
 	args := appendManagedASRBootstrapArgs(python, "-m", "venv", staging)
-	if err := runManagedASRSetupCommand(ctx, python.Command, args, nil); err != nil {
+	if err := runManagedASRSetupCommand(ctx, python.Command, args, managedASRSetupBaseEnv()); err != nil {
 		return fmt.Errorf("create isolated Teams speech recognition Python environment: %w", err)
 	}
 	_ = os.RemoveAll(venvDir)
@@ -331,10 +337,11 @@ func createManagedASRVenv(ctx context.Context, cacheRoot string) error {
 }
 
 func installManagedASRPackages(ctx context.Context, python string) error {
-	env := asrCommandEnv(os.Environ(), []string{
+	env := asrCommandEnv(managedASRSetupBaseEnv(), []string{
 		"PIP_DISABLE_PIP_VERSION_CHECK=1",
 		"PIP_NO_CACHE_DIR=1",
 		"PIP_NO_INPUT=1",
+		"PYTHONNOUSERSITE=1",
 	}, ASRTranscribeInput{Language: defaultASRLanguage, Speed: defaultASRSpeed})
 	if err := runManagedASRSetupCommand(ctx, python, []string{"-m", "pip", "install", "--upgrade", "pip"}, env); err != nil {
 		return fmt.Errorf("upgrade isolated Teams speech recognition installer: %w", err)
@@ -345,8 +352,22 @@ func installManagedASRPackages(ctx context.Context, python string) error {
 	return nil
 }
 
+func managedASRSetupBaseEnv() []string {
+	env := envSliceToMap(os.Environ())
+	for _, key := range []string{
+		"PYTHONHOME",
+		"PYTHONPATH",
+		"VIRTUAL_ENV",
+		"CONDA_PREFIX",
+		"CONDA_DEFAULT_ENV",
+	} {
+		delete(env, key)
+	}
+	return envMapToSlice(env)
+}
+
 func managedASRPackageInstallArgs() []string {
-	args := []string{"-m", "pip", "install", "--upgrade"}
+	args := []string{"-m", "pip", "install", "--upgrade", "--only-binary=:all:"}
 	args = append(args, managedASRRuntimePackages...)
 	return args
 }
@@ -371,10 +392,10 @@ func runManagedASRSetupCommand(ctx context.Context, command string, args []strin
 	return nil
 }
 
-func findManagedASRBootstrapPython() (managedASRBootstrapPython, error) {
+func findManagedASRBootstrapPython(ctx context.Context, cacheRoot string) (managedASRBootstrapPython, error) {
 	var errors []string
 	for _, candidate := range managedASRBootstrapPythonCandidates(runtime.GOOS) {
-		path, err := exec.LookPath(candidate.Command)
+		path, err := managedASRLookPath(candidate.Command)
 		if err != nil {
 			continue
 		}
@@ -382,16 +403,20 @@ func findManagedASRBootstrapPython() (managedASRBootstrapPython, error) {
 		if candidate.Display == "" {
 			candidate.Display = filepath.Base(path)
 		}
-		if err := validateManagedASRBootstrapPython(candidate); err != nil {
+		if err := validateManagedASRBootstrapPythonFn(candidate); err != nil {
 			errors = append(errors, err.Error())
 			continue
 		}
 		return candidate, nil
 	}
-	if len(errors) > 0 {
-		return managedASRBootstrapPython{}, fmt.Errorf("Python 3.10+ with venv support is required for managed Teams speech recognition setup: %s", strings.Join(errors, "; "))
+	managed, managedErr := ensureManagedASRStandalonePythonFn(ctx, cacheRoot)
+	if managedErr == nil {
+		return managed, nil
 	}
-	return managedASRBootstrapPython{}, fmt.Errorf("Python 3.10+ with venv support is required for managed Teams speech recognition setup but was not found on PATH")
+	if len(errors) > 0 {
+		return managedASRBootstrapPython{}, fmt.Errorf("could not prepare isolated Python 3.10+ for managed Teams speech recognition setup: system Python candidates failed (%s); managed Python setup failed: %w", strings.Join(errors, "; "), managedErr)
+	}
+	return managedASRBootstrapPython{}, fmt.Errorf("could not prepare isolated Python 3.10+ for managed Teams speech recognition setup: no usable system Python 3.10+ was found on PATH; managed Python setup failed: %w", managedErr)
 }
 
 func managedASRBootstrapPythonCandidates(goos string) []managedASRBootstrapPython {
@@ -410,7 +435,7 @@ func managedASRBootstrapPythonCandidates(goos string) []managedASRBootstrapPytho
 func validateManagedASRBootstrapPython(python managedASRBootstrapPython) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	args := appendManagedASRBootstrapArgs(python, "-c", "import sys, venv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)")
+	args := appendManagedASRBootstrapArgs(python, "-c", "import sys, venv, ensurepip; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)")
 	cmd := exec.CommandContext(ctx, python.Command, args...)
 	output, err := cmd.CombinedOutput()
 	if err == nil {

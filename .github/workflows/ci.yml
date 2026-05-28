@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr)|ASR(DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|BootstrapPythonCandidatesArePlatformSpecific))|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
+          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr)|ASR(DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadsExtractsAndMarksRuntime)))|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
@@ -129,6 +129,15 @@ jobs:
           python3 -m pip index versions qwen-asr | grep -F '0.0.6'
           python3 -m pip index versions imageio-ffmpeg | grep -F '0.6.0'
           python3 -m pip index versions torch | grep -E '2\.(4|5|6|7|8|9|10|11|12)\.'
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
+            Linux-aarch64|Linux-arm64) target=aarch64-unknown-linux-gnu ;;
+            Darwin-x86_64) target=x86_64-apple-darwin ;;
+            Darwin-arm64) target=aarch64-apple-darwin ;;
+            *) echo "unsupported CI platform for managed Python check: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+          esac
+          url="https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.10.20+20260510-${target}-install_only_stripped.tar.gz"
+          curl -fsSLI --max-time 30 "$url" >/dev/null
 
       - name: Teams managed ASR dependency availability (Windows)
         if: runner.os == 'Windows'
@@ -140,6 +149,12 @@ jobs:
           py -3 -m pip index versions qwen-asr | Select-String -SimpleMatch "0.0.6"
           py -3 -m pip index versions imageio-ffmpeg | Select-String -SimpleMatch "0.6.0"
           py -3 -m pip index versions torch | Select-String -Pattern "2\.(4|5|6|7|8|9|10|11|12)\."
+          $target = "x86_64-pc-windows-msvc"
+          $url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.10.20+20260510-$target-install_only_stripped.tar.gz"
+          $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 5 -TimeoutSec 30
+          if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+            throw "missing python-build-standalone asset for $target"
+          }
 
       - name: Teams work chat creation info regressions
         shell: bash
