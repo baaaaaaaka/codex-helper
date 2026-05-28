@@ -16,16 +16,17 @@ import (
 const maxTrackedMessageIDs = 500
 
 type Registry struct {
-	Version                int                  `json:"version"`
-	UserID                 string               `json:"user_id,omitempty"`
-	UserPrincipal          string               `json:"user_principal,omitempty"`
-	ControlChatID          string               `json:"control_chat_id,omitempty"`
-	ControlChatURL         string               `json:"control_chat_url,omitempty"`
-	ControlChatTopic       string               `json:"control_chat_topic,omitempty"`
-	ControlChatUserTitle   string               `json:"control_chat_user_title,omitempty"`
-	ControlChatTitleSource string               `json:"control_chat_title_source,omitempty"`
-	Sessions               []Session            `json:"sessions,omitempty"`
-	Chats                  map[string]ChatState `json:"chats,omitempty"`
+	Version                 int                  `json:"version"`
+	UserID                  string               `json:"user_id,omitempty"`
+	UserPrincipal           string               `json:"user_principal,omitempty"`
+	MachineHostnameOverride string               `json:"machine_hostname_override,omitempty"`
+	ControlChatID           string               `json:"control_chat_id,omitempty"`
+	ControlChatURL          string               `json:"control_chat_url,omitempty"`
+	ControlChatTopic        string               `json:"control_chat_topic,omitempty"`
+	ControlChatUserTitle    string               `json:"control_chat_user_title,omitempty"`
+	ControlChatTitleSource  string               `json:"control_chat_title_source,omitempty"`
+	Sessions                []Session            `json:"sessions,omitempty"`
+	Chats                   map[string]ChatState `json:"chats,omitempty"`
 }
 
 type Session struct {

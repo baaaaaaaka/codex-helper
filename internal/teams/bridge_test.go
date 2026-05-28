@@ -16222,6 +16222,201 @@ func TestBridgeControlRenameUpdatesTeamsTopicAndDurableState(t *testing.T) {
 	}
 }
 
+func TestParseRenameHostnameArgumentPreservesRegularRenameTitles(t *testing.T) {
+	tests := []struct {
+		name     string
+		argument string
+		want     string
+		wantOK   bool
+	}{
+		{name: "hostname", argument: "hostname lab box", want: "lab box", wantOK: true},
+		{name: "case insensitive hostname", argument: "HOSTNAME lab box", want: "lab box", wantOK: true},
+		{name: "hostname usage", argument: "hostname", want: "", wantOK: true},
+		{name: "regular host title", argument: "host meeting", want: "", wantOK: false},
+		{name: "regular title", argument: "release control", want: "", wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseRenameHostnameArgument(tt.argument)
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("parseRenameHostnameArgument(%q) = %q, %v; want %q, %v", tt.argument, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestBridgeRenameHostnameUpdatesControlAndWorkChatTopics(t *testing.T) {
+	patched := map[string]string{}
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/chats/"):
+			var payload struct {
+				Topic string `json:"topic"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+			chatID := strings.TrimPrefix(r.URL.Path, "/chats/")
+			patched[chatID] = payload.Topic
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/chats/control-chat/messages":
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode message: %v", err)
+			}
+			sent = append(sent, bridgeSentMessage{ChatID: "control-chat", Content: body.Body.Content})
+			_, _ = fmt.Fprint(w, `{"id":"sent-1","messageType":"message"}`)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.machine.Label = "old-host"
+	bridge.machine.Hostname = "old-host"
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatURL = "https://teams.example/control"
+	bridge.reg.ControlChatUserTitle = "release control"
+	bridge.reg.ControlChatTitleSource = sessionTitleSourceUser
+	bridge.reg.ControlChatTopic = ControlChatTitle(ChatTitleOptions{MachineLabel: "old-host", UserTitle: "release control"})
+	session := bridge.reg.SessionByID("s001")
+	session.UserTitle = "manual room"
+	session.TitleSource = sessionTitleSourceUser
+	session.Cwd = "/workspace/manual"
+	session.Topic = WorkChatTitle(ChatTitleOptions{MachineLabel: "old-host", UserTitle: "manual room", Cwd: session.Cwd})
+	bridge.reg.Sessions = append(bridge.reg.Sessions, Session{
+		ID:          "s002",
+		ChatID:      "chat-2",
+		ChatURL:     "https://teams.example/chat-2",
+		Topic:       WorkChatTitle(ChatTitleOptions{MachineLabel: "old-host", Topic: "auto summary", Cwd: "/workspace/auto"}),
+		TitleSource: sessionTitleSourceAuto,
+		Status:      "active",
+		Cwd:         "/workspace/auto",
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	})
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		now := time.Now()
+		storeOnlyTopic := WorkChatTitle(ChatTitleOptions{MachineLabel: "old-host", Topic: "store only summary", Cwd: "/workspace/store-only"})
+		state.MachineIdentity = teamstore.MachineIdentity{ID: bridge.machine.ID, Label: "old-host", Hostname: "old-host", AccountID: "user-1", Profile: bridge.scope.Profile, ScopeID: bridge.scope.ID, CreatedAt: now, UpdatedAt: now}
+		state.ControlChat = teamstore.ControlChatBinding{
+			MachineID:      bridge.machine.ID,
+			ScopeID:        bridge.scope.ID,
+			AccountID:      "user-1",
+			Profile:        bridge.scope.Profile,
+			TeamsChatID:    "control-chat",
+			TeamsChatURL:   "https://teams.example/control",
+			TeamsChatTopic: bridge.reg.ControlChatTopic,
+			UserTitle:      "release control",
+			TitleSource:    sessionTitleSourceUser,
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		for _, regSession := range bridge.reg.Sessions {
+			state.Sessions[regSession.ID] = teamstore.SessionContext{
+				ID:           regSession.ID,
+				Status:       teamstore.SessionStatus(regSession.Status),
+				TeamsChatID:  regSession.ChatID,
+				TeamsChatURL: regSession.ChatURL,
+				TeamsTopic:   regSession.Topic,
+				UserTitle:    regSession.UserTitle,
+				TitleSource:  regSession.TitleSource,
+				Cwd:          regSession.Cwd,
+				CreatedAt:    regSession.CreatedAt,
+				UpdatedAt:    regSession.UpdatedAt,
+			}
+		}
+		state.Sessions["s003"] = teamstore.SessionContext{
+			ID:           "s003",
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  "chat-3",
+			TeamsChatURL: "https://teams.example/chat-3",
+			TeamsTopic:   storeOnlyTopic,
+			TitleSource:  sessionTitleSourceAuto,
+			Cwd:          "/workspace/store-only",
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed durable state: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("hostname-rename"), "helper rename hostname lab box"); err != nil {
+		t.Fatalf("hostname rename error: %v", err)
+	}
+
+	for _, chatID := range []string{"control-chat", "chat-1", "chat-2", "chat-3"} {
+		if patched[chatID] == "" {
+			t.Fatalf("missing patched topic for %s: %#v", chatID, patched)
+		}
+		if !strings.Contains(patched[chatID], "lab box") || strings.Contains(patched[chatID], "old-host") {
+			t.Fatalf("patched topic for %s = %q, want new hostname only", chatID, patched[chatID])
+		}
+	}
+	if !strings.Contains(patched["control-chat"], "release control") {
+		t.Fatalf("control topic = %q, want preserved user title", patched["control-chat"])
+	}
+	if !strings.Contains(patched["chat-1"], "manual room") {
+		t.Fatalf("manual work topic = %q, want preserved user title", patched["chat-1"])
+	}
+	if !strings.Contains(patched["chat-2"], "auto summary") || strings.Count(patched["chat-2"], DefaultWorkChatMarker) != 1 {
+		t.Fatalf("auto work topic = %q, want stripped old machine prefix and preserved auto title", patched["chat-2"])
+	}
+	if !strings.Contains(patched["chat-3"], "store only summary") || strings.Count(patched["chat-3"], DefaultWorkChatMarker) != 1 {
+		t.Fatalf("store-only work topic = %q, want stripped old machine prefix and preserved auto title", patched["chat-3"])
+	}
+	if bridge.reg.MachineHostnameOverride != "lab box" || bridge.machine.Label != "lab box" || bridge.machine.Hostname != "lab box" {
+		t.Fatalf("machine hostname override not applied: reg=%q machine=%#v", bridge.reg.MachineHostnameOverride, bridge.machine)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.MachineIdentity.Label != "lab box" || state.MachineIdentity.Hostname != "lab box" {
+		t.Fatalf("durable machine identity = %#v, want lab box label/hostname", state.MachineIdentity)
+	}
+	if state.ControlChat.TeamsChatTopic != patched["control-chat"] || state.Sessions["s001"].TeamsTopic != patched["chat-1"] || state.Sessions["s002"].TeamsTopic != patched["chat-2"] || state.Sessions["s003"].TeamsTopic != patched["chat-3"] {
+		t.Fatalf("durable topics not updated: control=%q sessions=%#v patched=%#v", state.ControlChat.TeamsChatTopic, state.Sessions, patched)
+	}
+	freshBridge := newBridgeTestBridge(&GraphClient{}, store, &recordingExecutor{})
+	freshBridge.machine.Label = "old-host"
+	freshBridge.machine.Hostname = "old-host"
+	freshBridge.reg.MachineHostnameOverride = ""
+	if err := freshBridge.restoreMachineHostnameOverrideFromStore(context.Background()); err != nil {
+		t.Fatalf("restore machine hostname override from store: %v", err)
+	}
+	if freshBridge.machine.Label != "lab box" || freshBridge.machine.Hostname != "lab box" {
+		t.Fatalf("fresh bridge machine = %#v, want lab box restored from durable store", freshBridge.machine)
+	}
+	freshEmptyMachineBridge := newBridgeTestBridge(&GraphClient{}, store, &recordingExecutor{})
+	freshEmptyMachineBridge.machine = teamstore.MachineRecord{}
+	freshEmptyMachineBridge.reg.MachineHostnameOverride = ""
+	if err := freshEmptyMachineBridge.restoreMachineHostnameOverrideFromStore(context.Background()); err != nil {
+		t.Fatalf("restore machine hostname override with empty machine: %v", err)
+	}
+	if freshEmptyMachineBridge.machine.Label != "lab box" || freshEmptyMachineBridge.machine.Hostname != "lab box" {
+		t.Fatalf("empty-machine bridge machine = %#v, want lab box restored from durable store", freshEmptyMachineBridge.machine)
+	}
+	if len(sent) != 1 || !strings.Contains(sent[0].Content, "Hostname renamed") || !strings.Contains(sent[0].Content, "Work chats: 3 updated") {
+		t.Fatalf("hostname rename ack = %#v", sent)
+	}
+}
+
 func TestBridgeEnsureControlChatPreservesUserControlTitle(t *testing.T) {
 	var patchedTopic string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

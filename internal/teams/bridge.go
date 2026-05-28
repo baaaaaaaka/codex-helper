@@ -412,7 +412,9 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 	reg.UserID = user.ID
 	reg.UserPrincipal = user.UserPrincipalName
 	httpClient := graph.httpClient()
-	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, user: user, scope: scope, machine: MachineRecordForUser(user, scope), out: out, markAnswerChatsUnread: true}, nil
+	machine := MachineRecordForUser(user, scope)
+	applyMachineHostnameOverrideToRecord(&machine, reg.MachineHostnameOverride)
+	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, user: user, scope: scope, machine: machine, out: out, markAnswerChatsUnread: true}, nil
 }
 
 func (b *Bridge) readClient() *GraphClient {
@@ -661,6 +663,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	}
 	if b.machine.ID == "" {
 		b.machine = MachineRecordForUser(b.user, b.scope)
+		b.applyRegistryMachineHostnameOverride()
 	}
 	b.maxWorkChatPollsPerCycle = opts.MaxWorkChatPollsPerCycle
 	b.leaseDuration = opts.Interval * 3
@@ -683,6 +686,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 			if resolvedScope.ID != b.scope.ID {
 				b.scope = resolvedScope
 				b.machine = MachineRecordForUser(b.user, b.scope)
+				b.applyRegistryMachineHostnameOverride()
 			}
 		}
 		store, err := teamstore.Open(storePath)
@@ -2966,6 +2970,9 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		case DashboardCommandMkdir:
 			return b.createWorkspaceDirectory(ctx, parsed.Argument)
 		case DashboardCommandRename:
+			if hostname, ok := parseRenameHostnameArgument(parsed.Argument); ok {
+				return b.renameMachineHostname(ctx, hostname, b.reg.ControlChatID)
+			}
 			return b.renameControlChat(ctx, parsed.Argument)
 		case DashboardCommandDetails:
 			message, err := b.formatDetailsControlTarget(ctx, parsed.Target)
@@ -3220,6 +3227,7 @@ func controlHelpText() string {
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
 		"- `st` / `status` - show active Work chats",
 		"- `helper rename <title>` - rename this Control chat",
+		"- `helper rename hostname <name>` - rename this machine in all related chat titles",
 		"- `skills` - list installed skill subscriptions",
 		"",
 		"After `p`, reply with a number such as `1` to open that workspace. On a workspace page, send `new` to create a Work chat in that workspace.",
@@ -3250,6 +3258,7 @@ func controlAdvancedHelpText() string {
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
 		"- `helper rename <title>` - rename this Control chat",
+		"- `helper rename hostname <name>` - rename this machine in the Control chat and all linked Work chats",
 		"- `h` / `help` / `menu` - show short help",
 		"- `helper restart` - show the safe restart confirmation",
 		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
@@ -3318,6 +3327,7 @@ func sessionAdvancedHelpText() string {
 		"`helper details` or `!details` - show IDs and debug details",
 		"`beacon status`, `beacon list`, `beacon switch <profile>`, or `beacon switch local` - inspect or switch this Work chat execution target",
 		"`helper rename <title>` or `!rename <title>` - rename this Teams chat",
+		"`helper rename hostname <name>` - rename this machine in all related chat titles",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
@@ -5591,6 +5601,64 @@ func machineLabel() string {
 	return host
 }
 
+func sanitizeMachineHostnameOverride(raw string) string {
+	return SanitizeDashboardTitle(raw)
+}
+
+func applyMachineHostnameOverrideToRecord(machine *teamstore.MachineRecord, raw string) bool {
+	if machine == nil {
+		return false
+	}
+	label := sanitizeMachineHostnameOverride(raw)
+	if label == "" {
+		return false
+	}
+	changed := machine.Label != label || machine.Hostname != label
+	machine.Label = label
+	machine.Hostname = label
+	return changed
+}
+
+func (b *Bridge) applyRegistryMachineHostnameOverride() bool {
+	if b == nil {
+		return false
+	}
+	return applyMachineHostnameOverrideToRecord(&b.machine, b.reg.MachineHostnameOverride)
+}
+
+func (b *Bridge) restoreMachineHostnameOverrideFromStore(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	if b.scope.ID == "" {
+		b.scope = ScopeIdentityForUser(b.user)
+	}
+	if b.machine.ID == "" {
+		b.machine = MachineRecordForUser(b.user, b.scope)
+	}
+	if sanitizeMachineHostnameOverride(b.reg.MachineHostnameOverride) != "" {
+		b.applyRegistryMachineHostnameOverride()
+		return nil
+	}
+	if sanitizeMachineHostnameOverride(os.Getenv(envTeamsMachineLabel)) != "" {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(state.MachineIdentity.ID) == "" || strings.TrimSpace(state.MachineIdentity.ID) != strings.TrimSpace(b.machine.ID) {
+		return nil
+	}
+	storedLabel := sanitizeMachineHostnameOverride(state.MachineIdentity.Label)
+	currentLabel := sanitizeMachineHostnameOverride(b.machine.Label)
+	if storedLabel == "" || storedLabel == currentLabel {
+		return nil
+	}
+	applyMachineHostnameOverrideToRecord(&b.machine, storedLabel)
+	return nil
+}
+
 func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg ChatMessage, text string) error {
 	return b.handleSessionMessageWithQueueState(ctx, chatID, msg, text, nil, nil)
 }
@@ -5640,6 +5708,9 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 			}
 			return b.sendFileCommand(ctx, session, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandRename:
+			if hostname, ok := parseRenameHostnameArgument(parsed.Argument); ok {
+				return b.renameMachineHostname(ctx, hostname, chatID)
+			}
 			return b.renameSessionChat(ctx, session, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandDetails:
 			return b.sendToChat(ctx, chatID, b.formatSessionDetails(session))
@@ -7528,6 +7599,303 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 	return b.sendToChat(ctx, session.ChatID, "Work chat renamed.\n\nNew title:\n"+shortenTeamsLine(topic, 96)+"\n\nUse `helper details` to see the full Teams title and link.")
 }
 
+func parseRenameHostnameArgument(argument string) (string, bool) {
+	name, rest := splitDashboardCommandBody(argument)
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "hostname":
+		return strings.TrimSpace(rest), true
+	default:
+		return "", false
+	}
+}
+
+type hostnameRenameSessionTarget struct {
+	ID          string
+	ChatID      string
+	Topic       string
+	UserTitle   string
+	TitleSource string
+	Cwd         string
+	UpdatedAt   time.Time
+}
+
+func hostnameRenameSessionTargets(reg Registry, state teamstore.State) []hostnameRenameSessionTarget {
+	targets := make(map[string]hostnameRenameSessionTarget)
+	for id, session := range state.Sessions {
+		id = strings.TrimSpace(id)
+		if id == "" || isControlFallbackSessionID(id) || strings.TrimSpace(session.TeamsChatID) == "" {
+			continue
+		}
+		targets[id] = hostnameRenameSessionTarget{
+			ID:          id,
+			ChatID:      strings.TrimSpace(session.TeamsChatID),
+			Topic:       session.TeamsTopic,
+			UserTitle:   session.UserTitle,
+			TitleSource: session.TitleSource,
+			Cwd:         session.Cwd,
+			UpdatedAt:   session.UpdatedAt,
+		}
+	}
+	for _, session := range reg.Sessions {
+		id := strings.TrimSpace(session.ID)
+		if id == "" || isControlFallbackSessionID(id) || strings.TrimSpace(session.ChatID) == "" {
+			continue
+		}
+		targets[id] = hostnameRenameSessionTarget{
+			ID:          id,
+			ChatID:      strings.TrimSpace(session.ChatID),
+			Topic:       session.Topic,
+			UserTitle:   session.UserTitle,
+			TitleSource: session.TitleSource,
+			Cwd:         session.Cwd,
+			UpdatedAt:   session.UpdatedAt,
+		}
+	}
+	ids := make([]string, 0, len(targets))
+	for id := range targets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]hostnameRenameSessionTarget, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, targets[id])
+	}
+	return out
+}
+
+func workChatTopicForHostnameRename(target hostnameRenameSessionTarget, newLabel string, profile string, oldLabels []string) string {
+	displayTopic := strings.TrimSpace(target.Topic)
+	if strings.TrimSpace(target.UserTitle) == "" {
+		displayTopic = stripWorkChatMachineTitlePrefix(displayTopic, oldLabels)
+	}
+	return SanitizeTopic(WorkChatTitle(ChatTitleOptions{
+		MachineLabel: newLabel,
+		Profile:      profile,
+		UserTitle:    target.UserTitle,
+		Topic:        displayTopic,
+		Cwd:          target.Cwd,
+	}))
+}
+
+func stripWorkChatMachineTitlePrefix(topic string, oldLabels []string) string {
+	topic = strings.TrimSpace(topic)
+	if topic == "" {
+		return ""
+	}
+	for _, label := range oldLabels {
+		prefix := strings.TrimSpace(DefaultWorkChatMarker + " " + machineTitlePart(label))
+		if prefix == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(topic, prefix+" - "); ok {
+			return strings.TrimSpace(rest)
+		}
+		if strings.EqualFold(topic, prefix) {
+			return ""
+		}
+	}
+	return topic
+}
+
+func machineHostnameRenameOldLabels(machine teamstore.MachineRecord, state teamstore.State) []string {
+	seen := map[string]bool{}
+	var labels []string
+	add := func(value string) {
+		value = sanitizeMachineHostnameOverride(value)
+		if value == "" {
+			return
+		}
+		key := strings.ToLower(value)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		labels = append(labels, value)
+	}
+	add(machine.Label)
+	add(machine.Hostname)
+	add(state.MachineIdentity.Label)
+	add(state.MachineIdentity.Hostname)
+	add(machineLabel())
+	add("machine")
+	return labels
+}
+
+func (b *Bridge) renameMachineHostname(ctx context.Context, raw string, replyChatID string) error {
+	label := sanitizeMachineHostnameOverride(raw)
+	if label == "" {
+		return b.sendToChat(ctx, replyChatID, "usage: `helper rename hostname <name>`")
+	}
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	if b.scope.ID == "" {
+		b.scope = ScopeIdentityForUser(b.user)
+	}
+	if b.machine.ID == "" {
+		b.machine = MachineRecordForUser(b.user, b.scope)
+		b.applyRegistryMachineHostnameOverride()
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	oldLabels := machineHostnameRenameOldLabels(b.machine, state)
+	controlChatID := firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID)
+	controlUserTitle := firstNonEmptyString(b.reg.ControlChatUserTitle, state.ControlChat.UserTitle)
+	controlTopic := ""
+	controlUpdated := false
+	var failures []string
+	if strings.TrimSpace(controlChatID) != "" {
+		controlTopic = SanitizeTopic(ControlChatTitle(ChatTitleOptions{
+			MachineLabel: label,
+			Profile:      b.scope.Profile,
+			UserTitle:    controlUserTitle,
+		}))
+		if err := b.graph.UpdateChatTopic(ctx, controlChatID, controlTopic); err != nil {
+			failures = append(failures, "control chat: "+err.Error())
+		} else {
+			controlUpdated = true
+		}
+	}
+
+	sessionTopics := map[string]string{}
+	for _, target := range hostnameRenameSessionTargets(b.reg, state) {
+		topic := workChatTopicForHostnameRename(target, label, b.scope.Profile, oldLabels)
+		if err := b.graph.UpdateChatTopic(ctx, target.ChatID, topic); err != nil {
+			failures = append(failures, target.ID+": "+err.Error())
+			continue
+		}
+		sessionTopics[target.ID] = topic
+	}
+
+	now := time.Now()
+	applyMachineHostnameOverrideToRecord(&b.machine, label)
+	b.reg.MachineHostnameOverride = label
+	if controlUpdated {
+		b.reg.ControlChatID = controlChatID
+		b.reg.ControlChatTopic = controlTopic
+	}
+	for sessionID, topic := range sessionTopics {
+		if session := b.reg.SessionByID(sessionID); session != nil {
+			session.Topic = topic
+			session.UpdatedAt = now
+		}
+	}
+	if err := b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
+		changed := false
+		setMachineString := func(target *string, value string) {
+			if *target != value {
+				*target = value
+				changed = true
+			}
+		}
+		if state.MachineIdentity.ID == "" {
+			state.MachineIdentity.ID = b.machine.ID
+			state.MachineIdentity.CreatedAt = now
+			changed = true
+		}
+		setMachineString(&state.MachineIdentity.Label, label)
+		setMachineString(&state.MachineIdentity.Hostname, label)
+		setMachineString(&state.MachineIdentity.ScopeID, b.scope.ID)
+		setMachineString(&state.MachineIdentity.AccountID, b.user.ID)
+		setMachineString(&state.MachineIdentity.UserPrincipal, b.user.UserPrincipalName)
+		setMachineString(&state.MachineIdentity.Profile, b.scope.Profile)
+		if state.MachineIdentity.Kind != b.machine.Kind {
+			state.MachineIdentity.Kind = b.machine.Kind
+			changed = true
+		}
+		if state.MachineIdentity.Priority != b.machine.Priority {
+			state.MachineIdentity.Priority = b.machine.Priority
+			changed = true
+		}
+		if changed || state.MachineIdentity.UpdatedAt.IsZero() {
+			state.MachineIdentity.UpdatedAt = now
+			changed = true
+		}
+		if machine := state.Machines[b.machine.ID]; machine.ID != "" {
+			if machine.Label != label || machine.Hostname != label {
+				machine.Label = label
+				machine.Hostname = label
+				machine.UpdatedAt = now
+				state.Machines[machine.ID] = machine
+				changed = true
+			}
+		}
+		if controlUpdated {
+			if state.ControlChat.MachineID != b.machine.ID {
+				state.ControlChat.MachineID = b.machine.ID
+				changed = true
+			}
+			if state.ControlChat.ScopeID != b.scope.ID {
+				state.ControlChat.ScopeID = b.scope.ID
+				changed = true
+			}
+			if state.ControlChat.AccountID != b.user.ID {
+				state.ControlChat.AccountID = b.user.ID
+				changed = true
+			}
+			if state.ControlChat.Profile != b.scope.Profile {
+				state.ControlChat.Profile = b.scope.Profile
+				changed = true
+			}
+			if state.ControlChat.TeamsChatID == "" {
+				state.ControlChat.TeamsChatID = controlChatID
+				changed = true
+			}
+			if state.ControlChat.BoundAt.IsZero() {
+				state.ControlChat.BoundAt = now
+				changed = true
+			}
+			if state.ControlChat.TeamsChatTopic != controlTopic {
+				state.ControlChat.TeamsChatTopic = controlTopic
+				state.ControlChat.UpdatedAt = now
+				changed = true
+			}
+		}
+		for sessionID, topic := range sessionTopics {
+			current := state.Sessions[sessionID]
+			if current.ID == "" {
+				continue
+			}
+			if current.TeamsTopic != topic {
+				current.TeamsTopic = topic
+				current.UpdatedAt = now
+				state.Sessions[sessionID] = current
+				changed = true
+			}
+		}
+		return changed, nil
+	}); err != nil {
+		return err
+	}
+	if err := b.Save(); err != nil {
+		return err
+	}
+
+	var lines []string
+	lines = append(lines, "Hostname renamed.\n\nNew hostname: "+label)
+	if controlUpdated {
+		lines = append(lines, "Control chat: updated")
+	} else if strings.TrimSpace(controlChatID) == "" {
+		lines = append(lines, "Control chat: not bound")
+	}
+	lines = append(lines, fmt.Sprintf("Work chats: %d updated", len(sessionTopics)))
+	if len(failures) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, "Some chat titles were not updated:")
+		const maxReportedFailures = 4
+		for i, failure := range failures {
+			if i >= maxReportedFailures {
+				lines = append(lines, fmt.Sprintf("- and %d more", len(failures)-i))
+				break
+			}
+			lines = append(lines, "- "+shortenTeamsLine(failure, 140))
+		}
+	}
+	return b.sendToChat(ctx, replyChatID, strings.Join(lines, "\n"))
+}
+
 func (b *Bridge) renameControlChat(ctx context.Context, title string) error {
 	title = SanitizeDashboardTitle(title)
 	if title == "" {
@@ -9183,6 +9551,7 @@ func (b *Bridge) claimControlLease(ctx context.Context) (bool, error) {
 	}
 	if b.machine.ID == "" {
 		b.machine = MachineRecordForUser(b.user, b.scope)
+		b.applyRegistryMachineHostnameOverride()
 	}
 	duration := b.leaseDuration
 	if duration <= 0 {
@@ -9640,6 +10009,9 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
+	if err := b.restoreMachineHostnameOverrideFromStore(ctx); err != nil {
+		return err
+	}
 	if b.reg.ControlChatID == "" && len(b.reg.Sessions) == 0 && len(b.reg.Chats) == 0 {
 		return nil
 	}
@@ -9652,6 +10024,7 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 			}
 			if b.machine.ID == "" {
 				b.machine = MachineRecordForUser(b.user, b.scope)
+				b.applyRegistryMachineHostnameOverride()
 			}
 			machineID := b.machine.ID
 			if state.MachineIdentity.ID == "" {
@@ -9834,6 +10207,7 @@ func (b *Bridge) recordControlChatBindingWithTitle(ctx context.Context, chat Cha
 	}
 	if b.machine.ID == "" {
 		b.machine = MachineRecordForUser(b.user, b.scope)
+		b.applyRegistryMachineHostnameOverride()
 	}
 	machineID := b.machine.ID
 	label := b.machine.Label
