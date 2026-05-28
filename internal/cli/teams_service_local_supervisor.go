@@ -1059,10 +1059,10 @@ func retireTeamsServiceSystemdUserArtifactsForLocalSupervisor(ctx context.Contex
 		systemdAvailable = false
 	}
 	if systemdAvailable {
-		if data, err := teamsServiceSystemdStop(retireCtx); err != nil && !teamsServiceSystemdUnitMissingError(err, data) {
+		if data, err := teamsServiceSystemdStop(retireCtx); err != nil && !teamsServiceSystemdUnitMissingError(err, data) && !teamsServiceSystemdUserUnavailableCommandError(err, data) {
 			return fmt.Errorf("stop old systemd Teams service before local-supervisor fallback: %w", err)
 		}
-		if data, err := teamsServiceRunSystemctl(retireCtx, "disable", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName); err != nil && !teamsServiceSystemdUnitMissingError(err, data) {
+		if data, err := teamsServiceRunSystemctl(retireCtx, "disable", teamsServiceUnitName, teamsServiceWatchdogUnitName, teamsServiceWatchdogTimerName); err != nil && !teamsServiceSystemdUnitMissingError(err, data) && !teamsServiceSystemdUserUnavailableCommandError(err, data) {
 			return fmt.Errorf("disable old systemd Teams service before local-supervisor fallback: %w", err)
 		}
 	}
@@ -1082,11 +1082,44 @@ func retireTeamsServiceSystemdUserArtifactsForLocalSupervisor(ctx context.Contex
 		}
 	}
 	if systemdAvailable {
-		if _, err := teamsServiceRunSystemctl(retireCtx, "daemon-reload"); err != nil {
+		if data, err := teamsServiceRunSystemctl(retireCtx, "daemon-reload"); err != nil && !teamsServiceSystemdUserUnavailableCommandError(err, data) {
 			errs = append(errs, fmt.Errorf("reload systemd after retiring old Teams service units: %w", err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func teamsServiceSystemdUserUnavailableCommandError(err error, data []byte) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error() + "\n" + string(data)))
+	for _, marker := range []string{
+		"failed to connect to bus",
+		"failed to get d-bus connection",
+		"failed to get environment",
+		"org.freedesktop.systemd1 exited",
+		"org.freedesktop.dbus.error.namehasnoowner",
+		"the name org.freedesktop.systemd1 was not provided",
+		"dbus-org.freedesktop.systemd1.service not found",
+		"cannot autolaunch d-bus",
+		"no medium found",
+		"host is down",
+		"connection refused",
+		"connection reset by peer",
+		"no route to host",
+		"transport endpoint is not connected",
+		"transport endpoint not connected",
+		"xdg_runtime_dir",
+		"not booted with systemd",
+		"system has not been booted with systemd",
+		"executable file not found",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func teamsServiceSystemdUserUnavailableError(err error) bool {
@@ -1097,9 +1130,27 @@ func teamsServiceSystemdUserUnavailableError(err error) bool {
 	for _, marker := range []string{
 		"failed to connect to bus",
 		"failed to get d-bus connection",
+		"failed to get environment",
+		"org.freedesktop.systemd1 exited",
+		"org.freedesktop.dbus.error.namehasnoowner",
+		"the name org.freedesktop.systemd1 was not provided",
+		"dbus-org.freedesktop.systemd1.service not found",
+		"cannot autolaunch d-bus",
 		"operation not permitted",
+		"permission denied",
 		"no medium found",
 		"host is down",
+		"connection refused",
+		"connection reset by peer",
+		"no route to host",
+		"transport endpoint is not connected",
+		"transport endpoint not connected",
+		"xdg_runtime_dir",
+		"context deadline exceeded",
+		"deadline exceeded",
+		"timed out",
+		"timeout",
+		"signal: killed",
 		"not booted with systemd",
 		"system has not been booted with systemd",
 		"no such file or directory",

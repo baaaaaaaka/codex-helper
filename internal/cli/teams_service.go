@@ -803,7 +803,9 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	if opts.FallbackOnly {
 		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
 			if err := wslBackend.RetireScheduledTasks(ctx); err != nil {
-				return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only cannot safely start the Windows Startup watchdog because old WSL Scheduled Tasks could not be disabled: %w", err)
+				if !wslBackend.canSkipScheduledTaskRetireForStartupFallback(err) {
+					return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only cannot safely start the Windows Startup watchdog because old WSL Scheduled Tasks could not be disabled: %w", err)
+				}
 			}
 			path, err := wslBackend.InstallStartupFallback(ctx, spec, true)
 			return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, err
@@ -828,6 +830,15 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	}
 	accessDenied := isTeamsServiceWindowsAccessDeniedError(err)
 	if !accessDenied && !opts.NoUAC {
+		if isTeamsServiceWindowsScheduledTasksUnavailableError(err) && wslBackend.canSkipScheduledTaskRetireForStartupFallback(err) {
+			fallbackReason := "Windows Scheduled Task setup could not be completed because Windows Scheduled Task cmdlets are unavailable: " + teamsServiceBootstrapErrorSummary(err)
+			printTeamsServiceBootstrapTaskFallback(opts.Out, fallbackReason)
+			path, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, true)
+			if fallbackErr != nil {
+				return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback failed after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(fallbackErr))
+			}
+			return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, nil
+		}
 		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Scheduled Task setup failed: %s", teamsServiceBootstrapErrorSummary(err))
 	}
 	out := opts.Out
@@ -858,7 +869,11 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		}
 	}
 	if retireErr := wslBackend.RetireScheduledTasks(ctx); retireErr != nil {
-		if uacConfirmed {
+		if isTeamsServiceWindowsScheduledTasksUnavailableError(err) && wslBackend.canSkipScheduledTaskRetireForStartupFallback(retireErr) {
+			if strings.TrimSpace(fallbackReason) != "" {
+				fallbackReason += " Windows Scheduled Task cmdlets are unavailable and no Teams Scheduled Task config was found, so installing the Startup fallback without task retirement."
+			}
+		} else if uacConfirmed {
 			if elevatedRetireErr := wslBackend.RetireScheduledTasksElevated(ctx); elevatedRetireErr != nil {
 				return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): normal cleanup failed: %s; elevated cleanup failed: %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr), teamsServiceBootstrapErrorSummary(elevatedRetireErr))
 			}
@@ -1118,7 +1133,9 @@ func ensureTeamsServiceForRun(ctx context.Context, registryPath *string, buildOp
 				return specErr
 			}
 			if retireErr := wslBackend.RetireScheduledTasks(ctx); retireErr != nil {
-				return fmt.Errorf("WSL Scheduled Task setup failed (%v), and Startup fallback is unsafe because old WSL Scheduled Tasks could not be disabled: %w", err, retireErr)
+				if !isTeamsServiceWindowsScheduledTasksUnavailableError(err) || !wslBackend.canSkipScheduledTaskRetireForStartupFallback(retireErr) {
+					return fmt.Errorf("WSL Scheduled Task setup failed (%v), and Startup fallback is unsafe because old WSL Scheduled Tasks could not be disabled: %w", err, retireErr)
+				}
 			}
 			if _, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, false); fallbackErr != nil {
 				return fmt.Errorf("WSL Scheduled Task setup was blocked (%v), and Startup fallback setup failed: %w", err, fallbackErr)
@@ -2385,19 +2402,77 @@ func isTeamsServiceWindowsAccessDeniedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	lower := strings.ToLower(err.Error())
+	lower := strings.ToLower(teamsServiceCommandFailureDetail(err))
 	for _, needle := range []string{
 		"access is denied",
 		"0x80070005",
 		"unauthorizedaccessexception",
+		"permission denied",
+		"permissiondenied",
 		"accessdenied",
 		"e_accessdenied",
+		"拒绝访问",
+		"存取被拒",
+		"zugriff verweigert",
+		"acceso denegado",
+		"accès refusé",
+		"accesso negato",
 	} {
 		if strings.Contains(lower, needle) {
 			return true
 		}
 	}
 	return false
+}
+
+func isTeamsServiceWindowsScheduledTasksUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(teamsServiceCommandFailureDetail(err))
+	for _, needle := range []string{
+		"register-scheduledtask' is not recognized",
+		"get-scheduledtask' is not recognized",
+		"scheduledtasks module could not be loaded",
+		"module 'scheduledtasks' could not be loaded",
+		"no valid module file was found",
+		"not recognized as the name of a cmdlet",
+	} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func teamsServiceCommandFailureDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	if idx := strings.Index(text, " failed: "); idx >= 0 {
+		if detail := strings.TrimSpace(text[idx+len(" failed: "):]); detail != "" {
+			if firstNewline := strings.Index(detail, "\n"); firstNewline >= 0 {
+				if commandOutput := strings.TrimSpace(detail[firstNewline+1:]); commandOutput != "" {
+					return commandOutput
+				}
+			}
+			return detail
+		}
+	}
+	return text
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) canSkipScheduledTaskRetireForStartupFallback(err error) bool {
+	if !isTeamsServiceWindowsScheduledTasksUnavailableError(err) {
+		return false
+	}
+	path, pathErr := b.Path()
+	if pathErr != nil {
+		return false
+	}
+	_, statErr := os.Stat(path)
+	return os.IsNotExist(statErr)
 }
 
 func teamsServiceBootstrapErrorSummary(err error) string {

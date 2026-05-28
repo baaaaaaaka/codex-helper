@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1875,6 +1876,104 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *t
 	}
 }
 
+func TestTeamsBackgroundKeepaliveWSLBootstrapFallsBackWhenScheduledTasksCmdletsUnavailableCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			[]byte("Register-ScheduledTask : The term 'Register-ScheduledTask' is not recognized as the name of a cmdlet.\n"),
+		},
+		errs: []error{
+			errors.New("exit status 1"),
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bootstrap fallback error: %v\noutput:\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") ||
+		!strings.Contains(got, "Scheduled Task cmdlets are unavailable") ||
+		!strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+		t.Fatalf("bootstrap output missing ScheduledTasks-unavailable fallback:\n%s", got)
+	}
+	if strings.Contains(got, "NEXT STEP: TYPE yes TO CONTINUE") {
+		t.Fatalf("ScheduledTasks-unavailable fallback should not ask for UAC:\n%s", got)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("bootstrap calls = %#v, want direct repair then Startup fallback", runner.calls)
+	}
+	fallback := strings.Join(runner.calls[1].args, " ")
+	if !strings.Contains(fallback, "Start-Process -FilePath 'wscript.exe'") || strings.Contains(fallback, "Register-ScheduledTask") {
+		t.Fatalf("fallback call should use Startup watchdog without ScheduledTasks cmdlets:\n%s", fallback)
+	}
+}
+
+func TestTeamsBackgroundKeepaliveWSLBootstrapDoesNotSkipRetireWhenTaskConfigExistsCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			[]byte("Register-ScheduledTask : The term 'Register-ScheduledTask' is not recognized as the name of a cmdlet.\n"),
+		},
+		errs: []error{
+			errors.New("exit status 1"),
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	taskConfigPath, err := backend.Path()
+	if err != nil {
+		t.Fatalf("task config path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(taskConfigPath), 0o700); err != nil {
+		t.Fatalf("mkdir task config dir: %v", err)
+	}
+	if err := os.WriteFile(taskConfigPath, []byte("stale scheduled task config"), 0o600); err != nil {
+		t.Fatalf("write stale task config: %v", err)
+	}
+
+	var out strings.Builder
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr("/home/alice/teams registry.json"))
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"bootstrap"})
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "Windows Scheduled Task setup failed") {
+		t.Fatalf("bootstrap error = %v, want hard failure while stale task config exists\noutput:\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "USING STARTUP WATCHDOG FALLBACK") {
+		t.Fatalf("bootstrap must not install fallback while stale task config exists:\n%s", out.String())
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("bootstrap calls = %#v, want only direct repair", runner.calls)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbackOnceCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -1925,11 +2024,54 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbac
 	}
 }
 
+func TestTeamsBackgroundKeepaliveAutoEnsureWSLScheduledTasksUnavailableSkipsRetireWithoutTaskConfigCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	unavailable := errors.New("Register-ScheduledTask : The term 'Register-ScheduledTask' is not recognized as the name of a cmdlet")
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			unavailable,
+			unavailable,
+			nil,
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            "/home/alice/bin/codex-proxy",
+		cwd:            "/home/alice/work dir",
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	err := ensureTeamsServiceForRun(context.Background(), stringPtr("/home/alice/teams registry.json"))
+	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") {
+		t.Fatalf("auto ensure ScheduledTasks-unavailable error = %v, want Startup fallback diagnostic", err)
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("auto ensure calls = %#v, want direct repair, failed retire probe, plus fallback install", runner.calls)
+	}
+	retire := strings.Join(runner.calls[1].args, " ")
+	if !strings.Contains(retire, "Disable-ScheduledTask") {
+		t.Fatalf("auto ensure should still attempt stale WSL task retirement before safe skip:\n%s", retire)
+	}
+	fallback := strings.Join(runner.calls[2].args, " ")
+	if !strings.Contains(fallback, "GetFolderPath('Startup')") || strings.Contains(fallback, "Register-ScheduledTask") {
+		t.Fatalf("auto ensure fallback command should use Startup watchdog without ScheduledTasks cmdlets:\n%s", fallback)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallbackOnceCI(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
+		outputs: [][]byte{
+			[]byte("Register-ScheduledTask : Access is denied.\n"),
+		},
 		errs: []error{
 			errTeamsKeepaliveScheduledTaskFailureForTest{},
 			nil,

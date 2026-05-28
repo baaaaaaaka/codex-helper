@@ -185,6 +185,76 @@ func TestTeamsServiceLinuxAutoFailsClosedOnUnknownSystemdProbeError(t *testing.T
 	}
 }
 
+func TestTeamsServiceSystemdUserUnavailableErrorMatrix(t *testing.T) {
+	unavailable := []string{
+		"systemctl --user show-environment failed: exit status 1: Failed to connect to bus: No such file or directory",
+		"systemctl --user show-environment failed: exit status 1: Failed to get D-Bus connection: Operation not permitted",
+		"systemctl --user show-environment failed: exit status 1: Failed to get environment: Process org.freedesktop.systemd1 exited with status 1",
+		"systemctl --user show-environment failed: exit status 1: org.freedesktop.DBus.Error.NameHasNoOwner",
+		"systemctl --user show-environment failed: exit status 1: The name org.freedesktop.systemd1 was not provided by any .service files",
+		"systemctl --user show-environment failed: exit status 1: Unit dbus-org.freedesktop.systemd1.service not found",
+		"systemctl --user show-environment failed: exit status 1: Cannot autolaunch D-Bus without X11 $DISPLAY",
+		"systemctl --user show-environment failed: exit status 1: Failed to connect to bus: No medium found",
+		"systemctl --user show-environment failed: exit status 1: Failed to connect to bus: Host is down",
+		"systemctl --user show-environment failed: exit status 1: Failed to connect to bus: Connection refused",
+		"systemctl --user show-environment failed: exit status 1: Failed to connect to bus: Transport endpoint is not connected",
+		"systemctl --user show-environment failed: exit status 1: Failed to connect to bus: $XDG_RUNTIME_DIR not set",
+		"systemctl --user show-environment failed: context deadline exceeded",
+		"systemctl --user show-environment failed: signal: killed",
+		"systemctl --user show-environment failed: exit status 1: System has not been booted with systemd as init system",
+		"systemctl --user show-environment failed: exec: \"systemctl\": executable file not found in $PATH",
+	}
+	for _, sample := range unavailable {
+		if !teamsServiceSystemdUserUnavailableError(errors.New(sample)) {
+			t.Fatalf("systemd unavailable sample was not classified for fallback:\n%s", sample)
+		}
+	}
+
+	unknown := []string{
+		"systemctl --user show-environment failed: exit status 1",
+		"systemctl --user show-environment failed: exit status 1: invalid option --definitely-not-real",
+		"systemctl --user show-environment failed: exit status 1: malformed unit file",
+	}
+	for _, sample := range unknown {
+		if teamsServiceSystemdUserUnavailableError(errors.New(sample)) {
+			t.Fatalf("unknown systemd sample was incorrectly classified for fallback:\n%s", sample)
+		}
+	}
+}
+
+func TestTeamsServiceLinuxAutoFallsBackForKnownSystemdProbeFailures(t *testing.T) {
+	lockCLITestHooks(t)
+
+	samples := []string{
+		"systemctl --user show-environment failed: exit status 1: Failed to get environment: Process org.freedesktop.systemd1 exited with status 1",
+		"systemctl --user show-environment failed: exit status 1: Failed to connect to bus: Connection refused",
+		"systemctl --user show-environment failed: exit status 1: Cannot autolaunch D-Bus without X11 $DISPLAY",
+		"systemctl --user show-environment failed: context deadline exceeded",
+	}
+	for _, sample := range samples {
+		t.Run(sample, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+				goos:                    "linux",
+				exe:                     filepath.Join(tmp, "bin", "codex-proxy"),
+				cwd:                     tmp,
+				unitDir:                 filepath.Join(tmp, "systemd", "user"),
+				runner:                  &recordingTeamsServiceRunner{},
+				systemdUserAvailableErr: errors.New(sample),
+			})
+
+			backend, err := teamsServiceBackendForCurrentPlatform()
+			if err != nil {
+				t.Fatalf("teamsServiceBackendForCurrentPlatform error: %v", err)
+			}
+			if got := backend.ID(); got != "local-supervisor" {
+				t.Fatalf("backend ID = %q, want local-supervisor", got)
+			}
+		})
+	}
+}
+
 func TestTeamsServiceLinuxAutoUsesSystemdWhenOnlyDisabledLocalConfigExists(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -670,6 +740,92 @@ func TestTeamsServiceLocalSupervisorRetireSystemdFailureBlocksStart(t *testing.T
 	}
 }
 
+func TestTeamsServiceLocalSupervisorRetireSystemdUnavailableAllowsStart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	startedPID := 6124
+	runner := &recordingTeamsServiceRunner{
+		output: []byte("Failed to connect to bus: Connection refused\n"),
+		err:    errors.New("exit status 1"),
+	}
+	systemdAvailable := true
+	started := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               runner,
+		systemdUserAvailable: &systemdAvailable,
+		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+			started = true
+			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				SupervisorPID:  startedPID,
+				SupervisorPGID: 7124,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+		localVerifyProcessIdentity: func(int, string) error {
+			return nil
+		},
+	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == startedPID }
+	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
+
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+		t.Fatalf("install should only write local supervisor config before retiring systemd: %v", err)
+	}
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
+		t.Fatalf("start should allow local-supervisor when systemd disappears during retire: %v", err)
+	}
+	if !started {
+		t.Fatal("local supervisor did not start after systemd became unavailable during retire")
+	}
+	if !teamsServiceCallSeen(runner.calls, "stop") || !teamsServiceCallSeen(runner.calls, "disable") {
+		t.Fatalf("retire calls = %#v, want stop and disable attempted before fallback start", runner.calls)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRetireSystemdTimeoutBlocksStart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	runner := &recordingTeamsServiceRunner{err: context.DeadlineExceeded}
+	systemdAvailable := true
+	started := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exePath,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd", "user"),
+		runner:               runner,
+		systemdUserAvailable: &systemdAvailable,
+		localStartDetached: func(context.Context, string, string, teamsServiceSpec) (int, error) {
+			started = true
+			return os.Getpid(), nil
+		},
+	})
+
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+		t.Fatalf("install should only write local supervisor config before retiring systemd: %v", err)
+	}
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err == nil || !strings.Contains(err.Error(), "stop old systemd") {
+		t.Fatalf("start err = %v, want fail-closed systemd stop timeout", err)
+	}
+	if started {
+		t.Fatal("local supervisor started after systemd stop timeout")
+	}
+}
+
 func TestTeamsServiceLocalSupervisorSystemdProbeUnknownBlocksFallbackStart(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -704,44 +860,57 @@ func TestTeamsServiceLocalSupervisorSystemdProbeUnknownBlocksFallbackStart(t *te
 func TestTeamsServiceLocalSupervisorSystemdUnavailableProbeAllowsFallbackStart(t *testing.T) {
 	lockCLITestHooks(t)
 
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	exePath := filepath.Join(tmp, "bin", "codex-proxy")
-	startedPID := 6123
-	started := false
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:                    "linux",
-		exe:                     exePath,
-		cwd:                     tmp,
-		unitDir:                 filepath.Join(tmp, "systemd", "user"),
-		runner:                  &recordingTeamsServiceRunner{},
-		systemdUserAvailableErr: errors.New("systemctl --user show-environment failed: exit status 1: Failed to get D-Bus connection: Operation not permitted"),
-		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
-			started = true
-			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
-				Version:        teamsServiceLocalSupervisorStatusVersion,
-				ConfigPath:     configPath,
-				SupervisorPID:  startedPID,
-				SupervisorPGID: 7123,
-				State:          "running",
-				UpdatedAt:      time.Now(),
+	tests := []struct {
+		name string
+		err  string
+	}{
+		{name: "dbus permission denied", err: "systemctl --user show-environment failed: exit status 1: Failed to get D-Bus connection: Operation not permitted"},
+		{name: "environment probe exited", err: "systemctl --user show-environment failed: exit status 1: Failed to get environment: Process org.freedesktop.systemd1 exited with status 1"},
+		{name: "bus connection refused", err: "systemctl --user show-environment failed: exit status 1: Failed to connect to bus: Connection refused"},
+		{name: "dbus cannot autolaunch", err: "systemctl --user show-environment failed: exit status 1: Cannot autolaunch D-Bus without X11 $DISPLAY"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			exePath := filepath.Join(tmp, "bin", "codex-proxy")
+			startedPID := 6123
+			started := false
+			withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+				goos:                    "linux",
+				exe:                     exePath,
+				cwd:                     tmp,
+				unitDir:                 filepath.Join(tmp, "systemd", "user"),
+				runner:                  &recordingTeamsServiceRunner{},
+				systemdUserAvailableErr: errors.New(tc.err),
+				localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
+					started = true
+					return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+						Version:        teamsServiceLocalSupervisorStatusVersion,
+						ConfigPath:     configPath,
+						SupervisorPID:  startedPID,
+						SupervisorPGID: 7123,
+						State:          "running",
+						UpdatedAt:      time.Now(),
+					})
+				},
+				localVerifyProcessIdentity: func(int, string) error {
+					return nil
+				},
 			})
-		},
-		localVerifyProcessIdentity: func(int, string) error {
-			return nil
-		},
-	})
-	prevAlive := teamsLocalSupervisorProcessAlive
-	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == startedPID }
-	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
-		t.Fatalf("install local supervisor config: %v", err)
-	}
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
-		t.Fatalf("start should allow confirmed unavailable systemd probe: %v", err)
-	}
-	if !started {
-		t.Fatal("local supervisor did not start after confirmed unavailable systemd probe")
+			prevAlive := teamsLocalSupervisorProcessAlive
+			teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == startedPID }
+			t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
+			if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exePath, WorkingDir: tmp}); err != nil {
+				t.Fatalf("install local supervisor config: %v", err)
+			}
+			if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
+				t.Fatalf("start should allow confirmed unavailable systemd probe: %v", err)
+			}
+			if !started {
+				t.Fatal("local supervisor did not start after confirmed unavailable systemd probe")
+			}
+		})
 	}
 }
 
@@ -4325,6 +4494,66 @@ func TestTeamsServiceBootstrapErrorSummaryKeepsFailuresReadable(t *testing.T) {
 	accessDenied := teamsServiceBootstrapErrorSummary(errors.New("Register-ScheduledTask : Access is denied.\nAt line:1 char:1\nlarge command"))
 	if strings.Contains(accessDenied, "Register-ScheduledTask") || !strings.Contains(accessDenied, "Windows denied permission") {
 		t.Fatalf("access denied should be summarized without raw PowerShell noise, got %q", accessDenied)
+	}
+}
+
+func TestTeamsServiceWindowsAccessDeniedErrorMatrix(t *testing.T) {
+	accessDenied := []string{
+		"Register-ScheduledTask : Access is denied.",
+		"powershell.exe -Command Register-ScheduledTask failed: exit status 1\nRegister-ScheduledTask : Access is denied.\nAt line:1 char:1\n+ Register-ScheduledTask ...",
+		"Register-ScheduledTask : Permission denied.",
+		"UnauthorizedAccessException: Access to the path is denied.",
+		"FullyQualifiedErrorId : AccessDenied",
+		"Exception from HRESULT: 0x80070005 (E_ACCESSDENIED)",
+		"Register-ScheduledTask : 拒绝访问。",
+		"Register-ScheduledTask : 存取被拒。",
+		"Register-ScheduledTask : Zugriff verweigert.",
+		"Register-ScheduledTask : Acceso denegado.",
+		"Register-ScheduledTask : Accès refusé.",
+		"Register-ScheduledTask : Accesso negato.",
+	}
+	for _, sample := range accessDenied {
+		if !isTeamsServiceWindowsAccessDeniedError(errors.New(sample)) {
+			t.Fatalf("access denied sample was not classified:\n%s", sample)
+		}
+	}
+
+	unknown := []string{
+		"Register-ScheduledTask failed: exit status 1",
+		"powershell.exe -Command \"if (-not $actionMatches) { throw 'Teams WSL Scheduled Task action did not refresh; access is denied or task is protected' }\" failed: exit status 1",
+		"Register-ScheduledTask : The task XML contains a value which is incorrectly formatted.",
+		"Get-ScheduledTask : The system cannot find the file specified.",
+	}
+	for _, sample := range unknown {
+		if isTeamsServiceWindowsAccessDeniedError(errors.New(sample)) {
+			t.Fatalf("unknown Windows Scheduled Task error was incorrectly classified as access denied:\n%s", sample)
+		}
+	}
+}
+
+func TestTeamsServiceWindowsScheduledTasksUnavailableErrorMatrix(t *testing.T) {
+	unavailable := []string{
+		"Register-ScheduledTask : The term 'Register-ScheduledTask' is not recognized as the name of a cmdlet",
+		"powershell.exe -Command Register-ScheduledTask failed: exit status 1\nRegister-ScheduledTask : The term 'Register-ScheduledTask' is not recognized as the name of a cmdlet.\nAt line:1 char:1\n+ Register-ScheduledTask ...\nCommandNotFoundException",
+		"Get-ScheduledTask : The term 'Get-ScheduledTask' is not recognized as the name of a cmdlet",
+		"The module 'ScheduledTasks' could not be loaded. For more information, run 'Import-Module ScheduledTasks'.",
+		"Import-Module : The specified module 'ScheduledTasks' was not loaded because no valid module file was found",
+	}
+	for _, sample := range unavailable {
+		if !isTeamsServiceWindowsScheduledTasksUnavailableError(errors.New(sample)) {
+			t.Fatalf("ScheduledTasks unavailable sample was not classified:\n%s", sample)
+		}
+	}
+
+	unknown := []string{
+		"Register-ScheduledTask failed: exit status 1",
+		"Register-ScheduledTask : The task XML contains a value which is incorrectly formatted.",
+		"Register-ScheduledTask : Access is denied.",
+	}
+	for _, sample := range unknown {
+		if isTeamsServiceWindowsScheduledTasksUnavailableError(errors.New(sample)) {
+			t.Fatalf("unknown Windows Scheduled Task error was incorrectly classified as cmdlet unavailable:\n%s", sample)
+		}
 	}
 }
 
