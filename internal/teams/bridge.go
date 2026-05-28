@@ -3144,7 +3144,7 @@ func (b *Bridge) prepareControlFallbackInputFromTeamsMessage(ctx context.Context
 	}
 	transcripts, err := b.transcribeTeamsMediaAttachments(ctx, session, turnID, localFiles)
 	if err != nil {
-		return ExecutionInput{}, cleanupHosted, "Teams media transcription failed: " + err.Error(), nil
+		return ExecutionInput{}, cleanupHosted, teamsASRFailureUserMessage(err), nil
 	}
 	preparedPrompt := promptWithASRTranscripts(promptText, transcripts)
 	if strings.TrimSpace(preparedPrompt) == "" && len(localFiles) > 0 {
@@ -6904,7 +6904,7 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 	// execution planning so Teams media credentials and temp files stay local.
 	transcripts, err := b.transcribeTeamsMediaAttachments(ctx, session, turnID, localFiles)
 	if err != nil {
-		return ExecutionInput{}, cleanupAll, "Teams media transcription failed: " + err.Error(), nil
+		return ExecutionInput{}, cleanupAll, teamsASRFailureUserMessage(err), nil
 	}
 	return executionInputWithPreparedTeamsContext(prompt, referencedMessages, localFiles, transcripts), cleanupAll, "", nil
 }

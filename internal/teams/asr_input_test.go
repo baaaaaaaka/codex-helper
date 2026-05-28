@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -144,6 +145,17 @@ func TestTranscribeTeamsMediaAttachmentsFiltersAndDefaults(t *testing.T) {
 	}
 	if len(transcripts) != 2 || transcripts[0].SourceName != "voice.m4a" || transcripts[0].Language != defaultASRLanguage || transcripts[0].Speed != defaultASRSpeed {
 		t.Fatalf("transcripts = %#v", transcripts)
+	}
+}
+
+func TestTranscribeTeamsMediaAttachmentsRequiresConfiguredASRForMedia(t *testing.T) {
+	bridge := &Bridge{}
+	_, err := bridge.transcribeTeamsMediaAttachments(context.Background(), &Session{ID: "s001"}, "turn-1", []LocalAttachment{
+		{Path: "/tmp/photo.jpg", PromptPath: ".codex-helper/photo.jpg", ContentType: "image/jpeg"},
+		{Path: "/tmp/voice.m4a", PromptPath: ".codex-helper/voice.m4a", ContentType: "audio/mp4"},
+	})
+	if !errors.Is(err, errASRCommandNotConfigured) {
+		t.Fatalf("transcribeTeamsMediaAttachments error = %v, want ASR not configured", err)
 	}
 }
 

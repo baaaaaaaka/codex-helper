@@ -5381,6 +5381,34 @@ func TestBridgeControlAudioCardFallsBackToCodexWithASR(t *testing.T) {
 	}
 }
 
+func TestBridgeControlAudioCardWithoutASRReportsSetupMessage(t *testing.T) {
+	graph, sent := newBridgeControlAudioCardGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessage("control-audio-card")
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/control-chat/messages/control-audio-card/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, ""); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none without configured ASR", executor.prompts)
+	}
+	got := sentPlainJoined(*sent)
+	if !strings.Contains(got, "Codex received your control-chat question") ||
+		!strings.Contains(got, "Teams voice/video transcription is not configured") ||
+		!strings.Contains(got, "CODEX_HELPER_TEAMS_ASR_COMMAND") {
+		t.Fatalf("control no-ASR response = %q", got)
+	}
+}
+
 func TestBridgeControlExplicitCommandRejectsMessageReference(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -10340,6 +10368,35 @@ func TestBridgeSessionTeamsAudioCardIsDownloadedAndTranscribed(t *testing.T) {
 	}
 	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "transcribed answer") {
 		t.Fatalf("sent messages = %#v, want ack plus final answer", *sent)
+	}
+}
+
+func TestBridgeSessionTeamsAudioCardWithoutASRReportsSetupMessage(t *testing.T) {
+	graph, sent := newBridgeAudioCardGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	msg := bridgeTestMessage("message-audio-card")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p>please handle this voice clip</p>"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-card/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "please handle this voice clip")
+	if err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none without configured ASR", executor.prompts)
+	}
+	got := sentPlainJoined(*sent)
+	if !strings.Contains(got, "Teams voice/video transcription is not configured") ||
+		!strings.Contains(got, "CODEX_HELPER_TEAMS_ASR_COMMAND") ||
+		strings.Contains(got, "should not run") {
+		t.Fatalf("session no-ASR response = %q", got)
 	}
 }
 

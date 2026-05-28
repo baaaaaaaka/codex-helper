@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 )
 
 const teamsASRMaxCPUThreads = 4
+
+var errASRCommandNotConfigured = errors.New("ASR command is not configured")
 
 type CommandASRTranscriber struct {
 	Command string
@@ -32,7 +35,7 @@ func NewCommandASRTranscriber(command string, args []string) *CommandASRTranscri
 
 func (t *CommandASRTranscriber) TranscribeTeamsMedia(ctx context.Context, input ASRTranscribeInput) (ASRTranscript, error) {
 	if t == nil || strings.TrimSpace(t.Command) == "" {
-		return ASRTranscript{}, fmt.Errorf("ASR command is not configured")
+		return ASRTranscript{}, errASRCommandNotConfigured
 	}
 	sourcePath := strings.TrimSpace(input.File.Path)
 	if sourcePath == "" {

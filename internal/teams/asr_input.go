@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -147,9 +148,6 @@ func executionInputWithPreparedTeamsContext(text string, refs []ReferencedMessag
 }
 
 func (b *Bridge) transcribeTeamsMediaAttachments(ctx context.Context, session *Session, turnID string, files []LocalAttachment) ([]ASRTranscript, error) {
-	if b == nil || b.asrTranscriber == nil {
-		return nil, nil
-	}
 	var transcripts []ASRTranscript
 	sourceIndex := 0
 	for _, file := range files {
@@ -157,6 +155,9 @@ func (b *Bridge) transcribeTeamsMediaAttachments(ctx context.Context, session *S
 			continue
 		}
 		sourceIndex++
+		if b == nil || b.asrTranscriber == nil {
+			return nil, errASRCommandNotConfigured
+		}
 		stopProgress := b.startTeamsASRProgressLoop(ctx, session, turnID, sourceIndex, file)
 		transcript, err := b.asrTranscriber.TranscribeTeamsMedia(ctx, ASRTranscribeInput{
 			Session:     session,
@@ -191,6 +192,13 @@ func (b *Bridge) transcribeTeamsMediaAttachments(ctx context.Context, session *S
 		transcripts = append(transcripts, transcript)
 	}
 	return transcripts, nil
+}
+
+func teamsASRFailureUserMessage(err error) string {
+	if errors.Is(err, errASRCommandNotConfigured) {
+		return "Teams voice/video transcription is not configured on this helper. I downloaded the Teams media, but I did not send it to Codex because Codex would receive the audio/video file instead of the spoken text. Configure a local ASR command with `cxp teams run --asr-command <program>` plus repeated `--asr-arg ...`, or set `CODEX_HELPER_TEAMS_ASR_COMMAND` and `CODEX_HELPER_TEAMS_ASR_ARGS_JSON` for the Teams service. The command can use placeholders such as `{input}`, `{language}`, `{speed}`, and `{threads}`, and may print plain transcript text or ASRTranscript JSON."
+	}
+	return "Teams media transcription failed: " + err.Error()
 }
 
 func (b *Bridge) startTeamsASRProgressLoop(ctx context.Context, session *Session, turnID string, sourceIndex int, file LocalAttachment) func() {
