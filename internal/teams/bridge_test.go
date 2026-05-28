@@ -10055,6 +10055,64 @@ func TestBridgeSessionRetryFailedTurnFetchesOriginalMessage(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionRetryASRFailureInterruptsRetryBeforeCodex(t *testing.T) {
+	original := bridgePollMessage("original-1", "2026-04-30T01:00:00Z", "retry prompt")
+	original.Body.Content = `<p>retry prompt</p><audio src="https://graph.microsoft.com/v1.0/chats/chat-1/messages/original-1/hostedContents/audio-1/$value"></audio>`
+	graph, sent := newBridgeRetryHostedMediaGraph(t, original)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asrTranscriber = &fakeASRTranscriber{err: errors.New("asr boom")}
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	inbound, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: "original-1",
+		Text:           "retry prompt",
+		Status:         teamstore.InboundStatusPersisted,
+	})
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if _, err := store.MarkTurnFailed(context.Background(), turn.ID, "network"); err != nil {
+		t.Fatalf("MarkTurnFailed error: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("retry-command"), "/retry "+turn.ID); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none after ASR failure", executor.prompts)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %#v, want ASR failure notice only", *sent)
+	}
+	if plain := PlainTextFromTeamsHTML((*sent)[0].Content); !strings.Contains(plain, "Teams media transcription failed") || !strings.Contains(plain, "asr boom") {
+		t.Fatalf("ASR retry failure notice = %q", plain)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var retry teamstore.Turn
+	for _, candidate := range state.Turns {
+		if strings.HasPrefix(candidate.ID, strings.TrimSpace(turn.ID)+":retry:") {
+			retry = candidate
+			break
+		}
+	}
+	if retry.Status != teamstore.TurnStatusInterrupted || !strings.Contains(retry.RecoveryReason, "Teams media transcription failed") {
+		t.Fatalf("retry turn = %#v, want interrupted with ASR failure", retry)
+	}
+}
+
 func TestBridgeSessionRetryUsesPersistedInboundTextWhenTeamsMessageWasAnnotatedAway(t *testing.T) {
 	original := bridgePollMessage("original-1", "2026-04-30T01:00:00Z", "")
 	original.Body.Content = "<p><strong>🧑‍💻 User:</strong></p>"
@@ -23924,6 +23982,61 @@ func newBridgeRetryGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]b
 	t.Cleanup(func() {
 		if !gotOriginal {
 			t.Fatal("retry did not fetch original Teams message")
+		}
+	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     client,
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
+func newBridgeRetryHostedMediaGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	gotOriginal := false
+	gotHostedContent := false
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/original-1":
+			gotOriginal = true
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(original); err != nil {
+				t.Fatalf("encode original message: %v", err)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/original-1/hostedContents/audio-1/$value":
+			gotHostedContent = true
+			w.Header().Set("Content-Type", "audio/mp4")
+			_, _ = w.Write([]byte("audio-bytes"))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		return w.Result(), nil
+	})}
+	t.Cleanup(func() {
+		if !gotOriginal {
+			t.Fatal("retry did not fetch original Teams message")
+		}
+		if !gotHostedContent {
+			t.Fatal("retry did not fetch hosted media")
 		}
 	})
 	return &GraphClient{

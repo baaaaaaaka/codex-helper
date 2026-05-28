@@ -496,12 +496,12 @@ func installTeamsService(ctx context.Context, registryPath *string) (string, err
 	return backend.Install(ctx, spec)
 }
 
-func repairTeamsService(ctx context.Context, registryPath *string, opts teamsServiceRepairOptions) (string, error) {
+func repairTeamsService(ctx context.Context, registryPath *string, opts teamsServiceRepairOptions, buildOptions ...teamsServiceSpecBuildOption) (string, error) {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return "", err
 	}
-	spec, err := buildTeamsServiceSpec(registryPath)
+	spec, err := buildTeamsServiceSpec(registryPath, buildOptions...)
 	if err != nil {
 		return "", err
 	}
@@ -906,6 +906,26 @@ type teamsServiceSpec struct {
 	WindowsWatchdogLauncherPath string
 }
 
+type teamsServiceSpecBuildOptions struct {
+	Environment map[string]string
+}
+
+type teamsServiceSpecBuildOption func(*teamsServiceSpecBuildOptions)
+
+func teamsServiceSpecEnvironmentOverrides(env map[string]string) teamsServiceSpecBuildOption {
+	return func(opts *teamsServiceSpecBuildOptions) {
+		if len(env) == 0 {
+			return
+		}
+		if opts.Environment == nil {
+			opts.Environment = make(map[string]string, len(env))
+		}
+		for key, value := range env {
+			opts.Environment[key] = value
+		}
+	}
+}
+
 type teamsServiceBackend interface {
 	ID() string
 	Name() string
@@ -1059,7 +1079,7 @@ func defaultTeamsServiceAuthPreflight() error {
 	return nil
 }
 
-func ensureTeamsServiceForRun(ctx context.Context, registryPath *string) error {
+func ensureTeamsServiceForRun(ctx context.Context, registryPath *string, buildOptions ...teamsServiceSpecBuildOption) error {
 	if runningInsideTeamsCodexChild() {
 		return nil
 	}
@@ -1089,11 +1109,11 @@ func ensureTeamsServiceForRun(ctx context.Context, registryPath *string) error {
 		}
 	}
 	start := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) == ""
-	_, err = repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: start})
+	_, err = repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: start}, buildOptions...)
 	if err != nil {
 		wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
 		if ok {
-			spec, specErr := buildTeamsServiceSpec(registryPath)
+			spec, specErr := buildTeamsServiceSpec(registryPath, buildOptions...)
 			if specErr != nil {
 				return specErr
 			}
@@ -2517,7 +2537,7 @@ func teamsServiceRunCommandDirect(ctx context.Context, name string, args ...stri
 	return runner.Run(ctx, name, args...)
 }
 
-func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
+func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpecBuildOption) (teamsServiceSpec, error) {
 	exe, err := teamsServiceExecutable()
 	if err != nil {
 		return teamsServiceSpec{}, err
@@ -2552,6 +2572,20 @@ func buildTeamsServiceSpec(registryPath *string) (teamsServiceSpec, error) {
 	env, err := teamsServiceEnvironmentForWorkingDir(cwd)
 	if err != nil {
 		return teamsServiceSpec{}, err
+	}
+	var opts teamsServiceSpecBuildOptions
+	for _, apply := range buildOptions {
+		if apply != nil {
+			apply(&opts)
+		}
+	}
+	for name, value := range opts.Environment {
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if name == "" || value == "" || !teamsServiceEnvironmentValueAllowed(name, value) {
+			continue
+		}
+		env[name] = value
 	}
 	env[update.EnvInstallDir] = exe
 	return teamsServiceSpec{
@@ -2835,6 +2869,8 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HELPER_TEAMS_MACHINE_LABEL",
 		"CODEX_HELPER_TEAMS_MACHINE_KIND",
 		"CODEX_HELPER_TEAMS_MACHINE_PRIORITY",
+		envTeamsASRCommand,
+		envTeamsASRArgsJSON,
 		"CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS",
 		"CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES",
 		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",

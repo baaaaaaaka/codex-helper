@@ -2780,7 +2780,7 @@ func outboxDeliveryProtected(msg OutboxMessage) bool {
 func outboxDeliveryTransient(msg OutboxMessage) bool {
 	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
 	switch kind {
-	case "canceled", "interrupted", "queued-status":
+	case "asr-progress", "canceled", "interrupted", "queued-status":
 		return true
 	}
 	return strings.HasPrefix(kind, "codex-status-") ||

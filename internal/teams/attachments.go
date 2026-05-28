@@ -132,6 +132,63 @@ func (b *Bridge) downloadHostedContentAttachments(ctx context.Context, session *
 	return files, cleanup, "", nil
 }
 
+func attachmentPreflightMessage(msg ChatMessage) string {
+	if message := hostedContentAttachmentPreflightMessage(msg); message != "" {
+		return message
+	}
+	if message := referenceFileAttachmentPreflightMessage(msg); message != "" {
+		return message
+	}
+	if message := messageReferenceAttachmentPreflightMessage(msg); message != "" {
+		return message
+	}
+	return ""
+}
+
+func hostedContentAttachmentPreflightMessage(msg ChatMessage) string {
+	_, truncated := hostedContentIDsFromHTML(msg.Body.Content, maxHostedContentPerMessage)
+	if truncated {
+		return fmt.Sprintf("Teams message has more than %d inline images. Please send fewer images in one message.", maxHostedContentPerMessage)
+	}
+	return ""
+}
+
+func referenceFileAttachmentPreflightMessage(msg ChatMessage) string {
+	if len(msg.Attachments) == 0 {
+		return ""
+	}
+	supportedCount := 0
+	for _, attachment := range msg.Attachments {
+		if isMessageReferenceAttachment(attachment) {
+			continue
+		}
+		if !isSupportedReferenceAttachment(attachment) {
+			return UnsupportedAttachmentMessage(msg.Attachments)
+		}
+		supportedCount++
+	}
+	if supportedCount > maxReferenceAttachmentsPerMessage {
+		return fmt.Sprintf("Teams message has more than %d file attachments. Please send fewer files in one message.", maxReferenceAttachmentsPerMessage)
+	}
+	if supportedCount > 0 && !fileAttachmentScopesEnabled() {
+		return "Teams file attachment download requires `Files.Read` or `Files.ReadWrite` in CODEX_HELPER_TEAMS_READ_SCOPES. Re-authenticate with `codex-proxy teams auth read` after adding that scope."
+	}
+	return ""
+}
+
+func messageReferenceAttachmentPreflightMessage(msg ChatMessage) string {
+	totalRefs := 0
+	for _, attachment := range msg.Attachments {
+		if isMessageReferenceAttachment(attachment) {
+			totalRefs++
+		}
+	}
+	if totalRefs > maxMessageReferencesPerMessage {
+		return fmt.Sprintf("Teams message has more than %d quoted/referenced messages. Please send fewer references in one message.", maxMessageReferencesPerMessage)
+	}
+	return ""
+}
+
 func (b *Bridge) downloadReferenceFileAttachments(ctx context.Context, session *Session, msg ChatMessage) ([]LocalAttachment, func(), string, error) {
 	if len(msg.Attachments) == 0 {
 		return nil, func() {}, "", nil

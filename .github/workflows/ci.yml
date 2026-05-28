@@ -112,6 +112,14 @@ jobs:
           go test ./internal/teams -count=1 -run 'Test(ParseCodexTokenStats(PrefersTokenCountAndReportsDiagnostics|MergesRateOnlyTokenCount|AllowsLargeTranscriptLines|FallsBackToUsageFields)|FormatCodexTokenStatsHidesMetadataOnlyRateLimits|RenderCodexTokenStatsHTMLEscapesMetadataAndTableValues|BridgeWorkHelperStatsReadsLinkedTranscript|ParseWorkChatPlainTextIsCodexInput)$' -v
           go test ./internal/codexrunner -count=1 -run 'Test(ParseJSONLExtractsThreadTurnMessageFailureAndCachedTokens|AppServerRunnerStartThreadEncodesThreadStartAndTurnStart)$' -v
 
+      - name: Teams ASR input regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|ASRCommandEnvCapsCPUThreadVariables|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContextCombinesSpeechReferencesAndImages|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachmentsFiltersAndDefaults|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|BridgeSessionRetryASRFailureInterruptsRetryBeforeCodex)$'
+          go test ./internal/teams -count=1 -run "$asr_pattern" -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsASRArgsFromEnvAndServiceOverrides|TeamsServiceInstallPreservesScopedEnvironment)$' -v
+
       - name: Cross-compile check (Linux only)
         if: runner.os == 'Linux'
         shell: bash

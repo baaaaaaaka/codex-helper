@@ -182,6 +182,7 @@ type BridgeOptions struct {
 	ControlFallbackExecutor    Executor
 	ControlFallbackModel       string
 	ControlFallbackHelpContext string
+	ASRTranscriber             ASRTranscriber
 	Runner                     codexrunner.Runner
 	HelperRestarter            HelperRestarter
 	HelperPendingRestarter     HelperPendingRestarter
@@ -297,6 +298,7 @@ type Bridge struct {
 	leaseDuration                     time.Duration
 	out                               io.Writer
 	executor                          Executor
+	asrTranscriber                    ASRTranscriber
 	controlFallbackExecutor           Executor
 	controlFallbackModel              string
 	helperRestarter                   HelperRestarter
@@ -703,6 +705,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	} else {
 		b.executor = opts.Executor
 	}
+	b.asrTranscriber = opts.ASRTranscriber
 	b.controlFallbackExecutor = opts.ControlFallbackExecutor
 	b.controlFallbackModel = strings.TrimSpace(opts.ControlFallbackModel)
 	b.controlFallbackHelpContext = strings.TrimSpace(opts.ControlFallbackHelpContext)
@@ -5631,6 +5634,9 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 	} else if duplicate {
 		return nil
 	}
+	if message := attachmentPreflightMessage(msg); message != "" {
+		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, message)
+	}
 	if b.asyncTurns {
 		var turns sessionTurnQueueState
 		if knownTurns != nil {
@@ -5696,44 +5702,6 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 		}
 	}
 
-	localFiles, cleanupFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, chatID, msg)
-	if err != nil {
-		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return b.rejectSessionAttachmentWithMessage(ctx, session, msg, message)
-		}
-		return err
-	}
-	if hostedAttachmentMessage != "" {
-		cleanupFiles()
-		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, hostedAttachmentMessage)
-	}
-	referenceFiles, cleanupReferenceFiles, unsupportedAttachmentMessage, err := b.downloadReferenceFileAttachments(ctx, session, msg)
-	if err != nil {
-		cleanupFiles()
-		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return b.rejectSessionAttachmentWithMessage(ctx, session, msg, message)
-		}
-		return err
-	}
-	cleanupLocalFiles := func() {
-		cleanupFiles()
-		cleanupReferenceFiles()
-	}
-	if unsupportedAttachmentMessage != "" {
-		cleanupLocalFiles()
-		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, unsupportedAttachmentMessage)
-	}
-	localFiles = append(localFiles, referenceFiles...)
-	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, chatID, msg)
-	if err != nil {
-		cleanupLocalFiles()
-		return err
-	}
-	if referencedMessageWarning != "" {
-		cleanupLocalFiles()
-		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, referencedMessageWarning)
-	}
-
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
@@ -5750,32 +5718,22 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 	}
 	session.UpdatedAt = time.Now()
 	if err := b.queueTeamsPromptAckForMessage(ctx, session, turn, msg, false); err != nil {
-		cleanupLocalFiles()
 		return err
 	}
-	promptText := PromptWithReferencedMessages(text, referencedMessages)
 	if b.asyncTurns {
-		input := ExecutionInputWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles)
 		started, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
-			defer cleanupLocalFiles()
-			return b.runQueuedTurnInput(runCtx, runSession, claimed, runSession.ChatID, input)
+			return b.runPreparedQueuedTurnFromMessage(runCtx, runSession, claimed, runSession.ChatID, msg, text, b.executor)
 		})
 		if err != nil {
-			cleanupLocalFiles()
 			return err
 		}
 		if started && knownTurns != nil {
 			knownTurns.Running = true
 		}
-		if !started {
-			cleanupLocalFiles()
-		}
 		b.boostPolling(time.Now())
 		return nil
 	}
-	defer cleanupLocalFiles()
-
-	return b.runQueuedTurnInput(ctx, session, turn, chatID, ExecutionInputWithLocalAttachments(TeamsCodexPrompt(promptText), localFiles))
+	return b.runPreparedQueuedTurnFromMessage(ctx, session, turn, chatID, msg, text, b.executor)
 }
 
 func (b *Bridge) rejectExternalWorkCommand(ctx context.Context, session *Session, msg ChatMessage) error {
@@ -5831,44 +5789,6 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 	if err != nil {
 		return b.sendToChat(ctx, session.ChatID, "retry failed while reading the original Teams message: "+err.Error())
 	}
-	var localFiles []LocalAttachment
-	if len(msg.Attachments) > 0 {
-		referenceFiles, cleanupReferenceFiles, unsupportedAttachmentMessage, err := b.downloadReferenceFileAttachments(ctx, session, msg)
-		if err != nil {
-			if message, ok := attachmentDownloadUserMessage(err); ok {
-				return b.sendToChat(ctx, session.ChatID, message)
-			}
-			return b.sendToChat(ctx, session.ChatID, "retry failed while downloading Teams file attachment: "+err.Error())
-		}
-		defer cleanupReferenceFiles()
-		if unsupportedAttachmentMessage != "" {
-			return b.sendToChat(ctx, session.ChatID, unsupportedAttachmentMessage)
-		}
-		localFiles = append(localFiles, referenceFiles...)
-	}
-	hostedFiles, cleanupFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, inbound.TeamsChatID, msg)
-	if err != nil {
-		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return b.sendToChat(ctx, session.ChatID, message)
-		}
-		return b.sendToChat(ctx, session.ChatID, "retry failed while downloading Teams hosted content: "+err.Error())
-	}
-	defer cleanupFiles()
-	if hostedAttachmentMessage != "" {
-		return b.sendToChat(ctx, session.ChatID, hostedAttachmentMessage)
-	}
-	localFiles = append(localFiles, hostedFiles...)
-	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, session.ChatID, msg)
-	if err != nil {
-		return err
-	}
-	if referencedMessageWarning != "" {
-		return b.sendToChat(ctx, session.ChatID, referencedMessageWarning)
-	}
-	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, inbound.Text)
-	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
-		return b.sendToChat(ctx, session.ChatID, "retry cannot use an empty or helper-generated original message.")
-	}
 	retryTurn, _, err := b.store.QueueTurn(ctx, teamstore.Turn{
 		ID:             retryTurnID(turn.ID),
 		SessionID:      session.ID,
@@ -5878,7 +5798,7 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 	if err != nil {
 		return err
 	}
-	return b.runQueuedTurnInput(ctx, session, retryTurn, session.ChatID, ExecutionInputWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles))
+	return b.runPreparedQueuedTurnFromMessage(ctx, session, retryTurn, session.ChatID, msg, inbound.Text, b.executor)
 }
 
 func latestRetryableTurnID(state teamstore.State, sessionID string) (string, bool) {
@@ -6338,7 +6258,7 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 		cleanupPrompt := func() {}
 		if inbound.Source == "teams_session_import_deferred_attachment" && strings.TrimSpace(inbound.TeamsChatID) != "" && strings.TrimSpace(inbound.TeamsMessageID) != "" {
 			if msg, err := b.readClient().GetMessageWithoutRateLimitRetry(ctx, inbound.TeamsChatID, inbound.TeamsMessageID); err == nil {
-				prepared, cleanup, warning, err := b.prepareSessionPromptFromTeamsMessage(ctx, session, inbound.TeamsChatID, msg, text)
+				prepared, cleanup, warning, err := b.prepareSessionPromptFromTeamsMessage(ctx, session, "", inbound.TeamsChatID, msg, text)
 				if err != nil {
 					cleanup()
 					return err
@@ -6836,91 +6756,65 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 			return err
 		}
 	}
-	localFiles, cleanup, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, inbound.TeamsChatID, msg)
-	if err != nil {
-		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return b.interruptTurnForAttachmentMessage(ctx, session, turn, message)
-		}
-		return err
-	}
-	defer cleanup()
-	if hostedAttachmentMessage != "" {
-		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn has too many hosted attachments"); err != nil {
-			return err
-		}
-		return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-			ID:          "outbox:" + turn.ID + ":hosted-attachment-limit",
-			SessionID:   session.ID,
-			TurnID:      turn.ID,
-			TeamsChatID: session.ChatID,
-			Kind:        "interrupted",
-			Body:        hostedAttachmentMessage,
-		})
-	}
-	referenceFiles, cleanupReferenceFiles, unsupportedAttachmentMessage, err := b.downloadReferenceFileAttachments(ctx, session, msg)
-	if err != nil {
-		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return b.interruptTurnForAttachmentMessage(ctx, session, turn, message)
-		}
-		return err
-	}
-	defer cleanupReferenceFiles()
-	if unsupportedAttachmentMessage != "" {
-		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn has unsupported attachment"); err != nil {
-			return err
-		}
-		return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-			ID:          "outbox:" + turn.ID + ":recovery-unsupported-attachment",
-			SessionID:   session.ID,
-			TurnID:      turn.ID,
-			TeamsChatID: session.ChatID,
-			Kind:        "recovery-unsupported-attachment",
-			Body:        unsupportedAttachmentMessage,
-		})
-	}
-	localFiles = append(localFiles, referenceFiles...)
-	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, session.ChatID, msg)
-	if err != nil {
-		return err
-	}
-	if referencedMessageWarning != "" {
-		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn has too many message references"); err != nil {
-			return err
-		}
-		return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-			ID:          "outbox:" + turn.ID + ":recovery-message-reference-limit",
-			SessionID:   session.ID,
-			TurnID:      turn.ID,
-			TeamsChatID: session.ChatID,
-			Kind:        "interrupted",
-			Body:        referencedMessageWarning,
-		})
-	}
-	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, inbound.Text)
-	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
-		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn original prompt is empty or helper-generated"); err != nil {
-			return err
-		}
-		return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-			ID:          "outbox:" + turn.ID + ":recovery-empty",
-			SessionID:   session.ID,
-			TurnID:      turn.ID,
-			TeamsChatID: session.ChatID,
-			Kind:        "recovery-empty",
-			Body:        "queued turn could not be recovered because the original prompt is empty: " + turn.ID,
-		})
-	}
-	prompt = PromptWithReferencedMessages(prompt, referencedMessages)
-	basePrompt := TeamsCodexPrompt(prompt)
-	executor := b.executor
 	if session.ID == controlFallbackSessionID {
-		basePrompt = b.controlFallbackCodexPrompt(ctx, prompt)
-		executor = b.effectiveControlFallbackExecutor()
+		return b.runRecoveredControlFallbackQueuedTurn(ctx, session, turn, msg, inbound.Text)
 	}
-	return b.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, session.ChatID, ExecutionInputWithLocalAttachments(basePrompt, localFiles))
+	return b.runPreparedQueuedTurnFromMessage(ctx, session, turn, inbound.TeamsChatID, msg, inbound.Text, b.executor)
 }
 
-func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, session *Session, chatID string, msg ChatMessage, fallbackText string) (ExecutionInput, func(), string, error) {
+func (b *Bridge) runRecoveredControlFallbackQueuedTurn(ctx context.Context, session *Session, turn teamstore.Turn, msg ChatMessage, fallbackText string) error {
+	prompt, warning, err := b.controlFallbackPromptWithMessageReferences(ctx, msg, fallbackText)
+	if err != nil {
+		return err
+	}
+	if warning != "" {
+		return b.interruptTurnForAttachmentMessage(ctx, session, turn, warning)
+	}
+	if strings.TrimSpace(prompt) == "" {
+		return b.interruptTurnForAttachmentMessage(ctx, session, turn, "queued turn could not be recovered because the original prompt is empty: "+turn.ID)
+	}
+	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, b.controlFallbackCodexPrompt(ctx, prompt))
+}
+
+func (b *Bridge) runPreparedQueuedTurnFromMessage(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, msg ChatMessage, fallbackText string, executor Executor) error {
+	sessionID := ""
+	if session != nil {
+		sessionID = session.ID
+	}
+	prepCtx, cancelPrep := context.WithCancel(ctx)
+	unregisterPrepCancel := b.registerRunningTurnCancel(sessionID, turn.ID, cancelPrep)
+	input, cleanupPrompt, preparationMessage, err := b.prepareSessionPromptFromTeamsMessage(prepCtx, session, turn.ID, chatID, msg, fallbackText)
+	cancelRequested, cancelReason, cancelSilent := b.runningTurnCancelState(turn.ID)
+	unregisterPrepCancel()
+	cancelPrep()
+	if cleanupPrompt == nil {
+		cleanupPrompt = func() {}
+	}
+	defer cleanupPrompt()
+	if cancelRequested {
+		if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, firstNonEmptyString(cancelReason, "canceled by user")); markErr != nil {
+			return markErr
+		}
+		if cancelSilent {
+			return nil
+		}
+		return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "canceled", "Codex request canceled.")
+	}
+	if err != nil {
+		return err
+	}
+	if preparationMessage != "" {
+		return b.interruptTurnForAttachmentMessage(ctx, session, turn, preparationMessage)
+	}
+	if interrupted, err := b.turnInterrupted(ctx, turn.ID); err != nil {
+		return err
+	} else if interrupted {
+		return nil
+	}
+	return b.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, chatID, input)
+}
+
+func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, session *Session, turnID string, chatID string, msg ChatMessage, fallbackText string) (ExecutionInput, func(), string, error) {
 	cleanupHosted := func() {}
 	cleanupReference := func() {}
 	cleanupAll := func() {
@@ -6961,7 +6855,13 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
 		return ExecutionInput{}, cleanupAll, "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it.", nil
 	}
-	return ExecutionInputWithLocalAttachments(TeamsCodexPrompt(PromptWithReferencedMessages(prompt, referencedMessages)), localFiles), cleanupAll, "", nil
+	// ASR is helper-local preprocessing. It intentionally runs before beacon
+	// execution planning so Teams media credentials and temp files stay local.
+	transcripts, err := b.transcribeTeamsMediaAttachments(ctx, session, turnID, localFiles)
+	if err != nil {
+		return ExecutionInput{}, cleanupAll, "Teams media transcription failed: " + err.Error(), nil
+	}
+	return executionInputWithPreparedTeamsContext(prompt, referencedMessages, localFiles, transcripts), cleanupAll, "", nil
 }
 
 func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID string) error {

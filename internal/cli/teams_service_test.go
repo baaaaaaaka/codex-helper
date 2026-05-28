@@ -2968,6 +2968,8 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "work-profile")
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "1")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", filepath.Join(tmp, "read-token.json"))
+	t.Setenv(envTeamsASRCommand, filepath.Join(tmp, "bin", "teams-asr"))
+	t.Setenv(envTeamsASRArgsJSON, `["--input={input}","--threads={threads}"]`)
 	t.Setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	exePath := filepath.Join(tmp, "bin", "codex-proxy")
@@ -2995,12 +2997,48 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=work-profile"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE="+filepath.Join(tmp, "read-token.json")),
+		"Environment=" + systemdQuoteArg(envTeamsASRCommand+"="+filepath.Join(tmp, "bin", "teams-asr")),
+		"Environment=" + systemdQuoteArg(envTeamsASRArgsJSON+`=["--input={input}","--threads={threads}"]`),
 		"Environment=" + systemdQuoteArg("HTTPS_PROXY=http://proxy.example.test:8080"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_SERVICE_MODE=background"),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing preserved env %q:\n%s", want, unit)
 		}
+	}
+}
+
+func TestTeamsASRArgsFromEnvAndServiceOverrides(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	t.Setenv(envTeamsASRArgsJSON, `["--input={input}","--prefix=  keep spaces  ","--threads={threads}"]`)
+	args, err := teamsASRArgsFromFlagsOrEnv(nil, true)
+	if err != nil {
+		t.Fatalf("teamsASRArgsFromFlagsOrEnv: %v", err)
+	}
+	if strings.Join(args, "\n") != "--input={input}\n--prefix=  keep spaces  \n--threads={threads}" {
+		t.Fatalf("ASR args = %#v", args)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
+	spec, err := buildTeamsServiceSpec(
+		stringPtr("registry.json"),
+		teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(filepath.Join(tmp, "asr"), []string{"--input={input}", "--threads={threads}"})),
+	)
+	if err != nil {
+		t.Fatalf("buildTeamsServiceSpec: %v", err)
+	}
+	if spec.Environment[envTeamsASRCommand] != filepath.Join(tmp, "asr") {
+		t.Fatalf("ASR command env = %q", spec.Environment[envTeamsASRCommand])
+	}
+	if spec.Environment[envTeamsASRArgsJSON] != `["--input={input}","--threads={threads}"]` {
+		t.Fatalf("ASR args env = %q", spec.Environment[envTeamsASRArgsJSON])
 	}
 }
 

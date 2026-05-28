@@ -27,6 +27,8 @@ import (
 const (
 	defaultTeamsOwnerStaleAfter       = 5 * time.Minute
 	defaultTeamsChatRecreateDrainTime = 2 * time.Minute
+	envTeamsASRCommand                = "CODEX_HELPER_TEAMS_ASR_COMMAND"
+	envTeamsASRArgsJSON               = "CODEX_HELPER_TEAMS_ASR_ARGS_JSON"
 )
 
 var (
@@ -637,6 +639,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var codexPath string
 	var workDir string
 	var codexArgs []string
+	var asrCommand string
+	var asrArgs []string
 	var controlFallbackModel string
 	var timeout time.Duration
 	var ownerStaleAfter time.Duration
@@ -657,9 +661,14 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					return err
 				}
 			}
+			effectiveASRCommand := firstNonEmptyString(asrCommand, os.Getenv(envTeamsASRCommand))
+			effectiveASRArgs, err := teamsASRArgsFromFlagsOrEnv(asrArgs, effectiveASRCommand != "")
+			if err != nil {
+				return err
+			}
 			runOnce := func() error {
 				if autoService && !once {
-					if err := ensureTeamsServiceForRun(cmd.Context(), registryPath); err != nil {
+					if err := ensureTeamsServiceForRun(cmd.Context(), registryPath, teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(asrCommand, asrArgs))); err != nil {
 						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
 					}
 				}
@@ -701,6 +710,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				asrTranscriber := teams.NewCommandASRTranscriber(effectiveASRCommand, effectiveASRArgs)
 				var helperAutoUpdater teams.HelperAutoUpdater
 				if autoUpdate {
 					helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo, autoUpdatePrerelease)
@@ -717,6 +727,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					ControlFallbackExecutor:    controlFallbackExecutor,
 					ControlFallbackModel:       controlFallbackModel,
 					ControlFallbackHelpContext: teamsControlFallbackHelpContext(),
+					ASRTranscriber:             asrTranscriber,
 					HelperRestarter:            restartTeamsHelperFromTeams,
 					HelperPendingRestarter:     restartTeamsHelperFromTeamsAfterPendingReplacement,
 					HelperReloader:             reloadTeamsHelperFromTeams,
@@ -741,6 +752,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Override Codex CLI path")
 	cmd.Flags().StringVar(&workDir, "workdir", "", "Working directory for Codex sessions")
 	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra argument to pass to codex exec (repeatable)")
+	cmd.Flags().StringVar(&asrCommand, "asr-command", "", "Optional local Teams audio/video transcription command; stdout may be plain text or ASRTranscript JSON")
+	cmd.Flags().StringArrayVar(&asrArgs, "asr-arg", nil, "Argument for --asr-command (repeatable); placeholders: {input}, {language}, {speed}, {threads}, {source_index}, {prompt_path}, {content_type}")
 	cmd.Flags().StringVar(&controlFallbackModel, "control-fallback-model", teams.DefaultControlFallbackModel, "Optional Codex model override for unrecognized control-chat requests; empty uses Codex default")
 	cmd.Flags().DurationVar(&timeout, "codex-timeout", 0, "Timeout for each Codex turn; 0 disables the helper-enforced turn timeout")
 	cmd.Flags().DurationVar(&ownerStaleAfter, "owner-stale-after", defaultTeamsOwnerStaleAfter, "How long a Teams helper owner can miss heartbeats before recovery or another helper may take over")
@@ -751,6 +764,41 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&autoUpdatePrerelease, "auto-update-prerelease", false, "Allow Teams helper auto-update checks to select eligible GitHub prereleases")
 	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
 	return cmd
+}
+
+func teamsASRArgsFromFlagsOrEnv(flagArgs []string, enabled bool) ([]string, error) {
+	if len(flagArgs) > 0 {
+		return append([]string(nil), flagArgs...), nil
+	}
+	if !enabled {
+		return nil, nil
+	}
+	raw := strings.TrimSpace(os.Getenv(envTeamsASRArgsJSON))
+	if raw == "" {
+		return nil, nil
+	}
+	var args []string
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		return nil, fmt.Errorf("invalid %s JSON array: %w", envTeamsASRArgsJSON, err)
+	}
+	return args, nil
+}
+
+func teamsASRServiceEnvironmentOverrides(command string, args []string) map[string]string {
+	env := make(map[string]string)
+	if command = strings.TrimSpace(command); command != "" {
+		env[envTeamsASRCommand] = command
+	}
+	if len(args) > 0 {
+		data, err := json.Marshal(args)
+		if err == nil {
+			env[envTeamsASRArgsJSON] = string(data)
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
 }
 
 var (
