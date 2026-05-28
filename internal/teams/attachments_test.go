@@ -24,6 +24,53 @@ func TestHostedContentIDsFromHTMLDedupesAndBounds(t *testing.T) {
 	}
 }
 
+func TestTeamsMediaCardHostedContentIDs(t *testing.T) {
+	attachment := MessageAttachment{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content: `{
+			"duration": "PT2S",
+			"media": [
+				{"url": "https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/audio-1/$value"},
+				{"url": "https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/audio-1/$value"},
+				{"url": "https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/audio-2/$value"}
+			]
+		}`,
+	}
+	got := hostedContentIDsFromTeamsMediaCardAttachment(attachment)
+	want := []string{"audio-1", "audio-2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("hosted content ids = %#v, want %#v", got, want)
+	}
+}
+
+func TestTeamsMediaCardPreflightDoesNotRequireFilesRead(t *testing.T) {
+	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "openid profile offline_access User.Read Chat.Read")
+	msg := ChatMessage{
+		Attachments: []MessageAttachment{{
+			ID:          "audio-card-1",
+			ContentType: "application/vnd.microsoft.card.audio",
+			Content:     `{"media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/audio-1/$value"}]}`,
+		}},
+	}
+	if got := attachmentPreflightMessage(msg); got != "" {
+		t.Fatalf("audio card preflight message = %q, want empty", got)
+	}
+}
+
+func TestTeamsMediaCardWithoutHostedContentIsRejected(t *testing.T) {
+	msg := ChatMessage{
+		Attachments: []MessageAttachment{{
+			ID:          "audio-card-1",
+			ContentType: "application/vnd.microsoft.card.audio",
+			Content:     `{"duration":"PT2S","media":[{"url":"https://example.com/not-graph.mp4"}]}`,
+		}},
+	}
+	if got := attachmentPreflightMessage(msg); !strings.Contains(got, "application/vnd.microsoft.card.audio") {
+		t.Fatalf("audio card without hosted content preflight = %q, want unsupported message", got)
+	}
+}
+
 func TestPromptWithLocalAttachments(t *testing.T) {
 	prompt := PromptWithLocalAttachments("look", []LocalAttachment{{
 		Path:        "/tmp/image.png",
@@ -246,6 +293,58 @@ func TestDownloadHostedContentUsesWorkspaceRelativePromptAlias(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(session.Cwd, filepath.FromSlash(files[0].PromptPath))); err != nil {
 		t.Fatalf("workspace-relative attachment path is not readable: %v", err)
+	}
+}
+
+func TestDownloadHostedContentFromTeamsAudioCard(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/messages/message-audio/hostedContents/audio-1/$value") {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Content-Type", "audio/mp4")
+		_, _ = w.Write([]byte("audio-bytes"))
+	}))
+	defer server.Close()
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	bridge := &Bridge{graph: graph}
+	msg := ChatMessage{
+		ID: "message-audio",
+		Attachments: []MessageAttachment{{
+			ID:          "audio-card-1",
+			ContentType: "application/vnd.microsoft.card.audio",
+			Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio/hostedContents/audio-1/$value"}]}`,
+		}},
+	}
+	session := &Session{ID: "s001", Cwd: filepath.Join(tmp, "workspace")}
+	if err := os.MkdirAll(session.Cwd, 0o700); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	files, cleanup, warning, err := bridge.downloadHostedContentAttachments(context.Background(), session, "chat-1", msg)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("downloadHostedContentAttachments error: %v", err)
+	}
+	if warning != "" || len(files) != 1 {
+		t.Fatalf("unexpected result files=%#v warning=%q", files, warning)
+	}
+	if files[0].ContentType != "audio/mp4" || !isTeamsMediaAttachment(files[0]) {
+		t.Fatalf("downloaded file = %#v, want ASR media", files[0])
+	}
+	data, err := os.ReadFile(files[0].Path)
+	if err != nil {
+		t.Fatalf("read downloaded audio: %v", err)
+	}
+	if string(data) != "audio-bytes" {
+		t.Fatalf("downloaded audio bytes = %q", string(data))
 	}
 }
 

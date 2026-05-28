@@ -3001,6 +3001,9 @@ func unsupportedControlAttachments(msg ChatMessage, allowMessageReferences bool)
 		if allowMessageReferences && isMessageReferenceAttachment(attachment) {
 			continue
 		}
+		if allowMessageReferences && isSupportedTeamsMediaCardAttachment(attachment) {
+			continue
+		}
 		unsupported = append(unsupported, attachment)
 	}
 	for _, id := range HostedContentIDsFromHTML(msg.Body.Content) {
@@ -3052,7 +3055,8 @@ func controlCommandConsumesDashboardView(parsed ParsedDashboardCommand) bool {
 }
 
 func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text string) error {
-	if strings.TrimSpace(text) == "" {
+	hasMedia := hasSupportedTeamsMediaCardAttachment(msg.Attachments)
+	if strings.TrimSpace(text) == "" && !hasMedia {
 		return b.sendControl(ctx, controlHelpText())
 	}
 	if control, blocked, err := b.serviceControlBlocksNewWork(ctx); err != nil {
@@ -3095,20 +3099,59 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 		return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 	}
 	session.UpdatedAt = time.Now()
-	prompt := b.controlFallbackCodexPromptForMessage(ctx, promptText, msg.ID)
 	if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 		return err
 	}
 	if b.asyncTurns {
 		if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
-			return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), runSession, claimed, runSession.ChatID, prompt)
+			return b.runControlFallbackQueuedTurnFromMessage(runCtx, runSession, claimed, msg, promptText)
 		}); err != nil {
 			return err
 		}
 		b.boostPolling(time.Now())
 		return nil
 	}
-	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, prompt)
+	return b.runControlFallbackQueuedTurnFromMessage(ctx, session, turn, msg, promptText)
+}
+
+func (b *Bridge) runControlFallbackQueuedTurnFromMessage(ctx context.Context, session *Session, turn teamstore.Turn, msg ChatMessage, promptText string) error {
+	input, cleanupPrompt, preparationMessage, err := b.prepareControlFallbackInputFromTeamsMessage(ctx, session, turn.ID, msg, promptText)
+	if cleanupPrompt == nil {
+		cleanupPrompt = func() {}
+	}
+	defer cleanupPrompt()
+	if err != nil {
+		return err
+	}
+	if preparationMessage != "" {
+		return b.interruptTurnForAttachmentMessage(ctx, session, turn, preparationMessage)
+	}
+	return b.runQueuedTurnInputWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, input)
+}
+
+func (b *Bridge) prepareControlFallbackInputFromTeamsMessage(ctx context.Context, session *Session, turnID string, msg ChatMessage, promptText string) (ExecutionInput, func(), string, error) {
+	cleanupHosted := func() {}
+	localFiles, cleanupHostedFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, session.ChatID, msg)
+	cleanupHosted = cleanupHostedFiles
+	if err != nil {
+		if message, ok := attachmentDownloadUserMessage(err); ok {
+			return ExecutionInput{}, cleanupHosted, message, nil
+		}
+		return ExecutionInput{}, cleanupHosted, "", err
+	}
+	if hostedAttachmentMessage != "" {
+		return ExecutionInput{}, cleanupHosted, hostedAttachmentMessage, nil
+	}
+	transcripts, err := b.transcribeTeamsMediaAttachments(ctx, session, turnID, localFiles)
+	if err != nil {
+		return ExecutionInput{}, cleanupHosted, "Teams media transcription failed: " + err.Error(), nil
+	}
+	preparedPrompt := promptWithASRTranscripts(promptText, transcripts)
+	if strings.TrimSpace(preparedPrompt) == "" && len(localFiles) > 0 {
+		preparedPrompt = defaultLocalAttachmentPrompt
+	}
+	preparedPrompt = b.controlFallbackCodexPromptForMessage(ctx, preparedPrompt, msg.ID)
+	return ExecutionInputWithLocalAttachments(preparedPrompt, localFiles), cleanupHosted, "", nil
 }
 
 func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, error) {
@@ -6580,12 +6623,15 @@ func (b *Bridge) rejectDeferredSessionInboundAfterUpgrade(ctx context.Context, i
 
 func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound teamstore.InboundEvent) error {
 	text := strings.TrimSpace(inbound.Text)
-	if text == "" {
+	msg, hasContext := chatMessageFromInboundContext(inbound)
+	if !hasContext {
+		msg = ChatMessage{ID: inbound.TeamsMessageID}
+		msg.Body.ContentType = "html"
+		msg.Body.Content = html.EscapeString(text)
+	}
+	if text == "" && !(inbound.Source == "teams_control_fallback" && hasSupportedTeamsMediaCardAttachment(msg.Attachments)) {
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred control input text is unavailable")
 	}
-	msg := ChatMessage{ID: inbound.TeamsMessageID}
-	msg.Body.ContentType = "html"
-	msg.Body.Content = html.EscapeString(text)
 	switch inbound.Source {
 	case "teams_control_new":
 		arg, err := controlNewSessionArgument(text)
@@ -6637,20 +6683,19 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 		if !turnCreated {
 			return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 		}
-		prompt := b.controlFallbackCodexPromptForMessage(ctx, promptText, inbound.TeamsMessageID)
 		if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 			return err
 		}
 		if b.asyncTurns {
 			if _, err := b.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
-				return b.runQueuedTurnWithExecutor(runCtx, b.effectiveControlFallbackExecutor(), runSession, claimed, runSession.ChatID, prompt)
+				return b.runControlFallbackQueuedTurnFromMessage(runCtx, runSession, claimed, msg, promptText)
 			}); err != nil {
 				return err
 			}
 			b.boostPolling(time.Now())
 			return nil
 		}
-		return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, prompt)
+		return b.runControlFallbackQueuedTurnFromMessage(ctx, session, turn, msg, promptText)
 	default:
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "unsupported deferred control input")
 	}
@@ -6770,10 +6815,10 @@ func (b *Bridge) runRecoveredControlFallbackQueuedTurn(ctx context.Context, sess
 	if warning != "" {
 		return b.interruptTurnForAttachmentMessage(ctx, session, turn, warning)
 	}
-	if strings.TrimSpace(prompt) == "" {
+	if strings.TrimSpace(prompt) == "" && !hasSupportedTeamsMediaCardAttachment(msg.Attachments) {
 		return b.interruptTurnForAttachmentMessage(ctx, session, turn, "queued turn could not be recovered because the original prompt is empty: "+turn.ID)
 	}
-	return b.runQueuedTurnWithExecutor(ctx, b.effectiveControlFallbackExecutor(), session, turn, session.ChatID, b.controlFallbackCodexPrompt(ctx, prompt))
+	return b.runControlFallbackQueuedTurnFromMessage(ctx, session, turn, msg, prompt)
 }
 
 func (b *Bridge) runPreparedQueuedTurnFromMessage(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, msg ChatMessage, fallbackText string, executor Executor) error {
@@ -9946,25 +9991,25 @@ func (b *Bridge) persistInboundWithStatusAndSource(ctx context.Context, session 
 		Source:          source,
 		Status:          status,
 	}
-	if shouldPersistInboundMessageReferenceContext(session, msg) {
+	if shouldPersistInboundAttachmentContext(session, msg) {
 		event.TeamsBodyType = strings.TrimSpace(msg.Body.ContentType)
 		event.TeamsBodyHTML = msg.Body.Content
-		event.TeamsAttachments = inboundMessageReferenceContextsFromMessage(msg)
+		event.TeamsAttachments = inboundAttachmentContextsFromMessage(msg)
 	}
 	return b.store.PersistInbound(ctx, event)
 }
 
-func shouldPersistInboundMessageReferenceContext(session *Session, msg ChatMessage) bool {
-	return session != nil && session.ID == controlFallbackSessionID && hasMessageReferenceAttachment(msg.Attachments)
+func shouldPersistInboundAttachmentContext(session *Session, msg ChatMessage) bool {
+	return session != nil && session.ID == controlFallbackSessionID && (hasMessageReferenceAttachment(msg.Attachments) || hasSupportedTeamsMediaCardAttachment(msg.Attachments))
 }
 
-func inboundMessageReferenceContextsFromMessage(msg ChatMessage) []teamstore.InboundAttachmentContext {
+func inboundAttachmentContextsFromMessage(msg ChatMessage) []teamstore.InboundAttachmentContext {
 	if len(msg.Attachments) == 0 {
 		return nil
 	}
 	out := make([]teamstore.InboundAttachmentContext, 0, len(msg.Attachments))
 	for _, attachment := range msg.Attachments {
-		if !isMessageReferenceAttachment(attachment) {
+		if !isMessageReferenceAttachment(attachment) && !isSupportedTeamsMediaCardAttachment(attachment) {
 			continue
 		}
 		out = append(out, teamstore.InboundAttachmentContext{

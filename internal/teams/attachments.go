@@ -21,6 +21,11 @@ const defaultLocalAttachmentPrompt = "Please inspect the attached file(s)."
 
 var hostedContentRefPattern = regexp.MustCompile(`(?i)/hostedContents/([^/"'<>\s]+)/\$value`)
 
+type hostedContentAttachmentRef struct {
+	ID       string
+	SourceID string
+}
+
 type LocalAttachment struct {
 	Path        string
 	PromptPath  string
@@ -60,6 +65,14 @@ type messageReferenceWho struct {
 	} `json:"application"`
 }
 
+type teamsMediaCardContent struct {
+	Media []teamsMediaCardMedia `json:"media"`
+}
+
+type teamsMediaCardMedia struct {
+	URL string `json:"url"`
+}
+
 func HostedContentIDsFromHTML(content string) []string {
 	ids, _ := hostedContentIDsFromHTML(content, maxHostedContentPerMessage)
 	return ids
@@ -91,16 +104,104 @@ func hostedContentIDsFromHTML(content string, limit int) ([]string, bool) {
 	return ids, truncated
 }
 
+func hostedContentRefsFromMessage(msg ChatMessage, limit int) ([]hostedContentAttachmentRef, bool) {
+	if limit <= 0 {
+		limit = maxHostedContentPerMessage
+	}
+	seen := make(map[string]bool)
+	var refs []hostedContentAttachmentRef
+	truncated := false
+	add := func(id string, sourceID string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		if len(refs) >= limit {
+			truncated = true
+			return
+		}
+		refs = append(refs, hostedContentAttachmentRef{
+			ID:       id,
+			SourceID: firstNonEmptyString(sourceID, id),
+		})
+	}
+	bodyIDs, bodyTruncated := hostedContentIDsFromHTML(msg.Body.Content, limit)
+	truncated = bodyTruncated
+	for _, id := range bodyIDs {
+		add(id, id)
+	}
+	for _, attachment := range msg.Attachments {
+		for _, id := range hostedContentIDsFromTeamsMediaCardAttachment(attachment) {
+			add(id, firstNonEmptyString(attachment.ID, id))
+		}
+	}
+	return refs, truncated
+}
+
+func isTeamsMediaCardAttachment(attachment MessageAttachment) bool {
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(attachment.ContentType, ";")[0]))
+	switch contentType {
+	case "application/vnd.microsoft.card.audio", "application/vnd.microsoft.card.video":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSupportedTeamsMediaCardAttachment(attachment MessageAttachment) bool {
+	return len(hostedContentIDsFromTeamsMediaCardAttachment(attachment)) > 0
+}
+
+func hasSupportedTeamsMediaCardAttachment(attachments []MessageAttachment) bool {
+	for _, attachment := range attachments {
+		if isSupportedTeamsMediaCardAttachment(attachment) {
+			return true
+		}
+	}
+	return false
+}
+
+func hostedContentIDsFromTeamsMediaCardAttachment(attachment MessageAttachment) []string {
+	if !isTeamsMediaCardAttachment(attachment) {
+		return nil
+	}
+	content := strings.TrimSpace(attachment.Content)
+	if content == "" {
+		return nil
+	}
+	var card teamsMediaCardContent
+	if err := json.Unmarshal([]byte(content), &card); err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	for _, media := range card.Media {
+		for _, id := range HostedContentIDsFromHTML(media.URL) {
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func hostedContentLimitMessage() string {
+	return fmt.Sprintf("Teams message has more than %d inline Teams media attachments. Please send fewer media items in one message.", maxHostedContentPerMessage)
+}
+
 func (b *Bridge) downloadHostedContentAttachments(ctx context.Context, session *Session, chatID string, msg ChatMessage) ([]LocalAttachment, func(), string, error) {
-	ids, truncated := hostedContentIDsFromHTML(msg.Body.Content, maxHostedContentPerMessage)
-	if len(ids) == 0 {
+	refs, truncated := hostedContentRefsFromMessage(msg, maxHostedContentPerMessage)
+	if len(refs) == 0 {
 		if truncated {
-			return nil, func() {}, fmt.Sprintf("Teams message has more than %d inline images. Please send fewer images in one message.", maxHostedContentPerMessage), nil
+			return nil, func() {}, hostedContentLimitMessage(), nil
 		}
 		return nil, func() {}, "", nil
 	}
 	if truncated {
-		return nil, func() {}, fmt.Sprintf("Teams message has more than %d inline images. Please send fewer images in one message.", maxHostedContentPerMessage), nil
+		return nil, func() {}, hostedContentLimitMessage(), nil
 	}
 	dir, err := createAttachmentTempDir(session, msg)
 	if err != nil {
@@ -110,8 +211,8 @@ func (b *Bridge) downloadHostedContentAttachments(ctx context.Context, session *
 		_ = os.RemoveAll(dir)
 	}
 	var files []LocalAttachment
-	for i, id := range ids {
-		value, err := b.readClient().GetHostedContentValueWithoutRateLimitRetry(ctx, chatID, msg.ID, id)
+	for i, ref := range refs {
+		value, err := b.readClient().GetHostedContentValueWithoutRateLimitRetry(ctx, chatID, msg.ID, ref.ID)
 		if err != nil {
 			cleanup()
 			return nil, func() {}, "", err
@@ -126,7 +227,7 @@ func (b *Bridge) downloadHostedContentAttachments(ctx context.Context, session *
 			Path:        path,
 			PromptPath:  promptAttachmentPath(session, path),
 			ContentType: strings.TrimSpace(value.ContentType),
-			SourceID:    id,
+			SourceID:    firstNonEmptyString(ref.SourceID, ref.ID),
 		})
 	}
 	return files, cleanup, "", nil
@@ -146,9 +247,9 @@ func attachmentPreflightMessage(msg ChatMessage) string {
 }
 
 func hostedContentAttachmentPreflightMessage(msg ChatMessage) string {
-	_, truncated := hostedContentIDsFromHTML(msg.Body.Content, maxHostedContentPerMessage)
+	_, truncated := hostedContentRefsFromMessage(msg, maxHostedContentPerMessage)
 	if truncated {
-		return fmt.Sprintf("Teams message has more than %d inline images. Please send fewer images in one message.", maxHostedContentPerMessage)
+		return hostedContentLimitMessage()
 	}
 	return ""
 }
@@ -160,6 +261,9 @@ func referenceFileAttachmentPreflightMessage(msg ChatMessage) string {
 	supportedCount := 0
 	for _, attachment := range msg.Attachments {
 		if isMessageReferenceAttachment(attachment) {
+			continue
+		}
+		if isSupportedTeamsMediaCardAttachment(attachment) {
 			continue
 		}
 		if !isSupportedReferenceAttachment(attachment) {
@@ -197,6 +301,9 @@ func (b *Bridge) downloadReferenceFileAttachments(ctx context.Context, session *
 	supportedCount := 0
 	for _, attachment := range msg.Attachments {
 		if isMessageReferenceAttachment(attachment) {
+			continue
+		}
+		if isSupportedTeamsMediaCardAttachment(attachment) {
 			continue
 		}
 		if !isSupportedReferenceAttachment(attachment) {

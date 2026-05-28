@@ -5347,6 +5347,40 @@ func TestBridgeControlAskMessageReferenceIncludesQuoteContext(t *testing.T) {
 	}
 }
 
+func TestBridgeControlAudioCardFallsBackToCodexWithASR(t *testing.T) {
+	graph, sent := newBridgeControlAudioCardGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "control voice answer",
+		CodexThreadID: "control-thread-1",
+		CodexTurnID:   "control-turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	asr := &fakeASRTranscriber{}
+	bridge.asrTranscriber = asr
+	msg := bridgeTestMessage("control-audio-card")
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/control-chat/messages/control-audio-card/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, ""); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(asr.calls) != 1 {
+		t.Fatalf("ASR calls = %d, want 1", len(asr.calls))
+	}
+	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "Automatic local ASR transcript") || !strings.Contains(got[0], "transcript for") {
+		t.Fatalf("control fallback prompt = %#v, want ASR transcript", got)
+	}
+	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "control voice answer") {
+		t.Fatalf("unexpected control voice transcript:\n%s", got)
+	}
+}
+
 func TestBridgeControlExplicitCommandRejectsMessageReference(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -5370,6 +5404,32 @@ func TestBridgeControlExplicitCommandRejectsMessageReference(t *testing.T) {
 	got := sentPlainJoined(*sent)
 	if !strings.Contains(got, "I could not process") || !strings.Contains(got, "only supported with ask <question>") {
 		t.Fatalf("explicit control command quote response = %q", got)
+	}
+}
+
+func TestBridgeControlExplicitCommandRejectsAudioCard(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-status-audio", "<p>status</p>")
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/control-chat/messages/control-status-audio/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "status"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none for explicit control command audio", executor.prompts)
+	}
+	got := sentPlainJoined(*sent)
+	if !strings.Contains(got, "I could not process") || !strings.Contains(got, "application/vnd.microsoft.card.audio") {
+		t.Fatalf("explicit control command audio response = %q", got)
 	}
 }
 
@@ -10246,6 +10306,40 @@ func TestBridgeSessionHostedContentIsPassedAsCodexImageInput(t *testing.T) {
 	}
 	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "saw image input") {
 		t.Fatalf("sent messages = %#v, want ack plus final image response", *sent)
+	}
+}
+
+func TestBridgeSessionTeamsAudioCardIsDownloadedAndTranscribed(t *testing.T) {
+	graph, sent := newBridgeAudioCardGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "transcribed answer"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	asr := &fakeASRTranscriber{}
+	bridge.asrTranscriber = asr
+	msg := bridgeTestMessage("message-audio-card")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p>please handle this voice clip</p>"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-card/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "please handle this voice clip")
+	if err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(asr.calls) != 1 {
+		t.Fatalf("ASR calls = %d, want 1", len(asr.calls))
+	}
+	if asr.calls[0].File.ContentType != "audio/mp4" || !strings.Contains(asr.calls[0].File.PromptPath, "attachment-001") {
+		t.Fatalf("ASR input file = %#v, want downloaded audio attachment", asr.calls[0].File)
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "Automatic local ASR transcript") || !strings.Contains(executor.prompts[0], "transcript for") {
+		t.Fatalf("executor prompts = %#v, want ASR transcript context", executor.prompts)
+	}
+	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "transcribed answer") {
+		t.Fatalf("sent messages = %#v, want ack plus final answer", *sent)
 	}
 }
 
@@ -24232,6 +24326,92 @@ func newBridgeHostedContentGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessa
 		server.Close()
 		if !gotHostedContent {
 			t.Fatal("hosted content was not downloaded")
+		}
+	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
+func newBridgeAudioCardGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	gotHostedContent := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/message-audio-card/hostedContents/audio-1/$value":
+			gotHostedContent = true
+			w.Header().Set("Content-Type", "audio/mp4")
+			_, _ = w.Write([]byte("audio-bytes"))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		if !gotHostedContent {
+			t.Fatal("audio card hosted content was not downloaded")
+		}
+	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
+func newBridgeControlAudioCardGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	gotHostedContent := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/control-chat/messages/control-audio-card/hostedContents/audio-1/$value":
+			gotHostedContent = true
+			w.Header().Set("Content-Type", "audio/mp4")
+			_, _ = w.Write([]byte("audio-bytes"))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		if !gotHostedContent {
+			t.Fatal("control audio card hosted content was not downloaded")
 		}
 	})
 	return &GraphClient{
