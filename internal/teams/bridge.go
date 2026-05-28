@@ -2498,6 +2498,9 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	if !b.annotateUserMessages {
 		return
 	}
+	if hasSupportedTeamsMediaCardAttachment(msg.Attachments) {
+		return
+	}
 	if msg.ID == "" || hasUserAnnotationPrefix(msg.Body.Content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
 		return
 	}
@@ -2527,6 +2530,28 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	}
 	if err := b.queueIncomingUserMarkerMirror(ctx, chatID, msg); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams user message marker fallback failed: %v\n", err)
+	}
+}
+
+func (b *Bridge) annotateIncomingUserMessageWithASRTranscripts(ctx context.Context, chatID string, msg ChatMessage, transcripts []ASRTranscript) {
+	if b == nil || !b.annotateUserMessages || b.graph == nil || b.annotationDisabled || len(transcripts) == 0 {
+		return
+	}
+	if strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" || !messageAuthoredByCurrentUser(msg, b.user) {
+		return
+	}
+	annotated, ok := userAnnotatedASRTranscriptMessageHTML(msg, transcripts)
+	if !ok {
+		return
+	}
+	if err := b.graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, msg, annotated); err != nil {
+		if shouldDisableAttachmentPreservingUserMessageAnnotation(err) {
+			b.annotationDisabled = true
+		}
+		if !b.annotationWarned && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams user ASR transcript annotation disabled or unavailable: %v\n", err)
+			b.annotationWarned = true
+		}
 	}
 }
 
@@ -2671,6 +2696,44 @@ func userAnnotatedAttachmentMessageHTML(msg ChatMessage, _ User) (string, bool) 
 	return `<p><strong>` + html.EscapeString(label) + `:</strong></p>` + content, true
 }
 
+func userAnnotatedASRTranscriptMessageHTML(msg ChatMessage, transcripts []ASRTranscript) (string, bool) {
+	if len(transcripts) == 0 || strings.TrimSpace(msg.ID) == "" || isHelperAttachmentEchoMessage(msg) {
+		return "", false
+	}
+	content := strings.TrimSpace(msg.Body.Content)
+	if content != "" && strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
+		content = "<p>" + html.EscapeString(PlainTextFromTeamsHTML(content)) + "</p>"
+	}
+	if strings.Contains(PlainTextFromTeamsHTML(content), teamsASRTranscriptAnnotationLabel) {
+		return "", false
+	}
+	var b strings.Builder
+	if hasUserAnnotationPrefix(content) {
+		b.WriteString(content)
+	} else {
+		b.WriteString(`<p><strong>`)
+		b.WriteString(html.EscapeString(incomingUserLabel()))
+		b.WriteString(`:</strong></p>`)
+		if content != "" {
+			b.WriteString(content)
+		}
+	}
+	for _, attachment := range msg.Attachments {
+		if !isSupportedTeamsMediaCardAttachment(attachment) {
+			continue
+		}
+		id := strings.TrimSpace(attachment.ID)
+		if id == "" || teamsAttachmentPlaceholderIDSet(b.String())[id] {
+			continue
+		}
+		b.WriteString(`<attachment id="`)
+		b.WriteString(html.EscapeString(id))
+		b.WriteString(`"></attachment>`)
+	}
+	b.WriteString(asrTranscriptAnnotationHTML(transcripts))
+	return b.String(), true
+}
+
 func messageAuthoredByCurrentUser(msg ChatMessage, current User) bool {
 	senderID := strings.TrimSpace(chatMessageAuthorUserID(msg))
 	currentID := strings.TrimSpace(current.ID)
@@ -2729,7 +2792,7 @@ func hasUserAnnotationPrefix(content string) bool {
 }
 
 func promptTextFromTeamsMessageHTML(content string) string {
-	return stripUserAnnotationPrefix(PlainTextFromTeamsHTML(content))
+	return stripASRTranscriptAnnotation(stripUserAnnotationPrefix(PlainTextFromTeamsHTML(content)))
 }
 
 func commandRouteTextFromTeamsMessage(msg ChatMessage, fallbackText string) string {
@@ -2744,7 +2807,7 @@ func commandRouteTextFromTeamsMessage(msg ChatMessage, fallbackText string) stri
 }
 
 func commandRouteTextFromPlainText(text string) string {
-	text = stripUserAnnotationPrefix(strings.TrimSpace(text))
+	text = stripASRTranscriptAnnotation(stripUserAnnotationPrefix(strings.TrimSpace(text)))
 	if text == "" {
 		return ""
 	}
@@ -3156,6 +3219,7 @@ func (b *Bridge) prepareControlFallbackInputFromTeamsMessage(ctx context.Context
 	if err != nil {
 		return ExecutionInput{}, cleanupHosted, teamsASRFailureUserMessage(err), nil
 	}
+	b.annotateIncomingUserMessageWithASRTranscripts(ctx, session.ChatID, msg, transcripts)
 	preparedPrompt := promptWithASRTranscripts(promptText, transcripts)
 	codexFiles := nonTeamsMediaAttachments(localFiles)
 	if strings.TrimSpace(preparedPrompt) == "" && len(codexFiles) > 0 {
@@ -7011,6 +7075,7 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 	if err != nil {
 		return ExecutionInput{}, cleanupAll, teamsASRFailureUserMessage(err), nil
 	}
+	b.annotateIncomingUserMessageWithASRTranscripts(ctx, chatID, msg, transcripts)
 	return executionInputWithPreparedTeamsContext(prompt, referencedMessages, localFiles, transcripts), cleanupAll, "", nil
 }
 

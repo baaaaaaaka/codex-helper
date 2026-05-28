@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -296,5 +297,65 @@ func TestASRProgressOutboxIsTransientAndSkippedOnInterrupt(t *testing.T) {
 	}
 	if got := state.OutboxMessages[outbox.ID].Status; got != teamstore.OutboxStatusSkipped {
 		t.Fatalf("ASR progress status = %q, want skipped", got)
+	}
+}
+
+func TestASRProgressFirstRunSetupNoticeIsUserVisible(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	cacheRoot := t.TempDir()
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.asrTranscriber = NewManagedQwenASRTranscriber(ManagedASRConfig{CacheRoot: cacheRoot})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	if !bridge.teamsASRFirstRunSetupLikely() {
+		t.Fatal("fresh ASR cache should be treated as first-run setup")
+	}
+	if err := bridge.queueTeamsASRProgress(context.Background(), session, "turn-asr", 1, LocalAttachment{
+		Path:       filepath.Join(cacheRoot, "attachment-001.f4a"),
+		PromptPath: "attachment-001.f4a",
+	}, 0, 1); err != nil {
+		t.Fatalf("queueTeamsASRProgress error: %v", err)
+	}
+	got := sentPlainJoined(*sent)
+	for _, want := range []string{
+		"Transcribing Teams media before running Codex.",
+		"First-time setup",
+		"private Python/ASR environment",
+		"local Qwen speech model",
+		"future voice messages should start faster",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("first-run progress missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestPromptTextStripsVisibleASRTranscriptAnnotation(t *testing.T) {
+	msg := ChatMessage{ID: "message-voice"}
+	msg.Body.ContentType = "html"
+	msg.Body.Content = `<p>please handle this voice clip</p><attachment id="audio-card-1"></attachment>`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-voice/hostedContents/audio-1/$value"}]}`,
+	}}
+	body, ok := userAnnotatedASRTranscriptMessageHTML(msg, []ASRTranscript{{SourceName: "attachment-001.f4a", Text: "recognized speech"}})
+	if !ok {
+		t.Fatal("userAnnotatedASRTranscriptMessageHTML returned !ok")
+	}
+	if plain := PlainTextFromTeamsHTML(body); !strings.Contains(plain, teamsASRTranscriptAnnotationLabel) || !strings.Contains(plain, "recognized speech") {
+		t.Fatalf("annotated body missing visible ASR transcript:\n%s", plain)
+	}
+	if got := promptTextFromTeamsMessageHTML(body); got != "please handle this voice clip" {
+		t.Fatalf("promptTextFromTeamsMessageHTML() = %q, want original typed prompt only", got)
+	}
+	routed := ChatMessage{}
+	routed.Body.Content = body
+	if got := commandRouteTextFromTeamsMessage(routed, ""); got != "" {
+		t.Fatalf("command route text = %q, want edited user-marker message ignored by router", got)
 	}
 }

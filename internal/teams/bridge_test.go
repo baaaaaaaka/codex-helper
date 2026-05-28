@@ -10457,6 +10457,108 @@ func TestBridgeSessionTeamsAudioCardIsDownloadedAndTranscribed(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionTeamsAudioCardAnnotatesOriginalMessageWithASRTranscript(t *testing.T) {
+	var sent []bridgeSentMessage
+	var patched []struct {
+		Content     string
+		Attachments []MessageAttachment
+	}
+	gotHostedContent := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/message-audio-card/hostedContents/audio-1/$value":
+			gotHostedContent = true
+			w.Header().Set("Content-Type", "audio/mp4")
+			_, _ = w.Write([]byte("audio-bytes"))
+		case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/message-audio-card":
+			var body struct {
+				Body struct {
+					ContentType string `json:"contentType"`
+					Content     string `json:"content"`
+				} `json:"body"`
+				Attachments []MessageAttachment `json:"attachments"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode ASR annotation patch: %v", err)
+			}
+			if body.Body.ContentType != "html" {
+				t.Fatalf("patch content type = %q, want html", body.Body.ContentType)
+			}
+			patched = append(patched, struct {
+				Content     string
+				Attachments []MessageAttachment
+			}{Content: body.Body.Content, Attachments: body.Attachments})
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph post: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "transcribed answer"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.annotateUserMessages = true
+	bridge.asrTranscriber = &fakeASRTranscriber{}
+	msg := bridgeTestMessage("message-audio-card")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p>please handle this voice clip</p>"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-card/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "please handle this voice clip"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if !gotHostedContent {
+		t.Fatal("audio card hosted content was not downloaded")
+	}
+	if len(patched) != 1 {
+		t.Fatalf("patch count = %d, want one ASR annotation patch", len(patched))
+	}
+	plain := PlainTextFromTeamsHTML(patched[0].Content)
+	requirePlainTextInOrder(t, plain,
+		"🧑‍💻 User:",
+		"please handle this voice clip",
+		teamsASRTranscriptAnnotationLabel,
+		"transcript for",
+	)
+	if !strings.Contains(patched[0].Content, `<attachment id="audio-card-1"></attachment>`) {
+		t.Fatalf("patch did not preserve audio card attachment placeholder:\n%s", patched[0].Content)
+	}
+	if len(patched[0].Attachments) != 1 || patched[0].Attachments[0].ID != "audio-card-1" {
+		t.Fatalf("patch attachments = %#v, want preserved audio card", patched[0].Attachments)
+	}
+	if got := promptTextFromTeamsMessageHTML(patched[0].Content); got != "please handle this voice clip" {
+		t.Fatalf("patched message prompt text = %q, want original typed prompt only", got)
+	}
+	if got := len(sent); got != 2 || !strings.Contains(sent[1].Content, "transcribed answer") {
+		t.Fatalf("sent messages = %#v, want ack plus final answer", sent)
+	}
+}
+
 func TestBridgeSessionTeamsMixedHostedImageAndAudioKeepsImageOnlyAsAttachment(t *testing.T) {
 	graph, sent := newBridgeMediaCardGraph(t, "chat-1", "message-mixed-media", []bridgeHostedMedia{
 		{ID: "image-1", ContentType: "image/png", Bytes: []byte("image-bytes")},

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,6 +20,8 @@ const (
 	teamsASRProgressNoticeAfter = 60 * time.Second
 	teamsASRProgressRepeatAfter = 30 * time.Second
 )
+
+const teamsASRTranscriptAnnotationLabel = "🎙️ Speech-to-text transcript (automatic; may contain recognition errors)"
 
 type ASRTranscript struct {
 	SourceIndex  int    `json:"source_index,omitempty"`
@@ -191,6 +195,9 @@ func (b *Bridge) transcribeTeamsMediaAttachments(ctx context.Context, session *S
 		if transcript.SourcePath == "" {
 			transcript.SourcePath = firstNonEmptyString(file.PromptPath, file.Path)
 		}
+		if transcript.TranscriptID == "" {
+			transcript.TranscriptID = strings.TrimSpace(file.SourceID)
+		}
 		if transcript.SourceName == "" {
 			transcript.SourceName = filepath.Base(firstNonEmptyString(file.PromptPath, file.Path))
 		}
@@ -255,9 +262,13 @@ func (b *Bridge) startTeamsASRProgressLoop(ctx context.Context, session *Session
 	progressCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	started := time.Now()
+	initialDelay := teamsASRProgressNoticeAfter
+	if b.teamsASRFirstRunSetupLikely() {
+		initialDelay = 0
+	}
 	go func() {
 		defer close(done)
-		timer := time.NewTimer(teamsASRProgressNoticeAfter)
+		timer := time.NewTimer(initialDelay)
 		defer timer.Stop()
 		count := 0
 		for {
@@ -300,6 +311,9 @@ func (b *Bridge) queueTeamsASRProgress(ctx context.Context, session *Session, tu
 		if managed, ok := b.asrTranscriber.(*ManagedASRTranscriber); ok && managed != nil {
 			if cfg, err := resolveManagedASRConfig(managed.Config); err == nil {
 				lines = append(lines, "", "Local speech recognition runtime:", "Cache: "+cfg.CacheRoot, "Disk preflight: at least "+formatASRBytes(cfg.MinFreeBytes)+" free.")
+				if !managedASRRuntimePreparedForProgress(cfg) {
+					lines = append(lines, "", "First-time setup: cxp is preparing a private Python/ASR environment and may also download the local Qwen speech model. This can take several minutes once per machine; future voice messages should start faster.")
+				}
 			}
 		}
 	}
@@ -313,4 +327,90 @@ func (b *Bridge) queueTeamsASRProgress(ctx context.Context, session *Session, tu
 		Body:             body,
 		NotificationKind: "turn_progress",
 	})
+}
+
+func (b *Bridge) teamsASRFirstRunSetupLikely() bool {
+	if b == nil {
+		return false
+	}
+	managed, ok := b.asrTranscriber.(*ManagedASRTranscriber)
+	if !ok || managed == nil {
+		return false
+	}
+	cfg, err := resolveManagedASRConfig(managed.Config)
+	if err != nil {
+		return false
+	}
+	return !managedASRRuntimePreparedForProgress(cfg)
+}
+
+func managedASRRuntimePreparedForProgress(cfg ManagedASRConfig) bool {
+	cfg, err := resolveManagedASRConfig(cfg)
+	if err != nil {
+		return false
+	}
+	if _, err := os.Stat(managedASRVenvPython(cfg.CacheRoot)); err != nil {
+		return false
+	}
+	if !managedASRRuntimeMarkerCurrent(filepath.Join(cfg.CacheRoot, "runtime.json")) {
+		return false
+	}
+	if modelID := strings.TrimSpace(cfg.ModelID); modelID != "" {
+		modelDir := filepath.Join(cfg.CacheRoot, "huggingface", "hub", "models--"+strings.ReplaceAll(modelID, "/", "--"))
+		if _, err := os.Stat(modelDir); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func stripASRTranscriptAnnotation(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	idx := strings.Index(text, teamsASRTranscriptAnnotationLabel)
+	if idx < 0 {
+		return text
+	}
+	return strings.TrimSpace(text[:idx])
+}
+
+func asrTranscriptAnnotationHTML(transcripts []ASRTranscript) string {
+	if len(transcripts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(`<p><strong>`)
+	b.WriteString(html.EscapeString(teamsASRTranscriptAnnotationLabel))
+	b.WriteString(`:</strong></p>`)
+	for i, transcript := range transcripts {
+		name := asrTranscriptDisplayName(transcript)
+		label := "Clip"
+		if len(transcripts) > 1 {
+			label = fmt.Sprintf("Clip %d", i+1)
+		}
+		b.WriteString(`<p><em>`)
+		b.WriteString(html.EscapeString(label + ": " + name))
+		b.WriteString(`</em></p>`)
+		text := strings.TrimSpace(transcript.Text)
+		if text == "" {
+			text = "(empty transcript)"
+		}
+		for _, line := range strings.Split(text, "\n") {
+			line = strings.TrimRight(line, " \t")
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			b.WriteString(`<p>`)
+			b.WriteString(html.EscapeString(line))
+			b.WriteString(`</p>`)
+		}
+		if warning := strings.TrimSpace(transcript.Warning); warning != "" {
+			b.WriteString(`<p><em>Warning: `)
+			b.WriteString(html.EscapeString(warning))
+			b.WriteString(`</em></p>`)
+		}
+	}
+	return b.String()
 }
