@@ -126,6 +126,14 @@ jobs:
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'TestBridge(ControlNewCreatesDirectoryBoundSession|PublishImportsExistingTranscriptInExactTeamsOrder|RecreateSessionChatRebindsSessionAndRetiresOldRouting)$' -v
 
+      - name: Teams history watch Teams-origin regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          history_watch_pattern='TestBridgeHistoryWatch(SkipsTeamsOriginPromptBeforeFinal|SkipsTeamsOriginPromptAfterInjectedContext|StressSkipsTeamsOriginFinalAfterInjectedContextBurst|StressSkipsTeamsOriginFinalAcrossCheckpoint|ClearsTeamsOriginMarkerForLocalPrompt|SkipsTeamsOriginPromptByInboundHash|DoesNotSkipLocalPromptWithSameTextAsTeamsInboundDifferentThread|PublishesLocalSessionBeforeFinalAnswer|PersistsPendingAssistantAcrossPolls)$'
+          go test ./internal/teams -count=1 -run "$history_watch_pattern" -v
+          go test ./internal/teams/store -count=1 -run 'TestSQLiteHistoryWatchColdUpdatePreservesSplitTables$' -v
+
       - name: Cross-compile check (Linux only)
         if: runner.os == 'Linux'
         shell: bash

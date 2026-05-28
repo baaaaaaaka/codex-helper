@@ -18,15 +18,17 @@ import (
 const historyTieredTailReaderSize = 4 * 1024
 
 type historyTieredFileState struct {
-	Path        string
-	Size        int64
-	ModTime     time.Time
-	Offset      int64
-	Line        int
-	SessionID   string
-	ThreadID    string
-	TurnID      string
-	LastFinalID string
+	Path                string
+	Size                int64
+	ModTime             time.Time
+	Offset              int64
+	Line                int
+	SessionID           string
+	ThreadID            string
+	TeamsOriginThreadID string
+	TurnID              string
+	TeamsOriginTurnID   string
+	LastFinalID         string
 
 	pendingAssistant historyTieredAssistantCandidate
 }

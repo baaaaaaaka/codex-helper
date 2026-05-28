@@ -436,7 +436,9 @@ type HistoryWatchCheckpoint struct {
 	Line                        int       `json:"line,omitempty"`
 	SessionID                   string    `json:"session_id,omitempty"`
 	ThreadID                    string    `json:"thread_id,omitempty"`
+	TeamsOriginThreadID         string    `json:"teams_origin_thread_id,omitempty"`
 	TurnID                      string    `json:"turn_id,omitempty"`
+	TeamsOriginTurnID           string    `json:"teams_origin_turn_id,omitempty"`
 	LastFinalID                 string    `json:"last_final_id,omitempty"`
 	PendingAssistantSourceID    string    `json:"pending_assistant_source_id,omitempty"`
 	PendingAssistantThreadID    string    `json:"pending_assistant_thread_id,omitempty"`

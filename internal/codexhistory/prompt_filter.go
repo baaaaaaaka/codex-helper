@@ -10,6 +10,12 @@ var teamsHelperPromptSuffixMarkers = []string{
 
 const teamsHelperUserMessageLead = "User message:"
 
+// ShouldSkipSystemInjectedUserPrompt reports whether text is a Codex-injected
+// user-message wrapper rather than a real user prompt.
+func ShouldSkipSystemInjectedUserPrompt(text string) bool {
+	return shouldSkipFirstPrompt(text)
+}
+
 func shouldSkipFirstPrompt(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {

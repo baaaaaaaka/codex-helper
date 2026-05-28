@@ -265,19 +265,32 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 			return err
 		}
 	}
-	sessionStarted, blocked, err := b.publishHistoryWatchSessionStart(ctx, path, result)
+	start, err := b.publishHistoryWatchSessionStart(ctx, path, result)
 	if err != nil {
 		return err
 	}
-	if blocked {
+	if start.blocked {
 		return nil
+	}
+	if start.clearTeamsOrigin {
+		result.State.TeamsOriginThreadID = ""
+		result.State.TeamsOriginTurnID = ""
+	}
+	if strings.TrimSpace(start.teamsOriginTurnID) != "" {
+		result.State.TeamsOriginTurnID = strings.TrimSpace(start.teamsOriginTurnID)
+	}
+	if strings.TrimSpace(start.teamsOriginThreadID) != "" {
+		result.State.TeamsOriginThreadID = strings.TrimSpace(start.teamsOriginThreadID)
 	}
 	for _, final := range result.Finals {
 		if strings.TrimSpace(final.Key) == "" || final.Key == checkpoint.LastFinalID {
 			continue
 		}
+		if historyWatchFinalMatchesTeamsOrigin(final, result.State.TeamsOriginThreadID, result.State.TeamsOriginTurnID) {
+			continue
+		}
 		handled, err := b.publishHistoryWatchFinal(ctx, path, final, publishHistoryWatchFinalOptions{
-			ForceDetectedNotification: sessionStarted,
+			ForceDetectedNotification: start.sessionStarted,
 		})
 		if err != nil {
 			return err
@@ -291,16 +304,18 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 
 func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchCheckpoint) historyTieredFileState {
 	return historyTieredFileState{
-		Path:             strings.TrimSpace(checkpoint.Path),
-		Size:             checkpoint.Size,
-		ModTime:          checkpoint.ModTime,
-		Offset:           checkpoint.Offset,
-		Line:             checkpoint.Line,
-		SessionID:        strings.TrimSpace(checkpoint.SessionID),
-		ThreadID:         strings.TrimSpace(checkpoint.ThreadID),
-		TurnID:           strings.TrimSpace(checkpoint.TurnID),
-		LastFinalID:      strings.TrimSpace(checkpoint.LastFinalID),
-		pendingAssistant: historyWatchPendingAssistantFromCheckpoint(checkpoint),
+		Path:                strings.TrimSpace(checkpoint.Path),
+		Size:                checkpoint.Size,
+		ModTime:             checkpoint.ModTime,
+		Offset:              checkpoint.Offset,
+		Line:                checkpoint.Line,
+		SessionID:           strings.TrimSpace(checkpoint.SessionID),
+		ThreadID:            strings.TrimSpace(checkpoint.ThreadID),
+		TeamsOriginThreadID: strings.TrimSpace(checkpoint.TeamsOriginThreadID),
+		TurnID:              strings.TrimSpace(checkpoint.TurnID),
+		TeamsOriginTurnID:   strings.TrimSpace(checkpoint.TeamsOriginTurnID),
+		LastFinalID:         strings.TrimSpace(checkpoint.LastFinalID),
+		pendingAssistant:    historyWatchPendingAssistantFromCheckpoint(checkpoint),
 	}
 }
 
@@ -314,17 +329,19 @@ func historyWatchCheckpointID(path string) string {
 func (b *Bridge) recordHistoryWatchCheckpoint(ctx context.Context, id string, state historyTieredFileState, now time.Time) error {
 	return b.store.UpdateHistoryWatch(ctx, func(historyWatch map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
 		checkpoint := teamstore.HistoryWatchCheckpoint{
-			ID:          id,
-			Path:        strings.TrimSpace(state.Path),
-			Size:        state.Size,
-			ModTime:     state.ModTime,
-			Offset:      state.Offset,
-			Line:        state.Line,
-			SessionID:   strings.TrimSpace(state.SessionID),
-			ThreadID:    strings.TrimSpace(state.ThreadID),
-			TurnID:      strings.TrimSpace(state.TurnID),
-			LastFinalID: strings.TrimSpace(state.LastFinalID),
-			UpdatedAt:   now,
+			ID:                  id,
+			Path:                strings.TrimSpace(state.Path),
+			Size:                state.Size,
+			ModTime:             state.ModTime,
+			Offset:              state.Offset,
+			Line:                state.Line,
+			SessionID:           strings.TrimSpace(state.SessionID),
+			ThreadID:            strings.TrimSpace(state.ThreadID),
+			TeamsOriginThreadID: strings.TrimSpace(state.TeamsOriginThreadID),
+			TurnID:              strings.TrimSpace(state.TurnID),
+			TeamsOriginTurnID:   strings.TrimSpace(state.TeamsOriginTurnID),
+			LastFinalID:         strings.TrimSpace(state.LastFinalID),
+			UpdatedAt:           now,
 		}
 		applyHistoryWatchPendingAssistant(&checkpoint, state.pendingAssistant)
 		historyWatch[id] = checkpoint
@@ -339,29 +356,40 @@ func (b *Bridge) removeHistoryWatchCheckpoint(ctx context.Context, id string) er
 	})
 }
 
-func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path string, result historyTieredTailResult) (bool, bool, error) {
+type historyWatchSessionStartResult struct {
+	sessionStarted      bool
+	teamsOriginThreadID string
+	teamsOriginTurnID   string
+	clearTeamsOrigin    bool
+	blocked             bool
+}
+
+func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path string, result historyTieredTailResult) (historyWatchSessionStartResult, error) {
 	record, ok := historyTieredFirstVisibleUserPromptRecord(result.Records)
 	if !ok {
-		return false, false, nil
+		return historyWatchSessionStartResult{}, nil
 	}
 	if isSubagent, err := codexhistory.SessionFileIsSubagentContext(ctx, path); err == nil && isSubagent {
-		return false, false, nil
+		return historyWatchSessionStartResult{}, nil
 	} else if err != nil && !os.IsNotExist(err) {
-		return false, false, err
+		return historyWatchSessionStartResult{}, err
 	}
 	if b.historyWatchRecordLooksTeamsOrigin(ctx, record) {
-		return false, false, nil
+		return historyWatchSessionStartResult{
+			teamsOriginThreadID: strings.TrimSpace(firstNonEmptyString(record.ThreadID, result.State.ThreadID)),
+			teamsOriginTurnID:   strings.TrimSpace(firstNonEmptyString(record.TurnID, result.State.TurnID)),
+		}, nil
 	}
 	threadID := strings.TrimSpace(firstNonEmptyString(record.ThreadID, result.State.ThreadID))
 	local, project, ok, err := b.findHistoryWatchCodexSession(ctx, path, threadID)
 	if err != nil || !ok {
-		return false, true, err
+		return historyWatchSessionStartResult{blocked: true}, err
 	}
 	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
 		if err := b.ensureDurableSession(ctx, existing); err != nil {
-			return false, false, err
+			return historyWatchSessionStartResult{}, err
 		}
-		return false, false, nil
+		return historyWatchSessionStartResult{clearTeamsOrigin: true}, nil
 	}
 	if strings.TrimSpace(local.FirstPrompt) == "" {
 		local.FirstPrompt = formatTranscriptRecordForTeams(record)
@@ -373,9 +401,20 @@ func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path strin
 		BackgroundImport:                true,
 	})
 	if err != nil {
-		return false, false, err
+		return historyWatchSessionStartResult{}, err
 	}
-	return true, false, nil
+	return historyWatchSessionStartResult{sessionStarted: true, clearTeamsOrigin: true}, nil
+}
+
+func historyWatchFinalMatchesTeamsOrigin(final historyTieredFinal, teamsOriginThreadID string, teamsOriginTurnID string) bool {
+	teamsOriginThreadID = strings.TrimSpace(teamsOriginThreadID)
+	teamsOriginTurnID = strings.TrimSpace(teamsOriginTurnID)
+	finalTurnID := strings.TrimSpace(final.Record.TurnID)
+	if teamsOriginTurnID != "" && finalTurnID == teamsOriginTurnID {
+		return true
+	}
+	finalThreadID := strings.TrimSpace(final.Record.ThreadID)
+	return teamsOriginThreadID != "" && finalThreadID == teamsOriginThreadID && (teamsOriginTurnID == "" || finalTurnID == "")
 }
 
 func historyTieredFirstVisibleUserPromptRecord(records []TranscriptRecord) (TranscriptRecord, bool) {
@@ -384,6 +423,9 @@ func historyTieredFirstVisibleUserPromptRecord(records []TranscriptRecord) (Tran
 			continue
 		}
 		if strings.TrimSpace(formatTranscriptRecordForTeams(record)) == "" {
+			continue
+		}
+		if codexhistory.ShouldSkipSystemInjectedUserPrompt(record.Text) {
 			continue
 		}
 		return record, true

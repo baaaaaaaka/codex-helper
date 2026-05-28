@@ -8102,7 +8102,7 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 		state.HelperDeliveries["helper-1"] = HelperDeliveryRecord{ID: "helper-1", SessionID: "session-1", TurnID: "turn-1", OutboxID: "outbox-1", Status: HelperDeliveryStatusSent, CreatedAt: now}
 		state.ArtifactRecords["artifact-1"] = ArtifactRecord{ID: "artifact-1", SessionID: "session-1", TurnID: "turn-1", OutboxID: "outbox-1", Status: "uploaded", CreatedAt: now}
 		state.Notifications["notification-1"] = NotificationRecord{ID: "notification-1", SessionID: "session-1", TurnID: "turn-1", Status: NotificationStatusSent, CreatedAt: now}
-		state.HistoryWatch[checkpointID] = HistoryWatchCheckpoint{ID: checkpointID, Path: "/tmp/session.jsonl", Size: 100, Offset: 100, Line: 10, SessionID: "session-1", ThreadID: "thread-1", TurnID: "turn-1", UpdatedAt: now}
+		state.HistoryWatch[checkpointID] = HistoryWatchCheckpoint{ID: checkpointID, Path: "/tmp/session.jsonl", Size: 100, Offset: 100, Line: 10, SessionID: "session-1", ThreadID: "thread-1", TeamsOriginThreadID: "thread-1", TurnID: "turn-1", TeamsOriginTurnID: "turn-1", UpdatedAt: now}
 		state.HistoryWatchReady = now
 		return nil
 	}); err != nil {
@@ -8118,6 +8118,12 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 	if watchState.HistoryWatch[checkpointID].Path == "" || watchState.HistoryWatchReady.IsZero() {
 		t.Fatalf("HistoryWatchState missed checkpoint metadata: %#v", watchState)
 	}
+	if watchState.HistoryWatch[checkpointID].TeamsOriginTurnID != "turn-1" {
+		t.Fatalf("HistoryWatchState missed Teams-origin checkpoint turn: %#v", watchState.HistoryWatch[checkpointID])
+	}
+	if watchState.HistoryWatch[checkpointID].TeamsOriginThreadID != "thread-1" {
+		t.Fatalf("HistoryWatchState missed Teams-origin checkpoint thread: %#v", watchState.HistoryWatch[checkpointID])
+	}
 	if len(watchState.Sessions) != 0 || len(watchState.InboundEvents) != 0 || len(watchState.Turns) != 0 || len(watchState.OutboxMessages) != 0 {
 		t.Fatalf("HistoryWatchState should not load hot tables: sessions=%d inbound=%d turns=%d outbox=%d", len(watchState.Sessions), len(watchState.InboundEvents), len(watchState.Turns), len(watchState.OutboxMessages))
 	}
@@ -8129,6 +8135,8 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 		checkpoint.Offset = 128
 		checkpoint.Line = 12
 		checkpoint.LastFinalID = "final-1"
+		checkpoint.TeamsOriginThreadID = "thread-teams-origin"
+		checkpoint.TeamsOriginTurnID = "turn-teams-origin"
 		checkpoint.UpdatedAt = updatedAt
 		historyWatch[checkpointID] = checkpoint
 		*ready = updatedAt
@@ -8144,7 +8152,7 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after history watch update: %v", err)
 	}
-	if checkpoint := state.HistoryWatch[checkpointID]; checkpoint.Offset != 128 || checkpoint.LastFinalID != "final-1" || !checkpoint.UpdatedAt.Equal(updatedAt) {
+	if checkpoint := state.HistoryWatch[checkpointID]; checkpoint.Offset != 128 || checkpoint.LastFinalID != "final-1" || checkpoint.TeamsOriginThreadID != "thread-teams-origin" || checkpoint.TeamsOriginTurnID != "turn-teams-origin" || !checkpoint.UpdatedAt.Equal(updatedAt) {
 		t.Fatalf("history watch checkpoint not updated: %#v", checkpoint)
 	}
 	if state.Sessions["session-1"].ID == "" || state.InboundEvents["inbound-1"].ID == "" || state.Turns["turn-1"].ID == "" || state.OutboxMessages["outbox-1"].ID == "" {

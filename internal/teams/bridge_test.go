@@ -21129,6 +21129,286 @@ func TestBridgeHistoryWatchSkipsTeamsOriginPromptBeforeFinal(t *testing.T) {
 	}
 }
 
+func TestBridgeHistoryWatchSkipsTeamsOriginPromptAfterInjectedContext(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-teams-origin-context.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	injectedContext := "<environment_context>\n  <cwd>/home/baka/project/codex-helper</cwd>\n  <shell>zsh</shell>\n</environment_context>"
+	prompt := "User message:\ndo the task\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper."
+	body := `{"type":"session_meta","payload":{"id":"thread-teams-origin-context"}}` + "\n" +
+		`{"thread_id":"thread-teams-origin-context","turn_id":"turn-1","id":"env","role":"user","text":` + strconv.Quote(injectedContext) + `}` + "\n" +
+		`{"thread_id":"thread-teams-origin-context","turn_id":"turn-1","id":"u1","role":"user","text":` + strconv.Quote(prompt) + `}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-teams-origin-context", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, false); err != nil {
+		t.Fatalf("history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-teams-origin-context") != nil {
+		t.Fatal("history watch published a Teams-origin helper prompt after injected context as a new local Work chat")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("Teams-origin helper prompt after injected context should not notify Teams: %#v", *sent)
+	}
+}
+
+func TestBridgeHistoryWatchStressSkipsTeamsOriginFinalAfterInjectedContextBurst(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	threadID := "thread-teams-origin-context-burst"
+	turnID := "turn-context-burst"
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-"+threadID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	if err := os.WriteFile(transcriptPath, []byte(teamsOriginHistoryWatchStressTranscript(threadID, turnID, 250, true)), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, threadID, transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(time.Duration(i)*10*time.Second), false); err != nil {
+			t.Fatalf("history watch stress sync %d error: %v", i, err)
+		}
+		if bridge.reg.SessionByCodexThreadID(threadID) != nil {
+			t.Fatalf("history watch stress sync %d published a Teams-origin transcript as a new local Work chat", i)
+		}
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("Teams-origin stress transcript should not notify Teams: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load stress state: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.TeamsOriginThreadID != threadID {
+			t.Fatalf("Teams-origin thread checkpoint = %q, want %q", checkpoint.TeamsOriginThreadID, threadID)
+		}
+		if checkpoint.TeamsOriginTurnID != turnID {
+			t.Fatalf("Teams-origin turn checkpoint = %q, want %q", checkpoint.TeamsOriginTurnID, turnID)
+		}
+		if checkpoint.LastFinalID == "" {
+			t.Fatalf("Teams-origin final should be checkpointed to avoid repeated scans: %#v", checkpoint)
+		}
+	}
+}
+
+func TestBridgeHistoryWatchStressSkipsTeamsOriginFinalAcrossCheckpoint(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	threadID := "thread-teams-origin-two-phase"
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-"+threadID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	if err := os.WriteFile(transcriptPath, []byte(teamsOriginHistoryWatchStressTranscriptNoTurnIDs(threadID, 250, false)), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, threadID, transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, false); err != nil {
+		t.Fatalf("initial history watch sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID(threadID) != nil {
+		t.Fatal("history watch published a Teams-origin prompt as a new local Work chat")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load initial state: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("initial history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.TeamsOriginThreadID != threadID {
+			t.Fatalf("initial Teams-origin thread checkpoint = %q, want %q", checkpoint.TeamsOriginThreadID, threadID)
+		}
+		if checkpoint.TeamsOriginTurnID != "" {
+			t.Fatalf("initial Teams-origin turn checkpoint = %q, want empty for real response_item transcript", checkpoint.TeamsOriginTurnID)
+		}
+	}
+
+	appendLine(t, transcriptPath, `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final answer from Teams-origin turn"}]}}`)
+	appendLine(t, transcriptPath, `{"type":"turn.completed"}`)
+	for i := 0; i < 20; i++ {
+		if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(time.Duration(i+1)*10*time.Second), false); err != nil {
+			t.Fatalf("two-phase history watch sync %d error: %v", i, err)
+		}
+		if bridge.reg.SessionByCodexThreadID(threadID) != nil {
+			t.Fatalf("two-phase history watch sync %d published a Teams-origin final as a new local Work chat", i)
+		}
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("two-phase Teams-origin transcript should not notify Teams: %#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load final state: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("final history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.TeamsOriginThreadID != threadID {
+			t.Fatalf("final Teams-origin thread checkpoint = %q, want %q", checkpoint.TeamsOriginThreadID, threadID)
+		}
+		if checkpoint.TeamsOriginTurnID != "" {
+			t.Fatalf("final Teams-origin turn checkpoint = %q, want empty for real response_item transcript", checkpoint.TeamsOriginTurnID)
+		}
+		if checkpoint.LastFinalID == "" {
+			t.Fatalf("two-phase Teams-origin final should be checkpointed to avoid repeated scans: %#v", checkpoint)
+		}
+	}
+}
+
+func TestBridgeHistoryWatchClearsTeamsOriginMarkerForLocalPrompt(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := t.TempDir()
+	threadID := "thread-local-after-teams-origin"
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-"+threadID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	initial := teamsOriginHistoryWatchStressTranscriptNoTurnIDs(threadID, 3, false)
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, threadID, transcriptPath)
+	defer restoreDiscover()
+	graph, _ := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	checkpointID := historyWatchCheckpointID(transcriptPath)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		state.HistoryWatch[checkpointID] = teamstore.HistoryWatchCheckpoint{
+			ID:                  checkpointID,
+			Path:                transcriptPath,
+			Size:                info.Size(),
+			ModTime:             info.ModTime(),
+			Offset:              info.Size(),
+			Line:                strings.Count(initial, "\n"),
+			ThreadID:            threadID,
+			TeamsOriginThreadID: threadID,
+			UpdatedAt:           now.Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed Teams-origin checkpoint: %v", err)
+	}
+
+	appendLine(t, transcriptPath, `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"local follow-up prompt"}]}}`)
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, false); err != nil {
+		t.Fatalf("history watch local follow-up sync error: %v", err)
+	}
+	if bridge.reg.SessionByCodexThreadID(threadID) == nil {
+		t.Fatal("local follow-up prompt after Teams-origin checkpoint should still publish as a local Work chat")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load final state: %v", err)
+	}
+	checkpoint := state.HistoryWatch[checkpointID]
+	if checkpoint.TeamsOriginThreadID != "" || checkpoint.TeamsOriginTurnID != "" {
+		t.Fatalf("local follow-up prompt should clear Teams-origin markers: %#v", checkpoint)
+	}
+}
+
+func teamsOriginHistoryWatchStressTranscript(threadID string, turnID string, injectedCount int, includeFinal bool) string {
+	prompt := "User message:\ndo the task\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper."
+	var b strings.Builder
+	fmt.Fprintf(&b, `{"type":"session_meta","payload":{"id":%s}}`+"\n", strconv.Quote(threadID))
+	for i := 0; i < injectedCount; i++ {
+		var text string
+		switch i % 3 {
+		case 0:
+			text = fmt.Sprintf("<environment_context>\n  <cwd>/home/baka/project/codex-helper/%03d</cwd>\n  <shell>zsh</shell>\n</environment_context>", i)
+		case 1:
+			text = fmt.Sprintf("# AGENTS.md\nsynthetic instructions %03d", i)
+		default:
+			text = fmt.Sprintf("synthetic instruction %03d\n<INSTRUCTIONS>skip me</INSTRUCTIONS>", i)
+		}
+		fmt.Fprintf(&b, `{"thread_id":%s,"turn_id":%s,"id":"synthetic-%03d","role":"user","text":%s}`+"\n", strconv.Quote(threadID), strconv.Quote(turnID), i, strconv.Quote(text))
+	}
+	fmt.Fprintf(&b, `{"thread_id":%s,"turn_id":%s,"id":"u-teams","role":"user","text":%s}`+"\n", strconv.Quote(threadID), strconv.Quote(turnID), strconv.Quote(prompt))
+	if includeFinal {
+		fmt.Fprintf(&b, `{"thread_id":%s,"turn_id":%s,"id":"a-final","role":"assistant","text":"final answer from Teams-origin turn"}`+"\n", strconv.Quote(threadID), strconv.Quote(turnID))
+		fmt.Fprintf(&b, `{"type":"turn.completed","thread_id":%s,"turn_id":%s}`+"\n", strconv.Quote(threadID), strconv.Quote(turnID))
+	}
+	return b.String()
+}
+
+func teamsOriginHistoryWatchStressTranscriptNoTurnIDs(threadID string, injectedCount int, includeFinal bool) string {
+	prompt := "User message:\ndo the task\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper."
+	var b strings.Builder
+	fmt.Fprintf(&b, `{"type":"session_meta","payload":{"id":%s}}`+"\n", strconv.Quote(threadID))
+	for i := 0; i < injectedCount; i++ {
+		var text string
+		switch i % 3 {
+		case 0:
+			text = fmt.Sprintf("<environment_context>\n  <cwd>/home/baka/project/codex-helper/%03d</cwd>\n  <shell>zsh</shell>\n</environment_context>", i)
+		case 1:
+			text = fmt.Sprintf("# AGENTS.md\nsynthetic instructions %03d", i)
+		default:
+			text = fmt.Sprintf("synthetic instruction %03d\n<INSTRUCTIONS>skip me</INSTRUCTIONS>", i)
+		}
+		fmt.Fprintf(&b, `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":%s}]}}`+"\n", strconv.Quote(text))
+	}
+	fmt.Fprintf(&b, `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":%s}]}}`+"\n", strconv.Quote(prompt))
+	if includeFinal {
+		fmt.Fprintf(&b, `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final answer from Teams-origin turn"}]}}`+"\n")
+		fmt.Fprintf(&b, `{"type":"turn.completed"}`+"\n")
+	}
+	return b.String()
+}
+
 func TestBridgeHistoryWatchSkipsTeamsOriginPromptByInboundHash(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
 	codexRoot := t.TempDir()
