@@ -300,7 +300,7 @@ func TestASRProgressOutboxIsTransientAndSkippedOnInterrupt(t *testing.T) {
 	}
 }
 
-func TestASRProgressFirstRunSetupNoticeIsUserVisible(t *testing.T) {
+func TestASRProgressStartsAfterDelayAndHeartbeatIsConcise(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	cacheRoot := t.TempDir()
@@ -311,25 +311,43 @@ func TestASRProgressFirstRunSetupNoticeIsUserVisible(t *testing.T) {
 		t.Fatalf("ensureDurableSession error: %v", err)
 	}
 
-	if !bridge.teamsASRFirstRunSetupLikely() {
-		t.Fatal("fresh ASR cache should be treated as first-run setup")
+	stopProgress := bridge.startTeamsASRProgressLoop(context.Background(), session, "turn-asr-delay", 1, LocalAttachment{
+		Path:       filepath.Join(cacheRoot, "attachment-001.f4a"),
+		PromptPath: "attachment-001.f4a",
+	})
+	time.Sleep(20 * time.Millisecond)
+	stopProgress()
+	if got := strings.TrimSpace(sentPlainJoined(*sent)); got != "" {
+		t.Fatalf("ASR progress should not be sent before the heartbeat delay, got:\n%s", got)
 	}
+
 	if err := bridge.queueTeamsASRProgress(context.Background(), session, "turn-asr", 1, LocalAttachment{
 		Path:       filepath.Join(cacheRoot, "attachment-001.f4a"),
 		PromptPath: "attachment-001.f4a",
-	}, 0, 1); err != nil {
+	}, 61*time.Second, 1); err != nil {
 		t.Fatalf("queueTeamsASRProgress error: %v", err)
 	}
 	got := sentPlainJoined(*sent)
 	for _, want := range []string{
-		"Transcribing Teams media before running Codex.",
+		"Still transcribing Teams media before running Codex.",
+		"Clip: attachment-001.f4a",
+		"Elapsed: 1m",
+		"Still running; Codex will start after transcription finishes.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("heartbeat progress missing %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{
+		"Local speech recognition runtime",
+		"Cache:",
+		"Disk preflight",
 		"First-time setup",
 		"private Python/ASR environment",
 		"local Qwen speech model",
-		"future voice messages should start faster",
 	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("first-run progress missing %q:\n%s", want, got)
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("heartbeat progress should not expose setup detail %q:\n%s", forbidden, got)
 		}
 	}
 }

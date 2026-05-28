@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -262,13 +261,9 @@ func (b *Bridge) startTeamsASRProgressLoop(ctx context.Context, session *Session
 	progressCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	started := time.Now()
-	initialDelay := teamsASRProgressNoticeAfter
-	if b.teamsASRFirstRunSetupLikely() {
-		initialDelay = 0
-	}
 	go func() {
 		defer close(done)
-		timer := time.NewTimer(initialDelay)
+		timer := time.NewTimer(teamsASRProgressNoticeAfter)
 		defer timer.Stop()
 		count := 0
 		for {
@@ -301,21 +296,11 @@ func (b *Bridge) queueTeamsASRProgress(ctx context.Context, session *Session, tu
 		SourcePath:  firstNonEmptyString(file.PromptPath, file.Path),
 	})
 	lines := []string{
-		"Transcribing Teams media before running Codex.",
+		"Still transcribing Teams media before running Codex.",
 		"",
 		fmt.Sprintf("Clip: %s", name),
 		fmt.Sprintf("Elapsed: %s", formatCodexQuietDuration(elapsed)),
-		"Codex will start after transcription finishes.",
-	}
-	if count == 1 {
-		if managed, ok := b.asrTranscriber.(*ManagedASRTranscriber); ok && managed != nil {
-			if cfg, err := resolveManagedASRConfig(managed.Config); err == nil {
-				lines = append(lines, "", "Local speech recognition runtime:", "Cache: "+cfg.CacheRoot, "Disk preflight: at least "+formatASRBytes(cfg.MinFreeBytes)+" free.")
-				if !managedASRRuntimePreparedForProgress(cfg) {
-					lines = append(lines, "", "First-time setup: cxp is preparing a private Python/ASR environment and may also download the local Qwen speech model. This can take several minutes once per machine; future voice messages should start faster.")
-				}
-			}
-		}
+		"Still running; Codex will start after transcription finishes.",
 	}
 	body := strings.Join(lines, "\n")
 	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
@@ -327,41 +312,6 @@ func (b *Bridge) queueTeamsASRProgress(ctx context.Context, session *Session, tu
 		Body:             body,
 		NotificationKind: "turn_progress",
 	})
-}
-
-func (b *Bridge) teamsASRFirstRunSetupLikely() bool {
-	if b == nil {
-		return false
-	}
-	managed, ok := b.asrTranscriber.(*ManagedASRTranscriber)
-	if !ok || managed == nil {
-		return false
-	}
-	cfg, err := resolveManagedASRConfig(managed.Config)
-	if err != nil {
-		return false
-	}
-	return !managedASRRuntimePreparedForProgress(cfg)
-}
-
-func managedASRRuntimePreparedForProgress(cfg ManagedASRConfig) bool {
-	cfg, err := resolveManagedASRConfig(cfg)
-	if err != nil {
-		return false
-	}
-	if _, err := os.Stat(managedASRVenvPython(cfg.CacheRoot)); err != nil {
-		return false
-	}
-	if !managedASRRuntimeMarkerCurrent(filepath.Join(cfg.CacheRoot, "runtime.json")) {
-		return false
-	}
-	if modelID := strings.TrimSpace(cfg.ModelID); modelID != "" {
-		modelDir := filepath.Join(cfg.CacheRoot, "huggingface", "hub", "models--"+strings.ReplaceAll(modelID, "/", "--"))
-		if _, err := os.Stat(modelDir); err != nil {
-			return false
-		}
-	}
-	return true
 }
 
 func stripASRTranscriptAnnotation(text string) string {
