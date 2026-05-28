@@ -5390,7 +5390,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	if err := b.activateBeaconNewSession(session.ID, parsed); err != nil {
 		return err
 	}
-	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+"."); err != nil {
+	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, workChatCreatedNotice(session)); err != nil {
 		return err
 	}
 	if err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
@@ -5561,11 +5561,34 @@ func sessionReadyMessage(session Session, prompt string, target ...string) strin
 		lines = append(lines, "Session: "+session.ID)
 	}
 	lines = append(lines, "Project: "+sessionReadyProjectLabel(session))
+	if cwd := strings.TrimSpace(session.Cwd); cwd != "" {
+		lines = append(lines, "Working directory: "+cwd)
+	}
 	if len(target) > 0 && strings.TrimSpace(target[0]) != "" {
 		lines = append(lines, "Execution target: "+strings.TrimSpace(target[0]))
 	}
 	lines = append(lines, "Commands: `helper status` or `!status`, `helper stats`, `helper help`, `helper close` to close this Codex session in Teams.")
-	lines = append(lines, "Need the full path? Send `helper status`.")
+	lines = append(lines, "Need more details? Send `helper status`.")
+	return strings.Join(lines, "\n")
+}
+
+func workChatCreatedNotice(session Session) string {
+	return workChatLifecycleNotice("Work chat created", session)
+}
+
+func workChatLifecycleNotice(status string, session Session) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "Work chat created"
+	}
+	sessionID := strings.TrimSpace(session.ID)
+	lines := []string{status + "."}
+	if sessionID != "" {
+		lines[0] = status + ": " + sessionID + "."
+	}
+	if cwd := strings.TrimSpace(session.Cwd); cwd != "" {
+		lines = append(lines, "Working directory: "+cwd)
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -12225,6 +12248,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 			return "", err
 		}
 	}
+	createdNotice := workChatCreatedNotice(session)
 	if !opts.ChatCreatedNoticeAfterImport {
 		if opts.LocalSessionStartedNotification {
 			var err error
@@ -12239,9 +12263,9 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		} else {
 			var err error
 			if opts.BackgroundImport {
-				_, err = b.queueChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+				_, err = b.queueChatCreatedNotice(ctx, session.ID, chat.ID, createdNotice, opts.ChatCreatedNotification)
 			} else {
-				err = b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+				err = b.sendChatCreatedNotice(ctx, session.ID, chat.ID, createdNotice, opts.ChatCreatedNotification)
 			}
 			if err != nil {
 				return "", err
@@ -12273,9 +12297,9 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		} else {
 			var err error
 			if opts.BackgroundImport {
-				_, err = b.queueChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+				_, err = b.queueChatCreatedNotice(ctx, session.ID, chat.ID, createdNotice, opts.ChatCreatedNotification)
 			} else {
-				err = b.sendChatCreatedNotice(ctx, session.ID, chat.ID, "Work chat created: "+session.ID+".", opts.ChatCreatedNotification)
+				err = b.sendChatCreatedNotice(ctx, session.ID, chat.ID, createdNotice, opts.ChatCreatedNotification)
 			}
 			if err != nil {
 				return "", err

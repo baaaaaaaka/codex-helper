@@ -120,6 +120,12 @@ jobs:
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
           go test ./internal/cli -count=1 -run 'Test(TeamsASRArgsFromEnvAndServiceOverrides|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
+      - name: Teams work chat creation info regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'TestBridge(ControlNewCreatesDirectoryBoundSession|PublishImportsExistingTranscriptInExactTeamsOrder|RecreateSessionChatRebindsSessionAndRetiresOldRouting)$' -v
+
       - name: Cross-compile check (Linux only)
         if: runner.os == 'Linux'
         shell: bash

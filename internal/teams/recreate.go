@@ -124,7 +124,7 @@ func (b *Bridge) RecreateSessionChat(ctx context.Context, selector string, opts 
 	if err := b.Save(); err != nil {
 		return RecreatedChat{}, err
 	}
-	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, "Work chat recreated: "+session.ID+"."); err != nil {
+	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, workChatLifecycleNotice("Work chat recreated", *session)); err != nil {
 		return RecreatedChat{}, err
 	}
 	if err := b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{

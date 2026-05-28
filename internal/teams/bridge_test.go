@@ -8275,7 +8275,7 @@ func TestBridgePublishImportsExistingTranscriptInExactTeamsOrder(t *testing.T) {
 	if len(work) < 7 {
 		t.Fatalf("work import sent %d message(s), want create mention, title, user, chunked assistant, user, assistant: %#v", len(work), work)
 	}
-	if !strings.Contains(work[0], "Work chat created:") {
+	if !strings.Contains(work[0], "Work chat created:") || !strings.Contains(work[0], "Working directory: /home/user/project/order") {
 		t.Fatalf("first imported message = %q, want work chat creation mention", work[0])
 	}
 	if !strings.Contains(work[1], "Imported Codex session") {
@@ -13841,13 +13841,17 @@ func TestBridgeControlNewCreatesDirectoryBoundSession(t *testing.T) {
 		t.Fatalf("control ack should help mobile users find the new chat, got %q", controlAck)
 	}
 	createdNotice := PlainTextFromTeamsHTML(sent[0].Content)
-	if !strings.Contains(createdNotice, "Work chat created: s001") || sent[0].Mentions != 1 {
+	if !strings.Contains(createdNotice, "Work chat created: s001") ||
+		!strings.Contains(createdNotice, "Working directory: "+workDir) ||
+		sent[0].Mentions != 1 {
 		t.Fatalf("work chat creation mention = %#v", sent[0])
 	}
 	anchor := PlainTextFromTeamsHTML(sent[1].Content)
 	if !strings.Contains(anchor, "Codex will start automatically") ||
 		!strings.Contains(anchor, "Status: waiting for your first task") ||
 		!strings.Contains(anchor, "Project: "+filepath.Base(workDir)) ||
+		!strings.Contains(anchor, "Working directory: "+workDir) ||
+		strings.Contains(anchor, "Need the full path?") ||
 		strings.Contains(anchor, "Folder: "+workDir) {
 		t.Fatalf("work chat anchor = %q", anchor)
 	}
@@ -16834,13 +16838,20 @@ func TestBridgeRecreateSessionChatRebindsSessionAndRetiresOldRouting(t *testing.
 	if strings.Contains(sent[0].Content, "🧑‍💻 User") {
 		t.Fatalf("old work migration notice was rendered as a user message: %s", sent[0].Content)
 	}
-	if sent[2].ChatID != "new-work" || sent[2].Mentions != 0 || !strings.Contains(sent[2].Content, "Work chat recreated: s001.") {
+	recreatedNotice := PlainTextFromTeamsHTML(sent[2].Content)
+	if sent[2].ChatID != "new-work" ||
+		sent[2].Mentions != 0 ||
+		!strings.Contains(recreatedNotice, "Work chat recreated: s001.") ||
+		!strings.Contains(recreatedNotice, "Working directory: /workspace/demo") {
 		t.Fatalf("recreated work notice = %#v", sent)
 	}
 	if sent[3].ChatID != "control-chat" || sent[3].Mentions != 1 || !strings.Contains(sent[3].Content, "Codex chat ready") || !strings.Contains(sent[3].Content, "new-work") {
 		t.Fatalf("recreated work fallback = %#v", sent)
 	}
-	if sent[4].ChatID != "new-work" || !strings.Contains(PlainTextFromTeamsHTML(sent[4].Content), "ready") {
+	recreatedAnchor := PlainTextFromTeamsHTML(sent[4].Content)
+	if sent[4].ChatID != "new-work" ||
+		!strings.Contains(recreatedAnchor, "ready") ||
+		!strings.Contains(recreatedAnchor, "Working directory: /workspace/demo") {
 		t.Fatalf("recreated work messages = %#v", sent)
 	}
 	state, err := store.Load(context.Background())
