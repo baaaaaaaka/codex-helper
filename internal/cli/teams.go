@@ -710,7 +710,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				asrTranscriber := teams.NewCommandASRTranscriber(effectiveASRCommand, effectiveASRArgs)
+				asrTranscriber := teamsASRTranscriberFromConfig(effectiveASRCommand, effectiveASRArgs)
 				var helperAutoUpdater teams.HelperAutoUpdater
 				if autoUpdate {
 					helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo, autoUpdatePrerelease)
@@ -754,6 +754,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra argument to pass to codex exec (repeatable)")
 	cmd.Flags().StringVar(&asrCommand, "asr-command", "", "Optional local Teams audio/video transcription command; stdout may be plain text or ASRTranscript JSON")
 	cmd.Flags().StringArrayVar(&asrArgs, "asr-arg", nil, "Argument for --asr-command (repeatable); placeholders: {input}, {language}, {speed}, {threads}, {source_index}, {prompt_path}, {content_type}")
+	_ = cmd.Flags().MarkHidden("asr-command")
+	_ = cmd.Flags().MarkHidden("asr-arg")
 	cmd.Flags().StringVar(&controlFallbackModel, "control-fallback-model", teams.DefaultControlFallbackModel, "Optional Codex model override for unrecognized control-chat requests; empty uses Codex default")
 	cmd.Flags().DurationVar(&timeout, "codex-timeout", 0, "Timeout for each Codex turn; 0 disables the helper-enforced turn timeout")
 	cmd.Flags().DurationVar(&ownerStaleAfter, "owner-stale-after", defaultTeamsOwnerStaleAfter, "How long a Teams helper owner can miss heartbeats before recovery or another helper may take over")
@@ -782,6 +784,13 @@ func teamsASRArgsFromFlagsOrEnv(flagArgs []string, enabled bool) ([]string, erro
 		return nil, fmt.Errorf("invalid %s JSON array: %w", envTeamsASRArgsJSON, err)
 	}
 	return args, nil
+}
+
+func teamsASRTranscriberFromConfig(command string, args []string) teams.ASRTranscriber {
+	if strings.TrimSpace(command) != "" {
+		return teams.NewCommandASRTranscriber(command, args)
+	}
+	return teams.NewManagedQwenASRTranscriber()
 }
 
 func teamsASRServiceEnvironmentOverrides(command string, args []string) map[string]string {

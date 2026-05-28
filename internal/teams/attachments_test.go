@@ -44,6 +44,47 @@ func TestTeamsMediaCardHostedContentIDs(t *testing.T) {
 	}
 }
 
+func TestHostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards(t *testing.T) {
+	msg := ChatMessage{
+		Attachments: []MessageAttachment{
+			{
+				ID:          "audio-card-1",
+				ContentType: "application/vnd.microsoft.card.audio",
+				Content: `{"media":[
+					{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/shared-1/$value"},
+					{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/audio-1/$value"},
+					{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/audio-1/$value"}
+				]}`,
+			},
+			{
+				ID:          "video-card-1",
+				ContentType: "application/vnd.microsoft.card.video",
+				Content: `{"media":[
+					{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/video-1/$value"}
+				]}`,
+			},
+		},
+	}
+	msg.Body.Content = `<p>
+		<img src="https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-1/hostedContents/body-1/$value">
+		<img src="../hostedContents/shared-1/$value">
+	</p>`
+
+	got, truncated := hostedContentRefsFromMessage(msg, maxHostedContentPerMessage)
+	if truncated {
+		t.Fatalf("hosted content refs unexpectedly truncated: %#v", got)
+	}
+	want := []hostedContentAttachmentRef{
+		{ID: "body-1", SourceID: "body-1"},
+		{ID: "shared-1", SourceID: "shared-1"},
+		{ID: "audio-1", SourceID: "audio-card-1"},
+		{ID: "video-1", SourceID: "video-card-1"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("hosted content refs = %#v, want %#v", got, want)
+	}
+}
+
 func TestTeamsMediaCardPreflightDoesNotRequireFilesRead(t *testing.T) {
 	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "openid profile offline_access User.Read Chat.Read")
 	msg := ChatMessage{

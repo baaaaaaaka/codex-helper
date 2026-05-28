@@ -4763,7 +4763,10 @@ func TestBridgeControlClosedLinkedSessionIsNotPresentedAsOpenable(t *testing.T) 
 		t.Fatalf("closed session selection = %q", selection)
 	}
 	status := PlainTextFromTeamsHTML((*sent)[3].Content)
-	if !strings.Contains(status, "no active linked work chats") || strings.Contains(status, "https://teams.example/chat-1") {
+	if !strings.Contains(status, "no active linked work chats") ||
+		!strings.Contains(status, "Speech recognition:") ||
+		teamsVisibleMessageLeaksASRConfiguration(status) ||
+		strings.Contains(status, "https://teams.example/chat-1") {
 		t.Fatalf("control status = %q, want closed chats hidden", status)
 	}
 }
@@ -5252,7 +5255,7 @@ func TestBridgeControlUnknownTextFallsBackToCodex(t *testing.T) {
 	if got := len(*sent); got != 2 {
 		t.Fatalf("sent message count = %d, want ack plus final", got)
 	}
-	if !strings.Contains((*sent)[0].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[0].Content, "Codex will answer it here") || !strings.Contains((*sent)[1].Content, "fallback answer") {
+	if !strings.Contains((*sent)[0].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[0].Content, "Codex will answer it here after helper-local preparation succeeds") || strings.Contains((*sent)[0].Content, "submitted to Codex") || !strings.Contains((*sent)[1].Content, "fallback answer") {
 		t.Fatalf("sent content did not include control ack and executor output: %#v", *sent)
 	}
 	if strings.Contains((*sent)[1].Content, "Control chat commands") || strings.Contains((*sent)[1].Content, "User message:") {
@@ -5376,17 +5379,23 @@ func TestBridgeControlAudioCardFallsBackToCodexWithASR(t *testing.T) {
 	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "Automatic local ASR transcript") || !strings.Contains(got[0], "transcript for") {
 		t.Fatalf("control fallback prompt = %#v, want ASR transcript", got)
 	}
+	for _, forbidden := range []string{"Attached files saved locally", "audio/mp4"} {
+		if strings.Contains(executor.prompts[0], forbidden) {
+			t.Fatalf("control fallback prompt exposed raw audio attachment detail %q:\n%s", forbidden, executor.prompts[0])
+		}
+	}
 	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "control voice answer") {
 		t.Fatalf("unexpected control voice transcript:\n%s", got)
 	}
 }
 
 func TestBridgeControlAudioCardWithoutASRReportsSetupMessage(t *testing.T) {
-	graph, sent := newBridgeControlAudioCardGraph(t)
+	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	bridge.controlFallbackExecutor = executor
+	bridge.asrTranscriber = NewCommandASRTranscriber("", nil)
 	msg := bridgeTestMessage("control-audio-card")
 	msg.ChatID = "control-chat"
 	msg.Attachments = []MessageAttachment{{
@@ -5401,11 +5410,19 @@ func TestBridgeControlAudioCardWithoutASRReportsSetupMessage(t *testing.T) {
 	if len(executor.prompts) != 0 {
 		t.Fatalf("executor prompts = %#v, want none without configured ASR", executor.prompts)
 	}
+	if got, err := store.HasQueuedTurns(context.Background()); err != nil || got {
+		t.Fatalf("HasQueuedTurns = %v err=%v, want no queued turn before ASR setup", got, err)
+	}
 	got := sentPlainJoined(*sent)
-	if !strings.Contains(got, "Codex received your control-chat question") ||
-		!strings.Contains(got, "Teams voice/video transcription is not configured") ||
-		!strings.Contains(got, "CODEX_HELPER_TEAMS_ASR_COMMAND") {
+	if strings.Contains(got, "Codex received your control-chat question") ||
+		strings.Contains(got, "submitted to Codex") ||
+		!strings.Contains(got, "Teams voice/video transcription is not ready") ||
+		!strings.Contains(got, "cxp should prepare local speech recognition automatically") ||
+		teamsVisibleMessageLeaksASRConfiguration(got) {
 		t.Fatalf("control no-ASR response = %q", got)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %#v, want only ASR setup notice", *sent)
 	}
 }
 
@@ -5818,7 +5835,7 @@ func TestBridgeControlHelperUpdateQuestionFallsBackToCodex(t *testing.T) {
 	if got := executor.prompts; len(got) != 1 || !strings.Contains(got[0], "User message:\n"+text) {
 		t.Fatalf("executor prompts = %#v, want control fallback prompt", got)
 	}
-	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[0].Content, "request has already been submitted to Codex") || !strings.Contains((*sent)[1].Content, "upgrade explanation") {
+	if len(*sent) != 2 || !strings.Contains((*sent)[0].Content, "Codex received your control-chat question") || !strings.Contains((*sent)[0].Content, "before Codex starts") || strings.Contains((*sent)[0].Content, "submitted to Codex") || !strings.Contains((*sent)[1].Content, "upgrade explanation") {
 		t.Fatalf("sent = %#v, want fallback ack and answer", *sent)
 	}
 }
@@ -7364,6 +7381,10 @@ func TestBridgeWorkHelperCommandPrefixDoesNotRunCodex(t *testing.T) {
 	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "STATUS: Work chat") {
 		t.Fatalf("helper status response = %#v", *sent)
 	}
+	status := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(status, "Speech recognition:") || teamsVisibleMessageLeaksASRConfiguration(status) {
+		t.Fatalf("helper status ASR line = %q", status)
+	}
 }
 
 func TestBridgeWorkStatusMapsContextCanceledFailure(t *testing.T) {
@@ -7550,6 +7571,66 @@ func TestBridgeUpgradeDrainDefersAndReplaysControlFallbackOnce(t *testing.T) {
 	}
 	if len(executor.prompts) != 1 || len(*sent) != 3 {
 		t.Fatalf("deferred control fallback replayed more than once, prompts=%#v sent=%#v", executor.prompts, *sent)
+	}
+}
+
+func TestBridgeUpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.SetDraining(context.Background(), teamstore.HelperUpgradeReason); err != nil {
+		t.Fatalf("SetDraining error: %v", err)
+	}
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+	bridge.asrTranscriber = NewCommandASRTranscriber("", nil)
+	msg := bridgeTestMessage("control-deferred-audio-card")
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/control-chat/messages/control-deferred-audio-card/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, ""); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts during drain = %#v, want none", executor.prompts)
+	}
+	deferred, err := store.DeferredInbound(context.Background())
+	if err != nil {
+		t.Fatalf("DeferredInbound error: %v", err)
+	}
+	if len(deferred) != 1 || deferred[0].Source != "teams_control_fallback" || len(deferred[0].TeamsAttachments) != 1 {
+		t.Fatalf("deferred control audio inbound = %#v", deferred)
+	}
+	if _, err := store.ClearDrain(context.Background()); err != nil {
+		t.Fatalf("ClearDrain error: %v", err)
+	}
+	if err := bridge.processDeferredInbound(context.Background()); err != nil {
+		t.Fatalf("processDeferredInbound error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts after replay = %#v, want none without configured ASR", executor.prompts)
+	}
+	got := sentPlainJoined(*sent)
+	if !strings.Contains(got, "upgrade in progress") ||
+		!strings.Contains(got, "Teams voice/video transcription is not ready") ||
+		teamsVisibleMessageLeaksASRConfiguration(got) ||
+		strings.Contains(got, "Codex received your control-chat question") ||
+		strings.Contains(got, "submitted to Codex") {
+		t.Fatalf("deferred control no-ASR transcript = %q", got)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent messages = %#v, want drain notice plus ASR setup notice", *sent)
+	}
+	deferred, err = store.DeferredInbound(context.Background())
+	if err != nil {
+		t.Fatalf("DeferredInbound after replay error: %v", err)
+	}
+	if len(deferred) != 0 {
+		t.Fatalf("deferred inbound after replay = %#v, want none", deferred)
 	}
 }
 
@@ -10366,8 +10447,178 @@ func TestBridgeSessionTeamsAudioCardIsDownloadedAndTranscribed(t *testing.T) {
 	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "Automatic local ASR transcript") || !strings.Contains(executor.prompts[0], "transcript for") {
 		t.Fatalf("executor prompts = %#v, want ASR transcript context", executor.prompts)
 	}
+	for _, forbidden := range []string{"Attached files saved locally", "audio/mp4"} {
+		if strings.Contains(executor.prompts[0], forbidden) {
+			t.Fatalf("session prompt exposed raw audio attachment detail %q:\n%s", forbidden, executor.prompts[0])
+		}
+	}
 	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "transcribed answer") {
 		t.Fatalf("sent messages = %#v, want ack plus final answer", *sent)
+	}
+}
+
+func TestBridgeSessionTeamsMixedHostedImageAndAudioKeepsImageOnlyAsAttachment(t *testing.T) {
+	graph, sent := newBridgeMediaCardGraph(t, "chat-1", "message-mixed-media", []bridgeHostedMedia{
+		{ID: "image-1", ContentType: "image/png", Bytes: []byte("image-bytes")},
+		{ID: "audio-1", ContentType: "audio/mp4", Bytes: []byte("audio-bytes")},
+	})
+	store := newBridgeTestStore(t)
+	executor := &imageInputRecordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	asr := &fakeASRTranscriber{}
+	bridge.asrTranscriber = asr
+	msg := bridgeTestMessage("message-mixed-media")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = `<p>inspect image and voice</p><img src="https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-mixed-media/hostedContents/image-1/$value">`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT2S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-mixed-media/hostedContents/audio-1/$value"}]}`,
+	}}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "inspect image and voice"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(asr.calls) != 1 || asr.calls[0].File.ContentType != "audio/mp4" {
+		t.Fatalf("ASR calls = %#v, want one audio call", asr.calls)
+	}
+	if len(executor.input.ImagePaths) != 1 || !strings.Contains(executor.input.ImagePaths[0], "attachment-001") {
+		t.Fatalf("image paths = %#v, want only hosted image as Codex image input", executor.input.ImagePaths)
+	}
+	if string(executor.imageRead) != "image-bytes" {
+		t.Fatalf("image bytes = %q, want hosted image bytes", string(executor.imageRead))
+	}
+	requirePlainTextInOrder(t, executor.input.Prompt,
+		"inspect image and voice",
+		"Automatic local ASR transcript",
+		"transcript for",
+		"Attached files saved locally for this turn",
+		"attachment-001",
+	)
+	for _, forbidden := range []string{"audio/mp4", ".codex-helper/teams-attachments/message-mixed-media/attachment-002"} {
+		if strings.Contains(executor.input.Prompt, forbidden) {
+			t.Fatalf("mixed media prompt exposed raw audio attachment detail %q:\n%s", forbidden, executor.input.Prompt)
+		}
+	}
+	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "saw image input") {
+		t.Fatalf("sent messages = %#v, want ack plus final image response", *sent)
+	}
+}
+
+func TestBridgeSessionTeamsVideoCardIsDownloadedAndTranscribed(t *testing.T) {
+	graph, sent := newBridgeMediaCardGraph(t, "chat-1", "message-video-card", []bridgeHostedMedia{
+		{ID: "video-1", ContentType: "video/mp4", Bytes: []byte("video-bytes")},
+	})
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "transcribed video answer"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	asr := &fakeASRTranscriber{}
+	bridge.asrTranscriber = asr
+	msg := bridgeTestMessage("message-video-card")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p>please handle this video clip</p>"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "video-card-1",
+		ContentType: "application/vnd.microsoft.card.video",
+		Content:     `{"duration":"PT4S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-video-card/hostedContents/video-1/$value"}]}`,
+	}}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "please handle this video clip"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(asr.calls) != 1 {
+		t.Fatalf("ASR calls = %d, want 1", len(asr.calls))
+	}
+	if asr.calls[0].File.ContentType != "video/mp4" || !strings.Contains(asr.calls[0].File.PromptPath, "attachment-001") {
+		t.Fatalf("ASR input file = %#v, want downloaded video attachment", asr.calls[0].File)
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "Automatic local ASR transcript") || !strings.Contains(executor.prompts[0], "transcript for") {
+		t.Fatalf("executor prompts = %#v, want ASR transcript context", executor.prompts)
+	}
+	for _, forbidden := range []string{"Attached files saved locally", "video/mp4"} {
+		if strings.Contains(executor.prompts[0], forbidden) {
+			t.Fatalf("session prompt exposed raw video attachment detail %q:\n%s", forbidden, executor.prompts[0])
+		}
+	}
+	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "transcribed video answer") {
+		t.Fatalf("sent messages = %#v, want ack plus final answer", *sent)
+	}
+}
+
+func TestBridgeSessionTeamsAudioCardTranscribesMultipleClipsInOrder(t *testing.T) {
+	graph, sent := newBridgeMediaCardGraph(t, "chat-1", "message-audio-multi-card", []bridgeHostedMedia{
+		{ID: "audio-1", ContentType: "audio/mp4", Bytes: []byte("audio-one")},
+		{ID: "audio-2", ContentType: "audio/mp4", Bytes: []byte("audio-two")},
+	})
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "multi voice answer"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	asr := &fakeASRTranscriber{}
+	bridge.asrTranscriber = asr
+	msg := bridgeTestMessage("message-audio-multi-card")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p>combine these voice clips</p>"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     `{"duration":"PT6S","media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-multi-card/hostedContents/audio-1/$value"},{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-multi-card/hostedContents/audio-2/$value"}]}`,
+	}}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "combine these voice clips"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(asr.calls) != 2 {
+		t.Fatalf("ASR calls = %d, want 2", len(asr.calls))
+	}
+	if asr.calls[0].SourceIndex != 1 || asr.calls[1].SourceIndex != 2 {
+		t.Fatalf("ASR source indexes = %d/%d, want 1/2", asr.calls[0].SourceIndex, asr.calls[1].SourceIndex)
+	}
+	prompt := strings.Join(executor.prompts, "\n---\n")
+	requirePlainTextInOrder(t, prompt, "Voice/video clip 1", "attachment-001", "Voice/video clip 2", "attachment-002")
+	for _, forbidden := range []string{"Attached files saved locally", "audio/mp4"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("multi-audio prompt exposed raw audio attachment detail %q:\n%s", forbidden, prompt)
+		}
+	}
+	if got := len(*sent); got != 2 || !strings.Contains((*sent)[1].Content, "multi voice answer") {
+		t.Fatalf("sent messages = %#v, want ack plus final answer", *sent)
+	}
+}
+
+func TestBridgeSessionTeamsMediaLimitDoesNotDownloadOrRunASR(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	asr := &fakeASRTranscriber{}
+	bridge.asrTranscriber = asr
+	msg := bridgeTestMessage("message-audio-too-many")
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p>too many voice clips</p>"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content: `{"media":[
+			{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-too-many/hostedContents/audio-1/$value"},
+			{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-too-many/hostedContents/audio-2/$value"},
+			{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-too-many/hostedContents/audio-3/$value"},
+			{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-too-many/hostedContents/audio-4/$value"},
+			{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-too-many/hostedContents/audio-5/$value"},
+			{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/message-audio-too-many/hostedContents/audio-6/$value"}
+		]}`,
+	}}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "too many voice clips"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(asr.calls) != 0 {
+		t.Fatalf("ASR calls = %d, want none when Teams media limit is exceeded", len(asr.calls))
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none when Teams media limit is exceeded", executor.prompts)
+	}
+	if got := sentPlainJoined(*sent); !strings.Contains(got, "more than 5 inline Teams media attachments") || strings.Contains(got, "should not run") {
+		t.Fatalf("media-limit response = %q", got)
 	}
 }
 
@@ -10393,8 +10644,9 @@ func TestBridgeSessionTeamsAudioCardWithoutASRReportsSetupMessage(t *testing.T) 
 		t.Fatalf("executor prompts = %#v, want none without configured ASR", executor.prompts)
 	}
 	got := sentPlainJoined(*sent)
-	if !strings.Contains(got, "Teams voice/video transcription is not configured") ||
-		!strings.Contains(got, "CODEX_HELPER_TEAMS_ASR_COMMAND") ||
+	if !strings.Contains(got, "Teams voice/video transcription is not ready") ||
+		!strings.Contains(got, "cxp should prepare local speech recognition automatically") ||
+		teamsVisibleMessageLeaksASRConfiguration(got) ||
 		strings.Contains(got, "should not run") {
 		t.Fatalf("session no-ASR response = %q", got)
 	}
@@ -24924,6 +25176,66 @@ func newBridgeAudioCardGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) 
 	}, &sent
 }
 
+type bridgeHostedMedia struct {
+	ID          string
+	ContentType string
+	Bytes       []byte
+}
+
+func newBridgeMediaCardGraph(t *testing.T, chatID string, messageID string, media []bridgeHostedMedia) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	got := make(map[string]bool, len(media))
+	byPath := make(map[string]bridgeHostedMedia, len(media))
+	for _, item := range media {
+		path := fmt.Sprintf("/chats/%s/messages/%s/hostedContents/%s/$value", chatID, messageID, item.ID)
+		byPath[path] = item
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			item, ok := byPath[r.URL.Path]
+			if !ok {
+				t.Fatalf("unexpected Graph media request: %s %s", r.Method, r.URL.String())
+			}
+			got[item.ID] = true
+			w.Header().Set("Content-Type", item.ContentType)
+			_, _ = w.Write(item.Bytes)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			postedChatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: postedChatID, Content: body.Body.Content})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		for _, item := range media {
+			if !got[item.ID] {
+				t.Fatalf("hosted media %s was not downloaded", item.ID)
+			}
+		}
+	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
+}
+
 func newBridgeControlAudioCardGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
 	t.Helper()
 	var sent []bridgeSentMessage
@@ -25211,6 +25523,23 @@ func sentPlainJoined(messages []bridgeSentMessage) string {
 		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
 	return strings.Join(plain, "\n---\n")
+}
+
+func teamsVisibleMessageLeaksASRConfiguration(text string) bool {
+	for _, forbidden := range []string{
+		"--asr-command",
+		"--asr-arg",
+		"CODEX_HELPER_TEAMS_ASR_COMMAND",
+		"CODEX_HELPER_TEAMS_ASR_ARGS_JSON",
+		"{input}",
+		"{threads}",
+		"placeholder",
+	} {
+		if strings.Contains(text, forbidden) {
+			return true
+		}
+	}
+	return false
 }
 
 func legacyV5LoadTeamsStateForBridgeTest(data []byte) (teamstore.State, error) {

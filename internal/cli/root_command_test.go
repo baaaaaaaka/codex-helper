@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
 func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
@@ -104,6 +105,20 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	} else if flag.DefValue != "0s" {
 		t.Fatalf("teams run --codex-timeout default = %q, want 0s", flag.DefValue)
 	}
+	if flag := runCmd.Flags().Lookup("asr-command"); flag == nil {
+		t.Fatal("teams run should keep developer ASR override wired")
+	} else if !flag.Hidden {
+		t.Fatal("teams run should hide developer ASR override from user help")
+	}
+	if flag := runCmd.Flags().Lookup("asr-arg"); flag == nil {
+		t.Fatal("teams run should keep developer ASR arg override wired")
+	} else if !flag.Hidden {
+		t.Fatal("teams run should hide developer ASR args from user help")
+	}
+	runHelp := runCmd.UsageString()
+	if strings.Contains(runHelp, "--asr-command") || strings.Contains(runHelp, "CODEX_HELPER_TEAMS_ASR") {
+		t.Fatalf("teams run help leaked ASR implementation details:\n%s", runHelp)
+	}
 
 	authCmd, _, err := teamsCmd.Find([]string{"auth"})
 	if err != nil {
@@ -116,6 +131,26 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	sort.Strings(authNames)
 	if want := []string{"config", "file-write", "file-write-logout", "file-write-status", "full", "full-logout", "full-status", "logout", "read", "read-logout", "read-status", "status"}; !reflect.DeepEqual(authNames, want) {
 		t.Fatalf("unexpected teams auth subcommands\n got: %#v\nwant: %#v", authNames, want)
+	}
+}
+
+func TestTeamsASRTranscriberDefaultsToManagedQwenRuntime(t *testing.T) {
+	transcriber := teamsASRTranscriberFromConfig("", nil)
+	managed, ok := transcriber.(*teams.ManagedASRTranscriber)
+	if !ok {
+		t.Fatalf("default ASR transcriber = %T, want managed Qwen runtime", transcriber)
+	}
+	if managed == nil || managed.Config.ModelID != "" {
+		t.Fatalf("managed ASR config = %#v, want default model resolved lazily", managed)
+	}
+
+	override := teamsASRTranscriberFromConfig("/tmp/custom-asr", []string{"--input={input}"})
+	command, ok := override.(*teams.CommandASRTranscriber)
+	if !ok {
+		t.Fatalf("developer ASR override = %T, want command transcriber", override)
+	}
+	if command.Command != "/tmp/custom-asr" || strings.Join(command.Args, "\n") != "--input={input}" {
+		t.Fatalf("developer ASR override not preserved: %#v", command)
 	}
 }
 

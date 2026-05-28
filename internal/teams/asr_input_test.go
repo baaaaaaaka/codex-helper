@@ -87,14 +87,65 @@ func TestExecutionInputWithPreparedTeamsContextCombinesSpeechReferencesAndImages
 		"Referenced Teams message for this turn",
 		"quoted context",
 		"Attached files saved locally for this turn",
-		".codex-helper/voice.m4a",
+		".codex-helper/photo.jpg",
 	} {
 		if !strings.Contains(input.Prompt, want) {
 			t.Fatalf("prepared prompt missing %q:\n%s", want, input.Prompt)
 		}
 	}
+	for _, forbidden := range []string{
+		".codex-helper/voice.m4a",
+		"audio/mp4",
+	} {
+		if strings.Contains(input.Prompt, forbidden) {
+			t.Fatalf("prepared prompt exposed raw Teams media %q:\n%s", forbidden, input.Prompt)
+		}
+	}
 	if !reflect.DeepEqual(input.ImagePaths, []string{"/tmp/photo.jpg"}) {
 		t.Fatalf("image paths = %#v, want only the supported image", input.ImagePaths)
+	}
+}
+
+func TestExecutionInputWithPreparedTeamsContextStressMixedInputsDoesNotExposeRawTeamsMedia(t *testing.T) {
+	input := executionInputWithPreparedTeamsContext(
+		"typed text with mixed inputs",
+		[]ReferencedMessage{{Sender: "Dana", Text: "quoted context", Fetched: true}},
+		[]LocalAttachment{
+			{Path: "/tmp/photo.jpg", PromptPath: ".codex-helper/photo.jpg", ContentType: "image/jpeg"},
+			{Path: "/tmp/spec.pdf", PromptPath: ".codex-helper/spec.pdf", ContentType: "application/pdf"},
+			{Path: "/tmp/voice.m4a", PromptPath: ".codex-helper/voice.m4a", ContentType: "audio/mp4"},
+			{Path: "/tmp/demo.mp4", PromptPath: ".codex-helper/demo.mp4", ContentType: "video/mp4"},
+		},
+		[]ASRTranscript{
+			{SourceName: "voice.m4a", Text: "first speech transcript", ContentType: "audio/mp4"},
+			{SourceName: "demo.mp4", Text: "second video transcript", ContentType: "video/mp4"},
+		},
+	)
+
+	requirePlainTextInOrder(t, input.Prompt,
+		"User message:",
+		"typed text with mixed inputs",
+		"Automatic local ASR transcript",
+		"first speech transcript",
+		"second video transcript",
+		"Referenced Teams message for this turn",
+		"quoted context",
+		"Attached files saved locally for this turn",
+		".codex-helper/photo.jpg",
+		".codex-helper/spec.pdf",
+	)
+	for _, forbidden := range []string{
+		".codex-helper/voice.m4a",
+		".codex-helper/demo.mp4",
+		"audio/mp4",
+		"video/mp4",
+	} {
+		if strings.Contains(input.Prompt, forbidden) {
+			t.Fatalf("mixed-input prompt exposed raw Teams media %q:\n%s", forbidden, input.Prompt)
+		}
+	}
+	if !reflect.DeepEqual(input.ImagePaths, []string{"/tmp/photo.jpg"}) {
+		t.Fatalf("image paths = %#v, want only photo", input.ImagePaths)
 	}
 }
 
@@ -156,6 +207,41 @@ func TestTranscribeTeamsMediaAttachmentsRequiresConfiguredASRForMedia(t *testing
 	})
 	if !errors.Is(err, errASRCommandNotConfigured) {
 		t.Fatalf("transcribeTeamsMediaAttachments error = %v, want ASR not configured", err)
+	}
+}
+
+func TestTranscribeTeamsMediaAttachmentsTreatsEmptyCommandASRAsUnconfigured(t *testing.T) {
+	bridge := &Bridge{asrTranscriber: NewCommandASRTranscriber("", nil)}
+	_, err := bridge.transcribeTeamsMediaAttachments(context.Background(), &Session{ID: "s001"}, "turn-1", []LocalAttachment{
+		{Path: "/tmp/voice.m4a", PromptPath: ".codex-helper/voice.m4a", ContentType: "audio/mp4"},
+	})
+	if !errors.Is(err, errASRCommandNotConfigured) {
+		t.Fatalf("transcribeTeamsMediaAttachments error = %v, want ASR not configured", err)
+	}
+}
+
+func TestTeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration(t *testing.T) {
+	cases := []struct {
+		name        string
+		transcriber ASRTranscriber
+		want        string
+	}{
+		{name: "managed default", transcriber: NewManagedQwenASRTranscriber(), want: "managed local Qwen ASR"},
+		{name: "developer override", transcriber: &CommandASRTranscriber{Command: "/tmp/asr"}, want: "developer override configured"},
+		{name: "missing", transcriber: nil, want: "not ready"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := teamsASRStatusLine(tc.transcriber)
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("ASR status line = %q, want %q", got, tc.want)
+			}
+			for _, forbidden := range []string{"--asr-command", "--asr-arg", "CODEX_HELPER_TEAMS_ASR", "{input}", "{threads}"} {
+				if strings.Contains(got, forbidden) {
+					t.Fatalf("ASR status leaked implementation detail %q: %q", forbidden, got)
+				}
+			}
+		})
 	}
 }
 

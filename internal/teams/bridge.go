@@ -3082,6 +3082,9 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 		}
 		return b.sendControl(ctx, serviceControlBlockedMessage(control, "control fallback requests"))
 	}
+	if hasMedia && !teamsASRTranscriberConfigured(b.asrTranscriber) {
+		return b.sendControl(ctx, teamsASRFailureUserMessage(errASRCommandNotConfigured))
+	}
 	session, err := b.ensureControlFallbackSession(ctx)
 	if err != nil {
 		return err
@@ -3154,11 +3157,12 @@ func (b *Bridge) prepareControlFallbackInputFromTeamsMessage(ctx context.Context
 		return ExecutionInput{}, cleanupHosted, teamsASRFailureUserMessage(err), nil
 	}
 	preparedPrompt := promptWithASRTranscripts(promptText, transcripts)
-	if strings.TrimSpace(preparedPrompt) == "" && len(localFiles) > 0 {
+	codexFiles := nonTeamsMediaAttachments(localFiles)
+	if strings.TrimSpace(preparedPrompt) == "" && len(codexFiles) > 0 {
 		preparedPrompt = defaultLocalAttachmentPrompt
 	}
 	preparedPrompt = b.controlFallbackCodexPromptForMessage(ctx, preparedPrompt, msg.ID)
-	return ExecutionInputWithLocalAttachments(preparedPrompt, localFiles), cleanupHosted, "", nil
+	return ExecutionInputWithLocalAttachments(preparedPrompt, codexFiles), cleanupHosted, "", nil
 }
 
 func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, error) {
@@ -5315,7 +5319,7 @@ func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, 
 		TeamsChatID: session.ChatID,
 		Kind:        "ack",
 		AckKind:     "control_prompt",
-		Body:        "❓ **Codex received your control-chat question.**\n\nThis message is not a helper command, so **Codex will answer it here**. The request has already been submitted to Codex.\n\nFor project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
+		Body:        "❓ **Codex received your control-chat question.**\n\nThis message is not a helper command, so **Codex will answer it here after helper-local preparation succeeds**. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.\n\nFor project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
 	})
 	if err != nil {
 		return err
@@ -6756,6 +6760,13 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 		}
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "replayed control publish command")
 	case "teams_control_fallback":
+		if hasSupportedTeamsMediaCardAttachment(msg.Attachments) && !teamsASRTranscriberConfigured(b.asrTranscriber) {
+			message := teamsASRFailureUserMessage(errASRCommandNotConfigured)
+			if markErr := b.markDeferredInboundIgnored(ctx, inbound.ID, message); markErr != nil {
+				return markErr
+			}
+			return b.sendControl(ctx, message)
+		}
 		session, err := b.ensureControlFallbackSession(ctx)
 		if err != nil {
 			return err
@@ -11775,9 +11786,9 @@ func (b *Bridge) formatSessionList() string {
 	}
 	if len(active) == 0 {
 		if closedCount > 0 {
-			return fmt.Sprintf("Control status: no active linked work chats. %d closed work chat(s) are hidden because the helper no longer polls them.\n\nSend `projects` to choose a workspace, `new <directory>` to create a Work chat, or `sessions` then `continue <number>` to import an existing local Codex session.", closedCount)
+			return fmt.Sprintf("Control status: no active linked work chats. %d closed work chat(s) are hidden because the helper no longer polls them.\n\n%s\n\nSend `projects` to choose a workspace, `new <directory>` to create a Work chat, or `sessions` then `continue <number>` to import an existing local Codex session.", closedCount, teamsASRStatusLine(b.asrTranscriber))
 		}
-		return "Control status: no linked work chats yet.\n\nNext: send `projects` to choose a workspace, or `new <directory>` to create a Work chat."
+		return "Control status: no linked work chats yet.\n\n" + teamsASRStatusLine(b.asrTranscriber) + "\n\nNext: send `projects` to choose a workspace, or `new <directory>` to create a Work chat."
 	}
 	lines := []string{"## Active Work chats"}
 	for _, session := range active {
@@ -11786,6 +11797,7 @@ func (b *Bridge) formatSessionList() string {
 	if closedCount > 0 {
 		lines = append(lines, fmt.Sprintf("%d closed work chat(s) hidden. The helper no longer reads or responds in closed chats.", closedCount))
 	}
+	lines = append(lines, teamsASRStatusLine(b.asrTranscriber))
 	lines = append(lines, "Next: open one of these Teams chats to continue work, or send `new <directory>` to create another Work chat.")
 	return strings.Join(lines, "\n")
 }
@@ -11802,6 +11814,7 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 	if strings.TrimSpace(session.Cwd) != "" {
 		lines = append(lines, "Folder: "+session.Cwd)
 	}
+	lines = append(lines, teamsASRStatusLine(b.asrTranscriber))
 	if target := b.beaconTargetSummary(session.ID); target != "" {
 		lines = append(lines, target)
 	}

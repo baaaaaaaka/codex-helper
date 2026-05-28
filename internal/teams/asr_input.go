@@ -144,7 +144,21 @@ func promptWithASRTranscripts(text string, transcripts []ASRTranscript) string {
 func executionInputWithPreparedTeamsContext(text string, refs []ReferencedMessage, files []LocalAttachment, transcripts []ASRTranscript) ExecutionInput {
 	prompt := promptWithASRTranscripts(text, transcripts)
 	prompt = PromptWithReferencedMessages(prompt, refs)
-	return ExecutionInputWithLocalAttachments(TeamsCodexPrompt(prompt), files)
+	return ExecutionInputWithLocalAttachments(TeamsCodexPrompt(prompt), nonTeamsMediaAttachments(files))
+}
+
+func nonTeamsMediaAttachments(files []LocalAttachment) []LocalAttachment {
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]LocalAttachment, 0, len(files))
+	for _, file := range files {
+		if isTeamsMediaAttachment(file) {
+			continue
+		}
+		out = append(out, file)
+	}
+	return out
 }
 
 func (b *Bridge) transcribeTeamsMediaAttachments(ctx context.Context, session *Session, turnID string, files []LocalAttachment) ([]ASRTranscript, error) {
@@ -155,7 +169,7 @@ func (b *Bridge) transcribeTeamsMediaAttachments(ctx context.Context, session *S
 			continue
 		}
 		sourceIndex++
-		if b == nil || b.asrTranscriber == nil {
+		if b == nil || !teamsASRTranscriberConfigured(b.asrTranscriber) {
 			return nil, errASRCommandNotConfigured
 		}
 		stopProgress := b.startTeamsASRProgressLoop(ctx, session, turnID, sourceIndex, file)
@@ -194,11 +208,41 @@ func (b *Bridge) transcribeTeamsMediaAttachments(ctx context.Context, session *S
 	return transcripts, nil
 }
 
+func teamsASRTranscriberConfigured(transcriber ASRTranscriber) bool {
+	if transcriber == nil {
+		return false
+	}
+	if command, ok := transcriber.(*CommandASRTranscriber); ok {
+		if command == nil {
+			return false
+		}
+		return strings.TrimSpace(command.Command) != ""
+	}
+	return true
+}
+
 func teamsASRFailureUserMessage(err error) string {
 	if errors.Is(err, errASRCommandNotConfigured) {
-		return "Teams voice/video transcription is not configured on this helper. I downloaded the Teams media, but I did not send it to Codex because Codex would receive the audio/video file instead of the spoken text. Configure a local ASR command with `cxp teams run --asr-command <program>` plus repeated `--asr-arg ...`, or set `CODEX_HELPER_TEAMS_ASR_COMMAND` and `CODEX_HELPER_TEAMS_ASR_ARGS_JSON` for the Teams service. The command can use placeholders such as `{input}`, `{language}`, `{speed}`, and `{threads}`, and may print plain transcript text or ASRTranscript JSON."
+		return "Teams voice/video transcription is not ready on this helper yet. I received Teams media, but I did not send the raw audio/video to Codex. cxp should prepare local speech recognition automatically; please update/reload the helper and try again."
 	}
 	return "Teams media transcription failed: " + err.Error()
+}
+
+func teamsASRStatusLine(transcriber ASRTranscriber) string {
+	switch value := transcriber.(type) {
+	case *ManagedASRTranscriber:
+		if value != nil {
+			return "Speech recognition: managed local Qwen ASR; cxp sets it up automatically on the first Teams voice/video message."
+		}
+	case *CommandASRTranscriber:
+		if value != nil && strings.TrimSpace(value.Command) != "" {
+			return "Speech recognition: developer override configured."
+		}
+	}
+	if teamsASRTranscriberConfigured(transcriber) {
+		return "Speech recognition: configured."
+	}
+	return "Speech recognition: not ready in this helper process; update/reload the helper to enable automatic local ASR."
 }
 
 func (b *Bridge) startTeamsASRProgressLoop(ctx context.Context, session *Session, turnID string, sourceIndex int, file LocalAttachment) func() {
@@ -245,13 +289,21 @@ func (b *Bridge) queueTeamsASRProgress(ctx context.Context, session *Session, tu
 		SourceName:  filepath.Base(firstNonEmptyString(file.PromptPath, file.Path)),
 		SourcePath:  firstNonEmptyString(file.PromptPath, file.Path),
 	})
-	body := strings.Join([]string{
+	lines := []string{
 		"Transcribing Teams media before running Codex.",
 		"",
 		fmt.Sprintf("Clip: %s", name),
 		fmt.Sprintf("Elapsed: %s", formatCodexQuietDuration(elapsed)),
 		"Codex will start after transcription finishes.",
-	}, "\n")
+	}
+	if count == 1 {
+		if managed, ok := b.asrTranscriber.(*ManagedASRTranscriber); ok && managed != nil {
+			if cfg, err := resolveManagedASRConfig(managed.Config); err == nil {
+				lines = append(lines, "", "Local speech recognition runtime:", "Cache: "+cfg.CacheRoot, "Disk preflight: at least "+formatASRBytes(cfg.MinFreeBytes)+" free.")
+			}
+		}
+	}
+	body := strings.Join(lines, "\n")
 	return b.queueAndBestEffortSendOutbox(ctx, teamstore.OutboxMessage{
 		ID:               fmt.Sprintf("outbox:%s:%s:%03d:%03d", strings.TrimSpace(turnID), teamsASRProgressKind, sourceIndex, count),
 		SessionID:        session.ID,

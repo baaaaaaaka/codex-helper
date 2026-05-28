@@ -116,9 +116,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|ASRCommandEnvCapsCPUThreadVariables|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContextCombinesSpeechReferencesAndImages|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachmentsFiltersAndDefaults|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|BridgeSessionRetryASRFailureInterruptsRetryBeforeCodex)$'
+          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr)|ASR(DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|BootstrapPythonCandidatesArePlatformSpecific))|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
-          go test ./internal/cli -count=1 -run 'Test(TeamsASRArgsFromEnvAndServiceOverrides|TeamsServiceInstallPreservesScopedEnvironment)$' -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
+
+      - name: Teams managed ASR dependency availability (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys, venv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
+          python3 -m pip index versions qwen-asr | grep -F '0.0.6'
+          python3 -m pip index versions imageio-ffmpeg | grep -F '0.6.0'
+          python3 -m pip index versions torch | grep -E '2\.(4|5|6|7|8|9|10|11|12)\.'
+
+      - name: Teams managed ASR dependency availability (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          py -3 -c "import sys, venv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+          py -3 -m pip index versions qwen-asr | Select-String -SimpleMatch "0.0.6"
+          py -3 -m pip index versions imageio-ffmpeg | Select-String -SimpleMatch "0.6.0"
+          py -3 -m pip index versions torch | Select-String -Pattern "2\.(4|5|6|7|8|9|10|11|12)\."
 
       - name: Teams work chat creation info regressions
         shell: bash
