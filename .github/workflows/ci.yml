@@ -294,6 +294,7 @@ jobs:
         run: |
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test ./internal/cli -count=1 -run 'Test(ParseCodexAppArgs|CodexDesktopPlatformForCurrentHost|CodexDesktopMacDownloadURLForArch|CodexDesktopAppLaunchOptionsConvertsWSLPaths|CodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe|LaunchCodexDesktopAppWindowsRequiresPowerShell|PrintCodexDesktopAppLaunchAdvisoriesWarnsForWSLProxy|RunCodexApp(DirectLaunchesDesktopApp|ProxyLaunchUsesLongLivedProxy|ExplicitProfilePreservesDisabledPreference|DoesNotPersistProxyPreferenceWhenProfileSetupFails|LinuxFailsBeforeProxyPrompt)|FindCodexAppBundle|EnsureCodexDesktopAppMac(SkipsBrokenCandidate|SkipsUntrustedCandidate|ExplicitUntrustedAppFails)|VerifyCodexDesktopAppMacRejectsWrongTeamID|CodexDesktopMacInstallHomePrefersEffectiveUser|InstallCodexDesktopAppMac(VerifiesBeforeReplacing|KeepsExistingBundleWhenCopyFails)|StartCodexAppProxyDaemonCleansPlaceholderOnStartFailure|EnsureCodexAppProxyURLCleansInstanceWhenReadinessTimesOut)$'
           go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
           go test . -count=1 -run 'TestInstallSh(ReloadsPathWhenHomeContainsSpaces|RemovesLegacyCodexClp|RemovesLegacyCodexClaudeProxyAndClpSymlink|RemovesCodexOwnedClaudeProxyWithoutVersionOutput|PreservesExternalClpSymlinkToClaudeProxy)$'
 
@@ -304,6 +305,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test ./internal/cli -count=1 -run 'Test(ParseCodexAppArgs|CodexDesktopPlatformForCurrentHost|CodexDesktopMacDownloadURLForArch|CodexDesktopAppLaunchOptionsConvertsWSLPaths|CodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe|LaunchCodexDesktopAppWindowsRequiresPowerShell|PrintCodexDesktopAppLaunchAdvisoriesWarnsForWSLProxy|RunCodexApp(DirectLaunchesDesktopApp|ProxyLaunchUsesLongLivedProxy|ExplicitProfilePreservesDisabledPreference|DoesNotPersistProxyPreferenceWhenProfileSetupFails|LinuxFailsBeforeProxyPrompt)|FindCodexAppBundle|EnsureCodexDesktopAppMac(SkipsBrokenCandidate|SkipsUntrustedCandidate|ExplicitUntrustedAppFails)|VerifyCodexDesktopAppMacRejectsWrongTeamID|CodexDesktopMacInstallHomePrefersEffectiveUser|InstallCodexDesktopAppMac(VerifiesBeforeReplacing|KeepsExistingBundleWhenCopyFails)|StartCodexAppProxyDaemonCleansPlaceholderOnStartFailure|EnsureCodexAppProxyURLCleansInstanceWhenReadinessTimesOut)$'
           go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
           go test . -count=1 -run 'TestInstallPs1(RemovesLegacyCodexClpExe|RemovesLegacyCodexClaudeProxyAndClpCmd|PreservesExternalClpCmdReferencingClaudeProxy)$'
 
@@ -702,6 +704,46 @@ jobs:
           $env:CODEX_HELPER_BIN = $cxp
           .\scripts\ci\skills_smoke.ps1
           Remove-Item Env:\CODEX_HELPER_BIN
+
+      - name: Codex desktop app unsupported smoke (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-desktop-unsupported.json" app --cwd "$RUNNER_TEMP" >"$RUNNER_TEMP/codex-desktop-unsupported.out" 2>&1; then
+            echo "cxp app unexpectedly succeeded on Linux" >&2
+            cat "$RUNNER_TEMP/codex-desktop-unsupported.out" >&2
+            exit 1
+          fi
+          grep -q "only available for macOS and Windows" "$RUNNER_TEMP/codex-desktop-unsupported.out"
+
+      - name: Codex desktop app network install smoke (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper="$RUNNER_TEMP/codex-proxy-desktop-network-smoke"
+          go build -o "$helper" ./cmd/codex-proxy
+          bash scripts/ci/retry.sh 2 10 bash scripts/ci/codex_app_network_install_smoke.sh "$helper" proxy
+
+      - name: Codex desktop app network install smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-network-smoke.exe"
+          go build -o $helper .\cmd\codex-proxy
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+              .\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper
+              break
+            } catch {
+              if ($attempt -eq 2) { throw }
+              Write-Warning "Codex desktop app smoke failed on attempt $attempt; retrying in 10 seconds: $($_.Exception.Message)"
+              Start-Sleep -Seconds 10
+            }
+          }
 
       - name: Install Codex for integration (Linux/macOS)
         if: runner.os != 'Windows'

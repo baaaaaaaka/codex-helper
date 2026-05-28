@@ -46,6 +46,7 @@ func newRootCmd() *cobra.Command {
 
 	cmd.AddCommand(
 		newInternalNpmWrapperCmd(),
+		newAppCmd(opts),
 		newInitCmd(opts),
 		newRunCmd(opts),
 		newTuiCmd(opts),

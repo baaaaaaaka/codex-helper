@@ -13,6 +13,7 @@
 
 - `cxp`: open the local Codex history TUI.
 - `cxp tui`: open the local Codex history TUI explicitly.
+- `cxp app [profile]`: install the Codex desktop app if needed, use or configure proxy mode, and launch the desktop app on macOS, Windows, or WSL. Linux outside WSL has no official Codex desktop app. If a proxy profile is literally named `app`, use `cxp tui app` to open the TUI with that profile.
 - `cxp run [profile] -- <cmd args...>`: run a command through the selected proxy profile and helper runtime handling.
 - `cxp init`: create or repair local proxy configuration interactively.
 

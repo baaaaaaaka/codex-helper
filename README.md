@@ -120,6 +120,7 @@ codex-proxy proxy doctor
 | Command | Description |
 |---------|-------------|
 | `codex-proxy [profile]` | Open the TUI (default) |
+| `codex-proxy app [profile]` | Install if needed, use or configure proxy mode, and launch the Codex desktop app on macOS, Windows, or WSL |
 | `codex-proxy --upgrade-codex` | Reinstall Codex CLI using detected install source |
 | `codex-proxy completion <shell>` | Generate shell completion |
 | `codex-proxy init` | Create an SSH profile |
@@ -495,6 +496,24 @@ enabled but no profile exists, you will be prompted to configure SSH.
 If `codex` is missing or unusable, `codex-proxy` will automatically install
 `@openai/codex` in a user-local location (and bootstrap a private Node.js
 runtime when the system Node.js is missing or too old).
+
+Launch the Codex desktop app directly:
+
+```bash
+codex-proxy app
+```
+
+On macOS and Windows this installs the desktop app if needed, uses the saved
+direct/proxy preference, asks on first setup, and launches the desktop app. WSL
+launches the Windows desktop app. Linux outside WSL has no official Codex
+desktop app, so the command exits with an unsupported-platform message there.
+Use `codex-proxy app <profile>` to force a proxy profile. If proxy mode is
+enabled, the command passes proxy environment variables to the desktop app and
+prints a warning for WSL/AppX cases where the desktop app may not inherit or
+reach that environment directly.
+
+`app` is a root command. If you have a proxy profile literally named `app`, use
+`codex-proxy tui app` to open the TUI with that profile.
 
 To use a specific Codex binary:
 
