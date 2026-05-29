@@ -217,6 +217,38 @@ func TestInstallPs1ChecksumDownloadRemainsBestEffort(t *testing.T) {
 	}
 }
 
+func TestReadmeWindowsInstallAvoidsDownloadAndExecuteOneLiner(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(repoRoot, "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	text := string(data)
+	lower := strings.ToLower(text)
+	for _, forbidden := range []string{
+		"install.ps1 | iex",
+		"install.ps1 | invoke-expression",
+		"invoke-expression",
+	} {
+		if strings.Contains(lower, forbidden) {
+			t.Fatalf("README should not recommend Defender-prone PowerShell download-and-execute pattern %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`$u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"`,
+		"Invoke-WebRequest -UseBasicParsing $u -OutFile $p",
+		"Unblock-File -LiteralPath $p",
+		"& $p",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("README missing safer Windows install step %q", required)
+		}
+	}
+}
+
 func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	run.env = overrideEnv(run.env, "SHELL", "")

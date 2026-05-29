@@ -21,7 +21,7 @@ sh -c 'url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/insta
 Windows (PowerShell):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1 | iex"
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
 
 The installer drops a `cxp` shim alongside `codex-proxy`, tries to add the
@@ -71,7 +71,7 @@ sh -c 'set -e; url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/ma
 Windows (PowerShell):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command '$u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"; $p=Join-Path $env:TEMP "teams-auth-bootstrap.ps1"; iwr -useb $u -OutFile $p; & $p; Remove-Item -Force $p'
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"; $p=Join-Path $env:TEMP "teams-auth-bootstrap.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
 
 When setup finishes, open the Teams control chat shown by bootstrap and send
@@ -765,10 +765,10 @@ Install a specific version (example):
 curl -fsSL https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.sh | sh -s -- --version vX.Y.Z
 ```
 
-### Windows (PowerShell one-liner)
+### Windows (PowerShell)
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1 | iex"
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
 
 By default it installs to `%USERPROFILE%\.local\bin\codex-proxy.exe`.
@@ -786,7 +786,7 @@ or `prompt` to ask in the terminal before showing the UAC prompt.
 Install a specific version:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1'; $p=Join-Path $env:TEMP 'codex-proxy-install.ps1'; iwr -useb $u -OutFile $p; & $p -Version vX.Y.Z; Remove-Item -Force $p"
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p -Version vX.Y.Z } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
 
 ### Environment variables

@@ -26,16 +26,14 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
         script = POWERSHELL_SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("$LASTEXITCODE:", script)
 
-    def test_readme_powershell_download_command_preserves_child_variables(self) -> None:
+    def test_readme_powershell_bootstrap_downloads_file_before_running(self) -> None:
         readme = README.read_text(encoding="utf-8")
         self.assertIn(
-            'powershell -NoProfile -ExecutionPolicy Bypass -Command \'$u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"',
+            '$u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"',
             readme,
         )
-        self.assertNotIn(
-            'powershell -NoProfile -ExecutionPolicy Bypass -Command "$u=\'https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1\'',
-            readme,
-        )
+        self.assertIn("Unblock-File -LiteralPath $p", readme)
+        self.assertIn("& $p", readme)
 
     def test_bash_script_interactive_flow_configures_all_client_slots(self) -> None:
         bash = shutil.which("bash")
