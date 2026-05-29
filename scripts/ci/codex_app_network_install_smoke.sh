@@ -167,6 +167,24 @@ for _ in $(seq 1 90); do
     fi
   done
   if [ "${#launched_pids[@]}" -gt 0 ]; then
+    if [ "$mode" = "proxy" ]; then
+      found_proxy_arg=0
+      for pid in "${launched_pids[@]}"; do
+        cmdline="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
+        if grep -Fq -- "--proxy-server=http://127.0.0.1:$proxy_port" <<<"$cmdline"; then
+          found_proxy_arg=1
+          break
+        fi
+      done
+      if [ "$found_proxy_arg" != "1" ]; then
+        echo "Codex desktop app process did not receive the configured Chromium proxy argument" >&2
+        for pid in "${launched_pids[@]}"; do
+          ps -ww -p "$pid" -o pid= -o command= >&2 || true
+        done
+        kill "${launched_pids[@]}" >/dev/null 2>&1 || true
+        exit 1
+      fi
+    fi
     echo "Codex desktop app network install smoke passed: $app"
     kill "${launched_pids[@]}" >/dev/null 2>&1 || true
     exit 0

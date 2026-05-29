@@ -4,11 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -493,7 +498,9 @@ func TestPrintCodexDesktopAppLaunchAdvisoriesWarnsForWSLProxy(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"proxy environment variables",
+		"Chromium proxy arguments",
+		"http://127.0.0.1:23123",
+		"quit it first",
 		"Windows Codex desktop app from WSL",
 		"Windows must be able to access the converted working directory and CODEX_HOME paths",
 		"Windows-reachable address",
@@ -521,6 +528,10 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 		"OpenAI.Codex",
 		"app\\Codex.exe",
 		"Start-CodexDesktopProcess $exe",
+		"$codexArgs = @('--proxy-server=http://127.0.0.1:23123')",
+		"Start-Process -FilePath $FilePath -ArgumentList $codexArgs -WorkingDirectory $cwd",
+		"proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost",
+		"proxy mode cannot use AppX activation because Chromium --proxy-server would be lost",
 		"falling back to AppX activation",
 		"CODEX_HOME/proxy environment may not be inherited",
 		"pass --app-path to the installed Codex.exe",
@@ -538,8 +549,128 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 	if strings.Contains(script, "codex app") {
 		t.Fatalf("Windows desktop app script must not launch Codex CLI app subcommand:\n%s", script)
 	}
-	if strings.Contains(script, "ArgumentList") {
-		t.Fatalf("Windows desktop app script should not pass unsupported desktop app args:\n%s", script)
+	if strings.Contains(script, "shell:AppsFolder\\' + $aumid) -ArgumentList") {
+		t.Fatalf("Windows AppX fallback should not pass direct-process app args:\n%s", script)
+	}
+}
+
+func TestCodexDesktopWindowsScriptOmitsProxyArgWithoutProxy(t *testing.T) {
+	script := codexDesktopWindowsInstallAndLaunchScript(codexDesktopAppOptions{
+		Cwd: `C:\work`,
+	})
+	if !strings.Contains(script, "$codexArgs = @()") {
+		t.Fatalf("Windows desktop app script missing empty direct-process app args:\n%s", script)
+	}
+	if strings.Contains(script, "--proxy-server=") {
+		t.Fatalf("Windows desktop app script should not pass proxy args without proxy:\n%s", script)
+	}
+	if !strings.Contains(script, "Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd") {
+		t.Fatalf("Windows desktop app script should still allow AppX fallback without proxy:\n%s", script)
+	}
+}
+
+func TestStartCodexDesktopProcessPassesProxyArgAndEnv(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevCommandContext := codexAppCommandContext
+	t.Cleanup(func() { codexAppCommandContext = prevCommandContext })
+
+	var capturedName string
+	var capturedArgs []string
+	var capturedCmd *exec.Cmd
+	codexAppCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		capturedName = name
+		capturedArgs = append([]string(nil), args...)
+		capturedCmd = exec.CommandContext(ctx, os.Args[0], "-test.run=TestCodexAppProxyDaemonHelperProcess")
+		return capturedCmd
+	}
+
+	err := startCodexDesktopProcess(context.Background(), "/Applications/Codex.app/Contents/MacOS/Codex", codexDesktopAppOptions{
+		Cwd:      t.TempDir(),
+		ProxyURL: "http://127.0.0.1:61272",
+		ExtraEnv: []string{envCodexHome + "=" + filepath.Join(t.TempDir(), ".codex")},
+	})
+	if err != nil {
+		t.Fatalf("startCodexDesktopProcess error: %v", err)
+	}
+	if capturedName != "/Applications/Codex.app/Contents/MacOS/Codex" {
+		t.Fatalf("command = %q, want Codex executable", capturedName)
+	}
+	if len(capturedArgs) != 1 || capturedArgs[0] != "--proxy-server=http://127.0.0.1:61272" {
+		t.Fatalf("args = %#v, want Chromium proxy arg", capturedArgs)
+	}
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "WS_PROXY", "WSS_PROXY"} {
+		if got := envValue(capturedCmd.Env, key); got != "http://127.0.0.1:61272" {
+			t.Fatalf("%s = %q, want proxy URL", key, got)
+		}
+	}
+}
+
+func TestStartCodexDesktopProcessOmitsProxyArgWithoutProxy(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevCommandContext := codexAppCommandContext
+	t.Cleanup(func() { codexAppCommandContext = prevCommandContext })
+
+	var capturedArgs []string
+	codexAppCommandContext = func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		capturedArgs = append([]string(nil), args...)
+		return exec.CommandContext(ctx, os.Args[0], "-test.run=TestCodexAppProxyDaemonHelperProcess")
+	}
+
+	err := startCodexDesktopProcess(context.Background(), "/Applications/Codex.app/Contents/MacOS/Codex", codexDesktopAppOptions{
+		Cwd: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("startCodexDesktopProcess error: %v", err)
+	}
+	if len(capturedArgs) != 0 {
+		t.Fatalf("args = %#v, want no Chromium proxy args without proxy", capturedArgs)
+	}
+}
+
+func TestCodexDesktopWindowsScriptDirectLaunchPassesProxyArgIntegration(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell Start-Process integration is Windows-only")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skipf("powershell.exe not found: %v", err)
+	}
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args.txt")
+	fakeApp := filepath.Join(dir, "fake-codex.cmd")
+	scriptBody := "@echo off\r\n" +
+		"echo %* > \"%ARGS_OUT%\"\r\n"
+	if err := os.WriteFile(fakeApp, []byte(scriptBody), 0o700); err != nil {
+		t.Fatalf("write fake Codex app: %v", err)
+	}
+
+	script := codexDesktopWindowsInstallAndLaunchScript(codexDesktopAppOptions{
+		Cwd:      dir,
+		AppPath:  fakeApp,
+		ProxyURL: "http://127.0.0.1:23123",
+		ExtraEnv: []string{
+			"ARGS_OUT=" + argsPath,
+		},
+	})
+	cmd := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell launch failed: %v\n%s", err, out)
+	}
+	var args string
+	for i := 0; i < 50; i++ {
+		raw, readErr := os.ReadFile(argsPath)
+		if readErr == nil {
+			args = strings.TrimSpace(string(raw))
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if args != "--proxy-server=http://127.0.0.1:23123" {
+		t.Fatalf("fake Codex app args = %q, want Chromium proxy arg\nPowerShell output:\n%s", args, out)
 	}
 }
 
@@ -739,22 +870,25 @@ func TestInstallCodexDesktopAppMacVerifiesBeforeReplacing(t *testing.T) {
 	stubCodexAppMacOpenAIIdentity(t)
 
 	prevRunCommand := codexAppRunCommand
-	t.Cleanup(func() { codexAppRunCommand = prevRunCommand })
+	prevDownload := codexAppDownloadPackageFn
+	t.Cleanup(func() {
+		codexAppRunCommand = prevRunCommand
+		codexAppDownloadPackageFn = prevDownload
+	})
 
 	home := t.TempDir()
 	oldApp := filepath.Join(home, "Applications", codexDesktopMacAppName)
 	writeFakeCodexMacApp(t, oldApp, "old")
 
 	var calls []string
+	var downloads []codexAppDownloadOptions
+	codexAppDownloadPackageFn = func(_ context.Context, opts codexAppDownloadOptions) error {
+		downloads = append(downloads, opts)
+		return os.WriteFile(opts.Path, []byte("dmg"), 0o600)
+	}
 	codexAppRunCommand = func(_ context.Context, _ io.Writer, name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		switch name {
-		case "curl":
-			out := commandArgAfter(args, "-o")
-			if out == "" {
-				t.Fatalf("curl missing -o: %v", args)
-			}
-			return os.WriteFile(out, []byte("dmg"), 0o600)
 		case "hdiutil":
 			if len(args) > 0 && args[0] == "attach" {
 				mount := commandArgAfter(args, "-mountpoint")
@@ -792,8 +926,14 @@ func TestInstallCodexDesktopAppMacVerifiesBeforeReplacing(t *testing.T) {
 	if string(data) != "new" {
 		t.Fatalf("installed executable = %q, want new", data)
 	}
-	if !commandContains(calls, "curl --proxy http://127.0.0.1:23123") {
-		t.Fatalf("curl did not use selected proxy:\n%s", strings.Join(calls, "\n"))
+	if len(downloads) != 1 {
+		t.Fatalf("downloads = %d, want 1", len(downloads))
+	}
+	if downloads[0].URL != codexDesktopMacAppleSiliconDownloadURL {
+		t.Fatalf("download URL = %q", downloads[0].URL)
+	}
+	if downloads[0].ProxyURL != "http://127.0.0.1:23123" {
+		t.Fatalf("download proxy = %q", downloads[0].ProxyURL)
 	}
 	assertCommandBefore(t, calls, "codesign ", "spctl ")
 	assertCommandBefore(t, calls, "spctl ", "xattr ")
@@ -806,17 +946,22 @@ func TestInstallCodexDesktopAppMacKeepsExistingBundleWhenCopyFails(t *testing.T)
 	lockCLITestHooks(t)
 
 	prevRunCommand := codexAppRunCommand
-	t.Cleanup(func() { codexAppRunCommand = prevRunCommand })
+	prevDownload := codexAppDownloadPackageFn
+	t.Cleanup(func() {
+		codexAppRunCommand = prevRunCommand
+		codexAppDownloadPackageFn = prevDownload
+	})
 
 	home := t.TempDir()
 	oldApp := filepath.Join(home, "Applications", codexDesktopMacAppName)
 	writeFakeCodexMacApp(t, oldApp, "old")
 	copyErr := errors.New("copy failed")
 
+	codexAppDownloadPackageFn = func(_ context.Context, opts codexAppDownloadOptions) error {
+		return os.WriteFile(opts.Path, []byte("dmg"), 0o600)
+	}
 	codexAppRunCommand = func(_ context.Context, _ io.Writer, name string, args ...string) error {
 		switch name {
-		case "curl":
-			return os.WriteFile(commandArgAfter(args, "-o"), []byte("dmg"), 0o600)
 		case "hdiutil":
 			if len(args) > 0 && args[0] == "attach" {
 				writeFakeCodexMacApp(t, filepath.Join(commandArgAfter(args, "-mountpoint"), codexDesktopMacAppName), "mounted")
@@ -839,6 +984,304 @@ func TestInstallCodexDesktopAppMacKeepsExistingBundleWhenCopyFails(t *testing.T)
 	}
 	if string(data) != "old" {
 		t.Fatalf("existing app was replaced on copy failure: %q", data)
+	}
+}
+
+func TestDownloadCodexAppPackageParallelRangeDownloadReportsProgress(t *testing.T) {
+	data := codexAppDownloadTestData(512*1024 + 7)
+	var rangeRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			w.Header().Set("Accept-Ranges", "bytes")
+		case http.MethodGet:
+			rawRange := r.Header.Get("Range")
+			if rawRange == "" {
+				http.Error(w, "range required", http.StatusBadRequest)
+				return
+			}
+			start, end, ok := parseCodexAppDownloadTestRange(rawRange)
+			if !ok || start < 0 || end < start || end >= int64(len(data)) {
+				http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			rangeRequests.Add(1)
+			w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[start : end+1])
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "Codex.dmg")
+	var log bytes.Buffer
+	if err := downloadCodexAppPackage(context.Background(), codexAppDownloadOptions{
+		URL:             server.URL,
+		Path:            dest,
+		Log:             &log,
+		Attempts:        1,
+		ParallelParts:   4,
+		ParallelMinSize: 1,
+	}); err != nil {
+		t.Fatalf("download package: %v\nlog:\n%s", err, log.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read download: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded data did not match source")
+	}
+	if rangeRequests.Load() != 4 {
+		t.Fatalf("range requests = %d, want 4", rangeRequests.Load())
+	}
+	for _, want := range []string{"with 4 parallel connections", "Codex desktop app package download: 0%", "Codex desktop app package download: 100%"} {
+		if !strings.Contains(log.String(), want) {
+			t.Fatalf("download log missing %q:\n%s", want, log.String())
+		}
+	}
+}
+
+func TestDownloadCodexAppPackageFallsBackWhenServerIgnoresRange(t *testing.T) {
+	data := codexAppDownloadTestData(256 * 1024)
+	var ignoredRanges atomic.Int64
+	var fullGets atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			w.Header().Set("Accept-Ranges", "bytes")
+		case http.MethodGet:
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			if r.Header.Get("Range") != "" {
+				ignoredRanges.Add(1)
+				_, _ = w.Write(data)
+				return
+			}
+			fullGets.Add(1)
+			_, _ = w.Write(data)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "Codex.dmg")
+	var log bytes.Buffer
+	if err := downloadCodexAppPackage(context.Background(), codexAppDownloadOptions{
+		URL:             server.URL,
+		Path:            dest,
+		Log:             &log,
+		Attempts:        1,
+		ParallelParts:   4,
+		ParallelMinSize: 1,
+	}); err != nil {
+		t.Fatalf("download package: %v\nlog:\n%s", err, log.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read download: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded data did not match source")
+	}
+	if ignoredRanges.Load() == 0 {
+		t.Fatal("server did not receive range requests")
+	}
+	if fullGets.Load() != 1 {
+		t.Fatalf("full GETs = %d, want 1", fullGets.Load())
+	}
+	if !strings.Contains(log.String(), "falling back to single-connection download") {
+		t.Fatalf("download log missing fallback message:\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), "Codex desktop app package download: 100%") {
+		t.Fatalf("download log missing 100%% progress:\n%s", log.String())
+	}
+}
+
+func TestDownloadCodexAppPackageFallsBackWhenContentRangeDoesNotMatch(t *testing.T) {
+	data := codexAppDownloadTestData(256 * 1024)
+	var badRanges atomic.Int64
+	var fullGets atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			w.Header().Set("Accept-Ranges", "bytes")
+		case http.MethodGet:
+			rawRange := r.Header.Get("Range")
+			if rawRange == "" {
+				fullGets.Add(1)
+				w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+				_, _ = w.Write(data)
+				return
+			}
+			start, end, ok := parseCodexAppDownloadTestRange(rawRange)
+			if !ok {
+				http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			badRanges.Add(1)
+			w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start+1, end+1, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[start : end+1])
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "Codex.dmg")
+	var log bytes.Buffer
+	if err := downloadCodexAppPackage(context.Background(), codexAppDownloadOptions{
+		URL:             server.URL,
+		Path:            dest,
+		Log:             &log,
+		Attempts:        1,
+		ParallelParts:   4,
+		ParallelMinSize: 1,
+	}); err != nil {
+		t.Fatalf("download package: %v\nlog:\n%s", err, log.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read download: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded data did not match source")
+	}
+	if badRanges.Load() == 0 {
+		t.Fatal("server did not receive range requests")
+	}
+	if fullGets.Load() != 1 {
+		t.Fatalf("full GETs = %d, want 1", fullGets.Load())
+	}
+	if !strings.Contains(log.String(), "falling back to single-connection download") {
+		t.Fatalf("download log missing fallback message:\n%s", log.String())
+	}
+}
+
+func TestDownloadCodexAppPackageFallsBackWithoutRangeAndReportsProgress(t *testing.T) {
+	data := codexAppDownloadTestData(128 * 1024)
+	var rangeProbes atomic.Int64
+	var fullGets atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		case http.MethodGet:
+			if r.Header.Get("Range") != "" {
+				rangeProbes.Add(1)
+				http.Error(w, "ranges disabled", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			fullGets.Add(1)
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			_, _ = w.Write(data)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "Codex.dmg")
+	var log bytes.Buffer
+	if err := downloadCodexAppPackage(context.Background(), codexAppDownloadOptions{
+		URL:             server.URL,
+		Path:            dest,
+		Log:             &log,
+		Attempts:        1,
+		ParallelParts:   4,
+		ParallelMinSize: 1,
+	}); err != nil {
+		t.Fatalf("download package: %v\nlog:\n%s", err, log.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read download: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded data did not match source")
+	}
+	if rangeProbes.Load() != 1 {
+		t.Fatalf("range probes = %d, want 1", rangeProbes.Load())
+	}
+	if fullGets.Load() != 1 {
+		t.Fatalf("full GETs = %d, want 1", fullGets.Load())
+	}
+	if strings.Contains(log.String(), "parallel connections") {
+		t.Fatalf("fallback log should not claim parallel download:\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), "Codex desktop app package download: 100%") {
+		t.Fatalf("fallback log missing 100%% progress:\n%s", log.String())
+	}
+}
+
+func TestDownloadCodexAppPackageUsesSelectedProxy(t *testing.T) {
+	data := []byte("downloaded through selected proxy")
+	var proxyHits atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		if !strings.Contains(r.URL.String(), "codex.invalid/Codex.dmg") {
+			http.Error(w, "request did not use absolute proxy URL: "+r.URL.String(), http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		case http.MethodGet:
+			if r.Header.Get("Range") != "" {
+				http.Error(w, "ranges disabled", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			_, _ = w.Write(data)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer proxy.Close()
+
+	dest := filepath.Join(t.TempDir(), "Codex.dmg")
+	if err := downloadCodexAppPackage(context.Background(), codexAppDownloadOptions{
+		URL:           "http://codex.invalid/Codex.dmg",
+		Path:          dest,
+		ProxyURL:      proxy.URL,
+		Log:           io.Discard,
+		Attempts:      1,
+		ParallelParts: 1,
+	}); err != nil {
+		t.Fatalf("download package through proxy: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read download: %v", err)
+	}
+	if string(got) != string(data) {
+		t.Fatalf("downloaded data = %q", got)
+	}
+	if proxyHits.Load() == 0 {
+		t.Fatal("proxy was not used")
+	}
+}
+
+func TestDownloadCodexAppPackageRejectsInvalidProxyURL(t *testing.T) {
+	err := downloadCodexAppPackage(context.Background(), codexAppDownloadOptions{
+		URL:      "https://example.invalid/Codex.dmg",
+		Path:     filepath.Join(t.TempDir(), "Codex.dmg"),
+		ProxyURL: "localhost",
+		Attempts: 1,
+	})
+	if err == nil {
+		t.Fatal("expected invalid proxy URL error")
+	}
+	if !strings.Contains(err.Error(), "scheme and host") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -979,6 +1422,22 @@ func commandArgAfter(args []string, name string) string {
 	return ""
 }
 
+func codexAppDownloadTestData(size int) []byte {
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte((i * 31) % 251)
+	}
+	return data
+}
+
+func parseCodexAppDownloadTestRange(raw string) (int64, int64, bool) {
+	var start, end int64
+	if n, err := fmt.Sscanf(raw, "bytes=%d-%d", &start, &end); n != 2 || err != nil {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
 func assertCommandBefore(t *testing.T, calls []string, first string, second string) {
 	t.Helper()
 	firstIndex := -1
@@ -994,13 +1453,4 @@ func assertCommandBefore(t *testing.T, calls []string, first string, second stri
 	if firstIndex < 0 || secondIndex < 0 || firstIndex >= secondIndex {
 		t.Fatalf("command order %q before %q not observed in calls:\n%s", first, second, strings.Join(calls, "\n"))
 	}
-}
-
-func commandContains(calls []string, want string) bool {
-	for _, call := range calls {
-		if strings.Contains(call, want) {
-			return true
-		}
-	}
-	return false
 }

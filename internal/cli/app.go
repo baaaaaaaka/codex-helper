@@ -39,6 +39,7 @@ var (
 	codexAppCommandContext        = exec.CommandContext
 	codexAppRunCommand            = runCodexAppLoggedCommand
 	codexAppCommandOutput         = runCodexAppCommandOutput
+	codexAppDownloadPackageFn     = downloadCodexAppPackage
 	codexAppLookPath              = exec.LookPath
 	codexAppUserHomeDir           = os.UserHomeDir
 	codexAppMacSystemAppsDir      = "/Applications"
@@ -429,7 +430,8 @@ func launchCodexDesktopApp(ctx context.Context, opts codexDesktopAppOptions) err
 
 func printCodexDesktopAppLaunchAdvisories(opts codexDesktopAppOptions) {
 	if strings.TrimSpace(opts.ProxyURL) != "" {
-		codexAppWarn(opts.Log, "Codex desktop app will receive proxy environment variables. If sign-in or network requests still bypass the proxy, configure the desktop app or system proxy directly.")
+		codexAppWarn(opts.Log, "Codex desktop app will use proxy %s through environment variables and Chromium proxy arguments when direct launch is available.", opts.ProxyURL)
+		codexAppWarn(opts.Log, "if Codex desktop app is already running, quit it first so the new proxy arguments take effect.")
 	}
 	if opts.Platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
 		codexAppWarn(opts.Log, "launching the Windows Codex desktop app from WSL. Windows must be able to access the converted working directory and CODEX_HOME paths.")
@@ -545,11 +547,12 @@ func installCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions,
 	defer os.RemoveAll(tmpDir)
 
 	dmgPath := filepath.Join(tmpDir, "Codex.dmg")
-	curlArgs := []string{"--retry", "5", "--retry-delay", "5", "--connect-timeout", "30", "-fsSL", "-o", dmgPath, installURL}
-	if proxyURL := strings.TrimSpace(opts.ProxyURL); proxyURL != "" {
-		curlArgs = append([]string{"--proxy", proxyURL}, curlArgs...)
-	}
-	if err := codexAppRunCommand(ctx, opts.Log, "curl", curlArgs...); err != nil {
+	if err := codexAppDownloadPackageFn(ctx, codexAppDownloadOptions{
+		URL:      installURL,
+		Path:     dmgPath,
+		ProxyURL: opts.ProxyURL,
+		Log:      opts.Log,
+	}); err != nil {
 		return "", fmt.Errorf("download Codex desktop app DMG; check network, proxy, and TLS inspection settings: %w", err)
 	}
 
@@ -692,6 +695,7 @@ func launchCodexDesktopAppWindows(ctx context.Context, opts codexDesktopAppOptio
 
 func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) string {
 	envAssignments := codexDesktopWindowsEnvPowerShell(opts)
+	appArgs := codexDesktopWindowsAppArgsPowerShell(opts)
 	cwd := powershellSingleQuote(opts.Cwd)
 	appPath := powershellSingleQuote(opts.AppPath)
 	packageName := powershellSingleQuote(codexDesktopWindowsPackageName)
@@ -699,6 +703,7 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 	return strings.Join([]string{
 		"$ErrorActionPreference = 'Stop'",
 		envAssignments,
+		appArgs,
 		"$appPath = " + appPath,
 		"$cwd = " + cwd,
 		"$packageName = " + packageName,
@@ -706,14 +711,15 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"function Get-CodexPackage { Get-AppxPackage -Name $packageName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1 }",
 		"function Get-CodexWinget { $cmd = Get-Command winget -ErrorAction SilentlyContinue; if ($null -eq $cmd) { throw 'winget was not found. Install or update App Installer, enable Microsoft Store/winget, or pass --app-path to an existing Codex.exe.' }; return $cmd }",
 		"function Warn-NonInteractiveDesktop { if (-not ([Environment]::UserInteractive)) { Write-Warning 'Current Windows session is non-interactive. The Codex desktop app may install successfully but no visible window may appear; run from an interactive Windows desktop session if launch is not visible.' } }",
-		"function Start-CodexDesktopProcess([string]$FilePath) { Start-Process -FilePath $FilePath -WorkingDirectory $cwd | Out-Null }",
+		"function Start-CodexDesktopProcess([string]$FilePath) { if ($codexArgs.Count -gt 0) { Start-Process -FilePath $FilePath -ArgumentList $codexArgs -WorkingDirectory $cwd | Out-Null } else { Start-Process -FilePath $FilePath -WorkingDirectory $cwd | Out-Null } }",
 		"Warn-NonInteractiveDesktop",
 		"$pkg = Get-CodexPackage",
 		"if ($null -eq $pkg -and [string]::IsNullOrWhiteSpace($appPath)) { $winget = Get-CodexWinget; & $winget.Source install --id $storeId --source msstore --exact --accept-source-agreements --accept-package-agreements --disable-interactivity; if ($LASTEXITCODE -ne 0) { throw ('winget Microsoft Store install failed with exit code ' + $LASTEXITCODE + '. Microsoft Store/winget may be blocked by enterprise policy, unavailable on this Windows edition, or unable to reach the network/proxy.') }; $pkg = Get-CodexPackage }",
 		"if (-not [string]::IsNullOrWhiteSpace($appPath)) { if (-not (Test-Path -LiteralPath $appPath)) { throw ('Codex desktop app path not found: ' + $appPath) }; Start-CodexDesktopProcess $appPath; return }",
 		"if ($null -eq $pkg) { throw 'OpenAI.Codex package was not found after installation. Microsoft Store/winget may be blocked by policy or source availability.' }",
 		"$exe = Join-Path $pkg.InstallLocation 'app\\Codex.exe'",
-		"if (Test-Path -LiteralPath $exe) { try { Start-CodexDesktopProcess $exe; return } catch { Write-Warning ('direct Codex.exe launch failed: ' + $_.Exception.Message + '; falling back to AppX activation') } }",
+		"if (Test-Path -LiteralPath $exe) { try { Start-CodexDesktopProcess $exe; return } catch { if ($codexArgs.Count -gt 0) { throw ('direct Codex.exe launch failed and proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost: ' + $_.Exception.Message + '. Pass --app-path to the installed Codex.exe so cxp can launch it directly.') }; Write-Warning ('direct Codex.exe launch failed: ' + $_.Exception.Message + '; falling back to AppX activation') } }",
+		"if ($codexArgs.Count -gt 0) { throw 'Codex.exe was not found in the Microsoft Store package and proxy mode cannot use AppX activation because Chromium --proxy-server would be lost. Pass --app-path to the installed Codex.exe so cxp can launch it directly.' }",
 		"$manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName",
 		"$app = @($manifest.Package.Applications.Application | Select-Object -First 1)",
 		"if ($app.Count -eq 0) { throw 'Codex desktop app manifest does not define an application entry' }",
@@ -721,6 +727,18 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"Write-Warning 'Falling back to AppX activation; CODEX_HOME/proxy environment may not be inherited by the desktop app. If ChatGPT auth or proxy support is required, pass --app-path to the installed Codex.exe so cxp can launch it directly.'",
 		"Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd | Out-Null",
 	}, "; ")
+}
+
+func codexDesktopWindowsAppArgsPowerShell(opts codexDesktopAppOptions) string {
+	args := codexDesktopAppProcessArgs(opts)
+	if len(args) == 0 {
+		return "$codexArgs = @()"
+	}
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, powershellSingleQuote(arg))
+	}
+	return "$codexArgs = @(" + strings.Join(quoted, ", ") + ")"
 }
 
 func codexDesktopWindowsEnvPowerShell(opts codexDesktopAppOptions) string {
@@ -744,7 +762,7 @@ func codexDesktopWindowsEnvPowerShell(opts codexDesktopAppOptions) string {
 }
 
 func startCodexDesktopProcess(ctx context.Context, executable string, opts codexDesktopAppOptions) error {
-	cmd := codexAppCommandContext(ctx, executable)
+	cmd := codexAppCommandContext(ctx, executable, codexDesktopAppProcessArgs(opts)...)
 	if strings.TrimSpace(opts.Cwd) != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -763,6 +781,13 @@ func startCodexDesktopProcess(ctx context.Context, executable string, opts codex
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+func codexDesktopAppProcessArgs(opts codexDesktopAppOptions) []string {
+	if proxyURL := strings.TrimSpace(opts.ProxyURL); proxyURL != "" {
+		return []string{"--proxy-server=" + proxyURL}
+	}
+	return nil
 }
 
 func codexAppProxyEnv(base []string, proxyURL string) []string {
