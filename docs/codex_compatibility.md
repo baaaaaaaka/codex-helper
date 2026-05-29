@@ -8,7 +8,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.135.0 | pass | pass | pass | pass | pass | pass | 2026-05-28T19:35:12Z |
 | 0.135.0-alpha.2 | pass | pass | pass | pass | pass | pass | 2026-05-27T23:08:31Z |
 | 0.135.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-27T19:57:27Z |
-| 0.134.0 | pass | pass | pass | pass | pass | pass | 2026-05-26T21:11:09Z |
+| 0.134.0 | pass | pass | pass | pass | pass | pass | 2026-05-29T21:21:58Z |
 | 0.134.0-alpha.3 | pass | pass | pass | pass | pass | pass | 2026-05-26T01:57:55Z |
 | 0.134.0-alpha.2 | pass | pass | pass | pass | pass | pass | 2026-05-22T23:57:21Z |
 | 0.134.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-22T20:54:24Z |
