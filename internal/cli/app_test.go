@@ -523,10 +523,12 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 		"Start-CodexDesktopProcess $exe",
 		"falling back to AppX activation",
 		"CODEX_HOME/proxy environment may not be inherited",
+		"pass --app-path to the installed Codex.exe",
 		"Current Windows session is non-interactive",
 		"Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd",
 		"$env:CODEX_HOME = 'C:\\Users\\Alice\\.codex'",
 		"$env:HTTP_PROXY = 'http://127.0.0.1:23123'",
+		"$env:ALL_PROXY = 'http://127.0.0.1:23123'",
 		"$env:WSS_PROXY = 'http://127.0.0.1:23123'",
 	} {
 		if !strings.Contains(script, want) {

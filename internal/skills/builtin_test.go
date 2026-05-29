@@ -111,6 +111,7 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 	}
 	for _, want := range []string{
 		"cxp app [profile]",
+		"cxp app auth [profile]",
 		"cxp run [profile] -- <cmd args...>",
 		"cxp init",
 		"cxp proxy doctor",

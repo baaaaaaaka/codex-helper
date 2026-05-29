@@ -120,6 +120,7 @@ jobs:
           grep -q 'profiles=0 instances=0 stopped=0 failed=0' <<<"$reset_out"
           grep -q 'Next launch will ask whether to configure proxy mode.' <<<"$reset_out"
           "$HOME/.local/bin/cxp" app --help | grep -q 'Install and launch the Codex desktop app'
+          "$HOME/.local/bin/cxp" app auth --help | grep -q 'Authenticate Codex for the desktop app'
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             if "$HOME/.local/bin/cxp" --config "$RUNNER_TEMP/codex-desktop-unsupported.json" app --cwd "$RUNNER_TEMP" >"$RUNNER_TEMP/codex-desktop-unsupported.out" 2>&1; then
               echo "cxp app unexpectedly succeeded on Linux" >&2
@@ -162,6 +163,7 @@ jobs:
           if ($resetOut -notmatch "profiles=0 instances=0 stopped=0 failed=0") { throw "proxy reset smoke did not report empty reset counts" }
           if ($resetOut -notmatch "Next launch will ask whether to configure proxy mode.") { throw "proxy reset smoke did not mention next prompt" }
           & $cxp app --help | Select-String "Install and launch the Codex desktop app" | Out-Null
+          & $cxp app auth --help | Select-String "Authenticate Codex for the desktop app" | Out-Null
           $env:CODEX_HELPER_BIN = $exe
           .\scripts\ci\skills_smoke.ps1
           $env:CODEX_HELPER_BIN = $cxp

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -68,6 +69,64 @@ func TestAppServerProcessStarterPassesExtraEnv(t *testing.T) {
 	}
 	if got.Env["CODEX_HELPER_TEAMS_CHILD"] != "1" || got.Env["CODEX_HELPER_TEAMS_PARENT_PID"] != "1234" {
 		t.Fatalf("extra env not passed to app-server process: %#v", got.Env)
+	}
+}
+
+func TestAppServerProcessStarterConfiguresCommandBeforeStart(t *testing.T) {
+	command, args := appServerProcessHelperCommand("meta")
+
+	transport, err := (AppServerProcessStarter{}).StartAppServer(context.Background(), AppServerStartRequest{
+		Command:  command,
+		Args:     args,
+		ExtraEnv: []string{"CODEX_HELPER_BEFORE_CONFIGURE=before"},
+		ConfigureCommand: func(cmd *exec.Cmd) error {
+			cmd.Env = append(cmd.Env, "CODEX_HELPER_CONFIGURED=after")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartAppServer error: %v", err)
+	}
+	defer transport.Close()
+
+	line := readProcessTestLine(t, transport)
+	var got struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(line, &got); err != nil {
+		t.Fatalf("metadata line is not JSON: %s: %v", string(line), err)
+	}
+	if got.Env["CODEX_HELPER_BEFORE_CONFIGURE"] != "before" || got.Env["CODEX_HELPER_CONFIGURED"] != "after" {
+		t.Fatalf("configure command env not passed to app-server process: %#v", got.Env)
+	}
+}
+
+func TestAppServerProcessStarterConfigureCommandInheritsParentEnv(t *testing.T) {
+	t.Setenv("CODEX_HELPER_TEAMS_CHILD", "parent")
+	command, args := appServerProcessHelperCommand("meta")
+
+	transport, err := (AppServerProcessStarter{}).StartAppServer(context.Background(), AppServerStartRequest{
+		Command: command,
+		Args:    args,
+		ConfigureCommand: func(cmd *exec.Cmd) error {
+			cmd.Env = append(cmd.Env, "CODEX_HELPER_CONFIGURED=after")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartAppServer error: %v", err)
+	}
+	defer transport.Close()
+
+	line := readProcessTestLine(t, transport)
+	var got struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(line, &got); err != nil {
+		t.Fatalf("metadata line is not JSON: %s: %v", string(line), err)
+	}
+	if got.Env["CODEX_HELPER_TEAMS_CHILD"] != "parent" || got.Env["CODEX_HELPER_CONFIGURED"] != "after" {
+		t.Fatalf("configure command did not inherit parent env before appending: %#v", got.Env)
 	}
 }
 
@@ -302,6 +361,8 @@ func runAppServerProcessHelper(args []string) int {
 			"env": map[string]string{
 				"CODEX_HELPER_TEAMS_CHILD":      os.Getenv("CODEX_HELPER_TEAMS_CHILD"),
 				"CODEX_HELPER_TEAMS_PARENT_PID": os.Getenv("CODEX_HELPER_TEAMS_PARENT_PID"),
+				"CODEX_HELPER_BEFORE_CONFIGURE": os.Getenv("CODEX_HELPER_BEFORE_CONFIGURE"),
+				"CODEX_HELPER_CONFIGURED":       os.Getenv("CODEX_HELPER_CONFIGURED"),
 			},
 		})
 		time.Sleep(24 * time.Hour)

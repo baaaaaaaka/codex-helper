@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,11 +42,12 @@ func (f AppServerTransportStarterFunc) StartAppServer(ctx context.Context, req A
 }
 
 type AppServerStartRequest struct {
-	Command    string
-	Args       []string
-	WorkingDir string
-	ExtraEnv   []string
-	Timeout    time.Duration
+	Command          string
+	Args             []string
+	WorkingDir       string
+	ExtraEnv         []string
+	Timeout          time.Duration
+	ConfigureCommand func(*exec.Cmd) error
 }
 
 type AppServerRunner struct {

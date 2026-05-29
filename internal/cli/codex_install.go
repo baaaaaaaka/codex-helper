@@ -35,9 +35,10 @@ var (
 )
 
 type codexInstallOptions struct {
-	installerEnv     []string
-	withInstallerEnv func(context.Context, func([]string) error) error
-	upgradeCodex     bool
+	installerEnv              []string
+	withInstallerEnv          func(context.Context, func([]string) error) error
+	configureInstallerCommand func(*exec.Cmd) error
+	upgradeCodex              bool
 }
 
 type codexInstallCmd struct {
@@ -1466,7 +1467,7 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 		}
 
 		runInstall := func(installerEnv []string) error {
-			return runCodexInstaller(ctx, out, installerEnv)
+			return runCodexInstallerWithOptions(ctx, out, installerEnv, opts.configureInstallerCommand)
 		}
 		if opts.withInstallerEnv != nil {
 			if err := opts.withInstallerEnv(ctx, runInstall); err != nil {
@@ -2165,6 +2166,10 @@ func clearCachedCodexPath() {
 }
 
 func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string) error {
+	return runCodexInstallerWithOptions(ctx, out, installerEnv, nil)
+}
+
+func runCodexInstallerWithOptions(ctx context.Context, out io.Writer, installerEnv []string, configureCommand func(*exec.Cmd) error) error {
 	if err := ensureCodexInstallDiskSpace(out, installerEnv, nil); err != nil {
 		return err
 	}
@@ -2202,6 +2207,11 @@ func runCodexInstaller(ctx context.Context, out io.Writer, installerEnv []string
 		cmd.Stdout = out
 		cmd.Stderr = out
 		cmd.Stdin = os.Stdin
+		if configureCommand != nil {
+			if err := configureCommand(cmd); err != nil {
+				return err
+			}
+		}
 		if err := cmd.Run(); err != nil {
 			attemptError := fmt.Sprintf("%s: %v", installerAttemptLabel(candidate), err)
 			if exitCode, ok := commandExitCode(err); ok {

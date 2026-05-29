@@ -104,6 +104,7 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&appPath, "app-path", "", "Override Codex desktop app path")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "Working directory for Codex app (default: current directory)")
 	cmd.Flags().StringVar(&profileFlag, "profile", "", "Proxy profile id or name")
+	cmd.AddCommand(newAppAuthCmd(root))
 	return cmd
 }
 
@@ -717,7 +718,7 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"$app = @($manifest.Package.Applications.Application | Select-Object -First 1)",
 		"if ($app.Count -eq 0) { throw 'Codex desktop app manifest does not define an application entry' }",
 		"$aumid = $pkg.PackageFamilyName + '!' + $app[0].Id",
-		"Write-Warning 'Falling back to AppX activation; CODEX_HOME/proxy environment may not be inherited by the desktop app.'",
+		"Write-Warning 'Falling back to AppX activation; CODEX_HOME/proxy environment may not be inherited by the desktop app. If ChatGPT auth or proxy support is required, pass --app-path to the installed Codex.exe so cxp can launch it directly.'",
 		"Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd | Out-Null",
 	}, "; ")
 }
@@ -749,10 +750,7 @@ func startCodexDesktopProcess(ctx context.Context, executable string, opts codex
 	}
 	envVars := os.Environ()
 	if strings.TrimSpace(opts.ProxyURL) != "" {
-		envVars = env.WithProxy(envVars, opts.ProxyURL)
-		for _, key := range []string{"WS_PROXY", "WSS_PROXY"} {
-			envVars = append(envVars, key+"="+opts.ProxyURL)
-		}
+		envVars = codexAppProxyEnv(envVars, opts.ProxyURL)
 	}
 	envVars = append(envVars, opts.ExtraEnv...)
 	updatedEnv, err := applyExecIdentity(cmd, envVars, opts.ExecIdentity)
@@ -765,6 +763,14 @@ func startCodexDesktopProcess(ctx context.Context, executable string, opts codex
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+func codexAppProxyEnv(base []string, proxyURL string) []string {
+	envVars := env.WithProxy(base, proxyURL)
+	for _, key := range []string{"ALL_PROXY", "all_proxy", "WS_PROXY", "WSS_PROXY"} {
+		envVars = append(envVars, key+"="+proxyURL)
+	}
+	return envVars
 }
 
 func runCodexAppLoggedCommand(ctx context.Context, log io.Writer, name string, args ...string) error {

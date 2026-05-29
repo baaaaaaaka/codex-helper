@@ -121,6 +121,7 @@ codex-proxy proxy doctor
 |---------|-------------|
 | `codex-proxy [profile]` | Open the TUI (default) |
 | `codex-proxy app [profile]` | Install if needed, use or configure proxy mode, and launch the Codex desktop app on macOS, Windows, or WSL |
+| `codex-proxy app auth [profile]` | Complete ChatGPT auth for the Codex desktop app using the same `CODEX_HOME` and proxy setup |
 | `codex-proxy --upgrade-codex` | Reinstall Codex CLI using detected install source |
 | `codex-proxy completion <shell>` | Generate shell completion |
 | `codex-proxy init` | Create an SSH profile |
@@ -512,8 +513,30 @@ enabled, the command passes proxy environment variables to the desktop app and
 prints a warning for WSL/AppX cases where the desktop app may not inherit or
 reach that environment directly.
 
-`app` is a root command. If you have a proxy profile literally named `app`, use
-`codex-proxy tui app` to open the TUI with that profile.
+Authenticate the Codex desktop app without relying on the desktop UI to show a
+device code:
+
+```bash
+codex-proxy app auth
+```
+
+This starts a temporary Codex app-server, requests ChatGPT device-code login,
+opens the verification URL when possible, waits for completion, and writes auth
+through Codex's own login flow into the same `CODEX_HOME` that `codex-proxy app`
+uses. Use `codex-proxy app auth <profile>` to force a proxy profile. The Codex
+token polling and exchange use the selected proxy; when a supported Chromium
+browser is available, the verification page is opened in an isolated per-run
+profile with that proxy as well. In proxy mode, `app auth` does not silently
+fall back to an unmanaged default browser; if a proxy-managed browser cannot be
+opened, it prints the URL and one-time code and asks you to open them manually in
+a browser configured for the selected proxy. On WSL, Windows browser access to a
+WSL loopback proxy is checked before auto-open because it is
+environment-specific.
+
+`app` is a root command, and `auth` is an `app` subcommand. If you have proxy
+profiles literally named `app` or `auth`, use `codex-proxy tui app`,
+`codex-proxy app --profile auth`, or `codex-proxy app auth --profile auth` to
+remove the ambiguity.
 
 To use a specific Codex binary:
 
