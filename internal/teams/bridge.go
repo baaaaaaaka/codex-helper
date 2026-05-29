@@ -13380,7 +13380,7 @@ func latestRecentCompletedTeamsTurn(state teamstore.State, sessionID string, now
 		if !ok {
 			continue
 		}
-		if inbound.Source != "" && inbound.Source != "teams" {
+		if !inboundSourceIsTeamsOrigin(inbound.Source) {
 			continue
 		}
 		if latest.CompletedAt.IsZero() || turn.CompletedAt.After(latest.CompletedAt) {
@@ -14385,7 +14385,7 @@ func teamsOriginTextHashes(state teamstore.State, sessionID string) map[string]b
 		if inbound.SessionID != sessionID || inbound.TurnID == "" {
 			continue
 		}
-		if inbound.Source != "" && inbound.Source != "teams" {
+		if !inboundSourceIsTeamsOrigin(inbound.Source) {
 			continue
 		}
 		addTeamsOriginInboundTextHashes(hashes, inbound)
@@ -14399,7 +14399,7 @@ func teamsOriginDisplayTexts(state teamstore.State, sessionID string) map[string
 		if inbound.SessionID != sessionID || inbound.TurnID == "" {
 			continue
 		}
-		if inbound.Source != "" && inbound.Source != "teams" {
+		if !inboundSourceIsTeamsOrigin(inbound.Source) {
 			continue
 		}
 		addTeamsOriginInboundDisplayTexts(displays, inbound)
@@ -14413,7 +14413,7 @@ func teamsOriginTerminalTextHashes(state teamstore.State, sessionID string) map[
 		if inbound.SessionID != sessionID || inbound.TurnID == "" {
 			continue
 		}
-		if inbound.Source != "" && inbound.Source != "teams" {
+		if !inboundSourceIsTeamsOrigin(inbound.Source) {
 			continue
 		}
 		turn, ok := state.Turns[inbound.TurnID]
@@ -14432,6 +14432,11 @@ func teamsTurnStatusTerminal(status teamstore.TurnStatus) bool {
 	default:
 		return false
 	}
+}
+
+func inboundSourceIsTeamsOrigin(source string) bool {
+	source = strings.ToLower(strings.TrimSpace(source))
+	return source == "" || source == "teams" || strings.HasPrefix(source, "teams_")
 }
 
 func addTeamsOriginInboundTextHashes(hashes map[string]bool, inbound teamstore.InboundEvent) {
@@ -14498,9 +14503,12 @@ func teamsOriginTranscriptUserDisplayBody(record TranscriptRecord, body string, 
 	if record.Kind != TranscriptKindUser {
 		return body
 	}
-	for _, candidate := range teamsOriginTranscriptUserHashCandidates(body) {
-		hash := normalizedTextHash(candidate)
+	for _, candidate := range teamsOriginTranscriptUserCandidates(body) {
+		hash := normalizedTextHash(candidate.Text)
 		if display := strings.TrimSpace(displays[hash]); display != "" {
+			if candidate.ASROnly && strings.EqualFold(strings.TrimSpace(candidate.Text), defaultLocalAttachmentPrompt) && strings.EqualFold(display, defaultLocalAttachmentPrompt) {
+				return ""
+			}
 			return display
 		}
 	}
@@ -14508,36 +14516,107 @@ func teamsOriginTranscriptUserDisplayBody(record TranscriptRecord, body string, 
 }
 
 func teamsOriginTranscriptUserHashCandidates(body string) []string {
+	normalized := teamsOriginTranscriptUserCandidates(body)
 	var candidates []string
 	seen := make(map[string]bool)
-	addCandidate := func(text string) {
-		text = strings.TrimSpace(text)
+	for _, candidate := range normalized {
+		text := strings.TrimSpace(candidate.Text)
 		if text == "" || seen[text] {
-			return
+			continue
 		}
 		seen[text] = true
 		candidates = append(candidates, text)
 	}
-	add := func(text string) {
-		addCandidate(text)
+	return candidates
+}
+
+type teamsOriginTranscriptUserCandidate struct {
+	Text    string
+	ASROnly bool
+}
+
+func teamsOriginTranscriptUserCandidates(body string) []teamsOriginTranscriptUserCandidate {
+	var candidates []teamsOriginTranscriptUserCandidate
+	candidateSeen := make(map[string]bool)
+	addCandidate := func(text string, asrOnly bool) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		key := fmt.Sprintf("%t\x00%s", asrOnly, text)
+		if candidateSeen[key] {
+			return
+		}
+		candidateSeen[key] = true
+		candidates = append(candidates, teamsOriginTranscriptUserCandidate{Text: text, ASROnly: asrOnly})
+	}
+	add := func(text string, asrOnly bool) {
+		addCandidate(text, asrOnly)
 		unwrapped := stripTeamsUserMessageEnvelope(text)
-		addCandidate(unwrapped)
+		addCandidate(unwrapped, asrOnly)
 		cleaned := strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(text)))
-		addCandidate(cleaned)
-		addCandidate(stripTeamsUserMessageEnvelope(cleaned))
-		addCandidate(StripHelperPromptEchoes(StripArtifactManifestBlocks(unwrapped)))
+		addCandidate(cleaned, asrOnly)
+		addCandidate(stripTeamsUserMessageEnvelope(cleaned), asrOnly)
+		addCandidate(StripHelperPromptEchoes(StripArtifactManifestBlocks(unwrapped)), asrOnly)
 	}
 
-	add(body)
-	withoutImages := stripCodexImagePlaceholders(body)
-	add(withoutImages)
-	withoutReferences := stripReferencedTeamsMessagePromptSection(body)
-	add(withoutReferences)
-	add(stripReferencedTeamsMessagePromptSection(withoutImages))
-	add(stripLocalAttachmentPromptSection(body))
-	add(stripLocalAttachmentPromptSection(withoutImages))
-	add(stripLocalAttachmentPromptSection(withoutReferences))
+	type variant struct {
+		text    string
+		asrOnly bool
+	}
+	var variants []variant
+	variantSeen := make(map[string]bool)
+	enqueue := func(text string, asrOnly bool) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		key := fmt.Sprintf("%t\x00%s", asrOnly, text)
+		if variantSeen[key] {
+			return
+		}
+		variantSeen[key] = true
+		variants = append(variants, variant{text: text, asrOnly: asrOnly})
+	}
+
+	enqueue(body, false)
+	for i := 0; i < len(variants); i++ {
+		current := variants[i]
+		add(current.text, current.asrOnly)
+		unwrapped := stripTeamsUserMessageEnvelope(current.text)
+		enqueue(unwrapped, current.asrOnly)
+		cleaned := strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(current.text)))
+		enqueue(cleaned, current.asrOnly)
+		enqueue(stripTeamsUserMessageEnvelope(cleaned), current.asrOnly)
+		enqueue(StripHelperPromptEchoes(StripArtifactManifestBlocks(unwrapped)), current.asrOnly)
+		enqueue(stripCodexImagePlaceholders(current.text), current.asrOnly)
+		enqueue(stripReferencedTeamsMessagePromptSection(current.text), current.asrOnly)
+		enqueue(stripLocalAttachmentPromptSection(current.text), current.asrOnly)
+		if stripped, ok := stripASRTranscriptPromptSection(current.text); ok {
+			if stripped == "" {
+				enqueue(defaultLocalAttachmentPrompt, true)
+			} else {
+				enqueue(stripped, current.asrOnly)
+			}
+		}
+	}
 	return candidates
+}
+
+func stripASRTranscriptPromptSection(text string) (string, bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", false
+	}
+	if strings.HasPrefix(text, teamsASRTranscriptPromptLead) {
+		return "", true
+	}
+	for _, prefix := range []string{"\r\n\r\n", "\n\n", "\r\n", "\n"} {
+		if idx := strings.Index(text, prefix+teamsASRTranscriptPromptLead); idx >= 0 {
+			return strings.TrimSpace(text[:idx]), true
+		}
+	}
+	return text, false
 }
 
 func stripCodexImagePlaceholders(text string) string {

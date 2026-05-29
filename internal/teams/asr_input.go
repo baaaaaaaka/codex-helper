@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	defaultASRSpeed             = "1.25x"
-	defaultASRLanguage          = "auto"
-	teamsASRProgressKind        = "asr-progress"
-	teamsASRProgressNoticeAfter = 60 * time.Second
-	teamsASRProgressRepeatAfter = 30 * time.Second
+	defaultASRSpeed              = "1.25x"
+	defaultASRLanguage           = "auto"
+	teamsASRProgressKind         = "asr-progress"
+	teamsASRProgressNoticeAfter  = 60 * time.Second
+	teamsASRProgressRepeatAfter  = 30 * time.Second
+	teamsASRTranscriptPromptLead = "Automatic local ASR transcript from Microsoft Teams media."
 )
 
 const teamsASRTranscriptAnnotationLabel = "🎙️ Speech-to-text transcript (automatic; may contain recognition errors)"
@@ -88,7 +89,8 @@ func promptWithASRTranscripts(text string, transcripts []ASRTranscript) string {
 		b.WriteString(text)
 		b.WriteString("\n\n")
 	}
-	b.WriteString("Automatic local ASR transcript from Microsoft Teams media. The transcript may contain recognition errors, especially names, code identifiers, paths, commands, acronyms, and mixed Chinese/English terms. Prefer explicit typed text over ASR text when they conflict, and ask for clarification when a critical command or identifier is ambiguous.\n")
+	b.WriteString(teamsASRTranscriptPromptLead)
+	b.WriteString(" The transcript may contain recognition errors, especially names, code identifiers, paths, commands, acronyms, and mixed Chinese/English terms. Prefer explicit typed text over ASR text when they conflict, and ask for clarification when a critical command or identifier is ambiguous.\n")
 	for i, transcript := range transcripts {
 		if i > 0 {
 			b.WriteString("\n")

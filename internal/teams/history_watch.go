@@ -468,7 +468,7 @@ func teamsOriginTextHashesForHistoryWatch(state teamstore.State, threadID string
 		if inbound.TurnID == "" {
 			continue
 		}
-		if inbound.Source != "" && inbound.Source != "teams" {
+		if !inboundSourceIsTeamsOrigin(inbound.Source) {
 			continue
 		}
 		if !teamsOriginInboundMatchesHistoryThread(state, inbound, threadID) {
