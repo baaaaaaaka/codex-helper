@@ -201,6 +201,7 @@ func TestRunCodexAppAuthDirectUsesAppServerAuthHome(t *testing.T) {
 	cobraCmd.SetErr(&errOut)
 
 	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	err = runCodexAppAuth(cobraCmd, &rootOptions{configPath: cfgPath}, codexAppAuthOptions{
 		cwd:       cwd,
 		codexDir:  "codex-home",
@@ -297,9 +298,11 @@ func TestRunCodexAppAuthExplicitProfileUsesProxyFlow(t *testing.T) {
 	cobraCmd.SetOut(io.Discard)
 	cobraCmd.SetErr(io.Discard)
 
+	cwd := t.TempDir()
+	t.Setenv("HOME", cwd)
 	err = runCodexAppAuth(cobraCmd, &rootOptions{configPath: cfgPath}, codexAppAuthOptions{
 		profileRef: "dev",
-		cwd:        t.TempDir(),
+		cwd:        cwd,
 		codexDir:   "codex-home",
 		codexPath:  codexPath,
 		timeout:    time.Second,
@@ -969,7 +972,7 @@ func TestCodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode(t *testing.T) {
 		t.Skip("managed node layout differs on Windows")
 	}
 	home := t.TempDir()
-	nodeDir := filepath.Join(home, ".cache", "codex-proxy", "node", "v22-linux-"+nodeRuntimeArch(runtime.GOARCH), "bin")
+	nodeDir := filepath.Join(home, ".cache", "codex-proxy", "node", "v22-"+runtime.GOOS+"-"+nodeRuntimeArch(runtime.GOARCH), "bin")
 	if err := os.MkdirAll(nodeDir, 0o755); err != nil {
 		t.Fatalf("create managed node dir: %v", err)
 	}
