@@ -33,9 +33,11 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp beacon worker serve --allocation <request-id>`",
 		"--shared-store",
 		"--codex-path <codex-or-wrapper>",
+		"--no-yolo",
 		"--skip-git-repo-check",
 		"CXP_BEACON_CODEX_BIN",
-		"Teams service `--codex-arg` does not automatically reach remote beacon workers",
+		"launch Codex in yolo mode by default",
+		"Teams service `--codex-arg` settings do not automatically reach remote beacon workers",
 		"Keep exactly one `exec`",
 		"`--adapter-shell direct`",
 		"user-shell capture is incompatible",
@@ -116,8 +118,8 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 		},
 		{
 			name:     "worker adapter troubleshooting",
-			fallback: []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "Keep exactly one `exec`", "`--adapter-shell direct`"},
-			docs:     []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "Keep exactly one `exec`", "`--adapter-shell direct`"},
+			fallback: []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--no-yolo", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "launch Codex in yolo mode by default", "Keep exactly one `exec`", "`--adapter-shell direct`"},
+			docs:     []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--no-yolo", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "launch Codex in yolo mode by default", "Keep exactly one `exec`", "`--adapter-shell direct`"},
 		},
 	}
 	for _, check := range checks {

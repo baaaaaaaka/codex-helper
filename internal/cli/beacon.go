@@ -921,6 +921,7 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 	var host string
 	var workerID string
 	var codexPath string
+	var noYolo bool
 	var waitDuration time.Duration
 	cmd := &cobra.Command{
 		Use:   "run-once",
@@ -930,11 +931,18 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 When this runs inside Slurm/LSF, make sure the worker command uses the same beacon
 state as the Teams owner, normally by launching through "cxp beacon --store
 <shared-store> worker ...". If the scheduler/container PATH cannot find Codex,
-pass --codex-path to the real Codex executable or to a small wrapper. A wrapper is
-the right place to add Codex exec flags such as --skip-git-repo-check; Teams
-service --codex-arg settings do not automatically apply to remote beacon workers.`),
+pass --codex-path to the real Codex executable or to a small wrapper. Beacon
+workers launch Codex in yolo mode by default so scheduler/container devices and
+mounts stay visible; pass --no-yolo only when this worker must keep Codex
+sandboxing. A wrapper is still useful for path resolution or extra Codex exec
+flags such as --skip-git-repo-check; Teams service --codex-arg settings do not
+automatically apply to remote beacon workers.`),
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			workerOpts := defaultBeaconWorkerCodexOptions()
+			if noYolo {
+				workerOpts.Yolo = false
+			}
 			if strings.TrimSpace(workerID) == "" {
 				workerID = defaultBeaconWorkerID()
 			}
@@ -988,7 +996,7 @@ service --codex-arg settings do not automatically apply to remote beacon workers
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No queued beacon jobs.")
 				return nil
 			}
-			return runClaimedBeaconWorkerJob(cmd.Context(), cmd.OutOrStdout(), store, machineID, workerID, codexPath, job)
+			return runClaimedBeaconWorkerJob(cmd.Context(), cmd.OutOrStdout(), store, machineID, workerID, codexPath, workerOpts, job)
 		},
 	}
 	cmd.Flags().StringVar(&machineID, "machine", "", "Beacon machine id to claim jobs for")
@@ -998,6 +1006,7 @@ service --codex-arg settings do not automatically apply to remote beacon workers
 	cmd.Flags().StringVar(&host, "host", "", "Worker hostname to register with --allocation")
 	cmd.Flags().StringVar(&workerID, "worker", "", "Worker id to stamp terminal output with")
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable or wrapper path (default: codex)")
+	cmd.Flags().BoolVar(&noYolo, "no-yolo", false, "Launch Codex without default beacon yolo mode")
 	cmd.Flags().DurationVar(&waitDuration, "wait", 0, "Wait for a queued job before exiting, for example 30m")
 	return cmd
 }
@@ -1010,6 +1019,7 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 	var host string
 	var workerID string
 	var codexPath string
+	var noYolo bool
 	var idleTimeout time.Duration
 	var maxJobs int
 	cmd := &cobra.Command{
@@ -1020,11 +1030,18 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 When this runs inside Slurm/LSF, make sure the worker command uses the same beacon
 state as the Teams owner, normally by launching through "cxp beacon --store
 <shared-store> worker ...". If the scheduler/container PATH cannot find Codex,
-pass --codex-path to the real Codex executable or to a small wrapper. A wrapper is
-the right place to add Codex exec flags such as --skip-git-repo-check; Teams
-service --codex-arg settings do not automatically apply to remote beacon workers.`),
+pass --codex-path to the real Codex executable or to a small wrapper. Beacon
+workers launch Codex in yolo mode by default so scheduler/container devices and
+mounts stay visible; pass --no-yolo only when this worker must keep Codex
+sandboxing. A wrapper is still useful for path resolution or extra Codex exec
+flags such as --skip-git-repo-check; Teams service --codex-arg settings do not
+automatically apply to remote beacon workers.`),
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			workerOpts := defaultBeaconWorkerCodexOptions()
+			if noYolo {
+				workerOpts.Yolo = false
+			}
 			if strings.TrimSpace(allocationID) == "" {
 				return fmt.Errorf("--allocation is required")
 			}
@@ -1079,7 +1096,7 @@ service --codex-arg settings do not automatically apply to remote beacon workers
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "No queued beacon jobs before idle timeout after serving %d job(s).\n", served)
 					return nil
 				}
-				if err := runClaimedBeaconWorkerJob(cmd.Context(), cmd.OutOrStdout(), store, machineID, workerID, codexPath, job); err != nil {
+				if err := runClaimedBeaconWorkerJob(cmd.Context(), cmd.OutOrStdout(), store, machineID, workerID, codexPath, workerOpts, job); err != nil {
 					return err
 				}
 				served++
@@ -1097,6 +1114,7 @@ service --codex-arg settings do not automatically apply to remote beacon workers
 	cmd.Flags().StringVar(&host, "host", "", "Worker hostname")
 	cmd.Flags().StringVar(&workerID, "worker", "", "Worker id to stamp terminal output with")
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable or wrapper path (default: codex)")
+	cmd.Flags().BoolVar(&noYolo, "no-yolo", false, "Launch Codex without default beacon yolo mode")
 	cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 30*time.Minute, "Exit after this long without a queued job")
 	cmd.Flags().IntVar(&maxJobs, "max-jobs", 0, "Maximum jobs to serve before exiting (0 means unlimited until idle)")
 	return cmd
@@ -1162,7 +1180,7 @@ func waitAndClaimBeaconWorkerJob(ctx context.Context, store *beacon.Store, machi
 	}
 }
 
-func runClaimedBeaconWorkerJob(ctx context.Context, out anyWriter, store *beacon.Store, machineID string, workerID string, codexPath string, job beacon.JobAttempt) error {
+func runClaimedBeaconWorkerJob(ctx context.Context, out anyWriter, store *beacon.Store, machineID string, workerID string, codexPath string, opts beaconWorkerCodexOptions, job beacon.JobAttempt) error {
 	streamWriter, streamErr := beacon.NewJobStreamWriter(store.Path(), job)
 	if streamErr != nil {
 		_, _ = fmt.Fprintf(out, "job=%s stream=disabled reason=%s\n", job.ID, streamErr)
@@ -1183,7 +1201,7 @@ func runClaimedBeaconWorkerJob(ctx context.Context, out anyWriter, store *beacon
 			_ = streamWriter.Append(event)
 		}
 	}
-	payload, runErr := runBeaconWorkerJob(ctx, job, codexPath, handler)
+	payload, runErr := runBeaconWorkerJobWithOptions(ctx, job, codexPath, handler, opts)
 	stopHeartbeat()
 	if streamWriter != nil {
 		_ = streamWriter.Close()
@@ -1247,12 +1265,47 @@ func startBeaconWorkerHeartbeat(ctx context.Context, store *beacon.Store, machin
 	}
 }
 
+type beaconWorkerCodexOptions struct {
+	Yolo bool
+}
+
+func defaultBeaconWorkerCodexOptions() beaconWorkerCodexOptions {
+	return beaconWorkerCodexOptions{Yolo: true}
+}
+
+type prependCodexArgsLauncher struct {
+	Args []string
+}
+
+func (l prependCodexArgsLauncher) Launch(ctx context.Context, req codexrunner.LaunchRequest) (codexrunner.LaunchResult, error) {
+	if len(l.Args) > 0 {
+		args := make([]string, 0, len(l.Args)+len(req.Args))
+		args = append(args, l.Args...)
+		args = append(args, req.Args...)
+		req.Args = args
+	}
+	return codexrunner.DirectLauncher{}.Launch(ctx, req)
+}
+
 func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath string, handler codexrunner.EventHandler) (beacon.JobTerminalPayload, error) {
+	return runBeaconWorkerJobWithOptions(ctx, job, codexPath, handler, defaultBeaconWorkerCodexOptions())
+}
+
+func runBeaconWorkerJobWithOptions(ctx context.Context, job beacon.JobAttempt, codexPath string, handler codexrunner.EventHandler, opts beaconWorkerCodexOptions) (beacon.JobTerminalPayload, error) {
 	command := strings.TrimSpace(codexPath)
 	if command == "" {
 		command = "codex"
 	}
-	runner := &codexrunner.ExecRunner{Command: command, WorkingDir: job.Payload.WorkingDir}
+	var launcher codexrunner.CommandLauncher
+	if opts.Yolo {
+		yoloArgs := codexYoloLaunchArgs(command)
+		if len(yoloArgs) == 0 {
+			err := fmt.Errorf("beacon worker yolo mode is required but no supported Codex yolo launch flag was detected for %q; pass --no-yolo to run without yolo mode", command)
+			return beacon.JobTerminalPayload{Error: err.Error()}, err
+		}
+		launcher = prependCodexArgsLauncher{Args: yoloArgs}
+	}
+	runner := &codexrunner.ExecRunner{Launcher: launcher, Command: command, WorkingDir: job.Payload.WorkingDir}
 	result, err := runner.StartTurn(ctx, codexrunner.StartTurnInput{
 		ThreadID: strings.TrimSpace(job.Payload.CodexThreadID),
 		TurnInput: codexrunner.TurnInput{

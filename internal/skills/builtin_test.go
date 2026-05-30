@@ -204,8 +204,10 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 			required: []string{
 				"--shared-store",
 				"--codex-path <codex-or-wrapper>",
+				"--no-yolo",
 				"--skip-git-repo-check",
 				"CXP_BEACON_CODEX_BIN",
+				"launch Codex in yolo mode by default",
 				"Keep exactly one `exec`",
 				"`--adapter-shell direct`",
 				"user-shell capture is incompatible",

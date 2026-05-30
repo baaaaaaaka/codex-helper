@@ -114,6 +114,8 @@ jobs:
           test -f "$HOME/.codex/skills/cxp/SKILL.md"
           test -f "$HOME/.codex/skills/cxp/references/commands.md"
           grep -q -- "--after-current-turn" "$HOME/.codex/skills/cxp/references/commands.md"
+          grep -q -- "--no-yolo" "$HOME/.codex/skills/cxp/references/commands.md"
+          grep -q "launch Codex in yolo mode by default" "$HOME/.codex/skills/cxp/references/commands.md"
           "$HOME/.local/bin/codex-proxy" proxy doctor || true
           reset_out="$("$HOME/.local/bin/codex-proxy" --config "$RUNNER_TEMP/proxy-reset-smoke.json" proxy reset)"
           printf '%s\n' "$reset_out"
@@ -158,6 +160,8 @@ jobs:
           $builtinReference = Join-Path $builtinSkill "references\commands.md"
           if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
           if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--after-current-turn") { throw "builtin cxp command reference missing deferred beacon switch guidance" }
+          if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--no-yolo") { throw "builtin cxp command reference missing beacon no-yolo guidance" }
+          if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "launch Codex in yolo mode by default") { throw "builtin cxp command reference missing beacon default yolo guidance" }
           & $exe proxy doctor | Out-Default
           $resetConfig = Join-Path $env:RUNNER_TEMP "proxy-reset-smoke.json"
           $resetOut = (& $exe --config $resetConfig proxy reset | Out-String)

@@ -349,12 +349,15 @@ Beacon adapter troubleshooting:
   `cxp beacon --store <shared-store> worker ...`.
 - If `$SHELL -lic` fails under tcsh/csh, update the profile with
   `--adapter-shell direct`; profile revisions apply to future turns.
+- Beacon workers launch Codex in yolo mode by default so scheduler/container
+  devices and mounts stay visible; pass worker `--no-yolo` only when the worker
+  must keep Codex sandboxing.
 - If worker doctor reports `missing codex`, set scheduler PATH or pass worker
-  `--codex-path <codex-or-wrapper>` from the adapter. A wrapper is the right
-  place to add Codex exec flags such as `--skip-git-repo-check`; Teams service
-  `--codex-arg` settings do not automatically reach remote beacon workers. The
-  generated templates honor `CXP_BEACON_CODEX_BIN` by passing it as worker
-  `--codex-path`.
+  `--codex-path <codex-or-wrapper>` from the adapter. A wrapper is still useful
+  for path resolution or extra Codex exec flags such as `--skip-git-repo-check`;
+  Teams service `--codex-arg` settings do not automatically reach remote beacon
+  workers. The generated templates honor `CXP_BEACON_CODEX_BIN` by passing it as
+  worker `--codex-path`.
 
 The active Teams helper owner periodically queries existing provider jobs,
 projects scheduler state back into beacon machines/jobs, and renews allocations
