@@ -46,7 +46,7 @@ exec sleep 30
 				Prompt:     "run remotely",
 				WorkingDir: tempDir,
 			},
-		}, codexPath)
+		}, codexPath, nil)
 		done <- runResult{payload: payload, err: err}
 	}()
 	deadline := time.Now().Add(5 * time.Second)
@@ -885,13 +885,118 @@ func TestBeaconWorkerRunOnceClaimsJobAndWritesTerminal(t *testing.T) {
 	if len(st.Terminals) != 1 {
 		t.Fatalf("terminal count = %d, state=%#v", len(st.Terminals), st)
 	}
+	var jobID string
 	for _, terminal := range st.Terminals {
+		jobID = terminal.JobID
 		if !strings.Contains(terminal.Payload, "worker done") || !strings.Contains(terminal.Payload, "thread-worker") {
 			t.Fatalf("terminal payload = %#v", terminal)
 		}
 	}
+	reader, err := beacon.NewJobStreamReader(storePath, jobID, beacon.JobStreamReaderOptions{})
+	if err != nil {
+		t.Fatalf("NewJobStreamReader: %v", err)
+	}
+	records, err := reader.ReadAvailable()
+	if err != nil {
+		t.Fatalf("ReadAvailable stream: %v", err)
+	}
+	var sawProgress bool
+	for _, record := range records {
+		event := record.Event.StreamEvent()
+		if record.JobID == jobID && event.Text == "worker done" && len(event.Raw) == 0 {
+			sawProgress = true
+		}
+	}
+	if !sawProgress {
+		t.Fatalf("worker stream did not include progress event, records=%#v", records)
+	}
 	if jobs := st.Machines["machine-1"].Jobs; len(jobs) != 0 {
 		t.Fatalf("worker terminal should clear active machine job, jobs=%#v", jobs)
+	}
+}
+
+func TestBeaconWorkerRunOnceStressStreamsManyEvents(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "beacon.json")
+	store, err := beacon.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	workDir := t.TempDir()
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			SharedPath:        filepath.Dir(storePath),
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(beacon.LeaseAccepting)}
+		req, _, err := beacon.EnsureAllocationRequest(st, "conv-1", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}, time.Unix(1, 0))
+		if err != nil {
+			return err
+		}
+		_, _, err = beacon.EnqueueJobAttempt(st, req.ID, st.Machines["machine-1"], beacon.JobPayload{Prompt: "remote prompt", WorkingDir: workDir}, time.Unix(2, 0))
+		return err
+	}); err != nil {
+		t.Fatalf("seed beacon job: %v", err)
+	}
+	const total = 250
+	codexPath := writeBeaconCLIStressCodexFixture(t, total)
+	out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "worker", "run-once", "--machine", "machine-1", "--worker", "worker-1", "--codex-path", codexPath)
+	if err != nil {
+		t.Fatalf("worker run-once: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "terminal=valid") || !strings.Contains(out, "outbox_queued=true") {
+		t.Fatalf("worker output = %s", out)
+	}
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("load after worker: %v", err)
+	}
+	if len(st.Terminals) != 1 {
+		t.Fatalf("terminal count = %d, state=%#v", len(st.Terminals), st)
+	}
+	var jobID string
+	for _, terminal := range st.Terminals {
+		jobID = terminal.JobID
+		if !strings.Contains(terminal.Payload, "worker stress 249") {
+			t.Fatalf("terminal payload = %#v", terminal)
+		}
+	}
+	reader, err := beacon.NewJobStreamReader(storePath, jobID, beacon.JobStreamReaderOptions{})
+	if err != nil {
+		t.Fatalf("NewJobStreamReader: %v", err)
+	}
+	records, err := reader.ReadAvailable()
+	if err != nil {
+		t.Fatalf("ReadAvailable stream: %v", err)
+	}
+	seen := make([]bool, total)
+	for _, record := range records {
+		event := record.Event.StreamEvent()
+		if !strings.HasPrefix(event.Text, "worker stress ") {
+			continue
+		}
+		var idx int
+		if _, err := fmt.Sscanf(event.Text, "worker stress %d", &idx); err != nil {
+			t.Fatalf("parse stream text %q: %v", event.Text, err)
+		}
+		if idx < 0 || idx >= total {
+			t.Fatalf("stream index %d out of range", idx)
+		}
+		if seen[idx] {
+			t.Fatalf("duplicate stream index %d", idx)
+		}
+		seen[idx] = true
+	}
+	for idx, ok := range seen {
+		if !ok {
+			t.Fatalf("missing stream index %d; records=%d", idx, len(records))
+		}
 	}
 }
 
@@ -1161,6 +1266,31 @@ func writeBeaconCLICodexFixture(t *testing.T, final string) string {
 	}, "\n")
 	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatalf("write codex fixture: %v", err)
+	}
+	return path
+}
+
+func writeBeaconCLIStressCodexFixture(t *testing.T, total int) string {
+	t.Helper()
+	if os.PathSeparator != '/' {
+		t.Skip("POSIX codex fixture script")
+	}
+	path := filepath.Join(t.TempDir(), "codex-stress-fixture.sh")
+	var body strings.Builder
+	body.WriteString("#!/bin/sh\n")
+	body.WriteString("cat >/dev/null\n")
+	body.WriteString("printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-worker\"}'\n")
+	for i := 0; i < total; i++ {
+		text := fmt.Sprintf("worker stress %d", i)
+		body.WriteString("printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"id\":\"item-")
+		body.WriteString(fmt.Sprintf("%d", i))
+		body.WriteString("\",\"type\":\"agent_message\",\"text\":")
+		body.WriteString(shellSingleQuoteForBeaconCLITestJSON(text))
+		body.WriteString("}}'\n")
+	}
+	body.WriteString("printf '%s\\n' '{\"type\":\"turn.completed\"}'\n")
+	if err := os.WriteFile(path, []byte(body.String()), 0o700); err != nil {
+		t.Fatalf("write codex stress fixture: %v", err)
 	}
 	return path
 }

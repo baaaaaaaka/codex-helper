@@ -14,6 +14,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -417,6 +418,521 @@ func TestBeaconJobExecutorRechecksMachineReadinessBeforeEnqueue(t *testing.T) {
 	}
 	if len(st.JobAttempts) != 0 {
 		t.Fatalf("stale machine should not receive a queued job: %#v", st.JobAttempts)
+	}
+}
+
+func TestBeaconJobExecutorStreamsPerJobSidecarBeforeTerminal(t *testing.T) {
+	store, err := beacon.NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	prevPoll := beaconJobPollInterval
+	prevDrain := beaconJobStreamDrainInterval
+	beaconJobPollInterval = 5 * time.Millisecond
+	beaconJobStreamDrainInterval = 1 * time.Millisecond
+	t.Cleanup(func() {
+		beaconJobPollInterval = prevPoll
+		beaconJobStreamDrainInterval = prevDrain
+	})
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			SharedPath:        teamsBeaconSharedPathForTest(t),
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "s001", "turn-stream", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}, time.Now())
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = beacon.AllocationRunning
+		req.Target.MachineID = "machine-1"
+		req.Target.LeaseID = "lease-1"
+		req.Target.ProviderJobID = "slurm-1"
+		st.Allocations[req.ID] = req
+		st.Machines["machine-1"] = beacon.Machine{
+			ID:            "machine-1",
+			LeaseID:       "lease-1",
+			ProviderJobID: "slurm-1",
+			Profile:       "gpu",
+			State:         string(beacon.LeaseAccepting),
+			ProviderState: beacon.ProviderJobRunning,
+			Doctor:        healthyTeamsBeaconDoctor(),
+			LastHeartbeat: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon state: %v", err)
+	}
+	job, err := enqueueBeaconJobForTurn(context.Background(), store, beacon.TurnExecutionPlan{
+		Action:              beacon.TurnRunBeacon,
+		ConversationID:      "s001",
+		TurnID:              "turn-stream",
+		AllocationRequestID: req.ID,
+		MachineID:           "machine-1",
+		LeaseID:             "lease-1",
+		ProviderJobID:       "slurm-1",
+		Snapshot:            beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"},
+	}, &Session{ID: "s001", Cwd: t.TempDir()}, ExecutionInput{Prompt: "stream remotely"})
+	if err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+	emptyStream, err := beacon.NewJobStreamWriter(store.Path(), job)
+	if err != nil {
+		t.Fatalf("create empty stream: %v", err)
+	}
+	if err := emptyStream.Close(); err != nil {
+		t.Fatalf("close empty stream: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events := make(chan codexrunner.StreamEvent, 8)
+	done := make(chan struct {
+		result ExecutionResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := waitBeaconJobTerminalWithEventHandler(ctx, store, job.ID, func(event codexrunner.StreamEvent) {
+			events <- event
+		})
+		done <- struct {
+			result ExecutionResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	var claimed beacon.JobAttempt
+	if err := store.Update(func(st *beacon.State) error {
+		var ok bool
+		var err error
+		claimed, ok, err = beacon.ClaimNextJobForMachine(st, "machine-1", "worker-1", time.Now())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("job was not claimable")
+		}
+		_, err = beacon.MarkJobStarted(st, claimed.ID, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+	streamWriter, err := beacon.NewJobStreamWriter(store.Path(), claimed)
+	if err != nil {
+		t.Fatalf("open stream writer: %v", err)
+	}
+	if err := streamWriter.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Text: "remote progress", ThreadID: "thread-remote", TurnID: "codex-turn-1"}); err != nil {
+		t.Fatalf("append stream event: %v", err)
+	}
+	if err := streamWriter.Close(); err != nil {
+		t.Fatalf("close stream writer: %v", err)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != codexrunner.StreamEventAgentMessage || event.Text != "remote progress" {
+			t.Fatalf("stream event = %#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for stream event before terminal")
+	}
+
+	if err := store.Update(func(st *beacon.State) error {
+		_, err := beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
+			JobID:      claimed.ID,
+			RequestID:  claimed.RequestID,
+			TurnID:     claimed.TurnID,
+			WorkerID:   claimed.WorkerID,
+			LeaseID:    claimed.LeaseID,
+			ClaimEpoch: claimed.ClaimEpoch,
+			ProviderIdentity: beacon.ProviderIdentity{
+				ProviderJobID: claimed.ProviderIdentity.ProviderJobID,
+			},
+			Payload: []byte(`{"text":"remote final","codex_thread_id":"thread-remote","codex_turn_id":"codex-turn-1"}`),
+		}, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("accept terminal: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("waitBeaconJobTerminalWithEventHandler: %v", got.err)
+		}
+		if got.result.Text != "remote final" || got.result.CodexThreadID != "thread-remote" || got.result.CodexTurnID != "codex-turn-1" {
+			t.Fatalf("result = %#v", got.result)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for terminal")
+	}
+}
+
+func TestBeaconJobExecutorStressStreamsManySidecarEventsBeforeTerminal(t *testing.T) {
+	store, err := beacon.NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	prevPoll := beaconJobPollInterval
+	prevDrain := beaconJobStreamDrainInterval
+	beaconJobPollInterval = time.Millisecond
+	beaconJobStreamDrainInterval = time.Millisecond
+	t.Cleanup(func() {
+		beaconJobPollInterval = prevPoll
+		beaconJobStreamDrainInterval = prevDrain
+	})
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			SharedPath:        teamsBeaconSharedPathForTest(t),
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "s001", "turn-stream-stress", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}, time.Now())
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = beacon.AllocationRunning
+		req.Target.MachineID = "machine-1"
+		req.Target.LeaseID = "lease-1"
+		req.Target.ProviderJobID = "slurm-1"
+		st.Allocations[req.ID] = req
+		st.Machines["machine-1"] = beacon.Machine{
+			ID:            "machine-1",
+			LeaseID:       "lease-1",
+			ProviderJobID: "slurm-1",
+			Profile:       "gpu",
+			State:         string(beacon.LeaseAccepting),
+			ProviderState: beacon.ProviderJobRunning,
+			Doctor:        healthyTeamsBeaconDoctor(),
+			LastHeartbeat: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon state: %v", err)
+	}
+	job, err := enqueueBeaconJobForTurn(context.Background(), store, beacon.TurnExecutionPlan{
+		Action:              beacon.TurnRunBeacon,
+		ConversationID:      "s001",
+		TurnID:              "turn-stream-stress",
+		AllocationRequestID: req.ID,
+		MachineID:           "machine-1",
+		LeaseID:             "lease-1",
+		ProviderJobID:       "slurm-1",
+		Snapshot:            beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"},
+	}, &Session{ID: "s001", Cwd: t.TempDir()}, ExecutionInput{Prompt: "stream many events remotely"})
+	if err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+	emptyStream, err := beacon.NewJobStreamWriter(store.Path(), job)
+	if err != nil {
+		t.Fatalf("create empty stream: %v", err)
+	}
+	if err := emptyStream.Close(); err != nil {
+		t.Fatalf("close empty stream: %v", err)
+	}
+
+	const total = 500
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	events := make(chan codexrunner.StreamEvent, total+16)
+	done := make(chan struct {
+		result ExecutionResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := waitBeaconJobTerminalWithEventHandler(ctx, store, job.ID, func(event codexrunner.StreamEvent) {
+			events <- event
+		})
+		done <- struct {
+			result ExecutionResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	var claimed beacon.JobAttempt
+	if err := store.Update(func(st *beacon.State) error {
+		var ok bool
+		var err error
+		claimed, ok, err = beacon.ClaimNextJobForMachine(st, "machine-1", "worker-stress", time.Now())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("job was not claimable")
+		}
+		_, err = beacon.MarkJobStarted(st, claimed.ID, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+	streamWriter, err := beacon.NewJobStreamWriter(store.Path(), claimed)
+	if err != nil {
+		t.Fatalf("open stream writer: %v", err)
+	}
+	for i := 0; i < total; i++ {
+		if err := streamWriter.Append(codexrunner.StreamEvent{
+			Kind:     codexrunner.StreamEventAgentMessage,
+			Text:     fmt.Sprintf("remote progress %03d", i),
+			ThreadID: "thread-remote",
+			TurnID:   "codex-turn-stress",
+		}); err != nil {
+			t.Fatalf("append stream event %d: %v", i, err)
+		}
+	}
+	if err := streamWriter.Close(); err != nil {
+		t.Fatalf("close stream writer: %v", err)
+	}
+	seen := make([]bool, total)
+	for count := 0; count < total; {
+		select {
+		case event := <-events:
+			var idx int
+			if _, err := fmt.Sscanf(event.Text, "remote progress %03d", &idx); err != nil {
+				t.Fatalf("unexpected event text %q: %v", event.Text, err)
+			}
+			if idx < 0 || idx >= total {
+				t.Fatalf("event index %d out of range", idx)
+			}
+			if seen[idx] {
+				t.Fatalf("duplicate event index %d", idx)
+			}
+			seen[idx] = true
+			count++
+		case <-ctx.Done():
+			t.Fatalf("timed out after receiving %d/%d stream events", count, total)
+		}
+	}
+
+	if err := store.Update(func(st *beacon.State) error {
+		_, err := beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
+			JobID:      claimed.ID,
+			RequestID:  claimed.RequestID,
+			TurnID:     claimed.TurnID,
+			WorkerID:   claimed.WorkerID,
+			LeaseID:    claimed.LeaseID,
+			ClaimEpoch: claimed.ClaimEpoch,
+			ProviderIdentity: beacon.ProviderIdentity{
+				ProviderJobID: claimed.ProviderIdentity.ProviderJobID,
+			},
+			Payload: []byte(`{"text":"remote final after stress","codex_thread_id":"thread-remote","codex_turn_id":"codex-turn-stress"}`),
+		}, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("accept terminal: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("waitBeaconJobTerminalWithEventHandler: %v", got.err)
+		}
+		if got.result.Text != "remote final after stress" || got.result.CodexTurnID != "codex-turn-stress" {
+			t.Fatalf("result = %#v", got.result)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for terminal")
+	}
+}
+
+func TestBeaconJobExecutorStressSkipsStaleSidecarClaimMetadata(t *testing.T) {
+	store, err := beacon.NewStore(filepath.Join(t.TempDir(), "beacon.json"))
+	if err != nil {
+		t.Fatalf("beacon store: %v", err)
+	}
+	prevPoll := beaconJobPollInterval
+	prevDrain := beaconJobStreamDrainInterval
+	beaconJobPollInterval = time.Millisecond
+	beaconJobStreamDrainInterval = time.Millisecond
+	t.Cleanup(func() {
+		beaconJobPollInterval = prevPoll
+		beaconJobStreamDrainInterval = prevDrain
+	})
+	var req beacon.AllocationRequest
+	if err := store.Update(func(st *beacon.State) error {
+		st.Profiles["gpu"] = beacon.Profile{
+			Name:              "gpu",
+			Provider:          beacon.ProviderSlurm,
+			ProxyMode:         beacon.ProxyNone,
+			IsolationDefault:  beacon.IsolationShared,
+			SharedPath:        teamsBeaconSharedPathForTest(t),
+			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
+			Confirmed:         true,
+			ProviderPreviewOK: true,
+			DoctorOK:          true,
+		}
+		var err error
+		req, _, err = beacon.EnsureAllocationRequest(st, "s001", "turn-stream-stale", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}, time.Now())
+		if err != nil {
+			return err
+		}
+		req.ProviderIdentity.ProviderJobID = "slurm-1"
+		req.State = beacon.AllocationRunning
+		req.Target.MachineID = "machine-1"
+		req.Target.LeaseID = "lease-1"
+		req.Target.ProviderJobID = "slurm-1"
+		st.Allocations[req.ID] = req
+		st.Machines["machine-1"] = beacon.Machine{
+			ID:            "machine-1",
+			LeaseID:       "lease-1",
+			ProviderJobID: "slurm-1",
+			Profile:       "gpu",
+			State:         string(beacon.LeaseAccepting),
+			ProviderState: beacon.ProviderJobRunning,
+			Doctor:        healthyTeamsBeaconDoctor(),
+			LastHeartbeat: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed beacon state: %v", err)
+	}
+	job, err := enqueueBeaconJobForTurn(context.Background(), store, beacon.TurnExecutionPlan{
+		Action:              beacon.TurnRunBeacon,
+		ConversationID:      "s001",
+		TurnID:              "turn-stream-stale",
+		AllocationRequestID: req.ID,
+		MachineID:           "machine-1",
+		LeaseID:             "lease-1",
+		ProviderJobID:       "slurm-1",
+		Snapshot:            beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"},
+	}, &Session{ID: "s001", Cwd: t.TempDir()}, ExecutionInput{Prompt: "stream stale records"})
+	if err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+	emptyStream, err := beacon.NewJobStreamWriter(store.Path(), job)
+	if err != nil {
+		t.Fatalf("create empty stream: %v", err)
+	}
+	if err := emptyStream.Close(); err != nil {
+		t.Fatalf("close empty stream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events := make(chan codexrunner.StreamEvent, 8)
+	done := make(chan struct {
+		result ExecutionResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := waitBeaconJobTerminalWithEventHandler(ctx, store, job.ID, func(event codexrunner.StreamEvent) {
+			events <- event
+		})
+		done <- struct {
+			result ExecutionResult
+			err    error
+		}{result: result, err: err}
+	}()
+	var claimed beacon.JobAttempt
+	if err := store.Update(func(st *beacon.State) error {
+		var ok bool
+		var err error
+		claimed, ok, err = beacon.ClaimNextJobForMachine(st, "machine-1", "worker-current", time.Now())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("job was not claimable")
+		}
+		_, err = beacon.MarkJobStarted(st, claimed.ID, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+	staleCases := []struct {
+		name string
+		job  beacon.JobAttempt
+	}{
+		{name: "stale worker", job: claimed},
+		{name: "missing worker", job: claimed},
+		{name: "stale lease", job: claimed},
+		{name: "stale claim", job: claimed},
+		{name: "stale provider", job: claimed},
+		{name: "stale request", job: claimed},
+		{name: "stale turn", job: claimed},
+	}
+	staleCases[0].job.WorkerID = "worker-old"
+	staleCases[1].job.WorkerID = ""
+	staleCases[2].job.LeaseID = "lease-old"
+	staleCases[3].job.ClaimEpoch = claimed.ClaimEpoch + 1
+	staleCases[4].job.ProviderIdentity.ProviderJobID = "slurm-old"
+	staleCases[5].job.RequestID = "req-old"
+	staleCases[6].job.TurnID = "turn-old"
+	for _, tc := range staleCases {
+		writer, err := beacon.NewJobStreamWriter(store.Path(), tc.job)
+		if err != nil {
+			t.Fatalf("open stale writer %s: %v", tc.name, err)
+		}
+		if err := writer.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Text: tc.name}); err != nil {
+			t.Fatalf("append stale event %s: %v", tc.name, err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close stale writer %s: %v", tc.name, err)
+		}
+	}
+	goodWriter, err := beacon.NewJobStreamWriter(store.Path(), claimed)
+	if err != nil {
+		t.Fatalf("open good writer: %v", err)
+	}
+	if err := goodWriter.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Text: "current progress"}); err != nil {
+		t.Fatalf("append good event: %v", err)
+	}
+	if err := goodWriter.Close(); err != nil {
+		t.Fatalf("close good writer: %v", err)
+	}
+	select {
+	case event := <-events:
+		if event.Text != "current progress" {
+			t.Fatalf("dispatched stale event instead of current progress: %#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for current progress")
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected extra stale event dispatched: %#v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := store.Update(func(st *beacon.State) error {
+		_, err := beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
+			JobID:      claimed.ID,
+			RequestID:  claimed.RequestID,
+			TurnID:     claimed.TurnID,
+			WorkerID:   claimed.WorkerID,
+			LeaseID:    claimed.LeaseID,
+			ClaimEpoch: claimed.ClaimEpoch,
+			ProviderIdentity: beacon.ProviderIdentity{
+				ProviderJobID: claimed.ProviderIdentity.ProviderJobID,
+			},
+			Payload: []byte(`{"text":"remote final after stale records","codex_thread_id":"thread-remote","codex_turn_id":"codex-turn-stale"}`),
+		}, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("accept terminal: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("waitBeaconJobTerminalWithEventHandler: %v", got.err)
+		}
+		if got.result.Text != "remote final after stale records" {
+			t.Fatalf("result = %#v", got.result)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for terminal")
 	}
 }
 

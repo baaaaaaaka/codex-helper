@@ -988,40 +988,7 @@ service --codex-arg settings do not automatically apply to remote beacon workers
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No queued beacon jobs.")
 				return nil
 			}
-			if err := store.Update(func(st *beacon.State) error {
-				_, err := beacon.MarkJobStarted(st, job.ID, time.Now())
-				return err
-			}); err != nil {
-				return err
-			}
-			stopHeartbeat := startBeaconWorkerHeartbeat(cmd.Context(), store, machineID, workerID, time.Minute)
-			payload, runErr := runBeaconWorkerJob(cmd.Context(), job, codexPath)
-			stopHeartbeat()
-			payloadBytes, err := json.Marshal(payload)
-			if err != nil {
-				return fmt.Errorf("marshal worker terminal payload: %w", err)
-			}
-			var decision beacon.WorkerTerminalDecision
-			if err := store.Update(func(st *beacon.State) error {
-				var err error
-				decision, err = beacon.AcceptWorkerTerminal(st, beacon.WorkerTerminalEnvelope{
-					JobID:      job.ID,
-					RequestID:  job.RequestID,
-					TurnID:     job.TurnID,
-					WorkerID:   workerID,
-					LeaseID:    job.LeaseID,
-					ClaimEpoch: job.ClaimEpoch,
-					ProviderIdentity: beacon.ProviderIdentity{
-						ProviderJobID: job.ProviderIdentity.ProviderJobID,
-					},
-					Payload: payloadBytes,
-				}, time.Now())
-				return err
-			}); err != nil {
-				return err
-			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "job=%s terminal=%s outbox_queued=%t\n", job.ID, decision.Integrity, decision.OutboxQueued)
-			return runErr
+			return runClaimedBeaconWorkerJob(cmd.Context(), cmd.OutOrStdout(), store, machineID, workerID, codexPath, job)
 		},
 	}
 	cmd.Flags().StringVar(&machineID, "machine", "", "Beacon machine id to claim jobs for")
@@ -1196,15 +1163,31 @@ func waitAndClaimBeaconWorkerJob(ctx context.Context, store *beacon.Store, machi
 }
 
 func runClaimedBeaconWorkerJob(ctx context.Context, out anyWriter, store *beacon.Store, machineID string, workerID string, codexPath string, job beacon.JobAttempt) error {
+	streamWriter, streamErr := beacon.NewJobStreamWriter(store.Path(), job)
+	if streamErr != nil {
+		_, _ = fmt.Fprintf(out, "job=%s stream=disabled reason=%s\n", job.ID, streamErr)
+	}
 	if err := store.Update(func(st *beacon.State) error {
 		_, err := beacon.MarkJobStarted(st, job.ID, time.Now())
 		return err
 	}); err != nil {
+		if streamWriter != nil {
+			_ = streamWriter.Close()
+		}
 		return err
 	}
 	stopHeartbeat := startBeaconWorkerHeartbeat(ctx, store, machineID, workerID, time.Minute)
-	payload, runErr := runBeaconWorkerJob(ctx, job, codexPath)
+	var handler codexrunner.EventHandler
+	if streamWriter != nil {
+		handler = func(event codexrunner.StreamEvent) {
+			_ = streamWriter.Append(event)
+		}
+	}
+	payload, runErr := runBeaconWorkerJob(ctx, job, codexPath, handler)
 	stopHeartbeat()
+	if streamWriter != nil {
+		_ = streamWriter.Close()
+	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal worker terminal payload: %w", err)
@@ -1264,7 +1247,7 @@ func startBeaconWorkerHeartbeat(ctx context.Context, store *beacon.Store, machin
 	}
 }
 
-func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath string) (beacon.JobTerminalPayload, error) {
+func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath string, handler codexrunner.EventHandler) (beacon.JobTerminalPayload, error) {
 	command := strings.TrimSpace(codexPath)
 	if command == "" {
 		command = "codex"
@@ -1273,9 +1256,10 @@ func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath st
 	result, err := runner.StartTurn(ctx, codexrunner.StartTurnInput{
 		ThreadID: strings.TrimSpace(job.Payload.CodexThreadID),
 		TurnInput: codexrunner.TurnInput{
-			Prompt:     job.Payload.Prompt,
-			ImagePaths: append([]string(nil), job.Payload.ImagePaths...),
-			WorkingDir: job.Payload.WorkingDir,
+			Prompt:       job.Payload.Prompt,
+			ImagePaths:   append([]string(nil), job.Payload.ImagePaths...),
+			WorkingDir:   job.Payload.WorkingDir,
+			EventHandler: handler,
 		},
 	})
 	payload := beacon.JobTerminalPayload{

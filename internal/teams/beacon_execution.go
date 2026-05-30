@@ -17,6 +17,7 @@ var beaconLeaseMaintenanceInterval = 30 * time.Second
 var beaconReconcileStaleWorkerAfter = beacon.DefaultWorkerHeartbeatStaleAfter
 var beaconReconcileIdleWorkerAfter = 30 * time.Minute
 var beaconReconcileStaleJobAfter = 10 * time.Minute
+var beaconJobStreamRetention = 24 * time.Hour
 
 func (b *Bridge) prepareBeaconTurnExecution(ctx context.Context, session *Session, turn teamstore.Turn) (beacon.TurnExecutionPlan, bool, error) {
 	if b == nil || session == nil || strings.TrimSpace(turn.ID) == "" {
@@ -202,6 +203,15 @@ func (b *Bridge) reconcileBeaconState(ctx context.Context, store *beacon.Store, 
 		return nil
 	}); err != nil {
 		return err
+	}
+	if beaconJobStreamRetention > 0 {
+		current, err := store.Load()
+		if err != nil {
+			return err
+		}
+		if err := beacon.CleanupJobStreams(store.Path(), current, now, beaconJobStreamRetention); err != nil {
+			return err
+		}
 	}
 	return b.queueBeaconLifecycleNotifications(ctx, store, now)
 }
@@ -406,7 +416,7 @@ func (b *Bridge) cancelBeaconTurn(ctx context.Context, session *Session, turn te
 	if b == nil || session == nil || strings.TrimSpace(turn.ID) == "" {
 		return nil
 	}
-	store, err := beacon.NewStore("")
+	store, err := b.beaconStoreForTurn(session.ID, turn.ID)
 	if err != nil {
 		return fmt.Errorf("beacon state unavailable: %w", err)
 	}
@@ -509,7 +519,7 @@ func (b *Bridge) recordBeaconTurnStartFailure(ctx context.Context, session *Sess
 	if b == nil || session == nil || strings.TrimSpace(turn.ID) == "" {
 		return nil
 	}
-	store, err := beacon.NewStore("")
+	store, err := beacon.NewStore(plan.StorePath)
 	if err != nil {
 		return fmt.Errorf("beacon state unavailable: %w", err)
 	}
@@ -534,7 +544,7 @@ func (b *Bridge) recordBeaconTurnFinish(ctx context.Context, session *Session, t
 	if b == nil || session == nil || strings.TrimSpace(turn.ID) == "" || (plan.Action != beacon.TurnRunBeacon && plan.Action != beacon.TurnWaitAllocation) {
 		return nil
 	}
-	store, err := beacon.NewStore("")
+	store, err := beacon.NewStore(plan.StorePath)
 	if err != nil {
 		return fmt.Errorf("beacon state unavailable: %w", err)
 	}

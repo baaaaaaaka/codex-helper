@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 )
 
 var beaconJobPollInterval = 200 * time.Millisecond
 var beaconAllocationPollInterval = time.Second
+var beaconJobStreamDrainInterval = 50 * time.Millisecond
 
 type BeaconJobExecutor struct {
 	Plan beacon.TurnExecutionPlan
@@ -22,6 +24,10 @@ func (e BeaconJobExecutor) Run(ctx context.Context, session *Session, prompt str
 }
 
 func (e BeaconJobExecutor) RunInput(ctx context.Context, session *Session, input ExecutionInput) (ExecutionResult, error) {
+	return e.RunInputWithEventHandler(ctx, session, input, nil)
+}
+
+func (e BeaconJobExecutor) RunInputWithEventHandler(ctx context.Context, session *Session, input ExecutionInput, handler codexrunner.EventHandler) (ExecutionResult, error) {
 	plan := e.Plan
 	store, err := beacon.NewStore(plan.StorePath)
 	if err != nil {
@@ -40,7 +46,7 @@ func (e BeaconJobExecutor) RunInput(ctx context.Context, session *Session, input
 	if err != nil {
 		return ExecutionResult{}, err
 	}
-	return waitBeaconJobTerminal(ctx, store, job.ID)
+	return waitBeaconJobTerminalWithEventHandler(ctx, store, job.ID, handler)
 }
 
 func waitBeaconAllocationReady(ctx context.Context, store *beacon.Store, initial beacon.TurnExecutionPlan) (beacon.TurnExecutionPlan, error) {
@@ -129,15 +135,31 @@ func enqueueBeaconJobForTurn(ctx context.Context, store *beacon.Store, plan beac
 }
 
 func waitBeaconJobTerminal(ctx context.Context, store *beacon.Store, jobID string) (ExecutionResult, error) {
+	return waitBeaconJobTerminalWithEventHandler(ctx, store, jobID, nil)
+}
+
+func waitBeaconJobTerminalWithEventHandler(ctx context.Context, store *beacon.Store, jobID string, handler codexrunner.EventHandler) (ExecutionResult, error) {
 	interval := beaconJobPollInterval
 	if interval <= 0 {
 		interval = 200 * time.Millisecond
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var streamReader *beacon.JobStreamReader
+	if handler != nil {
+		reader, err := beacon.NewJobStreamReader(store.Path(), jobID, beacon.JobStreamReaderOptions{StartAtEnd: true})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		streamReader = reader
+	}
 	for {
-		result, done, err := readBeaconJobTerminal(store, jobID)
+		result, done, attempt, attemptOK, err := readBeaconJobTerminalAndAttempt(store, jobID)
+		if err == nil {
+			dispatchBeaconJobStreamEvents(streamReader, jobID, attempt, attemptOK, handler)
+		}
 		if done || err != nil {
+			drainBeaconJobStream(ctx, store, streamReader, jobID, handler)
 			return result, err
 		}
 		select {
@@ -148,15 +170,116 @@ func waitBeaconJobTerminal(ctx context.Context, store *beacon.Store, jobID strin
 	}
 }
 
+func dispatchBeaconJobStreamEvents(reader *beacon.JobStreamReader, jobID string, attempt beacon.JobAttempt, attemptOK bool, handler codexrunner.EventHandler) int {
+	if reader == nil || handler == nil {
+		return 0
+	}
+	records, err := reader.ReadAvailable()
+	if err != nil {
+		return 0
+	}
+	dispatched := 0
+	jobID = strings.TrimSpace(jobID)
+	for _, record := range records {
+		if !beaconJobStreamRecordMatchesAttempt(record, jobID, attempt, attemptOK) {
+			continue
+		}
+		event := record.Event.StreamEvent()
+		if strings.TrimSpace(string(event.Kind)) == "" {
+			continue
+		}
+		handler(event)
+		dispatched++
+	}
+	return dispatched
+}
+
+func beaconJobStreamRecordMatchesAttempt(record beacon.JobStreamRecord, jobID string, attempt beacon.JobAttempt, attemptOK bool) bool {
+	if strings.TrimSpace(record.JobID) != strings.TrimSpace(jobID) {
+		return false
+	}
+	if !attemptOK {
+		return false
+	}
+	if !beaconJobStreamFieldMatches(record.RequestID, attempt.RequestID) {
+		return false
+	}
+	if !beaconJobStreamFieldMatches(record.TurnID, attempt.TurnID) {
+		return false
+	}
+	if !beaconJobStreamFieldMatches(record.WorkerID, attempt.WorkerID) {
+		return false
+	}
+	if !beaconJobStreamFieldMatches(record.LeaseID, attempt.LeaseID) {
+		return false
+	}
+	if !beaconJobStreamFieldMatches(record.ProviderJobID, attempt.ProviderIdentity.ProviderJobID) {
+		return false
+	}
+	if attempt.ClaimEpoch > 0 && record.ClaimEpoch != attempt.ClaimEpoch {
+		return false
+	}
+	return true
+}
+
+func beaconJobStreamFieldMatches(recordValue string, attemptValue string) bool {
+	attemptValue = strings.TrimSpace(attemptValue)
+	if attemptValue == "" {
+		return true
+	}
+	return strings.TrimSpace(recordValue) == attemptValue
+}
+
+func drainBeaconJobStream(ctx context.Context, store *beacon.Store, reader *beacon.JobStreamReader, jobID string, handler codexrunner.EventHandler) {
+	if reader == nil || handler == nil {
+		return
+	}
+	interval := beaconJobStreamDrainInterval
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+	for stableReads := 0; stableReads < 2; {
+		_, _, attempt, attemptOK, err := readBeaconJobTerminalAndAttempt(store, jobID)
+		if err != nil {
+			stableReads++
+			continue
+		}
+		if dispatchBeaconJobStreamEvents(reader, jobID, attempt, attemptOK, handler) == 0 {
+			stableReads++
+		} else {
+			stableReads = 0
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 func readBeaconJobTerminal(store *beacon.Store, jobID string) (ExecutionResult, bool, error) {
+	result, done, _, _, err := readBeaconJobTerminalAndAttempt(store, jobID)
+	return result, done, err
+}
+
+func readBeaconJobTerminalAndAttempt(store *beacon.Store, jobID string) (ExecutionResult, bool, beacon.JobAttempt, bool, error) {
 	st, err := store.Load()
 	if err != nil {
-		return ExecutionResult{}, false, err
+		return ExecutionResult{}, false, beacon.JobAttempt{}, false, err
 	}
-	if rec, ok := st.Terminals[strings.TrimSpace(jobID)]; ok && strings.TrimSpace(rec.Payload) != "" {
+	jobID = strings.TrimSpace(jobID)
+	attempt, attemptOK := st.JobAttempts[jobID]
+	if rec, ok := st.Terminals[jobID]; ok && strings.TrimSpace(rec.Payload) != "" {
 		var payload beacon.JobTerminalPayload
 		if err := json.Unmarshal([]byte(rec.Payload), &payload); err != nil {
-			return ExecutionResult{}, true, fmt.Errorf("parse beacon terminal payload for %s: %w", jobID, err)
+			return ExecutionResult{}, true, attempt, attemptOK, fmt.Errorf("parse beacon terminal payload for %s: %w", jobID, err)
 		}
 		result := ExecutionResult{
 			Text:             payload.Text,
@@ -165,17 +288,17 @@ func readBeaconJobTerminal(store *beacon.Store, jobID string) (ExecutionResult, 
 			CodexTurnID:      payload.CodexTurnID,
 		}
 		if strings.TrimSpace(payload.Error) != "" {
-			return result, true, fmt.Errorf("beacon worker failed: %s", strings.TrimSpace(payload.Error))
+			return result, true, attempt, attemptOK, fmt.Errorf("beacon worker failed: %s", strings.TrimSpace(payload.Error))
 		}
-		return result, true, nil
+		return result, true, attempt, attemptOK, nil
 	}
-	if attempt, ok := st.JobAttempts[strings.TrimSpace(jobID)]; ok {
+	if attemptOK {
 		switch attempt.Phase {
 		case beacon.JobQuarantined, beacon.JobTombstoned:
-			return ExecutionResult{}, true, fmt.Errorf("beacon job %s cannot complete from phase %s", jobID, attempt.Phase)
+			return ExecutionResult{}, true, attempt, true, fmt.Errorf("beacon job %s cannot complete from phase %s", jobID, attempt.Phase)
 		}
 	}
-	return ExecutionResult{}, false, nil
+	return ExecutionResult{}, false, attempt, attemptOK, nil
 }
 
 func beaconMachineForPlan(st beacon.State, plan beacon.TurnExecutionPlan, now time.Time) (beacon.Machine, bool) {
