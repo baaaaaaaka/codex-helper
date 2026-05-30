@@ -640,11 +640,36 @@ func TestCodexDesktopWindowsScriptDirectLaunchPassesProxyArgIntegration(t *testi
 
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args.txt")
-	fakeApp := filepath.Join(dir, "fake-codex.cmd")
-	scriptBody := "@echo off\r\n" +
-		"echo %* > \"%ARGS_OUT%\"\r\n"
-	if err := os.WriteFile(fakeApp, []byte(scriptBody), 0o700); err != nil {
-		t.Fatalf("write fake Codex app: %v", err)
+	helperSrc := filepath.Join(dir, "fake_codex.go")
+	fakeApp := filepath.Join(dir, "fake-codex.exe")
+	helperBody := `package main
+
+import (
+	"os"
+	"strings"
+)
+
+func main() {
+	out := os.Getenv("ARGS_OUT")
+	if out == "" {
+		os.Exit(2)
+	}
+	if err := os.WriteFile(out, []byte(strings.Join(os.Args[1:], " ")), 0600); err != nil {
+		panic(err)
+	}
+}
+`
+	if err := os.WriteFile(helperSrc, []byte(helperBody), 0o600); err != nil {
+		t.Fatalf("write fake Codex app source: %v", err)
+	}
+	goExe, err := exec.LookPath("go")
+	if err != nil {
+		t.Skipf("go executable not found for fake Codex app build: %v", err)
+	}
+	buildCmd := exec.Command(goExe, "build", "-o", fakeApp, helperSrc)
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build fake Codex app: %v\n%s", err, out)
 	}
 
 	script := codexDesktopWindowsInstallAndLaunchScript(codexDesktopAppOptions{
@@ -661,7 +686,7 @@ func TestCodexDesktopWindowsScriptDirectLaunchPassesProxyArgIntegration(t *testi
 		t.Fatalf("PowerShell launch failed: %v\n%s", err, out)
 	}
 	var args string
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 100; i++ {
 		raw, readErr := os.ReadFile(argsPath)
 		if readErr == nil {
 			args = strings.TrimSpace(string(raw))
