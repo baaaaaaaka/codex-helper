@@ -29,6 +29,12 @@ const (
 	defaultTeamsChatRecreateDrainTime = 2 * time.Minute
 	envTeamsASRCommand                = "CODEX_HELPER_TEAMS_ASR_COMMAND"
 	envTeamsASRArgsJSON               = "CODEX_HELPER_TEAMS_ASR_ARGS_JSON"
+	envTeamsASRBackend                = "CODEX_HELPER_TEAMS_ASR_BACKEND"
+	envTeamsASRLlamaBinary            = "CODEX_HELPER_TEAMS_ASR_LLAMA_BINARY"
+	envTeamsASRLlamaModel             = "CODEX_HELPER_TEAMS_ASR_LLAMA_MODEL"
+	envTeamsASRLlamaMMProj            = "CODEX_HELPER_TEAMS_ASR_LLAMA_MMPROJ"
+	envTeamsASRLlamaDevice            = "CODEX_HELPER_TEAMS_ASR_LLAMA_DEVICE"
+	envTeamsASRFFmpeg                 = "CODEX_HELPER_TEAMS_ASR_FFMPEG"
 )
 
 var (
@@ -790,7 +796,7 @@ func teamsASRTranscriberFromConfig(command string, args []string) teams.ASRTrans
 	if strings.TrimSpace(command) != "" {
 		return teams.NewCommandASRTranscriber(command, args)
 	}
-	return teams.NewManagedQwenASRTranscriber()
+	return teams.NewManagedQwenASRTranscriber(teamsASRManagedConfigFromEnv())
 }
 
 func teamsASRServiceEnvironmentOverrides(command string, args []string) map[string]string {
@@ -804,10 +810,37 @@ func teamsASRServiceEnvironmentOverrides(command string, args []string) map[stri
 			env[envTeamsASRArgsJSON] = string(data)
 		}
 	}
+	for _, key := range teamsASRManagedEnvironmentKeys() {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			env[key] = value
+		}
+	}
 	if len(env) == 0 {
 		return nil
 	}
 	return env
+}
+
+func teamsASRManagedConfigFromEnv() teams.ManagedASRConfig {
+	return teams.ManagedASRConfig{
+		Backend:         strings.TrimSpace(os.Getenv(envTeamsASRBackend)),
+		LlamaBinaryPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaBinary)),
+		LlamaModelPath:  strings.TrimSpace(os.Getenv(envTeamsASRLlamaModel)),
+		LlamaMMProjPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaMMProj)),
+		LlamaDevice:     strings.TrimSpace(os.Getenv(envTeamsASRLlamaDevice)),
+		FFmpegPath:      strings.TrimSpace(os.Getenv(envTeamsASRFFmpeg)),
+	}
+}
+
+func teamsASRManagedEnvironmentKeys() []string {
+	return []string{
+		envTeamsASRBackend,
+		envTeamsASRLlamaBinary,
+		envTeamsASRLlamaModel,
+		envTeamsASRLlamaMMProj,
+		envTeamsASRLlamaDevice,
+		envTeamsASRFFmpeg,
+	}
 }
 
 var (

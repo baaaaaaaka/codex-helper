@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,12 +20,18 @@ import (
 )
 
 const (
-	DefaultManagedASRModelID       = "Qwen/Qwen3-ASR-0.6B"
-	managedASRRuntimeVersion       = "qwen3-asr-runtime-v2"
-	managedASRDefaultMinFreeBytes  = 8 * 1024 * 1024 * 1024
-	managedASRStaleTempAge         = 24 * time.Hour
-	managedASRBackendTransformers  = "qwen-asr-transformers"
-	managedASRRunnerScriptFileName = "qwen3_asr_runner.py"
+	DefaultManagedASRModelID          = "Qwen/Qwen3-ASR-0.6B"
+	managedASRRuntimeVersion          = "qwen3-asr-runtime-v2"
+	managedASRDefaultMinFreeBytes     = 8 * 1024 * 1024 * 1024
+	managedASRStaleTempAge            = 24 * time.Hour
+	managedASRBackendAuto             = "auto"
+	managedASRBackendLlama            = "llama"
+	managedASRBackendTransformers     = "qwen-asr-transformers"
+	managedASRBackendTransformersMode = "transformers"
+	managedASRRunnerScriptFileName    = "qwen3_asr_runner.py"
+	managedASRLlamaPrompt             = "Transcribe the audio exactly. Do not translate. Preserve the spoken language. Preserve English words, acronyms, code identifiers, file names, and paths as spoken."
+	managedASRLlamaContextSize        = "2048"
+	managedASRLlamaMaxTokens          = "-1"
 )
 
 var managedASRRuntimePackages = []string{
@@ -43,13 +50,22 @@ type ManagedASRConfig struct {
 	CacheRoot    string
 	ModelID      string
 	MinFreeBytes uint64
+	Backend      string
+
+	LlamaBinaryPath string
+	LlamaModelPath  string
+	LlamaMMProjPath string
+	LlamaDevice     string
+	FFmpegPath      string
 }
 
 type ManagedASRTranscriber struct {
 	Config ManagedASRConfig
 
-	ensureRuntime managedASRRuntimeEnsurer
-	runCommand    managedASRCommandRunner
+	ensureRuntime      managedASRRuntimeEnsurer
+	ensureLlamaRuntime managedASRLlamaRuntimeEnsurer
+	runCommand         managedASRCommandRunner
+	runLlamaCommand    managedASRCommandRunner
 }
 
 type managedASRRuntime struct {
@@ -60,6 +76,17 @@ type managedASRRuntime struct {
 	Env        []string
 }
 
+type managedASRLlamaRuntime struct {
+	Command    string
+	CacheRoot  string
+	ModelID    string
+	ModelPath  string
+	MMProjPath string
+	Device     string
+	FFmpegPath string
+	Env        []string
+}
+
 type managedASRBootstrapPython struct {
 	Command string
 	Args    []string
@@ -67,6 +94,8 @@ type managedASRBootstrapPython struct {
 }
 
 type managedASRRuntimeEnsurer func(context.Context, ManagedASRConfig) (managedASRRuntime, error)
+
+type managedASRLlamaRuntimeEnsurer func(context.Context, ManagedASRConfig) (managedASRLlamaRuntime, error)
 
 type managedASRCommandRunner func(context.Context, string, []string, []string, *bytes.Buffer, *bytes.Buffer) error
 
@@ -91,9 +120,11 @@ func NewManagedQwenASRTranscriber(config ...ManagedASRConfig) *ManagedASRTranscr
 		cfg = config[0]
 	}
 	return &ManagedASRTranscriber{
-		Config:        cfg,
-		ensureRuntime: ensureManagedASRRuntime,
-		runCommand:    runManagedASRCommand,
+		Config:             cfg,
+		ensureRuntime:      ensureManagedASRRuntime,
+		ensureLlamaRuntime: ensureManagedASRLlamaRuntime,
+		runCommand:         runManagedASRCommand,
+		runLlamaCommand:    runManagedASRCommand,
 	}
 }
 
@@ -105,6 +136,33 @@ func (t *ManagedASRTranscriber) TranscribeTeamsMedia(ctx context.Context, input 
 	if sourcePath == "" {
 		return ASRTranscript{}, fmt.Errorf("ASR source file path is empty")
 	}
+	switch mode := managedASRBackendMode(t.Config.Backend); mode {
+	case managedASRBackendLlama:
+		return t.transcribeTeamsMediaLlama(ctx, input)
+	case managedASRBackendAuto:
+		transcript, err := t.transcribeTeamsMediaLlama(ctx, input)
+		if err == nil {
+			return transcript, nil
+		}
+		if !managedASRCanFallbackFromLlama(err) {
+			return ASRTranscript{}, err
+		}
+		fallback, fallbackErr := t.transcribeTeamsMediaTransformers(ctx, input)
+		if fallbackErr != nil {
+			return ASRTranscript{}, fmt.Errorf("llama ASR backend failed (%v); transformers fallback failed: %w", err, fallbackErr)
+		}
+		if strings.TrimSpace(fallback.Warning) == "" {
+			fallback.Warning = "llama ASR backend failed; used qwen-asr-transformers fallback"
+		}
+		return fallback, nil
+	case managedASRBackendTransformersMode:
+		return t.transcribeTeamsMediaTransformers(ctx, input)
+	default:
+		return ASRTranscript{}, fmt.Errorf("unsupported managed Teams ASR backend %q", strings.TrimSpace(t.Config.Backend))
+	}
+}
+
+func (t *ManagedASRTranscriber) transcribeTeamsMediaTransformers(ctx context.Context, input ASRTranscribeInput) (ASRTranscript, error) {
 	ensureRuntime := t.ensureRuntime
 	if ensureRuntime == nil {
 		ensureRuntime = ensureManagedASRRuntime
@@ -120,7 +178,7 @@ func (t *ManagedASRTranscriber) TranscribeTeamsMedia(ctx context.Context, input 
 	modelID := firstNonEmptyString(runtime.ModelID, t.Config.ModelID, DefaultManagedASRModelID)
 	args := []string{
 		runtime.ScriptPath,
-		"--input", sourcePath,
+		"--input", strings.TrimSpace(input.File.Path),
 		"--language", managedASRLanguageArg(input.Language),
 		"--speed", firstNonEmptyString(input.Speed, defaultASRSpeed),
 		"--threads", strconv.Itoa(teamsASRMaxCPUThreads),
@@ -158,6 +216,98 @@ func (t *ManagedASRTranscriber) TranscribeTeamsMedia(ctx context.Context, input 
 	return transcript, nil
 }
 
+func (t *ManagedASRTranscriber) transcribeTeamsMediaLlama(ctx context.Context, input ASRTranscribeInput) (ASRTranscript, error) {
+	ensureLlamaRuntime := t.ensureLlamaRuntime
+	if ensureLlamaRuntime == nil {
+		ensureLlamaRuntime = ensureManagedASRLlamaRuntime
+	}
+	runtime, err := ensureLlamaRuntime(ctx, t.Config)
+	if err != nil {
+		return ASRTranscript{}, err
+	}
+	if err := os.MkdirAll(runtime.CacheRoot, 0o700); err != nil {
+		return ASRTranscript{}, err
+	}
+	if err := cleanupManagedASRTemp(runtime.CacheRoot, time.Now(), managedASRStaleTempAge); err != nil {
+		return ASRTranscript{}, err
+	}
+	audioPath, cleanup, err := prepareManagedASRAudioForLlama(ctx, strings.TrimSpace(input.File.Path), firstNonEmptyString(input.Speed, defaultASRSpeed), runtime)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return ASRTranscript{}, err
+	}
+
+	args := []string{
+		"-m", runtime.ModelPath,
+		"--mmproj", runtime.MMProjPath,
+		"--audio", audioPath,
+		"-p", managedASRLlamaPrompt,
+		"-t", strconv.Itoa(teamsASRMaxCPUThreads),
+		"-tb", strconv.Itoa(teamsASRMaxCPUThreads),
+		"-c", managedASRLlamaContextSize,
+		"-n", managedASRLlamaMaxTokens,
+		"--temp", "0",
+		"--no-warmup",
+		"--verbosity", "1",
+		"--no-log-prefix",
+		"--no-log-timestamps",
+	}
+	if strings.EqualFold(strings.TrimSpace(runtime.Device), "cpu") {
+		args = append(args, "--device", "none")
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	runCommand := t.runLlamaCommand
+	if runCommand == nil {
+		runCommand = runManagedASRCommand
+	}
+	env := managedASRLlamaEnv(runtime, input)
+	if err := runCommand(ctx, runtime.Command, args, env, &stdout, &stderr); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return ASRTranscript{}, fmt.Errorf("%w: %s", err, shortenTeamsLine(detail, 600))
+		}
+		return ASRTranscript{}, err
+	}
+	text, detectedLanguage := managedASRParseLlamaOutput(stdout.String())
+	return ASRTranscript{
+		SourceIndex: input.SourceIndex,
+		SourceName:  asrTranscriptDisplayName(ASRTranscript{SourceIndex: input.SourceIndex, SourcePath: firstNonEmptyString(input.File.PromptPath, input.File.Path)}),
+		SourcePath:  firstNonEmptyString(input.File.PromptPath, input.File.Path),
+		ContentType: input.File.ContentType,
+		Text:        text,
+		Language:    firstNonEmptyString(detectedLanguage, input.Language),
+		Speed:       input.Speed,
+		Model:       runtime.ModelID,
+		Backend:     managedASRLlamaBackendName(runtime.Device),
+	}, nil
+}
+
+func managedASRBackendMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return managedASRBackendAuto
+	case managedASRBackendTransformersMode, managedASRBackendTransformers, "torch", "qwen-asr":
+		return managedASRBackendTransformersMode
+	case managedASRBackendAuto:
+		return managedASRBackendAuto
+	case managedASRBackendLlama, "llama.cpp", "llamacpp", "qwen-asr-llama":
+		return managedASRBackendLlama
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func managedASRCanFallbackFromLlama(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var fallback managedASRLlamaFallbackError
+	return errors.As(err, &fallback)
+}
+
 func managedASRLanguageArg(language string) string {
 	language = strings.TrimSpace(language)
 	if language == "" {
@@ -184,6 +334,159 @@ func managedASREnv(runtime managedASRRuntime, input ASRTranscribeInput) []string
 	}
 	extra = append(extra, "PYTHONIOENCODING=utf-8", "PYTHONNOUSERSITE=1")
 	return asrCommandEnv(managedASRSetupBaseEnv(), extra, input)
+}
+
+func prepareManagedASRAudioForLlama(ctx context.Context, path string, speed string, runtime managedASRLlamaRuntime) (string, func(), error) {
+	factor := managedASRSpeedFactor(speed)
+	if factor == 1.0 && managedASRLlamaCanReadDirectly(path) {
+		return path, nil, nil
+	}
+	ffmpeg := strings.TrimSpace(runtime.FFmpegPath)
+	var err error
+	if ffmpeg == "" {
+		ffmpeg, err = resolveManagedASRLlamaFFmpeg(ctx, runtime.CacheRoot, "")
+		if err != nil || strings.TrimSpace(ffmpeg) == "" {
+			baseErr := err
+			if baseErr == nil {
+				baseErr = errors.New("ffmpeg path is empty")
+			}
+			wrapped := fmt.Errorf("llama ASR backend requires ffmpeg for Teams media preprocessing and speed=%s; install ffmpeg or set CODEX_HELPER_TEAMS_ASR_FFMPEG: %w", firstNonEmptyString(speed, defaultASRSpeed), baseErr)
+			if errors.Is(wrapped, errManagedASRFFmpegUnsupported) {
+				return "", nil, managedASRLlamaFallbackError{Err: wrapped}
+			}
+			return "", nil, wrapped
+		}
+	}
+	tmpRoot := filepath.Join(runtime.CacheRoot, "tmp")
+	if err := os.MkdirAll(tmpRoot, 0o700); err != nil {
+		return "", nil, err
+	}
+	tmpDir, err := os.MkdirTemp(tmpRoot, "transcribe-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+	out := filepath.Join(tmpDir, "input.wav")
+	filter := "aresample=16000"
+	if factor != 1.0 {
+		filter = fmt.Sprintf("atempo=%.6g,%s", factor, filter)
+	}
+	cmd := exec.CommandContext(ctx, ffmpeg,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-i", path,
+		"-filter:a", filter,
+		"-ac", "1",
+		"-ar", "16000",
+		out,
+	)
+	cmd.Env = managedASRSetupBaseEnv()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := runASRCommand(ctx, cmd); err != nil {
+		cleanup()
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return "", nil, fmt.Errorf("prepare llama ASR audio with ffmpeg: %w: %s", err, shortenTeamsLine(detail, 600))
+		}
+		return "", nil, fmt.Errorf("prepare llama ASR audio with ffmpeg: %w", err)
+	}
+	return out, cleanup, nil
+}
+
+func managedASRSpeedFactor(value string) float64 {
+	value = strings.TrimSpace(strings.ToLower(value))
+	value = strings.TrimSuffix(value, "x")
+	factor, err := strconv.ParseFloat(value, 64)
+	if err != nil || factor <= 0 {
+		return 1.0
+	}
+	return factor
+}
+
+func managedASRLlamaCanReadDirectly(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".wav", ".mp3", ".flac":
+		return true
+	default:
+		return false
+	}
+}
+
+func managedASRLlamaEnv(rt managedASRLlamaRuntime, input ASRTranscribeInput) []string {
+	extra := append([]string(nil), rt.Env...)
+	if wslLib := "/usr/lib/wsl/lib"; runtime.GOOS == "linux" {
+		if _, err := os.Stat(filepath.Join(wslLib, "libcuda.so.1")); err == nil {
+			extra = prependASREnvPath(extra, "LD_LIBRARY_PATH", wslLib)
+		}
+	}
+	return asrCommandEnv(managedASRSetupBaseEnv(), extra, input)
+}
+
+func prependASREnvPath(extra []string, key string, path string) []string {
+	key = strings.TrimSpace(key)
+	path = strings.TrimSpace(path)
+	if key == "" || path == "" {
+		return extra
+	}
+	for i, item := range extra {
+		existingKey, existingValue, ok := strings.Cut(item, "=")
+		if !ok || existingKey != key {
+			continue
+		}
+		if existingValue == "" {
+			extra[i] = key + "=" + path
+		} else {
+			extra[i] = key + "=" + path + string(os.PathListSeparator) + existingValue
+		}
+		return extra
+	}
+	value := path
+	if existing := strings.TrimSpace(os.Getenv(key)); existing != "" {
+		value += string(os.PathListSeparator) + existing
+	}
+	return append(extra, key+"="+value)
+}
+
+func managedASRParseLlamaOutput(value string) (string, string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", ""
+	}
+	const marker = "<asr_text>"
+	idx := strings.Index(value, marker)
+	if idx < 0 {
+		return value, ""
+	}
+	prefix := strings.TrimSpace(value[:idx])
+	text := strings.TrimSpace(value[idx+len(marker):])
+	return text, managedASRParseLlamaLanguage(prefix)
+}
+
+func managedASRParseLlamaLanguage(prefix string) string {
+	language := ""
+	for _, line := range strings.Split(prefix, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(line), "language") {
+			continue
+		}
+		language = strings.TrimSpace(line[len("language"):])
+		language = strings.TrimSpace(strings.TrimPrefix(language, ":"))
+		if language != "" {
+			return language
+		}
+	}
+	return language
+}
+
+func managedASRLlamaBackendName(device string) string {
+	device = strings.ToLower(strings.TrimSpace(device))
+	if device == "" {
+		device = managedASRBackendAuto
+	}
+	device = strings.ReplaceAll(device, "/", "-")
+	return "qwen-asr-llama/" + device
 }
 
 func runManagedASRCommand(ctx context.Context, command string, args []string, env []string, stdout *bytes.Buffer, stderr *bytes.Buffer) error {
@@ -538,7 +841,14 @@ func writePrivateFileReplacing(path string, data []byte, mode os.FileMode) error
 	if err := os.Chmod(tmpPath, mode); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	return replaceFile(tmpPath, path)
+}
+
+func replaceFile(oldPath string, newPath string) error {
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(newPath)
+	}
+	return os.Rename(oldPath, newPath)
 }
 
 func formatASRBytes(bytes uint64) string {

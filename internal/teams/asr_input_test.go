@@ -227,7 +227,9 @@ func TestTeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration(t *testing.T) 
 		transcriber ASRTranscriber
 		want        string
 	}{
-		{name: "managed default", transcriber: NewManagedQwenASRTranscriber(), want: "managed local Qwen ASR"},
+		{name: "managed default", transcriber: NewManagedQwenASRTranscriber(), want: "automatic backend selection"},
+		{name: "managed llama", transcriber: NewManagedQwenASRTranscriber(ManagedASRConfig{Backend: managedASRBackendLlama}), want: "llama.cpp opt-in backend"},
+		{name: "managed auto", transcriber: NewManagedQwenASRTranscriber(ManagedASRConfig{Backend: managedASRBackendAuto}), want: "automatic backend selection"},
 		{name: "developer override", transcriber: &CommandASRTranscriber{Command: "/tmp/asr"}, want: "developer override configured"},
 		{name: "missing", transcriber: nil, want: "not ready"},
 	}

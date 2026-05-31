@@ -116,9 +116,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr)|ASR(DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadsExtractsAndMarksRuntime)))|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOrigin(TextHashesIncludesControlFallbackSource|TranscriptUserDisplayBodyUsesOriginalTeamsPrompt)|BridgeSyncLinkedTranscript(MirrorsTeamsOriginUserPromptWithoutASRContext|SkipsASROnlyTeamsOriginUserPrompt)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
+          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr|LlamaOptInInvokesConfiguredRuntime|AutoFallsBackToTransformers|AutoDoesNotFallbackFromLlamaRuntimeFailure|DefaultDownloadsManagedLlamaRuntime|ExplicitLlamaRejectsConfiguredMissingBinary)|ASR(ParseLlamaOutputHandlesLanguageColon|Llama(ConfigUsesLightweightDiskPreflight|ModelMarkerRejectsCorruptCachedFile|RuntimeConcurrentSetupReusesSingleInstall|BinaryInstall(FallsBackToCPUAssetWhenAcceleratedValidationFails|HonorsExplicitCPUDevice)|AssetMatrixCoversExpectedAccelerationFallbacks)|FFmpegWheelAssetMatrixCoversExpectedPlatforms|DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadsExtractsAndMarksRuntime)))|EnsureManagedASRFFmpegInstallsAndReusesManagedWheel|DownloadManagedASRLlamaFile(RejectsSizeAndHashMismatch|RetriesAndReplacesExistingTarget)|ExtractManagedASRZipRejectsUnsafePath|PrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOrigin(TextHashesIncludesControlFallbackSource|TranscriptUserDisplayBodyUsesOriginalTeamsPrompt)|BridgeSyncLinkedTranscript(MirrorsTeamsOriginUserPromptWithoutASRContext|SkipsASROnlyTeamsOriginUserPrompt)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
-          go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
       - name: Teams managed ASR dependency availability (Linux/macOS)
         if: runner.os != 'Windows'
@@ -126,18 +126,74 @@ jobs:
         run: |
           set -euo pipefail
           python3 -c 'import sys, venv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
-          python3 -m pip index versions qwen-asr | grep -F '0.0.6'
-          python3 -m pip index versions imageio-ffmpeg | grep -F '0.6.0'
-          python3 -m pip index versions torch | grep -E '2\.(4|5|6|7|8|9|10|11|12)\.'
+          bash scripts/ci/retry.sh 3 5 python3 -m pip index versions qwen-asr | grep -F '0.0.6'
+          bash scripts/ci/retry.sh 3 5 python3 -m pip index versions imageio-ffmpeg | grep -F '0.6.0'
+          bash scripts/ci/retry.sh 3 5 python3 -m pip index versions torch | grep -E '2\.(4|5|6|7|8|9|10|11|12)\.'
+          check_url() {
+            local url="$1"
+            echo "checking $url"
+            for attempt in 1 2 3; do
+              if curl -fsSLI --max-time 30 "$url" >/dev/null; then
+                return 0
+              fi
+              if [ "$attempt" = 3 ]; then
+                return 1
+              fi
+              sleep 5
+            done
+          }
           case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
-            Linux-aarch64|Linux-arm64) target=aarch64-unknown-linux-gnu ;;
-            Darwin-x86_64) target=x86_64-apple-darwin ;;
-            Darwin-arm64) target=aarch64-apple-darwin ;;
+            Linux-x86_64)
+              target=x86_64-unknown-linux-gnu
+              llama_urls=(
+                "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-ubuntu-vulkan-x64.tar.gz"
+                "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-ubuntu-x64.tar.gz"
+              )
+              ffmpeg_url="https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl"
+              ;;
+            Linux-aarch64|Linux-arm64)
+              target=aarch64-unknown-linux-gnu
+              llama_urls=(
+                "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-ubuntu-vulkan-arm64.tar.gz"
+                "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-ubuntu-arm64.tar.gz"
+              )
+              ffmpeg_url="https://files.pythonhosted.org/packages/33/e7/1925bfbc563c39c1d2e82501d8372734a5c725e53ac3b31b4c2d081e895b/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_aarch64.whl"
+              ;;
+            Darwin-x86_64)
+              target=x86_64-apple-darwin
+              llama_urls=("https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-macos-x64.tar.gz")
+              ffmpeg_url="https://files.pythonhosted.org/packages/da/58/87ef68ac83f4c7690961bce288fd8e382bc5f1513860fc7f90a9c1c1c6bf/imageio_ffmpeg-0.6.0-py3-none-macosx_10_9_intel.macosx_10_9_x86_64.whl"
+              ;;
+            Darwin-arm64)
+              target=aarch64-apple-darwin
+              llama_urls=("https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-macos-arm64.tar.gz")
+              ffmpeg_url="https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl"
+              ;;
             *) echo "unsupported CI platform for managed Python check: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
           esac
           url="https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.10.20+20260510-${target}-install_only_stripped.tar.gz"
-          curl -fsSLI --max-time 30 "$url" >/dev/null
+          check_url "$url"
+          check_url "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf"
+          check_url "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
+          check_url "$ffmpeg_url"
+          for url in "${llama_urls[@]}"; do
+            check_url "$url"
+          done
+          release_asset_urls=(
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-ubuntu-vulkan-x64.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-ubuntu-x64.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-macos-x64.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-macos-arm64.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-win-vulkan-x64.zip"
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-win-cpu-x64.zip"
+            "https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl"
+            "https://files.pythonhosted.org/packages/da/58/87ef68ac83f4c7690961bce288fd8e382bc5f1513860fc7f90a9c1c1c6bf/imageio_ffmpeg-0.6.0-py3-none-macosx_10_9_intel.macosx_10_9_x86_64.whl"
+            "https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl"
+            "https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl"
+          )
+          for url in "${release_asset_urls[@]}"; do
+            check_url "$url"
+          done
 
       - name: Teams managed ASR dependency availability (Windows)
         if: runner.os == 'Windows'
@@ -146,15 +202,62 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           py -3 -c "import sys, venv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
-          py -3 -m pip index versions qwen-asr | Select-String -SimpleMatch "0.0.6"
-          py -3 -m pip index versions imageio-ffmpeg | Select-String -SimpleMatch "0.6.0"
-          py -3 -m pip index versions torch | Select-String -Pattern "2\.(4|5|6|7|8|9|10|11|12)\."
+          function Invoke-Retry([scriptblock]$Command) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                & $Command
+                return
+              } catch {
+                if ($attempt -eq 3) {
+                  throw
+                }
+                Start-Sleep -Seconds 5
+              }
+            }
+          }
+          Invoke-Retry {
+            $out = py -3 -m pip index versions qwen-asr
+            if (-not ($out | Select-String -SimpleMatch "0.0.6")) { throw "qwen-asr 0.0.6 not listed" }
+          }
+          Invoke-Retry {
+            $out = py -3 -m pip index versions imageio-ffmpeg
+            if (-not ($out | Select-String -SimpleMatch "0.6.0")) { throw "imageio-ffmpeg 0.6.0 not listed" }
+          }
+          Invoke-Retry {
+            $out = py -3 -m pip index versions torch
+            if (-not ($out | Select-String -Pattern "2\.(4|5|6|7|8|9|10|11|12)\.")) { throw "supported torch version not listed" }
+          }
+          function Test-ManagedASRAsset([string]$Url) {
+            Write-Host "checking $Url"
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                $response = Invoke-WebRequest -Uri $Url -Method Head -MaximumRedirection 5 -TimeoutSec 30
+                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                  return
+                }
+                throw "missing managed ASR asset: $Url"
+              } catch {
+                if ($attempt -eq 3) {
+                  throw
+                }
+                Start-Sleep -Seconds 5
+              }
+            }
+          }
           $target = "x86_64-pc-windows-msvc"
           $url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.10.20+20260510-$target-install_only_stripped.tar.gz"
-          $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 5 -TimeoutSec 30
-          if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
-            throw "missing python-build-standalone asset for $target"
-          }
+          Test-ManagedASRAsset $url
+          Test-ManagedASRAsset "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf"
+          Test-ManagedASRAsset "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
+          Test-ManagedASRAsset "https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl"
+          Test-ManagedASRAsset "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-win-vulkan-x64.zip"
+          Test-ManagedASRAsset "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-win-cpu-x64.zip"
+
+      - name: Teams managed ASR real runtime smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODEX_HELPER_ASR_REAL_ASSET_TEST=1 go test ./internal/teams -count=1 -run 'TestManagedASRRealPinnedLlamaAndFFmpegAssetsInstallAndValidate$' -v
 
       - name: Teams work chat creation info regressions
         shell: bash

@@ -154,6 +154,29 @@ func TestTeamsASRTranscriberDefaultsToManagedQwenRuntime(t *testing.T) {
 	}
 }
 
+func TestTeamsASRTranscriberReadsManagedLlamaEnv(t *testing.T) {
+	t.Setenv(envTeamsASRBackend, "llama")
+	t.Setenv(envTeamsASRLlamaBinary, "/opt/llama/llama-mtmd-cli")
+	t.Setenv(envTeamsASRLlamaModel, "/models/qwen.gguf")
+	t.Setenv(envTeamsASRLlamaMMProj, "/models/mmproj.gguf")
+	t.Setenv(envTeamsASRLlamaDevice, "cpu")
+	t.Setenv(envTeamsASRFFmpeg, "/opt/ffmpeg")
+
+	transcriber := teamsASRTranscriberFromConfig("", nil)
+	managed, ok := transcriber.(*teams.ManagedASRTranscriber)
+	if !ok {
+		t.Fatalf("ASR transcriber = %T, want managed Qwen runtime", transcriber)
+	}
+	if managed.Config.Backend != "llama" ||
+		managed.Config.LlamaBinaryPath != "/opt/llama/llama-mtmd-cli" ||
+		managed.Config.LlamaModelPath != "/models/qwen.gguf" ||
+		managed.Config.LlamaMMProjPath != "/models/mmproj.gguf" ||
+		managed.Config.LlamaDevice != "cpu" ||
+		managed.Config.FFmpegPath != "/opt/ffmpeg" {
+		t.Fatalf("managed ASR config from env = %#v", managed.Config)
+	}
+}
+
 func TestRestartTeamsHelperFromTeamsWindowsServiceSchedulesTaskStart(t *testing.T) {
 	prevGOOS := teamsServiceGOOS
 	prevDetached := teamsServiceStartDetached

@@ -240,6 +240,12 @@ func teamsASRStatusLine(transcriber ASRTranscriber) string {
 	switch value := transcriber.(type) {
 	case *ManagedASRTranscriber:
 		if value != nil {
+			switch managedASRBackendMode(value.Config.Backend) {
+			case managedASRBackendLlama:
+				return "Speech recognition: managed local Qwen ASR using llama.cpp opt-in backend."
+			case managedASRBackendAuto:
+				return "Speech recognition: managed local Qwen ASR using automatic backend selection."
+			}
 			return "Speech recognition: managed local Qwen ASR; cxp sets it up automatically on the first Teams voice/video message."
 		}
 	case *CommandASRTranscriber:

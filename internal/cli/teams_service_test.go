@@ -3139,6 +3139,12 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", filepath.Join(tmp, "read-token.json"))
 	t.Setenv(envTeamsASRCommand, filepath.Join(tmp, "bin", "teams-asr"))
 	t.Setenv(envTeamsASRArgsJSON, `["--input={input}","--threads={threads}"]`)
+	t.Setenv(envTeamsASRBackend, "llama")
+	t.Setenv(envTeamsASRLlamaBinary, filepath.Join(tmp, "bin", "llama-mtmd-cli"))
+	t.Setenv(envTeamsASRLlamaModel, filepath.Join(tmp, "models", "qwen.gguf"))
+	t.Setenv(envTeamsASRLlamaMMProj, filepath.Join(tmp, "models", "mmproj.gguf"))
+	t.Setenv(envTeamsASRLlamaDevice, "cpu")
+	t.Setenv(envTeamsASRFFmpeg, filepath.Join(tmp, "bin", "ffmpeg"))
 	t.Setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	exePath := filepath.Join(tmp, "bin", "codex-proxy")
@@ -3168,6 +3174,12 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE="+filepath.Join(tmp, "read-token.json")),
 		"Environment=" + systemdQuoteArg(envTeamsASRCommand+"="+filepath.Join(tmp, "bin", "teams-asr")),
 		"Environment=" + systemdQuoteArg(envTeamsASRArgsJSON+`=["--input={input}","--threads={threads}"]`),
+		"Environment=" + systemdQuoteArg(envTeamsASRBackend+"=llama"),
+		"Environment=" + systemdQuoteArg(envTeamsASRLlamaBinary+"="+filepath.Join(tmp, "bin", "llama-mtmd-cli")),
+		"Environment=" + systemdQuoteArg(envTeamsASRLlamaModel+"="+filepath.Join(tmp, "models", "qwen.gguf")),
+		"Environment=" + systemdQuoteArg(envTeamsASRLlamaMMProj+"="+filepath.Join(tmp, "models", "mmproj.gguf")),
+		"Environment=" + systemdQuoteArg(envTeamsASRLlamaDevice+"=cpu"),
+		"Environment=" + systemdQuoteArg(envTeamsASRFFmpeg+"="+filepath.Join(tmp, "bin", "ffmpeg")),
 		"Environment=" + systemdQuoteArg("HTTPS_PROXY=http://proxy.example.test:8080"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_SERVICE_MODE=background"),
 	} {
@@ -3182,6 +3194,9 @@ func TestTeamsASRArgsFromEnvAndServiceOverrides(t *testing.T) {
 
 	tmp := t.TempDir()
 	t.Setenv(envTeamsASRArgsJSON, `["--input={input}","--prefix=  keep spaces  ","--threads={threads}"]`)
+	t.Setenv(envTeamsASRBackend, "llama")
+	t.Setenv(envTeamsASRLlamaModel, filepath.Join(tmp, "models", "qwen.gguf"))
+	t.Setenv(envTeamsASRLlamaMMProj, filepath.Join(tmp, "models", "mmproj.gguf"))
 	args, err := teamsASRArgsFromFlagsOrEnv(nil, true)
 	if err != nil {
 		t.Fatalf("teamsASRArgsFromFlagsOrEnv: %v", err)
@@ -3208,6 +3223,11 @@ func TestTeamsASRArgsFromEnvAndServiceOverrides(t *testing.T) {
 	}
 	if spec.Environment[envTeamsASRArgsJSON] != `["--input={input}","--threads={threads}"]` {
 		t.Fatalf("ASR args env = %q", spec.Environment[envTeamsASRArgsJSON])
+	}
+	if spec.Environment[envTeamsASRBackend] != "llama" ||
+		spec.Environment[envTeamsASRLlamaModel] != filepath.Join(tmp, "models", "qwen.gguf") ||
+		spec.Environment[envTeamsASRLlamaMMProj] != filepath.Join(tmp, "models", "mmproj.gguf") {
+		t.Fatalf("managed ASR env = %#v", spec.Environment)
 	}
 }
 
