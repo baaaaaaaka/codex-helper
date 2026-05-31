@@ -1030,7 +1030,7 @@ func managedASRLlamaInstallEnvForCommand(root string, command string) []string {
 }
 
 func validateManagedASRLlamaBinary(ctx context.Context, command string, env []string) error {
-	validateCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	validateCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(validateCtx, strings.TrimSpace(command), "--help")
 	cmd.Env = append(managedASRSetupBaseEnv(), env...)
