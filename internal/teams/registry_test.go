@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
 func TestSaveRegistryNoopDoesNotRewriteFile(t *testing.T) {
@@ -79,6 +81,7 @@ func TestSaveRegistryMergesProjectionState(t *testing.T) {
 			ChatID:        "chat-1",
 			Status:        "active",
 			CodexThreadID: "thread-old",
+			ModelProfile:  modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", APIKeyRef: "secret:model-profile/mimo25/api-key", Revision: 2},
 		}},
 		Chats: map[string]ChatState{
 			"chat-1": {
@@ -115,6 +118,9 @@ func TestSaveRegistryMergesProjectionState(t *testing.T) {
 	}
 	if session := merged.SessionByID("s001"); session == nil || session.CodexThreadID != "thread-old" {
 		t.Fatalf("merged session = %#v, want existing thread preserved", session)
+	}
+	if session := merged.SessionByID("s001"); session == nil || session.ModelProfile.Name != "mimo25" || session.ModelProfile.Revision != 2 {
+		t.Fatalf("merged session = %#v, want existing model profile preserved", session)
 	}
 	if !merged.HasSeen("chat-1", "seen-old") || !merged.HasSeen("chat-1", "seen-new") {
 		t.Fatalf("seen ids not merged: %#v", merged.Chats["chat-1"].SeenMessageIDs)

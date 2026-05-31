@@ -18,6 +18,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
@@ -123,40 +124,41 @@ const (
 )
 
 type State struct {
-	SchemaVersion        int                                 `json:"schema_version"`
-	CreatedAt            time.Time                           `json:"created_at,omitempty"`
-	UpdatedAt            time.Time                           `json:"updated_at,omitempty"`
-	Scope                ScopeIdentity                       `json:"scope,omitempty"`
-	MachineIdentity      MachineIdentity                     `json:"machine_identity,omitempty"`
-	Machines             map[string]MachineRecord            `json:"machines,omitempty"`
-	ControlLease         ControlLease                        `json:"control_lease,omitempty"`
-	ControlChat          ControlChatBinding                  `json:"control_chat,omitempty"`
-	ServiceOwner         *OwnerMetadata                      `json:"service_owner,omitempty"`
-	LockOwner            *OwnerMetadata                      `json:"lock_owner,omitempty"`
-	ServiceControl       ServiceControl                      `json:"service_control,omitempty"`
-	Upgrade              *UpgradeRequest                     `json:"upgrade,omitempty"`
-	Sessions             map[string]SessionContext           `json:"sessions,omitempty"`
-	Turns                map[string]Turn                     `json:"turns,omitempty"`
-	InboundEvents        map[string]InboundEvent             `json:"inbound_events,omitempty"`
-	OutboxMessages       map[string]OutboxMessage            `json:"outbox_messages,omitempty"`
-	MessageProvenance    map[string]MessageProvenanceRecord  `json:"message_provenance,omitempty"`
-	ChatPolls            map[string]ChatPollState            `json:"chat_polls,omitempty"`
-	Workspaces           map[string]WorkspaceRecord          `json:"workspaces,omitempty"`
-	DashboardViews       map[string]DashboardViewRecord      `json:"dashboard_views,omitempty"`
-	DashboardNumbers     map[string]DashboardNumberRecord    `json:"dashboard_numbers,omitempty"`
-	TranscriptLedger     map[string]TranscriptLedgerRecord   `json:"transcript_ledger,omitempty"`
-	TranscriptDeliveries map[string]TranscriptDeliveryRecord `json:"transcript_deliveries,omitempty"`
-	HelperDeliveries     map[string]HelperDeliveryRecord     `json:"helper_deliveries,omitempty"`
-	ImportCheckpoints    map[string]ImportCheckpoint         `json:"import_checkpoints,omitempty"`
-	HistoryWatch         map[string]HistoryWatchCheckpoint   `json:"history_watch,omitempty"`
-	HistoryWatchReady    time.Time                           `json:"history_watch_ready,omitempty"`
-	ChatSequences        map[string]ChatSequenceState        `json:"chat_sequences,omitempty"`
-	ChatRateLimits       map[string]ChatRateLimitState       `json:"chat_rate_limits,omitempty"`
-	ArtifactRecords      map[string]ArtifactRecord           `json:"artifact_records,omitempty"`
-	Notifications        map[string]NotificationRecord       `json:"notifications,omitempty"`
-	SkillPushReviews     map[string]SkillPushReview          `json:"skill_push_reviews,omitempty"`
-	Workflow             WorkflowNotificationConfig          `json:"workflow,omitempty"`
-	AutoUpdate           AutoUpdateState                     `json:"auto_update,omitempty"`
+	SchemaVersion          int                                 `json:"schema_version"`
+	CreatedAt              time.Time                           `json:"created_at,omitempty"`
+	UpdatedAt              time.Time                           `json:"updated_at,omitempty"`
+	Scope                  ScopeIdentity                       `json:"scope,omitempty"`
+	MachineIdentity        MachineIdentity                     `json:"machine_identity,omitempty"`
+	Machines               map[string]MachineRecord            `json:"machines,omitempty"`
+	ControlLease           ControlLease                        `json:"control_lease,omitempty"`
+	ControlChat            ControlChatBinding                  `json:"control_chat,omitempty"`
+	ServiceOwner           *OwnerMetadata                      `json:"service_owner,omitempty"`
+	LockOwner              *OwnerMetadata                      `json:"lock_owner,omitempty"`
+	ServiceControl         ServiceControl                      `json:"service_control,omitempty"`
+	Upgrade                *UpgradeRequest                     `json:"upgrade,omitempty"`
+	Sessions               map[string]SessionContext           `json:"sessions,omitempty"`
+	Turns                  map[string]Turn                     `json:"turns,omitempty"`
+	InboundEvents          map[string]InboundEvent             `json:"inbound_events,omitempty"`
+	OutboxMessages         map[string]OutboxMessage            `json:"outbox_messages,omitempty"`
+	MessageProvenance      map[string]MessageProvenanceRecord  `json:"message_provenance,omitempty"`
+	ChatPolls              map[string]ChatPollState            `json:"chat_polls,omitempty"`
+	Workspaces             map[string]WorkspaceRecord          `json:"workspaces,omitempty"`
+	DashboardViews         map[string]DashboardViewRecord      `json:"dashboard_views,omitempty"`
+	DashboardNumbers       map[string]DashboardNumberRecord    `json:"dashboard_numbers,omitempty"`
+	TranscriptLedger       map[string]TranscriptLedgerRecord   `json:"transcript_ledger,omitempty"`
+	TranscriptDeliveries   map[string]TranscriptDeliveryRecord `json:"transcript_deliveries,omitempty"`
+	HelperDeliveries       map[string]HelperDeliveryRecord     `json:"helper_deliveries,omitempty"`
+	ImportCheckpoints      map[string]ImportCheckpoint         `json:"import_checkpoints,omitempty"`
+	HistoryWatch           map[string]HistoryWatchCheckpoint   `json:"history_watch,omitempty"`
+	HistoryWatchReady      time.Time                           `json:"history_watch_ready,omitempty"`
+	ChatSequences          map[string]ChatSequenceState        `json:"chat_sequences,omitempty"`
+	ChatRateLimits         map[string]ChatRateLimitState       `json:"chat_rate_limits,omitempty"`
+	ArtifactRecords        map[string]ArtifactRecord           `json:"artifact_records,omitempty"`
+	Notifications          map[string]NotificationRecord       `json:"notifications,omitempty"`
+	ModelProfileKeyIntakes map[string]ModelProfileKeyIntake    `json:"model_profile_key_intakes,omitempty"`
+	SkillPushReviews       map[string]SkillPushReview          `json:"skill_push_reviews,omitempty"`
+	Workflow               WorkflowNotificationConfig          `json:"workflow,omitempty"`
+	AutoUpdate             AutoUpdateState                     `json:"auto_update,omitempty"`
 }
 
 type ScopeIdentity struct {
@@ -642,27 +644,28 @@ type OwnerMetadata struct {
 }
 
 type SessionContext struct {
-	ID                string        `json:"id"`
-	Status            SessionStatus `json:"status"`
-	TeamsChatID       string        `json:"teams_chat_id"`
-	TeamsChatURL      string        `json:"teams_chat_url,omitempty"`
-	TeamsTopic        string        `json:"teams_topic,omitempty"`
-	UserTitle         string        `json:"user_title,omitempty"`
-	TitleSource       string        `json:"title_source,omitempty"`
-	CodexThreadID     string        `json:"codex_thread_id,omitempty"`
-	LatestCodexTurnID string        `json:"latest_codex_turn_id,omitempty"`
-	LatestTurnID      string        `json:"latest_turn_id,omitempty"`
-	RunnerKind        string        `json:"runner_kind,omitempty"`
-	CodexVersion      string        `json:"codex_version,omitempty"`
-	Cwd               string        `json:"cwd,omitempty"`
-	CodexHome         string        `json:"codex_home,omitempty"`
-	Profile           string        `json:"profile,omitempty"`
-	Model             string        `json:"model,omitempty"`
-	Sandbox           string        `json:"sandbox,omitempty"`
-	ProxyMode         string        `json:"proxy_mode,omitempty"`
-	YoloMode          string        `json:"yolo_mode,omitempty"`
-	CreatedAt         time.Time     `json:"created_at,omitempty"`
-	UpdatedAt         time.Time     `json:"updated_at,omitempty"`
+	ID                string                `json:"id"`
+	Status            SessionStatus         `json:"status"`
+	TeamsChatID       string                `json:"teams_chat_id"`
+	TeamsChatURL      string                `json:"teams_chat_url,omitempty"`
+	TeamsTopic        string                `json:"teams_topic,omitempty"`
+	UserTitle         string                `json:"user_title,omitempty"`
+	TitleSource       string                `json:"title_source,omitempty"`
+	CodexThreadID     string                `json:"codex_thread_id,omitempty"`
+	LatestCodexTurnID string                `json:"latest_codex_turn_id,omitempty"`
+	LatestTurnID      string                `json:"latest_turn_id,omitempty"`
+	RunnerKind        string                `json:"runner_kind,omitempty"`
+	CodexVersion      string                `json:"codex_version,omitempty"`
+	Cwd               string                `json:"cwd,omitempty"`
+	CodexHome         string                `json:"codex_home,omitempty"`
+	Profile           string                `json:"profile,omitempty"`
+	Model             string                `json:"model,omitempty"`
+	ModelProfile      modelprofile.Snapshot `json:"model_profile,omitempty"`
+	Sandbox           string                `json:"sandbox,omitempty"`
+	ProxyMode         string                `json:"proxy_mode,omitempty"`
+	YoloMode          string                `json:"yolo_mode,omitempty"`
+	CreatedAt         time.Time             `json:"created_at,omitempty"`
+	UpdatedAt         time.Time             `json:"updated_at,omitempty"`
 }
 
 type InboundEvent struct {
@@ -697,24 +700,25 @@ type InboundAttachmentContext struct {
 }
 
 type Turn struct {
-	ID              string     `json:"id"`
-	SessionID       string     `json:"session_id"`
-	InboundEventID  string     `json:"inbound_event_id,omitempty"`
-	ScopeID         string     `json:"scope_id,omitempty"`
-	MachineID       string     `json:"machine_id,omitempty"`
-	LeaseGeneration int64      `json:"lease_generation,omitempty"`
-	Status          TurnStatus `json:"status"`
-	CodexThreadID   string     `json:"codex_thread_id,omitempty"`
-	CodexTurnID     string     `json:"codex_turn_id,omitempty"`
-	FailureMessage  string     `json:"failure_message,omitempty"`
-	RecoveryReason  string     `json:"recovery_reason,omitempty"`
-	QueuedAt        time.Time  `json:"queued_at,omitempty"`
-	StartedAt       time.Time  `json:"started_at,omitempty"`
-	CompletedAt     time.Time  `json:"completed_at,omitempty"`
-	FailedAt        time.Time  `json:"failed_at,omitempty"`
-	InterruptedAt   time.Time  `json:"interrupted_at,omitempty"`
-	CreatedAt       time.Time  `json:"created_at,omitempty"`
-	UpdatedAt       time.Time  `json:"updated_at,omitempty"`
+	ID              string                `json:"id"`
+	SessionID       string                `json:"session_id"`
+	InboundEventID  string                `json:"inbound_event_id,omitempty"`
+	ScopeID         string                `json:"scope_id,omitempty"`
+	MachineID       string                `json:"machine_id,omitempty"`
+	LeaseGeneration int64                 `json:"lease_generation,omitempty"`
+	Status          TurnStatus            `json:"status"`
+	CodexThreadID   string                `json:"codex_thread_id,omitempty"`
+	CodexTurnID     string                `json:"codex_turn_id,omitempty"`
+	ModelProfile    modelprofile.Snapshot `json:"model_profile,omitempty"`
+	FailureMessage  string                `json:"failure_message,omitempty"`
+	RecoveryReason  string                `json:"recovery_reason,omitempty"`
+	QueuedAt        time.Time             `json:"queued_at,omitempty"`
+	StartedAt       time.Time             `json:"started_at,omitempty"`
+	CompletedAt     time.Time             `json:"completed_at,omitempty"`
+	FailedAt        time.Time             `json:"failed_at,omitempty"`
+	InterruptedAt   time.Time             `json:"interrupted_at,omitempty"`
+	CreatedAt       time.Time             `json:"created_at,omitempty"`
+	UpdatedAt       time.Time             `json:"updated_at,omitempty"`
 }
 
 type OutboxMessage struct {
@@ -760,6 +764,39 @@ type OutboxMessage struct {
 	SentAt                 time.Time    `json:"sent_at,omitempty"`
 	LastSendAttempt        time.Time    `json:"last_send_attempt,omitempty"`
 	LastSendError          string       `json:"last_send_error,omitempty"`
+}
+
+type ModelProfileKeyIntakeStatus string
+
+const (
+	ModelProfileKeyIntakePending   ModelProfileKeyIntakeStatus = "pending"
+	ModelProfileKeyIntakeConfirmed ModelProfileKeyIntakeStatus = "confirmed"
+	ModelProfileKeyIntakeSaving    ModelProfileKeyIntakeStatus = "saving"
+	ModelProfileKeyIntakeCompleted ModelProfileKeyIntakeStatus = "completed"
+	ModelProfileKeyIntakeCanceled  ModelProfileKeyIntakeStatus = "canceled"
+	ModelProfileKeyIntakeExpired   ModelProfileKeyIntakeStatus = "expired"
+)
+
+type ModelProfileKeyIntake struct {
+	ID               string                      `json:"id"`
+	ScopeID          string                      `json:"scope_id,omitempty"`
+	TeamsChatID      string                      `json:"teams_chat_id,omitempty"`
+	RequestMessageID string                      `json:"request_message_id,omitempty"`
+	AuthorUserID     string                      `json:"author_user_id,omitempty"`
+	AuthorName       string                      `json:"author_name,omitempty"`
+	ProfileName      string                      `json:"profile_name,omitempty"`
+	Provider         string                      `json:"provider,omitempty"`
+	SSHProxy         string                      `json:"ssh_proxy,omitempty"`
+	SetDefault       bool                        `json:"set_default,omitempty"`
+	CodeHash         string                      `json:"code_hash,omitempty"`
+	Status           ModelProfileKeyIntakeStatus `json:"status,omitempty"`
+	LastError        string                      `json:"last_error,omitempty"`
+	CreatedAt        time.Time                   `json:"created_at,omitempty"`
+	UpdatedAt        time.Time                   `json:"updated_at,omitempty"`
+	ExpiresAt        time.Time                   `json:"expires_at,omitempty"`
+	ConfirmedAt      time.Time                   `json:"confirmed_at,omitempty"`
+	CompletedAt      time.Time                   `json:"completed_at,omitempty"`
+	CanceledAt       time.Time                   `json:"canceled_at,omitempty"`
 }
 
 type MessageProvenanceRecord struct {
@@ -2836,6 +2873,9 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		if turn.Status == "" {
 			turn.Status = TurnStatusQueued
 		}
+		if turn.ModelProfile.IsZero() {
+			turn.ModelProfile = session.ModelProfile
+		}
 		if turn.QueuedAt.IsZero() {
 			turn.QueuedAt = now
 		}
@@ -4728,29 +4768,30 @@ func (s *Store) withSessionLock(ctx context.Context, sessionID string, fn func()
 func newState() State {
 	now := time.Now()
 	state := State{
-		SchemaVersion:        SchemaVersion,
-		CreatedAt:            now,
-		UpdatedAt:            now,
-		Machines:             make(map[string]MachineRecord),
-		Sessions:             make(map[string]SessionContext),
-		Turns:                make(map[string]Turn),
-		InboundEvents:        make(map[string]InboundEvent),
-		OutboxMessages:       make(map[string]OutboxMessage),
-		MessageProvenance:    make(map[string]MessageProvenanceRecord),
-		ChatPolls:            make(map[string]ChatPollState),
-		Workspaces:           make(map[string]WorkspaceRecord),
-		DashboardViews:       make(map[string]DashboardViewRecord),
-		DashboardNumbers:     make(map[string]DashboardNumberRecord),
-		TranscriptLedger:     make(map[string]TranscriptLedgerRecord),
-		TranscriptDeliveries: make(map[string]TranscriptDeliveryRecord),
-		HelperDeliveries:     make(map[string]HelperDeliveryRecord),
-		ImportCheckpoints:    make(map[string]ImportCheckpoint),
-		HistoryWatch:         make(map[string]HistoryWatchCheckpoint),
-		ChatSequences:        make(map[string]ChatSequenceState),
-		ChatRateLimits:       make(map[string]ChatRateLimitState),
-		ArtifactRecords:      make(map[string]ArtifactRecord),
-		Notifications:        make(map[string]NotificationRecord),
-		SkillPushReviews:     make(map[string]SkillPushReview),
+		SchemaVersion:          SchemaVersion,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+		Machines:               make(map[string]MachineRecord),
+		Sessions:               make(map[string]SessionContext),
+		Turns:                  make(map[string]Turn),
+		InboundEvents:          make(map[string]InboundEvent),
+		OutboxMessages:         make(map[string]OutboxMessage),
+		MessageProvenance:      make(map[string]MessageProvenanceRecord),
+		ChatPolls:              make(map[string]ChatPollState),
+		Workspaces:             make(map[string]WorkspaceRecord),
+		DashboardViews:         make(map[string]DashboardViewRecord),
+		DashboardNumbers:       make(map[string]DashboardNumberRecord),
+		TranscriptLedger:       make(map[string]TranscriptLedgerRecord),
+		TranscriptDeliveries:   make(map[string]TranscriptDeliveryRecord),
+		HelperDeliveries:       make(map[string]HelperDeliveryRecord),
+		ImportCheckpoints:      make(map[string]ImportCheckpoint),
+		HistoryWatch:           make(map[string]HistoryWatchCheckpoint),
+		ChatSequences:          make(map[string]ChatSequenceState),
+		ChatRateLimits:         make(map[string]ChatRateLimitState),
+		ArtifactRecords:        make(map[string]ArtifactRecord),
+		Notifications:          make(map[string]NotificationRecord),
+		ModelProfileKeyIntakes: make(map[string]ModelProfileKeyIntake),
+		SkillPushReviews:       make(map[string]SkillPushReview),
 	}
 	return state
 }
@@ -4824,6 +4865,9 @@ func (s *State) ensure(now time.Time) {
 	}
 	if s.Notifications == nil {
 		s.Notifications = make(map[string]NotificationRecord)
+	}
+	if s.ModelProfileKeyIntakes == nil {
+		s.ModelProfileKeyIntakes = make(map[string]ModelProfileKeyIntake)
 	}
 	if s.SkillPushReviews == nil {
 		s.SkillPushReviews = make(map[string]SkillPushReview)

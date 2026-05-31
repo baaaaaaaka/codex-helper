@@ -24,6 +24,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -3067,7 +3068,7 @@ func teamsServiceProxyHasCredentials(value string) bool {
 }
 
 func teamsServiceEnvironmentAllowlist() []string {
-	return []string{
+	names := []string{
 		"CODEX_HOME",
 		"CODEX_DIR",
 		"CODEX_HELPER_CONFIG",
@@ -3125,6 +3126,13 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"all_proxy",
 		"no_proxy",
 	}
+	for _, providerID := range modelprofile.ProviderIDs() {
+		spec, ok := modelprofile.LookupProvider(providerID)
+		if ok && strings.TrimSpace(spec.RecommendedEnv) != "" {
+			names = append(names, strings.TrimSpace(spec.RecommendedEnv))
+		}
+	}
+	return names
 }
 
 func sortedEnvironmentKeys(env map[string]string) []string {

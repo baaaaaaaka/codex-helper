@@ -2155,6 +2155,9 @@ func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, boo
 			if turn.Status == "" {
 				turn.Status = TurnStatusQueued
 			}
+			if turn.ModelProfile.IsZero() {
+				turn.ModelProfile = session.ModelProfile
+			}
 			if turn.QueuedAt.IsZero() {
 				turn.QueuedAt = now
 			}

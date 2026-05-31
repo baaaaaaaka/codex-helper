@@ -77,3 +77,47 @@ func TestConfigProfileEdges(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigModelProfileOps(t *testing.T) {
+	now := time.Now()
+	cfg := Config{Version: CurrentVersion}
+
+	if got := cfg.EffectiveDefaultModelProfile(); got != DefaultModelProfileName {
+		t.Fatalf("EffectiveDefaultModelProfile=%q", got)
+	}
+	if got, ok := cfg.FindModelProfile(""); !ok || got.Provider != DefaultModelProfileName {
+		t.Fatalf("default model profile missing: ok=%v got=%#v", ok, got)
+	}
+
+	cfg.UpsertModelProfile("deepseek-work", ModelProfile{
+		Provider:  "deepseek",
+		APIKeyRef: "env:DEEPSEEK_API_KEY",
+		SSHProxy:  "work",
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+
+	got, ok := cfg.FindModelProfile("DeepSeek-Work")
+	if !ok || got.Provider != "deepseek" || got.Revision != 1 {
+		t.Fatalf("FindModelProfile failed: ok=%v got=%#v", ok, got)
+	}
+
+	got.APIKeyRef = "secret:model-profile/deepseek-work/api-key"
+	got.Revision = 2
+	cfg.UpsertModelProfile("deepseek-work", got)
+	got, ok = cfg.FindModelProfile("deepseek-work")
+	if !ok || got.APIKeyRef != "secret:model-profile/deepseek-work/api-key" || got.Revision != 2 {
+		t.Fatalf("UpsertModelProfile update failed: ok=%v got=%#v", ok, got)
+	}
+
+	cfg.DefaultModelProfile = "deepseek-work"
+	if !cfg.RemoveModelProfile("DEEPSEEK-WORK") {
+		t.Fatalf("RemoveModelProfile returned false")
+	}
+	if cfg.DefaultModelProfile != "" {
+		t.Fatalf("DefaultModelProfile should reset when removed, got %q", cfg.DefaultModelProfile)
+	}
+	if _, ok := cfg.FindModelProfile("deepseek-work"); ok {
+		t.Fatalf("removed model profile still found")
+	}
+}

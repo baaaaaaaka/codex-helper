@@ -23,6 +23,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 )
@@ -41,6 +42,7 @@ var (
 )
 
 func newRunCmd(root *rootOptions) *cobra.Command {
+	var modelProfile string
 	cmd := &cobra.Command{
 		Use:   "run [profile] -- [cmd args...]",
 		Short: "Run a command using direct mode or an SSH-backed local proxy",
@@ -51,6 +53,7 @@ func newRunCmd(root *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().Bool("yolo", false, "Launch Codex with helper-managed yolo mode")
+	cmd.Flags().StringVar(&modelProfile, "model-profile", "", "Model profile id or name for Codex launches")
 	return cmd
 }
 
@@ -76,6 +79,9 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		after = []string{"codex"}
 	}
 	runOpts := runTargetOptionsFromRunFlags(cmd)
+	if strings.TrimSpace(runOpts.ModelProfileRef) != "" && (len(after) == 0 || !isCodexCommand(after[0])) {
+		return fmt.Errorf("--model-profile only applies to Codex launches")
+	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -83,6 +89,33 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	store, _, err := newRootStore(root, "")
 	if err != nil {
 		return err
+	}
+	modelProfileOwnsProxy := false
+	if runOpts.ModelProfileRef != "" || (len(after) > 0 && isCodexCommand(after[0])) {
+		cfgForModelProfile, err := store.Load()
+		if err != nil {
+			return err
+		}
+		resolvedModelProfile, err := modelprofile.Resolve(cfgForModelProfile, runOpts.ModelProfileRef)
+		if err != nil {
+			return err
+		}
+		modelProfileSelected := strings.TrimSpace(runOpts.ModelProfileRef) != "" || strings.TrimSpace(cfgForModelProfile.DefaultModelProfile) != ""
+		if resolvedModelProfile.SSHProfile != nil {
+			if profileRef != "" {
+				selected, ok := cfgForModelProfile.FindProfile(profileRef)
+				if !ok {
+					return fmt.Errorf("profile %q not found", profileRef)
+				}
+				if selected.ID != resolvedModelProfile.SSHProfile.ID {
+					return fmt.Errorf("model profile %q requires ssh proxy %q, but run selected proxy profile %q", resolvedModelProfile.Name, resolvedModelProfile.SSHProfile.Name, profileRef)
+				}
+			} else {
+				profileRef = resolvedModelProfile.SSHProfile.Name
+			}
+		} else if modelProfileSelected {
+			modelProfileOwnsProxy = true
+		}
 	}
 
 	if profileRef != "" {
@@ -97,16 +130,19 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			}
 			cfg.ProxyEnabled = &enabled
 		}
-		if runOpts.YoloEnabled {
+		if runOpts.YoloEnabled || runOpts.ModelProfileRef != "" {
 			runOpts.Log = cmd.ErrOrStderr()
 			return runWithProfileOptionsFn(ctx, store, profile, cfg.Instances, after, runOpts)
 		}
 		return runWithProfileFn(ctx, store, profile, cfg.Instances, after)
 	}
 
-	useProxy, _, err := ensureProxyPreferenceRunFn(ctx, store, "", cmd.ErrOrStderr())
-	if err != nil {
-		return err
+	useProxy := false
+	if !modelProfileOwnsProxy {
+		useProxy, _, err = ensureProxyPreferenceRunFn(ctx, store, "", cmd.ErrOrStderr())
+		if err != nil {
+			return err
+		}
 	}
 	if useProxy {
 		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, "", autoInit, cmd.OutOrStdout())
@@ -143,6 +179,14 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		}
 		opts.ExtraEnv = append(opts.ExtraEnv, extraEnv...)
 		opts.ExecIdentity = execIdentity
+		var modelCleanup func()
+		resolvedCmd, modelCleanup, err = prepareCodexModelProfileForRun(ctx, store, resolvedCmd, &opts, "")
+		if err != nil {
+			return err
+		}
+		if modelCleanup != nil {
+			defer modelCleanup()
+		}
 		var cleanup func()
 		resolvedCmd, cleanup = prepareYoloCodexCommandForRun(store, resolvedCmd, &opts)
 		if cleanup != nil {
@@ -164,6 +208,9 @@ func runTargetOptionsFromRunFlags(cmd *cobra.Command) runTargetOptions {
 	if err == nil && yolo {
 		opts.YoloEnabled = true
 		opts.RequireYolo = true
+	}
+	if flag := cmd.Flags().Lookup("model-profile"); flag != nil {
+		opts.ModelProfileRef = strings.TrimSpace(flag.Value.String())
 	}
 	return opts
 }
@@ -211,6 +258,14 @@ func runWithExistingInstanceOptions(
 	if isCodexCommand(cmdArgs[0]) {
 		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 			return err
+		}
+		var modelCleanup func()
+		cmdArgs, modelCleanup, err = prepareCodexModelProfileForRun(ctx, store, cmdArgs, &opts, proxyURL)
+		if err != nil {
+			return err
+		}
+		if modelCleanup != nil {
+			defer modelCleanup()
 		}
 		var cleanup func()
 		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
@@ -270,6 +325,14 @@ func runWithNewStackOptions(
 	if isCodexCommand(cmdArgs[0]) {
 		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 			return err
+		}
+		var modelCleanup func()
+		cmdArgs, modelCleanup, err = prepareCodexModelProfileForRun(ctx, store, cmdArgs, &opts, proxyURL)
+		if err != nil {
+			return err
+		}
+		if modelCleanup != nil {
+			defer modelCleanup()
 		}
 		var cleanup func()
 		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
@@ -375,7 +438,9 @@ type runTargetOptions struct {
 	RequireYolo    bool
 	OnYoloFallback func() error
 	// PatchInfo, when set, records patch failure on startup crash.
-	PatchInfo *patchRunInfo
+	PatchInfo            *patchRunInfo
+	ModelProfileRef      string
+	ModelProfileSnapshot modelprofile.Snapshot
 }
 
 type codexResolveError struct {

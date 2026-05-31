@@ -51,21 +51,23 @@ var (
 )
 
 type codexAppOptions struct {
-	profileRef string
-	codexDir   string
-	appPath    string
-	cwd        string
+	profileRef      string
+	modelProfileRef string
+	codexDir        string
+	appPath         string
+	cwd             string
 }
 
 type codexDesktopAppOptions struct {
-	Platform     codexDesktopPlatform
-	Cwd          string
-	AppPath      string
-	InstallHome  string
-	ExtraEnv     []string
-	ProxyURL     string
-	ExecIdentity *execIdentity
-	Log          io.Writer
+	Platform         codexDesktopPlatform
+	Cwd              string
+	AppPath          string
+	InstallHome      string
+	ExtraEnv         []string
+	ProxyURL         string
+	ModelProfileName string
+	ExecIdentity     *execIdentity
+	Log              io.Writer
 }
 
 type codexDesktopPlatform string
@@ -80,6 +82,7 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 	var appPath string
 	var cwd string
 	var profileFlag string
+	var modelProfileFlag string
 
 	cmd := &cobra.Command{
 		Use:   "app [profile]",
@@ -93,10 +96,11 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			return runCodexApp(cmd, root, codexAppOptions{
-				profileRef: profileRef,
-				codexDir:   codexDir,
-				appPath:    appPath,
-				cwd:        cwd,
+				profileRef:      profileRef,
+				modelProfileRef: modelProfileFlag,
+				codexDir:        codexDir,
+				appPath:         appPath,
+				cwd:             cwd,
 			})
 		},
 	}
@@ -105,6 +109,7 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&appPath, "app-path", "", "Override Codex desktop app path")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "Working directory for Codex app (default: current directory)")
 	cmd.Flags().StringVar(&profileFlag, "profile", "", "Proxy profile id or name")
+	cmd.Flags().StringVar(&modelProfileFlag, "model-profile", "", "Model profile id or name for Codex launches")
 	cmd.AddCommand(newAppAuthCmd(root))
 	return cmd
 }
@@ -160,8 +165,13 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 			return err
 		}
 		useProxy = true
-	} else {
+	} else if strings.TrimSpace(opts.modelProfileRef) == "" {
 		useProxy, cfg, err = ensureProxyPreferenceFunc(ctx, store, opts.profileRef, cmd.ErrOrStderr())
+		if err != nil {
+			return err
+		}
+	} else {
+		cfg, err = store.Load()
 		if err != nil {
 			return err
 		}
@@ -195,6 +205,17 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 			return err
 		}
 		launchOpts.ProxyURL = proxyURL
+	}
+
+	if strings.TrimSpace(opts.modelProfileRef) != "" {
+		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, cmd.ErrOrStderr())
+		if err != nil {
+			return err
+		}
+		launchOpts, err = applyCodexDesktopModelProfileLaunch(store, launchOpts, launch)
+		if err != nil {
+			return err
+		}
 	}
 
 	return codexAppLaunchDesktopFn(ctx, launchOpts)
@@ -373,6 +394,7 @@ func startCodexAppProxyDaemon(_ context.Context, store *config.Store, profile co
 	defer logFile.Close()
 	c.Stdout = logFile
 	c.Stderr = logFile
+	configureTeamsServiceDetachedCommand(c)
 
 	if err := c.Start(); err != nil {
 		return "", err
@@ -432,6 +454,10 @@ func printCodexDesktopAppLaunchAdvisories(opts codexDesktopAppOptions) {
 	if strings.TrimSpace(opts.ProxyURL) != "" {
 		codexAppWarn(opts.Log, "Codex desktop app will use proxy %s through environment variables and Chromium proxy arguments when direct launch is available.", opts.ProxyURL)
 		codexAppWarn(opts.Log, "if Codex desktop app is already running, quit it first so the new proxy arguments take effect.")
+	}
+	if strings.TrimSpace(opts.ModelProfileName) != "" {
+		codexAppWarn(opts.Log, "Codex desktop app will use model profile %q through an isolated CODEX_HOME and local adapter.", opts.ModelProfileName)
+		codexAppWarn(opts.Log, "if Codex desktop app is already running, quit it first so the model profile configuration takes effect.")
 	}
 	if opts.Platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
 		codexAppWarn(opts.Log, "launching the Windows Codex desktop app from WSL. Windows must be able to access the converted working directory and CODEX_HOME paths.")

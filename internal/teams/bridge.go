@@ -22,6 +22,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	xhtml "golang.org/x/net/html"
 )
@@ -57,6 +58,7 @@ const (
 	mainLoopWorkflowFlushMaxNotifications      = 1
 	maxQueuedTurnStartsPerCycle                = 16
 	parkNoticeGraphFallbackLookupTTL           = 5 * time.Minute
+	graphOutboxSendMinInterval                 = 1200 * time.Millisecond
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
 	// body content. Split far below that to reduce Teams client rendering
@@ -182,6 +184,8 @@ type BridgeOptions struct {
 	ControlFallbackExecutor    Executor
 	ControlFallbackModel       string
 	ControlFallbackHelpContext string
+	ModelProfileResolver       ModelProfileResolver
+	ModelProfileManager        ModelProfileManager
 	ASRTranscriber             ASRTranscriber
 	Runner                     codexrunner.Runner
 	HelperRestarter            HelperRestarter
@@ -190,6 +194,35 @@ type BridgeOptions struct {
 	HelperAutoUpdater          HelperAutoUpdater
 	HelperAutoUpdatePrerelease bool
 	CodexUpgrader              CodexUpgrader
+}
+
+type ModelProfileResolver func(context.Context, string) (modelprofile.Snapshot, error)
+
+type ModelProfileManager interface {
+	ListModelProfiles(context.Context) (string, error)
+	ModelProfileProviders(context.Context) (string, error)
+	ModelProfileSetupGuide(context.Context, string) (string, error)
+	ModelProfileDoctor(context.Context, string) (string, error)
+	SetDefaultModelProfile(context.Context, string) (string, error)
+	DeleteModelProfile(context.Context, string, bool) (string, error)
+	SaveModelProfileAPIKey(context.Context, ModelProfileAPIKeySaveRequest) (ModelProfileAPIKeySaveResult, error)
+}
+
+type ModelProfileAPIKeySaveRequest struct {
+	ProfileName string
+	Provider    string
+	APIKey      string
+	SSHProxy    string
+	SetDefault  bool
+}
+
+type ModelProfileAPIKeySaveResult struct {
+	ProfileName string
+	Provider    string
+	APIKeyRef   string
+	Fingerprint string
+	Revision    int
+	SetDefault  bool
 }
 
 type helperAutoUpdateApplyOptions struct {
@@ -302,6 +335,8 @@ type Bridge struct {
 	controlFallbackExecutor           Executor
 	controlFallbackModel              string
 	helperRestarter                   HelperRestarter
+	modelProfileResolver              ModelProfileResolver
+	modelProfileManager               ModelProfileManager
 	helperPendingRestarter            HelperPendingRestarter
 	helperReloader                    HelperReloader
 	helperAutoUpdater                 HelperAutoUpdater
@@ -320,6 +355,8 @@ type Bridge struct {
 	ownerStaleAfter                   time.Duration
 	ownerHeartbeatInterval            time.Duration
 	outboxFlushMu                     sync.Mutex
+	outboxSendPaceMu                  sync.Mutex
+	outboxSendPaceLast                map[string]time.Time
 	pollMu                            sync.Mutex
 	fastPollUntil                     time.Time
 	lastPollErrorLog                  string
@@ -713,6 +750,8 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	b.controlFallbackExecutor = opts.ControlFallbackExecutor
 	b.controlFallbackModel = strings.TrimSpace(opts.ControlFallbackModel)
 	b.controlFallbackHelpContext = strings.TrimSpace(opts.ControlFallbackHelpContext)
+	b.modelProfileResolver = opts.ModelProfileResolver
+	b.modelProfileManager = opts.ModelProfileManager
 	b.helperRestarter = opts.HelperRestarter
 	b.helperPendingRestarter = opts.HelperPendingRestarter
 	b.helperReloader = opts.HelperReloader
@@ -1200,12 +1239,13 @@ func registrySessionFromDurable(durable teamstore.SessionContext) Session {
 		Status:        status,
 		CodexThreadID: durable.CodexThreadID,
 		Cwd:           durable.Cwd,
+		ModelProfile:  durable.ModelProfile,
 		CreatedAt:     durable.CreatedAt,
 		UpdatedAt:     durable.UpdatedAt,
 	}
 }
 
-func sanitizeControlFallbackSession(session *teamstore.SessionContext, model string, now time.Time) bool {
+func sanitizeControlFallbackSession(session *teamstore.SessionContext, model string, snapshot modelprofile.Snapshot, now time.Time) bool {
 	if session == nil {
 		return false
 	}
@@ -1227,6 +1267,10 @@ func sanitizeControlFallbackSession(session *teamstore.SessionContext, model str
 	setString(&session.RunnerKind, "control_fallback")
 	if strings.TrimSpace(model) != "" {
 		setString(&session.Model, model)
+	}
+	if session.ModelProfile.IsZero() && !snapshot.IsZero() {
+		session.ModelProfile = snapshot
+		changed = true
 	}
 	setString(&session.TeamsChatID, "")
 	setString(&session.TeamsChatURL, "")
@@ -2928,8 +2972,14 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 	if msg.Body.Content == "" && strings.TrimSpace(text) != "" {
 		msg.Body.Content = text
 	}
-	b.recordControlChatUserMessage(ctx, msg, text)
 	routeText := commandRouteTextFromTeamsMessage(msg, text)
+	if isModelProfileKeyIntakeControlRoute(routeText) {
+		return b.handleModelProfileKeyIntakeControlMessage(ctx, msg, routeText)
+	}
+	if message := modelAPIKeyPreflightMessage(routeText); message != "" {
+		return b.sendControl(ctx, message)
+	}
+	b.recordControlChatUserMessage(ctx, msg, text)
 	parsed := ParseDashboardCommand(ChatScopeControl, routeText)
 	allowMessageReferences := controlInputAllowsMessageReferences(parsed, routeText)
 	if unsupported := unsupportedControlAttachments(msg, allowMessageReferences); len(unsupported) > 0 {
@@ -2993,6 +3043,12 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.handleSkillsCommandFromMessage(ctx, b.reg.ControlChatID, msg, parsed.Argument)
 		case DashboardCommandBeacon:
 			return b.handleBeaconControlCommand(ctx, msg, parsed.Argument)
+		case DashboardCommandModel:
+			message, err := b.handleModelControlCommand(ctx, msg, parsed.Argument)
+			if err != nil {
+				return b.sendControl(ctx, controlCommandErrorMessage(err))
+			}
+			return b.sendControl(ctx, message)
 		case DashboardCommandRestart:
 			return b.restartHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandReload:
@@ -3063,6 +3119,60 @@ func controlInputAllowsMessageReferences(parsed ParsedDashboardCommand, routeTex
 		return parsed.Name == DashboardCommandAsk
 	}
 	return !looksLikeControlPath(routeText)
+}
+
+func modelAPIKeyPreflightMessage(text string) string {
+	if !containsRawModelAPIKey(text) {
+		return ""
+	}
+	return "I cannot accept raw API keys in normal Teams messages. Use `model setup <provider> [name] --teams-key-intake` to start the explicit one-time Teams key intake flow, or configure a model profile from a local terminal with `cxp model-profile setup <name> --provider <provider> --api-key-stdin`."
+}
+
+func containsRawModelAPIKey(text string) bool {
+	fields := strings.Fields(strings.TrimSpace(text))
+	for i, field := range fields {
+		normalized := strings.ToLower(strings.Trim(field, "`'\""))
+		normalized = strings.ReplaceAll(normalized, "_", "-")
+		if strings.HasPrefix(normalized, "--api-key-env") || strings.HasPrefix(normalized, "api-key-env") ||
+			strings.HasPrefix(normalized, "--api-key-stdin") || strings.HasPrefix(normalized, "api-key-stdin") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(normalized, "--api-key="), strings.HasPrefix(normalized, "api-key="):
+			return true
+		case normalized == "--api-key", normalized == "api-key":
+			if i+1 < len(fields) && strings.TrimSpace(fields[i+1]) != "" {
+				return true
+			}
+		case strings.EqualFold(strings.TrimSuffix(normalized, ":"), "authorization") && i+1 < len(fields) && strings.EqualFold(strings.Trim(fields[i+1], "`'\""), "bearer"):
+			return true
+		case looksLikeRawModelAPIKeyToken(strings.Trim(field, "`'\"")):
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRawModelAPIKeyToken(token string) bool {
+	token = strings.TrimSpace(strings.Trim(token, "`'\""))
+	if len(token) < 16 {
+		return false
+	}
+	lower := strings.ToLower(token)
+	if !strings.HasPrefix(lower, "sk-") && !strings.HasPrefix(lower, "sk_") {
+		return false
+	}
+	for _, r := range token {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func unsupportedControlAttachments(msg ChatMessage, allowMessageReferences bool) []MessageAttachment {
@@ -3235,21 +3345,26 @@ func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, er
 	}
 	now := time.Now()
 	model := b.effectiveControlFallbackModel()
+	snapshot, err := b.resolveNewSessionModelProfile(ctx, "")
+	if err != nil {
+		return nil, err
+	}
 	created, _, err := b.store.CreateSession(ctx, teamstore.SessionContext{
-		ID:         controlFallbackSessionID,
-		Status:     teamstore.SessionStatusActive,
-		RunnerKind: "control_fallback",
-		Model:      model,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:           controlFallbackSessionID,
+		Status:       teamstore.SessionStatusActive,
+		RunnerKind:   "control_fallback",
+		Model:        model,
+		ModelProfile: snapshot,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if !isDurableControlFallbackSession(created) || created.Status != teamstore.SessionStatusActive || created.Model != model || created.TeamsChatID != "" || created.TeamsChatURL != "" || created.TeamsTopic != "" || created.Cwd != "" {
+	if !isDurableControlFallbackSession(created) || created.Status != teamstore.SessionStatusActive || created.Model != model || (created.ModelProfile.IsZero() && !snapshot.IsZero()) || created.TeamsChatID != "" || created.TeamsChatURL != "" || created.TeamsTopic != "" || created.Cwd != "" {
 		if err := b.store.UpdateSession(ctx, controlFallbackSessionID, func(state *teamstore.State) error {
 			current := state.Sessions[controlFallbackSessionID]
-			sanitizeControlFallbackSession(&current, model, now)
+			sanitizeControlFallbackSession(&current, model, snapshot, now)
 			state.Sessions[controlFallbackSessionID] = current
 			return nil
 		}); err != nil {
@@ -3278,6 +3393,7 @@ func (b *Bridge) controlFallbackSessionFromState(durable teamstore.SessionContex
 		Status:        status,
 		CodexThreadID: durable.CodexThreadID,
 		Cwd:           durable.Cwd,
+		ModelProfile:  durable.ModelProfile,
 		CreatedAt:     durable.CreatedAt,
 		UpdatedAt:     durable.UpdatedAt,
 	}
@@ -3291,6 +3407,8 @@ func controlHelpText() string {
 		"Start here:",
 		"- `p` / `projects` - choose a workspace",
 		"- `n <directory>` / `new <directory>` - create a new Work chat for a directory",
+		"- `new <directory> --model-profile <name>` - create a Work chat pinned to a model profile",
+		"- `model list` / `model default <name>` - list profiles or set the default for future chats",
 		"- `s` / `sessions` - show sessions in the selected workspace",
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
 		"- `st` / `status` - show active Work chats",
@@ -3325,6 +3443,7 @@ func controlAdvancedHelpText() string {
 		"- `d <number>` / `details <number>` - show technical IDs and details",
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
+		"- `model list`, `model providers`, `model setup <provider> <name>`, `model doctor <name>`, `model default <name>` - manage model profiles",
 		"- `helper rename <title>` - rename this Control chat",
 		"- `helper rename hostname <name>` - rename this machine in the Control chat and all linked Work chats",
 		"- `h` / `help` / `menu` - show short help",
@@ -3380,6 +3499,7 @@ func sessionHelpText() string {
 		"`helper details` or `!details` - show debug IDs and links",
 		"`beacon status` - show this Work chat execution target",
 		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
+		"`model status`, `model switch <profile>`, or `model fork <profile>` - inspect or change this Work chat model profile",
 		"`helper publish-history` - import a paused local Codex history backlog",
 		"`helper skills list` / `helper skills add <url>` / `helper skills push` / `helper skills push confirm` - inspect and push skill subscriptions",
 		"",
@@ -5441,15 +5561,16 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		return err
 	}
 	session := Session{
-		ID:          sessionID,
-		ChatID:      chat.ID,
-		ChatURL:     chat.WebURL,
-		Topic:       chat.Topic,
-		TitleSource: sessionTitleSourceAuto,
-		Status:      "active",
-		Cwd:         parsed.WorkDir,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:           sessionID,
+		ChatID:       chat.ID,
+		ChatURL:      chat.WebURL,
+		Topic:        chat.Topic,
+		TitleSource:  sessionTitleSourceAuto,
+		Status:       "active",
+		Cwd:          parsed.WorkDir,
+		ModelProfile: parsed.ModelProfileSnapshot,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
@@ -5466,7 +5587,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		SessionID:   session.ID,
 		TeamsChatID: chat.ID,
 		Kind:        "anchor",
-		Body:        sessionReadyMessage(session, parsed.Title, parsed.beaconTargetLabel()),
+		Body:        sessionReadyMessage(session, parsed.Title, parsed.modelProfileTargetLabel(), parsed.beaconTargetLabel()),
 	}); err != nil {
 		return err
 	}
@@ -5491,10 +5612,12 @@ func (b *Bridge) controlCommandAlreadyHandled(ctx context.Context, msg ChatMessa
 }
 
 type newSessionRequest struct {
-	WorkDir         string
-	Title           string
-	BeaconProfile   string
-	BeaconIsolation string
+	WorkDir              string
+	Title                string
+	BeaconProfile        string
+	BeaconIsolation      string
+	ModelProfile         string
+	ModelProfileSnapshot modelprofile.Snapshot
 }
 
 func (r newSessionRequest) beaconTargetLabel() string {
@@ -5506,6 +5629,13 @@ func (r newSessionRequest) beaconTargetLabel() string {
 		label += " isolation=" + strings.TrimSpace(r.BeaconIsolation)
 	}
 	return label
+}
+
+func (r newSessionRequest) modelProfileTargetLabel() string {
+	if r.ModelProfileSnapshot.IsZero() || r.ModelProfileSnapshot.IsDefault() {
+		return ""
+	}
+	return "model:" + modelProfileDisplayName(r.ModelProfileSnapshot)
 }
 
 func (b *Bridge) parseNewSessionRequest(ctx context.Context, raw string) (newSessionRequest, error) {
@@ -5521,6 +5651,11 @@ func (b *Bridge) parseNewSessionRequest(ctx context.Context, raw string) (newSes
 	if parsed.WorkDir == "" {
 		return newSessionRequest{}, fmt.Errorf("usage: `new <directory>`; after opening a workspace from `projects`, you can also send `new`")
 	}
+	snapshot, err := b.resolveNewSessionModelProfile(ctx, parsed.ModelProfile)
+	if err != nil {
+		return newSessionRequest{}, err
+	}
+	parsed.ModelProfileSnapshot = snapshot
 	return parsed, nil
 }
 
@@ -5535,29 +5670,99 @@ func parseNewSessionRequest(raw string) (newSessionRequest, error) {
 		if err != nil {
 			return newSessionRequest{}, err
 		}
+		cleaned, modelProfile, err := parseModelProfileOptionsFromNewSession(cleaned)
+		if err != nil {
+			return newSessionRequest{}, err
+		}
 		if strings.TrimSpace(cleaned) == "" {
-			return newSessionRequest{BeaconProfile: profile, BeaconIsolation: isolation}, nil
+			return newSessionRequest{BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
 		}
 		resolved, err := resolveUserWorkspacePath(cleaned)
 		if err != nil {
 			return newSessionRequest{}, err
 		}
-		return newSessionRequest{WorkDir: resolved, BeaconProfile: profile, BeaconIsolation: isolation}, nil
+		return newSessionRequest{WorkDir: resolved, BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
 	}
 	dir, profile, isolation, err := parseBeaconOptionsFromNewSession(before)
+	if err != nil {
+		return newSessionRequest{}, err
+	}
+	dir, modelProfile, err := parseModelProfileOptionsFromNewSession(dir)
 	if err != nil {
 		return newSessionRequest{}, err
 	}
 	dir = strings.TrimSpace(dir)
 	title := strings.TrimSpace(after)
 	if dir == "" {
-		return newSessionRequest{Title: title, BeaconProfile: profile, BeaconIsolation: isolation}, nil
+		return newSessionRequest{Title: title, BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
 	}
 	resolved, err := resolveUserWorkspacePath(dir)
 	if err != nil {
 		return newSessionRequest{}, err
 	}
-	return newSessionRequest{WorkDir: resolved, Title: title, BeaconProfile: profile, BeaconIsolation: isolation}, nil
+	return newSessionRequest{WorkDir: resolved, Title: title, BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
+}
+
+func parseModelProfileOptionsFromNewSession(raw string) (string, string, error) {
+	if !strings.Contains(raw, "--model-profile") && !strings.Contains(raw, "--modelprofile") && !strings.Contains(raw, "--mp") && !strings.Contains(raw, "--model") {
+		return raw, "", nil
+	}
+	words := strings.Fields(raw)
+	var keep []string
+	var profile string
+	for i := 0; i < len(words); i++ {
+		switch strings.ToLower(strings.TrimSpace(words[i])) {
+		case "--model-profile", "--modelprofile", "--mp", "--model":
+			if i+1 >= len(words) {
+				return "", "", fmt.Errorf("%s requires a model profile name", words[i])
+			}
+			i++
+			profile = strings.TrimSpace(words[i])
+		default:
+			keep = append(keep, words[i])
+		}
+	}
+	return strings.Join(keep, " "), profile, nil
+}
+
+func (b *Bridge) resolveNewSessionModelProfile(ctx context.Context, ref string) (modelprofile.Snapshot, error) {
+	ref = strings.TrimSpace(ref)
+	if b == nil || b.modelProfileResolver == nil {
+		if ref == "" {
+			return modelprofile.Snapshot{}, nil
+		}
+		return modelprofile.Snapshot{}, fmt.Errorf("cannot create model-profile work chat: model profile resolver is not configured")
+	}
+	snapshot, err := b.modelProfileResolver(ctx, ref)
+	if err != nil {
+		if ref == "" {
+			return modelprofile.Snapshot{}, fmt.Errorf("cannot resolve default model profile: %w", err)
+		}
+		return modelprofile.Snapshot{}, fmt.Errorf("cannot create model-profile work chat for %q: %w", ref, err)
+	}
+	return snapshot, nil
+}
+
+func modelProfileDisplayName(snapshot modelprofile.Snapshot) string {
+	if snapshot.IsZero() || snapshot.IsDefault() {
+		return "default"
+	}
+	name := strings.TrimSpace(snapshot.Name)
+	if name == "" {
+		name = strings.TrimSpace(snapshot.Provider)
+	}
+	provider := strings.TrimSpace(snapshot.Provider)
+	if provider == "" || strings.EqualFold(provider, name) {
+		provider = ""
+	}
+	label := name
+	if provider != "" {
+		label += " (" + provider + ")"
+	}
+	if snapshot.Revision > 0 {
+		label += fmt.Sprintf(" rev %d", snapshot.Revision)
+	}
+	return label
 }
 
 func (b *Bridge) currentControlWorkspace(ctx context.Context) (teamstore.WorkspaceRecord, bool) {
@@ -5632,8 +5837,10 @@ func sessionReadyMessage(session Session, prompt string, target ...string) strin
 	if cwd := strings.TrimSpace(session.Cwd); cwd != "" {
 		lines = append(lines, "Working directory: "+cwd)
 	}
-	if len(target) > 0 && strings.TrimSpace(target[0]) != "" {
-		lines = append(lines, "Execution target: "+strings.TrimSpace(target[0]))
+	for _, item := range target {
+		if strings.TrimSpace(item) != "" {
+			lines = append(lines, "Execution target: "+strings.TrimSpace(item))
+		}
 	}
 	lines = append(lines, "Commands: `helper status` or `!status`, `helper stats`, `helper help`, `helper close` to close this Codex session in Teams.")
 	lines = append(lines, "Need more details? Send `helper status`.")
@@ -5764,6 +5971,9 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 		return nil
 	}
 	routeText := commandRouteTextFromTeamsMessage(msg, text)
+	if message := modelAPIKeyPreflightMessage(routeText); message != "" {
+		return b.sendToChat(ctx, chatID, message)
+	}
 	if parsed := ParseDashboardCommand(ChatScopeWork, routeText); parsed.HelperCommand {
 		if !messageAuthoredByCurrentUser(msg, b.user) {
 			return b.rejectExternalWorkCommand(ctx, session, msg)
@@ -5811,6 +6021,12 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 			return b.handleSkillsCommandFromMessage(ctx, chatID, msg, parsed.Argument)
 		case DashboardCommandBeacon:
 			return b.handleBeaconWorkCommand(ctx, session, msg, parsed.Argument)
+		case DashboardCommandModel:
+			message, err := b.handleModelWorkCommand(ctx, session, parsed.Argument)
+			if err != nil {
+				return b.sendToChat(ctx, chatID, controlCommandErrorMessage(err))
+			}
+			return b.sendToChat(ctx, chatID, message)
 		case DashboardCommandHelp:
 			if isAdvancedHelpArg(parsed.Argument) {
 				return b.sendToChat(ctx, chatID, sessionAdvancedHelpText())
@@ -5998,6 +6214,7 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 		ID:             retryTurnID(turn.ID),
 		SessionID:      session.ID,
 		CodexThreadID:  session.CodexThreadID,
+		ModelProfile:   retryTurnModelProfile(turn, session.ModelProfile),
 		RecoveryReason: "retry of " + turn.ID,
 	})
 	if err != nil {
@@ -6934,6 +7151,7 @@ func (b *Bridge) sessionForIDState(state teamstore.State, sessionID string) *Ses
 		Status:        string(durable.Status),
 		CodexThreadID: durable.CodexThreadID,
 		Cwd:           durable.Cwd,
+		ModelProfile:  durable.ModelProfile,
 		CreatedAt:     durable.CreatedAt,
 		UpdatedAt:     durable.UpdatedAt,
 	}
@@ -8413,6 +8631,7 @@ func (b *Bridge) runQueuedTurnInput(ctx context.Context, session *Session, turn 
 }
 
 func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, input ExecutionInput) error {
+	session = sessionWithTurnModelProfile(session, turn)
 	if b.currentLeaseGeneration() > 0 {
 		if err := b.ensureActiveControlLease(ctx); err != nil {
 			return err
@@ -9316,8 +9535,16 @@ func (f *codexEventForwarder) send(kind string, text string) error {
 	f.seq++
 	msgKind := fmt.Sprintf("codex-%s-%03d", kind, f.seq)
 	err := f.bridge.queueAndSendOutboxChunks(f.ctx, f.sessionID, f.turnID, f.chatID, msgKind, text)
-	if err != nil && f.err == nil {
-		f.err = err
+	if err != nil {
+		if isOutboxDeliveryDeferred(err) {
+			if f.bridge != nil && f.bridge.out != nil {
+				_, _ = fmt.Fprintf(f.bridge.out, "Teams Codex stream outbox delivery deferred: %v\n", err)
+			}
+			return nil
+		}
+		if f.err == nil {
+			f.err = err
+		}
 	}
 	return err
 }
@@ -10100,8 +10327,24 @@ func registrySessionsEqual(left Session, right Session) bool {
 		left.Status == right.Status &&
 		left.CodexThreadID == right.CodexThreadID &&
 		left.Cwd == right.Cwd &&
+		modelProfileSnapshotsEqual(left.ModelProfile, right.ModelProfile) &&
 		left.CreatedAt.Equal(right.CreatedAt) &&
 		left.UpdatedAt.Equal(right.UpdatedAt)
+}
+
+func modelProfileSnapshotsEqual(left modelprofile.Snapshot, right modelprofile.Snapshot) bool {
+	return left.Name == right.Name &&
+		left.Provider == right.Provider &&
+		left.APIKeyRef == right.APIKeyRef &&
+		left.SSHProxy == right.SSHProxy &&
+		left.Revision == right.Revision &&
+		left.KeyFingerprint == right.KeyFingerprint &&
+		left.BaseURLHash == right.BaseURLHash &&
+		left.AdapterProfile == right.AdapterProfile &&
+		left.DefaultModel == right.DefaultModel &&
+		left.CatalogFingerprint == right.CatalogFingerprint &&
+		left.SSHProxyFingerprint == right.SSHProxyFingerprint &&
+		left.CapturedAt.Equal(right.CapturedAt)
 }
 
 func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
@@ -10222,13 +10465,14 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				TitleSource:   session.TitleSource,
 				CodexThreadID: session.CodexThreadID,
 				Cwd:           session.Cwd,
+				ModelProfile:  session.ModelProfile,
 				CreatedAt:     created,
 				UpdatedAt:     updated,
 			}
 			changed = true
 		}
 		if fallback, ok := state.Sessions[controlFallbackSessionID]; ok {
-			if sanitizeControlFallbackSession(&fallback, "", now) {
+			if sanitizeControlFallbackSession(&fallback, "", modelprofile.Snapshot{}, now) {
 				state.Sessions[controlFallbackSessionID] = fallback
 				changed = true
 			}
@@ -10406,6 +10650,7 @@ func (b *Bridge) ensureDurableSession(ctx context.Context, session *Session) err
 		CodexThreadID: session.CodexThreadID,
 		RunnerKind:    "executor",
 		Cwd:           session.Cwd,
+		ModelProfile:  session.ModelProfile,
 		CreatedAt:     session.CreatedAt,
 		UpdatedAt:     session.UpdatedAt,
 	})
@@ -10566,7 +10811,24 @@ func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamst
 		MachineID:       b.machine.ID,
 		LeaseGeneration: leaseGeneration,
 		CodexThreadID:   session.CodexThreadID,
+		ModelProfile:    session.ModelProfile,
 	})
+}
+
+func sessionWithTurnModelProfile(session *Session, turn teamstore.Turn) *Session {
+	if session == nil || turn.ModelProfile.IsZero() {
+		return session
+	}
+	clone := *session
+	clone.ModelProfile = turn.ModelProfile
+	return &clone
+}
+
+func retryTurnModelProfile(turn teamstore.Turn, fallback modelprofile.Snapshot) modelprofile.Snapshot {
+	if !turn.ModelProfile.IsZero() {
+		return turn.ModelProfile
+	}
+	return fallback
 }
 
 func (b *Bridge) queueAndSendOutboxChunks(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string) error {
@@ -11040,6 +11302,51 @@ func (b *Bridge) forgetAcceptedOutbox(outboxID string) {
 	delete(b.acceptedOutboxes, strings.TrimSpace(outboxID))
 }
 
+func (b *Bridge) waitForOutboxSendPace(ctx context.Context, chatID string) error {
+	if b == nil || !shouldPaceGraphOutboxSends(b.graph) || graphOutboxSendMinInterval <= 0 {
+		return nil
+	}
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil
+	}
+	now := time.Now()
+	b.outboxSendPaceMu.Lock()
+	if b.outboxSendPaceLast == nil {
+		b.outboxSendPaceLast = make(map[string]time.Time)
+	}
+	last := b.outboxSendPaceLast[chatID]
+	delay := graphOutboxSendMinInterval - now.Sub(last)
+	if last.IsZero() || delay <= 0 {
+		b.outboxSendPaceLast[chatID] = now
+		b.outboxSendPaceMu.Unlock()
+		return nil
+	}
+	b.outboxSendPaceMu.Unlock()
+	if err := b.graph.sleepFor(ctx, delay); err != nil {
+		return err
+	}
+	b.outboxSendPaceMu.Lock()
+	if b.outboxSendPaceLast == nil {
+		b.outboxSendPaceLast = make(map[string]time.Time)
+	}
+	b.outboxSendPaceLast[chatID] = time.Now()
+	b.outboxSendPaceMu.Unlock()
+	return nil
+}
+
+func shouldPaceGraphOutboxSends(graph *GraphClient) bool {
+	if graph == nil {
+		return false
+	}
+	base := strings.TrimRight(strings.TrimSpace(graph.baseURL), "/")
+	if base == "" {
+		return true
+	}
+	graphBase := strings.TrimRight(graphBaseURL, "/")
+	return base == graphBase || strings.HasPrefix(base, graphBase+"/")
+}
+
 func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamstore.OutboxMessage, opts outboxSendOptions) error {
 	if b.currentLeaseGeneration() > 0 {
 		if err := b.ensureActiveControlLease(ctx); err != nil {
@@ -11084,6 +11391,9 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return err
 	} else if ok {
 		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(earlier.LastSendAttempt, earlier.CreatedAt)}
+	}
+	if err := b.waitForOutboxSendPace(ctx, outbox.TeamsChatID); err != nil {
+		return err
 	}
 	claimed, err := b.store.MarkOutboxSendAttempt(ctx, outbox.ID)
 	if errors.Is(err, teamstore.ErrOutboxSendNotClaimed) {
@@ -11857,7 +12167,11 @@ func (b *Bridge) formatSessionList() string {
 	}
 	lines := []string{"## Active Work chats"}
 	for _, session := range active {
-		lines = append(lines, fmt.Sprintf("- **%s** [%s]\n  %s\n  %s", session.Topic, session.Status, session.ID, session.ChatURL))
+		meta := []string{session.ID, session.ChatURL}
+		if label := modelProfileDisplayName(session.ModelProfile); label != "default" {
+			meta = append(meta, "Model profile: "+label)
+		}
+		lines = append(lines, fmt.Sprintf("- **%s** [%s]\n  %s", session.Topic, session.Status, strings.Join(meta, "\n  ")))
 	}
 	if closedCount > 0 {
 		lines = append(lines, fmt.Sprintf("%d closed work chat(s) hidden. The helper no longer reads or responds in closed chats.", closedCount))
@@ -11878,6 +12192,9 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 	}
 	if strings.TrimSpace(session.Cwd) != "" {
 		lines = append(lines, "Folder: "+session.Cwd)
+	}
+	if label := modelProfileDisplayName(session.ModelProfile); label != "default" {
+		lines = append(lines, "Model profile: "+label)
 	}
 	lines = append(lines, teamsASRStatusLine(b.asrTranscriber))
 	if target := b.beaconTargetSummary(session.ID); target != "" {
@@ -12154,6 +12471,9 @@ func (b *Bridge) formatSessionDetails(session *Session) string {
 	if session.Cwd != "" {
 		lines = append(lines, "Working directory: "+session.Cwd)
 	}
+	if label := modelProfileDisplayName(session.ModelProfile); label != "default" {
+		lines = append(lines, "Model profile: "+label)
+	}
 	if session.CodexThreadID != "" {
 		lines = append(lines, "Codex thread: "+session.CodexThreadID)
 	}
@@ -12290,6 +12610,10 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		Topic:        local.DisplayTitle(),
 		Cwd:          firstNonEmptyString(local.ProjectPath, project.Path),
 	})
+	modelSnapshot, err := b.resolveNewSessionModelProfile(ctx, "")
+	if err != nil {
+		return "", err
+	}
 	chat, err := b.createMeetingChat(ctx, title)
 	if err != nil {
 		return "", err
@@ -12304,6 +12628,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		Status:        "active",
 		CodexThreadID: local.SessionID,
 		Cwd:           firstNonEmptyString(local.ProjectPath, project.Path),
+		ModelProfile:  modelSnapshot,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}

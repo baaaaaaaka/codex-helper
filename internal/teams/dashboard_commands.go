@@ -45,6 +45,7 @@ const (
 	DashboardCommandSendFile       DashboardCommandName = "send-file"
 	DashboardCommandSkills         DashboardCommandName = "skills"
 	DashboardCommandBeacon         DashboardCommandName = "beacon"
+	DashboardCommandModel          DashboardCommandName = "model"
 )
 
 type ParsedDashboardCommand struct {
@@ -182,10 +183,17 @@ func parseWorkChatCommand(trimmed string) ParsedDashboardCommand {
 	return ParsedDashboardCommand{
 		Scope:         ChatScopeWork,
 		Name:          commandName,
-		Argument:      arg,
-		Target:        parseDashboardCommandTarget(arg),
+		Argument:      dashboardCommandArgumentAlias(commandName, name, arg),
+		Target:        parseDashboardCommandTarget(dashboardCommandArgumentAlias(commandName, name, arg)),
 		HelperCommand: true,
 	}
+}
+
+func dashboardCommandArgumentAlias(commandName DashboardCommandName, name string, arg string) string {
+	if commandName == DashboardCommandModel && strings.EqualFold(strings.TrimSpace(name), "models") && strings.TrimSpace(arg) == "" {
+		return "list"
+	}
+	return arg
 }
 
 func workBareCommandName(text string) (DashboardCommandName, string, bool) {
@@ -201,6 +209,13 @@ func workBareCommandName(text string) (DashboardCommandName, string, bool) {
 		}
 	case "beacon":
 		return DashboardCommandBeacon, arg, true
+	case "model":
+		return DashboardCommandModel, arg, true
+	case "models":
+		if strings.TrimSpace(arg) == "" {
+			arg = "list"
+		}
+		return DashboardCommandModel, arg, true
 	default:
 	}
 	return DashboardCommandNone, "", false
@@ -317,7 +332,7 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == "" || isAdvancedHelpArg(arg)
 	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
 		return arg == ""
-	case DashboardCommandSkills, DashboardCommandBeacon:
+	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel:
 		return true
 	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
@@ -361,6 +376,8 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandSkills, true
 	case "beacon":
 		return DashboardCommandBeacon, true
+	case "model", "models", "model-profile", "model-profiles", "profiles":
+		return DashboardCommandModel, true
 	default:
 		return DashboardCommandNone, false
 	}
@@ -453,6 +470,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandSkills, true
 	case "beacon":
 		return DashboardCommandBeacon, true
+	case "model", "models", "model-profile", "model-profiles", "profiles":
+		return DashboardCommandModel, true
 	default:
 		return DashboardCommandNone, false
 	}

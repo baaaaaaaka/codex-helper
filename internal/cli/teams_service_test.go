@@ -3468,6 +3468,73 @@ func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceEnvironmentPreservesModelProfileProviderKeys(t *testing.T) {
+	t.Setenv("MIMO_API_KEY", "sk-mimo-test")
+	t.Setenv("DEEPSEEK_API_KEY", "sk-deepseek-test")
+	t.Setenv("UNRELATED_MODEL_KEY", "sk-ignored")
+
+	env := teamsServiceEnvironment()
+	if env["MIMO_API_KEY"] != "sk-mimo-test" {
+		t.Fatalf("MIMO_API_KEY not preserved for Teams service model profiles: %#v", env)
+	}
+	if env["DEEPSEEK_API_KEY"] != "sk-deepseek-test" {
+		t.Fatalf("DEEPSEEK_API_KEY not preserved for Teams service model profiles: %#v", env)
+	}
+	if env["UNRELATED_MODEL_KEY"] != "" {
+		t.Fatalf("unexpected non-allowlisted model key preserved: %#v", env)
+	}
+}
+
+func TestTeamsServiceInstallRendersModelProfileProviderKeysForBackgroundService(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	t.Setenv("CODEX_HELPER_CONFIG", filepath.Join(tmp, "cxp-config.json"))
+	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "thirdparty-service")
+	t.Setenv("DEEPSEEK_API_KEY", "sk-deepseek-background-test")
+	t.Setenv("MIMO_API_KEY", "sk-mimo-background-test")
+	t.Setenv("QWEN_API_KEY", "sk-qwen-background-test")
+	t.Setenv("UNRELATED_MODEL_KEY", "sk-ignored")
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	registryPath := filepath.Join(tmp, "teams-registry.json")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exePath,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, &registryPath)
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	for _, want := range []string{
+		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + systemdQuoteArg(registryPath),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_CONFIG="+filepath.Join(tmp, "cxp-config.json")),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=thirdparty-service"),
+		"Environment=" + systemdQuoteArg("DEEPSEEK_API_KEY=sk-deepseek-background-test"),
+		"Environment=" + systemdQuoteArg("MIMO_API_KEY=sk-mimo-background-test"),
+		"Environment=" + systemdQuoteArg("QWEN_API_KEY=sk-qwen-background-test"),
+		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_SERVICE_MODE=background"),
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit missing model-profile service entry %q:\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, "UNRELATED_MODEL_KEY") || strings.Contains(unit, "sk-ignored") {
+		t.Fatalf("unit preserved non-allowlisted model key:\n%s", unit)
+	}
+}
+
 func TestTeamsServiceEnvironmentMirrorsSingleCodexHomeEnv(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("CODEX_HOME", filepath.Join(tmp, "codex home"))

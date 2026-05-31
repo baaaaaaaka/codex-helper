@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/gofrs/flock"
 )
 
@@ -30,17 +31,18 @@ type Registry struct {
 }
 
 type Session struct {
-	ID            string    `json:"id"`
-	ChatID        string    `json:"chat_id"`
-	ChatURL       string    `json:"chat_url,omitempty"`
-	Topic         string    `json:"topic"`
-	UserTitle     string    `json:"user_title,omitempty"`
-	TitleSource   string    `json:"title_source,omitempty"`
-	Status        string    `json:"status"`
-	CodexThreadID string    `json:"codex_thread_id,omitempty"`
-	Cwd           string    `json:"cwd,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID            string                `json:"id"`
+	ChatID        string                `json:"chat_id"`
+	ChatURL       string                `json:"chat_url,omitempty"`
+	Topic         string                `json:"topic"`
+	UserTitle     string                `json:"user_title,omitempty"`
+	TitleSource   string                `json:"title_source,omitempty"`
+	Status        string                `json:"status"`
+	CodexThreadID string                `json:"codex_thread_id,omitempty"`
+	Cwd           string                `json:"cwd,omitempty"`
+	ModelProfile  modelprofile.Snapshot `json:"model_profile,omitempty"`
+	CreatedAt     time.Time             `json:"created_at"`
+	UpdatedAt     time.Time             `json:"updated_at"`
 }
 
 type ChatState struct {
@@ -165,6 +167,9 @@ func mergeRegistrySessions(existing []Session, next []Session) []Session {
 		if existingSession, ok := existingByID[id]; ok {
 			if strings.TrimSpace(session.CodexThreadID) == "" {
 				session.CodexThreadID = existingSession.CodexThreadID
+			}
+			if session.ModelProfile.IsZero() {
+				session.ModelProfile = existingSession.ModelProfile
 			}
 		}
 		merged = append(merged, session)

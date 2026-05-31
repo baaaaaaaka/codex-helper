@@ -22,6 +22,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -152,8 +153,9 @@ func (e *serialStreamingExecutor) promptSnapshot() []string {
 }
 
 type parallelSessionStart struct {
-	SessionID string
-	Prompt    string
+	SessionID    string
+	Prompt       string
+	ModelProfile modelprofile.Snapshot
 }
 
 type parallelBlockingExecutor struct {
@@ -180,7 +182,11 @@ func (e *parallelBlockingExecutor) RunWithEventHandler(ctx context.Context, sess
 	e.prompts[sessionID] = append(e.prompts[sessionID], visible)
 	count := len(e.prompts[sessionID])
 	e.mu.Unlock()
-	e.started <- parallelSessionStart{SessionID: sessionID, Prompt: visible}
+	var snapshot modelprofile.Snapshot
+	if session != nil {
+		snapshot = session.ModelProfile
+	}
+	e.started <- parallelSessionStart{SessionID: sessionID, Prompt: visible, ModelProfile: snapshot}
 	select {
 	case <-ctx.Done():
 		return ExecutionResult{}, ctx.Err()
@@ -867,6 +873,158 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	}
 	if strings.Count(joined, "FINAL MARKER") != 1 {
 		t.Fatalf("final agent message was duplicated in streamed transcript:\n%s", joined)
+	}
+}
+
+func TestBridgeStreamingProgressGraph429DoesNotFailTurnCI(t *testing.T) {
+	var posts int
+	rateLimited := true
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodPost || !strings.Contains(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+				t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			}
+			posts++
+			if rateLimited && posts > 1 {
+				w.Header().Set("Retry-After", "600")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.WriteString(`{"error":{"code":"TooManyRequests","message":"API calls quota exceeded! 10Per10Secs"}}`)
+				return w.Result(), nil
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, posts)
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("429 should be surfaced to the outbox scheduler without hidden Graph sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &streamingRecordingExecutor{
+		events: []codexrunner.StreamEvent{
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "checking before final"},
+			{Kind: codexrunner.StreamEventCommandStarted, Command: "go test ./..."},
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "FINAL MARKER after rate limit"},
+			{Kind: codexrunner.StreamEventTurnCompleted},
+		},
+		result: ExecutionResult{Text: "FINAL MARKER after rate limit", CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-stream-429"), "fix it"); err != nil {
+		t.Fatalf("handleSessionMessage should not fail on transient Graph 429 from progress delivery: %v", err)
+	}
+	if posts < 2 {
+		t.Fatalf("Graph posts = %d, want success followed by a progress 429", posts)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var completedTurns int
+	for _, turn := range state.Turns {
+		if turn.Status == teamstore.TurnStatusCompleted {
+			completedTurns++
+		}
+		if turn.Status == teamstore.TurnStatusFailed {
+			t.Fatalf("turn failed after transient Graph 429: %#v", turn)
+		}
+	}
+	if completedTurns != 1 {
+		t.Fatalf("completed turns = %d, want 1: %#v", completedTurns, state.Turns)
+	}
+	var progressQueued, finalQueued bool
+	for _, outbox := range state.OutboxMessages {
+		plain := PlainTextFromTeamsHTML(outbox.Body)
+		if strings.EqualFold(outbox.Kind, "error") || strings.Contains(plain, "Graph POST") || strings.Contains(plain, "TooManyRequests") {
+			t.Fatalf("transient Graph 429 leaked as a user-visible error outbox: %#v plain=%q", outbox, plain)
+		}
+		if strings.Contains(outbox.Kind, "codex-progress") && outbox.Status == teamstore.OutboxStatusQueued {
+			progressQueued = true
+		}
+		if strings.HasPrefix(outbox.Kind, "final") && outbox.Status == teamstore.OutboxStatusQueued {
+			finalQueued = true
+		}
+	}
+	if !progressQueued || !finalQueued {
+		t.Fatalf("expected queued progress and final after chat rate limit, progress=%t final=%t outbox=%#v", progressQueued, finalQueued, state.OutboxMessages)
+	}
+	limit, ok := state.ChatRateLimits["chat-1"]
+	if !ok || !limit.BlockedUntil.After(time.Now()) {
+		t.Fatalf("chat rate limit = %#v ok=%t, want future block", limit, ok)
+	}
+	rateLimited = false
+	if err := store.ClearChatRateLimit(context.Background(), "chat-1"); err != nil {
+		t.Fatalf("ClearChatRateLimit: %v", err)
+	}
+	if err := bridge.flushPendingOutboxForChat(context.Background(), "chat-1"); err != nil {
+		t.Fatalf("flushPendingOutboxForChat after clearing streaming 429: %v", err)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after streaming 429 drain: %v", err)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.TeamsChatID == "chat-1" && outbox.Status != teamstore.OutboxStatusSent {
+			t.Fatalf("outbox %s after streaming 429 drain = %#v, want sent", outbox.ID, outbox)
+		}
+	}
+	if _, ok := state.ChatRateLimits["chat-1"]; ok {
+		t.Fatalf("chat rate limit remained after successful drain: %#v", state.ChatRateLimits["chat-1"])
+	}
+}
+
+func TestBridgePacesRealGraphOutboxWritesCI(t *testing.T) {
+	var posts int
+	var sleeps []time.Duration
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodPost || !strings.Contains(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+				t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			}
+			posts++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, posts)
+			return w.Result(), nil
+		})},
+		baseURL:    graphBaseURL,
+		maxRetries: 0,
+		sleep: func(_ context.Context, d time.Duration) error {
+			sleeps = append(sleeps, d)
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	for i := 1; i <= 2; i++ {
+		if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+			ID:          fmt.Sprintf("outbox:paced:%02d", i),
+			TeamsChatID: "chat-1",
+			Kind:        "helper",
+			Body:        fmt.Sprintf("paced message %02d", i),
+		}); err != nil {
+			t.Fatalf("QueueOutbox %d: %v", i, err)
+		}
+	}
+
+	if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flushPendingOutbox: %v", err)
+	}
+	if posts != 2 {
+		t.Fatalf("Graph posts = %d, want 2", posts)
+	}
+	if len(sleeps) != 1 || sleeps[0] <= time.Second {
+		t.Fatalf("Graph write sleeps = %#v, want one conservative same-chat pacing delay", sleeps)
 	}
 }
 
@@ -4806,6 +4964,29 @@ func TestParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle(t *testing.T
 		t.Fatalf("beacon directory request parsed as %#v", got)
 	}
 
+	got, err = parseNewSessionRequest(tmp + " --model-profile mimo25 -- inspect model build")
+	if err != nil {
+		t.Fatalf("parse model-profile directory request: %v", err)
+	}
+	if got.WorkDir != tmp || got.Title != "inspect model build" || got.ModelProfile != "mimo25" {
+		t.Fatalf("model-profile directory request parsed as %#v", got)
+	}
+
+	got, err = parseNewSessionRequest("--model-profile deepseek")
+	if err != nil {
+		t.Fatalf("parse model-profile selected-workspace request: %v", err)
+	}
+	if got.WorkDir != "" || got.Title != "" || got.ModelProfile != "deepseek" {
+		t.Fatalf("model-profile selected-workspace request parsed as %#v", got)
+	}
+	got, err = parseNewSessionRequest(tmp + " --model mimo25")
+	if err != nil {
+		t.Fatalf("parse --model directory request: %v", err)
+	}
+	if got.WorkDir != tmp || got.ModelProfile != "mimo25" {
+		t.Fatalf("--model directory request parsed as %#v", got)
+	}
+
 	got, err = parseNewSessionRequest("--beacon gpu --beacon-isolation shared")
 	if err != nil {
 		t.Fatalf("parse beacon selected-workspace request: %v", err)
@@ -4817,6 +4998,9 @@ func TestParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle(t *testing.T
 	if _, err = parseNewSessionRequest(tmp + " --beacon"); err == nil {
 		t.Fatal("missing beacon profile should fail")
 	}
+	if _, err = parseNewSessionRequest(tmp + " --model-profile"); err == nil {
+		t.Fatal("missing model profile should fail")
+	}
 
 	got, err = parseNewSessionRequest("")
 	if err != nil {
@@ -4824,6 +5008,60 @@ func TestParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle(t *testing.T
 	}
 	if got.WorkDir != "" || got.Title != "" {
 		t.Fatalf("empty request parsed as %#v, want empty for selected workspace fallback", got)
+	}
+}
+
+func TestBridgeCreateSessionPinsModelProfileSnapshot(t *testing.T) {
+	createdTopic := ""
+	graph, sent := newBridgeCreateChatGraph(t, &createdTopic)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.reg.Sessions = nil
+	bridge.modelProfileResolver = func(_ context.Context, ref string) (modelprofile.Snapshot, error) {
+		if strings.TrimSpace(ref) != "mimo25" {
+			t.Fatalf("model profile ref = %q, want mimo25", ref)
+		}
+		return modelprofile.Snapshot{
+			Name:      "mimo25",
+			Provider:  "mimo",
+			APIKeyRef: "secret:model-profile/mimo25/api-key",
+			SSHProxy:  "jump",
+			Revision:  7,
+		}, nil
+	}
+
+	workDir := t.TempDir()
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessageWithText("new-model-profile", "new "+workDir+" --model-profile mimo25"), "new "+workDir+" --model-profile mimo25"); err != nil {
+		t.Fatalf("handleControlMessage new model profile: %v", err)
+	}
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatalf("session not created: %#v", bridge.reg.Sessions)
+	}
+	if session.ModelProfile.Name != "mimo25" || session.ModelProfile.Provider != "mimo" || session.ModelProfile.Revision != 7 || session.ModelProfile.APIKeyRef == "" {
+		t.Fatalf("registry model profile snapshot = %#v", session.ModelProfile)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	durable := state.Sessions["s001"]
+	if durable.ModelProfile.Name != "mimo25" || durable.ModelProfile.Provider != "mimo" || durable.ModelProfile.Revision != 7 || durable.ModelProfile.APIKeyRef == "" {
+		t.Fatalf("durable model profile snapshot = %#v", durable.ModelProfile)
+	}
+	var anchor string
+	for _, msg := range *sent {
+		text := PlainTextFromTeamsHTML(msg.Content)
+		if strings.Contains(text, "Work chat is ready") {
+			anchor = text
+			break
+		}
+	}
+	if !strings.Contains(anchor, "Execution target: model:mimo25 (mimo) rev 7") {
+		t.Fatalf("anchor missing model target, topic=%q anchor=%q sent=%#v", createdTopic, anchor, *sent)
+	}
+	if strings.Contains(anchor, "secret:") || strings.Contains(anchor, "api-key") {
+		t.Fatalf("anchor leaked model profile secret ref: %q", anchor)
 	}
 }
 
@@ -5516,6 +5754,50 @@ func TestPersistInboundStoresOnlyControlFallbackMessageReferenceContext(t *testi
 	}
 	if len(refInbound.TeamsAttachments) != 1 || refInbound.TeamsAttachments[0].ID != "quote-1" || refInbound.TeamsBodyHTML == "" {
 		t.Fatalf("control reference inbound did not store message reference context: %#v", refInbound)
+	}
+}
+
+func TestBridgeControlFallbackPinsDefaultModelProfileSnapshot(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.modelProfileResolver = func(_ context.Context, ref string) (modelprofile.Snapshot, error) {
+		if ref != "" {
+			t.Fatalf("control fallback default resolver ref = %q, want empty", ref)
+		}
+		return modelprofile.Snapshot{
+			Name:      "mimo25",
+			Provider:  "mimo",
+			APIKeyRef: "secret:model-profile/mimo25/api-key",
+			Revision:  5,
+		}, nil
+	}
+
+	session, err := bridge.ensureControlFallbackSession(context.Background())
+	if err != nil {
+		t.Fatalf("ensureControlFallbackSession error: %v", err)
+	}
+	if session.ModelProfile.Name != "mimo25" || session.ModelProfile.Revision != 5 {
+		t.Fatalf("control fallback session model profile = %#v", session.ModelProfile)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	durable := state.Sessions[controlFallbackSessionID]
+	if durable.ModelProfile.Name != "mimo25" || durable.ModelProfile.Revision != 5 {
+		t.Fatalf("durable control fallback model profile = %#v", durable.ModelProfile)
+	}
+
+	bridge.modelProfileResolver = func(context.Context, string) (modelprofile.Snapshot, error) {
+		return modelprofile.Snapshot{Name: "deepseek", Provider: "deepseek", Revision: 9}, nil
+	}
+	session, err = bridge.ensureControlFallbackSession(context.Background())
+	if err != nil {
+		t.Fatalf("second ensureControlFallbackSession error: %v", err)
+	}
+	if session.ModelProfile.Name != "mimo25" || session.ModelProfile.Revision != 5 {
+		t.Fatalf("control fallback should keep pinned model profile, got %#v", session.ModelProfile)
 	}
 }
 
@@ -23126,6 +23408,69 @@ func TestBridgeSkippedOutboxDoesNotBlockQueuedTurnWaitNotice(t *testing.T) {
 	waitForCompletedTurnCount(t, store, "s005", 1)
 }
 
+func TestBridgeAsyncConcurrentSessionsKeepModelProfilesIsolated(t *testing.T) {
+	t.Parallel()
+	graph, _ := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 10),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	now := time.Now()
+	snapshots := map[string]modelprofile.Snapshot{
+		"s001": {Name: "mimo25", Provider: "mimo", APIKeyRef: "env:MIMO_KEY_A", Revision: 1},
+		"s002": {Name: "deepseek", Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_KEY_B", Revision: 2},
+		"s003": {Name: "mimo25", Provider: "mimo", APIKeyRef: "env:MIMO_KEY_C", SSHProxy: "jump-c", Revision: 3},
+	}
+	bridge.reg.Sessions = []Session{
+		{ID: "s001", ChatID: "chat-1", ChatURL: "https://teams.example/chat-1", Topic: "one", Status: "active", ModelProfile: snapshots["s001"], CreatedAt: now, UpdatedAt: now},
+		{ID: "s002", ChatID: "chat-2", ChatURL: "https://teams.example/chat-2", Topic: "two", Status: "active", ModelProfile: snapshots["s002"], CreatedAt: now, UpdatedAt: now},
+		{ID: "s003", ChatID: "chat-3", ChatURL: "https://teams.example/chat-3", Topic: "three", Status: "active", ModelProfile: snapshots["s003"], CreatedAt: now, UpdatedAt: now},
+	}
+	for i := range bridge.reg.Sessions {
+		if err := bridge.ensureDurableSession(context.Background(), &bridge.reg.Sessions[i]); err != nil {
+			t.Fatalf("ensure durable session %s: %v", bridge.reg.Sessions[i].ID, err)
+		}
+	}
+
+	for _, session := range bridge.reg.Sessions {
+		prompt := "profile prompt for " + session.ID
+		msg := bridgePollMessage("profile-"+session.ID, "2026-05-03T01:00:00Z", prompt)
+		if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, prompt); err != nil {
+			t.Fatalf("handle prompt for %s: %v", session.ID, err)
+		}
+	}
+
+	startedBySession := map[string]parallelSessionStart{}
+	for len(startedBySession) < len(snapshots) {
+		select {
+		case got := <-executor.started:
+			startedBySession[got.SessionID] = got
+		case <-time.After(bridgeAsyncTestTimeout):
+			t.Fatalf("timed out waiting for profile-isolated starts; got %#v", startedBySession)
+		}
+	}
+	for sessionID, want := range snapshots {
+		got, ok := startedBySession[sessionID]
+		if !ok {
+			t.Fatalf("session %s did not start; got %#v", sessionID, startedBySession)
+		}
+		if !modelProfileSnapshotsEqual(got.ModelProfile, want) {
+			t.Fatalf("session %s model profile = %#v, want %#v", sessionID, got.ModelProfile, want)
+		}
+		if !strings.Contains(got.Prompt, "profile prompt for "+sessionID) {
+			t.Fatalf("session %s prompt = %q", sessionID, got.Prompt)
+		}
+	}
+	close(executor.release)
+	waitForBridgeAsyncTurns(t, bridge)
+	for sessionID := range snapshots {
+		waitForCompletedTurnCount(t, store, sessionID, 1)
+	}
+}
+
 func TestBridgeQueuedTurnWaitNoticeFailureDoesNotStarveLaterSessions(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -26209,6 +26554,459 @@ func TestBridgeRecordControlChatBindingSkipsSaveWhenUnchanged(t *testing.T) {
 	}
 	if state.ControlChat.TeamsChatTopic != "renamed control" {
 		t.Fatalf("control chat topic = %q, want renamed control", state.ControlChat.TeamsChatTopic)
+	}
+}
+
+func TestBridgeModelProfileSwitchOnlyBeforeFirstTurn(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now()
+	session := Session{
+		ID:           "s001",
+		ChatID:       "chat-1",
+		ChatURL:      "https://teams.example/chat-1",
+		Topic:        "work",
+		Status:       "active",
+		Cwd:          t.TempDir(),
+		ModelProfile: modelprofile.Snapshot{Name: "default", Provider: "default", Revision: 1},
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if _, created, err := store.CreateSession(ctx, teamstore.SessionContext{
+		ID:           session.ID,
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  session.ChatID,
+		TeamsChatURL: session.ChatURL,
+		TeamsTopic:   session.Topic,
+		Cwd:          session.Cwd,
+		ModelProfile: session.ModelProfile,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	want := modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", APIKeyRef: "secret:model-profile/mimo25/api-key", Revision: 4, KeyFingerprint: "key:mimo"}
+	bridge := &Bridge{
+		store: store,
+		reg:   Registry{Version: 1, Sessions: []Session{session}, Chats: map[string]ChatState{}},
+		modelProfileResolver: func(_ context.Context, ref string) (modelprofile.Snapshot, error) {
+			if ref != "mimo25" {
+				t.Fatalf("model profile ref = %q, want mimo25", ref)
+			}
+			return want, nil
+		},
+	}
+	message, err := bridge.switchWorkModelProfile(ctx, &session, "mimo25")
+	if err != nil {
+		t.Fatalf("switchWorkModelProfile: %v", err)
+	}
+	if !strings.Contains(message, "mimo25") {
+		t.Fatalf("switch message = %q", message)
+	}
+	if !modelProfileSnapshotsEqual(session.ModelProfile, want) {
+		t.Fatalf("session model profile = %#v, want %#v", session.ModelProfile, want)
+	}
+	if got := bridge.reg.SessionByID(session.ID).ModelProfile; !modelProfileSnapshotsEqual(got, want) {
+		t.Fatalf("registry model profile = %#v, want %#v", got, want)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := state.Sessions[session.ID].ModelProfile; !modelProfileSnapshotsEqual(got, want) {
+		t.Fatalf("durable model profile = %#v, want %#v", got, want)
+	}
+
+	inbound, created, err := store.PersistInbound(ctx, teamstore.InboundEvent{
+		ID:             "inbound-1",
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: "msg-1",
+		Status:         teamstore.InboundStatusPersisted,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	if err != nil || !created {
+		t.Fatalf("PersistInbound created=%v err=%v", created, err)
+	}
+	if _, created, err := store.QueueTurn(ctx, teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil || !created {
+		t.Fatalf("QueueTurn created=%v err=%v", created, err)
+	}
+	if _, err := bridge.switchWorkModelProfile(ctx, &session, "mimo25"); err == nil || !strings.Contains(err.Error(), "queued or running") {
+		t.Fatalf("switch with queued turn err = %v, want queued/running rejection", err)
+	}
+}
+
+func TestBridgeTurnModelProfileOverridesSessionForExecution(t *testing.T) {
+	session := &Session{ID: "s001", ModelProfile: modelprofile.Snapshot{Name: "deepseek", Provider: "deepseek", Revision: 1}}
+	turn := teamstore.Turn{ID: "turn-1", SessionID: "s001", ModelProfile: modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", Revision: 2}}
+	got := sessionWithTurnModelProfile(session, turn)
+	if got == session {
+		t.Fatal("sessionWithTurnModelProfile should clone when turn has a pinned model profile")
+	}
+	if got.ModelProfile.Name != "mimo25" || session.ModelProfile.Name != "deepseek" {
+		t.Fatalf("model profile override got=%#v original=%#v", got.ModelProfile, session.ModelProfile)
+	}
+}
+
+func TestModelAPIKeyPreflightRejectsRawKeysButAllowsRefs(t *testing.T) {
+	reject := []string{
+		"model setup mimo --api-key sk-test",
+		"model setup mimo api_key=sk-test",
+		"Authorization: Bearer sk-test",
+		"sk-1234567890abcdef1234567890abcdef",
+	}
+	for _, text := range reject {
+		if !containsRawModelAPIKey(text) {
+			t.Fatalf("containsRawModelAPIKey(%q)=false, want true", text)
+		}
+	}
+	allow := []string{
+		"model setup mimo --api-key-env MIMO_API_KEY",
+		"model setup mimo --api-key-stdin",
+		"new /tmp/work --model mimo25",
+	}
+	for _, text := range allow {
+		if containsRawModelAPIKey(text) {
+			t.Fatalf("containsRawModelAPIKey(%q)=true, want false", text)
+		}
+	}
+}
+
+type fakeModelProfileManager struct {
+	mu           sync.Mutex
+	saveRequests []ModelProfileAPIKeySaveRequest
+	saveResult   ModelProfileAPIKeySaveResult
+	saveErr      error
+	saveStarted  chan struct{}
+	saveBlock    <-chan struct{}
+	startedOnce  sync.Once
+}
+
+func (m *fakeModelProfileManager) ListModelProfiles(context.Context) (string, error) {
+	return "profiles", nil
+}
+
+func (m *fakeModelProfileManager) ModelProfileProviders(context.Context) (string, error) {
+	return "providers", nil
+}
+
+func (m *fakeModelProfileManager) ModelProfileSetupGuide(context.Context, string) (string, error) {
+	return "setup guide", nil
+}
+
+func (m *fakeModelProfileManager) ModelProfileDoctor(context.Context, string) (string, error) {
+	return "doctor", nil
+}
+
+func (m *fakeModelProfileManager) SetDefaultModelProfile(context.Context, string) (string, error) {
+	return "default set", nil
+}
+
+func (m *fakeModelProfileManager) DeleteModelProfile(context.Context, string, bool) (string, error) {
+	return "deleted", nil
+}
+
+func (m *fakeModelProfileManager) SaveModelProfileAPIKey(_ context.Context, req ModelProfileAPIKeySaveRequest) (ModelProfileAPIKeySaveResult, error) {
+	m.mu.Lock()
+	m.saveRequests = append(m.saveRequests, req)
+	saveErr := m.saveErr
+	saveResult := m.saveResult
+	saveBlock := m.saveBlock
+	if m.saveStarted != nil {
+		m.startedOnce.Do(func() { close(m.saveStarted) })
+	}
+	m.mu.Unlock()
+	if saveBlock != nil {
+		<-saveBlock
+	}
+	if saveErr != nil {
+		return ModelProfileAPIKeySaveResult{}, saveErr
+	}
+	if saveResult.ProfileName != "" {
+		return saveResult, nil
+	}
+	return ModelProfileAPIKeySaveResult{
+		ProfileName: req.ProfileName,
+		Provider:    req.Provider,
+		APIKeyRef:   modelprofile.SecretRefForProfile(req.ProfileName),
+		Fingerprint: "fp-test",
+		Revision:    1,
+		SetDefault:  req.SetDefault,
+	}, nil
+}
+
+func (m *fakeModelProfileManager) saveRequestCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.saveRequests)
+}
+
+func (m *fakeModelProfileManager) saveRequestAt(i int) ModelProfileAPIKeySaveRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.saveRequests[i]
+}
+
+func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	manager := &fakeModelProfileManager{}
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.modelProfileManager = manager
+	oldCode := newModelProfileKeyIntakeCode
+	oldNow := modelProfileKeyIntakeNow
+	base := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	newModelProfileKeyIntakeCode = func() (string, error) { return "ABCD2345", nil }
+	modelProfileKeyIntakeNow = func() time.Time { return base }
+	t.Cleanup(func() {
+		newModelProfileKeyIntakeCode = oldCode
+		modelProfileKeyIntakeNow = oldNow
+	})
+
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup mimo mimo25 --teams-key-intake --set-default"); err != nil {
+		t.Fatalf("setup key intake: %v", err)
+	}
+	stateAfterSetup, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after setup: %v", err)
+	}
+	if len(stateAfterSetup.ModelProfileKeyIntakes) != 1 {
+		t.Fatalf("intakes after setup = %d, want 1", len(stateAfterSetup.ModelProfileKeyIntakes))
+	}
+	for _, intake := range stateAfterSetup.ModelProfileKeyIntakes {
+		if !modelProfileKeyIntakeMatches(intake, "ABCD2345", "control-chat", "user-1") {
+			t.Fatalf("setup intake does not match expected code/chat/user: status=%q chat=%q user=%q hash=%q expected_hash=%q", intake.Status, intake.TeamsChatID, intake.AuthorUserID, intake.CodeHash, modelProfileKeyIntakeCodeHash("ABCD2345", intake))
+		}
+	}
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-key"), "model key confirm ABCD2345"); err != nil {
+		t.Fatalf("confirm key intake: %v", err)
+	}
+	stateAfterConfirm, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after confirm: %v", err)
+	}
+	for _, intake := range stateAfterConfirm.ModelProfileKeyIntakes {
+		if intake.ProfileName == "mimo25" && intake.Status != teamstore.ModelProfileKeyIntakeConfirmed {
+			t.Fatalf("intake status after confirm = %q, want confirmed", intake.Status)
+		}
+	}
+	rawKey := "sk-1234567890abcdef1234567890abcdef"
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("save-key"), "model key ABCD2345 "+rawKey); err != nil {
+		t.Fatalf("save key intake: %v", err)
+	}
+	if got := manager.saveRequestCount(); got != 1 {
+		t.Fatalf("SaveModelProfileAPIKey calls = %d, want 1", got)
+	}
+	req := manager.saveRequestAt(0)
+	if req.Provider != "mimo" || req.ProfileName != "mimo25" || req.APIKey != rawKey || !req.SetDefault {
+		t.Fatalf("save request provider/name/key/default mismatch: provider=%q name=%q key_match=%v default=%v", req.Provider, req.ProfileName, req.APIKey == rawKey, req.SetDefault)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	var completed int
+	for _, intake := range state.ModelProfileKeyIntakes {
+		if intake.ProfileName == "mimo25" {
+			if intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
+				t.Fatalf("intake status = %q, want completed", intake.Status)
+			}
+			completed++
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("completed intakes = %d, want 1", completed)
+	}
+	assertFileDoesNotContain(t, store.Path(), rawKey)
+	assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), rawKey)
+}
+
+func TestBridgeModelProfileTeamsKeyIntakeRejectsWrongUnconfirmedAndExpiredCodes(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	manager := &fakeModelProfileManager{}
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.modelProfileManager = manager
+	oldCode := newModelProfileKeyIntakeCode
+	oldNow := modelProfileKeyIntakeNow
+	base := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	newModelProfileKeyIntakeCode = func() (string, error) { return "WXYZ7892", nil }
+	modelProfileKeyIntakeNow = func() time.Time { return base }
+	t.Cleanup(func() {
+		newModelProfileKeyIntakeCode = oldCode
+		modelProfileKeyIntakeNow = oldNow
+	})
+
+	rawKey := "sk-abcdef1234567890abcdef1234567890"
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-unconfirmed"), "model setup deepseek deepseek-work --teams-key-intake"); err != nil {
+		t.Fatalf("setup key intake: %v", err)
+	}
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("wrong-code"), "model key BADCODE "+rawKey); err != nil {
+		t.Fatalf("wrong code: %v", err)
+	}
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("unconfirmed-code"), "model key WXYZ7892 "+rawKey); err != nil {
+		t.Fatalf("unconfirmed code: %v", err)
+	}
+	if got := manager.saveRequestCount(); got != 0 {
+		t.Fatalf("save requests before confirm = %d, want 0", got)
+	}
+	assertFileDoesNotContain(t, store.Path(), rawKey)
+	assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), rawKey)
+
+	modelProfileKeyIntakeNow = func() time.Time { return base.Add(modelProfileKeyIntakeTTL + time.Second) }
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("expired-confirm"), "model key confirm WXYZ7892"); err != nil {
+		t.Fatalf("expired confirm: %v", err)
+	}
+	if got := manager.saveRequestCount(); got != 0 {
+		t.Fatalf("save requests after expired confirm = %d, want 0", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	var expired int
+	for _, intake := range state.ModelProfileKeyIntakes {
+		if intake.ProfileName == "deepseek-work" && intake.Status == teamstore.ModelProfileKeyIntakeExpired {
+			expired++
+		}
+	}
+	if expired != 1 {
+		t.Fatalf("expired intakes = %d, want 1", expired)
+	}
+}
+
+func TestBridgeModelProfileTeamsKeyIntakeSanitizesSaveErrors(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	rawKey := "sk-error1234567890abcdef1234567890"
+	manager := &fakeModelProfileManager{saveErr: fmt.Errorf("provider rejected key %s", rawKey)}
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.modelProfileManager = manager
+	oldCode := newModelProfileKeyIntakeCode
+	oldNow := modelProfileKeyIntakeNow
+	base := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	newModelProfileKeyIntakeCode = func() (string, error) { return "ERR23456", nil }
+	modelProfileKeyIntakeNow = func() time.Time { return base }
+	t.Cleanup(func() {
+		newModelProfileKeyIntakeCode = oldCode
+		modelProfileKeyIntakeNow = oldNow
+	})
+
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-error"), "model setup mimo mimo25 --teams-key-intake"); err != nil {
+		t.Fatalf("setup key intake: %v", err)
+	}
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-error"), "model key confirm ERR23456"); err != nil {
+		t.Fatalf("confirm key intake: %v", err)
+	}
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("save-error"), "model key ERR23456 "+rawKey); err != nil {
+		t.Fatalf("save key intake with sanitized manager error: %v", err)
+	}
+	if got := manager.saveRequestCount(); got != 1 {
+		t.Fatalf("SaveModelProfileAPIKey calls = %d, want 1", got)
+	}
+	assertFileDoesNotContain(t, store.Path(), rawKey)
+	assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), rawKey)
+	for _, msg := range *sent {
+		if strings.Contains(PlainTextFromTeamsHTML(msg.Content), rawKey) {
+			t.Fatalf("sent Teams message contains raw secret")
+		}
+	}
+}
+
+func TestBridgeModelProfileTeamsKeyIntakeClaimsConcurrentSave(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	saveStarted := make(chan struct{})
+	saveRelease := make(chan struct{})
+	manager := &fakeModelProfileManager{
+		saveStarted: saveStarted,
+		saveBlock:   saveRelease,
+	}
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.modelProfileManager = manager
+	oldCode := newModelProfileKeyIntakeCode
+	oldNow := modelProfileKeyIntakeNow
+	base := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	newModelProfileKeyIntakeCode = func() (string, error) { return "CLAIM123", nil }
+	modelProfileKeyIntakeNow = func() time.Time { return base }
+	t.Cleanup(func() {
+		newModelProfileKeyIntakeCode = oldCode
+		modelProfileKeyIntakeNow = oldNow
+	})
+
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-claim"), "model setup mimo mimo25 --teams-key-intake"); err != nil {
+		t.Fatalf("setup key intake: %v", err)
+	}
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-claim"), "model key confirm CLAIM123"); err != nil {
+		t.Fatalf("confirm key intake: %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := bridge.completeModelProfileKeyIntake(ctx, bridgeTestMessage("save-claim-1"), "CLAIM123", "sk-first-concurrent-secret")
+		firstDone <- err
+	}()
+	select {
+	case <-saveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first save attempt to start")
+	}
+
+	secondMessage, err := bridge.completeModelProfileKeyIntake(ctx, bridgeTestMessage("save-claim-2"), "CLAIM123", "sk-second-concurrent-secret")
+	if err != nil {
+		t.Fatalf("second concurrent save returned error: %v", err)
+	}
+	if !strings.Contains(secondMessage, "already being saved") {
+		t.Fatalf("second concurrent save message = %q, want already-being-saved response", secondMessage)
+	}
+	if got := manager.saveRequestCount(); got != 1 {
+		t.Fatalf("SaveModelProfileAPIKey calls while first save blocked = %d, want 1", got)
+	}
+
+	close(saveRelease)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first save returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first save attempt to finish")
+	}
+	if got := manager.saveRequestCount(); got != 1 {
+		t.Fatalf("SaveModelProfileAPIKey calls after first save finished = %d, want 1", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	for _, intake := range state.ModelProfileKeyIntakes {
+		if intake.ProfileName == "mimo25" && intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
+			t.Fatalf("intake status = %q, want completed", intake.Status)
+		}
+	}
+	assertFileDoesNotContain(t, store.Path(), "sk-first-concurrent-secret")
+	assertFileDoesNotContain(t, store.Path(), "sk-second-concurrent-secret")
+}
+
+func assertFileDoesNotContain(t *testing.T, path string, secret string) {
+	t.Helper()
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if strings.Contains(string(data), secret) {
+		t.Fatalf("%s contains raw secret", path)
 	}
 }
 

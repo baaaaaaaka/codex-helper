@@ -1258,6 +1258,232 @@ func TestRunLikeExplicitProfileForcesProxy(t *testing.T) {
 	}
 }
 
+func TestRunLikeModelProfileSSHProxyPassesModelProfileOptions(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	disabled := false
+	profile := config.Profile{ID: "p1", Name: "primary", Host: "example.com", User: "coder", CreatedAt: time.Now()}
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &disabled,
+		Profiles:     []config.Profile{profile},
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-ssh": {
+				Provider:  "deepseek",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				SSHProxy:  "primary",
+				Revision:  1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunWithProfileOptions := runWithProfileOptionsFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runWithProfileOptionsFn = prevRunWithProfileOptions
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("model profile runs through an SSH proxy must preserve model-profile options")
+		return nil
+	}
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("model profile SSH proxy run should use the proxy execution path")
+		return nil
+	}
+
+	var gotProfile config.Profile
+	var gotCmdArgs []string
+	var gotOpts runTargetOptions
+	runWithProfileOptionsFn = func(ctx context.Context, _ *config.Store, prof config.Profile, _ []config.Instance, cmdArgs []string, opts runTargetOptions) error {
+		gotProfile = prof
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		gotOpts = opts
+		return nil
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--model-profile", "deepseek-ssh", "--", "codex", "exec", "-"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+	if gotProfile.ID != profile.ID {
+		t.Fatalf("profile = %#v, want %#v", gotProfile, profile)
+	}
+	if !reflect.DeepEqual(gotCmdArgs, []string{"codex", "exec", "-"}) {
+		t.Fatalf("cmd args = %v", gotCmdArgs)
+	}
+	if gotOpts.ModelProfileRef != "deepseek-ssh" || !gotOpts.UseProxy {
+		t.Fatalf("opts = %+v, want model profile and proxy enabled", gotOpts)
+	}
+}
+
+func TestRunLikeDirectModelProfileSimulatesCodexLaunch(t *testing.T) {
+	lockCLITestHooks(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codex launch script uses Unix shell")
+	}
+
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-live": {
+				Provider:  "deepseek",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  7,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "sk-ci-deepseek")
+	t.Setenv(envCodexHome, t.TempDir())
+
+	binDir := t.TempDir()
+	fakeCodex := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(fakeCodex, []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo codex 0.0.0; exit 0; fi\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunWithProfileOptions := runWithProfileOptionsFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	prevEnsureProxy := ensureProxyPreferenceRunFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runWithProfileOptionsFn = prevRunWithProfileOptions
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+		ensureProxyPreferenceRunFn = prevEnsureProxy
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("direct model-profile run should not use SSH profile path")
+		return nil
+	}
+	runWithProfileOptionsFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string, runTargetOptions) error {
+		t.Fatal("direct model-profile run should not use SSH profile options path")
+		return nil
+	}
+	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		t.Fatal("direct model-profile run without an ssh proxy should not prompt for generic proxy preference")
+		return false, config.Config{}, nil
+	}
+
+	var gotCmdArgs []string
+	var gotOpts runTargetOptions
+	runTargetWithFallbackWithOptionsFn = func(ctx context.Context, cmdArgs []string, proxyURL string, healthCheck func() error, fatalCh <-chan error, opts runTargetOptions) error {
+		gotCmdArgs = append([]string(nil), cmdArgs...)
+		gotOpts = opts
+		if proxyURL != "" {
+			t.Fatalf("proxyURL = %q, want direct mode", proxyURL)
+		}
+		if healthCheck != nil || fatalCh != nil {
+			t.Fatalf("direct mode should not pass proxy health/fatal hooks")
+		}
+		baseURL := codexOverrideValue(t, cmdArgs, `model_providers.`+cxpCodexModelProviderID+`.base_url`)
+		proxyKey := envValue(opts.ExtraEnv, envCXPResponsesProxyKey)
+		if proxyKey == "" {
+			t.Fatalf("missing %s in ExtraEnv: %v", envCXPResponsesProxyKey, opts.ExtraEnv)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(baseURL, "/")+"/models", nil)
+		if err != nil {
+			t.Fatalf("new /models request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+proxyKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET adapter /models: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET adapter /models status = %d", resp.StatusCode)
+		}
+		return nil
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--model-profile", "deepseek-live", "--", "codex", "exec", "-"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+	if len(gotCmdArgs) == 0 || filepath.Base(gotCmdArgs[0]) != "codex" {
+		t.Fatalf("cmd args = %v, want resolved codex command", gotCmdArgs)
+	}
+	joined := strings.Join(gotCmdArgs, "\n")
+	for _, want := range []string{
+		`model_provider="` + cxpCodexModelProviderID + `"`,
+		`model="deepseek/deepseek-v4-flash"`,
+		`model_catalog_json="`,
+		`model_providers.` + cxpCodexModelProviderID + `.wire_api="responses"`,
+		`model_providers.` + cxpCodexModelProviderID + `.requires_openai_auth=false`,
+		"exec\n-",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("codex args missing %q:\n%v", want, gotCmdArgs)
+		}
+	}
+	if gotOpts.UseProxy || gotOpts.ModelProfileRef != "deepseek-live" {
+		t.Fatalf("opts = %+v, want direct model profile run", gotOpts)
+	}
+	if got := envValue(gotOpts.ExtraEnv, envCodexHome); got == "" {
+		t.Fatalf("missing %s in ExtraEnv: %v", envCodexHome, gotOpts.ExtraEnv)
+	}
+}
+
+func TestRunLikeRejectsModelProfileForNonCodexCommand(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--model-profile", "mimo25", "--", "bash", "-lc", "true"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--model-profile only applies to Codex launches") {
+		t.Fatalf("run command error = %v, want model-profile non-Codex rejection", err)
+	}
+}
+
+func codexOverrideValue(t *testing.T, args []string, key string) string {
+	t.Helper()
+	prefix := key + "="
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-c" {
+			continue
+		}
+		value, ok := strings.CutPrefix(args[i+1], prefix)
+		if !ok {
+			continue
+		}
+		return strings.Trim(value, `"`)
+	}
+	t.Fatalf("missing codex override %q in args: %v", key, args)
+	return ""
+}
+
 func TestRunLikePersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 	lockCLITestHooks(t)
 

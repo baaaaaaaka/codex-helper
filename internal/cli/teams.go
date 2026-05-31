@@ -656,6 +656,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var autoUpdateRepo string
 	var autoUpdatePrerelease bool
 	var autoService bool
+	var modelProfile string
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
@@ -708,11 +709,11 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					return err
 				}
 				httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
-				executor, err := newTeamsExecutor(root, executorName, runnerName, codexPath, workDir, codexArgs, timeout, cmd.ErrOrStderr())
+				executor, err := newTeamsExecutor(root, executorName, runnerName, codexPath, workDir, codexArgs, modelProfile, timeout, cmd.ErrOrStderr())
 				if err != nil {
 					return err
 				}
-				controlFallbackExecutor, err := newTeamsControlFallbackExecutor(root, runnerName, codexPath, workDir, codexArgs, controlFallbackModel, timeout, cmd.ErrOrStderr())
+				controlFallbackExecutor, err := newTeamsControlFallbackExecutor(root, runnerName, codexPath, workDir, codexArgs, modelProfile, controlFallbackModel, timeout, cmd.ErrOrStderr())
 				if err != nil {
 					return err
 				}
@@ -733,6 +734,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					ControlFallbackExecutor:    controlFallbackExecutor,
 					ControlFallbackModel:       controlFallbackModel,
 					ControlFallbackHelpContext: teamsControlFallbackHelpContext(),
+					ModelProfileResolver:       newTeamsModelProfileResolver(root),
+					ModelProfileManager:        newTeamsModelProfileManager(root),
 					ASRTranscriber:             asrTranscriber,
 					HelperRestarter:            restartTeamsHelperFromTeams,
 					HelperPendingRestarter:     restartTeamsHelperFromTeamsAfterPendingReplacement,
@@ -758,6 +761,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Override Codex CLI path")
 	cmd.Flags().StringVar(&workDir, "workdir", "", "Working directory for Codex sessions")
 	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra argument to pass to codex exec (repeatable)")
+	cmd.Flags().StringVar(&modelProfile, "model-profile", "", "Model profile id or name for Codex launches")
 	cmd.Flags().StringVar(&asrCommand, "asr-command", "", "Optional local Teams audio/video transcription command; stdout may be plain text or ASRTranscript JSON")
 	cmd.Flags().StringArrayVar(&asrArgs, "asr-arg", nil, "Argument for --asr-command (repeatable); placeholders: {input}, {language}, {speed}, {threads}, {source_index}, {prompt_path}, {content_type}")
 	_ = cmd.Flags().MarkHidden("asr-command")
@@ -1578,11 +1582,11 @@ func newTeamsAuthFileWriteLogoutCmd() *cobra.Command {
 	}
 }
 
-func newTeamsExecutor(root *rootOptions, name string, runnerName string, codexPath string, workDir string, codexArgs []string, timeout time.Duration, log io.Writer) (teams.Executor, error) {
+func newTeamsExecutor(root *rootOptions, name string, runnerName string, codexPath string, workDir string, codexArgs []string, modelProfile string, timeout time.Duration, log io.Writer) (teams.Executor, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "codex":
 		args := codexArgsWithDefaultReasoningEffort(codexArgs, teams.DefaultSessionReasoningEffort)
-		return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, timeout, log)
+		return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, modelProfile, timeout, log)
 	case "echo":
 		return teams.EchoExecutor{}, nil
 	default:
@@ -1590,11 +1594,11 @@ func newTeamsExecutor(root *rootOptions, name string, runnerName string, codexPa
 	}
 }
 
-func newTeamsControlFallbackExecutor(root *rootOptions, runnerName string, codexPath string, workDir string, codexArgs []string, model string, timeout time.Duration, log io.Writer) (teams.Executor, error) {
+func newTeamsControlFallbackExecutor(root *rootOptions, runnerName string, codexPath string, workDir string, codexArgs []string, modelProfile string, model string, timeout time.Duration, log io.Writer) (teams.Executor, error) {
 	model = strings.TrimSpace(model)
 	args := codexArgsWithModel(codexArgs, model)
 	args = codexArgsWithReasoningEffort(args, teams.DefaultControlFallbackReasoningEffort)
-	return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, timeout, log)
+	return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, modelProfile, timeout, log)
 }
 
 func codexArgsWithDefaultReasoningEffort(args []string, effort string) []string {

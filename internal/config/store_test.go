@@ -39,6 +39,17 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 		Profiles: []Profile{
 			{ID: "p1", Name: "n1", Host: "h", Port: 22, User: "u", CreatedAt: now},
 		},
+		DefaultModelProfile: "deepseek-work",
+		ModelProfiles: map[string]ModelProfile{
+			"deepseek-work": {
+				Provider:  "deepseek",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				SSHProxy:  "n1",
+				Revision:  2,
+				CreatedAt: now,
+				UpdatedAt: now,
+			},
+		},
 	}
 
 	if err := store.Save(in); err != nil {
@@ -54,6 +65,34 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	}
 	if len(out.Profiles) != 1 || out.Profiles[0].ID != "p1" {
 		t.Fatalf("Profiles=%#v", out.Profiles)
+	}
+	if out.DefaultModelProfile != "deepseek-work" {
+		t.Fatalf("DefaultModelProfile=%q", out.DefaultModelProfile)
+	}
+	if got := out.ModelProfiles["deepseek-work"]; got.Provider != "deepseek" || got.APIKeyRef != "env:DEEPSEEK_API_KEY" || got.Revision != 2 {
+		t.Fatalf("ModelProfiles round trip failed: %#v", out.ModelProfiles)
+	}
+}
+
+func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"profiles":[{"id":"p1","name":"n1","host":"h","port":22,"user":"u","createdAt":"2026-05-31T00:00:00Z"}]}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Version != CurrentVersion {
+		t.Fatalf("Version=%d want %d", cfg.Version, CurrentVersion)
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "n1" {
+		t.Fatalf("Profiles=%#v", cfg.Profiles)
 	}
 }
 

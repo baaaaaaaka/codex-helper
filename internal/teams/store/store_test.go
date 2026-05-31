@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
 func TestLoadMissingReturnsEmptyState(t *testing.T) {
@@ -139,6 +141,50 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if state.ServiceControl.UpdatedAt.IsZero() {
 		t.Fatal("service control UpdatedAt is zero after roundtrip")
+	}
+}
+
+func TestQueueTurnPinsSessionModelProfileSnapshot(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			snapshot := modelprofile.Snapshot{
+				Name:               "mimo25",
+				Provider:           "mimo",
+				APIKeyRef:          "secret:model-profile/mimo25/api-key",
+				Revision:           3,
+				KeyFingerprint:     "key:test",
+				BaseURLHash:        "url:test",
+				CatalogFingerprint: "catalog:test",
+			}
+			session := testSession()
+			session.ModelProfile = snapshot
+			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+				t.Fatalf("CreateSession created=%v err=%v", created, err)
+			}
+			inbound, created, err := store.PersistInbound(ctx, testInbound())
+			if err != nil || !created {
+				t.Fatalf("PersistInbound created=%v err=%v", created, err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			turn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+			if err != nil || !created {
+				t.Fatalf("QueueTurn created=%v err=%v", created, err)
+			}
+			if turn.ModelProfile != snapshot {
+				t.Fatalf("queued turn model profile = %#v, want %#v", turn.ModelProfile, snapshot)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := state.Turns[turn.ID].ModelProfile; got != snapshot {
+				t.Fatalf("stored turn model profile = %#v, want %#v", got, snapshot)
+			}
+		})
 	}
 }
 

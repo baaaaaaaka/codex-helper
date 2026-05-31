@@ -127,7 +127,7 @@ func (s *Store) loadUnlocked() (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 
-	if cfg.Version == 0 {
+	if cfg.Version == 0 || cfg.Version == 1 {
 		cfg.Version = CurrentVersion
 	}
 	if cfg.Version != CurrentVersion {

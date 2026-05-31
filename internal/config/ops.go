@@ -2,6 +2,8 @@ package config
 
 import "strings"
 
+const DefaultModelProfileName = "default"
+
 func (c Config) FindProfile(ref string) (Profile, bool) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
@@ -52,6 +54,64 @@ func (c *Config) RemoveInstance(id string) bool {
 		}
 		c.Instances = append(c.Instances[:i], c.Instances[i+1:]...)
 		return true
+	}
+	return false
+}
+
+func (c Config) EffectiveDefaultModelProfile() string {
+	name := strings.TrimSpace(c.DefaultModelProfile)
+	if name == "" {
+		return DefaultModelProfileName
+	}
+	return name
+}
+
+func (c Config) FindModelProfile(ref string) (ModelProfile, bool) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = c.EffectiveDefaultModelProfile()
+	}
+	if strings.EqualFold(ref, DefaultModelProfileName) {
+		return ModelProfile{
+			Provider: DefaultModelProfileName,
+			Revision: 1,
+		}, true
+	}
+	for name, profile := range c.ModelProfiles {
+		if strings.EqualFold(strings.TrimSpace(name), ref) {
+			return profile, true
+		}
+	}
+	return ModelProfile{}, false
+}
+
+func (c *Config) UpsertModelProfile(name string, p ModelProfile) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.EqualFold(name, DefaultModelProfileName) {
+		return
+	}
+	if c.ModelProfiles == nil {
+		c.ModelProfiles = map[string]ModelProfile{}
+	}
+	if p.Revision <= 0 {
+		p.Revision = 1
+	}
+	c.ModelProfiles[name] = p
+}
+
+func (c *Config) RemoveModelProfile(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.EqualFold(name, DefaultModelProfileName) || c.ModelProfiles == nil {
+		return false
+	}
+	for existing := range c.ModelProfiles {
+		if strings.EqualFold(existing, name) {
+			delete(c.ModelProfiles, existing)
+			if strings.EqualFold(c.DefaultModelProfile, existing) {
+				c.DefaultModelProfile = ""
+			}
+			return true
+		}
 	}
 	return false
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
 func TestParseCodexAppArgs(t *testing.T) {
@@ -58,6 +59,19 @@ func TestParseCodexAppArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func mustCodexCatalogJSONForProvider(t *testing.T, provider string) []byte {
+	t.Helper()
+	spec, err := modelprofile.MustLookupProvider(provider)
+	if err != nil {
+		t.Fatalf("lookup provider %q: %v", provider, err)
+	}
+	raw, err := modelprofile.CodexModelCatalogJSON(spec)
+	if err != nil {
+		t.Fatalf("catalog for provider %q: %v", provider, err)
+	}
+	return raw
 }
 
 func TestCodexDesktopPlatformForCurrentHost(t *testing.T) {
@@ -233,6 +247,290 @@ func TestRunCodexAppDirectLaunchesDesktopApp(t *testing.T) {
 	}
 	if got := envValue(got.ExtraEnv, envCodexHome); got != filepath.Join(cwd, "codex-home") {
 		t.Fatalf("CODEX_HOME = %q", got)
+	}
+}
+
+func TestRunCodexAppModelProfileLaunchUsesIsolatedCodexHome(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"mimo25": {
+				Provider:  "mimo",
+				APIKeyRef: "env:MIMO_API_KEY",
+				Revision:  3,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevGOOS := codexAppGOOS
+	prevIsWSL := codexAppIsWSL
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevEnsureProfile := ensureProfileFunc
+	prevEnsureProxyURL := codexAppEnsureProxyURLFn
+	prevEnsureModel := codexAppEnsureModelProfileLaunchFn
+	prevLaunch := codexAppLaunchDesktopFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppIsWSL = prevIsWSL
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		ensureProfileFunc = prevEnsureProfile
+		codexAppEnsureProxyURLFn = prevEnsureProxyURL
+		codexAppEnsureModelProfileLaunchFn = prevEnsureModel
+		codexAppLaunchDesktopFn = prevLaunch
+	})
+
+	codexAppGOOS = func() string { return "darwin" }
+	codexAppIsWSL = func() bool { return false }
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		t.Fatal("model profile desktop launch without --profile should not prompt for generic proxy preference")
+		return false, config.Config{}, nil
+	}
+	ensureProfileFunc = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
+		t.Fatal("model profile desktop launch should not require an SSH proxy profile unless --profile is selected")
+		return config.Profile{}, config.Config{}, nil
+	}
+	codexAppEnsureProxyURLFn = func(context.Context, *config.Store, config.Profile, []config.Instance, io.Writer) (string, error) {
+		t.Fatal("model profile desktop launch should not start the desktop network proxy by default")
+		return "", nil
+	}
+	codexAppEnsureModelProfileLaunchFn = func(_ context.Context, gotStore *config.Store, ref string, _ io.Writer) (codexModelProfileLaunch, error) {
+		if gotStore.Path() != cfgPath {
+			t.Fatalf("store path = %q, want %q", gotStore.Path(), cfgPath)
+		}
+		if ref != "mimo25" {
+			t.Fatalf("model profile ref = %q, want mimo25", ref)
+		}
+		return codexModelProfileLaunch{
+			Enabled:      true,
+			Name:         "mimo25",
+			ProviderID:   "mimo",
+			Model:        "mimo/mimo-v2.5",
+			BaseURL:      "http://127.0.0.1:34567/v1",
+			ProxyKey:     "local-proxy-key",
+			Revision:     3,
+			ProviderName: "MiMo",
+			CatalogJSON:  mustCodexCatalogJSONForProvider(t, "mimo"),
+		}, nil
+	}
+
+	var got codexDesktopAppOptions
+	codexAppLaunchDesktopFn = func(_ context.Context, opts codexDesktopAppOptions) error {
+		got = opts
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cwd := t.TempDir()
+	if err := runCodexApp(cmd, &rootOptions{configPath: cfgPath}, codexAppOptions{
+		cwd:             cwd,
+		codexDir:        "codex-home",
+		modelProfileRef: "mimo25",
+	}); err != nil {
+		t.Fatalf("runCodexApp error: %v", err)
+	}
+
+	if got.ProxyURL != "" {
+		t.Fatalf("desktop proxy URL = %q, want empty", got.ProxyURL)
+	}
+	if got.ModelProfileName != "mimo25" {
+		t.Fatalf("desktop model profile name = %q, want mimo25", got.ModelProfileName)
+	}
+	modelHome := envValue(got.ExtraEnv, envCodexHome)
+	if modelHome == "" || modelHome == filepath.Join(cwd, "codex-home") {
+		t.Fatalf("CODEX_HOME = %q, want isolated model profile home", modelHome)
+	}
+	if got := envValue(got.ExtraEnv, envCXPResponsesProxyKey); got != "local-proxy-key" {
+		t.Fatalf("%s = %q, want local proxy key", envCXPResponsesProxyKey, got)
+	}
+	raw, err := os.ReadFile(filepath.Join(modelHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read generated config.toml: %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{
+		`model_provider = "cxp-thirdparty"`,
+		`model = "mimo/mimo-v2.5"`,
+		`model_catalog_json = "`,
+		`base_url = "http://127.0.0.1:34567/v1"`,
+		`env_key = "CXP_RESPONSES_PROXY_KEY"`,
+		`wire_api = "responses"`,
+		`requires_openai_auth = false`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated config missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "MIMO_API_KEY") || strings.Contains(text, "sk-") || strings.Contains(text, "local-proxy-key") {
+		t.Fatalf("generated config should not leak API key refs or proxy keys:\n%s", text)
+	}
+}
+
+func TestApplyCodexDesktopModelProfileLaunchMacKeepsHostLocalAdapterURL(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	opts, err := applyCodexDesktopModelProfileLaunch(store, codexDesktopAppOptions{
+		Platform: codexDesktopPlatformMac,
+		ExtraEnv: []string{
+			envCodexHome + "=" + filepath.Join(t.TempDir(), "old-codex-home"),
+			"OTHER_ENV=keep",
+		},
+	}, codexModelProfileLaunch{
+		Enabled:      true,
+		Name:         "mimo25",
+		ProviderID:   "mimo",
+		Model:        "mimo/mimo-v2.5",
+		BaseURL:      "http://127.0.0.1:45678/v1",
+		ProxyKey:     "mac-proxy-key",
+		Revision:     4,
+		ProviderName: "MiMo",
+		CatalogJSON:  mustCodexCatalogJSONForProvider(t, "mimo"),
+	})
+	if err != nil {
+		t.Fatalf("applyCodexDesktopModelProfileLaunch: %v", err)
+	}
+
+	modelHome := envValue(opts.ExtraEnv, envCodexHome)
+	if modelHome == "" || strings.Contains(modelHome, `\\wsl`) {
+		t.Fatalf("macOS CODEX_HOME = %q, want host-local generated Codex home", modelHome)
+	}
+	if got := envValue(opts.ExtraEnv, "OTHER_ENV"); got != "keep" {
+		t.Fatalf("OTHER_ENV = %q, want preserved", got)
+	}
+	if got := envValue(opts.ExtraEnv, envCXPResponsesProxyKey); got != "mac-proxy-key" {
+		t.Fatalf("%s = %q, want mac proxy key", envCXPResponsesProxyKey, got)
+	}
+	raw, err := os.ReadFile(filepath.Join(modelHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read generated mac config.toml: %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{
+		`base_url = "http://127.0.0.1:45678/v1"`,
+		`wire_api = "responses"`,
+		`requires_openai_auth = false`,
+		`supports_websockets = false`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated mac config missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "mac-proxy-key") {
+		t.Fatalf("generated mac config leaked proxy key:\n%s", text)
+	}
+}
+
+func TestRunCodexAppModelProfileFromWSLWritesWindowsReachableAdapterURL(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"mimo25": {
+				Provider:  "mimo",
+				APIKeyRef: "env:MIMO_API_KEY",
+				Revision:  3,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevGOOS := codexAppGOOS
+	prevIsWSL := codexAppIsWSL
+	prevWSLPath := codexAppWSLPathFn
+	prevWSLHost := codexAppWSLHostForWindowsFn
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevEnsureModel := codexAppEnsureModelProfileLaunchFn
+	prevLaunch := codexAppLaunchDesktopFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppIsWSL = prevIsWSL
+		codexAppWSLPathFn = prevWSLPath
+		codexAppWSLHostForWindowsFn = prevWSLHost
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		codexAppEnsureModelProfileLaunchFn = prevEnsureModel
+		codexAppLaunchDesktopFn = prevLaunch
+	})
+
+	codexAppGOOS = func() string { return "linux" }
+	codexAppIsWSL = func() bool { return true }
+	codexAppWSLPathFn = func(path string) (string, error) {
+		return `\\wsl.localhost\Ubuntu` + strings.ReplaceAll(path, "/", `\`), nil
+	}
+	codexAppWSLHostForWindowsFn = func() (string, error) {
+		return "172.22.174.179", nil
+	}
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		t.Fatal("model profile desktop launch without --profile should not prompt for generic proxy preference")
+		return false, config.Config{}, nil
+	}
+	codexAppEnsureModelProfileLaunchFn = func(context.Context, *config.Store, string, io.Writer) (codexModelProfileLaunch, error) {
+		return codexModelProfileLaunch{
+			Enabled:      true,
+			Name:         "mimo25",
+			ProviderID:   "mimo",
+			Model:        "mimo/mimo-v2.5",
+			BaseURL:      "http://127.0.0.1:34567/v1",
+			ProxyKey:     "local-proxy-key",
+			Revision:     3,
+			ProviderName: "MiMo",
+			CatalogJSON:  mustCodexCatalogJSONForProvider(t, "mimo"),
+		}, nil
+	}
+
+	var got codexDesktopAppOptions
+	codexAppLaunchDesktopFn = func(_ context.Context, opts codexDesktopAppOptions) error {
+		got = opts
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := runCodexApp(cmd, &rootOptions{configPath: cfgPath}, codexAppOptions{
+		cwd:             t.TempDir(),
+		modelProfileRef: "mimo25",
+	}); err != nil {
+		t.Fatalf("runCodexApp error: %v", err)
+	}
+
+	if got.Platform != codexDesktopPlatformWindows {
+		t.Fatalf("platform = %q, want windows", got.Platform)
+	}
+	if modelHome := envValue(got.ExtraEnv, envCodexHome); !strings.HasPrefix(modelHome, `\\wsl.localhost\Ubuntu`) {
+		t.Fatalf("CODEX_HOME = %q, want Windows WSL path", modelHome)
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(cfgPath), "model-profiles", "mimo25-rev3", "codex", "config.toml"))
+	if err != nil {
+		t.Fatalf("read generated config.toml: %v", err)
+	}
+	if !strings.Contains(string(raw), `base_url = "http://172.22.174.179:34567/v1"`) {
+		t.Fatalf("generated config did not use Windows-reachable WSL adapter URL:\n%s", raw)
 	}
 }
 
@@ -507,6 +805,24 @@ func TestPrintCodexDesktopAppLaunchAdvisoriesWarnsForWSLProxy(t *testing.T) {
 	} {
 		if !strings.Contains(log.String(), want) {
 			t.Fatalf("desktop app advisory missing %q:\n%s", want, log.String())
+		}
+	}
+}
+
+func TestPrintCodexDesktopAppLaunchAdvisoriesWarnsForModelProfile(t *testing.T) {
+	var log bytes.Buffer
+	printCodexDesktopAppLaunchAdvisories(codexDesktopAppOptions{
+		Platform:         codexDesktopPlatformMac,
+		ModelProfileName: "mimo25",
+		Log:              &log,
+	})
+	for _, want := range []string{
+		`model profile "mimo25"`,
+		"isolated CODEX_HOME",
+		"quit it first",
+	} {
+		if !strings.Contains(log.String(), want) {
+			t.Fatalf("desktop app model-profile advisory missing %q:\n%s", want, log.String())
 		}
 	}
 }

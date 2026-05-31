@@ -64,7 +64,7 @@ func TestExecRunnerResumeUsesExactThreadIDAndNeverLast(t *testing.T) {
 			`{"type":"turn.completed"}`,
 		}, "\n"))},
 	}
-	runner := NewExecRunner(launcher)
+	runner := &ExecRunner{Launcher: launcher, WorkingDir: "/work"}
 
 	got, err := runner.ResumeThread(context.Background(), "thread-exact", TurnInput{
 		Prompt:    "continue",
@@ -77,9 +77,12 @@ func TestExecRunnerResumeUsesExactThreadIDAndNeverLast(t *testing.T) {
 	if !reflect.DeepEqual(launcher.req.Args, wantArgs) {
 		t.Fatalf("args = %#v, want %#v", launcher.req.Args, wantArgs)
 	}
+	if launcher.req.Dir != "/work" {
+		t.Fatalf("resume working dir = %q, want /work", launcher.req.Dir)
+	}
 	for _, arg := range launcher.req.Args {
-		if arg == "--last" {
-			t.Fatalf("resume args included --last: %#v", launcher.req.Args)
+		if arg == "--last" || arg == "-C" {
+			t.Fatalf("resume args included unsupported resume arg %q: %#v", arg, launcher.req.Args)
 		}
 	}
 	if got.ThreadID != "thread-exact" {

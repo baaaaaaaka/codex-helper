@@ -22,7 +22,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "app", "beacon", "history", "init", "proxy", "run", "skills", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "app", "beacon", "history", "init", "model-profile", "proxy", "responses", "run", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -31,6 +31,52 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	if cmd.Flags().Lookup("upgrade-codex") == nil {
 		t.Fatal("expected --upgrade-codex flag")
+	}
+	appCmd, _, err := cmd.Find([]string{"app"})
+	if err != nil {
+		t.Fatalf("find app command: %v", err)
+	}
+	if appCmd.Flags().Lookup("model-profile") == nil {
+		t.Fatal("app command should expose --model-profile")
+	}
+}
+
+func TestModelProfileCommandWiresPlannedSubcommands(t *testing.T) {
+	cmd := newRootCmd()
+	modelCmd, _, err := cmd.Find([]string{"model-profile"})
+	if err != nil {
+		t.Fatalf("find model-profile command: %v", err)
+	}
+	var names []string
+	for _, sub := range modelCmd.Commands() {
+		names = append(names, sub.Name())
+	}
+	sort.Strings(names)
+	want := []string{"delete", "doctor", "list", "set-default", "setup"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("unexpected model-profile subcommands\n got: %#v\nwant: %#v", names, want)
+	}
+	setupCmd, _, err := modelCmd.Find([]string{"setup"})
+	if err != nil {
+		t.Fatalf("find model-profile setup: %v", err)
+	}
+	for _, name := range []string{"provider", "api-key-env", "api-key-stdin", "ssh-proxy", "set-default", "no-doctor"} {
+		if setupCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("model-profile setup should expose --%s", name)
+		}
+	}
+}
+
+func TestResponsesCommandWiresServeFlags(t *testing.T) {
+	cmd := newRootCmd()
+	serveCmd, _, err := cmd.Find([]string{"responses", "serve"})
+	if err != nil {
+		t.Fatalf("find responses serve command: %v", err)
+	}
+	for _, name := range []string{"listen", "base-url", "api-key", "api-key-env", "model", "provider", "store-path", "providers-json", "proxy-keys", "scope-salt"} {
+		if serveCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("responses serve should expose --%s", name)
+		}
 	}
 }
 
@@ -104,6 +150,9 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 		t.Fatal("teams run should expose --codex-timeout")
 	} else if flag.DefValue != "0s" {
 		t.Fatalf("teams run --codex-timeout default = %q, want 0s", flag.DefValue)
+	}
+	if runCmd.Flags().Lookup("model-profile") == nil {
+		t.Fatal("teams run should expose --model-profile")
 	}
 	if flag := runCmd.Flags().Lookup("asr-command"); flag == nil {
 		t.Fatal("teams run should keep developer ASR override wired")

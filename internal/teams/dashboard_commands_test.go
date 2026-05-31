@@ -70,6 +70,11 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "helper status", name: DashboardCommandStatus},
 		{text: "helper skills", name: DashboardCommandSkills},
 		{text: "helper skills sync acme", name: DashboardCommandSkills, raw: "sync acme"},
+		{text: "model list", name: DashboardCommandModel, raw: "list"},
+		{text: "model key confirm ABCD2345", name: DashboardCommandModel, raw: "key confirm ABCD2345"},
+		{text: "models", name: DashboardCommandModel},
+		{text: "helper model default mimo25", name: DashboardCommandModel, raw: "default mimo25"},
+		{text: "/model doctor deepseek", name: DashboardCommandModel, raw: "doctor deepseek"},
 		{text: "beacon list", name: DashboardCommandBeacon, raw: "list"},
 		{text: "/beacon machine list", name: DashboardCommandBeacon, raw: "machine list"},
 		{text: "helper beacon profile list", name: DashboardCommandBeacon, raw: "profile list"},
@@ -188,7 +193,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper file report.txt", "helper publish-history", "helper skills push", "codex status", "codex stats", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper file report.txt", "helper publish-history", "helper skills push", "model status", "models", "helper model switch mimo25", "codex status", "codex stats", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {
