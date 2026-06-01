@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -143,7 +144,7 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	}
 }
 
-func TestTeamsCodexLauncherModelProfileWithoutSSHSkipsGenericProxyPromptCI(t *testing.T) {
+func TestTeamsCodexLauncherModelProfileWithoutSSHRespectsDisabledProxyPreferenceCI(t *testing.T) {
 	lockCLITestHooks(t)
 	if os.PathSeparator != '/' {
 		t.Skip("shell stub test uses POSIX script")
@@ -154,8 +155,10 @@ func TestTeamsCodexLauncherModelProfileWithoutSSHSkipsGenericProxyPromptCI(t *te
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	disabled := false
 	if err := store.Save(config.Config{
-		Version: config.CurrentVersion,
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &disabled,
 		ModelProfiles: map[string]config.ModelProfile{
 			"deepseek-live": {
 				Provider:  "deepseek",
@@ -182,8 +185,7 @@ func TestTeamsCodexLauncherModelProfileWithoutSSHSkipsGenericProxyPromptCI(t *te
 		runTargetWithFallbackWithOptionsFn = prevRunTarget
 	})
 	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		t.Fatal("Teams model profile without ssh proxy should not prompt for generic proxy preference")
-		return false, config.Config{}, nil
+		return false, config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}, nil
 	}
 
 	var gotArgs []string
@@ -211,13 +213,78 @@ func TestTeamsCodexLauncherModelProfileWithoutSSHSkipsGenericProxyPromptCI(t *te
 		t.Fatalf("exit code = %d", result.ExitCode)
 	}
 	if gotOpts.UseProxy {
-		t.Fatalf("UseProxy = true, want false for model profile without ssh")
+		t.Fatalf("UseProxy = true, want false when global proxy preference is disabled")
 	}
 	if envValue(gotOpts.ExtraEnv, envCXPResponsesProxyKey) == "" {
 		t.Fatalf("missing model profile proxy key env: %v", gotOpts.ExtraEnv)
 	}
 	if !strings.Contains(strings.Join(gotArgs, "\n"), `model_providers.`+cxpCodexModelProviderID+`.requires_openai_auth=false`) {
 		t.Fatalf("missing third-party codex config override: %v", gotArgs)
+	}
+}
+
+func TestTeamsCodexLauncherModelProfileWithoutSSHUsesGlobalProxyPreferenceCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	for _, tc := range []struct {
+		name     string
+		snapshot modelprofile.Snapshot
+	}{
+		{
+			name:     "default",
+			snapshot: modelprofile.Snapshot{Name: "default", Provider: "default", Revision: 1},
+		},
+		{
+			name:     "third-party",
+			snapshot: modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", APIKeyRef: "env:MIMO_KEY", Revision: 1},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "config.json")
+			store, err := config.NewStore(cfgPath)
+			if err != nil {
+				t.Fatalf("NewStore: %v", err)
+			}
+			enabled := true
+			profile := config.Profile{ID: "p1", Name: "primary", Host: "example.com", User: "coder", CreatedAt: time.Now()}
+			if err := store.Save(config.Config{
+				Version:      config.CurrentVersion,
+				ProxyEnabled: &enabled,
+				Profiles:     []config.Profile{profile},
+			}); err != nil {
+				t.Fatalf("Save config: %v", err)
+			}
+
+			prevEnsureProxy := ensureProxyPreferenceRunFn
+			prevEnsureProfile := ensureProfileRunFn
+			t.Cleanup(func() {
+				ensureProxyPreferenceRunFn = prevEnsureProxy
+				ensureProfileRunFn = prevEnsureProfile
+			})
+			ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+				return true, config.Config{Version: config.CurrentVersion, ProxyEnabled: &enabled, Profiles: []config.Profile{profile}}, nil
+			}
+			wantErr := errors.New("stop after proxy selection")
+			var gotProfileRef string
+			ensureProfileRunFn = func(_ context.Context, _ *config.Store, profileRef string, _ bool, _ io.Writer) (config.Profile, config.Config, error) {
+				gotProfileRef = profileRef
+				return config.Profile{}, config.Config{}, wantErr
+			}
+
+			launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard, modelProfileSnapshot: tc.snapshot}
+			_, err = launcher.Launch(context.Background(), codexrunner.LaunchRequest{
+				Command: "codex",
+				Args:    []string{"exec", "--json", "-"},
+				Dir:     t.TempDir(),
+				Stdin:   "prompt text",
+			})
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("Launch error = %v, want %v", err, wantErr)
+			}
+			if gotProfileRef != "" {
+				t.Fatalf("profile ref = %q, want generic global proxy profile selection", gotProfileRef)
+			}
+		})
 	}
 }
 
@@ -742,7 +809,8 @@ func TestTeamsCodexExecutorSessionModelProfileLaunchInjectsAdapterCI(t *testing.
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
+	disabled := false
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	t.Setenv("MIMO_KEY_PINNED", "sk-ci-mimo")
@@ -761,8 +829,7 @@ func TestTeamsCodexExecutorSessionModelProfileLaunchInjectsAdapterCI(t *testing.
 		runTargetWithFallbackWithOptionsFn = prevRunTarget
 	})
 	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		t.Fatal("session model profile without ssh proxy should not prompt for generic proxy preference")
-		return false, config.Config{}, nil
+		return false, config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}, nil
 	}
 
 	var gotArgs []string
@@ -798,7 +865,7 @@ func TestTeamsCodexExecutorSessionModelProfileLaunchInjectsAdapterCI(t *testing.
 		t.Fatalf("thread id = %q", result.CodexThreadID)
 	}
 	if gotOpts.UseProxy {
-		t.Fatalf("UseProxy = true, want false for session model profile without ssh")
+		t.Fatalf("UseProxy = true, want false when global proxy preference is disabled")
 	}
 	if gotOpts.ModelProfileRef != "" || gotOpts.ModelProfileSnapshot.Provider != "mimo" || gotOpts.ModelProfileSnapshot.APIKeyRef != "env:MIMO_KEY_PINNED" {
 		t.Fatalf("model profile opts = ref %q snapshot %#v", gotOpts.ModelProfileRef, gotOpts.ModelProfileSnapshot)
@@ -840,9 +907,10 @@ func TestTeamsCodexExecutorProfileRunnerCacheIsConcurrentAndSnapshotScoped(t *te
 		runnersByProfile: map[string]codexrunner.Runner{},
 	}
 	snapshots := []modelprofile.Snapshot{
-		{Name: "mimo25", Provider: "mimo", APIKeyRef: "env:MIMO_KEY_A", Revision: 1},
-		{Name: "mimo25", Provider: "mimo", APIKeyRef: "env:MIMO_KEY_B", Revision: 1},
-		{Name: "deepseek", Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_KEY", SSHProxy: "jump-a", Revision: 2},
+		{Name: "mimo25", Provider: "mimo", Model: "mimo/mimo-v2.5", APIKeyRef: "env:MIMO_KEY_A", Revision: 1},
+		{Name: "mimo25", Provider: "mimo", Model: "mimo/mimo-v2.5-pro", APIKeyRef: "env:MIMO_KEY_A", Revision: 1},
+		{Name: "mimo25", Provider: "mimo", Model: "mimo/mimo-v2.5-pro", APIKeyRef: "env:MIMO_KEY_B", Revision: 1},
+		{Name: "deepseek", Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", APIKeyRef: "env:DEEPSEEK_KEY", SSHProxy: "jump-a", Revision: 2},
 	}
 
 	var wg sync.WaitGroup

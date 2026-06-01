@@ -27,6 +27,7 @@ type ModelSpec struct {
 	UpstreamID       string
 	DisplayName      string
 	Description      string
+	Aliases          []string
 	ContextWindow    int
 	MaxContextWindow int
 	SupportsTools    bool
@@ -96,12 +97,106 @@ func (p ProviderSpec) ModelCatalog() []ModelSpec {
 }
 
 func (p ProviderSpec) DefaultPublicModel() string {
+	if model, ok := p.ResolveModel(p.DefaultModel); ok {
+		return model.PublicID()
+	}
 	for _, model := range p.ModelCatalog() {
 		if model.PublicID() != "" {
 			return model.PublicID()
 		}
 	}
 	return strings.TrimSpace(p.DefaultModel)
+}
+
+func (p ProviderSpec) ResolveModel(ref string) (ModelSpec, bool) {
+	models := p.ModelCatalog()
+	if len(models) == 0 {
+		return ModelSpec{}, false
+	}
+	ref = strings.ToLower(strings.TrimSpace(ref))
+	if ref == "" {
+		ref = strings.ToLower(strings.TrimSpace(p.DefaultModel))
+	}
+	if ref == "" {
+		return models[0], true
+	}
+	var matched *ModelSpec
+	for i := range models {
+		model := models[i]
+		for _, alias := range modelAliases(p.ID, model) {
+			if strings.ToLower(strings.TrimSpace(alias)) != ref {
+				continue
+			}
+			if matched != nil && !strings.EqualFold(matched.PublicID(), model.PublicID()) {
+				return ModelSpec{}, false
+			}
+			copy := model
+			matched = &copy
+		}
+	}
+	if matched != nil {
+		return *matched, true
+	}
+	return ModelSpec{}, false
+}
+
+func (p ProviderSpec) MustResolveModel(ref string) (ModelSpec, error) {
+	model, ok := p.ResolveModel(ref)
+	if ok {
+		return model, nil
+	}
+	choices := make([]string, 0, len(p.ModelCatalog()))
+	for _, model := range p.ModelCatalog() {
+		if id := model.PublicID(); id != "" {
+			choices = append(choices, id)
+		}
+	}
+	return ModelSpec{}, fmt.Errorf("unknown model %q for provider %q; available models: %s", strings.TrimSpace(ref), p.ID, strings.Join(choices, ", "))
+}
+
+func modelAliases(providerID string, model ModelSpec) []string {
+	raw := []string{
+		model.PublicID(),
+		model.UpstreamModel(),
+		model.DisplayName,
+	}
+	raw = append(raw, model.Aliases...)
+	providerID = strings.TrimSpace(providerID)
+	if providerID != "" {
+		prefix := providerID + "/"
+		raw = append(raw,
+			strings.TrimPrefix(model.PublicID(), prefix),
+			strings.TrimPrefix(model.UpstreamModel(), prefix),
+		)
+	}
+	for _, value := range []string{model.PublicID(), model.UpstreamModel()} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if idx := strings.LastIndex(value, "/"); idx >= 0 && idx+1 < len(value) {
+			raw = append(raw, value[idx+1:])
+			value = value[idx+1:]
+		}
+		if idx := strings.LastIndex(value, "-"); idx >= 0 && idx+1 < len(value) {
+			raw = append(raw, value[idx+1:])
+		}
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(raw))
+	for _, alias := range raw {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		key := strings.ToLower(alias)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, alias)
+	}
+	return out
 }
 
 var providerCatalog = map[string]ProviderSpec{
@@ -124,11 +219,23 @@ var providerCatalog = map[string]ProviderSpec{
 			UpstreamID:       "deepseek-v4-flash",
 			DisplayName:      "DeepSeek V4 Flash",
 			Description:      "Fast DeepSeek coding model routed by CXP.",
+			Aliases:          []string{"flash", "v4-flash", "default", "fast"},
 			ContextWindow:    128000,
 			MaxContextWindow: 128000,
 			SupportsTools:    true,
 			SupportsReason:   true,
 			Priority:         0,
+		}, {
+			ID:               "deepseek/deepseek-v4-pro",
+			UpstreamID:       "deepseek-v4-pro",
+			DisplayName:      "DeepSeek V4 Pro",
+			Description:      "Higher-quality DeepSeek coding model routed by CXP.",
+			Aliases:          []string{"pro", "v4-pro"},
+			ContextWindow:    128000,
+			MaxContextWindow: 128000,
+			SupportsTools:    true,
+			SupportsReason:   true,
+			Priority:         1,
 		}},
 	},
 	"mimo": {
@@ -146,6 +253,7 @@ var providerCatalog = map[string]ProviderSpec{
 			UpstreamID:       "mimo-v2.5",
 			DisplayName:      "MiMo 2.5",
 			Description:      "MiMo 2.5 family model routed by CXP.",
+			Aliases:          []string{"base", "standard", "normal", "default", "mimo25"},
 			ContextWindow:    128000,
 			MaxContextWindow: 128000,
 			SupportsTools:    true,
@@ -156,6 +264,7 @@ var providerCatalog = map[string]ProviderSpec{
 			UpstreamID:       "mimo-v2.5-pro",
 			DisplayName:      "MiMo 2.5 Pro",
 			Description:      "MiMo 2.5 Pro family model routed by CXP.",
+			Aliases:          []string{"pro", "mimo25-pro"},
 			ContextWindow:    128000,
 			MaxContextWindow: 128000,
 			SupportsTools:    true,

@@ -11,6 +11,7 @@ import (
 type Snapshot struct {
 	Name                string    `json:"name,omitempty"`
 	Provider            string    `json:"provider,omitempty"`
+	Model               string    `json:"model,omitempty"`
 	APIKeyRef           string    `json:"apiKeyRef,omitempty"`
 	SSHProxy            string    `json:"sshProxy,omitempty"`
 	Revision            int       `json:"revision,omitempty"`
@@ -18,6 +19,7 @@ type Snapshot struct {
 	BaseURLHash         string    `json:"baseUrlHash,omitempty"`
 	AdapterProfile      string    `json:"adapterProfile,omitempty"`
 	DefaultModel        string    `json:"defaultModel,omitempty"`
+	ModelFingerprint    string    `json:"modelFingerprint,omitempty"`
 	CatalogFingerprint  string    `json:"catalogFingerprint,omitempty"`
 	SSHProxyFingerprint string    `json:"sshProxyFingerprint,omitempty"`
 	CapturedAt          time.Time `json:"capturedAt,omitempty"`
@@ -27,6 +29,7 @@ type Resolved struct {
 	Name       string
 	Profile    config.ModelProfile
 	Provider   ProviderSpec
+	Model      ModelSpec
 	SSHProfile *config.Profile
 }
 
@@ -39,6 +42,16 @@ func (r Resolved) Revision() int {
 		return 1
 	}
 	return r.Profile.Revision
+}
+
+func (r Resolved) SelectedPublicModel() string {
+	if model := r.Model.PublicID(); strings.TrimSpace(model) != "" {
+		return model
+	}
+	if model := strings.TrimSpace(r.Profile.Model); model != "" {
+		return model
+	}
+	return r.Provider.DefaultPublicModel()
 }
 
 func (r Resolved) Snapshot(now time.Time) Snapshot {
@@ -56,15 +69,18 @@ func (r Resolved) Snapshot(now time.Time) Snapshot {
 	if provider == "" {
 		provider = DefaultProvider
 	}
+	model := strings.TrimSpace(r.SelectedPublicModel())
 	return Snapshot{
 		Name:                name,
 		Provider:            provider,
+		Model:               model,
 		APIKeyRef:           strings.TrimSpace(r.Profile.APIKeyRef),
 		SSHProxy:            strings.TrimSpace(r.Profile.SSHProxy),
 		Revision:            r.Revision(),
 		BaseURLHash:         BaseURLHash(r.Provider.BaseURL),
 		AdapterProfile:      strings.TrimSpace(r.Provider.AdapterProfile),
-		DefaultModel:        strings.TrimSpace(r.Provider.DefaultPublicModel()),
+		DefaultModel:        model,
+		ModelFingerprint:    ModelFingerprint(r.Provider, model),
 		CatalogFingerprint:  CatalogFingerprint(r.Provider),
 		SSHProxyFingerprint: SSHProxyFingerprint(r.SSHProfile),
 		CapturedAt:          now.UTC(),
@@ -94,10 +110,16 @@ func ValidateSnapshotRuntime(snapshot Snapshot, resolved Resolved, apiKey string
 	if strings.TrimSpace(snapshot.AdapterProfile) != "" && snapshot.AdapterProfile != expected.AdapterProfile {
 		return fmt.Errorf("model profile %q adapter profile changed since the chat was pinned", snapshot.Name)
 	}
+	if strings.TrimSpace(snapshot.Model) != "" && snapshot.Model != expected.Model {
+		return fmt.Errorf("model profile %q model changed since the chat was pinned", snapshot.Name)
+	}
 	if strings.TrimSpace(snapshot.DefaultModel) != "" && snapshot.DefaultModel != expected.DefaultModel {
 		return fmt.Errorf("model profile %q default model changed since the chat was pinned", snapshot.Name)
 	}
-	if strings.TrimSpace(snapshot.CatalogFingerprint) != "" && snapshot.CatalogFingerprint != expected.CatalogFingerprint {
+	if strings.TrimSpace(snapshot.ModelFingerprint) != "" && snapshot.ModelFingerprint != expected.ModelFingerprint {
+		return fmt.Errorf("model profile %q selected model mapping changed since the chat was pinned", snapshot.Name)
+	}
+	if strings.TrimSpace(snapshot.CatalogFingerprint) != "" && snapshot.CatalogFingerprint != expected.CatalogFingerprint && !snapshotSelectedModelStillCompatible(snapshot, resolved) {
 		return fmt.Errorf("model profile %q model catalog changed since the chat was pinned", snapshot.Name)
 	}
 	if strings.TrimSpace(snapshot.SSHProxyFingerprint) != "" && snapshot.SSHProxyFingerprint != expected.SSHProxyFingerprint {
@@ -115,6 +137,7 @@ func ValidateSnapshotRuntime(snapshot Snapshot, resolved Resolved, apiKey string
 func (s Snapshot) IsZero() bool {
 	return strings.TrimSpace(s.Name) == "" &&
 		strings.TrimSpace(s.Provider) == "" &&
+		strings.TrimSpace(s.Model) == "" &&
 		strings.TrimSpace(s.APIKeyRef) == "" &&
 		strings.TrimSpace(s.SSHProxy) == "" &&
 		s.Revision <= 0 &&
@@ -122,6 +145,7 @@ func (s Snapshot) IsZero() bool {
 		strings.TrimSpace(s.BaseURLHash) == "" &&
 		strings.TrimSpace(s.AdapterProfile) == "" &&
 		strings.TrimSpace(s.DefaultModel) == "" &&
+		strings.TrimSpace(s.ModelFingerprint) == "" &&
 		strings.TrimSpace(s.CatalogFingerprint) == "" &&
 		strings.TrimSpace(s.SSHProxyFingerprint) == "" &&
 		s.CapturedAt.IsZero()
@@ -166,6 +190,13 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 	if spec.UsesAdapter && strings.TrimSpace(profile.APIKeyRef) == "" {
 		return Resolved{}, fmt.Errorf("model profile %q requires an api key for provider %q", name, spec.ID)
 	}
+	selectedModel, ok := spec.ResolveModel(profile.Model)
+	if spec.UsesAdapter && !ok {
+		return Resolved{}, unknownModelForProfileError(name, spec, profile.Model)
+	}
+	if ok {
+		profile.Model = selectedModel.PublicID()
+	}
 
 	var sshProfile *config.Profile
 	if strings.TrimSpace(profile.SSHProxy) != "" {
@@ -180,6 +211,7 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 		Name:       name,
 		Profile:    profile,
 		Provider:   spec,
+		Model:      selectedModel,
 		SSHProfile: sshProfile,
 	}, nil
 }
@@ -198,6 +230,7 @@ func ResolveSnapshot(cfg config.Config, snapshot Snapshot) (Resolved, error) {
 	}
 	profile := config.ModelProfile{
 		Provider:  providerID,
+		Model:     strings.TrimSpace(firstNonEmpty(snapshot.Model, snapshot.DefaultModel)),
 		APIKeyRef: strings.TrimSpace(snapshot.APIKeyRef),
 		SSHProxy:  strings.TrimSpace(snapshot.SSHProxy),
 		Revision:  snapshot.Revision,
@@ -212,6 +245,13 @@ func ResolveSnapshot(cfg config.Config, snapshot Snapshot) (Resolved, error) {
 	if spec.UsesAdapter && strings.TrimSpace(profile.APIKeyRef) == "" {
 		return Resolved{}, fmt.Errorf("model profile %q requires an api key for provider %q", name, spec.ID)
 	}
+	selectedModel, ok := spec.ResolveModel(profile.Model)
+	if spec.UsesAdapter && !ok {
+		return Resolved{}, unknownModelForProfileError(name, spec, profile.Model)
+	}
+	if ok {
+		profile.Model = selectedModel.PublicID()
+	}
 	var sshProfile *config.Profile
 	if strings.TrimSpace(profile.SSHProxy) != "" {
 		p, ok := cfg.FindProfile(profile.SSHProxy)
@@ -220,7 +260,7 @@ func ResolveSnapshot(cfg config.Config, snapshot Snapshot) (Resolved, error) {
 		}
 		sshProfile = &p
 	}
-	return Resolved{Name: name, Profile: profile, Provider: spec, SSHProfile: sshProfile}, nil
+	return Resolved{Name: name, Profile: profile, Provider: spec, Model: selectedModel, SSHProfile: sshProfile}, nil
 }
 
 func findNamedModelProfile(cfg config.Config, ref string) (string, config.ModelProfile, bool) {
@@ -234,4 +274,21 @@ func findNamedModelProfile(cfg config.Config, ref string) (string, config.ModelP
 		}
 	}
 	return "", config.ModelProfile{}, false
+}
+
+func snapshotSelectedModelStillCompatible(snapshot Snapshot, resolved Resolved) bool {
+	modelRef := strings.TrimSpace(firstNonEmpty(snapshot.Model, snapshot.DefaultModel))
+	if modelRef == "" {
+		return false
+	}
+	model, ok := resolved.Provider.ResolveModel(modelRef)
+	return ok && strings.EqualFold(model.PublicID(), resolved.SelectedPublicModel())
+}
+
+func unknownModelForProfileError(name string, spec ProviderSpec, ref string) error {
+	_, err := spec.MustResolveModel(ref)
+	if err != nil {
+		return fmt.Errorf("model profile %q references %w", name, err)
+	}
+	return fmt.Errorf("model profile %q references unknown model %q for provider %q", name, strings.TrimSpace(ref), spec.ID)
 }

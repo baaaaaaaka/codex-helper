@@ -13,7 +13,6 @@ import (
 )
 
 func TestTeamsThirdPartyCacheStressMultiChatLongConversationMockCI(t *testing.T) {
-	t.Parallel()
 	ctx := context.Background()
 	graph, _ := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
@@ -27,9 +26,10 @@ func TestTeamsThirdPartyCacheStressMultiChatLongConversationMockCI(t *testing.T)
 		Profile  modelprofile.Snapshot
 		Revision int
 	}{
-		{ID: "cache-a", ChatID: "chat-cache-a", Profile: modelprofile.Snapshot{Name: "deepseek-live", Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_API_KEY", Revision: 1, CapturedAt: now}},
-		{ID: "cache-b", ChatID: "chat-cache-b", Profile: modelprofile.Snapshot{Name: "mimo25-live", Provider: "mimo", APIKeyRef: "env:MIMO_API_KEY", SSHProxy: "mimo-jump", Revision: 2, CapturedAt: now}},
-		{ID: "cache-c", ChatID: "chat-cache-c", Profile: modelprofile.Snapshot{Name: "deepseek-alt", Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_API_KEY_ALT", SSHProxy: "deepseek-jump", Revision: 3, CapturedAt: now}},
+		{ID: "cache-a", ChatID: "chat-cache-a", Profile: modelprofile.Snapshot{Name: "deepseek-live", Provider: "deepseek", Model: "deepseek/deepseek-v4-flash", APIKeyRef: "env:DEEPSEEK_API_KEY", Revision: 1, CapturedAt: now}},
+		{ID: "cache-b", ChatID: "chat-cache-b", Profile: modelprofile.Snapshot{Name: "mimo25-live", Provider: "mimo", Model: "mimo/mimo-v2.5-pro", APIKeyRef: "env:MIMO_API_KEY", SSHProxy: "mimo-jump", Revision: 2, CapturedAt: now}},
+		{ID: "cache-c", ChatID: "chat-cache-c", Profile: modelprofile.Snapshot{Name: "deepseek-alt", Provider: "deepseek", Model: "deepseek/deepseek-v4-flash", APIKeyRef: "env:DEEPSEEK_API_KEY_ALT", SSHProxy: "deepseek-jump", Revision: 3, CapturedAt: now}},
+		{ID: "cache-d", ChatID: "chat-cache-d", Profile: modelprofile.Snapshot{Name: "deepseek-live", Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", APIKeyRef: "env:DEEPSEEK_API_KEY", Revision: 1, CapturedAt: now}},
 	}
 	bridge.reg.Sessions = nil
 	for _, scenario := range scenarios {
@@ -50,9 +50,9 @@ func TestTeamsThirdPartyCacheStressMultiChatLongConversationMockCI(t *testing.T)
 	}
 
 	orders := [][]int{
-		{0, 1, 2},
-		{2, 0, 1},
-		{1, 2, 0},
+		{0, 1, 2, 3},
+		{3, 2, 0, 1},
+		{1, 3, 2, 0},
 	}
 	const rounds = 8
 	for round := 0; round < rounds; round++ {
@@ -129,6 +129,7 @@ func mockCacheStressMarker(sessionID string, round int) string {
 type mockCacheStressObservation struct {
 	SessionID string
 	Provider  string
+	Model     string
 	Profile   modelprofile.Snapshot
 	ThreadID  string
 	Turn      int
@@ -186,6 +187,7 @@ func (e *mockCacheStressExecutor) RunWithEventHandler(ctx context.Context, sessi
 	e.observations = append(e.observations, mockCacheStressObservation{
 		SessionID: session.ID,
 		Provider:  session.ModelProfile.Provider,
+		Model:     session.ModelProfile.Model,
 		Profile:   session.ModelProfile,
 		ThreadID:  threadID,
 		Turn:      count,
@@ -198,7 +200,7 @@ func (e *mockCacheStressExecutor) RunWithEventHandler(ctx context.Context, sessi
 		handler(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Text: fmt.Sprintf("mock cache continuing %s turn %02d", session.ID, count)})
 	}
 	return ExecutionResult{
-		Text:          fmt.Sprintf("MOCK_CACHE_STRESS_OK %s provider=%s turn=%02d input=%d cached=%d", marker, session.ModelProfile.Provider, count, input, cached),
+		Text:          fmt.Sprintf("MOCK_CACHE_STRESS_OK %s provider=%s model=%s turn=%02d input=%d cached=%d", marker, session.ModelProfile.Provider, session.ModelProfile.Model, count, input, cached),
 		CodexThreadID: threadID,
 		CodexTurnID:   fmt.Sprintf("turn-%s-%02d", session.ID, count),
 	}, nil
@@ -223,6 +225,7 @@ func (e *mockCacheStressExecutor) assertStableCache(t *testing.T, rounds int) {
 	for sessionID, observations := range bySession {
 		threadID := ""
 		provider := ""
+		model := ""
 		for _, obs := range observations {
 			if threadID == "" {
 				threadID = obs.ThreadID
@@ -233,6 +236,11 @@ func (e *mockCacheStressExecutor) assertStableCache(t *testing.T, rounds int) {
 				provider = obs.Provider
 			} else if obs.Provider != provider {
 				t.Fatalf("%s provider changed from %s to %s; observations=%#v", sessionID, provider, obs.Provider, observations)
+			}
+			if model == "" {
+				model = obs.Model
+			} else if obs.Model != model {
+				t.Fatalf("%s model changed from %s to %s; observations=%#v", sessionID, model, obs.Model, observations)
 			}
 			if obs.Turn > 1 && obs.Cached <= 0 {
 				t.Fatalf("%s turn %02d did not simulate a cache hit: %#v", sessionID, obs.Turn, obs)

@@ -159,19 +159,15 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 
 	useProxy := false
 	var cfg config.Config
+	proxyRef := strings.TrimSpace(opts.profileRef)
 	if strings.TrimSpace(opts.profileRef) != "" {
 		cfg, err = store.Load()
 		if err != nil {
 			return err
 		}
 		useProxy = true
-	} else if strings.TrimSpace(opts.modelProfileRef) == "" {
-		useProxy, cfg, err = ensureProxyPreferenceFunc(ctx, store, opts.profileRef, cmd.ErrOrStderr())
-		if err != nil {
-			return err
-		}
 	} else {
-		cfg, err = store.Load()
+		useProxy, cfg, err = ensureProxyPreferenceFunc(ctx, store, "", cmd.ErrOrStderr())
 		if err != nil {
 			return err
 		}
@@ -179,7 +175,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 
 	var profile *config.Profile
 	if useProxy {
-		p, cfgWithProfile, err := ensureProfileFunc(ctx, store, opts.profileRef, true, cmd.OutOrStdout())
+		p, cfgWithProfile, err := ensureProfileFunc(ctx, store, proxyRef, true, cmd.OutOrStdout())
 		if err != nil {
 			return err
 		}
@@ -192,6 +188,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 			cfg.ProxyEnabled = &enabled
 		}
 		profile = &p
+		proxyRef = p.ID
 	}
 
 	launchOpts, err := codexDesktopAppLaunchOptions(root, opts.codexDir, cwd, platform, opts.appPath, cmd.ErrOrStderr())
@@ -208,7 +205,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 	}
 
 	if strings.TrimSpace(opts.modelProfileRef) != "" {
-		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, cmd.ErrOrStderr())
+		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, proxyRef, cmd.ErrOrStderr())
 		if err != nil {
 			return err
 		}

@@ -148,7 +148,7 @@ func modelControlUsage() string {
 		"- `model list` - list profiles",
 		"- `model providers` - list supported providers",
 		"- `model setup <provider> [name]` - show setup commands",
-		"- `model setup <provider> [name] --teams-key-intake` - configure a key from Teams with a one-time code",
+		"- `model setup <provider> [name] --model <model> --teams-key-intake` - configure a key from Teams with a one-time code",
 		"- `model key confirm <code>` then `model key <code> <api-key>` - finish Teams key intake",
 		"- `model doctor <name>` - validate a profile",
 		"- `model default <name>` - set the default for future chats",

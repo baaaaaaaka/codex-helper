@@ -320,9 +320,13 @@ func TestProviderRegistryStressConcurrentResolve(t *testing.T) {
 				ID:           "deepseek",
 				ProfileID:    "deepseek",
 				APIKey:       "sk-deepseek",
-				DefaultModel: "deepseek-v4-flash",
-				Models:       []ModelInfo{{ID: "deepseek-v4-flash"}, {ID: "shared-coder"}},
-				Adapter:      runtimeEchoAdapter{},
+				DefaultModel: "deepseek/deepseek-v4-flash",
+				Models: []ModelInfo{
+					{ID: "deepseek/deepseek-v4-flash", UpstreamID: "deepseek-v4-flash"},
+					{ID: "deepseek/deepseek-v4-pro", UpstreamID: "deepseek-v4-pro"},
+					{ID: "shared-coder"},
+				},
+				Adapter: runtimeEchoAdapter{},
 			},
 			{
 				ID:           "qwen",
@@ -347,11 +351,12 @@ func TestProviderRegistryStressConcurrentResolve(t *testing.T) {
 	}
 	cases := []resolveCase{
 		{name: "mimo locked key", auth: "mi-key", model: "mimo-v2.5", wantProvider: "mimo", wantModel: "mimo-v2.5"},
-		{name: "deepseek locked key", auth: "ds-key", model: "deepseek-v4-flash", wantProvider: "deepseek", wantModel: "deepseek-v4-flash"},
+		{name: "deepseek locked key flash", auth: "ds-key", model: "deepseek/deepseek-v4-flash", wantProvider: "deepseek", wantModel: "deepseek-v4-flash"},
+		{name: "deepseek locked key pro", auth: "ds-key", model: "deepseek/deepseek-v4-pro", wantProvider: "deepseek", wantModel: "deepseek-v4-pro"},
 		{name: "wildcard qwen", auth: "all-key", model: "qwen-coder", wantProvider: "qwen", wantModel: "qwen-coder"},
 		{name: "ambiguous model with explicit provider", auth: "all-key", model: "shared-coder", providerHeader: "mimo", wantProvider: "mimo", wantModel: "shared-coder"},
 		{name: "missing proxy key", model: "mimo-v2.5", wantStatus: http.StatusUnauthorized},
-		{name: "locked key wrong model", auth: "mi-key", model: "deepseek-v4-flash", wantStatus: http.StatusUnauthorized},
+		{name: "locked key wrong model", auth: "mi-key", model: "deepseek/deepseek-v4-flash", wantStatus: http.StatusUnauthorized},
 		{name: "ambiguous model without provider", auth: "all-key", model: "shared-coder", wantStatus: http.StatusConflict},
 	}
 

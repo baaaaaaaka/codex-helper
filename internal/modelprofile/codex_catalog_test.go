@@ -56,7 +56,40 @@ func TestProviderSpecDefaultPublicModel(t *testing.T) {
 		t.Fatalf("DefaultPublicModel = %q", got)
 	}
 	models := spec.ModelCatalog()
-	if len(models) != 1 || models[0].UpstreamModel() != "deepseek-v4-flash" {
+	if len(models) != 2 || models[0].UpstreamModel() != "deepseek-v4-flash" || models[1].UpstreamModel() != "deepseek-v4-pro" {
 		t.Fatalf("models = %#v", models)
+	}
+	if got, ok := spec.ResolveModel("pro"); !ok || got.PublicID() != "deepseek/deepseek-v4-pro" {
+		t.Fatalf("ResolveModel(pro) = %#v ok=%v", got, ok)
+	}
+	if got, ok := spec.ResolveModel("flash"); !ok || got.PublicID() != "deepseek/deepseek-v4-flash" {
+		t.Fatalf("ResolveModel(flash) = %#v ok=%v", got, ok)
+	}
+}
+
+func TestMiMoProviderSpecResolvesTierAliases(t *testing.T) {
+	spec, err := MustLookupProvider("mimo")
+	if err != nil {
+		t.Fatalf("lookup mimo: %v", err)
+	}
+	for _, tc := range []struct {
+		ref  string
+		want string
+	}{
+		{ref: "", want: "mimo/mimo-v2.5"},
+		{ref: "base", want: "mimo/mimo-v2.5"},
+		{ref: "standard", want: "mimo/mimo-v2.5"},
+		{ref: "mimo25", want: "mimo/mimo-v2.5"},
+		{ref: "mimo-v2.5", want: "mimo/mimo-v2.5"},
+		{ref: "mimo/mimo-v2.5", want: "mimo/mimo-v2.5"},
+		{ref: "pro", want: "mimo/mimo-v2.5-pro"},
+		{ref: "mimo25-pro", want: "mimo/mimo-v2.5-pro"},
+		{ref: "mimo-v2.5-pro", want: "mimo/mimo-v2.5-pro"},
+		{ref: "mimo/mimo-v2.5-pro", want: "mimo/mimo-v2.5-pro"},
+	} {
+		got, ok := spec.ResolveModel(tc.ref)
+		if !ok || got.PublicID() != tc.want {
+			t.Fatalf("ResolveModel(%q) = %#v ok=%v, want %q", tc.ref, got, ok, tc.want)
+		}
 	}
 }

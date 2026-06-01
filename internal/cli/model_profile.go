@@ -18,6 +18,7 @@ import (
 
 type modelProfileSetupOptions struct {
 	provider    string
+	model       string
 	apiKeyEnv   string
 	apiKeyStdin bool
 	sshProxy    string
@@ -55,6 +56,7 @@ func newModelProfileSetupCmd(root *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&opts.provider, "provider", "", "Model provider: default, deepseek, mimo, kimi, glm, minimax, qwen")
+	cmd.Flags().StringVar(&opts.model, "model", "", "Provider model to use by default, for example pro or deepseek/deepseek-v4-pro")
 	cmd.Flags().StringVar(&opts.apiKeyEnv, "api-key-env", "", "Environment variable containing the provider API key")
 	cmd.Flags().BoolVar(&opts.apiKeyStdin, "api-key-stdin", false, "Read the provider API key from stdin and save it to the local secret store")
 	cmd.Flags().StringVar(&opts.sshProxy, "ssh-proxy", "", "SSH proxy profile id or name to use for this model profile")
@@ -199,6 +201,25 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 		return fmt.Errorf("the built-in default model profile must use provider %q", modelprofile.DefaultProvider)
 	}
 	existing, existed := cfg.FindModelProfile(name)
+	modelRef := strings.TrimSpace(opts.model)
+	if modelRef == "" && strings.TrimSpace(existing.Model) != "" && strings.EqualFold(existing.Provider, spec.ID) {
+		modelRef = existing.Model
+	}
+	if modelRef == "" && spec.UsesAdapter && len(spec.ModelCatalog()) > 1 && term.IsTerminal(int(os.Stdin.Fd())) {
+		_, _ = fmt.Fprintf(os.Stderr, "Available models for %s:\n", spec.ID)
+		for _, model := range spec.ModelCatalog() {
+			_, _ = fmt.Fprintf(os.Stderr, "- %s (%s)%s\n", model.PublicID(), model.Label(), modelAliasSummary(model))
+		}
+		modelRef = prompt(reader, "Model", spec.DefaultPublicModel())
+	}
+	selectedModel, err := spec.MustResolveModel(modelRef)
+	if spec.UsesAdapter && err != nil {
+		return err
+	}
+	modelID := ""
+	if spec.UsesAdapter {
+		modelID = selectedModel.PublicID()
+	}
 
 	apiKeyRef := ""
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
@@ -244,7 +265,7 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 	revision := existing.Revision
 	if revision <= 0 {
 		revision = 1
-	} else if modelProfileSetupChanges(existing, spec.ID, apiKeyRef, sshProxy) {
+	} else if modelProfileSetupChanges(existing, spec.ID, modelID, apiKeyRef, sshProxy) {
 		revision++
 	}
 	createdAt := existing.CreatedAt
@@ -256,6 +277,7 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 	}
 	profile := config.ModelProfile{
 		Provider:  spec.ID,
+		Model:     modelID,
 		APIKeyRef: apiKeyRef,
 		SSHProxy:  sshProxy,
 		Revision:  revision,
@@ -280,8 +302,8 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 	if existed {
 		action = "Updated"
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s model profile %q (provider=%s, api_key=%s, ssh_proxy=%s, revision=%d)\n",
-		action, name, spec.ID, modelprofile.MaskRef(profile.APIKeyRef), emptyAsNone(profile.SSHProxy), profile.Revision)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s model profile %q (provider=%s, model=%s, api_key=%s, ssh_proxy=%s, revision=%d)\n",
+		action, name, spec.ID, emptyAsNone(profile.Model), modelprofile.MaskRef(profile.APIKeyRef), emptyAsNone(profile.SSHProxy), profile.Revision)
 	if !opts.noDoctor {
 		return runModelProfileDoctor(cmd.OutOrStdout(), store, name)
 	}
@@ -300,6 +322,9 @@ func runModelProfileDoctor(out io.Writer, store *config.Store, name string) erro
 	if out != nil {
 		_, _ = fmt.Fprintf(out, "OK  model profile %q\n", resolved.Name)
 		_, _ = fmt.Fprintf(out, "OK  provider %s\n", resolved.Provider.ID)
+		if resolved.Provider.UsesAdapter {
+			_, _ = fmt.Fprintf(out, "OK  model %s\n", resolved.SelectedPublicModel())
+		}
 	}
 	if resolved.Provider.UsesAdapter {
 		secrets := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
@@ -338,8 +363,14 @@ func printModelProfiles(out io.Writer, cfg config.Config) {
 		if provider == "" {
 			provider = modelprofile.DefaultProvider
 		}
-		_, _ = fmt.Fprintf(out, "%s %s: provider=%s api_key=%s ssh_proxy=%s revision=%d\n",
-			marker, name, provider, modelprofile.MaskRef(p.APIKeyRef), emptyAsNone(p.SSHProxy), maxInt(p.Revision, 1))
+		model := strings.TrimSpace(p.Model)
+		if model == "" {
+			if spec, ok := modelprofile.LookupProvider(provider); ok && spec.UsesAdapter {
+				model = spec.DefaultPublicModel()
+			}
+		}
+		_, _ = fmt.Fprintf(out, "%s %s: provider=%s model=%s api_key=%s ssh_proxy=%s revision=%d\n",
+			marker, name, provider, emptyAsNone(model), modelprofile.MaskRef(p.APIKeyRef), emptyAsNone(p.SSHProxy), maxInt(p.Revision, 1))
 	}
 	printOne(config.DefaultModelProfileName, config.ModelProfile{Provider: modelprofile.DefaultProvider, Revision: 1})
 	names := make([]string, 0, len(cfg.ModelProfiles))
@@ -365,13 +396,35 @@ func findModelProfileForCLI(cfg config.Config, ref string) (string, config.Model
 	return "", config.ModelProfile{}, false
 }
 
-func modelProfileSetupChanges(existing config.ModelProfile, provider string, apiKeyRef string, sshProxy string) bool {
+func modelProfileSetupChanges(existing config.ModelProfile, provider string, model string, apiKeyRef string, sshProxy string) bool {
 	if strings.TrimSpace(apiKeyRef) == "" {
 		apiKeyRef = existing.APIKeyRef
 	}
 	return strings.TrimSpace(existing.Provider) != strings.TrimSpace(provider) ||
+		strings.TrimSpace(existing.Model) != strings.TrimSpace(model) ||
 		strings.TrimSpace(existing.APIKeyRef) != strings.TrimSpace(apiKeyRef) ||
 		strings.TrimSpace(existing.SSHProxy) != strings.TrimSpace(sshProxy)
+}
+
+func modelAliasSummary(model modelprofile.ModelSpec) string {
+	aliases := make([]string, 0, len(model.Aliases))
+	seen := map[string]bool{}
+	for _, alias := range model.Aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		key := strings.ToLower(alias)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		aliases = append(aliases, alias)
+	}
+	if len(aliases) == 0 {
+		return ""
+	}
+	return " (aliases: " + strings.Join(aliases, ", ") + ")"
 }
 
 func readModelProfileAPIKey(in io.Reader) (string, error) {

@@ -45,6 +45,7 @@ type Profile struct {
 
 type ModelProfile struct {
 	Provider  string    `json:"provider"`
+	Model     string    `json:"model,omitempty"`
 	APIKeyRef string    `json:"apiKeyRef,omitempty"`
 	SSHProxy  string    `json:"sshProxy,omitempty"`
 	Revision  int       `json:"revision"`
@@ -68,8 +69,10 @@ type Instance struct {
 	LastSeenAt           time.Time `json:"lastSeenAt"`
 	ModelProfileName     string    `json:"modelProfileName,omitempty"`
 	ModelProvider        string    `json:"modelProvider,omitempty"`
+	ModelPublicModel     string    `json:"modelPublicModel,omitempty"`
 	ModelAPIKeyRef       string    `json:"modelApiKeyRef,omitempty"`
 	ModelSSHProxy        string    `json:"modelSshProxy,omitempty"`
+	ModelUpstreamProxyID string    `json:"modelUpstreamProxyId,omitempty"`
 	ModelRevision        int       `json:"modelRevision,omitempty"`
 	ModelProxyKey        string    `json:"modelProxyKey,omitempty"`
 	ModelProfileCaptured time.Time `json:"modelProfileCapturedAt,omitempty"`

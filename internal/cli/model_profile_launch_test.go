@@ -29,6 +29,7 @@ func TestPrepareCodexModelProfileForRunStartsAdapterAndInjectsConfig(t *testing.
 		ModelProfiles: map[string]config.ModelProfile{
 			"deepseek-work": {
 				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
 				APIKeyRef: "env:DEEPSEEK_API_KEY",
 				Revision:  2,
 			},
@@ -53,7 +54,7 @@ func TestPrepareCodexModelProfileForRunStartsAdapterAndInjectsConfig(t *testing.
 	joined := strings.Join(gotArgs, "\n")
 	for _, want := range []string{
 		`model_provider="cxp-thirdparty"`,
-		`model="deepseek/deepseek-v4-flash"`,
+		`model="deepseek/deepseek-v4-pro"`,
 		`model_catalog_json="`,
 		`model_providers.cxp-thirdparty.wire_api="responses"`,
 		`model_providers.cxp-thirdparty.requires_openai_auth=false`,
@@ -131,6 +132,7 @@ func TestStartModelProfileAdapterServesModels(t *testing.T) {
 		ModelProfiles: map[string]config.ModelProfile{
 			"mimo25": {
 				Provider:  "mimo",
+				Model:     "mimo/mimo-v2.5-pro",
 				APIKeyRef: "env:MIMO_API_KEY",
 				Revision:  1,
 			},
@@ -157,7 +159,7 @@ func TestStartModelProfileAdapterServesModels(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /models status=%d", resp.StatusCode)
 	}
-	if launch.Model != "mimo/mimo-v2.5" {
+	if launch.Model != "mimo/mimo-v2.5-pro" {
 		t.Fatalf("launch model = %q, want public model id", launch.Model)
 	}
 	if launch.CatalogPath == "" {
@@ -169,6 +171,102 @@ func TestStartModelProfileAdapterServesModels(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"slug": "mimo/mimo-v2.5"`) || !strings.Contains(string(raw), `"slug": "mimo/mimo-v2.5-pro"`) {
 		t.Fatalf("catalog missing MiMo public models:\n%s", raw)
+	}
+}
+
+func TestPrepareTeamsAppServerModelProfileWithoutSSHUsesGlobalProxyPreferenceCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	enabled := true
+	profile := config.Profile{ID: "p1", Name: "dev", Host: "host", Port: 22, User: "me"}
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{profile},
+		ModelProfiles: map[string]config.ModelProfile{
+			"mimo25": {Provider: "mimo", APIKeyRef: "env:MIMO_API_KEY", Revision: 1},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("MIMO_API_KEY", "sk-test")
+
+	prevEnsureProxyURL := codexAppEnsureProxyURLFn
+	t.Cleanup(func() { codexAppEnsureProxyURLFn = prevEnsureProxyURL })
+	codexAppEnsureProxyURLFn = func(_ context.Context, gotStore *config.Store, gotProfile config.Profile, _ []config.Instance, _ io.Writer) (string, error) {
+		if gotStore.Path() != store.Path() {
+			t.Fatalf("store path = %q, want %q", gotStore.Path(), store.Path())
+		}
+		if gotProfile.ID != profile.ID {
+			t.Fatalf("upstream profile = %#v, want %#v", gotProfile, profile)
+		}
+		return "http://127.0.0.1:23456", nil
+	}
+
+	args, env, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "mimo25", modelprofile.Snapshot{}, io.Discard)
+	if err != nil {
+		t.Fatalf("prepareTeamsAppServerModelProfile: %v", err)
+	}
+	if !slices.ContainsFunc(env, func(entry string) bool {
+		return strings.HasPrefix(entry, envCXPResponsesProxyKey+"=")
+	}) {
+		t.Fatalf("missing proxy key env: %v", env)
+	}
+	joined := strings.Join(args, "\n")
+	for _, want := range []string{
+		`model_provider="` + cxpCodexModelProviderID + `"`,
+		`model="mimo/mimo-v2.5"`,
+		`model_providers.` + cxpCodexModelProviderID + `.wire_api="responses"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("appserver args missing %q:\n%v", want, args)
+		}
+	}
+}
+
+func TestPrepareTeamsAppServerModelProfileClearsIncompleteProxyPreferenceCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		ModelProfiles: map[string]config.ModelProfile{
+			"mimo25": {Provider: "mimo", APIKeyRef: "env:MIMO_API_KEY", Revision: 1},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("MIMO_API_KEY", "sk-test")
+
+	prevEnsureProxyURL := codexAppEnsureProxyURLFn
+	t.Cleanup(func() { codexAppEnsureProxyURLFn = prevEnsureProxyURL })
+	codexAppEnsureProxyURLFn = func(context.Context, *config.Store, config.Profile, []config.Instance, io.Writer) (string, error) {
+		t.Fatal("incomplete ProxyEnabled=true state should not attempt to select a missing upstream proxy")
+		return "", nil
+	}
+
+	args, _, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "mimo25", modelprofile.Snapshot{}, io.Discard)
+	if err != nil {
+		t.Fatalf("prepareTeamsAppServerModelProfile: %v", err)
+	}
+	if joined := strings.Join(args, "\n"); !strings.Contains(joined, `model="mimo/mimo-v2.5"`) {
+		t.Fatalf("appserver args missing selected model:\n%v", args)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ProxyEnabled != nil {
+		t.Fatalf("incomplete proxy preference should be cleared, got %v", cfg.ProxyEnabled)
 	}
 }
 
@@ -192,7 +290,7 @@ func TestEnsureLongLivedModelProfileAdapterReusesHealthyInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	instanceProfileID := modelProfileAdapterInstanceProfileID(resolved, "sk-reusable", modelProfileAdapterListenHostForApp())
+	instanceProfileID := modelProfileAdapterInstanceProfileID(resolved, "sk-reusable", modelProfileAdapterListenHostForApp(), "")
 	const instanceID = "adapter-inst"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/_codex_proxy/health" {
@@ -234,7 +332,7 @@ func TestEnsureLongLivedModelProfileAdapterReusesHealthyInstance(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	launch, err := ensureLongLivedModelProfileAdapterForApp(context.Background(), store, "mimo25", io.Discard)
+	launch, err := ensureLongLivedModelProfileAdapterForApp(context.Background(), store, "mimo25", "", io.Discard)
 	if err != nil {
 		t.Fatalf("ensureLongLivedModelProfileAdapterForApp: %v", err)
 	}
@@ -250,5 +348,119 @@ func TestEnsureLongLivedModelProfileAdapterReusesHealthyInstance(t *testing.T) {
 	if !strings.Contains(string(launch.CatalogJSON), `"slug": "mimo/mimo-v2.5"`) ||
 		!strings.Contains(string(launch.CatalogJSON), `"slug": "mimo/mimo-v2.5-pro"`) {
 		t.Fatalf("launch catalog missing MiMo public models:\n%s", launch.CatalogJSON)
+	}
+}
+
+func TestModelProfileAdapterInstanceIdentitySeparatesSelectedModel(t *testing.T) {
+	cfg := config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-flash": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-flash",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  7,
+			},
+			"deepseek-pro": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  7,
+			},
+		},
+	}
+	flash, err := modelprofile.Resolve(cfg, "deepseek-flash")
+	if err != nil {
+		t.Fatalf("resolve flash: %v", err)
+	}
+	pro, err := modelprofile.Resolve(cfg, "deepseek-pro")
+	if err != nil {
+		t.Fatalf("resolve pro: %v", err)
+	}
+	if flash.SelectedPublicModel() != "deepseek/deepseek-v4-flash" || pro.SelectedPublicModel() != "deepseek/deepseek-v4-pro" {
+		t.Fatalf("selected models flash=%q pro=%q", flash.SelectedPublicModel(), pro.SelectedPublicModel())
+	}
+	flashID := modelProfileAdapterInstanceProfileID(flash, "sk-same-key", "127.0.0.1", "")
+	proID := modelProfileAdapterInstanceProfileID(pro, "sk-same-key", "127.0.0.1", "")
+	if flashID == proID {
+		t.Fatalf("adapter instance profile ID did not include selected model: %s", flashID)
+	}
+
+	inst := config.Instance{
+		HTTPPort:         12345,
+		ModelProxyKey:    "proxy-key",
+		ModelPublicModel: "deepseek/deepseek-v4-pro",
+	}
+	launch := modelProfileAdapterLaunchFromInstance(pro, inst)
+	if launch.Model != "deepseek/deepseek-v4-pro" {
+		t.Fatalf("launch model = %q", launch.Model)
+	}
+}
+
+func TestModelProfileUpstreamProxyProfileUsesFallbackOnlyWhenModelProfileHasNoSSH(t *testing.T) {
+	modelProxy := config.Profile{ID: "model-proxy", Name: "model"}
+	globalProxy := config.Profile{ID: "global-proxy", Name: "global"}
+	cfg := config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles:     []config.Profile{modelProxy, globalProxy},
+		ModelProfiles: map[string]config.ModelProfile{
+			"with-ssh": {Provider: "mimo", APIKeyRef: "env:MIMO_API_KEY", SSHProxy: "model", Revision: 1},
+			"no-ssh":   {Provider: "mimo", APIKeyRef: "env:MIMO_API_KEY", Revision: 1},
+		},
+	}
+	withSSH, err := modelprofile.Resolve(cfg, "with-ssh")
+	if err != nil {
+		t.Fatalf("resolve with ssh: %v", err)
+	}
+	got, err := modelProfileUpstreamProxyProfile(cfg, withSSH, "global")
+	if err != nil {
+		t.Fatalf("modelProfileUpstreamProxyProfile with ssh: %v", err)
+	}
+	if got == nil || got.ID != modelProxy.ID {
+		t.Fatalf("explicit model ssh proxy should win, got %#v", got)
+	}
+
+	noSSH, err := modelprofile.Resolve(cfg, "no-ssh")
+	if err != nil {
+		t.Fatalf("resolve no ssh: %v", err)
+	}
+	got, err = modelProfileUpstreamProxyProfile(cfg, noSSH, "global")
+	if err != nil {
+		t.Fatalf("modelProfileUpstreamProxyProfile no ssh: %v", err)
+	}
+	if got == nil || got.ID != globalProxy.ID {
+		t.Fatalf("fallback global proxy = %#v, want %#v", got, globalProxy)
+	}
+
+	disabled := false
+	cfg.ProxyEnabled = &disabled
+	got, err = modelProfileUpstreamProxyProfile(cfg, noSSH, "")
+	if err != nil {
+		t.Fatalf("modelProfileUpstreamProxyProfile disabled: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("disabled global proxy should not select an upstream profile: %#v", got)
+	}
+}
+
+func TestModelProfileAdapterInstanceIdentitySeparatesUpstreamProxy(t *testing.T) {
+	cfg := config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"mimo25": {Provider: "mimo", APIKeyRef: "env:MIMO_API_KEY", Revision: 1},
+		},
+	}
+	resolved, err := modelprofile.Resolve(cfg, "mimo25")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	proxyA := config.Profile{ID: "a", Name: "a", Host: "a.example", Port: 22, User: "me"}
+	proxyB := config.Profile{ID: "b", Name: "b", Host: "b.example", Port: 22, User: "me"}
+	withoutProxy := modelProfileAdapterInstanceProfileID(resolved, "sk-same-key", "127.0.0.1", "")
+	withProxyA := modelProfileAdapterInstanceProfileID(resolved, "sk-same-key", "127.0.0.1", modelprofile.SSHProxyFingerprint(&proxyA))
+	withProxyB := modelProfileAdapterInstanceProfileID(resolved, "sk-same-key", "127.0.0.1", modelprofile.SSHProxyFingerprint(&proxyB))
+	if withoutProxy == withProxyA || withProxyA == withProxyB || withoutProxy == withProxyB {
+		t.Fatalf("adapter instance identity should include upstream proxy: none=%s a=%s b=%s", withoutProxy, withProxyA, withProxyB)
 	}
 }

@@ -211,6 +211,7 @@ type ModelProfileManager interface {
 type ModelProfileAPIKeySaveRequest struct {
 	ProfileName string
 	Provider    string
+	Model       string
 	APIKey      string
 	SSHProxy    string
 	SetDefault  bool
@@ -219,6 +220,7 @@ type ModelProfileAPIKeySaveRequest struct {
 type ModelProfileAPIKeySaveResult struct {
 	ProfileName string
 	Provider    string
+	Model       string
 	APIKeyRef   string
 	Fingerprint string
 	Revision    int
@@ -5780,6 +5782,9 @@ func modelProfileDisplayName(snapshot modelprofile.Snapshot) string {
 	if provider != "" {
 		label += " (" + provider + ")"
 	}
+	if model := strings.TrimSpace(snapshot.Model); model != "" {
+		label += " model " + model
+	}
 	if snapshot.Revision > 0 {
 		label += fmt.Sprintf(" rev %d", snapshot.Revision)
 	}
@@ -10369,12 +10374,14 @@ func modelProfileSnapshotsEqual(left modelprofile.Snapshot, right modelprofile.S
 	return left.Name == right.Name &&
 		left.Provider == right.Provider &&
 		left.APIKeyRef == right.APIKeyRef &&
+		left.Model == right.Model &&
 		left.SSHProxy == right.SSHProxy &&
 		left.Revision == right.Revision &&
 		left.KeyFingerprint == right.KeyFingerprint &&
 		left.BaseURLHash == right.BaseURLHash &&
 		left.AdapterProfile == right.AdapterProfile &&
 		left.DefaultModel == right.DefaultModel &&
+		left.ModelFingerprint == right.ModelFingerprint &&
 		left.CatalogFingerprint == right.CatalogFingerprint &&
 		left.SSHProxyFingerprint == right.SSHProxyFingerprint &&
 		left.CapturedAt.Equal(right.CapturedAt)

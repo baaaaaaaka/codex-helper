@@ -14,14 +14,13 @@ import (
 )
 
 func TestTeamsInstalledBackgroundServiceModelProfileRecoveryStressCI(t *testing.T) {
-	t.Parallel()
 	ctx := context.Background()
 	graph, _, created := newDeterministicStressGraph(t)
 	store := newBridgeTestStore(t)
 	now := time.Now().UTC()
 	resolver := newMutableServiceStressResolver(map[string]modelprofile.Snapshot{
-		"alpha": {Name: "alpha", Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_API_KEY_A", SSHProxy: "ssh-alpha", Revision: 11, CapturedAt: now},
-		"beta":  {Name: "beta", Provider: "mimo", APIKeyRef: "env:MIMO_API_KEY_B", SSHProxy: "ssh-beta", Revision: 22, CapturedAt: now},
+		"alpha": {Name: "alpha", Provider: "deepseek", Model: "deepseek/deepseek-v4-flash", APIKeyRef: "env:DEEPSEEK_API_KEY_A", SSHProxy: "ssh-alpha", Revision: 11, CapturedAt: now},
+		"beta":  {Name: "beta", Provider: "mimo", Model: "mimo/mimo-v2.5-pro", APIKeyRef: "env:MIMO_API_KEY_B", SSHProxy: "ssh-beta", Revision: 22, CapturedAt: now},
 	})
 	firstExecutor := &deterministicStressExecutor{}
 	bridge := newBridgeTestBridge(graph, store, firstExecutor)
@@ -62,7 +61,7 @@ func TestTeamsInstalledBackgroundServiceModelProfileRecoveryStressCI(t *testing.
 		}
 	}
 
-	resolver.Set("alpha", modelprofile.Snapshot{Name: "alpha", Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_API_KEY_NEW", SSHProxy: "ssh-alpha-new", Revision: 99, CapturedAt: now.Add(time.Minute)})
+	resolver.Set("alpha", modelprofile.Snapshot{Name: "alpha", Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", APIKeyRef: "env:DEEPSEEK_API_KEY_NEW", SSHProxy: "ssh-alpha-new", Revision: 99, CapturedAt: now.Add(time.Minute)})
 	restartedExecutor := &deterministicStressExecutor{}
 	restarted := newBridgeTestBridge(graph, store, restartedExecutor)
 	restarted.reg.Sessions = nil
@@ -114,6 +113,12 @@ func TestTeamsInstalledBackgroundServiceModelProfileRecoveryStressCI(t *testing.
 		}
 		if scenario.Name != "alpha-new" && session.ModelProfile.Revision != scenario.InitialRevision {
 			t.Fatalf("%s profile revision changed from %d to %d", scenario.Name, scenario.InitialRevision, session.ModelProfile.Revision)
+		}
+		if scenario.Name == "alpha-new" && session.ModelProfile.Model != "deepseek/deepseek-v4-pro" {
+			t.Fatalf("alpha-new model = %q, want deepseek/deepseek-v4-pro", session.ModelProfile.Model)
+		}
+		if scenario.Name == "alpha-old" && session.ModelProfile.Model != "deepseek/deepseek-v4-flash" {
+			t.Fatalf("alpha-old model changed to %q", session.ModelProfile.Model)
 		}
 		if scenario.Name == "alpha-new" && session.ModelProfile.Revision != 99 {
 			t.Fatalf("alpha-new profile revision = %d, want 99", session.ModelProfile.Revision)

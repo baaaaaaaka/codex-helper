@@ -24,6 +24,7 @@ var (
 type modelProfileKeyIntakeSetupOptions struct {
 	Provider       string
 	ProfileName    string
+	Model          string
 	SSHProxy       string
 	SetDefault     bool
 	TeamsKeyIntake bool
@@ -57,6 +58,14 @@ func parseModelProfileKeyIntakeSetupOptions(arg string) (modelProfileKeyIntakeSe
 		case strings.HasPrefix(lower, "--provider="):
 			opts.Provider = strings.TrimSpace(word[len("--provider="):])
 			providerWasFlag = true
+		case lower == "--model":
+			if i+1 >= len(fields) {
+				return opts, fmt.Errorf("--model requires a value")
+			}
+			i++
+			opts.Model = strings.TrimSpace(fields[i])
+		case strings.HasPrefix(lower, "--model="):
+			opts.Model = strings.TrimSpace(word[len("--model="):])
 		case lower == "--ssh-proxy":
 			if i+1 >= len(fields) {
 				return opts, fmt.Errorf("--ssh-proxy requires a value")
@@ -93,6 +102,7 @@ func parseModelProfileKeyIntakeSetupOptions(arg string) (modelProfileKeyIntakeSe
 	}
 	opts.Provider = modelprofile.NormalizeProvider(opts.Provider)
 	opts.ProfileName = strings.TrimSpace(opts.ProfileName)
+	opts.Model = strings.TrimSpace(opts.Model)
 	opts.SSHProxy = strings.TrimSpace(opts.SSHProxy)
 	if strings.EqualFold(opts.SSHProxy, "none") {
 		opts.SSHProxy = ""
@@ -136,6 +146,14 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 	if spec.ID == modelprofile.DefaultProvider || !spec.UsesAdapter {
 		return "The built-in `default` profile uses official Codex auth and does not need an API key. Use `model default default` for future Work chats.", nil
 	}
+	modelID := ""
+	if strings.TrimSpace(opts.Model) != "" {
+		selectedModel, err := spec.MustResolveModel(opts.Model)
+		if err != nil {
+			return "", err
+		}
+		modelID = selectedModel.PublicID()
+	}
 	name := strings.TrimSpace(opts.ProfileName)
 	if name == "" {
 		name = defaultTeamsModelProfileNameForProvider(spec.ID)
@@ -150,7 +168,7 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 	now := modelProfileKeyIntakeNow().UTC()
 	chatID := firstNonEmptyString(msg.ChatID, b.reg.ControlChatID)
 	intake := teamstore.ModelProfileKeyIntake{
-		ID:               "model-key-intake:" + shortStableID(strings.Join([]string{chatID, chatMessageAuthorUserID(msg), msg.ID, name, spec.ID, fmt.Sprint(now.UnixNano())}, "\n")),
+		ID:               "model-key-intake:" + shortStableID(strings.Join([]string{chatID, chatMessageAuthorUserID(msg), msg.ID, name, spec.ID, modelID, fmt.Sprint(now.UnixNano())}, "\n")),
 		ScopeID:          b.scope.ID,
 		TeamsChatID:      chatID,
 		RequestMessageID: msg.ID,
@@ -158,6 +176,7 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 		AuthorName:       chatMessageAuthorDisplayName(msg),
 		ProfileName:      name,
 		Provider:         spec.ID,
+		Model:            modelID,
 		SSHProxy:         opts.SSHProxy,
 		SetDefault:       opts.SetDefault,
 		Status:           teamstore.ModelProfileKeyIntakePending,
@@ -172,8 +191,12 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 	}); err != nil {
 		return "", err
 	}
+	modelLabel := modelID
+	if modelLabel == "" {
+		modelLabel = "existing/default"
+	}
 	lines := []string{
-		fmt.Sprintf("Teams API key intake started for model profile `%s` (provider `%s`).", name, spec.ID),
+		fmt.Sprintf("Teams API key intake started for model profile `%s` (provider `%s`, model `%s`).", name, spec.ID, modelLabel),
 		"",
 		"Security note: the next message containing the API key may still be retained by Microsoft Teams/Graph/audit systems. I will not write that raw key to local Teams state, control history, or helper outbox; it will only be saved in the local model profile secret store.",
 		"",
@@ -378,6 +401,7 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 	result, saveErr := b.modelProfileManager.SaveModelProfileAPIKey(ctx, ModelProfileAPIKeySaveRequest{
 		ProfileName: intake.ProfileName,
 		Provider:    intake.Provider,
+		Model:       intake.Model,
 		APIKey:      apiKey,
 		SSHProxy:    intake.SSHProxy,
 		SetDefault:  intake.SetDefault,
@@ -413,7 +437,7 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 		return "", safeSaveErr
 	}
 	lines := []string{
-		fmt.Sprintf("Saved model profile `%s` (provider `%s`, api_key=%s, fingerprint=%s, revision=%d).", result.ProfileName, result.Provider, modelprofile.MaskRef(result.APIKeyRef), result.Fingerprint, result.Revision),
+		fmt.Sprintf("Saved model profile `%s` (provider `%s`, model `%s`, api_key=%s, fingerprint=%s, revision=%d).", result.ProfileName, result.Provider, result.Model, modelprofile.MaskRef(result.APIKeyRef), result.Fingerprint, result.Revision),
 		"Raw key was not written to local Teams state, control history, or helper outbox.",
 	}
 	if result.SetDefault {
@@ -516,13 +540,13 @@ func sanitizeModelProfileKeyIntakeError(err error, apiKey string) string {
 }
 
 func modelProfileKeyIntakeSetupUsage() string {
-	return "Usage: `model setup <provider> [name] --teams-key-intake [--set-default] [--ssh-proxy <profile>]`"
+	return "Usage: `model setup <provider> [name] --teams-key-intake [--model <model>] [--set-default] [--ssh-proxy <profile>]`"
 }
 
 func modelProfileKeyIntakeUsage() string {
 	return strings.Join([]string{
 		"Model API key intake commands:",
-		"- Start: `model setup <provider> [name] --teams-key-intake`",
+		"- Start: `model setup <provider> [name] --teams-key-intake [--model <model>]`",
 		"- Confirm: `model key confirm <code>`",
 		"- Save: `model key <code> <api-key>`",
 		"- Cancel: `model key cancel <code>`",

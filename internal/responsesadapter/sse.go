@@ -112,7 +112,7 @@ func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, re
 		writeJSON(w, http.StatusBadGateway, errorBody("provider stream ended before completion"))
 		return
 	}
-	response := buildResponseObject(responseID, req, providerReq.Model, result.text, result.messageOutputIndex, result.reasoningText, result.reasoningOutputIndex, result.usage, result.toolCalls)
+	response := buildResponseObject(responseID, req, req.Model, result.text, result.messageOutputIndex, result.reasoningText, result.reasoningOutputIndex, result.usage, result.toolCalls)
 	if f.Store != nil {
 		if err := f.Store.Store(ResponseRecord{
 			ID:                 responseID,
@@ -124,7 +124,7 @@ func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, re
 			ReasoningText:      result.reasoningText,
 			ToolCalls:          result.toolCalls,
 			Status:             ResponseStatusCompleted,
-			Model:              providerReq.Model,
+			Model:              req.Model,
 			Usage:              result.usage,
 		}); err != nil {
 			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
@@ -163,7 +163,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 	reasoningOutputIndex := -1
 	var usage *Usage
 	toolCalls := newToolCallAccumulator(responseID)
-	created := buildResponseObject(responseID, req, providerReq.Model, "", 0, "", -1, nil, nil)
+	created := buildResponseObject(responseID, req, req.Model, "", 0, "", -1, nil, nil)
 	created.Status = string(ResponseStatusInProgress)
 	writeEvent("response.created", map[string]any{"response": created})
 
@@ -217,7 +217,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 	}
 
 	emitFailure := func(message string) {
-		writeEvent("response.failed", map[string]any{"response": failedResponseObject(responseID, req, providerReq.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, toolCalls.records(), message)})
+		writeEvent("response.failed", map[string]any{"response": failedResponseObject(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, toolCalls.records(), message)})
 	}
 
 	for {
@@ -290,7 +290,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 					})
 				}
 				records := toolCalls.records()
-				response := buildResponseObject(responseID, req, providerReq.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, records)
+				response := buildResponseObject(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, records)
 				if f.Store != nil {
 					if err := f.Store.Store(ResponseRecord{
 						ID:                 responseID,
@@ -302,10 +302,10 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 						ReasoningText:      reasoning,
 						ToolCalls:          records,
 						Status:             ResponseStatusCompleted,
-						Model:              providerReq.Model,
+						Model:              req.Model,
 						Usage:              usage,
 					}); err != nil {
-						writeEvent("response.failed", map[string]any{"response": failedResponseObject(responseID, req, providerReq.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, records, err.Error())})
+						writeEvent("response.failed", map[string]any{"response": failedResponseObject(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, records, err.Error())})
 						return
 					}
 				}

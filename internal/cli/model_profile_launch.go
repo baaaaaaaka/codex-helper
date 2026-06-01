@@ -145,7 +145,7 @@ func startModelProfileAdapterForCodex(
 			ProfileID:    resolved.Provider.AdapterProfile,
 			BaseURL:      resolved.Provider.BaseURL,
 			APIKey:       apiKey,
-			DefaultModel: resolved.Provider.DefaultPublicModel(),
+			DefaultModel: resolved.SelectedPublicModel(),
 			Models:       responsesAdapterModelsForProvider(resolved.Provider),
 			Adapter:      adapter,
 		}},
@@ -182,7 +182,7 @@ func startModelProfileAdapterForCodex(
 		Enabled:      true,
 		Name:         resolved.Name,
 		ProviderID:   resolved.Provider.ID,
-		Model:        resolved.Provider.DefaultPublicModel(),
+		Model:        resolved.SelectedPublicModel(),
 		BaseURL:      baseURL,
 		ProxyKey:     proxyKey,
 		Revision:     resolved.Revision(),
@@ -283,9 +283,19 @@ func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot m
 	if resolved.IsDefault() {
 		return nil, nil, nil
 	}
+	if resolved.SSHProfile == nil {
+		cfg, err = modelProfileConfigWithImplicitProxyPreference(store, cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	upstreamProxyURL := ""
-	if resolved.SSHProfile != nil {
-		upstreamProxyURL, err = codexAppEnsureProxyURLFn(context.Background(), store, *resolved.SSHProfile, cfg.Instances, log)
+	upstreamProfile, err := modelProfileUpstreamProxyProfile(cfg, resolved, "")
+	if err != nil {
+		return nil, nil, err
+	}
+	if upstreamProfile != nil {
+		upstreamProxyURL, err = codexAppEnsureProxyURLFn(context.Background(), store, *upstreamProfile, cfg.Instances, log)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -303,6 +313,30 @@ func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot m
 	}
 	env := []string{envCXPResponsesProxyKey + "=" + launch.ProxyKey}
 	return args, env, nil
+}
+
+func modelProfileConfigWithImplicitProxyPreference(store *config.Store, cfg config.Config) (config.Config, error) {
+	if cfg.ProxyEnabled != nil {
+		if *cfg.ProxyEnabled && len(cfg.Profiles) == 0 && store != nil {
+			if err := store.Update(func(updated *config.Config) error {
+				updated.ProxyEnabled = nil
+				return nil
+			}); err != nil {
+				return cfg, err
+			}
+			cfg.ProxyEnabled = nil
+		}
+		return cfg, nil
+	}
+	if len(cfg.Profiles) == 0 {
+		return cfg, nil
+	}
+	enabled := true
+	if err := persistProxyPreference(store, enabled); err != nil {
+		return cfg, err
+	}
+	cfg.ProxyEnabled = &enabled
+	return cfg, nil
 }
 
 func appendCodexModelProfileArgs(cmdArgs []string, launch codexModelProfileLaunch) []string {

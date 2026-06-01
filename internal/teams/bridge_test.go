@@ -26,7 +26,23 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
-const bridgeAsyncTestTimeout = 30 * time.Second
+const bridgeAsyncBaseTestTimeout = 30 * time.Second
+
+var bridgeAsyncTestTimeout = bridgeAsyncWaitTimeoutForTest()
+
+func bridgeAsyncWaitTimeoutForTest() time.Duration {
+	if bridgeRaceDetectorEnabled {
+		return 3 * time.Minute
+	}
+	return bridgeAsyncBaseTestTimeout
+}
+
+func bridgeIdleWaitTimeoutForTest() time.Duration {
+	if bridgeRaceDetectorEnabled {
+		return 45 * time.Second
+	}
+	return 5 * time.Second
+}
 
 var discoverCodexSessionTestMu sync.Mutex
 
@@ -1403,7 +1419,7 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 		if !strings.Contains(got, "second prompt") {
 			t.Fatalf("second started prompt = %q", got)
 		}
-	case <-time.After(20 * time.Second):
+	case <-time.After(bridgeAsyncWaitTimeoutForTest()):
 		t.Fatal("queued second Codex turn did not start after first finished")
 	}
 	executor.release <- struct{}{}
@@ -2503,7 +2519,7 @@ func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T)
 
 func waitForNoActiveTurnsOrOutbox(t *testing.T, store *teamstore.Store, sessionID string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(bridgeIdleWaitTimeoutForTest())
 	stable := 0
 	for {
 		state, err := store.Load(context.Background())
@@ -2558,7 +2574,7 @@ func waitForBridgeAsyncTurns(t *testing.T, bridge *Bridge) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(bridgeAsyncTestTimeout):
+	case <-time.After(bridgeAsyncWaitTimeoutForTest()):
 		t.Fatal("timed out waiting for async Teams turns to finish")
 	}
 }
@@ -26738,6 +26754,7 @@ func (m *fakeModelProfileManager) SaveModelProfileAPIKey(_ context.Context, req 
 	return ModelProfileAPIKeySaveResult{
 		ProfileName: req.ProfileName,
 		Provider:    req.Provider,
+		Model:       req.Model,
 		APIKeyRef:   modelprofile.SecretRefForProfile(req.ProfileName),
 		Fingerprint: "fp-test",
 		Revision:    1,
@@ -26774,7 +26791,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup mimo mimo25 --teams-key-intake --set-default"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup mimo mimo25 --model pro --teams-key-intake --set-default"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	stateAfterSetup, err := store.Load(ctx)
@@ -26809,8 +26826,8 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		t.Fatalf("SaveModelProfileAPIKey calls = %d, want 1", got)
 	}
 	req := manager.saveRequestAt(0)
-	if req.Provider != "mimo" || req.ProfileName != "mimo25" || req.APIKey != rawKey || !req.SetDefault {
-		t.Fatalf("save request provider/name/key/default mismatch: provider=%q name=%q key_match=%v default=%v", req.Provider, req.ProfileName, req.APIKey == rawKey, req.SetDefault)
+	if req.Provider != "mimo" || req.ProfileName != "mimo25" || req.Model != "mimo/mimo-v2.5-pro" || req.APIKey != rawKey || !req.SetDefault {
+		t.Fatalf("save request provider/name/model/key/default mismatch: provider=%q name=%q model=%q key_match=%v default=%v", req.Provider, req.ProfileName, req.Model, req.APIKey == rawKey, req.SetDefault)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {

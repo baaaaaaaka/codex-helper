@@ -56,6 +56,26 @@ func CatalogFingerprint(provider ProviderSpec) string {
 	return "catalog:" + hex.EncodeToString(sum[:])[:24]
 }
 
+func ModelFingerprint(provider ProviderSpec, modelRef string) string {
+	model, ok := provider.ResolveModel(modelRef)
+	if !ok {
+		return ""
+	}
+	material := strings.Join([]string{
+		strings.TrimSpace(provider.ID),
+		strings.TrimSpace(model.PublicID()),
+		strings.TrimSpace(model.UpstreamModel()),
+		fmt.Sprint(model.ContextWindow),
+		fmt.Sprint(model.MaxContextWindow),
+		fmt.Sprint(model.SupportsTools),
+		fmt.Sprint(model.SupportsVision),
+		fmt.Sprint(model.SupportsReason),
+		fmt.Sprint(model.SupportsSearch),
+	}, "\n")
+	sum := sha256.Sum256([]byte(material))
+	return "model:" + hex.EncodeToString(sum[:])[:24]
+}
+
 func SSHProxyFingerprint(profile *config.Profile) string {
 	if profile == nil {
 		return ""

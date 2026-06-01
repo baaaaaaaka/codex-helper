@@ -96,6 +96,12 @@ func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
 	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "n1" {
 		t.Fatalf("Profiles=%#v", cfg.Profiles)
 	}
+	if cfg.DefaultModelProfile != "" || len(cfg.ModelProfiles) != 0 {
+		t.Fatalf("version 1 migration should not synthesize model profiles: default=%q profiles=%#v", cfg.DefaultModelProfile, cfg.ModelProfiles)
+	}
+	if got, ok := cfg.FindModelProfile(""); !ok || got.SSHProxy != "" {
+		t.Fatalf("built-in default model profile should not inherit an ssh proxy: ok=%v profile=%#v", ok, got)
+	}
 }
 
 func TestStore_LoadAcceptsNewerAdditiveConfig(t *testing.T) {

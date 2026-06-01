@@ -614,7 +614,7 @@ func loadSessionMetaPersistentStateLockedContext(ctx context.Context, cachePath 
 		persistentSessionMetaState.path == cachePath &&
 		persistentSessionMetaState.cacheFilePresent == present &&
 		(!present || persistentSessionMetaState.cacheFileMtime == mtime) {
-		return persistentSessionMetaState.cache, nil
+		return clonePersistentSessionMetaCache(persistentSessionMetaState.cache), nil
 	}
 
 	cache, err := loadPersistentSessionMetaCacheContext(ctx, cachePath)
@@ -629,7 +629,7 @@ func loadSessionMetaPersistentStateLockedContext(ctx context.Context, cachePath 
 	persistentSessionMetaState.cacheFileMtime = mtime
 	persistentSessionMetaState.loaded = true
 	persistentSessionMetaState.cache = cache
-	return cache, nil
+	return clonePersistentSessionMetaCache(cache), nil
 }
 
 func loadHistoryIndexPersistentStateLocked(cachePath string) persistentHistoryIndexCache {
@@ -646,7 +646,7 @@ func loadHistoryIndexPersistentStateLockedContext(ctx context.Context, cachePath
 		persistentHistoryIndexState.path == cachePath &&
 		persistentHistoryIndexState.cacheFilePresent == present &&
 		(!present || persistentHistoryIndexState.cacheFileMtime == mtime) {
-		return persistentHistoryIndexState.cache, nil
+		return clonePersistentHistoryIndexCache(persistentHistoryIndexState.cache), nil
 	}
 
 	cache, err := loadPersistentHistoryIndexCacheContext(ctx, cachePath)
@@ -661,7 +661,32 @@ func loadHistoryIndexPersistentStateLockedContext(ctx context.Context, cachePath
 	persistentHistoryIndexState.cacheFileMtime = mtime
 	persistentHistoryIndexState.loaded = true
 	persistentHistoryIndexState.cache = cache
-	return cache, nil
+	return clonePersistentHistoryIndexCache(cache), nil
+}
+
+func clonePersistentSessionMetaCache(src persistentSessionMetaCache) persistentSessionMetaCache {
+	out := persistentSessionMetaCache{
+		Version: src.Version,
+		Entries: map[string]persistentSessionMetaEntry{},
+	}
+	for key, entry := range src.Entries {
+		out.Entries[key] = entry
+	}
+	return out
+}
+
+func clonePersistentHistoryIndexCache(src persistentHistoryIndexCache) persistentHistoryIndexCache {
+	out := persistentHistoryIndexCache{
+		Version: src.Version,
+		Entries: map[string]persistentHistoryIndexEntry{},
+	}
+	for key, entry := range src.Entries {
+		out.Entries[key] = persistentHistoryIndexEntry{
+			FileCacheKey: entry.FileCacheKey,
+			Sessions:     cloneHistorySessions(entry.Sessions),
+		}
+	}
+	return out
 }
 
 func loadPersistentSessionMetaCache(path string) (persistentSessionMetaCache, error) {

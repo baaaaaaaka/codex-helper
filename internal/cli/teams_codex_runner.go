@@ -213,12 +213,14 @@ func modelProfileSnapshotKey(snapshot modelprofile.Snapshot) string {
 		strings.TrimSpace(snapshot.Name),
 		strings.TrimSpace(snapshot.Provider),
 		strings.TrimSpace(snapshot.APIKeyRef),
+		strings.TrimSpace(snapshot.Model),
 		strings.TrimSpace(snapshot.SSHProxy),
 		fmt.Sprint(snapshot.Revision),
 		strings.TrimSpace(snapshot.KeyFingerprint),
 		strings.TrimSpace(snapshot.BaseURLHash),
 		strings.TrimSpace(snapshot.AdapterProfile),
 		strings.TrimSpace(snapshot.DefaultModel),
+		strings.TrimSpace(snapshot.ModelFingerprint),
 		strings.TrimSpace(snapshot.CatalogFingerprint),
 		strings.TrimSpace(snapshot.SSHProxyFingerprint),
 	}, "\x00")
@@ -290,7 +292,6 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 	}
 	proxyRef := ""
 	useProxy := false
-	modelProfileOwnsProxy := false
 	if l.modelProfileRef != "" || !l.modelProfileSnapshot.IsZero() {
 		cfg, err := store.Load()
 		if err != nil {
@@ -308,11 +309,9 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 		if resolved.SSHProfile != nil {
 			useProxy = true
 			proxyRef = resolved.SSHProfile.Name
-		} else {
-			modelProfileOwnsProxy = true
 		}
 	}
-	if !useProxy && !modelProfileOwnsProxy {
+	if !useProxy {
 		useProxy, _, err = ensureProxyPreferenceRunFn(ctx, store, "", log)
 		if err != nil {
 			return codexrunner.LaunchResult{}, err

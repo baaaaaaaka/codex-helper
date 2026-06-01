@@ -67,7 +67,15 @@ func (m teamsModelProfileManager) ModelProfileProviders(ctx context.Context) (st
 		if len(features) == 0 {
 			features = append(features, "chat")
 		}
-		lines = append(lines, fmt.Sprintf("- %s: %s, default model `%s`, env `%s`", spec.ID, strings.Join(features, "/"), spec.DefaultPublicModel(), spec.RecommendedEnv))
+		models := []string{}
+		for _, model := range spec.ModelCatalog() {
+			models = append(models, "`"+model.PublicID()+"`"+modelAliasSummary(model))
+		}
+		modelText := "`" + spec.DefaultPublicModel() + "`"
+		if len(models) > 1 {
+			modelText = strings.Join(models, ", ")
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s, default `%s`, models %s, env `%s`", spec.ID, strings.Join(features, "/"), spec.DefaultPublicModel(), modelText, spec.RecommendedEnv))
 	}
 	_ = ctx
 	return strings.Join(lines, "\n"), nil
@@ -105,6 +113,17 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 		fmt.Sprintf("`model setup %s %s --teams-key-intake --set-default`", shellQuoteForTeams(spec.ID), shellQuoteForTeams(name)),
 		"",
 		"After that, use `model list` in Teams, `model default <name>` for future Work chats, or `new <directory> --model <name>`.",
+	}
+	if models := spec.ModelCatalog(); len(models) > 1 {
+		lines = append(lines, "", "Optional model choices:")
+		for _, model := range models {
+			lines = append(lines, fmt.Sprintf("- `%s` - %s%s", model.PublicID(), model.Label(), modelAliasSummary(model)))
+		}
+		lines = append(lines,
+			"",
+			fmt.Sprintf("To pin a non-default model, add `--model <model>`, for example: `cxp model-profile setup %s --provider %s --model %s --api-key-stdin --set-default`", shellQuoteForTeams(name), shellQuoteForTeams(spec.ID), shellQuoteForTeams(models[len(models)-1].PublicID())),
+			fmt.Sprintf("Teams key intake also supports it: `model setup %s %s --model %s --teams-key-intake --set-default`", shellQuoteForTeams(spec.ID), shellQuoteForTeams(name), shellQuoteForTeams(models[len(models)-1].PublicID())),
+		)
 	}
 	_ = ctx
 	return strings.Join(lines, "\n"), nil
@@ -215,6 +234,16 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 	if canonical, _, ok := findModelProfileForCLI(cfg, name); ok {
 		name = canonical
 	}
+	existing, existed := cfg.FindModelProfile(name)
+	modelRef := strings.TrimSpace(req.Model)
+	if modelRef == "" && existed && strings.EqualFold(existing.Provider, spec.ID) && strings.TrimSpace(existing.Model) != "" {
+		modelRef = existing.Model
+	}
+	selectedModel, err := spec.MustResolveModel(modelRef)
+	if err != nil {
+		return teams.ModelProfileAPIKeySaveResult{}, err
+	}
+	modelID := selectedModel.PublicID()
 	sshProxy := strings.TrimSpace(req.SSHProxy)
 	if strings.EqualFold(sshProxy, "none") {
 		sshProxy = ""
@@ -226,13 +255,12 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 	}
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
 	apiKeyRef := modelprofile.SecretRefForProfile(name)
-	existing, existed := cfg.FindModelProfile(name)
 	oldKey, oldKeyFound, err := secretStore.Get(apiKeyRef)
 	if err != nil {
 		return teams.ModelProfileAPIKeySaveResult{}, err
 	}
 	changed := !existed ||
-		modelProfileSetupChanges(existing, spec.ID, apiKeyRef, sshProxy) ||
+		modelProfileSetupChanges(existing, spec.ID, modelID, apiKeyRef, sshProxy) ||
 		!oldKeyFound ||
 		strings.TrimSpace(oldKey) != apiKey
 	revision := existing.Revision
@@ -252,6 +280,7 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 	}
 	profile := config.ModelProfile{
 		Provider:  spec.ID,
+		Model:     modelID,
 		APIKeyRef: apiKeyRef,
 		SSHProxy:  sshProxy,
 		Revision:  revision,
@@ -271,6 +300,7 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 	return teams.ModelProfileAPIKeySaveResult{
 		ProfileName: name,
 		Provider:    spec.ID,
+		Model:       modelID,
 		APIKeyRef:   apiKeyRef,
 		Fingerprint: modelprofile.Fingerprint(apiKey),
 		Revision:    revision,
@@ -279,9 +309,42 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 }
 
 func parseTeamsModelSetupGuideArg(arg string) (string, string) {
-	first, rest := splitWords2(arg)
-	second, _ := splitWords2(rest)
-	return strings.TrimSpace(first), strings.TrimSpace(second)
+	fields := strings.Fields(strings.TrimSpace(arg))
+	var provider, name string
+	var positional []string
+	providerWasFlag := false
+	for i := 0; i < len(fields); i++ {
+		word := strings.TrimSpace(fields[i])
+		lower := strings.ToLower(word)
+		switch {
+		case lower == "--provider" && i+1 < len(fields):
+			i++
+			provider = fields[i]
+			providerWasFlag = true
+		case strings.HasPrefix(lower, "--provider="):
+			provider = word[len("--provider="):]
+			providerWasFlag = true
+		case (lower == "--model" || lower == "--ssh-proxy") && i+1 < len(fields):
+			i++
+		case strings.HasPrefix(lower, "--model="), strings.HasPrefix(lower, "--ssh-proxy="):
+		case strings.HasPrefix(lower, "-"):
+		default:
+			positional = append(positional, word)
+		}
+	}
+	if providerWasFlag {
+		if len(positional) > 0 {
+			name = positional[0]
+		}
+	} else {
+		if len(positional) > 0 {
+			provider = positional[0]
+		}
+		if len(positional) > 1 {
+			name = positional[1]
+		}
+	}
+	return strings.TrimSpace(provider), strings.TrimSpace(name)
 }
 
 func splitWords2(s string) (string, string) {

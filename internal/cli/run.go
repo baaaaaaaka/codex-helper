@@ -90,7 +90,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	if err != nil {
 		return err
 	}
-	modelProfileOwnsProxy := false
+	modelProfileLaunchRequested := false
 	if runOpts.ModelProfileRef != "" || (len(after) > 0 && isCodexCommand(after[0])) {
 		cfgForModelProfile, err := store.Load()
 		if err != nil {
@@ -100,7 +100,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		if err != nil {
 			return err
 		}
-		modelProfileSelected := strings.TrimSpace(runOpts.ModelProfileRef) != "" || strings.TrimSpace(cfgForModelProfile.DefaultModelProfile) != ""
+		modelProfileLaunchRequested = strings.TrimSpace(runOpts.ModelProfileRef) != "" || strings.TrimSpace(cfgForModelProfile.DefaultModelProfile) != ""
 		if resolvedModelProfile.SSHProfile != nil {
 			if profileRef != "" {
 				selected, ok := cfgForModelProfile.FindProfile(profileRef)
@@ -113,8 +113,6 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			} else {
 				profileRef = resolvedModelProfile.SSHProfile.Name
 			}
-		} else if modelProfileSelected {
-			modelProfileOwnsProxy = true
 		}
 	}
 
@@ -130,7 +128,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			}
 			cfg.ProxyEnabled = &enabled
 		}
-		if runOpts.YoloEnabled || runOpts.ModelProfileRef != "" {
+		if runOpts.YoloEnabled || modelProfileLaunchRequested {
 			runOpts.Log = cmd.ErrOrStderr()
 			return runWithProfileOptionsFn(ctx, store, profile, cfg.Instances, after, runOpts)
 		}
@@ -138,11 +136,9 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	}
 
 	useProxy := false
-	if !modelProfileOwnsProxy {
-		useProxy, _, err = ensureProxyPreferenceRunFn(ctx, store, "", cmd.ErrOrStderr())
-		if err != nil {
-			return err
-		}
+	useProxy, _, err = ensureProxyPreferenceRunFn(ctx, store, "", cmd.ErrOrStderr())
+	if err != nil {
+		return err
 	}
 	if useProxy {
 		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, "", autoInit, cmd.OutOrStdout())
@@ -156,7 +152,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			}
 			cfgWithProfile.ProxyEnabled = &enabled
 		}
-		if runOpts.YoloEnabled {
+		if runOpts.YoloEnabled || modelProfileLaunchRequested {
 			runOpts.Log = cmd.ErrOrStderr()
 			return runWithProfileOptionsFn(ctx, store, profile, cfgWithProfile.Instances, after, runOpts)
 		}

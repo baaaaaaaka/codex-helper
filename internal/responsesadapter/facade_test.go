@@ -113,6 +113,71 @@ func TestFacadeReturnsNonStreamResponse(t *testing.T) {
 	}
 }
 
+func TestFacadeKeepsPublicModelWhenProviderUsesUpstreamModel(t *testing.T) {
+	store := NewMemoryStore()
+	adapter := &recordingAdapter{events: []ProviderEvent{
+		{Kind: ProviderEventTextDelta, Delta: "mapped"},
+		{Kind: ProviderEventDone},
+	}}
+	registry := mustProviderRegistry(t, ProviderRegistryOptions{
+		DefaultProvider: "mimo",
+		ProxyKeys:       map[string]string{"mi-key": "mimo"},
+		Providers: []ProviderConfig{{
+			ID:           "mimo",
+			ProfileID:    "mimo",
+			APIKey:       "sk-mimo",
+			DefaultModel: "mimo/mimo-v2.5",
+			Models: []ModelInfo{{
+				ID:         "mimo/mimo-v2.5",
+				OwnedBy:    "mimo",
+				UpstreamID: "mimo-v2.5",
+			}, {
+				ID:         "mimo/mimo-v2.5-pro",
+				OwnedBy:    "mimo",
+				UpstreamID: "mimo-v2.5-pro",
+			}},
+			Adapter: adapter,
+		}},
+	})
+	facade := &Facade{
+		Router: registry,
+		Store:  store,
+		NewID: func(prefix string) (string, error) {
+			return prefix + "_001", nil
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"mimo/mimo-v2.5-pro","input":"map model"}`))
+	req.Header.Set("Authorization", "Bearer mi-key")
+	req.Header.Set("x-codex-thread-id", "thread-public")
+	rec := httptest.NewRecorder()
+	facade.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["model"] != "mimo/mimo-v2.5-pro" {
+		t.Fatalf("response model = %q, want public model", body["model"])
+	}
+	if len(adapter.requests) != 1 || adapter.requests[0].Model != "mimo-v2.5-pro" {
+		t.Fatalf("upstream request model = %#v, want upstream model", adapter.requests)
+	}
+	if adapter.requests[0].Scope.Model != "mimo/mimo-v2.5-pro" {
+		t.Fatalf("request scope model = %q, want public model", adapter.requests[0].Scope.Model)
+	}
+	record, err := store.Get("resp_001", adapter.requests[0].Scope)
+	if err != nil {
+		t.Fatalf("stored response not found under public model scope: %v", err)
+	}
+	if record.Model != "mimo/mimo-v2.5-pro" {
+		t.Fatalf("stored response model = %q, want public model", record.Model)
+	}
+}
+
 func TestFacadeExposesReusableInstanceHealth(t *testing.T) {
 	facade := &Facade{InstanceID: "adapter-inst"}
 	req := httptest.NewRequest(http.MethodGet, "/_codex_proxy/health", nil)

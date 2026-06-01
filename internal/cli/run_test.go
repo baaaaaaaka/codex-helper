@@ -1329,6 +1329,74 @@ func TestRunLikeModelProfileSSHProxyPassesModelProfileOptions(t *testing.T) {
 	}
 }
 
+func TestRunLikeModelProfileWithoutSSHUsesGlobalProxyPreference(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTempStore(t)
+	enabled := true
+	profile := config.Profile{ID: "p1", Name: "primary", Host: "example.com", User: "coder", CreatedAt: time.Now()}
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{profile},
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-live": {
+				Provider:  "deepseek",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevRunWithProfile := runWithProfileFn
+	prevRunWithProfileOptions := runWithProfileOptionsFn
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() {
+		runWithProfileFn = prevRunWithProfile
+		runWithProfileOptionsFn = prevRunWithProfileOptions
+		runTargetWithFallbackWithOptionsFn = prevRunTarget
+	})
+
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("model profile proxy run must preserve model-profile options")
+		return nil
+	}
+	runTargetWithFallbackWithOptionsFn = func(context.Context, []string, string, func() error, <-chan error, runTargetOptions) error {
+		t.Fatal("model profile proxy run should use the proxy execution path")
+		return nil
+	}
+
+	var gotProfile config.Profile
+	var gotOpts runTargetOptions
+	runWithProfileOptionsFn = func(ctx context.Context, _ *config.Store, prof config.Profile, _ []config.Instance, cmdArgs []string, opts runTargetOptions) error {
+		gotProfile = prof
+		gotOpts = opts
+		if !reflect.DeepEqual(cmdArgs, []string{"codex", "exec", "-"}) {
+			t.Fatalf("cmd args = %v", cmdArgs)
+		}
+		return nil
+	}
+
+	root := &rootOptions{configPath: store.Path()}
+	cmd := newRunCmd(root)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"--model-profile", "deepseek-live", "--", "codex", "exec", "-"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+	if gotProfile.ID != profile.ID {
+		t.Fatalf("profile = %#v, want %#v", gotProfile, profile)
+	}
+	if gotOpts.ModelProfileRef != "deepseek-live" || !gotOpts.UseProxy {
+		t.Fatalf("opts = %+v, want global proxy preference with model profile preserved", gotOpts)
+	}
+}
+
 func TestRunLikeDirectModelProfileSimulatesCodexLaunch(t *testing.T) {
 	lockCLITestHooks(t)
 	if runtime.GOOS == "windows" {
@@ -1336,8 +1404,10 @@ func TestRunLikeDirectModelProfileSimulatesCodexLaunch(t *testing.T) {
 	}
 
 	store := newTempStore(t)
+	disabled := false
 	if err := store.Save(config.Config{
-		Version: config.CurrentVersion,
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &disabled,
 		ModelProfiles: map[string]config.ModelProfile{
 			"deepseek-live": {
 				Provider:  "deepseek",
@@ -1378,8 +1448,7 @@ func TestRunLikeDirectModelProfileSimulatesCodexLaunch(t *testing.T) {
 		return nil
 	}
 	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		t.Fatal("direct model-profile run without an ssh proxy should not prompt for generic proxy preference")
-		return false, config.Config{}, nil
+		return false, config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}, nil
 	}
 
 	var gotCmdArgs []string

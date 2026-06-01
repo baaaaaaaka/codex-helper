@@ -34,6 +34,7 @@ func TestResolveThirdPartyModelProfileWithSSHProxy(t *testing.T) {
 		ModelProfiles: map[string]config.ModelProfile{
 			"deepseek-work": {
 				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
 				APIKeyRef: "env:DEEPSEEK_API_KEY",
 				SSHProxy:  "work",
 				Revision:  3,
@@ -45,7 +46,7 @@ func TestResolveThirdPartyModelProfileWithSSHProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if got.Name != "deepseek-work" || got.Provider.ID != "deepseek" || !got.Provider.UsesAdapter || got.Revision() != 3 {
+	if got.Name != "deepseek-work" || got.Provider.ID != "deepseek" || got.SelectedPublicModel() != "deepseek/deepseek-v4-pro" || !got.Provider.UsesAdapter || got.Revision() != 3 {
 		t.Fatalf("resolved profile = %#v", got)
 	}
 	if got.SSHProfile == nil || got.SSHProfile.ID != "ssh-1" {
@@ -78,6 +79,7 @@ func TestResolveSnapshotPinsProfileFields(t *testing.T) {
 		Name:      "mimo25",
 		Provider:  "mimo",
 		APIKeyRef: "env:OLD_MIMO_KEY",
+		Model:     "mimo/mimo-v2.5-pro",
 		SSHProxy:  "jump",
 		Revision:  3,
 	}
@@ -85,7 +87,7 @@ func TestResolveSnapshotPinsProfileFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveSnapshot: %v", err)
 	}
-	if got.Name != "mimo25" || got.Profile.APIKeyRef != "env:OLD_MIMO_KEY" || got.Revision() != 3 || got.Provider.ID != "mimo" {
+	if got.Name != "mimo25" || got.Profile.APIKeyRef != "env:OLD_MIMO_KEY" || got.SelectedPublicModel() != "mimo/mimo-v2.5-pro" || got.Revision() != 3 || got.Provider.ID != "mimo" {
 		t.Fatalf("resolved snapshot = %#v", got)
 	}
 	if got.SSHProfile == nil || got.SSHProfile.Name != "jump" {
@@ -106,6 +108,7 @@ func TestRuntimeSnapshotCapturesAndValidatesRuntimeIdentity(t *testing.T) {
 		ModelProfiles: map[string]config.ModelProfile{
 			"mimo25": {
 				Provider:  "mimo",
+				Model:     "mimo/mimo-v2.5-pro",
 				APIKeyRef: "env:MIMO_API_KEY",
 				SSHProxy:  "jump",
 				Revision:  2,
@@ -125,7 +128,7 @@ func TestRuntimeSnapshotCapturesAndValidatesRuntimeIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RuntimeSnapshot: %v", err)
 	}
-	if snapshot.KeyFingerprint == "" || snapshot.BaseURLHash == "" || snapshot.CatalogFingerprint == "" || snapshot.SSHProxyFingerprint == "" {
+	if snapshot.Model != "mimo/mimo-v2.5-pro" || snapshot.DefaultModel != "mimo/mimo-v2.5-pro" || snapshot.KeyFingerprint == "" || snapshot.BaseURLHash == "" || snapshot.ModelFingerprint == "" || snapshot.CatalogFingerprint == "" || snapshot.SSHProxyFingerprint == "" {
 		t.Fatalf("runtime snapshot missing identity fields: %#v", snapshot)
 	}
 	if err := ValidateSnapshotRuntime(snapshot, resolved, "sk-mimo-one"); err != nil {
@@ -133,6 +136,22 @@ func TestRuntimeSnapshotCapturesAndValidatesRuntimeIdentity(t *testing.T) {
 	}
 	if err := ValidateSnapshotRuntime(snapshot, resolved, "sk-mimo-two"); err == nil || !strings.Contains(err.Error(), "api key changed") {
 		t.Fatalf("ValidateSnapshotRuntime changed key err=%v, want api key changed", err)
+	}
+	changedModel := snapshot
+	changedModel.Model = "mimo/mimo-v2.5"
+	if err := ValidateSnapshotRuntime(changedModel, resolved, "sk-mimo-one"); err == nil || !strings.Contains(err.Error(), "model changed") {
+		t.Fatalf("ValidateSnapshotRuntime changed model err=%v, want model changed", err)
+	}
+	changedModelMapping := snapshot
+	changedModelMapping.ModelFingerprint = "model:old"
+	if err := ValidateSnapshotRuntime(changedModelMapping, resolved, "sk-mimo-one"); err == nil || !strings.Contains(err.Error(), "selected model mapping changed") {
+		t.Fatalf("ValidateSnapshotRuntime changed model mapping err=%v, want selected model mapping changed", err)
+	}
+	additiveCatalogChange := snapshot
+	additiveCatalogChange.ModelFingerprint = ""
+	additiveCatalogChange.CatalogFingerprint = "catalog:old"
+	if err := ValidateSnapshotRuntime(additiveCatalogChange, resolved, "sk-mimo-one"); err != nil {
+		t.Fatalf("ValidateSnapshotRuntime old additive catalog fingerprint: %v", err)
 	}
 }
 
@@ -142,6 +161,7 @@ func TestResolveModelProfileErrors(t *testing.T) {
 		ModelProfiles: map[string]config.ModelProfile{
 			"missing-key": {Provider: "deepseek"},
 			"missing-ssh": {Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_API_KEY", SSHProxy: "none"},
+			"bad-model":   {Provider: "deepseek", Model: "nope", APIKeyRef: "env:DEEPSEEK_API_KEY"},
 			"unknown":     {Provider: "unknown", APIKeyRef: "env:KEY"},
 		},
 	}
@@ -152,6 +172,7 @@ func TestResolveModelProfileErrors(t *testing.T) {
 		{"missing", "not found"},
 		{"missing-key", "requires an api key"},
 		{"missing-ssh", "missing ssh proxy"},
+		{"bad-model", "available models"},
 		{"unknown", "unknown model provider"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

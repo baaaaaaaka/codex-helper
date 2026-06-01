@@ -35,7 +35,7 @@ var (
 	modelProfileAdapterPollInterval    = 200 * time.Millisecond
 )
 
-func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config.Store, ref string, log io.Writer) (codexModelProfileLaunch, error) {
+func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config.Store, ref string, proxyRef string, log io.Writer) (codexModelProfileLaunch, error) {
 	if store == nil {
 		return codexModelProfileLaunch{}, nil
 	}
@@ -58,8 +58,12 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 	if err != nil {
 		return codexModelProfileLaunch{}, err
 	}
+	upstreamProfile, err := modelProfileUpstreamProxyProfile(cfg, resolved, proxyRef)
+	if err != nil {
+		return codexModelProfileLaunch{}, err
+	}
 	listenHost := modelProfileAdapterListenHostForApp()
-	instanceProfileID := modelProfileAdapterInstanceProfileID(resolved, apiKey, listenHost)
+	instanceProfileID := modelProfileAdapterInstanceProfileID(resolved, apiKey, listenHost, modelprofile.SSHProxyFingerprint(upstreamProfile))
 	if inst := reusableModelProfileAdapterInstance(cfg.Instances, instanceProfileID); inst != nil {
 		return modelProfileAdapterLaunchFromInstance(resolved, *inst), nil
 	}
@@ -71,7 +75,7 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 	if log != nil {
 		_, _ = fmt.Fprintf(log, "starting a long-lived model adapter for profile %q...\n", resolved.Name)
 	}
-	instanceID, err := startModelProfileAdapterDaemon(ctx, store, resolved, instanceProfileID, listenHost)
+	instanceID, err := startModelProfileAdapterDaemon(ctx, store, resolved, instanceProfileID, listenHost, upstreamProfile)
 	if err != nil {
 		return codexModelProfileLaunch{}, err
 	}
@@ -117,7 +121,7 @@ func modelProfileAdapterLaunchFromInstance(resolved modelprofile.Resolved, inst 
 		Enabled:      true,
 		Name:         resolved.Name,
 		ProviderID:   resolved.Provider.ID,
-		Model:        resolved.Provider.DefaultPublicModel(),
+		Model:        resolved.SelectedPublicModel(),
 		BaseURL:      fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
 		ProxyKey:     inst.ModelProxyKey,
 		Revision:     resolved.Revision(),
@@ -126,7 +130,7 @@ func modelProfileAdapterLaunchFromInstance(resolved modelprofile.Resolved, inst 
 	}
 }
 
-func startModelProfileAdapterDaemon(_ context.Context, store *config.Store, resolved modelprofile.Resolved, instanceProfileID string, listenHost string) (string, error) {
+func startModelProfileAdapterDaemon(_ context.Context, store *config.Store, resolved modelprofile.Resolved, instanceProfileID string, listenHost string, upstreamProfile *config.Profile) (string, error) {
 	instanceID, err := ids.New()
 	if err != nil {
 		return "", err
@@ -148,11 +152,15 @@ func startModelProfileAdapterDaemon(_ context.Context, store *config.Store, reso
 		LastSeenAt:           now,
 		ModelProfileName:     snapshot.Name,
 		ModelProvider:        snapshot.Provider,
+		ModelPublicModel:     snapshot.Model,
 		ModelAPIKeyRef:       snapshot.APIKeyRef,
 		ModelSSHProxy:        snapshot.SSHProxy,
 		ModelRevision:        snapshot.Revision,
 		ModelProxyKey:        proxyKey,
 		ModelProfileCaptured: snapshot.CapturedAt,
+	}
+	if upstreamProfile != nil {
+		inst.ModelUpstreamProxyID = upstreamProfile.ID
 	}
 	if err := proxyRecordInstance(store, inst); err != nil {
 		return "", err
@@ -276,16 +284,23 @@ func runModelProfileAdapterDaemon(parentCtx context.Context, store *config.Store
 	if err != nil {
 		return err
 	}
-	upstreamProxyURL := ""
-	if resolved.SSHProfile != nil {
-		upstreamProxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *resolved.SSHProfile, cfg.Instances, os.Stderr)
-		if err != nil {
-			return err
-		}
-	}
 	listenHost := strings.TrimSpace(os.Getenv(envCXPModelProfileAdapterListenHost))
 	if listenHost == "" {
 		listenHost = "127.0.0.1"
+	}
+	upstreamProfile, err := modelProfileUpstreamProxyProfile(cfg, resolved, inst.ModelUpstreamProxyID)
+	if err != nil {
+		return err
+	}
+	if expectedProfileID := modelProfileAdapterInstanceProfileID(resolved, apiKey, listenHost, modelprofile.SSHProxyFingerprint(upstreamProfile)); inst.ProfileID != expectedProfileID {
+		return fmt.Errorf("model adapter instance profile changed since it was recorded")
+	}
+	upstreamProxyURL := ""
+	if upstreamProfile != nil {
+		upstreamProxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *upstreamProfile, cfg.Instances, os.Stderr)
+		if err != nil {
+			return err
+		}
 	}
 	listenAddr := net.JoinHostPort(listenHost, "0")
 	if inst.HTTPPort > 0 {
@@ -375,7 +390,7 @@ func modelProfileAdapterFacade(
 			ProfileID:    resolved.Provider.AdapterProfile,
 			BaseURL:      resolved.Provider.BaseURL,
 			APIKey:       apiKey,
-			DefaultModel: resolved.Provider.DefaultPublicModel(),
+			DefaultModel: resolved.SelectedPublicModel(),
 			Models:       responsesAdapterModelsForProvider(resolved.Provider),
 			Adapter:      adapter,
 		}},
@@ -396,12 +411,12 @@ func modelProfileAdapterListenHostForApp() string {
 	return "127.0.0.1"
 }
 
-func modelProfileAdapterInstanceProfileID(resolved modelprofile.Resolved, apiKey string, listenHost string) string {
-	material := strings.Join([]string{
+func modelProfileAdapterInstanceProfileID(resolved modelprofile.Resolved, apiKey string, listenHost string, upstreamProxyFingerprint string) string {
+	parts := []string{
 		resolved.Name,
 		resolved.Provider.ID,
 		resolved.Provider.BaseURL,
-		resolved.Provider.DefaultPublicModel(),
+		resolved.SelectedPublicModel(),
 		resolved.Provider.AdapterProfile,
 		modelProfileCatalogFingerprint(resolved.Provider),
 		resolved.Profile.APIKeyRef,
@@ -409,15 +424,42 @@ func modelProfileAdapterInstanceProfileID(resolved modelprofile.Resolved, apiKey
 		strconv.Itoa(resolved.Revision()),
 		responsesadapter.KeyFingerprint(apiKey, "cxp-model-profile-adapter-instance-v1"),
 		strings.TrimSpace(listenHost),
-	}, "\n")
+	}
+	if upstreamProxyFingerprint = strings.TrimSpace(upstreamProxyFingerprint); upstreamProxyFingerprint != "" {
+		parts = append(parts, "upstream-proxy:"+upstreamProxyFingerprint)
+	}
+	material := strings.Join(parts, "\n")
 	sum := sha256.Sum256([]byte(material))
 	return modelProfileAdapterInstancePrefix + hex.EncodeToString(sum[:])[:32]
+}
+
+func modelProfileUpstreamProxyProfile(cfg config.Config, resolved modelprofile.Resolved, fallbackProxyRef string) (*config.Profile, error) {
+	if resolved.SSHProfile != nil {
+		profile := *resolved.SSHProfile
+		return &profile, nil
+	}
+	if fallbackProxyRef = strings.TrimSpace(fallbackProxyRef); fallbackProxyRef != "" {
+		profile, err := selectProfile(cfg, fallbackProxyRef)
+		if err != nil {
+			return nil, err
+		}
+		return &profile, nil
+	}
+	if cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
+		return nil, nil
+	}
+	profile, err := selectProfile(cfg, "")
+	if err != nil {
+		return nil, err
+	}
+	return &profile, nil
 }
 
 func modelProfileSnapshotFromInstance(inst config.Instance) modelprofile.Snapshot {
 	return modelprofile.Snapshot{
 		Name:       inst.ModelProfileName,
 		Provider:   inst.ModelProvider,
+		Model:      inst.ModelPublicModel,
 		APIKeyRef:  inst.ModelAPIKeyRef,
 		SSHProxy:   inst.ModelSSHProxy,
 		Revision:   inst.ModelRevision,

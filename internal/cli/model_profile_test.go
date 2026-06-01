@@ -39,6 +39,7 @@ func TestModelProfileSetupListDoctorAndDefault(t *testing.T) {
 		"--config", configPath,
 		"model-profile", "setup", "deepseek-work",
 		"--provider", "deepseek",
+		"--model", "pro",
 		"--api-key-env", "DEEPSEEK_API_KEY",
 		"--ssh-proxy", "work",
 		"--set-default",
@@ -47,6 +48,7 @@ func TestModelProfileSetupListDoctorAndDefault(t *testing.T) {
 		`Saved model profile "deepseek-work"`,
 		"OK  model profile \"deepseek-work\"",
 		"OK  provider deepseek",
+		"OK  model deepseek/deepseek-v4-pro",
 		"OK  api key env:DEEPSEEK_API_KEY fingerprint=",
 		"OK  ssh proxy work",
 	} {
@@ -63,12 +65,12 @@ func TestModelProfileSetupListDoctorAndDefault(t *testing.T) {
 		t.Fatalf("DefaultModelProfile=%q", cfg.DefaultModelProfile)
 	}
 	mp := cfg.ModelProfiles["deepseek-work"]
-	if mp.Provider != "deepseek" || mp.APIKeyRef != "env:DEEPSEEK_API_KEY" || mp.SSHProxy != "work" || mp.Revision != 1 {
+	if mp.Provider != "deepseek" || mp.Model != "deepseek/deepseek-v4-pro" || mp.APIKeyRef != "env:DEEPSEEK_API_KEY" || mp.SSHProxy != "work" || mp.Revision != 1 {
 		t.Fatalf("stored model profile=%#v", mp)
 	}
 
 	out = runRootCommandForModelProfileTest(t, "--config", configPath, "model-profile", "list")
-	if !strings.Contains(out, "* deepseek-work: provider=deepseek api_key=env:DEEPSEEK_API_KEY ssh_proxy=work revision=1") {
+	if !strings.Contains(out, "* deepseek-work: provider=deepseek model=deepseek/deepseek-v4-pro api_key=env:DEEPSEEK_API_KEY ssh_proxy=work revision=1") {
 		t.Fatalf("list output did not mark default profile:\n%s", out)
 	}
 
@@ -89,6 +91,7 @@ func TestModelProfileSetupStoresSecretFromStdin(t *testing.T) {
 		"--config", configPath,
 		"model-profile", "setup", "mimo25",
 		"--provider", "mimo",
+		"--model", "pro",
 		"--api-key-stdin",
 		"--no-doctor",
 	})
@@ -107,10 +110,117 @@ func TestModelProfileSetupStoresSecretFromStdin(t *testing.T) {
 	if ref != modelprofile.SecretRefForProfile("mimo25") {
 		t.Fatalf("APIKeyRef=%q", ref)
 	}
+	if got := cfg.ModelProfiles["mimo25"].Model; got != "mimo/mimo-v2.5-pro" {
+		t.Fatalf("Model=%q", got)
+	}
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
 	value, err := modelprofile.ResolveAPIKey(ref, secretStore, nil)
 	if err != nil || value != "sk-secret" {
 		t.Fatalf("ResolveAPIKey value=%q err=%v", value, err)
+	}
+}
+
+func TestModelProfileSetupRejectsUnknownModel(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{
+		"--config", configPath,
+		"model-profile", "setup", "deepseek-work",
+		"--provider", "deepseek",
+		"--model", "ultra",
+		"--api-key-env", "DEEPSEEK_API_KEY",
+		"--no-doctor",
+	})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "unknown model") || !strings.Contains(err.Error(), "deepseek/deepseek-v4-pro") {
+		t.Fatalf("Execute err=%v out=%s", err, out.String())
+	}
+}
+
+func TestTeamsModelProfileSetupGuideMentionsModelChoice(t *testing.T) {
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: filepath.Join(t.TempDir(), "config.json")})
+	out, err := manager.ModelProfileSetupGuide(context.Background(), "deepseek")
+	if err != nil {
+		t.Fatalf("ModelProfileSetupGuide: %v", err)
+	}
+	for _, want := range []string{
+		"`deepseek/deepseek-v4-flash`",
+		"`deepseek/deepseek-v4-pro`",
+		"--model <model>",
+		"--teams-key-intake",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("setup guide missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestTeamsModelProfileSetupGuideMentionsMiMoTierAliases(t *testing.T) {
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: filepath.Join(t.TempDir(), "config.json")})
+	out, err := manager.ModelProfileSetupGuide(context.Background(), "mimo")
+	if err != nil {
+		t.Fatalf("ModelProfileSetupGuide: %v", err)
+	}
+	for _, want := range []string{
+		"`mimo/mimo-v2.5`",
+		"`mimo/mimo-v2.5-pro`",
+		"aliases: base, standard",
+		"aliases: pro",
+		"--model <model>",
+		"--teams-key-intake",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("setup guide missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestTeamsModelProfileProvidersMentionsMiMoTierAliases(t *testing.T) {
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: filepath.Join(t.TempDir(), "config.json")})
+	out, err := manager.ModelProfileProviders(context.Background())
+	if err != nil {
+		t.Fatalf("ModelProfileProviders: %v", err)
+	}
+	for _, want := range []string{
+		"- mimo:",
+		"`mimo/mimo-v2.5`",
+		"`mimo/mimo-v2.5-pro`",
+		"aliases: base, standard",
+		"aliases: pro",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("providers output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestTeamsModelProfileManagerSaveModelProfileAPIKeyDefaultsModelForNewProfile(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
+	result, err := manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
+		ProfileName: "mimo25",
+		Provider:    "mimo",
+		APIKey:      "sk-first-secret",
+	})
+	if err != nil {
+		t.Fatalf("SaveModelProfileAPIKey: %v", err)
+	}
+	if result.Model != "mimo/mimo-v2.5" {
+		t.Fatalf("default model = %q, want mimo base", result.Model)
+	}
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.ModelProfiles["mimo25"].Model; got != "mimo/mimo-v2.5" {
+		t.Fatalf("stored model = %q, want mimo base", got)
 	}
 }
 
@@ -138,6 +248,7 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 	result, err := manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
 		ProfileName: "mimo25",
 		Provider:    "mimo",
+		Model:       "mimo/mimo-v2.5-pro",
 		APIKey:      "sk-first-secret",
 		SSHProxy:    "work",
 		SetDefault:  true,
@@ -145,7 +256,7 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SaveModelProfileAPIKey first: %v", err)
 	}
-	if result.ProfileName != "mimo25" || result.Provider != "mimo" || result.APIKeyRef != modelprofile.SecretRefForProfile("mimo25") || result.Revision != 1 || !result.SetDefault {
+	if result.ProfileName != "mimo25" || result.Provider != "mimo" || result.Model != "mimo/mimo-v2.5-pro" || result.APIKeyRef != modelprofile.SecretRefForProfile("mimo25") || result.Revision != 1 || !result.SetDefault {
 		t.Fatalf("first save result mismatch: %#v", result)
 	}
 	cfg, err := store.Load()
@@ -156,7 +267,7 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 		t.Fatalf("DefaultModelProfile=%q", cfg.DefaultModelProfile)
 	}
 	profile := cfg.ModelProfiles["mimo25"]
-	if profile.Provider != "mimo" || profile.APIKeyRef != modelprofile.SecretRefForProfile("mimo25") || profile.SSHProxy != "work" || profile.Revision != 1 {
+	if profile.Provider != "mimo" || profile.Model != "mimo/mimo-v2.5-pro" || profile.APIKeyRef != modelprofile.SecretRefForProfile("mimo25") || profile.SSHProxy != "work" || profile.Revision != 1 {
 		t.Fatalf("stored profile after first save = %#v", profile)
 	}
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
@@ -174,8 +285,8 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SaveModelProfileAPIKey same key: %v", err)
 	}
-	if result.Revision != 1 {
-		t.Fatalf("same key revision=%d, want 1", result.Revision)
+	if result.Revision != 1 || result.Model != "mimo/mimo-v2.5-pro" {
+		t.Fatalf("same key result = %#v, want revision 1 and preserved pro model", result)
 	}
 
 	result, err = manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
@@ -187,8 +298,8 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SaveModelProfileAPIKey rotated key: %v", err)
 	}
-	if result.Revision != 2 {
-		t.Fatalf("rotated key revision=%d, want 2", result.Revision)
+	if result.Revision != 2 || result.Model != "mimo/mimo-v2.5-pro" {
+		t.Fatalf("rotated key result = %#v, want revision 2 and preserved pro model", result)
 	}
 	cfg, err = store.Load()
 	if err != nil {
@@ -200,6 +311,27 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 	value, err = modelprofile.ResolveAPIKey(profile.APIKeyRef, secretStore, nil)
 	if err != nil || value != "sk-second-secret" {
 		t.Fatalf("rotated secret value_match=%v err=%v", value == "sk-second-secret", err)
+	}
+
+	result, err = manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
+		ProfileName: "mimo25",
+		Provider:    "mimo",
+		Model:       "base",
+		APIKey:      "sk-second-secret",
+		SSHProxy:    "work",
+	})
+	if err != nil {
+		t.Fatalf("SaveModelProfileAPIKey changed model: %v", err)
+	}
+	if result.Revision != 3 || result.Model != "mimo/mimo-v2.5" {
+		t.Fatalf("changed model result = %#v, want revision 3 and mimo/mimo-v2.5", result)
+	}
+	cfg, err = store.Load()
+	if err != nil {
+		t.Fatalf("Load after model change: %v", err)
+	}
+	if got := cfg.ModelProfiles["mimo25"]; got.Revision != 3 || got.Model != "mimo/mimo-v2.5" {
+		t.Fatalf("stored profile after model change = %#v", got)
 	}
 }
 

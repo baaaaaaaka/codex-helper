@@ -74,6 +74,53 @@ func resetPersistentCacheStatesForTest() {
 	persistentCacheLocalWriterState.mu.Unlock()
 }
 
+func TestPersistentCacheStateLoadReturnsDetachedMaps(t *testing.T) {
+	resetPersistentCacheStatesForTest()
+	cachePath := filepath.Join(t.TempDir(), "session_meta_cache.json")
+
+	persistentSessionMetaState.mu.Lock()
+	persistentSessionMetaState.path = cachePath
+	persistentSessionMetaState.cacheFilePresent = false
+	persistentSessionMetaState.cacheFileMtime = 0
+	persistentSessionMetaState.loaded = true
+	persistentSessionMetaState.cache = persistentSessionMetaCache{
+		Version: persistentCacheVersion,
+		Entries: map[string]persistentSessionMetaEntry{
+			"/tmp/session.jsonl": {Meta: sessionFileMeta{FirstPrompt: "original"}},
+		},
+	}
+	metaCache := loadSessionMetaPersistentStateLocked(cachePath)
+	persistentSessionMetaState.mu.Unlock()
+	metaCache.Entries["/tmp/session.jsonl"] = persistentSessionMetaEntry{Meta: sessionFileMeta{FirstPrompt: "mutated"}}
+
+	persistentSessionMetaState.mu.Lock()
+	if got := persistentSessionMetaState.cache.Entries["/tmp/session.jsonl"].Meta.FirstPrompt; got != "original" {
+		t.Fatalf("session meta state cache was aliased, got %q", got)
+	}
+	persistentSessionMetaState.mu.Unlock()
+
+	persistentHistoryIndexState.mu.Lock()
+	persistentHistoryIndexState.path = cachePath
+	persistentHistoryIndexState.cacheFilePresent = false
+	persistentHistoryIndexState.cacheFileMtime = 0
+	persistentHistoryIndexState.loaded = true
+	persistentHistoryIndexState.cache = persistentHistoryIndexCache{
+		Version: persistentCacheVersion,
+		Entries: map[string]persistentHistoryIndexEntry{
+			"/tmp/history.jsonl": {Sessions: map[string]*historySessionInfo{"s1": {FirstPrompt: "original"}}},
+		},
+	}
+	historyCache := loadHistoryIndexPersistentStateLocked(cachePath)
+	persistentHistoryIndexState.mu.Unlock()
+	historyCache.Entries["/tmp/history.jsonl"].Sessions["s1"].FirstPrompt = "mutated"
+
+	persistentHistoryIndexState.mu.Lock()
+	if got := persistentHistoryIndexState.cache.Entries["/tmp/history.jsonl"].Sessions["s1"].FirstPrompt; got != "original" {
+		t.Fatalf("history index state cache was aliased, got %q", got)
+	}
+	persistentHistoryIndexState.mu.Unlock()
+}
+
 func setPersistentCacheWriterIDForTest(t *testing.T, id string) {
 	t.Helper()
 

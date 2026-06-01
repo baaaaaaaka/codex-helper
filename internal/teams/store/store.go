@@ -786,6 +786,7 @@ type ModelProfileKeyIntake struct {
 	AuthorName       string                      `json:"author_name,omitempty"`
 	ProfileName      string                      `json:"profile_name,omitempty"`
 	Provider         string                      `json:"provider,omitempty"`
+	Model            string                      `json:"model,omitempty"`
 	SSHProxy         string                      `json:"ssh_proxy,omitempty"`
 	SetDefault       bool                        `json:"set_default,omitempty"`
 	CodeHash         string                      `json:"code_hash,omitempty"`
