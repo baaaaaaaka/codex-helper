@@ -1816,7 +1816,7 @@ func TestBridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession(t *testi
 		if got.SessionID != "s001" || !strings.Contains(got.Prompt, "second prompt for s001") {
 			t.Fatalf("follow-up start = %#v, want serialized second s001 prompt", got)
 		}
-	case <-time.After(20 * time.Second):
+	case <-time.After(2 * bridgeAsyncTestTimeout):
 		t.Fatal("second s001 turn did not start after first completed")
 	}
 	waitForCompletedTurnCount(t, store, "s001", 2)
