@@ -952,7 +952,9 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 		"app\\Codex.exe",
 		"Start-CodexDesktopProcess $exe",
 		"$codexArgs = @('--proxy-server=http://127.0.0.1:23123')",
-		"Start-Process -FilePath $FilePath -ArgumentList $codexArgs -WorkingDirectory $cwd",
+		"$codexWaitForExit = $false",
+		"$start.ArgumentList = $codexArgs",
+		"Start-Process @start | Out-Null",
 		"proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost",
 		"proxy mode cannot use AppX activation because Chromium --proxy-server would be lost",
 		"falling back to AppX activation",
@@ -989,6 +991,23 @@ func TestCodexDesktopWindowsScriptOmitsProxyArgWithoutProxy(t *testing.T) {
 	}
 	if !strings.Contains(script, "Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd") {
 		t.Fatalf("Windows desktop app script should still allow AppX fallback without proxy:\n%s", script)
+	}
+}
+
+func TestCodexDesktopWindowsScriptWaitForExitOption(t *testing.T) {
+	script := codexDesktopWindowsInstallAndLaunchScript(codexDesktopAppOptions{
+		Cwd:         `C:\work`,
+		AppPath:     `C:\Codex\Codex.exe`,
+		WaitForExit: true,
+	})
+	for _, want := range []string{
+		"$codexWaitForExit = $true",
+		"$start.Wait = $true",
+		"Start-Process @start | Out-Null",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("Windows desktop app wait script missing %q:\n%s", want, script)
+		}
 	}
 }
 
@@ -1065,7 +1084,7 @@ func TestCodexDesktopWindowsScriptDirectLaunchPassesProxyArgIntegration(t *testi
 	argsPath := filepath.Join(dir, "args.txt")
 	helperSrc := filepath.Join(dir, "fake_codex.go")
 	fakeApp := filepath.Join(dir, "fake-codex.exe")
-	helperBody := `package main
+	helperBody := fmt.Sprintf(`package main
 
 import (
 	"os"
@@ -1073,15 +1092,20 @@ import (
 )
 
 func main() {
-	out := os.Getenv("ARGS_OUT")
-	if out == "" {
-		os.Exit(2)
+	lines := []string{
+		"args=" + strings.Join(os.Args[1:], " "),
+		"CODEX_HOME=" + os.Getenv("CODEX_HOME"),
+		"HTTP_PROXY=" + os.Getenv("HTTP_PROXY"),
+		"HTTPS_PROXY=" + os.Getenv("HTTPS_PROXY"),
+		"ALL_PROXY=" + os.Getenv("ALL_PROXY"),
+		"WS_PROXY=" + os.Getenv("WS_PROXY"),
+		"WSS_PROXY=" + os.Getenv("WSS_PROXY"),
 	}
-	if err := os.WriteFile(out, []byte(strings.Join(os.Args[1:], " ")), 0600); err != nil {
+	if err := os.WriteFile(%q, []byte(strings.Join(lines, "\n")), 0600); err != nil {
 		panic(err)
 	}
 }
-`
+`, argsPath)
 	if err := os.WriteFile(helperSrc, []byte(helperBody), 0o600); err != nil {
 		t.Fatalf("write fake Codex app source: %v", err)
 	}
@@ -1096,11 +1120,12 @@ func main() {
 	}
 
 	script := codexDesktopWindowsInstallAndLaunchScript(codexDesktopAppOptions{
-		Cwd:      dir,
-		AppPath:  fakeApp,
-		ProxyURL: "http://127.0.0.1:23123",
+		Cwd:         dir,
+		AppPath:     fakeApp,
+		ProxyURL:    "http://127.0.0.1:23123",
+		WaitForExit: true,
 		ExtraEnv: []string{
-			"ARGS_OUT=" + argsPath,
+			envCodexHome + "=" + filepath.Join(dir, ".codex"),
 		},
 	})
 	cmd := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
@@ -1108,17 +1133,27 @@ func main() {
 	if err != nil {
 		t.Fatalf("PowerShell launch failed: %v\n%s", err, out)
 	}
-	var args string
+	var data string
 	for i := 0; i < 100; i++ {
 		raw, readErr := os.ReadFile(argsPath)
 		if readErr == nil {
-			args = strings.TrimSpace(string(raw))
+			data = strings.TrimSpace(string(raw))
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if args != "--proxy-server=http://127.0.0.1:23123" {
-		t.Fatalf("fake Codex app args = %q, want Chromium proxy arg\nPowerShell output:\n%s", args, out)
+	for _, want := range []string{
+		"args=--proxy-server=http://127.0.0.1:23123",
+		"CODEX_HOME=" + filepath.Join(dir, ".codex"),
+		"HTTP_PROXY=http://127.0.0.1:23123",
+		"HTTPS_PROXY=http://127.0.0.1:23123",
+		"ALL_PROXY=http://127.0.0.1:23123",
+		"WS_PROXY=http://127.0.0.1:23123",
+		"WSS_PROXY=http://127.0.0.1:23123",
+	} {
+		if !strings.Contains(data, want) {
+			t.Fatalf("fake Codex app output missing %q:\n%s\nPowerShell output:\n%s", want, data, out)
+		}
 	}
 }
 

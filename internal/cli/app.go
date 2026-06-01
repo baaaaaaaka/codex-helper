@@ -66,6 +66,7 @@ type codexDesktopAppOptions struct {
 	ExtraEnv         []string
 	ProxyURL         string
 	ModelProfileName string
+	WaitForExit      bool
 	ExecIdentity     *execIdentity
 	Log              io.Writer
 }
@@ -719,6 +720,10 @@ func launchCodexDesktopAppWindows(ctx context.Context, opts codexDesktopAppOptio
 func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) string {
 	envAssignments := codexDesktopWindowsEnvPowerShell(opts)
 	appArgs := codexDesktopWindowsAppArgsPowerShell(opts)
+	waitForExit := "$codexWaitForExit = $false"
+	if opts.WaitForExit {
+		waitForExit = "$codexWaitForExit = $true"
+	}
 	cwd := powershellSingleQuote(opts.Cwd)
 	appPath := powershellSingleQuote(opts.AppPath)
 	packageName := powershellSingleQuote(codexDesktopWindowsPackageName)
@@ -727,6 +732,7 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"$ErrorActionPreference = 'Stop'",
 		envAssignments,
 		appArgs,
+		waitForExit,
 		"$appPath = " + appPath,
 		"$cwd = " + cwd,
 		"$packageName = " + packageName,
@@ -734,7 +740,7 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"function Get-CodexPackage { Get-AppxPackage -Name $packageName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1 }",
 		"function Get-CodexWinget { $cmd = Get-Command winget -ErrorAction SilentlyContinue; if ($null -eq $cmd) { throw 'winget was not found. Install or update App Installer, enable Microsoft Store/winget, or pass --app-path to an existing Codex.exe.' }; return $cmd }",
 		"function Warn-NonInteractiveDesktop { if (-not ([Environment]::UserInteractive)) { Write-Warning 'Current Windows session is non-interactive. The Codex desktop app may install successfully but no visible window may appear; run from an interactive Windows desktop session if launch is not visible.' } }",
-		"function Start-CodexDesktopProcess([string]$FilePath) { if ($codexArgs.Count -gt 0) { Start-Process -FilePath $FilePath -ArgumentList $codexArgs -WorkingDirectory $cwd | Out-Null } else { Start-Process -FilePath $FilePath -WorkingDirectory $cwd | Out-Null } }",
+		"function Start-CodexDesktopProcess([string]$FilePath) { $start = @{ FilePath = $FilePath; WorkingDirectory = $cwd }; if ($codexArgs.Count -gt 0) { $start.ArgumentList = $codexArgs }; if ($codexWaitForExit) { $start.Wait = $true }; Start-Process @start | Out-Null }",
 		"Warn-NonInteractiveDesktop",
 		"$pkg = Get-CodexPackage",
 		"if ($null -eq $pkg -and [string]::IsNullOrWhiteSpace($appPath)) { $winget = Get-CodexWinget; & $winget.Source install --id $storeId --source msstore --exact --accept-source-agreements --accept-package-agreements --disable-interactivity; if ($LASTEXITCODE -ne 0) { throw ('winget Microsoft Store install failed with exit code ' + $LASTEXITCODE + '. Microsoft Store/winget may be blocked by enterprise policy, unavailable on this Windows edition, or unable to reach the network/proxy.') }; $pkg = Get-CodexPackage }",
