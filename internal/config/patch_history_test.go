@@ -328,6 +328,7 @@ func TestPatchHistoryStore_IsFailed(t *testing.T) {
 		t.Fatalf("expected not failed")
 	}
 
+	// A single (legacy) failure must NOT latch — only the threshold does.
 	if err := s.Upsert(PatchHistoryEntry{
 		Path:          "/usr/bin/codex",
 		OrigSHA256:    "aaa",
@@ -336,13 +337,92 @@ func TestPatchHistoryStore_IsFailed(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
+	if failed, _ := s.IsFailed("/usr/bin/codex", "aaa"); failed {
+		t.Fatalf("single legacy failure should not latch")
+	}
 
+	// At the threshold it latches.
+	if err := s.Upsert(PatchHistoryEntry{
+		Path:          "/usr/bin/codex",
+		OrigSHA256:    "aaa",
+		Failed:        true,
+		FailureCount:  PatchFailureThreshold,
+		FailureReason: "SIGSEGV",
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
 	failed, err = s.IsFailed("/usr/bin/codex", "aaa")
 	if err != nil {
 		t.Fatalf("IsFailed: %v", err)
 	}
 	if !failed {
-		t.Fatalf("expected failed")
+		t.Fatalf("expected failed at threshold")
+	}
+}
+
+func TestPatchHistoryStore_KnownGood(t *testing.T) {
+	s := newTestPatchHistoryStore(t)
+
+	if _, ok, err := s.LastKnownGood(); err != nil || ok {
+		t.Fatalf("expected no known-good initially, ok=%v err=%v", ok, err)
+	}
+
+	// Record one known-good entry.
+	if err := s.RecordKnownGood("/usr/bin/codex", "aaa", "0.135.0"); err != nil {
+		t.Fatalf("RecordKnownGood: %v", err)
+	}
+	got, ok, err := s.LastKnownGood()
+	if err != nil || !ok {
+		t.Fatalf("expected a known-good entry, ok=%v err=%v", ok, err)
+	}
+	if got.CodexVersion != "0.135.0" || got.OrigSHA256 != "aaa" {
+		t.Fatalf("unexpected known-good %#v", got)
+	}
+
+	// A newer known-good (different hash) wins by KnownGoodAt.
+	time.Sleep(2 * time.Millisecond)
+	if err := s.RecordKnownGood("/usr/bin/codex", "bbb", "0.136.0"); err != nil {
+		t.Fatalf("RecordKnownGood: %v", err)
+	}
+	got, ok, _ = s.LastKnownGood()
+	if !ok || got.OrigSHA256 != "bbb" || got.CodexVersion != "0.136.0" {
+		t.Fatalf("expected newest known-good bbb/0.136.0, got %#v", got)
+	}
+
+	// RecordKnownGood clears a prior failure on the same entry.
+	if err := s.RecordFailure("/usr/bin/codex", "bbb", "test", "crash"); err != nil {
+		t.Fatalf("RecordFailure: %v", err)
+	}
+	if err := s.RecordKnownGood("/usr/bin/codex", "bbb", "0.136.0"); err != nil {
+		t.Fatalf("RecordKnownGood: %v", err)
+	}
+	if failed, _ := s.IsFailed("/usr/bin/codex", "bbb"); failed {
+		t.Fatal("RecordKnownGood should clear failure state")
+	}
+}
+
+func TestPatchHistoryStore_LastKnownGoodSkipsLatchedFailures(t *testing.T) {
+	s := newTestPatchHistoryStore(t)
+
+	if err := s.RecordKnownGood("/usr/bin/codex", "aaa", "0.135.0"); err != nil {
+		t.Fatalf("RecordKnownGood aaa: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := s.RecordKnownGood("/usr/bin/codex", "bbb", "0.136.0"); err != nil {
+		t.Fatalf("RecordKnownGood bbb: %v", err)
+	}
+	for i := 0; i < PatchFailureThreshold; i++ {
+		if err := s.RecordFailure("/usr/bin/codex", "bbb", "test", "crash"); err != nil {
+			t.Fatalf("RecordFailure bbb #%d: %v", i+1, err)
+		}
+	}
+
+	got, ok, err := s.LastKnownGood()
+	if err != nil || !ok {
+		t.Fatalf("expected older known-good fallback, ok=%v err=%v", ok, err)
+	}
+	if got.OrigSHA256 != "aaa" || got.CodexVersion != "0.135.0" {
+		t.Fatalf("latched known-good entry should be skipped, got %#v", got)
 	}
 }
 

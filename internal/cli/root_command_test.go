@@ -22,7 +22,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "app", "beacon", "history", "init", "model-profile", "proxy", "responses", "run", "skills", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "app", "beacon", "history", "init", "model-profile", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}

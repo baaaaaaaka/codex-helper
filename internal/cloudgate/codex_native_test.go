@@ -1,11 +1,13 @@
 package cloudgate
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTargetTriple(t *testing.T) {
@@ -152,6 +154,120 @@ func TestFindNativeBinaryNotFound(t *testing.T) {
 	_, _, err := FindNativeBinary(wrapper)
 	if err == nil {
 		t.Fatal("expected error for missing native binary")
+	}
+	if !errors.Is(err, ErrNativeBinaryNotFound) {
+		t.Fatalf("missing-binary error should be retryable (ErrNativeBinaryNotFound), got %v", err)
+	}
+}
+
+// TestFindNativeBinaryWithRetrySucceedsWhenBinaryAppears simulates the npm
+// reinstall race: the vendor binary is briefly absent, then appears. The retry
+// wrapper must ride out the gap instead of failing the launch.
+func TestFindNativeBinaryWithRetrySucceedsWhenBinaryAppears(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	binDir := filepath.Join(dir, "bin")
+	nativeDir := filepath.Join(dir, "vendor", triple, "codex")
+	for _, d := range []string{binDir, nativeDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	wrapperPath := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
+
+	// Tighten the retry budget for the test and restore afterward.
+	prevAttempts, prevDelay := nativeBinaryResolveAttempts, nativeBinaryResolveDelay
+	t.Cleanup(func() {
+		nativeBinaryResolveAttempts, nativeBinaryResolveDelay = prevAttempts, prevDelay
+	})
+	nativeBinaryResolveAttempts = 10
+	nativeBinaryResolveDelay = 10 * time.Millisecond
+
+	// The binary appears after a couple of retry intervals.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(25 * time.Millisecond)
+		_ = os.WriteFile(nativePath, []byte("native binary"), 0o755)
+	}()
+	t.Cleanup(func() { <-done })
+
+	gotBin, _, err := FindNativeBinaryWithRetry(wrapperPath)
+	if err != nil {
+		t.Fatalf("FindNativeBinaryWithRetry: %v", err)
+	}
+	if gotBin != nativePath {
+		t.Errorf("expected native binary %q, got %q", nativePath, gotBin)
+	}
+}
+
+// TestFindNativeBinaryWithRetryExhausts verifies the wrapper gives up (rather
+// than hanging) when the binary never appears.
+func TestFindNativeBinaryWithRetryExhausts(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	wrapperPath := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+
+	prevAttempts, prevDelay := nativeBinaryResolveAttempts, nativeBinaryResolveDelay
+	t.Cleanup(func() {
+		nativeBinaryResolveAttempts, nativeBinaryResolveDelay = prevAttempts, prevDelay
+	})
+	nativeBinaryResolveAttempts = 3
+	nativeBinaryResolveDelay = 1 * time.Millisecond
+
+	_, _, err := FindNativeBinaryWithRetry(wrapperPath)
+	if !errors.Is(err, ErrNativeBinaryNotFound) {
+		t.Fatalf("expected ErrNativeBinaryNotFound after exhausting retries, got %v", err)
+	}
+}
+
+// TestFindNativeBinaryWithRetryDoesNotRetryHardError verifies a non-not-found
+// error (e.g. an unresolvable wrapper path) returns immediately without burning
+// the retry budget.
+func TestFindNativeBinaryWithRetryDoesNotRetryHardError(t *testing.T) {
+	if targetTriple() == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	prevAttempts, prevDelay := nativeBinaryResolveAttempts, nativeBinaryResolveDelay
+	t.Cleanup(func() {
+		nativeBinaryResolveAttempts, nativeBinaryResolveDelay = prevAttempts, prevDelay
+	})
+	nativeBinaryResolveAttempts = 5
+	nativeBinaryResolveDelay = 10 * time.Second // would make retries take ~40s
+
+	start := time.Now()
+	_, _, err := FindNativeBinaryWithRetry(filepath.Join(t.TempDir(), "does-not-exist", "codex"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error for an unresolvable wrapper")
+	}
+	if errors.Is(err, ErrNativeBinaryNotFound) {
+		t.Fatalf("unresolvable wrapper should be a hard error, not retryable not-found: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("hard error should short-circuit, took %s", elapsed)
 	}
 }
 

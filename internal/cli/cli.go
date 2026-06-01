@@ -5,7 +5,7 @@ import (
 )
 
 var (
-	version = "v0.1.6"
+	version = "v0.1.7"
 	commit  = ""
 	date    = ""
 )
@@ -58,6 +58,7 @@ func newRootCmd() *cobra.Command {
 		newSkillsCmd(opts),
 		newUpgradeCmd(opts),
 		newHistoryCmd(opts),
+		newSelftestCmd(opts),
 	)
 
 	return cmd

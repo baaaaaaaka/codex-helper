@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -96,6 +98,85 @@ func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
 	}
 }
 
+func TestStore_LoadAcceptsNewerAdditiveConfig(t *testing.T) {
+	// A future binary wrote a higher generation with only additive changes
+	// (reader floor unchanged). An older binary must read it, not die — and the
+	// unknown field must be ignored without error.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := fmt.Sprintf(`{"version":%d,"minReader":%d,"profiles":[{"id":"p1","name":"n1"}],"someFutureField":{"x":1}}`,
+		CurrentVersion+1, MinReaderVersion)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].ID != "p1" {
+		t.Fatalf("Profiles=%#v", cfg.Profiles)
+	}
+	// The newer write-generation stamp is preserved (not downgraded on read).
+	if cfg.Version != CurrentVersion+1 {
+		t.Fatalf("Version=%d want %d", cfg.Version, CurrentVersion+1)
+	}
+}
+
+func TestStore_SaveStampsReaderFloor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(Config{}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Version != CurrentVersion {
+		t.Fatalf("Version=%d want %d", cfg.Version, CurrentVersion)
+	}
+	if cfg.MinReader != MinReaderVersion {
+		t.Fatalf("MinReader=%d want %d", cfg.MinReader, MinReaderVersion)
+	}
+}
+
+func TestStore_SaveKeepsFirstMinReaderGenerationRollbackCompatible(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(Config{}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	var raw struct {
+		Version   int `json:"version"`
+		MinReader int `json:"minReader"`
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	if raw.Version != 2 {
+		t.Fatalf("first minReader-aware release must keep version=2 for v0.1.6 rollback, got %d", raw.Version)
+	}
+	if raw.MinReader != MinReaderVersion {
+		t.Fatalf("MinReader=%d want %d", raw.MinReader, MinReaderVersion)
+	}
+}
+
 func TestDefaultPathForHome(t *testing.T) {
 	home := filepath.Join(string(filepath.Separator), "tmp", "test-home")
 
@@ -177,10 +258,10 @@ func TestStore_ErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("Load rejects unsupported version", func(t *testing.T) {
+	t.Run("Load rejects corrupt negative version", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.json")
-		if err := os.WriteFile(path, []byte(`{"version":999}`), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(`{"version":-1}`), 0o600); err != nil {
 			t.Fatalf("write config: %v", err)
 		}
 		store, err := NewStore(path)
@@ -188,18 +269,38 @@ func TestStore_ErrorPaths(t *testing.T) {
 			t.Fatalf("NewStore: %v", err)
 		}
 		if _, err := store.Load(); err == nil {
-			t.Fatalf("expected version error")
+			t.Fatalf("expected corrupt-config error for negative version")
 		}
 	})
 
-	t.Run("Save rejects unsupported version", func(t *testing.T) {
+	t.Run("Load rejects config requiring a newer reader", func(t *testing.T) {
 		dir := t.TempDir()
-		store, err := NewStore(filepath.Join(dir, "config.json"))
+		path := filepath.Join(dir, "config.json")
+		if err := os.WriteFile(path, []byte(fmt.Sprintf(`{"version":999,"minReader":%d}`, SupportedReaderVersion+1)), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		store, err := NewStore(path)
 		if err != nil {
 			t.Fatalf("NewStore: %v", err)
 		}
-		if err := store.Save(Config{Version: CurrentVersion + 1}); err == nil {
-			t.Fatalf("expected save version error")
+		_, err = store.Load()
+		if !errors.Is(err, ErrStaleReader) {
+			t.Fatalf("expected ErrStaleReader, got %v", err)
+		}
+	})
+
+	t.Run("Save refuses to clobber a newer-generation file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.json")
+		if err := os.WriteFile(path, []byte(fmt.Sprintf(`{"version":%d}`, CurrentVersion+1)), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		store, err := NewStore(path)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+		if err := store.Save(Config{}); err == nil {
+			t.Fatalf("expected refuse-to-overwrite error")
 		}
 	})
 

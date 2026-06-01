@@ -2,10 +2,29 @@ package config
 
 import "time"
 
+// CurrentVersion is the schema generation this binary stamps into configs it
+// writes. It stays at 2 for the first minReader-aware release so v0.1.6 can
+// still read config files after rollback; future additive schema changes can
+// bump this while keeping MinReaderVersion stable.
 const CurrentVersion = 2
+
+// MinReaderVersion is the minimum reader generation required to SAFELY read a
+// config written by this binary. Raise it ONLY for breaking schema changes
+// (removed/renamed/semantically-changed fields). Additive changes MUST leave it
+// unchanged so older binaries can still read newer configs — encoding/json
+// ignores unknown fields, so an additive change does not require a newer reader.
+// See (*Store).loadUnlocked for the gate.
+const MinReaderVersion = 1
+
+// SupportedReaderVersion is the newest reader floor this binary can satisfy. A
+// config whose minReader exceeds it is rejected with ErrStaleReader (this build
+// is too old to read it). It moves together with MinReaderVersion when a
+// breaking change lands.
+const SupportedReaderVersion = 1
 
 type Config struct {
 	Version             int                     `json:"version"`
+	MinReader           int                     `json:"minReader,omitempty"`
 	ProxyEnabled        *bool                   `json:"proxyEnabled,omitempty"`
 	YoloEnabled         *bool                   `json:"yoloEnabled,omitempty"`
 	Profiles            []Profile               `json:"profiles"`

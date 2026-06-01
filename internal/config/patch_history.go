@@ -12,6 +12,12 @@ import (
 	"github.com/gofrs/flock"
 )
 
+// PatchFailureThreshold is the number of consecutive non-transient startup
+// failures required before a patched binary is considered broken and patching
+// is skipped. Requiring repetition (rather than latching on the first failure)
+// prevents a one-off crash from permanently disabling yolo for a codex version.
+const PatchFailureThreshold = 3
+
 // PatchHistoryEntry records a single patch operation.
 type PatchHistoryEntry struct {
 	Path          string    `json:"path"`
@@ -20,7 +26,28 @@ type PatchHistoryEntry struct {
 	ProxyVersion  string    `json:"proxyVersion"`
 	PatchedAt     time.Time `json:"patchedAt"`
 	Failed        bool      `json:"failed,omitempty"`
+	FailureCount  int       `json:"failureCount,omitempty"`
 	FailureReason string    `json:"failureReason,omitempty"`
+	// CodexVersion is the codex CLI version string for this binary, recorded
+	// when known. KnownGood marks a binary that has both patched and run
+	// cleanly at least once — a safe target to fall back to if a later codex
+	// build misbehaves. KnownGoodAt is when it was last confirmed good.
+	CodexVersion string    `json:"codexVersion,omitempty"`
+	KnownGood    bool      `json:"knownGood,omitempty"`
+	KnownGoodAt  time.Time `json:"knownGoodAt,omitempty"`
+}
+
+// effectiveFailureCount returns the consecutive-failure count, treating a legacy
+// entry (Failed=true with no count, written before FailureCount existed) as a
+// single failure so it never permanently latches on upgrade.
+func effectiveFailureCount(e PatchHistoryEntry) int {
+	if e.FailureCount > 0 {
+		return e.FailureCount
+	}
+	if e.Failed {
+		return 1
+	}
+	return 0
 }
 
 // PatchHistory is the on-disk structure for patch_history.json.
@@ -102,18 +129,122 @@ func (s *PatchHistoryStore) IsPatched(path, origSHA256 string) (bool, error) {
 	return false, nil
 }
 
-// IsFailed returns true if a previous patch for this binary was recorded as failed.
+// IsFailed reports whether this binary has reached the consecutive-failure
+// threshold and patching should be skipped. A single (or sub-threshold) failure
+// does not latch, so a transient crash cannot permanently disable yolo.
 func (s *PatchHistoryStore) IsFailed(path, origSHA256 string) (bool, error) {
 	h, err := s.Load()
 	if err != nil {
 		return false, err
 	}
 	for _, e := range h.Entries {
-		if e.Path == path && e.OrigSHA256 == origSHA256 && e.Failed {
-			return true, nil
+		if e.Path == path && e.OrigSHA256 == origSHA256 {
+			return effectiveFailureCount(e) >= PatchFailureThreshold, nil
 		}
 	}
 	return false, nil
+}
+
+// RecordFailure increments the consecutive-failure count for (path, origSHA256),
+// preserving any existing patch metadata. Caller must have already filtered out
+// transient (non-binary) failures.
+func (s *PatchHistoryStore) RecordFailure(path, origSHA256, proxyVersion, reason string) error {
+	return s.Update(func(h *PatchHistory) error {
+		for i := range h.Entries {
+			if h.Entries[i].Path == path && h.Entries[i].OrigSHA256 == origSHA256 {
+				h.Entries[i].FailureCount = effectiveFailureCount(h.Entries[i]) + 1
+				h.Entries[i].Failed = true
+				h.Entries[i].FailureReason = reason
+				h.Entries[i].PatchedAt = time.Now()
+				if proxyVersion != "" {
+					h.Entries[i].ProxyVersion = proxyVersion
+				}
+				return nil
+			}
+		}
+		h.Entries = append(h.Entries, PatchHistoryEntry{
+			Path:          path,
+			OrigSHA256:    origSHA256,
+			ProxyVersion:  proxyVersion,
+			PatchedAt:     time.Now(),
+			Failed:        true,
+			FailureCount:  1,
+			FailureReason: reason,
+		})
+		return nil
+	})
+}
+
+// RecordKnownGood marks (path, origSHA256) as a binary that has patched and run
+// cleanly: it clears any failure count and records the codex version (when
+// known). Such an entry is a safe fallback target if a later codex build
+// misbehaves.
+func (s *PatchHistoryStore) RecordKnownGood(path, origSHA256, codexVersion string) error {
+	now := time.Now()
+	return s.Update(func(h *PatchHistory) error {
+		for i := range h.Entries {
+			if h.Entries[i].Path == path && h.Entries[i].OrigSHA256 == origSHA256 {
+				h.Entries[i].FailureCount = 0
+				h.Entries[i].Failed = false
+				h.Entries[i].FailureReason = ""
+				h.Entries[i].KnownGood = true
+				h.Entries[i].KnownGoodAt = now
+				if codexVersion != "" {
+					h.Entries[i].CodexVersion = codexVersion
+				}
+				return nil
+			}
+		}
+		h.Entries = append(h.Entries, PatchHistoryEntry{
+			Path:         path,
+			OrigSHA256:   origSHA256,
+			CodexVersion: codexVersion,
+			KnownGood:    true,
+			KnownGoodAt:  now,
+			PatchedAt:    now,
+		})
+		return nil
+	})
+}
+
+// LastKnownGood returns the most recently confirmed known-good entry, or false
+// if none has been recorded.
+func (s *PatchHistoryStore) LastKnownGood() (PatchHistoryEntry, bool, error) {
+	h, err := s.Load()
+	if err != nil {
+		return PatchHistoryEntry{}, false, err
+	}
+	var best PatchHistoryEntry
+	found := false
+	for _, e := range h.Entries {
+		if !e.KnownGood {
+			continue
+		}
+		if effectiveFailureCount(e) >= PatchFailureThreshold {
+			continue
+		}
+		if !found || e.KnownGoodAt.After(best.KnownGoodAt) {
+			best = e
+			found = true
+		}
+	}
+	return best, found, nil
+}
+
+// ClearFailure resets the consecutive-failure count for (path, origSHA256),
+// called after the patched binary runs successfully. Patch metadata is kept.
+func (s *PatchHistoryStore) ClearFailure(path, origSHA256 string) error {
+	return s.Update(func(h *PatchHistory) error {
+		for i := range h.Entries {
+			if h.Entries[i].Path == path && h.Entries[i].OrigSHA256 == origSHA256 {
+				h.Entries[i].FailureCount = 0
+				h.Entries[i].Failed = false
+				h.Entries[i].FailureReason = ""
+				return nil
+			}
+		}
+		return nil
+	})
 }
 
 // Find returns the entry for the given path and origSHA256, or nil if not found.

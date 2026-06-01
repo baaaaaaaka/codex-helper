@@ -239,14 +239,40 @@ func isYoloFailure(err error, output string) bool {
 	return false
 }
 
+// isTransientLaunchFailure returns true if err indicates the process was killed
+// for reasons unrelated to a broken binary — OOM (SIGKILL → "signal: killed"),
+// a context/timeout kill, or a user interrupt (SIGINT/SIGTERM). These must NOT
+// be recorded as patch failures, or a one-off OOM would permanently latch yolo
+// off for an otherwise-good codex version.
+func isTransientLaunchFailure(err error, output string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	lower := strings.ToLower(err.Error() + " " + output)
+	for _, marker := range []string{
+		"signal: killed",     // SIGKILL: OOM-killer or CommandContext timeout
+		"signal: interrupt",  // SIGINT: Ctrl-C / cancellation
+		"signal: terminated", // SIGTERM
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // isPatchedBinaryStartupFailure returns true if err + output indicate that a
-// patched Codex binary failed to start properly.
+// patched Codex binary failed to start properly. Transient kills (OOM, timeout,
+// interrupt) are excluded — see isTransientLaunchFailure.
 func isPatchedBinaryStartupFailure(err error, output string) bool {
 	if err == nil {
 		return false
 	}
-	if strings.Contains(strings.ToLower(err.Error()), "signal: killed") {
-		return true
+	if isTransientLaunchFailure(err, output) {
+		return false
 	}
 	if isPatchedBinaryFailure(err, output) {
 		return true
@@ -266,8 +292,11 @@ func isPatchedBinaryStartupFailure(err error, output string) bool {
 	return false
 }
 
-// isPatchedBinaryFailure checks output for error patterns specific to a
-// patched Codex binary (corrupted binary, missing libraries, etc.).
+// isPatchedBinaryFailure checks output for error patterns that indicate the
+// patched binary is structurally broken (corrupted, wrong arch, missing libs).
+// Ambiguous/transient markers like "killed" and "abort" are intentionally NOT
+// here: genuine crash signals (SIGABRT, SIGSEGV, …) are detected precisely via
+// exitDueToFatalSignal, while "killed"/"abort" in output are often transient.
 func isPatchedBinaryFailure(err error, output string) bool {
 	if err == nil {
 		return false
@@ -278,11 +307,9 @@ func isPatchedBinaryFailure(err error, output string) bool {
 		"exec format error",
 		"cannot execute binary",
 		"bad cpu type",
-		"killed",
 		"segmentation fault",
 		"bus error",
 		"illegal instruction",
-		"abort",
 	}
 	for _, p := range patterns {
 		if strings.Contains(lower, p) {

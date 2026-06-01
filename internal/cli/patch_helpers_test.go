@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -184,11 +185,14 @@ func TestIsPatchedBinaryFailure(t *testing.T) {
 		{"exec format error", true},
 		{"cannot execute binary file", true},
 		{"bad cpu type in executable", true},
-		{"Killed", true},
 		{"Segmentation fault (core dumped)", true},
 		{"Bus error", true},
 		{"Illegal instruction", true},
-		{"Abort trap: 6", true},
+		// "Killed" (OOM/timeout) and "Abort trap" are no longer treated as a
+		// broken binary — they are transient/ambiguous. Genuine SIGABRT is
+		// caught precisely by exitDueToFatalSignal, not by output matching.
+		{"Killed", false},
+		{"Abort trap: 6", false},
 	}
 	for _, tc := range cases {
 		got := isPatchedBinaryFailure(os.ErrInvalid, tc.output)
@@ -209,7 +213,6 @@ func TestIsPatchedBinaryFailure_CaseInsensitive(t *testing.T) {
 		"Bus Error",
 		"EXEC FORMAT ERROR",
 		"NOT A VALID EXECUTABLE",
-		"ABORT",
 		"ILLEGAL INSTRUCTION",
 	}
 	for _, output := range cases {
@@ -224,7 +227,6 @@ func TestIsPatchedBinaryFailure_Substrings(t *testing.T) {
 	cases := []string{
 		"Error: not a valid executable (binary corrupted)",
 		"./codex-patched: exec format error\n",
-		"zsh: abort      ./codex-patched",
 		"/tmp/codex-patched: cannot execute binary file: Exec format error",
 	}
 	for _, output := range cases {
@@ -300,9 +302,9 @@ func TestIsPatchedBinaryStartupFailure_PermissionDenied(t *testing.T) {
 }
 
 func TestIsPatchedBinaryStartupFailure_OnlyOutputMatch(t *testing.T) {
-	// Error is generic but output indicates a crash.
-	if !isPatchedBinaryStartupFailure(fmt.Errorf("exit status 134"), "Abort trap: 6") {
-		t.Error("expected true for abort output with generic error")
+	// Error is generic but output indicates a structural crash.
+	if !isPatchedBinaryStartupFailure(fmt.Errorf("exit status 135"), "bus error") {
+		t.Error("expected true for bus error output with generic error")
 	}
 }
 
@@ -327,22 +329,39 @@ func TestIsPatchedBinaryStartupFailure_FatalSignal(t *testing.T) {
 	}
 }
 
-func TestIsPatchedBinaryStartupFailure_SignalKilledString(t *testing.T) {
-	if !isPatchedBinaryStartupFailure(fmt.Errorf("signal: killed"), "") {
-		t.Error("expected true for signal: killed")
+func TestIsPatchedBinaryStartupFailure_SignalKilledIsTransient(t *testing.T) {
+	// "signal: killed" (SIGKILL) is an OOM/timeout kill, NOT a broken binary —
+	// it must not be recorded as a patch failure or it would latch yolo off for
+	// a good codex version.
+	if isPatchedBinaryStartupFailure(fmt.Errorf("signal: killed"), "") {
+		t.Error("expected false for signal: killed (transient)")
+	}
+	if !isTransientLaunchFailure(fmt.Errorf("signal: killed"), "") {
+		t.Error("expected signal: killed to be classified transient")
 	}
 }
 
-func TestIsPatchedBinaryStartupFailure_SignalKilledStringCaseInsensitive(t *testing.T) {
-	if !isPatchedBinaryStartupFailure(fmt.Errorf("Signal: KILLED"), "") {
-		t.Error("expected true for case-insensitive signal: killed match")
-	}
-}
-
-func TestIsPatchedBinaryStartupFailure_WrappedSignalKilledString(t *testing.T) {
+func TestIsPatchedBinaryStartupFailure_WrappedSignalKilledIsTransient(t *testing.T) {
 	err := fmt.Errorf("run failed: %w", fmt.Errorf("signal: killed"))
-	if !isPatchedBinaryStartupFailure(err, "") {
-		t.Error("expected true for wrapped signal: killed error")
+	if isPatchedBinaryStartupFailure(err, "") {
+		t.Error("expected false for wrapped signal: killed (transient)")
+	}
+}
+
+func TestIsTransientLaunchFailure_InterruptAndTimeout(t *testing.T) {
+	cases := []error{
+		fmt.Errorf("signal: interrupt"),
+		fmt.Errorf("signal: terminated"),
+		context.Canceled,
+		context.DeadlineExceeded,
+	}
+	for _, err := range cases {
+		if !isTransientLaunchFailure(err, "") {
+			t.Errorf("expected transient for %v", err)
+		}
+		if isPatchedBinaryStartupFailure(err, "") {
+			t.Errorf("expected non-latching for %v", err)
+		}
 	}
 }
 
@@ -620,9 +639,9 @@ func TestRecordPatchFailure_WritesToStore(t *testing.T) {
 		ConfigDir:      dir,
 	}
 
+	// A single failure records the reason but does NOT latch (below threshold).
 	recordPatchFailure(info, fmt.Errorf("signal: segmentation fault"), "Segmentation fault (core dumped)")
 
-	// Verify the failure was recorded.
 	phs, err := config.NewPatchHistoryStore(dir)
 	if err != nil {
 		t.Fatalf("NewPatchHistoryStore: %v", err)
@@ -631,33 +650,35 @@ func TestRecordPatchFailure_WritesToStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IsFailed: %v", err)
 	}
-	if !failed {
-		t.Fatal("expected failure to be recorded")
+	if failed {
+		t.Fatal("single failure should not latch (below threshold)")
 	}
 
-	// Verify failure reason.
 	entry, err := phs.Find("/bin/codex", "abc123")
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
-	if entry == nil {
-		t.Fatal("expected entry")
-	}
-	if !entry.Failed {
-		t.Fatal("expected Failed=true")
-	}
-	if entry.FailureReason == "" {
-		t.Fatal("expected non-empty failure reason")
+	if entry == nil || !entry.Failed || entry.FailureCount != 1 {
+		t.Fatalf("expected Failed=true count=1, got %#v", entry)
 	}
 	if !strings.Contains(entry.FailureReason, "segmentation fault") {
 		t.Fatalf("expected 'segmentation fault' in reason, got %q", entry.FailureReason)
 	}
+
+	// Reaching the threshold latches it.
+	for i := 1; i < config.PatchFailureThreshold; i++ {
+		recordPatchFailure(info, fmt.Errorf("signal: segmentation fault"), "Segmentation fault")
+	}
+	failed, _ = phs.IsFailed("/bin/codex", "abc123")
+	if !failed {
+		t.Fatalf("expected latch after %d failures", config.PatchFailureThreshold)
+	}
 }
 
-func TestRecordPatchFailure_OverwritesPreviousSuccess(t *testing.T) {
+func TestRecordPatchFailure_ThresholdAndClearOnSuccess(t *testing.T) {
 	dir := t.TempDir()
 
-	// First, record a success.
+	// Start from a recorded success.
 	phs, err := config.NewPatchHistoryStore(dir)
 	if err != nil {
 		t.Fatalf("NewPatchHistoryStore: %v", err)
@@ -666,22 +687,26 @@ func TestRecordPatchFailure_OverwritesPreviousSuccess(t *testing.T) {
 		Path:          "/bin/codex",
 		OrigSHA256:    "abc123",
 		PatchedSHA256: "def456",
-		Failed:        false,
 	})
 
-	// Now record a failure.
 	info := &patchRunInfo{
 		OrigBinaryPath: "/bin/codex",
 		OrigSHA256:     "abc123",
 		ConfigDir:      dir,
 	}
-	recordPatchFailure(info, fmt.Errorf("crash"), "boom")
 
-	// Should now be failed.
-	phs2, _ := config.NewPatchHistoryStore(dir)
-	failed, _ := phs2.IsFailed("/bin/codex", "abc123")
-	if !failed {
-		t.Fatal("expected failure to overwrite success")
+	// Accumulate failures up to the threshold → latched.
+	for i := 0; i < config.PatchFailureThreshold; i++ {
+		recordPatchFailure(info, fmt.Errorf("crash"), "boom")
+	}
+	if failed, _ := phs.IsFailed("/bin/codex", "abc123"); !failed {
+		t.Fatal("expected latch at threshold")
+	}
+
+	// A clean run clears the count.
+	recordPatchSuccess(info)
+	if failed, _ := phs.IsFailed("/bin/codex", "abc123"); failed {
+		t.Fatal("expected clear after successful run")
 	}
 }
 

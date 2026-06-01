@@ -1,12 +1,28 @@
 package cloudgate
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
+)
+
+// ErrNativeBinaryNotFound marks the case where the codex wrapper resolved but
+// no native binary exists yet at the expected vendor location — typically a
+// transient window while codex's npm package is mid-reinstall. It is retryable;
+// other resolution errors (unsupported platform, bad wrapper) are not.
+var ErrNativeBinaryNotFound = errors.New("native codex binary not found")
+
+// Native binary resolution retry budget, tunable for tests. The total wait
+// rides out the brief window where an npm reinstall has removed the old vendor
+// binary but not yet written the new one.
+var (
+	nativeBinaryResolveAttempts = 8
+	nativeBinaryResolveDelay    = 300 * time.Millisecond
 )
 
 // targetTriple returns the Rust target triple for the current platform.
@@ -218,7 +234,30 @@ func firstResolvedPlatformVendorRoot(moduleDir string, platPkg string) (vendorRo
 }
 
 func missingBinaryErrorForVendorRoot(triple string, vendorRoot string) error {
-	return fmt.Errorf("native binary not found for %s in resolved platform package vendor %s", triple, filepath.Clean(vendorRoot))
+	return fmt.Errorf("%w for %s in resolved platform package vendor %s", ErrNativeBinaryNotFound, triple, filepath.Clean(vendorRoot))
+}
+
+// FindNativeBinaryWithRetry wraps FindNativeBinary, retrying only on
+// ErrNativeBinaryNotFound (the transient npm-reinstall window). Hard errors
+// (unsupported platform, unresolvable wrapper) return immediately.
+func FindNativeBinaryWithRetry(codexWrapperPath string) (nativeBin string, pathDir string, err error) {
+	attempts := nativeBinaryResolveAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	for i := 0; i < attempts; i++ {
+		nativeBin, pathDir, err = FindNativeBinary(codexWrapperPath)
+		if err == nil {
+			return nativeBin, pathDir, nil
+		}
+		if !errors.Is(err, ErrNativeBinaryNotFound) {
+			return "", "", err
+		}
+		if i < attempts-1 {
+			time.Sleep(nativeBinaryResolveDelay)
+		}
+	}
+	return "", "", err
 }
 
 // FindNativeBinary locates the native Codex binary given the path to the
@@ -269,7 +308,8 @@ func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string
 		candidates = append(candidates, candidatePlatformPackageRoots(moduleDir, platPkg)...)
 	}
 	return "", "", fmt.Errorf(
-		"native binary not found for %s (checked %s)",
+		"%w for %s (checked %s)",
+		ErrNativeBinaryNotFound,
 		triple,
 		strings.Join(dedupePaths(candidates), ", "),
 	)
@@ -283,7 +323,7 @@ func PrepareYoloBinary(codexWrapperPath string, cacheDir string) (*PatchResult, 
 }
 
 func PrepareYoloBinaryForIdentity(codexWrapperPath string, cacheDir string, reqIdentity string) (*PatchResult, []string, error) {
-	nativeBin, pathDir, err := FindNativeBinary(codexWrapperPath)
+	nativeBin, pathDir, err := FindNativeBinaryWithRetry(codexWrapperPath)
 	if err != nil {
 		return nil, nil, err
 	}

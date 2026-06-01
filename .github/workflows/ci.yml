@@ -469,6 +469,36 @@ jobs:
           $pattern = 'Test(WriteFileAtomicallyReplacesExistingFile|PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
           go test ./internal/cli -count=1 -run $pattern
 
+      - name: Config and patch resilience regressions (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          config_pattern='Test(Store_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|SaveKeepsFirstMinReaderGenerationRollbackCompatible|ErrorPaths)|PatchHistoryStore_(IsFailed|KnownGood|LastKnownGoodSkipsLatchedFailures))$'
+          cloudgate_pattern='Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|PatchCodexBinaryReportsMatchCounts)$'
+          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|PreparePatchedBinary(PreservesSubThresholdFailureCount|PreservesKnownGoodMetadata|SkipsOnFailed|RecordsHistory)|RecordPatchSuccessMarksKnownGood|IsPatchedBinaryStartupFailure_SignalKilledIsTransient|IsTransientLaunchFailure_InterruptAndTimeout)$'
+          teams_pattern='Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
+          go test ./internal/config -count=1 -run "$config_pattern" -v
+          go test ./internal/cloudgate -count=1 -run "$cloudgate_pattern" -v
+          go test ./internal/cli -count=1 -run "$cli_pattern" -v
+          go test ./internal/teams -count=1 -run "$teams_pattern" -v
+          go test ./internal/update -count=1 -run 'TestReplaceBinary(BacksUpPrevious|FirstInstallHasNoBackup)$' -v
+
+      - name: Config and patch resilience regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $configPattern = 'Test(Store_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|SaveKeepsFirstMinReaderGenerationRollbackCompatible|ErrorPaths)|PatchHistoryStore_(IsFailed|KnownGood|LastKnownGoodSkipsLatchedFailures))$'
+          $cloudgatePattern = 'Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|PatchCodexBinaryReportsMatchCounts)$'
+          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|PreparePatchedBinary(PreservesSubThresholdFailureCount|PreservesKnownGoodMetadata|SkipsOnFailed|RecordsHistory)|RecordPatchSuccessMarksKnownGood|IsPatchedBinaryStartupFailure_SignalKilledIsTransient|IsTransientLaunchFailure_InterruptAndTimeout)$'
+          $teamsPattern = 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
+          go test ./internal/config -count=1 -run $configPattern -v
+          go test ./internal/cloudgate -count=1 -run $cloudgatePattern -v
+          go test ./internal/cli -count=1 -run $cliPattern -v
+          go test ./internal/teams -count=1 -run $teamsPattern -v
+
       - name: Teams background keepalive regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

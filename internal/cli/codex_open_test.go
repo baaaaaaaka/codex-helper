@@ -743,6 +743,7 @@ func TestPreparePatchedBinarySkipsOnFailed(t *testing.T) {
 		ProxyVersion:  "test",
 		PatchedAt:     time.Now(),
 		Failed:        true,
+		FailureCount:  config.PatchFailureThreshold,
 		FailureReason: "test: simulated crash",
 	}); err != nil {
 		t.Fatalf("upsert failed entry: %v", err)
@@ -796,6 +797,117 @@ func TestPreparePatchedBinaryRecordsHistory(t *testing.T) {
 	}
 	if entry.ProxyVersion == "" {
 		t.Fatal("entry should have proxy version")
+	}
+}
+
+// TestPreparePatchedBinaryPreservesSubThresholdFailureCount verifies that a
+// successful patch does NOT reset an accumulating (sub-threshold) failure
+// count. If it did, every re-patch would wipe the counter and the failure
+// threshold could never be reached.
+func TestPreparePatchedBinaryPreservesSubThresholdFailureCount(t *testing.T) {
+	wrapperPath, _ := setupMockCodexInstall(t)
+	configDir := filepath.Join(t.TempDir(), "config")
+
+	origHash, err := hashFileSHA256(wrapperPath)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	phs, err := config.NewPatchHistoryStore(configDir)
+	if err != nil {
+		t.Fatalf("patch history: %v", err)
+	}
+	// Seed a sub-threshold failure (1 < threshold), so patching is NOT skipped.
+	if err := phs.RecordFailure(wrapperPath, origHash, "test", "transient-ish crash"); err != nil {
+		t.Fatalf("RecordFailure: %v", err)
+	}
+
+	result, _, _, skipped, patchErr := preparePatchedBinary(wrapperPath, configDir)
+	if skipped || patchErr != nil || result == nil || result.PatchedBinary == "" {
+		t.Fatalf("expected a successful (non-skipped) patch, skipped=%v err=%v", skipped, patchErr)
+	}
+	defer result.Cleanup()
+
+	entry, err := phs.Find(wrapperPath, origHash)
+	if err != nil || entry == nil {
+		t.Fatalf("Find: entry=%v err=%v", entry, err)
+	}
+	if entry.FailureCount != 1 {
+		t.Fatalf("successful patch must preserve failure count, got %d want 1", entry.FailureCount)
+	}
+	if entry.PatchedSHA256 == "" {
+		t.Fatal("successful patch should still record patched metadata")
+	}
+}
+
+// TestPreparePatchedBinaryPreservesKnownGoodMetadata verifies that a later
+// patch attempt updates the patch metadata without erasing the clean-run marker
+// recorded by recordPatchSuccess.
+func TestPreparePatchedBinaryPreservesKnownGoodMetadata(t *testing.T) {
+	wrapperPath, _ := setupMockCodexInstall(t)
+	configDir := filepath.Join(t.TempDir(), "config")
+
+	origHash, err := hashFileSHA256(wrapperPath)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	phs, err := config.NewPatchHistoryStore(configDir)
+	if err != nil {
+		t.Fatalf("patch history: %v", err)
+	}
+	if err := phs.RecordKnownGood(wrapperPath, origHash, "0.136.0"); err != nil {
+		t.Fatalf("RecordKnownGood: %v", err)
+	}
+	before, err := phs.Find(wrapperPath, origHash)
+	if err != nil || before == nil || !before.KnownGood || before.KnownGoodAt.IsZero() {
+		t.Fatalf("seed known-good entry failed: before=%#v err=%v", before, err)
+	}
+
+	result, _, _, skipped, patchErr := preparePatchedBinary(wrapperPath, configDir)
+	if skipped || patchErr != nil || result == nil || result.PatchedBinary == "" {
+		t.Fatalf("expected a successful patch, skipped=%v err=%v", skipped, patchErr)
+	}
+	defer result.Cleanup()
+
+	after, err := phs.Find(wrapperPath, origHash)
+	if err != nil || after == nil {
+		t.Fatalf("Find after patch: entry=%v err=%v", after, err)
+	}
+	if !after.KnownGood || after.CodexVersion != "0.136.0" || !after.KnownGoodAt.Equal(before.KnownGoodAt) {
+		t.Fatalf("known-good metadata was not preserved: before=%#v after=%#v", before, after)
+	}
+	if after.PatchedSHA256 == "" {
+		t.Fatal("patch metadata should still be refreshed")
+	}
+}
+
+// TestRecordPatchSuccessMarksKnownGood verifies the run.go wiring records a
+// known-good entry after a clean run (C3).
+func TestRecordPatchSuccessMarksKnownGood(t *testing.T) {
+	configDir := t.TempDir()
+	info := &patchRunInfo{
+		// A non-existent codex path makes resolveCodexVersion return "" without
+		// affecting the known-good marking, which is what we assert.
+		OrigBinaryPath: filepath.Join(configDir, "codex-absent"),
+		OrigSHA256:     "abc123",
+		ConfigDir:      configDir,
+	}
+
+	recordPatchSuccess(info)
+
+	phs, err := config.NewPatchHistoryStore(configDir)
+	if err != nil {
+		t.Fatalf("patch history: %v", err)
+	}
+	entry, err := phs.Find(info.OrigBinaryPath, info.OrigSHA256)
+	if err != nil || entry == nil {
+		t.Fatalf("Find: entry=%v err=%v", entry, err)
+	}
+	if !entry.KnownGood {
+		t.Fatal("clean run should mark the entry known-good")
+	}
+	good, ok, err := phs.LastKnownGood()
+	if err != nil || !ok || good.OrigSHA256 != "abc123" {
+		t.Fatalf("LastKnownGood = %#v ok=%v err=%v", good, ok, err)
 	}
 }
 
@@ -982,6 +1094,7 @@ func TestRunCodexNewSessionLogsPatchSkip(t *testing.T) {
 		Path:          scriptPath,
 		OrigSHA256:    origHash,
 		Failed:        true,
+		FailureCount:  config.PatchFailureThreshold,
 		FailureReason: "test: simulated crash",
 		PatchedAt:     time.Now(),
 	}); err != nil {
@@ -1210,6 +1323,7 @@ func TestRunCodexNewSessionDeletesCacheWhenPatchSkipped(t *testing.T) {
 		Path:          scriptPath,
 		OrigSHA256:    origHash,
 		Failed:        true,
+		FailureCount:  config.PatchFailureThreshold,
 		FailureReason: "test: simulated crash",
 		PatchedAt:     time.Now(),
 	}); err != nil {
@@ -1364,6 +1478,7 @@ func TestRunCodexSessionDeletesCacheWhenPatchSkipped(t *testing.T) {
 		Path:          scriptPath,
 		OrigSHA256:    origHash,
 		Failed:        true,
+		FailureCount:  config.PatchFailureThreshold,
 		FailureReason: "test: simulated crash",
 		PatchedAt:     time.Now(),
 	}); err != nil {

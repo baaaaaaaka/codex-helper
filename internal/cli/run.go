@@ -617,6 +617,12 @@ func requireYoloLaunchArgs(cmdArgs []string, opts runTargetOptions) error {
 	if len(cmdArgs) < 2 || !commandArgsHaveYolo(cmdArgs[1:]) {
 		return fmt.Errorf("yolo mode is required but no supported Codex yolo launch flag was detected")
 	}
+	// NOTE: we intentionally do NOT require the binary patch to have matched
+	// here. Yolo can also be enabled via the cloud-requirements cache bypass, so
+	// "binary patched" is not the right invariant. Whether yolo is actually
+	// effective is verified behaviorally by the runtime isYoloFailure fallback
+	// (and, later, the dedicated validation probe). PatchResult.MatchCounts is
+	// exposed for diagnostics.
 	return nil
 }
 
@@ -759,6 +765,11 @@ func runTargetWithFallbackWithOptions(
 		stderrBuf := &limitedBuffer{max: maxOutputCaptureBytes}
 		err := runTargetOnceWithOptions(ctx, cmdArgs, proxyURL, healthCheck, fatalCh, stdoutBuf, stderrBuf, opts)
 		if err == nil {
+			// A clean run clears any accumulated patch-failure count so a
+			// future transient blip can't push a good binary over the threshold.
+			if opts.PatchInfo != nil {
+				recordPatchSuccess(opts.PatchInfo)
+			}
 			return nil
 		}
 		out := stdoutBuf.String() + stderrBuf.String()
@@ -774,7 +785,8 @@ func runTargetWithFallbackWithOptions(
 			opts.YoloEnabled = false
 			continue
 		}
-		// Record patch failure if the patched binary crashed on startup.
+		// Record patch failure only if the patched binary itself is broken —
+		// isPatchedBinaryStartupFailure already excludes transient kills.
 		if opts.PatchInfo != nil && isPatchedBinaryStartupFailure(err, out) {
 			recordPatchFailure(opts.PatchInfo, err, out)
 		}
@@ -955,8 +967,9 @@ func isTerminalFile(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
-// recordPatchFailure persists a failure entry in the patch history store so
-// subsequent runs skip the same broken patch.
+// recordPatchFailure increments the consecutive-failure count for the patched
+// binary. Patching is skipped only after PatchFailureThreshold consecutive
+// failures (see PatchHistoryStore.IsFailed), so a single crash does not latch.
 func recordPatchFailure(info *patchRunInfo, err error, output string) {
 	if info == nil || info.ConfigDir == "" {
 		return
@@ -965,12 +978,24 @@ func recordPatchFailure(info *patchRunInfo, err error, output string) {
 	if phsErr != nil {
 		return
 	}
-	_ = phs.Upsert(config.PatchHistoryEntry{
-		Path:          info.OrigBinaryPath,
-		OrigSHA256:    info.OrigSHA256,
-		ProxyVersion:  currentProxyVersion(),
-		PatchedAt:     time.Now(),
-		Failed:        true,
-		FailureReason: formatFailureReason(err, output),
-	})
+	_ = phs.RecordFailure(info.OrigBinaryPath, info.OrigSHA256, currentProxyVersion(), formatFailureReason(err, output))
+}
+
+// recordPatchSuccess marks the patched binary known-good after a clean run: it
+// clears any accumulated failure count (so transient failures never reach the
+// threshold) and records this codex version as a safe fallback target. The
+// codex --version probe runs only on the first clean run of a given hash (or
+// after a prior failure), so steady-state runs stay cheap.
+func recordPatchSuccess(info *patchRunInfo) {
+	if info == nil || info.ConfigDir == "" {
+		return
+	}
+	phs, phsErr := config.NewPatchHistoryStore(info.ConfigDir)
+	if phsErr != nil {
+		return
+	}
+	if e, _ := phs.Find(info.OrigBinaryPath, info.OrigSHA256); e != nil && e.KnownGood && !e.Failed && e.FailureCount == 0 {
+		return
+	}
+	_ = phs.RecordKnownGood(info.OrigBinaryPath, info.OrigSHA256, resolveCodexVersion(info.OrigBinaryPath))
 }

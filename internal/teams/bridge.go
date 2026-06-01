@@ -5173,7 +5173,7 @@ func (b *Bridge) requestCodexUpgradeAfterFailure(ctx context.Context, session *S
 			"",
 			"Codex rejected this request because the installed CLI is too old for the selected model.",
 			"",
-			"Automatic Codex upgrade is not available in this helper configuration. Upgrade Codex manually, then send `helper retry last` here.",
+			"Automatic Codex upgrade isn't enabled here, so an administrator needs to update Codex — no action needed from you. Once it's updated, send `helper retry last` here.",
 		}, "\n")
 	}
 	noticeMsg := teamstore.OutboxMessage{
@@ -5312,11 +5312,32 @@ func codexUpgradeTargetNoticeBody(succeeded bool, path string, cause error) stri
 		}
 		return body
 	}
-	body := "⚠️ Codex CLI upgrade failed.\n\nI could not upgrade Codex automatically. Upgrade Codex manually, then retry this request with `helper retry last`."
+	body := "⚠️ Codex CLI upgrade failed.\n\nI could not upgrade Codex automatically; an administrator needs to update it — no action needed from you. Once it's updated, send `helper retry last` here."
 	if cause != nil && strings.TrimSpace(cause.Error()) != "" {
 		body += "\n\nError:\n" + trimTeamsCommandOutput(cause.Error(), 600)
 	}
 	return body
+}
+
+// infraLaunchFailureNotice returns a user-facing, non-blaming, Teams-actionable
+// message for an infrastructure/setup launch failure (config or version
+// mismatch, missing native binary, patch unavailable, transport not
+// configured). It is classified structurally via the codexrunner ErrorLaunch
+// kind, so it does not depend on fragile error-text matching. The second return
+// is false for ordinary codex/content failures, which keep their own text.
+func infraLaunchFailureNotice(err error) (string, bool) {
+	if !codexrunner.IsKind(err, codexrunner.ErrorLaunch) {
+		return "", false
+	}
+	return strings.Join([]string{
+		"⚠️ I couldn't start Codex due to a setup issue on my side — this is not a problem with your request.",
+		"",
+		"This usually means the Codex CLI or my own configuration needs attention (for example a version mismatch after an update). I did not retry automatically, to avoid duplicating work.",
+		"Once it's sorted out, send `helper retry last` here.",
+		"",
+		"Diagnostic for the admin:",
+		trimTeamsCommandOutput(err.Error(), 600),
+	}, "\n"), true
 }
 
 func codexErrorRequiresUpgrade(err error) bool {
@@ -8755,6 +8776,18 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 				return upgradeErr
 			}
 			return nil
+		}
+		if infraBody, ok := infraLaunchFailureNotice(err); ok {
+			// Setup/infrastructure failure: don't surface the raw internal error
+			// as if Codex produced it. Audit loudly for the operator and show the
+			// user a reassuring, Teams-actionable message.
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "codex launch failure (infrastructure, not user request): %v\n", err)
+			}
+			return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", infraBody, outboxQueueOptions{
+				MentionOwner:     true,
+				NotificationKind: "needs_attention",
+			})
 		}
 		errorBody := "error: " + err.Error()
 		if (plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation) && strings.HasPrefix(strings.TrimSpace(err.Error()), "Beacon ") {

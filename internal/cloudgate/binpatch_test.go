@@ -674,6 +674,46 @@ func TestPatchCodexBinaryMissingFile(t *testing.T) {
 	}
 }
 
+func TestPatchCodexBinaryReportsMatchCounts(t *testing.T) {
+	dir := t.TempDir()
+
+	// A binary missing every literal: MatchCounts is populated with zeros so a
+	// caller can detect a codex build that silently defeated the patch.
+	noTarget := filepath.Join(dir, "codex-none")
+	if err := os.WriteFile(noTarget, buildSyntheticBinary(t, "unrelated content only"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	res, err := PatchCodexBinary(noTarget, filepath.Join(dir, "c1"))
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	if res.MatchCounts[requirementsPatchName] != 0 {
+		t.Fatalf("expected 0 requirements matches, got %d", res.MatchCounts[requirementsPatchName])
+	}
+	if res.RequirementsRedirected() {
+		t.Fatal("RequirementsRedirected should be false when nothing matched")
+	}
+
+	// A binary containing the requirements literal: the family matches and
+	// RequirementsRedirected reports true.
+	withReq := filepath.Join(dir, "codex-req")
+	if err := os.WriteFile(withReq, buildSyntheticBinary(t, origReqPath), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	res2, err := PatchCodexBinary(withReq, filepath.Join(dir, "c2"))
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer res2.Cleanup()
+	defer os.RemoveAll(filepath.Dir(mustPatchedReqPath(t)))
+	if res2.MatchCounts[requirementsPatchName] != 1 {
+		t.Fatalf("expected 1 requirements match, got %d", res2.MatchCounts[requirementsPatchName])
+	}
+	if !res2.RequirementsRedirected() {
+		t.Fatal("RequirementsRedirected should be true after matching")
+	}
+}
+
 func TestPatchCodexBinaryPartialPatches(t *testing.T) {
 	dir := t.TempDir()
 

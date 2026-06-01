@@ -216,9 +216,25 @@ type PatchResult struct {
 	RequirementsPath string
 	// OrigSHA256 is the SHA-256 hex digest of the original binary before patching.
 	OrigSHA256 string
+	// MatchCounts records how many sites each named patch family matched. It is
+	// populated even when nothing matched (all zeros), so callers can detect a
+	// codex build whose layout changed and silently defeated the patch.
+	MatchCounts map[string]int
 
 	leasePath          string
 	stopLeaseHeartbeat func()
+}
+
+// requirementsPatchName identifies the patch that redirects the system
+// requirements path to the permissive TOML — the core yolo mechanism.
+const requirementsPatchName = "requirements path"
+
+// RequirementsRedirected reports whether the requirements-path redirect matched.
+func (r *PatchResult) RequirementsRedirected() bool {
+	if r == nil {
+		return false
+	}
+	return r.MatchCounts[requirementsPatchName] > 0
 }
 
 // RemoveCloudRequirementsCache deletes the cloud requirements cache file
@@ -488,26 +504,28 @@ func patchCodexBinaryWithRuntime(
 		{
 			old:  []byte(origReqPath),
 			new:  []byte(patchedReqPath),
-			name: "requirements path",
+			name: requirementsPatchName,
 		},
 	}
 	patches = append(patches, cloudRequirementsPatches...)
 	patches = append(patches, accountPlanTypePatches...)
 	patches = append(patches, tomlKeyPatches...)
 
+	matchCounts := make(map[string]int, len(patches))
 	for _, p := range patches {
 		var count int
 		data, count, err = applyBinaryPatchAll(data, p)
 		if err != nil {
 			return nil, err
 		}
+		matchCounts[p.name] = count
 		if count > 0 {
 			patched = true
 		}
 	}
 
 	if !patched {
-		return &PatchResult{OrigSHA256: origHash}, nil
+		return &PatchResult{OrigSHA256: origHash, MatchCounts: matchCounts}, nil
 	}
 
 	// Write patched binary.
@@ -565,6 +583,7 @@ func patchCodexBinaryWithRuntime(
 		PatchedBinary:      patchedPath,
 		RequirementsPath:   patchedReqPath,
 		OrigSHA256:         origHash,
+		MatchCounts:        matchCounts,
 		leasePath:          leasePath,
 		stopLeaseHeartbeat: stopLeaseHeartbeat,
 	}, nil

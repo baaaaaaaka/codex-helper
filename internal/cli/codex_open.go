@@ -397,16 +397,28 @@ func preparePatchedBinaryWithArtifacts(
 		}
 	}
 
-	// Record successful patch in history.
+	// Record the successful patch in history, preserving any accumulated
+	// failure count: a successful *patch* is not a successful *run*, so only a
+	// clean run (recordPatchSuccess) may reset the count. Resetting here would
+	// let each re-patch wipe the counter and defeat the failure threshold.
 	if phs != nil && hashErr == nil && patchResult != nil && patchResult.PatchedBinary != "" {
 		patchedHash, _ := hashFileSHA256(patchResult.PatchedBinary)
-		_ = phs.Upsert(config.PatchHistoryEntry{
+		entry := config.PatchHistoryEntry{
 			Path:          codexPath,
 			OrigSHA256:    origHash,
 			PatchedSHA256: patchedHash,
 			ProxyVersion:  currentProxyVersion(),
 			PatchedAt:     time.Now(),
-		})
+		}
+		if existing, _ := phs.Find(codexPath, origHash); existing != nil {
+			entry.Failed = existing.Failed
+			entry.FailureCount = existing.FailureCount
+			entry.FailureReason = existing.FailureReason
+			entry.CodexVersion = existing.CodexVersion
+			entry.KnownGood = existing.KnownGood
+			entry.KnownGoodAt = existing.KnownGoodAt
+		}
+		_ = phs.Upsert(entry)
 	}
 
 	return patchResult, patchEnv, info, false, nil
