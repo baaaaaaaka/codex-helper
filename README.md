@@ -646,6 +646,10 @@ projects
 status
 ```
 
+If a quick Codex question sent in the control chat gets stuck, send
+`helper cancel last` in that same control chat. Work chat requests are still
+canceled inside their own Work chat.
+
 Beacon profile setup is a local `codex-proxy beacon ...` CLI workflow. You can
 ask questions about it in the Teams control chat, but profile mutation commands
 should be run locally unless the helper prints a specific supported Teams

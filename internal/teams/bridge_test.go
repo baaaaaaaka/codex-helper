@@ -2216,6 +2216,165 @@ func TestBridgeControlFallbackAsyncDoesNotBlockControlLoop(t *testing.T) {
 	waitForNoActiveTurnsOrOutbox(t, store, controlFallbackSessionID)
 }
 
+func TestBridgeControlCancelLastRunningFallbackCancelsExecutor(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "should not finish"},
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.controlFallbackExecutor = executor
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-fallback-running", "2026-04-30T01:00:00Z", "summarize current helper state"), "summarize current helper state"); err != nil {
+		t.Fatalf("handle control fallback error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("control fallback did not start")
+	}
+	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-cancel-running", "2026-04-30T01:00:05Z", "helper cancel last"), "helper cancel last"); err != nil {
+		close(executor.release)
+		t.Fatalf("handle control cancel error: %v", err)
+	}
+
+	var canceledTurn teamstore.Turn
+	deadline := time.Now().Add(bridgeAsyncTestTimeout)
+	for {
+		state, err := store.Load(ctx)
+		if err != nil {
+			close(executor.release)
+			t.Fatalf("Load after control cancel error: %v", err)
+		}
+		for _, turn := range state.Turns {
+			if turn.SessionID == controlFallbackSessionID && turn.Status == teamstore.TurnStatusInterrupted {
+				canceledTurn = turn
+				break
+			}
+		}
+		if canceledTurn.ID != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(executor.release)
+			t.Fatalf("timed out waiting for control fallback cancel; turns=%#v", state.Turns)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if strings.TrimSpace(canceledTurn.RecoveryReason) != "canceled by user" {
+		close(executor.release)
+		t.Fatalf("canceled control turn reason = %q, want canceled by user", canceledTurn.RecoveryReason)
+	}
+	waitForNoActiveTurnsOrOutbox(t, store, controlFallbackSessionID)
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Codex received your control-chat question", "helper cancel last", "cancel requested for running turn", "Codex request canceled."} {
+		if !strings.Contains(joined, want) {
+			close(executor.release)
+			t.Fatalf("control cancel transcript missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "should not finish") || strings.Contains(joined, "error: context canceled") {
+		close(executor.release)
+		t.Fatalf("control cancel should not finish or surface context cancellation:\n%s", joined)
+	}
+	close(executor.release)
+}
+
+func TestBridgeControlCancelAllFallbackCancelsRunningAndQueued(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  ExecutionResult{Text: "should not finish"},
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.controlFallbackExecutor = executor
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-cancel-all-running", "2026-04-30T01:00:00Z", "first control question"), "first control question"); err != nil {
+		t.Fatalf("handle first control fallback error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("first control fallback did not start")
+	}
+	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-cancel-all-queued", "2026-04-30T01:00:01Z", "second control question"), "second control question"); err != nil {
+		close(executor.release)
+		t.Fatalf("handle second control fallback error: %v", err)
+	}
+	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-cancel-all-command", "2026-04-30T01:00:02Z", "helper cancel all"), "helper cancel all"); err != nil {
+		close(executor.release)
+		t.Fatalf("handle control cancel all error: %v", err)
+	}
+
+	deadline := time.Now().Add(bridgeAsyncTestTimeout)
+	for {
+		state, err := store.Load(ctx)
+		if err != nil {
+			close(executor.release)
+			t.Fatalf("Load after control cancel all error: %v", err)
+		}
+		interrupted := 0
+		for _, turn := range state.Turns {
+			if turn.SessionID == controlFallbackSessionID && turn.Status == teamstore.TurnStatusInterrupted {
+				interrupted++
+			}
+		}
+		if interrupted == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(executor.release)
+			t.Fatalf("timed out waiting for both control fallback turns to cancel; turns=%#v", state.Turns)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	waitForNoActiveTurnsOrOutbox(t, store, controlFallbackSessionID)
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"cancel all requested for this Control chat.", "Running requests cancel requested", "Queued requests canceled", "Codex request canceled."} {
+		if !strings.Contains(joined, want) {
+			close(executor.release)
+			t.Fatalf("control cancel all transcript missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "should not finish") || strings.Contains(joined, "error: context canceled") {
+		close(executor.release)
+		t.Fatalf("control cancel all should not finish or surface context cancellation:\n%s", joined)
+	}
+	close(executor.release)
+}
+
+func TestBridgeControlCancelLastWithoutFallbackSaysControlChat(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.controlFallbackExecutor = executor
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessageWithText("control-cancel-empty", "helper cancel last"), "helper cancel last"); err != nil {
+		t.Fatalf("handle control cancel without fallback error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none", executor.prompts)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent message count = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(got, "no running or queued turn") || !strings.Contains(got, "control chat") || strings.Contains(got, "Work chat") {
+		t.Fatalf("control cancel empty response = %q", got)
+	}
+}
+
 func TestBridgeAsyncTurnsSendsQueuedNoticeForEveryNewBacklogMessage(t *testing.T) {
 	graph, sent := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)

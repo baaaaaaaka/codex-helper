@@ -77,6 +77,7 @@ func teamsControlFallbackHelpContext() string {
 		"- `continue <number-or-session-id>` / `c <...>`: create/open a Work chat for an existing Codex session.",
 		"- `open <number>`: show an existing linked Work chat.",
 		"- `status` / `st`: list active Work chats.",
+		"- `helper cancel last` / `helper cancel all`: cancel/drop queued/running control-chat Codex question(s).",
 		"- `skills` / `helper skills list`: list installed skill subscriptions.",
 		"- `helper skills add <github/gitlab/git-url>`: install skills from a git source and keep them updated.",
 		"- `helper skills sync [name]`: sync one skill source, or all sources when no name is given.",

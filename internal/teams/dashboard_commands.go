@@ -126,10 +126,22 @@ func ParseDashboardCommand(scope ChatScope, text string) ParsedDashboardCommand 
 }
 
 func helperPrefixedControlTextShouldStayHelperUnknown(name string, arg string) bool {
+	if helperPrefixedControlCancelName(name) && !helperCancelCommandArgLooksExplicit(arg) {
+		return false
+	}
 	if helperPrefixedControlNameIsWorkOnly(name) {
 		return true
 	}
 	return false
+}
+
+func helperPrefixedControlCancelName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "cancel", "stop":
+		return true
+	default:
+		return false
+	}
 }
 
 func helperPrefixedControlNameIsWorkOnly(name string) bool {
@@ -237,6 +249,9 @@ func controlDashboardCommandName(syntax dashboardCommandSyntax, name string, arg
 	if commandName, ok := controlAdminCommandName(syntax, name, arg); ok {
 		return commandName, true
 	}
+	if commandName, ok := controlCancelCommandName(syntax, name, arg); ok {
+		return commandName, true
+	}
 	switch syntax {
 	case dashboardCommandSyntaxSlash, dashboardCommandSyntaxBang, dashboardCommandSyntaxCX:
 		return controlLegacyCommandName(name, arg)
@@ -296,6 +311,37 @@ func controlAdminCommandName(syntax dashboardCommandSyntax, name string, arg str
 		}
 	}
 	return DashboardCommandNone, false
+}
+
+func controlCancelCommandName(syntax dashboardCommandSyntax, name string, arg string) (DashboardCommandName, bool) {
+	switch syntax {
+	case dashboardCommandSyntaxSlash, dashboardCommandSyntaxBang:
+	case dashboardCommandSyntaxHelp:
+		if !helperCancelCommandArgLooksExplicit(arg) {
+			return DashboardCommandNone, false
+		}
+	default:
+		return DashboardCommandNone, false
+	}
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "cancel", "stop":
+		return DashboardCommandCancel, true
+	default:
+		return DashboardCommandNone, false
+	}
+}
+
+func helperCancelCommandArgLooksExplicit(arg string) bool {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return true
+	}
+	first, _ := splitDashboardCommandBody(arg)
+	first = strings.ToLower(strings.TrimSpace(first))
+	if first == "last" || first == "all" {
+		return true
+	}
+	return strings.HasPrefix(first, "turn:") || strings.HasPrefix(first, "turn-")
 }
 
 func helperWebhookCommandArgLooksExplicit(arg string) bool {

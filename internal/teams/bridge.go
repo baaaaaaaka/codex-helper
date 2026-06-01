@@ -2475,12 +2475,15 @@ func looksLikeRenderedHelperLifecycleOutputPlainText(text string) bool {
 		"⏳ Helper reload is already in progress.",
 		"usage: `helper cancel last`",
 		"no running or queued turn is available to cancel in this session.",
+		"no running or queued turn is available to cancel in this control chat.",
 		"turn canceled:",
 		"Codex request canceled.",
 		"cancel all requested for this Work chat.",
+		"cancel all requested for this Control chat.",
 		"cancel all could not cancel every running request",
 		"This Codex request is running, but this helper process does not own",
 		"turn not found in this session:",
+		"turn not found in this control chat:",
 	} {
 		if strings.HasPrefix(text, prefix) {
 			return true
@@ -3061,6 +3064,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.sendControl(ctx, message)
 		case DashboardCommandStatus:
 			return b.sendControl(ctx, b.formatSessionList())
+		case DashboardCommandCancel:
+			return b.cancelControlFallbackCommand(ctx, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandSkills:
 			return b.handleSkillsCommandFromMessage(ctx, b.reg.ControlChatID, msg, parsed.Argument)
 		case DashboardCommandBeacon:
@@ -3320,11 +3325,29 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 }
 
 func (b *Bridge) runControlFallbackQueuedTurnFromMessage(ctx context.Context, session *Session, turn teamstore.Turn, msg ChatMessage, promptText string) error {
-	input, cleanupPrompt, preparationMessage, err := b.prepareControlFallbackInputFromTeamsMessage(ctx, session, turn.ID, msg, promptText)
+	if session == nil {
+		return fmt.Errorf("control fallback session is required")
+	}
+	sessionID := session.ID
+	prepCtx, cancelPrep := context.WithCancel(ctx)
+	unregisterPrepCancel := b.registerRunningTurnCancel(sessionID, turn.ID, cancelPrep)
+	input, cleanupPrompt, preparationMessage, err := b.prepareControlFallbackInputFromTeamsMessage(prepCtx, session, turn.ID, msg, promptText)
+	cancelRequested, cancelReason, cancelSilent := b.runningTurnCancelState(turn.ID)
+	unregisterPrepCancel()
+	cancelPrep()
 	if cleanupPrompt == nil {
 		cleanupPrompt = func() {}
 	}
 	defer cleanupPrompt()
+	if cancelRequested {
+		if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, firstNonEmptyString(cancelReason, "canceled by user")); markErr != nil {
+			return markErr
+		}
+		if cancelSilent {
+			return nil
+		}
+		return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, session.ChatID, "canceled", "Codex request canceled.")
+	}
 	if err != nil {
 		return err
 	}
@@ -3465,6 +3488,7 @@ func controlAdvancedHelpText() string {
 		"- `d <number>` / `details <number>` - show technical IDs and details",
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
+		"- `helper cancel last` / `helper cancel all` - stop queued/running Codex question(s) in this Control chat",
 		"- `model list`, `model setup <model>`, `model doctor <model>`, `model use <model>` - manage models",
 		"- `helper rename <title>` - rename this Control chat",
 		"- `helper rename hostname <name>` - rename this machine in the Control chat and all linked Work chats",
@@ -5546,7 +5570,7 @@ func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, 
 		TeamsChatID: session.ChatID,
 		Kind:        "ack",
 		AckKind:     "control_prompt",
-		Body:        "❓ **Codex received your control-chat question.**\n\nThis message is not a helper command, so **Codex will answer it here after helper-local preparation succeeds**. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.\n\nFor project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
+		Body:        "❓ **Codex received your control-chat question.**\n\nThis message is not a helper command, so **Codex will answer it here after helper-local preparation succeeds**. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.\n\nTo stop this control-chat request, send `helper cancel last` here. For project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
 	})
 	if err != nil {
 		return err
@@ -7347,8 +7371,31 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 }
 
 func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID string) error {
+	return b.cancelTurnCommandForScope(ctx, session, turnID, "Work chat")
+}
+
+func (b *Bridge) cancelControlFallbackCommand(ctx context.Context, turnID string) error {
+	if strings.TrimSpace(turnID) == "" {
+		return b.sendControl(ctx, "usage: `helper cancel last`, `helper cancel all`, or `helper cancel <turn-id>`\n\nThese commands apply to the current Control chat Codex question.")
+	}
+	session, err := b.ensureControlFallbackSession(ctx)
+	if err != nil {
+		return err
+	}
+	return b.cancelTurnCommandForScope(ctx, session, turnID, "Control chat")
+}
+
+func (b *Bridge) cancelTurnCommandForScope(ctx context.Context, session *Session, turnID string, scopeLabel string) error {
+	if session == nil {
+		return fmt.Errorf("cancel %s session is required", strings.ToLower(strings.TrimSpace(firstNonEmptyString(scopeLabel, "request"))))
+	}
+	scopeLabel = strings.TrimSpace(scopeLabel)
+	if scopeLabel == "" {
+		scopeLabel = "session"
+	}
+	scopeRef := cancelScopeReference(scopeLabel)
 	if turnID == "" {
-		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>`, or `!cancel <turn-id>`\n\nThese commands apply to this Work chat.")
+		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>`, or `!cancel <turn-id>`\n\nThese commands apply to this "+scopeLabel+".")
 	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
@@ -7359,17 +7406,17 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 	}
 	switch strings.ToLower(strings.TrimSpace(turnID)) {
 	case "all":
-		return b.cancelAllTurnsCommand(ctx, session, state)
+		return b.cancelAllTurnsCommand(ctx, session, state, scopeLabel)
 	case "last":
 		resolved, ok := latestCancelableTurnID(state, session.ID)
 		if !ok {
-			return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this session.")
+			return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this "+scopeRef+".")
 		}
 		turnID = resolved
 	}
 	turn, ok := state.Turns[turnID]
 	if !ok || turn.SessionID != session.ID {
-		return b.sendToChat(ctx, session.ChatID, "turn not found in this session: "+turnID)
+		return b.sendToChat(ctx, session.ChatID, "turn not found in this "+scopeRef+": "+turnID)
 	}
 	switch turn.Status {
 	case teamstore.TurnStatusQueued:
@@ -7400,36 +7447,45 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 	}
 }
 
-func (b *Bridge) cancelAllTurnsCommand(ctx context.Context, session *Session, state teamstore.State) error {
+func (b *Bridge) cancelAllTurnsCommand(ctx context.Context, session *Session, state teamstore.State, scopeLabel string) error {
+	scopeLabel = strings.TrimSpace(scopeLabel)
+	if scopeLabel == "" {
+		scopeLabel = "session"
+	}
+	scopeRef := cancelScopeReference(scopeLabel)
 	targets := cancelableTurnsForSession(state, session.ID)
 	if len(targets) == 0 {
-		return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this session.")
+		return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this "+scopeRef+".")
 	}
 	var canceledQueued []teamstore.Turn
 	var requestedRunning []teamstore.Turn
 	var unavailableRunning []teamstore.Turn
 	for _, turn := range targets {
-		switch turn.Status {
-		case teamstore.TurnStatusQueued:
-			if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
-				return err
-			}
+		if turn.Status != teamstore.TurnStatusQueued {
+			continue
+		}
+		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
+			return err
+		}
+		if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
+			return err
+		}
+		canceledQueued = append(canceledQueued, turn)
+	}
+	for _, turn := range targets {
+		if turn.Status != teamstore.TurnStatusRunning {
+			continue
+		}
+		if b.requestRunningTurnCancel(turn.ID) {
 			if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
 				return err
 			}
-			canceledQueued = append(canceledQueued, turn)
-		case teamstore.TurnStatusRunning:
-			if b.requestRunningTurnCancel(turn.ID) {
-				if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
-					return err
-				}
-				requestedRunning = append(requestedRunning, turn)
-			} else {
-				unavailableRunning = append(unavailableRunning, turn)
-			}
+			requestedRunning = append(requestedRunning, turn)
+		} else {
+			unavailableRunning = append(unavailableRunning, turn)
 		}
 	}
-	return b.sendToChat(ctx, session.ChatID, formatCancelAllResponse(state, canceledQueued, requestedRunning, unavailableRunning))
+	return b.sendToChat(ctx, session.ChatID, formatCancelAllResponse(state, canceledQueued, requestedRunning, unavailableRunning, scopeLabel))
 }
 
 func latestCancelableTurnID(state teamstore.State, sessionID string) (string, bool) {
@@ -7483,6 +7539,13 @@ func cancelableTurnRank(turn teamstore.Turn) int {
 	}
 }
 
+func cancelScopeReference(scopeLabel string) string {
+	if strings.EqualFold(strings.TrimSpace(scopeLabel), "Control chat") {
+		return "control chat"
+	}
+	return "session"
+}
+
 func formatCancelOneResponse(state teamstore.State, sessionID string, turn teamstore.Turn, action string, includeRemaining bool) string {
 	lines := []string{strings.TrimSpace(action) + ": `" + turn.ID + "`"}
 	if summary := turnPromptSummary(state, turn); summary != "" {
@@ -7499,10 +7562,14 @@ func formatCancelOneResponse(state teamstore.State, sessionID string, turn teams
 	return strings.Join(lines, "\n")
 }
 
-func formatCancelAllResponse(state teamstore.State, canceledQueued []teamstore.Turn, requestedRunning []teamstore.Turn, unavailableRunning []teamstore.Turn) string {
-	lines := []string{"cancel all requested for this Work chat."}
+func formatCancelAllResponse(state teamstore.State, canceledQueued []teamstore.Turn, requestedRunning []teamstore.Turn, unavailableRunning []teamstore.Turn, scopeLabel string) string {
+	scopeLabel = strings.TrimSpace(scopeLabel)
+	if scopeLabel == "" {
+		scopeLabel = "Work chat"
+	}
+	lines := []string{"cancel all requested for this " + scopeLabel + "."}
 	if len(canceledQueued)+len(requestedRunning) == 0 && len(unavailableRunning) > 0 {
-		lines[0] = "cancel all could not cancel every running request in this Work chat."
+		lines[0] = "cancel all could not cancel every running request in this " + scopeLabel + "."
 	}
 	if len(requestedRunning) > 0 {
 		lines = append(lines, "", "**Running requests cancel requested:**")

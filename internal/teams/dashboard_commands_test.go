@@ -180,6 +180,35 @@ func TestParseControlUnknownInputForwardsOnlyPlainTextToCodex(t *testing.T) {
 	}
 }
 
+func TestParseControlCancelTargetsControlFallback(t *testing.T) {
+	for _, text := range []string{"helper cancel", "helper cancel last", "helper cancel all", "helper cancel turn:inbound:control:message", "helper stop turn-123", "helper stop last", "!cancel last", "/cancel last"} {
+		t.Run(text, func(t *testing.T) {
+			cmd := ParseDashboardCommand(ChatScopeControl, text)
+			if !cmd.HelperCommand || cmd.Name != DashboardCommandCancel {
+				t.Fatalf("control cancel parsed as %#v, want helper cancel", cmd)
+			}
+			if cmd.ForwardToCodex || cmd.RequiresCodex {
+				t.Fatalf("control cancel should not be forwarded to Codex: %#v", cmd)
+			}
+		})
+	}
+}
+
+func TestParseControlCancelNaturalLanguageFallsBackToCodex(t *testing.T) {
+	for _, text := range []string{
+		"helper cancel 为什么不能取消",
+		"helper stop should explain the stuck request",
+		"helper cancel can you tell me how this works",
+	} {
+		t.Run(text, func(t *testing.T) {
+			cmd := ParseDashboardCommand(ChatScopeControl, text)
+			if cmd.HelperCommand || !cmd.ForwardToCodex || !cmd.RequiresCodex {
+				t.Fatalf("natural control cancel text should go to Codex, got %#v", cmd)
+			}
+		})
+	}
+}
+
 func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 	for _, text := range []string{"1", "status", "stats", "details", "close", "rename this chat", "retry the failed test", "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗", "helper webhook 能不能一键配置"} {
 		t.Run(text, func(t *testing.T) {
