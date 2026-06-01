@@ -613,6 +613,13 @@ jobs:
           go test ./internal/cli -count=1 -run "$upgrade_cmd_pattern" -v
           go test ./internal/cli ./internal/teams ./internal/teams/store -count=1 -run "$helper_upgrade_handoff_pattern" -v
 
+      - name: Teams app-server model profile cancellation regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfile(ProxyPrepareTimesOutCI|UsesCallerCancellationCI)|TeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI)$' -v
+          go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
+
       - name: Teams user-marker compact and fallback regressions
         shell: bash
         run: |

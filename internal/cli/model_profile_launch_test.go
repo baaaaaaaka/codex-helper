@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +19,15 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
+
+func waitForProxyPrepareContext(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(2 * time.Second):
+		return fmt.Errorf("proxy prepare context was not canceled")
+	}
+}
 
 func TestPrepareCodexModelProfileForRunStartsAdapterAndInjectsConfig(t *testing.T) {
 	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
@@ -225,6 +235,100 @@ func TestPrepareTeamsAppServerModelProfileWithoutSSHUsesGlobalProxyPreferenceCI(
 		if !strings.Contains(joined, want) {
 			t.Fatalf("appserver args missing %q:\n%v", want, args)
 		}
+	}
+}
+
+func TestPrepareTeamsAppServerModelProfileProxyPrepareTimesOutCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{{ID: "p1", Name: "dev", Host: "host", Port: 22, User: "me"}},
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-pro": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
+
+	oldTimeout := teamsAppServerModelProfilePrepareTimeout
+	teamsAppServerModelProfilePrepareTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { teamsAppServerModelProfilePrepareTimeout = oldTimeout })
+
+	prevEnsureProxyURL := codexAppEnsureProxyURLFn
+	t.Cleanup(func() { codexAppEnsureProxyURLFn = prevEnsureProxyURL })
+	codexAppEnsureProxyURLFn = func(ctx context.Context, _ *config.Store, _ config.Profile, _ []config.Instance, _ io.Writer) (string, error) {
+		return "", waitForProxyPrepareContext(ctx)
+	}
+
+	started := time.Now()
+	_, _, err = prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "deepseek-pro", modelprofile.Snapshot{}, io.Discard)
+	if err == nil {
+		t.Fatal("prepareTeamsAppServerModelProfile error = nil, want timeout")
+	}
+	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("prepare error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+		t.Fatalf("prepare took %s, want bounded timeout", elapsed)
+	}
+}
+
+func TestPrepareTeamsAppServerModelProfileUsesCallerCancellationCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{{ID: "p1", Name: "dev", Host: "host", Port: 22, User: "me"}},
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-pro": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
+
+	oldTimeout := teamsAppServerModelProfilePrepareTimeout
+	teamsAppServerModelProfilePrepareTimeout = time.Hour
+	t.Cleanup(func() { teamsAppServerModelProfilePrepareTimeout = oldTimeout })
+
+	prevEnsureProxyURL := codexAppEnsureProxyURLFn
+	t.Cleanup(func() { codexAppEnsureProxyURLFn = prevEnsureProxyURL })
+	codexAppEnsureProxyURLFn = func(ctx context.Context, _ *config.Store, _ config.Profile, _ []config.Instance, _ io.Writer) (string, error) {
+		return "", waitForProxyPrepareContext(ctx)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = prepareTeamsAppServerModelProfileWithContext(ctx, &rootOptions{configPath: store.Path()}, "deepseek-pro", modelprofile.Snapshot{}, io.Discard)
+	if err == nil {
+		t.Fatal("prepareTeamsAppServerModelProfileWithContext error = nil, want cancellation")
+	}
+	if !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("prepare error = %v, want canceled", err)
 	}
 }
 

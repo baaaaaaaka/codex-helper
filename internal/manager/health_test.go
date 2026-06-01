@@ -22,6 +22,25 @@ func TestHealthClient_CheckHTTPProxy(t *testing.T) {
 	}
 }
 
+func TestHealthClient_CheckHTTPProxyContextCancellation(t *testing.T) {
+	port, closeFn := startBlockingHealthServer(t)
+	defer closeFn()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := (HealthClient{Timeout: 3 * time.Second}).CheckHTTPProxyContext(ctx, port, "inst-1")
+	if err == nil {
+		t.Fatal("CheckHTTPProxyContext error = nil, want cancellation")
+	}
+	if ctx.Err() == nil {
+		t.Fatalf("context was not canceled: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+		t.Fatalf("health check ignored context cancellation; elapsed=%s err=%v", elapsed, err)
+	}
+}
+
 func TestHealthClient_CheckHTTPProxyUsesOneShotConnection(t *testing.T) {
 	closeCh := make(chan struct{}, 1)
 	requestCloseCh := make(chan bool, 1)
@@ -136,7 +155,11 @@ func startConnectProxyServer(t *testing.T, connectStatus int) (port int, closeFn
 	}
 
 	return tcp.Port, func() {
-		_ = srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+		}
 		_ = ln.Close()
 	}
 }
@@ -167,7 +190,41 @@ func startHealthOnlyServer(t *testing.T, instanceID string) (port int, closeFn f
 	}
 
 	return tcp.Port, func() {
-		_ = srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+		}
+		_ = ln.Close()
+	}
+}
+
+func startBlockingHealthServer(t *testing.T) (port int, closeFn func()) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_codex_proxy/health", func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	tcp, err := net.ResolveTCPAddr("tcp", "127.0.0.1:"+portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	return tcp.Port, func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+		}
 		_ = ln.Close()
 	}
 }

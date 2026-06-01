@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -13,8 +14,19 @@ var (
 )
 
 func FindReusableInstance(instances []config.Instance, profileID string, hc HealthClient) *config.Instance {
+	inst, _ := FindReusableInstanceContext(context.Background(), instances, profileID, hc)
+	return inst
+}
+
+func FindReusableInstanceContext(ctx context.Context, instances []config.Instance, profileID string, hc HealthClient) (*config.Instance, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var best *config.Instance
 	for i := range instances {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		inst := &instances[i]
 		if inst.ProfileID != profileID {
 			continue
@@ -25,7 +37,10 @@ func FindReusableInstance(instances []config.Instance, profileID string, hc Heal
 		if inst.DaemonPID <= 0 || !reuseProcessAlive(inst.DaemonPID) {
 			continue
 		}
-		if err := hc.CheckHTTPProxy(inst.HTTPPort, inst.ID); err != nil {
+		if err := hc.CheckHTTPProxyContext(ctx, inst.HTTPPort, inst.ID); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			continue
 		}
 
@@ -34,7 +49,7 @@ func FindReusableInstance(instances []config.Instance, profileID string, hc Heal
 			best = &copy
 		}
 	}
-	return best
+	return best, nil
 }
 
 func isReusableDaemon(inst *config.Instance) bool {

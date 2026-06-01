@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,8 +22,18 @@ type healthResponse struct {
 }
 
 func (c HealthClient) CheckHTTPProxy(port int, expectedInstanceID string) error {
+	return c.CheckHTTPProxyContext(context.Background(), port, expectedInstanceID)
+}
+
+func (c HealthClient) CheckHTTPProxyContext(ctx context.Context, port int, expectedInstanceID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if port <= 0 || port > 65535 {
 		return fmt.Errorf("invalid http port %d", port)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
@@ -43,7 +54,11 @@ func (c HealthClient) CheckHTTPProxy(port int, expectedInstanceID string) error 
 		Transport: tr,
 	}
 
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/_codex_proxy/health", port))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/_codex_proxy/health", port), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}

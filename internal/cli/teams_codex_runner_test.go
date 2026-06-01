@@ -747,7 +747,7 @@ func TestTeamsCodexExecutorRoutesSessionModelProfileSnapshot(t *testing.T) {
 		APIKeyRef: "env:OLD_MIMO_KEY",
 		Revision:  3,
 	}
-	runner, err := executor.runnerForSessionProfile(&teams.Session{ModelProfile: oldSnapshot})
+	runner, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{ModelProfile: oldSnapshot})
 	if err != nil {
 		t.Fatalf("runnerForSessionProfile: %v", err)
 	}
@@ -762,19 +762,76 @@ func TestTeamsCodexExecutorRoutesSessionModelProfileSnapshot(t *testing.T) {
 	if launcher.modelProfileSnapshot.APIKeyRef != "env:OLD_MIMO_KEY" || launcher.modelProfileSnapshot.Revision != 3 {
 		t.Fatalf("launcher snapshot = %#v, want old pinned key/revision", launcher.modelProfileSnapshot)
 	}
-	again, err := executor.runnerForSessionProfile(&teams.Session{ModelProfile: oldSnapshot})
+	again, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{ModelProfile: oldSnapshot})
 	if err != nil {
 		t.Fatalf("runnerForSessionProfile cached: %v", err)
 	}
 	if again != runner {
 		t.Fatalf("profile runner cache missed: first=%p second=%p", runner, again)
 	}
-	base, err := executor.runnerForSessionProfile(&teams.Session{})
+	base, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{})
 	if err != nil {
 		t.Fatalf("runnerForSessionProfile default: %v", err)
 	}
 	if base != baseRunner {
 		t.Fatalf("default session runner = %T/%p, want base %p", base, base, baseRunner)
+	}
+}
+
+func TestTeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: &enabled,
+		Profiles:     []config.Profile{{ID: "p1", Name: "dev", Host: "host", Port: 22, User: "me"}},
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-pro": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
+
+	oldTimeout := teamsAppServerModelProfilePrepareTimeout
+	teamsAppServerModelProfilePrepareTimeout = time.Hour
+	t.Cleanup(func() { teamsAppServerModelProfilePrepareTimeout = oldTimeout })
+
+	prevEnsureProxyURL := codexAppEnsureProxyURLFn
+	t.Cleanup(func() { codexAppEnsureProxyURLFn = prevEnsureProxyURL })
+	codexAppEnsureProxyURLFn = func(ctx context.Context, _ *config.Store, _ config.Profile, _ []config.Instance, _ io.Writer) (string, error) {
+		return "", waitForProxyPrepareContext(ctx)
+	}
+
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "appserver", "/tmp/codex", "/work", nil, "", time.Hour, io.Discard)
+	if err != nil {
+		t.Fatalf("newManagedTeamsCodexExecutor: %v", err)
+	}
+	snapshot := modelprofile.Snapshot{
+		Name:      "deepseek-pro",
+		Provider:  "deepseek",
+		Model:     "deepseek/deepseek-v4-pro",
+		APIKeyRef: "env:DEEPSEEK_API_KEY",
+		Revision:  1,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = executor.(teamsCodexExecutor).RunInput(ctx, &teams.Session{ModelProfile: snapshot}, teams.ExecutionInput{Prompt: "say ok"})
+	if err == nil {
+		t.Fatal("RunInput error = nil, want cancellation")
+	}
+	if !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("RunInput error = %v, want canceled", err)
 	}
 }
 
@@ -921,7 +978,7 @@ func TestTeamsCodexExecutorProfileRunnerCacheIsConcurrentAndSnapshotScoped(t *te
 		go func() {
 			defer wg.Done()
 			snapshot := snapshots[i%len(snapshots)]
-			runner, err := executor.runnerForSessionProfile(&teams.Session{ModelProfile: snapshot})
+			runner, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{ModelProfile: snapshot})
 			if err != nil {
 				errs <- err
 				return
@@ -957,7 +1014,7 @@ func TestTeamsCodexExecutorProfileRunnerCacheIsConcurrentAndSnapshotScoped(t *te
 		if !ok {
 			t.Fatalf("missing cached runner for %#v", snapshot)
 		}
-		again, err := executor.runnerForSessionProfile(&teams.Session{ModelProfile: snapshot})
+		again, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{ModelProfile: snapshot})
 		if err != nil {
 			t.Fatalf("runnerForSessionProfile cached: %v", err)
 		}

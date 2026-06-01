@@ -26,6 +26,10 @@ const (
 	envCXPResponsesProxyKey = "CXP_RESPONSES_PROXY_KEY"
 )
 
+const defaultTeamsAppServerModelProfilePrepareTimeout = 30 * time.Second
+
+var teamsAppServerModelProfilePrepareTimeout = defaultTeamsAppServerModelProfilePrepareTimeout
+
 func prepareCodexModelProfileForRun(
 	ctx context.Context,
 	store *config.Store,
@@ -72,8 +76,14 @@ func startModelProfileAdapterForCodex(
 	upstreamProxyURL string,
 	log io.Writer,
 ) (codexModelProfileLaunch, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if store == nil {
 		return codexModelProfileLaunch{}, nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return codexModelProfileLaunch{}, nil, err
 	}
 	cfg, err := store.Load()
 	if err != nil {
@@ -91,6 +101,9 @@ func startModelProfileAdapterForCodex(
 	if resolved.IsDefault() {
 		return codexModelProfileLaunch{}, nil, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return codexModelProfileLaunch{}, nil, err
+	}
 	apiKey, err := modelprofile.ResolveAPIKey(
 		resolved.Profile.APIKeyRef,
 		modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path())),
@@ -102,12 +115,18 @@ func startModelProfileAdapterForCodex(
 	if err := modelprofile.ValidateSnapshotRuntime(snapshot, resolved, apiKey); err != nil {
 		return codexModelProfileLaunch{}, nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return codexModelProfileLaunch{}, nil, err
+	}
 	catalogJSON, err := modelprofile.CodexModelCatalogJSON(resolved.Provider)
 	if err != nil {
 		return codexModelProfileLaunch{}, nil, err
 	}
 	catalogPath, err := writeCodexModelProfileCatalog(store, resolved, catalogJSON)
 	if err != nil {
+		return codexModelProfileLaunch{}, nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return codexModelProfileLaunch{}, nil, err
 	}
 	proxyKey, err := ids.New()
@@ -173,11 +192,14 @@ func startModelProfileAdapterForCodex(
 		<-done
 		storeCleanup()
 	}
+	if err := ctx.Err(); err != nil {
+		cleanup()
+		return codexModelProfileLaunch{}, nil, err
+	}
 	baseURL := "http://" + ln.Addr().String() + "/v1"
 	if log != nil {
 		_, _ = fmt.Fprintf(log, "using model profile %q through local Responses adapter at %s\n", resolved.Name, baseURL)
 	}
-	_ = ctx
 	return codexModelProfileLaunch{
 		Enabled:      true,
 		Name:         resolved.Name,
@@ -259,9 +281,18 @@ func modelProfileRequiresAdapter(root *rootOptions, ref string) (bool, error) {
 }
 
 func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot modelprofile.Snapshot, log io.Writer) ([]string, []string, error) {
+	return prepareTeamsAppServerModelProfileWithContext(context.Background(), root, ref, snapshot, log)
+}
+
+func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *rootOptions, ref string, snapshot modelprofile.Snapshot, log io.Writer) ([]string, []string, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" && snapshot.IsZero() {
 		return nil, nil, nil
+	}
+	ctx, cancel := withTeamsAppServerModelProfilePrepareTimeout(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	store, _, err := newRootStore(root, "")
 	if err != nil {
@@ -295,12 +326,15 @@ func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot m
 		return nil, nil, err
 	}
 	if upstreamProfile != nil {
-		upstreamProxyURL, err = codexAppEnsureProxyURLFn(context.Background(), store, *upstreamProfile, cfg.Instances, log)
+		upstreamProxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *upstreamProfile, cfg.Instances, log)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	launch, _, err := startModelProfileAdapterForCodex(context.Background(), store, ref, snapshot, upstreamProxyURL, log)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	launch, _, err := startModelProfileAdapterForCodex(ctx, store, ref, snapshot, upstreamProxyURL, log)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -313,6 +347,20 @@ func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot m
 	}
 	env := []string{envCXPResponsesProxyKey + "=" + launch.ProxyKey}
 	return args, env, nil
+}
+
+func withTeamsAppServerModelProfilePrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	timeout := teamsAppServerModelProfilePrepareTimeout
+	if timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func modelProfileConfigWithImplicitProxyPreference(store *config.Store, cfg config.Config) (config.Config, error) {

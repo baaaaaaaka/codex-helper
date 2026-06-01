@@ -305,11 +305,15 @@ func defaultCodexAppWSLPath(path string) (string, error) {
 
 func ensureCodexAppProxyURL(ctx context.Context, store *config.Store, profile config.Profile, instances []config.Instance, log io.Writer) (string, error) {
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
-	if inst := manager.FindReusableInstance(instances, profile.ID, hc); inst != nil {
+	if inst, err := manager.FindReusableInstanceContext(ctx, instances, profile.ID, hc); err != nil {
+		return "", err
+	} else if inst != nil {
 		return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
 	}
 	if freshCfg, err := store.Load(); err == nil {
-		if inst := manager.FindReusableInstance(freshCfg.Instances, profile.ID, hc); inst != nil {
+		if inst, err := manager.FindReusableInstanceContext(ctx, freshCfg.Instances, profile.ID, hc); err != nil {
+			return "", err
+		} else if inst != nil {
 			return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
 		}
 	}
@@ -422,7 +426,9 @@ func waitForCodexAppProxyURL(ctx context.Context, store *config.Store, profileID
 	for {
 		cfg, err := store.Load()
 		if err == nil {
-			if inst := manager.FindReusableInstance(cfg.Instances, profileID, hc); inst != nil {
+			if inst, err := manager.FindReusableInstanceContext(ctx, cfg.Instances, profileID, hc); err != nil {
+				return "", err
+			} else if inst != nil {
 				return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
 			}
 		}

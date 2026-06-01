@@ -43,10 +43,25 @@ func newManagedTeamsCodexExecutor(
 	timeout time.Duration,
 	log io.Writer,
 ) (teams.Executor, error) {
-	return newManagedTeamsCodexExecutorWithSnapshot(root, runnerName, codexPath, workDir, codexArgs, modelProfile, modelprofile.Snapshot{}, timeout, log)
+	return newManagedTeamsCodexExecutorWithContext(context.Background(), root, runnerName, codexPath, workDir, codexArgs, modelProfile, modelprofile.Snapshot{}, timeout, log)
 }
 
 func newManagedTeamsCodexExecutorWithSnapshot(
+	root *rootOptions,
+	runnerName string,
+	codexPath string,
+	workDir string,
+	codexArgs []string,
+	modelProfile string,
+	snapshot modelprofile.Snapshot,
+	timeout time.Duration,
+	log io.Writer,
+) (teams.Executor, error) {
+	return newManagedTeamsCodexExecutorWithContext(context.Background(), root, runnerName, codexPath, workDir, codexArgs, modelProfile, snapshot, timeout, log)
+}
+
+func newManagedTeamsCodexExecutorWithContext(
+	ctx context.Context,
 	root *rootOptions,
 	runnerName string,
 	codexPath string,
@@ -74,7 +89,7 @@ func newManagedTeamsCodexExecutorWithSnapshot(
 	switch strings.ToLower(strings.TrimSpace(runnerName)) {
 	case "", "exec":
 	case "appserver", "app-server":
-		appServerModelArgs, appServerModelEnv, err := prepareTeamsAppServerModelProfile(root, modelProfile, snapshot, log)
+		appServerModelArgs, appServerModelEnv, err := prepareTeamsAppServerModelProfileWithContext(ctx, root, modelProfile, snapshot, log)
 		if err != nil {
 			return nil, err
 		}
@@ -130,7 +145,7 @@ func teamsCodexEffectiveWorkDir(session *teams.Session, fallback string) string 
 
 func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, session *teams.Session, input teams.ExecutionInput, handler codexrunner.EventHandler) (teams.ExecutionResult, error) {
 	workDir := teamsCodexEffectiveWorkDir(session, e.workDir)
-	runner, err := e.runnerForSessionProfile(session)
+	runner, err := e.runnerForSessionProfile(ctx, session)
 	if err != nil {
 		return teams.ExecutionResult{}, err
 	}
@@ -177,7 +192,7 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 	return out, nil
 }
 
-func (e teamsCodexExecutor) runnerForSessionProfile(session *teams.Session) (codexrunner.Runner, error) {
+func (e teamsCodexExecutor) runnerForSessionProfile(ctx context.Context, session *teams.Session) (codexrunner.Runner, error) {
 	if session == nil || session.ModelProfile.IsZero() {
 		return e.runner, nil
 	}
@@ -193,7 +208,7 @@ func (e teamsCodexExecutor) runnerForSessionProfile(session *teams.Session) (cod
 	if runner, ok := e.runnersByProfile[key]; ok {
 		return runner, nil
 	}
-	executor, err := newManagedTeamsCodexExecutorWithSnapshot(e.root, e.runnerName, e.codexPath, e.workDir, e.codexArgs, "", session.ModelProfile, e.timeout, e.log)
+	executor, err := newManagedTeamsCodexExecutorWithContext(ctx, e.root, e.runnerName, e.codexPath, e.workDir, e.codexArgs, "", session.ModelProfile, e.timeout, e.log)
 	if err != nil {
 		return nil, err
 	}

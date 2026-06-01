@@ -70,6 +70,37 @@ func TestFindReusableInstance_IgnoresWrongInstanceID(t *testing.T) {
 	}
 }
 
+func TestFindReusableInstanceContextHonorsCancellation(t *testing.T) {
+	prevAlive := reuseProcessAlive
+	t.Cleanup(func() { reuseProcessAlive = prevAlive })
+	reuseProcessAlive = func(int) bool { return true }
+
+	port, closeFn := startBlockingHealthServer(t)
+	defer closeFn()
+	instances := []config.Instance{{
+		ID:         "inst-blocking",
+		ProfileID:  "prof-1",
+		Kind:       config.InstanceKindDaemon,
+		HTTPPort:   port,
+		DaemonPID:  os.Getpid(),
+		LastSeenAt: time.Now(),
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	got, err := FindReusableInstanceContext(ctx, instances, "prof-1", HealthClient{Timeout: 3 * time.Second})
+	if err == nil {
+		t.Fatalf("FindReusableInstanceContext err = nil, got %#v", got)
+	}
+	if ctx.Err() == nil {
+		t.Fatalf("context was not canceled: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+		t.Fatalf("reuse scan ignored context cancellation; elapsed=%s err=%v", elapsed, err)
+	}
+}
+
 func TestIsInstanceStale(t *testing.T) {
 	now := time.Now()
 	inst := config.Instance{LastSeenAt: now.Add(-10 * time.Minute)}

@@ -388,7 +388,9 @@ func runWithProfileOptions(
 	opts runTargetOptions,
 ) error {
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
-	if inst := manager.FindReusableInstance(instances, profile.ID, hc); inst != nil {
+	if inst, err := manager.FindReusableInstanceContext(ctx, instances, profile.ID, hc); err != nil {
+		return err
+	} else if inst != nil {
 		err := runWithExistingInstanceOptions(ctx, store, hc, *inst, cmdArgs, opts)
 		if err == nil {
 			return nil
@@ -403,7 +405,9 @@ func runWithProfileOptions(
 	// Re-read config from disk to catch instances recorded by other
 	// processes after our initial snapshot was loaded.
 	if freshCfg, err := store.Load(); err == nil {
-		if inst := manager.FindReusableInstance(freshCfg.Instances, profile.ID, hc); inst != nil {
+		if inst, err := manager.FindReusableInstanceContext(ctx, freshCfg.Instances, profile.ID, hc); err != nil {
+			return err
+		} else if inst != nil {
 			err := runWithExistingInstanceOptions(ctx, store, hc, *inst, cmdArgs, opts)
 			if err == nil {
 				return nil
@@ -635,7 +639,9 @@ func withProfileInstallEnv(
 
 	var reuseErr error
 	hc := manager.HealthClient{Timeout: 1 * time.Second}
-	if inst := manager.FindReusableInstance(instances, profile.ID, hc); inst != nil {
+	if inst, err := manager.FindReusableInstanceContext(ctx, instances, profile.ID, hc); err != nil {
+		return err
+	} else if inst != nil {
 		if err := installViaProxy(fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)); err == nil {
 			return nil
 		} else {
@@ -644,7 +650,9 @@ func withProfileInstallEnv(
 	}
 	if store != nil {
 		if freshCfg, err := store.Load(); err == nil {
-			if inst := manager.FindReusableInstance(freshCfg.Instances, profile.ID, hc); inst != nil {
+			if inst, err := manager.FindReusableInstanceContext(ctx, freshCfg.Instances, profile.ID, hc); err != nil {
+				return err
+			} else if inst != nil {
 				if err := installViaProxy(fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort)); err == nil {
 					return nil
 				} else if reuseErr == nil {
