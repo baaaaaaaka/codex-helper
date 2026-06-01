@@ -22,7 +22,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "app", "beacon", "history", "init", "model-profile", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "app", "beacon", "history", "init", "model", "model-profile", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -38,6 +38,32 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	if appCmd.Flags().Lookup("model-profile") == nil {
 		t.Fatal("app command should expose --model-profile")
+	}
+}
+
+func TestModelCommandWiresSimpleSubcommands(t *testing.T) {
+	cmd := newRootCmd()
+	modelCmd, _, err := cmd.Find([]string{"model"})
+	if err != nil {
+		t.Fatalf("find model command: %v", err)
+	}
+	var names []string
+	for _, sub := range modelCmd.Commands() {
+		names = append(names, sub.Name())
+	}
+	sort.Strings(names)
+	want := []string{"doctor", "list", "setup", "use"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("unexpected model subcommands\n got: %#v\nwant: %#v", names, want)
+	}
+	setupCmd, _, err := modelCmd.Find([]string{"setup"})
+	if err != nil {
+		t.Fatalf("find model setup: %v", err)
+	}
+	for _, name := range []string{"api-key-env", "api-key-stdin", "ssh-proxy", "no-default", "no-doctor"} {
+		if setupCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("model setup should expose --%s", name)
+		}
 	}
 }
 

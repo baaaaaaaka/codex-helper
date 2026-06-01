@@ -335,6 +335,176 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 	}
 }
 
+func TestTeamsModelProfileManagerSimpleSetupReusesFamilyCredential(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
+	result, err := manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
+		ProfileName:     "mimo25",
+		Provider:        "mimo",
+		Model:           "mimo/mimo-v2.5",
+		APIKey:          "sk-family",
+		SetDefault:      true,
+		CredentialScope: "mimo25",
+	})
+	if err != nil {
+		t.Fatalf("SaveModelProfileAPIKey: %v", err)
+	}
+	familyRef := modelprofile.SecretRefForCredentialScope("mimo25")
+	if result.APIKeyRef != familyRef {
+		t.Fatalf("APIKeyRef=%q, want family ref %q", result.APIKeyRef, familyRef)
+	}
+
+	setup, err := manager.SetupModelProfile(context.Background(), teams.ModelProfileSetupRequest{
+		Model:      "mimo-v2.5-pro",
+		SetDefault: true,
+	})
+	if err != nil {
+		t.Fatalf("SetupModelProfile: %v", err)
+	}
+	if setup.NeedsAPIKey || !setup.ReusedAPIKey || setup.ProfileName != "mimo25-pro" || setup.APIKeyRef != familyRef {
+		t.Fatalf("setup result = %#v", setup)
+	}
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DefaultModelProfile != "mimo25-pro" {
+		t.Fatalf("DefaultModelProfile=%q", cfg.DefaultModelProfile)
+	}
+	if got := cfg.ModelProfiles["mimo25-pro"]; got.Model != "mimo/mimo-v2.5-pro" || got.APIKeyRef != familyRef {
+		t.Fatalf("mimo25-pro profile=%#v", got)
+	}
+}
+
+func TestModelSetupStoresFamilyCredentialAndSiblingReusesIt(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetIn(strings.NewReader("sk-mimo-family\n"))
+	cmd.SetArgs([]string{
+		"--config", configPath,
+		"model", "setup", "mimo-v2.5",
+		"--api-key-stdin",
+		"--no-doctor",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("first setup: %v\n%s", err, out.String())
+	}
+
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load after first setup: %v", err)
+	}
+	familyRef := modelprofile.SecretRefForCredentialScope("mimo25")
+	if cfg.DefaultModelProfile != "mimo25" {
+		t.Fatalf("DefaultModelProfile after first setup = %q", cfg.DefaultModelProfile)
+	}
+	if got := cfg.ModelProfiles["mimo25"]; got.Provider != "mimo" || got.Model != "mimo/mimo-v2.5" || got.APIKeyRef != familyRef {
+		t.Fatalf("mimo25 profile = %#v, want family credential %q", got, familyRef)
+	}
+
+	out = bytes.Buffer{}
+	cmd = newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{
+		"--config", configPath,
+		"model", "setup", "mimo-v2.5-pro",
+		"--no-doctor",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("second setup should reuse family key: %v\n%s", err, out.String())
+	}
+	cfg, err = store.Load()
+	if err != nil {
+		t.Fatalf("Load after second setup: %v", err)
+	}
+	if cfg.DefaultModelProfile != "mimo25-pro" {
+		t.Fatalf("DefaultModelProfile after second setup = %q", cfg.DefaultModelProfile)
+	}
+	if got := cfg.ModelProfiles["mimo25-pro"]; got.Provider != "mimo" || got.Model != "mimo/mimo-v2.5-pro" || got.APIKeyRef != familyRef {
+		t.Fatalf("mimo25-pro profile = %#v, want family credential %q", got, familyRef)
+	}
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
+	value, err := modelprofile.ResolveAPIKey(familyRef, secretStore, nil)
+	if err != nil || value != "sk-mimo-family" {
+		t.Fatalf("family credential value=%q err=%v", value, err)
+	}
+}
+
+func TestModelUseCreatesSiblingProfileFromFamilyCredential(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
+	familyRef := modelprofile.SecretRefForCredentialScope("deepseek")
+	if err := secretStore.Put(familyRef, "sk-deepseek-family"); err != nil {
+		t.Fatalf("Put secret: %v", err)
+	}
+	out := runRootCommandForModelProfileTest(t, "--config", configPath, "model", "use", "deepseek-v4-pro")
+	if !strings.Contains(out, "Default model: DeepSeek V4 Pro") {
+		t.Fatalf("model use output:\n%s", out)
+	}
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DefaultModelProfile != "deepseek-pro" {
+		t.Fatalf("DefaultModelProfile=%q", cfg.DefaultModelProfile)
+	}
+	if got := cfg.ModelProfiles["deepseek-pro"]; got.Provider != "deepseek" || got.Model != "deepseek/deepseek-v4-pro" || got.APIKeyRef != familyRef {
+		t.Fatalf("deepseek-pro profile=%#v, want family ref %q", got, familyRef)
+	}
+}
+
+func TestModelListShowsDisplayNamesAndCustomDefaultModel(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.Save(config.Config{
+		Version:             config.CurrentVersion,
+		DefaultModelProfile: "deepseek-work",
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-work": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+				CreatedAt: now,
+				UpdatedAt: now,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	out := runRootCommandForModelProfileTest(t, "--config", configPath, "model", "list")
+	for _, want := range []string{
+		"DeepSeek V4 Pro",
+		"* 3. deepseek-v4-pro",
+		"uses key env:DEEPSEEK_API_KEY",
+		"MiMo 2.5 Pro",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("model list missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func runRootCommandForModelProfileTest(t *testing.T, args ...string) string {
 	t.Helper()
 	cmd := newRootCmd()

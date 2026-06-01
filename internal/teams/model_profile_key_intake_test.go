@@ -52,10 +52,56 @@ func TestParseModelProfileKeyIntakeSetupOptionsModelFlag(t *testing.T) {
 	}
 }
 
+func TestParseModelProfileKeyIntakeSetupOptionsSimpleModel(t *testing.T) {
+	got, err := parseModelProfileKeyIntakeSetupOptions("mimo-v2.5-pro")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got.Provider != "mimo" ||
+		got.ProfileName != "mimo25-pro" ||
+		got.Model != "mimo/mimo-v2.5-pro" ||
+		got.CredentialScope != "mimo25" ||
+		!got.SetDefault ||
+		!got.SimpleModel {
+		t.Fatalf("parsed simple model = %#v", got)
+	}
+}
+
 func TestParseModelProfileKeyIntakeSetupOptionsRejectsMissingModelValue(t *testing.T) {
 	_, err := parseModelProfileKeyIntakeSetupOptions("mimo mimo25 --model")
 	if err == nil || !strings.Contains(err.Error(), "--model requires a value") {
 		t.Fatalf("parse err=%v, want missing model value", err)
+	}
+}
+
+func TestBridgeModelProfileTeamsKeyIntakeSimpleModelStoresCredentialScope(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.modelProfileManager = &fakeModelProfileManager{}
+	oldCode := newModelProfileKeyIntakeCode
+	newModelProfileKeyIntakeCode = func() (string, error) { return "MIMO25P1", nil }
+	t.Cleanup(func() { newModelProfileKeyIntakeCode = oldCode })
+
+	out, err := bridge.startModelProfileKeyIntake(ctx, bridgeTestMessage("setup-mimo-pro"), "mimo-v2.5-pro")
+	if err != nil {
+		t.Fatalf("startModelProfileKeyIntake: %v", err)
+	}
+	if !strings.Contains(out, "MiMo 2.5 Pro") || !strings.Contains(out, "model key confirm MIMO25P1") {
+		t.Fatalf("intake output:\n%s", out)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load store: %v", err)
+	}
+	if len(state.ModelProfileKeyIntakes) != 1 {
+		t.Fatalf("pending intakes = %#v", state.ModelProfileKeyIntakes)
+	}
+	for _, intake := range state.ModelProfileKeyIntakes {
+		if intake.Provider != "mimo" || intake.ProfileName != "mimo25-pro" || intake.Model != "mimo/mimo-v2.5-pro" || intake.CredentialScope != "mimo25" || !intake.SetDefault {
+			t.Fatalf("stored intake = %#v", intake)
+		}
 	}
 }
 

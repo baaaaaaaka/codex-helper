@@ -202,19 +202,39 @@ type ModelProfileManager interface {
 	ListModelProfiles(context.Context) (string, error)
 	ModelProfileProviders(context.Context) (string, error)
 	ModelProfileSetupGuide(context.Context, string) (string, error)
+	SetupModelProfile(context.Context, ModelProfileSetupRequest) (ModelProfileSetupResult, error)
 	ModelProfileDoctor(context.Context, string) (string, error)
 	SetDefaultModelProfile(context.Context, string) (string, error)
 	DeleteModelProfile(context.Context, string, bool) (string, error)
 	SaveModelProfileAPIKey(context.Context, ModelProfileAPIKeySaveRequest) (ModelProfileAPIKeySaveResult, error)
 }
 
+type ModelProfileSetupRequest struct {
+	Model      string
+	SSHProxy   string
+	SetDefault bool
+}
+
+type ModelProfileSetupResult struct {
+	ProfileName     string
+	Provider        string
+	Model           string
+	DisplayName     string
+	APIKeyRef       string
+	NeedsAPIKey     bool
+	ReusedAPIKey    bool
+	CredentialScope string
+	SetDefault      bool
+}
+
 type ModelProfileAPIKeySaveRequest struct {
-	ProfileName string
-	Provider    string
-	Model       string
-	APIKey      string
-	SSHProxy    string
-	SetDefault  bool
+	ProfileName     string
+	Provider        string
+	Model           string
+	APIKey          string
+	SSHProxy        string
+	SetDefault      bool
+	CredentialScope string
 }
 
 type ModelProfileAPIKeySaveResult struct {
@@ -3127,7 +3147,7 @@ func modelAPIKeyPreflightMessage(text string) string {
 	if !containsRawModelAPIKey(text) {
 		return ""
 	}
-	return "I cannot accept raw API keys in normal Teams messages. Use `model setup <provider> [name] --teams-key-intake` to start the explicit one-time Teams key intake flow, or configure a model profile from a local terminal with `cxp model-profile setup <name> --provider <provider> --api-key-stdin`."
+	return "I cannot accept raw API keys in normal Teams messages. Use `model setup <model>` to start the explicit one-time Teams key intake flow, or configure a model from a local terminal with `cxp model setup <model> --api-key-stdin`."
 }
 
 func containsRawModelAPIKey(text string) bool {
@@ -3409,8 +3429,8 @@ func controlHelpText() string {
 		"Start here:",
 		"- `p` / `projects` - choose a workspace",
 		"- `n <directory>` / `new <directory>` - create a new Work chat for a directory",
-		"- `new <directory> --model-profile <name>` - create a Work chat pinned to a model profile",
-		"- `model list` / `model default <name>` - list profiles or set the default for future chats",
+		"- `new <directory> --model <model>` - create a Work chat pinned to a model",
+		"- `model list` / `model use <model>` - list models or set the default for future chats",
 		"- `s` / `sessions` - show sessions in the selected workspace",
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
 		"- `st` / `status` - show active Work chats",
@@ -3445,7 +3465,7 @@ func controlAdvancedHelpText() string {
 		"- `d <number>` / `details <number>` - show technical IDs and details",
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
-		"- `model list`, `model providers`, `model setup <provider> <name>`, `model doctor <name>`, `model default <name>` - manage model profiles",
+		"- `model list`, `model setup <model>`, `model doctor <model>`, `model use <model>` - manage models",
 		"- `helper rename <title>` - rename this Control chat",
 		"- `helper rename hostname <name>` - rename this machine in the Control chat and all linked Work chats",
 		"- `h` / `help` / `menu` - show short help",
@@ -3501,7 +3521,7 @@ func sessionHelpText() string {
 		"`helper details` or `!details` - show debug IDs and links",
 		"`beacon status` - show this Work chat execution target",
 		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
-		"`model status`, `model switch <profile>`, or `model fork <profile>` - inspect or change this Work chat model profile",
+		"`model status`, `model switch <model>`, or `model fork <model>` - inspect or change this Work chat model",
 		"`helper publish-history` - import a paused local Codex history backlog",
 		"`helper skills list` / `helper skills add <url>` / `helper skills push` / `helper skills push confirm` - inspect and push skill subscriptions",
 		"",
@@ -5750,6 +5770,9 @@ func parseModelProfileOptionsFromNewSession(raw string) (string, string, error) 
 
 func (b *Bridge) resolveNewSessionModelProfile(ctx context.Context, ref string) (modelprofile.Snapshot, error) {
 	ref = strings.TrimSpace(ref)
+	if choice, ok := modelprofile.LookupModelChoice(ref); ok {
+		ref = choice.RecommendedProfile
+	}
 	if b == nil || b.modelProfileResolver == nil {
 		if ref == "" {
 			return modelprofile.Snapshot{}, nil

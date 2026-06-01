@@ -9,17 +9,18 @@ import (
 const DefaultProvider = "default"
 
 type ProviderSpec struct {
-	ID             string
-	DisplayName    string
-	DefaultModel   string
-	Models         []ModelSpec
-	BaseURL        string
-	AdapterProfile string
-	RecommendedEnv string
-	UsesAdapter    bool
-	SupportsTools  bool
-	SupportsVision bool
-	SupportsReason bool
+	ID              string
+	DisplayName     string
+	DefaultModel    string
+	CredentialScope string
+	Models          []ModelSpec
+	BaseURL         string
+	AdapterProfile  string
+	RecommendedEnv  string
+	UsesAdapter     bool
+	SupportsTools   bool
+	SupportsVision  bool
+	SupportsReason  bool
 }
 
 type ModelSpec struct {
@@ -35,6 +36,26 @@ type ModelSpec struct {
 	SupportsReason   bool
 	SupportsSearch   bool
 	Priority         int
+}
+
+type ModelChoice struct {
+	ID                  string
+	DisplayName         string
+	Description         string
+	ProviderID          string
+	ProviderDisplayName string
+	PublicModel         string
+	UpstreamModel       string
+	CredentialScope     string
+	RecommendedProfile  string
+	RecommendedEnv      string
+	Aliases             []string
+	RequiresAPIKey      bool
+	SupportsTools       bool
+	SupportsVision      bool
+	SupportsReason      bool
+	SupportsSearch      bool
+	Priority            int
 }
 
 func (m ModelSpec) PublicID() string {
@@ -140,6 +161,17 @@ func (p ProviderSpec) ResolveModel(ref string) (ModelSpec, bool) {
 	return ModelSpec{}, false
 }
 
+func (p ProviderSpec) FamilyCredentialScope() string {
+	scope := strings.TrimSpace(p.CredentialScope)
+	if scope != "" {
+		return scope
+	}
+	if strings.TrimSpace(p.ID) != "" {
+		return strings.TrimSpace(p.ID)
+	}
+	return DefaultProvider
+}
+
 func (p ProviderSpec) MustResolveModel(ref string) (ModelSpec, error) {
 	model, ok := p.ResolveModel(ref)
 	if ok {
@@ -152,6 +184,188 @@ func (p ProviderSpec) MustResolveModel(ref string) (ModelSpec, error) {
 		}
 	}
 	return ModelSpec{}, fmt.Errorf("unknown model %q for provider %q; available models: %s", strings.TrimSpace(ref), p.ID, strings.Join(choices, ", "))
+}
+
+func ModelChoices() []ModelChoice {
+	ids := ProviderIDs()
+	out := make([]ModelChoice, 0, len(ids))
+	for _, providerID := range ids {
+		spec, ok := LookupProvider(providerID)
+		if !ok {
+			continue
+		}
+		if spec.ID == DefaultProvider || !spec.UsesAdapter {
+			out = append(out, ModelChoice{
+				ID:                  DefaultProvider,
+				DisplayName:         "Codex Official",
+				Description:         "Codex official API",
+				ProviderID:          DefaultProvider,
+				ProviderDisplayName: "Codex official API",
+				RecommendedProfile:  DefaultProvider,
+				RequiresAPIKey:      false,
+				Priority:            -1000,
+				Aliases:             []string{"codex", "official", "openai", "gpt"},
+			})
+			continue
+		}
+		if len(spec.Models) == 0 {
+			continue
+		}
+		models := spec.ModelCatalog()
+		sort.SliceStable(models, func(i, j int) bool {
+			if models[i].Priority != models[j].Priority {
+				return models[i].Priority < models[j].Priority
+			}
+			return strings.ToLower(models[i].PublicID()) < strings.ToLower(models[j].PublicID())
+		})
+		for _, model := range models {
+			publicID := model.PublicID()
+			if publicID == "" {
+				continue
+			}
+			out = append(out, ModelChoice{
+				ID:                  choiceID(spec, model),
+				DisplayName:         model.Label(),
+				Description:         model.Description,
+				ProviderID:          spec.ID,
+				ProviderDisplayName: spec.DisplayName,
+				PublicModel:         publicID,
+				UpstreamModel:       model.UpstreamModel(),
+				CredentialScope:     spec.FamilyCredentialScope(),
+				RecommendedProfile:  RecommendedProfileName(spec, model),
+				RecommendedEnv:      strings.TrimSpace(spec.RecommendedEnv),
+				Aliases:             modelAliases(spec.ID, model),
+				RequiresAPIKey:      true,
+				SupportsTools:       model.SupportsTools || spec.SupportsTools,
+				SupportsVision:      model.SupportsVision || spec.SupportsVision,
+				SupportsReason:      model.SupportsReason || spec.SupportsReason,
+				SupportsSearch:      model.SupportsSearch,
+				Priority:            model.Priority,
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].ProviderID == DefaultProvider && out[j].ProviderID != DefaultProvider {
+			return true
+		}
+		if out[i].ProviderID != DefaultProvider && out[j].ProviderID == DefaultProvider {
+			return false
+		}
+		if out[i].ProviderID != out[j].ProviderID {
+			return strings.ToLower(out[i].ProviderID) < strings.ToLower(out[j].ProviderID)
+		}
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority < out[j].Priority
+		}
+		return strings.ToLower(out[i].ID) < strings.ToLower(out[j].ID)
+	})
+	return out
+}
+
+func LookupModelChoice(ref string) (ModelChoice, bool) {
+	ref = strings.ToLower(strings.TrimSpace(ref))
+	if ref == "" {
+		return ModelChoice{}, false
+	}
+	if ref == DefaultProvider {
+		for _, choice := range ModelChoices() {
+			if choice.ID == DefaultProvider {
+				return choice, true
+			}
+		}
+	}
+	var matched *ModelChoice
+	for _, choice := range ModelChoices() {
+		for _, alias := range choiceAliases(choice) {
+			if strings.ToLower(strings.TrimSpace(alias)) != ref {
+				continue
+			}
+			if matched != nil && !strings.EqualFold(matched.ID, choice.ID) {
+				return ModelChoice{}, false
+			}
+			copy := choice
+			matched = &copy
+		}
+	}
+	if matched == nil {
+		return ModelChoice{}, false
+	}
+	return *matched, true
+}
+
+func MustLookupModelChoice(ref string) (ModelChoice, error) {
+	choice, ok := LookupModelChoice(ref)
+	if ok {
+		return choice, nil
+	}
+	choices := make([]string, 0, len(ModelChoices()))
+	for _, choice := range ModelChoices() {
+		choices = append(choices, choice.ID)
+	}
+	return ModelChoice{}, fmt.Errorf("unknown model %q; available models: %s", strings.TrimSpace(ref), strings.Join(choices, ", "))
+}
+
+func RecommendedProfileName(spec ProviderSpec, model ModelSpec) string {
+	if spec.ID == DefaultProvider || !spec.UsesAdapter {
+		return DefaultProvider
+	}
+	publicID := model.PublicID()
+	switch {
+	case strings.EqualFold(publicID, "deepseek/deepseek-v4-flash"):
+		return "deepseek-flash"
+	case strings.EqualFold(publicID, "deepseek/deepseek-v4-pro"):
+		return "deepseek-pro"
+	case strings.EqualFold(publicID, "mimo/mimo-v2.5"):
+		return "mimo25"
+	case strings.EqualFold(publicID, "mimo/mimo-v2.5-pro"):
+		return "mimo25-pro"
+	}
+	base := strings.TrimSpace(publicID)
+	if idx := strings.LastIndex(base, "/"); idx >= 0 && idx+1 < len(base) {
+		base = base[idx+1:]
+	}
+	base = strings.TrimPrefix(base, spec.ID+"-")
+	if base == "" {
+		base = spec.ID
+	}
+	return strings.ToLower(strings.ReplaceAll(base, "_", "-"))
+}
+
+func choiceID(spec ProviderSpec, model ModelSpec) string {
+	publicID := strings.TrimSpace(model.PublicID())
+	if publicID == "" {
+		return strings.TrimSpace(model.UpstreamModel())
+	}
+	if strings.HasPrefix(publicID, spec.ID+"/") {
+		return strings.TrimPrefix(publicID, spec.ID+"/")
+	}
+	return publicID
+}
+
+func choiceAliases(choice ModelChoice) []string {
+	raw := []string{
+		choice.ID,
+		choice.DisplayName,
+		choice.PublicModel,
+		choice.UpstreamModel,
+		choice.RecommendedProfile,
+	}
+	raw = append(raw, choice.Aliases...)
+	seen := map[string]bool{}
+	out := make([]string, 0, len(raw))
+	for _, alias := range raw {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		key := strings.ToLower(alias)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, alias)
+	}
+	return out
 }
 
 func modelAliases(providerID string, model ModelSpec) []string {
@@ -205,15 +419,16 @@ var providerCatalog = map[string]ProviderSpec{
 		DisplayName: "Codex official API",
 	},
 	"deepseek": {
-		ID:             "deepseek",
-		DisplayName:    "DeepSeek",
-		DefaultModel:   "deepseek-v4-flash",
-		BaseURL:        "https://api.deepseek.com/v1",
-		AdapterProfile: "deepseek",
-		RecommendedEnv: "DEEPSEEK_API_KEY",
-		UsesAdapter:    true,
-		SupportsTools:  true,
-		SupportsReason: true,
+		ID:              "deepseek",
+		DisplayName:     "DeepSeek",
+		DefaultModel:    "deepseek-v4-flash",
+		CredentialScope: "deepseek",
+		BaseURL:         "https://api.deepseek.com/v1",
+		AdapterProfile:  "deepseek",
+		RecommendedEnv:  "DEEPSEEK_API_KEY",
+		UsesAdapter:     true,
+		SupportsTools:   true,
+		SupportsReason:  true,
 		Models: []ModelSpec{{
 			ID:               "deepseek/deepseek-v4-flash",
 			UpstreamID:       "deepseek-v4-flash",
@@ -239,15 +454,16 @@ var providerCatalog = map[string]ProviderSpec{
 		}},
 	},
 	"mimo": {
-		ID:             "mimo",
-		DisplayName:    "MiMo",
-		DefaultModel:   "mimo-v2.5",
-		BaseURL:        "https://api.xiaomimimo.com/v1",
-		AdapterProfile: "mimo",
-		RecommendedEnv: "MIMO_API_KEY",
-		UsesAdapter:    true,
-		SupportsTools:  true,
-		SupportsVision: true,
+		ID:              "mimo",
+		DisplayName:     "MiMo",
+		DefaultModel:    "mimo-v2.5",
+		CredentialScope: "mimo25",
+		BaseURL:         "https://api.xiaomimimo.com/v1",
+		AdapterProfile:  "mimo",
+		RecommendedEnv:  "MIMO_API_KEY",
+		UsesAdapter:     true,
+		SupportsTools:   true,
+		SupportsVision:  true,
 		Models: []ModelSpec{{
 			ID:               "mimo/mimo-v2.5",
 			UpstreamID:       "mimo-v2.5",

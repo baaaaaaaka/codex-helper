@@ -93,3 +93,43 @@ func TestMiMoProviderSpecResolvesTierAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestModelChoicesListUserFacingModelsAndCredentialScopes(t *testing.T) {
+	choices := ModelChoices()
+	byID := map[string]ModelChoice{}
+	for _, choice := range choices {
+		byID[choice.ID] = choice
+	}
+	for _, id := range []string{"default", "deepseek-v4-flash", "deepseek-v4-pro", "mimo-v2.5", "mimo-v2.5-pro"} {
+		if _, ok := byID[id]; !ok {
+			t.Fatalf("ModelChoices missing %q: %#v", id, choices)
+		}
+	}
+	if len(choices) != 5 {
+		t.Fatalf("ModelChoices len=%d choices=%#v, want only fully covered simple models", len(choices), choices)
+	}
+	if got := byID["deepseek-v4-flash"].CredentialScope; got != "deepseek" {
+		t.Fatalf("deepseek credential scope = %q", got)
+	}
+	if got := byID["deepseek-v4-pro"].CredentialScope; got != "deepseek" {
+		t.Fatalf("deepseek pro credential scope = %q", got)
+	}
+	if got := byID["mimo-v2.5"].CredentialScope; got != "mimo25" {
+		t.Fatalf("mimo base credential scope = %q", got)
+	}
+	if got := byID["mimo-v2.5-pro"].CredentialScope; got != "mimo25" {
+		t.Fatalf("mimo pro credential scope = %q", got)
+	}
+	if byID["mimo-v2.5"].RecommendedProfile != "mimo25" || byID["mimo-v2.5-pro"].RecommendedProfile != "mimo25-pro" {
+		t.Fatalf("mimo recommended profiles: base=%q pro=%q", byID["mimo-v2.5"].RecommendedProfile, byID["mimo-v2.5-pro"].RecommendedProfile)
+	}
+}
+
+func TestLookupModelChoiceRejectsAmbiguousTierAlias(t *testing.T) {
+	if got, ok := LookupModelChoice("mimo25-pro"); !ok || got.ID != "mimo-v2.5-pro" {
+		t.Fatalf("LookupModelChoice(mimo25-pro) = %#v ok=%v", got, ok)
+	}
+	if got, ok := LookupModelChoice("pro"); ok || got.ID != "" {
+		t.Fatalf("LookupModelChoice(pro) = %#v ok=%v, want ambiguous miss", got, ok)
+	}
+}

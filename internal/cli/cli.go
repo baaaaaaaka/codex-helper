@@ -5,7 +5,7 @@ import (
 )
 
 var (
-	version = "v0.1.7"
+	version = "v0.1.8"
 	commit  = ""
 	date    = ""
 )
@@ -48,6 +48,7 @@ func newRootCmd() *cobra.Command {
 		newInternalNpmWrapperCmd(),
 		newAppCmd(opts),
 		newInitCmd(opts),
+		newModelCmd(opts),
 		newModelProfileCmd(opts),
 		newRunCmd(opts),
 		newTuiCmd(opts),

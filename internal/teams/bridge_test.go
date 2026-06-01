@@ -22,6 +22,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
@@ -26720,6 +26721,31 @@ func (m *fakeModelProfileManager) ModelProfileSetupGuide(context.Context, string
 	return "setup guide", nil
 }
 
+func (m *fakeModelProfileManager) SetupModelProfile(_ context.Context, req ModelProfileSetupRequest) (ModelProfileSetupResult, error) {
+	choice, ok := modelprofile.LookupModelChoice(req.Model)
+	if !ok {
+		return ModelProfileSetupResult{}, fmt.Errorf("unknown model %q", req.Model)
+	}
+	if choice.RequiresAPIKey {
+		return ModelProfileSetupResult{
+			ProfileName:     choice.RecommendedProfile,
+			Provider:        choice.ProviderID,
+			Model:           choice.PublicModel,
+			DisplayName:     choice.DisplayName,
+			NeedsAPIKey:     true,
+			CredentialScope: choice.CredentialScope,
+			SetDefault:      req.SetDefault,
+		}, nil
+	}
+	return ModelProfileSetupResult{
+		ProfileName: config.DefaultModelProfileName,
+		Provider:    modelprofile.DefaultProvider,
+		Model:       modelprofile.DefaultProvider,
+		DisplayName: choice.DisplayName,
+		SetDefault:  req.SetDefault,
+	}, nil
+}
+
 func (m *fakeModelProfileManager) ModelProfileDoctor(context.Context, string) (string, error) {
 	return "doctor", nil
 }
@@ -26751,11 +26777,15 @@ func (m *fakeModelProfileManager) SaveModelProfileAPIKey(_ context.Context, req 
 	if saveResult.ProfileName != "" {
 		return saveResult, nil
 	}
+	apiKeyRef := modelprofile.SecretRefForProfile(req.ProfileName)
+	if strings.TrimSpace(req.CredentialScope) != "" {
+		apiKeyRef = modelprofile.SecretRefForCredentialScope(req.CredentialScope)
+	}
 	return ModelProfileAPIKeySaveResult{
 		ProfileName: req.ProfileName,
 		Provider:    req.Provider,
 		Model:       req.Model,
-		APIKeyRef:   modelprofile.SecretRefForProfile(req.ProfileName),
+		APIKeyRef:   apiKeyRef,
 		Fingerprint: "fp-test",
 		Revision:    1,
 		SetDefault:  req.SetDefault,

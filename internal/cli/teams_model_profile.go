@@ -36,9 +36,10 @@ func (m teamsModelProfileManager) ListModelProfiles(ctx context.Context) (string
 		return "", err
 	}
 	var out bytes.Buffer
-	printModelProfiles(&out, cfg)
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+	printModelChoices(&out, cfg, secretStore)
 	_ = ctx
-	return strings.TrimSpace(out.String()) + "\n\nUse `model default <name>` for future Work chats, or `model switch <name>` inside a new empty Work chat.", nil
+	return strings.TrimSpace(out.String()) + "\n\nUse `model setup <model>` to configure a model, or `model use <model>` for future Work chats.", nil
 }
 
 func (m teamsModelProfileManager) ModelProfileProviders(ctx context.Context) (string, error) {
@@ -82,9 +83,30 @@ func (m teamsModelProfileManager) ModelProfileProviders(ctx context.Context) (st
 }
 
 func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, arg string) (string, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		store, err := m.store()
+		if err != nil {
+			return "", err
+		}
+		cfg, err := store.Load()
+		if err != nil {
+			return "", err
+		}
+		var out bytes.Buffer
+		secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+		printModelChoices(&out, cfg, secretStore)
+		return strings.TrimSpace(out.String()) + "\n\nReply with `model setup <model>`, for example `model setup mimo-v2.5-pro`.", nil
+	}
+	if choice, ok := modelprofile.LookupModelChoice(arg); ok {
+		if !choice.RequiresAPIKey {
+			return "Use `model use default` to switch future Work chats back to the Codex official API.", nil
+		}
+		return fmt.Sprintf("Set up %s with `model setup %s`. If no %s API key is configured yet, I will start a one-time Teams key intake.", choice.DisplayName, choice.ID, choice.ProviderDisplayName), nil
+	}
 	provider, name := parseTeamsModelSetupGuideArg(arg)
 	if provider == "" {
-		return "Usage: `model setup <provider> [name]`\n\nRun `model providers` to see supported providers. For no-terminal setup, use `model setup <provider> [name] --teams-key-intake`.", nil
+		return "Usage: `model setup <model>`\n\nRun `model setup` to see all available models.", nil
 	}
 	spec, err := modelprofile.MustLookupProvider(provider)
 	if err != nil {
@@ -129,10 +151,115 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 	return strings.Join(lines, "\n"), nil
 }
 
+func (m teamsModelProfileManager) SetupModelProfile(ctx context.Context, req teams.ModelProfileSetupRequest) (teams.ModelProfileSetupResult, error) {
+	choice, err := modelprofile.MustLookupModelChoice(req.Model)
+	if err != nil {
+		return teams.ModelProfileSetupResult{}, err
+	}
+	if !choice.RequiresAPIKey {
+		store, err := m.store()
+		if err != nil {
+			return teams.ModelProfileSetupResult{}, err
+		}
+		if err := store.Update(func(cfg *config.Config) error {
+			cfg.DefaultModelProfile = ""
+			return nil
+		}); err != nil {
+			return teams.ModelProfileSetupResult{}, err
+		}
+		_ = ctx
+		return teams.ModelProfileSetupResult{
+			ProfileName: config.DefaultModelProfileName,
+			Provider:    modelprofile.DefaultProvider,
+			Model:       modelprofile.DefaultProvider,
+			DisplayName: choice.DisplayName,
+			SetDefault:  true,
+		}, nil
+	}
+	store, err := m.store()
+	if err != nil {
+		return teams.ModelProfileSetupResult{}, err
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return teams.ModelProfileSetupResult{}, err
+	}
+	sshProxy := strings.TrimSpace(req.SSHProxy)
+	if strings.EqualFold(sshProxy, "none") {
+		sshProxy = ""
+	}
+	if sshProxy != "" {
+		if _, ok := cfg.FindProfile(sshProxy); !ok {
+			return teams.ModelProfileSetupResult{}, fmt.Errorf("ssh proxy profile %q not found", sshProxy)
+		}
+	}
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+	apiKeyRef := reusableAPIKeyRef(cfg, secretStore, choice)
+	if apiKeyRef == "" {
+		return teams.ModelProfileSetupResult{
+			ProfileName:     choice.RecommendedProfile,
+			Provider:        choice.ProviderID,
+			Model:           choice.PublicModel,
+			DisplayName:     choice.DisplayName,
+			NeedsAPIKey:     true,
+			CredentialScope: choice.CredentialScope,
+			SetDefault:      req.SetDefault,
+		}, nil
+	}
+	profileName := choice.RecommendedProfile
+	existing, existed := cfg.FindModelProfile(profileName)
+	if sshProxy == "" && existed {
+		sshProxy = existing.SSHProxy
+	}
+	now := time.Now().UTC()
+	revision := existing.Revision
+	if revision <= 0 {
+		revision = 1
+	} else if modelProfileSetupChanges(existing, choice.ProviderID, choice.PublicModel, apiKeyRef, sshProxy) {
+		revision++
+	}
+	createdAt := existing.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	profile := config.ModelProfile{
+		Provider:  choice.ProviderID,
+		Model:     choice.PublicModel,
+		APIKeyRef: apiKeyRef,
+		SSHProxy:  sshProxy,
+		Revision:  revision,
+		CreatedAt: createdAt,
+		UpdatedAt: now,
+	}
+	if err := store.Update(func(cfg *config.Config) error {
+		cfg.UpsertModelProfile(profileName, profile)
+		if req.SetDefault {
+			cfg.DefaultModelProfile = profileName
+		}
+		return nil
+	}); err != nil {
+		return teams.ModelProfileSetupResult{}, err
+	}
+	_ = ctx
+	return teams.ModelProfileSetupResult{
+		ProfileName:     profileName,
+		Provider:        choice.ProviderID,
+		Model:           choice.PublicModel,
+		DisplayName:     choice.DisplayName,
+		APIKeyRef:       apiKeyRef,
+		ReusedAPIKey:    true,
+		CredentialScope: choice.CredentialScope,
+		SetDefault:      req.SetDefault,
+	}, nil
+}
+
 func (m teamsModelProfileManager) ModelProfileDoctor(ctx context.Context, name string) (string, error) {
 	store, err := m.store()
 	if err != nil {
 		return "", err
+	}
+	if choice, ok := modelprofile.LookupModelChoice(name); ok {
+		name = choice.RecommendedProfile
 	}
 	var out bytes.Buffer
 	if err := runModelProfileDoctor(&out, store, strings.TrimSpace(name)); err != nil {
@@ -145,7 +272,17 @@ func (m teamsModelProfileManager) ModelProfileDoctor(ctx context.Context, name s
 func (m teamsModelProfileManager) SetDefaultModelProfile(ctx context.Context, name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return "", fmt.Errorf("model profile name is required")
+		return "", fmt.Errorf("model is required")
+	}
+	if choice, ok := modelprofile.LookupModelChoice(name); ok {
+		result, err := m.SetupModelProfile(ctx, teams.ModelProfileSetupRequest{Model: choice.ID, SetDefault: true})
+		if err != nil {
+			return "", err
+		}
+		if result.NeedsAPIKey {
+			return "", fmt.Errorf("%s is not configured yet; run `model setup %s` first", choice.ID, choice.ID)
+		}
+		return fmt.Sprintf("Default model for future Work chats: %s\n\nExisting Work chats keep their pinned model.", result.DisplayName), nil
 	}
 	store, err := m.store()
 	if err != nil {
@@ -255,6 +392,9 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 	}
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
 	apiKeyRef := modelprofile.SecretRefForProfile(name)
+	if strings.TrimSpace(req.CredentialScope) != "" {
+		apiKeyRef = modelprofile.SecretRefForCredentialScope(req.CredentialScope)
+	}
 	oldKey, oldKeyFound, err := secretStore.Get(apiKeyRef)
 	if err != nil {
 		return teams.ModelProfileAPIKeySaveResult{}, err

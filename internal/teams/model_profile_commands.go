@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
@@ -24,6 +25,16 @@ func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage,
 		if modelProfileSetupRequestsTeamsKeyIntake(rest) {
 			return b.startModelProfileKeyIntake(ctx, msg, rest)
 		}
+		if _, ok := modelprofile.LookupModelChoice(rest); ok {
+			result, err := b.modelManagerSetupModel(ctx, rest, true)
+			if err != nil {
+				return "", err
+			}
+			if result.NeedsAPIKey {
+				return b.startModelProfileKeyIntake(ctx, msg, rest)
+			}
+			return formatTeamsModelSetupResult(result), nil
+		}
 		return b.modelManagerSetupGuide(ctx, rest)
 	case "key", "api-key", "apikey":
 		return modelProfileKeyIntakeUsage(), nil
@@ -31,7 +42,17 @@ func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage,
 		return b.modelManagerDoctor(ctx, rest)
 	case "default", "set-default", "use":
 		if strings.TrimSpace(rest) == "" {
-			return "", fmt.Errorf("usage: `model default <profile>`")
+			return "", fmt.Errorf("usage: `model use <model>`")
+		}
+		if _, ok := modelprofile.LookupModelChoice(rest); ok {
+			result, err := b.modelManagerSetupModel(ctx, rest, true)
+			if err != nil {
+				return "", err
+			}
+			if result.NeedsAPIKey {
+				return b.startModelProfileKeyIntake(ctx, msg, rest)
+			}
+			return formatTeamsModelUseResult(result), nil
 		}
 		return b.modelManagerSetDefault(ctx, rest)
 	case "delete", "remove", "rm":
@@ -117,6 +138,13 @@ func (b *Bridge) modelManagerSetupGuide(ctx context.Context, arg string) (string
 	return b.modelProfileManager.ModelProfileSetupGuide(ctx, arg)
 }
 
+func (b *Bridge) modelManagerSetupModel(ctx context.Context, model string, setDefault bool) (ModelProfileSetupResult, error) {
+	if b == nil || b.modelProfileManager == nil {
+		return ModelProfileSetupResult{}, fmt.Errorf("%s", modelProfileManagerUnavailable())
+	}
+	return b.modelProfileManager.SetupModelProfile(ctx, ModelProfileSetupRequest{Model: strings.TrimSpace(model), SetDefault: setDefault})
+}
+
 func (b *Bridge) modelManagerDoctor(ctx context.Context, name string) (string, error) {
 	if b == nil || b.modelProfileManager == nil {
 		return modelProfileManagerUnavailable(), nil
@@ -139,20 +167,19 @@ func (b *Bridge) modelManagerDelete(ctx context.Context, name string, confirm bo
 }
 
 func modelProfileManagerUnavailable() string {
-	return "Model profile management is not configured for this Teams service. Use the local CLI: `cxp model-profile list`, `cxp model-profile setup <name>`, and `cxp model-profile set-default <name>`."
+	return "Model management is not configured for this Teams service. Use the local CLI: `cxp model list`, `cxp model setup <model>`, and `cxp model use <model>`."
 }
 
 func modelControlUsage() string {
 	return strings.Join([]string{
-		"Model profile commands:",
-		"- `model list` - list profiles",
-		"- `model providers` - list supported providers",
-		"- `model setup <provider> [name]` - show setup commands",
-		"- `model setup <provider> [name] --model <model> --teams-key-intake` - configure a key from Teams with a one-time code",
+		"Model commands:",
+		"- `model list` - list available models and setup status",
+		"- `model setup` - list model choices",
+		"- `model setup <model>` - configure a model",
 		"- `model key confirm <code>` then `model key <code> <api-key>` - finish Teams key intake",
-		"- `model doctor <name>` - validate a profile",
-		"- `model default <name>` - set the default for future chats",
-		"- `new <directory> --model <name>` - create a chat pinned to a profile",
+		"- `model doctor <model>` - validate the model backing profile",
+		"- `model use <model>` - set the default for future chats",
+		"- `new <directory> --model <model>` - create a chat pinned to a model",
 	}, "\n")
 }
 
@@ -164,6 +191,30 @@ func modelWorkUsage() string {
 		"- `model fork <name>` - create a new Work chat with another profile",
 		"- `model list` - list profiles",
 	}, "\n")
+}
+
+func formatTeamsModelSetupResult(result ModelProfileSetupResult) string {
+	if result.ProfileName == config.DefaultModelProfileName || result.Provider == modelprofile.DefaultProvider {
+		return "Default model: Codex Official\n\nExisting Work chats keep their pinned model."
+	}
+	lines := []string{
+		fmt.Sprintf("Saved model %s as `%s`.", result.DisplayName, result.ProfileName),
+	}
+	if result.ReusedAPIKey {
+		lines = append(lines, fmt.Sprintf("Using existing %s API key %s.", result.Provider, modelprofile.MaskRef(result.APIKeyRef)))
+	}
+	if result.SetDefault {
+		lines = append(lines, "Default model for future Work chats: "+result.DisplayName)
+	}
+	lines = append(lines, "Existing Work chats keep their pinned model.")
+	return strings.Join(lines, "\n")
+}
+
+func formatTeamsModelUseResult(result ModelProfileSetupResult) string {
+	if result.ProfileName == config.DefaultModelProfileName || result.Provider == modelprofile.DefaultProvider {
+		return "Default model for future Work chats: Codex Official\n\nExisting Work chats keep their pinned model."
+	}
+	return fmt.Sprintf("Default model for future Work chats: %s\n\nExisting Work chats keep their pinned model.", result.DisplayName)
 }
 
 func (b *Bridge) formatWorkModelStatus(ctx context.Context, session *Session) (string, error) {

@@ -28,6 +28,10 @@ func SecretRefForProfile(name string) string {
 	return SecretRefPrefix + "model-profile/" + strings.TrimSpace(name) + "/api-key"
 }
 
+func SecretRefForCredentialScope(scope string) string {
+	return SecretRefPrefix + "model-credential/" + strings.TrimSpace(scope) + "/default/api-key"
+}
+
 func SecretPathForConfig(configPath string) string {
 	dir := filepath.Dir(filepath.Clean(configPath))
 	return filepath.Join(dir, "model-profile-secrets.json")
