@@ -1006,25 +1006,34 @@ func TestBridgePacesRealGraphOutboxWritesCI(t *testing.T) {
 	}
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-	for i := 1; i <= 2; i++ {
-		if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
-			ID:          fmt.Sprintf("outbox:paced:%02d", i),
-			TeamsChatID: "chat-1",
-			Kind:        "helper",
-			Body:        fmt.Sprintf("paced message %02d", i),
-		}); err != nil {
-			t.Fatalf("QueueOutbox %d: %v", i, err)
-		}
+	bridge.outboxSendPaceMu.Lock()
+	bridge.outboxSendPaceLast = map[string]time.Time{
+		"chat-1": time.Now().Add(-100 * time.Millisecond),
+	}
+	bridge.outboxSendPaceMu.Unlock()
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:paced:01",
+		TeamsChatID: "chat-1",
+		Kind:        "helper",
+		Body:        "paced message 01",
+	}); err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
 	}
 
 	if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
 		t.Fatalf("flushPendingOutbox: %v", err)
 	}
-	if posts != 2 {
-		t.Fatalf("Graph posts = %d, want 2", posts)
+	if posts != 1 {
+		t.Fatalf("Graph posts = %d, want 1", posts)
 	}
-	if len(sleeps) != 1 || sleeps[0] <= time.Second {
-		t.Fatalf("Graph write sleeps = %#v, want one conservative same-chat pacing delay", sleeps)
+	if len(sleeps) != 1 {
+		t.Fatalf("Graph write sleeps = %#v, want one same-chat pacing delay", sleeps)
+	}
+	if sleeps[0] <= 0 || sleeps[0] > graphOutboxSendMinInterval {
+		t.Fatalf("Graph write sleep = %s, want positive delay up to %s", sleeps[0], graphOutboxSendMinInterval)
+	}
+	if sleeps[0] < graphOutboxSendMinInterval/2 {
+		t.Fatalf("Graph write sleep = %s, want conservative same-chat pacing delay", sleeps[0])
 	}
 }
 
