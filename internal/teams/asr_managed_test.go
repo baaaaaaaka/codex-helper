@@ -717,6 +717,10 @@ func TestManagedASRLlamaRuntimeConcurrentSetupReusesSingleInstall(t *testing.T) 
 }
 
 func TestManagedASRLlamaBinaryDefaultInstallsCPUAssetWithoutAcceleratedProbe(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("default CPU-only managed llama install is enforced on Linux/Windows")
+	}
+
 	cacheRoot := t.TempDir()
 	vulkanArchive := buildManagedASRLlamaTestArchiveWithRoot(t, "vulkan")
 	cpuArchive := buildManagedASRLlamaTestArchiveWithRoot(t, "cpu")
