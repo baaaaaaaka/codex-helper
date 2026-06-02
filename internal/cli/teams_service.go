@@ -1781,6 +1781,11 @@ func (b teamsServiceWindowsTaskBackend) RepairElevated(ctx context.Context, spec
 	if err != nil {
 		return "", err
 	}
+	startAfterRepair := opts.Start
+	if startAfterRepair {
+		opts.Start = false
+		opts.Enable = true
+	}
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
 	cmd := teamsServiceWindowsStopBridgeChildrenPowerShell(task) + "; " + buildTeamsServiceWindowsTaskRegisterCommand(xmlPath, watchdogXMLPath)
 	switch {
@@ -1789,8 +1794,13 @@ func (b teamsServiceWindowsTaskBackend) RepairElevated(ctx context.Context, spec
 	case opts.Enable:
 		cmd += "; " + teamsServiceWindowsEnableTasksPowerShell()
 	}
-	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWindowsElevatedCommand(cmd)); err != nil {
+	if _, err := teamsServiceRunWindowsElevatedPowerShell(ctx, cmd); err != nil {
 		return "", err
+	}
+	if startAfterRepair {
+		if _, err := b.Run(ctx, "start"); err != nil {
+			return "", fmt.Errorf("start Teams Scheduled Tasks after UAC repair: %w", err)
+		}
 	}
 	return xmlPath, nil
 }
@@ -2114,11 +2124,17 @@ func (b teamsServiceWSLWindowsTaskBackend) Repair(ctx context.Context, spec team
 
 func (b teamsServiceWSLWindowsTaskBackend) RepairElevated(ctx context.Context, spec teamsServiceSpec, opts teamsServiceRepairOptions, principalUser string) (string, error) {
 	args := buildTeamsServiceWSLArguments(spec)
+	startAfterRepair := opts.Start
+	if startAfterRepair {
+		opts.Start = false
+		opts.Enable = true
+	}
+	preserveRunning := !opts.Start && !startAfterRepair
 	cmd := buildTeamsServiceWSLRegisterCommand(b.Name(), args, teamsServiceWSLRegisterOptions{
 		Enable:          opts.Enable,
 		Start:           opts.Start,
 		PreserveEnabled: !opts.Enable,
-		PreserveRunning: !opts.Start,
+		PreserveRunning: preserveRunning,
 		PrincipalUser:   principalUser,
 		CleanLegacy:     true,
 	})
@@ -2127,12 +2143,17 @@ func (b teamsServiceWSLWindowsTaskBackend) RepairElevated(ctx context.Context, s
 		Enable:          opts.Enable,
 		Start:           opts.Start,
 		PreserveEnabled: !opts.Enable,
-		PreserveRunning: !opts.Start,
+		PreserveRunning: preserveRunning,
 		PrincipalUser:   principalUser,
 		CleanLegacy:     true,
 	})
 	if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLElevatedCommand(cmd)); err != nil {
 		return "", err
+	}
+	if startAfterRepair {
+		if _, err := b.Run(ctx, "start"); err != nil {
+			return "", fmt.Errorf("start WSL Teams Scheduled Tasks after UAC repair: %w", err)
+		}
 	}
 	return b.writeTaskConfig(args)
 }
@@ -3884,6 +3905,65 @@ func buildTeamsServiceWindowsElevatedCommand(command string) string {
 		"$p = Start-Process -FilePath 'powershell.exe' -ArgumentList $uacArgs -Verb RunAs -Wait -PassThru; " +
 		"if ($null -eq $p) { throw 'Windows UAC process did not start' }; " +
 		"if ($p.ExitCode -ne 0) { throw ('elevated Teams service bootstrap failed with exit code ' + $p.ExitCode) }"
+}
+
+func teamsServiceRunWindowsElevatedPowerShell(ctx context.Context, command string) ([]byte, error) {
+	dir, err := teamsServiceWindowsTaskXMLDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		dir = os.TempDir()
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	workDir, err := os.MkdirTemp(dir, "codex-helper-teams-uac-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(workDir)
+
+	scriptPath := filepath.Join(workDir, "elevated.ps1")
+	stdoutPath := filepath.Join(workDir, "stdout.log")
+	stderrPath := filepath.Join(workDir, "stderr.log")
+	script := buildTeamsServiceWindowsElevatedScript(command, stdoutPath, stderrPath)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+		return nil, err
+	}
+	return teamsServiceRunPowerShell(ctx, buildTeamsServiceWindowsElevatedScriptCommand(scriptPath, stdoutPath, stderrPath))
+}
+
+func buildTeamsServiceWindowsElevatedScript(command string, stdoutPath string, stderrPath string) string {
+	command = strings.TrimSpace(command)
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference = 'Stop'\r\n")
+	b.WriteString("$stdoutLog = " + powershellSingleQuote(stdoutPath) + "\r\n")
+	b.WriteString("$stderrLog = " + powershellSingleQuote(stderrPath) + "\r\n")
+	b.WriteString("try {\r\n")
+	b.WriteString("  Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue\r\n")
+	b.WriteString("  & {\r\n")
+	if command != "" {
+		b.WriteString("    " + command + "\r\n")
+	}
+	b.WriteString("  } *>&1 | Tee-Object -FilePath $stdoutLog | Out-Null\r\n")
+	b.WriteString("} catch {\r\n")
+	b.WriteString("  $message = ($_ | Out-String).Trim()\r\n")
+	b.WriteString("  if ([string]::IsNullOrWhiteSpace($message) -and $null -ne $_.Exception) { $message = $_.Exception.Message }\r\n")
+	b.WriteString("  if ([string]::IsNullOrWhiteSpace($message)) { $message = 'unknown elevated Teams service bootstrap error' }\r\n")
+	b.WriteString("  Set-Content -LiteralPath $stderrLog -Value $message -Encoding UTF8\r\n")
+	b.WriteString("  exit 1\r\n")
+	b.WriteString("}\r\n")
+	b.WriteString("exit 0\r\n")
+	return b.String()
+}
+
+func buildTeamsServiceWindowsElevatedScriptCommand(scriptPath string, stdoutPath string, stderrPath string) string {
+	return "$uacArgs = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File'," + powershellSingleQuote(scriptPath) + "); " +
+		"$uacStdout = " + powershellSingleQuote(stdoutPath) + "; $uacStderr = " + powershellSingleQuote(stderrPath) + "; " +
+		"$p = Start-Process -FilePath 'powershell.exe' -ArgumentList $uacArgs -Verb RunAs -Wait -PassThru; " +
+		"if ($null -eq $p) { throw 'Windows UAC process did not start' }; " +
+		"$uacDetails = @(); " +
+		"foreach ($uacLog in @($uacStderr,$uacStdout)) { if (Test-Path -LiteralPath $uacLog) { $uacText = (Get-Content -LiteralPath $uacLog -Raw -ErrorAction SilentlyContinue).Trim(); if (-not [string]::IsNullOrWhiteSpace($uacText)) { $uacDetails += $uacText } } }; " +
+		"if ($p.ExitCode -ne 0) { $uacDetail = ($uacDetails -join \"`n\").Trim(); if (-not [string]::IsNullOrWhiteSpace($uacDetail)) { throw ('elevated Teams service bootstrap failed with exit code ' + $p.ExitCode + ': ' + $uacDetail) }; throw ('elevated Teams service bootstrap failed with exit code ' + $p.ExitCode) }; " +
+		"if ($uacDetails.Count -gt 0) { $uacDetails -join \"`n\" }"
 }
 
 func buildTeamsServiceWSLTaskConfig(taskName string, args []string) string {

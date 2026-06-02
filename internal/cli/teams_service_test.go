@@ -74,6 +74,83 @@ func teamsServiceTestRegistryPath(cwd string, registryPath string) string {
 	return filepath.Join(cwd, registryPath)
 }
 
+func assertTeamsServiceWindowsElevatedScriptCommand(t *testing.T, command string) {
+	t.Helper()
+	for _, want := range []string{
+		"Start-Process",
+		"-Verb RunAs",
+		"-File",
+		"codex-helper-teams-uac-",
+		"elevated.ps1",
+		"stdout.log",
+		"stderr.log",
+		"elevated Teams service bootstrap failed with exit code",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("elevated launcher missing %q:\n%s", want, command)
+		}
+	}
+	for _, forbidden := range []string{"Register-ScheduledTask", "Start-ScheduledTask", "Enable-ScheduledTask"} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("elevated launcher should execute a script file instead of inline %q:\n%s", forbidden, command)
+		}
+	}
+}
+
+func assertTeamsServiceWindowsElevatedScriptForRepair(t *testing.T, script string, expectEnable bool, expectStart bool) {
+	t.Helper()
+	for _, want := range []string{
+		"$ErrorActionPreference = 'Stop'",
+		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
+		"Register-ScheduledTask",
+		teamsServiceWindowsTaskName,
+		teamsServiceWindowsWatchdogTaskName,
+		"exit 1",
+		"exit 0",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("elevated script missing %q:\n%s", want, script)
+		}
+	}
+	if expectEnable && !strings.Contains(script, "Enable-ScheduledTask") {
+		t.Fatalf("elevated script should enable repaired tasks:\n%s", script)
+	}
+	if !expectEnable && strings.Contains(script, "Enable-ScheduledTask") {
+		t.Fatalf("elevated script should not enable install-only tasks:\n%s", script)
+	}
+	if expectStart && !strings.Contains(script, "Start-ScheduledTask") {
+		t.Fatalf("elevated script should start repaired tasks:\n%s", script)
+	}
+	if !expectStart {
+		for _, forbidden := range []string{"Start-ScheduledTask", "Start-CodexHelperScheduledTaskIfStopped"} {
+			if strings.Contains(script, forbidden) {
+				t.Fatalf("elevated script should not start tasks before returning to current-user context, found %q:\n%s", forbidden, script)
+			}
+		}
+	}
+	for _, forbidden := range []string{"RunLevel Highest", "HighestAvailable", "NT AUTHORITY\\SYSTEM", "-UserId 'SYSTEM'", "LogonType Password"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("elevated script must stay current-user least-privilege, found %q:\n%s", forbidden, script)
+		}
+	}
+}
+
+func assertTeamsServiceWindowsElevatedScriptFile(t *testing.T, taskDir string, expectEnable bool, expectStart bool) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(taskDir, "codex-helper-teams-uac-*", "elevated.ps1"))
+	if err != nil {
+		t.Fatalf("glob elevated script: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("elevated script matches = %#v, want exactly one", matches)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read elevated script %s: %v", matches[0], err)
+	}
+	assertTeamsServiceWindowsElevatedScriptForRepair(t, string(data), expectEnable, expectStart)
+}
+
 func TestConfirmTeamsServiceUACPromptRejectsTeamsServiceModeWithoutReading(t *testing.T) {
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
 
@@ -4651,11 +4728,13 @@ func TestTeamsServiceBootstrapWindowsAccessDeniedPromptsForUAC(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	taskDir := filepath.Join(tmp, "tasks")
 	runner := &scriptedTeamsServiceRunner{
 		outputs: [][]byte{
 			nil,
 			[]byte("Register-ScheduledTask : Access is denied.\n"),
 			[]byte("NVIDIA\\jason\n"),
+			nil,
 			nil,
 		},
 		errs: []error{
@@ -4663,9 +4742,14 @@ func TestTeamsServiceBootstrapWindowsAccessDeniedPromptsForUAC(t *testing.T) {
 			errors.New("exit status 1"),
 			nil,
 			nil,
+			nil,
+		},
+		onRun: func(index int, _ string, _ []string) {
+			if index == 3 {
+				assertTeamsServiceWindowsElevatedScriptFile(t, taskDir, true, false)
+			}
 		},
 	}
-	taskDir := filepath.Join(tmp, "tasks")
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "windows",
 		exe:            filepath.Join(tmp, "codex-proxy.exe"),
@@ -4699,30 +4783,24 @@ func TestTeamsServiceBootstrapWindowsAccessDeniedPromptsForUAC(t *testing.T) {
 			t.Fatalf("bootstrap output missing %q:\n%s", want, gotOut)
 		}
 	}
-	if len(runner.calls) != 4 {
-		t.Fatalf("PowerShell calls = %#v, want cleanup, failed register, current-user lookup, and elevated repair", runner.calls)
+	if len(runner.calls) != 5 {
+		t.Fatalf("PowerShell calls = %#v, want cleanup, failed register, current-user lookup, elevated repair, and normal start", runner.calls)
 	}
 	elevated := strings.Join(runner.calls[3].args, " ")
+	assertTeamsServiceWindowsElevatedScriptCommand(t, elevated)
+	start := strings.Join(runner.calls[4].args, " ")
 	for _, want := range []string{
-		"Start-Process",
-		"-Verb RunAs",
-		"Register-ScheduledTask",
 		"Enable-ScheduledTask",
-		"Start-ScheduledTask",
-		teamsServiceWindowsTaskName,
-		teamsServiceWindowsWatchdogTaskName,
+		"Start-CodexHelperScheduledTaskIfStopped " + powershellSingleQuote(teamsServiceWindowsTaskName),
+		"Start-CodexHelperScheduledTaskIfStopped " + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName),
 	} {
-		if !strings.Contains(elevated, want) {
-			t.Fatalf("elevated command missing %q:\n%s", want, elevated)
+		if !strings.Contains(start, want) {
+			t.Fatalf("post-UAC start command missing %q:\n%s", want, start)
 		}
 	}
-	requireSubstringsInOrder(t, elevated,
-		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
-		"Register-ScheduledTask",
-	)
 	for _, forbidden := range []string{"RunLevel Highest", "HighestAvailable", "NT AUTHORITY\\SYSTEM", "-UserId 'SYSTEM'", "LogonType Password"} {
-		if strings.Contains(elevated, forbidden) {
-			t.Fatalf("elevated command must stay current-user least-privilege, found %q:\n%s", forbidden, elevated)
+		if strings.Contains(elevated, forbidden) || strings.Contains(start, forbidden) {
+			t.Fatalf("UAC repair/start must stay current-user least-privilege, found %q:\nelevated=%s\nstart=%s", forbidden, elevated, start)
 		}
 	}
 	for _, path := range []string{
@@ -4796,6 +4874,7 @@ func TestTeamsServiceBootstrapNoStartWindowsAccessDeniedPromptsForUAC(t *testing
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	taskDir := filepath.Join(tmp, "tasks")
 	runner := &scriptedTeamsServiceRunner{
 		outputs: [][]byte{
 			nil,
@@ -4809,12 +4888,17 @@ func TestTeamsServiceBootstrapNoStartWindowsAccessDeniedPromptsForUAC(t *testing
 			nil,
 			nil,
 		},
+		onRun: func(index int, _ string, _ []string) {
+			if index == 3 {
+				assertTeamsServiceWindowsElevatedScriptFile(t, taskDir, true, false)
+			}
+		},
 	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "windows",
 		exe:            filepath.Join(tmp, "codex-proxy.exe"),
 		cwd:            filepath.Join(tmp, "work"),
-		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		windowsTaskDir: taskDir,
 		runner:         runner,
 	})
 
@@ -4840,20 +4924,14 @@ func TestTeamsServiceBootstrapNoStartWindowsAccessDeniedPromptsForUAC(t *testing
 		t.Fatalf("PowerShell calls = %#v, want cleanup, failed register, current-user lookup, and elevated repair", runner.calls)
 	}
 	elevated := strings.Join(runner.calls[3].args, " ")
-	requireSubstringsInOrder(t, elevated,
-		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
-		"Register-ScheduledTask",
-		"Enable-ScheduledTask",
-	)
-	if strings.Contains(elevated, "Start-ScheduledTask") {
-		t.Fatalf("bootstrap --no-start elevated repair must not start tasks:\n%s", elevated)
-	}
+	assertTeamsServiceWindowsElevatedScriptCommand(t, elevated)
 }
 
 func TestTeamsServiceInstallWindowsAccessDeniedPromptsForUAC(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	taskDir := filepath.Join(tmp, "tasks")
 	runner := &scriptedTeamsServiceRunner{
 		outputs: [][]byte{
 			nil,
@@ -4867,12 +4945,17 @@ func TestTeamsServiceInstallWindowsAccessDeniedPromptsForUAC(t *testing.T) {
 			nil,
 			nil,
 		},
+		onRun: func(index int, _ string, _ []string) {
+			if index == 3 {
+				assertTeamsServiceWindowsElevatedScriptFile(t, taskDir, false, false)
+			}
+		},
 	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "windows",
 		exe:            filepath.Join(tmp, "codex-proxy.exe"),
 		cwd:            filepath.Join(tmp, "work"),
-		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		windowsTaskDir: taskDir,
 		runner:         runner,
 	})
 
@@ -4898,21 +4981,14 @@ func TestTeamsServiceInstallWindowsAccessDeniedPromptsForUAC(t *testing.T) {
 		t.Fatalf("PowerShell calls = %#v, want cleanup, failed register, current-user lookup, and elevated install", runner.calls)
 	}
 	elevated := strings.Join(runner.calls[3].args, " ")
-	requireSubstringsInOrder(t, elevated,
-		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
-		"Register-ScheduledTask",
-	)
-	for _, forbidden := range []string{"Enable-ScheduledTask", "Start-ScheduledTask"} {
-		if strings.Contains(elevated, forbidden) {
-			t.Fatalf("install elevated repair must not run %s:\n%s", forbidden, elevated)
-		}
-	}
+	assertTeamsServiceWindowsElevatedScriptCommand(t, elevated)
 }
 
 func TestTeamsServiceInstallWindowsAccessDeniedYesUsesUACWithoutPrompt(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	taskDir := filepath.Join(tmp, "tasks")
 	runner := &scriptedTeamsServiceRunner{
 		outputs: [][]byte{
 			nil,
@@ -4926,12 +5002,17 @@ func TestTeamsServiceInstallWindowsAccessDeniedYesUsesUACWithoutPrompt(t *testin
 			nil,
 			nil,
 		},
+		onRun: func(index int, _ string, _ []string) {
+			if index == 3 {
+				assertTeamsServiceWindowsElevatedScriptFile(t, taskDir, false, false)
+			}
+		},
 	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "windows",
 		exe:            filepath.Join(tmp, "codex-proxy.exe"),
 		cwd:            filepath.Join(tmp, "work"),
-		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		windowsTaskDir: taskDir,
 		runner:         runner,
 	})
 
@@ -4958,12 +5039,15 @@ func TestTeamsServiceInstallWindowsAccessDeniedYesUsesUACWithoutPrompt(t *testin
 	if len(runner.calls) != 4 {
 		t.Fatalf("PowerShell calls = %#v, want cleanup, failed register, current-user lookup, and elevated install", runner.calls)
 	}
+	elevated := strings.Join(runner.calls[3].args, " ")
+	assertTeamsServiceWindowsElevatedScriptCommand(t, elevated)
 }
 
 func TestTeamsServiceInstallWindowsCleanupAccessDeniedUsesUAC(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	taskDir := filepath.Join(tmp, "tasks")
 	runner := &scriptedTeamsServiceRunner{
 		outputs: [][]byte{
 			[]byte("Stop-ScheduledTask : Access is denied.\n"),
@@ -4975,12 +5059,17 @@ func TestTeamsServiceInstallWindowsCleanupAccessDeniedUsesUAC(t *testing.T) {
 			nil,
 			nil,
 		},
+		onRun: func(index int, _ string, _ []string) {
+			if index == 2 {
+				assertTeamsServiceWindowsElevatedScriptFile(t, taskDir, false, false)
+			}
+		},
 	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "windows",
 		exe:            filepath.Join(tmp, "codex-proxy.exe"),
 		cwd:            filepath.Join(tmp, "work"),
-		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		windowsTaskDir: taskDir,
 		runner:         runner,
 	})
 
@@ -4996,13 +5085,7 @@ func TestTeamsServiceInstallWindowsCleanupAccessDeniedUsesUAC(t *testing.T) {
 		t.Fatalf("PowerShell calls = %#v, want failed cleanup, current-user lookup, and elevated install", runner.calls)
 	}
 	elevated := strings.Join(runner.calls[2].args, " ")
-	requireSubstringsInOrder(t, elevated,
-		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
-		"Register-ScheduledTask",
-	)
-	if strings.Contains(elevated, "Start-ScheduledTask") || strings.Contains(elevated, "Enable-ScheduledTask") {
-		t.Fatalf("install cleanup UAC repair must not enable or start tasks:\n%s", elevated)
-	}
+	assertTeamsServiceWindowsElevatedScriptCommand(t, elevated)
 }
 
 func TestTeamsServiceBootstrapErrorSummaryKeepsFailuresReadable(t *testing.T) {
@@ -5021,6 +5104,51 @@ func TestTeamsServiceBootstrapErrorSummaryKeepsFailuresReadable(t *testing.T) {
 	accessDenied := teamsServiceBootstrapErrorSummary(errors.New("Register-ScheduledTask : Access is denied.\nAt line:1 char:1\nlarge command"))
 	if strings.Contains(accessDenied, "Register-ScheduledTask") || !strings.Contains(accessDenied, "Windows denied permission") {
 		t.Fatalf("access denied should be summarized without raw PowerShell noise, got %q", accessDenied)
+	}
+}
+
+func TestTeamsServiceWindowsElevatedScriptCapturesInnerErrors(t *testing.T) {
+	script := buildTeamsServiceWindowsElevatedScript(
+		"Register-ScheduledTask -TaskName 'Codex Helper Teams Bridge'; Start-ScheduledTask -TaskName 'Codex Helper Teams Bridge'",
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\stdout.log`,
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\stderr.log`,
+	)
+	for _, want := range []string{
+		"$ErrorActionPreference = 'Stop'",
+		"Register-ScheduledTask -TaskName 'Codex Helper Teams Bridge'",
+		"Start-ScheduledTask -TaskName 'Codex Helper Teams Bridge'",
+		"Set-Content -LiteralPath $stderrLog -Value $message -Encoding UTF8",
+		"exit 1",
+		"exit 0",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("elevated script missing %q:\n%s", want, script)
+		}
+	}
+
+	launcher := buildTeamsServiceWindowsElevatedScriptCommand(
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\elevated.ps1`,
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\stdout.log`,
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\stderr.log`,
+	)
+	for _, want := range []string{
+		"Start-Process",
+		"-Verb RunAs",
+		"-File",
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\elevated.ps1`,
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\stdout.log`,
+		`C:\Users\alice\AppData\Local\Temp\codex-uac\stderr.log`,
+		"Get-Content -LiteralPath $uacLog -Raw",
+		"elevated Teams service bootstrap failed with exit code",
+	} {
+		if !strings.Contains(launcher, want) {
+			t.Fatalf("elevated launcher missing %q:\n%s", want, launcher)
+		}
+	}
+	for _, forbidden := range []string{"Register-ScheduledTask", "Start-ScheduledTask -TaskName"} {
+		if strings.Contains(launcher, forbidden) {
+			t.Fatalf("elevated launcher should not inline inner command %q:\n%s", forbidden, launcher)
+		}
 	}
 }
 
@@ -5247,6 +5375,7 @@ func TestTeamsServiceBootstrapPendingActivationWindowsAccessDeniedPromptsForUAC(
 		detachedArgs = append([]string(nil), args...)
 		return nil
 	}
+	taskDir := filepath.Join(tmp, "tasks")
 	runner := &scriptedTeamsServiceRunner{
 		outputs: [][]byte{
 			nil,
@@ -5260,11 +5389,16 @@ func TestTeamsServiceBootstrapPendingActivationWindowsAccessDeniedPromptsForUAC(
 			nil,
 			nil,
 		},
+		onRun: func(index int, _ string, _ []string) {
+			if index == 3 {
+				assertTeamsServiceWindowsElevatedScriptFile(t, taskDir, true, false)
+			}
+		},
 	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "windows",
 		exe:            exe,
-		windowsTaskDir: filepath.Join(tmp, "tasks"),
+		windowsTaskDir: taskDir,
 		runner:         runner,
 	})
 
@@ -5283,14 +5417,7 @@ func TestTeamsServiceBootstrapPendingActivationWindowsAccessDeniedPromptsForUAC(
 		t.Fatalf("PowerShell calls = %#v, want cleanup, failed register, current-user lookup, and elevated repair", runner.calls)
 	}
 	elevated := strings.Join(runner.calls[3].args, " ")
-	requireSubstringsInOrder(t, elevated,
-		"$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity",
-		"Register-ScheduledTask",
-		"Enable-ScheduledTask",
-	)
-	if strings.Contains(elevated, "Start-ScheduledTask") {
-		t.Fatalf("pending activation elevated repair must not start old tasks:\n%s", elevated)
-	}
+	assertTeamsServiceWindowsElevatedScriptCommand(t, elevated)
 	if detachedName == "" {
 		t.Fatal("pending activation did not schedule detached PowerShell")
 	}

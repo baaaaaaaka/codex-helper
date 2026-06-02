@@ -1467,8 +1467,8 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("bootstrap UAC repair error: %v\noutput:\n%s", err, out.String())
 	}
-	if len(runner.calls) != 6 {
-		t.Fatalf("bootstrap UAC calls = %#v, want direct, current-user query, elevated repair, verification, stale task retirement, and cleanup", runner.calls)
+	if len(runner.calls) != 7 {
+		t.Fatalf("bootstrap UAC calls = %#v, want direct, current-user query, elevated repair, normal start, verification, stale task retirement, and cleanup", runner.calls)
 	}
 	gotOut := out.String()
 	if !strings.Contains(gotOut, "NEXT STEP: TYPE yes TO CONTINUE") || !strings.Contains(gotOut, "Type yes and press Enter") {
@@ -1501,7 +1501,6 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		wantExe,
 		"Register-ScheduledTask",
 		"Enable-ScheduledTask",
-		"Start-ScheduledTask",
 		"--auto-service=false",
 		"RunLevel Limited",
 		"NVIDIA\\jason",
@@ -1510,9 +1509,22 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 			t.Fatalf("elevated command missing %q:\n%s", want, elevated)
 		}
 	}
+	if strings.Contains(elevated, "Start-ScheduledTask") {
+		t.Fatalf("elevated repair should not start WSL tasks before returning to current-user context:\n%s", elevated)
+	}
+	start := strings.Join(runner.calls[3].args, " ")
+	for _, want := range []string{
+		"Start-CodexHelperScheduledTaskIfStopped $taskName",
+		"Enable-ScheduledTask -TaskName $taskName",
+		teamsServiceWSLVerifyTaskRunningPowerShell(),
+	} {
+		if !strings.Contains(start, want) {
+			t.Fatalf("post-UAC WSL start command missing %q:\n%s", want, start)
+		}
+	}
 	for _, forbidden := range []string{"RunLevel Highest", "HighestAvailable", "NT AUTHORITY\\SYSTEM", "-UserId 'SYSTEM'", "LogonType Password"} {
-		if strings.Contains(elevated, forbidden) {
-			t.Fatalf("elevated command must stay current-user least-privilege, found %q:\n%s", forbidden, elevated)
+		if strings.Contains(elevated, forbidden) || strings.Contains(start, forbidden) {
+			t.Fatalf("UAC repair/start must stay current-user least-privilege, found %q:\nelevated=%s\nstart=%s", forbidden, elevated, start)
 		}
 	}
 	if got := out.String(); !strings.Contains(got, "Teams service bootstrap ready: wsl-windows-task-scheduler-uac") {
@@ -3553,6 +3565,7 @@ type scriptedTeamsServiceRunner struct {
 	calls   []teamsServiceCommandCall
 	outputs [][]byte
 	errs    []error
+	onRun   func(index int, name string, args []string)
 }
 
 func (r *scriptedTeamsServiceRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -3561,6 +3574,9 @@ func (r *scriptedTeamsServiceRunner) Run(_ context.Context, name string, args ..
 		name: name,
 		args: append([]string{}, args...),
 	})
+	if r.onRun != nil {
+		r.onRun(idx, name, append([]string{}, args...))
+	}
 	var out []byte
 	if idx < len(r.outputs) {
 		out = append([]byte{}, r.outputs[idx]...)
