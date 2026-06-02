@@ -77,6 +77,13 @@ var newSSHTunnel = func(cfg internalssh.TunnelConfig) (sshTunnel, error) {
 	return internalssh.NewTunnel(cfg)
 }
 
+var interactiveSSHProfileSetupAllowed = func() bool {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+		return false
+	}
+	return isTerminalFile(os.Stdin)
+}
+
 func (e *sshProbeError) Error() string {
 	if e.output == "" {
 		return e.err.Error()
@@ -99,6 +106,9 @@ func (defaultSSHOps) installPublicKey(ctx context.Context, prof config.Profile, 
 }
 
 func initProfileInteractive(ctx context.Context, store *config.Store) (config.Profile, error) {
+	if !interactiveSSHProfileSetupAllowed() {
+		return config.Profile{}, fmt.Errorf("interactive SSH profile setup requires a terminal; run `codex-proxy init` from an interactive shell before enabling proxy mode")
+	}
 	return initProfileInteractiveWithDeps(ctx, store, bufio.NewReader(os.Stdin), defaultSSHOps{}, os.Stderr)
 }
 

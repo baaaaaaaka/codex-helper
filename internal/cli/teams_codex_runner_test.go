@@ -223,6 +223,113 @@ func TestTeamsCodexLauncherModelProfileWithoutSSHRespectsDisabledProxyPreference
 	}
 }
 
+func TestTeamsCodexLauncherModelProfileWithoutSSHServiceDefaultsDirectWhenProxyUnsetCI(t *testing.T) {
+	lockCLITestHooks(t)
+	if os.PathSeparator != '/' {
+		t.Skip("shell stub test uses POSIX script")
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-live": {
+				Provider:  "deepseek",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	t.Setenv("DEEPSEEK_API_KEY", "sk-ci-deepseek")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	binDir := t.TempDir()
+	codexPath := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	setTestCodexHomeEnv(t, t.TempDir())
+
+	prevRunTarget := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRunTarget })
+
+	var gotArgs []string
+	var gotOpts runTargetOptions
+	runTargetWithFallbackWithOptionsFn = func(_ context.Context, cmdArgs []string, _ string, _ func() error, _ <-chan error, opts runTargetOptions) error {
+		gotArgs = append([]string{}, cmdArgs...)
+		gotOpts = opts
+		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"thread.started","thread_id":"thread-model-profile-default-direct"}`)
+		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
+		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"turn.completed"}`)
+		return nil
+	}
+
+	type launchResult struct {
+		result codexrunner.LaunchResult
+		err    error
+	}
+	done := make(chan launchResult, 1)
+	launchDir := t.TempDir()
+	go func() {
+		launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard, modelProfileRef: "deepseek-live"}
+		result, err := launcher.Launch(context.Background(), codexrunner.LaunchRequest{
+			Command: codexPath,
+			Args:    []string{"exec", "--json", "-"},
+			Dir:     launchDir,
+			Stdin:   "prompt text",
+		})
+		done <- launchResult{result: result, err: err}
+	}()
+
+	var result codexrunner.LaunchResult
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Launch: %v", got.err)
+		}
+		result = got.result
+	case <-time.After(5 * time.Second):
+		t.Fatal("Teams model-profile launch blocked on stdin")
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code = %d", result.ExitCode)
+	}
+	if gotOpts.UseProxy {
+		t.Fatalf("UseProxy = true, want service-mode default direct when proxy preference is unset")
+	}
+	if envValue(gotOpts.ExtraEnv, envCXPResponsesProxyKey) == "" {
+		t.Fatalf("missing model profile proxy key env: %v", gotOpts.ExtraEnv)
+	}
+	if !strings.Contains(strings.Join(gotArgs, "\n"), `model_providers.`+cxpCodexModelProviderID+`.requires_openai_auth=false`) {
+		t.Fatalf("missing third-party codex config override: %v", gotArgs)
+	}
+	updated, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if updated.ProxyEnabled == nil || *updated.ProxyEnabled {
+		t.Fatalf("expected service launch to persist ProxyEnabled=false, got %v", updated.ProxyEnabled)
+	}
+}
+
 func TestTeamsCodexLauncherModelProfileWithoutSSHUsesGlobalProxyPreferenceCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -1254,6 +1361,53 @@ func TestRunTeamsUpgradeCodexOnceUsesExistingUpgradePath(t *testing.T) {
 	}
 }
 
+func TestRunTeamsUpgradeCodexOnceSkipsIncompleteProxyPreferenceCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	cfgPath := filepath.Join(tmp, "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(true)}); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	prevEnsureProfile := ensureProfileRunFn
+	prevUpgrade := upgradeCodexInstalledForTeamsRun
+	t.Cleanup(func() {
+		ensureProfileRunFn = prevEnsureProfile
+		upgradeCodexInstalledForTeamsRun = prevUpgrade
+	})
+	ensureProfileRunFn = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
+		t.Fatal("incomplete proxy preference must not start interactive profile setup during Teams upgrade")
+		return config.Profile{}, config.Config{}, nil
+	}
+	called := false
+	upgradeCodexInstalledForTeamsRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+		called = true
+		if !opts.upgradeCodex {
+			t.Fatal("expected upgradeCodex install option")
+		}
+		if opts.withInstallerEnv != nil {
+			t.Fatal("did not expect proxy installer env for incomplete proxy preference")
+		}
+		return "/managed/codex", nil
+	}
+
+	cmd := newRootCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := runTeamsUpgradeCodexOnce(cmd, &rootOptions{configPath: cfgPath}, ""); err != nil {
+		t.Fatalf("runTeamsUpgradeCodexOnce error: %v", err)
+	}
+	if !called {
+		t.Fatal("upgrade function was not called")
+	}
+}
+
 func TestRunTeamsUpgradeCodexOnceRejectsLiveTeamsOwnerBeforeUpgrade(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -1400,6 +1554,49 @@ func TestRunTeamsCodexUpgradeFromBridgeUsesExistingUpgradePath(t *testing.T) {
 		called = true
 		if !opts.upgradeCodex {
 			t.Fatal("expected upgradeCodex install option")
+		}
+		return "/managed/codex", nil
+	}
+
+	got, err := runTeamsCodexUpgradeFromBridge(context.Background(), &rootOptions{configPath: cfgPath}, io.Discard, "")
+	if err != nil {
+		t.Fatalf("runTeamsCodexUpgradeFromBridge error: %v", err)
+	}
+	if !called || got.Path != "/managed/codex" {
+		t.Fatalf("upgrade called=%v result=%#v", called, got)
+	}
+}
+
+func TestRunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(true)}); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	prevEnsureProfile := ensureProfileRunFn
+	prevUpgrade := upgradeCodexInstalledForTeamsRun
+	t.Cleanup(func() {
+		ensureProfileRunFn = prevEnsureProfile
+		upgradeCodexInstalledForTeamsRun = prevUpgrade
+	})
+	ensureProfileRunFn = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
+		t.Fatal("incomplete proxy preference must not start interactive profile setup during bridge upgrade")
+		return config.Profile{}, config.Config{}, nil
+	}
+	called := false
+	upgradeCodexInstalledForTeamsRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+		called = true
+		if !opts.upgradeCodex {
+			t.Fatal("expected upgradeCodex install option")
+		}
+		if opts.withInstallerEnv != nil {
+			t.Fatal("did not expect proxy installer env for incomplete proxy preference")
 		}
 		return "/managed/codex", nil
 	}

@@ -68,7 +68,7 @@ func runUpgradeCodexFromRoot(cmd *cobra.Command, root *rootOptions) error {
 
 func upgradeUsesProxy(cfg config.Config) bool {
 	if cfg.ProxyEnabled != nil {
-		return *cfg.ProxyEnabled
+		return *cfg.ProxyEnabled && len(cfg.Profiles) > 0
 	}
 	return len(cfg.Profiles) > 0
 }

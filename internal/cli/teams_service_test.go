@@ -74,6 +74,52 @@ func teamsServiceTestRegistryPath(cwd string, registryPath string) string {
 	return filepath.Join(cwd, registryPath)
 }
 
+func TestConfirmTeamsServiceUACPromptRejectsTeamsServiceModeWithoutReading(t *testing.T) {
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+
+	var out strings.Builder
+	if confirmTeamsServiceUACPrompt(strings.NewReader("yes\n"), &out, false) {
+		t.Fatal("Teams service mode must not accept an interactive UAC confirmation")
+	}
+	if !strings.Contains(out.String(), "stdin is non-interactive") {
+		t.Fatalf("expected non-interactive explanation, got:\n%s", out.String())
+	}
+}
+
+func TestConfirmTeamsServiceUACPromptRejectsNonTerminalStdinWithoutBlocking(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	done := make(chan bool, 1)
+	var out strings.Builder
+	go func() {
+		done <- confirmTeamsServiceUACPrompt(nil, &out, false)
+	}()
+	select {
+	case confirmed := <-done:
+		if confirmed {
+			t.Fatal("non-terminal stdin must not confirm UAC")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("UAC confirmation blocked on non-terminal stdin")
+	}
+	if !strings.Contains(out.String(), "stdin is non-interactive") {
+		t.Fatalf("expected non-interactive explanation, got:\n%s", out.String())
+	}
+}
+
 func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -5856,6 +5902,9 @@ func TestTeamsServiceRunPowerShellCanUseExplicitExecutablePath(t *testing.T) {
 	}
 	if len(runner.calls) != 1 || runner.calls[0].name != "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" {
 		t.Fatalf("powershell executable call = %#v", runner.calls)
+	}
+	if joined := strings.Join(runner.calls[0].args, " "); !strings.Contains(joined, "-WindowStyle Hidden -Command") {
+		t.Fatalf("powershell args should hide helper status probes, got %q", joined)
 	}
 }
 

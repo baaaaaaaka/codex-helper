@@ -348,3 +348,200 @@ func TestHistoryOpenPersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 		t.Fatalf("expected ProxyEnabled=true persisted, got %v", updated.ProxyEnabled)
 	}
 }
+
+func TestHistoryOpenExplicitProfileUsesProxyDespiteDisabledPreference(t *testing.T) {
+	lockCLITestHooks(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	profile := config.Profile{ID: "p1", Name: "dev", Host: "example.com", Port: 22, User: "coder"}
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(false),
+		Profiles:     []config.Profile{profile},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevEnsureProfile := ensureProfileFunc
+	prevPersist := persistProxyPreferenceFunc
+	prevFind := findSessionWithProjectFunc
+	prevRun := runCodexSessionFunc
+	t.Cleanup(func() {
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		ensureProfileFunc = prevEnsureProfile
+		persistProxyPreferenceFunc = prevPersist
+		findSessionWithProjectFunc = prevFind
+		runCodexSessionFunc = prevRun
+	})
+
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		t.Fatal("explicit history --profile should not consult global proxy preference")
+		return false, config.Config{}, nil
+	}
+	ensureProfileFunc = func(_ context.Context, _ *config.Store, profileRef string, autoInit bool, _ io.Writer) (config.Profile, config.Config, error) {
+		if profileRef != "dev" {
+			t.Fatalf("profile ref = %q, want dev", profileRef)
+		}
+		if !autoInit {
+			t.Fatal("expected explicit history profile path to preserve existing auto-init behavior")
+		}
+		return profile, config.Config{
+			Version:      config.CurrentVersion,
+			ProxyEnabled: boolPtr(false),
+			Profiles:     []config.Profile{profile},
+		}, nil
+	}
+	persistProxyPreferenceFunc = func(*config.Store, bool) error {
+		t.Fatal("explicit profile should not rewrite global proxy preference")
+		return nil
+	}
+	findSessionWithProjectFunc = func(string, string) (*codexhistory.Session, *codexhistory.Project, error) {
+		return &codexhistory.Session{SessionID: "sid"}, &codexhistory.Project{Path: t.TempDir()}, nil
+	}
+	runCodexSessionFunc = func(
+		_ context.Context,
+		_ *rootOptions,
+		_ *config.Store,
+		gotProfile *config.Profile,
+		_ []config.Instance,
+		_ codexhistory.Session,
+		_ codexhistory.Project,
+		_ string,
+		_ string,
+		useProxy bool,
+		_ bool,
+		_ io.Writer,
+	) error {
+		if gotProfile == nil || gotProfile.ID != profile.ID {
+			t.Fatalf("profile = %#v, want %#v", gotProfile, profile)
+		}
+		if !useProxy {
+			t.Fatal("explicit history --profile should launch with proxy enabled")
+		}
+		return nil
+	}
+
+	root := &rootOptions{configPath: cfgPath}
+	codexDir := ""
+	codexPath := ""
+	profileRef := "dev"
+	cmd := newHistoryOpenCmd(root, &codexDir, &codexPath, &profileRef)
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{"sid"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute history open: %v", err)
+	}
+
+	updated, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if updated.ProxyEnabled == nil || *updated.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=false to remain unchanged, got %v", updated.ProxyEnabled)
+	}
+}
+
+func TestRunHistoryTuiExplicitProfileUsesProxyDespiteDisabledPreference(t *testing.T) {
+	lockCLITestHooks(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	profile := config.Profile{ID: "p1", Name: "dev", Host: "example.com", Port: 22, User: "coder"}
+	if err := store.Save(config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(false),
+		Profiles:     []config.Profile{profile},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevEnsureProfile := ensureProfileFunc
+	prevPersist := persistProxyPreferenceFunc
+	prevSelect := selectSession
+	prevRun := runCodexSessionFunc
+	t.Cleanup(func() {
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		ensureProfileFunc = prevEnsureProfile
+		persistProxyPreferenceFunc = prevPersist
+		selectSession = prevSelect
+		runCodexSessionFunc = prevRun
+	})
+
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		t.Fatal("explicit history tui --profile should not consult global proxy preference")
+		return false, config.Config{}, nil
+	}
+	ensureProfileFunc = func(_ context.Context, _ *config.Store, profileRef string, autoInit bool, _ io.Writer) (config.Profile, config.Config, error) {
+		if profileRef != "dev" {
+			t.Fatalf("profile ref = %q, want dev", profileRef)
+		}
+		if !autoInit {
+			t.Fatal("expected explicit history profile path to preserve existing auto-init behavior")
+		}
+		return profile, config.Config{
+			Version:      config.CurrentVersion,
+			ProxyEnabled: boolPtr(false),
+			Profiles:     []config.Profile{profile},
+		}, nil
+	}
+	persistProxyPreferenceFunc = func(*config.Store, bool) error {
+		t.Fatal("explicit profile should not rewrite global proxy preference")
+		return nil
+	}
+	selectSession = func(_ context.Context, opts tui.Options) (*tui.Selection, error) {
+		if !opts.ProxyEnabled {
+			t.Fatal("TUI should show proxy enabled for explicit --profile")
+		}
+		if !opts.ProxyConfigured {
+			t.Fatal("TUI should know a proxy profile is configured")
+		}
+		return &tui.Selection{
+			Session:  codexhistory.Session{SessionID: "sid"},
+			Project:  codexhistory.Project{Path: t.TempDir()},
+			UseProxy: true,
+		}, nil
+	}
+	runCodexSessionFunc = func(
+		_ context.Context,
+		_ *rootOptions,
+		_ *config.Store,
+		gotProfile *config.Profile,
+		_ []config.Instance,
+		_ codexhistory.Session,
+		_ codexhistory.Project,
+		_ string,
+		_ string,
+		useProxy bool,
+		_ bool,
+		_ io.Writer,
+	) error {
+		if gotProfile == nil || gotProfile.ID != profile.ID {
+			t.Fatalf("profile = %#v, want %#v", gotProfile, profile)
+		}
+		if !useProxy {
+			t.Fatal("explicit history tui --profile should launch with proxy enabled")
+		}
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "dev", "", "", 0); err != nil {
+		t.Fatalf("runHistoryTui error: %v", err)
+	}
+
+	updated, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if updated.ProxyEnabled == nil || *updated.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=false to remain unchanged, got %v", updated.ProxyEnabled)
+	}
+}

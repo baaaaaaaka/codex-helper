@@ -117,6 +117,88 @@ func TestCodexInstallerCandidatesUnsupported(t *testing.T) {
 	}
 }
 
+func TestCodexInstallerCommandStdinDisabledForTeamsService(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	if got := codexInstallerCommandStdin(); got != nil {
+		t.Fatalf("installer stdin = %#v, want nil in Teams service mode", got)
+	}
+}
+
+func TestCodexInstallerCommandStdinDisabledForNonTerminal(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	if got := codexInstallerCommandStdin(); got != nil {
+		t.Fatalf("installer stdin = %#v, want nil for non-terminal stdin", got)
+	}
+}
+
+func TestRunCodexInstallerDoesNotPassStdinInTeamsService(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell installer command test on windows")
+	}
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	stopErr := errors.New("stop after stdin check")
+	called := false
+	err = runCodexInstallerWithOptions(context.Background(), io.Discard, []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + t.TempDir(),
+		"TMPDIR=" + t.TempDir(),
+	}, func(cmd *exec.Cmd) error {
+		called = true
+		if cmd.Stdin != nil {
+			t.Fatalf("installer command stdin = %#v, want nil in Teams service mode", cmd.Stdin)
+		}
+		return stopErr
+	})
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("runCodexInstallerWithOptions error = %v, want %v", err, stopErr)
+	}
+	if !called {
+		t.Fatal("installer command was not configured")
+	}
+}
+
 func TestInstallerAttemptLabel(t *testing.T) {
 	if got := installerAttemptLabel(codexInstallCmd{path: "bash"}); got != "bash" {
 		t.Fatalf("expected bare path label, got %q", got)
@@ -988,6 +1070,74 @@ func TestRunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets(t *testing.T) {
 		if path == filepath.Clean(managedPrefix) || path == filepath.Clean(managedNodeRoot) {
 			t.Fatalf("system npm upgrade should not check managed disk target %q; checked paths: %v", path, checked)
 		}
+	}
+}
+
+func TestRunSystemNpmCodexUpgradeDoesNotPassStdinInTeamsService(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based npm test on windows")
+	}
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	root := t.TempDir()
+	systemPrefix := filepath.Join(root, "system-prefix")
+	tmpDir := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(systemPrefix, 0o755); err != nil {
+		t.Fatalf("mkdir system prefix: %v", err)
+	}
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("mkdir tmp dir: %v", err)
+	}
+
+	binDir := t.TempDir()
+	marker := filepath.Join(root, "npm-install-ran")
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + systemPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  IFS= read -r _ || true\n" +
+		"  echo ran > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+	t.Setenv("PATH", binDir)
+
+	done := make(chan error, 1)
+	homeDir := t.TempDir()
+	go func() {
+		done <- runSystemNpmCodexUpgrade(context.Background(), io.Discard, []string{
+			"PATH=" + binDir,
+			"HOME=" + homeDir,
+			"TMPDIR=" + tmpDir,
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runSystemNpmCodexUpgrade error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("system npm Codex upgrade blocked on inherited stdin")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected npm install marker: %v", err)
 	}
 }
 

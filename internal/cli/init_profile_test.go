@@ -356,6 +356,70 @@ func TestSSHProbeHonorsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestInitProfileInteractiveRejectsTeamsServiceModeWithoutReading(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	store := newTempStore(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := initProfileInteractive(context.Background(), store)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "interactive SSH profile setup requires a terminal") {
+			t.Fatalf("initProfileInteractive error = %v, want non-interactive terminal error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initProfileInteractive blocked on Teams service stdin")
+	}
+}
+
+func TestInitProfileInteractiveRejectsNonTerminalStdinWithoutBlocking(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	store := newTempStore(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := initProfileInteractive(context.Background(), store)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "interactive SSH profile setup requires a terminal") {
+			t.Fatalf("initProfileInteractive error = %v, want non-interactive terminal error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initProfileInteractive blocked on non-terminal stdin")
+	}
+}
+
 func TestEnsureProfileAutoInitUsesInteractiveInitializer(t *testing.T) {
 	lockCLITestHooks(t)
 	store := newTempStore(t)

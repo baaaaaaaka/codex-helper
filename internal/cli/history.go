@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -164,7 +166,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 				return err
 			}
 
-			useProxy, cfg, err := ensureProxyPreferenceFunc(ctx, store, *profileRef, cmd.ErrOrStderr())
+			useProxy, cfg, err := historyProxyPreference(ctx, store, *profileRef, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -229,7 +231,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 	startSkillsDailyAutoSync(ctx, paths)
 
 	for {
-		useProxy, cfg, err := ensureProxyPreferenceFunc(ctx, store, profileRef, cmd.ErrOrStderr())
+		useProxy, cfg, err := historyProxyPreference(ctx, store, profileRef, cmd.ErrOrStderr())
 		if err != nil {
 			return err
 		}
@@ -337,4 +339,15 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			cmd.ErrOrStderr(),
 		)
 	}
+}
+
+func historyProxyPreference(ctx context.Context, store *config.Store, profileRef string, out io.Writer) (bool, config.Config, error) {
+	if strings.TrimSpace(profileRef) == "" {
+		return ensureProxyPreferenceFunc(ctx, store, profileRef, out)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return false, cfg, err
+	}
+	return true, cfg, nil
 }

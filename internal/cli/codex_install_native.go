@@ -232,7 +232,7 @@ func nativeWindowsInstallCodexPackage(ctx context.Context, out io.Writer, cfg na
 	cmd.Env = env
 	cmd.Stdout = out
 	cmd.Stderr = out
-	cmd.Stdin = os.Stdin
+	cmd.Stdin = codexInstallerCommandStdin()
 	if err := cmd.Run(); err != nil {
 		if diskErr := ensureCodexInstallDiskSpace(out, installerEnv, []codexInstallDiskTarget{
 			{label: "managed npm prefix", path: cfg.npmPrefix},

@@ -6,20 +6,39 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
+var proxyPreferencePromptAllowed = func() bool {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+		return false
+	}
+	return isTerminalFile(os.Stdin)
+}
+
 func ensureProxyPreference(ctx context.Context, store *config.Store, profileRef string, out io.Writer) (bool, config.Config, error) {
-	return ensureProxyPreferenceWithReader(ctx, store, profileRef, out, bufio.NewReader(os.Stdin))
+	return ensureProxyPreferenceWithReaderMode(ctx, store, profileRef, out, bufio.NewReader(os.Stdin), proxyPreferencePromptAllowed())
 }
 
 func ensureProxyPreferenceWithReader(
+	ctx context.Context,
+	store *config.Store,
+	profileRef string,
+	out io.Writer,
+	reader *bufio.Reader,
+) (bool, config.Config, error) {
+	return ensureProxyPreferenceWithReaderMode(ctx, store, profileRef, out, reader, true)
+}
+
+func ensureProxyPreferenceWithReaderMode(
 	_ context.Context,
 	store *config.Store,
 	profileRef string,
 	out io.Writer,
 	reader *bufio.Reader,
+	allowPrompt bool,
 ) (bool, config.Config, error) {
 	cfg, err := store.Load()
 	if err != nil {
@@ -45,6 +64,21 @@ func ensureProxyPreferenceWithReader(
 			return false, cfg, err
 		}
 		cfg.ProxyEnabled = &enabled
+		return enabled, cfg, nil
+	}
+
+	if !allowPrompt {
+		if strings.TrimSpace(profileRef) != "" {
+			return false, cfg, fmt.Errorf("proxy profile %q requested but no SSH profiles are configured; cannot prompt in non-interactive mode", profileRef)
+		}
+		enabled := false
+		if err := persistProxyPreference(store, enabled); err != nil {
+			return false, cfg, err
+		}
+		cfg.ProxyEnabled = &enabled
+		if out != nil {
+			_, _ = fmt.Fprintln(out, "codex-proxy SSH preference is unset; non-interactive launch defaults to direct mode.")
+		}
 		return enabled, cfg, nil
 	}
 

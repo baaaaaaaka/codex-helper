@@ -66,6 +66,12 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfile(ProxyPrepareTimesOutCI|UsesCallerCancellationCI)|TeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI)$' -v
           go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
 
+      - name: Teams non-interactive stdin regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(EnsureProxyPreference(ServiceDefaultsToDirectWithoutPrompt|NonTerminalDefaultsToDirectWithoutPrompt|NonInteractiveUsesConfiguredProfiles|NonInteractiveResetsIncompleteStateToDirect)|TeamsCodexLauncherModelProfileWithoutSSHServiceDefaultsDirectWhenProxyUnsetCI|RunTeamsUpgradeCodexOnceSkipsIncompleteProxyPreferenceCI|RunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI|CodexInstallerCommandStdinDisabledFor(TeamsService|NonTerminal)|RunCodexInstallerDoesNotPassStdinInTeamsService|RunSystemNpmCodexUpgradeDoesNotPassStdinInTeamsService|ConfirmTeamsServiceUACPromptRejects(TeamsServiceModeWithoutReading|NonTerminalStdinWithoutBlocking)|InitProfileInteractiveRejects(TeamsServiceModeWithoutReading|NonTerminalStdinWithoutBlocking)|HistoryOpenExplicitProfileUsesProxyDespiteDisabledPreference|RunHistoryTuiExplicitProfileUsesProxyDespiteDisabledPreference)$' -v
+
       - name: Model choice reusable credential regressions
         shell: bash
         run: |

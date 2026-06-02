@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
@@ -177,6 +178,113 @@ func TestEnsureProxyPreferencePromptsWhenNoProfiles(t *testing.T) {
 	}
 }
 
+func TestEnsureProxyPreferenceServiceDefaultsToDirectWithoutPrompt(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+	store := newTempStore(t)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	got, cfg, err := runEnsureProxyPreferenceWithTimeout(t, store)
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if got {
+		t.Fatalf("expected service mode to default to direct mode")
+	}
+	if cfg.ProxyEnabled == nil || *cfg.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=false in returned config, got %v", cfg.ProxyEnabled)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.ProxyEnabled == nil || *loaded.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=false persisted, got %v", loaded.ProxyEnabled)
+	}
+}
+
+func TestEnsureProxyPreferenceNonTerminalDefaultsToDirectWithoutPrompt(t *testing.T) {
+	lockCLITestHooks(t)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+	store := newTempStore(t)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	prevStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = prevStdin
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	got, cfg, err := runEnsureProxyPreferenceWithTimeout(t, store)
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if got {
+		t.Fatalf("expected non-terminal stdin to default to direct mode")
+	}
+	if cfg.ProxyEnabled == nil || *cfg.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=false, got %v", cfg.ProxyEnabled)
+	}
+}
+
+func TestEnsureProxyPreferenceNonInteractiveUsesConfiguredProfiles(t *testing.T) {
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version:  config.CurrentVersion,
+		Profiles: []config.Profile{{ID: "p1", Name: "p1"}},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	got, cfg, err := ensureProxyPreferenceWithReaderMode(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("n\n")), false)
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if !got || cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
+		t.Fatalf("expected configured profile to enable proxy in non-interactive mode")
+	}
+}
+
+func TestEnsureProxyPreferenceNonInteractiveResetsIncompleteStateToDirect(t *testing.T) {
+	store := newTempStore(t)
+	enabled := true
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &enabled}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	got, cfg, err := ensureProxyPreferenceWithReaderMode(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("y\n")), false)
+	if err != nil {
+		t.Fatalf("ensureProxyPreference error: %v", err)
+	}
+	if got {
+		t.Fatalf("expected incomplete non-interactive state to default to direct mode")
+	}
+	if cfg.ProxyEnabled == nil || *cfg.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=false in returned config, got %v", cfg.ProxyEnabled)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.ProxyEnabled == nil || *loaded.ProxyEnabled {
+		t.Fatalf("expected ProxyEnabled=false persisted, got %v", loaded.ProxyEnabled)
+	}
+}
+
 func TestEnsureProxyPreferenceDefaultsToProxyWhenProfilesExist(t *testing.T) {
 	store := newTempStore(t)
 	if err := store.Save(config.Config{
@@ -208,27 +316,35 @@ func TestEnsureProxyPreferenceWriteFailure(t *testing.T) {
 	}
 }
 
-func TestEnsureProxyPreferenceUsesStdin(t *testing.T) {
-	lockCLITestHooks(t)
+func TestEnsureProxyPreferenceWithReaderUsesProvidedInput(t *testing.T) {
 	store := newTempStore(t)
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
-	}
-	prevStdin := os.Stdin
-	os.Stdin = reader
-	t.Cleanup(func() { os.Stdin = prevStdin })
 
-	if _, err := writer.Write([]byte("y\n")); err != nil {
-		t.Fatalf("write stdin: %v", err)
-	}
-	_ = writer.Close()
-
-	enabled, _, err := ensureProxyPreference(context.Background(), store, "", io.Discard)
+	enabled, _, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("y\n")))
 	if err != nil {
 		t.Fatalf("ensureProxyPreference error: %v", err)
 	}
 	if !enabled {
-		t.Fatalf("expected proxy enabled from stdin input")
+		t.Fatalf("expected proxy enabled from provided input")
+	}
+}
+
+func runEnsureProxyPreferenceWithTimeout(t *testing.T, store *config.Store) (bool, config.Config, error) {
+	t.Helper()
+	type result struct {
+		enabled bool
+		cfg     config.Config
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		enabled, cfg, err := ensureProxyPreference(context.Background(), store, "", io.Discard)
+		done <- result{enabled: enabled, cfg: cfg, err: err}
+	}()
+	select {
+	case got := <-done:
+		return got.enabled, got.cfg, got.err
+	case <-time.After(time.Second):
+		t.Fatal("ensureProxyPreference blocked on stdin")
+		return false, config.Config{}, nil
 	}
 }

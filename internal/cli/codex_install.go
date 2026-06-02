@@ -32,6 +32,15 @@ var (
 	codexInstallLockMaxWait    = 30 * time.Second
 	codexRemoveAll             = os.RemoveAll
 	errCodexBinaryNotFound     = errors.New("codex binary not found")
+	codexInstallerCommandStdin = func() io.Reader {
+		if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+			return nil
+		}
+		if !isTerminalFile(os.Stdin) {
+			return nil
+		}
+		return os.Stdin
+	}
 )
 
 type codexInstallOptions struct {
@@ -1740,7 +1749,7 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 	cmd.Env = codexNPMInstallEnv(installerEnv)
 	cmd.Stdout = out
 	cmd.Stderr = out
-	cmd.Stdin = os.Stdin
+	cmd.Stdin = codexInstallerCommandStdin()
 	if err := cmd.Run(); err != nil {
 		if diskErr := ensureCodexInstallDiskSpaceForTargets(out, installerEnv, codexInstallDiskTargets(installerEnv, diskTargets, false)); diskErr != nil {
 			return diskErr
@@ -2206,7 +2215,7 @@ func runCodexInstallerWithOptions(ctx context.Context, out io.Writer, installerE
 		}
 		cmd.Stdout = out
 		cmd.Stderr = out
-		cmd.Stdin = os.Stdin
+		cmd.Stdin = codexInstallerCommandStdin()
 		if configureCommand != nil {
 			if err := configureCommand(cmd); err != nil {
 				return err

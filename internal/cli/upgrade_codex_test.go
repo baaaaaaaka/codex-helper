@@ -94,9 +94,17 @@ func TestUpgradeUsesProxy(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "explicit true with no profiles",
+			name: "explicit true with no profiles is incomplete",
 			cfg: config.Config{
 				ProxyEnabled: &enabled,
+			},
+			want: false,
+		},
+		{
+			name: "explicit true with profiles",
+			cfg: config.Config{
+				ProxyEnabled: &enabled,
+				Profiles:     []config.Profile{{ID: "p1", Name: "p1"}},
 			},
 			want: true,
 		},

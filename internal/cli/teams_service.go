@@ -2546,7 +2546,7 @@ func appendLaunchctlOutput(chunks ...[]byte) []byte {
 }
 
 func teamsServiceRunPowerShell(ctx context.Context, command string) ([]byte, error) {
-	args := []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command}
+	args := []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}
 	name := teamsServicePowerShellExecutable()
 	data, err := teamsServiceRunCommandDirect(ctx, name, args...)
 	if err != nil {
@@ -2706,6 +2706,13 @@ func confirmTeamsServiceUACPrompt(in io.Reader, out io.Writer, assumeYes bool) b
 	if in == nil {
 		in = os.Stdin
 	}
+	if !teamsServiceUACPromptInputAllowed(in) {
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, "UAC prompt was not confirmed because stdin is non-interactive.")
+		_, _ = fmt.Fprintln(out, "============================================================")
+		_, _ = fmt.Fprintln(out)
+		return false
+	}
 	var answer string
 	if _, err := fmt.Fscan(in, &answer); err != nil {
 		_, _ = fmt.Fprintln(out)
@@ -2722,6 +2729,16 @@ func confirmTeamsServiceUACPrompt(in io.Reader, out io.Writer, assumeYes bool) b
 	_, _ = fmt.Fprintln(out, "============================================================")
 	_, _ = fmt.Fprintln(out)
 	return confirmed
+}
+
+func teamsServiceUACPromptInputAllowed(in io.Reader) bool {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+		return false
+	}
+	if f, ok := in.(*os.File); ok {
+		return isTerminalFile(f)
+	}
+	return true
 }
 
 func defaultTeamsServicePowerShellExecutable() string {
