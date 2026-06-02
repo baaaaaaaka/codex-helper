@@ -405,6 +405,7 @@ type Bridge struct {
 	markAnswerUnreadWarned            bool
 	asyncTurnWG                       sync.WaitGroup
 	helperRestartWG                   sync.WaitGroup
+	asrWarmUpWG                       sync.WaitGroup
 	runningTurnMu                     sync.Mutex
 	runningTurnCancels                map[string]*runningTurnCancel
 	acceptedOutboxMu                  sync.Mutex
@@ -971,7 +972,9 @@ func (b *Bridge) startASRWarmUp(ctx context.Context) {
 	if !ok || warmable == nil {
 		return
 	}
+	b.asrWarmUpWG.Add(1)
 	go func() {
+		defer b.asrWarmUpWG.Done()
 		warmCtx, cancel := context.WithTimeout(ctx, teamsASRWarmUpTimeout)
 		defer cancel()
 		if err := warmable.WarmUpTeamsASR(warmCtx); err != nil && warmCtx.Err() == nil && b.out != nil {
@@ -3605,7 +3608,9 @@ func (b *Bridge) startASRWarmUpFromControl(ctx context.Context, msg ChatMessage)
 	if err := b.sendControl(ctx, "Speech recognition warm-up started. I will send a follow-up when it finishes."); err != nil {
 		return err
 	}
+	b.asrWarmUpWG.Add(1)
 	go func() {
+		defer b.asrWarmUpWG.Done()
 		warmCtx, cancel := context.WithTimeout(context.Background(), teamsASRWarmUpTimeout)
 		defer cancel()
 		if err := warmable.WarmUpTeamsASR(warmCtx); err != nil {

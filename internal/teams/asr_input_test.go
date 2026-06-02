@@ -295,13 +295,10 @@ func TestBridgeControlASRWarmUpStartsOptionalTranscriber(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("manual ASR warm-up was not invoked")
 	}
+	bridge.asrWarmUpWG.Wait()
 	got := sentPlainJoined(*sent)
 	if !strings.Contains(got, "Speech recognition warm-up started") {
 		t.Fatalf("manual ASR warm-up response = %q", got)
-	}
-	deadline := time.Now().Add(time.Second)
-	for !strings.Contains(sentPlainJoined(*sent), "Speech recognition warm-up completed") && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
 	}
 	if got := sentPlainJoined(*sent); !strings.Contains(got, "Speech recognition warm-up completed") {
 		t.Fatalf("manual ASR warm-up completion response = %q", got)
