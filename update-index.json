@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-06-02T09:17:37Z",
+  "generated_at": "2026-06-02T09:45:09Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.8-rc.5_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.8-rc.5_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.8-rc.5_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.8-rc.5_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.8-rc.5",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-06-02T09:44:29Z",
+      "tag_name": "v0.1.8-rc.5",
+      "version": "0.1.8-rc.5"
+    },
     {
       "assets": [
         {
@@ -4059,47 +4100,6 @@
       "published_at": "2026-05-19T19:01:39Z",
       "tag_name": "v0.1.0-rc.127",
       "version": "0.1.0-rc.127"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.126_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.126_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.126_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.0-rc.126_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        },
-        {
-          "name": "teams-auth-bootstrap.ps1"
-        },
-        {
-          "name": "teams-auth-bootstrap.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.0-rc.126",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-05-19T15:32:27Z",
-      "tag_name": "v0.1.0-rc.126",
-      "version": "0.1.0-rc.126"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
