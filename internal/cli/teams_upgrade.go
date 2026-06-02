@@ -635,14 +635,15 @@ func delayedTeamsServiceStartCommand(backend teamsServiceBackend, pendingReplace
 			return "", nil, fmt.Errorf("WSL Teams service backend has unexpected type %T", backend)
 		}
 		command := "Start-Sleep -Seconds 3; " +
-			teamsServiceWSLResolveTaskPowerShell(wslBackend.Name()) + "Enable-ScheduledTask -TaskName $taskName | Out-Null; Start-ScheduledTask -TaskName $taskName; " +
-			teamsServiceWSLResolveOptionalTaskPowerShell(wslBackend.watchdogName()) + "if ($null -ne $task) { if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName | Out-Null }; if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName } }"
+			teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() +
+			teamsServiceWSLResolveTaskPowerShell(wslBackend.Name()) + "Enable-ScheduledTask -TaskName $taskName | Out-Null; Start-CodexHelperScheduledTaskIfStopped $taskName; " +
+			teamsServiceWSLResolveOptionalTaskPowerShell(wslBackend.watchdogName()) + "if ($null -ne $task) { if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $taskName | Out-Null }; Start-CodexHelperScheduledTaskIfStopped $taskName }"
 		return teamsServicePowerShellExecutable(), []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}, nil
 	}
 	switch teamsServiceGOOS() {
 	case "windows":
 		task := powershellSingleQuote(teamsServiceWindowsTaskName)
-		command := delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath) + "Enable-ScheduledTask -TaskName " + task + " | Out-Null; Start-ScheduledTask -TaskName " + task
+		command := delayedWindowsTeamsServiceStartPowerShell(pendingReplacePath) + teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() + "Enable-ScheduledTask -TaskName " + task + " | Out-Null; Start-CodexHelperScheduledTaskIfStopped " + task
 		return teamsServicePowerShellExecutable(), []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command}, nil
 	case "darwin":
 		path, err := backend.Path()

@@ -1839,7 +1839,7 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 	case "restart":
 		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
 		cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-ScheduledTask -TaskName "+task+"; if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask -TaskName "+watchdogTask+" }")
+		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-CodexHelperScheduledTaskIfStopped "+task+"; if ($null -ne $watchdogTask) { Start-CodexHelperScheduledTaskIfStopped "+watchdogTask+" }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
 	}
@@ -1856,11 +1856,11 @@ func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action str
 	case "status":
 		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null; $bridgeTask = Get-ScheduledTask -TaskName "+task+"; if ($bridgeTask.State -ne 'Running') { "+cleanupBridgeChildren+"Start-ScheduledTask -TaskName "+task+" }")
+		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; $bridgeTask = Get-ScheduledTask -TaskName "+task+"; if ($bridgeTask.State -ne 'Running') { "+cleanupBridgeChildren+"Start-CodexHelperScheduledTaskIfStopped "+task+" }")
 	case "stop":
 		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren)
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; Start-ScheduledTask -TaskName "+task)
+		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; Start-CodexHelperScheduledTaskIfStopped "+task)
 	default:
 		return nil, fmt.Errorf("unsupported primary Teams service action for Task Scheduler: %s", action)
 	}
@@ -1883,7 +1883,45 @@ func teamsServiceWindowsStartTasksPowerShell() string {
 	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
 	resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
 	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
-	return "Enable-ScheduledTask -TaskName " + task + " | Out-Null; " + resolveWatchdog + "if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " | Out-Null }; $bridgeTask = Get-ScheduledTask -TaskName " + task + "; if ($bridgeTask.State -ne 'Running') { " + cleanupBridgeChildren + "Start-ScheduledTask -TaskName " + task + " }; if ($null -ne $watchdogTask -and $watchdogTask.State -ne 'Running') { Start-ScheduledTask -TaskName " + watchdogTask + " }"
+	return teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() +
+		"Enable-ScheduledTask -TaskName " + task + " | Out-Null; " +
+		resolveWatchdog +
+		"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " | Out-Null }; " +
+		"$bridgeTask = Get-ScheduledTask -TaskName " + task + "; " +
+		"if ($bridgeTask.State -ne 'Running') { " + cleanupBridgeChildren + "Start-CodexHelperScheduledTaskIfStopped " + task + " }; " +
+		"if ($null -ne $watchdogTask) { Start-CodexHelperScheduledTaskIfStopped " + watchdogTask + " }"
+}
+
+func teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() string {
+	return "function Test-CodexHelperScheduledTaskRunning([string]$taskName, [int]$attempts) { " +
+		"for ($i = 0; $i -lt $attempts; $i++) { " +
+		"$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
+		"if ($null -eq $task) { return $false }; " +
+		"if ($task.State -eq 'Running') { return $true }; " +
+		"if ($i -lt ($attempts - 1)) { Start-Sleep -Milliseconds 250 } " +
+		"}; " +
+		"return $false " +
+		"}; " +
+		"function Start-CodexHelperScheduledTaskIfStopped([string]$taskName) { " +
+		"if ([string]::IsNullOrWhiteSpace($taskName)) { return }; " +
+		"$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
+		"if ($null -eq $task) { return }; " +
+		"if ($task.State -eq 'Running' -and (Test-CodexHelperScheduledTaskRunning $taskName 3)) { return }; " +
+		"try { Start-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null } catch { " +
+		"if (-not (Test-CodexHelperScheduledTaskRunning $taskName 10)) { throw } " +
+		"} " +
+		"}; "
+}
+
+func teamsServiceWaitScheduledTaskStoppedFunctionPowerShell() string {
+	return "function Wait-CodexHelperScheduledTaskStopped([string]$taskName, [int]$attempts) { " +
+		"for ($i = 0; $i -lt $attempts; $i++) { " +
+		"$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; " +
+		"if ($null -eq $task -or $task.State -ne 'Running') { return $true }; " +
+		"if ($i -lt ($attempts - 1)) { Start-Sleep -Milliseconds 250 } " +
+		"}; " +
+		"return $false " +
+		"}; "
 }
 
 func teamsServiceWindowsStopBridgeChildrenPowerShell(taskNameExpr string) string {
@@ -3667,11 +3705,11 @@ func buildTeamsServiceWSLRetireTaskCommand(taskName string, includeCurrent bool)
 }
 
 func teamsServiceWSLStartTaskAndVerifyPowerShell() string {
-	return "Start-ScheduledTask -TaskName $taskName | Out-Null; " + teamsServiceWSLVerifyTaskRunningPowerShell()
+	return teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() + "Start-CodexHelperScheduledTaskIfStopped $taskName; " + teamsServiceWSLVerifyTaskRunningPowerShell()
 }
 
 func teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell() string {
-	return "if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName | Out-Null }; " + teamsServiceWSLVerifyTaskRunningPowerShell()
+	return teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() + "if ($task.State -ne 'Running') { Start-CodexHelperScheduledTaskIfStopped $taskName }; " + teamsServiceWSLVerifyTaskRunningPowerShell()
 }
 
 func teamsServiceWSLEnableStartTaskAndVerifyPowerShell() string {

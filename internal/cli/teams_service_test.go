@@ -4264,6 +4264,42 @@ func TestTeamsServiceWindowsPowerShellPropagatesChildExitCodeCI(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceWindowsStartTasksRefreshesTaskState(t *testing.T) {
+	got := teamsServiceWindowsStartTasksPowerShell()
+	requireSubstringsInOrder(t, got,
+		"function Test-CodexHelperScheduledTaskRunning",
+		"function Start-CodexHelperScheduledTaskIfStopped",
+		"try { Start-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null } catch",
+		"if (-not (Test-CodexHelperScheduledTaskRunning $taskName 10)) { throw }",
+		"Start-CodexHelperScheduledTaskIfStopped "+powershellSingleQuote(teamsServiceWindowsTaskName),
+		"Start-CodexHelperScheduledTaskIfStopped "+powershellSingleQuote(teamsServiceWindowsWatchdogTaskName),
+	)
+	if strings.Contains(got, "$watchdogTask.State -ne 'Running') { Start-ScheduledTask") {
+		t.Fatalf("watchdog start must not use stale task state:\n%s", got)
+	}
+}
+
+func TestTeamsServiceWSLStartTasksRefreshTaskState(t *testing.T) {
+	for name, got := range map[string]string{
+		"start":            teamsServiceWSLStartTaskAndVerifyPowerShell(),
+		"start_if_stopped": teamsServiceWSLStartTaskIfStoppedAndVerifyPowerShell(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			requireSubstringsInOrder(t, got,
+				"function Test-CodexHelperScheduledTaskRunning",
+				"function Start-CodexHelperScheduledTaskIfStopped",
+				"try { Start-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null } catch",
+				"if (-not (Test-CodexHelperScheduledTaskRunning $taskName 10)) { throw }",
+				"Start-CodexHelperScheduledTaskIfStopped $taskName",
+				"Teams WSL Scheduled Task did not stay running after start",
+			)
+			if strings.Contains(got, "$task.State -ne 'Running') { Start-ScheduledTask -TaskName $taskName") {
+				t.Fatalf("WSL start must not use stale task state:\n%s", got)
+			}
+		})
+	}
+}
+
 func TestTeamsServiceBootstrapShowsControlChatInForeground(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -5119,7 +5155,7 @@ func TestTeamsServiceBootstrapSchedulesPendingHelperActivationBeforeStartingOldW
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
 		"Write-Status 'failed'",
-		"Start-ScheduledTask",
+		"Start-CodexHelperScheduledTaskIfStopped",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("activation command missing %q:\nname=%s\nargs=%s", want, detachedName, joined)
@@ -5218,7 +5254,7 @@ func TestTeamsServiceBootstrapPendingActivationWindowsAccessDeniedPromptsForUAC(
 		exe,
 		teamsServiceWindowsTaskName,
 		teamsServiceWindowsWatchdogTaskName,
-		"Start-ScheduledTask",
+		"Start-CodexHelperScheduledTaskIfStopped",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("activation command missing %q:\nname=%s\nargs=%s", want, detachedName, joined)
@@ -5545,7 +5581,7 @@ func TestTeamsServiceStartAndRestartActivatePendingWindowsHelperBeforeOldEntry(t
 				t.Fatalf("%s detached name = %q, want powershell.exe", tc.name, detachedName)
 			}
 			joined := strings.Join(detachedArgs, " ")
-			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-ScheduledTask"} {
+			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-CodexHelperScheduledTaskIfStopped"} {
 				if !strings.Contains(joined, want) {
 					t.Fatalf("%s activation command missing %q:\n%s", tc.name, want, joined)
 				}
@@ -5634,7 +5670,7 @@ func TestTeamsServiceRestartForceRecoversBeforePendingWindowsActivation(t *testi
 		t.Fatalf("detached name = %q, want powershell.exe", detachedName)
 	}
 	joined := strings.Join(detachedArgs, " ")
-	for _, want := range []string{pending, exe, "$want='0.1.0-rc.75'", "Move-Item -Force", "Start-ScheduledTask"} {
+	for _, want := range []string{pending, exe, "$want='0.1.0-rc.75'", "Move-Item -Force", "Start-CodexHelperScheduledTaskIfStopped"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("activation command missing %q:\n%s", want, joined)
 		}

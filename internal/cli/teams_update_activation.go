@@ -341,7 +341,8 @@ func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPa
 		"if (-not (Test-Path -LiteralPath $src)) { Log ('source missing: ' + $src); if (Test-DestVersion) { $ready=$true; Log 'formal entry already matches pending target' }; break }; " +
 		windowsTeamsMovePendingHelperPowerShell() +
 		"if ($ready) { Write-Status 'success' 'activated pending helper' } else { if ([string]::IsNullOrWhiteSpace($lastErr)) { $lastErr='activation failed before service start' }; Log ('activation failed before service start: ' + $lastErr); Write-Status 'failed' $lastErr }; " +
-		"foreach ($task in @(" + powershellSingleQuote(teamsServiceWindowsTaskName) + "," + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + ")) { try { Enable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null; Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch { Log ('start task failed ' + $task + ': ' + $_.Exception.Message) } }"
+		teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() +
+		"foreach ($task in @(" + powershellSingleQuote(teamsServiceWindowsTaskName) + "," + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + ")) { try { Enable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null; Start-CodexHelperScheduledTaskIfStopped $task } catch { Log ('start task failed ' + $task + ': ' + $_.Exception.Message) } }"
 }
 
 func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, installPath string, version string, args []string) string {

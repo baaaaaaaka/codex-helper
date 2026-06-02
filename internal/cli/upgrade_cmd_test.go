@@ -1235,7 +1235,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshUsesUACRepair(t *testing.T) {
 	}
 	lastCall := runner.calls[len(runner.calls)-1]
 	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
-	if !strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") || strings.Contains(lastJoined, "Register-ScheduledTask") {
+	if !strings.Contains(lastJoined, "Start-CodexHelperScheduledTaskIfStopped $taskName") || strings.Contains(lastJoined, "Register-ScheduledTask") {
 		t.Fatalf("expected normal Scheduled Task start after elevated repair, last call=%#v all calls=%#v", lastCall, runner.calls)
 	}
 }
@@ -1318,7 +1318,7 @@ func TestUpgradeCmdWSLMatchingTaskRefreshSkipsRepairAndUAC(t *testing.T) {
 	lastCall := runner.calls[len(runner.calls)-1]
 	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
 	if !strings.Contains(lastJoined, "Enable-ScheduledTask -TaskName $taskName") ||
-		!strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
+		!strings.Contains(lastJoined, "Start-CodexHelperScheduledTaskIfStopped $taskName") {
 		t.Fatalf("expected normal Scheduled Task start, last call=%#v all calls=%#v", lastCall, runner.calls)
 	}
 }
@@ -1861,11 +1861,11 @@ func TestScheduleDelayedTeamsServiceStartUsesWSLWindowsTask(t *testing.T) {
 	joined := strings.Join(detachedArgs, " ")
 	if detachedName != "powershell.exe" ||
 		!strings.Contains(joined, "Enable-ScheduledTask") ||
-		!strings.Contains(joined, "Start-ScheduledTask") ||
+		!strings.Contains(joined, "Start-CodexHelperScheduledTaskIfStopped $taskName") ||
+		!strings.Contains(joined, "Test-CodexHelperScheduledTaskRunning") ||
 		!strings.Contains(joined, "Codex Helper Teams Bridge (WSL Ubuntu-22.04 alice work ") ||
 		!strings.Contains(joined, "Codex Helper Teams Watchdog (WSL Ubuntu-22.04 alice work ") ||
-		!strings.Contains(joined, "$task.State -eq 'Disabled'") ||
-		!strings.Contains(joined, "$task.State -ne 'Running'") {
+		!strings.Contains(joined, "$task.State -eq 'Disabled'") {
 		t.Fatalf("unexpected WSL delayed restart: name=%q args=%#v", detachedName, detachedArgs)
 	}
 }
@@ -1954,7 +1954,7 @@ func TestScheduleDelayedTeamsServiceStartUsesConfiguredPowerShell(t *testing.T) 
 	if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
 		t.Fatalf("scheduleDelayedTeamsServiceStart error: %v", err)
 	}
-	if detachedName != configuredPowerShell || !strings.Contains(strings.Join(detachedArgs, " "), "Start-ScheduledTask") {
+	if detachedName != configuredPowerShell || !strings.Contains(strings.Join(detachedArgs, " "), "Start-CodexHelperScheduledTaskIfStopped $taskName") {
 		t.Fatalf("unexpected delayed restart command: name=%q args=%#v", detachedName, detachedArgs)
 	}
 }
@@ -1999,7 +1999,7 @@ func TestScheduleDelayedTeamsServiceStartUsesWindowsPendingActivation(t *testing
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
 		"Write-Status 'failed'",
-		"Start-ScheduledTask",
+		"Start-CodexHelperScheduledTaskIfStopped",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("windows activation command missing %q:\n%s", want, joined)
@@ -2052,7 +2052,7 @@ func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testi
 		}
 	}
 	activation := strings.Join(detachedArgs, " ")
-	for _, want := range []string{pending, exe, ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-ScheduledTask"} {
+	for _, want := range []string{pending, exe, ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-CodexHelperScheduledTaskIfStopped"} {
 		if !strings.Contains(activation, want) {
 			t.Fatalf("activation command missing %q:\n%s", want, activation)
 		}
@@ -2116,7 +2116,7 @@ func TestRestartTeamsHelperFromTeamsUsesPendingActivationForWindowsService(t *te
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
 		"Write-Status 'failed'",
-		"Start-ScheduledTask",
+		"Start-CodexHelperScheduledTaskIfStopped",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("pending activation restart command missing %q:\n%s", want, joined)
