@@ -8846,7 +8846,11 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, "ambiguous Codex execution: "+err.Error()); markErr != nil {
 				return markErr
 			}
-			return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "interrupted", "Codex accepted the request, but the helper could not confirm whether it finished. I did not retry automatically because that could duplicate work.\n\nCheck recent messages and changed files first. To run the same Teams request again in this same session, send `helper retry last` here. Advanced: `helper retry "+turn.ID+"`.", outboxQueueOptions{
+			body := "Codex accepted the request, but the helper could not confirm whether it finished. I did not retry automatically because that could duplicate work.\n\nCheck recent messages and changed files first. To run the same Teams request again in this same session, send `helper retry last` here. Advanced: `helper retry " + turn.ID + "`."
+			if detail := strings.TrimSpace(trimTeamsCommandOutput(err.Error(), 600)); detail != "" {
+				body += "\n\nDiagnostic for the admin:\n" + detail
+			}
+			return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "interrupted", body, outboxQueueOptions{
 				MentionOwner:     true,
 				NotificationKind: "needs_attention",
 			})

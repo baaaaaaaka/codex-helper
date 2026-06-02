@@ -106,10 +106,7 @@ func newModelDoctorCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if choice, ok := modelprofile.LookupModelChoice(ref); ok {
-				ref = choice.RecommendedProfile
-			}
-			return runModelProfileDoctor(cmd.OutOrStdout(), store, ref)
+			return runModelDoctor(cmd.OutOrStdout(), store, ref)
 		},
 	}
 }
@@ -342,6 +339,99 @@ func reusableAPIKeyRef(cfg config.Config, secretStore *modelprofile.SecretStore,
 	return ""
 }
 
+func runModelDoctor(out io.Writer, store *config.Store, ref string) error {
+	ref = strings.TrimSpace(ref)
+	choice, ok := modelprofile.LookupModelChoice(ref)
+	if !ok {
+		return runModelProfileDoctor(out, store, ref)
+	}
+	profileName := strings.TrimSpace(choice.RecommendedProfile)
+	if profileName == "" {
+		profileName = config.DefaultModelProfileName
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return err
+	}
+	if readyProfileName := modelChoiceReadyProfileName(cfg, choice); readyProfileName != "" {
+		return runModelProfileDoctor(out, store, readyProfileName)
+	}
+	if !choice.RequiresAPIKey {
+		return runModelProfileDoctor(out, store, profileName)
+	}
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+	if ref := reusableAPIKeyRef(cfg, secretStore, choice); ref != "" {
+		return fmt.Errorf("model %s has a saved %s API key (%s), but profile %q is not configured for %s yet; run `model setup %s`, then retry `model doctor %s`",
+			choice.ID, choice.ProviderDisplayName, modelprofile.MaskRef(ref), profileName, choice.DisplayName, choice.ID, choice.ID)
+	}
+	return fmt.Errorf("model %s is not configured yet; run `model setup %s` to configure %s", choice.ID, choice.ID, choice.DisplayName)
+}
+
+func modelChoiceReadyProfileName(cfg config.Config, choice modelprofile.ModelChoice) string {
+	if !choice.RequiresAPIKey {
+		return config.DefaultModelProfileName
+	}
+	candidates := []string{}
+	seen := map[string]bool{}
+	addCandidate := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		candidates = append(candidates, name)
+	}
+	addCandidate(choice.RecommendedProfile)
+	addCandidate(cfg.EffectiveDefaultModelProfile())
+	names := make([]string, 0, len(cfg.ModelProfiles))
+	for name := range cfg.ModelProfiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		addCandidate(name)
+	}
+	for _, name := range candidates {
+		resolved, err := modelprofile.Resolve(cfg, name)
+		if err != nil {
+			continue
+		}
+		if resolvedModelChoiceMatches(resolved, choice) {
+			return resolved.Name
+		}
+	}
+	return ""
+}
+
+func resolvedModelChoiceMatches(resolved modelprofile.Resolved, choice modelprofile.ModelChoice) bool {
+	if !choice.RequiresAPIKey {
+		return strings.EqualFold(resolved.Provider.ID, modelprofile.DefaultProvider)
+	}
+	return strings.EqualFold(resolved.Provider.ID, choice.ProviderID) &&
+		strings.EqualFold(resolved.SelectedPublicModel(), choice.PublicModel) &&
+		strings.TrimSpace(resolved.Profile.APIKeyRef) != ""
+}
+
+func modelChoiceStatus(cfg config.Config, secretStore *modelprofile.SecretStore, choice modelprofile.ModelChoice) string {
+	if !choice.RequiresAPIKey {
+		return "ready"
+	}
+	if readyProfileName := modelChoiceReadyProfileName(cfg, choice); readyProfileName != "" {
+		if strings.EqualFold(readyProfileName, strings.TrimSpace(choice.RecommendedProfile)) {
+			return "ready"
+		}
+		return "ready (profile " + readyProfileName + ")"
+	}
+	if ref := reusableAPIKeyRef(cfg, secretStore, choice); ref != "" {
+		return "needs setup (key " + modelprofile.MaskRef(ref) + ")"
+	}
+	return "needs key"
+}
+
 func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofile.SecretStore) {
 	if out == nil {
 		return
@@ -349,13 +439,7 @@ func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofi
 	defaultName := cfg.EffectiveDefaultModelProfile()
 	_, _ = fmt.Fprintln(out, "Models")
 	for i, choice := range modelprofile.ModelChoices() {
-		status := "ready"
-		if choice.RequiresAPIKey {
-			status = "needs key"
-			if ref := reusableAPIKeyRef(cfg, secretStore, choice); ref != "" {
-				status = "uses key " + modelprofile.MaskRef(ref)
-			}
-		}
+		status := modelChoiceStatus(cfg, secretStore, choice)
 		marker := " "
 		if modelChoiceIsDefault(cfg, choice, defaultName) {
 			marker = "*"

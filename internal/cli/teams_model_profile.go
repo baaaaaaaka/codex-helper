@@ -258,11 +258,8 @@ func (m teamsModelProfileManager) ModelProfileDoctor(ctx context.Context, name s
 	if err != nil {
 		return "", err
 	}
-	if choice, ok := modelprofile.LookupModelChoice(name); ok {
-		name = choice.RecommendedProfile
-	}
 	var out bytes.Buffer
-	if err := runModelProfileDoctor(&out, store, strings.TrimSpace(name)); err != nil {
+	if err := runModelDoctor(&out, store, strings.TrimSpace(name)); err != nil {
 		return "", err
 	}
 	_ = ctx

@@ -469,6 +469,158 @@ func TestModelUseCreatesSiblingProfileFromFamilyCredential(t *testing.T) {
 	}
 }
 
+func TestModelListShowsNeedsSetupWhenFamilyCredentialExistsWithoutProfile(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
+	familyRef := modelprofile.SecretRefForCredentialScope("deepseek")
+	if err := secretStore.Put(familyRef, "sk-deepseek-family"); err != nil {
+		t.Fatalf("Put secret: %v", err)
+	}
+
+	out := runRootCommandForModelProfileTest(t, "--config", configPath, "model", "list")
+	for _, want := range []string{
+		"deepseek-v4-flash",
+		"DeepSeek V4 Flash",
+		"deepseek-v4-pro",
+		"needs setup (key secret:<saved>)",
+		"mimo-v2.5",
+		"needs key",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("model list missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "uses key secret:<saved>") {
+		t.Fatalf("model list should not mark missing recommended profiles as using the key:\n%s", out)
+	}
+}
+
+func TestModelDoctorExplainsMissingRecommendedProfileWithReusableCredential(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
+	if err := secretStore.Put(modelprofile.SecretRefForCredentialScope("deepseek"), "sk-deepseek-family"); err != nil {
+		t.Fatalf("Put secret: %v", err)
+	}
+
+	err, out := runRootCommandForModelProfileTestError("--config", configPath, "model", "doctor", "deepseek-v4-flash")
+	if err == nil {
+		t.Fatalf("model doctor unexpectedly succeeded:\n%s", out)
+	}
+	body := err.Error() + "\n" + out
+	for _, want := range []string{
+		"model deepseek-v4-flash has a saved DeepSeek API key",
+		"profile \"deepseek-flash\" is not configured",
+		"run `model setup deepseek-v4-flash`",
+		"retry `model doctor deepseek-v4-flash`",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("model doctor error missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestTeamsModelProfileDoctorExplainsMissingRecommendedProfileWithReusableCredential(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
+	if err := secretStore.Put(modelprofile.SecretRefForCredentialScope("deepseek"), "sk-deepseek-family"); err != nil {
+		t.Fatalf("Put secret: %v", err)
+	}
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
+
+	out, err := manager.ModelProfileDoctor(context.Background(), "deepseek-v4-flash")
+	if err == nil {
+		t.Fatalf("ModelProfileDoctor unexpectedly succeeded:\n%s", out)
+	}
+	for _, want := range []string{
+		"model deepseek-v4-flash has a saved DeepSeek API key",
+		"profile \"deepseek-flash\" is not configured",
+		"run `model setup deepseek-v4-flash`",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Teams doctor error missing %q:\n%s", want, err.Error())
+		}
+	}
+}
+
+func TestModelDoctorValidatesCustomProfileBackingModelChoice(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.Save(config.Config{
+		Version:             config.CurrentVersion,
+		DefaultModelProfile: "deepseek-work",
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-work": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+				CreatedAt: now,
+				UpdatedAt: now,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "sk-deepseek-custom-profile")
+
+	out := runRootCommandForModelProfileTest(t, "--config", configPath, "model", "doctor", "deepseek-v4-pro")
+	for _, want := range []string{
+		"OK  model profile \"deepseek-work\"",
+		"OK  provider deepseek",
+		"OK  model deepseek/deepseek-v4-pro",
+		"OK  api key env:DEEPSEEK_API_KEY",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("model doctor output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestTeamsModelProfileDoctorValidatesCustomProfileBackingModelChoice(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.Save(config.Config{
+		Version:             config.CurrentVersion,
+		DefaultModelProfile: "deepseek-work",
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-work": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+				CreatedAt: now,
+				UpdatedAt: now,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "sk-deepseek-custom-profile")
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
+
+	out, err := manager.ModelProfileDoctor(context.Background(), "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("ModelProfileDoctor error: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"OK  model profile \"deepseek-work\"",
+		"OK  provider deepseek",
+		"OK  model deepseek/deepseek-v4-pro",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("Teams doctor output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestModelListShowsDisplayNamesAndCustomDefaultModel(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(configPath)
@@ -496,7 +648,7 @@ func TestModelListShowsDisplayNamesAndCustomDefaultModel(t *testing.T) {
 	for _, want := range []string{
 		"DeepSeek V4 Pro",
 		"* 3. deepseek-v4-pro",
-		"uses key env:DEEPSEEK_API_KEY",
+		"ready (profile deepseek-work)",
 		"MiMo 2.5 Pro",
 	} {
 		if !strings.Contains(out, want) {
@@ -516,4 +668,14 @@ func runRootCommandForModelProfileTest(t *testing.T, args ...string) string {
 		t.Fatalf("Execute(%v): %v\n%s", args, err, out.String())
 	}
 	return out.String()
+}
+
+func runRootCommandForModelProfileTestError(args ...string) (error, string) {
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return err, out.String()
 }

@@ -620,6 +620,12 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfile(ProxyPrepareTimesOutCI|UsesCallerCancellationCI)|TeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI)$' -v
           go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
 
+      - name: Model choice reusable credential regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(ModelListShows(NeedsSetupWhenFamilyCredentialExistsWithoutProfile|DisplayNamesAndCustomDefaultModel)|ModelDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice)|TeamsModelProfileDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice))$' -v
+
       - name: Teams user-marker compact and fallback regressions
         shell: bash
         run: |
@@ -668,6 +674,12 @@ jobs:
           go test ./internal/teams -count=1 -run "$workflow_pattern" -v
           go test ./internal/teams -count=1 -run 'TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite$' -v
           go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
+
+      - name: Teams ambiguous execution diagnostic regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'TestBridgeQueuedTurnAmbiguousErrorIncludesDiagnostic$' -v
 
       - name: Beacon mode simulation regressions
         shell: bash

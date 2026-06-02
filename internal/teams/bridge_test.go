@@ -3847,6 +3847,51 @@ func TestBridgeQueuedTurnErrorMentionsOwnerWhenWorkflowDisabled(t *testing.T) {
 	}
 }
 
+func TestBridgeQueuedTurnAmbiguousErrorIncludesDiagnostic(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	session := (&Registry{
+		Sessions: []Session{{
+			ID:     "s001",
+			ChatID: "chat-1",
+			Status: "active",
+		}},
+	}).SessionByChatID("chat-1")
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{
+		result: ExecutionResult{CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+		err: &AmbiguousExecutionError{
+			ThreadID: "thread-1",
+			TurnID:   "turn-1",
+			Err:      errors.New("stream disconnected before completion"),
+		},
+	})
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:ambiguous", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+
+	if err := bridge.runQueuedTurn(context.Background(), session, turn, session.ChatID, "fail ambiguously"); err != nil {
+		t.Fatalf("runQueuedTurn error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent count = %d, want 1: %#v", len(*sent), *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	for _, want := range []string{
+		"could not confirm whether it finished",
+		"Diagnostic for the admin:",
+		"stream disconnected before completion",
+		"helper retry last",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("ambiguous notice missing %q:\n%s", want, plain)
+		}
+	}
+}
+
 func TestBridgeChunkedNeedsAttentionMentionsOwnerOnlyOnLastPart(t *testing.T) {
 	t.Parallel()
 	graph, _ := newBridgeTestGraph(t)
