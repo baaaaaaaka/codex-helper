@@ -509,18 +509,6 @@ func (b *Bridge) ensureControlChat(ctx context.Context, syncRegistry bool) (Chat
 		return Chat{ID: b.reg.ControlChatID, Topic: b.reg.ControlChatTopic, WebURL: b.reg.ControlChatURL, ChatType: "meeting"}, nil
 	}
 	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()), Profile: b.scope.Profile})
-	if chat, ok := b.findExistingControlChat(ctx, topic); ok {
-		b.reg.ControlChatID = chat.ID
-		b.reg.ControlChatTopic = chat.Topic
-		b.reg.ControlChatURL = chat.WebURL
-		if err := b.recordControlChatBinding(ctx, chat); err != nil {
-			return chat, err
-		}
-		if err := b.Save(); err != nil {
-			return chat, err
-		}
-		return chat, nil
-	}
 	chat, err := b.createMeetingChat(ctx, topic)
 	if err != nil {
 		return Chat{}, err
@@ -634,33 +622,6 @@ func (b *Bridge) queueLocalSessionStartedNotice(ctx context.Context, sessionID s
 		return false, err
 	}
 	return true, nil
-}
-
-func (b *Bridge) findExistingControlChat(ctx context.Context, topic string) (Chat, bool) {
-	topic = strings.TrimSpace(SanitizeTopic(topic))
-	if topic == "" || b.graph == nil {
-		return Chat{}, false
-	}
-	chats, err := b.graph.ListChats(ctx, 50)
-	if err != nil {
-		return Chat{}, false
-	}
-	for _, chat := range chats {
-		if strings.TrimSpace(chat.Topic) != topic {
-			continue
-		}
-		if chat.ChatType != "" && chat.ChatType != "meeting" {
-			continue
-		}
-		members, err := b.graph.ListChatMembers(ctx, chat.ID)
-		if err != nil {
-			return Chat{}, false
-		}
-		if len(members) == 1 && (strings.TrimSpace(members[0].UserID) == b.user.ID || strings.EqualFold(strings.TrimSpace(members[0].Email), strings.TrimSpace(b.user.UserPrincipalName))) {
-			return chat, true
-		}
-	}
-	return Chat{}, false
 }
 
 func (b *Bridge) Save() error {

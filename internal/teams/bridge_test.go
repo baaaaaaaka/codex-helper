@@ -16917,25 +16917,29 @@ func TestBridgeDashboardProjectsCacheReusesDiscoveryForFollowupSelection(t *test
 	}
 }
 
-func TestBridgeEnsureControlChatSkipsExistingSingleMemberGroupChat(t *testing.T) {
+func TestBridgeEnsureControlChatDoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding(t *testing.T) {
 	store := newBridgeTestStore(t)
 	t.Setenv(envTeamsMachineLabel, "qa-host")
 	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: "qa-host"})
 	var created bool
 	var readySent int
+	var remoteSearch bool
+	var memberLookup bool
 	var requests []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.String())
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/me/chats":
+			remoteSearch = true
 			_ = json.NewEncoder(w).Encode(map[string]any{"value": []map[string]string{{
 				"id":       "existing-control",
 				"topic":    topic,
-				"chatType": "group",
+				"chatType": "meeting",
 				"webUrl":   "https://teams.example/existing-control",
 			}}})
 		case r.Method == http.MethodGet && r.URL.Path == "/chats/existing-control/members":
+			memberLookup = true
 			_, _ = fmt.Fprint(w, `{"value":[{"id":"member-1","userId":"user-1","email":"user@example.test"}]}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			created = true
@@ -16968,7 +16972,10 @@ func TestBridgeEnsureControlChatSkipsExistingSingleMemberGroupChat(t *testing.T)
 		t.Fatalf("EnsureControlChat error: %v", err)
 	}
 	if !created || readySent != 2 {
-		t.Fatalf("legacy single-member group should be skipped and replaced by meeting chat: created=%v ready=%v requests=%v", created, readySent, requests)
+		t.Fatalf("fresh control chat should be created without remote adoption: created=%v ready=%v requests=%v", created, readySent, requests)
+	}
+	if remoteSearch || memberLookup {
+		t.Fatalf("fresh local binding should not search/adopt remote chats by title: remoteSearch=%v memberLookup=%v requests=%v", remoteSearch, memberLookup, requests)
 	}
 	if chat.ID != "new-control" || bridge.reg.ControlChatID != "new-control" {
 		t.Fatalf("control chat binding = chat=%#v reg=%#v", chat, bridge.reg)
@@ -17448,8 +17455,6 @@ func TestBridgeEnsureControlChatQueuesReadyMessageDurably(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/me/chats":
-			_, _ = fmt.Fprint(w, `{"value":[]}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			writeTestOnlineMeeting(w, "new-control", "control")
 		case r.Method == http.MethodPost && (r.URL.Path == "/chats/old-control/messages" || r.URL.Path == "/chats/new-control/messages"):
