@@ -74,6 +74,40 @@ func TestOpenAIChatAdapterStreamsTextAndUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatAdapterHandlesUsageWithoutPromptTokenDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`data: {"choices":[{"delta":{"content":"ok"}}]}`,
+			"",
+			`data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+			"",
+			`data: [DONE]`,
+			"",
+		}, "\n")))
+	}))
+	defer server.Close()
+
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", HTTPClient: server.Client()}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"})
+	if err != nil {
+		t.Fatalf("Stream error: %v", err)
+	}
+	events := collectEvents(stream)
+	if got := eventText(events); got != "ok" {
+		t.Fatalf("text = %q", got)
+	}
+	var usage *Usage
+	for _, event := range events {
+		if event.Kind == ProviderEventUsage {
+			usage = event.Usage
+		}
+	}
+	if usage == nil || usage.InputTokens != 3 || usage.OutputTokens != 2 || usage.TotalTokens != 5 || usage.CachedTokens != 0 {
+		t.Fatalf("usage = %#v, events = %#v", usage, events)
+	}
+}
+
 func TestOpenAIChatAdapterKeepsTailUsageAfterFinishChunk(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

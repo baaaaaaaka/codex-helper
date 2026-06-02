@@ -1051,6 +1051,7 @@ var (
 		"service_owner",
 	)
 	pollScheduleSnapshotFields = stateFieldSet(
+		"control_chat",
 		"sessions",
 		"turns",
 		"chat_polls",

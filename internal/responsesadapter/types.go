@@ -165,7 +165,7 @@ type usageWire struct {
 	OutputTokens       int `json:"output_tokens,omitempty"`
 	TotalTokens        int `json:"total_tokens,omitempty"`
 	InputTokensDetails struct {
-		CachedTokens int `json:"cached_tokens,omitempty"`
+		CachedTokens int `json:"cached_tokens"`
 	} `json:"input_tokens_details,omitempty"`
 	OutputTokensDetails struct {
 		ReasoningTokens int `json:"reasoning_tokens,omitempty"`

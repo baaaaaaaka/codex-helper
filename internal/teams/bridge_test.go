@@ -6328,6 +6328,40 @@ func TestBridgeRestoreRegistryFromStoreKeepsLegacyRegistryWhenStoreHasNoSessions
 	}
 }
 
+func TestBridgeRestoreRegistryFromStoreDoesNotAdoptForeignControlBinding(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatID = "local-control"
+	bridge.reg.ControlChatURL = TeamsChatURL("local-control", "tenant-1")
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		now := time.Now()
+		state.ControlChat = teamstore.ControlChatBinding{
+			MachineID:      "other-machine",
+			ScopeID:        bridge.scope.ID,
+			AccountID:      bridge.user.ID,
+			Profile:        bridge.scope.Profile,
+			TeamsChatID:    "foreign-control",
+			TeamsChatURL:   TeamsChatURL("foreign-control", "tenant-1"),
+			TeamsChatTopic: "foreign control",
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed foreign control binding: %v", err)
+	}
+
+	if err := bridge.restoreRegistryFromStore(context.Background()); err != nil {
+		t.Fatalf("restoreRegistryFromStore error: %v", err)
+	}
+
+	if bridge.reg.ControlChatID != "local-control" || bridge.reg.ControlChatURL != TeamsChatURL("local-control", "tenant-1") {
+		t.Fatalf("foreign control binding should not be adopted: %#v", bridge.reg)
+	}
+}
+
 func TestBridgeControlHelperUpdateQuestionFallsBackToCodex(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -14948,6 +14982,116 @@ func TestBridgePollOncePrioritizesControlAfterControlActivity(t *testing.T) {
 	}
 }
 
+func TestBridgePollOnceSyncsRecreatedControlChatFromDurableBinding(t *testing.T) {
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: nil,
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if !strings.Contains(r.URL.Path, "/chats/new-control/messages") {
+				t.Fatalf("poll should read recreated control chat, got %s", r.URL.Path)
+			}
+		},
+	}})
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatID = "old-control"
+	bridge.reg.ControlChatURL = TeamsChatURL("old-control", "tenant-1")
+	bridge.reg.ControlChatTopic = "old control"
+	bridge.reg.Sessions = nil
+	bridge.reg.Chats = map[string]ChatState{"old-control": {SeenMessageIDs: []string{"old-seen"}}}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		now := time.Now()
+		state.ControlChat = teamstore.ControlChatBinding{
+			MachineID:      bridge.machine.ID,
+			ScopeID:        bridge.scope.ID,
+			AccountID:      bridge.user.ID,
+			Profile:        bridge.scope.Profile,
+			TeamsChatID:    "new-control",
+			TeamsChatURL:   TeamsChatURL("new-control", "tenant-1"),
+			TeamsChatTopic: "new control",
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		state.ChatPolls["old-control"] = teamstore.ChatPollState{ChatID: "old-control", Seeded: true, PollState: inboundPollStateWarm}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed durable recreated control binding: %v", err)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+
+	if bridge.reg.ControlChatID != "new-control" || bridge.reg.ControlChatURL != TeamsChatURL("new-control", "tenant-1") || bridge.reg.ControlChatTopic != "new control" {
+		t.Fatalf("registry control chat was not synced: %#v", bridge.reg)
+	}
+	if _, ok := bridge.reg.Chats["old-control"]; ok {
+		t.Fatalf("old control chat state should be retired from registry: %#v", bridge.reg.Chats)
+	}
+	if _, ok := bridge.reg.Chats["new-control"]; !ok {
+		t.Fatalf("new control chat state was not initialized: %#v", bridge.reg.Chats)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "new-control")
+	if err != nil || !ok {
+		t.Fatalf("new control ChatPoll ok=%v err=%v", ok, err)
+	}
+	if !poll.Seeded {
+		t.Fatalf("new control poll was not seeded: %#v", poll)
+	}
+}
+
+func TestBridgePollOnceDoesNotSyncForeignControlChatBinding(t *testing.T) {
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: nil,
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if !strings.Contains(r.URL.Path, "/chats/old-control/messages") {
+				t.Fatalf("poll should keep local control chat, got %s", r.URL.Path)
+			}
+		},
+	}})
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatID = "old-control"
+	bridge.reg.ControlChatURL = TeamsChatURL("old-control", "tenant-1")
+	bridge.reg.Sessions = nil
+	bridge.reg.Chats = map[string]ChatState{"old-control": {}}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		now := time.Now()
+		state.ControlChat = teamstore.ControlChatBinding{
+			MachineID:      "other-machine",
+			ScopeID:        bridge.scope.ID,
+			AccountID:      bridge.user.ID,
+			Profile:        bridge.scope.Profile,
+			TeamsChatID:    "foreign-control",
+			TeamsChatURL:   TeamsChatURL("foreign-control", "tenant-1"),
+			TeamsChatTopic: "foreign control",
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed foreign durable control binding: %v", err)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+
+	if bridge.reg.ControlChatID != "old-control" {
+		t.Fatalf("foreign control binding should not be adopted: %#v", bridge.reg)
+	}
+	if _, ok, err := store.ChatPoll(context.Background(), "foreign-control"); err != nil || ok {
+		t.Fatalf("foreign control poll ok=%v err=%v, want absent", ok, err)
+	}
+}
+
 func TestBridgePollOnceSkipsChatsUntilNextPollAt(t *testing.T) {
 	now := time.Now()
 	readGraph := newBridgePollGraph(t, nil)
@@ -17354,25 +17498,6 @@ func TestBridgeEnsureControlChatRestoresPersistedUserControlTitle(t *testing.T) 
 	defer server.Close()
 	store := newBridgeTestStore(t)
 	topic := ControlChatTitle(ChatTitleOptions{MachineLabel: "qa-host", UserTitle: "release control"})
-	now := time.Now()
-	if err := store.Update(context.Background(), func(state *teamstore.State) error {
-		state.ControlChat = teamstore.ControlChatBinding{
-			MachineID:      "machine-1",
-			ScopeID:        "scope-1",
-			AccountID:      "user-1",
-			Profile:        "default",
-			TeamsChatID:    "control-chat",
-			TeamsChatURL:   "https://teams.example/control",
-			TeamsChatTopic: topic,
-			UserTitle:      "release control",
-			TitleSource:    sessionTitleSourceUser,
-			BoundAt:        now,
-			UpdatedAt:      now,
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed control binding: %v", err)
-	}
 	bridge := newBridgeTestBridge(&GraphClient{
 		auth:       &fakeGraphAuth{token: "access"},
 		client:     server.Client(),
@@ -17388,6 +17513,25 @@ func TestBridgeEnsureControlChatRestoresPersistedUserControlTitle(t *testing.T) 
 	bridge.reg.ControlChatTopic = ""
 	bridge.reg.ControlChatUserTitle = ""
 	bridge.reg.ControlChatTitleSource = ""
+	now := time.Now()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			MachineID:      bridge.machine.ID,
+			ScopeID:        bridge.scope.ID,
+			AccountID:      bridge.user.ID,
+			Profile:        bridge.scope.Profile,
+			TeamsChatID:    "control-chat",
+			TeamsChatURL:   "https://teams.example/control",
+			TeamsChatTopic: topic,
+			UserTitle:      "release control",
+			TitleSource:    sessionTitleSourceUser,
+			BoundAt:        now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed control binding: %v", err)
+	}
 
 	chat, err := bridge.EnsureControlChat(context.Background())
 	if err != nil {

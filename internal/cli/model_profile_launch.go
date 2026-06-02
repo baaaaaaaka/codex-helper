@@ -155,7 +155,7 @@ func startModelProfileAdapterForCodex(
 			storeCleanup()
 			return codexModelProfileLaunch{}, nil, fmt.Errorf("parse upstream proxy url: %w", err)
 		}
-		adapter.HTTPClient = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+		adapter.HTTPClient = responsesadapter.NewUpstreamHTTPClient(http.ProxyURL(proxyURL))
 	}
 	registry, err := responsesadapter.NewProviderRegistry(responsesadapter.ProviderRegistryOptions{
 		DefaultProvider: resolved.Provider.ID,

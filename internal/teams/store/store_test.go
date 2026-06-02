@@ -1557,6 +1557,16 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	if len(pollState.OutboxMessages) != 0 || len(pollState.ChatRateLimits) != 0 {
 		t.Fatalf("poll snapshot included unselected fields: outbox=%d rate_limits=%d", len(pollState.OutboxMessages), len(pollState.ChatRateLimits))
 	}
+	pollSchedule, err := store.PollScheduleSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("PollScheduleSnapshot sqlite error: %v", err)
+	}
+	if pollSchedule.ControlChat.TeamsChatID != "control-chat" || len(pollSchedule.Sessions) != 2 || pollSchedule.ChatPolls["chat-1"].PollState != "warm" || pollSchedule.ServiceOwner == nil {
+		t.Fatalf("poll schedule snapshot missing selected fields: %#v", pollSchedule)
+	}
+	if len(pollSchedule.InboundEvents) != 0 || len(pollSchedule.OutboxMessages) != 0 || len(pollSchedule.ChatRateLimits) != 0 {
+		t.Fatalf("poll schedule snapshot included unselected hot fields: inbound=%d outbox=%d rate_limits=%d", len(pollSchedule.InboundEvents), len(pollSchedule.OutboxMessages), len(pollSchedule.ChatRateLimits))
+	}
 	active, err := store.SessionActiveTurnQueueSnapshot(ctx, "s1")
 	if err != nil {
 		t.Fatalf("SessionActiveTurnQueueSnapshot sqlite error: %v", err)

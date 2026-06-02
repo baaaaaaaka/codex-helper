@@ -1048,6 +1048,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 	if err != nil {
 		return err
 	}
+	if err := b.syncControlChatProjectionFromState(ctx, state); err != nil {
+		return err
+	}
 	controlPoll, hasControlPoll := state.ChatPolls[b.reg.ControlChatID]
 	controlDecision := decideInboundPoll(inboundPollInput{
 		ChatID:  b.reg.ControlChatID,
@@ -1161,6 +1164,75 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		queueStateBySession[s.ID] = turns
 	}
 	return firstErr
+}
+
+func (b *Bridge) syncControlChatProjectionFromState(ctx context.Context, state teamstore.State) error {
+	if b == nil || strings.TrimSpace(state.ControlChat.TeamsChatID) == "" {
+		return nil
+	}
+	if !b.controlChatBindingMatchesBridge(state.ControlChat) {
+		return nil
+	}
+	changed := false
+	setRegistryControlString := func(target *string, value string) {
+		if *target != value {
+			*target = value
+			changed = true
+		}
+	}
+	setRegistryControlStringIfPresent := func(target *string, value string) {
+		if strings.TrimSpace(value) == "" && strings.TrimSpace(*target) != "" {
+			return
+		}
+		setRegistryControlString(target, value)
+	}
+	oldControlChatID := strings.TrimSpace(b.reg.ControlChatID)
+	newControlChatID := strings.TrimSpace(state.ControlChat.TeamsChatID)
+	setRegistryControlString(&b.reg.ControlChatID, newControlChatID)
+	setRegistryControlStringIfPresent(&b.reg.ControlChatURL, state.ControlChat.TeamsChatURL)
+	setRegistryControlStringIfPresent(&b.reg.ControlChatTopic, state.ControlChat.TeamsChatTopic)
+	setRegistryControlStringIfPresent(&b.reg.ControlChatUserTitle, state.ControlChat.UserTitle)
+	setRegistryControlStringIfPresent(&b.reg.ControlChatTitleSource, state.ControlChat.TitleSource)
+	if oldControlChatID != newControlChatID {
+		b.reg.ensureMaps()
+		if oldControlChatID != "" {
+			delete(b.reg.Chats, oldControlChatID)
+		}
+		if _, ok := b.reg.Chats[newControlChatID]; !ok {
+			b.reg.Chats[newControlChatID] = ChatState{}
+		}
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return b.Save()
+}
+
+func (b *Bridge) controlChatBindingMatchesBridge(binding teamstore.ControlChatBinding) bool {
+	if b == nil || strings.TrimSpace(binding.TeamsChatID) == "" {
+		return false
+	}
+	if strings.TrimSpace(b.scope.ID) == "" {
+		b.scope = ScopeIdentityForUser(b.user)
+	}
+	if strings.TrimSpace(b.machine.ID) == "" {
+		b.machine = MachineRecordForUser(b.user, b.scope)
+		b.applyRegistryMachineHostnameOverride()
+	}
+	if expected := strings.TrimSpace(binding.ScopeID); expected != "" && strings.TrimSpace(b.scope.ID) != "" && expected != strings.TrimSpace(b.scope.ID) {
+		return false
+	}
+	if expected := strings.TrimSpace(binding.AccountID); expected != "" && strings.TrimSpace(b.user.ID) != "" && expected != strings.TrimSpace(b.user.ID) {
+		return false
+	}
+	if expected := strings.TrimSpace(binding.Profile); expected != "" && strings.TrimSpace(b.scope.Profile) != "" && expected != strings.TrimSpace(b.scope.Profile) {
+		return false
+	}
+	if expected := strings.TrimSpace(binding.MachineID); expected != "" && strings.TrimSpace(b.machine.ID) != "" && expected != strings.TrimSpace(b.machine.ID) {
+		return false
+	}
+	return true
 }
 
 func effectiveOwnerPollTop(top int) int {
@@ -10291,7 +10363,7 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 		b.reg.UserPrincipal = b.user.UserPrincipalName
 		changed = true
 	}
-	if state.ControlChat.TeamsChatID != "" {
+	if state.ControlChat.TeamsChatID != "" && b.controlChatBindingMatchesBridge(state.ControlChat) {
 		setRegistryControlString := func(target *string, value string) {
 			if *target != value {
 				*target = value

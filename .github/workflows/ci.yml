@@ -105,6 +105,19 @@ jobs:
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'Test(ChatTitlesUseDistinctLeadingEmoji|ParseControlDashboardCommandsDoNotRequireCodex|ParseRenameHostnameArgumentPreservesRegularRenameTitles|Bridge(ControlRenameUpdatesTeamsTopicAndDurableState|RenameHostnameUpdatesControlAndWorkChatTopics|EnsureControlChat(DoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|PreservesUserControlTitle|RestoresPersistedUserControlTitle|BackfillsUserControlTitleIntoPartialDurableBinding|RenamesOldControlTopic)|SessionRenameUpdatesTeamsTopicAndDurableState))$' -v
 
+      - name: Responses adapter provider compatibility regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|OpenAIChatAdapterHandlesUsageWithoutPromptTokenDetails|FacadeCompletedUsageIncludesZeroCachedTokens|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
+
+      - name: Teams durable control binding regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'TestBridge(RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding))$' -v
+          go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
+
       - name: Teams helper stats regressions
         shell: bash
         run: |

@@ -78,6 +78,12 @@ jobs:
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(ModelListShows(NeedsSetupWhenFamilyCredentialExistsWithoutProfile|DisplayNamesAndCustomDefaultModel)|ModelDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice)|TeamsModelProfileDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice))$' -v
 
+      - name: Responses adapter provider compatibility regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|OpenAIChatAdapterHandlesUsageWithoutPromptTokenDetails|FacadeCompletedUsageIncludesZeroCachedTokens|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
+
   teams-runtime-preflight:
     name: Teams runtime preflight (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -106,7 +112,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/teams -count=1 -run 'TestBridgeEnsureControlChatDoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding$' -v
+          go test ./internal/teams -count=1 -run 'TestBridge(EnsureControlChatDoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding))$' -v
+          go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
   goreleaser:
     runs-on: ubuntu-latest

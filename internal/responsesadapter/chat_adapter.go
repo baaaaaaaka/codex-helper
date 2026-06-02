@@ -115,7 +115,7 @@ func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-c
 	}
 	client := a.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultUpstreamHTTPClient()
 	}
 	resp, err := a.doChatCompletionsRequest(ctx, client, endpoint, payload)
 	if err != nil {
@@ -404,12 +404,15 @@ func chatCompletionsURL(base string) (string, error) {
 	return u.String(), nil
 }
 
-func parseChatCompletionSSE(ctx context.Context, body io.Reader, out chan<- ProviderEvent) {
+func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sawDone := false
 	inlineThink := newInlineThinkParser()
+	idleExpired, touchIdleWatch, stopIdleWatch := watchUpstreamStreamIdle(ctx, body)
+	defer stopIdleWatch()
 	for scanner.Scan() {
+		touchIdleWatch()
 		select {
 		case <-ctx.Done():
 			return
@@ -460,6 +463,15 @@ func parseChatCompletionSSE(ctx context.Context, body io.Reader, out chan<- Prov
 			out <- ProviderEvent{Kind: ProviderEventUsage, Usage: chunk.Usage.toUsage()}
 		}
 	}
+	select {
+	case <-idleExpired:
+		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("upstream chat stream idle timeout after %s", upstreamHTTPStreamIdleTimeout)}
+		return
+	default:
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	if err := scanner.Err(); err != nil {
 		out <- ProviderEvent{Kind: ProviderEventError, Err: err}
 		return
@@ -467,6 +479,58 @@ func parseChatCompletionSSE(ctx context.Context, body io.Reader, out chan<- Prov
 	if !sawDone {
 		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("upstream chat stream ended before [DONE]")}
 	}
+}
+
+func watchUpstreamStreamIdle(ctx context.Context, body io.Closer) (<-chan struct{}, func(), func()) {
+	timeout := upstreamHTTPStreamIdleTimeout
+	expired := make(chan struct{}, 1)
+	if timeout <= 0 {
+		return expired, func() {}, func() {}
+	}
+	activity := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = body.Close()
+				return
+			case <-done:
+				return
+			case <-activity:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(timeout)
+			case <-timer.C:
+				select {
+				case expired <- struct{}{}:
+				default:
+				}
+				_ = body.Close()
+				return
+			}
+		}
+	}()
+	touch := func() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+	stop := func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+	return expired, touch, stop
 }
 
 type chatCompletionChunk struct {

@@ -89,6 +89,41 @@ func TestFacadeStreamsTextLifecycleAndStoresCompletedResponse(t *testing.T) {
 	}
 }
 
+func TestFacadeCompletedUsageIncludesZeroCachedTokens(t *testing.T) {
+	facade := newTestFacade(NewMemoryStore(), fakeAdapter{
+		events: []ProviderEvent{
+			{Kind: ProviderEventTextDelta, Delta: "ok"},
+			{Kind: ProviderEventUsage, Usage: &Usage{InputTokens: 3, OutputTokens: 2, TotalTokens: 5}},
+			{Kind: ProviderEventDone},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"model-a","stream":true,"input":"say ok"}`))
+	rec := httptest.NewRecorder()
+	facade.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	completed := firstSSEEventNamed(t, events, "response.completed")
+	response, ok := completed.data["response"].(map[string]any)
+	if !ok {
+		t.Fatalf("completed response = %#v", completed.data["response"])
+	}
+	usage, ok := response["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("completed usage = %#v", response["usage"])
+	}
+	inputDetails, ok := usage["input_tokens_details"].(map[string]any)
+	if !ok {
+		t.Fatalf("completed usage missing input_tokens_details: %#v", usage)
+	}
+	if inputDetails["cached_tokens"] != float64(0) {
+		t.Fatalf("cached_tokens = %#v, want 0 in %#v", inputDetails["cached_tokens"], usage)
+	}
+}
+
 func TestFacadeReturnsNonStreamResponse(t *testing.T) {
 	facade := newTestFacade(NewMemoryStore(), fakeAdapter{
 		events: []ProviderEvent{
