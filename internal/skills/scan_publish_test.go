@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSkillNameRequiresFrontmatterDescription(t *testing.T) {
@@ -299,6 +301,56 @@ func TestPublishSkillsRejectsDuplicateExportNames(t *testing.T) {
 	}
 	if _, err := publishSkills(t.TempDir(), source, "commit", trees); err == nil || !containsString(err.Error(), "duplicate export directory") {
 		t.Fatalf("publish duplicate export error = %v", err)
+	}
+}
+
+func TestPublishSkillsRetriesTransientRenameFailure(t *testing.T) {
+	root := t.TempDir()
+	source := Source{ID: "source", Name: "acme", RemoteURL: "repo"}
+	initial := []skillTree{{
+		Name:       "review",
+		SourceDir:  "skills/review",
+		ExportName: "acme__review",
+		Files:      []treeFile{{RelPath: "SKILL.md", Mode: "100644", Data: []byte("---\nname: review\ndescription: Review\n---\ninitial\n")}},
+	}}
+	if _, err := publishSkills(root, source, "commit-1", initial); err != nil {
+		t.Fatalf("initial publishSkills: %v", err)
+	}
+
+	previousRename := skillPublishRename
+	previousSleep := skillPublishSleep
+	failures := 0
+	t.Cleanup(func() {
+		skillPublishRename = previousRename
+		skillPublishSleep = previousSleep
+	})
+	skillPublishSleep = func(time.Duration) {}
+	skillPublishRename = func(oldPath, newPath string) error {
+		if failures == 0 && strings.Contains(newPath, ".cxp-backup-") {
+			failures++
+			return &os.PathError{Op: "rename", Path: oldPath, Err: fs.ErrPermission}
+		}
+		return os.Rename(oldPath, newPath)
+	}
+
+	updated := []skillTree{{
+		Name:       "review",
+		SourceDir:  "skills/review",
+		ExportName: "acme__review",
+		Files:      []treeFile{{RelPath: "SKILL.md", Mode: "100644", Data: []byte("---\nname: review\ndescription: Review\n---\nupdated\n")}},
+	}}
+	if _, err := publishSkills(root, source, "commit-2", updated); err != nil {
+		t.Fatalf("publishSkills after transient rename failure: %v", err)
+	}
+	if failures != 1 {
+		t.Fatalf("transient rename failures = %d, want 1", failures)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "acme__review", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read updated skill: %v", err)
+	}
+	if !strings.Contains(string(data), "updated") {
+		t.Fatalf("updated skill = %q, want updated content", data)
 	}
 }
 

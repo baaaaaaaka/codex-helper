@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -24,6 +25,19 @@ import (
 const manifestFilename = ".cxp-skill-manifest.json"
 const gitLFSPointerVersion = "version https://git-lfs.github.com/spec/v1"
 const skillsLFSRemoteName = "cxp-skills-lfs"
+
+var (
+	skillPublishRename            = os.Rename
+	skillPublishSleep             = time.Sleep
+	skillPublishRenameRetryDelays = []time.Duration{
+		10 * time.Millisecond,
+		25 * time.Millisecond,
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		500 * time.Millisecond,
+	}
+)
 
 type treeFile struct {
 	RepoPath string
@@ -443,7 +457,7 @@ func publishSkills(targetRoot string, source Source, commit string, trees []skil
 		hadTarget := false
 		if _, err := os.Stat(target); err == nil {
 			hadTarget = true
-			if err := os.Rename(target, backup); err != nil {
+			if err := renameSkillPublishPath(target, backup); err != nil {
 				_ = os.RemoveAll(staging)
 				return nil, fmt.Errorf("backup existing skill %s: %w", tree.ExportName, err)
 			}
@@ -451,9 +465,9 @@ func publishSkills(targetRoot string, source Source, commit string, trees []skil
 			_ = os.RemoveAll(staging)
 			return nil, fmt.Errorf("stat existing skill %s: %w", tree.ExportName, err)
 		}
-		if err := os.Rename(staging, target); err != nil {
+		if err := renameSkillPublishPath(staging, target); err != nil {
 			if hadTarget {
-				_ = os.Rename(backup, target)
+				_ = renameSkillPublishPath(backup, target)
 			}
 			_ = os.RemoveAll(staging)
 			return nil, fmt.Errorf("publish skill %s: %w", tree.ExportName, err)
@@ -473,6 +487,33 @@ func publishSkills(targetRoot string, source Source, commit string, trees []skil
 		return nil, err
 	}
 	return installed, nil
+}
+
+func renameSkillPublishPath(oldPath, newPath string) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = skillPublishRename(oldPath, newPath)
+		if err == nil {
+			return nil
+		}
+		if attempt >= len(skillPublishRenameRetryDelays) || !isTransientSkillPublishRenameError(err) {
+			return err
+		}
+		skillPublishSleep(skillPublishRenameRetryDelays[attempt])
+	}
+}
+
+func isTransientSkillPublishRenameError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, fs.ErrPermission) || os.IsPermission(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "access is denied") ||
+		strings.Contains(msg, "being used by another process") ||
+		strings.Contains(msg, "process cannot access")
 }
 
 func refuseLocalChangesForSource(targetRoot string, sourceID string) error {
