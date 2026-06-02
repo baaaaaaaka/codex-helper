@@ -125,17 +125,28 @@ func TestManagedQwenASRTranscriberReportsRuntimeFailureWithStderr(t *testing.T) 
 
 func TestManagedQwenASRTranscriberLlamaOptInInvokesConfiguredRuntime(t *testing.T) {
 	cacheRoot := t.TempDir()
+	nativeLib := t.TempDir()
 	binary := writeManagedASRTestFile(t, cacheRoot, "bin/llama-mtmd-cli", 0o700)
 	model := writeManagedASRTestFile(t, cacheRoot, "models/qwen.gguf", 0o600)
 	mmproj := writeManagedASRTestFile(t, cacheRoot, "models/mmproj.gguf", 0o600)
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() { validateManagedASRLlamaBinaryFn = prevValidate })
+	var validatedCommand string
+	var validatedEnv []string
+	validateManagedASRLlamaBinaryFn = func(_ context.Context, command string, env []string) error {
+		validatedCommand = command
+		validatedEnv = append([]string(nil), env...)
+		return nil
+	}
 	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
-		CacheRoot:       cacheRoot,
-		Backend:         managedASRBackendLlama,
-		LlamaBinaryPath: binary,
-		LlamaModelPath:  model,
-		LlamaMMProjPath: mmproj,
-		LlamaDevice:     "cpu",
-		MinFreeBytes:    1,
+		CacheRoot:         cacheRoot,
+		Backend:           managedASRBackendLlama,
+		LlamaBinaryPath:   binary,
+		LlamaModelPath:    model,
+		LlamaMMProjPath:   mmproj,
+		LlamaDevice:       "cpu",
+		NativeLibraryPath: nativeLib,
+		MinFreeBytes:      1,
 	})
 	var gotCommand string
 	var gotArgs []string
@@ -167,6 +178,9 @@ func TestManagedQwenASRTranscriberLlamaOptInInvokesConfiguredRuntime(t *testing.
 	if gotCommand != binary {
 		t.Fatalf("llama command = %q, want %q", gotCommand, binary)
 	}
+	if validatedCommand != binary {
+		t.Fatalf("validated llama command = %q, want %q", validatedCommand, binary)
+	}
 	requirePlainTextInOrder(t, strings.Join(gotArgs, "\n"),
 		"-m", model,
 		"--mmproj", mmproj,
@@ -179,6 +193,12 @@ func TestManagedQwenASRTranscriberLlamaOptInInvokesConfiguredRuntime(t *testing.
 	env := envSliceToMap(gotEnv)
 	if env["CODEX_HELPER_TEAMS_ASR_THREADS"] != "4" || env["CODEX_HELPER_TEAMS_ASR_SPEED"] != "1x" {
 		t.Fatalf("llama env missing ASR controls: %#v", env)
+	}
+	if !strings.Contains(env[managedASRNativeLibraryEnvKey()], nativeLib) {
+		t.Fatalf("llama run env missing native library path %q: %#v", nativeLib, env)
+	}
+	if !strings.Contains(envSliceToMap(validatedEnv)[managedASRNativeLibraryEnvKey()], nativeLib) {
+		t.Fatalf("llama validation env missing native library path %q: %#v", nativeLib, validatedEnv)
 	}
 }
 
@@ -225,6 +245,9 @@ func TestManagedQwenASRTranscriberAutoDoesNotFallbackFromLlamaRuntimeFailure(t *
 	binary := writeManagedASRTestFile(t, cacheRoot, "bin/llama-mtmd-cli", 0o700)
 	model := writeManagedASRTestFile(t, cacheRoot, "models/qwen.gguf", 0o600)
 	mmproj := writeManagedASRTestFile(t, cacheRoot, "models/mmproj.gguf", 0o600)
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() { validateManagedASRLlamaBinaryFn = prevValidate })
+	validateManagedASRLlamaBinaryFn = func(context.Context, string, []string) error { return nil }
 	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
 		CacheRoot:       cacheRoot,
 		Backend:         managedASRBackendAuto,
@@ -251,8 +274,143 @@ func TestManagedQwenASRTranscriberAutoDoesNotFallbackFromLlamaRuntimeFailure(t *
 	}
 }
 
+func TestManagedQwenASRTranscriberAutoRetriesAcceleratedLlamaRuntimeWithCPU(t *testing.T) {
+	cacheRoot := t.TempDir()
+	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
+		CacheRoot:    cacheRoot,
+		Backend:      managedASRBackendAuto,
+		MinFreeBytes: 1,
+	})
+	var requestedDevices []string
+	transcriber.ensureLlamaRuntime = func(_ context.Context, cfg ManagedASRConfig) (managedASRLlamaRuntime, error) {
+		device := firstNonEmptyString(strings.TrimSpace(cfg.LlamaDevice), "vulkan")
+		requestedDevices = append(requestedDevices, device)
+		return managedASRLlamaRuntime{
+			Command:    "/opt/llama/llama-mtmd-cli",
+			CacheRoot:  cacheRoot,
+			ModelID:    DefaultManagedASRModelID,
+			ModelPath:  "/models/qwen.gguf",
+			MMProjPath: "/models/mmproj.gguf",
+			Device:     device,
+			Env:        []string{"LLAMA_ENV=1"},
+		}, nil
+	}
+	var runDevices []string
+	transcriber.runLlamaCommand = func(_ context.Context, _ string, args []string, _ []string, stdout *bytes.Buffer, stderr *bytes.Buffer) error {
+		if managedASRTestHasArg(args, "--device") {
+			runDevices = append(runDevices, "cpu")
+			_, _ = stdout.WriteString("<asr_text>\ncpu transcript\n")
+			return nil
+		}
+		runDevices = append(runDevices, "vulkan")
+		_, _ = stderr.WriteString("vulkan backend failed to initialize")
+		return errors.New("exit status 1")
+	}
+	transcriber.ensureRuntime = func(context.Context, ManagedASRConfig) (managedASRRuntime, error) {
+		t.Fatal("accelerated llama runtime failure should retry CPU before transformers")
+		return managedASRRuntime{}, nil
+	}
+
+	transcript, err := transcriber.TranscribeTeamsMedia(context.Background(), ASRTranscribeInput{
+		File:     LocalAttachment{Path: "/tmp/input.wav", ContentType: "audio/wav"},
+		Language: defaultASRLanguage,
+		Speed:    "1x",
+	})
+	if err != nil {
+		t.Fatalf("TranscribeTeamsMedia error: %v", err)
+	}
+	if transcript.Text != "cpu transcript" || transcript.Backend != "qwen-asr-llama/cpu" || !strings.Contains(transcript.Warning, "retried with CPU") {
+		t.Fatalf("CPU retry transcript = %#v", transcript)
+	}
+	if !reflect.DeepEqual(requestedDevices, []string{"vulkan", "cpu"}) {
+		t.Fatalf("requested devices = %#v, want accelerated then cpu", requestedDevices)
+	}
+	if !reflect.DeepEqual(runDevices, []string{"vulkan", "cpu"}) {
+		t.Fatalf("run devices = %#v, want accelerated then cpu", runDevices)
+	}
+}
+
+func TestManagedQwenASRTranscriberAutoDoesNotFallbackToTransformersForNativeLlamaRuntimeFailure(t *testing.T) {
+	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
+		CacheRoot:    t.TempDir(),
+		Backend:      managedASRBackendAuto,
+		MinFreeBytes: 1,
+	})
+	transcriber.ensureLlamaRuntime = func(context.Context, ManagedASRConfig) (managedASRLlamaRuntime, error) {
+		return managedASRLlamaRuntime{}, managedASRLlamaFallbackError{
+			Err: errors.New("downloaded llama.cpp runtime is not usable: exit status 0xc0000135"),
+		}
+	}
+	transcriber.ensureRuntime = func(context.Context, ManagedASRConfig) (managedASRRuntime, error) {
+		t.Fatal("native llama runtime dependency failure should not invoke transformers fallback")
+		return managedASRRuntime{}, nil
+	}
+	_, err := transcriber.TranscribeTeamsMedia(context.Background(), ASRTranscribeInput{
+		File:     LocalAttachment{Path: "/tmp/input.wav", ContentType: "audio/wav"},
+		Language: defaultASRLanguage,
+		Speed:    "1x",
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "0xc0000135") {
+		t.Fatalf("native llama runtime error = %v, want direct native failure", err)
+	}
+}
+
+func TestManagedQwenASRTranscriberWarmUpAutoUsesLlamaRuntimeFirst(t *testing.T) {
+	cacheRoot := t.TempDir()
+	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
+		CacheRoot:    cacheRoot,
+		Backend:      managedASRBackendAuto,
+		MinFreeBytes: 1,
+	})
+	var gotConfig ManagedASRConfig
+	transcriber.ensureLlamaRuntime = func(_ context.Context, cfg ManagedASRConfig) (managedASRLlamaRuntime, error) {
+		gotConfig = cfg
+		return managedASRLlamaRuntime{
+			Command:    "/opt/llama/llama-mtmd-cli",
+			CacheRoot:  cacheRoot,
+			ModelID:    DefaultManagedASRModelID,
+			ModelPath:  "/models/qwen.gguf",
+			MMProjPath: "/models/mmproj.gguf",
+			Device:     "cpu",
+			FFmpegPath: "/opt/ffmpeg",
+		}, nil
+	}
+	transcriber.ensureRuntime = func(context.Context, ManagedASRConfig) (managedASRRuntime, error) {
+		t.Fatal("successful llama warm-up should not invoke transformers setup")
+		return managedASRRuntime{}, nil
+	}
+	if err := transcriber.WarmUpTeamsASR(context.Background()); err != nil {
+		t.Fatalf("WarmUpTeamsASR error: %v", err)
+	}
+	if gotConfig.CacheRoot != cacheRoot || gotConfig.Backend != managedASRBackendAuto {
+		t.Fatalf("warm-up llama config = %#v", gotConfig)
+	}
+}
+
+func TestManagedQwenASRTranscriberWarmUpAutoDoesNotFallbackToTransformersForNativeLlamaFailure(t *testing.T) {
+	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
+		CacheRoot:    t.TempDir(),
+		Backend:      managedASRBackendAuto,
+		MinFreeBytes: 1,
+	})
+	transcriber.ensureLlamaRuntime = func(context.Context, ManagedASRConfig) (managedASRLlamaRuntime, error) {
+		return managedASRLlamaRuntime{}, managedASRLlamaFallbackError{
+			Err: errors.New("downloaded llama.cpp runtime is not usable: exit status 0xc0000135"),
+		}
+	}
+	transcriber.ensureRuntime = func(context.Context, ManagedASRConfig) (managedASRRuntime, error) {
+		t.Fatal("native llama warm-up failure should not invoke transformers setup")
+		return managedASRRuntime{}, nil
+	}
+	err := transcriber.WarmUpTeamsASR(context.Background())
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "0xc0000135") {
+		t.Fatalf("native llama warm-up error = %v, want direct native failure", err)
+	}
+}
+
 func TestManagedQwenASRTranscriberDefaultDownloadsManagedLlamaRuntime(t *testing.T) {
 	cacheRoot := t.TempDir()
+	nativeLib := t.TempDir()
 	binaryArchive := buildManagedASRLlamaTestArchive(t)
 	modelData := []byte("test qwen gguf")
 	mmprojData := []byte("test mmproj gguf")
@@ -321,8 +479,9 @@ func TestManagedQwenASRTranscriberDefaultDownloadsManagedLlamaRuntime(t *testing
 	}
 
 	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
-		CacheRoot:    cacheRoot,
-		MinFreeBytes: 1,
+		CacheRoot:         cacheRoot,
+		NativeLibraryPath: nativeLib,
+		MinFreeBytes:      1,
 	})
 	transcriber.ensureRuntime = func(context.Context, ManagedASRConfig) (managedASRRuntime, error) {
 		t.Fatal("default auto backend should use managed llama before transformers")
@@ -361,11 +520,17 @@ func TestManagedQwenASRTranscriberDefaultDownloadsManagedLlamaRuntime(t *testing
 	if !strings.Contains(strings.Join(validatedEnv, string(os.PathListSeparator)), filepath.Join("llama", "bin")) {
 		t.Fatalf("validated llama env should include nested archive bin dir, got %#v", validatedEnv)
 	}
+	if !strings.Contains(envSliceToMap(validatedEnv)[managedASRNativeLibraryEnvKey()], nativeLib) {
+		t.Fatalf("validated llama env missing native library path %q: %#v", nativeLib, validatedEnv)
+	}
 	if !strings.Contains(gotCommand, filepath.Join(cacheRoot, "llama", "runtime")) {
 		t.Fatalf("llama command = %q, want installed cache runtime", gotCommand)
 	}
 	if !strings.Contains(strings.Join(gotEnv, string(os.PathListSeparator)), filepath.Join(cacheRoot, "llama", "runtime", "llama", "bin")) {
 		t.Fatalf("llama run env should include installed archive bin dir, got %#v", gotEnv)
+	}
+	if !strings.Contains(envSliceToMap(gotEnv)[managedASRNativeLibraryEnvKey()], nativeLib) {
+		t.Fatalf("llama run env missing native library path %q: %#v", nativeLib, gotEnv)
 	}
 	requirePlainTextInOrder(t, strings.Join(gotArgs, "\n"),
 		"-m", filepath.Join(cacheRoot, "llama", "models", "test-qwen3-asr", "model.gguf"),
@@ -551,7 +716,7 @@ func TestManagedASRLlamaRuntimeConcurrentSetupReusesSingleInstall(t *testing.T) 
 	}
 }
 
-func TestManagedASRLlamaBinaryInstallFallsBackToCPUAssetWhenAcceleratedValidationFails(t *testing.T) {
+func TestManagedASRLlamaBinaryDefaultInstallsCPUAssetWithoutAcceleratedProbe(t *testing.T) {
 	cacheRoot := t.TempDir()
 	vulkanArchive := buildManagedASRLlamaTestArchiveWithRoot(t, "vulkan")
 	cpuArchive := buildManagedASRLlamaTestArchiveWithRoot(t, "cpu")
@@ -601,34 +766,31 @@ func TestManagedASRLlamaBinaryInstallFallsBackToCPUAssetWhenAcceleratedValidatio
 	var validations []string
 	validateManagedASRLlamaBinaryFn = func(_ context.Context, command string, _ []string) error {
 		validations = append(validations, command)
-		if strings.Contains(command, string(os.PathSeparator)+"vulkan"+string(os.PathSeparator)) {
-			return errors.New("vulkan runtime cannot start")
-		}
 		return nil
 	}
 
 	command, _, acceleration, err := ensureManagedASRLlamaBinary(context.Background(), filepath.Join(cacheRoot, "llama"), ManagedASRConfig{})
 	if err != nil {
-		t.Fatalf("cpu fallback install error: %v", err)
+		t.Fatalf("default cpu install error: %v", err)
 	}
 	if !strings.Contains(command, string(os.PathSeparator)+"cpu"+string(os.PathSeparator)) {
-		t.Fatalf("fallback command = %q, want cpu archive command", command)
+		t.Fatalf("default command = %q, want cpu archive command", command)
 	}
 	if acceleration != "cpu" {
-		t.Fatalf("fallback acceleration = %q, want cpu", acceleration)
+		t.Fatalf("default acceleration = %q, want cpu", acceleration)
 	}
-	if downloads["/vulkan.tar.gz"] != 1 || downloads["/cpu.tar.gz"] != 1 {
-		t.Fatalf("downloads = %#v, want accelerated attempt then cpu fallback", downloads)
+	if downloads["/vulkan.tar.gz"] != 0 || downloads["/cpu.tar.gz"] != 1 {
+		t.Fatalf("downloads = %#v, want only cpu asset by default", downloads)
 	}
-	if len(validations) != 2 {
-		t.Fatalf("validations = %#v, want both runtime candidates validated", validations)
+	if len(validations) != 1 {
+		t.Fatalf("validations = %#v, want only cpu runtime validated", validations)
 	}
 	data, err := os.ReadFile(filepath.Join(cacheRoot, "llama", "runtime", "runtime.json"))
 	if err != nil {
 		t.Fatalf("read runtime marker: %v", err)
 	}
 	if !strings.Contains(string(data), `"acceleration": "cpu"`) || !strings.Contains(string(data), `"asset_name": "cpu.tar.gz"`) {
-		t.Fatalf("runtime marker did not record cpu fallback:\n%s", data)
+		t.Fatalf("runtime marker did not record default cpu runtime:\n%s", data)
 	}
 }
 
@@ -693,6 +855,67 @@ func TestManagedASRLlamaBinaryInstallHonorsExplicitCPUDevice(t *testing.T) {
 	}
 }
 
+func TestManagedASRLlamaBinaryInstallHonorsExplicitAcceleratedDevice(t *testing.T) {
+	cacheRoot := t.TempDir()
+	vulkanArchive := buildManagedASRLlamaTestArchiveWithRoot(t, "vulkan")
+	cpuArchive := buildManagedASRLlamaTestArchiveWithRoot(t, "cpu")
+	downloads := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads[r.URL.Path]++
+		switch r.URL.Path {
+		case "/vulkan.tar.gz":
+			_, _ = w.Write(vulkanArchive)
+		case "/cpu.tar.gz":
+			_, _ = w.Write(cpuArchive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	prevHTTPClient := managedASRLlamaHTTPClient
+	prevAssets := managedASRLlamaBinaryAssetsFn
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() {
+		managedASRLlamaHTTPClient = prevHTTPClient
+		managedASRLlamaBinaryAssetsFn = prevAssets
+		validateManagedASRLlamaBinaryFn = prevValidate
+	})
+	managedASRLlamaHTTPClient = server.Client()
+	managedASRLlamaBinaryAssetsFn = func(string, string) ([]managedASRLlamaAsset, error) {
+		return []managedASRLlamaAsset{
+			{
+				Name:         "vulkan.tar.gz",
+				URL:          server.URL + "/vulkan.tar.gz",
+				SHA256:       managedASRTestSHA256(vulkanArchive),
+				Size:         int64(len(vulkanArchive)),
+				ArchiveKind:  "tar.gz",
+				Acceleration: "vulkan",
+			},
+			{
+				Name:         "cpu.tar.gz",
+				URL:          server.URL + "/cpu.tar.gz",
+				SHA256:       managedASRTestSHA256(cpuArchive),
+				Size:         int64(len(cpuArchive)),
+				ArchiveKind:  "tar.gz",
+				Acceleration: "cpu",
+			},
+		}, nil
+	}
+	validateManagedASRLlamaBinaryFn = func(context.Context, string, []string) error { return nil }
+
+	command, _, acceleration, err := ensureManagedASRLlamaBinary(context.Background(), filepath.Join(cacheRoot, "llama"), ManagedASRConfig{LlamaDevice: "vulkan"})
+	if err != nil {
+		t.Fatalf("vulkan device install error: %v", err)
+	}
+	if !strings.Contains(command, string(os.PathSeparator)+"vulkan"+string(os.PathSeparator)) || acceleration != "vulkan" {
+		t.Fatalf("vulkan device command = %q acceleration = %q", command, acceleration)
+	}
+	if downloads["/vulkan.tar.gz"] != 1 || downloads["/cpu.tar.gz"] != 0 {
+		t.Fatalf("downloads = %#v, want only explicit accelerated asset", downloads)
+	}
+}
+
 func TestManagedASRLlamaAssetMatrixCoversExpectedAccelerationFallbacks(t *testing.T) {
 	cases := []struct {
 		name             string
@@ -701,11 +924,11 @@ func TestManagedASRLlamaAssetMatrixCoversExpectedAccelerationFallbacks(t *testin
 		wantAcceleration []string
 		wantArchive      string
 	}{
-		{name: "linux amd64", goos: "linux", goarch: "amd64", wantAcceleration: []string{"vulkan", "cpu"}, wantArchive: "tar.gz"},
-		{name: "linux arm64", goos: "linux", goarch: "arm64", wantAcceleration: []string{"vulkan", "cpu"}, wantArchive: "tar.gz"},
+		{name: "linux amd64", goos: "linux", goarch: "amd64", wantAcceleration: []string{"cpu", "vulkan"}, wantArchive: "tar.gz"},
+		{name: "linux arm64", goos: "linux", goarch: "arm64", wantAcceleration: []string{"cpu", "vulkan"}, wantArchive: "tar.gz"},
 		{name: "darwin amd64", goos: "darwin", goarch: "amd64", wantAcceleration: []string{"metal"}, wantArchive: "tar.gz"},
 		{name: "darwin arm64", goos: "darwin", goarch: "arm64", wantAcceleration: []string{"metal"}, wantArchive: "tar.gz"},
-		{name: "windows amd64", goos: "windows", goarch: "amd64", wantAcceleration: []string{"vulkan", "cpu"}, wantArchive: "zip"},
+		{name: "windows amd64", goos: "windows", goarch: "amd64", wantAcceleration: []string{"cpu", "vulkan"}, wantArchive: "zip"},
 		{name: "windows arm64", goos: "windows", goarch: "arm64", wantAcceleration: []string{"cpu"}, wantArchive: "zip"},
 	}
 	for _, tc := range cases {
@@ -726,6 +949,53 @@ func TestManagedASRLlamaAssetMatrixCoversExpectedAccelerationFallbacks(t *testin
 	}
 	if _, err := managedASRLlamaBinaryAssets("linux", "386"); err == nil {
 		t.Fatal("unsupported llama platform should return an error")
+	}
+}
+
+func TestManagedASRLlamaAssetMatrixRejectsLinuxMuslUntilDedicatedAssetExists(t *testing.T) {
+	prevLibc := managedASRLlamaLinuxLibcFn
+	t.Cleanup(func() { managedASRLlamaLinuxLibcFn = prevLibc })
+	managedASRLlamaLinuxLibcFn = func() string { return "musl" }
+
+	_, err := managedASRLlamaBinaryAssets("linux", "amd64")
+	if err == nil || !strings.Contains(err.Error(), "musl runtime asset") {
+		t.Fatalf("linux musl asset error = %v, want explicit unsupported musl asset message", err)
+	}
+}
+
+func TestManagedASRLlamaAssetsForDeviceUsesCPUDefaultOnLinuxAndWindows(t *testing.T) {
+	assets := []managedASRLlamaAsset{
+		{Name: "vulkan", Acceleration: "vulkan"},
+		{Name: "cpu", Acceleration: "cpu"},
+	}
+	for _, goos := range []string{"linux", "windows"} {
+		t.Run(goos, func(t *testing.T) {
+			got, err := managedASRLlamaAssetsForDeviceOnGOOS(assets, "", goos)
+			if err != nil {
+				t.Fatalf("default assets error: %v", err)
+			}
+			if len(got) != 1 || got[0].Name != "cpu" || got[0].Acceleration != "cpu" {
+				t.Fatalf("default assets = %#v, want only cpu", got)
+			}
+			got, err = managedASRLlamaAssetsForDeviceOnGOOS(assets, "vulkan", goos)
+			if err != nil {
+				t.Fatalf("vulkan assets error: %v", err)
+			}
+			if len(got) != 1 || got[0].Name != "vulkan" || got[0].Acceleration != "vulkan" {
+				t.Fatalf("vulkan assets = %#v, want only vulkan", got)
+			}
+		})
+	}
+}
+
+func TestManagedASRLlamaAssetsForDeviceAllowsDarwinCPUModeWithMetalAsset(t *testing.T) {
+	assets := []managedASRLlamaAsset{{Name: "macos-metal", Acceleration: "metal"}}
+	got, err := managedASRLlamaAssetsForDeviceOnGOOS(assets, "cpu", "darwin")
+	if err != nil {
+		t.Fatalf("darwin cpu assets error: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "macos-metal" || got[0].Acceleration != "cpu" {
+		t.Fatalf("darwin cpu assets = %#v, want metal asset forced to cpu mode", got)
 	}
 }
 
@@ -912,7 +1182,7 @@ func TestEnsureManagedASRFFmpegInstallsAndReusesManagedWheel(t *testing.T) {
 			Size:   int64(len(ffmpegWheel)),
 		}, nil
 	}
-	validateManagedASRFFmpegBinaryFn = func(context.Context, string) error { return nil }
+	validateManagedASRFFmpegBinaryFn = func(context.Context, string, []string) error { return nil }
 
 	first, err := ensureManagedASRFFmpeg(context.Background(), filepath.Join(cacheRoot, "ffmpeg"))
 	if err != nil {
@@ -992,6 +1262,40 @@ func TestPrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg(t *testing.T) {
 	}
 }
 
+func TestManagedASRNativeLibraryPathRejectsMissingDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-native-libs")
+	_, err := ensureManagedASRLlamaRuntime(context.Background(), ManagedASRConfig{
+		CacheRoot:         t.TempDir(),
+		NativeLibraryPath: missing,
+		MinFreeBytes:      1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "configured ASR native library path is not usable") {
+		t.Fatalf("missing native library path error = %v", err)
+	}
+}
+
+func TestManagedASRNativeRuntimeFailureHintClassifiesCommonLoaderErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		detail string
+		want   string
+	}{
+		{name: "windows dll not found", err: errors.New("exit status 0xc0000135"), want: "Windows native DLL is missing"},
+		{name: "linux shared library", err: errors.New("exit status 127"), detail: "error while loading shared libraries: libstdc++.so.6: cannot open shared object file", want: "Linux shared library"},
+		{name: "glibc floor", err: errors.New("exit status 1"), detail: "version `GLIBC_2.38' not found", want: "newer glibc"},
+		{name: "macos dyld", err: errors.New("exit status 1"), detail: "Library not loaded: @rpath/libomp.dylib image not found", want: "macOS dynamic library"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hint := managedASRNativeRuntimeFailureHint("llama.cpp", tc.err, tc.detail)
+			if !strings.Contains(hint, tc.want) {
+				t.Fatalf("hint = %q, want %q", hint, tc.want)
+			}
+		})
+	}
+}
+
 func TestManagedQwenASRTranscriberExplicitLlamaRejectsConfiguredMissingBinary(t *testing.T) {
 	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
 		Backend:         managedASRBackendLlama,
@@ -1022,6 +1326,15 @@ func writeManagedASRTestFile(t *testing.T, root string, name string, mode os.Fil
 		t.Fatalf("write test file: %v", err)
 	}
 	return path
+}
+
+func managedASRTestHasArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestManagedASRLlamaConfigUsesLightweightDiskPreflight(t *testing.T) {

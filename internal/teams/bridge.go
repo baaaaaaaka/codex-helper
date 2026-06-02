@@ -46,6 +46,7 @@ const (
 	persistentPollFailureRestartAfter       = 10 * time.Minute
 	persistentPollFailureRestartMinCount    = 3
 	recentDuplicateSessionPromptWindow      = 3 * time.Minute
+	teamsASRWarmUpTimeout                   = 20 * time.Minute
 
 	// Automatic transcript sync is for small local Codex CLI catch-up. Large
 	// history import must stay explicit, otherwise helper startup can flood a
@@ -838,6 +839,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		_, _ = fmt.Fprintf(b.out, "Teams control chat: %s\n", chat.WebURL)
 		_, _ = fmt.Fprintln(b.out, "Listening. Send `help`, `p`, or `n <directory>` in the control chat.")
 	}
+	b.startASRWarmUp(ctx)
 	for {
 		if teamsStartupFallbackStopRequested() {
 			if b.out != nil {
@@ -959,6 +961,23 @@ func (b *Bridge) initializeControlChatAndRecoveryWithRegistrySync(ctx context.Co
 		return Chat{}, err
 	}
 	return chat, nil
+}
+
+func (b *Bridge) startASRWarmUp(ctx context.Context) {
+	if b == nil || !teamsASRTranscriberConfigured(b.asrTranscriber) {
+		return
+	}
+	warmable, ok := b.asrTranscriber.(ASRWarmUpTranscriber)
+	if !ok || warmable == nil {
+		return
+	}
+	go func() {
+		warmCtx, cancel := context.WithTimeout(ctx, teamsASRWarmUpTimeout)
+		defer cancel()
+		if err := warmable.WarmUpTeamsASR(warmCtx); err != nil && warmCtx.Err() == nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams ASR warm-up failed: %v\n", err)
+		}
+	}()
 }
 
 func (b *Bridge) boostPolling(now time.Time) {
@@ -3084,6 +3103,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.updateHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandWebhook:
 			return b.workflowWebhookFromControl(ctx, msg, parsed.Argument)
+		case DashboardCommandASR:
+			return b.asrFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandSelect:
 			message, err := b.resolveControlSelection(ctx, parsed.Target)
 			if err != nil {
@@ -3497,6 +3518,7 @@ func controlAdvancedHelpText() string {
 		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
 		"- `helper update now` - update to the latest stable helper release",
 		"- `helper update prerelease` - update to the newest helper release or pre-release",
+		"- `helper asr status` / `helper asr warmup` - inspect or pre-warm local Teams speech recognition",
 		"- `helper webhook setup` - show a guided Workflow webhook setup flow",
 		"- `helper webhook <url>` - enable Workflow notification cards with a Teams Workflow webhook URL",
 		"- `helper webhook off` - disable Workflow notification cards",
@@ -3529,6 +3551,74 @@ func controlAdvancedHelpText() string {
 		"`n /home/baka/project/codex-helper`",
 		"`m ~/tmp/mobile-fix`",
 	}, "\n")
+}
+
+func (b *Bridge) asrFromControl(ctx context.Context, msg ChatMessage, arg string) error {
+	name, _ := splitDashboardCommandBody(strings.TrimSpace(arg))
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "help", "?":
+		return b.sendControl(ctx, teamsASRControlHelpText(b.asrTranscriber))
+	case "status", "st":
+		return b.sendControl(ctx, teamsASRControlStatusText(b.asrTranscriber))
+	case "warm", "warmup", "warm-up", "prewarm", "pre-warm", "setup", "preflight":
+		return b.startASRWarmUpFromControl(ctx, msg)
+	default:
+		return b.sendControl(ctx, teamsASRControlHelpText(b.asrTranscriber))
+	}
+}
+
+func teamsASRControlHelpText(transcriber ASRTranscriber) string {
+	return strings.Join([]string{
+		"## Speech recognition",
+		"",
+		teamsASRStatusLine(transcriber),
+		"",
+		"Commands:",
+		"- `helper asr status` - show local ASR readiness mode",
+		"- `helper asr warmup` - pre-download and validate managed local ASR runtime assets",
+	}, "\n")
+}
+
+func teamsASRControlStatusText(transcriber ASRTranscriber) string {
+	return strings.Join([]string{
+		"## Speech recognition status",
+		"",
+		teamsASRStatusLine(transcriber),
+		"",
+		"Managed ASR warm-up runs automatically after the helper starts. Send `helper asr warmup` to retry it now.",
+	}, "\n")
+}
+
+func (b *Bridge) startASRWarmUpFromControl(ctx context.Context, msg ChatMessage) error {
+	if !teamsASRTranscriberConfigured(b.asrTranscriber) {
+		return b.sendControl(ctx, teamsASRFailureUserMessage(errASRCommandNotConfigured))
+	}
+	warmable, ok := b.asrTranscriber.(ASRWarmUpTranscriber)
+	if !ok || warmable == nil {
+		return b.sendControl(ctx, "Speech recognition is configured, but this ASR backend does not support managed warm-up.")
+	}
+	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_asr_warmup"); err != nil {
+		return err
+	} else if duplicate {
+		return nil
+	}
+	if err := b.sendControl(ctx, "Speech recognition warm-up started. I will send a follow-up when it finishes."); err != nil {
+		return err
+	}
+	go func() {
+		warmCtx, cancel := context.WithTimeout(context.Background(), teamsASRWarmUpTimeout)
+		defer cancel()
+		if err := warmable.WarmUpTeamsASR(warmCtx); err != nil {
+			if warmCtx.Err() != nil {
+				_ = b.sendControl(context.Background(), "Speech recognition warm-up timed out. It will retry automatically when Teams media is received.")
+				return
+			}
+			_ = b.sendControl(context.Background(), "Speech recognition warm-up failed: "+teamsASRUserFailureDetail(err))
+			return
+		}
+		_ = b.sendControl(context.Background(), "Speech recognition warm-up completed. Teams voice/video transcription is ready to use.")
+	}()
+	return nil
 }
 
 func sessionHelpText() string {

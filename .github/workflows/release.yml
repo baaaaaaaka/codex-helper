@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asr_pattern='Test(ManagedQwenASRTranscriber(LlamaOptInInvokesConfiguredRuntime|AutoFallsBackToTransformers|AutoDoesNotFallbackFromLlamaRuntimeFailure|DefaultDownloadsManagedLlamaRuntime|ExplicitLlamaRejectsConfiguredMissingBinary)|ManagedASR(ParseLlamaOutputHandlesLanguageColon|Llama(ConfigUsesLightweightDiskPreflight|ModelMarkerRejectsCorruptCachedFile|RuntimeConcurrentSetupReusesSingleInstall|BinaryInstall(FallsBackToCPUAssetWhenAcceleratedValidationFails|HonorsExplicitCPUDevice)|AssetMatrixCoversExpectedAccelerationFallbacks)|FFmpegWheelAssetMatrixCoversExpectedPlatforms)|EnsureManagedASRFFmpegInstallsAndReusesManagedWheel|DownloadManagedASRLlamaFile(RejectsSizeAndHashMismatch|RetriesAndReplacesExistingTarget)|ExtractManagedASRZipRejectsUnsafePath|PrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg)$'
+          asr_pattern='Test(ManagedQwenASRTranscriber|ManagedASR|EnsureManagedASRFFmpeg|DownloadManagedASRLlamaFile|ExtractManagedASRZip|PrepareManagedASRAudioForLlama|Bridge(StartASRWarmUp|ControlASR)|TeamsASRStatusLine|TranscribeTeamsMediaAttachments)'
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 

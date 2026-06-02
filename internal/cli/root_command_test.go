@@ -236,6 +236,7 @@ func TestTeamsASRTranscriberReadsManagedLlamaEnv(t *testing.T) {
 	t.Setenv(envTeamsASRLlamaMMProj, "/models/mmproj.gguf")
 	t.Setenv(envTeamsASRLlamaDevice, "cpu")
 	t.Setenv(envTeamsASRFFmpeg, "/opt/ffmpeg")
+	t.Setenv(envTeamsASRNativeLibraryPath, "/opt/asr-native-libs")
 
 	transcriber := teamsASRTranscriberFromConfig("", nil)
 	managed, ok := transcriber.(*teams.ManagedASRTranscriber)
@@ -247,7 +248,8 @@ func TestTeamsASRTranscriberReadsManagedLlamaEnv(t *testing.T) {
 		managed.Config.LlamaModelPath != "/models/qwen.gguf" ||
 		managed.Config.LlamaMMProjPath != "/models/mmproj.gguf" ||
 		managed.Config.LlamaDevice != "cpu" ||
-		managed.Config.FFmpegPath != "/opt/ffmpeg" {
+		managed.Config.FFmpegPath != "/opt/ffmpeg" ||
+		managed.Config.NativeLibraryPath != "/opt/asr-native-libs" {
 		t.Fatalf("managed ASR config from env = %#v", managed.Config)
 	}
 }

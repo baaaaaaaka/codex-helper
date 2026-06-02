@@ -35,6 +35,7 @@ const (
 	envTeamsASRLlamaMMProj            = "CODEX_HELPER_TEAMS_ASR_LLAMA_MMPROJ"
 	envTeamsASRLlamaDevice            = "CODEX_HELPER_TEAMS_ASR_LLAMA_DEVICE"
 	envTeamsASRFFmpeg                 = "CODEX_HELPER_TEAMS_ASR_FFMPEG"
+	envTeamsASRNativeLibraryPath      = "CODEX_HELPER_TEAMS_ASR_NATIVE_LIBRARY_PATH"
 )
 
 var (
@@ -827,12 +828,13 @@ func teamsASRServiceEnvironmentOverrides(command string, args []string) map[stri
 
 func teamsASRManagedConfigFromEnv() teams.ManagedASRConfig {
 	return teams.ManagedASRConfig{
-		Backend:         strings.TrimSpace(os.Getenv(envTeamsASRBackend)),
-		LlamaBinaryPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaBinary)),
-		LlamaModelPath:  strings.TrimSpace(os.Getenv(envTeamsASRLlamaModel)),
-		LlamaMMProjPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaMMProj)),
-		LlamaDevice:     strings.TrimSpace(os.Getenv(envTeamsASRLlamaDevice)),
-		FFmpegPath:      strings.TrimSpace(os.Getenv(envTeamsASRFFmpeg)),
+		Backend:           strings.TrimSpace(os.Getenv(envTeamsASRBackend)),
+		LlamaBinaryPath:   strings.TrimSpace(os.Getenv(envTeamsASRLlamaBinary)),
+		LlamaModelPath:    strings.TrimSpace(os.Getenv(envTeamsASRLlamaModel)),
+		LlamaMMProjPath:   strings.TrimSpace(os.Getenv(envTeamsASRLlamaMMProj)),
+		LlamaDevice:       strings.TrimSpace(os.Getenv(envTeamsASRLlamaDevice)),
+		FFmpegPath:        strings.TrimSpace(os.Getenv(envTeamsASRFFmpeg)),
+		NativeLibraryPath: strings.TrimSpace(os.Getenv(envTeamsASRNativeLibraryPath)),
 	}
 }
 
@@ -844,6 +846,7 @@ func teamsASRManagedEnvironmentKeys() []string {
 		envTeamsASRLlamaMMProj,
 		envTeamsASRLlamaDevice,
 		envTeamsASRFFmpeg,
+		envTeamsASRNativeLibraryPath,
 	}
 }
 

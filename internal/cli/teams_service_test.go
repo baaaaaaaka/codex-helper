@@ -3145,6 +3145,7 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	t.Setenv(envTeamsASRLlamaMMProj, filepath.Join(tmp, "models", "mmproj.gguf"))
 	t.Setenv(envTeamsASRLlamaDevice, "cpu")
 	t.Setenv(envTeamsASRFFmpeg, filepath.Join(tmp, "bin", "ffmpeg"))
+	t.Setenv(envTeamsASRNativeLibraryPath, filepath.Join(tmp, "native libs"))
 	t.Setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	exePath := filepath.Join(tmp, "bin", "codex-proxy")
@@ -3180,6 +3181,7 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 		"Environment=" + systemdQuoteArg(envTeamsASRLlamaMMProj+"="+filepath.Join(tmp, "models", "mmproj.gguf")),
 		"Environment=" + systemdQuoteArg(envTeamsASRLlamaDevice+"=cpu"),
 		"Environment=" + systemdQuoteArg(envTeamsASRFFmpeg+"="+filepath.Join(tmp, "bin", "ffmpeg")),
+		"Environment=" + systemdQuoteArg(envTeamsASRNativeLibraryPath+"="+filepath.Join(tmp, "native libs")),
 		"Environment=" + systemdQuoteArg("HTTPS_PROXY=http://proxy.example.test:8080"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_SERVICE_MODE=background"),
 	} {

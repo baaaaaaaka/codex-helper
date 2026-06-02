@@ -52,6 +52,10 @@ type ASRTranscriber interface {
 	TranscribeTeamsMedia(ctx context.Context, input ASRTranscribeInput) (ASRTranscript, error)
 }
 
+type ASRWarmUpTranscriber interface {
+	WarmUpTeamsASR(ctx context.Context) error
+}
+
 func isTeamsMediaAttachment(file LocalAttachment) bool {
 	contentType := strings.ToLower(strings.TrimSpace(strings.Split(file.ContentType, ";")[0]))
 	switch {
@@ -233,7 +237,31 @@ func teamsASRFailureUserMessage(err error) string {
 	if errors.Is(err, errASRCommandNotConfigured) {
 		return "Teams voice/video transcription is not ready on this helper yet. I received Teams media, but I did not send the raw audio/video to Codex. cxp should prepare local speech recognition automatically; please update/reload the helper and try again."
 	}
-	return "Teams media transcription failed: " + err.Error()
+	return "Teams media transcription failed: " + teamsASRUserFailureDetail(err)
+}
+
+func teamsASRUserFailureDetail(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	text := shortenTeamsLine(strings.TrimSpace(err.Error()), 600)
+	for _, token := range []string{
+		"CODEX_HELPER_TEAMS_ASR_COMMAND",
+		"CODEX_HELPER_TEAMS_ASR_ARGS_JSON",
+		"CODEX_HELPER_TEAMS_ASR_BACKEND",
+		"CODEX_HELPER_TEAMS_ASR_LLAMA_BINARY",
+		"CODEX_HELPER_TEAMS_ASR_LLAMA_MODEL",
+		"CODEX_HELPER_TEAMS_ASR_LLAMA_MMPROJ",
+		"CODEX_HELPER_TEAMS_ASR_LLAMA_DEVICE",
+		"CODEX_HELPER_TEAMS_ASR_FFMPEG",
+		"CODEX_HELPER_TEAMS_ASR_NATIVE_LIBRARY_PATH",
+	} {
+		text = strings.ReplaceAll(text, token, "the Teams ASR setting")
+	}
+	if strings.TrimSpace(text) == "" {
+		return "unknown error"
+	}
+	return text
 }
 
 func teamsASRStatusLine(transcriber ASRTranscriber) string {
