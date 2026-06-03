@@ -164,12 +164,23 @@ jobs:
           bash scripts/ci/retry.sh 3 5 python3 -m pip index versions torch | grep -E '2\.(4|5|6|7|8|9|10|11|12)\.'
           check_url() {
             local url="$1"
+            local status
             echo "checking $url"
             for attempt in 1 2 3; do
-              if curl -fsSLI --max-time 30 "$url" >/dev/null; then
+              status="$(curl -sSIL -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)"
+              if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
                 return 0
               fi
+              if [[ "$status" == "404" || "$status" == "410" ]]; then
+                echo "missing managed ASR asset ($status): $url" >&2
+                return 1
+              fi
               if [ "$attempt" = 3 ]; then
+                if [[ "$status" == "408" || "$status" == "429" || "$status" =~ ^5[0-9][0-9]$ ]]; then
+                  echo "::warning::managed ASR asset check was rate-limited or temporarily unavailable after retries (HTTP $status): $url"
+                  return 0
+                fi
+                echo "managed ASR asset check failed with HTTP ${status:-unknown}: $url" >&2
                 return 1
               fi
               sleep 5
@@ -264,11 +275,19 @@ jobs:
             Write-Host "checking $Url"
             for ($attempt = 1; $attempt -le 3; $attempt++) {
               try {
-                $response = Invoke-WebRequest -Uri $Url -Method Head -MaximumRedirection 5 -TimeoutSec 30
-                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                $response = Invoke-WebRequest -Uri $Url -Method Head -MaximumRedirection 5 -TimeoutSec 30 -SkipHttpErrorCheck
+                $status = [int]$response.StatusCode
+                if ($status -ge 200 -and $status -lt 300) {
                   return
                 }
-                throw "missing managed ASR asset: $Url"
+                if ($status -eq 404 -or $status -eq 410) {
+                  throw "missing managed ASR asset ($status): $Url"
+                }
+                if ($attempt -eq 3 -and ($status -eq 408 -or $status -eq 429 -or ($status -ge 500 -and $status -lt 600))) {
+                  Write-Host "::warning::managed ASR asset check was rate-limited or temporarily unavailable after retries (HTTP $status): $Url"
+                  return
+                }
+                throw "managed ASR asset check failed with HTTP ${status}: $Url"
               } catch {
                 if ($attempt -eq 3) {
                   throw
