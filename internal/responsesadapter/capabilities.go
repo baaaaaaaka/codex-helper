@@ -52,6 +52,9 @@ func (p ProviderProfile) reasoningEffort(requested string) string {
 	requested = strings.ToLower(strings.TrimSpace(requested))
 	switch requested {
 	case "xhigh":
+		if strings.Contains(p.ID, "deepseek") {
+			return "max"
+		}
 		return "high"
 	case "none", "minimal":
 		return "low"

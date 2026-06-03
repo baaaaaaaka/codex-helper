@@ -6529,11 +6529,9 @@ func (b *Bridge) formatBlockedTeamsPromptAckFromSnapshot(ctx context.Context, se
 	reason := blockedAckReason(gate)
 	lines := []string{
 		"⚠️ **Your request is queued.**",
-		reason,
-		"",
-		"---",
-		"",
 	}
+	lines = append(lines, blockedAckNextStepLines(gate)...)
+	lines = append(lines, reason, "", "---", "")
 	if snapshot != nil && session != nil {
 		if queueLines := formatSessionTurnQueueSnapshot(*snapshot, session.ID, requestAheadFallbackSummary(gate)); len(queueLines) > 0 {
 			lines = append(lines, queueLines...)
@@ -6543,31 +6541,91 @@ func (b *Bridge) formatBlockedTeamsPromptAckFromSnapshot(ctx context.Context, se
 	} else {
 		lines = append(lines, b.sessionTurnQueueSnapshotLines(ctx, session, gate)...)
 	}
-	lines = append(lines,
-		"",
-		"---",
-		"",
+	lines = append(lines, "", "---", "")
+	lines = append(lines, blockedAckOptionLines(gate)...)
+	return strings.Join(lines, "\n")
+}
+
+func blockedAckNextStepLines(gate localCodexBeforeTeamsGate) []string {
+	text := normalizedBlockedAckText(gate)
+	switch {
+	case strings.Contains(text, "paused backlog"):
+		return []string{
+			"",
+			"**Run this command in this Work chat:** `helper publish-history`",
+			"I will start your queued request automatically after the history import finishes.",
+			"",
+		}
+	case strings.Contains(text, "history sync needs attention"):
+		return []string{
+			"",
+			"**Next step:** run `helper publish-history` here to retry the local history import.",
+			"I will start your queued request automatically if the import can recover the checkpoint.",
+			"",
+		}
+	case strings.Contains(text, "already running"):
+		return []string{
+			"",
+			"**Next step:** wait. I will run your request after the current Codex request finishes.",
+			"",
+		}
+	case strings.Contains(text, "active in the cli"):
+		return []string{
+			"",
+			"**Next step:** wait for the local Codex CLI request to finish.",
+			"",
+		}
+	case strings.Contains(text, "preparing this chat history"):
+		return []string{
+			"",
+			"**Next step:** wait. I will run your request after the history import finishes.",
+			"",
+		}
+	case strings.Contains(text, "syncing recent codex updates"):
+		return []string{
+			"",
+			"**Next step:** wait. I will run your request after recent local Codex updates finish syncing.",
+			"",
+		}
+	default:
+		return []string{
+			"",
+			"**Next step:** wait. I will run your request after the blocking helper step clears.",
+			"",
+		}
+	}
+}
+
+func blockedAckOptionLines(gate localCodexBeforeTeamsGate) []string {
+	text := normalizedBlockedAckText(gate)
+	if strings.Contains(text, "paused backlog") {
+		return []string{
+			"**Other options:**",
+			"- Need this request immediately: send it in a different 💬 Work chat.",
+			"- Drop this queued request: `helper cancel last`.",
+		}
+	}
+	return []string{
 		"**Options:**",
 		"- Run this request next: do nothing. It is already submitted.",
 		"- Need it immediately: send it in a different 💬 Work chat.",
 		"- Drop this queued request: `helper cancel last`.",
 		"- Interrupt the request ahead only if it looks stuck: open the 🏠 Control chat and send `helper restart force`.",
-	)
-	return strings.Join(lines, "\n")
+	}
 }
 
 func blockedAckReason(gate localCodexBeforeTeamsGate) string {
-	text := strings.TrimSpace(gate.AckBody)
+	text := normalizedBlockedAckText(gate)
 	switch {
 	case strings.Contains(text, "already running"):
 		return "Another Codex request is already running in this Work chat, so I will run yours after it finishes."
-	case strings.Contains(text, "active in the CLI"):
+	case strings.Contains(text, "active in the cli"):
 		return "A local Codex CLI request is active for this chat, so I will run yours after that finishes."
 	case strings.Contains(text, "preparing this chat history"):
 		return "I am preparing this chat history first, so I will run your request after the import finishes."
 	case strings.Contains(text, "paused backlog"):
 		return "Local Codex history has a paused backlog, so I need that resolved before running your request."
-	case strings.Contains(text, "syncing recent Codex updates"):
+	case strings.Contains(text, "syncing recent codex updates"):
 		return "I am syncing recent local Codex updates first, so I will run your request after the sync finishes."
 	case strings.Contains(text, "history sync needs attention"):
 		return "Local Codex history sync needs attention before I can run your request."
@@ -6577,21 +6635,25 @@ func blockedAckReason(gate localCodexBeforeTeamsGate) string {
 }
 
 func requestAheadFallbackSummary(gate localCodexBeforeTeamsGate) string {
-	text := strings.TrimSpace(gate.AckBody)
+	text := normalizedBlockedAckText(gate)
 	switch {
-	case strings.Contains(text, "active in the CLI"):
+	case strings.Contains(text, "active in the cli"):
 		return "Local Codex CLI request. The prompt is not available from Teams."
 	case strings.Contains(text, "preparing this chat history"):
 		return "Local Codex history import."
 	case strings.Contains(text, "paused backlog"):
 		return "Paused local Codex history backlog. Send `helper publish-history` when you want to import it."
-	case strings.Contains(text, "syncing recent Codex updates"):
+	case strings.Contains(text, "syncing recent codex updates"):
 		return "Recent local Codex updates are being synced into this Teams chat."
 	case strings.Contains(text, "history sync needs attention"):
 		return "Local Codex history sync recovery."
 	default:
 		return "Codex/helper work already in progress."
 	}
+}
+
+func normalizedBlockedAckText(gate localCodexBeforeTeamsGate) string {
+	return strings.ToLower(strings.TrimSpace(gate.AckBody))
 }
 
 func (b *Bridge) sessionTurnQueueSnapshotLines(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) []string {
@@ -7200,15 +7262,15 @@ func (b *Bridge) sendQueuedTurnAttentionIfDue(ctx context.Context, session *Sess
 }
 
 func queuedTurnBlockedReason(gate localCodexBeforeTeamsGate) string {
-	text := strings.TrimSpace(gate.AckBody)
+	text := normalizedBlockedAckText(gate)
 	switch {
-	case strings.Contains(text, "active in the CLI"):
+	case strings.Contains(text, "active in the cli"):
 		return "Local Codex is still active for this chat."
 	case strings.Contains(text, "preparing this chat history"):
 		return "I am still preparing local history for this chat."
 	case strings.Contains(text, "paused backlog"):
 		return "Local history import is paused until you send `helper publish-history`."
-	case strings.Contains(text, "syncing recent Codex updates"):
+	case strings.Contains(text, "syncing recent codex updates"):
 		return "I am still syncing recent local Codex updates before running your Teams request."
 	case strings.Contains(text, "history sync needs attention"):
 		return "Local history sync needs attention before I can continue."

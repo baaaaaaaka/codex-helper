@@ -103,7 +103,7 @@ func TestOpenAIChatAdapterHandlesUsageWithoutPromptTokenDetails(t *testing.T) {
 			usage = event.Usage
 		}
 	}
-	if usage == nil || usage.InputTokens != 3 || usage.OutputTokens != 2 || usage.TotalTokens != 5 || usage.CachedTokens != 0 {
+	if usage == nil || usage.InputTokens != 3 || usage.OutputTokens != 2 || usage.TotalTokens != 5 || usage.CachedTokens != 0 || usage.ReasoningTokens != 0 {
 		t.Fatalf("usage = %#v, events = %#v", usage, events)
 	}
 }
@@ -328,7 +328,7 @@ func TestOpenAIChatAdapterAppliesDeepSeekProviderProfile(t *testing.T) {
 	if gotBody.Thinking == nil || gotBody.Thinking.Type != "enabled" {
 		t.Fatalf("thinking = %#v", gotBody.Thinking)
 	}
-	if gotBody.ReasoningEffort != "high" {
+	if gotBody.ReasoningEffort != "max" {
 		t.Fatalf("reasoning_effort = %q", gotBody.ReasoningEffort)
 	}
 	if gotBody.Temperature != nil || gotBody.TopP != nil {

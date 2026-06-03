@@ -21431,12 +21431,104 @@ func TestBridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog(t *testing.T) {
 	if !strings.Contains(joined, "helper publish-history") || strings.Contains(joined, "Codex is active in the CLI") {
 		t.Fatalf("blocked backlog ack should be actionable and not claim active CLI:\n%s", joined)
 	}
+	ack := PlainTextFromTeamsHTML((*sent)[len(*sent)-1].Content)
+	requirePlainTextInOrder(t, ack,
+		"Your request is queued.",
+		"Run this command in this Work chat:",
+		"helper publish-history",
+		"Local Codex history has a paused backlog",
+		"Queued requests:",
+		"teams prompt after catchup",
+		"Other options:",
+	)
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load final state error: %v", err)
 	}
 	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
 		t.Fatalf("queued turn count = %d, want 1", got)
+	}
+}
+
+func TestBlockedTeamsPromptAckNextStepsMatchGateReasons(t *testing.T) {
+	bridge := &Bridge{}
+	tests := []struct {
+		name    string
+		ackBody string
+		want    []string
+		deny    []string
+	}{
+		{
+			name:    "paused backlog asks for publish history without restart option",
+			ackBody: "Queued. Local Codex history has a paused backlog. Send `helper publish-history` here.",
+			want: []string{
+				"Run this command in this Work chat:",
+				"helper publish-history",
+				"Local Codex history has a paused backlog",
+				"Other options:",
+			},
+			deny: []string{"helper restart force"},
+		},
+		{
+			name:    "history sync recovery asks for publish history retry",
+			ackBody: "Queued. Local Codex history sync needs attention before I continue this chat.",
+			want: []string{
+				"run `helper publish-history` here to retry",
+				"Local Codex history sync needs attention",
+				"Options:",
+			},
+		},
+		{
+			name:    "same chat active request asks user to wait",
+			ackBody: "A Codex request is already running in this Work chat.",
+			want: []string{
+				"wait. I will run your request after the current Codex request finishes.",
+				"Another Codex request is already running",
+				"helper restart force",
+			},
+		},
+		{
+			name:    "local cli active request asks user to wait",
+			ackBody: "Queued. Codex is active in the CLI for this chat.",
+			want: []string{
+				"wait for the local Codex CLI request to finish.",
+				"A local Codex CLI request is active",
+			},
+		},
+		{
+			name:    "history import asks user to wait",
+			ackBody: "Queued. I am preparing this chat history first.",
+			want: []string{
+				"wait. I will run your request after the history import finishes.",
+				"I am preparing this chat history first",
+			},
+		},
+		{
+			name:    "recent updates sync asks user to wait",
+			ackBody: "Queued. I am syncing recent Codex updates first.",
+			want: []string{
+				"recent local Codex updates finish syncing.",
+				"I am syncing recent local Codex updates first",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ack := bridge.formatBlockedTeamsPromptAckFromSnapshot(context.Background(), nil, localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: tt.ackBody,
+			}, nil)
+			for _, want := range tt.want {
+				if !strings.Contains(ack, want) {
+					t.Fatalf("ack missing %q:\n%s", want, ack)
+				}
+			}
+			for _, denied := range tt.deny {
+				if strings.Contains(ack, denied) {
+					t.Fatalf("ack unexpectedly contains %q:\n%s", denied, ack)
+				}
+			}
+		})
 	}
 }
 

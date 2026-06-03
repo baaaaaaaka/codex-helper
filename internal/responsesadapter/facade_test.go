@@ -122,6 +122,13 @@ func TestFacadeCompletedUsageIncludesZeroCachedTokens(t *testing.T) {
 	if inputDetails["cached_tokens"] != float64(0) {
 		t.Fatalf("cached_tokens = %#v, want 0 in %#v", inputDetails["cached_tokens"], usage)
 	}
+	outputDetails, ok := usage["output_tokens_details"].(map[string]any)
+	if !ok {
+		t.Fatalf("completed usage missing output_tokens_details: %#v", usage)
+	}
+	if outputDetails["reasoning_tokens"] != float64(0) {
+		t.Fatalf("reasoning_tokens = %#v, want 0 in %#v", outputDetails["reasoning_tokens"], usage)
+	}
 }
 
 func TestFacadeReturnsNonStreamResponse(t *testing.T) {

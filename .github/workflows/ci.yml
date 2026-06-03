@@ -109,7 +109,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|OpenAIChatAdapterHandlesUsageWithoutPromptTokenDetails|FacadeCompletedUsageIncludesZeroCachedTokens|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
+          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|FacadeCompletedUsageIncludesZeroCachedTokens|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
 
       - name: Teams durable control binding regressions
         shell: bash
@@ -122,7 +122,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          teams_poll_backlog_pattern='Test(InboundPollContinuationDoesNotForceCatchup|InboundPollContinuationDoesNotRegressActiveIntervals|InboundPollDecisionCatchupAndBlocked|BridgePollAllowsFreshHelperPrefixedUserPromptFromContinuation|BridgePollUsesDurableContinuationAfterOnePage|BridgePollPreservesOldContinuationWhenHeadAlsoTruncated|BridgeTerminalPollCleanupKeepsSharedActiveChat|BridgeControlParkSessionClearsPollState|BridgeControlParkSessionAmbiguousAndNotFound|BridgeControlParkRejectsQueuedOrRunningSession|BridgePollOnceSkipsExplicitParkedPollWithStaleContinuation|BridgeControlUnparkAliasResumesWithHeadPoll)$'
+          teams_poll_backlog_pattern='Test(InboundPollContinuationDoesNotForceCatchup|InboundPollContinuationDoesNotRegressActiveIntervals|InboundPollDecisionCatchupAndBlocked|BridgePollAllowsFreshHelperPrefixedUserPromptFromContinuation|BridgePollUsesDurableContinuationAfterOnePage|BridgePollPreservesOldContinuationWhenHeadAlsoTruncated|BridgeTerminalPollCleanupKeepsSharedActiveChat|BridgeControlParkSessionClearsPollState|BridgeControlParkSessionAmbiguousAndNotFound|BridgeControlParkRejectsQueuedOrRunningSession|BridgePollOnceSkipsExplicitParkedPollWithStaleContinuation|BridgeControlUnparkAliasResumesWithHeadPoll|BridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog|BlockedTeamsPromptAckNextStepsMatchGateReasons)$'
           go test ./internal/teams -count=1 -run "$teams_poll_backlog_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed$' -v
           go test ./internal/cli -count=1 -run 'TestTeamsStatus(SeparatesCatchupBacklogAndInactiveRows|ShowsRunningTurnDetails)$' -v
