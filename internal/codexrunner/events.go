@@ -140,7 +140,14 @@ func applyTranscriptPayloadStreamEvent(event codexEvent, out *StreamEvent) bool 
 	case "event_msg":
 		switch strings.ToLower(strings.TrimSpace(payload.Type)) {
 		case "agent_message":
-			if !isFinalAnswerPhase(payload.Phase) {
+			// Stream both in-turn commentary and the final answer as live agent
+			// messages: the forwarder holds the latest as pending and flushes the
+			// previous as "progress", so intermediate commentary reaches Teams
+			// while the turn runs. This restores the behavior the old
+			// item.completed agent_message format had (no phase gate). Note this
+			// intentionally diverges from parser.go, which stays final-only
+			// because it computes the terminal TurnResult.
+			if !isStreamableAgentPhase(payload.Phase) {
 				return false
 			}
 			text := strings.TrimSpace(payload.Message)
@@ -160,7 +167,7 @@ func applyTranscriptPayloadStreamEvent(event codexEvent, out *StreamEvent) bool 
 	case "response_item":
 		if strings.ToLower(strings.TrimSpace(payload.Type)) != "message" ||
 			strings.ToLower(strings.TrimSpace(payload.Role)) != "assistant" ||
-			!isFinalAnswerPhase(payload.Phase) {
+			!isStreamableAgentPhase(payload.Phase) {
 			return false
 		}
 		text := strings.TrimSpace(agentMessageText(codexItem{Content: payload.Content}))
@@ -173,6 +180,18 @@ func applyTranscriptPayloadStreamEvent(event codexEvent, out *StreamEvent) bool 
 	default:
 		return false
 	}
+}
+
+// isStreamableAgentPhase reports whether an agent message phase should be
+// forwarded as a live agent message. Both commentary (in-turn progress) and
+// final_answer qualify; an empty/unknown phase does not, which preserves the
+// guard against treating stray assistant content as a turn message.
+func isStreamableAgentPhase(phase string) bool {
+	return isFinalAnswerPhase(phase) || isCommentaryPhase(phase)
+}
+
+func isCommentaryPhase(phase string) bool {
+	return strings.EqualFold(strings.TrimSpace(phase), "commentary")
 }
 
 func applyContextCompactPayload(raw json.RawMessage, out *StreamEvent) bool {

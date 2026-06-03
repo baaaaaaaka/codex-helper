@@ -92,6 +92,31 @@ func (e *streamingRecordingExecutor) RunWithEventHandler(_ context.Context, _ *S
 	return e.result, e.err
 }
 
+// jsonlParsingStreamingExecutor feeds raw Codex JSONL lines through the real
+// ParseStreamEventJSONL parser before forwarding, so a test exercises the full
+// parse -> forward -> Teams path (not pre-parsed StreamEvents).
+type jsonlParsingStreamingExecutor struct {
+	lines  []string
+	result ExecutionResult
+}
+
+func (e *jsonlParsingStreamingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunWithEventHandler(ctx, session, prompt, nil)
+}
+
+func (e *jsonlParsingStreamingExecutor) RunWithEventHandler(_ context.Context, _ *Session, _ string, handler codexrunner.EventHandler) (ExecutionResult, error) {
+	for _, line := range e.lines {
+		event, ok, err := codexrunner.ParseStreamEventJSONL([]byte(line))
+		if err != nil || !ok {
+			continue
+		}
+		if handler != nil {
+			handler(event)
+		}
+	}
+	return e.result, nil
+}
+
 type transcriptWritingStreamingExecutor struct {
 	write  func() error
 	events []codexrunner.StreamEvent
@@ -890,6 +915,55 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	}
 	if strings.Count(joined, "FINAL MARKER") != 1 {
 		t.Fatalf("final agent message was duplicated in streamed transcript:\n%s", joined)
+	}
+}
+
+// TestBridgeStreamsNewFormatCommentaryToTeams is the end-to-end regression guard
+// for the commentary delivery bug: raw transcript-style `event_msg ... phase=commentary`
+// lines (the newer Codex format) must be parsed and streamed to Teams as live
+// progress while the turn runs, with final_answer delivered as the final reply.
+func TestBridgeStreamsNewFormatCommentaryToTeams(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &jsonlParsingStreamingExecutor{
+		lines: []string{
+			`{"type":"thread.started","thread_id":"thread-1"}`,
+			`{"type":"turn.started","thread_id":"thread-1","turn_id":"turn-1"}`,
+			`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","thread_id":"thread-1","turn_id":"turn-1","message":"checking the failing test first"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","thread_id":"thread-1","turn_id":"turn-1","message":"editing the parser now"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","thread_id":"thread-1","turn_id":"turn-1","message":"Fixed the bug."}}`,
+			`{"type":"event_msg","payload":{"type":"task_complete","thread_id":"thread-1","turn_id":"turn-1","last_agent_message":"Fixed the bug."}}`,
+		},
+		result: ExecutionResult{Text: "Fixed the bug.", CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-commentary-stream"), "fix it"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+
+	for _, want := range []string{
+		"🤖 ⏳ Codex status:\nchecking the failing test first",
+		"🤖 ⏳ Codex status:\nediting the parser now",
+		"🤖 ✅ Codex answer:\nFixed the bug.",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("commentary was not streamed live to Teams, missing %q in:\n%s", want, joined)
+		}
+	}
+	// The intermediate commentary must appear before the final reply.
+	if strings.Index(joined, "editing the parser now") > strings.Index(joined, "🤖 ✅ Codex answer:") {
+		t.Fatalf("commentary should stream before the final answer:\n%s", joined)
+	}
+	// Final text delivered exactly once (commentary reconciled against final).
+	if strings.Count(joined, "Fixed the bug.") != 1 {
+		t.Fatalf("final answer should not be duplicated:\n%s", joined)
 	}
 }
 
@@ -18845,6 +18919,65 @@ func TestBridgeSyncLinkedTranscriptDedupesQueuedLiveFinal(t *testing.T) {
 	}
 	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), answer) {
 		t.Fatalf("queued live final was not delivered exactly once after sync: %#v", *sent)
+	}
+}
+
+// TestBridgeSyncLinkedTranscriptDedupesLiveStreamedCommentary guards the main
+// risk of streaming commentary live: after the turn, transcript sync re-scans
+// the JSONL where commentary appears as phase=commentary (TranscriptKindStatus).
+// It must NOT redeliver text the live forwarder already sent as codex-progress.
+func TestBridgeSyncLinkedTranscriptDedupesLiveStreamedCommentary(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	commentary := "checking the failing test first"
+	// Simulate the live forwarder having already streamed the commentary as a
+	// codex-progress message during the turn.
+	if _, err := bridge.queueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:turn-live:progress",
+		SessionID:      session.ID,
+		TurnID:         "turn-live",
+		TeamsChatID:    session.ChatID,
+		Kind:           "codex-progress-001",
+		Body:           commentary,
+		Status:         teamstore.OutboxStatusSent,
+		SourceTextHash: normalizedTextHash(commentary),
+	}); err != nil {
+		t.Fatalf("queue live progress outbox error: %v", err)
+	}
+
+	// The same commentary now appears in the linked transcript (phase=commentary),
+	// followed by a genuinely new final answer.
+	updated := initial +
+		`{"type":"event_msg","payload":{"id":"s2","type":"agent_message","phase":"commentary","message":` + strconv.Quote(commentary) + `}}` + "\n" +
+		`{"id":"a2","role":"assistant","text":"the final answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+
+	var joined strings.Builder
+	for _, msg := range *sent {
+		joined.WriteString(PlainTextFromTeamsHTML(msg.Content))
+		joined.WriteString("\n")
+	}
+	if strings.Contains(joined.String(), commentary) {
+		t.Fatalf("live-streamed commentary was duplicated by transcript sync:\n%s", joined.String())
+	}
+	if !strings.Contains(joined.String(), "the final answer") {
+		t.Fatalf("a genuinely new final answer should still be delivered by transcript sync:\n%s", joined.String())
 	}
 }
 

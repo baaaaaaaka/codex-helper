@@ -27,6 +27,43 @@ func TestParseStreamEventJSONLCommandExecution(t *testing.T) {
 	}
 }
 
+// TestParseStreamEventJSONLStreamsAgentProgressForBothCodexFormats documents the
+// compatibility guarantee: in-turn assistant progress streams live as an agent
+// message in BOTH the legacy item.completed format (no phase) and the newer
+// transcript-style event_msg format (phase=commentary).
+func TestParseStreamEventJSONLStreamsAgentProgressForBothCodexFormats(t *testing.T) {
+	cases := []struct {
+		name string
+		line []byte
+		want string
+	}{
+		{
+			name: "legacy item.completed agent_message",
+			line: []byte(`{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"checking the failing test first"}}`),
+			want: "checking the failing test first",
+		},
+		{
+			name: "new transcript event_msg commentary",
+			line: []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"checking the failing test first"}}`),
+			want: "checking the failing test first",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			event, ok, err := ParseStreamEventJSONL(tc.line)
+			if err != nil {
+				t.Fatalf("ParseStreamEventJSONL error: %v", err)
+			}
+			if !ok {
+				t.Fatalf("event was dropped; in-turn progress must stream live")
+			}
+			if event.Kind != StreamEventAgentMessage || event.Text != tc.want {
+				t.Fatalf("event = %#v, want AgentMessage %q", event, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseStreamEventJSONLRetryableStreamError(t *testing.T) {
 	line := []byte(`{"type":"error","threadId":"thread-1","turn_id":"turn-1","willRetry":true,"error":{"message":"Reconnecting... 2/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}}}}`)
 	event, ok, err := ParseStreamEventJSONL(line)
@@ -92,6 +129,20 @@ func TestParseStreamEventJSONLFinalAnswerAndTaskComplete(t *testing.T) {
 			wantText: "done from task",
 			wantTurn: "turn-3",
 		},
+		{
+			// Regression: in-turn commentary must stream live as an agent message
+			// (the forwarder flushes it as "progress"), not be dropped.
+			line:     []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","turn_id":"turn-4","message":"checking the tests"}}`),
+			wantKind: StreamEventAgentMessage,
+			wantText: "checking the tests",
+			wantTurn: "turn-4",
+		},
+		{
+			line:     []byte(`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","turnId":"turn-5","content":[{"type":"output_text","text":"still editing files"}]}}`),
+			wantKind: StreamEventAgentMessage,
+			wantText: "still editing files",
+			wantTurn: "turn-5",
+		},
 	}
 	for i, tc := range lines {
 		event, ok, err := ParseStreamEventJSONL(tc.line)
@@ -115,6 +166,28 @@ func TestParseStreamEventJSONLDoesNotTreatLiteralFinalAnswerAsCompletion(t *test
 	}
 	if ok {
 		t.Fatalf("event = %#v, want unrecognized literal text", event)
+	}
+}
+
+func TestParseStreamEventJSONLDropsEmptyAndUnknownPhaseAgentMessages(t *testing.T) {
+	lines := []struct {
+		name string
+		line []byte
+	}{
+		{"empty commentary text", []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"   "}}`)},
+		{"unknown phase", []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"scratchpad","message":"internal note"}}`)},
+		{"response_item non-assistant commentary", []byte(`{"type":"response_item","payload":{"type":"message","role":"system","phase":"commentary","content":[{"type":"output_text","text":"system note"}]}}`)},
+	}
+	for _, tc := range lines {
+		t.Run(tc.name, func(t *testing.T) {
+			event, ok, err := ParseStreamEventJSONL(tc.line)
+			if err != nil {
+				t.Fatalf("ParseStreamEventJSONL error: %v", err)
+			}
+			if ok {
+				t.Fatalf("event = %#v, want unrecognized", event)
+			}
+		})
 	}
 }
 
