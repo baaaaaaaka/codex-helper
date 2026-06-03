@@ -682,6 +682,16 @@ func TestTeamsStatusReportsPollDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openTeamsStore error: %v", err)
 	}
+	if _, _, err := st.CreateSession(context.Background(), teamsstore.SessionContext{ID: "s1", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	owner, err := teamsstore.CurrentOwner("v-test", "s1", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
 	if _, err := st.RecordChatPollSuccess(context.Background(), "chat-1", time.Now(), true, true, 50); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
 	}
@@ -695,6 +705,164 @@ func TestTeamsStatusReportsPollDiagnostics(t *testing.T) {
 		!strings.Contains(out, "1 active window warnings") ||
 		!strings.Contains(out, "1 historical window warnings") {
 		t.Fatalf("status did not show poll diagnostics:\n%s", out)
+	}
+}
+
+func TestTeamsStatusSeparatesCatchupBacklogAndInactiveRows(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	now := time.Now()
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	owner, err := teamsstore.CurrentOwner("v-test", "s-catchup", "", now)
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Sessions["s-catchup"] = teamsstore.SessionContext{ID: "s-catchup", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-catchup", CreatedAt: now, UpdatedAt: now}
+		state.Sessions["s-cold"] = teamsstore.SessionContext{ID: "s-cold", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-cold", CreatedAt: now, UpdatedAt: now}
+		state.Sessions["s-parked"] = teamsstore.SessionContext{ID: "s-parked", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-parked", CreatedAt: now, UpdatedAt: now}
+		state.Sessions["s-closed"] = teamsstore.SessionContext{ID: "s-closed", Status: teamsstore.SessionStatusClosed, TeamsChatID: "chat-closed", CreatedAt: now, UpdatedAt: now}
+		state.Sessions["s-archived"] = teamsstore.SessionContext{ID: "s-archived", Status: teamsstore.SessionStatusArchived, TeamsChatID: "chat-archived", CreatedAt: now, UpdatedAt: now}
+		state.ChatPolls["chat-catchup"] = teamsstore.ChatPollState{ChatID: "chat-catchup", Seeded: true, PollState: "catchup", ContinuationPath: "/chats/chat-catchup/messages?$skiptoken=active", LastSuccessfulPollAt: now, UpdatedAt: now}
+		state.ChatPolls["chat-cold"] = teamsstore.ChatPollState{ChatID: "chat-cold", Seeded: true, PollState: "cold", ContinuationPath: "/chats/chat-cold/messages?$skiptoken=backlog", LastSuccessfulPollAt: now, UpdatedAt: now}
+		state.ChatPolls["chat-parked"] = teamsstore.ChatPollState{ChatID: "chat-parked", Seeded: true, PollState: "parked", ContinuationPath: "/chats/chat-parked/messages?$skiptoken=paused", LastSuccessfulPollAt: now, ParkedAt: now.Add(-time.Hour), UpdatedAt: now}
+		state.ChatPolls["chat-closed"] = teamsstore.ChatPollState{ChatID: "chat-closed", Seeded: true, PollState: "catchup", ContinuationPath: "/chats/chat-closed/messages?$skiptoken=closed", LastSuccessfulPollAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed live state: %v", err)
+	}
+
+	staleStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope-stale", "state.json")
+	staleStore, err := teamsstore.Open(staleStatePath)
+	if err != nil {
+		t.Fatalf("Open stale scoped store: %v", err)
+	}
+	staleOwner := owner
+	staleOwner.ScopeID = "scope-stale"
+	staleOwner.LastHeartbeat = now.Add(-time.Hour)
+	if err := staleStore.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Scope = teamsstore.ScopeIdentity{ID: "scope-stale", Profile: "default"}
+		state.ServiceOwner = &staleOwner
+		state.Sessions["s-stale"] = teamsstore.SessionContext{ID: "s-stale", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-stale", CreatedAt: now, UpdatedAt: now}
+		state.ChatPolls["chat-stale"] = teamsstore.ChatPollState{ChatID: "chat-stale", Seeded: true, PollState: "catchup", ContinuationPath: "/chats/chat-stale/messages?$skiptoken=stale", LastSuccessfulPollAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale scoped state: %v", err)
+	}
+
+	e2eStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "test-e2e", "state.json")
+	e2eStore, err := teamsstore.Open(e2eStatePath)
+	if err != nil {
+		t.Fatalf("Open e2e scoped store: %v", err)
+	}
+	e2eOwner := staleOwner
+	e2eOwner.ScopeID = "test-e2e"
+	if err := e2eStore.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Scope = teamsstore.ScopeIdentity{ID: "test-e2e", Profile: "test-e2e"}
+		state.ServiceOwner = &e2eOwner
+		state.Sessions["s-e2e"] = teamsstore.SessionContext{ID: "s-e2e", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-e2e", CreatedAt: now, UpdatedAt: now}
+		state.ChatPolls["chat-e2e"] = teamsstore.ChatPollState{ChatID: "chat-e2e", Seeded: true, PollState: "catchup", ContinuationPath: "/chats/chat-e2e/messages?$skiptoken=e2e", LastSuccessfulPollAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed e2e scoped state: %v", err)
+	}
+
+	out := executeRootForTeamsTest(t, "teams", "status")
+	for _, want := range []string{
+		"Active summary: 2 pollable chats, 1 active catchup, 1 pollable backlog",
+		"Poll summary: 6 chats",
+		"1 active catchup",
+		"5 backlog continuations",
+		"Work row layers: pollable=2 parked=1 closed=1 archived=1 stale_scope=2 closed_legacy=1 test_e2e_stale=1",
+		"Scope layers: live=1 stale_owner=2 dead_owner=0 stopped=0",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("teams status output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "6 active catchup") || strings.Contains(out, "active continuations") {
+		t.Fatalf("status still collapses backlog into active catchup:\n%s", out)
+	}
+}
+
+func TestTeamsStatusShowsRunningTurnDetails(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	now := time.Now()
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	owner, err := teamsstore.CurrentOwner("v-test", "s-run", "turn-running", now)
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, now); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Scope = teamsstore.ScopeIdentity{ID: "scope-run", Profile: "default"}
+		state.Sessions["s-run"] = teamsstore.SessionContext{
+			ID:                "s-run",
+			Status:            teamsstore.SessionStatusActive,
+			TeamsChatID:       "chat-run",
+			CodexThreadID:     "thread-run",
+			LatestCodexTurnID: "codex-turn-run",
+			CreatedAt:         now.Add(-5 * time.Minute),
+			UpdatedAt:         now.Add(-2 * time.Minute),
+		}
+		state.Turns["turn-running"] = teamsstore.Turn{
+			ID:            "turn-running",
+			SessionID:     "s-run",
+			Status:        teamsstore.TurnStatusRunning,
+			CodexThreadID: "thread-run",
+			CodexTurnID:   "codex-turn-run",
+			StartedAt:     now.Add(-2 * time.Minute),
+			UpdatedAt:     now.Add(-30 * time.Second),
+			CreatedAt:     now.Add(-3 * time.Minute),
+		}
+		state.OutboxMessages["outbox-command"] = teamsstore.OutboxMessage{
+			ID:          "outbox-command",
+			SessionID:   "s-run",
+			TurnID:      "turn-running",
+			TeamsChatID: "chat-run",
+			Kind:        "codex-command-001",
+			Body:        "Running command:\ngo test ./internal/cli",
+			Status:      teamsstore.OutboxStatusSent,
+			CreatedAt:   now.Add(-90 * time.Second),
+			UpdatedAt:   now.Add(-20 * time.Second),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed running turn state: %v", err)
+	}
+
+	out := executeRootForTeamsTest(t, "teams", "status")
+	for _, want := range []string{
+		"Running turns:",
+		"session=s-run",
+		"turn=turn-running",
+		"codex_session=thread-run",
+		"codex_turn=codex-turn-run",
+		"chat=chat-run",
+		"scope=scope-run",
+		"age=",
+		"last_update=",
+		`child_command="go test ./internal/cli"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("teams status output missing %q:\n%s", want, out)
+		}
 	}
 }
 

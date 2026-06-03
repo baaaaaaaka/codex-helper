@@ -23,6 +23,7 @@ const (
 	DashboardCommandWorkspace      DashboardCommandName = "workspace"
 	DashboardCommandSessions       DashboardCommandName = "sessions"
 	DashboardCommandOpen           DashboardCommandName = "open"
+	DashboardCommandPark           DashboardCommandName = "park"
 	DashboardCommandResume         DashboardCommandName = "resume"
 	DashboardCommandPublish        DashboardCommandName = "publish"
 	DashboardCommandNew            DashboardCommandName = "new"
@@ -380,7 +381,7 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == ""
 	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel:
 		return true
-	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
+	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandPark, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
 	default:
 		return arg == ""
@@ -400,7 +401,9 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandSessions, true
 	case "o", "open":
 		return DashboardCommandOpen, true
-	case "r", "resume":
+	case "park":
+		return DashboardCommandPark, true
+	case "r", "resume", "unpark":
 		return DashboardCommandResume, true
 	case "c", "continue", "publish", "import":
 		return DashboardCommandPublish, true
@@ -498,6 +501,10 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandStats, true
 	case "close":
 		return DashboardCommandClose, true
+	case "park":
+		return DashboardCommandPark, true
+	case "resume", "unpark":
+		return DashboardCommandResume, true
 	case "retry":
 		return DashboardCommandRetry, true
 	case "restore-thread", "restore":

@@ -90,18 +90,6 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		decision.NextPollAt = poll.BlockedUntil
 		return decision
 	}
-	if input.Role != inboundPollRoleControl && strings.TrimSpace(poll.ContinuationPath) != "" {
-		decision.State = inboundPollStateCatchup
-		decision.Interval = inboundPollCatchupInterval
-		if poll.NextPollAt.IsZero() {
-			decision.Due = true
-			decision.NextPollAt = now
-			return decision
-		}
-		decision.NextPollAt = poll.NextPollAt
-		decision.Due = !now.Before(poll.NextPollAt)
-		return decision
-	}
 	if input.ForceCatchup || !input.HasPoll || !poll.Seeded {
 		decision.State = inboundPollStateCatchup
 		decision.Due = true

@@ -4226,6 +4226,15 @@ func (s *Store) UpdateChatPollSchedules(ctx context.Context, updates []ChatPollS
 	return out, nil
 }
 
+func (s *Store) ClearChatPollContinuationBackoffAndError(ctx context.Context, chatID string) (ChatPollState, error) {
+	return s.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:                chatID,
+		ClearBlockedUntil:     true,
+		ClearContinuationPath: true,
+		ResetFailures:         true,
+	})
+}
+
 func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpdate, now time.Time) (ChatPollState, bool, error) {
 	chatID := strings.TrimSpace(update.ChatID)
 	if chatID == "" {
@@ -4297,6 +4306,14 @@ func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpda
 	if update.ResetFailures {
 		if poll.FailureCount != 0 {
 			poll.FailureCount = 0
+			changed = true
+		}
+		if poll.LastError != "" {
+			poll.LastError = ""
+			changed = true
+		}
+		if !poll.LastErrorAt.IsZero() {
+			poll.LastErrorAt = time.Time{}
 			changed = true
 		}
 	}

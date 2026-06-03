@@ -168,9 +168,9 @@ func TestSortInboundPollDecisionsPrioritizesRunningUnderCycleCap(t *testing.T) {
 	}
 }
 
-func TestInboundPollDecisionCatchupAndBlocked(t *testing.T) {
+func TestInboundPollContinuationDoesNotForceCatchup(t *testing.T) {
 	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
-	catchup := decideInboundPoll(inboundPollInput{
+	decision := decideInboundPoll(inboundPollInput{
 		ChatID:  "chat-1",
 		Role:    inboundPollRoleWork,
 		HasPoll: true,
@@ -178,27 +178,82 @@ func TestInboundPollDecisionCatchupAndBlocked(t *testing.T) {
 			ChatID:           "chat-1",
 			Seeded:           true,
 			ContinuationPath: "/chats/chat-1/messages?$skiptoken=next",
+			LastActivityAt:   now.Add(-5 * time.Hour),
 			NextPollAt:       now.Add(time.Hour),
 		},
 		Now: now,
 	})
-	if catchup.Due || catchup.State != inboundPollStateCatchup || catchup.Interval != inboundPollCatchupInterval || !catchup.NextPollAt.Equal(now.Add(time.Hour)) {
-		t.Fatalf("continuation decision = %#v, want throttled catchup", catchup)
+	if decision.Due || decision.State != inboundPollStateCold || decision.Interval != inboundPollColdInterval || !decision.NextPollAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("cold continuation decision = %#v, want cold at existing schedule", decision)
 	}
-	dueCatchup := decideInboundPoll(inboundPollInput{
+}
+
+func TestInboundPollContinuationDoesNotRegressActiveIntervals(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name     string
+		idle     time.Duration
+		running  bool
+		want     string
+		interval time.Duration
+	}{
+		{name: "hot", idle: time.Minute, want: inboundPollStateHot, interval: inboundPollHotInterval},
+		{name: "warm", idle: 10 * time.Minute, want: inboundPollStateWarm, interval: inboundPollWarmInterval},
+		{name: "cool", idle: time.Hour, want: inboundPollStateCool, interval: inboundPollCoolInterval},
+		{name: "running", idle: 49 * time.Hour, running: true, want: inboundPollStateRunning, interval: inboundPollRunningInterval},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision := decideInboundPoll(inboundPollInput{
+				ChatID:  "chat-1",
+				Role:    inboundPollRoleWork,
+				HasPoll: true,
+				Poll: teamstore.ChatPollState{
+					ChatID:           "chat-1",
+					Seeded:           true,
+					ContinuationPath: "/chats/chat-1/messages?$skiptoken=next",
+					LastActivityAt:   now.Add(-tc.idle),
+					NextPollAt:       now.Add(time.Hour),
+				},
+				Running: tc.running,
+				Now:     now,
+			})
+			if decision.State != tc.want || decision.Interval != tc.interval || decision.Due || !decision.NextPollAt.Equal(now.Add(time.Hour)) {
+				t.Fatalf("decision = %#v, want state=%s interval=%v at existing schedule", decision, tc.want, tc.interval)
+			}
+		})
+	}
+}
+
+func TestInboundPollDecisionCatchupAndBlocked(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	forceCatchup := decideInboundPoll(inboundPollInput{
+		ChatID:       "chat-1",
+		Role:         inboundPollRoleWork,
+		HasPoll:      true,
+		ForceCatchup: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:     "chat-1",
+			Seeded:     true,
+			NextPollAt: now.Add(time.Hour),
+		},
+		Now: now,
+	})
+	if !forceCatchup.Due || forceCatchup.State != inboundPollStateCatchup || forceCatchup.Interval != inboundPollCatchupInterval || !forceCatchup.NextPollAt.Equal(now) {
+		t.Fatalf("force catchup decision = %#v, want due catchup", forceCatchup)
+	}
+	unseededCatchup := decideInboundPoll(inboundPollInput{
 		ChatID:  "chat-1",
 		Role:    inboundPollRoleWork,
 		HasPoll: true,
 		Poll: teamstore.ChatPollState{
-			ChatID:           "chat-1",
-			Seeded:           true,
-			ContinuationPath: "/chats/chat-1/messages?$skiptoken=next",
-			NextPollAt:       now.Add(-time.Second),
+			ChatID:     "chat-1",
+			NextPollAt: now.Add(time.Hour),
 		},
 		Now: now,
 	})
-	if !dueCatchup.Due || dueCatchup.State != inboundPollStateCatchup || dueCatchup.Interval != inboundPollCatchupInterval {
-		t.Fatalf("due continuation decision = %#v, want due catchup", dueCatchup)
+	if !unseededCatchup.Due || unseededCatchup.State != inboundPollStateCatchup || unseededCatchup.Interval != inboundPollCatchupInterval || !unseededCatchup.NextPollAt.Equal(now) {
+		t.Fatalf("unseeded catchup decision = %#v, want due catchup", unseededCatchup)
 	}
 	blockedUntil := now.Add(45 * time.Second)
 	blocked := decideInboundPoll(inboundPollInput{

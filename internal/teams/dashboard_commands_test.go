@@ -18,6 +18,10 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "/sessions", name: DashboardCommandSessions},
 		{text: "/open 3", name: DashboardCommandOpen, raw: "3", number: 3, isNumber: true},
 		{text: "/open session-abc", name: DashboardCommandOpen, raw: "session-abc"},
+		{text: "/park session-abc", name: DashboardCommandPark, raw: "session-abc"},
+		{text: "park s113", name: DashboardCommandPark, raw: "s113"},
+		{text: "helper park s113", name: DashboardCommandPark, raw: "s113"},
+		{text: "unpark s113", name: DashboardCommandResume, raw: "s113"},
 		{text: "/publish session-def", name: DashboardCommandPublish, raw: "session-def"},
 		{text: "/new build the thing", name: DashboardCommandNew, raw: "build the thing"},
 		{text: "/ask what can this control chat do", name: DashboardCommandAsk, raw: "what can this control chat do"},
@@ -210,7 +214,7 @@ func TestParseControlCancelNaturalLanguageFallsBackToCodex(t *testing.T) {
 }
 
 func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
-	for _, text := range []string{"1", "status", "stats", "details", "close", "rename this chat", "retry the failed test", "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗", "helper webhook 能不能一键配置"} {
+	for _, text := range []string{"1", "status", "stats", "details", "close", "park s001", "resume s001", "rename this chat", "retry the failed test", "helper upgrade 能够更新成避免 api 访问过于频繁的报错吗", "helper webhook 能不能一键配置"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if cmd.HelperCommand {
@@ -222,7 +226,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper file report.txt", "helper publish-history", "helper skills push", "model status", "models", "helper model switch mimo25", "codex status", "codex stats", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/park s001", "/resume s001", "/unpark s001", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper park s001", "helper resume s001", "helper unpark s001", "helper file report.txt", "helper publish-history", "helper skills push", "model status", "models", "helper model switch mimo25", "codex status", "codex stats", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {
@@ -238,6 +242,12 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 	}
 	if cmd := ParseDashboardCommand(ChatScopeWork, "helper stats"); cmd.Name != DashboardCommandStats {
 		t.Fatalf("helper stats parse = %#v, want stats", cmd)
+	}
+	if cmd := ParseDashboardCommand(ChatScopeWork, "helper park s001"); cmd.Name != DashboardCommandPark || cmd.Argument != "s001" {
+		t.Fatalf("helper park parse = %#v, want park s001", cmd)
+	}
+	if cmd := ParseDashboardCommand(ChatScopeWork, "helper unpark s001"); cmd.Name != DashboardCommandResume || cmd.Argument != "s001" {
+		t.Fatalf("helper unpark parse = %#v, want resume s001", cmd)
 	}
 }
 

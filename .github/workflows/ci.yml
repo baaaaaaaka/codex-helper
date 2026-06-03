@@ -118,6 +118,15 @@ jobs:
           go test ./internal/teams -count=1 -run 'TestBridge(RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding))$' -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
+      - name: Teams manual park and continuation regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          teams_poll_backlog_pattern='Test(InboundPollContinuationDoesNotForceCatchup|InboundPollContinuationDoesNotRegressActiveIntervals|InboundPollDecisionCatchupAndBlocked|BridgePollAllowsFreshHelperPrefixedUserPromptFromContinuation|BridgePollUsesDurableContinuationAfterOnePage|BridgePollPreservesOldContinuationWhenHeadAlsoTruncated|BridgeTerminalPollCleanupKeepsSharedActiveChat|BridgeControlParkSessionClearsPollState|BridgeControlParkSessionAmbiguousAndNotFound|BridgeControlParkRejectsQueuedOrRunningSession|BridgePollOnceSkipsExplicitParkedPollWithStaleContinuation|BridgeControlUnparkAliasResumesWithHeadPoll)$'
+          go test ./internal/teams -count=1 -run "$teams_poll_backlog_pattern" -v
+          go test ./internal/teams/store -count=1 -run 'TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed$' -v
+          go test ./internal/cli -count=1 -run 'TestTeamsStatus(SeparatesCatchupBacklogAndInactiveRows|ShowsRunningTurnDetails)$' -v
+
       - name: Teams watchdog lifecycle drain regressions
         shell: bash
         run: |

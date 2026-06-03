@@ -6997,6 +6997,95 @@ func TestChatPollScheduleCanClearContinuationPath(t *testing.T) {
 	}
 }
 
+func TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name          string
+		sessionID     string
+		chatID        string
+		sessionStatus SessionStatus
+		pollState     string
+	}{
+		{name: "parked", sessionID: "s-parked", chatID: "chat-parked", sessionStatus: SessionStatusActive, pollState: "parked"},
+		{name: "closed", sessionID: "s-closed", chatID: "chat-closed", sessionStatus: SessionStatusClosed, pollState: "cold"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := store.CreateSession(ctx, SessionContext{
+				ID:          tc.sessionID,
+				Status:      tc.sessionStatus,
+				TeamsChatID: tc.chatID,
+				UpdatedAt:   now.Add(-49 * time.Hour),
+			}); err != nil {
+				t.Fatalf("CreateSession error: %v", err)
+			}
+			if _, err := store.RecordChatPollSuccessWithContinuation(ctx, tc.chatID, now.Add(-time.Hour), true, true, 50, "/chats/"+tc.chatID+"/messages?$skiptoken=stale"); err != nil {
+				t.Fatalf("RecordChatPollSuccessWithContinuation error: %v", err)
+			}
+			if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+				ChatID:         tc.chatID,
+				PollState:      tc.pollState,
+				LastActivityAt: now.Add(-49 * time.Hour),
+				BlockedUntil:   now.Add(time.Hour),
+			}); err != nil {
+				t.Fatalf("UpdateChatPollSchedule error: %v", err)
+			}
+			if err := store.RecordChatPollError(ctx, tc.chatID, "temporary graph error"); err != nil {
+				t.Fatalf("RecordChatPollError error: %v", err)
+			}
+			poll, ok, err := store.ChatPoll(ctx, tc.chatID)
+			if err != nil || !ok {
+				t.Fatalf("ChatPoll before cleanup ok=%v err=%v", ok, err)
+			}
+			if poll.ContinuationPath == "" || poll.BlockedUntil.IsZero() || poll.LastError == "" || poll.LastErrorAt.IsZero() || poll.FailureCount == 0 {
+				t.Fatalf("test poll was not dirty before cleanup: %#v", poll)
+			}
+
+			poll, err = store.ClearChatPollContinuationBackoffAndError(ctx, tc.chatID)
+			if err != nil {
+				t.Fatalf("ClearChatPollContinuationBackoffAndError error: %v", err)
+			}
+			if poll.PollState != tc.pollState || poll.ContinuationPath != "" || !poll.BlockedUntil.IsZero() || poll.LastError != "" || !poll.LastErrorAt.IsZero() || poll.FailureCount != 0 {
+				t.Fatalf("cleanup poll mismatch: %#v", poll)
+			}
+			if tc.sessionStatus == SessionStatusClosed {
+				state, err := store.Load(ctx)
+				if err != nil {
+					t.Fatalf("Load state: %v", err)
+				}
+				if got := state.Sessions[tc.sessionID].Status; got != SessionStatusClosed {
+					t.Fatalf("closed session status changed to %q", got)
+				}
+			}
+
+			before, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read state before idempotent cleanup: %v", err)
+			}
+			pollBefore, ok, err := store.ChatPoll(ctx, tc.chatID)
+			if err != nil || !ok {
+				t.Fatalf("ChatPoll before idempotent cleanup ok=%v err=%v", ok, err)
+			}
+			pollAfter, err := store.ClearChatPollContinuationBackoffAndError(ctx, tc.chatID)
+			if err != nil {
+				t.Fatalf("idempotent ClearChatPollContinuationBackoffAndError error: %v", err)
+			}
+			after, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read state after idempotent cleanup: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("idempotent cleanup rewrote state file")
+			}
+			if !pollAfter.UpdatedAt.Equal(pollBefore.UpdatedAt) {
+				t.Fatalf("idempotent cleanup changed UpdatedAt: before=%s after=%s", pollBefore.UpdatedAt, pollAfter.UpdatedAt)
+			}
+		})
+	}
+}
+
 func TestChatPollScheduleStatePersistsParkAndBlock(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

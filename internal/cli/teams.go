@@ -1910,6 +1910,7 @@ func newTeamsFileWriteAuthManagerWithHTTPClient(client *http.Client) (*teams.Aut
 
 func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	out := cmd.OutOrStdout()
+	now := time.Now()
 	resolvedRegistryPath, err := teamsRegistryPath(registryPath)
 	if err != nil {
 		return err
@@ -1942,7 +1943,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	queuedOutbox := 0
 	runningTurns := 0
 	queuedTurns := 0
-	combinedPolls := map[string]teamsstore.ChatPollState{}
+	var statusStores []teamsStatusStoreSnapshot
 	var owners []teamsstore.OwnerMetadata
 	var serviceControls []teamsstore.ServiceControl
 	var controlLeases []string
@@ -1955,6 +1956,13 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		if err != nil {
 			return err
 		}
+		owner, ownerKind := teamsStatusOwner(state, now)
+		statusStores = append(statusStores, teamsStatusStoreSnapshot{
+			Path:      statePath,
+			State:     state,
+			Owner:     owner,
+			OwnerKind: ownerKind,
+		})
 		serviceControls = append(serviceControls, state.ServiceControl)
 		for _, session := range state.Sessions {
 			if session.RunnerKind == "control_fallback" && session.TeamsChatID == "" {
@@ -1977,10 +1985,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 				runningTurns++
 			}
 		}
-		for chatID, poll := range state.ChatPolls {
-			combinedPolls[statePath+" "+chatID] = poll
-		}
-		if owner, ok := stateOwner(state); ok {
+		if ownerKind == teamsStatusOwnerLive {
 			owners = append(owners, owner)
 		}
 		if state.ControlLease.HolderMachineID != "" {
@@ -1993,6 +1998,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			controlChatSource = statePath
 		}
 	}
+	statusSummary := buildTeamsStatusSummary(statusStores, controlChatID, defaultStatePath, now)
 	_, _ = fmt.Fprintln(out, "Teams status")
 	_, _ = fmt.Fprintf(out, "Registry: %s\n", resolvedRegistryPath)
 	if controlChatID == "" {
@@ -2059,7 +2065,16 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		_, _ = fmt.Fprintln(out, "Teams listener: running")
 	}
 	_, _ = fmt.Fprintf(out, "State summary: %d sessions, %d turns (%d queued, %d running), %d queued outbox\n", stateSessions, turns, queuedTurns, runningTurns, queuedOutbox)
-	_, _ = fmt.Fprintf(out, "Poll summary: %s\n", formatPollSummary(combinedPolls))
+	_, _ = fmt.Fprintf(out, "Poll summary: %s\n", formatPollSummary(statusSummary))
+	_, _ = fmt.Fprintf(out, "Active summary: %s\n", formatTeamsActiveSummary(statusSummary))
+	_, _ = fmt.Fprintf(out, "Work row layers: %s\n", formatTeamsWorkRowLayers(statusSummary))
+	_, _ = fmt.Fprintf(out, "Scope layers: %s\n", formatTeamsScopeLayers(statusSummary))
+	if len(statusSummary.RunningTurns) > 0 {
+		_, _ = fmt.Fprintln(out, "Running turns:")
+		for _, turn := range statusSummary.RunningTurns {
+			_, _ = fmt.Fprintf(out, "- %s\n", formatTeamsRunningTurnStatus(turn, now))
+		}
+	}
 	if len(owners) == 0 {
 		_, _ = fmt.Fprintln(out, "Owner: none")
 	} else {
@@ -2312,49 +2327,402 @@ func resolveTeamsSendFileChatID(registryPath string, sessionID string, explicitC
 	return "", fmt.Errorf("choose a target with --session or --chat-id")
 }
 
-func formatPollSummary(polls map[string]teamsstore.ChatPollState) string {
-	if len(polls) == 0 {
+const (
+	teamsStatusOwnerNone  = "none"
+	teamsStatusOwnerLive  = "live"
+	teamsStatusOwnerStale = "stale"
+	teamsStatusOwnerDead  = "dead"
+)
+
+type teamsStatusStoreSnapshot struct {
+	Path      string
+	State     teamsstore.State
+	Owner     teamsstore.OwnerMetadata
+	OwnerKind string
+}
+
+type teamsStatusSummary struct {
+	PollChats                    int
+	PollErrors                   int
+	HistoricalWindowWarnings     int
+	ActiveWindowWarnings         int
+	ActiveCatchupContinuations   int
+	PollableBacklogContinuations int
+	BacklogContinuations         int
+	ActiveReadBackoffs           int
+	LastSuccessfulPollAt         time.Time
+
+	PollableWorkChats int
+	ParkedRows        int
+	ClosedRows        int
+	ArchivedRows      int
+	StaleScopeRows    int
+	ClosedLegacyRows  int
+	TestE2EStaleRows  int
+
+	LiveScopes       int
+	StaleOwnerScopes int
+	StoppedScopes    int
+	DeadOwnerScopes  int
+
+	RunningTurns []teamsStatusRunningTurn
+}
+
+type teamsStatusRunningTurn struct {
+	StatePath    string
+	ScopeID      string
+	Layer        string
+	SessionID    string
+	TeamsChatID  string
+	TurnID       string
+	CodexThread  string
+	CodexTurn    string
+	StartedAt    time.Time
+	UpdatedAt    time.Time
+	ChildCommand string
+}
+
+func teamsStatusOwner(state teamsstore.State, now time.Time) (teamsstore.OwnerMetadata, string) {
+	owner, ok := teamsStatusRawOwner(state)
+	if !ok {
+		return teamsstore.OwnerMetadata{}, teamsStatusOwnerNone
+	}
+	if teamsstore.OwnerAppearsLocallyDead(owner) {
+		return owner, teamsStatusOwnerDead
+	}
+	if teamsstore.IsStale(owner, defaultTeamsOwnerStaleAfter, now) {
+		return owner, teamsStatusOwnerStale
+	}
+	return owner, teamsStatusOwnerLive
+}
+
+func teamsStatusRawOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool) {
+	if state.ServiceOwner != nil {
+		return *state.ServiceOwner, true
+	}
+	if state.LockOwner != nil {
+		return *state.LockOwner, true
+	}
+	return teamsstore.OwnerMetadata{}, false
+}
+
+func buildTeamsStatusSummary(stores []teamsStatusStoreSnapshot, controlChatID string, defaultStatePath string, now time.Time) teamsStatusSummary {
+	var summary teamsStatusSummary
+	activeCatchupPolls := make(map[string]bool)
+	totalContinuations := 0
+	for _, snapshot := range stores {
+		switch snapshot.OwnerKind {
+		case teamsStatusOwnerLive:
+			summary.LiveScopes++
+		case teamsStatusOwnerStale:
+			summary.StaleOwnerScopes++
+		case teamsStatusOwnerDead:
+			summary.DeadOwnerScopes++
+		default:
+			summary.StoppedScopes++
+		}
+		for _, poll := range snapshot.State.ChatPolls {
+			summary.PollChats++
+			if strings.TrimSpace(poll.LastError) != "" {
+				summary.PollErrors++
+			}
+			if !poll.LastWindowFullAt.IsZero() {
+				summary.HistoricalWindowWarnings++
+			}
+			if strings.TrimSpace(poll.ContinuationPath) != "" {
+				totalContinuations++
+			}
+			if poll.LastSuccessfulPollAt.After(summary.LastSuccessfulPollAt) {
+				summary.LastSuccessfulPollAt = poll.LastSuccessfulPollAt
+			}
+		}
+		for _, session := range snapshot.State.Sessions {
+			layer := teamsStatusSessionLayer(snapshot, session, controlChatID, defaultStatePath)
+			chatID := strings.TrimSpace(session.TeamsChatID)
+			poll, hasPoll := snapshot.State.ChatPolls[chatID]
+			if layer == "pollable" {
+				summary.PollableWorkChats++
+				if hasPoll && strings.TrimSpace(poll.LastWindowFullMessage) != "" {
+					summary.ActiveWindowWarnings++
+				}
+				if hasPoll && poll.BlockedUntil.After(now) {
+					summary.ActiveReadBackoffs++
+				}
+				if hasPoll && strings.TrimSpace(poll.ContinuationPath) != "" && strings.TrimSpace(poll.PollState) == "catchup" {
+					key := teamsStatusPollKey(snapshot.Path, chatID)
+					activeCatchupPolls[key] = true
+					summary.ActiveCatchupContinuations++
+				} else if hasPoll && strings.TrimSpace(poll.ContinuationPath) != "" {
+					summary.PollableBacklogContinuations++
+				}
+			}
+			switch layer {
+			case "parked":
+				summary.ParkedRows++
+			case "closed":
+				summary.ClosedRows++
+				if teamsStatusStoreIsLegacy(snapshot.Path, defaultStatePath) {
+					summary.ClosedLegacyRows++
+				}
+			case "archived":
+				summary.ArchivedRows++
+			case "stale_scope":
+				summary.StaleScopeRows++
+				if teamsStatusStoreLooksTestE2E(snapshot) {
+					summary.TestE2EStaleRows++
+				}
+			}
+		}
+		for _, turn := range snapshot.State.Turns {
+			if turn.Status != teamsstore.TurnStatusRunning {
+				continue
+			}
+			summary.RunningTurns = append(summary.RunningTurns, teamsStatusRunningTurnFromState(snapshot, turn))
+		}
+	}
+	summary.BacklogContinuations = totalContinuations - len(activeCatchupPolls)
+	if summary.BacklogContinuations < 0 {
+		summary.BacklogContinuations = 0
+	}
+	sort.Slice(summary.RunningTurns, func(i, j int) bool {
+		left := firstNonZeroCLITime(summary.RunningTurns[i].UpdatedAt, summary.RunningTurns[i].StartedAt)
+		right := firstNonZeroCLITime(summary.RunningTurns[j].UpdatedAt, summary.RunningTurns[j].StartedAt)
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return summary.RunningTurns[i].TurnID < summary.RunningTurns[j].TurnID
+	})
+	return summary
+}
+
+func teamsStatusSessionLayer(snapshot teamsStatusStoreSnapshot, session teamsstore.SessionContext, controlChatID string, defaultStatePath string) string {
+	if teamsStatusIsControlFallbackSession(session) {
+		return "control"
+	}
+	status := strings.TrimSpace(string(session.Status))
+	if status == "" {
+		status = string(teamsstore.SessionStatusActive)
+	}
+	switch teamsstore.SessionStatus(status) {
+	case teamsstore.SessionStatusClosed:
+		return "closed"
+	case teamsstore.SessionStatusArchived:
+		return "archived"
+	}
+	chatID := strings.TrimSpace(session.TeamsChatID)
+	if chatID == "" || (strings.TrimSpace(controlChatID) != "" && chatID == strings.TrimSpace(controlChatID)) {
+		return "control"
+	}
+	if snapshot.OwnerKind != teamsStatusOwnerLive {
+		return "stale_scope"
+	}
+	if poll, ok := snapshot.State.ChatPolls[chatID]; ok && strings.TrimSpace(poll.PollState) == "parked" {
+		return "parked"
+	}
+	return "pollable"
+}
+
+func teamsStatusIsControlFallbackSession(session teamsstore.SessionContext) bool {
+	return strings.TrimSpace(session.ID) == "__control_fallback__" || strings.EqualFold(strings.TrimSpace(session.RunnerKind), "control_fallback")
+}
+
+func teamsStatusStoreIsLegacy(path string, defaultStatePath string) bool {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(defaultStatePath) == "" {
+		return false
+	}
+	return filepath.Clean(path) == filepath.Clean(defaultStatePath)
+}
+
+func teamsStatusStoreLooksTestE2E(snapshot teamsStatusStoreSnapshot) bool {
+	values := []string{
+		snapshot.Path,
+		snapshot.State.Scope.ID,
+		snapshot.State.Scope.Profile,
+		snapshot.State.MachineIdentity.Profile,
+	}
+	for _, value := range values {
+		lower := strings.ToLower(strings.TrimSpace(value))
+		if strings.Contains(lower, "e2e") || strings.Contains(lower, "live-test") || strings.Contains(lower, "live_tests") {
+			return true
+		}
+	}
+	return false
+}
+
+func teamsStatusPollKey(statePath string, chatID string) string {
+	return filepath.Clean(strings.TrimSpace(statePath)) + "\x00" + strings.TrimSpace(chatID)
+}
+
+func teamsStatusRunningTurnFromState(snapshot teamsStatusStoreSnapshot, turn teamsstore.Turn) teamsStatusRunningTurn {
+	session := snapshot.State.Sessions[strings.TrimSpace(turn.SessionID)]
+	startedAt := firstNonZeroCLITime(turn.StartedAt, turn.QueuedAt, turn.CreatedAt)
+	updatedAt := firstNonZeroCLITime(turn.UpdatedAt, turn.StartedAt, turn.QueuedAt, turn.CreatedAt)
+	childCommand, childUpdatedAt := teamsStatusChildCommandForTurn(snapshot.State, turn.ID)
+	if childUpdatedAt.After(updatedAt) {
+		updatedAt = childUpdatedAt
+	}
+	layer := "unknown"
+	if snapshot.OwnerKind != "" {
+		layer = snapshot.OwnerKind
+	}
+	return teamsStatusRunningTurn{
+		StatePath:    snapshot.Path,
+		ScopeID:      firstNonEmptyCLI(snapshot.State.Scope.ID, snapshot.Owner.ScopeID),
+		Layer:        layer,
+		SessionID:    strings.TrimSpace(turn.SessionID),
+		TeamsChatID:  strings.TrimSpace(session.TeamsChatID),
+		TurnID:       strings.TrimSpace(turn.ID),
+		CodexThread:  strings.TrimSpace(firstNonEmptyCLI(turn.CodexThreadID, session.CodexThreadID)),
+		CodexTurn:    strings.TrimSpace(firstNonEmptyCLI(turn.CodexTurnID, session.LatestCodexTurnID)),
+		StartedAt:    startedAt,
+		UpdatedAt:    updatedAt,
+		ChildCommand: childCommand,
+	}
+}
+
+func teamsStatusChildCommandForTurn(state teamsstore.State, turnID string) (string, time.Time) {
+	var command string
+	var updatedAt time.Time
+	for _, msg := range state.OutboxMessages {
+		if strings.TrimSpace(msg.TurnID) != strings.TrimSpace(turnID) {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(strings.TrimSpace(msg.Kind)), "command") && !strings.Contains(msg.Body, "Running command:") && !strings.Contains(msg.Body, "Command:") {
+			continue
+		}
+		candidate := teamsStatusExtractCommand(msg.Body)
+		if candidate == "" {
+			continue
+		}
+		candidateUpdatedAt := firstNonZeroCLITime(msg.UpdatedAt, msg.CreatedAt, msg.SentAt)
+		if command == "" || candidateUpdatedAt.After(updatedAt) {
+			command = candidate
+			updatedAt = candidateUpdatedAt
+		}
+	}
+	return command, updatedAt
+}
+
+func teamsStatusExtractCommand(body string) string {
+	text := strings.TrimSpace(body)
+	if text == "" {
+		return ""
+	}
+	if strings.Contains(text, "<") && strings.Contains(text, ">") {
+		text = strings.TrimSpace(teams.PlainTextFromTeamsHTML(text))
+	}
+	for _, label := range []string{"Running command:", "Command:"} {
+		idx := strings.Index(text, label)
+		if idx < 0 {
+			continue
+		}
+		rest := strings.TrimSpace(text[idx+len(label):])
+		for _, line := range strings.Split(rest, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if strings.HasPrefix(line, "Status:") || strings.HasPrefix(line, "Exit code:") || strings.HasPrefix(line, "Output:") {
+				return ""
+			}
+			return line
+		}
+	}
+	return ""
+}
+
+func formatPollSummary(summary teamsStatusSummary) string {
+	if summary.PollChats == 0 {
 		return "unavailable"
 	}
-	errorCount := 0
-	historicalWindowCount := 0
-	activeWindowCount := 0
-	activeContinuationCount := 0
-	activeReadBackoffCount := 0
-	var lastSuccess time.Time
-	now := time.Now()
-	for _, poll := range polls {
-		if poll.LastError != "" {
-			errorCount++
-		}
-		if !poll.LastWindowFullAt.IsZero() {
-			historicalWindowCount++
-		}
-		if poll.LastWindowFullMessage != "" {
-			activeWindowCount++
-		}
-		if poll.ContinuationPath != "" {
-			activeContinuationCount++
-		}
-		if poll.BlockedUntil.After(now) {
-			activeReadBackoffCount++
-		}
-		if poll.LastSuccessfulPollAt.After(lastSuccess) {
-			lastSuccess = poll.LastSuccessfulPollAt
-		}
-	}
-	parts := []string{fmt.Sprintf("%d chats", len(polls))}
-	if !lastSuccess.IsZero() {
-		parts = append(parts, "last_success "+lastSuccess.Format(time.RFC3339))
+	parts := []string{fmt.Sprintf("%d chats", summary.PollChats)}
+	if !summary.LastSuccessfulPollAt.IsZero() {
+		parts = append(parts, "last_success "+summary.LastSuccessfulPollAt.Format(time.RFC3339))
 	}
 	parts = append(parts,
-		fmt.Sprintf("%d errors", errorCount),
-		fmt.Sprintf("%d active window warnings", activeWindowCount),
-		fmt.Sprintf("%d historical window warnings", historicalWindowCount),
-		fmt.Sprintf("%d active continuations", activeContinuationCount),
-		fmt.Sprintf("%d active read backoffs", activeReadBackoffCount),
+		fmt.Sprintf("%d errors", summary.PollErrors),
+		fmt.Sprintf("%d active window warnings", summary.ActiveWindowWarnings),
+		fmt.Sprintf("%d historical window warnings", summary.HistoricalWindowWarnings),
+		fmt.Sprintf("%d active catchup", summary.ActiveCatchupContinuations),
+		fmt.Sprintf("%d backlog continuations", summary.BacklogContinuations),
+		fmt.Sprintf("%d active read backoffs", summary.ActiveReadBackoffs),
 	)
 	return strings.Join(parts, ", ")
+}
+
+func formatTeamsActiveSummary(summary teamsStatusSummary) string {
+	return fmt.Sprintf("%d pollable chats, %d active catchup, %d pollable backlog", summary.PollableWorkChats, summary.ActiveCatchupContinuations, summary.PollableBacklogContinuations)
+}
+
+func formatTeamsWorkRowLayers(summary teamsStatusSummary) string {
+	return fmt.Sprintf("pollable=%d parked=%d closed=%d archived=%d stale_scope=%d closed_legacy=%d test_e2e_stale=%d", summary.PollableWorkChats, summary.ParkedRows, summary.ClosedRows, summary.ArchivedRows, summary.StaleScopeRows, summary.ClosedLegacyRows, summary.TestE2EStaleRows)
+}
+
+func formatTeamsScopeLayers(summary teamsStatusSummary) string {
+	return fmt.Sprintf("live=%d stale_owner=%d dead_owner=%d stopped=%d", summary.LiveScopes, summary.StaleOwnerScopes, summary.DeadOwnerScopes, summary.StoppedScopes)
+}
+
+func formatTeamsRunningTurnStatus(turn teamsStatusRunningTurn, now time.Time) string {
+	parts := []string{
+		"session=" + firstNonEmptyCLI(turn.SessionID, "unknown"),
+		"turn=" + firstNonEmptyCLI(turn.TurnID, "unknown"),
+	}
+	if turn.CodexThread != "" {
+		parts = append(parts, "codex_session="+turn.CodexThread)
+	}
+	if turn.CodexTurn != "" {
+		parts = append(parts, "codex_turn="+turn.CodexTurn)
+	}
+	if turn.TeamsChatID != "" {
+		parts = append(parts, "chat="+turn.TeamsChatID)
+	}
+	if turn.ScopeID != "" {
+		parts = append(parts, "scope="+turn.ScopeID)
+	}
+	if turn.Layer != "" {
+		parts = append(parts, "owner="+turn.Layer)
+	}
+	if !turn.StartedAt.IsZero() {
+		parts = append(parts, "age="+formatTeamsStatusDuration(now.Sub(turn.StartedAt)))
+	}
+	if !turn.UpdatedAt.IsZero() {
+		parts = append(parts, "last_update="+turn.UpdatedAt.Format(time.RFC3339))
+	}
+	if turn.ChildCommand != "" {
+		parts = append(parts, "child_command="+strconvQuoteCLI(turn.ChildCommand))
+	}
+	return strings.Join(parts, " ")
+}
+
+func firstNonZeroCLITime(values ...time.Time) time.Time {
+	for _, value := range values {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
+func formatTeamsStatusDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return d.Round(time.Second).String()
+	case d < time.Hour:
+		return strings.TrimSuffix(d.Round(time.Minute).String(), "0s")
+	default:
+		return strings.TrimSuffix(d.Round(time.Minute).String(), "0s")
+	}
+}
+
+func strconvQuoteCLI(value string) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
+	}
+	return string(data)
 }
 
 func openTeamsStore() (*teamsstore.Store, error) {

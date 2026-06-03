@@ -1066,7 +1066,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			}
 		}
 	} else {
-		controlHandled, err := b.pollChatWithRoleState(ctx, b.reg.ControlChatID, effectiveOwnerPollTop(top), inboundPollRoleControl, false, controlPoll, hasControlPoll, b.handleControlMessage)
+		controlHandled, err := b.pollChatWithRoleStateOptions(ctx, b.reg.ControlChatID, effectiveOwnerPollTop(top), inboundPollRoleControl, false, controlPoll, hasControlPoll, pollChatWithRoleOptions{}, b.handleControlMessage)
 		if err != nil {
 			return err
 		}
@@ -1103,6 +1103,12 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			continue
 		}
 		poll, hasPoll := state.ChatPolls[session.ChatID]
+		if explicitParkedWorkPollShouldSkip(poll, hasPoll) {
+			if update, ok := explicitParkedWorkPollMaintenanceUpdate(session.ChatID, poll); ok {
+				pendingScheduleUpdates = append(pendingScheduleUpdates, update)
+			}
+			continue
+		}
 		pollsByChat[session.ChatID] = poll
 		hasPollByChat[session.ChatID] = hasPoll
 		pollableByChat[session.ChatID] = session
@@ -1152,7 +1158,11 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 		s := session
 		turns := queueStateBySession[s.ID]
-		if _, err := b.pollChatWithRoleState(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], func(ctx context.Context, msg ChatMessage, text string) error {
+		pollOptions := pollChatWithRoleOptions{
+			AllowBacklogDrain: decision.State != inboundPollStateCold && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0,
+			MaxBacklogActions: 1,
+		}
+		if _, err := b.pollChatWithRoleStateOptions(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], pollOptions, func(ctx context.Context, msg ChatMessage, text string) error {
 			return b.handleSessionMessageWithQueueState(ctx, s.ChatID, msg, text, &turns, nil)
 		}); err != nil {
 			queueStateBySession[s.ID] = turns
@@ -1271,6 +1281,31 @@ func pollableWorkSessionFromRegistry(state teamstore.State, session Session, con
 	return registrySessionFromDurable(durable), true
 }
 
+func explicitParkedWorkPollShouldSkip(poll teamstore.ChatPollState, hasPoll bool) bool {
+	return hasPoll && strings.TrimSpace(poll.PollState) == inboundPollStateParked && !poll.ParkNoticeSentAt.IsZero()
+}
+
+func explicitParkedWorkPollMaintenanceUpdate(chatID string, poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, bool) {
+	if strings.TrimSpace(chatID) == "" {
+		return teamstore.ChatPollScheduleUpdate{}, false
+	}
+	if poll.ParkedAt.IsZero() ||
+		!poll.BlockedUntil.IsZero() ||
+		strings.TrimSpace(poll.ContinuationPath) != "" ||
+		poll.FailureCount != 0 ||
+		strings.TrimSpace(poll.LastError) != "" ||
+		!poll.LastErrorAt.IsZero() {
+		return teamstore.ChatPollScheduleUpdate{
+			ChatID:                chatID,
+			PollState:             inboundPollStateParked,
+			ClearBlockedUntil:     true,
+			ClearContinuationPath: true,
+			ResetFailures:         true,
+		}, true
+	}
+	return teamstore.ChatPollScheduleUpdate{}, false
+}
+
 func isControlFallbackSessionID(sessionID string) bool {
 	return strings.TrimSpace(sessionID) == controlFallbackSessionID
 }
@@ -1353,6 +1388,18 @@ func (b *Bridge) pollChatWithRole(ctx context.Context, chatID string, top int, r
 }
 
 func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, handle func(context.Context, ChatMessage, string) error) (bool, error) {
+	return b.pollChatWithRoleStateOptions(ctx, chatID, top, role, running, poll, hasPoll, pollChatWithRoleOptions{
+		AllowBacklogDrain: true,
+		MaxBacklogActions: 1,
+	}, handle)
+}
+
+type pollChatWithRoleOptions struct {
+	AllowBacklogDrain bool
+	MaxBacklogActions int
+}
+
+func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, opts pollChatWithRoleOptions, handle func(context.Context, ChatMessage, string) error) (bool, error) {
 	if err := b.ensureStore(); err != nil {
 		return false, err
 	}
@@ -1361,47 +1408,100 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 	if seeded && !poll.LastModifiedCursor.IsZero() {
 		modifiedAfter = poll.LastModifiedCursor.Add(-pollCursorOverlap)
 	}
-	var (
-		window MessageWindow
-		err    error
-	)
-	useContinuation := seeded && role != inboundPollRoleControl && strings.TrimSpace(poll.ContinuationPath) != ""
-	if useContinuation {
-		window, err = b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, poll.ContinuationPath)
-	} else {
-		window, err = b.readClient().ListMessagesWindowWithoutRateLimitRetry(ctx, chatID, top, modifiedAfter)
-	}
+	window, err := b.readClient().ListMessagesWindowWithoutRateLimitRetry(ctx, chatID, top, modifiedAfter)
 	if err != nil {
 		_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
 		return false, err
 	}
+	headResult, err := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll, window, top, 0, handle)
+	if err != nil {
+		return headResult.Handled, err
+	}
+	maxModified := headResult.MaxModified
+	windowFull := headResult.WindowFull
+	fetched := headResult.Fetched
+	handled := headResult.Handled
+	activityAt := headResult.ActivityAt
+	continuationPath := existingWorkContinuationPath(role, poll)
+	headContinuationPath := ""
+	if seeded && role != inboundPollRoleControl && window.Truncated {
+		headContinuationPath = strings.TrimSpace(window.NextPath)
+		if strings.TrimSpace(continuationPath) == "" {
+			continuationPath = headContinuationPath
+		}
+	}
+	if seeded && role != inboundPollRoleControl && !handled && opts.AllowBacklogDrain && strings.TrimSpace(poll.ContinuationPath) != "" {
+		backlogWindow, backlogErr := b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, poll.ContinuationPath)
+		if backlogErr != nil {
+			_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, backlogErr.Error(), inboundPollBlockedUntil(poll, backlogErr, time.Now()))
+			return handled, backlogErr
+		}
+		backlogResult, backlogErr := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll, backlogWindow, top, opts.MaxBacklogActions, handle)
+		if backlogErr != nil {
+			return handled || backlogResult.Handled, backlogErr
+		}
+		handled = handled || backlogResult.Handled
+		activityAt = latestTime(activityAt, backlogResult.ActivityAt)
+		maxModified = latestTime(maxModified, backlogResult.MaxModified)
+		windowFull = windowFull || backlogResult.WindowFull
+		fetched += backlogResult.Fetched
+		if !backlogResult.ActionLimitReached {
+			if backlogWindow.Truncated {
+				continuationPath = backlogWindow.NextPath
+			} else if headContinuationPath != "" {
+				continuationPath = headContinuationPath
+			} else {
+				continuationPath = ""
+			}
+		}
+	}
+	if headContinuationPath != "" && strings.TrimSpace(poll.ContinuationPath) != "" && strings.TrimSpace(continuationPath) != headContinuationPath {
+		maxModified = poll.LastModifiedCursor
+	}
+	if role == inboundPollRoleControl {
+		b.notePollSuccess(time.Now())
+	}
+	if handled && activityAt.IsZero() {
+		activityAt = time.Now()
+	}
+	_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, fetched, continuationPath, activityAt)
+	return handled, err
+}
+
+type pollMessageWindowResult struct {
+	Handled            bool
+	ActionLimitReached bool
+	ActivityAt         time.Time
+	MaxModified        time.Time
+	WindowFull         bool
+	Fetched            int
+}
+
+func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, role inboundPollRole, poll teamstore.ChatPollState, hasPoll bool, window MessageWindow, top int, maxActions int, handle func(context.Context, ChatMessage, string) error) (pollMessageWindowResult, error) {
 	msgs := window.Messages
 	sort.Slice(msgs, func(i, j int) bool {
 		return messageSortTime(msgs[i]).Before(messageSortTime(msgs[j]))
 	})
-	maxModified := maxMessageModifiedTime(msgs)
-	windowFull := window.Truncated || len(msgs) >= normalizedMessageTop(top)
-	if !seeded && len(b.reg.Chats[chatID].SeenMessageIDs) == 0 {
-		for _, msg := range msgs {
-			b.reg.MarkSeen(chatID, msg.ID)
-		}
-		_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, len(msgs), "", time.Time{})
-		if err != nil {
-			return false, err
-		}
-		if role == inboundPollRoleControl {
-			b.notePollSuccess(time.Now())
-		}
-		return false, nil
+	result := pollMessageWindowResult{
+		MaxModified: maxMessageModifiedTime(msgs),
+		WindowFull:  window.Truncated || len(msgs) >= normalizedMessageTop(top),
+		Fetched:     len(msgs),
 	}
-	handled := false
-	var activityAt time.Time
-	for _, msg := range msgs {
+	if !hasPoll || !poll.Seeded {
+		if len(b.reg.Chats[chatID].SeenMessageIDs) == 0 {
+			for _, msg := range msgs {
+				b.reg.MarkSeen(chatID, msg.ID)
+			}
+			return result, nil
+		}
+	}
+	actions := 0
+	for i, msg := range msgs {
 		legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
 		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
 		if err != nil {
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
-			return handled, err
+			return result, err
 		}
 		if ignore {
 			b.reg.MarkSeen(chatID, msg.ID)
@@ -1419,7 +1519,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 		globalClaim, claimed, err := b.tryClaimGlobalInbound(ctx, chatID, msg.ID)
 		if err != nil {
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
-			return handled, err
+			return result, err
 		}
 		if !claimed {
 			b.reg.MarkSeen(chatID, msg.ID)
@@ -1429,7 +1529,7 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 			if err := b.ensureActiveControlLease(ctx); err != nil {
 				releaseGlobalInbound(ctx, globalClaim)
 				b.recordChatPollHandlerError(ctx, chatID, poll, err)
-				return handled, err
+				return result, err
 			}
 		}
 		if err := handle(ctx, msg, text); err != nil {
@@ -1438,36 +1538,37 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 				b.reg.MarkSeen(chatID, msg.ID)
 				if completeErr := completeGlobalInbound(ctx, globalClaim); completeErr != nil {
 					_ = b.store.RecordChatPollError(ctx, chatID, completeErr.Error())
-					return handled, completeErr
+					return result, completeErr
 				}
 				continue
 			}
 			releaseGlobalInbound(ctx, globalClaim)
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
-			return handled, err
+			return result, err
 		}
 		b.reg.MarkSeen(chatID, msg.ID)
 		if err := completeGlobalInbound(ctx, globalClaim); err != nil {
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
-			return handled, err
+			return result, err
 		}
 		b.annotateIncomingUserMessage(ctx, chatID, msg)
-		handled = true
-		activityAt = latestTime(activityAt, time.Now(), messageSortTime(msg))
+		result.Handled = true
+		result.ActivityAt = latestTime(result.ActivityAt, time.Now(), messageSortTime(msg))
 		b.boostPolling(time.Now())
+		actions++
+		if maxActions > 0 && actions >= maxActions && i < len(msgs)-1 {
+			result.ActionLimitReached = true
+			break
+		}
 	}
-	continuationPath := ""
-	if seeded && role != inboundPollRoleControl && window.Truncated {
-		continuationPath = window.NextPath
-	}
+	return result, nil
+}
+
+func existingWorkContinuationPath(role inboundPollRole, poll teamstore.ChatPollState) string {
 	if role == inboundPollRoleControl {
-		b.notePollSuccess(time.Now())
+		return ""
 	}
-	if handled && activityAt.IsZero() {
-		activityAt = time.Now()
-	}
-	_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, len(msgs), continuationPath, activityAt)
-	return handled, err
+	return strings.TrimSpace(poll.ContinuationPath)
 }
 
 func (b *Bridge) recordChatPollHandlerError(ctx context.Context, chatID string, poll teamstore.ChatPollState, err error) {
@@ -1532,9 +1633,18 @@ func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role 
 }
 
 func (b *Bridge) recordChatPollSuccessAndSchedule(ctx context.Context, chatID string, role inboundPollRole, running bool, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, activityAt time.Time) (teamstore.ChatPollState, error) {
-	return b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
+	poll, err := b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
 		return chatPollScheduleUpdateAfterPoll(chatID, role, running, poll, activityAt, time.Now()), nil
 	})
+	if err != nil {
+		return poll, err
+	}
+	if role == inboundPollRoleWork {
+		if clearErr := b.clearTerminalWorkChatPollState(ctx, chatID); clearErr != nil {
+			return poll, clearErr
+		}
+	}
+	return poll, nil
 }
 
 func chatPollScheduleUpdateAfterPoll(chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time, now time.Time) teamstore.ChatPollScheduleUpdate {
@@ -1604,13 +1714,15 @@ func inboundPollDecisionScheduleUpdate(decision inboundPollDecision) (teamstore.
 		return teamstore.ChatPollScheduleUpdate{}, false
 	}
 	return teamstore.ChatPollScheduleUpdate{
-		ChatID:            decision.ChatID,
-		PollState:         decision.State,
-		PreviousPollState: decision.PreviousState,
-		NextPollAt:        decision.NextPollAt,
-		LastActivityAt:    decision.LastActivityAt,
-		BlockedUntil:      decision.BlockedUntil,
-		ClearBlockedUntil: decision.State != inboundPollStateBlocked,
+		ChatID:                decision.ChatID,
+		PollState:             decision.State,
+		PreviousPollState:     decision.PreviousState,
+		NextPollAt:            decision.NextPollAt,
+		LastActivityAt:        decision.LastActivityAt,
+		BlockedUntil:          decision.BlockedUntil,
+		ClearBlockedUntil:     decision.State != inboundPollStateBlocked,
+		ClearContinuationPath: decision.State == inboundPollStateParked,
+		ResetFailures:         decision.State == inboundPollStateParked,
 	}, true
 }
 
@@ -1636,7 +1748,13 @@ func inboundPollDecisionAlreadyPersisted(poll teamstore.ChatPollState, hasPoll b
 	if strings.TrimSpace(decision.State) == inboundPollStateBlocked {
 		return poll.BlockedUntil.Equal(decision.BlockedUntil)
 	}
-	return poll.BlockedUntil.IsZero()
+	if !poll.BlockedUntil.IsZero() {
+		return false
+	}
+	if strings.TrimSpace(decision.State) == inboundPollStateParked {
+		return strings.TrimSpace(poll.ContinuationPath) == "" && poll.FailureCount == 0 && strings.TrimSpace(poll.LastError) == "" && poll.LastErrorAt.IsZero()
+	}
+	return true
 }
 
 func inboundPollBlockedUntil(poll teamstore.ChatPollState, err error, now time.Time) time.Time {
@@ -3089,6 +3207,12 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
 			return b.sendControl(ctx, message)
+		case DashboardCommandPark:
+			message, err := b.parkWorkChat(ctx, parsed.Target)
+			if err != nil {
+				return b.sendControl(ctx, controlCommandErrorMessage(err))
+			}
+			return b.sendControl(ctx, message)
 		case DashboardCommandResume:
 			message, err := b.resumeParkedWorkChat(ctx, parsed.Argument)
 			if err != nil {
@@ -3519,6 +3643,7 @@ func controlAdvancedHelpText() string {
 		"Other control commands:",
 		"- `st` / `status` - list active Teams work chats",
 		"- `d <number>` / `details <number>` - show technical IDs and details",
+		"- `park <session-id>` / `resume <session-id>` / `unpark <session-id>` - manually pause or resume polling for a Work chat",
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
 		"- `helper cancel last` / `helper cancel all` - stop queued/running Codex question(s) in this Control chat",
@@ -3597,6 +3722,7 @@ func sessionAdvancedHelpText() string {
 		"`helper rename hostname <name>` - rename this machine in all related chat titles",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
+		"`helper park <session-id>` / `helper resume <session-id>` / `helper unpark <session-id>` - manually pause or resume polling for a Work chat",
 		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
 		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding; it never overwrites a different existing binding",
 		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
@@ -6087,6 +6213,22 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 				return err
 			}
 			return b.sendToChat(ctx, chatID, "Session closed. The helper will no longer read or respond in this Teams chat.\n\nThis chat remains visible in Teams. Use the 🏠 control chat to open or create another work chat.")
+		case DashboardCommandPark:
+			arg := strings.TrimSpace(parsed.Argument)
+			if arg == "" {
+				arg = session.ID
+			}
+			message, err := b.parkWorkChatByKey(ctx, arg)
+			if err != nil {
+				return b.sendToChat(ctx, chatID, controlCommandErrorMessage(err))
+			}
+			return b.sendToChat(ctx, chatID, message)
+		case DashboardCommandResume:
+			message, err := b.resumeParkedWorkChat(ctx, parsed.Argument)
+			if err != nil {
+				return b.sendToChat(ctx, chatID, controlCommandErrorMessage(err))
+			}
+			return b.sendToChat(ctx, chatID, message)
 		case DashboardCommandStatus:
 			return b.sendToChat(ctx, chatID, b.formatWorkSessionStatus(session))
 		case DashboardCommandStats:
@@ -10823,13 +10965,46 @@ func (b *Bridge) closeDurableSession(ctx context.Context, session *Session) erro
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
 		current := state.Sessions[session.ID]
 		current.Status = teamstore.SessionStatusClosed
 		current.UpdatedAt = session.UpdatedAt
 		state.Sessions[session.ID] = current
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	if strings.TrimSpace(session.ChatID) != "" {
+		_, err := b.store.ClearChatPollContinuationBackoffAndError(ctx, session.ChatID)
+		return err
+	}
+	return nil
+}
+
+func (b *Bridge) clearTerminalWorkChatPollState(ctx context.Context, chatID string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(chatID) == "" {
+		return nil
+	}
+	chatID = strings.TrimSpace(chatID)
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	matched := false
+	for _, session := range state.Sessions {
+		if strings.TrimSpace(session.TeamsChatID) != chatID {
+			continue
+		}
+		matched = true
+		if isActiveSessionStatus(string(session.Status)) {
+			return nil
+		}
+	}
+	if matched {
+		_, err := b.store.ClearChatPollContinuationBackoffAndError(ctx, chatID)
+		return err
+	}
+	return nil
 }
 
 func (b *Bridge) persistInbound(ctx context.Context, session *Session, msg ChatMessage) (teamstore.InboundEvent, bool, error) {
@@ -16177,6 +16352,144 @@ func (b *Bridge) formatOpenControlTarget(ctx context.Context, target DashboardCo
 		return b.localSessionNotInTeamsMessage(0, strings.TrimSpace(target.Raw)), nil
 	}
 	return b.formatOpenSession(target.Raw), nil
+}
+
+func (b *Bridge) parkWorkChat(ctx context.Context, target DashboardCommandTarget) (string, error) {
+	if target.IsNumber {
+		selection, err := b.resolveDashboardTarget(ctx, target.Number)
+		if err != nil {
+			return "", err
+		}
+		if selection.Kind != DashboardSelectionSession {
+			return "", fmt.Errorf("number %d is a workspace in the current dashboard view; send `project %d` to list its sessions", target.Number, target.Number)
+		}
+		session := b.linkedSessionForLocalSessionID(selection.SessionID)
+		if session == nil || !isActiveSessionStatus(session.Status) {
+			return "", fmt.Errorf("number %d is not linked to an active Work chat; send `continue %d` first", target.Number, target.Number)
+		}
+		return b.parkWorkChatSession(ctx, session)
+	}
+	return b.parkWorkChatByKey(ctx, target.Raw)
+}
+
+func (b *Bridge) parkWorkChatByKey(ctx context.Context, arg string) (string, error) {
+	session, err := b.resolveManualWorkChatTarget(arg, "park")
+	if err != nil {
+		return "", err
+	}
+	return b.parkWorkChatSession(ctx, session)
+}
+
+func (b *Bridge) parkWorkChatSession(ctx context.Context, session *Session) (string, error) {
+	if session == nil {
+		return "", fmt.Errorf("session is required")
+	}
+	if err := b.ensureStore(); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(session.ChatID) == "" {
+		return "", fmt.Errorf("session %s is not linked to a Teams Work chat", session.ID)
+	}
+	turns, err := b.sessionTurnQueueState(ctx, session.ID)
+	if err != nil {
+		return "", err
+	}
+	if turns.Running || turns.Queued > 0 {
+		return "", fmt.Errorf("cannot park %s: a Codex request is queued or running; wait for it to finish or cancel it with `helper cancel last` in that Work chat", session.ID)
+	}
+	now := time.Now()
+	if err := b.ensureDurableSession(ctx, session); err != nil {
+		return "", err
+	}
+	if _, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:                session.ChatID,
+		PollState:             inboundPollStateParked,
+		PreviousPollState:     "",
+		NextPollAt:            time.Time{},
+		LastActivityAt:        now,
+		ClearBlockedUntil:     true,
+		ClearContinuationPath: true,
+		ResetFailures:         true,
+	}); err != nil {
+		return "", err
+	}
+	if _, err := b.store.MarkChatPollParkNoticeSent(ctx, session.ChatID, now); err != nil {
+		return "", err
+	}
+	session.UpdatedAt = now
+	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+		current := state.Sessions[session.ID]
+		current.Status = teamstore.SessionStatusActive
+		current.UpdatedAt = now
+		state.Sessions[session.ID] = current
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	if session.ChatURL != "" {
+		return fmt.Sprintf("Parked %s.\n\nOpen Work chat: %s\n\nThe helper will stop polling that Work chat until you send `resume %s` or `unpark %s` in the Control chat.", session.ID, session.ChatURL, session.ID, session.ID), nil
+	}
+	return fmt.Sprintf("Parked %s.\n\nThe helper will stop polling that Work chat until you send `resume %s` or `unpark %s` in the Control chat.", session.ID, session.ID, session.ID), nil
+}
+
+func (b *Bridge) resolveManualWorkChatTarget(arg string, command string) (*Session, error) {
+	key := strings.TrimSpace(arg)
+	command = strings.TrimSpace(command)
+	if command == "" {
+		command = "park"
+	}
+	if key == "" {
+		return nil, fmt.Errorf("usage: `%s <session-id-or-resume-key>`", command)
+	}
+	var matches []*Session
+	addMatch := func(session *Session) {
+		if session == nil {
+			return
+		}
+		for _, existing := range matches {
+			if existing == session || strings.EqualFold(existing.ID, session.ID) {
+				return
+			}
+		}
+		matches = append(matches, session)
+	}
+	for i := range b.reg.Sessions {
+		session := &b.reg.Sessions[i]
+		if !isActiveSessionStatus(session.Status) {
+			continue
+		}
+		if strings.EqualFold(session.ID, key) ||
+			strings.EqualFold(session.ChatID, key) ||
+			strings.EqualFold(session.CodexThreadID, key) ||
+			strings.EqualFold(resumeKeyForSession(*session), key) {
+			addMatch(session)
+		}
+	}
+	if len(matches) == 0 {
+		lowerKey := strings.ToLower(key)
+		for i := range b.reg.Sessions {
+			session := &b.reg.Sessions[i]
+			if !isActiveSessionStatus(session.Status) {
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(session.ID)), lowerKey) {
+				addMatch(session)
+			}
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("work chat/session not found: %s", key)
+	case 1:
+		return matches[0], nil
+	default:
+		ids := make([]string, 0, len(matches))
+		for _, session := range matches {
+			ids = append(ids, session.ID)
+		}
+		sort.Strings(ids)
+		return nil, fmt.Errorf("ambiguous work chat/session target %q: matches %s", key, strings.Join(ids, ", "))
+	}
 }
 
 func (b *Bridge) resumeWorkChatIfParked(ctx context.Context, session *Session) (bool, error) {
