@@ -7597,13 +7597,18 @@ func TestBridgeControlReloadRunsBeforeReturningWithDelay(t *testing.T) {
 
 func TestBridgeClearsStaleHelperReloadDrainOnStart(t *testing.T) {
 	graph, _ := newBridgeTestGraph(t)
+	now := time.Now()
 	for _, tc := range []struct {
-		name       string
-		paused     bool
-		wantReason string
+		name         string
+		paused       bool
+		updatedAt    time.Time
+		wantDraining bool
+		wantReason   string
 	}{
-		{name: "running", paused: false},
-		{name: "paused", paused: true, wantReason: teamstore.HelperReloadReason},
+		{name: "stale running", updatedAt: now.Add(-helperReloadDrainStaleAfter - time.Minute)},
+		{name: "stale paused", paused: true, updatedAt: now.Add(-helperReloadDrainStaleAfter - time.Minute), wantReason: teamstore.HelperReloadReason},
+		{name: "fresh running remains draining", updatedAt: now.Add(-time.Minute), wantDraining: true, wantReason: teamstore.HelperReloadReason},
+		{name: "fresh paused remains draining", paused: true, updatedAt: now.Add(-time.Minute), wantDraining: true, wantReason: teamstore.HelperReloadReason},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newBridgeTestStore(t)
@@ -7612,7 +7617,7 @@ func TestBridgeClearsStaleHelperReloadDrainOnStart(t *testing.T) {
 					Paused:    tc.paused,
 					Draining:  true,
 					Reason:    teamstore.HelperReloadReason,
-					UpdatedAt: time.Now().Add(-time.Minute),
+					UpdatedAt: tc.updatedAt,
 				}
 				return nil
 			}); err != nil {
@@ -7626,8 +7631,8 @@ func TestBridgeClearsStaleHelperReloadDrainOnStart(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load error: %v", err)
 			}
-			if state.ServiceControl.Draining {
-				t.Fatalf("stale reload drain was not cleared: %#v", state.ServiceControl)
+			if state.ServiceControl.Draining != tc.wantDraining {
+				t.Fatalf("service control draining = %t, want %t: %#v", state.ServiceControl.Draining, tc.wantDraining, state.ServiceControl)
 			}
 			if state.ServiceControl.Paused != tc.paused || state.ServiceControl.Reason != tc.wantReason {
 				t.Fatalf("service control after stale reload clear = %#v", state.ServiceControl)

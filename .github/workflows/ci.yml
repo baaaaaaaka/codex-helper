@@ -118,6 +118,17 @@ jobs:
           go test ./internal/teams -count=1 -run 'TestBridge(RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding))$' -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
+      - name: Teams watchdog lifecycle drain regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          watchdog_pattern='TestTeamsServiceWatchdog(ClearsExpiredHelperUpgradeDrainWithIdleLocalOwner|DoesNotRestartExpiredHelperUpgradeDrainWithRemoteFreshOwner|ClearableUpgradeDrainWinsOverUnrelatedRemoteEvidence|ClearableReloadDrainWinsOverUnrelatedRemoteEvidence|DoesNotRestartExpiredHelperUpgradeDrainWithActiveTurn|ExpiredHelperUpgradeDrainIgnoresRestartCooldown|ClearsStaleHelperReloadDrainWithIdleLocalOwner|DoesNotRestartStaleHelperReloadDrainWithRemoteFreshOwner|DoesNotRestartStaleHelperReloadDrainWithActiveTurn|StaleHelperReloadDrainIgnoresRestartCooldown|ClearsLifecycleDrainBeforeStartingInactiveService|UnrelatedActiveTurnDoesNotBlockZombieDrainClear|RecoverableDrainWinsOverSeparatePausedState|ManyStateFilesRecoveryMatrix)$|TestRunTeamsServiceWatchdogOnce(DryRunLifecycleDrainClearDoesNotWriteState|ClearsExpiredHelperUpgradeDrainWithoutRestart|ClearsStaleHelperReloadDrainWithoutRestart|DoesNotClearFreshRemoteStoreDuringLocalDrainClear)$'
+          store_pattern='Test(AbortExpiredHelperUpgradeDrainPreservesPreviousDrain|AbortExpiredHelperUpgradeDrainPreservesFreshActiveOwner|ClearStaleHelperReloadDrainPreservesFreshDrain|ClearStaleHelperReloadDrainPreservesFreshRemoteOwner)$'
+          bridge_pattern='TestBridge(ClearsStaleHelperReloadDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainWhenRunningVersionMissesTarget|CompletesExpiredHelperUpgradeDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine|CompletesExpiredHelperUpgradeDrainWhenLastAttemptIsStale)$'
+          go test ./internal/cli -count=1 -run "$watchdog_pattern" -v
+          go test ./internal/teams/store -count=1 -run "$store_pattern" -v
+          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
+
       - name: Teams helper stats regressions
         shell: bash
         run: |

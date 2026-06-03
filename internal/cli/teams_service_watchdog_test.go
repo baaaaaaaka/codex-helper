@@ -13,6 +13,8 @@ import (
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
+const wantTeamsServiceWatchdogLifecycleDrainClearAction = "clear"
+
 func TestTeamsServiceWatchdogDefaultsAvoidTransientRestartLoops(t *testing.T) {
 	if defaultTeamsServiceWatchdogOwnerStaleAfter != 90*time.Second {
 		t.Fatalf("owner stale threshold = %s, want 90s", defaultTeamsServiceWatchdogOwnerStaleAfter)
@@ -175,7 +177,7 @@ func TestTeamsServiceWatchdogLifecycleStatePrecedenceMatrix(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceWatchdogRestartsExpiredHelperUpgradeDrainWithLocalOwner(t *testing.T) {
+func TestTeamsServiceWatchdogClearsExpiredHelperUpgradeDrainWithIdleLocalOwner(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -191,8 +193,8 @@ func TestTeamsServiceWatchdogRestartsExpiredHelperUpgradeDrainWithLocalOwner(t *
 	}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
-	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
-		t.Fatalf("decision = %+v, want restart for expired helper upgrade drain", decision)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction || !decision.CooldownUntil.IsZero() {
+		t.Fatalf("decision = %+v, want clear for expired helper upgrade drain without restart cooldown", decision)
 	}
 }
 
@@ -217,7 +219,7 @@ func TestTeamsServiceWatchdogDoesNotRestartExpiredHelperUpgradeDrainWithRemoteFr
 	}
 }
 
-func TestTeamsServiceWatchdogRemoteFreshOwnerWinsOverLocalUpgradeEvidence(t *testing.T) {
+func TestTeamsServiceWatchdogClearableUpgradeDrainWinsOverUnrelatedRemoteEvidence(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -234,12 +236,12 @@ func TestTeamsServiceWatchdogRemoteFreshOwnerWinsOverLocalUpgradeEvidence(t *tes
 	}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
-	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "another machine") {
-		t.Fatalf("decision = %+v, want remote owner evidence to block restart", decision)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("decision = %+v, want clearable local upgrade drain to win over unrelated remote evidence", decision)
 	}
 }
 
-func TestTeamsServiceWatchdogRemoteFreshOwnerWinsOverLocalReloadEvidence(t *testing.T) {
+func TestTeamsServiceWatchdogClearableReloadDrainWinsOverUnrelatedRemoteEvidence(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -256,8 +258,8 @@ func TestTeamsServiceWatchdogRemoteFreshOwnerWinsOverLocalReloadEvidence(t *test
 	}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
-	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "another machine") {
-		t.Fatalf("decision = %+v, want remote owner evidence to block restart", decision)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("decision = %+v, want clearable local reload drain to win over unrelated remote evidence", decision)
 	}
 }
 
@@ -283,7 +285,7 @@ func TestTeamsServiceWatchdogDoesNotRestartExpiredHelperUpgradeDrainWithActiveTu
 	}
 }
 
-func TestTeamsServiceWatchdogExpiredHelperUpgradeDrainRespectsRestartCooldown(t *testing.T) {
+func TestTeamsServiceWatchdogExpiredHelperUpgradeDrainIgnoresRestartCooldown(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -300,12 +302,12 @@ func TestTeamsServiceWatchdogExpiredHelperUpgradeDrainRespectsRestartCooldown(t 
 	state := teamsServiceWatchdogState{ConsecutiveStale: 2, LastActionAt: now.Add(-10 * time.Second)}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, state, opts)
-	if decision.Action != teamsServiceWatchdogActionNoop || decision.CooldownUntil.IsZero() {
-		t.Fatalf("decision = %+v, want noop until cooldown", decision)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction || !decision.CooldownUntil.IsZero() {
+		t.Fatalf("decision = %+v, want clear without restart cooldown", decision)
 	}
 }
 
-func TestTeamsServiceWatchdogRestartsStaleHelperReloadDrainWithLocalOwner(t *testing.T) {
+func TestTeamsServiceWatchdogClearsStaleHelperReloadDrainWithIdleLocalOwner(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -321,8 +323,8 @@ func TestTeamsServiceWatchdogRestartsStaleHelperReloadDrainWithLocalOwner(t *tes
 	}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
-	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
-		t.Fatalf("decision = %+v, want restart for stale helper reload drain", decision)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction || !decision.CooldownUntil.IsZero() {
+		t.Fatalf("decision = %+v, want clear for stale helper reload drain without restart cooldown", decision)
 	}
 }
 
@@ -369,7 +371,7 @@ func TestTeamsServiceWatchdogDoesNotRestartStaleHelperReloadDrainWithActiveTurn(
 	}
 }
 
-func TestTeamsServiceWatchdogStaleHelperReloadDrainRespectsRestartCooldown(t *testing.T) {
+func TestTeamsServiceWatchdogStaleHelperReloadDrainIgnoresRestartCooldown(t *testing.T) {
 	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -386,8 +388,25 @@ func TestTeamsServiceWatchdogStaleHelperReloadDrainRespectsRestartCooldown(t *te
 	state := teamsServiceWatchdogState{ConsecutiveStale: 2, LastActionAt: now.Add(-10 * time.Second)}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, state, opts)
-	if decision.Action != teamsServiceWatchdogActionNoop || decision.CooldownUntil.IsZero() {
-		t.Fatalf("decision = %+v, want noop until cooldown", decision)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction || !decision.CooldownUntil.IsZero() {
+		t.Fatalf("decision = %+v, want clear without restart cooldown", decision)
+	}
+}
+
+func TestTeamsServiceWatchdogClearsLifecycleDrainBeforeStartingInactiveService(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                 true,
+		Active:                    false,
+		StateFiles:                1,
+		ServiceDraining:           true,
+		HelperUpgradeDrainExpired: true,
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("decision = %+v, want clear before inactive service start", decision)
 	}
 }
 
@@ -460,6 +479,48 @@ func TestTeamsServiceWatchdogMergeDetectsExpiredHelperUpgradeDrainRemoteOwner(t 
 	mergeTeamsServiceWatchdogState(&snapshot, state, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
 	if !snapshot.ServiceDraining || !snapshot.HelperUpgradeDrainExpired || !snapshot.HelperUpgradeDrainRemoteOwnerFresh || snapshot.HelperUpgradeDrainLocalOwnerFresh {
 		t.Fatalf("snapshot did not detect remote expired helper upgrade drain owner: %+v", snapshot)
+	}
+}
+
+func TestTeamsServiceWatchdogUnrelatedActiveTurnDoesNotBlockZombieDrainClear(t *testing.T) {
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	zombieRootState := teamsstore.State{
+		ServiceControl: teamsstore.ServiceControl{Draining: true, Reason: teamsstore.HelperUpgradeReason},
+		Upgrade: &teamsstore.UpgradeRequest{
+			ID:         "upgrade-root-zombie",
+			Phase:      teamsstore.UpgradePhaseDraining,
+			Reason:     teamsstore.HelperUpgradeReason,
+			DeadlineAt: now.Add(-time.Minute),
+		},
+	}
+	activeScopeOwner := teamsstore.OwnerMetadata{
+		PID:             os.Getpid(),
+		Hostname:        hostname,
+		HelperVersion:   "v0.1.0-rc.87",
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeat:   now.Add(-5 * time.Second),
+		ActiveSessionID: "s002",
+		ActiveTurnID:    "turn-active",
+	}
+	activeScopeState := teamsstore.State{
+		ServiceOwner: &activeScopeOwner,
+		LockOwner:    &activeScopeOwner,
+	}
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	var snapshot teamsServiceWatchdogSnapshot
+	snapshot.Installed = true
+	snapshot.Active = true
+	snapshot.StateFiles = 2
+	mergeTeamsServiceWatchdogState(&snapshot, zombieRootState, opts)
+	mergeTeamsServiceWatchdogState(&snapshot, activeScopeState, opts)
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("decision = %+v snapshot=%+v, want clear for root zombie drain despite unrelated active turn", decision, snapshot)
 	}
 }
 
@@ -607,8 +668,8 @@ func TestTeamsServiceWatchdogRecoverableDrainWinsOverSeparatePausedState(t *test
 		t.Fatalf("snapshot did not retain both paused and recoverable drain evidence: %+v", snapshot)
 	}
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
-	if decision.Action != teamsServiceWatchdogActionRestart || !decision.Stale {
-		t.Fatalf("decision = %+v, want restart for recoverable drain despite separate paused state", decision)
+	if decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("decision = %+v, want clear for recoverable drain despite separate paused state", decision)
 	}
 }
 
@@ -661,7 +722,7 @@ func TestTeamsServiceWatchdogManyStateFilesRecoveryMatrix(t *testing.T) {
 	}{
 		{
 			name:             "local stale reload drain recovers despite many paused scopes",
-			wantAction:       teamsServiceWatchdogActionRestart,
+			wantAction:       wantTeamsServiceWatchdogLifecycleDrainClearAction,
 			wantReasonSubstr: "helper reload drain is stale",
 		},
 		{
@@ -671,10 +732,10 @@ func TestTeamsServiceWatchdogManyStateFilesRecoveryMatrix(t *testing.T) {
 			wantReasonSubstr: "active turn",
 		},
 		{
-			name:             "fresh remote owner in shared home prevents local takeover",
+			name:             "fresh remote owner in another store does not block local drain clear",
 			includeRemote:    true,
-			wantAction:       teamsServiceWatchdogActionNoop,
-			wantReasonSubstr: "another machine",
+			wantAction:       wantTeamsServiceWatchdogLifecycleDrainClearAction,
+			wantReasonSubstr: "helper reload drain is stale",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -823,6 +884,306 @@ func TestRunTeamsServiceWatchdogOnceStartsServiceAndDryRunDoesNot(t *testing.T) 
 	}
 	if stored.LastAction != teamsServiceWatchdogActionStart || !stored.LastActionAt.Equal(now) {
 		t.Fatalf("stored state = %+v, want start at %s", stored, now)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceDryRunLifecycleDrainClearDoesNotWriteState(t *testing.T) {
+	lockCLITestHooks(t)
+
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "watchdog.json")
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:                         true,
+			Active:                            true,
+			StateFiles:                        1,
+			ServiceDraining:                   true,
+			HelperUpgradeDrainExpired:         true,
+			HelperUpgradeDrainLocalOwnerFresh: true,
+			OwnerFound:                        true,
+			OwnerFresh:                        true,
+			LastOwnerHeartbeat:                now.Add(-5 * time.Second),
+		}, nil
+	}
+	teamsServiceWatchdogStartService = func(context.Context, bool) error {
+		t.Fatal("lifecycle drain clear dry-run must not start or restart service")
+		return nil
+	}
+
+	result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now, DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run watchdog: %v", err)
+	}
+	if result.Decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("dry-run action = %q, want lifecycle drain clear", result.Decision.Action)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("dry-run lifecycle drain clear should not write watchdog state, stat err=%v", err)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceClearsExpiredHelperUpgradeDrainWithoutRestart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	tmp := t.TempDir()
+	watchdogPath := filepath.Join(tmp, "watchdog.json")
+	storePath := filepath.Join(tmp, "teams", "state.json")
+	store, err := teamsstore.Open(storePath)
+	if err != nil {
+		t.Fatalf("Open teams store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ServiceControl = teamsstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamsstore.HelperUpgradeReason,
+			UpdatedAt: now.Add(-time.Minute),
+		}
+		state.Upgrade = &teamsstore.UpgradeRequest{
+			ID:         "upgrade-zombie",
+			Phase:      teamsstore.UpgradePhaseDraining,
+			Reason:     teamsstore.HelperUpgradeReason,
+			DeadlineAt: now.Add(-time.Minute),
+			StartedAt:  now.Add(-10 * time.Minute),
+			UpdatedAt:  now.Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed expired helper upgrade drain: %v", err)
+	}
+
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStorePaths := teamsServiceWatchdogStorePaths
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStorePaths = prevStorePaths
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return watchdogPath, nil }
+	teamsServiceWatchdogStorePaths = func() ([]string, error) { return []string{storePath}, nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:                 true,
+			Active:                    true,
+			StateFiles:                1,
+			ServiceDraining:           true,
+			HelperUpgradeDrainExpired: true,
+		}, nil
+	}
+	teamsServiceWatchdogStartService = func(context.Context, bool) error {
+		t.Fatal("lifecycle drain clear must not start or restart service")
+		return nil
+	}
+
+	result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+	if err != nil {
+		t.Fatalf("watchdog clear expired helper upgrade drain: %v", err)
+	}
+	if result.Decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("action = %q, want lifecycle drain clear", result.Decision.Action)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load teams store: %v", err)
+	}
+	if state.ServiceControl.Draining {
+		t.Fatalf("helper upgrade drain remained after watchdog clear: %#v", state.ServiceControl)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamsstore.UpgradePhaseAborted {
+		t.Fatalf("upgrade = %#v, want aborted", state.Upgrade)
+	}
+	stored, err := loadTeamsServiceWatchdogState()
+	if err != nil {
+		t.Fatalf("load watchdog state: %v", err)
+	}
+	if stored.LastAction != "" || !stored.LastActionAt.IsZero() {
+		t.Fatalf("watchdog clear stored restart cooldown marker: %+v", stored)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceClearsStaleHelperReloadDrainWithoutRestart(t *testing.T) {
+	lockCLITestHooks(t)
+
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	tmp := t.TempDir()
+	watchdogPath := filepath.Join(tmp, "watchdog.json")
+	storePath := filepath.Join(tmp, "teams", "state.json")
+	store, err := teamsstore.Open(storePath)
+	if err != nil {
+		t.Fatalf("Open teams store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ServiceControl = teamsstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamsstore.HelperReloadReason,
+			UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale helper reload drain: %v", err)
+	}
+
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStorePaths := teamsServiceWatchdogStorePaths
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStorePaths = prevStorePaths
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return watchdogPath, nil }
+	teamsServiceWatchdogStorePaths = func() ([]string, error) { return []string{storePath}, nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:              true,
+			Active:                 true,
+			StateFiles:             1,
+			ServiceDraining:        true,
+			HelperReloadDrainStale: true,
+		}, nil
+	}
+	teamsServiceWatchdogStartService = func(context.Context, bool) error {
+		t.Fatal("lifecycle drain clear must not start or restart service")
+		return nil
+	}
+
+	result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+	if err != nil {
+		t.Fatalf("watchdog clear stale helper reload drain: %v", err)
+	}
+	if result.Decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("action = %q, want lifecycle drain clear", result.Decision.Action)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load teams store: %v", err)
+	}
+	if state.ServiceControl.Draining {
+		t.Fatalf("helper reload drain remained after watchdog clear: %#v", state.ServiceControl)
+	}
+	stored, err := loadTeamsServiceWatchdogState()
+	if err != nil {
+		t.Fatalf("load watchdog state: %v", err)
+	}
+	if stored.LastAction != "" || !stored.LastActionAt.IsZero() {
+		t.Fatalf("watchdog clear stored restart cooldown marker: %+v", stored)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceDoesNotClearFreshRemoteStoreDuringLocalDrainClear(t *testing.T) {
+	lockCLITestHooks(t)
+
+	now := time.Date(2026, 5, 16, 1, 30, 0, 0, time.UTC)
+	tmp := t.TempDir()
+	watchdogPath := filepath.Join(tmp, "watchdog.json")
+	localStorePath := filepath.Join(tmp, "teams", "state.json")
+	remoteStorePath := filepath.Join(tmp, "teams", "scopes", "remote", "state.json")
+	localStore, err := teamsstore.Open(localStorePath)
+	if err != nil {
+		t.Fatalf("Open local teams store: %v", err)
+	}
+	t.Cleanup(func() { _ = localStore.Close() })
+	if err := localStore.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ServiceControl = teamsstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamsstore.HelperReloadReason,
+			UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed local stale helper reload drain: %v", err)
+	}
+	remoteStore, err := teamsstore.Open(remoteStorePath)
+	if err != nil {
+		t.Fatalf("Open remote teams store: %v", err)
+	}
+	t.Cleanup(func() { _ = remoteStore.Close() })
+	remoteOwner := teamsstore.OwnerMetadata{
+		PID:           4242,
+		Hostname:      "remote-shared-home-host",
+		StartedAt:     now.Add(-time.Hour),
+		LastHeartbeat: now.Add(-time.Second),
+	}
+	if err := remoteStore.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ServiceControl = teamsstore.ServiceControl{
+			Draining:  true,
+			Reason:    teamsstore.HelperReloadReason,
+			UpdatedAt: now.Add(-defaultTeamsServiceWatchdogReloadStaleAfter - time.Minute),
+		}
+		state.ServiceOwner = &remoteOwner
+		state.LockOwner = &remoteOwner
+		return nil
+	}); err != nil {
+		t.Fatalf("seed remote stale helper reload drain: %v", err)
+	}
+
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStorePaths := teamsServiceWatchdogStorePaths
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStorePaths = prevStorePaths
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return watchdogPath, nil }
+	teamsServiceWatchdogStorePaths = func() ([]string, error) { return []string{localStorePath, remoteStorePath}, nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:                         true,
+			Active:                            true,
+			StateFiles:                        2,
+			ServiceDraining:                   true,
+			HelperReloadDrainStale:            true,
+			HelperReloadDrainLocalOwnerFresh:  true,
+			HelperReloadDrainRemoteOwnerFresh: true,
+			OwnerFound:                        true,
+			OwnerFresh:                        true,
+			LastOwnerHeartbeat:                now.Add(-time.Second),
+		}, nil
+	}
+	teamsServiceWatchdogStartService = func(context.Context, bool) error {
+		t.Fatal("lifecycle drain clear must not start or restart service")
+		return nil
+	}
+
+	result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+	if err != nil {
+		t.Fatalf("watchdog clear local drain with remote store present: %v", err)
+	}
+	if result.Decision.Action != wantTeamsServiceWatchdogLifecycleDrainClearAction {
+		t.Fatalf("action = %q, want lifecycle drain clear", result.Decision.Action)
+	}
+	localState, err := localStore.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load local teams store: %v", err)
+	}
+	if localState.ServiceControl.Draining {
+		t.Fatalf("local helper reload drain remained after watchdog clear: %#v", localState.ServiceControl)
+	}
+	remoteState, err := remoteStore.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load remote teams store: %v", err)
+	}
+	if !remoteState.ServiceControl.Draining || remoteState.ServiceControl.Reason != teamsstore.HelperReloadReason {
+		t.Fatalf("fresh remote helper reload drain was cleared: %#v", remoteState.ServiceControl)
 	}
 }
 

@@ -2231,6 +2231,90 @@ func (s *Store) AbortUpgrade(ctx context.Context, upgradeID string, reason strin
 	})
 }
 
+func (s *Store) AbortExpiredHelperUpgradeDrain(ctx context.Context, upgradeID string, now time.Time, ownerStaleAfter time.Duration, reason string) (UpgradeRequest, bool, error) {
+	upgradeID = strings.TrimSpace(upgradeID)
+	if upgradeID == "" {
+		return UpgradeRequest{}, false, fmt.Errorf("upgrade id is required")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "helper upgrade drain expired; reconciled by watchdog"
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if ownerStaleAfter <= 0 {
+		ownerStaleAfter = 5 * time.Minute
+	}
+	var out UpgradeRequest
+	changed := false
+	err := s.Update(ctx, func(state *State) error {
+		if !state.ServiceControl.Draining || state.ServiceControl.Reason != HelperUpgradeReason {
+			return nil
+		}
+		if state.Upgrade == nil || state.Upgrade.ID != upgradeID || state.Upgrade.Reason != HelperUpgradeReason {
+			return nil
+		}
+		if !activeUpgrade(state.Upgrade) || state.Upgrade.DeadlineAt.IsZero() || state.Upgrade.DeadlineAt.After(now) {
+			return nil
+		}
+		if owner, ok := state.readOwner(); ok {
+			fresh := !IsStale(owner, ownerStaleAfter, now) && !OwnerAppearsLocallyDead(owner)
+			if fresh && (!OwnerAppearsLocal(owner) || strings.TrimSpace(owner.ActiveTurnID) != "") {
+				return nil
+			}
+		}
+		next := *state.Upgrade
+		next.Phase = UpgradePhaseAborted
+		next.AbortReason = trimDiagnostic(reason, 240)
+		if next.AbortedAt.IsZero() {
+			next.AbortedAt = now
+		}
+		next.UpdatedAt = now
+		state.Upgrade = &next
+		restoreUpgradeControl(state, next, now)
+		out = next
+		changed = true
+		return nil
+	})
+	return out, changed, err
+}
+
+func (s *Store) ClearStaleHelperReloadDrain(ctx context.Context, now time.Time, staleAfter time.Duration, ownerStaleAfter time.Duration) (ServiceControl, bool, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if ownerStaleAfter <= 0 {
+		ownerStaleAfter = 5 * time.Minute
+	}
+	var out ServiceControl
+	changed := false
+	err := s.Update(ctx, func(state *State) error {
+		if !HelperReloadDrainStale(*state, now, staleAfter) {
+			out = state.ServiceControl
+			return nil
+		}
+		if owner, ok := state.readOwner(); ok {
+			fresh := !IsStale(owner, ownerStaleAfter, now) && !OwnerAppearsLocallyDead(owner)
+			if fresh && (!OwnerAppearsLocal(owner) || strings.TrimSpace(owner.ActiveTurnID) != "") {
+				out = state.ServiceControl
+				return nil
+			}
+		}
+		next := state.ServiceControl
+		next.Draining = false
+		if !next.Paused {
+			next.Reason = ""
+		}
+		next.UpdatedAt = now
+		state.ServiceControl = next
+		out = next
+		changed = true
+		return nil
+	})
+	return out, changed, err
+}
+
 func upgradeNotificationTargetKey(target UpgradeNotificationTarget) string {
 	chatID := strings.TrimSpace(target.TeamsChatID)
 	turnID := strings.TrimSpace(target.TurnID)

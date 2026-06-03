@@ -4170,14 +4170,12 @@ func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
-	return b.store.Update(ctx, func(state *teamstore.State) error {
-		current := state.ServiceControl
-		if !current.Draining || current.Reason != teamstore.HelperReloadReason {
-			return nil
-		}
-		state.ServiceControl = clearStaleHelperReloadControl(current, time.Now())
-		return nil
-	})
+	ownerStaleAfter := b.ownerStaleAfter
+	if ownerStaleAfter <= 0 {
+		ownerStaleAfter = 5 * time.Minute
+	}
+	_, _, err := b.store.ClearStaleHelperReloadDrain(ctx, time.Now(), helperReloadDrainStaleAfter, ownerStaleAfter)
+	return err
 }
 
 func clearStaleHelperReloadControl(control teamstore.ServiceControl, now time.Time) teamstore.ServiceControl {
@@ -4201,13 +4199,13 @@ func (b *Bridge) completeExpiredHelperUpgradeDrainOnStart(ctx context.Context) e
 	if !teamstore.HelperUpgradeDrainExpired(state, now) {
 		return nil
 	}
+	ownerStaleAfter := b.ownerStaleAfter
+	if ownerStaleAfter <= 0 {
+		ownerStaleAfter = 5 * time.Minute
+	}
 	owner, hasOwner := helperRestartStateOwner(state)
 	if hasOwner {
-		staleAfter := b.ownerStaleAfter
-		if staleAfter <= 0 {
-			staleAfter = 5 * time.Minute
-		}
-		ownerFresh := !teamstore.IsStale(owner, staleAfter, now) && !teamstore.OwnerAppearsLocallyDead(owner)
+		ownerFresh := !teamstore.IsStale(owner, ownerStaleAfter, now) && !teamstore.OwnerAppearsLocallyDead(owner)
 		if ownerFresh && !teamstore.OwnerAppearsLocal(owner) {
 			return nil
 		}
@@ -4220,10 +4218,7 @@ func (b *Bridge) completeExpiredHelperUpgradeDrainOnStart(ctx context.Context) e
 		if targetTag != "" {
 			if !helperVersionMatchesTag(b.helperVersion, targetTag) {
 				reason := "helper upgrade drain expired before helper reached target " + targetTag
-				if _, err := b.store.AbortUpgrade(ctx, state.Upgrade.ID, reason); err != nil {
-					return err
-				}
-				_, err := b.store.ClearDrain(ctx)
+				_, _, err := b.store.AbortExpiredHelperUpgradeDrain(ctx, state.Upgrade.ID, now, ownerStaleAfter, reason)
 				return err
 			}
 			if _, err := b.store.RecordAutoUpdateInstalled(ctx, targetTag, now); err != nil {

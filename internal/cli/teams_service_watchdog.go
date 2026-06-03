@@ -21,6 +21,7 @@ const (
 	teamsServiceWatchdogActionNoop    = "noop"
 	teamsServiceWatchdogActionStart   = "start"
 	teamsServiceWatchdogActionRestart = "restart"
+	teamsServiceWatchdogActionClear   = "clear"
 
 	defaultTeamsServiceWatchdogOwnerStaleAfter    = 90 * time.Second
 	defaultTeamsServiceWatchdogPollStaleAfter     = 2 * time.Minute
@@ -87,6 +88,7 @@ var (
 	teamsServiceWatchdogNow             = time.Now
 	teamsServiceWatchdogStatePath       = defaultTeamsServiceWatchdogStatePath
 	teamsServiceWatchdogCollectSnapshot = collectTeamsServiceWatchdogSnapshot
+	teamsServiceWatchdogStorePaths      = existingTeamsStorePaths
 	teamsServiceWatchdogStartService    = startTeamsPrimaryService
 )
 
@@ -158,6 +160,15 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 	if opts.DryRun {
 		return result, nil
 	}
+	if decision.Action == teamsServiceWatchdogActionClear {
+		if err := reconcileTeamsServiceWatchdogLifecycleDrains(ctx, opts); err != nil {
+			return result, err
+		}
+		if err := saveTeamsServiceWatchdogState(next); err != nil {
+			return teamsServiceWatchdogResult{}, err
+		}
+		return result, nil
+	}
 	if decision.Action == teamsServiceWatchdogActionStart || decision.Action == teamsServiceWatchdogActionRestart {
 		pending := teamsServiceWatchdogPendingActionState(next)
 		if err := saveTeamsServiceWatchdogState(pending); err != nil {
@@ -212,7 +223,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		}
 		snapshot.Active = active
 	}
-	paths, err := existingTeamsStorePaths()
+	paths, err := teamsServiceWatchdogStorePaths()
 	if err != nil {
 		return snapshot, err
 	}
@@ -346,16 +357,16 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	if !snapshot.Installed {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is not installed"}
 	}
-	if !snapshot.Active {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionStart, Reason: "service is installed but not running"}
-	}
 	if snapshot.ServiceDraining {
 		if snapshot.HelperUpgradeDrainExpired {
-			return evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot, state, opts)
+			return evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot)
 		}
 		if snapshot.HelperReloadDrainStale {
-			return evaluateTeamsServiceWatchdogStaleHelperReloadDrain(snapshot, state, opts)
+			return evaluateTeamsServiceWatchdogStaleHelperReloadDrain(snapshot)
 		}
+	}
+	if !snapshot.Active {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionStart, Reason: "service is installed but not running"}
 	}
 	if snapshot.ServicePaused {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is paused"}
@@ -381,40 +392,65 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
 }
 
-func evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot teamsServiceWatchdogSnapshot, state teamsServiceWatchdogState, opts teamsServiceWatchdogOptions) teamsServiceWatchdogDecision {
+func evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot teamsServiceWatchdogSnapshot) teamsServiceWatchdogDecision {
 	reason := "helper upgrade drain expired"
-	if snapshot.OwnerFresh && snapshot.OwnerActiveTurn {
+	if snapshot.HelperUpgradeDrainLocalOwnerFresh && snapshot.OwnerActiveTurn {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; active turn is still heartbeating"}
 	}
-	if snapshot.HelperUpgradeDrainRemoteOwnerFresh {
+	if snapshot.HelperUpgradeDrainRemoteOwnerFresh && !snapshot.HelperUpgradeDrainLocalOwnerFresh {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; owner is fresh on another machine"}
 	}
-	consecutive := state.ConsecutiveStale + 1
-	if consecutive < opts.MinConsecutiveStale {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
-	}
-	if until, ok := teamsServiceWatchdogCooldownUntil(state, opts); ok {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; waiting for restart cooldown", Stale: true, ConsecutiveStale: consecutive, CooldownUntil: until}
-	}
-	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
+	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionClear, Reason: reason + "; reconciling stale lifecycle drain"}
 }
 
-func evaluateTeamsServiceWatchdogStaleHelperReloadDrain(snapshot teamsServiceWatchdogSnapshot, state teamsServiceWatchdogState, opts teamsServiceWatchdogOptions) teamsServiceWatchdogDecision {
+func evaluateTeamsServiceWatchdogStaleHelperReloadDrain(snapshot teamsServiceWatchdogSnapshot) teamsServiceWatchdogDecision {
 	reason := "helper reload drain is stale"
-	if snapshot.OwnerFresh && snapshot.OwnerActiveTurn {
+	if snapshot.HelperReloadDrainLocalOwnerFresh && snapshot.OwnerActiveTurn {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; active turn is still heartbeating"}
 	}
-	if snapshot.HelperReloadDrainRemoteOwnerFresh {
+	if snapshot.HelperReloadDrainRemoteOwnerFresh && !snapshot.HelperReloadDrainLocalOwnerFresh {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; owner is fresh on another machine"}
 	}
-	consecutive := state.ConsecutiveStale + 1
-	if consecutive < opts.MinConsecutiveStale {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
+	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionClear, Reason: reason + "; reconciling stale lifecycle drain"}
+}
+
+func reconcileTeamsServiceWatchdogLifecycleDrains(ctx context.Context, opts teamsServiceWatchdogOptions) error {
+	opts = normalizeTeamsServiceWatchdogOptions(opts)
+	paths, err := teamsServiceWatchdogStorePaths()
+	if err != nil {
+		return err
 	}
-	if until, ok := teamsServiceWatchdogCooldownUntil(state, opts); ok {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; waiting for restart cooldown", Stale: true, ConsecutiveStale: consecutive, CooldownUntil: until}
+	for _, path := range paths {
+		st, err := teamsstore.Open(path)
+		if err != nil {
+			return err
+		}
+		state, err := st.Load(ctx)
+		if err != nil {
+			_ = st.Close()
+			return err
+		}
+		if teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
+			if _, _, err := st.AbortExpiredHelperUpgradeDrain(ctx, state.Upgrade.ID, opts.Now, opts.OwnerStaleAfter, "helper upgrade drain expired; reconciled by watchdog"); err != nil {
+				_ = st.Close()
+				return err
+			}
+			if err := st.Close(); err != nil {
+				return err
+			}
+			continue
+		}
+		if teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter) {
+			if _, _, err := st.ClearStaleHelperReloadDrain(ctx, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter, opts.OwnerStaleAfter); err != nil {
+				_ = st.Close()
+				return err
+			}
+		}
+		if err := st.Close(); err != nil {
+			return err
+		}
 	}
-	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
+	return nil
 }
 
 func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot, opts teamsServiceWatchdogOptions) (bool, string) {

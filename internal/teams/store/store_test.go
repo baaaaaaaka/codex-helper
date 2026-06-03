@@ -3651,6 +3651,141 @@ func TestUpgradeAbortPreservesPreviousDrain(t *testing.T) {
 	}
 }
 
+func TestAbortExpiredHelperUpgradeDrainPreservesPreviousDrain(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+
+	if _, err := store.SetDraining(ctx, "maintenance"); err != nil {
+		t.Fatalf("SetDraining error: %v", err)
+	}
+	req, err := store.BeginUpgrade(ctx, HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade.DeadlineAt = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("expire upgrade error: %v", err)
+	}
+
+	aborted, changed, err := store.AbortExpiredHelperUpgradeDrain(ctx, req.ID, now, time.Minute, "watchdog reconciled expired helper upgrade")
+	if err != nil {
+		t.Fatalf("AbortExpiredHelperUpgradeDrain error: %v", err)
+	}
+	if !changed || aborted.Phase != UpgradePhaseAborted {
+		t.Fatalf("aborted=%#v changed=%v, want aborted change", aborted, changed)
+	}
+	control, err := store.ReadControl(ctx)
+	if err != nil {
+		t.Fatalf("ReadControl error: %v", err)
+	}
+	if !control.Draining || control.Reason != "maintenance" {
+		t.Fatalf("control after guarded abort = %#v, want previous maintenance drain", control)
+	}
+}
+
+func TestAbortExpiredHelperUpgradeDrainPreservesFreshActiveOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname error: %v", err)
+	}
+	req, err := store.BeginUpgrade(ctx, HelperUpgradeReason, time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade error: %v", err)
+	}
+	owner := OwnerMetadata{
+		PID:           os.Getpid(),
+		Hostname:      hostname,
+		StartedAt:     now.Add(-time.Hour),
+		LastHeartbeat: now.Add(-time.Second),
+		ActiveTurnID:  "turn-live",
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade.DeadlineAt = now.Add(-time.Minute)
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		return nil
+	}); err != nil {
+		t.Fatalf("seed active owner error: %v", err)
+	}
+
+	aborted, changed, err := store.AbortExpiredHelperUpgradeDrain(ctx, req.ID, now, time.Minute, "watchdog reconciled expired helper upgrade")
+	if err != nil {
+		t.Fatalf("AbortExpiredHelperUpgradeDrain error: %v", err)
+	}
+	if changed || aborted.ID != "" {
+		t.Fatalf("aborted=%#v changed=%v, want no change while local active turn owns drain", aborted, changed)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if !state.ServiceControl.Draining || state.Upgrade == nil || state.Upgrade.Phase != UpgradePhaseDraining {
+		t.Fatalf("state was cleared despite fresh active owner: control=%#v upgrade=%#v", state.ServiceControl, state.Upgrade)
+	}
+}
+
+func TestClearStaleHelperReloadDrainPreservesFreshDrain(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceControl = ServiceControl{
+			Draining:  true,
+			Reason:    HelperReloadReason,
+			UpdatedAt: now.Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed reload drain error: %v", err)
+	}
+
+	control, changed, err := store.ClearStaleHelperReloadDrain(ctx, now, 6*time.Minute, time.Minute)
+	if err != nil {
+		t.Fatalf("ClearStaleHelperReloadDrain error: %v", err)
+	}
+	if changed || !control.Draining || control.Reason != HelperReloadReason {
+		t.Fatalf("control=%#v changed=%v, want fresh reload drain preserved", control, changed)
+	}
+}
+
+func TestClearStaleHelperReloadDrainPreservesFreshRemoteOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	owner := OwnerMetadata{
+		PID:           4242,
+		Hostname:      "remote-shared-home-host",
+		StartedAt:     now.Add(-time.Hour),
+		LastHeartbeat: now.Add(-time.Second),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceControl = ServiceControl{
+			Draining:  true,
+			Reason:    HelperReloadReason,
+			UpdatedAt: now.Add(-10 * time.Minute),
+		}
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale reload drain error: %v", err)
+	}
+
+	control, changed, err := store.ClearStaleHelperReloadDrain(ctx, now, 6*time.Minute, time.Minute)
+	if err != nil {
+		t.Fatalf("ClearStaleHelperReloadDrain error: %v", err)
+	}
+	if changed || !control.Draining || control.Reason != HelperReloadReason {
+		t.Fatalf("control=%#v changed=%v, want fresh remote reload drain preserved", control, changed)
+	}
+}
+
 func TestAutoUpdateLifecyclePersistsCandidateAndClearsAfterInstall(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
