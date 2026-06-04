@@ -46,13 +46,17 @@ func TestPrepareOutboundAttachmentRestrictsToRootAndAllowedFiles(t *testing.T) {
 	}
 }
 
-func TestPrepareOutboundAttachmentRejectsSymlinkAndDisallowedExecutable(t *testing.T) {
+func TestPrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "malware.exe"), []byte("no"), 0o600); err != nil {
 		t.Fatalf("write executable fixture: %v", err)
 	}
-	if _, err := PrepareOutboundAttachment("malware.exe", OutboundAttachmentOptions{Root: root}); err == nil || !strings.Contains(err.Error(), "not allowed") {
-		t.Fatalf("expected disallowed extension error, got %v", err)
+	file, err := PrepareOutboundAttachment("malware.exe", OutboundAttachmentOptions{Root: root})
+	if err != nil {
+		t.Fatalf("PrepareOutboundAttachment arbitrary extension error: %v", err)
+	}
+	if file.Name != "malware.exe" || len(file.Bytes) == 0 {
+		t.Fatalf("unexpected prepared arbitrary extension file: %#v", file)
 	}
 	if err := os.WriteFile(filepath.Join(root, "target.txt"), []byte("ok"), 0o600); err != nil {
 		t.Fatalf("write target fixture: %v", err)

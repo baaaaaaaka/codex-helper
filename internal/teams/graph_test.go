@@ -463,6 +463,7 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPost, "/chats/a/../unhideForUser"},
 		{http.MethodPost, "/chats/a/../markChatUnreadForUser"},
 		{http.MethodPost, "/me/onlineMeetings/createOrGet?$top=1"},
+		{http.MethodGet, "/shares/u!abc/driveItem?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content/extra"},
 		{http.MethodGet, "/drives/drive-id/items/item-id/content"},
@@ -503,6 +504,7 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPost, "/chats/chat-id/unhideForUser"},
 		{http.MethodPost, "/chats/chat-id/markChatUnreadForUser"},
 		{http.MethodGet, "/chats/chat-id/messages/message-id/hostedContents/content-id/$value"},
+		{http.MethodGet, "/shares/u!abc/driveItem?$select=id,name,eTag,webUrl,webDavUrl,file"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content"},
 		{http.MethodPut, "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/file.txt:/content"},
 		{http.MethodGet, "/me/drive/items/item-id?$select=id,name,eTag,webUrl,webDavUrl"},
@@ -1222,6 +1224,29 @@ func TestGraphGetSharedDriveItemContentReturnsBytes(t *testing.T) {
 	}
 	if string(value.Bytes) != "file-bytes" || value.ContentType != "text/plain" {
 		t.Fatalf("unexpected shared file content: %#v", value)
+	}
+}
+
+func TestGraphGetSharedDriveItemMetadataReturnsNameAndMimeType(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/file.txt"
+	wantPath := "/shares/" + url.PathEscape(graphShareID(rawURL)) + "/driveItem"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != wantPath || r.URL.Query().Get("$select") != "id,name,eTag,webUrl,webDavUrl,file" {
+			t.Fatalf("unexpected request: %s %s want %s", r.Method, r.URL.String(), wantPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"item-1","name":"file.txt","file":{"mimeType":"text/plain"}}`)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	item, err := graph.GetSharedDriveItemMetadata(context.Background(), rawURL)
+	if err != nil {
+		t.Fatalf("GetSharedDriveItemMetadata error: %v", err)
+	}
+	if item.Name != "file.txt" || item.File == nil || item.File.MimeType != "text/plain" {
+		t.Fatalf("unexpected shared file metadata: %#v", item)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -16,6 +17,9 @@ const maxHostedContentPerMessage = 5
 const maxReferenceAttachmentsPerMessage = 5
 const maxMessageReferencesPerMessage = 3
 const maxReferencedMessageRunes = 2000
+const maxLocalAttachmentPathBytes = 240
+const maxLocalAttachmentNameBytes = 120
+const maxAttachmentTempPrefixPartBytes = 32
 const defaultReferencedTeamsMessagePrompt = "Please respond using the referenced Teams message context."
 const defaultLocalAttachmentPrompt = "Please inspect the attached file(s)."
 
@@ -27,10 +31,11 @@ type hostedContentAttachmentRef struct {
 }
 
 type LocalAttachment struct {
-	Path        string
-	PromptPath  string
-	ContentType string
-	SourceID    string
+	Path         string
+	PromptPath   string
+	ContentType  string
+	SourceID     string
+	OriginalName string
 }
 
 type ReferencedMessage struct {
@@ -331,26 +336,33 @@ func (b *Bridge) downloadReferenceFileAttachments(ctx context.Context, session *
 		_ = os.RemoveAll(dir)
 	}
 	var files []LocalAttachment
+	usedNames := make(map[string]bool)
 	for i, attachment := range refs {
+		var metadata DriveItem
+		if referenceAttachmentNeedsMetadata(attachment.Name) {
+			if item, metaErr := b.readClient().GetSharedDriveItemMetadataWithoutRateLimitRetry(ctx, attachment.ContentURL); metaErr == nil {
+				metadata = item
+			}
+		}
 		value, err := b.readClient().GetSharedDriveItemContentWithoutRateLimitRetry(ctx, attachment.ContentURL)
 		if err != nil {
 			cleanup()
 			return nil, func() {}, "", err
 		}
-		ext := attachmentExtension(firstNonEmptyString(value.ContentType, attachment.ContentType))
-		if nameExt := filepath.Ext(safeAttachmentName(attachment.Name)); nameExt != "" {
-			ext = nameExt
-		}
-		path := filepath.Join(dir, fmt.Sprintf("file-%03d%s", i+1, ext))
+		originalName := bestReferenceAttachmentName(attachment.Name, metadata.Name)
+		contentType := preferredAttachmentContentType(value.ContentType, driveItemMimeType(metadata), attachment.ContentType, originalName)
+		name := referenceAttachmentLocalName(dir, originalName, contentType, i+1, usedNames)
+		path := filepath.Join(dir, name)
 		if err := writePrivateFile(path, value.Bytes); err != nil {
 			cleanup()
 			return nil, func() {}, "", err
 		}
 		files = append(files, LocalAttachment{
-			Path:        path,
-			PromptPath:  promptAttachmentPath(session, path),
-			ContentType: strings.TrimSpace(firstNonEmptyString(value.ContentType, attachment.ContentType)),
-			SourceID:    strings.TrimSpace(firstNonEmptyString(attachment.ID, attachment.ContentURL)),
+			Path:         path,
+			PromptPath:   promptAttachmentPath(session, path),
+			ContentType:  strings.TrimSpace(contentType),
+			SourceID:     strings.TrimSpace(firstNonEmptyString(attachment.ID, attachment.ContentURL)),
+			OriginalName: strings.TrimSpace(originalName),
 		})
 	}
 	return files, cleanup, "", nil
@@ -621,12 +633,20 @@ func createAttachmentTempDir(session *Session, msg ChatMessage) (string, error) 
 func attachmentTempPrefix(session *Session, msg ChatMessage) string {
 	prefix := "message-"
 	if session != nil && strings.TrimSpace(session.ID) != "" {
-		prefix = safePathPart(session.ID) + "-"
+		prefix = attachmentTempPrefixPart(session.ID) + "-"
 	}
 	if strings.TrimSpace(msg.ID) != "" {
-		prefix += safePathPart(msg.ID) + "-"
+		prefix += attachmentTempPrefixPart(msg.ID) + "-"
 	}
 	return prefix
+}
+
+func attachmentTempPrefixPart(value string) string {
+	part := safePathPart(value)
+	if len(part) > maxAttachmentTempPrefixPartBytes {
+		return part[:maxAttachmentTempPrefixPartBytes]
+	}
+	return part
 }
 
 func promptAttachmentPath(session *Session, path string) string {
@@ -696,11 +716,22 @@ func PromptWithLocalAttachments(text string, files []LocalAttachment) string {
 	b.WriteString(text)
 	b.WriteString("\n\nAttached files saved locally for this turn:\n")
 	for _, file := range files {
+		displayPath := firstNonEmptyString(file.PromptPath, file.Path)
 		b.WriteString("- ")
-		b.WriteString(firstNonEmptyString(file.PromptPath, file.Path))
-		if file.ContentType != "" {
+		b.WriteString(displayPath)
+		originalName := promptOriginalAttachmentName(file.OriginalName, displayPath)
+		if file.ContentType != "" || originalName != "" {
 			b.WriteString(" (")
-			b.WriteString(file.ContentType)
+			if originalName != "" {
+				b.WriteString("original name: ")
+				b.WriteString(originalName)
+				if file.ContentType != "" {
+					b.WriteString("; ")
+				}
+			}
+			if file.ContentType != "" {
+				b.WriteString(file.ContentType)
+			}
 			b.WriteString(")")
 		}
 		b.WriteString("\n")
@@ -744,6 +775,255 @@ func isCodexImageAttachment(file LocalAttachment) bool {
 	default:
 		return false
 	}
+}
+
+func driveItemMimeType(item DriveItem) string {
+	if item.File == nil {
+		return ""
+	}
+	return strings.TrimSpace(item.File.MimeType)
+}
+
+func preferredAttachmentContentType(downloaded string, metadata string, attachment string, fileName string) string {
+	var generic string
+	for _, value := range []string{downloaded, metadata, attachment} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if isTeamsAttachmentContainerContentType(value) {
+			continue
+		}
+		if isGenericAttachmentContentType(value) {
+			if generic == "" {
+				generic = value
+			}
+			continue
+		}
+		return value
+	}
+	if inferred := contentTypeFromFileName(fileName); inferred != "" {
+		return inferred
+	}
+	return generic
+}
+
+func isGenericAttachmentContentType(contentType string) bool {
+	switch strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0])) {
+	case "", "application/octet-stream", "binary/octet-stream":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTeamsAttachmentContainerContentType(contentType string) bool {
+	switch strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0])) {
+	case "reference", "messagereference", "forwardedmessagereference":
+		return true
+	default:
+		return false
+	}
+}
+
+func contentTypeFromFileName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return strings.TrimSpace(mime.TypeByExtension(filepath.Ext(name)))
+}
+
+func referenceAttachmentNeedsMetadata(name string) bool {
+	safeName := safeLocalAttachmentFileName(name)
+	return safeName == "" || filepath.Ext(safeName) == "" || isGenericAttachmentFileName(safeName)
+}
+
+func bestReferenceAttachmentName(attachmentName string, metadataName string) string {
+	attachmentName = strings.TrimSpace(attachmentName)
+	metadataName = strings.TrimSpace(metadataName)
+	if attachmentName == "" {
+		return metadataName
+	}
+	attachmentSafe := safeLocalAttachmentFileName(attachmentName)
+	metadataSafe := safeLocalAttachmentFileName(metadataName)
+	if (filepath.Ext(attachmentSafe) == "" || isGenericAttachmentFileName(attachmentSafe)) &&
+		filepath.Ext(metadataSafe) != "" &&
+		!isGenericAttachmentFileName(metadataSafe) {
+		return metadataName
+	}
+	return attachmentName
+}
+
+func isGenericAttachmentFileName(name string) bool {
+	return strings.EqualFold(filepath.Ext(strings.TrimSpace(name)), ".bin")
+}
+
+func referenceAttachmentLocalName(dir string, originalName string, contentType string, index int, used map[string]bool) string {
+	name := safeLocalAttachmentFileName(originalName)
+	if name == "" {
+		name = fmt.Sprintf("file-%03d%s", index, attachmentExtension(contentType))
+	}
+	return uniqueLocalAttachmentName(dir, name, used)
+}
+
+func safeLocalAttachmentFileName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	slashName := strings.ReplaceAll(name, "\\", "/")
+	name = path.Base(slashName)
+	if name == "." || name == "/" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			b.WriteByte('_')
+		case strings.ContainsRune(`/\:*?"<>|`, r):
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	cleaned := strings.TrimRight(strings.TrimSpace(b.String()), " .")
+	if cleaned == "" || cleaned == "." || cleaned == ".." {
+		return ""
+	}
+	if windowsReservedAttachmentName(cleaned) {
+		cleaned = "_" + cleaned
+	}
+	return cleaned
+}
+
+func windowsReservedAttachmentName(name string) bool {
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	if stem == "" {
+		stem = name
+	}
+	stem = strings.ToUpper(strings.TrimSpace(stem))
+	switch stem {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	for i := 1; i <= 9; i++ {
+		if stem == fmt.Sprintf("COM%d", i) || stem == fmt.Sprintf("LPT%d", i) {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueLocalAttachmentName(dir string, name string, used map[string]bool) string {
+	budget := localAttachmentNameBudget(dir)
+	name = truncateFileNameBytes(name, budget)
+	if name == "" {
+		name = truncateFileNameBytes("attachment.bin", budget)
+	}
+	for i := 1; ; i++ {
+		candidate := name
+		if i > 1 {
+			candidate = fileNameWithNumericSuffix(name, i, budget)
+		}
+		key := strings.ToLower(candidate)
+		if used != nil && used[key] {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, candidate)); err == nil {
+			continue
+		}
+		if used != nil {
+			used[key] = true
+		}
+		return candidate
+	}
+}
+
+func localAttachmentNameBudget(dir string) int {
+	budget := maxLocalAttachmentPathBytes - len([]byte(filepath.Clean(dir))) - len(string(filepath.Separator))
+	if budget <= 0 {
+		return 1
+	}
+	if budget > maxLocalAttachmentNameBytes {
+		return maxLocalAttachmentNameBytes
+	}
+	return budget
+}
+
+func truncateFileNameBytes(name string, maxBytes int) string {
+	name = strings.TrimRight(strings.TrimSpace(name), " .")
+	if maxBytes <= 0 || name == "" {
+		return ""
+	}
+	if len([]byte(name)) <= maxBytes {
+		return name
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	if stem == "" || len([]byte(ext)) >= maxBytes {
+		return strings.TrimRight(truncateUTF8Bytes(name, maxBytes), " .")
+	}
+	stemBudget := maxBytes - len([]byte(ext))
+	stem = strings.TrimRight(truncateUTF8Bytes(stem, stemBudget), " .")
+	if stem == "" {
+		return strings.TrimRight(truncateUTF8Bytes(name, maxBytes), " .")
+	}
+	return stem + ext
+}
+
+func fileNameWithNumericSuffix(name string, n int, maxBytes int) string {
+	suffix := fmt.Sprintf("-%d", n)
+	if maxBytes < len([]byte(suffix)) {
+		token := fmt.Sprintf("%d", n)
+		if len([]byte(token)) <= maxBytes {
+			return token
+		}
+		return truncateUTF8Bytes(token[len(token)-maxBytes:], maxBytes)
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	if stem == "" || len([]byte(ext))+len([]byte(suffix)) >= maxBytes {
+		return truncateFileNameBytes(name, maxBytes-len([]byte(suffix))) + suffix
+	}
+	stemBudget := maxBytes - len([]byte(ext)) - len([]byte(suffix))
+	stem = strings.TrimRight(truncateUTF8Bytes(stem, stemBudget), " .")
+	if stem == "" {
+		stem = "file"
+	}
+	return stem + suffix + ext
+}
+
+func truncateUTF8Bytes(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len([]byte(value)) <= maxBytes {
+		return value
+	}
+	var b strings.Builder
+	for _, r := range value {
+		text := string(r)
+		if b.Len()+len([]byte(text)) > maxBytes {
+			break
+		}
+		b.WriteString(text)
+	}
+	return b.String()
+}
+
+func promptOriginalAttachmentName(originalName string, displayPath string) string {
+	originalName = strings.TrimSpace(originalName)
+	if originalName == "" {
+		return ""
+	}
+	displayBase := path.Base(strings.ReplaceAll(firstNonEmptyString(displayPath), "\\", "/"))
+	if originalName == displayBase {
+		return ""
+	}
+	return truncateRunes(strings.ReplaceAll(strings.ReplaceAll(originalName, "\r", " "), "\n", " "), 200)
 }
 
 func safePathPart(value string) string {

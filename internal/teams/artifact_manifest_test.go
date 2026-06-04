@@ -26,7 +26,7 @@ func TestParseArtifactManifestRejectsBadPaths(t *testing.T) {
 	}
 }
 
-func TestParseArtifactManifestRejectsDirectoryOversizeSymlinkAndDisallowedExtension(t *testing.T) {
+func TestParseArtifactManifestRejectsDirectoryOversizeAndSymlink(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		path string
@@ -50,12 +50,24 @@ func TestParseArtifactManifestRejectsDirectoryOversizeSymlinkAndDisallowedExtens
 			}
 		})
 	}
+}
 
-	_, err := ParseArtifactManifest(testArtifactManifest(t, []ArtifactManifestEntry{{Path: "run.exe"}}), ArtifactManifestOptions{
-		OutboundRoot: t.TempDir(),
+func TestParseArtifactManifestAllowsArbitraryExtensionsByDefault(t *testing.T) {
+	root := t.TempDir()
+	plan, err := ParseArtifactManifest(testArtifactManifest(t, []ArtifactManifestEntry{{Path: "run.exe"}}), ArtifactManifestOptions{
+		OutboundRoot: root,
+		ValidateFile: func(req ArtifactManifestValidationRequest) (ArtifactManifestFileInfo, error) {
+			if req.CleanPath != "run.exe" {
+				t.Fatalf("CleanPath = %q, want run.exe", req.CleanPath)
+			}
+			return ArtifactManifestFileInfo{Size: 3}, nil
+		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "not allowed") {
-		t.Fatalf("expected disallowed extension rejection, got %v", err)
+	if err != nil {
+		t.Fatalf("ParseArtifactManifest arbitrary extension error: %v", err)
+	}
+	if len(plan.Files) != 1 || plan.Files[0].Name != "run.exe" {
+		t.Fatalf("unexpected arbitrary extension plan: %#v", plan.Files)
 	}
 }
 

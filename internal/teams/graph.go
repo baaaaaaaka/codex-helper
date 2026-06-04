@@ -120,6 +120,9 @@ type DriveItem struct {
 	ETag      string `json:"eTag"`
 	WebURL    string `json:"webUrl"`
 	WebDavURL string `json:"webDavUrl"`
+	File      *struct {
+		MimeType string `json:"mimeType"`
+	} `json:"file,omitempty"`
 }
 
 type MessageWindow struct {
@@ -684,6 +687,25 @@ func (g *GraphClient) GetSharedDriveItemContentWithoutRateLimitRetry(ctx context
 	return g.getSharedDriveItemContentWithOptions(ctx, rawURL, graphRequestOptions{returnRateLimitWithoutRetry: true})
 }
 
+func (g *GraphClient) GetSharedDriveItemMetadata(ctx context.Context, rawURL string) (DriveItem, error) {
+	return g.getSharedDriveItemMetadataWithOptions(ctx, rawURL, graphRequestOptions{})
+}
+
+func (g *GraphClient) GetSharedDriveItemMetadataWithoutRateLimitRetry(ctx context.Context, rawURL string) (DriveItem, error) {
+	return g.getSharedDriveItemMetadataWithOptions(ctx, rawURL, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) getSharedDriveItemMetadataWithOptions(ctx context.Context, rawURL string, opts graphRequestOptions) (DriveItem, error) {
+	shareID := graphShareID(rawURL)
+	if shareID == "" {
+		return DriveItem{}, fmt.Errorf("sharing URL is required")
+	}
+	path := "/shares/" + url.PathEscape(shareID) + "/driveItem?$select=id,name,eTag,webUrl,webDavUrl,file"
+	var item DriveItem
+	err := g.doWithOptions(ctx, http.MethodGet, path, nil, &item, opts)
+	return item, err
+}
+
 func (g *GraphClient) getSharedDriveItemContentWithOptions(ctx context.Context, rawURL string, opts graphRequestOptions) (HostedContentValue, error) {
 	shareID := graphShareID(rawURL)
 	if shareID == "" {
@@ -1142,6 +1164,10 @@ func isAllowedGraphRequest(method string, path string) bool {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
 	}
+	if method == http.MethodGet && isShareDriveItemMetadataPath(clean) {
+		q, ok := allowedGraphQuery(path)
+		return ok && allowedDriveItemMetadataQuery(q)
+	}
 	if method == http.MethodPut && isMeDriveRootContentPath(clean) {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
@@ -1458,7 +1484,8 @@ func allowedListChatsQuery(values url.Values) bool {
 
 func allowedDriveItemMetadataQuery(values url.Values) bool {
 	selectValues := values["$select"]
-	return len(values) == 1 && len(selectValues) == 1 && selectValues[0] == "id,name,eTag,webUrl,webDavUrl"
+	return len(values) == 1 && len(selectValues) == 1 &&
+		(selectValues[0] == "id,name,eTag,webUrl,webDavUrl" || selectValues[0] == "id,name,eTag,webUrl,webDavUrl,file")
 }
 
 func allowedChatQuery(values url.Values) bool {
@@ -1584,6 +1611,14 @@ func isChatMessageHostedContentValuePath(path string) bool {
 func isShareDriveItemContentPath(path string) bool {
 	parts := strings.Split(path, "/")
 	if len(parts) != 5 || parts[0] != "" || parts[1] != "shares" || parts[2] == "" || parts[3] != "driveItem" || parts[4] != "content" {
+		return false
+	}
+	return safeGraphDynamicID(parts[2])
+}
+
+func isShareDriveItemMetadataPath(path string) bool {
+	parts := strings.Split(path, "/")
+	if len(parts) != 4 || parts[0] != "" || parts[1] != "shares" || parts[2] == "" || parts[3] != "driveItem" {
 		return false
 	}
 	return safeGraphDynamicID(parts[2])

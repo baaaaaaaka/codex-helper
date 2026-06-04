@@ -1224,8 +1224,10 @@ Constraints:
 - Do not hide model-visible artifact metadata if filtering would risk losing
   user-visible information; prefer robust sidecar parsing.
 - Do not notify the owner for replayed historical messages.
-- Do not process absolute paths, `..`, symlinks, directories, oversized files,
-  or disallowed extensions from an artifact manifest.
+- Do not process absolute paths, `..`, symlinks, directories, or oversized
+  files from an artifact manifest. File extensions are not blocked by default;
+  callers may still pass an explicit allowlist when a narrower policy is
+  required.
 - Do not let artifact handling inject dynamic Teams ids, message ids, upload
   paths, or routing metadata into every Codex prompt.
 
@@ -1235,8 +1237,9 @@ Tests:
 - Completion reminder is sent once and not duplicated on outbox replay.
 - Long output mentions at most once according to policy.
 - Renderer escapes HTML and keeps each chunk below the conservative byte limit.
-- Artifact manifest accepts allowed generated files and rejects paths outside
-  the outbound root, symlinks, oversized files, and disallowed extensions.
+- Artifact manifest accepts generated files with arbitrary extensions by
+  default and rejects paths outside the outbound root, symlinks, directories,
+  and oversized files.
 - Artifact upload names include stable session/turn context plus a
   collision-resistant digest or suffix, and uploads default to the Teams
   attachment folder rather than an arbitrary OneDrive location.

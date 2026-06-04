@@ -11438,7 +11438,7 @@ func TestBridgeSessionReferenceFileAttachmentIsDownloadedForCodexTurn(t *testing
 	if err != nil {
 		t.Fatalf("handleSessionMessage error: %v", err)
 	}
-	if !strings.Contains(executor.prompt, "Attached files saved locally") || !strings.Contains(executor.prompt, "file-001") {
+	if !strings.Contains(executor.prompt, "Attached files saved locally") || !strings.Contains(executor.prompt, "file.txt") {
 		t.Fatalf("executor prompt missing local file:\n%s", executor.prompt)
 	}
 	if got := len(*sent); got != 2 {

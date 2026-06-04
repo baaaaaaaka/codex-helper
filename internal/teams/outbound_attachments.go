@@ -314,14 +314,14 @@ func allowedOutboundFileName(name string, allowed map[string]bool) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	ext := strings.ToLower(filepath.Ext(name))
 	if len(allowed) == 0 {
-		return defaultOutboundExtensions()[ext] || defaultOutboundBaseNames()[name]
+		return true
 	}
 	return allowed[strings.ToLower(ext)]
 }
 
 func allowedOutboundExtension(ext string, allowed map[string]bool) bool {
 	if len(allowed) == 0 {
-		return defaultOutboundExtensions()[strings.ToLower(ext)]
+		return true
 	}
 	return allowed[strings.ToLower(ext)]
 }

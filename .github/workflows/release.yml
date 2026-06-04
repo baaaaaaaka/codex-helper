@@ -108,6 +108,13 @@ jobs:
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'TestBridgeQueuedTurnAmbiguousErrorIncludesDiagnostic$' -v
 
+      - name: Teams attachment filename and artifact upload regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          attachment_file_pattern='Test(DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink)$'
+          go test ./internal/teams -count=1 -run "$attachment_file_pattern" -v
+
       - name: Teams control chat scope isolation regressions
         shell: bash
         run: |

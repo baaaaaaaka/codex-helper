@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -288,6 +289,113 @@ func TestDownloadReferenceFileAttachmentsWritesPrivateFile(t *testing.T) {
 	}
 	if string(data) != "file-bytes" {
 		t.Fatalf("downloaded file bytes = %q", string(data))
+	}
+	if got := filepath.Base(files[0].Path); got != "file.txt" {
+		t.Fatalf("downloaded file name = %q, want original name", got)
+	}
+}
+
+func TestDownloadReferenceFileAttachmentsUsesDriveItemMetadataName(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_READ_SCOPES", "openid profile offline_access User.Read Chat.Read Files.Read")
+	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/opaque"
+	sharePath := "/shares/" + url.PathEscape(graphShareID(rawURL)) + "/driveItem"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == sharePath && r.URL.Query().Get("$select") == "id,name,eTag,webUrl,webDavUrl,file":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"item-1","name":"Design Review v2.pdf","file":{"mimeType":"application/pdf"}}`))
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == sharePath+"/content":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("pdf-bytes"))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	bridge := &Bridge{readGraph: &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}}
+	msg := ChatMessage{ID: "message-file", Attachments: []MessageAttachment{{
+		ID:          "file-1",
+		ContentType: "reference",
+		ContentURL:  rawURL,
+	}}}
+
+	files, cleanup, message, err := bridge.downloadReferenceFileAttachments(context.Background(), &Session{ID: "s001"}, msg)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("downloadReferenceFileAttachments error: %v", err)
+	}
+	if message != "" || len(files) != 1 {
+		t.Fatalf("unexpected result files=%#v message=%q", files, message)
+	}
+	if got := filepath.Base(files[0].Path); got != "Design Review v2.pdf" {
+		t.Fatalf("downloaded file name = %q", got)
+	}
+	if files[0].ContentType != "application/pdf" {
+		t.Fatalf("content type = %q, want metadata mime type", files[0].ContentType)
+	}
+}
+
+func TestReferenceAttachmentLocalNameTruncatesForPathBudgetAndDeduplicates(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), strings.Repeat("d", 80))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir long dir: %v", err)
+	}
+	used := map[string]bool{}
+	longName := strings.Repeat("very-long-report-", 20) + ".pdf"
+	first := referenceAttachmentLocalName(dir, longName, "application/pdf", 1, used)
+	second := referenceAttachmentLocalName(dir, longName, "application/pdf", 2, used)
+	if !strings.HasSuffix(first, ".pdf") || !strings.HasSuffix(second, ".pdf") {
+		t.Fatalf("truncated names should preserve extension: %q %q", first, second)
+	}
+	if first == second || !strings.Contains(second, "-2.pdf") {
+		t.Fatalf("duplicate names should receive numeric suffix: %q %q", first, second)
+	}
+	if got := len([]byte(filepath.Join(dir, first))); got > maxLocalAttachmentPathBytes {
+		t.Fatalf("first path length = %d, want <= %d (%q)", got, maxLocalAttachmentPathBytes, filepath.Join(dir, first))
+	}
+}
+
+func TestReferenceAttachmentLocalNameHandlesTinyPathBudgetDuplicates(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), strings.Repeat("a", 80), strings.Repeat("b", 80), strings.Repeat("c", 80))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir very long dir: %v", err)
+	}
+	used := map[string]bool{}
+	first := referenceAttachmentLocalName(dir, "report.pdf", "application/pdf", 1, used)
+	second := referenceAttachmentLocalName(dir, "report.pdf", "application/pdf", 2, used)
+	third := referenceAttachmentLocalName(dir, "report.pdf", "application/pdf", 3, used)
+	if first == "" || second == "" || third == "" || first == second || second == third || first == third {
+		t.Fatalf("tiny-budget names should be non-empty and unique: %q %q %q", first, second, third)
+	}
+}
+
+func TestBestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension(t *testing.T) {
+	if !referenceAttachmentNeedsMetadata("report") {
+		t.Fatal("extensionless attachment name should request metadata")
+	}
+	if got := bestReferenceAttachmentName("report", "report.pdf"); got != "report.pdf" {
+		t.Fatalf("best name = %q, want metadata name with extension", got)
+	}
+	if got := bestReferenceAttachmentName("report.txt", "report.pdf"); got != "report.txt" {
+		t.Fatalf("best name = %q, want explicit attachment name with extension", got)
+	}
+	if !referenceAttachmentNeedsMetadata("report.bin") {
+		t.Fatal("generic .bin attachment name should request metadata")
+	}
+	if got := bestReferenceAttachmentName("report.bin", "report.pdf"); got != "report.pdf" {
+		t.Fatalf("best generic name = %q, want metadata name with real extension", got)
+	}
+	if got := bestReferenceAttachmentName("firmware.bin", "firmware.bin"); got != "firmware.bin" {
+		t.Fatalf("real .bin name = %q, want attachment name", got)
 	}
 }
 
