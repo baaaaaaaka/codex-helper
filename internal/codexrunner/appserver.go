@@ -857,6 +857,7 @@ func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {
 			TurnID:           params.TurnID,
 			ItemID:           params.Item.ID,
 			ItemType:         params.Item.Type,
+			Phase:            params.Item.Phase,
 			Text:             agentMessageText(params.Item),
 			Command:          params.Item.Command,
 			AggregatedOutput: commandOutputText(params.Item),

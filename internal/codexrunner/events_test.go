@@ -33,19 +33,22 @@ func TestParseStreamEventJSONLCommandExecution(t *testing.T) {
 // transcript-style event_msg format (phase=commentary).
 func TestParseStreamEventJSONLStreamsAgentProgressForBothCodexFormats(t *testing.T) {
 	cases := []struct {
-		name string
-		line []byte
-		want string
+		name      string
+		line      []byte
+		want      string
+		wantPhase string
 	}{
 		{
-			name: "legacy item.completed agent_message",
-			line: []byte(`{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"checking the failing test first"}}`),
-			want: "checking the failing test first",
+			name:      "legacy item.completed agent_message",
+			line:      []byte(`{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"checking the failing test first"}}`),
+			want:      "checking the failing test first",
+			wantPhase: "",
 		},
 		{
-			name: "new transcript event_msg commentary",
-			line: []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"checking the failing test first"}}`),
-			want: "checking the failing test first",
+			name:      "new transcript event_msg commentary",
+			line:      []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"checking the failing test first"}}`),
+			want:      "checking the failing test first",
+			wantPhase: "commentary",
 		},
 	}
 	for _, tc := range cases {
@@ -59,6 +62,9 @@ func TestParseStreamEventJSONLStreamsAgentProgressForBothCodexFormats(t *testing
 			}
 			if event.Kind != StreamEventAgentMessage || event.Text != tc.want {
 				t.Fatalf("event = %#v, want AgentMessage %q", event, tc.want)
+			}
+			if event.Phase != tc.wantPhase {
+				t.Fatalf("phase = %q, want %q", event.Phase, tc.wantPhase)
 			}
 		})
 	}

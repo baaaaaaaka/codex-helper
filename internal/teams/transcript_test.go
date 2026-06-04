@@ -74,6 +74,22 @@ func TestParseCodexTranscriptClassifiesEventCommentaryAsStatus(t *testing.T) {
 	assertTranscriptRecord(t, got.Records[1], "final-1", "source:final-1", TranscriptKindAssistant, "done", 2)
 }
 
+func TestParseCodexTranscriptSkipsRawReasoningWithoutVisibleSummary(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"reasoning-raw","type":"reasoning","encrypted_content":"private thinking","content":[{"type":"reasoning_text","text":"private thinking"}],"summary":[]}}`,
+		`{"type":"response_item","payload":{"id":"reasoning-summary","type":"reasoning","summary":[{"type":"summary_text","text":"visible summary"}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 1 {
+		t.Fatalf("records = %#v, want only visible reasoning summary", got.Records)
+	}
+	assertTranscriptRecord(t, got.Records[0], "reasoning-summary", "source:reasoning-summary", TranscriptKindStatus, "visible summary", 2)
+}
+
 func TestParseCodexTranscriptKeepsResponseItemAssistantPrefixRecords(t *testing.T) {
 	first := "long assistant response_item body that is a legitimate first message and should stay"
 	second := first + " with additional text in a separate response item"

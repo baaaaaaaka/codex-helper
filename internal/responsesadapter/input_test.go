@@ -54,6 +54,28 @@ func TestParseInputFoldsReasoningIntoAssistantToolCallTurn(t *testing.T) {
 	}
 }
 
+func TestParseInputFoldsRawReasoningWithoutVisibleSummaryIntoAssistantToolCallTurn(t *testing.T) {
+	parsed, err := parseInput(json.RawMessage(`[
+		{"type":"message","role":"user","content":"run"},
+		{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+		{"type":"reasoning","encrypted_content":"raw cached reasoning","content":[{"type":"reasoning_text","text":"raw cached reasoning"}],"summary":[]},
+		{"type":"function_call_output","call_id":"call_a","output":"ok"}
+	]`))
+	if err != nil {
+		t.Fatalf("parseInput error: %v", err)
+	}
+	if len(parsed.Messages) != 3 {
+		t.Fatalf("messages = %#v", parsed.Messages)
+	}
+	assistant := parsed.Messages[1]
+	if assistant.Role != "assistant" || assistant.ReasoningContent != "raw cached reasoning" || len(assistant.ToolCalls) != 1 {
+		t.Fatalf("assistant = %#v", assistant)
+	}
+	if parsed.Messages[2].Role != "tool" || parsed.Messages[2].ToolCallID != "call_a" {
+		t.Fatalf("tool = %#v", parsed.Messages[2])
+	}
+}
+
 func TestParseInputDropsStandaloneReasoningItems(t *testing.T) {
 	parsed, err := parseInput(json.RawMessage(`[
 		{"type":"message","role":"user","content":"first turn"},

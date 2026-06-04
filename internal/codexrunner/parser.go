@@ -98,6 +98,7 @@ type codexItem struct {
 	ID                    string         `json:"id"`
 	Type                  string         `json:"type"`
 	Text                  string         `json:"text"`
+	Phase                 string         `json:"phase"`
 	Content               []codexContent `json:"content"`
 	Command               string         `json:"command"`
 	AggregatedOutput      string         `json:"aggregated_output"`
@@ -111,6 +112,7 @@ type codexItemWithoutCommandOutput struct {
 	ID            string         `json:"id"`
 	Type          string         `json:"type"`
 	Text          string         `json:"text"`
+	Phase         string         `json:"phase"`
 	Content       []codexContent `json:"content"`
 	Command       string         `json:"command"`
 	ExitCode      *int           `json:"exit_code"`
@@ -123,6 +125,7 @@ func (item codexItemWithoutCommandOutput) toCodexItem() codexItem {
 		ID:            item.ID,
 		Type:          item.Type,
 		Text:          item.Text,
+		Phase:         item.Phase,
 		Content:       item.Content,
 		Command:       item.Command,
 		ExitCode:      item.ExitCode,

@@ -967,6 +967,44 @@ func TestBridgeStreamsNewFormatCommentaryToTeams(t *testing.T) {
 	}
 }
 
+func TestBridgeStreamsUnphasedAgentMessagesToTeams(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &jsonlParsingStreamingExecutor{
+		lines: []string{
+			`{"type":"thread.started","thread_id":"thread-1"}`,
+			`{"type":"turn.started","thread_id":"thread-1","turn_id":"turn-1"}`,
+			`{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","content":[{"type":"output_text","text":"reading the failing path"}]}}`,
+			`{"type":"item.completed","item":{"id":"msg-2","type":"agent_message","content":[{"type":"output_text","text":"running the focused test"}]}}`,
+			`{"type":"event_msg","payload":{"type":"task_complete","thread_id":"thread-1","turn_id":"turn-1","last_agent_message":"Fixed."}}`,
+		},
+		result: ExecutionResult{Text: "Fixed.", CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-unphased-stream"), "fix it"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+
+	var plain []string
+	for _, msg := range *sent {
+		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
+	}
+	joined := strings.Join(plain, "\n---\n")
+	for _, want := range []string{
+		"🤖 ⏳ Codex status:\nreading the failing path",
+		"🤖 ⏳ Codex status:\nrunning the focused test",
+		"🤖 ✅ Codex answer:\nFixed.",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("unphased agent message stream missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Index(joined, "reading the failing path") > strings.Index(joined, "running the focused test") {
+		t.Fatalf("unphased agent messages should keep stream order:\n%s", joined)
+	}
+}
+
 func TestBridgeStreamingProgressGraph429DoesNotFailTurnCI(t *testing.T) {
 	var posts int
 	rateLimited := true

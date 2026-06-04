@@ -111,6 +111,14 @@ jobs:
           set -euo pipefail
           go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|FacadeCompletedUsageIncludesZeroCachedTokens|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
 
+      - name: Codex third-party reasoning visibility regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/responsesadapter -count=1 -run 'Test(FacadeStreams(TextLifecycleAndStoresCompletedResponse|MixedTextAndToolCallLifecycle|ReasoningLifecycleAndStoresCompletedResponse)|CodexCompatReasoningSSEMaintainsActiveReasoningItem|ParseInputFoldsRawReasoningWithoutVisibleSummaryIntoAssistantToolCallTurn)$' -v
+          go test ./internal/codexrunner -count=1 -run 'TestParseStreamEventJSONL(StreamsAgentProgressForBothCodexFormats|FinalAnswerAndTaskComplete|DropsEmptyAndUnknownPhaseAgentMessages)$' -v
+          go test ./internal/teams -count=1 -run 'Test(ParseCodexTranscript(ClassifiesEventCommentaryAsStatus|SkipsRawReasoningWithoutVisibleSummary)|BridgeStreams(NewFormatCommentaryToTeams|UnphasedAgentMessagesToTeams))$' -v
+
       - name: Teams durable control binding regressions
         shell: bash
         run: |

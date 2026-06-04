@@ -45,6 +45,9 @@ func TestFacadeStreamsTextLifecycleAndStoresCompletedResponse(t *testing.T) {
 			t.Fatalf("stream missing %q:\n%s", want, body)
 		}
 	}
+	if strings.Contains(body, `"phase":`) {
+		t.Fatalf("responses adapter should not synthesize message phase:\n%s", body)
+	}
 	events := parseSSEEvents(t, body)
 	added := firstSSEEventNamed(t, events, "response.output_item.added")
 	item, ok := added.data["item"].(map[string]any)
@@ -75,6 +78,17 @@ func TestFacadeStreamsTextLifecycleAndStoresCompletedResponse(t *testing.T) {
 	outputDetails, ok := usage["output_tokens_details"].(map[string]any)
 	if !ok || outputDetails["reasoning_tokens"] != float64(4) {
 		t.Fatalf("completed output token details = %#v", usage)
+	}
+	rawResponse, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal completed response: %v", err)
+	}
+	var completedResponse responseObject
+	if err := json.Unmarshal(rawResponse, &completedResponse); err != nil {
+		t.Fatalf("decode completed response: %v", err)
+	}
+	if len(completedResponse.Output) != 1 || completedResponse.Output[0].Type != "message" {
+		t.Fatalf("completed output = %#v", completedResponse.Output)
 	}
 
 	record, err := store.Get("resp_001", Scope{Tenant: "local", User: "local", Provider: "test-provider", Model: "model-a", Thread: "thread-a", Branch: "main"})
@@ -368,6 +382,9 @@ func TestFacadeStreamsMixedTextAndToolCallLifecycle(t *testing.T) {
 			t.Fatalf("stream missing %q:\n%s", want, body)
 		}
 	}
+	if strings.Contains(body, `"phase":`) {
+		t.Fatalf("responses adapter should not synthesize message phase for tool-call responses:\n%s", body)
+	}
 }
 
 func TestFacadeSalvagesMalformedToolArguments(t *testing.T) {
@@ -416,15 +433,24 @@ func TestFacadeStreamsReasoningLifecycleAndStoresCompletedResponse(t *testing.T)
 	}
 	body := rec.Body.String()
 	for _, want := range []string{
-		"event: response.reasoning_summary_part.added",
-		"event: response.reasoning_summary_text.delta",
 		"event: response.reasoning_text.delta",
 		`"type":"reasoning"`,
 		`"encrypted_content":"think"`,
+		`"content":[{"type":"reasoning_text","text":"think"}]`,
 		`"output_text":"answer"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("stream missing %q:\n%s", want, body)
+		}
+	}
+	for _, forbidden := range []string{
+		"event: response.reasoning_summary_part.added",
+		"event: response.reasoning_summary_text.delta",
+		`"summary":[{"text":"think"`,
+		`"summary":[{"type":"summary_text","text":"think"`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("stream leaked raw reasoning as visible summary %q:\n%s", forbidden, body)
 		}
 	}
 	events := parseSSEEvents(t, body)
@@ -434,12 +460,8 @@ func TestFacadeStreamsReasoningLifecycleAndStoresCompletedResponse(t *testing.T)
 		t.Fatalf("added item = %#v", added.data["item"])
 	}
 	summary, ok := item["summary"].([]any)
-	if !ok || len(summary) != 1 {
+	if !ok || len(summary) != 0 {
 		t.Fatalf("added reasoning summary = %#v", item["summary"])
-	}
-	summaryPart, ok := summary[0].(map[string]any)
-	if !ok || summaryPart["type"] != "summary_text" {
-		t.Fatalf("added reasoning summary part = %#v", summary[0])
 	}
 	record, err := store.Get("resp_001", Scope{Tenant: "local", User: "local", Provider: "test-provider", Model: "model-a", Thread: "thread-reasoning", Branch: "main"})
 	if err != nil {

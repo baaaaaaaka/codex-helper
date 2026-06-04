@@ -178,11 +178,6 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 			"output_index": reasoningOutputIndex,
 			"item":         buildReasoningItem(responseID, ""),
 		})
-		writeEvent("response.reasoning_summary_part.added", map[string]any{
-			"output_index":  reasoningOutputIndex,
-			"item_id":       reasoningItemID(responseID),
-			"summary_index": 0,
-		})
 	}
 
 	ensureMessageItem := func() {
@@ -234,12 +229,6 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 			case ProviderEventReasoningDelta:
 				ensureReasoningItem()
 				reasoning += event.Delta
-				writeEvent("response.reasoning_summary_text.delta", map[string]any{
-					"output_index":  reasoningOutputIndex,
-					"item_id":       reasoningItemID(responseID),
-					"summary_index": 0,
-					"delta":         event.Delta,
-				})
 				writeEvent("response.reasoning_text.delta", map[string]any{
 					"output_index":  reasoningOutputIndex,
 					"item_id":       reasoningItemID(responseID),
@@ -445,7 +434,7 @@ func buildReasoningItem(responseID string, text string) outputItem {
 	item := outputItem{
 		ID:      reasoningItemID(responseID),
 		Type:    "reasoning",
-		Summary: []reasoningSummary{{Type: "summary_text", Text: text}},
+		Summary: []reasoningSummary{},
 	}
 	if text != "" {
 		item.EncryptedContent = text

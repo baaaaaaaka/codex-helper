@@ -31,6 +31,7 @@ type StreamEvent struct {
 	TurnID           string
 	ItemID           string
 	ItemType         string
+	Phase            string
 	Text             string
 	Command          string
 	AggregatedOutput string
@@ -97,6 +98,7 @@ func streamEventFromCodexEventWithOptions(event codexEvent, raw []byte, includeR
 	case "item.started", "item/started", "item.completed", "item/completed":
 		out.ItemID = event.Item.ID
 		out.ItemType = event.Item.Type
+		out.Phase = event.Item.Phase
 		out.Text = agentMessageText(event.Item)
 		out.Command = event.Item.Command
 		out.AggregatedOutput = commandOutputText(event.Item)
@@ -155,6 +157,7 @@ func applyTranscriptPayloadStreamEvent(event codexEvent, out *StreamEvent) bool 
 				return false
 			}
 			out.Kind = StreamEventAgentMessage
+			out.Phase = payload.Phase
 			out.Text = text
 			return true
 		case "task_complete":
@@ -175,6 +178,7 @@ func applyTranscriptPayloadStreamEvent(event codexEvent, out *StreamEvent) bool 
 			return false
 		}
 		out.Kind = StreamEventAgentMessage
+		out.Phase = payload.Phase
 		out.Text = text
 		return true
 	default:

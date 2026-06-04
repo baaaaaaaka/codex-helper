@@ -115,10 +115,12 @@ func assertCodexCompatibleSSE(t *testing.T, events []parsedSSEEvent) {
 			if !activeMessage {
 				t.Fatalf("output_text delta without active message item: %#v", event.data)
 			}
-		case "response.reasoning_summary_part.added", "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		case "response.reasoning_text.delta":
 			if !activeReasoning {
 				t.Fatalf("%s without active reasoning item: %#v", event.name, event.data)
 			}
+		case "response.reasoning_summary_part.added", "response.reasoning_summary_text.delta":
+			t.Fatalf("raw provider reasoning should not be emitted as visible summary event: %#v", event.data)
 		case "response.function_call_arguments.delta":
 			itemID := stringField(t, event.data, "item_id")
 			if itemID == "" {
