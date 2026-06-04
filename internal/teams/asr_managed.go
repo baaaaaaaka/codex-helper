@@ -52,11 +52,12 @@ type ManagedASRConfig struct {
 	MinFreeBytes uint64
 	Backend      string
 
-	LlamaBinaryPath string
-	LlamaModelPath  string
-	LlamaMMProjPath string
-	LlamaDevice     string
-	FFmpegPath      string
+	LlamaBinaryPath   string
+	LlamaModelPath    string
+	LlamaMMProjPath   string
+	LlamaDevice       string
+	FFmpegPath        string
+	NativeLibraryPath string
 }
 
 type ManagedASRTranscriber struct {
@@ -128,6 +129,63 @@ func NewManagedQwenASRTranscriber(config ...ManagedASRConfig) *ManagedASRTranscr
 	}
 }
 
+func (t *ManagedASRTranscriber) WarmUpTeamsASR(ctx context.Context) error {
+	if t == nil {
+		return errASRCommandNotConfigured
+	}
+	switch mode := managedASRBackendMode(t.Config.Backend); mode {
+	case managedASRBackendLlama:
+		return t.warmUpTeamsMediaLlama(ctx, t.Config)
+	case managedASRBackendAuto:
+		err := t.warmUpTeamsMediaLlama(ctx, t.Config)
+		if err == nil {
+			return nil
+		}
+		if !managedASRCanFallbackToTransformers(err) {
+			return err
+		}
+		if fallbackErr := t.warmUpTeamsMediaTransformers(ctx, t.Config); fallbackErr != nil {
+			return fmt.Errorf("llama ASR warm-up failed (%v); transformers warm-up failed: %w", err, fallbackErr)
+		}
+		return nil
+	case managedASRBackendTransformersMode:
+		return t.warmUpTeamsMediaTransformers(ctx, t.Config)
+	default:
+		return fmt.Errorf("unsupported managed Teams ASR backend %q", strings.TrimSpace(t.Config.Backend))
+	}
+}
+
+func (t *ManagedASRTranscriber) warmUpTeamsMediaLlama(ctx context.Context, cfg ManagedASRConfig) error {
+	ensureLlamaRuntime := t.ensureLlamaRuntime
+	if ensureLlamaRuntime == nil {
+		ensureLlamaRuntime = ensureManagedASRLlamaRuntime
+	}
+	runtime, err := ensureLlamaRuntime(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(runtime.FFmpegPath) != "" {
+		return nil
+	}
+	if _, err := resolveManagedASRLlamaFFmpeg(ctx, runtime.CacheRoot, "", runtime.Env); err != nil {
+		wrapped := fmt.Errorf("llama ASR backend requires ffmpeg for Teams media preprocessing and speed=%s; install ffmpeg or set CODEX_HELPER_TEAMS_ASR_FFMPEG: %w", defaultASRSpeed, err)
+		if errors.Is(wrapped, errManagedASRFFmpegUnsupported) {
+			return managedASRLlamaFallbackError{Err: wrapped}
+		}
+		return wrapped
+	}
+	return nil
+}
+
+func (t *ManagedASRTranscriber) warmUpTeamsMediaTransformers(ctx context.Context, cfg ManagedASRConfig) error {
+	ensureRuntime := t.ensureRuntime
+	if ensureRuntime == nil {
+		ensureRuntime = ensureManagedASRRuntime
+	}
+	_, err := ensureRuntime(ctx, cfg)
+	return err
+}
+
 func (t *ManagedASRTranscriber) TranscribeTeamsMedia(ctx context.Context, input ASRTranscribeInput) (ASRTranscript, error) {
 	if t == nil {
 		return ASRTranscript{}, errASRCommandNotConfigured
@@ -144,7 +202,19 @@ func (t *ManagedASRTranscriber) TranscribeTeamsMedia(ctx context.Context, input 
 		if err == nil {
 			return transcript, nil
 		}
-		if !managedASRCanFallbackFromLlama(err) {
+		if managedASRShouldRetryLlamaRunWithCPU(t.Config, err) {
+			cpuConfig := t.Config
+			cpuConfig.LlamaDevice = "cpu"
+			cpuTranscript, cpuErr := t.transcribeTeamsMediaLlamaWithConfig(ctx, input, cpuConfig)
+			if cpuErr == nil {
+				if strings.TrimSpace(cpuTranscript.Warning) == "" {
+					cpuTranscript.Warning = "accelerated llama ASR failed; retried with CPU"
+				}
+				return cpuTranscript, nil
+			}
+			err = fmt.Errorf("accelerated llama ASR backend failed (%v); CPU retry failed: %w", err, cpuErr)
+		}
+		if !managedASRCanFallbackToTransformers(err) {
 			return ASRTranscript{}, err
 		}
 		fallback, fallbackErr := t.transcribeTeamsMediaTransformers(ctx, input)
@@ -189,6 +259,12 @@ func (t *ManagedASRTranscriber) transcribeTeamsMediaTransformers(ctx context.Con
 	env := managedASREnv(runtime, input)
 	if err := runCommand(ctx, runtime.Python, args, env, &stdout, &stderr); err != nil {
 		detail := strings.TrimSpace(stderr.String())
+		if hint := managedASRNativeRuntimeFailureHint("transformers ASR", err, detail); hint != "" {
+			if detail != "" {
+				return ASRTranscript{}, fmt.Errorf("%w: %s: %s", err, hint, shortenTeamsLine(detail, 600))
+			}
+			return ASRTranscript{}, fmt.Errorf("%w: %s", err, hint)
+		}
 		if detail != "" {
 			return ASRTranscript{}, fmt.Errorf("%w: %s", err, shortenTeamsLine(detail, 600))
 		}
@@ -217,11 +293,15 @@ func (t *ManagedASRTranscriber) transcribeTeamsMediaTransformers(ctx context.Con
 }
 
 func (t *ManagedASRTranscriber) transcribeTeamsMediaLlama(ctx context.Context, input ASRTranscribeInput) (ASRTranscript, error) {
+	return t.transcribeTeamsMediaLlamaWithConfig(ctx, input, t.Config)
+}
+
+func (t *ManagedASRTranscriber) transcribeTeamsMediaLlamaWithConfig(ctx context.Context, input ASRTranscribeInput, cfg ManagedASRConfig) (ASRTranscript, error) {
 	ensureLlamaRuntime := t.ensureLlamaRuntime
 	if ensureLlamaRuntime == nil {
 		ensureLlamaRuntime = ensureManagedASRLlamaRuntime
 	}
-	runtime, err := ensureLlamaRuntime(ctx, t.Config)
+	runtime, err := ensureLlamaRuntime(ctx, cfg)
 	if err != nil {
 		return ASRTranscript{}, err
 	}
@@ -266,10 +346,7 @@ func (t *ManagedASRTranscriber) transcribeTeamsMediaLlama(ctx context.Context, i
 	env := managedASRLlamaEnv(runtime, input)
 	if err := runCommand(ctx, runtime.Command, args, env, &stdout, &stderr); err != nil {
 		detail := strings.TrimSpace(stderr.String())
-		if detail != "" {
-			return ASRTranscript{}, fmt.Errorf("%w: %s", err, shortenTeamsLine(detail, 600))
-		}
-		return ASRTranscript{}, err
+		return ASRTranscript{}, managedASRLlamaCommandError(runtime, err, detail)
 	}
 	text, detectedLanguage := managedASRParseLlamaOutput(stdout.String())
 	return ASRTranscript{
@@ -308,6 +385,64 @@ func managedASRCanFallbackFromLlama(err error) bool {
 	return errors.As(err, &fallback)
 }
 
+func managedASRCanFallbackToTransformers(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var fallback managedASRLlamaFallbackError
+	if !errors.As(err, &fallback) {
+		return false
+	}
+	return managedASRNativeRuntimeFailureHint("llama.cpp", fallback.Err, "") == ""
+}
+
+type managedASRLlamaRunError struct {
+	Runtime managedASRLlamaRuntime
+	Err     error
+}
+
+func (e managedASRLlamaRunError) Error() string {
+	if e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func (e managedASRLlamaRunError) Unwrap() error {
+	return e.Err
+}
+
+func managedASRLlamaCommandError(runtime managedASRLlamaRuntime, err error, detail string) error {
+	var wrapped error
+	if hint := managedASRNativeRuntimeFailureHint("llama.cpp", err, detail); hint != "" {
+		if detail != "" {
+			wrapped = fmt.Errorf("%w: %s: %s", err, hint, shortenTeamsLine(detail, 600))
+		} else {
+			wrapped = fmt.Errorf("%w: %s", err, hint)
+		}
+	} else if detail != "" {
+		wrapped = fmt.Errorf("%w: %s", err, shortenTeamsLine(detail, 600))
+	} else {
+		wrapped = err
+	}
+	return managedASRLlamaRunError{Runtime: runtime, Err: wrapped}
+}
+
+func managedASRShouldRetryLlamaRunWithCPU(cfg ManagedASRConfig, err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if device := strings.ToLower(strings.TrimSpace(cfg.LlamaDevice)); device != "" && device != managedASRBackendAuto {
+		return false
+	}
+	var runErr managedASRLlamaRunError
+	if !errors.As(err, &runErr) {
+		return false
+	}
+	device := strings.ToLower(strings.TrimSpace(runErr.Runtime.Device))
+	return device != "" && device != managedASRBackendAuto && device != "cpu" && device != "none"
+}
+
 func managedASRLanguageArg(language string) string {
 	language = strings.TrimSpace(language)
 	if language == "" {
@@ -344,7 +479,7 @@ func prepareManagedASRAudioForLlama(ctx context.Context, path string, speed stri
 	ffmpeg := strings.TrimSpace(runtime.FFmpegPath)
 	var err error
 	if ffmpeg == "" {
-		ffmpeg, err = resolveManagedASRLlamaFFmpeg(ctx, runtime.CacheRoot, "")
+		ffmpeg, err = resolveManagedASRLlamaFFmpeg(ctx, runtime.CacheRoot, "", runtime.Env)
 		if err != nil || strings.TrimSpace(ffmpeg) == "" {
 			baseErr := err
 			if baseErr == nil {
@@ -381,12 +516,18 @@ func prepareManagedASRAudioForLlama(ctx context.Context, path string, speed stri
 		"-ar", "16000",
 		out,
 	)
-	cmd.Env = managedASRSetupBaseEnv()
+	cmd.Env = append(managedASRSetupBaseEnv(), runtime.Env...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := runASRCommand(ctx, cmd); err != nil {
 		cleanup()
 		detail := strings.TrimSpace(stderr.String())
+		if hint := managedASRNativeRuntimeFailureHint("ffmpeg", err, detail); hint != "" {
+			if detail != "" {
+				return "", nil, fmt.Errorf("prepare llama ASR audio with ffmpeg: %w: %s: %s", err, hint, shortenTeamsLine(detail, 600))
+			}
+			return "", nil, fmt.Errorf("prepare llama ASR audio with ffmpeg: %w: %s", err, hint)
+		}
 		if detail != "" {
 			return "", nil, fmt.Errorf("prepare llama ASR audio with ffmpeg: %w: %s", err, shortenTeamsLine(detail, 600))
 		}
@@ -489,6 +630,60 @@ func managedASRLlamaBackendName(device string) string {
 	return "qwen-asr-llama/" + device
 }
 
+func managedASRNativeRuntimeFailureHint(component string, err error, detail string) string {
+	statusText := strings.ToLower(strings.TrimSpace(err.Error() + " " + detail))
+	if exitCode, ok := managedASRCommandExitCode(err); ok {
+		switch uint32(exitCode) {
+		case 0xC0000135:
+			return component + " failed to start because a Windows native DLL is missing; provide app-local C/C++ runtime DLLs through the helper ASR native library path, or install the matching Microsoft Visual C++ runtime"
+		case 0xC0000139:
+			return component + " failed to start because a Windows native DLL entry point is missing; update the C/C++ runtime or use a binary compatible with this Windows version"
+		case 0xC000007B:
+			return component + " failed to start because the native binary or one of its DLLs has the wrong architecture or is corrupt; verify x64/ARM64 compatibility"
+		case 0xC000001D:
+			return component + " failed because this CPU does not support an instruction required by the native binary; use a lower-ISA compatible runtime"
+		}
+	}
+	switch {
+	case strings.Contains(statusText, "0xc0000135") || strings.Contains(statusText, "status_dll_not_found"):
+		return component + " failed to start because a Windows native DLL is missing; provide app-local C/C++ runtime DLLs through the helper ASR native library path, or install the matching Microsoft Visual C++ runtime"
+	case strings.Contains(statusText, "0xc0000139") || strings.Contains(statusText, "status_entrypoint_not_found"):
+		return component + " failed to start because a Windows native DLL entry point is missing; update the C/C++ runtime or use a binary compatible with this Windows version"
+	case strings.Contains(statusText, "0xc000007b") || strings.Contains(statusText, "status_invalid_image_format"):
+		return component + " failed to start because the native binary or one of its DLLs has the wrong architecture or is corrupt; verify x64/ARM64 compatibility"
+	case strings.Contains(statusText, "0xc000001d") || strings.Contains(statusText, "status_illegal_instruction"):
+		return component + " failed because this CPU does not support an instruction required by the native binary; use a lower-ISA compatible runtime"
+	case strings.Contains(statusText, "error while loading shared libraries"):
+		return component + " could not load a required Linux shared library; provide the library through the helper ASR native library path or use a compatible runtime bundle"
+	case strings.Contains(statusText, "glibc_") && strings.Contains(statusText, "not found"):
+		return component + " requires a newer glibc than this system provides; use a low-glibc compatible runtime bundle instead of a library path workaround"
+	case (strings.Contains(statusText, "glibcxx_") || strings.Contains(statusText, "cxxabi_")) && strings.Contains(statusText, "not found"):
+		return component + " requires a newer C++ runtime than this system provides; use a compatible bundled runtime or provide app-local C++ libraries"
+	case strings.Contains(statusText, "no such file or directory") && runtime.GOOS == "linux":
+		return component + " may be missing the Linux dynamic loader or may not be compatible with this distribution; use a compatible glibc or musl runtime"
+	case strings.Contains(statusText, "illegal instruction"):
+		return component + " failed because this CPU does not support an instruction required by the native binary; use a lower-ISA compatible runtime"
+	case strings.Contains(statusText, "library not loaded") || strings.Contains(statusText, "image not found"):
+		return component + " could not load a required macOS dynamic library; provide it through the helper ASR native library path or use a bundled runtime"
+	case strings.Contains(statusText, "symbol not found"):
+		return component + " requires a macOS runtime symbol that is not available on this system; use a binary compatible with this macOS version"
+	case strings.Contains(statusText, "bad cpu type"):
+		return component + " is not compatible with this Mac architecture; use the matching arm64 or x64 runtime"
+	case strings.Contains(statusText, "dll load failed") || strings.Contains(statusText, "winerror 126"):
+		return component + " could not load a required Windows native DLL; provide app-local runtime DLLs through the helper ASR native library path or use a compatible runtime"
+	default:
+		return ""
+	}
+}
+
+func managedASRCommandExitCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), true
+	}
+	return 0, false
+}
+
 func runManagedASRCommand(ctx context.Context, command string, args []string, env []string, stdout *bytes.Buffer, stderr *bytes.Buffer) error {
 	cmd := exec.Command(strings.TrimSpace(command), args...)
 	cmd.Env = env
@@ -499,6 +694,10 @@ func runManagedASRCommand(ctx context.Context, command string, args []string, en
 
 func ensureManagedASRRuntime(ctx context.Context, cfg ManagedASRConfig) (managedASRRuntime, error) {
 	resolved, err := resolveManagedASRConfig(cfg)
+	if err != nil {
+		return managedASRRuntime{}, err
+	}
+	nativeLibraryDirs, err := managedASRConfiguredNativeLibraryDirs(resolved.NativeLibraryPath)
 	if err != nil {
 		return managedASRRuntime{}, err
 	}
@@ -548,6 +747,7 @@ func ensureManagedASRRuntime(ctx context.Context, cfg ManagedASRConfig) (managed
 		ScriptPath: scriptPath,
 		CacheRoot:  resolved.CacheRoot,
 		ModelID:    resolved.ModelID,
+		Env:        managedASRMergeNativeLibraryEnv(nil, nativeLibraryDirs),
 	}, nil
 }
 

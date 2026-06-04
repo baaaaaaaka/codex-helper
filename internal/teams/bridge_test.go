@@ -27552,8 +27552,7 @@ func teamsVisibleMessageLeaksASRConfiguration(text string) bool {
 	for _, forbidden := range []string{
 		"--asr-command",
 		"--asr-arg",
-		"CODEX_HELPER_TEAMS_ASR_COMMAND",
-		"CODEX_HELPER_TEAMS_ASR_ARGS_JSON",
+		"CODEX_HELPER_TEAMS_ASR_",
 		"{input}",
 		"{threads}",
 		"placeholder",

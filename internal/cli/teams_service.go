@@ -3163,6 +3163,7 @@ func teamsServiceEnvironmentAllowlist() []string {
 		envTeamsASRLlamaMMProj,
 		envTeamsASRLlamaDevice,
 		envTeamsASRFFmpeg,
+		envTeamsASRNativeLibraryPath,
 		"CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS",
 		"CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES",
 		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",

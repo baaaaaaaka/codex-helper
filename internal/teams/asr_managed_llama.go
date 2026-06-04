@@ -48,6 +48,7 @@ var (
 	managedASRFFmpegWheelAssetFn        = managedASRFFmpegWheelAsset
 	validateManagedASRFFmpegBinaryFn    = validateManagedASRFFmpegBinary
 	validateManagedASRLlamaBinaryFn     = validateManagedASRLlamaBinary
+	managedASRLlamaLinuxLibcFn          = managedASRLlamaLinuxLibc
 	managedASRLlamaDownloadBackoff      = time.Second
 	managedASRLlamaDownloadTimeout      = 15 * time.Minute
 )
@@ -146,6 +147,10 @@ func ensureManagedASRLlamaRuntime(ctx context.Context, cfg ManagedASRConfig) (ma
 	if err != nil {
 		return managedASRLlamaRuntime{}, err
 	}
+	nativeLibraryDirs, err := managedASRConfiguredNativeLibraryDirs(resolved.NativeLibraryPath)
+	if err != nil {
+		return managedASRLlamaRuntime{}, err
+	}
 	if err := os.MkdirAll(resolved.CacheRoot, 0o700); err != nil {
 		return managedASRLlamaRuntime{}, err
 	}
@@ -174,7 +179,7 @@ func ensureManagedASRLlamaRuntime(ctx context.Context, cfg ManagedASRConfig) (ma
 	if err := os.MkdirAll(llamaRoot, 0o700); err != nil {
 		return managedASRLlamaRuntime{}, err
 	}
-	command, runtimeEnv, acceleration, err := ensureManagedASRLlamaBinary(ctx, llamaRoot, cfg)
+	command, runtimeEnv, acceleration, err := ensureManagedASRLlamaBinary(ctx, llamaRoot, resolved)
 	if err != nil {
 		return managedASRLlamaRuntime{}, err
 	}
@@ -190,7 +195,7 @@ func ensureManagedASRLlamaRuntime(ctx context.Context, cfg ManagedASRConfig) (ma
 		MMProjPath: mmprojPath,
 		Device:     firstNonEmptyString(acceleration, strings.TrimSpace(cfg.LlamaDevice), managedASRBackendAuto),
 		FFmpegPath: strings.TrimSpace(cfg.FFmpegPath),
-		Env:        runtimeEnv,
+		Env:        managedASRMergeNativeLibraryEnv(runtimeEnv, nativeLibraryDirs),
 	}, nil
 }
 
@@ -207,10 +212,14 @@ func resolveManagedASRLlamaConfig(cfg ManagedASRConfig) (ManagedASRConfig, error
 }
 
 func managedASRLlamaAssetsForDevice(assets []managedASRLlamaAsset, device string) ([]managedASRLlamaAsset, error) {
+	return managedASRLlamaAssetsForDeviceOnGOOS(assets, device, runtime.GOOS)
+}
+
+func managedASRLlamaAssetsForDeviceOnGOOS(assets []managedASRLlamaAsset, device string, goos string) ([]managedASRLlamaAsset, error) {
 	device = strings.ToLower(strings.TrimSpace(device))
 	switch device {
 	case "", managedASRBackendAuto:
-		return assets, nil
+		return managedASRLlamaDefaultAssetsForGOOS(assets, goos), nil
 	case "none":
 		device = "cpu"
 	}
@@ -218,12 +227,33 @@ func managedASRLlamaAssetsForDevice(assets []managedASRLlamaAsset, device string
 	for _, asset := range assets {
 		if strings.EqualFold(asset.Acceleration, device) {
 			filtered = append(filtered, asset)
+			continue
+		}
+		if device == "cpu" && goos == "darwin" && strings.EqualFold(asset.Acceleration, "metal") {
+			cpuAsset := asset
+			cpuAsset.Acceleration = "cpu"
+			filtered = append(filtered, cpuAsset)
 		}
 	}
 	if len(filtered) == 0 {
-		return nil, fmt.Errorf("managed llama.cpp Teams speech recognition runtime with %s acceleration is not available for %s/%s", device, runtime.GOOS, runtime.GOARCH)
+		return nil, fmt.Errorf("managed llama.cpp Teams speech recognition runtime with %s acceleration is not available for %s/%s", device, goos, runtime.GOARCH)
 	}
 	return filtered, nil
+}
+
+func managedASRLlamaDefaultAssetsForGOOS(assets []managedASRLlamaAsset, goos string) []managedASRLlamaAsset {
+	if goos == "linux" || goos == "windows" {
+		var cpu []managedASRLlamaAsset
+		for _, asset := range assets {
+			if strings.EqualFold(asset.Acceleration, "cpu") {
+				cpu = append(cpu, asset)
+			}
+		}
+		if len(cpu) > 0 {
+			return cpu
+		}
+	}
+	return assets
 }
 
 func managedASRLlamaAccelerationMatchesDevice(acceleration string, device string) bool {
@@ -243,16 +273,26 @@ func managedASRLlamaInstallErrorFallbackable(err error) bool {
 }
 
 func ensureManagedASRLlamaBinary(ctx context.Context, llamaRoot string, cfg ManagedASRConfig) (string, []string, string, error) {
+	nativeLibraryDirs, err := managedASRConfiguredNativeLibraryDirs(cfg.NativeLibraryPath)
+	if err != nil {
+		return "", nil, "", err
+	}
 	command := strings.TrimSpace(cfg.LlamaBinaryPath)
 	if command != "" {
 		if _, err := os.Stat(command); err != nil {
 			return "", nil, "", fmt.Errorf("llama ASR binary is not usable at %s: %w", command, err)
 		}
-		return command, nil, firstNonEmptyString(strings.TrimSpace(cfg.LlamaDevice), managedASRBackendAuto), nil
+		env := managedASRLlamaNativeLibraryEnvForCommand(filepath.Dir(command), command, nativeLibraryDirs)
+		if validateManagedASRLlamaBinaryFn != nil {
+			if err := validateManagedASRLlamaBinaryFn(ctx, command, env); err != nil {
+				return "", nil, "", fmt.Errorf("llama ASR binary is not usable at %s: %w", command, err)
+			}
+		}
+		return command, env, firstNonEmptyString(strings.TrimSpace(cfg.LlamaDevice), managedASRBackendAuto), nil
 	}
 
 	installRoot := filepath.Join(llamaRoot, "runtime")
-	if command, env, acceleration, ok := managedASRLlamaBinaryFromMarker(installRoot); ok {
+	if command, env, acceleration, ok := managedASRLlamaBinaryFromMarker(installRoot, nativeLibraryDirs); ok {
 		if managedASRLlamaAccelerationMatchesDevice(acceleration, cfg.LlamaDevice) {
 			return command, env, acceleration, nil
 		}
@@ -261,7 +301,13 @@ func ensureManagedASRLlamaBinary(ctx context.Context, llamaRoot string, cfg Mana
 	assets, err := managedASRLlamaBinaryAssetsFn(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		if path, lookErr := managedASRLookPath(managedASRLlamaBinaryFileName); lookErr == nil {
-			return path, nil, firstNonEmptyString(strings.TrimSpace(cfg.LlamaDevice), managedASRBackendAuto), nil
+			env := managedASRLlamaNativeLibraryEnvForCommand(filepath.Dir(path), path, nativeLibraryDirs)
+			if validateManagedASRLlamaBinaryFn != nil {
+				if err := validateManagedASRLlamaBinaryFn(ctx, path, env); err != nil {
+					return "", nil, "", fmt.Errorf("llama ASR binary found on PATH is not usable at %s: %w", path, err)
+				}
+			}
+			return path, env, firstNonEmptyString(strings.TrimSpace(cfg.LlamaDevice), managedASRBackendAuto), nil
 		}
 		return "", nil, "", managedASRLlamaFallbackError{Err: err}
 	}
@@ -272,7 +318,7 @@ func ensureManagedASRLlamaBinary(ctx context.Context, llamaRoot string, cfg Mana
 	var installErrors []string
 	fallbackable := len(assets) > 0
 	for _, asset := range assets {
-		command, env, err := installManagedASRLlamaBinary(ctx, installRoot, asset)
+		command, env, err := installManagedASRLlamaBinary(ctx, installRoot, asset, nativeLibraryDirs)
 		if err == nil {
 			return command, env, asset.Acceleration, nil
 		}
@@ -282,7 +328,13 @@ func ensureManagedASRLlamaBinary(ctx context.Context, llamaRoot string, cfg Mana
 		installErrors = append(installErrors, asset.Name+": "+err.Error())
 	}
 	if path, lookErr := managedASRLookPath(managedASRLlamaBinaryFileName); lookErr == nil {
-		return path, nil, firstNonEmptyString(strings.TrimSpace(cfg.LlamaDevice), managedASRBackendAuto), nil
+		env := managedASRLlamaNativeLibraryEnvForCommand(filepath.Dir(path), path, nativeLibraryDirs)
+		if validateManagedASRLlamaBinaryFn != nil {
+			if err := validateManagedASRLlamaBinaryFn(ctx, path, env); err != nil {
+				return "", nil, "", fmt.Errorf("llama ASR binary found on PATH is not usable at %s: %w", path, err)
+			}
+		}
+		return path, env, firstNonEmptyString(strings.TrimSpace(cfg.LlamaDevice), managedASRBackendAuto), nil
 	}
 	err = fmt.Errorf("managed llama.cpp download/install failed: %s", strings.Join(installErrors, "; "))
 	if fallbackable {
@@ -291,7 +343,7 @@ func ensureManagedASRLlamaBinary(ctx context.Context, llamaRoot string, cfg Mana
 	return "", nil, "", err
 }
 
-func managedASRLlamaBinaryFromMarker(installRoot string) (string, []string, string, bool) {
+func managedASRLlamaBinaryFromMarker(installRoot string, nativeLibraryDirs []string) (string, []string, string, bool) {
 	markerPath := filepath.Join(installRoot, "runtime.json")
 	data, err := os.ReadFile(markerPath)
 	if err != nil {
@@ -312,10 +364,10 @@ func managedASRLlamaBinaryFromMarker(installRoot string) (string, []string, stri
 	if marker.BinarySize > 0 && info.Size() != marker.BinarySize {
 		return "", nil, "", false
 	}
-	return command, managedASRLlamaInstallEnvForCommand(installRoot, command), strings.TrimSpace(marker.Acceleration), true
+	return command, managedASRLlamaNativeLibraryEnvForCommand(installRoot, command, nativeLibraryDirs), strings.TrimSpace(marker.Acceleration), true
 }
 
-func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset managedASRLlamaAsset) (string, []string, error) {
+func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset managedASRLlamaAsset, nativeLibraryDirs []string) (string, []string, error) {
 	parent := filepath.Dir(installRoot)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return "", nil, err
@@ -356,7 +408,7 @@ func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset
 	if err != nil {
 		return "", nil, err
 	}
-	env := managedASRLlamaInstallEnvForCommand(staging, command)
+	env := managedASRLlamaNativeLibraryEnvForCommand(staging, command, nativeLibraryDirs)
 	if validateManagedASRLlamaBinaryFn != nil {
 		if err := validateManagedASRLlamaBinaryFn(ctx, command, env); err != nil {
 			return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable: %w", err)}
@@ -395,7 +447,7 @@ func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset
 		return "", nil, err
 	}
 	finalCommand := filepath.Join(installRoot, rel)
-	return finalCommand, managedASRLlamaInstallEnvForCommand(installRoot, finalCommand), nil
+	return finalCommand, managedASRLlamaNativeLibraryEnvForCommand(installRoot, finalCommand, nativeLibraryDirs), nil
 }
 
 func ensureManagedASRLlamaModelFiles(ctx context.Context, llamaRoot string, cfg ManagedASRConfig) (string, string, error) {
@@ -530,7 +582,7 @@ func managedASRLlamaManagedModelAssets() managedASRLlamaModelAssets {
 	}
 }
 
-func resolveManagedASRLlamaFFmpeg(ctx context.Context, cacheRoot string, configuredPath string) (string, error) {
+func resolveManagedASRLlamaFFmpeg(ctx context.Context, cacheRoot string, configuredPath string, env []string) (string, error) {
 	configuredPath = strings.TrimSpace(configuredPath)
 	if configuredPath != "" {
 		if _, err := os.Stat(configuredPath); err != nil {
@@ -545,7 +597,7 @@ func resolveManagedASRLlamaFFmpeg(ctx context.Context, cacheRoot string, configu
 	if cacheRoot == "" {
 		return "", fmt.Errorf("managed ffmpeg cache root is empty")
 	}
-	path, err := ensureManagedASRFFmpeg(ctx, filepath.Join(cacheRoot, "ffmpeg"))
+	path, err := ensureManagedASRFFmpegWithEnv(ctx, filepath.Join(cacheRoot, "ffmpeg"), env)
 	if errors.Is(err, errManagedASRFFmpegUnsupported) {
 		return "", err
 	}
@@ -553,6 +605,10 @@ func resolveManagedASRLlamaFFmpeg(ctx context.Context, cacheRoot string, configu
 }
 
 func ensureManagedASRFFmpeg(ctx context.Context, installRoot string) (string, error) {
+	return ensureManagedASRFFmpegWithEnv(ctx, installRoot, nil)
+}
+
+func ensureManagedASRFFmpegWithEnv(ctx context.Context, installRoot string, env []string) (string, error) {
 	if path, ok := managedASRFFmpegFromMarker(installRoot); ok {
 		return path, nil
 	}
@@ -575,7 +631,7 @@ func ensureManagedASRFFmpeg(ctx context.Context, installRoot string) (string, er
 	if err != nil {
 		return "", err
 	}
-	return installManagedASRFFmpeg(ctx, installRoot, asset)
+	return installManagedASRFFmpeg(ctx, installRoot, asset, env)
 }
 
 func managedASRFFmpegFromMarker(installRoot string) (string, bool) {
@@ -597,7 +653,7 @@ func managedASRFFmpegFromMarker(installRoot string) (string, bool) {
 	return path, true
 }
 
-func installManagedASRFFmpeg(ctx context.Context, installRoot string, asset managedASRLlamaFileAsset) (string, error) {
+func installManagedASRFFmpeg(ctx context.Context, installRoot string, asset managedASRLlamaFileAsset, env []string) (string, error) {
 	parent := filepath.Dir(installRoot)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return "", err
@@ -626,7 +682,7 @@ func installManagedASRFFmpeg(ctx context.Context, installRoot string, asset mana
 	}
 	_ = os.Chmod(ffmpegPath, 0o700)
 	if validateManagedASRFFmpegBinaryFn != nil {
-		if err := validateManagedASRFFmpegBinaryFn(ctx, ffmpegPath); err != nil {
+		if err := validateManagedASRFFmpegBinaryFn(ctx, ffmpegPath, env); err != nil {
 			return "", fmt.Errorf("downloaded ffmpeg runtime is not usable: %w", err)
 		}
 	}
@@ -700,16 +756,22 @@ func findManagedASRFFmpegExecutable(root string) (string, error) {
 	return found, nil
 }
 
-func validateManagedASRFFmpegBinary(ctx context.Context, command string) error {
+func validateManagedASRFFmpegBinary(ctx context.Context, command string, env []string) error {
 	validateCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(validateCtx, strings.TrimSpace(command), "-version")
-	cmd.Env = managedASRSetupBaseEnv()
+	cmd.Env = append(managedASRSetupBaseEnv(), env...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := runASRCommand(validateCtx, cmd); err != nil {
 		detail := strings.TrimSpace(out.String())
+		if hint := managedASRNativeRuntimeFailureHint("ffmpeg", err, detail); hint != "" {
+			if detail != "" {
+				return fmt.Errorf("%w: %s: %s", err, hint, shortenTeamsLine(detail, 400))
+			}
+			return fmt.Errorf("%w: %s", err, hint)
+		}
 		if detail != "" {
 			return fmt.Errorf("%w: %s", err, shortenTeamsLine(detail, 400))
 		}
@@ -721,16 +783,19 @@ func validateManagedASRFFmpegBinary(ctx context.Context, command string) error {
 func managedASRLlamaBinaryAssets(goos string, goarch string) ([]managedASRLlamaAsset, error) {
 	switch goos {
 	case "linux":
+		if managedASRLlamaLinuxLibcFn != nil && managedASRLlamaLinuxLibcFn() == "musl" {
+			return nil, fmt.Errorf("managed llama.cpp Teams speech recognition runtime is not available on linux/%s musl; Alpine/musl requires a separate musl runtime asset", goarch)
+		}
 		switch goarch {
 		case "amd64":
 			return []managedASRLlamaAsset{
-				managedASRLlamaReleaseAsset("llama-b9437-bin-ubuntu-vulkan-x64.tar.gz", "177e7e70d13ac17df524a4126404025eff2b1f4b5a6f393e07b4bf1c25d31c65", 32237070, "vulkan"),
 				managedASRLlamaReleaseAsset("llama-b9437-bin-ubuntu-x64.tar.gz", "07b0bf370a696329463d999ecb5c4860717eef6824e55eaf062214d70e78174d", 14514126, "cpu"),
+				managedASRLlamaReleaseAsset("llama-b9437-bin-ubuntu-vulkan-x64.tar.gz", "177e7e70d13ac17df524a4126404025eff2b1f4b5a6f393e07b4bf1c25d31c65", 32237070, "vulkan"),
 			}, nil
 		case "arm64":
 			return []managedASRLlamaAsset{
-				managedASRLlamaReleaseAsset("llama-b9437-bin-ubuntu-vulkan-arm64.tar.gz", "4e9d6fb2e17ccb23bbf4346f70e09c53f9f992c9eaf0e2a264672a5c189b0a0d", 25462765, "vulkan"),
 				managedASRLlamaReleaseAsset("llama-b9437-bin-ubuntu-arm64.tar.gz", "ba0a1cf3c190d16107e78cd3e81c05a4c97dcab5c82291cb63f9bc0093d6987f", 11539448, "cpu"),
+				managedASRLlamaReleaseAsset("llama-b9437-bin-ubuntu-vulkan-arm64.tar.gz", "4e9d6fb2e17ccb23bbf4346f70e09c53f9f992c9eaf0e2a264672a5c189b0a0d", 25462765, "vulkan"),
 			}, nil
 		}
 	case "darwin":
@@ -748,8 +813,8 @@ func managedASRLlamaBinaryAssets(goos string, goarch string) ([]managedASRLlamaA
 		switch goarch {
 		case "amd64":
 			return []managedASRLlamaAsset{
-				managedASRLlamaReleaseAsset("llama-b9437-bin-win-vulkan-x64.zip", "02e354109984a4fc9f6dfa9cdfa8e2482b6b3d8ba6462856910efa0e84278855", 33096187, "vulkan"),
 				managedASRLlamaReleaseAsset("llama-b9437-bin-win-cpu-x64.zip", "7f19b3da00425946e41a83c15f8ef4bf5cd261f35f941e408e9b2634ce8b6d7f", 16104427, "cpu"),
+				managedASRLlamaReleaseAsset("llama-b9437-bin-win-vulkan-x64.zip", "02e354109984a4fc9f6dfa9cdfa8e2482b6b3d8ba6462856910efa0e84278855", 33096187, "vulkan"),
 			}, nil
 		case "arm64":
 			return []managedASRLlamaAsset{
@@ -758,6 +823,26 @@ func managedASRLlamaBinaryAssets(goos string, goarch string) ([]managedASRLlamaA
 		}
 	}
 	return nil, fmt.Errorf("managed llama.cpp Teams speech recognition runtime is not available for %s/%s", goos, goarch)
+}
+
+func managedASRLlamaLinuxLibc() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	if _, err := os.Stat("/etc/alpine-release"); err == nil {
+		return "musl"
+	}
+	for _, pattern := range []string{
+		"/lib/ld-musl-*.so.1",
+		"/lib64/ld-musl-*.so.1",
+		"/usr/lib/ld-musl-*.so.1",
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err == nil && len(matches) > 0 {
+			return "musl"
+		}
+	}
+	return "glibc"
 }
 
 func managedASRLlamaReleaseAsset(name string, sha256sum string, size int64, acceleration string) managedASRLlamaAsset {
@@ -974,6 +1059,10 @@ func managedASRLlamaInstallEnv(root string) []string {
 }
 
 func managedASRLlamaInstallEnvForCommand(root string, command string) []string {
+	return managedASRLlamaNativeLibraryEnvForCommand(root, command, nil)
+}
+
+func managedASRLlamaNativeLibraryEnvForCommand(root string, command string, nativeLibraryDirs []string) []string {
 	var dirs []string
 	addDir := func(path string) {
 		path = strings.TrimSpace(path)
@@ -1000,6 +1089,9 @@ func managedASRLlamaInstallEnvForCommand(root string, command string) []string {
 		addDir(parent)
 		addDir(filepath.Join(parent, "bin"))
 		addDir(filepath.Join(parent, "lib"))
+	}
+	for _, path := range nativeLibraryDirs {
+		addDir(path)
 	}
 	for _, rel := range []string{"bin", "lib", "."} {
 		addDir(filepath.Join(root, rel))
@@ -1029,6 +1121,69 @@ func managedASRLlamaInstallEnvForCommand(root string, command string) []string {
 	}
 }
 
+func managedASRConfiguredNativeLibraryDirs(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	var dirs []string
+	seen := map[string]bool{}
+	for _, item := range filepath.SplitList(value) {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if !filepath.IsAbs(item) {
+			abs, err := filepath.Abs(item)
+			if err != nil {
+				return nil, fmt.Errorf("resolve configured ASR native library path %s: %w", item, err)
+			}
+			item = abs
+		}
+		info, err := os.Stat(item)
+		if err != nil {
+			return nil, fmt.Errorf("configured ASR native library path is not usable at %s: %w", item, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("configured ASR native library path is not a directory: %s", item)
+		}
+		if seen[item] {
+			continue
+		}
+		seen[item] = true
+		dirs = append(dirs, item)
+	}
+	return dirs, nil
+}
+
+func managedASRMergeNativeLibraryEnv(env []string, nativeLibraryDirs []string) []string {
+	if len(nativeLibraryDirs) == 0 {
+		return env
+	}
+	key := managedASRNativeLibraryEnvKey()
+	if key == "" {
+		return env
+	}
+	value := strings.Join(nativeLibraryDirs, string(os.PathListSeparator))
+	existing := envSliceToMap(env)
+	if previous := strings.TrimSpace(existing[key]); previous != "" {
+		value += string(os.PathListSeparator) + previous
+	}
+	existing[key] = value
+	return envMapToSlice(existing)
+}
+
+func managedASRNativeLibraryEnvKey() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "PATH"
+	case "darwin":
+		return "DYLD_LIBRARY_PATH"
+	default:
+		return "LD_LIBRARY_PATH"
+	}
+}
+
 func validateManagedASRLlamaBinary(ctx context.Context, command string, env []string) error {
 	validateCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -1039,6 +1194,12 @@ func validateManagedASRLlamaBinary(ctx context.Context, command string, env []st
 	cmd.Stderr = &out
 	if err := runASRCommand(validateCtx, cmd); err != nil {
 		detail := strings.TrimSpace(out.String())
+		if hint := managedASRNativeRuntimeFailureHint("llama.cpp", err, detail); hint != "" {
+			if detail != "" {
+				return fmt.Errorf("%w: %s: %s", err, hint, shortenTeamsLine(detail, 400))
+			}
+			return fmt.Errorf("%w: %s", err, hint)
+		}
 		if detail != "" {
 			return fmt.Errorf("%w: %s", err, shortenTeamsLine(detail, 400))
 		}

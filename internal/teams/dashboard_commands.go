@@ -38,6 +38,7 @@ const (
 	DashboardCommandReload         DashboardCommandName = "reload"
 	DashboardCommandUpdate         DashboardCommandName = "update"
 	DashboardCommandWebhook        DashboardCommandName = "webhook"
+	DashboardCommandASR            DashboardCommandName = "asr"
 	DashboardCommandPublishHistory DashboardCommandName = "publish-history"
 	DashboardCommandClose          DashboardCommandName = "close"
 	DashboardCommandRetry          DashboardCommandName = "retry"
@@ -291,6 +292,8 @@ func controlAdminCommandName(syntax dashboardCommandSyntax, name string, arg str
 		if helperWebhookCommandArgLooksExplicit(arg) {
 			return DashboardCommandWebhook, true
 		}
+	case "asr", "speech", "speech-recognition":
+		return DashboardCommandASR, true
 	case "service":
 		if argName == "restart" || argName == "reboot" {
 			if strings.TrimSpace(argRest) == "" || helperRestartConfirmed(arg) {
@@ -379,7 +382,7 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == "" || isAdvancedHelpArg(arg)
 	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
 		return arg == ""
-	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel:
+	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel, DashboardCommandASR:
 		return true
 	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandPark, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
@@ -427,6 +430,8 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandBeacon, true
 	case "model", "models", "model-profile", "model-profiles", "profiles":
 		return DashboardCommandModel, true
+	case "asr", "speech", "speech-recognition":
+		return DashboardCommandASR, true
 	default:
 		return DashboardCommandNone, false
 	}

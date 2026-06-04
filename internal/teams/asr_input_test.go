@@ -29,6 +29,22 @@ func (f *fakeASRTranscriber) TranscribeTeamsMedia(_ context.Context, input ASRTr
 	}, nil
 }
 
+type fakeWarmUpASRTranscriber struct {
+	called chan struct{}
+	err    error
+}
+
+func (f *fakeWarmUpASRTranscriber) TranscribeTeamsMedia(context.Context, ASRTranscribeInput) (ASRTranscript, error) {
+	return ASRTranscript{Text: "transcript", Backend: "test"}, nil
+}
+
+func (f *fakeWarmUpASRTranscriber) WarmUpTeamsASR(context.Context) error {
+	if f.called != nil {
+		f.called <- struct{}{}
+	}
+	return f.err
+}
+
 func TestPromptWithASRTranscriptsLabelsSpeechAsFallibleContext(t *testing.T) {
 	prompt := promptWithASRTranscripts("typed request wins", []ASRTranscript{
 		{
@@ -245,6 +261,57 @@ func TestTeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestBridgeStartASRWarmUpInvokesOptionalTranscriber(t *testing.T) {
+	called := make(chan struct{}, 1)
+	bridge := &Bridge{asrTranscriber: &fakeWarmUpASRTranscriber{called: called}}
+	bridge.startASRWarmUp(context.Background())
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("ASR warm-up was not invoked")
+	}
+}
+
+func TestBridgeControlASRWarmUpStartsOptionalTranscriber(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	called := make(chan struct{}, 1)
+	bridge.asrTranscriber = &fakeWarmUpASRTranscriber{called: called}
+	msg := ChatMessage{
+		ID:     "control-asr-warmup",
+		ChatID: bridge.reg.ControlChatID,
+	}
+	msg.Body.Content = "helper asr warmup"
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "helper asr warmup"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("manual ASR warm-up was not invoked")
+	}
+	bridge.asrWarmUpWG.Wait()
+	got := sentPlainJoined(*sent)
+	if !strings.Contains(got, "Speech recognition warm-up started") {
+		t.Fatalf("manual ASR warm-up response = %q", got)
+	}
+	if got := sentPlainJoined(*sent); !strings.Contains(got, "Speech recognition warm-up completed") {
+		t.Fatalf("manual ASR warm-up completion response = %q", got)
+	}
+}
+
+func TestTeamsASRFailureUserMessageSanitizesConfigurationEnv(t *testing.T) {
+	got := teamsASRFailureUserMessage(errors.New("set CODEX_HELPER_TEAMS_ASR_FFMPEG or CODEX_HELPER_TEAMS_ASR_NATIVE_LIBRARY_PATH"))
+	if strings.Contains(got, "CODEX_HELPER_TEAMS_ASR_") {
+		t.Fatalf("ASR failure message leaked env var: %q", got)
+	}
+	if !strings.Contains(got, "the Teams ASR setting") {
+		t.Fatalf("ASR failure message = %q, want sanitized ASR setting hint", got)
 	}
 }
 
