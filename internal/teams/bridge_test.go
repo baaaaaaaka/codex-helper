@@ -19525,6 +19525,55 @@ func TestBridgeSyncLinkedTranscriptSkipsRecentTeamsTurnAgentMessageMirrorByCodex
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptSkipsUnphasedAgentMirrorsAfterCheckpointInsideRecentTeamsTurn(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTranscriptTest(t, store, session, "previous teams prompt")
+
+	firstStatus := "Let me inspect the design docs before Phase 0."
+	secondStatus := "Now let me check the actual data files and virtual environment."
+	final := "The real final answer should be sent once."
+	updated := initial +
+		`{"type":"item.completed","item":{"id":"status-1","type":"agent_message","text":` + strconv.Quote(firstStatus) + `}}` + "\n" +
+		`{"type":"item.completed","item":{"id":"status-2","type":"agent_message","content":[{"type":"output_text","text":` + strconv.Quote(secondStatus) + `}]}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"assistant-full","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":` + strconv.Quote(final) + `}]}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	for _, leaked := range []string{firstStatus, secondStatus} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("unphased live agent mirror was replayed:\n%s", joined)
+		}
+	}
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\n"+final) {
+		t.Fatalf("response_item final should still be delivered:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after sync error: %v", err)
+	}
+	for _, skipped := range []string{firstStatus, secondStatus} {
+		if !transcriptDeliveryWithTextStatusExists(state, session.ID, skipped, teamstore.TranscriptDeliveryStatusSkipped) {
+			t.Fatalf("skipped mirror delivery for %q was not recorded: %#v", skipped, state.TranscriptDeliveries)
+		}
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptKeepsAgentMessageWithoutRecentMirrorEvidence(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"

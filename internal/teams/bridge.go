@@ -14121,13 +14121,39 @@ type recentCompletedTeamsTranscriptMirrorSkipper struct {
 	codexTurnID   string
 }
 
-func newRecentCompletedTeamsTranscriptMirrorSkipper(state teamstore.State, sessionID string, now time.Time) recentCompletedTeamsTranscriptMirrorSkipper {
+func newRecentCompletedTeamsTranscriptMirrorSkipper(state teamstore.State, sessionID string, now time.Time, checkpoint teamstore.ImportCheckpoint) recentCompletedTeamsTranscriptMirrorSkipper {
 	turn, ok := latestRecentCompletedTeamsTurn(state, sessionID, now, localTranscriptCompletedTurnSettleWindow)
 	return recentCompletedTeamsTranscriptMirrorSkipper{
 		enabled:       ok,
+		seen:          recentCompletedTeamsCheckpointInTurnMirrorTail(turn, checkpoint),
 		codexThreadID: strings.TrimSpace(turn.CodexThreadID),
 		codexTurnID:   strings.TrimSpace(turn.CodexTurnID),
 	}
+}
+
+func recentCompletedTeamsCheckpointInTurnMirrorTail(turn teamstore.Turn, checkpoint teamstore.ImportCheckpoint) bool {
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" || checkpoint.UpdatedAt.IsZero() {
+		return false
+	}
+	startedAt := firstNonZeroTimeOrZero(turn.StartedAt, turn.CreatedAt, turn.QueuedAt)
+	completedAt := firstNonZeroTimeOrZero(turn.CompletedAt, turn.UpdatedAt)
+	if startedAt.IsZero() || completedAt.IsZero() {
+		return false
+	}
+	checkpointAt := checkpoint.UpdatedAt
+	if checkpointAt.Before(startedAt.Add(-time.Second)) {
+		return false
+	}
+	return !checkpointAt.After(completedAt.Add(2 * time.Second))
+}
+
+func firstNonZeroTimeOrZero(values ...time.Time) time.Time {
+	for _, value := range values {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
 }
 
 func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record TranscriptRecord, body string, teamsOriginHashes map[string]bool, known *knownTranscriptOutboxDedupeState) bool {
@@ -14651,13 +14677,13 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	teamsOriginTerminalHashes := teamsOriginTerminalTextHashes(state, session.ID)
 	knownForCount := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	now := time.Now()
-	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, teamsOriginDisplays, teamsOriginTerminalHashes, knownForCount, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now))
+	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, teamsOriginDisplays, teamsOriginTerminalHashes, knownForCount, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now, checkpoint))
 	if visibleBacklog > transcriptSyncMaxAutoBacklogRecords {
 		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, visibleBacklog)
 	}
 	dedupe := newTranscriptDedupeState()
 	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
-	recentTeamsMirror := newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now)
+	recentTeamsMirror := newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now, checkpoint)
 	sent := 0
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
