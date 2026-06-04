@@ -19432,6 +19432,130 @@ func TestBridgeSyncLinkedTranscriptDedupesLiveStreamedCommentary(t *testing.T) {
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptDedupesLiveStreamedFinalAnswerFragmentSentAsStatus(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+
+	fragment := "Let me inspect the reference projects before summarizing."
+	if _, err := bridge.queueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:turn-live:progress-fragment",
+		SessionID:      session.ID,
+		TurnID:         "turn-live",
+		TeamsChatID:    session.ChatID,
+		Kind:           "codex-progress-001",
+		Body:           fragment,
+		Status:         teamstore.OutboxStatusSent,
+		SourceTextHash: normalizedTextHash(fragment),
+	}); err != nil {
+		t.Fatalf("queue live progress outbox error: %v", err)
+	}
+
+	updated := initial +
+		`{"type":"event_msg","payload":{"id":"frag-1","type":"agent_message","phase":"final_answer","message":` + strconv.Quote(fragment) + `}}` + "\n" +
+		`{"type":"event_msg","payload":{"id":"final-1","type":"agent_message","phase":"final_answer","message":"the actual final answer"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, "🤖 ✅ Codex answer:\n"+fragment) {
+		t.Fatalf("live-streamed progress fragment was replayed as an answer:\n%s", joined)
+	}
+	if strings.Contains(joined, "🤖 ⏳ Codex status:\n"+fragment) {
+		t.Fatalf("live-streamed progress fragment was replayed as a status:\n%s", joined)
+	}
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\nthe actual final answer") {
+		t.Fatalf("genuine final answer should still be delivered:\n%s", joined)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptSkipsRecentTeamsTurnAgentMessageMirrorByCodexTurnID(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTest(t, store, session, "thread-1", "codex-turn-1")
+
+	fragment := "Let me continue the research where it left off."
+	final := "Here is the complete final answer."
+	updated := initial +
+		`{"type":"event_msg","payload":{"id":"frag-1","type":"agent_message","thread_id":"thread-1","turn_id":"codex-turn-1","phase":"final_answer","message":` + strconv.Quote(fragment) + `}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"assistant-full","type":"message","role":"assistant","thread_id":"thread-1","turn_id":"codex-turn-1","phase":"final_answer","content":[{"type":"output_text","text":` + strconv.Quote(final) + `}]}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, fragment) {
+		t.Fatalf("recent Teams turn live agent mirror was replayed:\n%s", joined)
+	}
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\n"+final) {
+		t.Fatalf("response_item final should still be delivered:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after sync error: %v", err)
+	}
+	if !transcriptDeliveryWithTextStatusExists(state, session.ID, fragment, teamstore.TranscriptDeliveryStatusSkipped) {
+		t.Fatalf("skipped mirror delivery was not recorded: %#v", state.TranscriptDeliveries)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptKeepsAgentMessageWithoutRecentMirrorEvidence(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTest(t, store, session, "thread-1", "codex-turn-1")
+
+	answer := "standalone historical agent message answer"
+	updated := initial +
+		`{"type":"event_msg","payload":{"id":"answer-1","type":"agent_message","thread_id":"thread-1","phase":"final_answer","message":` + strconv.Quote(answer) + `}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync error: %v", err)
+	}
+
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\n"+answer) {
+		t.Fatalf("agent_message without turn match or known anchor should not be skipped:\n%s", joined)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -23882,8 +24006,14 @@ func TestKnownTranscriptOutboxHashesUseHelperDeliveryLedger(t *testing.T) {
 	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, statusText, hashes) {
 		t.Fatal("helper delivery ledger was not recognized as already sent")
 	}
+	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "agent_message"}, statusText, hashes) {
+		t.Fatal("sent live status was not recognized as a streamed agent mirror")
+	}
 	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "failed status", hashes) {
 		t.Fatal("failed helper delivery should not suppress transcript recovery")
+	}
+	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "agent_message"}, "failed status", hashes) {
+		t.Fatal("failed helper delivery should not suppress assistant mirror recovery")
 	}
 }
 
@@ -27160,6 +27290,61 @@ func seedLinkedTranscriptForTest(t *testing.T, bridge *Bridge, transcriptPath st
 		t.Fatalf("seed checkpoint = %#v, want source path %q and a last record", checkpoint, transcriptPath)
 	}
 	return session
+}
+
+func seedRecentCompletedTeamsTurnForTest(t *testing.T, store *teamstore.Store, session *Session, codexThreadID string, codexTurnID string) {
+	t.Helper()
+	if session == nil {
+		t.Fatal("nil session")
+	}
+	now := time.Now()
+	seed := shortStableID(session.ID + ":" + codexThreadID + ":" + codexTurnID)
+	inboundID := "inbound:recent:" + seed
+	turnID := "turn:recent:" + seed
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		if state.InboundEvents == nil {
+			state.InboundEvents = map[string]teamstore.InboundEvent{}
+		}
+		if state.Turns == nil {
+			state.Turns = map[string]teamstore.Turn{}
+		}
+		state.InboundEvents[inboundID] = teamstore.InboundEvent{
+			ID:             inboundID,
+			SessionID:      session.ID,
+			TeamsChatID:    session.ChatID,
+			TeamsMessageID: "teams-message-" + seed,
+			Source:         "teams",
+			Status:         teamstore.InboundStatusPersisted,
+			TurnID:         turnID,
+			CreatedAt:      now.Add(-2 * time.Minute),
+			ReceivedAt:     now.Add(-2 * time.Minute),
+		}
+		state.Turns[turnID] = teamstore.Turn{
+			ID:             turnID,
+			SessionID:      session.ID,
+			InboundEventID: inboundID,
+			Status:         teamstore.TurnStatusCompleted,
+			CodexThreadID:  codexThreadID,
+			CodexTurnID:    codexTurnID,
+			CreatedAt:      now.Add(-2 * time.Minute),
+			StartedAt:      now.Add(-2 * time.Minute),
+			CompletedAt:    now.Add(-1 * time.Minute),
+			UpdatedAt:      now.Add(-1 * time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed recent completed turn: %v", err)
+	}
+}
+
+func transcriptDeliveryWithTextStatusExists(state teamstore.State, sessionID string, text string, status teamstore.TranscriptDeliveryStatus) bool {
+	hash := normalizedTextHash(text)
+	for _, delivery := range state.TranscriptDeliveries {
+		if delivery.SessionID == sessionID && delivery.TextHash == hash && delivery.Status == status {
+			return true
+		}
+	}
+	return false
 }
 
 func appendBridgeTestSession(t *testing.T, bridge *Bridge, store *teamstore.Store, sessionID string, chatID string) *Session {

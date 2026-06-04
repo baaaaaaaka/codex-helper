@@ -14062,7 +14062,7 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 		if !skip && dedupe.shouldSkip(record, body) {
 			skip = true
 		}
-		if !skip && record.Kind == TranscriptKindStatus && sawRecentTeamsTurnRecord {
+		if !skip && transcriptRecordIsRecentTeamsMirrorFollower(record) && sawRecentTeamsTurnRecord {
 			skip = true
 		}
 		if !skip {
@@ -14115,25 +14115,35 @@ func latestRecentCompletedTeamsTurn(state teamstore.State, sessionID string, now
 }
 
 type recentCompletedTeamsTranscriptMirrorSkipper struct {
-	enabled bool
-	seen    bool
+	enabled       bool
+	seen          bool
+	codexThreadID string
+	codexTurnID   string
 }
 
 func newRecentCompletedTeamsTranscriptMirrorSkipper(state teamstore.State, sessionID string, now time.Time) recentCompletedTeamsTranscriptMirrorSkipper {
-	_, ok := latestRecentCompletedTeamsTurn(state, sessionID, now, localTranscriptCompletedTurnSettleWindow)
-	return recentCompletedTeamsTranscriptMirrorSkipper{enabled: ok}
+	turn, ok := latestRecentCompletedTeamsTurn(state, sessionID, now, localTranscriptCompletedTurnSettleWindow)
+	return recentCompletedTeamsTranscriptMirrorSkipper{
+		enabled:       ok,
+		codexThreadID: strings.TrimSpace(turn.CodexThreadID),
+		codexTurnID:   strings.TrimSpace(turn.CodexTurnID),
+	}
 }
 
 func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record TranscriptRecord, body string, teamsOriginHashes map[string]bool, known *knownTranscriptOutboxDedupeState) bool {
 	if s == nil || !s.enabled {
 		return false
 	}
+	if s.matchesRecentCodexTurn(record) && transcriptRecordIsLiveAgentMirrorCandidate(record) {
+		s.seen = true
+		return true
+	}
 	if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) ||
 		known.shouldSkip(record, body) {
 		s.seen = true
 		return true
 	}
-	if record.Kind == TranscriptKindStatus && s.seen {
+	if transcriptRecordIsRecentTeamsMirrorFollower(record) && s.seen {
 		return true
 	}
 	if s.seen {
@@ -14141,6 +14151,22 @@ func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record Transcri
 		s.seen = false
 	}
 	return false
+}
+
+func (s *recentCompletedTeamsTranscriptMirrorSkipper) matchesRecentCodexTurn(record TranscriptRecord) bool {
+	if s == nil {
+		return false
+	}
+	recordTurnID := strings.TrimSpace(record.TurnID)
+	if s.codexTurnID == "" || recordTurnID == "" || recordTurnID != s.codexTurnID {
+		return false
+	}
+	recordThreadID := strings.TrimSpace(record.ThreadID)
+	return s.codexThreadID == "" || recordThreadID == "" || recordThreadID == s.codexThreadID
+}
+
+func transcriptRecordIsRecentTeamsMirrorFollower(record TranscriptRecord) bool {
+	return record.Kind == TranscriptKindStatus || transcriptRecordIsLiveAgentMirrorCandidate(record)
 }
 
 func (s *localTranscriptDeltaState) setCheckpointBeforeActive(records []TranscriptRecord, index int) {
@@ -15716,11 +15742,26 @@ func shouldSkipKnownTranscriptOutboxRecord(record TranscriptRecord, body string,
 		return false
 	}
 	hash := normalizedTextHash(body)
-	return hash != "" && hashes[record.Kind][hash]
+	if hash == "" {
+		return false
+	}
+	if hashes[record.Kind][hash] {
+		return true
+	}
+	// Live forwarder may have already sent a streaming agent_message candidate
+	// as progress; do not let transcript sync replay the same text as an answer.
+	if transcriptRecordIsLiveAgentMirrorCandidate(record) && hashes[TranscriptKindStatus][hash] {
+		return true
+	}
+	return false
 }
 
 func shouldSkipBackgroundTranscriptRecord(record TranscriptRecord) bool {
 	return record.Kind == TranscriptKindTool
+}
+
+func transcriptRecordIsLiveAgentMirrorCandidate(record TranscriptRecord) bool {
+	return record.Kind == TranscriptKindAssistant && transcriptRecordCanBeStreamingAssistantPrefix(record)
 }
 
 func transcriptSyncOutboxOptions(record TranscriptRecord) outboxQueueOptions {
