@@ -23895,6 +23895,58 @@ func TestBridgeSyncLinkedTranscriptSkipsTeamsOriginNoiseAndDeliveredFinal(t *tes
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptSkipsUnphasedResponseItemStatusMirror(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	seedRecentCompletedTeamsTurnForTranscriptTest(t, store, session, "previous teams prompt")
+
+	statusText := "All data generated. Let me fix the deprecation warning and update the design doc:"
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:delivered-status",
+		SessionID:      session.ID,
+		TurnID:         "turn-prev-status",
+		TeamsChatID:    session.ChatID,
+		Kind:           "codex-progress-001",
+		Body:           statusText,
+		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-status",
+	}); err != nil {
+		t.Fatalf("QueueOutbox status error: %v", err)
+	}
+
+	transcript := initial +
+		`{"id":"u-prev","role":"user","text":"previous teams prompt"}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"status-event","message":` + strconv.Quote(statusText) + `,"phase":null}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"status-response","type":"message","role":"assistant","content":[{"type":"output_text","text":` + strconv.Quote(statusText) + `}]}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"final-response","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"real final answer"}]}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write updated transcript: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync transcript error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %#v, want only final answer", *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(plain, "🤖 ✅ Codex answer:\nreal final answer") {
+		t.Fatalf("synced message = %q, want real final answer", plain)
+	}
+	if strings.Contains(plain, statusText) {
+		t.Fatalf("status mirror leaked as answer:\n%s", plain)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptKeepsUnanchoredLocalStatusAfterRecentTeamsTurn(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -24022,8 +24074,17 @@ func TestKnownTranscriptOutboxHashesIncludeUserStatusAndFinal(t *testing.T) {
 	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "already streamed status", hashes) {
 		t.Fatal("delivered live status was not recognized as already sent")
 	}
+	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "message"}, "already streamed status", hashes) {
+		t.Fatal("unphased assistant response_item mirror was not recognized as already sent status")
+	}
 	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant}, "already delivered answer", hashes) {
 		t.Fatal("delivered final answer was not recognized as already sent")
+	}
+	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "message"}, "not delivered as status", hashes) {
+		t.Fatal("unphased assistant response_item should not be suppressed without a delivered status hash")
+	}
+	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "message", Phase: "final_answer"}, "already streamed status", hashes) {
+		t.Fatal("final_answer response_item should not be suppressed by a status hash")
 	}
 	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "not delivered yet", hashes) {
 		t.Fatal("queued live status was not recognized as already known")
@@ -24058,11 +24119,17 @@ func TestKnownTranscriptOutboxHashesUseHelperDeliveryLedger(t *testing.T) {
 	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "agent_message"}, statusText, hashes) {
 		t.Fatal("sent live status was not recognized as a streamed agent mirror")
 	}
+	if !shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "message"}, statusText, hashes) {
+		t.Fatal("sent live status was not recognized as an unphased assistant response_item mirror")
+	}
 	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindStatus}, "failed status", hashes) {
 		t.Fatal("failed helper delivery should not suppress transcript recovery")
 	}
 	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "agent_message"}, "failed status", hashes) {
 		t.Fatal("failed helper delivery should not suppress assistant mirror recovery")
+	}
+	if shouldSkipKnownTranscriptOutboxRecord(TranscriptRecord{Kind: TranscriptKindAssistant, SourceType: "message"}, "failed status", hashes) {
+		t.Fatal("failed helper delivery should not suppress unphased assistant mirror recovery")
 	}
 }
 

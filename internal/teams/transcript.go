@@ -60,6 +60,7 @@ type TranscriptRecord struct {
 	SourceStartOffset int64
 	SourceOffset      int64
 	SourceType        string
+	Phase             string
 }
 
 type TranscriptDiagnostic struct {
@@ -503,6 +504,7 @@ type pendingTranscriptRecord struct {
 	createdAt    time.Time
 	sourceLine   int
 	sourceType   string
+	phase        string
 }
 
 func parseTranscriptLine(line []byte, lineNo int, state *transcriptParseState) ([]TranscriptRecord, []TranscriptDiagnostic) {
@@ -647,6 +649,10 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 	if !ok {
 		return pendingTranscriptRecord{}, false
 	}
+	phase := jsonStringField(payload, "phase")
+	if kind == TranscriptKindAssistant && strings.EqualFold(phase, "commentary") {
+		kind = TranscriptKindStatus
+	}
 	return pendingTranscriptRecord{
 		sourceItemID: sourceID,
 		threadID:     threadID,
@@ -656,6 +662,7 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 		createdAt:    createdAt,
 		sourceLine:   lineNo,
 		sourceType:   itemType,
+		phase:        phase,
 	}, true
 }
 
@@ -664,12 +671,13 @@ func eventMsgTranscriptRecord(payload map[string]json.RawMessage, lineNo int, cr
 	sourceID := jsonStringField(payload, "id", "item_id", "itemId", "message_id", "messageId")
 	threadID = firstNonEmptyString(jsonStringField(payload, "thread_id", "threadId"), threadID)
 	turnID = firstNonEmptyString(jsonStringField(payload, "turn_id", "turnId"), turnID)
+	phase := jsonStringField(payload, "phase")
 
 	kind := kindFromType(eventType)
 	if kind == TranscriptKindUnknown && eventType == "user_message" {
 		kind = TranscriptKindUser
 	}
-	if kind == TranscriptKindAssistant && strings.EqualFold(jsonStringField(payload, "phase"), "commentary") {
+	if kind == TranscriptKindAssistant && strings.EqualFold(phase, "commentary") {
 		kind = TranscriptKindStatus
 	}
 	if kind == TranscriptKindCompact {
@@ -694,6 +702,7 @@ func eventMsgTranscriptRecord(payload map[string]json.RawMessage, lineNo int, cr
 		createdAt:    createdAt,
 		sourceLine:   lineNo,
 		sourceType:   eventType,
+		phase:        phase,
 	}, true
 }
 
@@ -707,6 +716,7 @@ func completedItemTranscriptRecord(obj map[string]json.RawMessage, lineNo int, c
 
 	sourceID := jsonStringField(item, "id", "item_id", "itemId", "call_id", "callId")
 	itemType := jsonStringField(item, "type")
+	phase := firstNonEmptyString(jsonStringField(item, "phase"), jsonStringField(obj, "phase"))
 	role := strings.ToLower(strings.TrimSpace(jsonStringField(item, "role")))
 	if role == "system" || role == "developer" {
 		return pendingTranscriptRecord{}, false
@@ -715,7 +725,7 @@ func completedItemTranscriptRecord(obj map[string]json.RawMessage, lineNo int, c
 	if kind == TranscriptKindUnknown {
 		kind = kindFromType(itemType)
 	}
-	if kind == TranscriptKindAssistant && strings.EqualFold(jsonStringField(item, "phase"), "commentary") {
+	if kind == TranscriptKindAssistant && strings.EqualFold(phase, "commentary") {
 		kind = TranscriptKindStatus
 	}
 	text := firstNonEmptyString(
@@ -740,6 +750,7 @@ func completedItemTranscriptRecord(obj map[string]json.RawMessage, lineNo int, c
 		createdAt:    createdAt,
 		sourceLine:   lineNo,
 		sourceType:   itemType,
+		phase:        phase,
 	}, true
 }
 
@@ -954,6 +965,7 @@ func contextCompactTranscriptRecord(obj map[string]json.RawMessage, sourceType s
 		createdAt:    createdAt,
 		sourceLine:   lineNo,
 		sourceType:   sourceType,
+		phase:        jsonStringField(obj, "phase"),
 	}
 }
 
@@ -985,6 +997,7 @@ func (p pendingTranscriptRecord) toRecord() TranscriptRecord {
 		CreatedAt:    p.createdAt,
 		SourceLine:   p.sourceLine,
 		SourceType:   p.sourceType,
+		Phase:        p.phase,
 	}
 }
 

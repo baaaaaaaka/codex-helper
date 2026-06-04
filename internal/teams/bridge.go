@@ -15774,9 +15774,9 @@ func shouldSkipKnownTranscriptOutboxRecord(record TranscriptRecord, body string,
 	if hashes[record.Kind][hash] {
 		return true
 	}
-	// Live forwarder may have already sent a streaming agent_message candidate
-	// as progress; do not let transcript sync replay the same text as an answer.
-	if transcriptRecordIsLiveAgentMirrorCandidate(record) && hashes[TranscriptKindStatus][hash] {
+	// Live forwarder may have already sent a streaming assistant candidate as
+	// progress; do not let transcript sync replay the same text as an answer.
+	if transcriptRecordIsKnownLiveStatusMirrorCandidate(record) && hashes[TranscriptKindStatus][hash] {
 		return true
 	}
 	return false
@@ -15788,6 +15788,23 @@ func shouldSkipBackgroundTranscriptRecord(record TranscriptRecord) bool {
 
 func transcriptRecordIsLiveAgentMirrorCandidate(record TranscriptRecord) bool {
 	return record.Kind == TranscriptKindAssistant && transcriptRecordCanBeStreamingAssistantPrefix(record)
+}
+
+func transcriptRecordIsKnownLiveStatusMirrorCandidate(record TranscriptRecord) bool {
+	if transcriptRecordIsLiveAgentMirrorCandidate(record) {
+		return true
+	}
+	if record.Kind != TranscriptKindAssistant {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(record.Phase), "final_answer") {
+		return false
+	}
+	// Some Codex streams persist in-turn commentary twice: first as an
+	// agent_message event with a null phase, then as a generic assistant
+	// response_item message with no phase. Only suppress the generic message
+	// when its text is already known to have been delivered live as status.
+	return strings.EqualFold(strings.TrimSpace(record.SourceType), "message")
 }
 
 func transcriptSyncOutboxOptions(record TranscriptRecord) outboxQueueOptions {

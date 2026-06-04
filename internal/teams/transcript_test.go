@@ -74,6 +74,29 @@ func TestParseCodexTranscriptClassifiesEventCommentaryAsStatus(t *testing.T) {
 	assertTranscriptRecord(t, got.Records[1], "final-1", "source:final-1", TranscriptKindAssistant, "done", 2)
 }
 
+func TestParseCodexTranscriptClassifiesResponseItemCommentaryAsStatus(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"commentary-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
+		`{"type":"response_item","payload":{"id":"final-1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"done"}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 2 {
+		t.Fatalf("records = %#v, want 2", got.Records)
+	}
+	assertTranscriptRecord(t, got.Records[0], "commentary-1", "source:commentary-1", TranscriptKindStatus, "working", 1)
+	if got.Records[0].Phase != "commentary" {
+		t.Fatalf("commentary phase = %q, want commentary", got.Records[0].Phase)
+	}
+	assertTranscriptRecord(t, got.Records[1], "final-1", "source:final-1", TranscriptKindAssistant, "done", 2)
+	if got.Records[1].Phase != "final_answer" {
+		t.Fatalf("final phase = %q, want final_answer", got.Records[1].Phase)
+	}
+}
+
 func TestParseCodexTranscriptSkipsRawReasoningWithoutVisibleSummary(t *testing.T) {
 	input := strings.Join([]string{
 		`{"type":"response_item","payload":{"id":"reasoning-raw","type":"reasoning","encrypted_content":"private thinking","content":[{"type":"reasoning_text","text":"private thinking"}],"summary":[]}}`,
