@@ -955,11 +955,14 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 		"$codexWaitForExit = $false",
 		"$start.ArgumentList = $codexArgs",
 		"Start-Process @start | Out-Null",
+		"Get-CodexDirectLaunchFailureMessage",
+		"[System.StringComparison]::OrdinalIgnoreCase",
 		"proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost",
 		"proxy mode cannot use AppX activation because Chromium --proxy-server would be lost",
 		"falling back to AppX activation",
 		"CODEX_HOME/proxy environment may not be inherited",
-		"pass --app-path to the installed Codex.exe",
+		"Pass --app-path only for an unpackaged Codex.exe that Windows can execute directly.",
+		"protected WindowsApps package directory",
 		"Current Windows session is non-interactive",
 		"Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd",
 		"$env:CODEX_HOME = 'C:\\Users\\Alice\\.codex'",
@@ -976,6 +979,28 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 	}
 	if strings.Contains(script, "shell:AppsFolder\\' + $aumid) -ArgumentList") {
 		t.Fatalf("Windows AppX fallback should not pass direct-process app args:\n%s", script)
+	}
+}
+
+func TestCodexDesktopWindowsScriptExplainsWindowsAppsAppPathFailure(t *testing.T) {
+	script := codexDesktopWindowsInstallAndLaunchScript(codexDesktopAppOptions{
+		Cwd:      `C:\Users\Alice`,
+		AppPath:  `C:\Program Files\WindowsApps\OpenAI.Codex_26.601.2237.0_x64__2p2nqsd0c76g0\app\Codex.exe`,
+		ProxyURL: "http://127.0.0.1:23123",
+	})
+
+	for _, want := range []string{
+		"try { Start-CodexDesktopProcess $appPath; return } catch",
+		"Get-CodexDirectLaunchFailureMessage $appPath $_.Exception",
+		`\WindowsApps\`,
+		"protected WindowsApps package directory",
+		"AppX activation",
+		"cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments",
+		"unpackaged Codex.exe",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("Windows desktop app script missing %q:\n%s", want, script)
+		}
 	}
 }
 
@@ -1153,6 +1178,49 @@ func main() {
 	} {
 		if !strings.Contains(data, want) {
 			t.Fatalf("fake Codex app output missing %q:\n%s\nPowerShell output:\n%s", want, data, out)
+		}
+	}
+}
+
+func TestCodexDesktopWindowsScriptWindowsAppsAppPathFailureIntegration(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell Start-Process integration is Windows-only")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skipf("powershell.exe not found: %v", err)
+	}
+
+	dir := t.TempDir()
+	fakeAppDir := filepath.Join(dir, "Program Files", "WindowsApps", "OpenAI.Codex_26.601.2237.0_x64__2p2nqsd0c76g0", "app")
+	if err := os.MkdirAll(fakeAppDir, 0o700); err != nil {
+		t.Fatalf("create fake WindowsApps directory: %v", err)
+	}
+	fakeApp := filepath.Join(fakeAppDir, "Codex.exe")
+	if err := os.WriteFile(fakeApp, []byte("not a Windows executable"), 0o600); err != nil {
+		t.Fatalf("write fake invalid Codex executable: %v", err)
+	}
+
+	script := codexDesktopWindowsInstallAndLaunchScript(codexDesktopAppOptions{
+		Cwd:      dir,
+		AppPath:  fakeApp,
+		ProxyURL: "http://127.0.0.1:23123",
+	})
+	cmd := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("PowerShell launch unexpectedly succeeded for invalid WindowsApps Codex.exe:\n%s", out)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"direct Codex.exe launch failed:",
+		"protected WindowsApps package directory",
+		"AppX activation",
+		"cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments",
+		"unpackaged Codex.exe",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("PowerShell failure output missing %q:\n%s", want, text)
 		}
 	}
 }
