@@ -2375,6 +2375,16 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 				b.recordGlobalOutboundSuppressionProvenance(ctx, chatID, msg.ID)
 				return true, nil
 			}
+			if isHelperAttachmentEchoMessage(msg) {
+				delivered, err := b.hasDeliveredAttachmentOutboxEcho(ctx, chatID, msg)
+				if err != nil {
+					return false, err
+				}
+				if delivered {
+					b.markRegistrySent(chatID, msg.ID)
+					return true, nil
+				}
+			}
 		}
 		if legacyGeneratedOutputFallback {
 			delivered, err := b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
@@ -2417,6 +2427,77 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	return false, nil
+}
+
+func (b *Bridge) hasDeliveredAttachmentOutboxEcho(ctx context.Context, chatID string, msg ChatMessage) (bool, error) {
+	incomingKey := comparableTeamsPlainText(promptTextFromTeamsMessageHTML(msg.Body.Content))
+	if incomingKey == "" {
+		return false, nil
+	}
+	attachmentIDs := helperEchoReferenceAttachmentIDSet(msg)
+	if len(attachmentIDs) == 0 {
+		return false, nil
+	}
+	state, err := b.store.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.TeamsChatID != chatID || !outboxMayHaveReachedTeams(outbox) {
+			continue
+		}
+		teamsMessageID := strings.TrimSpace(msg.ID)
+		outboxMessageID := strings.TrimSpace(outbox.TeamsMessageID)
+		if teamsMessageID != "" && outboxMessageID != "" && outboxMessageID != teamsMessageID {
+			continue
+		}
+		attachmentID := normalizedTeamsAttachmentID(driveItemAttachmentID(driveItemFromOutbox(outbox)))
+		if attachmentID == "" || !attachmentIDs[attachmentID] {
+			continue
+		}
+		if comparableTeamsPlainText(helperAttachmentMessage(outbox.Body)) != incomingKey {
+			continue
+		}
+		matched := outbox
+		if teamsMessageID != "" && (outboxMessageID == "" || outbox.Status != teamstore.OutboxStatusSent) {
+			sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, teamsMessageID)
+			if err != nil {
+				return false, err
+			}
+			matched = sent
+		}
+		if err := b.recordGlobalOutboundMessage(ctx, matched, msg); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func helperEchoReferenceAttachmentIDSet(msg ChatMessage) map[string]bool {
+	ids := make(map[string]bool)
+	for _, attachment := range msg.Attachments {
+		contentType := strings.ToLower(strings.TrimSpace(strings.Split(attachment.ContentType, ";")[0]))
+		if contentType != "" && contentType != "reference" {
+			continue
+		}
+		if id := normalizedTeamsAttachmentID(attachment.ID); id != "" {
+			ids[id] = true
+		}
+	}
+	if len(msg.Attachments) > 0 {
+		return ids
+	}
+	for id := range teamsAttachmentPlaceholderIDSet(msg.Body.Content) {
+		if id := normalizedTeamsAttachmentID(id); id != "" {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+func normalizedTeamsAttachmentID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
 }
 
 func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context, chatID string, msg ChatMessage) (bool, error) {

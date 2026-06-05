@@ -135,6 +135,14 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed$' -v
           go test ./internal/cli -count=1 -run 'TestTeamsStatus(SeparatesCatchupBacklogAndInactiveRows|ShowsRunningTurnDetails)$' -v
 
+      - name: Teams helper attachment echo race regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          attachment_echo_pattern='TestBridgePoll(DropsFreshHelperAttachmentEchoFromSendingOutbox|AllowsFreshHelperAttachmentEchoWhenOutboxAttachmentIDDiffers|AllowsFreshHelperAttachmentEchoWhenAttachmentIsMessageReference|AllowsFreshArtifactEchoShapedUserMessageWithAttachment|DropsHelperAttachmentEchoWithoutDurableMatch|DropsGlobalOutboundFromSiblingScope)$'
+          go test ./internal/teams -count=1 -run "$attachment_echo_pattern" -v
+          go test ./internal/teams/store -count=1 -run 'TestMarkOutboxSentIsIdempotent$' -v
+
       - name: Teams watchdog lifecycle drain regressions
         shell: bash
         run: |

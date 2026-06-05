@@ -13781,6 +13781,205 @@ func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 	}
 }
 
+func TestBridgePollDropsFreshHelperAttachmentEchoFromSendingOutbox(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		sqlite bool
+	}{
+		{name: "json"},
+		{name: "sqlite", sqlite: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			attachmentID := "1176c944-0cb9-4304-974c-5837185efd6a"
+			msg := bridgePollMessage("fresh-helper-artifact-race", "2026-04-30T01:05:00Z", "")
+			msg.Body.Content = `<p>Codex: artifact attached: input.txt <attachment id="` + attachmentID + `"></attachment></p>`
+			msg.Attachments = []MessageAttachment{{
+				ID:          attachmentID,
+				ContentType: "reference",
+				ContentURL:  "https://contoso.sharepoint.com/input.txt",
+				Name:        "input.txt",
+			}}
+			graph := newBridgePollGraph(t, []bridgePollPage{{
+				messages: []ChatMessage{msg},
+			}})
+			store := newBridgeTestStore(t)
+			if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+				t.Fatalf("RecordChatPollSuccess error: %v", err)
+			}
+			if tt.sqlite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+				}
+			}
+			outbox := seedSendingAttachmentOutboxForPoll(t, store, "chat-1", "artifact attached: input.txt", `"{1176C944-0CB9-4304-974C-5837185EFD6A},1"`)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			var handled []string
+			if _, err := bridge.pollChat(ctx, "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+				handled = append(handled, text)
+				return nil
+			}); err != nil {
+				t.Fatalf("pollChat error: %v", err)
+			}
+			if len(handled) != 0 {
+				t.Fatalf("handled fresh helper attachment echo as inbound prompt: %#v", handled)
+			}
+			if !bridge.reg.HasSent("chat-1", "fresh-helper-artifact-race") {
+				t.Fatal("fresh helper attachment echo was not marked sent")
+			}
+			lookup, err := store.MessageLookup(ctx, "chat-1", "fresh-helper-artifact-race")
+			if err != nil {
+				t.Fatalf("MessageLookup error: %v", err)
+			}
+			if !lookup.HasDeliveredOutbox || !lookup.HasProvenance || lookup.Provenance.Origin != teamstore.MessageOriginHelperOutbox || lookup.Provenance.OutboxID != outbox.ID {
+				t.Fatalf("lookup = %#v, want helper outbox provenance for %q", lookup, outbox.ID)
+			}
+			ledgerPath, ok := bridge.globalOutboundLedgerPath()
+			if !ok {
+				t.Fatal("global outbound ledger path unavailable")
+			}
+			ledger, err := readGlobalOutboundLedger(ledgerPath)
+			if err != nil {
+				t.Fatalf("read global outbound ledger: %v", err)
+			}
+			item, ok := ledger.Items[globalOutboundKey("chat-1", "fresh-helper-artifact-race")]
+			if !ok {
+				t.Fatalf("global outbound ledger missing suppression entry: %#v", ledger.Items)
+			}
+			if item.OutboxID != outbox.ID || item.Origin != teamstore.MessageOriginHelperOutbox {
+				t.Fatalf("global outbound ledger item = %#v, want helper outbox %q", item, outbox.ID)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load error: %v", err)
+			}
+			sent := state.OutboxMessages[outbox.ID]
+			if sent.Status != teamstore.OutboxStatusSent || sent.TeamsMessageID != "fresh-helper-artifact-race" || sent.SentAt.IsZero() {
+				t.Fatalf("outbox after suppression = %#v, want sent with Teams message id", sent)
+			}
+			if got := len(state.InboundEvents); got != 0 {
+				t.Fatalf("inbound events = %d, want none: %#v", got, state.InboundEvents)
+			}
+		})
+	}
+}
+
+func TestBridgePollAllowsFreshHelperAttachmentEchoWhenOutboxAttachmentIDDiffers(t *testing.T) {
+	ctx := context.Background()
+	msg := bridgePollMessage("fresh-helper-artifact-different-attachment", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p>Codex: artifact attached: input.txt <attachment id="file-1"></attachment></p>`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "file-1",
+		ContentType: "reference",
+		ContentURL:  "https://contoso.sharepoint.com/user-input.txt",
+		Name:        "input.txt",
+	}}
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	outbox := seedSendingAttachmentOutboxForPoll(t, store, "chat-1", "artifact attached: input.txt", `"{1176C944-0CB9-4304-974C-5837185EFD6A},1"`)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(ctx, "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "artifact attached") {
+		t.Fatalf("handled = %#v, want fresh artifact-echo-shaped user prompt", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "fresh-helper-artifact-different-attachment") {
+		t.Fatal("attachment ID mismatch should not be marked as sent helper output")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	current := state.OutboxMessages[outbox.ID]
+	if current.Status != teamstore.OutboxStatusSending || current.TeamsMessageID != "" {
+		t.Fatalf("outbox after mismatch = %#v, want still sending without Teams message id", current)
+	}
+}
+
+func TestBridgePollAllowsFreshHelperAttachmentEchoWhenAttachmentIsMessageReference(t *testing.T) {
+	ctx := context.Background()
+	attachmentID := "1176c944-0cb9-4304-974c-5837185efd6a"
+	msg := bridgePollMessage("fresh-helper-artifact-message-reference", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p>Codex: artifact attached: input.txt <attachment id="` + attachmentID + `"></attachment></p>`
+	msg.Attachments = []MessageAttachment{{
+		ID:          attachmentID,
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quoted-message"}`,
+		Name:        "quoted-message",
+	}}
+	graph := newBridgePollGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{msg},
+	}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	outbox := seedSendingAttachmentOutboxForPoll(t, store, "chat-1", "artifact attached: input.txt", `"{1176C944-0CB9-4304-974C-5837185EFD6A},1"`)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(ctx, "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 1 || !strings.Contains(handled[0], "artifact attached") {
+		t.Fatalf("handled = %#v, want messageReference attachment prompt to remain inbound", handled)
+	}
+	if bridge.reg.HasSent("chat-1", "fresh-helper-artifact-message-reference") {
+		t.Fatal("messageReference attachment should not be marked as sent helper output")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	current := state.OutboxMessages[outbox.ID]
+	if current.Status != teamstore.OutboxStatusSending || current.TeamsMessageID != "" {
+		t.Fatalf("outbox after messageReference = %#v, want still sending without Teams message id", current)
+	}
+}
+
+func seedSendingAttachmentOutboxForPoll(t *testing.T, store *teamstore.Store, chatID string, body string, eTag string) teamstore.OutboxMessage {
+	t.Helper()
+	ctx := context.Background()
+	queued, created, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:             "outbox:artifact-race:" + shortStableID(chatID+":"+body+":"+eTag),
+		TeamsChatID:    chatID,
+		Kind:           "artifact",
+		Body:           body,
+		AttachmentPath: "/tmp/input.txt",
+		AttachmentName: "input.txt",
+		ArtifactIDs:    []string{"artifact:input"},
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	if !created {
+		t.Fatalf("QueueOutbox created = false for %q", queued.ID)
+	}
+	if _, err := store.MarkOutboxSendAttempt(ctx, queued.ID); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt error: %v", err)
+	}
+	uploaded, err := store.MarkOutboxDriveItem(ctx, queued.ID, "drive-item-input", "input.txt", eTag, "https://contoso.sharepoint.com/input.txt", "https://contoso.sharepoint.com/dav/input.txt")
+	if err != nil {
+		t.Fatalf("MarkOutboxDriveItem error: %v", err)
+	}
+	if uploaded.Status != teamstore.OutboxStatusSending || uploaded.LastSendAttempt.IsZero() || uploaded.DriveItemETag == "" {
+		t.Fatalf("seeded outbox = %#v, want sending with DriveItem metadata", uploaded)
+	}
+	return uploaded
+}
+
 func TestIsHelperAttachmentEchoMessageVariants(t *testing.T) {
 	tests := []struct {
 		name        string
