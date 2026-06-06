@@ -123,15 +123,19 @@ else
   sh "$installer" --repo "$repo" --version "$tag" --dir "$HOME/.local/bin"
 fi
 
-"$HOME/.local/bin/codex-proxy" --version | grep -q "${tag#v}"
-"$HOME/.local/bin/cxp" --version | grep -q "${tag#v}"
+codex_proxy_version="$("$HOME/.local/bin/codex-proxy" --version)"
+grep -q "${tag#v}" <<<"$codex_proxy_version"
+cxp_version="$("$HOME/.local/bin/cxp" --version)"
+grep -q "${tag#v}" <<<"$cxp_version"
 builtin_skill="$HOME/.agents/skills/cxp"
 test -f "$builtin_skill/SKILL.md"
 test -f "$builtin_skill/references/commands.md"
 grep -q -- "--after-current-turn" "$builtin_skill/references/commands.md"
 "$HOME/.local/bin/codex-proxy" proxy doctor || true
-"$HOME/.local/bin/codex-proxy" --config "$HOME/codex-proxy-skills-config.json" skills list | grep -q "No skill subscriptions."
-"$HOME/.local/bin/cxp" --config "$HOME/codex-proxy-skills-cxp-config.json" skills list | grep -q "No skill subscriptions."
+codex_proxy_skills_list="$("$HOME/.local/bin/codex-proxy" --config "$HOME/codex-proxy-skills-config.json" skills list)"
+grep -q "No skill subscriptions." <<<"$codex_proxy_skills_list"
+cxp_skills_list="$("$HOME/.local/bin/cxp" --config "$HOME/codex-proxy-skills-cxp-config.json" skills list)"
+grep -q "No skill subscriptions." <<<"$cxp_skills_list"
 CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash /ci/skills_smoke.sh
 CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash /ci/skills_migration_smoke.sh
 CODEX_HELPER_BIN="$HOME/.local/bin/cxp" bash /ci/skills_smoke.sh

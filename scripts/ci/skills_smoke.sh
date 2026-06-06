@@ -38,7 +38,8 @@ agents_dir="$home_dir/.agents/skills"
 test -f "$agents_dir/cxp/SKILL.md"
 test -f "$agents_dir/cxp/references/commands.md"
 grep -q -- "--after-current-turn" "$agents_dir/cxp/references/commands.md"
-"${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" list | grep -q "No skill subscriptions."
+list_output="$("${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" list)"
+grep -q "No skill subscriptions." <<<"$list_output"
 
 git_repo init
 git_repo config user.name "Skill Smoke"
@@ -118,4 +119,5 @@ if [[ -z "$branch" ]]; then
   echo "skills push did not create a review branch" >&2
   exit 1
 fi
-git_repo show "$branch:skills/review/SKILL.md" | grep -q "local smoke edit"
+pushed_skill="$(git_repo show "$branch:skills/review/SKILL.md")"
+grep -q "local smoke edit" <<<"$pushed_skill"

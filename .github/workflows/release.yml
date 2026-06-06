@@ -232,8 +232,10 @@ jobs:
           set -euo pipefail
           chmod +x ./install.sh
           ./install.sh --repo "${GITHUB_REPOSITORY}" --version "${GITHUB_REF_NAME}" --dir "$HOME/.local/bin"
-          "$HOME/.local/bin/codex-proxy" --version | grep -q "${GITHUB_REF_NAME#v}"
-          "$HOME/.local/bin/cxp" --version | grep -q "${GITHUB_REF_NAME#v}"
+          codex_proxy_version="$("$HOME/.local/bin/codex-proxy" --version)"
+          grep -q "${GITHUB_REF_NAME#v}" <<<"$codex_proxy_version"
+          cxp_version="$("$HOME/.local/bin/cxp" --version)"
+          grep -q "${GITHUB_REF_NAME#v}" <<<"$cxp_version"
           builtin_skill="$HOME/.agents/skills/cxp"
           test -f "$builtin_skill/SKILL.md"
           test -f "$builtin_skill/references/commands.md"
@@ -288,7 +290,8 @@ jobs:
           cp -a "$builtin_skill" "$legacy_builtin"
           rm -rf "$builtin_skill"
           "$HOME/.local/bin/codex-proxy" upgrade --repo "${GITHUB_REPOSITORY}" --version "${GITHUB_REF_NAME}" --install-path "$upgrade_target"
-          "$upgrade_target" --version | grep -q "${GITHUB_REF_NAME#v}"
+          upgrade_version="$("$upgrade_target" --version)"
+          grep -q "${GITHUB_REF_NAME#v}" <<<"$upgrade_version"
           test -f "$builtin_skill/SKILL.md"
           test -f "$builtin_skill/references/commands.md"
           test ! -e "$legacy_builtin"

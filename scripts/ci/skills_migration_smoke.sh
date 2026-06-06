@@ -51,14 +51,17 @@ agents="$home_dir/.agents/skills/acme__review"
 test -f "$legacy/SKILL.md"
 test ! -e "$agents"
 
-"${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" migrate --dry-run | grep -q "Migration: dry_run"
+dry_run_output="$("${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" migrate --dry-run)"
+grep -q "Migration: dry_run" <<<"$dry_run_output"
 test -f "$legacy/SKILL.md"
 test ! -e "$agents"
 
-"${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" list | grep -q "target agents"
+list_output="$("${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" list)"
+grep -q "target agents" <<<"$list_output"
 test -f "$agents/SKILL.md"
 test ! -e "$legacy"
-find "$codex_dir/skills/.cxp-migrated-backups" -name SKILL.md -print -quit | grep -q .
+backup_matches=("$codex_dir"/skills/.cxp-migrated-backups/*/*/SKILL.md)
+test -f "${backup_matches[0]:-}"
 
 cat > "$repo/skills/review/SKILL.md" <<'SKILL'
 ---
@@ -72,7 +75,8 @@ git_repo commit -m "post migration sync"
 
 "${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" sync acme
 grep -q "post-migration sync" "$agents/SKILL.md"
-"${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" doctor acme | grep -q "$home_dir/.agents/skills"
+doctor_output="$("${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" doctor acme)"
+grep -q "$home_dir/.agents/skills" <<<"$doctor_output"
 
 cat > "$repo/skills/review/SKILL.md" <<'SKILL'
 ---
@@ -115,7 +119,8 @@ mv "$fixture_skill_config.tmp" "$fixture_skill_config"
 oldshape_legacy="$fixture_codex/skills/oldshape__review"
 oldshape_agents="$fixture_home/.agents/skills/oldshape__review"
 test -f "$oldshape_legacy/SKILL.md"
-HOME="$fixture_home" XDG_CONFIG_HOME="$fixture_home/.config" XDG_CACHE_HOME="$fixture_home/.cache" \
-  "${helper_cmd[@]}" --config "$fixture_config" skills --codex-dir "$fixture_codex" list | grep -q "target agents"
+oldshape_list_output="$(HOME="$fixture_home" XDG_CONFIG_HOME="$fixture_home/.config" XDG_CACHE_HOME="$fixture_home/.cache" \
+  "${helper_cmd[@]}" --config "$fixture_config" skills --codex-dir "$fixture_codex" list)"
+grep -q "target agents" <<<"$oldshape_list_output"
 test -f "$oldshape_agents/SKILL.md"
 test ! -e "$oldshape_legacy"
