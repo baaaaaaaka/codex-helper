@@ -243,11 +243,13 @@ type EventStreamWriter struct {
 	handler              EventHandler
 	includeCommandOutput bool
 	includeRawEvent      bool
+	recoverParseErrors   bool
 	mu                   sync.Mutex
 	pending              []byte
 	lineNo               int
 	result               TurnResult
 	err                  error
+	recoverableErr       error
 	done                 bool
 }
 
@@ -261,6 +263,7 @@ func NewEventStreamWriter(dst io.Writer, handler EventHandler) io.Writer {
 type EventStreamOptions struct {
 	IncludeCommandOutput bool
 	IncludeRawEvent      bool
+	RecoverParseErrors   bool
 }
 
 func NewEventStreamCollector(dst io.Writer, handler EventHandler) *EventStreamWriter {
@@ -273,6 +276,7 @@ func NewEventStreamCollectorWithOptions(dst io.Writer, handler EventHandler, opt
 		handler:              handler,
 		includeCommandOutput: options.IncludeCommandOutput,
 		includeRawEvent:      options.IncludeRawEvent,
+		recoverParseErrors:   options.RecoverParseErrors,
 	}
 }
 
@@ -296,20 +300,20 @@ func (w *EventStreamWriter) Finish() (TurnResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.done {
-		return w.result, w.err
+		return w.result, w.resultErrLocked()
 	}
 	w.done = true
 	if len(bytes.TrimSpace(w.pending)) > 0 {
 		w.processLineLocked(w.pending)
 	}
 	w.pending = nil
-	return w.result, w.err
+	return w.result, w.resultErrLocked()
 }
 
 func (w *EventStreamWriter) Result() (TurnResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.result, w.err
+	return w.result, w.resultErrLocked()
 }
 
 func (w *EventStreamWriter) processCompleteLinesLocked() {
@@ -336,6 +340,12 @@ func (w *EventStreamWriter) processLineLocked(line []byte) {
 	w.lineNo++
 	event, trimmed, ok, err := parseCodexEventJSONLLineWithOptions(line, w.lineNo, w.includeCommandOutput)
 	if err != nil {
+		if w.recoverParseErrors {
+			if w.recoverableErr == nil {
+				w.recoverableErr = err
+			}
+			return
+		}
 		w.err = err
 		return
 	}
@@ -348,5 +358,27 @@ func (w *EventStreamWriter) processLineLocked(line []byte) {
 	}
 	if streamEvent, ok, err := streamEventFromCodexEventWithOptions(event, trimmed, w.includeRawEvent); err == nil && ok {
 		w.handler(streamEvent)
+	}
+}
+
+func (w *EventStreamWriter) resultErrLocked() error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.recoverableErr != nil && !turnResultHasRecoveredFinalOrTerminal(w.result) {
+		return w.recoverableErr
+	}
+	return nil
+}
+
+func turnResultHasRecoveredFinalOrTerminal(result TurnResult) bool {
+	if strings.TrimSpace(result.FinalAgentMessage) != "" {
+		return true
+	}
+	switch result.Status {
+	case TurnStatusCompleted, TurnStatusFailed:
+		return true
+	default:
+		return false
 	}
 }

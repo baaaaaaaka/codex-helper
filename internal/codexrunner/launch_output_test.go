@@ -78,6 +78,63 @@ func TestLaunchOutputRecorderOmitCommandOutputStillReportsInvalidJSON(t *testing
 	}
 }
 
+func TestLaunchOutputRecorderRecoverParseErrorsContinuesToRecoveredFinal(t *testing.T) {
+	var events []StreamEvent
+	recorder := NewLaunchOutputRecorderWithOptions(func(event StreamEvent) {
+		events = append(events, event)
+	}, LaunchOutputOptions{IncludeCommandOutput: false, RecoverParseErrors: true})
+	_, err := recorder.StdoutWriter().Write([]byte(strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-recover"}`,
+		`{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"unterminated`,
+		`{"type":"event_msg","thread_id":"thread-recover","payload":{"type":"agent_message","phase":"commentary","message":"working","turn_id":"turn-recover"}}`,
+		`{"type":"event_msg","thread_id":"thread-recover","payload":{"type":"agent_message","phase":"final_answer","message":"done","turn_id":"turn-recover"}}`,
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("write stream: %v", err)
+	}
+	result := recorder.LaunchResult(nil, 0)
+	if result.ParseErr != nil {
+		t.Fatalf("ParseErr = %v, want recovered success", result.ParseErr)
+	}
+	if result.ParsedResult == nil {
+		t.Fatal("ParsedResult is nil")
+	}
+	if got := result.ParsedResult.FinalAgentMessage; got != "done" {
+		t.Fatalf("final message = %q, want done", got)
+	}
+	if got := result.ParsedResult.Status; got != TurnStatusCompleted {
+		t.Fatalf("status = %q, want completed", got)
+	}
+	var agentMessages []string
+	for _, event := range events {
+		if event.Kind == StreamEventAgentMessage {
+			agentMessages = append(agentMessages, event.Text)
+		}
+	}
+	if strings.Join(agentMessages, "|") != "working|done" {
+		t.Fatalf("agent messages = %#v, want working and done", agentMessages)
+	}
+}
+
+func TestLaunchOutputRecorderRecoverParseErrorsWithoutTerminalReturnsFirstError(t *testing.T) {
+	recorder := NewLaunchOutputRecorderWithOptions(nil, LaunchOutputOptions{IncludeCommandOutput: false, RecoverParseErrors: true})
+	_, err := recorder.StdoutWriter().Write([]byte(strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-partial"}`,
+		`{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"unterminated`,
+		`{"type":"event_msg","thread_id":"thread-partial","payload":{"type":"agent_message","phase":"commentary","message":"working","turn_id":"turn-partial"}}`,
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("write stream: %v", err)
+	}
+	result := recorder.LaunchResult(nil, 0)
+	if !IsKind(result.ParseErr, ErrorParse) {
+		t.Fatalf("ParseErr = %v, want parse failure", result.ParseErr)
+	}
+	if result.ParsedResult == nil || result.ParsedResult.ThreadID != "thread-partial" {
+		t.Fatalf("parsed result = %#v, want partial thread id preserved", result.ParsedResult)
+	}
+}
+
 func TestLaunchOutputRecorderOmitCommandOutputStillParsesFinalEvents(t *testing.T) {
 	recorder := NewLaunchOutputRecorderWithOptions(nil, LaunchOutputOptions{IncludeCommandOutput: false})
 	_, err := recorder.StdoutWriter().Write([]byte(strings.Join([]string{

@@ -19521,6 +19521,129 @@ func TestBridgeSyncLinkedTranscriptSkipsWhileTeamsTurnActive(t *testing.T) {
 	}
 }
 
+func TestBridgeRunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheckpoint(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	*sent = nil
+	beforeState, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load before backfill error: %v", err)
+	}
+	beforeCheckpoint := beforeState.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	activeTranscript := initial +
+		`{"type":"event_msg","thread_id":"thread-1","payload":{"type":"agent_message","id":"progress-1","message":"watchdog progress","phase":"commentary","thread_id":"thread-1","turn_id":"codex-turn-1"}}` + "\n" +
+		`{"type":"event_msg","thread_id":"thread-1","payload":{"type":"agent_message","id":"final-1","message":"final must wait for completion","phase":"final_answer","thread_id":"thread-1","turn_id":"codex-turn-1"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(activeTranscript), 0o600); err != nil {
+		t.Fatalf("write active transcript: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{
+		ID:            "turn-active",
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "codex-turn-1",
+	}); err != nil {
+		t.Fatalf("QueueTurn running error: %v", err)
+	}
+	forwarder := &codexEventForwarder{
+		ctx:              context.Background(),
+		bridge:           bridge,
+		sessionID:        session.ID,
+		expectedThreadID: "thread-1",
+		turnID:           "turn-active",
+		chatID:           session.ChatID,
+	}
+
+	forwarder.sendIdleStatus(3 * time.Minute)
+
+	if len(*sent) != 1 {
+		t.Fatalf("sent %d messages, want one transcript progress backfill: %#v", len(*sent), *sent)
+	}
+	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if !strings.Contains(plain, "watchdog progress") || strings.Contains(plain, "Still working") || strings.Contains(plain, "final must wait") {
+		t.Fatalf("backfill message = %q, want progress only", plain)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after backfill error: %v", err)
+	}
+	mainCheckpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if mainCheckpoint.LastRecordID != beforeCheckpoint.LastRecordID || mainCheckpoint.LastSourceLine != beforeCheckpoint.LastSourceLine {
+		t.Fatalf("main checkpoint advanced during live backfill: before=%#v after=%#v", beforeCheckpoint, mainCheckpoint)
+	}
+	liveCheckpoint := state.ImportCheckpoints[liveTranscriptCheckpointID("turn-active")]
+	if liveCheckpoint.LastRecordID != "progress-1" {
+		t.Fatalf("live checkpoint = %#v, want progress-1", liveCheckpoint)
+	}
+	if turn := state.Turns["turn-active"]; turn.Status != teamstore.TurnStatusRunning {
+		t.Fatalf("turn status = %q, want running", turn.Status)
+	}
+}
+
+func TestBridgeRunningTurnTranscriptBackfillSkipsWhenLiveProgressAlreadyQueued(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-1", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	*sent = nil
+	activeTranscript := initial +
+		`{"type":"event_msg","thread_id":"thread-1","payload":{"type":"agent_message","id":"progress-1","message":"duplicate risk progress","phase":"commentary","thread_id":"thread-1","turn_id":"codex-turn-1"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(activeTranscript), 0o600); err != nil {
+		t.Fatalf("write active transcript: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{
+		ID:            "turn-active",
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "codex-turn-1",
+	}); err != nil {
+		t.Fatalf("QueueTurn running error: %v", err)
+	}
+	if _, err := bridge.queueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "outbox:live-progress",
+		SessionID:   session.ID,
+		TurnID:      "turn-active",
+		TeamsChatID: session.ChatID,
+		Kind:        "codex-progress-001",
+		Body:        "already live",
+		Status:      teamstore.OutboxStatusQueued,
+	}); err != nil {
+		t.Fatalf("queue live progress outbox error: %v", err)
+	}
+
+	queued, err := bridge.queueRunningTurnTranscriptBackfill(context.Background(), session.ID, "turn-active", session.ChatID, "thread-1", liveTranscriptBackfillMaxRecords)
+	if err != nil {
+		t.Fatalf("queueRunningTurnTranscriptBackfill error: %v", err)
+	}
+	if queued != 0 {
+		t.Fatalf("queued = %d, want no fallback after live progress", queued)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after backfill error: %v", err)
+	}
+	if checkpoint := state.ImportCheckpoints[liveTranscriptCheckpointID("turn-active")]; checkpoint.LastRecordID != "" {
+		t.Fatalf("live checkpoint = %#v, want no checkpoint", checkpoint)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptDedupesQueuedLiveFinal(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"

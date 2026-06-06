@@ -51,6 +51,7 @@ const (
 	// history import must stay explicit, otherwise helper startup can flood a
 	// Teams chat and delay inbound polling.
 	transcriptSyncMaxRecordsPerSessionPerCycle = 8
+	liveTranscriptBackfillMaxRecords           = 3
 	transcriptSyncMaxAutoBacklogRecords        = 80
 	transcriptImportMaxBatchesPerCycle         = 1
 	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
@@ -9773,6 +9774,7 @@ type codexEventForwarder struct {
 	pendingAgent            string
 	lastStreamRetryStatusAt time.Time
 	seq                     int
+	liveContentSent         bool
 	err                     error
 }
 
@@ -9816,7 +9818,7 @@ func (f *codexEventForwarder) Close(finalText string) error {
 	close(f.events)
 	<-f.done
 	if strings.TrimSpace(f.pendingAgent) != "" && !sameCodexVisibleText(f.pendingAgent, finalText) {
-		_ = f.send("progress", f.pendingAgent)
+		_ = f.sendStreamContent("progress", f.pendingAgent)
 	}
 	return f.err
 }
@@ -9867,7 +9869,7 @@ func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
 		f.sendStreamRetryStatus(event)
 	case codexrunner.StreamEventContextCompacted:
 		f.flushPendingAgent()
-		_ = f.send("compact", transcriptContextCompactMessage)
+		_ = f.sendStreamContent("compact", transcriptContextCompactMessage)
 	case codexrunner.StreamEventTurnFailed:
 		f.flushPendingAgent()
 		if event.Failure != nil && strings.TrimSpace(event.Failure.Message) != "" {
@@ -9904,13 +9906,16 @@ func (f *codexEventForwarder) flushPendingAgent() {
 	if strings.TrimSpace(f.pendingAgent) == "" {
 		return
 	}
-	_ = f.send("progress", f.pendingAgent)
+	_ = f.sendStreamContent("progress", f.pendingAgent)
 	f.pendingAgent = ""
 }
 
 func (f *codexEventForwarder) sendIdleStatus(quietFor time.Duration) {
 	if strings.TrimSpace(f.pendingAgent) != "" {
 		f.flushPendingAgent()
+		return
+	}
+	if f.tryLiveTranscriptBackfill() {
 		return
 	}
 	message := codexIdleStatusMessage
@@ -9993,6 +9998,28 @@ func (f *codexEventForwarder) send(kind string, text string) error {
 		}
 	}
 	return err
+}
+
+func (f *codexEventForwarder) sendStreamContent(kind string, text string) error {
+	err := f.send(kind, text)
+	if err == nil && strings.TrimSpace(text) != "" {
+		f.liveContentSent = true
+	}
+	return err
+}
+
+func (f *codexEventForwarder) tryLiveTranscriptBackfill() bool {
+	if f == nil || f.bridge == nil || f.liveContentSent {
+		return false
+	}
+	queued, err := f.bridge.queueRunningTurnTranscriptBackfill(f.ctx, f.sessionID, f.turnID, f.chatID, f.expectedThreadID, liveTranscriptBackfillMaxRecords)
+	if err != nil {
+		if f.bridge.out != nil {
+			_, _ = fmt.Fprintf(f.bridge.out, "Teams Codex live transcript backfill skipped: %v\n", err)
+		}
+		return false
+	}
+	return queued > 0
 }
 
 func (b *Bridge) canQueueLiveTurnOutbox(ctx context.Context, sessionID string, turnID string) bool {
@@ -14297,7 +14324,7 @@ func (b *Bridge) localTranscriptHasActionableDelta(ctx context.Context, session 
 func transcriptRecordIsTerminal(record TranscriptRecord) bool {
 	source := strings.ToLower(strings.TrimSpace(record.SourceType))
 	switch source {
-	case "turn.failed", "turn/completed", "turn.completed":
+	case "task_complete", "turn.failed", "turn/completed", "turn.completed":
 		return true
 	default:
 		return false
@@ -14647,6 +14674,142 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 		}
 	}
 	return queued, nil
+}
+
+func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, sessionID string, turnID string, chatID string, expectedThreadID string, maxRecords int) (int, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(turnID) == "" || strings.TrimSpace(chatID) == "" {
+		return 0, nil
+	}
+	if maxRecords <= 0 {
+		maxRecords = liveTranscriptBackfillMaxRecords
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return 0, err
+	}
+	turn, ok := state.Turns[strings.TrimSpace(turnID)]
+	if !ok || turn.Status != teamstore.TurnStatusRunning || strings.TrimSpace(turn.SessionID) != strings.TrimSpace(sessionID) {
+		return 0, nil
+	}
+	if turnHasLiveStreamContentOutbox(state, turn.ID) {
+		return 0, nil
+	}
+	session := b.reg.SessionByID(sessionID)
+	if session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
+		return 0, nil
+	}
+	sessionCopy := *session
+	sessionCopy.ChatID = firstNonEmptyString(chatID, sessionCopy.ChatID)
+	mainCheckpoint := state.ImportCheckpoints[transcriptCheckpointID(sessionCopy.ID)]
+	if strings.TrimSpace(mainCheckpoint.LastRecordID) == "" {
+		return 0, nil
+	}
+	switch mainCheckpoint.Status {
+	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
+		return 0, nil
+	}
+	local, ok := linkedTranscriptLocalFromCheckpoint(sessionCopy, mainCheckpoint)
+	if !ok {
+		return 0, nil
+	}
+	checkpointID := liveTranscriptCheckpointID(turn.ID)
+	checkpoint := mainCheckpoint
+	if liveCheckpoint := state.ImportCheckpoints[checkpointID]; strings.TrimSpace(liveCheckpoint.LastRecordID) != "" && cleanComparablePath(liveCheckpoint.SourcePath) == cleanComparablePath(mainCheckpoint.SourcePath) {
+		checkpoint = liveCheckpoint
+	}
+	threadID := firstNonEmptyString(expectedThreadID, local.SessionID, sessionCopy.CodexThreadID)
+	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, sessionCopy.CodexThreadID), threadID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") || len(transcript.Records) == 0 {
+		return 0, nil
+	}
+	teamsOriginHashes := teamsOriginTextHashes(state, sessionCopy.ID)
+	teamsOriginDisplays := teamsOriginDisplayTexts(state, sessionCopy.ID)
+	known := newKnownTranscriptOutboxDedupeState(state, sessionCopy.ID, checkpoint.UpdatedAt)
+	dedupe := newTranscriptDedupeState()
+	queued := 0
+	for i, record := range transcript.Records {
+		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
+		record.SourceLine = checkpointLine
+		record.SourceOffset = checkpointOffset
+		if !liveTranscriptRecordMatchesRunningTurn(record, turn, threadID) {
+			continue
+		}
+		if record.Kind == TranscriptKindAssistant || transcriptRecordIsTerminal(record) {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams Codex live transcript backfill stopped before terminal record: session=%s turn=%s source=%s line=%d record=%s type=%s\n", sessionCopy.ID, turn.ID, local.FilePath, checkpointLine, transcriptRecordCheckpointKey(record), record.SourceType)
+			}
+			break
+		}
+		body := formatTranscriptRecordForTeams(record)
+		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
+		if strings.TrimSpace(body) == "" || shouldSkipBackgroundTranscriptRecord(record) {
+			continue
+		}
+		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) || dedupe.shouldSkip(record, body) || known.shouldSkip(record, body) {
+			continue
+		}
+		switch record.Kind {
+		case TranscriptKindStatus, TranscriptKindCompact:
+			kind := transcriptRecordOutboxKind("codex", record, i+1)
+			if err := b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, sessionCopy, local, record, checkpointLine, checkpointOffset, kind, body, outboxQueueOptions{}, turn.ID, checkpointID, true); err != nil {
+				return queued, err
+			}
+			queued++
+			if queued >= maxRecords {
+				break
+			}
+		}
+	}
+	if queued == 0 {
+		return 0, nil
+	}
+	if err := b.flushPendingOutboxForChat(ctx, sessionCopy.ChatID); err != nil {
+		if isOutboxDeliveryDeferred(err) {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams Codex live transcript backfill delivery deferred: %v\n", err)
+			}
+			return queued, nil
+		}
+		return queued, err
+	}
+	b.boostPolling(time.Now())
+	return queued, nil
+}
+
+func liveTranscriptRecordMatchesRunningTurn(record TranscriptRecord, turn teamstore.Turn, expectedThreadID string) bool {
+	if recordThreadID := strings.TrimSpace(record.ThreadID); recordThreadID != "" && strings.TrimSpace(expectedThreadID) != "" && recordThreadID != strings.TrimSpace(expectedThreadID) {
+		return false
+	}
+	if recordTurnID := strings.TrimSpace(record.TurnID); recordTurnID != "" && strings.TrimSpace(turn.CodexTurnID) != "" && recordTurnID != strings.TrimSpace(turn.CodexTurnID) {
+		return false
+	}
+	return true
+}
+
+func turnHasLiveStreamContentOutbox(state teamstore.State, turnID string) bool {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return false
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.TrimSpace(msg.TurnID) != turnID || msg.Status == teamstore.OutboxStatusSkipped {
+			continue
+		}
+		kind := strings.TrimSpace(msg.Kind)
+		if strings.HasPrefix(kind, "codex-progress-") {
+			return true
+		}
+		if strings.HasPrefix(kind, "codex-compact-") && !strings.HasPrefix(strings.TrimSpace(msg.ID), "outbox:transcript-delivery:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, local codexhistory.Session) error {
@@ -15997,6 +16160,10 @@ func transcriptKindIsModelOutput(kind TranscriptKind) bool {
 
 func transcriptCheckpointID(sessionID string) string {
 	return "transcript:" + strings.TrimSpace(sessionID)
+}
+
+func liveTranscriptCheckpointID(turnID string) string {
+	return "transcript-live:" + strings.TrimSpace(turnID)
 }
 
 func (b *Bridge) recordTranscriptCheckpoint(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int) error {

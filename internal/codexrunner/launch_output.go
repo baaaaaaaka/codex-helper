@@ -12,6 +12,7 @@ type LaunchOutputRecorder struct {
 type LaunchOutputOptions struct {
 	IncludeCommandOutput bool
 	IncludeRawEvent      bool
+	RecoverParseErrors   bool
 }
 
 func NewLaunchOutputRecorder(handler EventHandler) *LaunchOutputRecorder {
@@ -25,6 +26,7 @@ func NewLaunchOutputRecorderWithOptions(handler EventHandler, options LaunchOutp
 	recorder.stream = NewEventStreamCollectorWithOptions(&recorder.stdout, handler, EventStreamOptions{
 		IncludeCommandOutput: options.IncludeCommandOutput,
 		IncludeRawEvent:      options.IncludeRawEvent,
+		RecoverParseErrors:   options.RecoverParseErrors,
 	})
 	return recorder
 }

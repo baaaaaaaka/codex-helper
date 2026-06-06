@@ -295,7 +295,7 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 	}
 	cmdArgs := append([]string{command}, req.Args...)
 	var stderr bytes.Buffer
-	stdout := codexrunner.NewLaunchOutputRecorderWithOptions(req.EventHandler, codexrunner.LaunchOutputOptions{IncludeCommandOutput: false})
+	stdout := codexrunner.NewLaunchOutputRecorderWithOptions(req.EventHandler, codexrunner.LaunchOutputOptions{IncludeCommandOutput: false, RecoverParseErrors: true})
 
 	log := l.log
 	if log == nil {
