@@ -708,6 +708,9 @@ func exportHasLocalChanges(root string, manifest exportManifest) (bool, error) {
 func localChangesForManifest(root string, manifest exportManifest) ([]LocalChange, error) {
 	known := map[string]FileManifest{}
 	for _, file := range manifest.Files {
+		if err := validateRepoRelPath(file.RelPath); err != nil {
+			return nil, fmt.Errorf("invalid managed manifest path %q: %w", file.RelPath, err)
+		}
 		known[file.RelPath] = file
 	}
 	var changes []LocalChange

@@ -125,14 +125,17 @@ fi
 
 "$HOME/.local/bin/codex-proxy" --version | grep -q "${tag#v}"
 "$HOME/.local/bin/cxp" --version | grep -q "${tag#v}"
-test -f "$HOME/.codex/skills/cxp/SKILL.md"
-test -f "$HOME/.codex/skills/cxp/references/commands.md"
-grep -q -- "--after-current-turn" "$HOME/.codex/skills/cxp/references/commands.md"
+builtin_skill="$HOME/.agents/skills/cxp"
+test -f "$builtin_skill/SKILL.md"
+test -f "$builtin_skill/references/commands.md"
+grep -q -- "--after-current-turn" "$builtin_skill/references/commands.md"
 "$HOME/.local/bin/codex-proxy" proxy doctor || true
 "$HOME/.local/bin/codex-proxy" --config "$HOME/codex-proxy-skills-config.json" skills list | grep -q "No skill subscriptions."
 "$HOME/.local/bin/cxp" --config "$HOME/codex-proxy-skills-cxp-config.json" skills list | grep -q "No skill subscriptions."
 CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash /ci/skills_smoke.sh
+CODEX_HELPER_BIN="$HOME/.local/bin/codex-proxy" bash /ci/skills_migration_smoke.sh
 CODEX_HELPER_BIN="$HOME/.local/bin/cxp" bash /ci/skills_smoke.sh
+CODEX_HELPER_BIN="$HOME/.local/bin/cxp" bash /ci/skills_migration_smoke.sh
 
 cfg="$HOME/codex-proxy-config.json"
 cat >"$cfg" <<EOF

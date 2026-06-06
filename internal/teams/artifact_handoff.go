@@ -96,7 +96,7 @@ Control chat commands the helper understands:
 - open <number>: show the linked Teams work chat for a session
 - status: show current helper sessions
 - skills or helper skills list: list installed skill subscriptions
-- helper skills add <github/gitlab/git-url>: install skills from a git source and keep them updated
+- helper skills add <github/gitlab/git-url>: install skills from a git source and keep them updated in the user agents skills directory
 - helper skills sync [name]: sync one skill source, or all sources when no name is given
 - helper skills push [name], then helper skills push confirm: review and push local skill edits from Teams
 Desktop forms like !continue 1 and codex continue 1 are also accepted. Legacy slash commands still work if Teams sends them.
@@ -110,7 +110,8 @@ Work chat helper commands:
 - helper close: close the Work chat binding
 
 Local cxp skills commands:
-- cxp skills install-builtin: install or repair bundled local skills such as the cxp usage skill
+- cxp skills install-builtin: install or repair bundled local skills such as the cxp usage skill in $HOME/.agents/skills
+- cxp skills migrate: migrate managed legacy skills from ~/.codex/skills to $HOME/.agents/skills
 
 Local cxp beacon commands:
 - cxp beacon profile list: list beacon profiles

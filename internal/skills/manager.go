@@ -83,6 +83,17 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 }
 
 func (m *Manager) Add(ctx context.Context, rawURL string, opts AddOptions) (Source, SyncResult, error) {
+	var source Source
+	var result SyncResult
+	err := m.withOperationLock(ctx, func() error {
+		var err error
+		source, result, err = m.addUnlocked(ctx, rawURL, opts)
+		return err
+	})
+	return source, result, err
+}
+
+func (m *Manager) addUnlocked(ctx context.Context, rawURL string, opts AddOptions) (Source, SyncResult, error) {
 	known := []string(nil)
 	if strings.Contains(rawURL, "github.com") || strings.Contains(rawURL, "gitlab") {
 		rough, _ := ParseURL(rawURL, URLParseOptions{Name: opts.Name, Ref: opts.Ref, Path: opts.Path})
@@ -96,7 +107,7 @@ func (m *Manager) Add(ctx context.Context, rawURL string, opts AddOptions) (Sour
 	}
 	targetKind := strings.TrimSpace(opts.TargetKind)
 	if targetKind == "" {
-		targetKind = TargetCodexHome
+		targetKind = TargetAgents
 	}
 	autoSync := true
 	if opts.AutoSync != nil {
@@ -148,6 +159,16 @@ func (m *Manager) Add(ctx context.Context, rawURL string, opts AddOptions) (Sour
 }
 
 func (m *Manager) Remove(ctx context.Context, idOrName string) (Source, error) {
+	var source Source
+	err := m.withOperationLock(ctx, func() error {
+		var err error
+		source, err = m.removeUnlocked(ctx, idOrName)
+		return err
+	})
+	return source, err
+}
+
+func (m *Manager) removeUnlocked(ctx context.Context, idOrName string) (Source, error) {
 	var removed *Source
 	if err := m.Store.Update(func(cfg *Config, st *State) error {
 		var next []Source
@@ -198,6 +219,16 @@ func (m *Manager) List(ctx context.Context) ([]StatusEntry, error) {
 }
 
 func (m *Manager) Sync(ctx context.Context, opts SyncOptions) ([]SyncResult, error) {
+	var results []SyncResult
+	err := m.withOperationLock(ctx, func() error {
+		var err error
+		results, err = m.syncUnlocked(ctx, opts)
+		return err
+	})
+	return results, err
+}
+
+func (m *Manager) syncUnlocked(ctx context.Context, opts SyncOptions) ([]SyncResult, error) {
 	cfg, err := m.Store.LoadConfig()
 	if err != nil {
 		return nil, err
@@ -444,7 +475,10 @@ func (m *Manager) StartDailyAutoSync(ctx context.Context) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_ = m.syncOne(ctx, source, true)
+				_ = m.withOperationLock(ctx, func() error {
+					result := m.syncOne(ctx, source, true)
+					return result.Error
+				})
 			}()
 		}
 		wg.Wait()

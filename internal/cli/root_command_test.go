@@ -119,7 +119,7 @@ func TestSkillsCommandWiresPlannedSubcommands(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"add", "doctor", "install-builtin", "list", "push", "remove", "sync"}
+	want := []string{"add", "doctor", "install-builtin", "list", "migrate", "push", "remove", "sync"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected skills subcommands\n got: %#v\nwant: %#v", names, want)
 	}

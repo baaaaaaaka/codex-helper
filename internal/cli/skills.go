@@ -23,10 +23,11 @@ func newSkillsCmd(root *rootOptions) *cobra.Command {
 		Use:   "skills",
 		Short: "Manage Codex skill subscriptions",
 	}
-	cmd.PersistentFlags().StringVar(&codexDir, "codex-dir", "", "Override Codex data dir (default: ~/.codex)")
+	cmd.PersistentFlags().StringVar(&codexDir, "codex-dir", "", "Override legacy Codex data dir used for migration (default: ~/.codex)")
 	cmd.AddCommand(
 		newSkillsInstallBuiltinCmd(root, &codexDir),
 		newSkillsAddCmd(root, &codexDir),
+		newSkillsMigrateCmd(root, &codexDir),
 		newSkillsListCmd(root, &codexDir),
 		newSkillsSyncCmd(root, &codexDir),
 		newSkillsRemoveCmd(root, &codexDir),
@@ -40,7 +41,7 @@ func newSkillsInstallBuiltinCmd(root *rootOptions, codexDir *string) *cobra.Comm
 	var yes bool
 	cmd := &cobra.Command{
 		Use:   "install-builtin [name]",
-		Short: "Install bundled skills into the Codex skills directory",
+		Short: "Install bundled skills into the user agents skills directory",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := withSignalContext(cmd.Context())
@@ -53,8 +54,9 @@ func newSkillsInstallBuiltinCmd(root *rootOptions, codexDir *string) *cobra.Comm
 			if len(args) > 0 {
 				name = args[0]
 			}
+			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			if !yes {
-				target, err := mgr.TargetRoot(skills.TargetCodexHome)
+				target, err := mgr.TargetRoot(skills.TargetAgents)
 				if err != nil {
 					return err
 				}
@@ -103,6 +105,7 @@ func newSkillsAddCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			auto := !noAutoSync
 			parsed, err := skills.ParseURL(args[0], skills.URLParseOptions{Name: name, Ref: ref, Path: subPath})
 			if err != nil {
@@ -116,7 +119,7 @@ func newSkillsAddCmd(root *rootOptions, codexDir *string) *cobra.Command {
 				if parsed.Path != "" {
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Path: %s\n", parsed.Path)
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Target: %s\n", firstNonEmptyString(target, skills.TargetCodexHome))
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Target: %s\n", firstNonEmptyString(target, skills.TargetAgents))
 				if auto {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Auto-sync: on")
 				} else {
@@ -150,9 +153,53 @@ func newSkillsAddCmd(root *rootOptions, codexDir *string) *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "", "Local source name (default: inferred)")
 	cmd.Flags().StringVar(&ref, "ref", "", "Branch, tag, or commit to sync (default: remote default branch or URL branch)")
 	cmd.Flags().StringVar(&subPath, "path", "", "Subdirectory containing skills (default: inferred from URL or repository root)")
-	cmd.Flags().StringVar(&target, "target", skills.TargetCodexHome, "Install target: codex-home or agents")
+	cmd.Flags().StringVar(&target, "target", skills.TargetAgents, "Install target: agents or codex-home")
+	_ = cmd.Flags().MarkHidden("target")
 	cmd.Flags().BoolVar(&noAutoSync, "no-auto-sync", false, "Disable daily auto-sync for this source")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Skip the install confirmation prompt")
+	return cmd
+}
+
+func newSkillsMigrateCmd(root *rootOptions, codexDir *string) *cobra.Command {
+	var yes bool
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "migrate",
+		Short: "Migrate managed skills from the legacy Codex skills directory to ~/.agents/skills",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx, stop := withSignalContext(cmd.Context())
+			defer stop()
+			mgr, err := newSkillsManager(root, *codexDir, cmd.OutOrStdout())
+			if err != nil {
+				return err
+			}
+			if !yes && !dryRun {
+				oldRoot, err := mgr.TargetRoot(skills.TargetCodexHome)
+				if err != nil {
+					return err
+				}
+				newRoot, err := mgr.TargetRoot(skills.TargetAgents)
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Legacy root: %s\n", oldRoot)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Agents root: %s\n", newRoot)
+				ok, err := promptSkillYesNo(cmd.InOrStdin(), cmd.OutOrStdout(), "Migrate managed skills?", true)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return nil
+				}
+			}
+			report, err := mgr.MigrateLegacySkills(ctx, skills.MigrationOptions{DryRun: dryRun, IncludeBuiltins: true})
+			printSkillMigrationReport(cmd.OutOrStdout(), report)
+			return err
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Skip the migration confirmation prompt")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be migrated without changing files")
 	return cmd
 }
 
@@ -167,6 +214,7 @@ func newSkillsListCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			runSkillsSelfHeal(cmd.Context(), mgr, cmd.ErrOrStderr())
 			entries, err := mgr.List(cmd.Context())
 			if err != nil {
 				return err
@@ -199,6 +247,7 @@ func newSkillsSyncCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			name := ""
 			if len(args) > 0 {
 				name = args[0]
@@ -239,6 +288,7 @@ func newSkillsRemoveCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			source, err := mgr.Remove(ctx, args[0])
 			if err != nil {
 				return err
@@ -261,6 +311,7 @@ func newSkillsDoctorCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			runSkillsSelfHeal(cmd.Context(), mgr, cmd.ErrOrStderr())
 			entries, err := mgr.List(cmd.Context())
 			if err != nil {
 				return err
@@ -274,6 +325,7 @@ func newSkillsDoctorCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Cache: %s\n", mgr.CacheDir)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Codex skill root: %s\n", filepath.Join(mgr.CodexDir, "skills"))
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Agents skill root: %s\n", filepath.Join(mgr.HomeDir, ".agents", "skills"))
+			printSkillMigrationStatus(cmd.OutOrStdout(), mgr)
 			found := false
 			for _, entry := range entries {
 				if name != "" && !skillSourceMatches(entry.Source, name) {
@@ -304,6 +356,7 @@ func newSkillsPushCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			name := ""
 			if len(args) > 0 {
 				name = args[0]
@@ -342,7 +395,25 @@ func startSkillsDailyAutoSync(ctx context.Context, paths effectivePaths) {
 	if err != nil {
 		return
 	}
+	runSkillsSelfHeal(ctx, mgr, io.Discard)
 	mgr.StartDailyAutoSync(ctx)
+}
+
+func runSkillsSelfHeal(ctx context.Context, mgr *skills.Manager, out io.Writer) {
+	healCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	report, err := mgr.MigrateLegacySkills(healCtx, skills.MigrationOptions{IncludeBuiltins: true})
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "Warning: failed to migrate managed skills to ~/.agents/skills: %v\n", err)
+		return
+	}
+	if report.Failed {
+		_, _ = fmt.Fprintf(out, "Warning: some managed skills could not be migrated to ~/.agents/skills; run `cxp skills doctor` for details.\n")
+		return
+	}
+	if migrationReportHasUnresolved(report) {
+		_, _ = fmt.Fprintf(out, "Warning: some legacy managed skills were not migrated because of local edits or target conflicts; run `cxp skills doctor` for details.\n")
+	}
 }
 
 func defaultSkillsCacheDir() (string, error) {
@@ -367,7 +438,7 @@ func printSkillEntries(out io.Writer, entries []skills.StatusEntry) {
 		if entry.Source.AutoSync {
 			auto = "auto-sync on"
 		}
-		_, _ = fmt.Fprintf(out, "%s  %s  %s\n", entry.Source.Name, state, auto)
+		_, _ = fmt.Fprintf(out, "%s  %s  %s  target %s\n", entry.Source.Name, state, auto, firstNonEmptyString(entry.Source.TargetKind, skills.TargetAgents))
 		_, _ = fmt.Fprintf(out, "  %s", skills.RedactURLSecrets(entry.Source.RemoteURL))
 		if entry.Source.Ref != "" {
 			_, _ = fmt.Fprintf(out, " @ %s", entry.Source.Ref)
@@ -382,6 +453,103 @@ func printSkillEntries(out io.Writer, entries []skills.StatusEntry) {
 		if entry.State.LastError != "" {
 			_, _ = fmt.Fprintf(out, "  error: %s\n", entry.State.LastError)
 		}
+	}
+}
+
+func printSkillMigrationReport(out io.Writer, report skills.MigrationReport) {
+	_, _ = fmt.Fprintf(out, "Migration: %s\n", report.Status)
+	_, _ = fmt.Fprintf(out, "Legacy root: %s\n", report.OldRoot)
+	_, _ = fmt.Fprintf(out, "Agents root: %s\n", report.NewRoot)
+	for _, result := range report.Results {
+		if result.Status == skills.MigrationStatusSkipped {
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "%s %s: %s", result.Kind, result.Name, result.Status)
+		if result.Message != "" {
+			_, _ = fmt.Fprintf(out, " (%s)", result.Message)
+		}
+		_, _ = fmt.Fprintln(out)
+		for _, skill := range result.Skills {
+			_, _ = fmt.Fprintf(out, "  - %s: %s", skill.ExportName, skill.Status)
+			if skill.NewPath != "" {
+				_, _ = fmt.Fprintf(out, " -> %s", skill.NewPath)
+			}
+			if skill.Message != "" {
+				_, _ = fmt.Fprintf(out, " (%s)", skill.Message)
+			}
+			_, _ = fmt.Fprintln(out)
+		}
+	}
+}
+
+func printSkillMigrationStatus(out io.Writer, mgr *skills.Manager) {
+	path := mgr.MigrationStatusPath()
+	_, _ = fmt.Fprintf(out, "Migration status file: %s\n", path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			_, _ = fmt.Fprintln(out, "Migration: not run")
+		}
+		return
+	}
+	var report skills.MigrationReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		_, _ = fmt.Fprintf(out, "Migration: unreadable status (%v)\n", err)
+		return
+	}
+	ended := "unknown time"
+	if !report.EndedAt.IsZero() {
+		ended = report.EndedAt.Format(time.RFC3339)
+	}
+	_, _ = fmt.Fprintf(out, "Migration: %s at %s (changed=%t failed=%t)\n", firstNonEmptyString(report.Status, skills.MigrationStatusSkipped), ended, report.Changed, report.Failed)
+	for _, result := range report.Results {
+		if !migrationStatusNeedsAttention(result.Status) {
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "  migration issue: %s %s %s", result.Kind, result.Name, result.Status)
+		if result.Message != "" {
+			_, _ = fmt.Fprintf(out, " (%s)", result.Message)
+		}
+		_, _ = fmt.Fprintln(out)
+		for _, skill := range result.Skills {
+			if !migrationStatusNeedsAttention(skill.Status) {
+				continue
+			}
+			_, _ = fmt.Fprintf(out, "    - %s: %s", skill.ExportName, skill.Status)
+			if skill.OldPath != "" {
+				_, _ = fmt.Fprintf(out, " old=%s", skill.OldPath)
+			}
+			if skill.NewPath != "" {
+				_, _ = fmt.Fprintf(out, " new=%s", skill.NewPath)
+			}
+			if skill.Message != "" {
+				_, _ = fmt.Fprintf(out, " (%s)", skill.Message)
+			}
+			_, _ = fmt.Fprintln(out)
+		}
+	}
+}
+
+func migrationReportHasUnresolved(report skills.MigrationReport) bool {
+	for _, result := range report.Results {
+		if migrationStatusNeedsAttention(result.Status) {
+			return true
+		}
+		for _, skill := range result.Skills {
+			if migrationStatusNeedsAttention(skill.Status) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func migrationStatusNeedsAttention(status string) bool {
+	switch status {
+	case skills.MigrationStatusFailed, skills.MigrationStatusLocalModified, skills.MigrationStatusConflict:
+		return true
+	default:
+		return false
 	}
 }
 

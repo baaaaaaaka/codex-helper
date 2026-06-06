@@ -39,7 +39,17 @@ func BuiltinSkillNames() []string {
 }
 
 func (m *Manager) InstallBuiltins(ctx context.Context, opts BuiltinInstallOptions) ([]BuiltinInstallResult, error) {
-	targetRoot, err := m.TargetRoot(TargetCodexHome)
+	var results []BuiltinInstallResult
+	err := m.withOperationLock(ctx, func() error {
+		var err error
+		results, err = m.installBuiltinsUnlocked(ctx, opts)
+		return err
+	})
+	return results, err
+}
+
+func (m *Manager) installBuiltinsUnlocked(ctx context.Context, opts BuiltinInstallOptions) ([]BuiltinInstallResult, error) {
+	targetRoot, err := m.TargetRoot(TargetAgents)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +98,7 @@ func (m *Manager) installBuiltin(name string, targetRoot string) (BuiltinInstall
 		RemoteURL:  "builtin://" + BuiltinCxpSkillName,
 		Provider:   builtinProvider,
 		Ref:        commit,
-		TargetKind: TargetCodexHome,
+		TargetKind: TargetAgents,
 		TargetRoot: targetRoot,
 		AutoSync:   false,
 		AddedAt:    now,

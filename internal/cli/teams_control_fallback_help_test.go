@@ -45,6 +45,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"Beacon execution profiles are separate from SSH proxy profiles",
 		"$CODEX_HELPER_CLI_PATH",
 		"`cxp skills install-builtin`",
+		"`cxp skills migrate`",
 		"`helper skills add <github/gitlab/git-url>`",
 		"`helper skills sync [name]`",
 		"`helper skills push [name]`",

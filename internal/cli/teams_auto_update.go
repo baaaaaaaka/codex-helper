@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -178,6 +179,7 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
+	installBundledSkillsFromHelper(ctx, firstNonEmptyString(res.PendingReplacePath, res.InstallPath), io.Discard)
 	return teams.HelperAutoUpdateApplyResult{
 		Version:            res.Version,
 		InstallPath:        res.InstallPath,

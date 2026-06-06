@@ -667,11 +667,18 @@ install_builtin_skills() {
     BUILTIN_SKILL_DETAILS="Built-in cxp skill install skipped by CODEX_PROXY_SKIP_BUILTIN_SKILLS=1"
     return 0
   fi
-  if "$dst" skills install-builtin --yes >/dev/null 2>&1; then
+  builtin_skill_err=""
+  if builtin_skill_err="$("$dst" skills install-builtin --yes 2>&1 >/dev/null)"; then
+    if [ -n "${builtin_skill_err:-}" ]; then
+      printf "%s\n" "$builtin_skill_err" >&2
+    fi
     BUILTIN_SKILL_DETAILS="Built-in cxp skill installed/checked"
     return 0
   fi
   echo "Warning: failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry." >&2
+  if [ -n "${builtin_skill_err:-}" ]; then
+    printf "%s\n" "$builtin_skill_err" >&2
+  fi
   BUILTIN_SKILL_DETAILS="Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
   return 0
 }

@@ -2,15 +2,18 @@
 set -euo pipefail
 
 root="$(mktemp -d)"
-trap 'rm -rf "$root"' EXIT
+trap 'chmod -R u+w "$root" 2>/dev/null || true; rm -rf "$root"' EXIT
 
 repo="$root/repo"
 config="$root/config.json"
 codex_dir="$root/codex"
+home_dir="$root/home"
 go_bin="${GO:-go}"
 if [[ -n "${CODEX_HELPER_BIN:-}" ]]; then
   helper_cmd=("$CODEX_HELPER_BIN")
 else
+  default_gomodcache="$("$go_bin" env GOMODCACHE 2>/dev/null || true)"
+  default_gocache="$("$go_bin" env GOCACHE 2>/dev/null || true)"
   helper_cmd=("$go_bin" run ./cmd/codex-proxy)
 fi
 
@@ -18,12 +21,23 @@ git_repo() {
   (cd "$repo" && git "$@")
 }
 
-mkdir -p "$repo/skills/review/scripts" "$codex_dir"
+export HOME="$home_dir"
+export XDG_CONFIG_HOME="$home_dir/.config"
+export XDG_CACHE_HOME="$home_dir/.cache"
+if [[ -n "${default_gomodcache:-}" && -z "${GOMODCACHE:-}" ]]; then
+  export GOMODCACHE="$default_gomodcache"
+fi
+if [[ -n "${default_gocache:-}" && -z "${GOCACHE:-}" ]]; then
+  export GOCACHE="$default_gocache"
+fi
+
+mkdir -p "$repo/skills/review/scripts" "$codex_dir" "$home_dir"
+agents_dir="$home_dir/.agents/skills"
 
 "${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" install-builtin --yes
-test -f "$codex_dir/skills/cxp/SKILL.md"
-test -f "$codex_dir/skills/cxp/references/commands.md"
-grep -q -- "--after-current-turn" "$codex_dir/skills/cxp/references/commands.md"
+test -f "$agents_dir/cxp/SKILL.md"
+test -f "$agents_dir/cxp/references/commands.md"
+grep -q -- "--after-current-turn" "$agents_dir/cxp/references/commands.md"
 "${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" list | grep -q "No skill subscriptions."
 
 git_repo init
@@ -45,7 +59,7 @@ git_repo add -A
 git_repo commit -m "initial skill"
 
 "${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" add "$repo" --name acme --ref HEAD --path skills/review --yes
-installed="$codex_dir/skills/acme__review"
+installed="$agents_dir/acme__review"
 test -f "$installed/SKILL.md"
 test -f "$installed/scripts/check.sh"
 test -x "$installed/scripts/check.sh"

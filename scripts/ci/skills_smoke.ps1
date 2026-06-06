@@ -6,6 +6,7 @@ $root = Join-Path $tempRoot ("skills-smoke-" + [guid]::NewGuid().ToString("N"))
 $repo = Join-Path $root "repo"
 $config = Join-Path $root "config.json"
 $codexDir = Join-Path $root "codex"
+$homeDir = Join-Path $root "home"
 $goBin = if ($env:GO) { $env:GO } else { "go" }
 if ($env:CODEX_HELPER_BIN) {
     $helperExe = $env:CODEX_HELPER_BIN
@@ -24,10 +25,36 @@ function Write-SmokeFile {
     Set-Content -LiteralPath $Path -Value $Content -NoNewline -Encoding UTF8
 }
 
-New-Item -ItemType Directory -Force -Path (Join-Path $repo "skills\review\scripts"), $codexDir | Out-Null
+function Restore-SmokeEnv {
+    foreach ($name in $script:smokeEnv.Keys) {
+        if ($null -eq $script:smokeEnv[$name]) {
+            Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path ("Env:" + $name) -Value $script:smokeEnv[$name]
+        }
+    }
+}
+
+$script:smokeEnv = @{
+    HOME = $env:HOME
+    USERPROFILE = $env:USERPROFILE
+    XDG_CONFIG_HOME = $env:XDG_CONFIG_HOME
+    XDG_CACHE_HOME = $env:XDG_CACHE_HOME
+    LOCALAPPDATA = $env:LOCALAPPDATA
+}
+
+try {
+    $env:HOME = $homeDir
+    $env:USERPROFILE = $homeDir
+    $env:XDG_CONFIG_HOME = Join-Path $homeDir ".config"
+    $env:XDG_CACHE_HOME = Join-Path $homeDir ".cache"
+    $env:LOCALAPPDATA = Join-Path $homeDir "AppData\Local"
+
+New-Item -ItemType Directory -Force -Path (Join-Path $repo "skills\review\scripts"), $codexDir, $homeDir | Out-Null
+$agentsDir = Join-Path $homeDir ".agents\skills"
 
 & $helperExe @helperArgs --config $config skills --codex-dir $codexDir install-builtin --yes
-$builtinSkill = Join-Path $codexDir "skills\cxp"
+$builtinSkill = Join-Path $agentsDir "cxp"
 if (!(Test-Path -LiteralPath (Join-Path $builtinSkill "SKILL.md"))) { throw "builtin cxp SKILL.md missing" }
 $builtinReference = Join-Path $builtinSkill "references\commands.md"
 if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
@@ -53,7 +80,7 @@ echo ok
 & git -C $repo commit -m "initial skill"
 
 & $helperExe @helperArgs --config $config skills --codex-dir $codexDir add $repo --name acme --ref HEAD --path skills/review --yes
-$installed = Join-Path $codexDir "skills\acme__review"
+$installed = Join-Path $agentsDir "acme__review"
 if (!(Test-Path -LiteralPath (Join-Path $installed "SKILL.md"))) { throw "installed SKILL.md missing" }
 if (!(Test-Path -LiteralPath (Join-Path $installed "scripts\check.sh"))) { throw "installed script missing" }
 
@@ -107,3 +134,7 @@ $branch = (& git -C $repo for-each-ref "--format=%(refname:short)" refs/heads/sk
 if (!$branch) { throw "skills push did not create a review branch" }
 $pushedSkill = & git -C $repo show "${branch}:skills/review/SKILL.md"
 if (($pushedSkill -join "`n") -notmatch "local smoke edit") { throw "review branch did not contain local edit" }
+} finally {
+    Restore-SmokeEnv
+    Remove-Item -Recurse -Force -LiteralPath $root -ErrorAction SilentlyContinue
+}

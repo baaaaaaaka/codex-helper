@@ -505,17 +505,30 @@ $builtinSkillDetail = ""
 if ($env:CODEX_PROXY_SKIP_BUILTIN_SKILLS -eq "1") {
   $builtinSkillDetail = "Built-in cxp skill install skipped by CODEX_PROXY_SKIP_BUILTIN_SKILLS=1"
 } else {
+  $builtinSkillErrFile = [IO.Path]::GetTempFileName()
   try {
-    & $dst skills install-builtin --yes *> $null
+    & $dst skills install-builtin --yes 1>$null 2>$builtinSkillErrFile
+    $builtinSkillErr = ""
+    if (Test-Path -LiteralPath $builtinSkillErrFile) {
+      $builtinSkillErr = Get-Content -Raw -LiteralPath $builtinSkillErrFile -ErrorAction SilentlyContinue
+    }
     if ($LASTEXITCODE -eq 0) {
+      if (-not [string]::IsNullOrWhiteSpace($builtinSkillErr)) {
+        Write-Warning $builtinSkillErr.Trim()
+      }
       $builtinSkillDetail = "Built-in cxp skill installed/checked"
     } else {
       Write-Warning "Failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry."
+      if (-not [string]::IsNullOrWhiteSpace($builtinSkillErr)) {
+        Write-Warning $builtinSkillErr.Trim()
+      }
       $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
     }
   } catch {
     Write-Warning "Failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry. $($_.Exception.Message)"
     $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
+  } finally {
+    Remove-Item -Force -LiteralPath $builtinSkillErrFile -ErrorAction SilentlyContinue
   }
 }
 $managedPrefix = $env:CODEX_NPM_PREFIX

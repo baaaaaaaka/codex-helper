@@ -131,8 +131,9 @@ codex-proxy proxy doctor
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
 | `codex-proxy history show <session-id>` | Print full history for a session |
 | `codex-proxy history open <session-id>` | Open a session in Codex |
-| `codex-proxy skills install-builtin` | Install or repair bundled skills, including the built-in `cxp` usage skill |
+| `codex-proxy skills install-builtin` | Install or repair bundled skills in `$HOME/.agents/skills`, including the built-in `cxp` usage skill |
 | `codex-proxy skills add <git-url>` | Install skills from a git source and keep them updated |
+| `codex-proxy skills migrate` | Migrate managed legacy skills from `~/.codex/skills` to `$HOME/.agents/skills` |
 | `codex-proxy skills list` | List Codex skill subscriptions |
 | `codex-proxy skills sync [name]` | Sync one skill source, or all sources when no name is given |
 | `codex-proxy skills push [name]` | Push local skill edits with per-change confirmation |
@@ -417,9 +418,11 @@ codex-proxy beacon switch-profile gpu --session <session-id> --after-current-tur
 ## Built-in cxp skill
 
 The installer best-effort installs a bundled `cxp` Codex skill into
-`~/.codex/skills/cxp`. The skill contains the local command map and the safe
-handoff rules for disruptive operations such as beacon profile switching and
-Teams helper restarts. It is managed as a built-in skill, not as a git-backed
+`$HOME/.agents/skills/cxp`. Managed skills previously installed under
+`~/.codex/skills` are migrated to the agents skills directory when the skills
+commands run. The skill contains the local command map and the safe handoff
+rules for disruptive operations such as beacon profile switching and Teams
+helper restarts. It is managed as a built-in skill, not as a git-backed
 subscription, so it does not appear as a remote source in `codex-proxy skills
 list`.
 
@@ -427,6 +430,13 @@ To repair or install it manually:
 
 ```bash
 codex-proxy skills install-builtin
+codex-proxy skills migrate --yes
+```
+
+To inspect a migration without changing files, run:
+
+```bash
+codex-proxy skills migrate --dry-run
 ```
 
 ## Codex history

@@ -53,7 +53,7 @@ func TestHandleSkillsCommandQueuesListPushReviewAndLocalOnlyRefusal(t *testing.T
 	}
 
 	prev := newTeamsSkillsManagerForCommand
-	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	newTeamsSkillsManagerForCommand = func(context.Context) (*skills.Manager, string, error) { return mgr, "", nil }
 	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
 
 	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
@@ -111,7 +111,7 @@ func TestHandleSkillsCommandPushConfirmPushesReviewBranch(t *testing.T) {
 	}
 
 	prev := newTeamsSkillsManagerForCommand
-	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	newTeamsSkillsManagerForCommand = func(context.Context) (*skills.Manager, string, error) { return mgr, "", nil }
 	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
 
 	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
@@ -163,7 +163,7 @@ func TestHandleSkillsCommandAddsSourceAndInstallsSkills(t *testing.T) {
 	mgr := newTeamsSkillsTestManager(t)
 	mgr.Git = teamsSkillsAddGitRunner{}
 	prev := newTeamsSkillsManagerForCommand
-	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	newTeamsSkillsManagerForCommand = func(context.Context) (*skills.Manager, string, error) { return mgr, "", nil }
 	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
 
 	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
@@ -211,7 +211,7 @@ func TestHandleSkillsCommandAddUsesTeamsHyperlinkHref(t *testing.T) {
 	mgr := newTeamsSkillsTestManager(t)
 	mgr.Git = teamsSkillsAddGitRunner{}
 	prev := newTeamsSkillsManagerForCommand
-	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	newTeamsSkillsManagerForCommand = func(context.Context) (*skills.Manager, string, error) { return mgr, "", nil }
 	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
 
 	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
@@ -291,11 +291,24 @@ func TestTeamsSkillAddURLFromTeamsMessagePrefersSafeMatchingHref(t *testing.T) {
 	}
 }
 
+func TestParseTeamsSkillAddArgsRejectsFlags(t *testing.T) {
+	if _, err := parseTeamsSkillAddArgs("--target codex-home https://github.com/acme/skills.git"); err == nil {
+		t.Fatal("parse add args accepted --target")
+	}
+	got, err := parseTeamsSkillAddArgs("https://github.com/acme/skills.git")
+	if err != nil {
+		t.Fatalf("parse add args: %v", err)
+	}
+	if got.RawURL != "https://github.com/acme/skills.git" {
+		t.Fatalf("args = %#v, want URL", got)
+	}
+}
+
 func TestHandleSkillsCommandAddReportsAuthHint(t *testing.T) {
 	mgr := newTeamsSkillsTestManager(t)
 	mgr.Git = teamsSkillsAuthFailGitRunner{}
 	prev := newTeamsSkillsManagerForCommand
-	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	newTeamsSkillsManagerForCommand = func(context.Context) (*skills.Manager, string, error) { return mgr, "", nil }
 	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
 
 	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
@@ -346,7 +359,7 @@ func TestRedactTeamsSkillURLRedactsHTTPSecretsButKeepsSSHUser(t *testing.T) {
 func TestSkillsCommandDispatchesThroughControlAndWorkChats(t *testing.T) {
 	mgr := newTeamsSkillsTestManager(t)
 	prev := newTeamsSkillsManagerForCommand
-	newTeamsSkillsManagerForCommand = func() (*skills.Manager, error) { return mgr, nil }
+	newTeamsSkillsManagerForCommand = func(context.Context) (*skills.Manager, string, error) { return mgr, "", nil }
 	t.Cleanup(func() { newTeamsSkillsManagerForCommand = prev })
 
 	store, err := teamstore.Open(filepath.Join(t.TempDir(), "teams-state.json"))
@@ -424,7 +437,7 @@ func TestNewTeamsSkillsManagerUsesCodexProxyStoreAndCodexEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("user cache dir: %v", err)
 	}
-	mgr, err := newTeamsSkillsManager()
+	mgr, _, err := newTeamsSkillsManager(context.Background())
 	if err != nil {
 		t.Fatalf("newTeamsSkillsManager with CODEX_DIR: %v", err)
 	}
@@ -439,7 +452,7 @@ func TestNewTeamsSkillsManagerUsesCodexProxyStoreAndCodexEnv(t *testing.T) {
 	}
 
 	t.Setenv("CODEX_DIR", "")
-	mgr, err = newTeamsSkillsManager()
+	mgr, _, err = newTeamsSkillsManager(context.Background())
 	if err != nil {
 		t.Fatalf("newTeamsSkillsManager with CODEX_HOME: %v", err)
 	}
@@ -448,7 +461,7 @@ func TestNewTeamsSkillsManagerUsesCodexProxyStoreAndCodexEnv(t *testing.T) {
 	}
 
 	t.Setenv("CODEX_HOME", "")
-	mgr, err = newTeamsSkillsManager()
+	mgr, _, err = newTeamsSkillsManager(context.Background())
 	if err != nil {
 		t.Fatalf("newTeamsSkillsManager with default codex home: %v", err)
 	}

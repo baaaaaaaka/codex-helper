@@ -906,10 +906,13 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/ci/skills_smoke.sh
+          bash scripts/ci/skills_migration_smoke.sh
           go build -o "$RUNNER_TEMP/codex-proxy-skills-smoke" ./cmd/codex-proxy
           CODEX_HELPER_BIN="$RUNNER_TEMP/codex-proxy-skills-smoke" bash scripts/ci/skills_smoke.sh
+          CODEX_HELPER_BIN="$RUNNER_TEMP/codex-proxy-skills-smoke" bash scripts/ci/skills_migration_smoke.sh
           cp "$RUNNER_TEMP/codex-proxy-skills-smoke" "$RUNNER_TEMP/cxp"
           CODEX_HELPER_BIN="$RUNNER_TEMP/cxp" bash scripts/ci/skills_smoke.sh
+          CODEX_HELPER_BIN="$RUNNER_TEMP/cxp" bash scripts/ci/skills_migration_smoke.sh
 
       - name: Skills managed Git LFS download smoke (Linux only)
         if: runner.os == 'Linux'
@@ -925,14 +928,17 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           .\scripts\ci\skills_smoke.ps1
+          .\scripts\ci\skills_migration_smoke.ps1
           $exe = Join-Path $env:RUNNER_TEMP "codex-proxy-skills-smoke.exe"
           go build -o $exe .\cmd\codex-proxy
           $env:CODEX_HELPER_BIN = $exe
           .\scripts\ci\skills_smoke.ps1
+          .\scripts\ci\skills_migration_smoke.ps1
           $cxp = Join-Path $env:RUNNER_TEMP "cxp.exe"
           Copy-Item -LiteralPath $exe -Destination $cxp
           $env:CODEX_HELPER_BIN = $cxp
           .\scripts\ci\skills_smoke.ps1
+          .\scripts\ci\skills_migration_smoke.ps1
           Remove-Item Env:\CODEX_HELPER_BIN
 
       - name: Codex desktop app unsupported smoke (Linux)

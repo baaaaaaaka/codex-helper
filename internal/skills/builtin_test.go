@@ -73,7 +73,7 @@ func TestInstallBuiltinsRefusesLocalModifications(t *testing.T) {
 
 func TestInstallBuiltinsRefusesUnmanagedExistingSkill(t *testing.T) {
 	mgr := newBuiltinTestManager(t)
-	target := filepath.Join(mgr.CodexDir, "skills", BuiltinCxpSkillName)
+	target := filepath.Join(mgr.HomeDir, ".agents", "skills", BuiltinCxpSkillName)
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		t.Fatalf("mkdir unmanaged target: %v", err)
 	}
@@ -122,9 +122,10 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp teams service restart --force",
 		"helper update prerelease",
 		"cxp skills install-builtin",
+		"cxp skills migrate",
 		"cxp history tui",
 		"cxp upgrade --include-prerelease",
-		"Built-in skills are installed into the Codex skills directory, but they are not git subscriptions",
+		"Built-in skills are installed into `$HOME/.agents/skills`, but they are not git subscriptions",
 	} {
 		if !strings.Contains(reference, want) {
 			t.Fatalf("commands.md missing %q:\n%s", want, reference)

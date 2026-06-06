@@ -169,7 +169,7 @@ func TestSkillsCommandInstallBuiltinCxp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("skills install-builtin: %v\n%s", err, out)
 	}
-	installed := filepath.Join(codexDir, "skills", "cxp")
+	installed := filepath.Join(home, ".agents", "skills", "cxp")
 	if _, err := os.Stat(filepath.Join(installed, "SKILL.md")); err != nil {
 		t.Fatalf("builtin SKILL.md missing: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestRunSkillsTextMenuAddListSyncAndBackCombo(t *testing.T) {
 			t.Fatalf("menu output missing %q:\n%s", want, text)
 		}
 	}
-	matches, err := installedReviewSkillManifests(filepath.Join(codexDir, "skills"))
+	matches, err := installedReviewSkillManifests(filepath.Join(home, ".agents", "skills"))
 	if err != nil {
 		t.Fatalf("list installed skills: %v", err)
 	}

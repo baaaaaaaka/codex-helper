@@ -218,6 +218,7 @@ func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) 
 	if len(result.Installed) != 1 {
 		t.Fatalf("installed skills = %d, want 1", len(result.Installed))
 	}
+	targetSkill := result.Installed[0].TargetPath
 	writeCLIFile(t, filepath.Join(repo, "skills", "review", "SKILL.md"), "---\nname: review\ndescription: Review code\n---\nauto update\n", 0o644)
 	cliGitRun(t, repo, "add", "-A")
 	cliGitRun(t, repo, "commit", "-m", "auto update")
@@ -234,7 +235,7 @@ func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) 
 	selectSession = func(_ context.Context, _ tui.Options) (*tui.Selection, error) {
 		deadline := time.Now().Add(historyDispatchTestTimeout(3 * time.Second))
 		for {
-			data, _ := os.ReadFile(filepath.Join(codexDir, "skills", "acme__review", "SKILL.md"))
+			data, _ := os.ReadFile(filepath.Join(targetSkill, "SKILL.md"))
 			st, _ := mgr.Store.LoadState()
 			var state skills.SourceState
 			for _, candidate := range st.Sources {

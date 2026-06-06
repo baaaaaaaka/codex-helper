@@ -141,15 +141,16 @@ Work chat commands:
 
 ## Skills
 
-- `cxp skills install-builtin`: install or repair bundled skills such as this `cxp` skill.
+- `cxp skills install-builtin`: install or repair bundled skills such as this `cxp` skill in `$HOME/.agents/skills`.
 - `cxp skills list`: list git-backed skill subscriptions.
-- `cxp skills add <github/gitlab/git-url>`: install skills from a git source and keep them updated.
+- `cxp skills add <github/gitlab/git-url>`: install skills from a git source and keep them updated in the user agents skills directory.
+- `cxp skills migrate`: migrate managed skills from the legacy Codex skills directory to `$HOME/.agents/skills`.
 - `cxp skills sync [name]`: sync one source, or all sources when no name is given.
 - `cxp skills doctor [name]`: inspect local skill subscription state.
 - `cxp skills push [name]`: review and push local skill edits with per-change confirmation.
 - `cxp skills remove <name>`: remove a git-backed subscription and its managed installed skills.
 
-Built-in skills are installed into the Codex skills directory, but they are not git subscriptions and do not appear as remote sources in `cxp skills list`.
+Built-in skills are installed into `$HOME/.agents/skills`, but they are not git subscriptions and do not appear as remote sources in `cxp skills list`.
 
 ## History
 

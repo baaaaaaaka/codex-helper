@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -23,7 +24,7 @@ func (b *Bridge) handleSkillsCommand(ctx context.Context, chatID string, arg str
 }
 
 func (b *Bridge) handleSkillsCommandFromMessage(ctx context.Context, chatID string, msg ChatMessage, arg string) error {
-	mgr, err := newTeamsSkillsManagerForCommand()
+	mgr, migrationWarning, err := newTeamsSkillsManagerForCommand(ctx)
 	if err != nil {
 		return b.sendToChat(ctx, chatID, "skills setup failed: "+err.Error())
 	}
@@ -37,14 +38,20 @@ func (b *Bridge) handleSkillsCommandFromMessage(ctx context.Context, chatID stri
 		if err != nil {
 			return b.sendToChat(ctx, chatID, "skills list failed: "+err.Error())
 		}
-		return b.sendToChat(ctx, chatID, formatTeamsSkillEntries(entries))
+		body := formatTeamsSkillEntries(entries)
+		body = appendTeamsSkillMigrationNotice(body, mgr, migrationWarning)
+		return b.sendToChat(ctx, chatID, body)
 	case "add":
-		rawURL := teamsSkillAddURLFromTeamsMessage(msg, rest)
+		addArgs, err := parseTeamsSkillAddArgs(rest)
+		if err != nil {
+			return b.sendToChat(ctx, chatID, err.Error())
+		}
+		rawURL := teamsSkillAddURLFromTeamsMessage(msg, addArgs.RawURL)
 		if rawURL == "" {
 			return b.sendToChat(ctx, chatID, "usage: `helper skills add <github/gitlab/git-url>`")
 		}
 		source, result, err := mgr.Add(ctx, rawURL, skills.AddOptions{})
-		return b.sendToChat(ctx, chatID, formatTeamsSkillAddResult(source, result, err))
+		return b.sendToChat(ctx, chatID, appendTeamsSkillMigrationNotice(formatTeamsSkillAddResult(source, result, err), mgr, migrationWarning))
 	case "sync":
 		name := firstTeamsSkillArg(rest)
 		results, err := mgr.Sync(ctx, skills.SyncOptions{Name: name, All: name == ""})
@@ -52,7 +59,7 @@ func (b *Bridge) handleSkillsCommandFromMessage(ctx context.Context, chatID stri
 		if err != nil {
 			body += "\n\nSync failed: " + err.Error()
 		}
-		return b.sendToChat(ctx, chatID, body)
+		return b.sendToChat(ctx, chatID, appendTeamsSkillMigrationNotice(body, mgr, migrationWarning))
 	case "push":
 		args, err := parseTeamsSkillPushArgs(rest)
 		if err != nil {
@@ -84,6 +91,25 @@ func firstTeamsSkillArg(rest string) string {
 		return ""
 	}
 	return fields[0]
+}
+
+type teamsSkillAddArgs struct {
+	RawURL string
+}
+
+func parseTeamsSkillAddArgs(rest string) (teamsSkillAddArgs, error) {
+	var out teamsSkillAddArgs
+	fields := strings.Fields(strings.TrimSpace(rest))
+	var raw []string
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if strings.HasPrefix(field, "-") {
+			return teamsSkillAddArgs{}, fmt.Errorf("usage: `helper skills add <github/gitlab/git-url>`")
+		}
+		raw = append(raw, field)
+	}
+	out.RawURL = strings.Join(raw, " ")
+	return out, nil
 }
 
 type teamsSkillPushArgs struct {
@@ -351,14 +377,14 @@ func looksLikeExplicitTeamsSkillURL(raw string) bool {
 	return at > 0 && colon > at+1
 }
 
-func newTeamsSkillsManager() (*skills.Manager, error) {
+func newTeamsSkillsManager(ctx context.Context) (*skills.Manager, string, error) {
 	configBase, err := os.UserConfigDir()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	cacheBase, err := os.UserCacheDir()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	home, _ := os.UserHomeDir()
 	codexDir := strings.TrimSpace(os.Getenv("CODEX_DIR"))
@@ -368,12 +394,25 @@ func newTeamsSkillsManager() (*skills.Manager, error) {
 	if codexDir == "" && home != "" {
 		codexDir = filepath.Join(home, ".codex")
 	}
-	return skills.NewManager(skills.ManagerOptions{
+	mgr, err := skills.NewManager(skills.ManagerOptions{
 		ConfigDir: filepath.Join(configBase, "codex-proxy"),
 		CacheDir:  filepath.Join(cacheBase, "codex-proxy", "skill-subscriptions"),
 		CodexDir:  codexDir,
 		HomeDir:   home,
 	})
+	if err != nil {
+		return nil, "", err
+	}
+	migrationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	report, err := mgr.MigrateLegacySkills(migrationCtx, skills.MigrationOptions{IncludeBuiltins: true})
+	if err != nil {
+		return mgr, "Skills migration warning: " + err.Error(), nil
+	}
+	if report.Failed {
+		return mgr, "Skills migration warning: some managed skills could not be migrated; run local `cxp skills doctor` for details.", nil
+	}
+	return mgr, "", nil
 }
 
 func formatTeamsSkillEntries(entries []skills.StatusEntry) string {
@@ -391,12 +430,15 @@ func formatTeamsSkillEntries(entries []skills.StatusEntry) string {
 		if entry.Source.AutoSync {
 			auto = "auto-sync on"
 		}
-		_, _ = fmt.Fprintf(&b, "\n- **%s**: %s, %s", entry.Source.Name, status, auto)
+		_, _ = fmt.Fprintf(&b, "\n- **%s**: %s, %s, target `%s`", entry.Source.Name, status, auto, firstNonEmptyString(entry.Source.TargetKind, skills.TargetAgents))
 		if entry.Source.Ref != "" {
 			_, _ = fmt.Fprintf(&b, ", ref `%s`", entry.Source.Ref)
 		}
 		if entry.Source.Path != "" {
 			_, _ = fmt.Fprintf(&b, ", path `%s`", entry.Source.Path)
+		}
+		if shouldShowTeamsSkillRoot(entry.Source.TargetKind) && entry.Source.TargetRoot != "" {
+			_, _ = fmt.Fprintf(&b, "\n  - root: `%s`", entry.Source.TargetRoot)
 		}
 		for _, skill := range entry.State.InstalledSkills {
 			_, _ = fmt.Fprintf(&b, "\n  - `%s` -> `%s`", skill.Name, skill.ExportName)
@@ -406,6 +448,59 @@ func formatTeamsSkillEntries(entries []skills.StatusEntry) string {
 		}
 	}
 	return b.String()
+}
+
+func formatTeamsSkillMigrationWarning(mgr *skills.Manager) string {
+	data, err := os.ReadFile(mgr.MigrationStatusPath())
+	if err != nil {
+		return ""
+	}
+	var report skills.MigrationReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		return ""
+	}
+	var lines []string
+	for _, result := range report.Results {
+		switch result.Status {
+		case skills.MigrationStatusLocalModified, skills.MigrationStatusConflict, skills.MigrationStatusFailed:
+		default:
+			continue
+		}
+		label := firstNonEmptyString(result.Name, result.ID)
+		line := "- `" + label + "`: `" + result.Status + "`"
+		if strings.TrimSpace(result.Message) != "" {
+			line += " - " + strings.TrimSpace(result.Message)
+		}
+		lines = append(lines, line)
+		for _, skill := range result.Skills {
+			if skill.Status != skills.MigrationStatusLocalModified && skill.Status != skills.MigrationStatusConflict && skill.Status != skills.MigrationStatusFailed {
+				continue
+			}
+			skillLine := "  - `" + skill.ExportName + "`: `" + skill.Status + "`"
+			if strings.TrimSpace(skill.Message) != "" {
+				skillLine += " - " + strings.TrimSpace(skill.Message)
+			}
+			lines = append(lines, skillLine)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "## Skills Migration Attention\n" + strings.Join(lines, "\n")
+}
+
+func appendTeamsSkillMigrationNotice(body string, mgr *skills.Manager, transientWarning string) string {
+	var notices []string
+	if strings.TrimSpace(transientWarning) != "" {
+		notices = append(notices, strings.TrimSpace(transientWarning))
+	}
+	if warning := formatTeamsSkillMigrationWarning(mgr); warning != "" {
+		notices = append(notices, warning)
+	}
+	if len(notices) == 0 {
+		return body
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + strings.Join(notices, "\n\n")
 }
 
 func formatTeamsSkillAddResult(source skills.Source, result skills.SyncResult, err error) string {
@@ -432,6 +527,10 @@ func formatTeamsSkillAddResult(source skills.Source, result skills.SyncResult, e
 	} else {
 		b.WriteString("\n  - auto-sync: off")
 	}
+	_, _ = fmt.Fprintf(&b, "\n  - target: `%s`", firstNonEmptyString(source.TargetKind, skills.TargetAgents))
+	if shouldShowTeamsSkillRoot(source.TargetKind) && source.TargetRoot != "" {
+		_, _ = fmt.Fprintf(&b, "\n  - root: `%s`", source.TargetRoot)
+	}
 	if err != nil {
 		status := result.State.Status
 		if status == "" {
@@ -446,6 +545,10 @@ func formatTeamsSkillAddResult(source skills.Source, result skills.SyncResult, e
 		_, _ = fmt.Fprintf(&b, "\n- `%s` -> `%s`", skill.Name, skill.ExportName)
 	}
 	return b.String()
+}
+
+func shouldShowTeamsSkillRoot(targetKind string) bool {
+	return strings.TrimSpace(targetKind) != "" && !strings.EqualFold(strings.TrimSpace(targetKind), skills.TargetAgents)
 }
 
 func formatTeamsSkillSyncResults(results []skills.SyncResult) string {

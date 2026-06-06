@@ -613,6 +613,19 @@ func TestUpgradeCmdRestartRequiredMessage(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)
 	tmp := t.TempDir()
+	pendingPath := filepath.Join(tmp, ".codex-proxy_1.2.3.tmp")
+	marker := filepath.Join(tmp, "pending-builtin-install-called")
+	if runtime.GOOS != "windows" {
+		script := "#!/bin/sh\n" +
+			"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ] && [ \"$3\" = \"--yes\" ]; then\n" +
+			"  printf called > \"" + marker + "\"\n" +
+			"  exit 0\n" +
+			"fi\n" +
+			"exit 64\n"
+		if err := os.WriteFile(pendingPath, []byte(script), 0o755); err != nil {
+			t.Fatalf("write pending helper stub: %v", err)
+		}
+	}
 
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
@@ -625,7 +638,7 @@ func TestUpgradeCmdRestartRequiredMessage(t *testing.T) {
 		return update.Status{Supported: true, UpdateAvailable: true}
 	}
 	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		return update.ApplyResult{Version: "1.2.3", RestartRequired: true, PendingReplacePath: filepath.Join(tmp, ".codex-proxy_1.2.3.tmp")}, nil
+		return update.ApplyResult{Version: "1.2.3", RestartRequired: true, PendingReplacePath: pendingPath}, nil
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
@@ -637,6 +650,11 @@ func TestUpgradeCmdRestartRequiredMessage(t *testing.T) {
 	if !strings.Contains(out.String(), "Update replacement for v1.2.3 is pending.") ||
 		!strings.Contains(out.String(), "verify `codex-proxy --version`") {
 		t.Fatalf("unexpected output: %q", out.String())
+	}
+	if runtime.GOOS != "windows" {
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("pending replacement binary was not asked to install bundled skills: %v", err)
+		}
 	}
 }
 

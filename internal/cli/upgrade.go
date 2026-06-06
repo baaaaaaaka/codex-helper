@@ -88,6 +88,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 			}
 
 			if res.RestartRequired {
+				installBundledSkillsFromHelper(ctx, firstNonEmptyString(res.PendingReplacePath, res.InstallPath), cmd.ErrOrStderr())
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update replacement for v%s is pending. Restart `codex-proxy`, then verify `codex-proxy --version` before treating the update as installed.\n", res.Version)
 				return nil
 			}
@@ -124,5 +125,9 @@ func installBundledSkillsFromHelper(ctx context.Context, helperPath string, out 
 			detail = ": " + detail
 		}
 		_, _ = fmt.Fprintf(out, "Warning: failed to install built-in cxp skill after upgrade; run `%s skills install-builtin --yes` to retry%s\n", helperPath, detail)
+		return
+	}
+	if detail := strings.TrimSpace(stderr.String()); detail != "" {
+		_, _ = fmt.Fprintln(out, detail)
 	}
 }
