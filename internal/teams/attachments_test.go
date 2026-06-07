@@ -187,6 +187,46 @@ func TestPromptWithReferencedMessagesQuoteOnlyAndTruncates(t *testing.T) {
 	}
 }
 
+func TestPrepareLongReferencedMessageFilesWritesReadableContextFile(t *testing.T) {
+	cwd := t.TempDir()
+	longTail := "item 14: this tail must remain available"
+	long := strings.Repeat("long referenced content\n", 160) + longTail
+	msg := ChatMessage{ID: "message-long-reference"}
+	refs := []ReferencedMessage{{
+		MessageID:       "quote-1",
+		Sender:          "Alex",
+		CreatedDateTime: "2026-06-07T01:02:03Z",
+		Text:            long,
+		Fetched:         true,
+	}}
+
+	got, files, cleanup, err := prepareLongReferencedMessageFiles(&Session{ID: "s001", Cwd: cwd}, msg, refs)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("prepareLongReferencedMessageFiles error: %v", err)
+	}
+	if len(got) != 1 || len(files) != 1 {
+		t.Fatalf("refs/files = %#v / %#v, want one saved reference file", got, files)
+	}
+	if files[0].PromptPath == "" || filepath.IsAbs(files[0].PromptPath) || !strings.Contains(files[0].PromptPath, ".codex-helper/teams-attachments/") {
+		t.Fatalf("prompt path = %q, want relative teams attachment path", files[0].PromptPath)
+	}
+	body, err := os.ReadFile(files[0].Path)
+	if err != nil {
+		t.Fatalf("read saved reference file: %v", err)
+	}
+	if !strings.Contains(string(body), longTail) {
+		t.Fatalf("saved reference file missing tail content")
+	}
+	prompt := PromptWithReferencedMessages("answer", got)
+	if !strings.Contains(prompt, "Full referenced message saved locally for Codex to read: "+files[0].PromptPath) {
+		t.Fatalf("prompt missing saved reference path:\n%s", prompt)
+	}
+	if strings.Contains(prompt, longTail) {
+		t.Fatalf("long tail should stay in file instead of inline prompt:\n%s", prompt)
+	}
+}
+
 func TestDownloadReferenceFileAttachmentsIgnoresMessageReference(t *testing.T) {
 	var bridge Bridge
 	files, cleanup, message, err := bridge.downloadReferenceFileAttachments(context.Background(), &Session{ID: "s001"}, ChatMessage{

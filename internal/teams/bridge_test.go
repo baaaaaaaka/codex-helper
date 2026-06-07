@@ -278,6 +278,109 @@ func (e *attachmentReadingExecutor) Run(_ context.Context, _ *Session, prompt st
 	return ExecutionResult{Text: "saw attachment", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}, nil
 }
 
+type referencedMessageFileReadingExecutor struct {
+	input      ExecutionInput
+	promptPath string
+	fileText   string
+	err        error
+}
+
+func (e *referencedMessageFileReadingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunInput(ctx, session, ExecutionInput{Prompt: prompt})
+}
+
+func (e *referencedMessageFileReadingExecutor) RunInput(_ context.Context, session *Session, input ExecutionInput) (ExecutionResult, error) {
+	e.input = input
+	promptPath, fileText, err := readReferencedMessageFileFromPrompt(session, input.Prompt)
+	if err != nil {
+		e.err = err
+		return ExecutionResult{}, err
+	}
+	e.promptPath = promptPath
+	e.fileText = fileText
+	return ExecutionResult{Text: "saw full reference file", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}, nil
+}
+
+func readReferencedMessageFileFromPrompt(session *Session, prompt string) (string, string, error) {
+	for _, field := range strings.Fields(prompt) {
+		candidate := strings.Trim(field, " \t\r\n-()`")
+		if !strings.Contains(candidate, "referenced-message-001.txt") {
+			continue
+		}
+		path := filepath.FromSlash(candidate)
+		if !filepath.IsAbs(path) && session != nil && strings.TrimSpace(session.Cwd) != "" {
+			path = filepath.Join(session.Cwd, path)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return candidate, "", err
+		}
+		return candidate, string(data), nil
+	}
+	return "", "", fmt.Errorf("referenced message file path not found in prompt")
+}
+
+type blockingReferencedMessageFileReadingExecutor struct {
+	started chan string
+	release chan struct{}
+
+	mu         sync.Mutex
+	inputs     []ExecutionInput
+	promptPath string
+	fileText   string
+	err        error
+}
+
+func (e *blockingReferencedMessageFileReadingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunInput(ctx, session, ExecutionInput{Prompt: prompt})
+}
+
+func (e *blockingReferencedMessageFileReadingExecutor) RunInput(ctx context.Context, session *Session, input ExecutionInput) (ExecutionResult, error) {
+	e.mu.Lock()
+	e.inputs = append(e.inputs, input)
+	index := len(e.inputs)
+	e.mu.Unlock()
+
+	promptPath := ""
+	if strings.Contains(input.Prompt, "referenced-message-001.txt") {
+		filePromptPath, fileText, err := readReferencedMessageFileFromPrompt(session, input.Prompt)
+		e.mu.Lock()
+		e.promptPath = filePromptPath
+		e.fileText = fileText
+		e.err = err
+		e.mu.Unlock()
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		promptPath = filePromptPath
+	}
+
+	visible := strings.TrimSpace(StripHelperPromptEchoes(input.Prompt))
+	e.started <- visible
+	select {
+	case <-ctx.Done():
+		return ExecutionResult{}, ctx.Err()
+	case <-e.release:
+		text := fmt.Sprintf("done %d", index)
+		if promptPath != "" {
+			text = "saw queued full reference file"
+		}
+		return ExecutionResult{Text: text, CodexThreadID: "thread-1", CodexTurnID: fmt.Sprintf("turn-%d", index)}, nil
+	}
+}
+
+func (e *blockingReferencedMessageFileReadingExecutor) inputSnapshot() []ExecutionInput {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]ExecutionInput(nil), e.inputs...)
+}
+
+func (e *blockingReferencedMessageFileReadingExecutor) referenceSnapshot() (string, string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.promptPath, e.fileText, e.err
+}
+
 type imageInputRecordingExecutor struct {
 	input      ExecutionInput
 	imageRead  []byte
@@ -1562,6 +1665,126 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("async queue transcript missing %q in:\n%s", want, joined)
 		}
+	}
+}
+
+func TestBridgeAsyncQueuedLongMessageReferenceWritesFullTextFileForCodex(t *testing.T) {
+	longTail := "item 14: queued reference tail that must be readable from the saved file"
+	longText := strings.Repeat("long queued referenced item\n", 170) + longTail
+	queued := bridgePollMessage("queued-long-quote", "2026-05-03T01:00:05Z", "answer queued reference")
+	queued.Body.Content = `<p>answer queued reference</p><attachment id="quote-1"></attachment>`
+	queued.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote","messageSender":{"user":{"displayName":"Preview Sender"}}}`,
+	}}
+
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/queued-long-quote":
+			if err := json.NewEncoder(w).Encode(queued); err != nil {
+				t.Fatalf("encode queued Teams message: %v", err)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/quote-1":
+			body := `<p>` + strings.ReplaceAll(stdhtml.EscapeString(longText), "\n", "<br>") + `</p>`
+			_, _ = fmt.Fprintf(w, `{"id":"quote-1","chatId":"chat-1","createdDateTime":"2026-06-07T01:02:03Z","messageType":"message","from":{"user":{"id":"alex-id","displayName":"Alex"}},"body":{"contentType":"html","content":%q}}`, body)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &blockingReferencedMessageFileReadingExecutor{
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	bridge.reg.Sessions[0].Cwd = t.TempDir()
+	ctx := context.Background()
+
+	first := bridgePollMessage("first", "2026-05-03T01:00:00Z", "first prompt")
+	if err := bridge.handleSessionMessage(ctx, "chat-1", first, "first prompt"); err != nil {
+		t.Fatalf("first handleSessionMessage error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "first prompt") {
+			t.Fatalf("first started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("first Codex turn did not start")
+	}
+
+	if err := bridge.handleSessionMessage(ctx, "chat-1", queued, "answer queued reference"); err != nil {
+		t.Fatalf("queued handleSessionMessage error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		t.Fatalf("queued reference turn started before first finished: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	waitForOutboxBody(t, store, "⚠️ **Your request is queued.**")
+
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "answer queued reference") ||
+			!strings.Contains(got, "Full referenced message saved locally for Codex to read:") {
+			t.Fatalf("queued reference prompt missing file guidance:\n%s", got)
+		}
+	case <-time.After(bridgeAsyncWaitTimeoutForTest()):
+		t.Fatal("queued reference turn did not start after first finished")
+	}
+	promptPath, fileText, err := executor.referenceSnapshot()
+	if err != nil {
+		t.Fatalf("executor read queued reference file error: %v", err)
+	}
+	if promptPath == "" || filepath.IsAbs(promptPath) || !strings.HasPrefix(promptPath, ".codex-helper/teams-attachments/") {
+		t.Fatalf("queued reference prompt path = %q, want relative teams attachment path", promptPath)
+	}
+	if !strings.Contains(fileText, longTail) {
+		t.Fatalf("queued reference file missing long tail")
+	}
+	inputs := executor.inputSnapshot()
+	if len(inputs) != 2 {
+		t.Fatalf("executor inputs = %#v, want first and queued reference input", inputs)
+	}
+	if !strings.Contains(inputs[1].Prompt, "Attached files saved locally for this turn:") {
+		t.Fatalf("queued reference raw prompt missing local file list:\n%s", inputs[1].Prompt)
+	}
+	if strings.Contains(inputs[1].Prompt, longTail) {
+		t.Fatalf("queued long tail should stay in file instead of inline prompt:\n%s", inputs[1].Prompt)
+	}
+
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 2)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	if got := sentPlainJoined(sent); !strings.Contains(got, "Your request is queued.") || !strings.Contains(got, "saw queued full reference file") {
+		t.Fatalf("queued long reference transcript missing queued ack or final answer:\n%s", got)
 	}
 }
 
@@ -5896,6 +6119,84 @@ func TestBridgeControlMessageReferenceFallsBackToCodex(t *testing.T) {
 	}
 	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "fallback answer") {
 		t.Fatalf("unexpected control fallback transcript:\n%s", got)
+	}
+}
+
+func TestBridgeControlLongMessageReferenceWritesFullTextFileForCodex(t *testing.T) {
+	longTail := "item 14: control fallback tail that must be readable from the saved file"
+	longText := strings.Repeat("long referenced control item\n", 170) + longTail
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/control-chat/messages/quote-1":
+			body := `<p>` + strings.ReplaceAll(stdhtml.EscapeString(longText), "\n", "<br>") + `</p>`
+			_, _ = fmt.Fprintf(w, `{"id":"quote-1","chatId":"control-chat","createdDateTime":"2026-06-07T01:02:03Z","messageType":"message","from":{"user":{"id":"alex-id","displayName":"Alex"}},"body":{"contentType":"html","content":%q}}`, body)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &referencedMessageFileReadingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.controlFallbackExecutor = executor
+	msg := bridgeTestMessageWithText("control-long-quote", `<p>看一下这个</p><attachment id="quote-1"></attachment>`)
+	msg.ChatID = "control-chat"
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote","messageSender":{"user":{"displayName":"Preview Sender"}}}`,
+	}}
+
+	if err := bridge.handleControlMessage(context.Background(), msg, "看一下这个"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	if executor.err != nil {
+		t.Fatalf("executor read reference file error: %v", executor.err)
+	}
+	if executor.promptPath == "" || !strings.Contains(executor.promptPath, "referenced-message-001.txt") {
+		t.Fatalf("executor prompt path = %q, want saved reference text file", executor.promptPath)
+	}
+	if !strings.Contains(executor.input.Prompt, "User message:\n看一下这个") ||
+		!strings.Contains(executor.input.Prompt, "Full referenced message saved locally for Codex to read: "+executor.promptPath) ||
+		!strings.Contains(executor.input.Prompt, "Attached files saved locally for this turn:") {
+		t.Fatalf("control fallback prompt missing reference file guidance:\n%s", executor.input.Prompt)
+	}
+	if !strings.Contains(executor.fileText, longTail) {
+		t.Fatalf("saved reference file missing long tail")
+	}
+	if strings.Contains(executor.input.Prompt, longTail) {
+		t.Fatalf("long tail should stay in file instead of inline prompt:\n%s", executor.input.Prompt)
+	}
+	if got := sentPlainJoined(sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "saw full reference file") {
+		t.Fatalf("unexpected control fallback transcript:\n%s", got)
+	}
+	for _, message := range sent {
+		if message.ChatID != "control-chat" {
+			t.Fatalf("control fallback sent to chat %q, want control-chat", message.ChatID)
+		}
 	}
 }
 
@@ -11475,6 +11776,75 @@ func TestBridgeSessionMessageReferenceIsReadForCodexTurn(t *testing.T) {
 		t.Fatalf("executor prompt missing quoted message context:\n%s", got[0])
 	}
 	if got := sentPlainJoined(*sent); strings.Contains(got, "I could not process") || !strings.Contains(got, "used quote") {
+		t.Fatalf("unexpected sent transcript:\n%s", got)
+	}
+}
+
+func TestBridgeSessionLongMessageReferenceWritesFullTextFileForCodex(t *testing.T) {
+	longTail := "item 14: complete tail that must be readable from the saved file"
+	longText := strings.Repeat("long referenced item\n", 170) + longTail
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/quote-1":
+			body := `<p>` + strings.ReplaceAll(stdhtml.EscapeString(longText), "\n", "<br>") + `</p>`
+			_, _ = fmt.Fprintf(w, `{"id":"quote-1","chatId":"chat-1","createdDateTime":"2026-06-07T01:02:03Z","messageType":"message","from":{"user":{"id":"alex-id","displayName":"Alex"}},"body":{"contentType":"html","content":%q}}`, body)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			sent = append(sent, bridgeSentMessage{Content: body.Body.Content})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &referencedMessageFileReadingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.reg.Sessions[0].Cwd = t.TempDir()
+	msg := bridgeTestMessageWithText("message-long-quote", `<p>answer this</p><attachment id="quote-1"></attachment>`)
+	msg.Attachments = []MessageAttachment{{
+		ID:          "quote-1",
+		ContentType: "messageReference",
+		Content:     `{"messageId":"quote-1","messagePreview":"preview quote","messageSender":{"user":{"displayName":"Preview Sender"}}}`,
+	}}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "answer this"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if executor.err != nil {
+		t.Fatalf("executor read reference file error: %v", executor.err)
+	}
+	if executor.promptPath == "" || filepath.IsAbs(executor.promptPath) || !strings.HasPrefix(executor.promptPath, ".codex-helper/teams-attachments/") {
+		t.Fatalf("executor prompt path = %q, want relative teams attachment path", executor.promptPath)
+	}
+	if !strings.Contains(executor.input.Prompt, "Full referenced message saved locally for Codex to read: "+executor.promptPath) ||
+		!strings.Contains(executor.input.Prompt, "Attached files saved locally for this turn:") {
+		t.Fatalf("prompt missing reference file guidance:\n%s", executor.input.Prompt)
+	}
+	if !strings.Contains(executor.fileText, longTail) {
+		t.Fatalf("saved reference file missing long tail")
+	}
+	if strings.Contains(executor.input.Prompt, longTail) {
+		t.Fatalf("long tail should not be inline when full reference file is present:\n%s", executor.input.Prompt)
+	}
+	if got := sentPlainJoined(sent); !strings.Contains(got, "saw full reference file") {
 		t.Fatalf("unexpected sent transcript:\n%s", got)
 	}
 }

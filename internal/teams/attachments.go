@@ -39,12 +39,14 @@ type LocalAttachment struct {
 }
 
 type ReferencedMessage struct {
-	MessageID       string
-	ConversationID  string
-	Sender          string
-	CreatedDateTime string
-	Text            string
-	Fetched         bool
+	MessageID          string
+	ConversationID     string
+	Sender             string
+	CreatedDateTime    string
+	Text               string
+	Fetched            bool
+	FullTextPath       string
+	FullTextPromptPath string
 }
 
 type messageReferenceContent struct {
@@ -514,10 +516,85 @@ func PromptWithReferencedMessages(text string, refs []ReferencedMessage) string 
 			b.WriteString("Source: Teams reference preview")
 		}
 		b.WriteString("\n")
+		if path := firstNonEmptyString(ref.FullTextPromptPath, ref.FullTextPath); path != "" {
+			b.WriteString("Full referenced message saved locally for Codex to read: ")
+			b.WriteString(path)
+			b.WriteString("\n")
+		}
 		b.WriteString(indentReferencedMessageText(truncateRunes(strings.TrimSpace(ref.Text), maxReferencedMessageRunes)))
 		b.WriteString("\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func prepareLongReferencedMessageFiles(session *Session, msg ChatMessage, refs []ReferencedMessage) ([]ReferencedMessage, []LocalAttachment, func(), error) {
+	cleanup := func() {}
+	if len(refs) == 0 {
+		return refs, nil, cleanup, nil
+	}
+	needsFiles := false
+	for _, ref := range refs {
+		if len([]rune(strings.TrimSpace(ref.Text))) > maxReferencedMessageRunes {
+			needsFiles = true
+			break
+		}
+	}
+	if !needsFiles {
+		return refs, nil, cleanup, nil
+	}
+	dir, err := createAttachmentTempDir(session, msg)
+	if err != nil {
+		return nil, nil, cleanup, err
+	}
+	cleanup = func() {
+		_ = os.RemoveAll(dir)
+	}
+	out := append([]ReferencedMessage(nil), refs...)
+	files := make([]LocalAttachment, 0, len(refs))
+	for i := range out {
+		if len([]rune(strings.TrimSpace(out[i].Text))) <= maxReferencedMessageRunes {
+			continue
+		}
+		name := fmt.Sprintf("referenced-message-%03d.txt", i+1)
+		path := filepath.Join(dir, name)
+		if err := writePrivateFile(path, referencedMessageTextFileBody(out[i])); err != nil {
+			cleanup()
+			return nil, nil, func() {}, err
+		}
+		file := LocalAttachment{
+			Path:         path,
+			PromptPath:   promptAttachmentPath(session, path),
+			ContentType:  "text/plain",
+			SourceID:     strings.TrimSpace(firstNonEmptyString(out[i].MessageID, out[i].ConversationID)),
+			OriginalName: name,
+		}
+		out[i].FullTextPath = file.Path
+		out[i].FullTextPromptPath = file.PromptPath
+		files = append(files, file)
+	}
+	return out, files, cleanup, nil
+}
+
+func referencedMessageTextFileBody(ref ReferencedMessage) []byte {
+	var b strings.Builder
+	b.WriteString("Referenced Teams message")
+	if ref.Sender != "" {
+		b.WriteString("\nFrom: ")
+		b.WriteString(ref.Sender)
+	}
+	if ref.CreatedDateTime != "" {
+		b.WriteString("\nTime: ")
+		b.WriteString(ref.CreatedDateTime)
+	}
+	if ref.Fetched {
+		b.WriteString("\nSource: Graph full message")
+	} else {
+		b.WriteString("\nSource: Teams reference preview")
+	}
+	b.WriteString("\n\n")
+	b.WriteString(strings.TrimSpace(ref.Text))
+	b.WriteString("\n")
+	return []byte(b.String())
 }
 
 func indentReferencedMessageText(text string) string {

@@ -3598,29 +3598,53 @@ func (b *Bridge) runControlFallbackQueuedTurnFromMessage(ctx context.Context, se
 
 func (b *Bridge) prepareControlFallbackInputFromTeamsMessage(ctx context.Context, session *Session, turnID string, msg ChatMessage, promptText string) (ExecutionInput, func(), string, error) {
 	cleanupHosted := func() {}
-	localFiles, cleanupHostedFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, session.ChatID, msg)
+	cleanupReferenceText := func() {}
+	cleanupAll := func() {
+		cleanupHosted()
+		cleanupReferenceText()
+	}
+	chatID := strings.TrimSpace(firstNonEmptyString(session.ChatID, msg.ChatID, b.reg.ControlChatID))
+	localFiles, cleanupHostedFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, chatID, msg)
 	cleanupHosted = cleanupHostedFiles
 	if err != nil {
 		if message, ok := attachmentDownloadUserMessage(err); ok {
-			return ExecutionInput{}, cleanupHosted, message, nil
+			return ExecutionInput{}, cleanupAll, message, nil
 		}
-		return ExecutionInput{}, cleanupHosted, "", err
+		return ExecutionInput{}, cleanupAll, "", err
 	}
 	if hostedAttachmentMessage != "" {
-		return ExecutionInput{}, cleanupHosted, hostedAttachmentMessage, nil
+		return ExecutionInput{}, cleanupAll, hostedAttachmentMessage, nil
 	}
+	referencedMessages, referencedMessageWarning, err := b.readMessageReferenceAttachments(ctx, chatID, msg)
+	if err != nil {
+		return ExecutionInput{}, cleanupAll, "", err
+	}
+	if referencedMessageWarning != "" {
+		return ExecutionInput{}, cleanupAll, referencedMessageWarning, nil
+	}
+	referencedMessages, referenceTextFiles, cleanupReferenceTextFiles, err := prepareLongReferencedMessageFiles(session, msg, referencedMessages)
+	cleanupReferenceText = cleanupReferenceTextFiles
+	if err != nil {
+		return ExecutionInput{}, cleanupAll, "", err
+	}
+	localFiles = append(localFiles, referenceTextFiles...)
 	transcripts, err := b.transcribeTeamsMediaAttachments(ctx, session, turnID, localFiles)
 	if err != nil {
-		return ExecutionInput{}, cleanupHosted, teamsASRFailureUserMessage(err), nil
+		return ExecutionInput{}, cleanupAll, teamsASRFailureUserMessage(err), nil
 	}
-	b.annotateIncomingUserMessageWithASRTranscripts(ctx, session.ChatID, msg, transcripts)
-	preparedPrompt := promptWithASRTranscripts(promptText, transcripts)
+	b.annotateIncomingUserMessageWithASRTranscripts(ctx, chatID, msg, transcripts)
+	basePrompt := promptText
+	if len(referencedMessages) > 0 {
+		basePrompt = stripReferencedTeamsMessagePromptSection(basePrompt)
+	}
+	preparedPrompt := promptWithASRTranscripts(basePrompt, transcripts)
+	preparedPrompt = PromptWithReferencedMessages(preparedPrompt, referencedMessages)
 	codexFiles := nonTeamsMediaAttachments(localFiles)
 	if strings.TrimSpace(preparedPrompt) == "" && len(codexFiles) > 0 {
 		preparedPrompt = defaultLocalAttachmentPrompt
 	}
 	preparedPrompt = b.controlFallbackCodexPromptForMessage(ctx, preparedPrompt, msg.ID)
-	return ExecutionInputWithLocalAttachments(preparedPrompt, codexFiles), cleanupHosted, "", nil
+	return ExecutionInputWithLocalAttachments(preparedPrompt, codexFiles), cleanupAll, "", nil
 }
 
 func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, error) {
@@ -7637,9 +7661,11 @@ func (b *Bridge) runPreparedQueuedTurnFromMessage(ctx context.Context, session *
 func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, session *Session, turnID string, chatID string, msg ChatMessage, fallbackText string) (ExecutionInput, func(), string, error) {
 	cleanupHosted := func() {}
 	cleanupReference := func() {}
+	cleanupReferenceText := func() {}
 	cleanupAll := func() {
 		cleanupHosted()
 		cleanupReference()
+		cleanupReferenceText()
 	}
 	localFiles, cleanupHostedFiles, hostedAttachmentMessage, err := b.downloadHostedContentAttachments(ctx, session, chatID, msg)
 	cleanupHosted = cleanupHostedFiles
@@ -7671,6 +7697,12 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 	if referencedMessageWarning != "" {
 		return ExecutionInput{}, cleanupAll, referencedMessageWarning, nil
 	}
+	referencedMessages, referenceTextFiles, cleanupReferenceTextFiles, err := prepareLongReferencedMessageFiles(session, msg, referencedMessages)
+	cleanupReferenceText = cleanupReferenceTextFiles
+	if err != nil {
+		return ExecutionInput{}, cleanupAll, "", err
+	}
+	localFiles = append(localFiles, referenceTextFiles...)
 	prompt, promptOK := promptTextFromTeamsMessageOrFallback(msg, fallbackText)
 	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
 		return ExecutionInput{}, cleanupAll, "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it.", nil
