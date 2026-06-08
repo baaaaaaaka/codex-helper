@@ -50,12 +50,13 @@ func TestCheckForUpdateAvailable(t *testing.T) {
 	}
 }
 
-func TestCheckForUpdateFallbackRedirect(t *testing.T) {
+func TestCheckForUpdateUsesRedirectBeforeAPI(t *testing.T) {
 	requireRuntimeAsset(t)
 	tag := "v1.4.0"
 	ver := "1.4.0"
 
-	server := newRedirectReleaseServer(t, "owner/name", tag)
+	apiCalls := 0
+	server := newRedirectReleaseServer(t, "owner/name", tag, &apiCalls)
 	defer server.Close()
 
 	restore := overrideGitHubBases(server.URL)
@@ -75,6 +76,9 @@ func TestCheckForUpdateFallbackRedirect(t *testing.T) {
 	}
 	if st.RemoteTag != tag {
 		t.Fatalf("expected remote tag %s, got %s", tag, st.RemoteTag)
+	}
+	if apiCalls != 0 {
+		t.Fatalf("expected redirect-first latest lookup to skip GitHub API, got %d API calls", apiCalls)
 	}
 }
 
@@ -607,12 +611,15 @@ func newReleaseListServer(t *testing.T, releases []testReleaseAsset) *httptest.S
 	return httptest.NewServer(http.HandlerFunc(handler))
 }
 
-func newRedirectReleaseServer(t *testing.T, repo, tag string) *httptest.Server {
+func newRedirectReleaseServer(t *testing.T, repo, tag string, apiCalls *int) *httptest.Server {
 	t.Helper()
 	tagPath := "/" + repo + "/releases/tag/" + tag
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/repos/") && strings.Contains(r.URL.Path, "/releases/latest"):
+			if apiCalls != nil {
+				*apiCalls = *apiCalls + 1
+			}
 			http.Error(w, "api unavailable", http.StatusServiceUnavailable)
 		case strings.Contains(r.URL.Path, "/releases/latest"):
 			w.Header().Set("Location", tagPath)

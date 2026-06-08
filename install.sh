@@ -727,20 +727,20 @@ get_latest_tag_from_redirect() {
 get_latest_tag() {
   tmp="$1"
   tag=""
-  if http_get "$api_base/repos/$repo/releases/latest" "$tmp"; then
-    if have_cmd sed; then
-      tag="$(sed -n 's/.*\"tag_name\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' "$tmp" | head -n 1 || true)"
-    fi
-  fi
-  if [ -n "${tag:-}" ]; then
-    printf "%s" "$tag"
-    return 0
-  fi
   if tag="$(get_latest_tag_from_redirect)"; then
     if [ -n "${tag:-}" ]; then
       printf "%s" "$tag"
       return 0
     fi
+  fi
+  if http_get "$api_base/repos/$repo/releases/latest" "$tmp"; then
+    if have_cmd sed; then
+      tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -n 1 || true)"
+    fi
+  fi
+  if [ -n "${tag:-}" ]; then
+    printf "%s" "$tag"
+    return 0
   fi
   echo "Failed to determine latest version automatically; pass --version vX.Y.Z" >&2
   return 1

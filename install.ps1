@@ -397,14 +397,8 @@ function New-ProfilePathLine([string]$pathValue) {
 
 function Get-LatestTag([string]$repo) {
   $apiUri = "$apiBase/repos/$repo/releases/latest"
-  try {
-    $resp = Invoke-RestMethod -Uri $apiUri -Headers @{ "User-Agent" = "codex-proxy-install" }
-    if ($resp.tag_name) { return [string]$resp.tag_name }
-  } catch {
-    # Fall back to parsing the redirect URL below.
-  }
-
   $latestUri = "$releaseBase/$repo/releases/latest"
+  $redirectError = $null
   try {
     $resp = Invoke-WebRequest -Uri $latestUri -Headers @{ "User-Agent" = "codex-proxy-install" } -UseBasicParsing
     $finalUri = $resp.BaseResponse.ResponseUri
@@ -414,8 +408,22 @@ function Get-LatestTag([string]$repo) {
         return [string]$tag
       }
     }
+    $redirectError = "missing tag in redirect URL"
   } catch {
-    throw "Failed to determine latest tag from $latestUri"
+    $redirectError = $_.Exception.Message
+  }
+
+  $apiError = $null
+  try {
+    $resp = Invoke-RestMethod -Uri $apiUri -Headers @{ "User-Agent" = "codex-proxy-install" }
+    if ($resp.tag_name) { return [string]$resp.tag_name }
+    $apiError = "missing tag_name in GitHub API response"
+  } catch {
+    $apiError = $_.Exception.Message
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($redirectError) -or -not [string]::IsNullOrWhiteSpace($apiError)) {
+    throw "Failed to determine latest tag from $latestUri; API fallback $apiUri failed: $apiError"
   }
 
   throw "Failed to determine latest tag from $apiUri"
