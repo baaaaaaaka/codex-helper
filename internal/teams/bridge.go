@@ -10058,11 +10058,10 @@ func (b *Bridge) canQueueLiveTurnOutbox(ctx context.Context, sessionID string, t
 	if b == nil || b.store == nil || strings.TrimSpace(turnID) == "" {
 		return true
 	}
-	state, err := b.store.Load(ctx)
+	turn, ok, err := b.store.TurnByID(ctx, turnID)
 	if err != nil {
 		return true
 	}
-	turn, ok := state.Turns[turnID]
 	if !ok {
 		return false
 	}

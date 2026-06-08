@@ -3,6 +3,7 @@ package teams
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19956,6 +19957,213 @@ func TestBridgeRunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheck
 	}
 	if turn := state.Turns["turn-active"]; turn.Status != teamstore.TurnStatusRunning {
 		t.Fatalf("turn status = %q, want running", turn.Status)
+	}
+}
+
+func TestBridgeCanQueueLiveTurnOutboxChecksTargetTurn(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	seedBridgeCanQueueLiveTurnOutboxFixtures(t, ctx, store)
+
+	if !bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-running") {
+		t.Fatal("running turn was not queueable")
+	}
+	if bridge.canQueueLiveTurnOutbox(ctx, "session-2", "turn-running") {
+		t.Fatal("turn with mismatched session was queueable")
+	}
+	if bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-completed") {
+		t.Fatal("completed turn was queueable")
+	}
+	if bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-missing") {
+		t.Fatal("missing turn was queueable")
+	}
+}
+
+func TestBridgeCanQueueLiveTurnOutboxChecksTargetTurnSQLite(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	seedBridgeCanQueueLiveTurnOutboxFixtures(t, ctx, store)
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+
+	if !bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-running") {
+		t.Fatal("SQLite running turn was not queueable")
+	}
+	if bridge.canQueueLiveTurnOutbox(ctx, "session-2", "turn-running") {
+		t.Fatal("SQLite turn with mismatched session was queueable")
+	}
+	if bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-completed") {
+		t.Fatal("SQLite completed turn was queueable")
+	}
+	if bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-missing") {
+		t.Fatal("SQLite missing turn was queueable")
+	}
+}
+
+func TestBridgeCanQueueLiveTurnOutboxIgnoresUnrelatedSQLiteCorruption(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	seedBridgeCanQueueLiveTurnOutboxFixtures(t, ctx, store)
+	if _, _, err := store.PersistInbound(ctx, teamstore.InboundEvent{
+		ID:             "inbound-corrupt",
+		TeamsChatID:    "chat-hot",
+		TeamsMessageID: "message-corrupt",
+		Status:         teamstore.InboundStatusPersisted,
+	}); err != nil {
+		t.Fatalf("PersistInbound corrupt target error: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	corruptSQLiteInboundEventJSON(t, store, "inbound-corrupt")
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("Store.Load unexpectedly succeeded with corrupt unrelated inbound row")
+	}
+
+	if bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-completed") {
+		t.Fatal("completed turn was queueable after unrelated SQLite corruption")
+	}
+}
+
+func seedBridgeCanQueueLiveTurnOutboxFixtures(t testing.TB, ctx context.Context, store *teamstore.Store) {
+	t.Helper()
+	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{ID: "session-1", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession session-1 error: %v", err)
+	}
+	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{ID: "session-2", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-2"}); err != nil {
+		t.Fatalf("CreateSession session-2 error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(ctx, teamstore.Turn{ID: "turn-running", SessionID: "session-1", Status: teamstore.TurnStatusRunning}); err != nil {
+		t.Fatalf("QueueTurn running error: %v", err)
+	}
+	if _, _, err := store.QueueTurn(ctx, teamstore.Turn{ID: "turn-completed", SessionID: "session-1", Status: teamstore.TurnStatusCompleted}); err != nil {
+		t.Fatalf("QueueTurn completed error: %v", err)
+	}
+}
+
+func corruptSQLiteInboundEventJSON(t testing.TB, store *teamstore.Store, inboundID string) {
+	t.Helper()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close sqlite store before corruption: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), "store.sqlite"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	defer db.Close()
+	result, err := db.Exec(`UPDATE inbound_events SET json = ? WHERE id = ?`, []byte("{"), inboundID)
+	if err != nil {
+		t.Fatalf("corrupt sqlite inbound row: %v", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		t.Fatalf("corrupt sqlite inbound rows affected: %v", err)
+	} else if rows != 1 {
+		t.Fatalf("corrupt sqlite inbound rows affected = %d, want 1", rows)
+	}
+}
+
+func BenchmarkBridgeCanQueueLiveTurnOutboxSQLiteLargeHistory(b *testing.B) {
+	ctx := context.Background()
+	store, err := teamstore.Open(filepath.Join(b.TempDir(), "state.json"))
+	if err != nil {
+		b.Fatalf("Open store error: %v", err)
+	}
+	b.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			b.Fatalf("Close store: %v", err)
+		}
+	})
+	now := time.Now()
+	const historyRows = 12000
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions["session-1"] = teamstore.SessionContext{
+			ID:           "session-1",
+			Status:       teamstore.SessionStatusActive,
+			TeamsChatID:  "chat-1",
+			LatestTurnID: "turn-running",
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		state.Turns["turn-running"] = teamstore.Turn{
+			ID:        "turn-running",
+			SessionID: "session-1",
+			Status:    teamstore.TurnStatusRunning,
+			QueuedAt:  now,
+			StartedAt: now,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		payload := strings.Repeat("history ", 24)
+		for i := 0; i < historyRows; i++ {
+			id := fmt.Sprintf("%05d", i)
+			inboundID := "inbound:" + id
+			outboxID := "outbox:" + id
+			state.InboundEvents[inboundID] = teamstore.InboundEvent{
+				ID:             inboundID,
+				SessionID:      "session-1",
+				TeamsChatID:    "chat-history",
+				TeamsMessageID: "teams-inbound-" + id,
+				Text:           payload,
+				Status:         teamstore.InboundStatusPersisted,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			state.HelperDeliveries["helper:"+id] = teamstore.HelperDeliveryRecord{
+				ID:             "helper:" + id,
+				SessionID:      "session-1",
+				TeamsChatID:    "chat-history",
+				TurnID:         "turn-running",
+				OutboxID:       outboxID,
+				TeamsMessageID: "teams-helper-" + id,
+				Kind:           "codex-progress",
+				Status:         teamstore.HelperDeliveryStatusSent,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				SentAt:         now,
+			}
+			state.TranscriptDeliveries["transcript:"+id] = teamstore.TranscriptDeliveryRecord{
+				ID:             "transcript:" + id,
+				SessionID:      "session-1",
+				OutboxID:       outboxID,
+				TeamsMessageID: "teams-transcript-" + id,
+				Kind:           "assistant",
+				TextHash:       "hash-" + id,
+				Status:         teamstore.TranscriptDeliveryStatusSent,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				SentAt:         now,
+			}
+			state.MessageProvenance["provenance:"+id] = teamstore.MessageProvenanceRecord{
+				ID:             "provenance:" + id,
+				TeamsChatID:    "chat-history",
+				TeamsMessageID: "teams-provenance-" + id,
+				Origin:         teamstore.MessageOriginHelperOutbox,
+				SessionID:      "session-1",
+				OutboxID:       outboxID,
+				Kind:           "sent",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+		}
+		return nil
+	}); err != nil {
+		b.Fatalf("seed state error: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		b.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !bridge.canQueueLiveTurnOutbox(ctx, "session-1", "turn-running") {
+			b.Fatal("running turn was not queueable")
+		}
 	}
 }
 
