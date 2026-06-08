@@ -15,11 +15,11 @@ import (
 	"testing"
 )
 
-func TestInstallPs1LatestViaAPI(t *testing.T) {
+func TestInstallPs1LatestViaRedirect(t *testing.T) {
 	runInstallPs1(t, false, false)
 }
 
-func TestInstallPs1LatestViaRedirect(t *testing.T) {
+func TestInstallPs1LatestSurvivesAPIUnavailable(t *testing.T) {
 	runInstallPs1(t, true, false)
 }
 

@@ -13,12 +13,25 @@ import (
 	"testing"
 )
 
-func TestInstallShLatestViaAPI(t *testing.T) {
-	runInstallSh(t, false, false)
+func TestInstallShLatestUsesRedirectBeforeAPI(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	apiHitsPath := filepath.Join(t.TempDir(), "api-hits.txt")
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_API_HITS", apiHitsPath)
+
+	runInstallShCommand(t, run)
+
+	assertFileMissingOrEmpty(t, apiHitsPath)
 }
 
-func TestInstallShLatestViaRedirect(t *testing.T) {
-	runInstallSh(t, true, false)
+func TestInstallShLatestFallsBackToAPIWhenRedirectUnavailable(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	apiHitsPath := filepath.Join(t.TempDir(), "api-hits.txt")
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_API_HITS", apiHitsPath)
+	run.env = overrideEnv(run.env, "CODEX_PROXY_TEST_LATEST_URL", "https://github.com/owner/name/releases/latest")
+
+	runInstallShCommand(t, run)
+
+	assertFileContains(t, apiHitsPath, "api\n")
 }
 
 func TestInstallShKeepsPathSetupWhenInstallDirAlreadySet(t *testing.T) {
@@ -924,6 +937,9 @@ fi
 
 case "$url" in
   *"/repos/"*"/releases/latest")
+    if [ -n "${CODEX_PROXY_TEST_API_HITS:-}" ]; then
+      printf "api\n" >> "$CODEX_PROXY_TEST_API_HITS"
+    fi
     if [ "${CODEX_PROXY_TEST_API_FAIL:-}" = "1" ]; then
       exit 22
     fi
@@ -989,6 +1005,31 @@ func runInstallShCommandWithCmd(t *testing.T, cmd *exec.Cmd) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install.sh failed: %v\n%s", err, string(output))
+	}
+}
+
+func assertFileMissingOrEmpty(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("expected %s to be empty or absent, got %q", path, string(data))
+	}
+}
+
+func assertFileContains(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("expected %s to contain %q, got %q", path, want, string(data))
 	}
 }
 

@@ -338,17 +338,17 @@ func normalizeVersion(v string) string {
 }
 
 func fetchLatestRelease(ctx context.Context, repo string, timeout time.Duration) (string, string, error) {
-	tag, ver, err := fetchLatestReleaseAPI(ctx, repo, timeout)
-	if err == nil {
-		return tag, ver, nil
-	}
-
 	tag, ver, redirectErr := fetchLatestReleaseRedirect(ctx, repo, timeout)
 	if redirectErr == nil {
 		return tag, ver, nil
 	}
 
-	return "", "", fmt.Errorf("release lookup failed: %v; redirect fallback failed: %v", err, redirectErr)
+	tag, ver, err := fetchLatestReleaseAPI(ctx, repo, timeout)
+	if err == nil {
+		return tag, ver, nil
+	}
+
+	return "", "", fmt.Errorf("release redirect lookup failed: %v; API fallback failed: %v", redirectErr, err)
 }
 
 func fetchLatestReleaseAPI(ctx context.Context, repo string, timeout time.Duration) (string, string, error) {
