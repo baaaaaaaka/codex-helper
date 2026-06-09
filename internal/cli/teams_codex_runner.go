@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +16,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
+
+const teamsCodexStderrCaptureBytes = 1 << 20
 
 type teamsCodexExecutor struct {
 	runner               codexrunner.Runner
@@ -294,8 +295,13 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 		command = "codex"
 	}
 	cmdArgs := append([]string{command}, req.Args...)
-	var stderr bytes.Buffer
+	stderr := &limitedBuffer{max: teamsCodexStderrCaptureBytes}
 	stdout := codexrunner.NewLaunchOutputRecorderWithOptions(req.EventHandler, codexrunner.LaunchOutputOptions{IncludeCommandOutput: false, RecoverParseErrors: true})
+	launchResult := func(exitCode int) codexrunner.LaunchResult {
+		result := stdout.LaunchResult(stderr.Bytes(), exitCode)
+		result.StderrTruncated = stderr.Truncated()
+		return result
+	}
 
 	log := l.log
 	if log == nil {
@@ -341,7 +347,7 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 		Log:                  log,
 		Stdin:                strings.NewReader(req.Stdin),
 		Stdout:               stdoutWriter,
-		Stderr:               &stderr,
+		Stderr:               stderr,
 		YoloEnabled:          true,
 		RequireYolo:          true,
 		ModelProfileRef:      l.modelProfileRef,
@@ -352,14 +358,14 @@ func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRe
 	if useProxy {
 		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, proxyRef, true, log)
 		if err != nil {
-			return stdout.LaunchResult(stderr.Bytes(), 0), err
+			return launchResult(0), err
 		}
 		runErr = runWithProfileOptions(ctx, store, profile, cfgWithProfile.Instances, cmdArgs, opts)
 	} else {
-		runErr = runTeamsCodexDirect(ctx, store, cmdArgs, log, stdoutWriter, &stderr, opts)
+		runErr = runTeamsCodexDirect(ctx, store, cmdArgs, log, stdoutWriter, stderr, opts)
 	}
 
-	result := stdout.LaunchResult(stderr.Bytes(), 0)
+	result := launchResult(0)
 	if runErr == nil {
 		return result, nil
 	}

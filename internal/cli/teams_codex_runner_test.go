@@ -144,6 +144,60 @@ func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexLauncherCapsStderrCI(t *testing.T) {
+	lockCLITestHooks(t)
+	if os.PathSeparator != '/' {
+		t.Skip("shell stub test uses POSIX script")
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false), YoloEnabled: boolPtr(false)}); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	binDir := t.TempDir()
+	codexPath := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	codexDir := t.TempDir()
+	setTestCodexHomeEnv(t, codexDir)
+	writeFakeCache(t, codexDir)
+	writeTestAuthJSON(t, codexDir, true)
+
+	prevRun := runTargetWithFallbackWithOptionsFn
+	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRun })
+	runTargetWithFallbackWithOptionsFn = func(_ context.Context, _ []string, _ string, _ func() error, _ <-chan error, opts runTargetOptions) error {
+		_, _ = opts.Stderr.Write([]byte(strings.Repeat("x", teamsCodexStderrCaptureBytes+4096)))
+		_, _ = opts.Stderr.Write([]byte("tail-marker"))
+		return errors.New("codex exited after noisy stderr")
+	}
+
+	launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard}
+	result, err := launcher.Launch(context.Background(), codexrunner.LaunchRequest{
+		Command: codexPath,
+		Args:    []string{"exec", "--json", "-"},
+		Dir:     t.TempDir(),
+		Stdin:   "prompt text",
+	})
+	if err == nil {
+		t.Fatal("Launch error = nil, want noisy stderr helper error")
+	}
+	if !result.StderrTruncated {
+		t.Fatal("StderrTruncated = false, want true")
+	}
+	if len(result.Stderr) > teamsCodexStderrCaptureBytes {
+		t.Fatalf("stderr len = %d, want <= %d", len(result.Stderr), teamsCodexStderrCaptureBytes)
+	}
+	if !strings.Contains(string(result.Stderr), "tail-marker") {
+		t.Fatal("stderr tail marker missing after truncation")
+	}
+}
+
 func TestTeamsCodexLauncherModelProfileWithoutSSHRespectsDisabledProxyPreferenceCI(t *testing.T) {
 	lockCLITestHooks(t)
 	if os.PathSeparator != '/' {

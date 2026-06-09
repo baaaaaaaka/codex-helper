@@ -89,6 +89,8 @@ var (
 	teamsServiceWatchdogStatePath       = defaultTeamsServiceWatchdogStatePath
 	teamsServiceWatchdogCollectSnapshot = collectTeamsServiceWatchdogSnapshot
 	teamsServiceWatchdogStorePaths      = existingTeamsStorePaths
+	teamsServiceWatchdogInstalled       = teamsServiceInstalled
+	teamsServiceWatchdogActive          = teamsServiceActive
 	teamsServiceWatchdogStartService    = startTeamsPrimaryService
 )
 
@@ -211,13 +213,13 @@ func normalizeTeamsServiceWatchdogOptions(opts teamsServiceWatchdogOptions) team
 
 func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
 	var snapshot teamsServiceWatchdogSnapshot
-	installed, err := teamsServiceInstalled()
+	installed, err := teamsServiceWatchdogInstalled()
 	if err != nil {
 		return snapshot, err
 	}
 	snapshot.Installed = installed
 	if installed {
-		active, err := teamsServiceActive(ctx)
+		active, err := teamsServiceWatchdogActive(ctx)
 		if err != nil {
 			return snapshot, err
 		}
@@ -228,11 +230,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		return snapshot, err
 	}
 	for _, path := range paths {
-		st, err := teamsstore.Open(path)
-		if err != nil {
-			return snapshot, err
-		}
-		state, err := st.Load(ctx)
+		state, err := loadTeamsStoreStateAndClose(ctx, path)
 		if err != nil {
 			return snapshot, err
 		}

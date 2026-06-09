@@ -556,7 +556,7 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 	return cmd
 }
 
-func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout time.Duration) error {
+func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout time.Duration) (err error) {
 	paths, err := existingTeamsStorePaths()
 	if err != nil {
 		return err
@@ -566,6 +566,13 @@ func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout
 		St   *teamsstore.Store
 	}
 	var stores []recreateStore
+	defer func() {
+		for _, item := range stores {
+			if closeErr := item.St.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}
+	}()
 	for _, path := range paths {
 		st, err := teamsstore.Open(path)
 		if err != nil {
@@ -573,17 +580,20 @@ func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout
 		}
 		state, err := st.Load(ctx)
 		if err != nil {
-			return err
+			return closeTeamsStoreWithPriorError(st, err)
 		}
 		owner, hasOwner := stateOwner(state)
 		if !hasOwner {
+			if err := st.Close(); err != nil {
+				return err
+			}
 			continue
 		}
 		if teamsstore.IsStale(owner, defaultTeamsOwnerStaleAfter, time.Now()) {
-			return fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before recreating chats", path)
+			return closeTeamsStoreWithPriorError(st, fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before recreating chats", path))
 		}
 		if _, err := st.SetDraining(ctx, "chat recreate"); err != nil {
-			return err
+			return closeTeamsStoreWithPriorError(st, err)
 		}
 		stores = append(stores, recreateStore{Path: path, St: st})
 	}
@@ -1030,7 +1040,7 @@ func markLegacyLocalSupervisorActivationSuccessIfPending(observedSupervisorEnv s
 	return writeTeamsServiceLocalSupervisorActivation(activation)
 }
 
-func queueLegacyLocalSupervisorActivationAttentionNotice(ctx context.Context, registryPath string, activation teamsServiceLocalSupervisorActivation) error {
+func queueLegacyLocalSupervisorActivationAttentionNotice(ctx context.Context, registryPath string, activation teamsServiceLocalSupervisorActivation) (err error) {
 	status := strings.TrimSpace(activation.Status)
 	if status != "failed" && status != "expired" {
 		return nil
@@ -1043,6 +1053,11 @@ func queueLegacyLocalSupervisorActivationAttentionNotice(ctx context.Context, re
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := st.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	state, err := st.Load(ctx)
 	if err != nil {
 		return err
@@ -1276,6 +1291,7 @@ func newTeamsPauseCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer func() { _ = closeTeamsStoreHandles(stores) }()
 			var control teamsstore.ServiceControl
 			for _, item := range stores {
 				control, err = item.Store.SetPaused(cmd.Context(), true, strings.Join(args, " "))
@@ -1299,6 +1315,7 @@ func newTeamsResumeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer func() { _ = closeTeamsStoreHandles(stores) }()
 			var control teamsstore.ServiceControl
 			for _, item := range stores {
 				control, err = item.Store.SetPaused(cmd.Context(), false, "")
@@ -1326,6 +1343,7 @@ func newTeamsDrainCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer func() { _ = closeTeamsStoreHandles(stores) }()
 			var control teamsstore.ServiceControl
 			for _, item := range stores {
 				control, err = item.Store.SetDraining(cmd.Context(), strings.Join(args, " "))
@@ -1383,42 +1401,8 @@ func recoverTeamsStores(ctx context.Context, force bool, staleAfter time.Duratio
 	}
 	var summary teamsRecoverSummary
 	for _, path := range paths {
-		st, err := teamsstore.Open(path)
-		if err != nil {
+		if err := recoverTeamsStore(ctx, path, force, staleAfter, &summary); err != nil {
 			return teamsRecoverSummary{}, err
-		}
-		owner, ok, err := st.ReadOwner(ctx)
-		if err != nil {
-			return teamsRecoverSummary{}, err
-		}
-		if ok && !force && !teamsstore.IsStale(owner, staleAfter, time.Now()) {
-			return teamsRecoverSummary{}, fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s active_session=%s active_turn=%s; run `teams drain` first or use `teams recover --force` if the process is gone", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID)
-		}
-		if ok && (force || teamsstore.IsStale(owner, staleAfter, time.Now())) {
-			if err := st.ClearOwner(ctx); err != nil {
-				return teamsRecoverSummary{}, err
-			}
-			summary.ClearedOwners = append(summary.ClearedOwners, fmt.Sprintf("%s pid=%d host=%s active_session=%s active_turn=%s", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID))
-		}
-		report, err := st.Recover(ctx)
-		if err != nil {
-			return teamsRecoverSummary{}, err
-		}
-		for _, id := range report.InterruptedTurnIDs {
-			summary.RecoveredTurns = append(summary.RecoveredTurns, path+" "+id)
-		}
-		for _, id := range report.SupersededOutboxIDs {
-			summary.SupersededOutbox = append(summary.SupersededOutbox, path+" "+id)
-		}
-		for _, id := range report.PreservedOutboxBlockerIDs {
-			summary.PreservedOutbox = append(summary.PreservedOutbox, path+" "+id)
-		}
-		state, err := st.Load(ctx)
-		if err != nil {
-			return teamsRecoverSummary{}, err
-		}
-		if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
-			summary.RemainingBlockers = append(summary.RemainingBlockers, path+" "+teamsUpgradeBlockerSummary(blockers))
 		}
 	}
 	sort.Strings(summary.ClearedOwners)
@@ -1427,6 +1411,52 @@ func recoverTeamsStores(ctx context.Context, force bool, staleAfter time.Duratio
 	sort.Strings(summary.PreservedOutbox)
 	sort.Strings(summary.RemainingBlockers)
 	return summary, nil
+}
+
+func recoverTeamsStore(ctx context.Context, path string, force bool, staleAfter time.Duration, summary *teamsRecoverSummary) (err error) {
+	st, err := teamsstore.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := st.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+	owner, ok, err := st.ReadOwner(ctx)
+	if err != nil {
+		return err
+	}
+	if ok && !force && !teamsstore.IsStale(owner, staleAfter, time.Now()) {
+		return fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s active_session=%s active_turn=%s; run `teams drain` first or use `teams recover --force` if the process is gone", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID)
+	}
+	if ok && (force || teamsstore.IsStale(owner, staleAfter, time.Now())) {
+		if err := st.ClearOwner(ctx); err != nil {
+			return err
+		}
+		summary.ClearedOwners = append(summary.ClearedOwners, fmt.Sprintf("%s pid=%d host=%s active_session=%s active_turn=%s", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID))
+	}
+	report, err := st.Recover(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range report.InterruptedTurnIDs {
+		summary.RecoveredTurns = append(summary.RecoveredTurns, path+" "+id)
+	}
+	for _, id := range report.SupersededOutboxIDs {
+		summary.SupersededOutbox = append(summary.SupersededOutbox, path+" "+id)
+	}
+	for _, id := range report.PreservedOutboxBlockerIDs {
+		summary.PreservedOutbox = append(summary.PreservedOutbox, path+" "+id)
+	}
+	state, err := st.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if blockers := teamsUpgradeBlockers(state); len(blockers) > 0 {
+		summary.RemainingBlockers = append(summary.RemainingBlockers, path+" "+teamsUpgradeBlockerSummary(blockers))
+	}
+	return nil
 }
 
 func printTeamsRecoverSummary(out io.Writer, summary teamsRecoverSummary) {
@@ -1948,11 +1978,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	var serviceControls []teamsstore.ServiceControl
 	var controlLeases []string
 	for _, statePath := range statePaths {
-		st, err := teamsstore.Open(statePath)
-		if err != nil {
-			return err
-		}
-		state, err := st.Load(cmd.Context())
+		state, err := loadTeamsStoreStateAndClose(cmd.Context(), statePath)
 		if err != nil {
 			return err
 		}
@@ -2258,11 +2284,7 @@ func printTeamsControlChatLocal(cmd *cobra.Command, registryPath string) error {
 		return err
 	}
 	for _, statePath := range statePaths {
-		st, err := teamsstore.Open(statePath)
-		if err != nil {
-			return err
-		}
-		state, err := st.Load(cmd.Context())
+		state, err := loadTeamsStoreStateAndClose(cmd.Context(), statePath)
 		if err != nil {
 			return err
 		}
@@ -2754,6 +2776,7 @@ func openTeamsStoresForControl() ([]teamsStoreHandle, error) {
 	for _, path := range paths {
 		st, err := teamsstore.Open(path)
 		if err != nil {
+			_ = closeTeamsStoreHandles(out)
 			return nil, err
 		}
 		out = append(out, teamsStoreHandle{Path: path, Store: st})

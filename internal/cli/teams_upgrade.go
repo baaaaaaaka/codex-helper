@@ -48,11 +48,7 @@ func ensureTeamsIdleBeforeCodexUpgrade(ctx context.Context) error {
 		return err
 	}
 	for _, path := range paths {
-		st, err := teamsstore.Open(path)
-		if err != nil {
-			return err
-		}
-		state, err := st.Load(ctx)
+		state, err := loadTeamsStoreStateAndClose(ctx, path)
 		if err != nil {
 			return err
 		}
@@ -101,61 +97,83 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 		Req  teamsstore.UpgradeRequest
 	}
 	var stores []upgradeStore
+	closeStores := func() error {
+		var firstErr error
+		for _, item := range stores {
+			if item.St == nil {
+				continue
+			}
+			if err := item.St.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+	fail := func(err error) (teamsUpgradeFinalizer, error) {
+		if closeErr := closeStores(); err == nil {
+			err = closeErr
+		}
+		return nil, err
+	}
 	for _, path := range paths {
 		st, err := teamsstore.Open(path)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 		state, err := st.Load(ctx)
 		if err != nil {
-			return nil, err
+			return fail(closeTeamsStoreWithPriorError(st, err))
 		}
 		owner, hasOwner := stateOwner(state)
 		if !hasOwner {
 			if helperUpgradeNeedsRescue(state) {
 				report, rescueErr := st.RescueForUpgrade(ctx, teamsstore.UpgradeRescueOptions{Reason: teamsUpgradeDrainReason, StaleAfter: 2 * time.Minute})
 				if rescueErr != nil {
-					return nil, rescueErr
+					return fail(closeTeamsStoreWithPriorError(st, rescueErr))
 				}
 				if out != nil {
 					printTeamsUpgradeRescueReport(out, path, report)
 				}
 				state, err = st.Load(ctx)
 				if err != nil {
-					return nil, err
+					return fail(closeTeamsStoreWithPriorError(st, err))
 				}
 				if blockers := helperUpgradeBlockers(state); len(blockers) > 0 {
 					_, _ = st.AbortUpgrade(context.Background(), report.Upgrade.ID, "helper upgrade rescue left protected Teams work")
-					return nil, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))
+					return fail(closeTeamsStoreWithPriorError(st, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))))
 				}
 				if report.Upgrade.ID != "" {
 					stores = append(stores, upgradeStore{Path: path, St: st, Req: report.Upgrade})
+				} else if err := st.Close(); err != nil {
+					return fail(err)
 				}
+			} else if err := st.Close(); err != nil {
+				return fail(err)
 			}
 			continue
 		}
 		if teamsstore.IsStale(owner, 2*time.Minute, time.Now()) {
 			report, rescueErr := st.RescueForUpgrade(ctx, teamsstore.UpgradeRescueOptions{Reason: teamsUpgradeDrainReason, StaleAfter: 2 * time.Minute})
 			if rescueErr != nil {
-				return nil, rescueErr
+				return fail(closeTeamsStoreWithPriorError(st, rescueErr))
 			}
 			if out != nil {
 				printTeamsUpgradeRescueReport(out, path, report)
 			}
 			state, err = st.Load(ctx)
 			if err != nil {
-				return nil, err
+				return fail(closeTeamsStoreWithPriorError(st, err))
 			}
 			if blockers := helperUpgradeBlockers(state); len(blockers) > 0 {
 				_, _ = st.AbortUpgrade(context.Background(), report.Upgrade.ID, "helper upgrade rescue left protected Teams work")
-				return nil, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))
+				return fail(closeTeamsStoreWithPriorError(st, fmt.Errorf("Teams upgrade paused because protected Teams work remains in %s: %s", path, teamsUpgradeBlockerSummary(blockers))))
 			}
 			stores = append(stores, upgradeStore{Path: path, St: st, Req: report.Upgrade})
 			continue
 		}
 		req, err := st.BeginUpgrade(ctx, teamsUpgradeDrainReason, timeout)
 		if err != nil {
-			return nil, err
+			return fail(closeTeamsStoreWithPriorError(st, err))
 		}
 		stores = append(stores, upgradeStore{Path: path, St: st, Req: req})
 	}
@@ -181,6 +199,9 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 				firstErr = err
 			}
 		}
+		if err := closeStores(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 		return firstErr
 	}
 	if timeout <= 0 {
@@ -195,7 +216,7 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 		for _, item := range stores {
 			itemDrained, err := teamsUpgradeStateDrained(ctx, item.St)
 			if err != nil {
-				return nil, err
+				return fail(err)
 			}
 			if !itemDrained {
 				drained = false
@@ -266,11 +287,7 @@ func helperUpgradeNeedsNoopRescue(ctx context.Context) (bool, error) {
 	}
 	now := time.Now()
 	for _, path := range paths {
-		st, err := teamsstore.Open(path)
-		if err != nil {
-			return false, err
-		}
-		state, err := st.Load(ctx)
+		state, err := loadTeamsStoreStateAndClose(ctx, path)
 		if err != nil {
 			return false, err
 		}

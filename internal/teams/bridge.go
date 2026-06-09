@@ -56,6 +56,7 @@ const (
 	transcriptImportMaxBatchesPerCycle         = 1
 	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
 	mainLoopOutboxFlushMaxMessages             = 2
+	outboxFlushPendingPageSize                 = 64
 	mainLoopWorkflowFlushMaxNotifications      = 1
 	maxQueuedTurnStartsPerCycle                = 16
 	parkNoticeGraphFallbackLookupTTL           = 5 * time.Minute
@@ -9309,7 +9310,7 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 	}
 	if preFinalQueued > 0 || len(queued) > 0 {
 		if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
-			if isOutboxDeliveryDeferred(err) || isGraphRateLimitError(err) {
+			if isOutboxDeliveryDeferred(err) || isGraphTransientServerError(err) {
 				if b.out != nil {
 					_, _ = fmt.Fprintf(b.out, "Teams final outbox delivery deferred: %v\n", err)
 				}
@@ -10025,8 +10026,8 @@ func (f *codexEventForwarder) send(kind string, text string) error {
 			}
 			return nil
 		}
-		if f.err == nil {
-			f.err = err
+		if f.bridge != nil && f.bridge.out != nil {
+			_, _ = fmt.Fprintf(f.bridge.out, "Teams Codex stream outbox send error: %v\n", err)
 		}
 	}
 	return err
@@ -11735,48 +11736,62 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 	b.outboxFlushMu.Lock()
 	err := func() error {
 		defer b.outboxFlushMu.Unlock()
-		pending, err := b.store.PendingOutbox(ctx)
-		if err != nil {
-			return err
-		}
-		sort.Slice(pending, func(i, j int) bool {
-			if pending[i].TeamsChatID != pending[j].TeamsChatID {
-				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
-			}
-			if pending[i].Sequence != pending[j].Sequence {
-				return pending[i].Sequence < pending[j].Sequence
-			}
-			return pending[i].CreatedAt.Before(pending[j].CreatedAt)
-		})
 		var firstErr error
 		var firstBlockedErr error
 		sent := 0
-		for _, msg := range pending {
-			if chatID != "" && msg.TeamsChatID != chatID {
-				continue
+		pageLimit := outboxFlushPendingPageSize
+		if opts.MaxMessages > 0 && opts.MaxMessages < pageLimit {
+			pageLimit = opts.MaxMessages
+		}
+		query := teamstore.PendingOutboxQuery{
+			SessionID:   strings.TrimSpace(sessionID),
+			TurnID:      strings.TrimSpace(turnID),
+			TeamsChatID: strings.TrimSpace(chatID),
+			Limit:       pageLimit,
+		}
+		for {
+			page, err := b.store.PendingOutboxPageAt(ctx, query)
+			if err != nil {
+				return err
 			}
-			if sessionID != "" && msg.SessionID != sessionID {
-				continue
-			}
-			if turnID != "" && msg.TurnID != turnID {
-				continue
-			}
-			if err := b.sendQueuedOutboxWithOptions(ctx, msg, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, SentSideEffects: &sentSideEffects}); err != nil {
-				if isOutboxDeliveryDeferred(err) {
-					if firstBlockedErr == nil {
-						firstBlockedErr = err
+			pending := page.Messages
+			sort.Slice(pending, func(i, j int) bool {
+				if pending[i].TeamsChatID != pending[j].TeamsChatID {
+					return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+				}
+				if pending[i].Sequence != pending[j].Sequence {
+					return pending[i].Sequence < pending[j].Sequence
+				}
+				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+			})
+			for _, msg := range pending {
+				if err := b.sendQueuedOutboxWithOptions(ctx, msg, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, SentSideEffects: &sentSideEffects}); err != nil {
+					if isOutboxDeliveryDeferred(err) {
+						if firstBlockedErr == nil {
+							firstBlockedErr = err
+						}
+						continue
+					}
+					if firstErr == nil {
+						firstErr = err
 					}
 					continue
 				}
-				if firstErr == nil {
-					firstErr = err
+				sent++
+				if opts.MaxMessages > 0 && sent >= opts.MaxMessages {
+					break
 				}
-				continue
 			}
-			sent++
 			if opts.MaxMessages > 0 && sent >= opts.MaxMessages {
 				break
 			}
+			if !page.More {
+				break
+			}
+			if page.NextCursor.IsZero() {
+				return fmt.Errorf("pending outbox pagination did not advance")
+			}
+			query.After = page.NextCursor
 		}
 		if firstErr != nil {
 			return firstErr
@@ -12623,6 +12638,11 @@ func isGraphRateLimitError(err error) bool {
 	return errors.As(err, &graphErr) && graphErr.StatusCode == 429
 }
 
+func isGraphTransientServerError(err error) bool {
+	var graphErr *GraphStatusError
+	return errors.As(err, &graphErr) && graphErr.StatusCode >= 500 && graphErr.StatusCode <= 599
+}
+
 func (b *Bridge) chatBlockedUntil(ctx context.Context, chatID string) (time.Time, bool) {
 	if b.store == nil || strings.TrimSpace(chatID) == "" {
 		return time.Time{}, false
@@ -12675,19 +12695,7 @@ func (b *Bridge) recordGraphRateLimit(ctx context.Context, chatID string, outbox
 	if graphErr.RetryAfter <= 0 {
 		blockedUntil = time.Now().Add(30 * time.Second)
 	}
-	_, _ = b.store.SetChatRateLimit(ctx, chatID, blockedUntil, graphErr.Error())
-	if outboxID != "" {
-		_ = b.store.Update(ctx, func(state *teamstore.State) error {
-			limit := state.ChatRateLimits[chatID]
-			limit.ChatID = chatID
-			limit.BlockedUntil = blockedUntil
-			limit.Reason = graphErr.Error()
-			limit.PoisonOutboxID = outboxID
-			limit.UpdatedAt = time.Now()
-			state.ChatRateLimits[chatID] = limit
-			return nil
-		})
-	}
+	_, _ = b.store.SetChatRateLimitForOutbox(ctx, chatID, blockedUntil, graphErr.Error(), outboxID)
 }
 
 func (b *Bridge) formatSessionList() string {

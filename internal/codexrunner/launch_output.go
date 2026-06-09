@@ -3,6 +3,7 @@ package codexrunner
 import "io"
 
 const defaultLaunchStdoutCaptureBytes = 1 << 20
+const defaultLaunchStderrCaptureBytes = 1 << 20
 
 type LaunchOutputRecorder struct {
 	stdout boundedOutputBuffer

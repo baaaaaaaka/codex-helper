@@ -244,6 +244,55 @@ func TestEventStreamCollectorFinishesPartialFinalLine(t *testing.T) {
 	}
 }
 
+func TestEventStreamCollectorCapsOversizedPendingLine(t *testing.T) {
+	oldLimit := eventStreamMaxPendingLineBytes
+	eventStreamMaxPendingLineBytes = 256
+	t.Cleanup(func() { eventStreamMaxPendingLineBytes = oldLimit })
+
+	collector := NewEventStreamCollectorWithOptions(nil, nil, EventStreamOptions{RecoverParseErrors: true})
+	if _, err := collector.Write([]byte(strings.Repeat("x", 512))); err != nil {
+		t.Fatalf("write oversized partial line: %v", err)
+	}
+	if len(collector.pending) > eventStreamMaxPendingLineBytes {
+		t.Fatalf("pending len = %d, want <= %d", len(collector.pending), eventStreamMaxPendingLineBytes)
+	}
+	if !collector.discardingLongLine {
+		t.Fatal("discardingLongLine = false, want true while oversized line has no newline")
+	}
+	if _, err := collector.Write([]byte("\n" + strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-after-long-line"}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"done after long line"}}`,
+		`{"type":"turn.completed"}`,
+	}, "\n"))); err != nil {
+		t.Fatalf("write recovery lines: %v", err)
+	}
+	result, err := collector.Finish()
+	if err != nil {
+		t.Fatalf("Finish error = %v, want recovered final success", err)
+	}
+	if result.ThreadID != "thread-after-long-line" || result.FinalAgentMessage != "done after long line" {
+		t.Fatalf("result = %#v, want recovered final after oversized line", result)
+	}
+}
+
+func TestEventStreamCollectorOversizedPendingLineReturnsParseError(t *testing.T) {
+	oldLimit := eventStreamMaxPendingLineBytes
+	eventStreamMaxPendingLineBytes = 256
+	t.Cleanup(func() { eventStreamMaxPendingLineBytes = oldLimit })
+
+	collector := NewEventStreamCollector(nil, nil)
+	if _, err := collector.Write([]byte(strings.Repeat("x", 512))); err != nil {
+		t.Fatalf("write oversized partial line: %v", err)
+	}
+	if len(collector.pending) > eventStreamMaxPendingLineBytes {
+		t.Fatalf("pending len = %d, want <= %d", len(collector.pending), eventStreamMaxPendingLineBytes)
+	}
+	_, err := collector.Finish()
+	if !IsKind(err, ErrorParse) {
+		t.Fatalf("Finish error = %v, want parse failure", err)
+	}
+}
+
 func TestDirectLauncherStreamsEventsWhileCapturingStdout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell command uses POSIX sh")

@@ -766,6 +766,30 @@ type OutboxMessage struct {
 	LastSendError          string       `json:"last_send_error,omitempty"`
 }
 
+type PendingOutboxCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+func (c PendingOutboxCursor) IsZero() bool {
+	return c.CreatedAt.IsZero() && strings.TrimSpace(c.ID) == ""
+}
+
+type PendingOutboxQuery struct {
+	Now         time.Time
+	SessionID   string
+	TurnID      string
+	TeamsChatID string
+	Limit       int
+	After       PendingOutboxCursor
+}
+
+type PendingOutboxPage struct {
+	Messages   []OutboxMessage
+	NextCursor PendingOutboxCursor
+	More       bool
+}
+
 type ModelProfileKeyIntakeStatus string
 
 const (
@@ -3580,6 +3604,9 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 	if chatID == "" || msg.Sequence <= 0 {
 		return OutboxMessage{}, false, nil
 	}
+	if earlier, found, handled, err := s.earlierUnsentOutboxSQLite(ctx, msg); handled || err != nil {
+		return earlier, found, err
+	}
 	state, err := s.OutboxStateSnapshot(ctx)
 	if err != nil {
 		return OutboxMessage{}, false, err
@@ -3929,28 +3956,99 @@ func (s *Store) PendingOutboxAt(ctx context.Context, now time.Time) ([]OutboxMes
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if pending, handled, err := s.pendingOutboxAtSQLite(ctx, now); handled || err != nil {
-		return pending, err
-	}
-	state, err := s.loadStateFieldsOrFull(ctx, pendingOutboxStateFields)
+	page, err := s.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now})
 	if err != nil {
 		return nil, err
 	}
-	var pending []OutboxMessage
-	for _, msg := range state.OutboxMessages {
-		acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && msg.TeamsMessageID != ""
-		if !acceptedWithTeamsID {
-			if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(now) {
-				continue
-			}
+	pending := append([]OutboxMessage(nil), page.Messages...)
+	query := PendingOutboxQuery{Now: now, After: page.NextCursor}
+	for page.More {
+		page, err = s.PendingOutboxPageAt(ctx, query)
+		if err != nil {
+			return nil, err
 		}
-		if acceptedWithTeamsID ||
-			msg.Status == OutboxStatusQueued ||
-			msg.Status == OutboxStatusSending && (msg.LastSendAttempt.IsZero() || now.Sub(msg.LastSendAttempt) > outboxSendLease) {
-			pending = append(pending, msg)
-		}
+		pending = append(pending, page.Messages...)
+		query.After = page.NextCursor
 	}
 	return pending, nil
+}
+
+func (s *Store) PendingOutboxPageAt(ctx context.Context, query PendingOutboxQuery) (PendingOutboxPage, error) {
+	if query.Now.IsZero() {
+		query.Now = time.Now()
+	}
+	query.SessionID = strings.TrimSpace(query.SessionID)
+	query.TurnID = strings.TrimSpace(query.TurnID)
+	query.TeamsChatID = strings.TrimSpace(query.TeamsChatID)
+	query.After.ID = strings.TrimSpace(query.After.ID)
+	if page, handled, err := s.pendingOutboxPageAtSQLite(ctx, query); handled || err != nil {
+		return page, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, pendingOutboxStateFields)
+	if err != nil {
+		return PendingOutboxPage{}, err
+	}
+	var candidates []OutboxMessage
+	for _, msg := range state.OutboxMessages {
+		if !pendingOutboxMatchesQuery(msg, state, query) {
+			continue
+		}
+		if !query.After.IsZero() && !pendingOutboxAfterCursor(msg, query.After) {
+			continue
+		}
+		candidates = append(candidates, msg)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return pendingOutboxPageLess(candidates[i], candidates[j])
+	})
+	limit := query.Limit
+	if limit <= 0 || limit > len(candidates) {
+		limit = len(candidates)
+	}
+	page := PendingOutboxPage{Messages: append([]OutboxMessage(nil), candidates[:limit]...)}
+	if len(candidates) > limit {
+		page.More = true
+	}
+	if limit > 0 {
+		last := candidates[limit-1]
+		page.NextCursor = PendingOutboxCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return page, nil
+}
+
+func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutboxQuery) bool {
+	if query.SessionID != "" && msg.SessionID != query.SessionID {
+		return false
+	}
+	if query.TurnID != "" && msg.TurnID != query.TurnID {
+		return false
+	}
+	if query.TeamsChatID != "" && msg.TeamsChatID != query.TeamsChatID {
+		return false
+	}
+	acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
+	if !acceptedWithTeamsID {
+		if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(query.Now) {
+			return false
+		}
+	}
+	return acceptedWithTeamsID ||
+		msg.Status == OutboxStatusQueued ||
+		msg.Status == OutboxStatusSending && (msg.LastSendAttempt.IsZero() || query.Now.Sub(msg.LastSendAttempt) > outboxSendLease)
+}
+
+func pendingOutboxAfterCursor(msg OutboxMessage, cursor PendingOutboxCursor) bool {
+	if msg.CreatedAt.After(cursor.CreatedAt) {
+		return true
+	}
+	return msg.CreatedAt.Equal(cursor.CreatedAt) && msg.ID > cursor.ID
+}
+
+func pendingOutboxPageLess(left OutboxMessage, right OutboxMessage) bool {
+	if !left.CreatedAt.Equal(right.CreatedAt) {
+		return left.CreatedAt.Before(right.CreatedAt)
+	}
+	return left.ID < right.ID
 }
 
 func (s *Store) ChatRateLimit(ctx context.Context, chatID string) (ChatRateLimitState, bool, error) {
@@ -3967,11 +4065,16 @@ func (s *Store) ChatRateLimit(ctx context.Context, chatID string) (ChatRateLimit
 }
 
 func (s *Store) SetChatRateLimit(ctx context.Context, chatID string, blockedUntil time.Time, reason string) (ChatRateLimitState, error) {
+	return s.SetChatRateLimitForOutbox(ctx, chatID, blockedUntil, reason, "")
+}
+
+func (s *Store) SetChatRateLimitForOutbox(ctx context.Context, chatID string, blockedUntil time.Time, reason string, outboxID string) (ChatRateLimitState, error) {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return ChatRateLimitState{}, fmt.Errorf("chat id is required")
 	}
-	if out, handled, err := s.setChatRateLimitSQLite(ctx, chatID, blockedUntil, reason); handled || err != nil {
+	outboxID = strings.TrimSpace(outboxID)
+	if out, handled, err := s.setChatRateLimitSQLite(ctx, chatID, blockedUntil, reason, outboxID); handled || err != nil {
 		return out, err
 	}
 	var out ChatRateLimitState
@@ -3981,6 +4084,9 @@ func (s *Store) SetChatRateLimit(ctx context.Context, chatID string, blockedUnti
 		next.ChatID = chatID
 		next.BlockedUntil = blockedUntil
 		next.Reason = trimDiagnostic(reason, 240)
+		if outboxID != "" {
+			next.PoisonOutboxID = outboxID
+		}
 		next.UpdatedAt = now
 		state.ChatRateLimits[chatID] = next
 		out = next

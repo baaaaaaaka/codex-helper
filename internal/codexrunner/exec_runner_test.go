@@ -3,6 +3,7 @@ package codexrunner
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -280,4 +281,35 @@ func TestExecRunnerDistinguishesLaunchAndCodexFailures(t *testing.T) {
 	if !IsKind(err, ErrorCodex) {
 		t.Fatalf("expected codex error, got %v", err)
 	}
+}
+
+func TestDirectLauncherCapsStderr(t *testing.T) {
+	result, err := DirectLauncher{}.Launch(context.Background(), LaunchRequest{
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestDirectLauncherHelperProcess", "--", "stderr"},
+	})
+	if err != nil {
+		t.Fatalf("Launch error: %v", err)
+	}
+	if result.ExitCode == 0 {
+		t.Fatal("ExitCode = 0, want helper failure")
+	}
+	if !result.StderrTruncated {
+		t.Fatal("StderrTruncated = false, want true")
+	}
+	if len(result.Stderr) > defaultLaunchStderrCaptureBytes {
+		t.Fatalf("stderr len = %d, want <= %d", len(result.Stderr), defaultLaunchStderrCaptureBytes)
+	}
+	if !strings.Contains(string(result.Stderr), "tail-marker") {
+		t.Fatalf("stderr tail marker missing from capped stderr")
+	}
+}
+
+func TestDirectLauncherHelperProcess(t *testing.T) {
+	if len(os.Args) < 2 || os.Args[len(os.Args)-1] != "stderr" {
+		return
+	}
+	_, _ = os.Stderr.WriteString(strings.Repeat("x", defaultLaunchStderrCaptureBytes+4096))
+	_, _ = os.Stderr.WriteString("tail-marker")
+	os.Exit(7)
 }

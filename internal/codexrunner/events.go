@@ -3,12 +3,17 @@ package codexrunner
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
 )
 
 type EventHandler func(StreamEvent)
+
+const defaultEventStreamMaxPendingLineBytes = 16 << 20
+
+var eventStreamMaxPendingLineBytes = defaultEventStreamMaxPendingLineBytes
 
 type StreamEventKind string
 
@@ -246,6 +251,7 @@ type EventStreamWriter struct {
 	recoverParseErrors   bool
 	mu                   sync.Mutex
 	pending              []byte
+	discardingLongLine   bool
 	lineNo               int
 	result               TurnResult
 	err                  error
@@ -291,8 +297,7 @@ func (w *EventStreamWriter) Write(p []byte) (int, error) {
 			return 0, err
 		}
 	}
-	w.pending = append(w.pending, p...)
-	w.processCompleteLinesLocked()
+	w.appendAndProcessLocked(p)
 	return len(p), nil
 }
 
@@ -303,10 +308,11 @@ func (w *EventStreamWriter) Finish() (TurnResult, error) {
 		return w.result, w.resultErrLocked()
 	}
 	w.done = true
-	if len(bytes.TrimSpace(w.pending)) > 0 {
+	if !w.discardingLongLine && len(bytes.TrimSpace(w.pending)) > 0 {
 		w.processLineLocked(w.pending)
 	}
 	w.pending = nil
+	w.discardingLongLine = false
 	return w.result, w.resultErrLocked()
 }
 
@@ -330,6 +336,62 @@ func (w *EventStreamWriter) processCompleteLinesLocked() {
 	if start > 0 {
 		copy(w.pending, w.pending[start:])
 		w.pending = w.pending[:len(w.pending)-start]
+	}
+}
+
+func (w *EventStreamWriter) appendAndProcessLocked(p []byte) {
+	maxLineBytes := eventStreamMaxPendingLineBytes
+	if maxLineBytes <= 0 {
+		w.pending = append(w.pending, p...)
+		w.processCompleteLinesLocked()
+		return
+	}
+	for len(p) > 0 {
+		if w.discardingLongLine {
+			idx := bytes.IndexByte(p, '\n')
+			if idx < 0 {
+				return
+			}
+			p = p[idx+1:]
+			w.discardingLongLine = false
+			w.pending = nil
+			continue
+		}
+		idx := bytes.IndexByte(p, '\n')
+		remaining := maxLineBytes - len(w.pending)
+		if idx >= 0 && idx <= remaining {
+			w.pending = append(w.pending, p[:idx]...)
+			w.processLineLocked(w.pending)
+			w.pending = nil
+			p = p[idx+1:]
+			continue
+		}
+		if len(p) <= remaining {
+			w.pending = append(w.pending, p...)
+			return
+		}
+		w.noteOversizedLineLocked(maxLineBytes)
+		w.pending = nil
+		if idx >= 0 {
+			p = p[idx+1:]
+			continue
+		}
+		w.discardingLongLine = true
+		return
+	}
+}
+
+func (w *EventStreamWriter) noteOversizedLineLocked(maxLineBytes int) {
+	w.lineNo++
+	err := newJSONLParseError(w.lineNo, fmt.Errorf("codex JSONL line exceeds %d bytes", maxLineBytes))
+	if w.recoverParseErrors {
+		if w.recoverableErr == nil {
+			w.recoverableErr = err
+		}
+		return
+	}
+	if w.err == nil {
+		w.err = err
 	}
 }
 

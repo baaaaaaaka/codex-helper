@@ -17,10 +17,12 @@ import (
 )
 
 const defaultAppServerProcessStderrLimit = 32 * 1024
+const defaultAppServerProcessStdoutLineLimit = 16 << 20
 
 var errAppServerProcessStdoutClosed = errors.New("app-server stdout closed")
 
 var appServerProcessRuntimeGOOS = func() string { return runtime.GOOS }
+var appServerProcessStdoutLineLimit = defaultAppServerProcessStdoutLineLimit
 
 type AppServerProcessStarter struct {
 	StderrLimit int
@@ -247,21 +249,25 @@ func (p *appServerProcessTransport) readStdout() {
 	defer p.wg.Done()
 	defer close(p.lines)
 
-	reader := bufio.NewReader(p.stdout)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			line = bytes.TrimRight(line, "\r\n")
-			p.sendLine(appServerProcessLine{line: append([]byte{}, line...)})
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				err = errAppServerProcessStdoutClosed
-			}
-			p.sendLine(appServerProcessLine{err: err})
-			return
-		}
+	scanner := bufio.NewScanner(p.stdout)
+	lineLimit := appServerProcessStdoutLineLimit
+	if lineLimit <= 0 {
+		lineLimit = defaultAppServerProcessStdoutLineLimit
 	}
+	initialBuffer := 64 * 1024
+	if initialBuffer > lineLimit {
+		initialBuffer = lineLimit
+	}
+	scanner.Buffer(make([]byte, 0, initialBuffer), lineLimit)
+	for scanner.Scan() {
+		line := bytes.TrimRight(scanner.Bytes(), "\r\n")
+		p.sendLine(appServerProcessLine{line: append([]byte{}, line...)})
+	}
+	err := scanner.Err()
+	if err == nil {
+		err = errAppServerProcessStdoutClosed
+	}
+	p.sendLine(appServerProcessLine{err: err})
 }
 
 func (p *appServerProcessTransport) readStderr() {

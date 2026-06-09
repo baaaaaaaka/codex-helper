@@ -648,6 +648,12 @@ func benchmarkCXPPerfModelDaemonOutboxFlushProfilesWithBackend(b *testing.B, bac
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteLiveProgressGuardProfiles(b *testing.B) {
+	b.Run("large-history", func(b *testing.B) {
+		benchmarkBridgeCanQueueLiveTurnOutboxSQLiteLargeHistory(b)
+	})
+}
+
 func BenchmarkCXPPerfModelSQLiteMainLoopIdleTickProfiles(b *testing.B) {
 	for _, profile := range cxpPerfProfiles {
 		profile := profile

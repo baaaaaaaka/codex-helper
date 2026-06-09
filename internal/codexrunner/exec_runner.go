@@ -267,6 +267,9 @@ func codexFailure(output LaunchResult, result TurnResult) error {
 		return &Error{Kind: ErrorCodex, Message: result.Failure.Message}
 	}
 	message := strings.TrimSpace(string(output.Stderr))
+	if message != "" && output.StderrTruncated {
+		message = "(stderr truncated to last 1048576 bytes)\n" + message
+	}
 	if message == "" {
 		message = strings.TrimSpace(string(output.Stdout))
 		if message != "" && output.StdoutTruncated {
@@ -304,12 +307,13 @@ func (DirectLauncher) Launch(ctx context.Context, req LaunchRequest) (LaunchResu
 	if req.Stdin != "" {
 		cmd.Stdin = strings.NewReader(req.Stdin)
 	}
-	var stderr bytes.Buffer
+	stderr := boundedOutputBuffer{max: defaultLaunchStderrCaptureBytes}
 	stdout := NewLaunchOutputRecorder(req.EventHandler)
 	cmd.Stdout = stdout.StdoutWriter()
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	result := stdout.LaunchResult(stderr.Bytes(), 0)
+	result.StderrTruncated = stderr.Truncated()
 	if err == nil {
 		return result, nil
 	}

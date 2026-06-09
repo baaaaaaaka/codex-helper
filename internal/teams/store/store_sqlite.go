@@ -766,6 +766,7 @@ func ensureSQLiteSchema(db *sql.DB) error {
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS outbox_turn_idx ON outbox_messages(turn_id, status, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS outbox_message_lookup_idx ON outbox_messages(teams_chat_id, teams_message_id, status)`,
+		`CREATE INDEX IF NOT EXISTS outbox_chat_sequence_idx ON outbox_messages(teams_chat_id, sequence, status, created_at, id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
@@ -3050,8 +3051,8 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 	return out, handled, err
 }
 
-func (s *Store) pendingOutboxAtSQLite(ctx context.Context, now time.Time) ([]OutboxMessage, bool, error) {
-	var out []OutboxMessage
+func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutboxQuery) (PendingOutboxPage, bool, error) {
+	var out PendingOutboxPage
 	handled := false
 	err := s.withStateLock(ctx, func() error {
 		pointer, ok, err := s.currentSQLitePointerUnlocked()
@@ -3062,34 +3063,76 @@ func (s *Store) pendingOutboxAtSQLite(ctx context.Context, now time.Time) ([]Out
 		if err != nil {
 			return err
 		}
-		rows, err := db.QueryContext(ctx, `SELECT o.json, COALESCE(r.blocked_until, 0)
+		clauses := []string{
+			"o.status IN (?, ?, ?)",
+			"(o.status <> ? OR o.teams_message_id <> '')",
+			"(o.status = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)",
+		}
+		args := []any{
+			string(OutboxStatusQueued), string(OutboxStatusSending), string(OutboxStatusAccepted),
+			string(OutboxStatusAccepted),
+			string(OutboxStatusAccepted), sqliteTime(query.Now),
+		}
+		if query.SessionID = strings.TrimSpace(query.SessionID); query.SessionID != "" {
+			clauses = append(clauses, "o.session_id = ?")
+			args = append(args, query.SessionID)
+		}
+		if query.TurnID = strings.TrimSpace(query.TurnID); query.TurnID != "" {
+			clauses = append(clauses, "o.turn_id = ?")
+			args = append(args, query.TurnID)
+		}
+		if query.TeamsChatID = strings.TrimSpace(query.TeamsChatID); query.TeamsChatID != "" {
+			clauses = append(clauses, "o.teams_chat_id = ?")
+			args = append(args, query.TeamsChatID)
+		}
+		if !query.After.IsZero() {
+			clauses = append(clauses, "(o.created_at > ? OR (o.created_at = ? AND o.id > ?))")
+			after := sqliteTime(query.After.CreatedAt)
+			args = append(args, after, after, strings.TrimSpace(query.After.ID))
+		}
+		stmt := `SELECT o.json, o.created_at, o.id, COALESCE(r.blocked_until, 0)
 FROM outbox_messages o
 LEFT JOIN chat_rate_limits r ON r.chat_id = o.teams_chat_id
-WHERE o.status IN (?, ?, ?)
-ORDER BY o.created_at, o.id`, string(OutboxStatusQueued), string(OutboxStatusSending), string(OutboxStatusAccepted))
+WHERE ` + strings.Join(clauses, " AND ") + `
+ORDER BY o.created_at, o.id`
+		rawLimit := query.Limit
+		if rawLimit > 0 {
+			rawLimit++
+			stmt += ` LIMIT ?`
+			args = append(args, rawLimit)
+		}
+		rows, err := db.QueryContext(ctx, stmt, args...)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
+		rawRows := 0
 		for rows.Next() {
 			var raw []byte
+			var createdAtNanos int64
+			var rowID string
 			var blockedUntilNanos int64
-			if err := rows.Scan(&raw, &blockedUntilNanos); err != nil {
+			if err := rows.Scan(&raw, &createdAtNanos, &rowID, &blockedUntilNanos); err != nil {
 				return err
 			}
+			rawRows++
+			if query.Limit > 0 && rawRows > query.Limit {
+				out.More = true
+				break
+			}
+			out.NextCursor = PendingOutboxCursor{CreatedAt: time.Unix(0, createdAtNanos), ID: rowID}
 			var msg OutboxMessage
 			if err := json.Unmarshal(raw, &msg); err != nil {
 				return err
 			}
-			acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && msg.TeamsMessageID != ""
-			if !acceptedWithTeamsID && blockedUntilNanos > 0 && time.Unix(0, blockedUntilNanos).After(now) {
+			state := State{ChatRateLimits: map[string]ChatRateLimitState{}}
+			if blockedUntilNanos > 0 {
+				state.ChatRateLimits[msg.TeamsChatID] = ChatRateLimitState{ChatID: msg.TeamsChatID, BlockedUntil: time.Unix(0, blockedUntilNanos)}
+			}
+			if !pendingOutboxMatchesQuery(msg, state, query) {
 				continue
 			}
-			if acceptedWithTeamsID ||
-				msg.Status == OutboxStatusQueued ||
-				msg.Status == OutboxStatusSending && (msg.LastSendAttempt.IsZero() || now.Sub(msg.LastSendAttempt) > outboxSendLease) {
-				out = append(out, msg)
-			}
+			out.Messages = append(out.Messages, msg)
 		}
 		if err := rows.Err(); err != nil {
 			return err
@@ -3098,6 +3141,37 @@ ORDER BY o.created_at, o.id`, string(OutboxStatusQueued), string(OutboxStatusSen
 		return nil
 	})
 	return out, handled, err
+}
+
+func (s *Store) earlierUnsentOutboxSQLite(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, bool, error) {
+	var out OutboxMessage
+	found := false
+	handled := false
+	chatID := strings.TrimSpace(msg.TeamsChatID)
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		out, found, err = loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages
+WHERE teams_chat_id = ?
+  AND id <> ?
+  AND sequence > 0
+  AND sequence < ?
+  AND status NOT IN (?, ?)
+ORDER BY sequence, created_at, id
+LIMIT 1`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped))
+		if err != nil {
+			return err
+		}
+		handled = true
+		return nil
+	})
+	return out, found, handled, err
 }
 
 func (s *Store) chatPollSQLite(ctx context.Context, chatID string) (ChatPollState, bool, bool, error) {
@@ -3233,7 +3307,7 @@ func (s *Store) updateChatPollSchedulesSQLite(ctx context.Context, updates []Cha
 	return out, handled, err
 }
 
-func (s *Store) setChatRateLimitSQLite(ctx context.Context, chatID string, blockedUntil time.Time, reason string) (ChatRateLimitState, bool, error) {
+func (s *Store) setChatRateLimitSQLite(ctx context.Context, chatID string, blockedUntil time.Time, reason string, outboxID string) (ChatRateLimitState, bool, error) {
 	var out ChatRateLimitState
 	handled := false
 	err := s.withStateLock(ctx, func() error {
@@ -3258,6 +3332,9 @@ func (s *Store) setChatRateLimitSQLite(ctx context.Context, chatID string, block
 		out.ChatID = chatID
 		out.BlockedUntil = blockedUntil
 		out.Reason = trimDiagnostic(reason, 240)
+		if strings.TrimSpace(outboxID) != "" {
+			out.PoisonOutboxID = strings.TrimSpace(outboxID)
+		}
 		out.UpdatedAt = time.Now()
 		if err := upsertSQLiteChatRateLimitTx(ctx, tx, out); err != nil {
 			return err

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -214,6 +215,25 @@ func TestAppServerProcessTransportReadFailureIncludesLimitedStderr(t *testing.T)
 	}
 }
 
+func TestAppServerProcessTransportRejectsOversizedStdoutLine(t *testing.T) {
+	oldLimit := appServerProcessStdoutLineLimit
+	appServerProcessStdoutLineLimit = 256
+	t.Cleanup(func() { appServerProcessStdoutLineLimit = oldLimit })
+
+	transport := startProcessHelper(t, AppServerProcessStarter{}, "long-stdout-line", "1024")
+	defer transport.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := transport.ReadLine(ctx)
+	if err == nil {
+		t.Fatal("ReadLine unexpectedly succeeded for oversized stdout line")
+	}
+	if !strings.Contains(err.Error(), "token too long") {
+		t.Fatalf("ReadLine error = %v, want scanner token-too-long error", err)
+	}
+}
+
 func TestAppServerProcessDiagnosticWaitsForStderrDrainAfterExit(t *testing.T) {
 	transport := &appServerProcessTransport{
 		stderrBuffer: newLimitedStderrBuffer(1024),
@@ -384,6 +404,16 @@ func runAppServerProcessHelper(args []string) int {
 	case "stderr-exit":
 		fmt.Fprint(os.Stderr, strings.Repeat("prefix-", 80), "tail-marker")
 		return 4
+	case "long-stdout-line":
+		size := appServerProcessStdoutLineLimit + 512
+		if len(args) > 1 {
+			if parsed, err := strconv.Atoi(args[1]); err == nil && parsed > 0 {
+				size = parsed
+			}
+		}
+		fmt.Fprint(os.Stdout, strings.Repeat("x", size))
+		time.Sleep(24 * time.Hour)
+		return 0
 	case "close-stdin":
 		fmt.Fprint(os.Stderr, "write-marker")
 		return 5

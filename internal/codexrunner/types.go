@@ -98,6 +98,7 @@ type LaunchResult struct {
 	Stdout          []byte
 	StdoutTruncated bool
 	Stderr          []byte
+	StderrTruncated bool
 	ExitCode        int
 	ParsedResult    *TurnResult
 	ParseErr        error

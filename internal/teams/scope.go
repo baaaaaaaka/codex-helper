@@ -119,8 +119,12 @@ func resolveExistingScopeStore(scope teamstore.ScopeIdentity, currentPath string
 			return teamstore.ScopeIdentity{}, "", false, err
 		}
 		state, err := st.Load(context.Background())
+		closeErr := st.Close()
 		if err != nil {
 			return teamstore.ScopeIdentity{}, "", false, err
+		}
+		if closeErr != nil {
+			return teamstore.ScopeIdentity{}, "", false, closeErr
 		}
 		if !scopeStateMatches(scope, state) {
 			continue

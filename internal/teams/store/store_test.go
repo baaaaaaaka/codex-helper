@@ -3038,6 +3038,173 @@ func TestPendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat(t *tes
 	}
 }
 
+func TestPendingOutboxPageMatchesFullPendingAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 30, 10, 0, 0, 0, time.UTC)
+			messages := []OutboxMessage{
+				{ID: "outbox:queued-a", SessionID: "s1", TurnID: "turn-1", TeamsChatID: "chat-open", Kind: "helper", Body: "queued-a", CreatedAt: now.Add(time.Millisecond)},
+				{ID: "outbox:blocked", SessionID: "s1", TurnID: "turn-1", TeamsChatID: "chat-blocked", Kind: "helper", Body: "blocked", CreatedAt: now.Add(2 * time.Millisecond)},
+				{ID: "outbox:accepted-with-id", SessionID: "s1", TurnID: "turn-1", TeamsChatID: "chat-blocked", Kind: "helper", Body: "accepted", Status: OutboxStatusAccepted, TeamsMessageID: "teams-accepted", CreatedAt: now.Add(3 * time.Millisecond)},
+				{ID: "outbox:accepted-without-id", SessionID: "s1", TurnID: "turn-1", TeamsChatID: "chat-open", Kind: "helper", Body: "accepted-without-id", Status: OutboxStatusAccepted, CreatedAt: now.Add(4 * time.Millisecond)},
+				{ID: "outbox:fresh-sending", SessionID: "s1", TurnID: "turn-1", TeamsChatID: "chat-open", Kind: "helper", Body: "fresh", Status: OutboxStatusSending, LastSendAttempt: now.Add(-outboxSendLease + time.Second), CreatedAt: now.Add(5 * time.Millisecond)},
+				{ID: "outbox:stale-sending", SessionID: "s1", TurnID: "turn-1", TeamsChatID: "chat-open", Kind: "helper", Body: "stale", Status: OutboxStatusSending, LastSendAttempt: now.Add(-outboxSendLease - time.Second), CreatedAt: now.Add(6 * time.Millisecond)},
+				{ID: "outbox:sent", SessionID: "s1", TurnID: "turn-1", TeamsChatID: "chat-open", Kind: "helper", Body: "sent", Status: OutboxStatusSent, TeamsMessageID: "teams-sent", CreatedAt: now.Add(7 * time.Millisecond)},
+				{ID: "outbox:queued-b", SessionID: "s2", TurnID: "turn-2", TeamsChatID: "chat-open", Kind: "helper", Body: "queued-b", CreatedAt: now.Add(8 * time.Millisecond)},
+			}
+			for _, msg := range messages {
+				if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+					t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
+				}
+			}
+			if _, err := store.SetChatRateLimit(ctx, "chat-blocked", now.Add(time.Hour), "429"); err != nil {
+				t.Fatalf("SetChatRateLimit error: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			full, err := store.PendingOutboxAt(ctx, now)
+			if err != nil {
+				t.Fatalf("PendingOutboxAt error: %v", err)
+			}
+			gotIDs := collectPendingOutboxPageIDsForTest(t, store, PendingOutboxQuery{Now: now, Limit: 2})
+			wantIDs := outboxIDsForTest(full)
+			if !reflect.DeepEqual(gotIDs, wantIDs) {
+				t.Fatalf("paged pending IDs = %#v, want full pending IDs %#v; full=%#v", gotIDs, wantIDs, full)
+			}
+			filteredIDs := collectPendingOutboxPageIDsForTest(t, store, PendingOutboxQuery{
+				Now:         now,
+				SessionID:   "s1",
+				TurnID:      "turn-1",
+				TeamsChatID: "chat-open",
+				Limit:       1,
+			})
+			wantFiltered := []string{"outbox:queued-a", "outbox:stale-sending"}
+			if !reflect.DeepEqual(filteredIDs, wantFiltered) {
+				t.Fatalf("filtered paged pending IDs = %#v, want %#v", filteredIDs, wantFiltered)
+			}
+		})
+	}
+}
+
+func TestPendingOutboxPageDoesNotStarveBehindFreshSendingRowsAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 5, 30, 11, 0, 0, 0, time.UTC)
+			for i := 0; i < 5; i++ {
+				msg := OutboxMessage{
+					ID:              fmt.Sprintf("outbox:fresh-%02d", i),
+					TeamsChatID:     "chat-1",
+					Kind:            "helper",
+					Body:            "fresh sending lease",
+					Status:          OutboxStatusSending,
+					LastSendAttempt: now.Add(-time.Second),
+					CreatedAt:       now.Add(time.Duration(i) * time.Millisecond),
+				}
+				if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+					t.Fatalf("QueueOutbox fresh %d error: %v", i, err)
+				}
+			}
+			due := OutboxMessage{
+				ID:          "outbox:due-behind-fresh",
+				TeamsChatID: "chat-1",
+				Kind:        "helper",
+				Body:        "due",
+				CreatedAt:   now.Add(10 * time.Millisecond),
+			}
+			if _, _, err := store.QueueOutbox(ctx, due); err != nil {
+				t.Fatalf("QueueOutbox due error: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			gotIDs := collectPendingOutboxPageIDsForTest(t, store, PendingOutboxQuery{Now: now, Limit: 2})
+			if !reflect.DeepEqual(gotIDs, []string{due.ID}) {
+				t.Fatalf("paged pending behind fresh sending = %#v, want only %s", gotIDs, due.ID)
+			}
+		})
+	}
+}
+
+func TestSetChatRateLimitForOutboxPreservesPoisonAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if sqlite {
+				if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+					ID:          "outbox:migration-seed",
+					TeamsChatID: "migration-chat",
+					Kind:        "helper",
+					Body:        "migration seed",
+				}); err != nil {
+					t.Fatalf("QueueOutbox migration seed error: %v", err)
+				}
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			blockedUntil := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+			limit, err := store.SetChatRateLimitForOutbox(ctx, " chat-1 ", blockedUntil, "429", " outbox:poison ")
+			if err != nil {
+				t.Fatalf("SetChatRateLimitForOutbox error: %v", err)
+			}
+			if limit.ChatID != "chat-1" || limit.PoisonOutboxID != "outbox:poison" {
+				t.Fatalf("rate limit with poison = %#v, want trimmed chat and poison outbox", limit)
+			}
+			limit, err = store.SetChatRateLimit(ctx, "chat-1", blockedUntil.Add(time.Minute), "429 again")
+			if err != nil {
+				t.Fatalf("SetChatRateLimit without outbox error: %v", err)
+			}
+			if limit.PoisonOutboxID != "outbox:poison" {
+				t.Fatalf("rate limit poison after ordinary update = %q, want preserved poison", limit.PoisonOutboxID)
+			}
+		})
+	}
+}
+
+func collectPendingOutboxPageIDsForTest(t *testing.T, store *Store, query PendingOutboxQuery) []string {
+	t.Helper()
+	ctx := context.Background()
+	var ids []string
+	seen := map[string]bool{}
+	for pages := 0; ; pages++ {
+		if pages > 100 {
+			t.Fatalf("pending outbox pagination did not finish; ids=%#v cursor=%#v", ids, query.After)
+		}
+		page, err := store.PendingOutboxPageAt(ctx, query)
+		if err != nil {
+			t.Fatalf("PendingOutboxPageAt error: %v", err)
+		}
+		for _, msg := range page.Messages {
+			if seen[msg.ID] {
+				t.Fatalf("duplicate outbox %q across pending pages; ids=%#v", msg.ID, ids)
+			}
+			seen[msg.ID] = true
+			ids = append(ids, msg.ID)
+		}
+		if !page.More {
+			return ids
+		}
+		if page.NextCursor.IsZero() {
+			t.Fatalf("pending outbox page had More=true without cursor; ids=%#v", ids)
+		}
+		query.After = page.NextCursor
+	}
+}
+
+func outboxIDsForTest(messages []OutboxMessage) []string {
+	ids := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		ids = append(ids, msg.ID)
+	}
+	return ids
+}
+
 func TestEarlierUnsentOutboxPreservesSameChatOrdering(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

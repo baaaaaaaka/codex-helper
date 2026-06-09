@@ -1214,6 +1214,90 @@ func TestBridgeStreamingProgressGraph429DoesNotFailTurnCI(t *testing.T) {
 	}
 }
 
+func TestBridgeStreamingProgressGraph502DoesNotFailTurnCI(t *testing.T) {
+	var posts int
+	var failedProgress bool
+	var sentPlain []string
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			if r.Method != http.MethodPost || !strings.Contains(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+				t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			}
+			posts++
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode Graph request: %v", err)
+			}
+			plain := PlainTextFromTeamsHTML(body.Body.Content)
+			sentPlain = append(sentPlain, plain)
+			if !failedProgress && strings.Contains(plain, "checking before final") {
+				failedProgress = true
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.WriteString(`{"error":{"code":"UnknownError","message":"Bad Gateway"}}`)
+				return w.Result(), nil
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, posts)
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &streamingRecordingExecutor{
+		events: []codexrunner.StreamEvent{
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "checking before final"},
+			{Kind: codexrunner.StreamEventCommandStarted, Command: "go test ./..."},
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "FINAL MARKER after bad gateway"},
+			{Kind: codexrunner.StreamEventTurnCompleted},
+		},
+		result: ExecutionResult{Text: "FINAL MARKER after bad gateway", CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-stream-502"), "fix it"); err != nil {
+		t.Fatalf("handleSessionMessage should not fail on transient Graph 502 from progress delivery: %v", err)
+	}
+	if !failedProgress {
+		t.Fatalf("Graph posts did not exercise the progress 502 path, posts=%d plain=%#v", posts, sentPlain)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var completedTurns int
+	for _, turn := range state.Turns {
+		if turn.Status == teamstore.TurnStatusCompleted {
+			completedTurns++
+		}
+		if turn.Status == teamstore.TurnStatusFailed {
+			t.Fatalf("turn failed after transient Graph 502: %#v", turn)
+		}
+	}
+	if completedTurns != 1 {
+		t.Fatalf("completed turns = %d, want 1: %#v", completedTurns, state.Turns)
+	}
+	joined := strings.Join(sentPlain, "\n---\n")
+	if !strings.Contains(joined, "FINAL MARKER after bad gateway") {
+		t.Fatalf("final answer was not sent after transient progress 502:\n%s", joined)
+	}
+	for _, outbox := range state.OutboxMessages {
+		plain := PlainTextFromTeamsHTML(outbox.Body)
+		if strings.EqualFold(outbox.Kind, "error") || strings.Contains(plain, "Graph POST") || strings.Contains(plain, "Bad Gateway") {
+			t.Fatalf("transient Graph 502 leaked as a user-visible error outbox: %#v plain=%q", outbox, plain)
+		}
+	}
+}
+
 func TestBridgePacesRealGraphOutboxWritesCI(t *testing.T) {
 	var posts int
 	var sleeps []time.Duration
@@ -20067,6 +20151,10 @@ func corruptSQLiteInboundEventJSON(t testing.TB, store *teamstore.Store, inbound
 }
 
 func BenchmarkBridgeCanQueueLiveTurnOutboxSQLiteLargeHistory(b *testing.B) {
+	benchmarkBridgeCanQueueLiveTurnOutboxSQLiteLargeHistory(b)
+}
+
+func benchmarkBridgeCanQueueLiveTurnOutboxSQLiteLargeHistory(b *testing.B) {
 	ctx := context.Background()
 	store, err := teamstore.Open(filepath.Join(b.TempDir(), "state.json"))
 	if err != nil {
@@ -26415,39 +26503,161 @@ func TestBridgeFlushPendingOutboxContinuesAfterRateLimitedChat(t *testing.T) {
 }
 
 func TestBridgeMainLoopOutboxFlushUsesSmallBudget(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			ctx := context.Background()
+			if sqlite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			for i := 1; i <= mainLoopOutboxFlushMaxMessages+2; i++ {
+				msg := teamstore.OutboxMessage{
+					ID:          fmt.Sprintf("outbox:budget-%d", i),
+					TeamsChatID: "chat-1",
+					Kind:        "helper",
+					Body:        fmt.Sprintf("budgeted message %d", i),
+				}
+				if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+					t.Fatalf("QueueOutbox %d error: %v", i, err)
+				}
+			}
+
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("flushPendingOutboxMainLoop error: %v", err)
+			}
+			if len(*sent) != mainLoopOutboxFlushMaxMessages {
+				t.Fatalf("main-loop flush sent %d messages, want budget %d", len(*sent), mainLoopOutboxFlushMaxMessages)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load state: %v", err)
+			}
+			queued := 0
+			for _, msg := range state.OutboxMessages {
+				if msg.Status == teamstore.OutboxStatusQueued {
+					queued++
+				}
+			}
+			if queued != 2 {
+				t.Fatalf("queued messages after budgeted flush = %d, want 2", queued)
+			}
+		})
+	}
+}
+
+func TestBridgeFlushPendingOutboxSQLiteDrainsMultiplePendingPages(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-	for i := 1; i <= mainLoopOutboxFlushMaxMessages+2; i++ {
+	base := time.Date(2026, 5, 30, 13, 0, 0, 0, time.UTC)
+	total := outboxFlushPendingPageSize + 5
+	for i := 0; i < total; i++ {
 		msg := teamstore.OutboxMessage{
-			ID:          fmt.Sprintf("outbox:budget-%d", i),
-			TeamsChatID: "chat-1",
+			ID:          fmt.Sprintf("outbox:page-%03d", i),
+			TeamsChatID: fmt.Sprintf("chat-%02d", i%3),
 			Kind:        "helper",
-			Body:        fmt.Sprintf("budgeted message %d", i),
+			Body:        fmt.Sprintf("paged message %d", i),
+			CreatedAt:   base.Add(time.Duration(i) * time.Millisecond),
 		}
-		if _, _, err := store.QueueOutbox(context.Background(), msg); err != nil {
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
 			t.Fatalf("QueueOutbox %d error: %v", i, err)
 		}
 	}
 
-	if err := bridge.flushPendingOutboxMainLoop(context.Background()); err != nil {
-		t.Fatalf("flushPendingOutboxMainLoop error: %v", err)
+	if err := bridge.flushPendingOutbox(ctx, "", ""); err != nil {
+		t.Fatalf("flushPendingOutbox error: %v", err)
 	}
-	if len(*sent) != mainLoopOutboxFlushMaxMessages {
-		t.Fatalf("main-loop flush sent %d messages, want budget %d", len(*sent), mainLoopOutboxFlushMaxMessages)
+	if len(*sent) != total {
+		t.Fatalf("sent messages after full flush = %d, want %d", len(*sent), total)
 	}
-	state, err := store.Load(context.Background())
+	state, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	queued := 0
-	for _, msg := range state.OutboxMessages {
-		if msg.Status == teamstore.OutboxStatusQueued {
-			queued++
+	for id, msg := range state.OutboxMessages {
+		if msg.Status != teamstore.OutboxStatusSent {
+			t.Fatalf("%s status = %q, want sent", id, msg.Status)
 		}
 	}
-	if queued != 2 {
-		t.Fatalf("queued messages after budgeted flush = %d, want 2", queued)
+}
+
+func TestBridgeFlushPendingOutboxForChatSQLiteDoesNotScanUnrelatedPages(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	var sent []bridgeSentMessage
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		if chatID != "target-chat" {
+			t.Fatalf("flushPendingOutboxForChat posted unrelated chat %q", chatID)
+		}
+		sent = append(sent, bridgeSentMessage{ChatID: chatID})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"sent-target","messageType":"message"}`)
+		return w.Result(), nil
+	})}
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     client,
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	base := time.Date(2026, 5, 30, 14, 0, 0, 0, time.UTC)
+	for i := 0; i < outboxFlushPendingPageSize+3; i++ {
+		msg := teamstore.OutboxMessage{
+			ID:          fmt.Sprintf("outbox:other-%03d", i),
+			TeamsChatID: "other-chat",
+			Kind:        "helper",
+			Body:        fmt.Sprintf("other message %d", i),
+			CreatedAt:   base.Add(time.Duration(i) * time.Millisecond),
+		}
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox other %d error: %v", i, err)
+		}
+	}
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:target",
+		TeamsChatID: "target-chat",
+		Kind:        "helper",
+		Body:        "target message",
+		CreatedAt:   base.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("QueueOutbox target error: %v", err)
+	}
+
+	if err := bridge.flushPendingOutboxForChat(ctx, "target-chat"); err != nil {
+		t.Fatalf("flushPendingOutboxForChat error: %v", err)
+	}
+	if len(sent) != 1 || sent[0].ChatID != "target-chat" {
+		t.Fatalf("sent = %#v, want one target-chat message", sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if got := state.OutboxMessages["outbox:target"].Status; got != teamstore.OutboxStatusSent {
+		t.Fatalf("target status = %q, want sent", got)
+	}
+	for id, msg := range state.OutboxMessages {
+		if strings.HasPrefix(id, "outbox:other-") && msg.Status != teamstore.OutboxStatusQueued {
+			t.Fatalf("%s status = %q, want still queued", id, msg.Status)
+		}
 	}
 }
 

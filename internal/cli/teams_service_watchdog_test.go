@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
@@ -1583,4 +1586,213 @@ func TestStartTeamsPrimaryServiceDoesNotTouchWatchdogSchedule(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCollectTeamsServiceWatchdogSnapshotSQLiteResourceStability(t *testing.T) {
+	for _, scenario := range []teamsServiceWatchdogResourceScenario{
+		{name: "idle-single-store", stores: 1},
+		{name: "active-many-stores", stores: 4, installed: true, active: true},
+		{name: "rate-limited-many-stores", stores: 4, installed: true, active: true, rateLimited: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			lockCLITestHooks(t)
+			paths := seedSQLiteWatchdogResourceStores(t, scenario)
+			installTeamsServiceWatchdogResourceHooks(t, paths, scenario)
+
+			beforeOpeners, beforeOpenDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
+			beforeGoroutines := runtime.NumGoroutine()
+			beforeHeap := teamsServiceWatchdogHeapAllocForTest()
+
+			opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{
+				Now: time.Date(2026, 6, 9, 11, 0, 0, 0, time.UTC),
+			})
+			for i := 0; i < 40; i++ {
+				snapshot, err := collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+				if err != nil {
+					t.Fatalf("collect snapshot iteration %d: %v", i+1, err)
+				}
+				if snapshot.StateFiles != scenario.stores {
+					t.Fatalf("iteration %d state files = %d, want %d", i+1, snapshot.StateFiles, scenario.stores)
+				}
+			}
+
+			afterOpeners := waitForTeamsServiceWatchdogOpenDBOpenersAtMost(t, beforeOpeners)
+			_, afterOpenDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
+			if afterOpeners > beforeOpeners {
+				t.Fatalf("OpenDB connectionOpener goroutines grew from %d to %d", beforeOpeners, afterOpeners)
+			}
+			if afterOpenDBRefs > beforeOpenDBRefs {
+				t.Fatalf("OpenDB stack references grew from %d to %d", beforeOpenDBRefs, afterOpenDBRefs)
+			}
+			if delta := runtime.NumGoroutine() - beforeGoroutines; delta > 8 {
+				t.Fatalf("goroutines grew by %d; before=%d after=%d", delta, beforeGoroutines, runtime.NumGoroutine())
+			}
+			afterHeap := teamsServiceWatchdogHeapAllocForTest()
+			if delta := int64(afterHeap) - int64(beforeHeap); delta > 8*1024*1024 {
+				t.Fatalf("heap alloc grew by %d bytes; before=%d after=%d", delta, beforeHeap, afterHeap)
+			}
+		})
+	}
+}
+
+func BenchmarkTeamsServiceWatchdogSnapshotSQLiteResourceStability(b *testing.B) {
+	for _, scenario := range []teamsServiceWatchdogResourceScenario{
+		{name: "idle-single-store", stores: 1},
+		{name: "active-many-stores", stores: 4, installed: true, active: true},
+		{name: "rate-limited-many-stores", stores: 4, installed: true, active: true, rateLimited: true},
+	} {
+		b.Run(scenario.name, func(b *testing.B) {
+			lockCLITestHooks(b)
+			paths := seedSQLiteWatchdogResourceStores(b, scenario)
+			installTeamsServiceWatchdogResourceHooks(b, paths, scenario)
+			opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{
+				Now: time.Date(2026, 6, 9, 11, 0, 0, 0, time.UTC),
+			})
+
+			beforeOpeners, beforeOpenDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
+			beforeGoroutines := runtime.NumGoroutine()
+			beforeHeap := teamsServiceWatchdogHeapAllocForTest()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := collectTeamsServiceWatchdogSnapshot(context.Background(), opts); err != nil {
+					b.Fatalf("collect snapshot: %v", err)
+				}
+			}
+			b.StopTimer()
+
+			afterOpeners := waitForTeamsServiceWatchdogOpenDBOpenersAtMost(b, beforeOpeners)
+			_, afterOpenDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
+			afterHeap := teamsServiceWatchdogHeapAllocForTest()
+			b.ReportMetric(float64(afterOpeners-beforeOpeners), "opendb_goroutines_delta")
+			b.ReportMetric(float64(afterOpenDBRefs-beforeOpenDBRefs), "opendb_refs_delta")
+			b.ReportMetric(float64(runtime.NumGoroutine()-beforeGoroutines), "goroutines_delta")
+			b.ReportMetric(float64(int64(afterHeap)-int64(beforeHeap)), "heap_alloc_delta_bytes")
+		})
+	}
+}
+
+type teamsServiceWatchdogResourceScenario struct {
+	name        string
+	stores      int
+	installed   bool
+	active      bool
+	rateLimited bool
+}
+
+func seedSQLiteWatchdogResourceStores(tb testing.TB, scenario teamsServiceWatchdogResourceScenario) []string {
+	tb.Helper()
+	if scenario.stores <= 0 {
+		scenario.stores = 1
+	}
+	paths := make([]string, 0, scenario.stores)
+	for i := 0; i < scenario.stores; i++ {
+		path := filepath.Join(tb.TempDir(), fmt.Sprintf("scope-%02d", i), "state.json")
+		seedSQLiteWatchdogResourceStore(tb, path, i, scenario)
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func seedSQLiteWatchdogResourceStore(tb testing.TB, path string, index int, scenario teamsServiceWatchdogResourceScenario) {
+	tb.Helper()
+	ctx := context.Background()
+	store, err := teamsstore.Open(path)
+	if err != nil {
+		tb.Fatalf("Open teams store: %v", err)
+	}
+	now := time.Date(2026, 6, 9, 10, 30, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *teamsstore.State) error {
+		scopeID := fmt.Sprintf("scope-%02d", index)
+		chatID := fmt.Sprintf("chat-%02d", index)
+		state.Scope = teamsstore.ScopeIdentity{ID: scopeID, Profile: "test"}
+		state.ServiceControl = teamsstore.ServiceControl{UpdatedAt: now}
+		state.ChatPolls[chatID] = teamsstore.ChatPollState{
+			ChatID:               chatID,
+			Seeded:               true,
+			LastSuccessfulPollAt: now.Add(-time.Minute),
+			LastActivityAt:       now.Add(-time.Minute),
+		}
+		state.Sessions[fmt.Sprintf("session-%02d", index)] = teamsstore.SessionContext{
+			ID:          fmt.Sprintf("session-%02d", index),
+			Status:      teamsstore.SessionStatusActive,
+			TeamsChatID: chatID,
+			UpdatedAt:   now.Add(-time.Minute),
+		}
+		if scenario.rateLimited {
+			state.ChatRateLimits[chatID] = teamsstore.ChatRateLimitState{
+				ChatID:       chatID,
+				BlockedUntil: now.Add(5 * time.Minute),
+				Reason:       "test 429",
+				UpdatedAt:    now,
+			}
+		}
+		return nil
+	}); err != nil {
+		_ = store.Close()
+		tb.Fatalf("seed teams store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		_ = store.Close()
+		tb.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		tb.Fatalf("Close seeded teams store: %v", err)
+	}
+}
+
+func installTeamsServiceWatchdogResourceHooks(tb testing.TB, paths []string, scenario teamsServiceWatchdogResourceScenario) {
+	tb.Helper()
+	prevStorePaths := teamsServiceWatchdogStorePaths
+	prevInstalled := teamsServiceWatchdogInstalled
+	prevActive := teamsServiceWatchdogActive
+	teamsServiceWatchdogStorePaths = func() ([]string, error) {
+		return append([]string(nil), paths...), nil
+	}
+	teamsServiceWatchdogInstalled = func() (bool, error) {
+		return scenario.installed, nil
+	}
+	teamsServiceWatchdogActive = func(context.Context) (bool, error) {
+		if !scenario.installed {
+			tb.Fatalf("teamsServiceWatchdogActive called when service is not installed")
+		}
+		return scenario.active, nil
+	}
+	tb.Cleanup(func() {
+		teamsServiceWatchdogStorePaths = prevStorePaths
+		teamsServiceWatchdogInstalled = prevInstalled
+		teamsServiceWatchdogActive = prevActive
+	})
+}
+
+func teamsServiceWatchdogOpenDBCountsForTest() (connectionOpeners int, openDBRefs int) {
+	stack := teamsServiceWatchdogGoroutineStackForTest()
+	return strings.Count(stack, "database/sql.(*DB).connectionOpener"), strings.Count(stack, "database/sql.OpenDB")
+}
+
+func teamsServiceWatchdogGoroutineStackForTest() string {
+	var buf bytes.Buffer
+	if p := pprof.Lookup("goroutine"); p != nil {
+		_ = p.WriteTo(&buf, 2)
+	}
+	return buf.String()
+}
+
+func waitForTeamsServiceWatchdogOpenDBOpenersAtMost(tb testing.TB, maxOpeners int) int {
+	tb.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		openers, _ := teamsServiceWatchdogOpenDBCountsForTest()
+		if openers <= maxOpeners || time.Now().After(deadline) {
+			return openers
+		}
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func teamsServiceWatchdogHeapAllocForTest() uint64 {
+	runtime.GC()
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	return mem.HeapAlloc
 }

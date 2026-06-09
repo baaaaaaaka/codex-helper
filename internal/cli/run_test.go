@@ -563,17 +563,29 @@ func TestLimitedBufferWrite(t *testing.T) {
 	if got := buf.String(); got != "bcdef" {
 		t.Fatalf("expected %q, got %q", "bcdef", got)
 	}
+	if !buf.Truncated() {
+		t.Fatal("expected buffer to report truncation after overflow")
+	}
+	if got := string(buf.Bytes()); got != "bcdef" {
+		t.Fatalf("Bytes() = %q, want %q", got, "bcdef")
+	}
 
 	buf = &limitedBuffer{max: 5}
 	_, _ = buf.Write([]byte("0123456789"))
 	if got := buf.String(); got != "56789" {
 		t.Fatalf("expected %q, got %q", "56789", got)
 	}
+	if !buf.Truncated() {
+		t.Fatal("expected buffer to report truncation after oversized write")
+	}
 
 	buf = &limitedBuffer{max: 0}
 	_, _ = buf.Write([]byte("abc"))
 	if got := buf.String(); got != "" {
 		t.Fatalf("expected empty buffer, got %q", got)
+	}
+	if !buf.Truncated() {
+		t.Fatal("expected zero-size buffer to report truncation after write")
 	}
 }
 

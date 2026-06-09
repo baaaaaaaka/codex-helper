@@ -12,7 +12,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 func newTeamsWorkflowCmd(root *rootOptions, registryPath *string) *cobra.Command {
@@ -200,11 +199,7 @@ func printTeamsWorkflowStatus(cmd *cobra.Command) error {
 	}
 	printed := false
 	for _, path := range paths {
-		st, err := teamsstore.Open(path)
-		if err != nil {
-			return err
-		}
-		state, err := st.Load(cmd.Context())
+		state, err := loadTeamsStoreStateAndClose(cmd.Context(), path)
 		if err != nil {
 			return err
 		}

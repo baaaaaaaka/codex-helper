@@ -730,29 +730,46 @@ func terminateProcess(p *os.Process, grace time.Duration) error {
 const maxOutputCaptureBytes = 64 * 1024
 
 type limitedBuffer struct {
-	buf []byte
-	max int
+	buf       []byte
+	max       int
+	truncated bool
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
 	if b.max <= 0 || len(p) == 0 {
+		if len(p) > 0 {
+			b.truncated = true
+		}
 		return len(p), nil
 	}
 	if len(p) >= b.max {
 		b.buf = append(b.buf[:0], p[len(p)-b.max:]...)
+		b.truncated = true
 		return len(p), nil
 	}
 	if len(b.buf)+len(p) > b.max {
 		overflow := len(b.buf) + len(p) - b.max
 		b.buf = append(b.buf[overflow:], p...)
+		b.truncated = true
 		return len(p), nil
 	}
 	b.buf = append(b.buf, p...)
 	return len(p), nil
 }
 
+func (b *limitedBuffer) Bytes() []byte {
+	if len(b.buf) == 0 {
+		return nil
+	}
+	return append([]byte(nil), b.buf...)
+}
+
 func (b *limitedBuffer) String() string {
 	return string(b.buf)
+}
+
+func (b *limitedBuffer) Truncated() bool {
+	return b.truncated
 }
 
 func runTargetWithFallbackWithOptions(
