@@ -47,6 +47,30 @@ func TestWorkflowNotificationsDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestWorkflowNotificationEventSkipsBeforeSnapshot(t *testing.T) {
+	bridge := &Bridge{}
+	for _, tc := range []teamstore.OutboxMessage{
+		{
+			ID:          "outbox-final",
+			TeamsChatID: "work-chat",
+			Kind:        "final-answer",
+		},
+		{
+			ID:          "outbox-queued-status",
+			TeamsChatID: "work-chat",
+			Kind:        "queued-status",
+		},
+	} {
+		event, ok, err := bridge.workflowNotificationEventForOutbox(context.Background(), tc)
+		if err != nil {
+			t.Fatalf("workflow notification event error for %s: %v", tc.Kind, err)
+		}
+		if ok || event.ID != "" {
+			t.Fatalf("workflow notification event for %s = %#v ok=%v, want skipped", tc.Kind, event, ok)
+		}
+	}
+}
+
 func TestWorkflowFallbackFormatsLocalSessionMentionAsFocusedClickableMessage(t *testing.T) {
 	url := "https://teams.microsoft.com/l/chat/19%3Ameeting_ZWYyZjFlNmUtZTkwYi00YzRkLTliODQtODA1YjE3NzU1YmY2%40thread.v2/0?tenantId=tenant-1"
 	body := workflowNotificationFallbackBody(WorkflowNotificationEvent{

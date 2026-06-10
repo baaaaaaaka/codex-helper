@@ -485,6 +485,154 @@ func (s *Store) loadSQLiteSelectedStateFieldsUnlocked(pointer storeSQLitePointer
 	return loadSQLiteSelectedState(context.Background(), db, wanted)
 }
 
+func (s *Store) hotPollScheduleStateSQLite(ctx context.Context) (State, bool, error) {
+	state, _, handled, err := s.hotPollScheduleSQLite(ctx, false)
+	return state, handled, err
+}
+
+func (s *Store) hotPollScheduleSnapshotSQLite(ctx context.Context) (State, map[string]bool, bool, error) {
+	return s.hotPollScheduleSQLite(ctx, true)
+}
+
+func (s *Store) hotPollScheduleSQLite(ctx context.Context, includeParkedSkip bool) (State, map[string]bool, bool, error) {
+	var state State
+	parkedSkip := map[string]bool{}
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		selected, err := loadSQLiteSelectedStateWithChatPollQuery(ctx, db, hotPollScheduleSnapshotFields,
+			`SELECT json FROM chat_polls WHERE COALESCE(parked_skip_eligible, 0) = 0`,
+		)
+		if err != nil {
+			return err
+		}
+		if includeParkedSkip {
+			skipped, err := loadSQLiteParkedNoticeChatIDs(ctx, db)
+			if err != nil {
+				return err
+			}
+			parkedSkip = skipped
+		}
+		state = selected
+		handled = true
+		return nil
+	})
+	return state, parkedSkip, handled, err
+}
+
+func (s *Store) hotPollWorkCandidatesSQLite(ctx context.Context, controlChatID string, idleBefore time.Time) ([]SessionContext, bool, error) {
+	var out []SessionContext
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		hasSessions, err := loadSQLiteHasSessions(ctx, db)
+		if err != nil {
+			return err
+		}
+		if !hasSessions {
+			return nil
+		}
+		sessions, err := loadSQLiteHotPollWorkCandidates(ctx, db, controlChatID, idleBefore)
+		if err != nil {
+			return err
+		}
+		out = sessions
+		handled = true
+		return nil
+	})
+	return out, handled, err
+}
+
+func (s *Store) idleWorkChatParkCandidatesSQLite(ctx context.Context, controlChatID string, idleBefore time.Time, limit int) ([]IdleWorkChatParkCandidate, bool, error) {
+	var out []IdleWorkChatParkCandidate
+	handled := false
+	if idleBefore.IsZero() || limit <= 0 {
+		return nil, false, nil
+	}
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		candidates, err := loadSQLiteIdleWorkChatParkCandidates(ctx, db, controlChatID, idleBefore, limit)
+		if err != nil {
+			return err
+		}
+		out = candidates
+		handled = true
+		return nil
+	})
+	return out, handled, err
+}
+
+func (s *Store) sessionsByIDSQLite(ctx context.Context, ids []string) (map[string]SessionContext, bool, error) {
+	out := make(map[string]SessionContext, len(ids))
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		const batchSize = 500
+		for start := 0; start < len(ids); start += batchSize {
+			end := start + batchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			if err := loadSQLiteSessionsByID(ctx, db, ids[start:end], out); err != nil {
+				return err
+			}
+		}
+		handled = true
+		return nil
+	})
+	return out, handled, err
+}
+
+func (s *Store) hasSessionsSQLite(ctx context.Context) (bool, bool, error) {
+	hasSessions := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		hasSessions, err = loadSQLiteHasSessions(ctx, db)
+		if err != nil {
+			return err
+		}
+		handled = true
+		return nil
+	})
+	return hasSessions, handled, err
+}
+
 func (s *Store) sqliteDBUnlocked(pointer storeSQLitePointer) (*sql.DB, error) {
 	path, err := s.storeSQLitePath(pointer)
 	if err != nil {
@@ -737,7 +885,8 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS outbox_session_idx ON outbox_messages(session_id, status, created_at, id)`,
 		`CREATE TABLE IF NOT EXISTS message_provenance (id TEXT PRIMARY KEY, teams_chat_id TEXT, teams_message_id TEXT, origin TEXT, session_id TEXT, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS message_provenance_lookup_idx ON message_provenance(teams_chat_id, teams_message_id, origin)`,
-		`CREATE TABLE IF NOT EXISTS chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, poll_state TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, poll_state TEXT, last_activity_at INTEGER, park_notice_sent_at INTEGER, parked_skip_eligible INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS chat_polls_parked_skip_idx ON chat_polls(parked_skip_eligible, chat_id)`,
 		`CREATE TABLE IF NOT EXISTS chat_rate_limits (chat_id TEXT PRIMARY KEY, blocked_until INTEGER, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS import_checkpoints (id TEXT PRIMARY KEY, session_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS import_checkpoints_session_idx ON import_checkpoints(session_id, status, updated_at, id)`,
@@ -763,10 +912,27 @@ func ensureSQLiteSchema(db *sql.DB) error {
 	if _, err := db.Exec(`ALTER TABLE outbox_messages ADD COLUMN turn_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
+	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN park_notice_sent_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN parked_skip_eligible INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN last_activity_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	if err := backfillSQLiteChatPollDerivedColumns(db); err != nil {
+		return err
+	}
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS outbox_turn_idx ON outbox_messages(turn_id, status, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS outbox_message_lookup_idx ON outbox_messages(teams_chat_id, teams_message_id, status)`,
 		`CREATE INDEX IF NOT EXISTS outbox_chat_sequence_idx ON outbox_messages(teams_chat_id, sequence, status, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS chat_polls_parked_skip_idx ON chat_polls(parked_skip_eligible, chat_id)`,
+		`CREATE INDEX IF NOT EXISTS chat_polls_auto_park_idx ON chat_polls(last_activity_at, chat_id) WHERE parked_skip_eligible = 0 AND last_activity_at > 0 AND poll_state IN ('cold', 'parked')`,
+		`CREATE INDEX IF NOT EXISTS transcript_deliveries_outbox_idx ON transcript_deliveries(outbox_id)`,
+		`CREATE INDEX IF NOT EXISTS helper_deliveries_outbox_idx ON helper_deliveries(outbox_id)`,
+		`CREATE INDEX IF NOT EXISTS artifact_records_outbox_idx ON artifact_records(outbox_id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
@@ -840,8 +1006,8 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	}); err != nil {
 		return err
 	}
-	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_polls(chat_id, next_poll_at, poll_state, updated_at, json) VALUES (?, ?, ?, ?, ?)`, state.ChatPolls, func(v ChatPollState) []any {
-		return []any{v.ChatID, sqliteTime(v.NextPollAt), v.PollState, sqliteTime(v.UpdatedAt)}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_polls(chat_id, next_poll_at, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, state.ChatPolls, func(v ChatPollState) []any {
+		return []any{v.ChatID, sqliteTime(v.NextPollAt), v.PollState, sqliteTime(v.LastActivityAt), sqliteTime(v.ParkNoticeSentAt), sqliteBool(chatPollParkedSkipEligible(v)), sqliteTime(v.UpdatedAt)}
 	}); err != nil {
 		return err
 	}
@@ -905,6 +1071,72 @@ func writeSQLiteMap[T any](ctx context.Context, tx *sql.Tx, stmtText string, val
 	return nil
 }
 
+func backfillSQLiteChatPollDerivedColumns(db *sql.DB) error {
+	rows, err := db.Query(`SELECT chat_id, json FROM chat_polls WHERE park_notice_sent_at IS NULL OR parked_skip_eligible IS NULL OR last_activity_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	type chatPollDerivedUpdate struct {
+		ChatID             string
+		LastActivityAt     int64
+		ParkNoticeSentAt   int64
+		ParkedSkipEligible int64
+	}
+	var updates []chatPollDerivedUpdate
+	for rows.Next() {
+		var chatID string
+		var raw []byte
+		if err := rows.Scan(&chatID, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		var poll ChatPollState
+		if err := json.Unmarshal(raw, &poll); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		chatID = strings.TrimSpace(chatID)
+		if chatID == "" {
+			chatID = strings.TrimSpace(poll.ChatID)
+		}
+		if chatID == "" {
+			continue
+		}
+		updates = append(updates, chatPollDerivedUpdate{
+			ChatID:             chatID,
+			LastActivityAt:     sqliteTime(poll.LastActivityAt),
+			ParkNoticeSentAt:   sqliteTime(poll.ParkNoticeSentAt),
+			ParkedSkipEligible: sqliteBool(chatPollParkedSkipEligible(poll)),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE chat_polls SET last_activity_at = ?, park_notice_sent_at = ?, parked_skip_eligible = ? WHERE chat_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, update := range updates {
+		if _, err := stmt.Exec(update.LastActivityAt, update.ParkNoticeSentAt, update.ParkedSkipEligible, update.ChatID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
 	if err := ensureSQLiteSchema(db); err != nil {
 		return State{}, err
@@ -960,9 +1192,10 @@ func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
 }
 
 func loadSQLiteSelectedState(ctx context.Context, db *sql.DB, wanted map[string]struct{}) (State, error) {
-	if err := ensureSQLiteSchema(db); err != nil {
-		return State{}, err
-	}
+	return loadSQLiteSelectedStateWithChatPollQuery(ctx, db, wanted, `SELECT json FROM chat_polls`)
+}
+
+func loadSQLiteSelectedStateWithChatPollQuery(ctx context.Context, db *sql.DB, wanted map[string]struct{}, chatPollQuery string, chatPollArgs ...any) (State, error) {
 	state, err := loadSQLiteColdState(ctx, db)
 	if err != nil {
 		return State{}, err
@@ -996,7 +1229,10 @@ func loadSQLiteSelectedState(ctx context.Context, db *sql.DB, wanted map[string]
 		}
 	}
 	if _, ok := wanted["chat_polls"]; ok {
-		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM chat_polls`, state.ChatPolls, func(v ChatPollState) string { return v.ChatID }); err != nil {
+		if strings.TrimSpace(chatPollQuery) == "" {
+			chatPollQuery = `SELECT json FROM chat_polls`
+		}
+		if err := loadSQLiteJSONMap(ctx, db, chatPollQuery, state.ChatPolls, func(v ChatPollState) string { return v.ChatID }, chatPollArgs...); err != nil {
 			return State{}, err
 		}
 	}
@@ -1039,6 +1275,131 @@ func loadSQLiteSelectedState(ctx context.Context, db *sql.DB, wanted map[string]
 	return state, nil
 }
 
+func loadSQLiteParkedNoticeChatIDs(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT chat_id FROM chat_polls WHERE COALESCE(parked_skip_eligible, 0) != 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var chatID string
+		if err := rows.Scan(&chatID); err != nil {
+			return nil, err
+		}
+		chatID = strings.TrimSpace(chatID)
+		if chatID != "" {
+			out[chatID] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+func loadSQLiteHasSessions(ctx context.Context, db *sql.DB) (bool, error) {
+	var one int
+	if err := db.QueryRowContext(ctx, `SELECT 1 FROM sessions LIMIT 1`).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlChatID string, idleBefore time.Time) ([]SessionContext, error) {
+	controlChatID = strings.TrimSpace(controlChatID)
+	args := []any{string(SessionStatusActive), controlChatID, controlChatID}
+	excludeIdle := ""
+	if !idleBefore.IsZero() {
+		excludeIdle = `  AND NOT (
+    COALESCE(p.last_activity_at, 0) > 0
+    AND COALESCE(p.last_activity_at, 0) <= ?
+    AND COALESCE(s.updated_at, 0) <= ?
+    AND COALESCE(p.parked_skip_eligible, 0) = 0
+    AND p.poll_state IN (?, ?)
+    AND NOT EXISTS (
+      SELECT 1 FROM turns t
+      WHERE t.session_id = s.id
+        AND t.status IN (?, ?)
+    )
+  )
+`
+		idleBeforeUnix := sqliteTime(idleBefore)
+		args = append(args, idleBeforeUnix, idleBeforeUnix, chatPollStateCold, chatPollStateParked, string(TurnStatusQueued), string(TurnStatusRunning))
+	}
+	rows, err := db.QueryContext(ctx, `SELECT s.json
+FROM sessions s
+LEFT JOIN chat_polls p ON p.chat_id = s.teams_chat_id
+WHERE (s.status IS NULL OR s.status = '' OR s.status = ?)
+  AND COALESCE(s.teams_chat_id, '') != ''
+  AND (? = '' OR s.teams_chat_id != ?)
+  AND (p.chat_id IS NULL OR COALESCE(p.parked_skip_eligible, 0) = 0)
+`+excludeIdle+`ORDER BY s.updated_at DESC, s.id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionContext
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var session SessionContext
+		if err := json.Unmarshal(raw, &session); err != nil {
+			return nil, err
+		}
+		out = append(out, session)
+	}
+	return out, rows.Err()
+}
+
+func loadSQLiteIdleWorkChatParkCandidates(ctx context.Context, db *sql.DB, controlChatID string, idleBefore time.Time, limit int) ([]IdleWorkChatParkCandidate, error) {
+	controlChatID = strings.TrimSpace(controlChatID)
+	if idleBefore.IsZero() || limit <= 0 {
+		return nil, nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT s.json, p.json
+FROM chat_polls p
+JOIN sessions s ON s.teams_chat_id = p.chat_id
+WHERE p.last_activity_at > 0
+  AND p.last_activity_at <= ?
+  AND COALESCE(s.updated_at, 0) <= ?
+  AND (s.status IS NULL OR s.status = '' OR s.status = ?)
+  AND COALESCE(s.teams_chat_id, '') != ''
+  AND (? = '' OR s.teams_chat_id != ?)
+  AND COALESCE(p.parked_skip_eligible, 0) = 0
+  AND p.poll_state IN (?, ?)
+  AND NOT EXISTS (
+    SELECT 1 FROM turns t
+    WHERE t.session_id = s.id
+      AND t.status IN (?, ?)
+  )
+ORDER BY p.last_activity_at ASC, s.updated_at ASC, s.id
+LIMIT ?`, sqliteTime(idleBefore), sqliteTime(idleBefore), string(SessionStatusActive), controlChatID, controlChatID, chatPollStateCold, chatPollStateParked, string(TurnStatusQueued), string(TurnStatusRunning), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IdleWorkChatParkCandidate
+	for rows.Next() {
+		var sessionRaw []byte
+		var pollRaw []byte
+		if err := rows.Scan(&sessionRaw, &pollRaw); err != nil {
+			return nil, err
+		}
+		var candidate IdleWorkChatParkCandidate
+		if err := json.Unmarshal(sessionRaw, &candidate.Session); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(pollRaw, &candidate.Poll); err != nil {
+			return nil, err
+		}
+		out = append(out, candidate)
+	}
+	return out, rows.Err()
+}
+
 func loadSQLiteColdState(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }) (State, error) {
@@ -1078,6 +1439,20 @@ func loadSQLiteJSONMap[T any](ctx context.Context, db *sql.DB, query string, out
 		out[key(value)] = value
 	}
 	return rows.Err()
+}
+
+func loadSQLiteSessionsByID(ctx context.Context, db *sql.DB, ids []string, out map[string]SessionContext) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := `SELECT json FROM sessions WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+	return loadSQLiteJSONMap(ctx, db, query, out, func(v SessionContext) string { return v.ID }, args...)
 }
 
 func loadSQLiteJSONMapTx[T any](ctx context.Context, tx *sql.Tx, query string, args []any, out map[string]T, key func(T) string) error {
@@ -1314,6 +1689,69 @@ func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) er
 	return handled, err
 }
 
+func (s *Store) importCheckpointSQLite(ctx context.Context, id string) (ImportCheckpoint, bool, bool, error) {
+	var out ImportCheckpoint
+	found := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		out, found, err = loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, id)
+		return err
+	})
+	return out, found, handled, err
+}
+
+func (s *Store) updateImportCheckpointSQLite(ctx context.Context, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, bool, error) {
+	var out ImportCheckpoint
+	changed := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		current, found, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		next, updateChanged, err := fn(current, found, now)
+		if err != nil {
+			return err
+		}
+		out = next
+		handled = true
+		if !updateChanged {
+			return tx.Commit()
+		}
+		next.ID = id
+		if err := upsertSQLiteImportCheckpointTx(ctx, tx, next); err != nil {
+			return err
+		}
+		out = next
+		changed = true
+		return tx.Commit()
+	})
+	return out, changed, handled, err
+}
+
 func (s *Store) updateSQLiteColdState(ctx context.Context, fn func(*State) error) (bool, error) {
 	handled := false
 	err := s.withStateLock(ctx, func() error {
@@ -1512,9 +1950,9 @@ func upsertSQLiteChatPollTx(ctx context.Context, tx *sql.Tx, v ChatPollState) er
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO chat_polls(chat_id, next_poll_at, poll_state, updated_at, json) VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(chat_id) DO UPDATE SET next_poll_at = excluded.next_poll_at, poll_state = excluded.poll_state, updated_at = excluded.updated_at, json = excluded.json`,
-		v.ChatID, sqliteTime(v.NextPollAt), v.PollState, sqliteTime(v.UpdatedAt), data)
+	_, err = tx.ExecContext(ctx, `INSERT INTO chat_polls(chat_id, next_poll_at, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(chat_id) DO UPDATE SET next_poll_at = excluded.next_poll_at, poll_state = excluded.poll_state, last_activity_at = excluded.last_activity_at, park_notice_sent_at = excluded.park_notice_sent_at, parked_skip_eligible = excluded.parked_skip_eligible, updated_at = excluded.updated_at, json = excluded.json`,
+		v.ChatID, sqliteTime(v.NextPollAt), v.PollState, sqliteTime(v.LastActivityAt), sqliteTime(v.ParkNoticeSentAt), sqliteBool(chatPollParkedSkipEligible(v)), sqliteTime(v.UpdatedAt), data)
 	return err
 }
 
@@ -2241,6 +2679,64 @@ func (s *Store) loadSQLiteSessionTurnQueueStateUnlocked(pointer storeSQLitePoint
 	return state, nil
 }
 
+func (s *Store) loadSQLiteSessionWorkflowEventForTurnUnlocked(pointer storeSQLitePointer, sessionID string, turnID string) (State, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return State{}, err
+	}
+	ctx := context.Background()
+	state := State{
+		SchemaVersion: SchemaVersion,
+		Sessions:      map[string]SessionContext{},
+		Turns:         map[string]Turn{},
+		InboundEvents: map[string]InboundEvent{},
+	}
+	if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, db, `SELECT json FROM sessions WHERE id = ?`, sessionID); err != nil {
+		return State{}, err
+	} else if ok {
+		state.Sessions[session.ID] = session
+	}
+	turn, ok, err := loadSQLiteJSONRow[Turn](ctx, db, `SELECT json FROM turns WHERE id = ?`, turnID)
+	if err != nil {
+		return State{}, err
+	}
+	if ok && strings.TrimSpace(turn.SessionID) == sessionID {
+		state.Turns[turn.ID] = turn
+		if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+			if inbound, ok, err := loadSQLiteJSONRow[InboundEvent](ctx, db, `SELECT json FROM inbound_events WHERE id = ?`, inboundID); err != nil {
+				return State{}, err
+			} else if ok {
+				state.InboundEvents[inbound.ID] = inbound
+			}
+		}
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) loadSQLiteSessionThreadResolutionStateUnlocked(pointer storeSQLitePointer, sessionID string) (State, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return State{}, err
+	}
+	ctx := context.Background()
+	state := State{
+		SchemaVersion: SchemaVersion,
+		Sessions:      map[string]SessionContext{},
+		Turns:         map[string]Turn{},
+	}
+	if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, db, `SELECT json FROM sessions WHERE id = ?`, sessionID); err != nil {
+		return State{}, err
+	} else if ok {
+		state.Sessions[session.ID] = session
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM turns WHERE session_id = ?`, state.Turns, func(v Turn) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
 func (s *Store) loadSQLiteSessionActiveTurnQueueStateUnlocked(pointer storeSQLitePointer, sessionID string) (State, error) {
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
@@ -2791,7 +3287,7 @@ func (s *Store) queueOutboxSQLite(ctx context.Context, msg OutboxMessage) (Outbo
 	return out, created, handled, err
 }
 
-func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCold bool, fn func(*State, OutboxMessage, time.Time) (OutboxMessage, error)) (OutboxMessage, bool, error) {
+func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCold bool, loadLinked bool, fn func(*State, OutboxMessage, time.Time) (OutboxMessage, error)) (OutboxMessage, bool, error) {
 	var out OutboxMessage
 	handled := false
 	sessionID := ""
@@ -2804,15 +3300,13 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 		if err != nil {
 			return err
 		}
-		current, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID)
-		if err != nil {
+		handled = true
+		if err := db.QueryRowContext(ctx, `SELECT session_id FROM outbox_messages WHERE id = ?`, outboxID).Scan(&sessionID); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("outbox message %q not found", outboxID)
+		} else if err != nil {
 			return err
 		}
-		handled = true
-		if !ok {
-			return fmt.Errorf("outbox message %q not found", outboxID)
-		}
-		sessionID = strings.TrimSpace(current.SessionID)
+		sessionID = strings.TrimSpace(sessionID)
 		return nil
 	})
 	if err != nil || !handled {
@@ -2864,7 +3358,7 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 					state.Sessions[sessionID] = session
 				}
 			}
-			if loadCold {
+			if loadCold || loadLinked {
 				if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
 					return err
 				}
@@ -2879,10 +3373,12 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 			if err := upsertSQLiteOutboxTx(ctx, tx, next); err != nil {
 				return err
 			}
-			if loadCold {
+			if loadCold || loadLinked {
 				if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
 					return err
 				}
+			}
+			if loadCold {
 				if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
 					return err
 				}
@@ -2915,15 +3411,13 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 		if err != nil {
 			return err
 		}
-		current, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID)
-		if err != nil {
+		handled = true
+		if err := db.QueryRowContext(ctx, `SELECT session_id FROM outbox_messages WHERE id = ?`, outboxID).Scan(&sessionID); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("outbox message %q not found", outboxID)
+		} else if err != nil {
 			return err
 		}
-		handled = true
-		if !ok {
-			return fmt.Errorf("outbox message %q not found", outboxID)
-		}
-		sessionID = strings.TrimSpace(current.SessionID)
+		sessionID = strings.TrimSpace(sessionID)
 		return nil
 	})
 	if err != nil || !handled {
@@ -2961,10 +3455,7 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 				return err
 			}
 			defer tx.Rollback()
-			state, err := loadSQLiteColdState(ctx, tx)
-			if err != nil {
-				return err
-			}
+			state := newState()
 			state.OutboxMessages = map[string]OutboxMessage{outboxID: current}
 			state.MessageProvenance = map[string]MessageProvenanceRecord{}
 			state.Sessions = map[string]SessionContext{}
@@ -3029,9 +3520,6 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 				}
 			}
 			if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
-				return err
-			}
-			if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
 				return err
 			}
 			if err := tx.Commit(); err != nil {
@@ -3143,6 +3631,45 @@ ORDER BY o.created_at, o.id`
 	return out, handled, err
 }
 
+func (s *Store) sentOutboxMessagesForChatSQLite(ctx context.Context, chatID string) ([]OutboxMessage, bool, error) {
+	var out []OutboxMessage
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		rows, err := db.QueryContext(ctx, `SELECT json FROM outbox_messages
+WHERE teams_chat_id = ?
+  AND status = ?
+ORDER BY created_at, id`, chatID, string(OutboxStatusSent))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			var msg OutboxMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				return err
+			}
+			if msg.TeamsChatID == chatID && msg.Status == OutboxStatusSent {
+				out = append(out, msg)
+			}
+		}
+		return rows.Err()
+	})
+	return out, handled, err
+}
+
 func (s *Store) earlierUnsentOutboxSQLite(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, bool, error) {
 	var out OutboxMessage
 	found := false
@@ -3192,6 +3719,40 @@ func (s *Store) chatPollSQLite(ctx context.Context, chatID string) (ChatPollStat
 		return err
 	})
 	return out, found, handled, err
+}
+
+func (s *Store) chatSessionActivitySQLite(ctx context.Context, chatID string) (bool, bool, bool, error) {
+	matched := false
+	active := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		rows, err := db.QueryContext(ctx, `SELECT status FROM sessions WHERE teams_chat_id = ?`, chatID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var rawStatus string
+			if err := rows.Scan(&rawStatus); err != nil {
+				return err
+			}
+			matched = true
+			if sessionStatusIsActive(SessionStatus(rawStatus)) {
+				active = true
+			}
+		}
+		return rows.Err()
+	})
+	return matched, active, handled, err
 }
 
 func (s *Store) recordChatPollSuccessWithContinuationAndScheduleSQLite(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, schedule func(ChatPollState) (ChatPollScheduleUpdate, error)) (ChatPollState, bool, error) {
@@ -3249,6 +3810,60 @@ func (s *Store) recordChatPollSuccessWithContinuationAndScheduleSQLite(ctx conte
 		return tx.Commit()
 	})
 	return out, handled, err
+}
+
+func (s *Store) markChatPollParkNoticeSentSQLite(ctx context.Context, chatID string, at time.Time) (ChatPollState, bool, error) {
+	var out ChatPollState
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if poll, ok, err := loadSQLiteJSONRow[ChatPollState](ctx, tx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID); err != nil {
+			return err
+		} else if ok {
+			out = poll
+		}
+		out.ChatID = chatID
+		out.ParkNoticeSentAt = at
+		out.UpdatedAt = time.Now()
+		handled = true
+		if err := upsertSQLiteChatPollTx(ctx, tx, out); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	return out, handled, err
+}
+
+func (s *Store) chatRateLimitSQLite(ctx context.Context, chatID string) (ChatRateLimitState, bool, bool, error) {
+	var out ChatRateLimitState
+	var found bool
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		out, found, err = loadSQLiteJSONRow[ChatRateLimitState](ctx, db, `SELECT json FROM chat_rate_limits WHERE chat_id = ?`, chatID)
+		handled = true
+		return err
+	})
+	return out, found, handled, err
 }
 
 func (s *Store) updateChatPollSchedulesSQLite(ctx context.Context, updates []ChatPollScheduleUpdate) (map[string]ChatPollState, bool, error) {
@@ -3368,4 +3983,11 @@ func sqliteTime(t time.Time) int64 {
 		return 0
 	}
 	return t.UnixNano()
+}
+
+func sqliteBool(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
 }

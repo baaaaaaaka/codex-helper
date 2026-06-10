@@ -85,8 +85,12 @@ var cxpPerfProfiles = []cxpPerfProfile{
 		HistoryLines:    1000,
 	},
 	{
+		// This is a transition-storm profile: many chats are still active and
+		// have not yet recorded a park notice, so a poll cycle can park and
+		// notify all of them. It is intentionally harsher than the normal
+		// steady state where old chats are already parked and notified.
 		Name:            "idle-chat-hoarder",
-		Description:     "hundreds of inactive chats that still need scheduling decisions",
+		Description:     "hundreds of inactive but still active chats crossing the park threshold in one cycle",
 		WorkChats:       240,
 		TurnsPerChat:    2,
 		MessagesPerPoll: 0,
@@ -681,6 +685,38 @@ func BenchmarkCXPPerfModelSQLiteMainLoopIdleTickProfiles(b *testing.B) {
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteIdleWorkAutoParkSweepProfiles(b *testing.B) {
+	var profile cxpPerfProfile
+	for _, candidate := range cxpPerfProfiles {
+		if candidate.Name == "idle-chat-hoarder" {
+			profile = candidate
+			break
+		}
+	}
+	if profile.Name == "" {
+		b.Fatal("idle-chat-hoarder profile not found")
+	}
+	profile.MessagesPerPoll = 0
+	store := newCXPPerfStore(b, profile)
+	graph := newCXPPerfGraph(profile)
+	bridge := newCXPPerfBridge(store, graph, profile)
+	bridge.asyncTurns = true
+	cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+	cxpPerfSeedIdleAutoParkCandidates(b, store)
+	cxpPerfMigrateStoreToSQLite(b, store)
+	cxpPerfPrepareActiveOwner(b, bridge)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tick := now.Add(time.Duration(i) * (autoParkSweepInterval + time.Second))
+		if err := bridge.maybeRunIdleWorkChatAutoPark(ctx, tick); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+			b.Fatalf("idle work auto-park sweep: %v", err)
+		}
+	}
+}
+
 func BenchmarkCXPPerfModelSQLiteActiveParkedMainLoopProfiles(b *testing.B) {
 	for _, profile := range cxpPerfProfiles {
 		profile := profile
@@ -707,6 +743,112 @@ func BenchmarkCXPPerfModelSQLiteActiveParkedMainLoopProfiles(b *testing.B) {
 			}
 		})
 	}
+}
+
+// BenchmarkCXPPerfModelSQLiteParkedChatHoarderMainLoop covers the realistic
+// steady state where thousands of old Work chats remain in the registry but
+// their poll rows are already parked and notified. It should not trigger the
+// first-park freeze-notice fanout measured by idle-chat-hoarder.
+func BenchmarkCXPPerfModelSQLiteParkedChatHoarderMainLoop(b *testing.B) {
+	profile := cxpPerfProfile{
+		Name:            "parked-chat-hoarder-2000",
+		Description:     "thousands of already parked and notified work chats",
+		WorkChats:       2000,
+		TurnsPerChat:    0,
+		MessagesPerPoll: 0,
+		MessageBytes:    80,
+		OutboxPerChat:   0,
+		LookupPerCycle:  64,
+		HistoryFiles:    0,
+		HistoryLines:    0,
+	}
+	store := newCXPPerfStore(b, profile)
+	graph := newCXPPerfGraph(profile)
+	bridge := newCXPPerfBridge(store, graph, profile)
+	bridge.asyncTurns = true
+	cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+	cxpPerfSeedActiveParkedSessions(b, store, bridge)
+	cxpPerfMigrateStoreToSQLite(b, store)
+	cxpPerfPrepareActiveOwner(b, bridge)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+	opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := cxpPerfRunMainLoopIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*11*time.Second)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+			b.Fatalf("parked chat hoarder main loop idle tick: %v", err)
+		}
+	}
+}
+
+// BenchmarkCXPPerfModelSQLiteRealisticMixedUser covers the expected large-user
+// steady state: around 100 active chats with mixed history sizes, thousands of
+// already parked chats, sparse user messages, and periodic live progress sends.
+//
+// Keep this as a dedicated benchmark instead of adding it to cxpPerfProfiles;
+// otherwise every generic profile benchmark would inherit the 2100-chat fixture
+// and make CI perf runs unreasonably slow.
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUser(b *testing.B) {
+	b.Run("idle-main-loop", func(b *testing.B) {
+		store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		ctx := context.Background()
+		now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+		opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
+		cxpPerfMarkMainLoopMaintenanceFresh(bridge, now)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := cxpPerfRunMainLoopSteadyIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*3*time.Second)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+				b.Fatalf("realistic mixed idle tick: %v", err)
+			}
+		}
+		_ = store
+	})
+	b.Run("transcript-sync-due", func(b *testing.B) {
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		ctx := context.Background()
+		now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+		opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := cxpPerfRunMainLoopIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*time.Minute)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+				b.Fatalf("realistic mixed transcript sync due tick: %v", err)
+			}
+		}
+	})
+	b.Run("live-progress-update", func(b *testing.B) {
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		ctx := context.Background()
+		sessionID, chatID, turnID := cxpPerfSeedRealisticRunningTurn(b, bridge.store)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if !bridge.canQueueLiveTurnOutbox(ctx, sessionID, turnID) {
+				b.Fatal("running turn unexpectedly rejected live progress")
+			}
+			kind := fmt.Sprintf("codex-progress-%03d", i+1)
+			body := fmt.Sprintf("working on realistic mixed user update %d", i+1)
+			if err := bridge.queueAndSendOutboxChunks(ctx, sessionID, turnID, chatID, kind, body); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+				b.Fatalf("realistic mixed live progress update: %v", err)
+			}
+		}
+	})
+	b.Run("single-user-message-drain", func(b *testing.B) {
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		ctx := context.Background()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := cxpPerfHandleRealisticUserMessage(ctx, bridge, i); err != nil {
+				b.Fatalf("realistic mixed user message: %v", err)
+			}
+			if err := cxpPerfDrainAsyncTurns(ctx, bridge); err != nil {
+				b.Fatalf("realistic mixed queued turn drain: %v", err)
+			}
+		}
+	})
 }
 
 func BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles(b *testing.B) {
@@ -1114,6 +1256,36 @@ func BenchmarkCXPPerfModelLinkedTranscriptIdleManySessions(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteBackgroundImportCheckpointOnly(b *testing.B) {
+	ctx := context.Background()
+	const backgroundRecords = 2000
+	var totalSQLiteBytes int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, bridge, session, transcriptPath := newCXPPerfBackgroundImportCheckpointOnlyFixture(b, backgroundRecords, i)
+		beforeBytes := cxpPerfSQLiteStoreBytes(b, store)
+		b.StartTimer()
+
+		result, err := bridge.importTranscriptRecordsToTeams(ctx, session, transcriptPath, "import-bg:"+session.ID, "import-bg", transcriptCheckpointID(session.ID), transcriptImportRunOptions{QueueOnly: true, MaxBatches: 1})
+		if err != nil {
+			b.Fatalf("background checkpoint-only import: %v", err)
+		}
+		if !result.Complete || result.Stats.SkippedBackground != backgroundRecords {
+			b.Fatalf("background checkpoint-only result = %#v, want complete with %d skipped records", result, backgroundRecords)
+		}
+
+		b.StopTimer()
+		afterBytes := cxpPerfSQLiteStoreBytes(b, store)
+		totalSQLiteBytes += afterBytes - beforeBytes
+		b.StartTimer()
+	}
+	if b.N > 0 {
+		b.ReportMetric(float64(totalSQLiteBytes)/float64(b.N), "sqlite_bytes/op")
 	}
 }
 
@@ -1627,6 +1799,67 @@ func cxpPerfSeedLinkedTranscriptFiles(tb testing.TB, store *teamstore.Store, bri
 	}
 }
 
+func newCXPPerfBackgroundImportCheckpointOnlyFixture(tb testing.TB, records int, index int) (*teamstore.Store, *Bridge, Session, string) {
+	tb.Helper()
+	profile := cxpPerfProfile{
+		Name:          "background-import-checkpoint-only",
+		WorkChats:     1,
+		TurnsPerChat:  1,
+		MessageBytes:  128,
+		OutboxPerChat: 0,
+	}
+	store := newCXPPerfStore(tb, profile)
+	cxpPerfMigrateStoreToSQLite(tb, store)
+	bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+	session := bridge.reg.Sessions[0]
+	threadID := fmt.Sprintf("perf-background-import-%06d", index)
+	session.CodexThreadID = threadID
+	bridge.reg.Sessions[0] = session
+	if err := bridge.ensureDurableSession(context.Background(), &session); err != nil {
+		tb.Fatalf("ensure durable perf session: %v", err)
+	}
+	transcriptPath := filepath.Join(tb.TempDir(), "background-import.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(cxpPerfBackgroundOnlyTranscriptContent(threadID, records)), 0o600); err != nil {
+		tb.Fatalf("write background-only transcript: %v", err)
+	}
+	return store, bridge, session, transcriptPath
+}
+
+func cxpPerfBackgroundOnlyTranscriptContent(threadID string, records int) string {
+	var b strings.Builder
+	b.WriteString(`{"type":"session_meta","payload":{"id":`)
+	b.WriteString(strconv.Quote(threadID))
+	b.WriteString("}}\n")
+	for i := 0; i < records; i++ {
+		b.WriteString(`{"type":"response_item","payload":{"id":`)
+		b.WriteString(strconv.Quote(fmt.Sprintf("tool-%06d", i)))
+		b.WriteString(`,"type":"function_call","name":"shell","arguments":`)
+		b.WriteString(strconv.Quote(fmt.Sprintf(`{"cmd":"rg perf-%06d"}`, i)))
+		b.WriteString("}}\n")
+	}
+	return b.String()
+}
+
+func cxpPerfSQLiteStoreBytes(tb testing.TB, store *teamstore.Store) int64 {
+	tb.Helper()
+	if store == nil {
+		return 0
+	}
+	dir := filepath.Dir(store.Path())
+	var total int64
+	for _, name := range []string{"store.sqlite", "store.sqlite-wal", "store.sqlite-shm"} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err == nil {
+			total += info.Size()
+			continue
+		}
+		if !os.IsNotExist(err) {
+			tb.Fatalf("stat sqlite file %s: %v", name, err)
+		}
+	}
+	return total
+}
+
 func cxpPerfStripLinkedTranscriptCheckpointPositionMetadata(tb testing.TB, store *teamstore.Store) {
 	tb.Helper()
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
@@ -1755,6 +1988,18 @@ func cxpPerfRunMainLoopIdleTick(ctx context.Context, bridge *Bridge, opts Bridge
 	bridge.lastHistoryWatchReconcile = now
 	bridge.lastBeaconReconcile = time.Time{}
 	bridge.lastBeaconLeaseMaintenance = time.Time{}
+	return cxpPerfRunMainLoopSteadyIdleTick(ctx, bridge, opts, now)
+}
+
+func cxpPerfMarkMainLoopMaintenanceFresh(bridge *Bridge, now time.Time) {
+	bridge.lastTranscriptSync = now
+	bridge.lastHistoryWatchSync = now
+	bridge.lastHistoryWatchReconcile = now
+	bridge.lastBeaconReconcile = now
+	bridge.lastBeaconLeaseMaintenance = now
+}
+
+func cxpPerfRunMainLoopSteadyIdleTick(ctx context.Context, bridge *Bridge, opts BridgeOptions, now time.Time) error {
 	if active, err := bridge.refreshControlLease(ctx); err != nil {
 		return err
 	} else if !active {
@@ -1767,6 +2012,9 @@ func cxpPerfRunMainLoopIdleTick(ctx context.Context, bridge *Bridge, opts Bridge
 		return err
 	}
 	if err := bridge.pollOnce(ctx, opts.Top); err != nil && !isGraphRateLimitError(err) {
+		return err
+	}
+	if err := bridge.maybeRunIdleWorkChatAutoPark(ctx, now); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
 		return err
 	}
 	if err := bridge.syncLinkedTranscriptsIfDue(ctx, now); err != nil {
@@ -1953,6 +2201,227 @@ func newCXPPerfStore(b testing.TB, profile cxpPerfProfile) *teamstore.Store {
 	return store
 }
 
+func cxpPerfRealisticMixedUserProfile() cxpPerfProfile {
+	return cxpPerfProfile{
+		Name:            "realistic-mixed-user",
+		Description:     "100 active mixed-length chats and 2000 parked chats",
+		WorkChats:       2100,
+		TurnsPerChat:    0,
+		MessagesPerPoll: 0,
+		MessageBytes:    256,
+		OutboxPerChat:   0,
+		LookupPerCycle:  128,
+		HistoryFiles:    0,
+		HistoryLines:    0,
+	}
+}
+
+func newCXPPerfRealisticMixedUserFixture(tb testing.TB) (*teamstore.Store, *Bridge) {
+	tb.Helper()
+	profile := cxpPerfRealisticMixedUserProfile()
+	store := newCXPPerfStore(tb, profile)
+	graph := newCXPPerfGraph(profile)
+	bridge := newCXPPerfBridge(store, graph, profile)
+	bridge.asyncTurns = true
+	cxpPerfSeedColdRuntimeMetadata(tb, store, profile)
+	cxpPerfSeedRealisticMixedUserState(tb, store, bridge)
+	cxpPerfMigrateStoreToSQLite(tb, store)
+	cxpPerfPrepareActiveOwner(tb, bridge)
+	return store, bridge
+}
+
+func cxpPerfSeedRealisticMixedUserState(tb testing.TB, store *teamstore.Store, bridge *Bridge) {
+	tb.Helper()
+	now := time.Date(2026, 5, 23, 9, 45, 0, 0, time.UTC)
+	oldActivity := now.Add(-49 * time.Hour)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ChatPolls[bridge.reg.ControlChatID] = teamstore.ChatPollState{
+			ChatID:               bridge.reg.ControlChatID,
+			Seeded:               true,
+			PollState:            inboundPollStateWarm,
+			NextPollAt:           now.Add(time.Hour),
+			LastActivityAt:       now.Add(-time.Minute),
+			LastModifiedCursor:   now.Add(-time.Minute),
+			LastSuccessfulPollAt: now.Add(-time.Minute),
+			UpdatedAt:            now,
+		}
+		for chat := 0; chat < 2100; chat++ {
+			sessionID := cxpPerfSessionID(chat)
+			chatID := cxpPerfChatID(chat)
+			session := state.Sessions[sessionID]
+			session.ID = sessionID
+			session.TeamsChatID = chatID
+			session.TeamsChatURL = "https://teams.example/" + chatID
+			session.TeamsTopic = "perf"
+			session.Cwd = fmt.Sprintf("/workspace/project-%03d", chat)
+			session.Status = teamstore.SessionStatusActive
+			if chat < 100 {
+				session.UpdatedAt = now.Add(-time.Duration(chat%90) * time.Second)
+				session.CodexThreadID = fmt.Sprintf("perf-thread-%03d", chat)
+				state.Sessions[sessionID] = session
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID:               chatID,
+					Seeded:               true,
+					PollState:            inboundPollStateWarm,
+					NextPollAt:           now.Add(-time.Duration(chat%30) * time.Second),
+					LastActivityAt:       session.UpdatedAt,
+					LastModifiedCursor:   session.UpdatedAt.Add(-time.Minute),
+					LastSuccessfulPollAt: session.UpdatedAt.Add(-time.Minute),
+					UpdatedAt:            session.UpdatedAt,
+				}
+				cxpPerfSeedRealisticChatHistory(state, chat, sessionID, chatID, session.CodexThreadID, now)
+			} else {
+				session.UpdatedAt = oldActivity
+				state.Sessions[sessionID] = session
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID:               chatID,
+					Seeded:               true,
+					PollState:            inboundPollStateParked,
+					LastActivityAt:       oldActivity,
+					LastModifiedCursor:   oldActivity,
+					LastSuccessfulPollAt: oldActivity,
+					ParkedAt:             oldActivity.Add(48 * time.Hour),
+					ParkNoticeSentAt:     oldActivity.Add(48*time.Hour + time.Minute),
+					UpdatedAt:            now.Add(-time.Hour),
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed realistic mixed user state: %v", err)
+	}
+	if bridge != nil {
+		for i := range bridge.reg.Sessions {
+			if i < 100 {
+				bridge.reg.Sessions[i].UpdatedAt = now.Add(-time.Duration(i%90) * time.Second)
+				bridge.reg.Sessions[i].CodexThreadID = fmt.Sprintf("perf-thread-%03d", i)
+			} else {
+				bridge.reg.Sessions[i].UpdatedAt = oldActivity
+			}
+		}
+	}
+}
+
+func cxpPerfSeedRealisticChatHistory(state *teamstore.State, chat int, sessionID string, chatID string, threadID string, now time.Time) {
+	turns := 8
+	outboxes := 2
+	switch {
+	case chat < 50:
+		turns = 500
+		outboxes = 50
+	case chat < 80:
+		turns = 120
+		outboxes = 12
+	}
+	for turn := 0; turn < turns; turn++ {
+		created := now.Add(-time.Duration(turns-turn) * time.Minute)
+		inboundID := fmt.Sprintf("realistic-inbound-%03d-%05d", chat, turn)
+		turnID := fmt.Sprintf("realistic-turn-%03d-%05d", chat, turn)
+		messageID := fmt.Sprintf("realistic-user-message-%03d-%05d", chat, turn)
+		state.InboundEvents[inboundID] = teamstore.InboundEvent{
+			ID:             inboundID,
+			SessionID:      sessionID,
+			TeamsChatID:    chatID,
+			TeamsMessageID: messageID,
+			Text:           cxpPerfText(256),
+			Status:         teamstore.InboundStatusPersisted,
+			CreatedAt:      created,
+			UpdatedAt:      created,
+		}
+		state.Turns[turnID] = teamstore.Turn{
+			ID:             turnID,
+			SessionID:      sessionID,
+			InboundEventID: inboundID,
+			Status:         teamstore.TurnStatusCompleted,
+			CodexThreadID:  threadID,
+			CodexTurnID:    fmt.Sprintf("realistic-codex-turn-%03d-%05d", chat, turn),
+			QueuedAt:       created,
+			StartedAt:      created.Add(time.Second),
+			CompletedAt:    created.Add(2 * time.Second),
+			CreatedAt:      created,
+			UpdatedAt:      created.Add(2 * time.Second),
+		}
+		state.MessageProvenance[fmt.Sprintf("realistic-user-provenance-%03d-%05d", chat, turn)] = teamstore.MessageProvenanceRecord{
+			ID:             fmt.Sprintf("realistic-user-provenance-%03d-%05d", chat, turn),
+			TeamsChatID:    chatID,
+			TeamsMessageID: messageID,
+			Origin:         teamstore.MessageOriginUserInbound,
+			SessionID:      sessionID,
+			InboundID:      inboundID,
+			CreatedAt:      created,
+			UpdatedAt:      created,
+		}
+	}
+	for outbox := 0; outbox < outboxes; outbox++ {
+		created := now.Add(-time.Duration(outboxes-outbox) * time.Minute)
+		outboxID := fmt.Sprintf("realistic-outbox-%03d-%04d", chat, outbox)
+		messageID := fmt.Sprintf("realistic-helper-message-%03d-%04d", chat, outbox)
+		state.OutboxMessages[outboxID] = teamstore.OutboxMessage{
+			ID:             outboxID,
+			SessionID:      sessionID,
+			TeamsChatID:    chatID,
+			Kind:           "final",
+			Body:           cxpPerfText(256),
+			Status:         teamstore.OutboxStatusSent,
+			TeamsMessageID: messageID,
+			SourceTextHash: normalizedTextHash(cxpPerfText(256)),
+			CreatedAt:      created,
+			UpdatedAt:      created,
+			SentAt:         created,
+		}
+		state.MessageProvenance[fmt.Sprintf("realistic-helper-provenance-%03d-%04d", chat, outbox)] = teamstore.MessageProvenanceRecord{
+			ID:             fmt.Sprintf("realistic-helper-provenance-%03d-%04d", chat, outbox),
+			TeamsChatID:    chatID,
+			TeamsMessageID: messageID,
+			Origin:         teamstore.MessageOriginHelperOutbox,
+			SessionID:      sessionID,
+			OutboxID:       outboxID,
+			CreatedAt:      created,
+			UpdatedAt:      created,
+		}
+	}
+}
+
+func cxpPerfSeedRealisticRunningTurn(tb testing.TB, store *teamstore.Store) (string, string, string) {
+	tb.Helper()
+	sessionID := cxpPerfSessionID(0)
+	chatID := cxpPerfChatID(0)
+	turnID := "realistic-running-turn"
+	now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Turns[turnID] = teamstore.Turn{
+			ID:            turnID,
+			SessionID:     sessionID,
+			Status:        teamstore.TurnStatusRunning,
+			CodexThreadID: "perf-thread-000",
+			CodexTurnID:   "realistic-codex-running-turn",
+			QueuedAt:      now.Add(-time.Minute),
+			StartedAt:     now,
+			CreatedAt:     now.Add(-time.Minute),
+			UpdatedAt:     now,
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed realistic running turn: %v", err)
+	}
+	return sessionID, chatID, turnID
+}
+
+func cxpPerfHandleRealisticUserMessage(ctx context.Context, bridge *Bridge, index int) error {
+	chat := index % 100
+	chatID := cxpPerfChatID(chat)
+	messageID := fmt.Sprintf("realistic-live-message-%06d", index)
+	now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC).Add(time.Duration(index) * 90 * time.Second)
+	msg := ChatMessage{
+		ID:              messageID,
+		ChatID:          chatID,
+		CreatedDateTime: now.Format(time.RFC3339),
+	}
+	msg.Body.ContentType = "html"
+	msg.Body.Content = "<p>realistic user message</p>"
+	return bridge.handleSessionMessage(ctx, chatID, msg, "realistic user message")
+}
+
 func cxpPerfSeedState(state *teamstore.State, profile cxpPerfProfile) {
 	now := time.Date(2026, 5, 23, 7, 0, 0, 0, time.UTC)
 	state.Scope = teamstore.ScopeIdentity{ID: "perf-scope", AccountID: "perf-user", OSUser: "perf", Profile: "perf", ConfigPath: "/tmp/cxp-perf/config.toml", CodexHome: "/tmp/cxp-perf/codex", CreatedAt: now, UpdatedAt: now}
@@ -2037,6 +2506,30 @@ func cxpPerfSeedActiveParkedSessions(b testing.TB, store *teamstore.Store, bridg
 		return nil
 	}); err != nil {
 		b.Fatalf("seed active parked sessions: %v", err)
+	}
+}
+
+func cxpPerfSeedIdleAutoParkCandidates(tb testing.TB, store *teamstore.Store) {
+	tb.Helper()
+	now := time.Date(2026, 5, 23, 7, 0, 0, 0, time.UTC)
+	oldActivity := now.Add(-49 * time.Hour)
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		for id, session := range state.Sessions {
+			session.UpdatedAt = oldActivity
+			state.Sessions[id] = session
+		}
+		for chatID, poll := range state.ChatPolls {
+			poll.PollState = inboundPollStateCold
+			poll.NextPollAt = now.Add(-time.Minute)
+			poll.LastActivityAt = oldActivity
+			poll.LastModifiedCursor = oldActivity
+			poll.LastSuccessfulPollAt = oldActivity
+			poll.UpdatedAt = now
+			state.ChatPolls[chatID] = poll
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed idle auto-park candidates: %v", err)
 	}
 }
 

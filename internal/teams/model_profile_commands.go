@@ -298,6 +298,7 @@ func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, s
 	if current := b.reg.SessionByID(session.ID); current != nil {
 		current.ModelProfile = snapshot
 		current.UpdatedAt = now
+		b.markRegistryProjectionDirty()
 	}
 	if strings.TrimSpace(b.registryPath) != "" {
 		return b.Save()
@@ -344,6 +345,7 @@ func (b *Bridge) forkWorkChatWithModelProfile(ctx context.Context, source *Sessi
 		UpdatedAt:    now,
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
+	b.markRegistryProjectionDirty()
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return "", err
 	}

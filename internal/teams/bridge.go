@@ -59,6 +59,11 @@ const (
 	outboxFlushPendingPageSize                 = 64
 	mainLoopWorkflowFlushMaxNotifications      = 1
 	maxQueuedTurnStartsPerCycle                = 16
+	maxParkNoticeSendsPerPollCycle             = maxWorkChatPollsPerCycle
+	autoParkSweepInterval                      = time.Minute
+	autoParkCandidatePrefetch                  = 16
+	autoParkCandidatesPerSweep                 = 1
+	autoParkSweepGraphTimeout                  = 10 * time.Second
 	parkNoticeGraphFallbackLookupTTL           = 5 * time.Minute
 	graphOutboxSendMinInterval                 = 1200 * time.Millisecond
 
@@ -348,6 +353,7 @@ type Bridge struct {
 	regMu                             sync.Mutex
 	registryProjectionLastFingerprint string
 	registryProjectionLastSavedAt     time.Time
+	registryProjectionDirty           bool
 	user                              User
 	scope                             teamstore.ScopeIdentity
 	machine                           teamstore.MachineRecord
@@ -389,6 +395,7 @@ type Bridge struct {
 	persistentPollFailureCount        int
 	parkNoticeLookupMu                sync.Mutex
 	parkNoticeLookupPreferences       map[string]parkNoticeLookupPreference
+	lastAutoParkSweep                 time.Time
 	lastTranscriptSync                time.Time
 	lastHistoryWatchSync              time.Time
 	lastHistoryWatchReconcile         time.Time
@@ -475,7 +482,7 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 	httpClient := graph.httpClient()
 	machine := MachineRecordForUser(user, scope)
 	applyMachineHostnameOverrideToRecord(&machine, reg.MachineHostnameOverride)
-	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, user: user, scope: scope, machine: machine, out: out, markAnswerChatsUnread: true}, nil
+	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, registryProjectionDirty: true, user: user, scope: scope, machine: machine, out: out, markAnswerChatsUnread: true}, nil
 }
 
 func (b *Bridge) readClient() *GraphClient {
@@ -503,6 +510,7 @@ func (b *Bridge) ensureControlChat(ctx context.Context, syncRegistry bool) (Chat
 		if desiredTopic != "" && b.reg.ControlChatTopic != desiredTopic {
 			if err := b.graph.UpdateChatTopic(ctx, b.reg.ControlChatID, desiredTopic); err == nil {
 				b.reg.ControlChatTopic = SanitizeTopic(desiredTopic)
+				b.markRegistryProjectionDirty()
 				_ = b.recordControlChatBinding(ctx, Chat{ID: b.reg.ControlChatID, Topic: b.reg.ControlChatTopic, WebURL: b.reg.ControlChatURL})
 				_ = b.Save()
 			}
@@ -518,6 +526,7 @@ func (b *Bridge) ensureControlChat(ctx context.Context, syncRegistry bool) (Chat
 	b.reg.ControlChatID = chat.ID
 	b.reg.ControlChatTopic = chat.Topic
 	b.reg.ControlChatURL = chat.WebURL
+	b.markRegistryProjectionDirty()
 	if err := b.recordControlChatBinding(ctx, chat); err != nil {
 		return chat, err
 	}
@@ -629,16 +638,9 @@ func (b *Bridge) queueLocalSessionStartedNotice(ctx context.Context, sessionID s
 func (b *Bridge) Save() error {
 	b.regMu.Lock()
 	defer b.regMu.Unlock()
-	data, err := json.Marshal(b.reg)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256(data)
-	fingerprint := hex.EncodeToString(sum[:])
 	now := time.Now()
-	if fingerprint == b.registryProjectionLastFingerprint &&
-		!b.registryProjectionLastSavedAt.IsZero() &&
-		now.Sub(b.registryProjectionLastSavedAt) < registryProjectionSaveMinInterval {
+	force := b.registryProjectionLastSavedAt.IsZero() || now.Sub(b.registryProjectionLastSavedAt) >= registryProjectionSaveMinInterval
+	if !b.registryProjectionDirty && !force {
 		path := strings.TrimSpace(b.registryPath)
 		if path == "" {
 			var pathErr error
@@ -653,12 +655,58 @@ func (b *Bridge) Save() error {
 			return statErr
 		}
 	}
+	data, err := json.Marshal(b.reg)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	fingerprint := hex.EncodeToString(sum[:])
+	if fingerprint == b.registryProjectionLastFingerprint &&
+		!b.registryProjectionLastSavedAt.IsZero() {
+		path := strings.TrimSpace(b.registryPath)
+		if path == "" {
+			var pathErr error
+			path, pathErr = DefaultRegistryPath()
+			if pathErr != nil {
+				return pathErr
+			}
+		}
+		if info, statErr := os.Stat(path); statErr == nil && !info.ModTime().After(b.registryProjectionLastSavedAt) {
+			b.registryProjectionDirty = false
+			b.registryProjectionLastSavedAt = now
+			return nil
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+	}
 	if err := SaveRegistry(b.registryPath, b.reg); err != nil {
 		return err
 	}
 	b.registryProjectionLastFingerprint = fingerprint
 	b.registryProjectionLastSavedAt = time.Now()
+	b.registryProjectionDirty = false
 	return nil
+}
+
+func (b *Bridge) markRegistryProjectionDirty() {
+	if b == nil {
+		return
+	}
+	b.regMu.Lock()
+	b.registryProjectionDirty = true
+	b.regMu.Unlock()
+}
+
+func (b *Bridge) markRegistrySeen(chatID string, messageID string) {
+	if b == nil {
+		return
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	b.reg.MarkSeen(chatID, messageID)
+	if strings.TrimSpace(messageID) != "" {
+		b.registryProjectionDirty = true
+	}
 }
 
 func (b *Bridge) markRegistrySent(chatID string, messageID string) {
@@ -668,6 +716,9 @@ func (b *Bridge) markRegistrySent(chatID string, messageID string) {
 	b.regMu.Lock()
 	defer b.regMu.Unlock()
 	b.reg.MarkSent(chatID, messageID)
+	if strings.TrimSpace(messageID) != "" {
+		b.registryProjectionDirty = true
+	}
 }
 
 func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
@@ -840,6 +891,20 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 				return restartErr
 			}
 		}
+		if err := b.maybeRunIdleWorkChatAutoPark(ctx, time.Now()); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams idle auto-park error: %v\n", err)
+		}
+		queuedTurnStartLimit := b.effectiveMaxQueuedTurnStartsPerCycle()
+		queuedTurnStartLimitActive := queuedTurnStartLimit > 0
+		queuedTurnStarts := 0
+		if started, err := b.processQueuedTurnsWithStartBudget(ctx, queuedTurnStartLimit, queuedTurnStartLimitActive); err != nil {
+			queuedTurnStarts += started
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
+			}
+		} else {
+			queuedTurnStarts += started
+		}
 		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
 		}
@@ -872,8 +937,19 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if err := b.processDeferredInbound(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams deferred input processing error: %v\n", err)
 		}
-		if err := b.processQueuedTurns(ctx); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
+		if !queuedTurnStartLimitActive || queuedTurnStarts < queuedTurnStartLimit {
+			remainingQueuedTurnStarts := queuedTurnStartLimit - queuedTurnStarts
+			if !queuedTurnStartLimitActive {
+				remainingQueuedTurnStarts = 0
+			}
+			if started, err := b.processQueuedTurnsWithStartBudget(ctx, remainingQueuedTurnStarts, queuedTurnStartLimitActive); err != nil {
+				queuedTurnStarts += started
+				if b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
+				}
+			} else {
+				queuedTurnStarts += started
+			}
 		}
 		if err := b.sendDeferredInterruptedTurnNotices(ctx); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams interrupted turn notice error: %v\n", err)
@@ -1046,7 +1122,8 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			return err
 		}
 	}
-	state, err := b.store.PollScheduleSnapshot(ctx)
+	now := time.Now()
+	state, err := b.store.HotPollScheduleState(ctx)
 	if err != nil {
 		return err
 	}
@@ -1059,10 +1136,12 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		Role:    inboundPollRoleControl,
 		Poll:    controlPoll,
 		HasPoll: hasControlPoll,
-		Now:     time.Now(),
+		Now:     now,
 	})
+	controlStateReusable := false
 	if !controlDecision.Due {
-		if !inboundPollDecisionAlreadyPersisted(controlPoll, hasControlPoll, controlDecision) {
+		controlStateReusable = inboundPollDecisionAlreadyPersisted(controlPoll, hasControlPoll, controlDecision)
+		if !controlStateReusable {
 			if err := b.persistInboundPollDecision(ctx, controlDecision); err != nil {
 				return err
 			}
@@ -1077,9 +1156,65 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 	}
 
-	state, err = b.store.PollScheduleSnapshot(ctx)
+	var candidateSessions []Session
+	requireDurableSessions := false
+	durableCandidates, durableCandidatesHandled, err := b.store.HotPollWorkCandidatesExcludingIdle(ctx, b.reg.ControlChatID, now.Add(-inboundPollParkAfter))
 	if err != nil {
 		return err
+	}
+	if durableCandidatesHandled {
+		if !controlStateReusable {
+			state, err = b.store.HotPollScheduleState(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		state.Sessions = make(map[string]teamstore.SessionContext, len(durableCandidates))
+		for _, durable := range durableCandidates {
+			if isDurableControlFallbackSession(durable) {
+				continue
+			}
+			session := registrySessionFromDurable(durable)
+			if !isActiveSessionStatus(session.Status) ||
+				strings.TrimSpace(session.ChatID) == "" ||
+				(strings.TrimSpace(b.reg.ControlChatID) != "" && session.ChatID == b.reg.ControlChatID) {
+				continue
+			}
+			state.Sessions[session.ID] = durable
+			candidateSessions = append(candidateSessions, session)
+		}
+		requireDurableSessions = true
+	} else {
+		var parkedPollSkip map[string]bool
+		state, parkedPollSkip, err = b.store.HotPollScheduleSnapshot(ctx)
+		if err != nil {
+			return err
+		}
+		candidateSessions = b.reg.ActiveSessionsForPoll(func(session Session) bool {
+			poll, hasPoll := state.ChatPolls[session.ChatID]
+			return workPollCandidateCanSkip(session.ChatID, poll, hasPoll, parkedPollSkip)
+		})
+		if len(candidateSessions) > 0 {
+			sessionIDs := make([]string, 0, len(candidateSessions))
+			for _, session := range candidateSessions {
+				if id := strings.TrimSpace(session.ID); id != "" {
+					sessionIDs = append(sessionIDs, id)
+				}
+			}
+			sessionsByID, err := b.store.SessionsByID(ctx, sessionIDs)
+			if err != nil {
+				return err
+			}
+			state.Sessions = sessionsByID
+			requireDurableSessions = len(state.Sessions) > 0
+			if !requireDurableSessions {
+				hasSessions, err := b.store.HasSessions(ctx)
+				if err != nil {
+					return err
+				}
+				requireDurableSessions = hasSessions
+			}
+		}
 	}
 	runningBySession := runningPollSessions(state)
 	queueStateBySession := pollSessionTurnQueueStates(state)
@@ -1095,8 +1230,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 	pollsByChat := make(map[string]teamstore.ChatPollState)
 	hasPollByChat := make(map[string]bool)
 	pollableByChat := make(map[string]Session)
-	for _, session := range b.reg.ActiveSessions() {
-		pollable, ok := pollableWorkSessionFromRegistry(state, session, b.reg.ControlChatID)
+	parkNoticeSends := 0
+	for _, session := range candidateSessions {
+		pollable, ok := pollableWorkSessionFromRegistryOptions(state.Sessions, session, b.reg.ControlChatID, requireDurableSessions)
 		if !ok {
 			continue
 		}
@@ -1121,10 +1257,16 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			HasPoll:          hasPoll,
 			Running:          runningBySession[session.ID],
 			SessionUpdatedAt: session.UpdatedAt,
-			Now:              time.Now(),
+			Now:              now,
 		})
 		if decision.ShouldPark {
+			if durableCandidatesHandled {
+				continue
+			}
 			if !decision.ShouldNotifyPark && !poll.ParkedAt.IsZero() && inboundPollDecisionAlreadyPersisted(poll, hasPoll, decision) {
+				continue
+			}
+			if decision.ShouldNotifyPark && parkNoticeSends >= maxParkNoticeSendsPerPollCycle {
 				continue
 			}
 			if err := flushPendingScheduleUpdates(); err != nil {
@@ -1132,6 +1274,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			}
 			if err := b.parkIdleWorkChat(ctx, session, decision); err != nil {
 				return err
+			}
+			if decision.ShouldNotifyPark {
+				parkNoticeSends++
 			}
 			continue
 		}
@@ -1218,6 +1363,7 @@ func (b *Bridge) syncControlChatProjectionFromState(ctx context.Context, state t
 	if !changed {
 		return nil
 	}
+	b.markRegistryProjectionDirty()
 	return b.Save()
 }
 
@@ -1255,6 +1401,10 @@ func effectiveOwnerPollTop(top int) int {
 }
 
 func pollableWorkSessionFromRegistry(state teamstore.State, session Session, controlChatID string) (Session, bool) {
+	return pollableWorkSessionFromRegistryOptions(state.Sessions, session, controlChatID, len(state.Sessions) > 0)
+}
+
+func pollableWorkSessionFromRegistryOptions(sessions map[string]teamstore.SessionContext, session Session, controlChatID string, requireDurable bool) (Session, bool) {
 	if !isActiveSessionStatus(session.Status) || isControlFallbackSessionID(session.ID) {
 		return Session{}, false
 	}
@@ -1264,10 +1414,10 @@ func pollableWorkSessionFromRegistry(state teamstore.State, session Session, con
 	if strings.TrimSpace(controlChatID) != "" && session.ChatID == controlChatID {
 		return Session{}, false
 	}
-	if len(state.Sessions) == 0 {
+	if !requireDurable && len(sessions) == 0 {
 		return session, true
 	}
-	durable, ok := state.Sessions[session.ID]
+	durable, ok := sessions[session.ID]
 	if !ok {
 		return Session{}, false
 	}
@@ -1285,6 +1435,21 @@ func pollableWorkSessionFromRegistry(state teamstore.State, session Session, con
 
 func explicitParkedWorkPollShouldSkip(poll teamstore.ChatPollState, hasPoll bool) bool {
 	return hasPoll && strings.TrimSpace(poll.PollState) == inboundPollStateParked && !poll.ParkNoticeSentAt.IsZero()
+}
+
+func parkedWorkPollCanSkipCandidate(chatID string, poll teamstore.ChatPollState, hasPoll bool) bool {
+	if !explicitParkedWorkPollShouldSkip(poll, hasPoll) {
+		return false
+	}
+	_, needsMaintenance := explicitParkedWorkPollMaintenanceUpdate(chatID, poll)
+	return !needsMaintenance
+}
+
+func workPollCandidateCanSkip(chatID string, poll teamstore.ChatPollState, hasPoll bool, parkedPollSkip map[string]bool) bool {
+	if hasPoll {
+		return parkedWorkPollCanSkipCandidate(chatID, poll, hasPoll)
+	}
+	return parkedPollSkip[strings.TrimSpace(chatID)]
 }
 
 func explicitParkedWorkPollMaintenanceUpdate(chatID string, poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, bool) {
@@ -1492,7 +1657,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 	if !hasPoll || !poll.Seeded {
 		if len(b.reg.Chats[chatID].SeenMessageIDs) == 0 {
 			for _, msg := range msgs {
-				b.reg.MarkSeen(chatID, msg.ID)
+				b.markRegistrySeen(chatID, msg.ID)
 			}
 			return result, nil
 		}
@@ -1506,16 +1671,16 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			return result, err
 		}
 		if ignore {
-			b.reg.MarkSeen(chatID, msg.ID)
+			b.markRegistrySeen(chatID, msg.ID)
 			continue
 		}
 		if isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
-			b.reg.MarkSeen(chatID, msg.ID)
+			b.markRegistrySeen(chatID, msg.ID)
 			continue
 		}
 		text := promptTextFromTeamsMessageHTML(msg.Body.Content)
 		if strings.TrimSpace(text) == "" && len(msg.Attachments) == 0 && len(HostedContentIDsFromHTML(msg.Body.Content)) == 0 {
-			b.reg.MarkSeen(chatID, msg.ID)
+			b.markRegistrySeen(chatID, msg.ID)
 			continue
 		}
 		globalClaim, claimed, err := b.tryClaimGlobalInbound(ctx, chatID, msg.ID)
@@ -1524,7 +1689,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			return result, err
 		}
 		if !claimed {
-			b.reg.MarkSeen(chatID, msg.ID)
+			b.markRegistrySeen(chatID, msg.ID)
 			continue
 		}
 		if b.currentLeaseGeneration() > 0 {
@@ -1537,7 +1702,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		if err := handle(ctx, msg, text); err != nil {
 			if errors.Is(err, teamstore.ErrInboundMessageFromHelperOutbox) {
 				b.markRegistrySent(chatID, msg.ID)
-				b.reg.MarkSeen(chatID, msg.ID)
+				b.markRegistrySeen(chatID, msg.ID)
 				if completeErr := completeGlobalInbound(ctx, globalClaim); completeErr != nil {
 					_ = b.store.RecordChatPollError(ctx, chatID, completeErr.Error())
 					return result, completeErr
@@ -1548,7 +1713,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return result, err
 		}
-		b.reg.MarkSeen(chatID, msg.ID)
+		b.markRegistrySeen(chatID, msg.ID)
 		if err := completeGlobalInbound(ctx, globalClaim); err != nil {
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return result, err
@@ -1692,6 +1857,112 @@ func (b *Bridge) effectiveMaxQueuedTurnStartsPerCycle() int {
 		}
 	}
 	return maxQueuedTurnStartsPerCycle
+}
+
+func (b *Bridge) maybeRunIdleWorkChatAutoPark(ctx context.Context, now time.Time) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !b.lastAutoParkSweep.IsZero() && now.Sub(b.lastAutoParkSweep) < autoParkSweepInterval {
+		return nil
+	}
+	b.lastAutoParkSweep = now
+	return b.sweepIdleWorkChatAutoPark(ctx, now)
+}
+
+func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	candidates, handled, err := b.store.IdleWorkChatParkCandidates(ctx, b.reg.ControlChatID, now.Add(-inboundPollParkAfter), autoParkCandidatePrefetch)
+	if err != nil || !handled || len(candidates) == 0 {
+		return err
+	}
+	state, err := b.store.HotPollScheduleState(ctx)
+	if err != nil {
+		return err
+	}
+	processed := 0
+	for _, candidate := range candidates {
+		session, decision, ok := b.idleWorkChatAutoParkDecision(state, candidate, now)
+		if !ok {
+			continue
+		}
+		parkCtx := ctx
+		cancel := func() {}
+		if autoParkSweepGraphTimeout > 0 {
+			parkCtx, cancel = context.WithTimeout(ctx, autoParkSweepGraphTimeout)
+		}
+		err := b.parkIdleWorkChat(parkCtx, session, decision)
+		cancel()
+		if err != nil {
+			return err
+		}
+		processed++
+		if processed >= autoParkCandidatesPerSweep {
+			break
+		}
+	}
+	return nil
+}
+
+func (b *Bridge) idleWorkChatAutoParkDecision(state teamstore.State, candidate teamstore.IdleWorkChatParkCandidate, now time.Time) (Session, inboundPollDecision, bool) {
+	durable := candidate.Session
+	session := registrySessionFromDurable(durable)
+	durableSessions := map[string]teamstore.SessionContext{}
+	if strings.TrimSpace(durable.ID) != "" {
+		durableSessions[durable.ID] = durable
+	}
+	pollable, ok := pollableWorkSessionFromRegistryOptions(durableSessions, session, b.reg.ControlChatID, true)
+	if !ok {
+		return Session{}, inboundPollDecision{}, false
+	}
+	session = pollable
+	if transcriptImportIsActive(state, session.ID) {
+		return Session{}, inboundPollDecision{}, false
+	}
+	poll := candidate.Poll
+	hasPoll := strings.TrimSpace(poll.ChatID) != ""
+	if latest, ok := state.ChatPolls[session.ChatID]; ok {
+		poll = latest
+		hasPoll = true
+	}
+	if !hasPoll || !poll.Seeded || explicitParkedWorkPollShouldSkip(poll, hasPoll) {
+		return Session{}, inboundPollDecision{}, false
+	}
+	switch strings.TrimSpace(poll.PollState) {
+	case inboundPollStateBlocked, inboundPollStateCatchup:
+		return Session{}, inboundPollDecision{}, false
+	}
+	if poll.BlockedUntil.After(now) || strings.TrimSpace(poll.ContinuationPath) != "" {
+		return Session{}, inboundPollDecision{}, false
+	}
+	turns := pollSessionTurnQueueStates(state)[session.ID]
+	if turns.Running || turns.Queued > 0 {
+		return Session{}, inboundPollDecision{}, false
+	}
+	if latestTime(poll.LastActivityAt, session.UpdatedAt).After(now.Add(-inboundPollParkAfter)) {
+		return Session{}, inboundPollDecision{}, false
+	}
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:           session.ChatID,
+		Role:             inboundPollRoleWork,
+		Poll:             poll,
+		HasPoll:          true,
+		Running:          turns.Running,
+		SessionUpdatedAt: session.UpdatedAt,
+		Now:              now,
+	})
+	if !decision.ShouldPark || !decision.ShouldNotifyPark {
+		return Session{}, inboundPollDecision{}, false
+	}
+	return session, decision, true
 }
 
 func (b *Bridge) persistInboundPollDecision(ctx context.Context, decision inboundPollDecision) error {
@@ -2224,11 +2495,11 @@ func (b *Bridge) parkNoticeAlreadySent(ctx context.Context, session Session, not
 		return true, nil
 	}
 	parkedAt := poll.ParkedAt
-	state, err := b.store.OutboxStateSnapshot(ctx)
+	messages, err := b.store.SentOutboxMessagesForChat(ctx, session.ChatID)
 	if err != nil {
 		return false, err
 	}
-	if sentFreezeNoticeExists(state, session.ChatID, noticeID, resumeCommand, parkedAt) {
+	if sentFreezeNoticeExists(messages, session.ChatID, noticeID, resumeCommand, parkedAt) {
 		return true, nil
 	}
 	if b.recentGraphFreezeNoticeExists(ctx, session.ChatID, resumeCommand, parkedAt) {
@@ -2237,8 +2508,8 @@ func (b *Bridge) parkNoticeAlreadySent(ctx context.Context, session Session, not
 	return false, nil
 }
 
-func sentFreezeNoticeExists(state teamstore.State, chatID string, noticeID string, resumeCommand string, since time.Time) bool {
-	for _, msg := range state.OutboxMessages {
+func sentFreezeNoticeExists(messages []teamstore.OutboxMessage, chatID string, noticeID string, resumeCommand string, since time.Time) bool {
+	for _, msg := range messages {
 		if msg.TeamsChatID != chatID || msg.Status != teamstore.OutboxStatusSent {
 			continue
 		}
@@ -3549,6 +3820,7 @@ func (b *Bridge) runControlFallback(ctx context.Context, msg ChatMessage, text s
 		return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 	}
 	session.UpdatedAt = time.Now()
+	b.markRegistryProjectionDirty()
 	if err := b.queueControlFallbackAck(ctx, session, turn); err != nil {
 		return err
 	}
@@ -5902,6 +6174,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		UpdatedAt:    now,
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
+	b.markRegistryProjectionDirty()
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return err
 	}
@@ -6302,7 +6575,7 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 		return nil
 	}
 	if isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
-		b.reg.MarkSeen(chatID, msg.ID)
+		b.markRegistrySeen(chatID, msg.ID)
 		return nil
 	}
 	routeText := commandRouteTextFromTeamsMessage(msg, text)
@@ -6317,6 +6590,7 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 		case DashboardCommandClose:
 			session.Status = "closed"
 			session.UpdatedAt = time.Now()
+			b.markRegistryProjectionDirty()
 			if err := b.closeDurableSession(ctx, session); err != nil {
 				return err
 			}
@@ -6436,6 +6710,7 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 				return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 			}
 			session.UpdatedAt = time.Now()
+			b.markRegistryProjectionDirty()
 			ackBody := b.formatBlockedTeamsPromptAckFromSnapshot(ctx, session, localCodexBeforeTeamsGate{
 				Block:   true,
 				AckBody: "A Codex request is already running in this Work chat.",
@@ -6489,6 +6764,7 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 		return b.flushPendingOutbox(ctx, session.ID, turn.ID)
 	}
 	session.UpdatedAt = time.Now()
+	b.markRegistryProjectionDirty()
 	if err := b.queueTeamsPromptAckForMessage(ctx, session, turn, msg, false); err != nil {
 		return err
 	}
@@ -7177,22 +7453,28 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 }
 
 func (b *Bridge) processQueuedTurns(ctx context.Context) error {
+	startLimit := b.effectiveMaxQueuedTurnStartsPerCycle()
+	_, err := b.processQueuedTurnsWithStartBudget(ctx, startLimit, startLimit > 0)
+	return err
+}
+
+func (b *Bridge) processQueuedTurnsWithStartBudget(ctx context.Context, startLimit int, enforceStartLimit bool) (int, error) {
 	if !b.asyncTurns {
-		return nil
+		return 0, nil
 	}
 	if err := b.ensureStore(); err != nil {
-		return err
+		return 0, err
 	}
 	hasQueued, err := b.store.HasQueuedTurns(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !hasQueued {
-		return nil
+		return 0, nil
 	}
 	state, err := b.store.QueuedTurnStateSnapshot(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	running := make(map[string]bool)
 	queued := make(map[string]bool)
@@ -7214,7 +7496,6 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 		}
 	}
 	sort.Strings(sessionIDs)
-	startLimit := b.effectiveMaxQueuedTurnStartsPerCycle()
 	started := 0
 	var firstErr error
 	recordSessionErr := func(session *Session, stage string, err error) {
@@ -7229,7 +7510,7 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 		}
 	}
 	for _, sessionID := range sessionIDs {
-		if startLimit > 0 && started >= startLimit {
+		if enforceStartLimit && started >= startLimit {
 			break
 		}
 		session := b.sessionForIDState(state, sessionID)
@@ -7256,7 +7537,7 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 			started++
 		}
 	}
-	return firstErr
+	return started, firstErr
 }
 
 func (b *Bridge) processQueuedTurnsForSession(ctx context.Context, session *Session) error {
@@ -7572,6 +7853,7 @@ func (b *Bridge) sessionForIDState(state teamstore.State, sessionID string) *Ses
 		session.Status = "active"
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
+	b.markRegistryProjectionDirty()
 	return b.reg.SessionByID(session.ID)
 }
 
@@ -8363,6 +8645,7 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 	session.UserTitle = title
 	session.TitleSource = sessionTitleSourceUser
 	session.UpdatedAt = time.Now()
+	b.markRegistryProjectionDirty()
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
@@ -8563,6 +8846,7 @@ func (b *Bridge) renameMachineHostname(ctx context.Context, raw string, replyCha
 			session.UpdatedAt = now
 		}
 	}
+	b.markRegistryProjectionDirty()
 	if err := b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
 		changed := false
 		setMachineString := func(target *string, value string) {
@@ -8697,6 +8981,7 @@ func (b *Bridge) renameControlChat(ctx context.Context, title string) error {
 	b.reg.ControlChatTopic = topic
 	b.reg.ControlChatUserTitle = title
 	b.reg.ControlChatTitleSource = sessionTitleSourceUser
+	b.markRegistryProjectionDirty()
 	chat := Chat{ID: b.reg.ControlChatID, Topic: topic, WebURL: b.reg.ControlChatURL, ChatType: "meeting"}
 	if err := b.recordControlChatBindingWithTitle(ctx, chat, title, sessionTitleSourceUser); err != nil {
 		return err
@@ -8774,6 +9059,7 @@ func (b *Bridge) maybeUpdateWorkChatTitleFromLocalSession(ctx context.Context, s
 		current.Topic = desiredTopic
 		current.TitleSource = sessionTitleSourceAuto
 		current.UpdatedAt = now
+		b.markRegistryProjectionDirty()
 	}
 	if b.store != nil {
 		if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
@@ -9298,6 +9584,7 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 		return err
 	}
 	session.UpdatedAt = time.Now()
+	b.markRegistryProjectionDirty()
 	if _, err := b.store.MarkTurnCompleted(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); err != nil {
 		return err
 	}
@@ -9342,11 +9629,13 @@ func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, se
 	if b == nil || session == nil || b.store == nil {
 		return ExecutionResult{}, false
 	}
-	state, err := b.store.Load(ctx)
+	checkpoint, found, err := b.store.ImportCheckpoint(ctx, transcriptCheckpointID(session.ID))
 	if err != nil {
 		return ExecutionResult{}, false
 	}
-	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if !found {
+		return ExecutionResult{}, false
+	}
 	local, ok := linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
 	if !ok {
 		return ExecutionResult{}, false
@@ -9695,13 +9984,10 @@ func (b *Bridge) handleClaimedQueuedTurnError(ctx context.Context, session *Sess
 	if err == nil || b == nil || b.store == nil {
 		return
 	}
-	state, loadErr := b.store.Load(ctx)
-	if loadErr == nil {
-		if current, ok := state.Turns[turn.ID]; ok {
-			switch current.Status {
-			case teamstore.TurnStatusCompleted, teamstore.TurnStatusFailed, teamstore.TurnStatusInterrupted:
-				return
-			}
+	if current, ok, loadErr := b.store.TurnByID(ctx, turn.ID); loadErr == nil && ok {
+		switch current.Status {
+		case teamstore.TurnStatusCompleted, teamstore.TurnStatusFailed, teamstore.TurnStatusInterrupted:
+			return
 		}
 	}
 	if _, markErr := b.store.MarkTurnInterrupted(ctx, turn.ID, "queued turn failed before Codex completed: "+err.Error()); markErr != nil {
@@ -10727,7 +11013,7 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 	}
 	for _, inbound := range state.InboundEvents {
 		if inbound.TeamsChatID != "" && inbound.TeamsMessageID != "" && !b.reg.HasSeen(inbound.TeamsChatID, inbound.TeamsMessageID) {
-			b.reg.MarkSeen(inbound.TeamsChatID, inbound.TeamsMessageID)
+			b.markRegistrySeen(inbound.TeamsChatID, inbound.TeamsMessageID)
 			changed = true
 		}
 	}
@@ -10738,6 +11024,7 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 		}
 	}
 	if changed {
+		b.markRegistryProjectionDirty()
 		return b.Save()
 	}
 	return nil
@@ -11189,25 +11476,15 @@ func (b *Bridge) clearTerminalWorkChatPollState(ctx context.Context, chatID stri
 		return nil
 	}
 	chatID = strings.TrimSpace(chatID)
-	state, err := b.store.Load(ctx)
+	matched, active, err := b.store.ChatSessionActivity(ctx, chatID)
 	if err != nil {
 		return err
 	}
-	matched := false
-	for _, session := range state.Sessions {
-		if strings.TrimSpace(session.TeamsChatID) != chatID {
-			continue
-		}
-		matched = true
-		if isActiveSessionStatus(string(session.Status)) {
-			return nil
-		}
+	if !matched || active {
+		return nil
 	}
-	if matched {
-		_, err := b.store.ClearChatPollContinuationBackoffAndError(ctx, chatID)
-		return err
-	}
-	return nil
+	_, err = b.store.ClearChatPollContinuationBackoffAndError(ctx, chatID)
+	return err
 }
 
 func (b *Bridge) persistInbound(ctx context.Context, session *Session, msg ChatMessage) (teamstore.InboundEvent, bool, error) {
@@ -11667,7 +11944,7 @@ func (b *Bridge) shouldSuppressOwnerMentionForWorkflow(ctx context.Context, msg 
 	if err != nil {
 		return false
 	}
-	if cfg.Enabled && b.workflowCardAvailable(ctx) {
+	if cfg.Enabled && b.workflowCardAvailableFromState(state, cfg) {
 		return true
 	}
 	return false
@@ -11820,6 +12097,10 @@ type outboxSendOptions struct {
 type sentOutboxSideEffect struct {
 	Outbox       teamstore.OutboxMessage
 	TeamsMessage ChatMessage
+}
+
+type sentOutboxSideEffectOptions struct {
+	GlobalOutboundRecorded bool
 }
 
 func (b *Bridge) rememberAcceptedOutbox(outboxID string, teamsMessageID string) {
@@ -12005,8 +12286,13 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	}
 	b.markRegistrySent(outbox.TeamsChatID, msg.ID)
 	b.rememberAcceptedOutbox(outbox.ID, msg.ID)
-	if err := b.recordGlobalOutboundMessage(ctx, outbox, msg); err != nil && b.out != nil {
-		_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
+	globalOutboundRecorded := false
+	if err := b.recordGlobalOutboundMessage(ctx, outbox, msg); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
+		}
+	} else {
+		globalOutboundRecorded = true
 	}
 	if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, msg.ID); err != nil {
 		return err
@@ -12014,7 +12300,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
 	if err == nil {
 		b.forgetAcceptedOutbox(outbox.ID)
-		b.recordSentOutboxSideEffect(ctx, sent, msg, opts)
+		b.recordSentOutboxSideEffectWithOptions(ctx, sent, msg, opts, sentOutboxSideEffectOptions{GlobalOutboundRecorded: globalOutboundRecorded})
 	}
 	return err
 }
@@ -12064,8 +12350,14 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 }
 
 func (b *Bridge) recordSentOutboxSideEffect(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions) {
-	if err := b.recordGlobalOutboundMessage(ctx, outbox, msg); err != nil && b.out != nil {
-		_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
+	b.recordSentOutboxSideEffectWithOptions(ctx, outbox, msg, opts, sentOutboxSideEffectOptions{})
+}
+
+func (b *Bridge) recordSentOutboxSideEffectWithOptions(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions, sideOpts sentOutboxSideEffectOptions) {
+	if !sideOpts.GlobalOutboundRecorded {
+		if err := b.recordGlobalOutboundMessage(ctx, outbox, msg); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
+		}
 	}
 	if err := b.recordOutboxMessageProvenance(ctx, outbox, msg); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams message provenance record error: %v\n", err)
@@ -13180,6 +13472,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		UpdatedAt:     now,
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
+	b.markRegistryProjectionDirty()
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return "", err
 	}
@@ -13488,6 +13781,15 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
+		if batcher.budgetExhausted() {
+			return transcriptImportResult{
+				LastRecordID: lastRecordID,
+				LastLine:     lastLine,
+				LastOffset:   lastOffset,
+				Stats:        stats,
+				Complete:     false,
+			}, nil
+		}
 		if shouldSkipImportedTranscriptRecord(record) {
 			stats.SkippedBackground++
 			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
@@ -13579,7 +13881,8 @@ type transcriptImportBatcher struct {
 	kindPrefix    string
 	checkpointID  string
 	records       []transcriptImportBatchRecord
-	checkpoints   []transcriptImportCheckpointRecord
+	checkpoint    transcriptImportCheckpointRecord
+	hasCheckpoint bool
 	htmlParts     []string
 	htmlBytes     int
 	batchIndex    int
@@ -13644,23 +13947,37 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 		b.htmlBytes += len(transcriptImportBatchSeparatorHTML)
 	}
 	b.records = append(b.records, record)
-	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: record.CheckpointKey, SourceLine: record.Record.SourceLine, SourceOffset: record.Record.SourceOffset})
+	b.rememberCheckpoint(record.CheckpointKey, record.Record.SourceLine, record.Record.SourceOffset)
 	b.htmlParts = append(b.htmlParts, html)
 	b.htmlBytes += len(html)
 	return nil
 }
 
 func (b *transcriptImportBatcher) recordCheckpoint(ctx context.Context, checkpointKey string, sourceLine int, sourceOffset int64) error {
-	if len(b.records) == 0 {
-		return b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, checkpointKey, sourceLine, sourceOffset, b.checkpointID)
-	}
-	b.checkpoints = append(b.checkpoints, transcriptImportCheckpointRecord{Key: checkpointKey, SourceLine: sourceLine, SourceOffset: sourceOffset})
+	b.rememberCheckpoint(checkpointKey, sourceLine, sourceOffset)
 	return nil
+}
+
+func (b *transcriptImportBatcher) rememberCheckpoint(checkpointKey string, sourceLine int, sourceOffset int64) {
+	if b == nil || strings.TrimSpace(checkpointKey) == "" {
+		return
+	}
+	b.checkpoint = transcriptImportCheckpointRecord{Key: checkpointKey, SourceLine: sourceLine, SourceOffset: sourceOffset}
+	b.hasCheckpoint = true
+}
+
+func (b *transcriptImportBatcher) flushCheckpoint(ctx context.Context) error {
+	if b == nil || !b.hasCheckpoint {
+		return nil
+	}
+	checkpoint := b.checkpoint
+	b.hasCheckpoint = false
+	return b.bridge.recordTranscriptCheckpointProgressDetailedWithID(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, b.checkpointID)
 }
 
 func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 	if len(b.records) == 0 {
-		return nil
+		return b.flushCheckpoint(ctx)
 	}
 	if b.budgetExhausted() {
 		return errTranscriptImportBudgetExhausted
@@ -13674,13 +13991,10 @@ func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 		return err
 	}
 	b.queuedBatches++
-	for _, checkpoint := range b.checkpoints {
-		if err := b.bridge.recordTranscriptCheckpointDetailedWithID(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, b.checkpointID); err != nil {
-			return err
-		}
+	if err := b.flushCheckpoint(ctx); err != nil {
+		return err
 	}
 	b.records = nil
-	b.checkpoints = nil
 	b.htmlParts = nil
 	b.htmlBytes = 0
 	return nil
@@ -14557,6 +14871,16 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 	if len(b.reg.Sessions) == 0 {
 		return nil
 	}
+	hasLinkedSession := false
+	for _, session := range b.reg.Sessions {
+		if session.Status == "active" && session.CodexThreadID != "" {
+			hasLinkedSession = true
+			break
+		}
+	}
+	if !hasLinkedSession {
+		return nil
+	}
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
@@ -14569,7 +14893,10 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 		return err
 	}
 	var needsDiscovery []Session
-	for _, session := range b.reg.ActiveSessions() {
+	for _, session := range b.reg.Sessions {
+		if session.Status != "active" {
+			continue
+		}
 		if session.CodexThreadID == "" {
 			continue
 		}
@@ -14969,6 +15296,23 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	recentTeamsMirror := newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now, checkpoint)
 	sent := 0
+	pendingCheckpoint := transcriptImportCheckpointRecord{}
+	hasPendingCheckpoint := false
+	rememberCheckpoint := func(key string, sourceLine int, sourceOffset int64) {
+		if strings.TrimSpace(key) == "" {
+			return
+		}
+		pendingCheckpoint = transcriptImportCheckpointRecord{Key: key, SourceLine: sourceLine, SourceOffset: sourceOffset}
+		hasPendingCheckpoint = true
+	}
+	flushPendingCheckpoint := func() error {
+		if !hasPendingCheckpoint {
+			return nil
+		}
+		checkpoint := pendingCheckpoint
+		hasPendingCheckpoint = false
+		return b.recordTranscriptCheckpointProgressDetailedWithID(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID)
+	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		record.SourceLine = checkpointLine
@@ -14977,17 +15321,13 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			continue
 		}
 		if shouldSkipBackgroundTranscriptRecord(record) {
-			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
-				return err
-			}
+			rememberCheckpoint(transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset)
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
 		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
 		if strings.TrimSpace(body) == "" {
-			if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset); err != nil {
-				return err
-			}
+			rememberCheckpoint(transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset)
 			continue
 		}
 		kind := transcriptRecordOutboxKind("sync", record, i+1)
@@ -14998,18 +15338,20 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			if err := b.recordSkippedTranscriptDelivery(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
 				return err
 			}
+			hasPendingCheckpoint = false
 			continue
 		}
 		opts := transcriptSyncOutboxOptions(record)
 		if err := b.queueAndSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, opts); err != nil {
 			return err
 		}
+		hasPendingCheckpoint = false
 		sent++
 		if sent >= transcriptSyncMaxRecordsPerSessionPerCycle {
 			return nil
 		}
 	}
-	return nil
+	return flushPendingCheckpoint()
 }
 
 func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore.ImportCheckpoint, sessionID string, threadID string) (Transcript, error) {
@@ -16263,6 +16605,55 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithID(ctx context.Context, s
 	})
 }
 
+func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(lastRecordID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(checkpointID) == "" {
+		checkpointID = transcriptCheckpointID(session.ID)
+	}
+	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(previous teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		status := previous.Status
+		if status == "" || status == importCheckpointStatusBlocked {
+			status = importCheckpointStatusComplete
+		}
+		next := teamstore.ImportCheckpoint{
+			ID:             checkpointID,
+			SessionID:      session.ID,
+			SourcePath:     sourcePath,
+			LastRecordID:   lastRecordID,
+			LastSourceLine: lastLine,
+			LastOffset:     firstNonZeroInt64(lastOffset, previous.LastOffset),
+			SourceSize:     sourceSize,
+			SourceModTime:  sourceModTime,
+			ImportTurnID:   previous.ImportTurnID,
+			KindPrefix:     previous.KindPrefix,
+			Status:         status,
+			UpdatedAt:      now,
+		}
+		if importCheckpointSameExceptUpdatedAt(previous, next) {
+			return previous, false, nil
+		}
+		return next, true, nil
+	})
+	return err
+}
+
+func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right teamstore.ImportCheckpoint) bool {
+	return left.ID == right.ID &&
+		left.SessionID == right.SessionID &&
+		left.SourcePath == right.SourcePath &&
+		left.LastRecordID == right.LastRecordID &&
+		left.LastSourceLine == right.LastSourceLine &&
+		left.LastOffset == right.LastOffset &&
+		left.SourceSize == right.SourceSize &&
+		left.SourceModTime.Equal(right.SourceModTime) &&
+		left.ImportTurnID == right.ImportTurnID &&
+		left.KindPrefix == right.KindPrefix &&
+		left.Status == right.Status
+}
+
 func transcriptSourceFileState(sourcePath string) (int64, time.Time) {
 	sourcePath = strings.TrimSpace(sourcePath)
 	if sourcePath == "" {
@@ -16305,11 +16696,8 @@ func (b *Bridge) markTranscriptImportStartedForRun(ctx context.Context, session 
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		now := time.Now()
-		id := checkpointID
-		checkpoint := state.ImportCheckpoints[id]
-		checkpoint.ID = id
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.ID = checkpointID
 		checkpoint.SessionID = session.ID
 		checkpoint.SourcePath = sourcePath
 		if strings.TrimSpace(importTurnID) != "" {
@@ -16320,9 +16708,9 @@ func (b *Bridge) markTranscriptImportStartedForRun(ctx context.Context, session 
 		}
 		checkpoint.Status = importCheckpointStatusImporting
 		checkpoint.UpdatedAt = now
-		state.ImportCheckpoints[id] = checkpoint
-		return nil
+		return checkpoint, true, nil
 	})
+	return err
 }
 
 func (b *Bridge) markTranscriptImportComplete(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int) error {
@@ -16349,11 +16737,8 @@ func (b *Bridge) markTranscriptImportPausedAt(ctx context.Context, session Sessi
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		now := time.Now()
-		id := checkpointID
-		checkpoint := state.ImportCheckpoints[id]
-		checkpoint.ID = id
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.ID = checkpointID
 		checkpoint.SessionID = session.ID
 		checkpoint.SourcePath = sourcePath
 		checkpoint.LastRecordID = lastRecordID
@@ -16369,9 +16754,9 @@ func (b *Bridge) markTranscriptImportPausedAt(ctx context.Context, session Sessi
 		}
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
-		state.ImportCheckpoints[id] = checkpoint
-		return nil
+		return checkpoint, true, nil
 	})
+	return err
 }
 
 func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, checkpointID string, completeEOF bool) error {
@@ -16379,11 +16764,8 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		now := time.Now()
-		id := checkpointID
-		checkpoint := state.ImportCheckpoints[id]
-		checkpoint.ID = id
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.ID = checkpointID
 		checkpoint.SessionID = session.ID
 		checkpoint.SourcePath = sourcePath
 		if strings.TrimSpace(lastRecordID) != "" {
@@ -16399,9 +16781,9 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 		}
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
-		state.ImportCheckpoints[id] = checkpoint
-		return nil
+		return checkpoint, true, nil
 	})
+	return err
 }
 
 func (b *Bridge) markTranscriptImportFailed(ctx context.Context, session Session, sourcePath string) error {
@@ -16412,25 +16794,20 @@ func (b *Bridge) markTranscriptImportFailedWithID(ctx context.Context, session S
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		now := time.Now()
-		id := checkpointID
-		checkpoint := state.ImportCheckpoints[id]
-		checkpoint.ID = id
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.ID = checkpointID
 		checkpoint.SessionID = session.ID
 		checkpoint.SourcePath = sourcePath
 		checkpoint.Status = importCheckpointStatusFailed
 		checkpoint.UpdatedAt = now
-		state.ImportCheckpoints[id] = checkpoint
-		return nil
+		return checkpoint, true, nil
 	})
+	return err
 }
 
 func (b *Bridge) markTranscriptImportBlocked(ctx context.Context, session Session, sourcePath string, previous teamstore.ImportCheckpoint) error {
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		now := time.Now()
-		id := transcriptCheckpointID(session.ID)
-		checkpoint := state.ImportCheckpoints[id]
+	id := transcriptCheckpointID(session.ID)
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, id, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if strings.TrimSpace(checkpoint.LastRecordID) == "" {
 			checkpoint.LastRecordID = previous.LastRecordID
 			checkpoint.LastSourceLine = previous.LastSourceLine
@@ -16440,9 +16817,9 @@ func (b *Bridge) markTranscriptImportBlocked(ctx context.Context, session Sessio
 		checkpoint.SourcePath = sourcePath
 		checkpoint.Status = importCheckpointStatusBlocked
 		checkpoint.UpdatedAt = now
-		state.ImportCheckpoints[id] = checkpoint
-		return nil
+		return checkpoint, true, nil
 	})
+	return err
 }
 
 func (b *Bridge) formatWorkspaceDashboard(ctx context.Context) (string, error) {
@@ -16851,6 +17228,7 @@ func (b *Bridge) parkWorkChatSession(ctx context.Context, session *Session) (str
 		return "", err
 	}
 	session.UpdatedAt = now
+	b.markRegistryProjectionDirty()
 	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
 		current := state.Sessions[session.ID]
 		current.Status = teamstore.SessionStatusActive
@@ -16966,6 +17344,7 @@ func (b *Bridge) resumeWorkChat(ctx context.Context, session *Session, now time.
 		return err
 	}
 	session.UpdatedAt = now
+	b.markRegistryProjectionDirty()
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}

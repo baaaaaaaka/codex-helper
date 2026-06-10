@@ -65,7 +65,7 @@ func (b *Bridge) resolveCodexThreadDecision(ctx context.Context, session *Sessio
 		return threadResolveDecision{Action: threadResolveStartNew}, nil
 	}
 	sessionID := strings.TrimSpace(session.ID)
-	state, err := b.store.SessionWorkflowEventSnapshot(ctx, sessionID)
+	state, err := b.store.SessionThreadResolutionSnapshot(ctx, sessionID)
 	if err != nil {
 		return threadResolveDecision{}, err
 	}
@@ -180,6 +180,7 @@ func (b *Bridge) bindSessionCodexThreadIfSafe(ctx context.Context, session *Sess
 	if current := b.reg.SessionByID(sessionID); current != nil {
 		current.CodexThreadID = threadID
 		current.UpdatedAt = time.Now()
+		b.markRegistryProjectionDirty()
 	}
 	if strings.TrimSpace(b.registryPath) != "" {
 		if err := b.Save(); err != nil && b.out != nil {

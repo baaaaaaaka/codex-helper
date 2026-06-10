@@ -46,6 +46,7 @@ func (b *Bridge) RecreateControlChat(ctx context.Context) (RecreatedChat, error)
 		delete(b.reg.Chats, old.ID)
 	}
 	b.reg.Chats[chat.ID] = ChatState{}
+	b.markRegistryProjectionDirty()
 	if err := b.recordControlChatBinding(ctx, chat); err != nil {
 		return RecreatedChat{}, err
 	}
@@ -115,6 +116,7 @@ func (b *Bridge) RecreateSessionChat(ctx context.Context, selector string, opts 
 		delete(b.reg.Chats, old.ID)
 	}
 	b.reg.Chats[chat.ID] = ChatState{}
+	b.markRegistryProjectionDirty()
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return RecreatedChat{}, err
 	}

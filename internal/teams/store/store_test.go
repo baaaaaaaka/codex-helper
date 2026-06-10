@@ -1540,6 +1540,8 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 		state.OutboxMessages["outbox-1"] = OutboxMessage{ID: "outbox-1", SessionID: "s1", TurnID: "turn-running", TeamsChatID: "chat-1", Kind: "final", Body: "pending", Status: OutboxStatusQueued, CreatedAt: now, UpdatedAt: now}
 		state.ImportCheckpoints["import-1"] = ImportCheckpoint{ID: "import-1", SessionID: "s1", LastRecordID: "record-1", Status: "complete", UpdatedAt: now}
 		state.ChatPolls["chat-1"] = ChatPollState{ChatID: "chat-1", Seeded: true, PollState: "warm", NextPollAt: now.Add(time.Minute), UpdatedAt: now}
+		state.ChatPolls["chat-parked-clean"] = ChatPollState{ChatID: "chat-parked-clean", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), UpdatedAt: now}
+		state.ChatPolls["chat-parked-stale"] = ChatPollState{ChatID: "chat-parked-stale", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), ContinuationPath: "/chats/chat-parked-stale/messages?$skiptoken=stale", UpdatedAt: now}
 		state.ChatRateLimits["chat-1"] = ChatRateLimitState{ChatID: "chat-1", BlockedUntil: now.Add(time.Hour), Reason: "429", UpdatedAt: now}
 		return nil
 	}); err != nil {
@@ -1564,8 +1566,37 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	if pollSchedule.ControlChat.TeamsChatID != "control-chat" || len(pollSchedule.Sessions) != 2 || pollSchedule.ChatPolls["chat-1"].PollState != "warm" || pollSchedule.ServiceOwner == nil {
 		t.Fatalf("poll schedule snapshot missing selected fields: %#v", pollSchedule)
 	}
+	if pollSchedule.ChatPolls["chat-parked-clean"].PollState != "parked" || pollSchedule.ChatPolls["chat-parked-stale"].ContinuationPath == "" {
+		t.Fatalf("poll schedule snapshot should include parked rows: %#v", pollSchedule.ChatPolls)
+	}
 	if len(pollSchedule.InboundEvents) != 0 || len(pollSchedule.OutboxMessages) != 0 || len(pollSchedule.ChatRateLimits) != 0 {
 		t.Fatalf("poll schedule snapshot included unselected hot fields: inbound=%d outbox=%d rate_limits=%d", len(pollSchedule.InboundEvents), len(pollSchedule.OutboxMessages), len(pollSchedule.ChatRateLimits))
+	}
+	hotPollState, err := store.HotPollScheduleState(ctx)
+	if err != nil {
+		t.Fatalf("HotPollScheduleState sqlite error: %v", err)
+	}
+	if _, ok := hotPollState.ChatPolls["chat-parked-clean"]; ok || hotPollState.ChatPolls["chat-parked-stale"].ContinuationPath == "" {
+		t.Fatalf("hot poll state should skip only clean parked rows: %#v", hotPollState.ChatPolls)
+	}
+	if len(hotPollState.Sessions) != 0 {
+		t.Fatalf("hot poll state should not load sessions eagerly: %d", len(hotPollState.Sessions))
+	}
+	hotPollSchedule, parkedSkip, err := store.HotPollScheduleSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("HotPollScheduleSnapshot sqlite error: %v", err)
+	}
+	if _, ok := hotPollSchedule.ChatPolls["chat-parked-clean"]; ok || !parkedSkip["chat-parked-clean"] {
+		t.Fatalf("hot poll schedule should skip clean parked row: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
+	}
+	if hotPollSchedule.ChatPolls["chat-parked-stale"].ContinuationPath == "" || parkedSkip["chat-parked-stale"] {
+		t.Fatalf("hot poll schedule should retain stale parked row for maintenance: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
+	}
+	if hotPollSchedule.ChatPolls["chat-1"].PollState != "warm" || hotPollSchedule.ServiceOwner == nil {
+		t.Fatalf("hot poll schedule missing non-parked selected fields: %#v", hotPollSchedule)
+	}
+	if len(hotPollSchedule.Sessions) != 0 {
+		t.Fatalf("hot poll schedule should not load sessions eagerly: %d", len(hotPollSchedule.Sessions))
 	}
 	active, err := store.SessionActiveTurnQueueSnapshot(ctx, "s1")
 	if err != nil {
@@ -1583,6 +1614,26 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	}
 	if len(fullSession.Turns) != 3 || fullSession.Turns["turn-other"].ID != "" || fullSession.InboundEvents["inbound-completed"].ID == "" {
 		t.Fatalf("full session queue snapshot = turns %#v inbound %#v", fullSession.Turns, fullSession.InboundEvents)
+	}
+	workflowTurn, err := store.SessionWorkflowEventSnapshotForTurn(ctx, "s1", "turn-running")
+	if err != nil {
+		t.Fatalf("SessionWorkflowEventSnapshotForTurn sqlite error: %v", err)
+	}
+	if len(workflowTurn.Sessions) != 1 || workflowTurn.Sessions["s1"].ID == "" {
+		t.Fatalf("workflow turn snapshot sessions = %#v", workflowTurn.Sessions)
+	}
+	if len(workflowTurn.Turns) != 1 || workflowTurn.Turns["turn-running"].ID == "" {
+		t.Fatalf("workflow turn snapshot turns = %#v", workflowTurn.Turns)
+	}
+	if len(workflowTurn.InboundEvents) != 1 || workflowTurn.InboundEvents["inbound-running"].ID == "" {
+		t.Fatalf("workflow turn snapshot inbound = %#v", workflowTurn.InboundEvents)
+	}
+	threadResolution, err := store.SessionThreadResolutionSnapshot(ctx, "s1")
+	if err != nil {
+		t.Fatalf("SessionThreadResolutionSnapshot sqlite error: %v", err)
+	}
+	if len(threadResolution.Sessions) != 1 || len(threadResolution.Turns) != 3 || len(threadResolution.InboundEvents) != 0 {
+		t.Fatalf("thread resolution snapshot = sessions %#v turns %#v inbound %#v", threadResolution.Sessions, threadResolution.Turns, threadResolution.InboundEvents)
 	}
 	workflow, err := store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
@@ -1603,6 +1654,408 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	}
 	if limit, ok, err := store.ChatRateLimit(ctx, "chat-1"); err != nil || !ok || limit.Reason != "429" {
 		t.Fatalf("ChatRateLimit sqlite = %#v ok=%v err=%v", limit, ok, err)
+	}
+}
+
+func TestImportCheckpointUsesNarrowSQLiteLookup(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 24, 3, 4, 5, 0, time.UTC)
+	checkpoint := ImportCheckpoint{
+		ID:             "transcript:session-1",
+		SessionID:      "session-1",
+		SourcePath:     "/tmp/cxp/session-1.jsonl",
+		LastRecordID:   "record-1",
+		LastSourceLine: 17,
+		LastOffset:     4096,
+		SourceSize:     8192,
+		SourceModTime:  now.Add(-time.Minute),
+		ImportTurnID:   "turn-1",
+		KindPrefix:     "assistant",
+		Status:         "complete",
+		UpdatedAt:      now,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ImportCheckpoints[checkpoint.ID] = checkpoint
+		state.ImportCheckpoints["transcript:broken"] = ImportCheckpoint{ID: "transcript:broken", SessionID: "broken", LastRecordID: "broken", Status: "complete", UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed import checkpoints: %v", err)
+	}
+
+	legacy, found, err := store.ImportCheckpoint(ctx, checkpoint.ID)
+	if err != nil {
+		t.Fatalf("ImportCheckpoint legacy error: %v", err)
+	}
+	if !found || !reflect.DeepEqual(legacy, checkpoint) {
+		t.Fatalf("ImportCheckpoint legacy = %#v found=%v, want %#v true", legacy, found, checkpoint)
+	}
+	if missing, found, err := store.ImportCheckpoint(ctx, "transcript:missing"); err != nil || found || missing.ID != "" {
+		t.Fatalf("ImportCheckpoint legacy missing = %#v found=%v err=%v, want missing nil", missing, found, err)
+	}
+
+	migrateStoreToSQLiteForTest(t, store)
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	res, err := db.ExecContext(ctx, `UPDATE import_checkpoints SET json = ? WHERE id = ?`, []byte(`{"broken"`), "transcript:broken")
+	if err != nil {
+		t.Fatalf("corrupt unrelated import checkpoint: %v", err)
+	}
+	if rows, err := res.RowsAffected(); err != nil || rows != 1 {
+		t.Fatalf("corrupt unrelated import checkpoint rows affected = %d err=%v, want 1", rows, err)
+	}
+
+	got, found, err := store.ImportCheckpoint(ctx, checkpoint.ID)
+	if err != nil {
+		t.Fatalf("ImportCheckpoint sqlite narrow lookup error: %v", err)
+	}
+	if !found || !reflect.DeepEqual(got, checkpoint) {
+		t.Fatalf("ImportCheckpoint sqlite = %#v found=%v, want %#v true", got, found, checkpoint)
+	}
+	if _, _, err := store.ImportCheckpoint(ctx, "transcript:broken"); err == nil {
+		t.Fatal("ImportCheckpoint corrupt requested row error = nil, want JSON error")
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt unrelated import checkpoint")
+	}
+}
+
+func TestUpdateImportCheckpointUsesNarrowSQLiteWrite(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 10, 7, 0, 0, 0, time.UTC)
+	checkpoint := ImportCheckpoint{
+		ID:             "transcript:session-1",
+		SessionID:      "session-1",
+		SourcePath:     "/tmp/cxp/session-1.jsonl",
+		LastRecordID:   "record-1",
+		LastSourceLine: 10,
+		LastOffset:     100,
+		Status:         "complete",
+		UpdatedAt:      now,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ImportCheckpoints[checkpoint.ID] = checkpoint
+		state.ImportCheckpoints["transcript:broken"] = ImportCheckpoint{ID: "transcript:broken", SessionID: "broken", LastRecordID: "broken", Status: "complete", UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed import checkpoints: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE import_checkpoints SET json = ? WHERE id = ?`, []byte(`{"broken"`), "transcript:broken"); err != nil {
+		t.Fatalf("corrupt unrelated import checkpoint: %v", err)
+	}
+
+	updated, changed, err := store.UpdateImportCheckpoint(ctx, checkpoint.ID, func(current ImportCheckpoint, found bool, updateTime time.Time) (ImportCheckpoint, bool, error) {
+		if !found || current.LastRecordID != "record-1" {
+			t.Fatalf("current checkpoint = %#v found=%v, want record-1 true", current, found)
+		}
+		current.LastRecordID = "record-2"
+		current.LastSourceLine = 20
+		current.LastOffset = 200
+		current.UpdatedAt = updateTime
+		return current, true, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateImportCheckpoint sqlite narrow write error: %v", err)
+	}
+	if !changed || updated.LastRecordID != "record-2" || updated.LastSourceLine != 20 || updated.LastOffset != 200 {
+		t.Fatalf("updated checkpoint = %#v changed=%v, want record-2 changed", updated, changed)
+	}
+	got, found, err := store.ImportCheckpoint(ctx, checkpoint.ID)
+	if err != nil {
+		t.Fatalf("ImportCheckpoint updated row error: %v", err)
+	}
+	if !found || got.LastRecordID != "record-2" || got.LastSourceLine != 20 || got.LastOffset != 200 {
+		t.Fatalf("ImportCheckpoint after update = %#v found=%v", got, found)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt unrelated import checkpoint")
+	}
+}
+
+func TestUpdateImportCheckpointSQLiteNoopDoesNotRewriteRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 10, 7, 30, 0, 0, time.UTC)
+	checkpoint := ImportCheckpoint{
+		ID:             "transcript:session-noop",
+		SessionID:      "session-noop",
+		SourcePath:     "/tmp/cxp/session-noop.jsonl",
+		LastRecordID:   "record-1",
+		LastSourceLine: 10,
+		LastOffset:     100,
+		Status:         "complete",
+		UpdatedAt:      now,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ImportCheckpoints[checkpoint.ID] = checkpoint
+		return nil
+	}); err != nil {
+		t.Fatalf("seed import checkpoint: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	var before []byte
+	if err := db.QueryRowContext(ctx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpoint.ID).Scan(&before); err != nil {
+		t.Fatalf("read checkpoint before noop: %v", err)
+	}
+
+	updated, changed, err := store.UpdateImportCheckpoint(ctx, checkpoint.ID, func(current ImportCheckpoint, found bool, updateTime time.Time) (ImportCheckpoint, bool, error) {
+		if !found || current.LastRecordID != checkpoint.LastRecordID {
+			t.Fatalf("current checkpoint = %#v found=%v, want seeded checkpoint", current, found)
+		}
+		current.UpdatedAt = updateTime
+		return current, false, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateImportCheckpoint noop error: %v", err)
+	}
+	if changed {
+		t.Fatalf("UpdateImportCheckpoint noop changed=true, updated=%#v", updated)
+	}
+	var after []byte
+	if err := db.QueryRowContext(ctx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpoint.ID).Scan(&after); err != nil {
+		t.Fatalf("read checkpoint after noop: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("noop checkpoint update rewrote row:\nbefore=%s\nafter=%s", string(before), string(after))
+	}
+}
+
+func TestUpdateImportCheckpointSQLiteCreatesMissingRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-created"] = SessionContext{ID: "session-created", Status: SessionStatusActive, TeamsChatID: "chat-created", UpdatedAt: time.Now()}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store before sqlite migration: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	created, changed, err := store.UpdateImportCheckpoint(ctx, "transcript:created", func(current ImportCheckpoint, found bool, updateTime time.Time) (ImportCheckpoint, bool, error) {
+		if found || current.ID != "" {
+			t.Fatalf("current checkpoint = %#v found=%v, want missing", current, found)
+		}
+		return ImportCheckpoint{
+			SessionID:      "session-created",
+			SourcePath:     "/tmp/cxp/session-created.jsonl",
+			LastRecordID:   "record-created",
+			LastSourceLine: 42,
+			LastOffset:     4200,
+			Status:         "complete",
+			UpdatedAt:      updateTime,
+		}, true, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateImportCheckpoint create error: %v", err)
+	}
+	if !changed || created.ID != "transcript:created" || created.LastRecordID != "record-created" {
+		t.Fatalf("created checkpoint = %#v changed=%v", created, changed)
+	}
+	got, found, err := store.ImportCheckpoint(ctx, "transcript:created")
+	if err != nil {
+		t.Fatalf("ImportCheckpoint created row error: %v", err)
+	}
+	if !found || got.SessionID != "session-created" || got.LastSourceLine != 42 || got.LastOffset != 4200 {
+		t.Fatalf("created row = %#v found=%v", got, found)
+	}
+}
+
+func TestSQLiteHotPollWorkCandidatesReturnsOnlyPositiveDurableCandidates(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 9, 11, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s-clean"] = SessionContext{ID: "s-clean", Status: SessionStatusActive, TeamsChatID: "chat-clean", UpdatedAt: now.Add(-time.Hour)}
+		state.Sessions["s-dirty"] = SessionContext{ID: "s-dirty", Status: SessionStatusActive, TeamsChatID: "chat-dirty", UpdatedAt: now.Add(-2 * time.Hour)}
+		state.Sessions["s-warm"] = SessionContext{ID: "s-warm", Status: SessionStatusActive, TeamsChatID: "chat-warm", UpdatedAt: now}
+		state.Sessions["s-missing"] = SessionContext{ID: "s-missing", Status: SessionStatusActive, TeamsChatID: "chat-missing", UpdatedAt: now.Add(time.Minute)}
+		state.Sessions["s-closed"] = SessionContext{ID: "s-closed", Status: SessionStatusClosed, TeamsChatID: "chat-closed", UpdatedAt: now.Add(2 * time.Minute)}
+		state.Sessions["s-control"] = SessionContext{ID: "s-control", Status: SessionStatusActive, TeamsChatID: "control-chat", UpdatedAt: now.Add(3 * time.Minute)}
+		state.ChatPolls["chat-clean"] = ChatPollState{ChatID: "chat-clean", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), UpdatedAt: now}
+		state.ChatPolls["chat-dirty"] = ChatPollState{ChatID: "chat-dirty", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), ContinuationPath: "/chats/chat-dirty/messages?$skiptoken=stale", UpdatedAt: now}
+		state.ChatPolls["chat-warm"] = ChatPollState{ChatID: "chat-warm", Seeded: true, PollState: "warm", NextPollAt: now.Add(-time.Second), UpdatedAt: now}
+		state.ChatPolls["chat-closed"] = ChatPollState{ChatID: "chat-closed", Seeded: true, PollState: "warm", NextPollAt: now.Add(-time.Second), UpdatedAt: now}
+		state.ChatPolls["control-chat"] = ChatPollState{ChatID: "control-chat", Seeded: true, PollState: "warm", NextPollAt: now.Add(-time.Second), UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed work candidates: %v", err)
+	}
+
+	if candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat"); err != nil || handled || len(candidates) != 0 {
+		t.Fatalf("json HotPollWorkCandidates = candidates=%#v handled=%v err=%v, want legacy fallback", candidates, handled, err)
+	}
+
+	migrateStoreToSQLiteForTest(t, store)
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil {
+		t.Fatalf("sqlite HotPollWorkCandidates error: %v", err)
+	}
+	if !handled {
+		t.Fatal("sqlite HotPollWorkCandidates was not handled")
+	}
+	got := make(map[string]bool, len(candidates))
+	for _, session := range candidates {
+		got[session.ID] = true
+	}
+	want := map[string]bool{"s-dirty": true, "s-warm": true, "s-missing": true}
+	if len(got) != len(want) {
+		t.Fatalf("candidate ids = %#v, want %#v", got, want)
+	}
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("candidate ids = %#v, missing %s", got, id)
+		}
+	}
+	for _, id := range []string{"s-clean", "s-closed", "s-control"} {
+		if got[id] {
+			t.Fatalf("candidate ids = %#v, should not include %s", got, id)
+		}
+	}
+}
+
+func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 9, 11, 0, 0, 0, time.UTC)
+	oldActivity := now.Add(-49 * time.Hour)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s-idle"] = SessionContext{ID: "s-idle", Status: SessionStatusActive, TeamsChatID: "chat-idle", UpdatedAt: oldActivity}
+		state.Sessions["s-running"] = SessionContext{ID: "s-running", Status: SessionStatusActive, TeamsChatID: "chat-running", UpdatedAt: oldActivity}
+		state.Sessions["s-recent"] = SessionContext{ID: "s-recent", Status: SessionStatusActive, TeamsChatID: "chat-recent", UpdatedAt: now}
+		state.ChatPolls["chat-idle"] = ChatPollState{ChatID: "chat-idle", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		state.ChatPolls["chat-running"] = ChatPollState{ChatID: "chat-running", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		state.ChatPolls["chat-recent"] = ChatPollState{ChatID: "chat-recent", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		state.Turns["turn-running"] = Turn{ID: "turn-running", SessionID: "s-running", Status: TurnStatusRunning, StartedAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Minute)}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed idle candidates: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	candidates, handled, err := store.HotPollWorkCandidatesExcludingIdle(ctx, "control-chat", now.Add(-48*time.Hour))
+	if err != nil {
+		t.Fatalf("HotPollWorkCandidatesExcludingIdle error: %v", err)
+	}
+	if !handled {
+		t.Fatal("HotPollWorkCandidatesExcludingIdle was not handled")
+	}
+	got := make(map[string]bool, len(candidates))
+	for _, session := range candidates {
+		got[session.ID] = true
+	}
+	if got["s-idle"] {
+		t.Fatalf("idle auto-park candidate stayed in hot poll candidates: %#v", got)
+	}
+	for _, id := range []string{"s-running", "s-recent"} {
+		if !got[id] {
+			t.Fatalf("candidate ids = %#v, missing %s", got, id)
+		}
+	}
+
+	parkCandidates, handled, err := store.IdleWorkChatParkCandidates(ctx, "control-chat", now.Add(-48*time.Hour), 16)
+	if err != nil {
+		t.Fatalf("IdleWorkChatParkCandidates error: %v", err)
+	}
+	if !handled {
+		t.Fatal("IdleWorkChatParkCandidates was not handled")
+	}
+	if len(parkCandidates) != 1 || parkCandidates[0].Session.ID != "s-idle" || parkCandidates[0].Poll.ChatID != "chat-idle" {
+		t.Fatalf("park candidates = %#v, want only s-idle", parkCandidates)
+	}
+}
+
+func TestStoreSessionsByIDFiltersRequestedSessions(t *testing.T) {
+	for _, migrate := range []bool{false, true} {
+		name := "json"
+		if migrate {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Date(2026, 6, 9, 10, 30, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions["s1"] = SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1", UpdatedAt: now}
+				state.Sessions["s2"] = SessionContext{ID: "s2", Status: SessionStatusClosed, TeamsChatID: "chat-2", UpdatedAt: now}
+				state.Sessions["s3"] = SessionContext{ID: "s3", Status: SessionStatusActive, TeamsChatID: "chat-3", UpdatedAt: now}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed sessions: %v", err)
+			}
+			if migrate {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			sessions, err := store.SessionsByID(ctx, []string{"s2", "missing", "s1", "s1", ""})
+			if err != nil {
+				t.Fatalf("SessionsByID: %v", err)
+			}
+			if len(sessions) != 2 || sessions["s1"].TeamsChatID != "chat-1" || sessions["s2"].Status != SessionStatusClosed {
+				t.Fatalf("SessionsByID returned %#v", sessions)
+			}
+			if _, ok := sessions["s3"]; ok {
+				t.Fatalf("SessionsByID loaded unrequested session: %#v", sessions["s3"])
+			}
+		})
+	}
+}
+
+func TestSQLiteHotPollScheduleSnapshotBackfillsParkedSkipColumns(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ChatPolls["chat-parked-clean"] = ChatPollState{ChatID: "chat-parked-clean", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), UpdatedAt: now}
+		state.ChatPolls["chat-parked-stale"] = ChatPollState{ChatID: "chat-parked-stale", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), ContinuationPath: "/chats/chat-parked-stale/messages?$skiptoken=stale", UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed parked polls: %v", err)
+	}
+	result := migrateStoreToSQLiteForTest(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	db, err := openSQLiteHandle(result.Path, false)
+	if err != nil {
+		t.Fatalf("open migrated sqlite db: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE chat_polls SET park_notice_sent_at = NULL, parked_skip_eligible = NULL`); err != nil {
+		_ = db.Close()
+		t.Fatalf("clear derived columns: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close sqlite db after clearing columns: %v", err)
+	}
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("reopen sqlite-backed store: %v", err)
+	}
+	defer reopened.Close()
+
+	hotPollSchedule, parkedSkip, err := reopened.HotPollScheduleSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("HotPollScheduleSnapshot after derived-column backfill: %v", err)
+	}
+	if _, ok := hotPollSchedule.ChatPolls["chat-parked-clean"]; ok || !parkedSkip["chat-parked-clean"] {
+		t.Fatalf("backfill should make clean parked row skippable: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
+	}
+	if hotPollSchedule.ChatPolls["chat-parked-stale"].ContinuationPath == "" || parkedSkip["chat-parked-stale"] {
+		t.Fatalf("backfill should keep stale parked row in hot snapshot: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
 	}
 }
 
@@ -7316,6 +7769,343 @@ func TestChatPollScheduleStatePersistsParkAndBlock(t *testing.T) {
 	}
 	if poll.PollState != "hot" || !poll.ParkedAt.IsZero() || !poll.ParkNoticeSentAt.IsZero() {
 		t.Fatalf("resume should clear park markers: %#v", poll)
+	}
+}
+
+func TestSQLiteMarkChatPollParkNoticeSentDoesNotLoadFullState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 9, 8, 0, 0, 0, time.UTC)
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      "parked",
+		LastActivityAt: now.Add(-49 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed parked poll: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	sentAt := now.Add(time.Minute)
+	poll, err := store.MarkChatPollParkNoticeSent(ctx, "chat-1", sentAt)
+	if err != nil {
+		t.Fatalf("MarkChatPollParkNoticeSent sqlite error: %v", err)
+	}
+	if poll.ChatID != "chat-1" || !poll.ParkNoticeSentAt.Equal(sentAt) {
+		t.Fatalf("park notice poll = %#v", poll)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("MarkChatPollParkNoticeSent loaded full state %d times", got)
+	}
+	loaded, ok, err := store.ChatPoll(ctx, "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll after mark ok=%v err=%v", ok, err)
+	}
+	if !loaded.ParkNoticeSentAt.Equal(sentAt) {
+		t.Fatalf("loaded park notice timestamp = %s, want %s", loaded.ParkNoticeSentAt, sentAt)
+	}
+}
+
+func TestSQLiteChatSessionActivityDoesNotLoadFullState(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name       string
+		sessions   []SessionContext
+		wantMatch  bool
+		wantActive bool
+	}{
+		{
+			name: "active shared chat",
+			sessions: []SessionContext{
+				{ID: "s-active", TeamsChatID: "chat-1", Status: SessionStatusActive},
+				{ID: "s-closed", TeamsChatID: "chat-1", Status: SessionStatusClosed},
+			},
+			wantMatch:  true,
+			wantActive: true,
+		},
+		{
+			name: "terminal shared chat",
+			sessions: []SessionContext{
+				{ID: "s-closed-a", TeamsChatID: "chat-1", Status: SessionStatusClosed},
+				{ID: "s-closed-b", TeamsChatID: "chat-1", Status: SessionStatusArchived},
+			},
+			wantMatch:  true,
+			wantActive: false,
+		},
+		{
+			name:       "no matching chat",
+			sessions:   []SessionContext{{ID: "s-other", TeamsChatID: "chat-other", Status: SessionStatusActive}},
+			wantMatch:  false,
+			wantActive: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				for _, session := range tc.sessions {
+					state.Sessions[session.ID] = session
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed sessions: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			var loads int64
+			prev := loadUnlockedTestHook
+			loadUnlockedTestHook = func() {
+				atomic.AddInt64(&loads, 1)
+			}
+			t.Cleanup(func() {
+				loadUnlockedTestHook = prev
+			})
+
+			matched, active, err := store.ChatSessionActivity(ctx, "chat-1")
+			if err != nil {
+				t.Fatalf("ChatSessionActivity sqlite error: %v", err)
+			}
+			if matched != tc.wantMatch || active != tc.wantActive {
+				t.Fatalf("ChatSessionActivity = matched=%v active=%v, want matched=%v active=%v", matched, active, tc.wantMatch, tc.wantActive)
+			}
+			if got := atomic.LoadInt64(&loads); got != 0 {
+				t.Fatalf("ChatSessionActivity loaded full state %d times", got)
+			}
+		})
+	}
+}
+
+func TestSQLiteChatRateLimitDoesNotLoadFullState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	blockedUntil := time.Date(2026, 6, 9, 9, 30, 0, 0, time.UTC)
+	if _, err := store.SetChatRateLimitForOutbox(ctx, "chat-1", blockedUntil, "429", "outbox-1"); err != nil {
+		t.Fatalf("seed chat rate limit: %v", err)
+	}
+	if _, err := store.SetChatRateLimit(ctx, "chat-other", blockedUntil.Add(time.Hour), "other"); err != nil {
+		t.Fatalf("seed other chat rate limit: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	limit, ok, err := store.ChatRateLimit(ctx, "chat-1")
+	if err != nil {
+		t.Fatalf("ChatRateLimit sqlite error: %v", err)
+	}
+	if !ok || limit.ChatID != "chat-1" || !limit.BlockedUntil.Equal(blockedUntil) || limit.Reason != "429" || limit.PoisonOutboxID != "outbox-1" {
+		t.Fatalf("ChatRateLimit sqlite = %#v ok=%v", limit, ok)
+	}
+	if _, ok, err := store.ChatRateLimit(ctx, "missing"); err != nil || ok {
+		t.Fatalf("ChatRateLimit missing ok=%v err=%v, want false nil", ok, err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("ChatRateLimit loaded full state %d times", got)
+	}
+}
+
+func TestSQLiteMarkOutboxSendAttemptDoesNotReadColdState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 9, 9, 45, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s1"] = SessionContext{ID: "s1", TeamsChatID: "chat-1", CodexThreadID: "thread-1", CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-1"] = Turn{ID: "turn-1", SessionID: "s1", Status: TurnStatusRunning, CodexThreadID: "thread-1", CreatedAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed session and turn: %v", err)
+	}
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox-1",
+		SessionID:   "s1",
+		TurnID:      "turn-1",
+		TeamsChatID: "chat-1",
+		Kind:        "queued-status",
+		Body:        "working",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox created=%v err=%v", created, err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load queued outbox state: %v", err)
+	}
+	var queuedDelivery HelperDeliveryRecord
+	for _, delivery := range state.HelperDeliveries {
+		if delivery.OutboxID == msg.ID {
+			queuedDelivery = delivery
+			break
+		}
+	}
+	if queuedDelivery.ID == "" || queuedDelivery.Status != HelperDeliveryStatusQueued {
+		t.Fatalf("queued helper delivery = %#v", queuedDelivery)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, []byte(`{"broken"`)); err != nil {
+		t.Fatalf("corrupt cold state: %v", err)
+	}
+
+	claimed, err := store.MarkOutboxSendAttempt(ctx, msg.ID)
+	if err != nil {
+		t.Fatalf("MarkOutboxSendAttempt with corrupt cold state: %v", err)
+	}
+	if claimed.Status != OutboxStatusSending || claimed.LastSendAttempt.IsZero() || claimed.LastSendError != "" {
+		t.Fatalf("claimed outbox = %#v", claimed)
+	}
+	var raw []byte
+	if err := db.QueryRowContext(ctx, `SELECT json FROM helper_deliveries WHERE outbox_id = ?`, msg.ID).Scan(&raw); err != nil {
+		t.Fatalf("load helper delivery row: %v", err)
+	}
+	var delivery HelperDeliveryRecord
+	if err := json.Unmarshal(raw, &delivery); err != nil {
+		t.Fatalf("unmarshal helper delivery row: %v", err)
+	}
+	if delivery.Status != HelperDeliveryStatusSending || delivery.ID != queuedDelivery.ID || !delivery.CreatedAt.Equal(queuedDelivery.CreatedAt) || delivery.CodexThreadID != "thread-1" {
+		t.Fatalf("helper delivery after send attempt = %#v, queued was %#v", delivery, queuedDelivery)
+	}
+}
+
+func TestSQLiteMarkOutboxDeliveredDoesNotReadColdState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 9, 10, 15, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s1"] = SessionContext{ID: "s1", TeamsChatID: "chat-1", CodexThreadID: "thread-1", CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-1"] = Turn{ID: "turn-1", SessionID: "s1", Status: TurnStatusRunning, CodexThreadID: "thread-1", CreatedAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed session and turn: %v", err)
+	}
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox-1",
+		SessionID:   "s1",
+		TurnID:      "turn-1",
+		TeamsChatID: "chat-1",
+		Kind:        "queued-status",
+		Body:        "done",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox created=%v err=%v", created, err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, []byte(`{"broken"`)); err != nil {
+		t.Fatalf("corrupt cold state: %v", err)
+	}
+
+	accepted, err := store.MarkOutboxAccepted(ctx, msg.ID, "teams-message-1")
+	if err != nil {
+		t.Fatalf("MarkOutboxAccepted with corrupt cold state: %v", err)
+	}
+	if accepted.Status != OutboxStatusAccepted || accepted.TeamsMessageID != "teams-message-1" {
+		t.Fatalf("accepted outbox = %#v", accepted)
+	}
+	sent, err := store.MarkOutboxSent(ctx, msg.ID, "teams-message-1")
+	if err != nil {
+		t.Fatalf("MarkOutboxSent with corrupt cold state: %v", err)
+	}
+	if sent.Status != OutboxStatusSent || sent.TeamsMessageID != "teams-message-1" || sent.SentAt.IsZero() {
+		t.Fatalf("sent outbox = %#v", sent)
+	}
+	var provenanceRaw []byte
+	if err := db.QueryRowContext(ctx, `SELECT json FROM message_provenance WHERE teams_chat_id = ? AND teams_message_id = ?`, "chat-1", "teams-message-1").Scan(&provenanceRaw); err != nil {
+		t.Fatalf("load message provenance row: %v", err)
+	}
+	var provenance MessageProvenanceRecord
+	if err := json.Unmarshal(provenanceRaw, &provenance); err != nil {
+		t.Fatalf("unmarshal message provenance row: %v", err)
+	}
+	if provenance.Origin != MessageOriginHelperOutbox || provenance.OutboxID != msg.ID || provenance.SessionID != "s1" {
+		t.Fatalf("message provenance = %#v", provenance)
+	}
+	var deliveryRaw []byte
+	if err := db.QueryRowContext(ctx, `SELECT json FROM helper_deliveries WHERE outbox_id = ?`, msg.ID).Scan(&deliveryRaw); err != nil {
+		t.Fatalf("load helper delivery row: %v", err)
+	}
+	var delivery HelperDeliveryRecord
+	if err := json.Unmarshal(deliveryRaw, &delivery); err != nil {
+		t.Fatalf("unmarshal helper delivery row: %v", err)
+	}
+	if delivery.Status != HelperDeliveryStatusSent || delivery.TeamsMessageID != "teams-message-1" || delivery.CodexThreadID != "thread-1" || delivery.SentAt.IsZero() {
+		t.Fatalf("helper delivery after sent = %#v", delivery)
+	}
+}
+
+func TestSQLiteSentOutboxMessagesForChatDoesNotLoadFullState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 9, 9, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages["sent-1"] = OutboxMessage{
+			ID:          "sent-1",
+			TeamsChatID: "chat-1",
+			Status:      OutboxStatusSent,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			SentAt:      now,
+		}
+		state.OutboxMessages["accepted-1"] = OutboxMessage{
+			ID:          "accepted-1",
+			TeamsChatID: "chat-1",
+			Status:      OutboxStatusAccepted,
+			CreatedAt:   now.Add(time.Second),
+			UpdatedAt:   now.Add(time.Second),
+		}
+		state.OutboxMessages["sent-other"] = OutboxMessage{
+			ID:          "sent-other",
+			TeamsChatID: "chat-other",
+			Status:      OutboxStatusSent,
+			CreatedAt:   now.Add(2 * time.Second),
+			UpdatedAt:   now.Add(2 * time.Second),
+			SentAt:      now.Add(2 * time.Second),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	messages, err := store.SentOutboxMessagesForChat(ctx, " chat-1 ")
+	if err != nil {
+		t.Fatalf("SentOutboxMessagesForChat sqlite error: %v", err)
+	}
+	if len(messages) != 1 || messages[0].ID != "sent-1" {
+		t.Fatalf("SentOutboxMessagesForChat = %#v, want only sent-1", messages)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("SentOutboxMessagesForChat loaded full state %d times", got)
 	}
 }
 

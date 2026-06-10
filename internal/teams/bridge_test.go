@@ -942,6 +942,55 @@ func TestBridgeSaveRepairsMissingRegistryDuringThrottleWindow(t *testing.T) {
 	}
 }
 
+func TestBridgeSaveSkipsCleanProjectionUntilDirty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "teams-registry.json")
+	bridge := &Bridge{
+		registryPath:                  path,
+		registryProjectionDirty:       true,
+		registryProjectionLastSavedAt: time.Time{},
+		reg: Registry{
+			Version:       1,
+			ControlChatID: "control-chat",
+			Sessions: []Session{{
+				ID:     "s001",
+				ChatID: "chat-1",
+				Topic:  "initial topic",
+				Status: "active",
+			}},
+		},
+	}
+	if err := bridge.Save(); err != nil {
+		t.Fatalf("initial Save: %v", err)
+	}
+	initial, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read initial registry: %v", err)
+	}
+	bridge.registryProjectionLastSavedAt = time.Now().Add(time.Minute)
+	bridge.reg.Sessions[0].Topic = "clean skipped topic"
+	if err := bridge.Save(); err != nil {
+		t.Fatalf("clean Save: %v", err)
+	}
+	clean, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read clean registry: %v", err)
+	}
+	if !bytes.Equal(clean, initial) {
+		t.Fatal("clean registry projection save rewrote the file before dirty was marked")
+	}
+	bridge.markRegistryProjectionDirty()
+	if err := bridge.Save(); err != nil {
+		t.Fatalf("dirty Save: %v", err)
+	}
+	dirty, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read dirty registry: %v", err)
+	}
+	if !strings.Contains(string(dirty), "clean skipped topic") {
+		t.Fatalf("dirty registry projection was not persisted: %s", dirty)
+	}
+}
+
 func TestCodexErrorRequiresUpgradeHeuristics(t *testing.T) {
 	matches := []string{
 		"Codex turn failed: The 'gpt-5.5' model requires a newer version of Codex.",
@@ -2354,6 +2403,82 @@ func TestBridgeProcessQueuedTurnsLimitsStartsPerCycle(t *testing.T) {
 	}
 	waitForCompletedTurnCount(t, store, "s003", 1)
 	waitForCompletedTurnCount(t, store, "s004", 1)
+	waitForBridgeAsyncTurns(t, bridge)
+}
+
+func TestBridgeProcessQueuedTurnsSharedBudgetAcrossMultipleDrains(t *testing.T) {
+	prompts := map[string]string{
+		"message-s001": "queued prompt for s001",
+		"message-s002": "queued prompt for s002",
+		"message-s003": "queued prompt for s003",
+	}
+	graph, _ := newBridgeQueuedTurnGraph(t, prompts)
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 10),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	bridge.maxQueuedTurnStartsPerCycle = 2
+	baseSession := bridge.reg.SessionByID("s001")
+	if baseSession == nil {
+		t.Fatal("missing base session s001")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), baseSession); err != nil {
+		t.Fatalf("ensure durable s001: %v", err)
+	}
+	sessions := []*Session{
+		baseSession,
+		appendBridgeTestSession(t, bridge, store, "s002", "chat-2"),
+		appendBridgeTestSession(t, bridge, store, "s003", "chat-3"),
+	}
+	for _, session := range sessions {
+		messageID := "message-" + session.ID
+		queueBridgeTurnForTest(t, bridge, session, messageID, prompts[messageID], time.Time{})
+	}
+
+	limit := bridge.effectiveMaxQueuedTurnStartsPerCycle()
+	started, err := bridge.processQueuedTurnsWithStartBudget(context.Background(), limit, true)
+	if err != nil {
+		close(executor.release)
+		t.Fatalf("processQueuedTurnsWithStartBudget first drain error: %v", err)
+	}
+	if started != 2 {
+		close(executor.release)
+		t.Fatalf("first drain started %d turns, want 2", started)
+	}
+	firstDrain := map[string]bool{}
+	for len(firstDrain) < 2 {
+		select {
+		case got := <-executor.started:
+			firstDrain[got.SessionID] = true
+		case <-time.After(bridgeAsyncTestTimeout):
+			close(executor.release)
+			t.Fatalf("timed out waiting for first drain starts; got %#v", firstDrain)
+		}
+	}
+
+	remaining := limit - started
+	secondStarted, err := bridge.processQueuedTurnsWithStartBudget(context.Background(), remaining, true)
+	if err != nil {
+		close(executor.release)
+		t.Fatalf("processQueuedTurnsWithStartBudget second drain error: %v", err)
+	}
+	if secondStarted != 0 {
+		close(executor.release)
+		t.Fatalf("second drain started %d turns after shared budget was exhausted, want 0", secondStarted)
+	}
+	select {
+	case got := <-executor.started:
+		close(executor.release)
+		t.Fatalf("unexpected extra start after shared budget was exhausted: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(executor.release)
+	waitForCompletedTurnCount(t, store, "s001", 1)
+	waitForCompletedTurnCount(t, store, "s002", 1)
 	waitForBridgeAsyncTurns(t, bridge)
 }
 
@@ -9992,6 +10117,60 @@ func TestBridgeBackgroundImportQueuesOneBatchAndResumesLater(t *testing.T) {
 	}
 }
 
+func TestBridgeBackgroundImportStopsBeforeCheckpointOnlyRecordsAfterBatchBudget(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-budgeted-import-tools"}}`,
+		`{"id":"a1","thread_id":"thread-budgeted-import-tools","role":"assistant","text":` + strconv.Quote(strings.Repeat("first budgeted answer ", 1400)) + `}`,
+		`{"type":"response_item","payload":{"id":"tool-1","type":"function_call","name":"shell","arguments":"{\"cmd\":\"rg one\"}"}}`,
+		`{"type":"response_item","payload":{"id":"tool-2","type":"function_call","name":"shell","arguments":"{\"cmd\":\"rg two\"}"}}`,
+		`{"id":"a2","thread_id":"thread-budgeted-import-tools","role":"assistant","text":"second budgeted answer"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	session.CodexThreadID = "thread-budgeted-import-tools"
+	bridge.reg.Sessions[0] = session
+	if err := bridge.ensureDurableSession(context.Background(), &session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+
+	result, err := bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import-bg:"+session.ID, "import-bg", transcriptCheckpointID(session.ID), transcriptImportRunOptions{QueueOnly: true, MaxBatches: 1})
+	if err != nil {
+		t.Fatalf("background import: %v", err)
+	}
+	if result.Complete {
+		t.Fatalf("background import result = %#v, want paused after first batch", result)
+	}
+	if result.LastRecordID != "a1" || result.Stats.SkippedBackground != 0 {
+		t.Fatalf("background import result = %#v, want stop at a1 before tool-only records", result)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("background import should queue without sending, sent=%#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "a1" {
+		t.Fatalf("checkpoint after first budgeted import = %#v, want a1", checkpoint)
+	}
+
+	result, err = bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import-bg:"+session.ID, "import-bg", transcriptCheckpointID(session.ID), transcriptImportRunOptions{QueueOnly: true, MaxBatches: 1})
+	if err != nil {
+		t.Fatalf("resume background import: %v", err)
+	}
+	if !result.Complete || result.LastRecordID != "a2" || result.Stats.SkippedBackground != 2 {
+		t.Fatalf("resume result = %#v, want complete second batch through a2 after two skipped tool records", result)
+	}
+}
+
 func TestBridgePollIgnoresImportBatchBeforeAnnotatingUserPrefix(t *testing.T) {
 	importBatch := teamstore.OutboxMessage{
 		ID:          "outbox:import-batch",
@@ -10561,6 +10740,120 @@ func TestBridgeSessionCancelQueuedTurnMarksInterrupted(t *testing.T) {
 	}
 	if !strings.Contains((*sent)[0].Content, "turn canceled") {
 		t.Fatalf("cancel response = %q", (*sent)[0].Content)
+	}
+}
+
+func TestBridgeHandleClaimedQueuedTurnErrorSkipsTerminalTurns(t *testing.T) {
+	cases := []struct {
+		name         string
+		wantStatus   teamstore.TurnStatus
+		prepare      func(context.Context, *testing.T, *teamstore.Store, string)
+		wantRecovery string
+		wantFailure  string
+	}{
+		{
+			name:       "completed",
+			wantStatus: teamstore.TurnStatusCompleted,
+			prepare: func(ctx context.Context, t *testing.T, store *teamstore.Store, turnID string) {
+				t.Helper()
+				if _, err := store.MarkTurnCompleted(ctx, turnID, "thread-1", "codex-turn-1"); err != nil {
+					t.Fatalf("MarkTurnCompleted error: %v", err)
+				}
+			},
+		},
+		{
+			name:        "failed",
+			wantStatus:  teamstore.TurnStatusFailed,
+			wantFailure: "already failed",
+			prepare: func(ctx context.Context, t *testing.T, store *teamstore.Store, turnID string) {
+				t.Helper()
+				if _, err := store.MarkTurnFailed(ctx, turnID, "already failed"); err != nil {
+					t.Fatalf("MarkTurnFailed error: %v", err)
+				}
+			},
+		},
+		{
+			name:         "interrupted",
+			wantStatus:   teamstore.TurnStatusInterrupted,
+			wantRecovery: "already interrupted",
+			prepare: func(ctx context.Context, t *testing.T, store *teamstore.Store, turnID string) {
+				t.Helper()
+				if _, err := store.MarkTurnInterrupted(ctx, turnID, "already interrupted"); err != nil {
+					t.Fatalf("MarkTurnInterrupted error: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			session := bridge.reg.SessionByChatID("chat-1")
+			if err := bridge.ensureDurableSession(ctx, session); err != nil {
+				t.Fatalf("ensureDurableSession error: %v", err)
+			}
+			turn, _, err := store.QueueTurn(ctx, teamstore.Turn{ID: "turn:error-terminal:" + tc.name, SessionID: session.ID})
+			if err != nil {
+				t.Fatalf("QueueTurn error: %v", err)
+			}
+			tc.prepare(ctx, t, store, turn.ID)
+
+			bridge.handleClaimedQueuedTurnError(ctx, session, turn, errors.New("should be ignored"))
+
+			if got := len(*sent); got != 0 {
+				t.Fatalf("sent messages = %d, want none: %#v", got, *sent)
+			}
+			got, ok, err := store.TurnByID(ctx, turn.ID)
+			if err != nil || !ok {
+				t.Fatalf("TurnByID = ok %v err %v", ok, err)
+			}
+			if got.Status != tc.wantStatus {
+				t.Fatalf("turn status = %q, want %q", got.Status, tc.wantStatus)
+			}
+			if tc.wantRecovery != "" && got.RecoveryReason != tc.wantRecovery {
+				t.Fatalf("recovery reason = %q, want %q", got.RecoveryReason, tc.wantRecovery)
+			}
+			if tc.wantFailure != "" && got.FailureMessage != tc.wantFailure {
+				t.Fatalf("failure message = %q, want %q", got.FailureMessage, tc.wantFailure)
+			}
+		})
+	}
+}
+
+func TestBridgeHandleClaimedQueuedTurnErrorInterruptsRunningTurn(t *testing.T) {
+	ctx := context.Background()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(ctx, teamstore.Turn{ID: "turn:error-running", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	running, err := store.MarkTurnRunning(ctx, turn.ID, "thread-1", "codex-turn-1")
+	if err != nil {
+		t.Fatalf("MarkTurnRunning error: %v", err)
+	}
+
+	bridge.handleClaimedQueuedTurnError(ctx, session, running, errors.New("Graph 429 Too Many Requests"))
+
+	got, ok, err := store.TurnByID(ctx, turn.ID)
+	if err != nil || !ok {
+		t.Fatalf("TurnByID = ok %v err %v", ok, err)
+	}
+	if got.Status != teamstore.TurnStatusInterrupted {
+		t.Fatalf("turn status = %q, want interrupted", got.Status)
+	}
+	if !strings.Contains(got.RecoveryReason, "Graph 429 Too Many Requests") {
+		t.Fatalf("recovery reason = %q, want Graph error", got.RecoveryReason)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "Codex could not continue this queued request") {
+		t.Fatalf("queued turn error notification = %#v", *sent)
 	}
 }
 
@@ -14048,6 +14341,23 @@ func TestBridgeShouldIgnoreFreshStrongHelperControlOutput(t *testing.T) {
 	}
 }
 
+func requireBridgeGlobalOutboundLedgerItem(t *testing.T, ctx context.Context, bridge *Bridge, chatID string, messageID string) globalOutboundItem {
+	t.Helper()
+	path, ok := bridge.globalOutboundLedgerPath()
+	if !ok {
+		t.Fatal("global outbound ledger path unavailable")
+	}
+	ledger, err := readGlobalOutboundLedger(path)
+	if err != nil {
+		t.Fatalf("read global outbound ledger: %v", err)
+	}
+	item, ok := ledger.Items[globalOutboundKey(chatID, messageID)]
+	if !ok {
+		t.Fatalf("global outbound ledger missing %q/%q", chatID, messageID)
+	}
+	return item
+}
+
 func TestBridgeSendQueuedOutboxRecordsGlobalOutbound(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
@@ -14080,14 +14390,7 @@ func TestBridgeSendQueuedOutboxRecordsGlobalOutbound(t *testing.T) {
 	if len(*sent) != 1 {
 		t.Fatalf("sent messages = %d, want 1", len(*sent))
 	}
-	ledger, err := readGlobalOutboundLedger(filepath.Join(tmp, "teams", "global-outbound-ledger.json"))
-	if err != nil {
-		t.Fatalf("read global outbound ledger: %v", err)
-	}
-	item, ok := ledger.Items[globalOutboundKey("chat-1", "sent-1")]
-	if !ok {
-		t.Fatalf("global outbound ledger missing sent message: %#v", ledger.Items)
-	}
+	item := requireBridgeGlobalOutboundLedgerItem(t, ctx, bridge, "chat-1", "sent-1")
 	if item.OutboxID != outbox.ID || item.ScopeID == "" || item.Origin != teamstore.MessageOriginHelperOutbox {
 		t.Fatalf("global outbound ledger item = %#v", item)
 	}
@@ -14172,12 +14475,12 @@ func TestBridgePollDropsGlobalOutboundFromSiblingScope(t *testing.T) {
 	if !bridge.reg.HasSent("chat-1", "legacy-helper-message") {
 		t.Fatal("global outbound suppression was not restored into registry")
 	}
-	ledger, err := readGlobalOutboundLedger(filepath.Join(tmp, "teams", "global-outbound-ledger.json"))
+	exists, err := bridge.hasGlobalOutboundMessage(ctx, "chat-1", "legacy-helper-message")
 	if err != nil {
-		t.Fatalf("read global outbound ledger: %v", err)
+		t.Fatalf("has global outbound backfilled message: %v", err)
 	}
-	if _, ok := ledger.Items[globalOutboundKey("chat-1", "legacy-helper-message")]; !ok {
-		t.Fatalf("global outbound ledger missing backfilled message: %#v", ledger.Items)
+	if !exists {
+		t.Fatalf("global outbound ledger missing backfilled message")
 	}
 	state, err := currentStore.Load(ctx)
 	if err != nil {
@@ -14289,18 +14592,7 @@ func TestBridgePollDropsFreshHelperAttachmentEchoFromSendingOutbox(t *testing.T)
 			if !lookup.HasDeliveredOutbox || !lookup.HasProvenance || lookup.Provenance.Origin != teamstore.MessageOriginHelperOutbox || lookup.Provenance.OutboxID != outbox.ID {
 				t.Fatalf("lookup = %#v, want helper outbox provenance for %q", lookup, outbox.ID)
 			}
-			ledgerPath, ok := bridge.globalOutboundLedgerPath()
-			if !ok {
-				t.Fatal("global outbound ledger path unavailable")
-			}
-			ledger, err := readGlobalOutboundLedger(ledgerPath)
-			if err != nil {
-				t.Fatalf("read global outbound ledger: %v", err)
-			}
-			item, ok := ledger.Items[globalOutboundKey("chat-1", "fresh-helper-artifact-race")]
-			if !ok {
-				t.Fatalf("global outbound ledger missing suppression entry: %#v", ledger.Items)
-			}
+			item := requireBridgeGlobalOutboundLedgerItem(t, ctx, bridge, "chat-1", "fresh-helper-artifact-race")
 			if item.OutboxID != outbox.ID || item.Origin != teamstore.MessageOriginHelperOutbox {
 				t.Fatalf("global outbound ledger item = %#v, want helper outbox %q", item, outbox.ID)
 			}
@@ -16559,6 +16851,240 @@ func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenNoLatestMessageTarget(t *t
 	}
 }
 
+func TestBridgePollOnceCapsParkNoticeFanoutPerCycle(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	totalChats := maxParkNoticeSendsPerPollCycle + 3
+	pages := make([]bridgePollPage, 0, totalChats*2)
+	for i := 0; i < totalChats*2; i++ {
+		pages = append(pages, bridgePollPage{messages: nil})
+	}
+	readGraph := newBridgePollGraph(t, pages)
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	sessions := make([]Session, 0, totalChats)
+	for i := 0; i < totalChats; i++ {
+		session := Session{
+			ID:        fmt.Sprintf("s%03d", i+1),
+			ChatID:    fmt.Sprintf("chat-%03d", i+1),
+			ChatURL:   fmt.Sprintf("https://teams.example/chat-%03d", i+1),
+			Status:    "active",
+			CreatedAt: oldActivity,
+			UpdatedAt: oldActivity,
+		}
+		sessions = append(sessions, session)
+		if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+			ID:          session.ID,
+			Status:      teamstore.SessionStatusActive,
+			TeamsChatID: session.ChatID,
+			UpdatedAt:   session.UpdatedAt,
+		}); err != nil {
+			t.Fatalf("create session %s: %v", session.ID, err)
+		}
+		if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, oldActivity, true, false, 1); err != nil {
+			t.Fatalf("seed work poll %s: %v", session.ChatID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+			ChatID:         session.ChatID,
+			PollState:      inboundPollStateCold,
+			NextPollAt:     now.Add(-time.Minute),
+			LastActivityAt: oldActivity,
+		}); err != nil {
+			t.Fatalf("schedule work poll %s: %v", session.ChatID, err)
+		}
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions = sessions
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("first pollOnce error: %v", err)
+	}
+	if len(*sent) != maxParkNoticeSendsPerPollCycle {
+		t.Fatalf("first poll sent %d freeze notices, want %d", len(*sent), maxParkNoticeSendsPerPollCycle)
+	}
+	notifiedAfterFirst := 0
+	for _, session := range sessions {
+		poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+		if err != nil || !ok {
+			t.Fatalf("ChatPoll %s ok=%v err=%v", session.ChatID, ok, err)
+		}
+		if !poll.ParkNoticeSentAt.IsZero() {
+			notifiedAfterFirst++
+		}
+	}
+	if notifiedAfterFirst != maxParkNoticeSendsPerPollCycle {
+		t.Fatalf("first poll recorded %d park notices, want %d", notifiedAfterFirst, maxParkNoticeSendsPerPollCycle)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("second pollOnce error: %v", err)
+	}
+	if len(*sent) != totalChats {
+		t.Fatalf("second poll total sent %d freeze notices, want %d", len(*sent), totalChats)
+	}
+	for _, session := range sessions {
+		poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+		if err != nil || !ok {
+			t.Fatalf("ChatPoll %s after second poll ok=%v err=%v", session.ChatID, ok, err)
+		}
+		if poll.PollState != inboundPollStateParked || poll.ParkedAt.IsZero() || poll.ParkNoticeSentAt.IsZero() {
+			t.Fatalf("chat %s was not eventually parked with notice: %#v", session.ChatID, poll)
+		}
+	}
+}
+
+func TestBridgePollOnceSQLiteDefersIdleWorkChatAutoParkToSweeper(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	readGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			t.Fatalf("pollOnce should not issue Graph requests for SQLite auto-park candidate: %s %s", r.Method, r.URL.String())
+			return httptest.NewRecorder().Result(), nil
+		})},
+		baseURL: "https://graph.example.test",
+	}
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:          "s001",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "chat-1",
+		UpdatedAt:   oldActivity,
+	}); err != nil {
+		t.Fatalf("create durable session: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("pollOnce sent freeze notice before sweeper: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateCold || !poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("pollOnce changed SQLite idle auto-park candidate: %#v", poll)
+	}
+}
+
+func TestBridgeIdleWorkChatAutoParkSweeperProcessesOneSQLiteCandidatePerInterval(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	totalChats := 3
+	pages := make([]bridgePollPage, 0, 4)
+	for i := 0; i < 4; i++ {
+		pages = append(pages, bridgePollPage{messages: nil})
+	}
+	readGraph := newBridgePollGraph(t, pages)
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	var sessions []Session
+	for i := 0; i < totalChats; i++ {
+		session := Session{
+			ID:        fmt.Sprintf("s%03d", i+1),
+			ChatID:    fmt.Sprintf("chat-%03d", i+1),
+			ChatURL:   fmt.Sprintf("https://teams.example/chat-%03d", i+1),
+			Status:    "active",
+			CreatedAt: oldActivity,
+			UpdatedAt: oldActivity,
+		}
+		sessions = append(sessions, session)
+		if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+			ID:          session.ID,
+			Status:      teamstore.SessionStatusActive,
+			TeamsChatID: session.ChatID,
+			UpdatedAt:   session.UpdatedAt,
+		}); err != nil {
+			t.Fatalf("create session %s: %v", session.ID, err)
+		}
+		if _, err := store.RecordChatPollSuccess(context.Background(), session.ChatID, oldActivity, true, false, 1); err != nil {
+			t.Fatalf("seed work poll %s: %v", session.ChatID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+			ChatID:         session.ChatID,
+			PollState:      inboundPollStateCold,
+			NextPollAt:     now.Add(-time.Minute),
+			LastActivityAt: oldActivity,
+		}); err != nil {
+			t.Fatalf("schedule work poll %s: %v", session.ChatID, err)
+		}
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions = sessions
+
+	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
+		t.Fatalf("first auto-park sweep error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("first sweep sent %d freeze notices, want 1", len(*sent))
+	}
+	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now.Add(30*time.Second)); err != nil {
+		t.Fatalf("throttled auto-park sweep error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("throttled sweep sent %d freeze notices total, want still 1", len(*sent))
+	}
+	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now.Add(autoParkSweepInterval+time.Second)); err != nil {
+		t.Fatalf("second auto-park sweep error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("second sweep sent %d freeze notices total, want 2", len(*sent))
+	}
+	notified := 0
+	for _, session := range sessions {
+		poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+		if err != nil || !ok {
+			t.Fatalf("ChatPoll %s ok=%v err=%v", session.ChatID, ok, err)
+		}
+		if !poll.ParkNoticeSentAt.IsZero() {
+			notified++
+		}
+	}
+	if notified != 2 {
+		t.Fatalf("notified chats after two sweeps = %d, want 2", notified)
+	}
+}
+
 func TestBridgePollOnceDoesNotSendStandaloneFreezeNoticeWhenAppendReadRateLimited(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-49 * time.Hour)
@@ -17079,6 +17605,55 @@ func TestBridgePollOnceSkipsAlreadyParkedNoticeSentWithoutGraphOrRewrite(t *test
 	}
 	if !after.UpdatedAt.Equal(before.UpdatedAt) || !after.ParkedAt.Equal(before.ParkedAt) || !after.ParkNoticeSentAt.Equal(before.ParkNoticeSentAt) {
 		t.Fatalf("already parked chat was rewritten: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestBridgePollOnceSkipsRegistrySessionWhenDurableSessionClosed(t *testing.T) {
+	now := time.Now()
+	graph := newBridgePollGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{
+		ID:           session.ID,
+		Status:       teamstore.SessionStatusClosed,
+		TeamsChatID:  session.ChatID,
+		TeamsChatURL: session.ChatURL,
+		TeamsTopic:   session.Topic,
+		CreatedAt:    now.Add(-time.Hour),
+		UpdatedAt:    now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("CreateSession closed session: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "control-chat", now, true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, session.ChatID, now.Add(-time.Hour), true, false, 1); err != nil {
+		t.Fatalf("seed work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to sqlite: %v", err)
+	}
+
+	if err := bridge.pollOnce(ctx, 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
 	}
 }
 
@@ -19335,6 +19910,27 @@ func TestBridgeUploadsArtifactManifestFromCodexResult(t *testing.T) {
 		if artifact.Status != "uploaded" || artifact.Path != "artifact.txt" || !strings.Contains(artifact.UploadName, "codex-artifact") || artifact.OutboxID == "" || artifact.DriveItemID == "" || artifact.TeamsMessageID == "" {
 			t.Fatalf("artifact record mismatch: %#v", artifact)
 		}
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptSkipsStoreWhenNoLinkedThreads(t *testing.T) {
+	bridge := newBridgeTestBridge(&GraphClient{}, nil, &recordingExecutor{})
+	bridge.reg.Sessions = append(bridge.reg.Sessions, Session{
+		ID:        "s002",
+		ChatID:    "chat-2",
+		Status:    "active",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	for i := range bridge.reg.Sessions {
+		bridge.reg.Sessions[i].CodexThreadID = ""
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("syncLinkedTranscripts without linked threads: %v", err)
+	}
+	if bridge.store != nil {
+		t.Fatal("syncLinkedTranscripts should not initialize store when no active session has a linked Codex thread")
 	}
 }
 

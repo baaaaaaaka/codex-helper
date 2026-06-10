@@ -256,11 +256,26 @@ func (r *Registry) NextSessionID() string {
 }
 
 func (r *Registry) ActiveSessions() []Session {
+	return r.activeSessionsFiltered(nil)
+}
+
+func (r *Registry) ActiveSessionsForPoll(skip func(Session) bool) []Session {
+	return r.activeSessionsFiltered(skip)
+}
+
+func (r *Registry) activeSessionsFiltered(skip func(Session) bool) []Session {
 	var sessions []Session
 	for _, s := range r.Sessions {
-		if s.Status == "active" {
-			sessions = append(sessions, s)
+		if s.Status != "active" {
+			continue
 		}
+		if skip != nil && skip(s) {
+			continue
+		}
+		sessions = append(sessions, s)
+	}
+	if len(sessions) < 2 {
+		return sessions
 	}
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)

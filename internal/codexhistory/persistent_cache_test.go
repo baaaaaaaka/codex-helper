@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -119,6 +120,63 @@ func TestPersistentCacheStateLoadReturnsDetachedMaps(t *testing.T) {
 		t.Fatalf("history index state cache was aliased, got %q", got)
 	}
 	persistentHistoryIndexState.mu.Unlock()
+}
+
+func TestPersistentSessionMetaReadDoesNotCloneLoadedCache(t *testing.T) {
+	setTestUserCacheDir(t)
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(filePath, []byte("session"), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat session file: %v", err)
+	}
+	cachePath, err := sessionMetaCacheFile()
+	if err != nil {
+		t.Fatalf("sessionMetaCacheFile: %v", err)
+	}
+
+	target := sessionFileMeta{SessionID: "target-session", FirstPrompt: "target prompt"}
+	entries := make(map[string]persistentSessionMetaEntry, 5001)
+	for i := 0; i < 5000; i++ {
+		entries[fmt.Sprintf("/tmp/unrelated-%04d.jsonl", i)] = persistentSessionMetaEntry{
+			Meta: sessionFileMeta{SessionID: fmt.Sprintf("unrelated-%04d", i)},
+		}
+	}
+	entries[filepath.Clean(filePath)] = persistentSessionMetaEntry{
+		FileCacheKey: newFileCacheKey(filePath, info),
+		Meta:         target,
+	}
+
+	persistentSessionMetaState.mu.Lock()
+	persistentSessionMetaState.path = cachePath
+	persistentSessionMetaState.cacheFilePresent = false
+	persistentSessionMetaState.cacheFileMtime = 0
+	persistentSessionMetaState.loaded = true
+	persistentSessionMetaState.cache = persistentSessionMetaCache{
+		Version: persistentCacheVersion,
+		Entries: entries,
+	}
+	persistentSessionMetaState.mu.Unlock()
+
+	var meta sessionFileMeta
+	var ok bool
+	var lookupErr error
+	allocs := testing.AllocsPerRun(10, func() {
+		meta, ok, lookupErr = readPersistentSessionMetaContext(context.Background(), filePath, info)
+	})
+	if lookupErr != nil {
+		t.Fatalf("readPersistentSessionMetaContext error: %v", lookupErr)
+	}
+	if !ok || meta.SessionID != target.SessionID || meta.FirstPrompt != target.FirstPrompt {
+		t.Fatalf("readPersistentSessionMetaContext = %#v, %v; want %#v, true", meta, ok, target)
+	}
+	if allocs > 200 {
+		t.Fatalf("readPersistentSessionMetaContext allocated %.0f times; likely cloned the loaded cache", allocs)
+	}
 }
 
 func setPersistentCacheWriterIDForTest(t *testing.T, id string) {

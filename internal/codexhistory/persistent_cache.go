@@ -140,17 +140,14 @@ func readPersistentSessionMetaContext(ctx context.Context, filePath string, info
 	cachePath, err := sessionMetaCacheFile()
 	if err == nil {
 		persistentSessionMetaState.mu.Lock()
-		cache, loadErr := loadSessionMetaPersistentStateLockedContext(ctx, cachePath)
+		meta, found, loadErr := lookupSessionMetaPersistentStateLockedContext(ctx, cachePath, filePath, info)
 		persistentSessionMetaState.mu.Unlock()
 		if loadErr != nil {
 			if isContextError(loadErr) {
 				return sessionFileMeta{}, false, loadErr
 			}
-		} else {
-			entry, ok := cache.Entries[filepath.Clean(filePath)]
-			if ok && matchesFileInfo(filePath, info, entry.FileCacheKey) {
-				return entry.Meta, true, nil
-			}
+		} else if found {
+			return meta, true, nil
 		}
 	}
 	if meta, ok, sharedErr := readSharedPersistentSessionMetaContext(ctx, filePath, info); sharedErr != nil {
@@ -609,18 +606,36 @@ func loadSessionMetaPersistentStateLocked(cachePath string) persistentSessionMet
 }
 
 func loadSessionMetaPersistentStateLockedContext(ctx context.Context, cachePath string) (persistentSessionMetaCache, error) {
+	if err := ensureSessionMetaPersistentStateLockedContext(ctx, cachePath); err != nil {
+		return persistentSessionMetaCache{}, err
+	}
+	return clonePersistentSessionMetaCache(persistentSessionMetaState.cache), nil
+}
+
+func lookupSessionMetaPersistentStateLockedContext(ctx context.Context, cachePath string, filePath string, info os.FileInfo) (sessionFileMeta, bool, error) {
+	if err := ensureSessionMetaPersistentStateLockedContext(ctx, cachePath); err != nil {
+		return sessionFileMeta{}, false, err
+	}
+	entry, ok := persistentSessionMetaState.cache.Entries[filepath.Clean(filePath)]
+	if !ok || !matchesFileInfo(filePath, info, entry.FileCacheKey) {
+		return sessionFileMeta{}, false, nil
+	}
+	return entry.Meta, true, nil
+}
+
+func ensureSessionMetaPersistentStateLockedContext(ctx context.Context, cachePath string) error {
 	present, mtime := cacheFileState(cachePath)
 	if persistentSessionMetaState.loaded &&
 		persistentSessionMetaState.path == cachePath &&
 		persistentSessionMetaState.cacheFilePresent == present &&
 		(!present || persistentSessionMetaState.cacheFileMtime == mtime) {
-		return clonePersistentSessionMetaCache(persistentSessionMetaState.cache), nil
+		return nil
 	}
 
 	cache, err := loadPersistentSessionMetaCacheContext(ctx, cachePath)
 	if err != nil {
 		if isContextError(err) {
-			return persistentSessionMetaCache{}, err
+			return err
 		}
 		cache = newPersistentSessionMetaCache()
 	}
@@ -629,7 +644,7 @@ func loadSessionMetaPersistentStateLockedContext(ctx context.Context, cachePath 
 	persistentSessionMetaState.cacheFileMtime = mtime
 	persistentSessionMetaState.loaded = true
 	persistentSessionMetaState.cache = cache
-	return clonePersistentSessionMetaCache(cache), nil
+	return nil
 }
 
 func loadHistoryIndexPersistentStateLocked(cachePath string) persistentHistoryIndexCache {

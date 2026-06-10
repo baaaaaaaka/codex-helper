@@ -118,9 +118,15 @@ const outboxSendLease = 2 * time.Minute
 const chatPollSuccessHeartbeatWriteInterval = 30 * time.Second
 
 const (
-	HelperUpgradeReason = "codex-proxy upgrade"
-	HelperReloadReason  = "codex-proxy reload"
-	CodexUpgradeReason  = "codex cli upgrade"
+	HelperUpgradeReason  = "codex-proxy upgrade"
+	HelperReloadReason   = "codex-proxy reload"
+	CodexUpgradeReason   = "codex cli upgrade"
+	chatPollStateHot     = "hot"
+	chatPollStateRunning = "running"
+	chatPollStateWarm    = "warm"
+	chatPollStateCool    = "cool"
+	chatPollStateCold    = "cold"
+	chatPollStateParked  = "parked"
 )
 
 type State struct {
@@ -617,6 +623,22 @@ type ChatPollState struct {
 	UpdatedAt             time.Time `json:"updated_at,omitempty"`
 }
 
+type IdleWorkChatParkCandidate struct {
+	Session SessionContext
+	Poll    ChatPollState
+}
+
+func chatPollParkedSkipEligible(poll ChatPollState) bool {
+	return strings.TrimSpace(poll.PollState) == chatPollStateParked &&
+		!poll.ParkNoticeSentAt.IsZero() &&
+		!poll.ParkedAt.IsZero() &&
+		poll.BlockedUntil.IsZero() &&
+		strings.TrimSpace(poll.ContinuationPath) == "" &&
+		poll.FailureCount == 0 &&
+		strings.TrimSpace(poll.LastError) == "" &&
+		poll.LastErrorAt.IsZero()
+}
+
 type ChatPollScheduleUpdate struct {
 	ChatID                string
 	PollState             string
@@ -1082,6 +1104,13 @@ var (
 		"import_checkpoints",
 		"service_owner",
 	)
+	hotPollScheduleSnapshotFields = stateFieldSet(
+		"control_chat",
+		"turns",
+		"chat_polls",
+		"import_checkpoints",
+		"service_owner",
+	)
 	queuedTurnStateSnapshotFields = stateFieldSet(
 		"sessions",
 		"turns",
@@ -1193,12 +1222,164 @@ func filterWorkflowEventSnapshotForSession(state State, sessionID string) State 
 	return out
 }
 
+func filterWorkflowEventSnapshotForTurn(state State, sessionID string, turnID string) State {
+	sessionID = strings.TrimSpace(sessionID)
+	turnID = strings.TrimSpace(turnID)
+	out := State{
+		SchemaVersion: SchemaVersion,
+		Sessions:      map[string]SessionContext{},
+		Turns:         map[string]Turn{},
+		InboundEvents: map[string]InboundEvent{},
+	}
+	if sessionID != "" {
+		if session, ok := state.Sessions[sessionID]; ok {
+			out.Sessions[sessionID] = session
+		}
+	}
+	if turnID != "" {
+		if turn, ok := state.Turns[turnID]; ok && (sessionID == "" || strings.TrimSpace(turn.SessionID) == sessionID) {
+			out.Turns[turn.ID] = turn
+			if sessionID == "" {
+				sessionID = strings.TrimSpace(turn.SessionID)
+				if sessionID != "" {
+					if session, ok := state.Sessions[sessionID]; ok {
+						out.Sessions[sessionID] = session
+					}
+				}
+			}
+			if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+				if inbound, ok := state.InboundEvents[inboundID]; ok {
+					out.InboundEvents[inboundID] = inbound
+				}
+			}
+		}
+	}
+	out.ensure(time.Time{})
+	return out
+}
+
+func filterThreadResolutionSnapshotForSession(state State, sessionID string) State {
+	sessionID = strings.TrimSpace(sessionID)
+	out := State{
+		SchemaVersion: SchemaVersion,
+		Sessions:      map[string]SessionContext{},
+		Turns:         map[string]Turn{},
+	}
+	if sessionID != "" {
+		if session, ok := state.Sessions[sessionID]; ok {
+			out.Sessions[sessionID] = session
+		}
+	}
+	for id, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) == sessionID {
+			out.Turns[id] = turn
+		}
+	}
+	out.ensure(time.Time{})
+	return out
+}
+
 func (s *Store) PollStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, pollStateSnapshotFields)
 }
 
 func (s *Store) PollScheduleSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, pollScheduleSnapshotFields)
+}
+
+func (s *Store) HotPollScheduleState(ctx context.Context) (State, error) {
+	if state, handled, err := s.hotPollScheduleStateSQLite(ctx); handled || err != nil {
+		return state, err
+	}
+	return s.PollScheduleSnapshot(ctx)
+}
+
+func (s *Store) HotPollScheduleSnapshot(ctx context.Context) (State, map[string]bool, error) {
+	if state, parkedSkip, handled, err := s.hotPollScheduleSnapshotSQLite(ctx); handled || err != nil {
+		return state, parkedSkip, err
+	}
+	state, err := s.PollScheduleSnapshot(ctx)
+	if err != nil {
+		return State{}, nil, err
+	}
+	parkedSkip := make(map[string]bool)
+	for chatID, poll := range state.ChatPolls {
+		if chatPollParkedSkipEligible(poll) {
+			parkedSkip[chatID] = true
+		}
+	}
+	return state, parkedSkip, nil
+}
+
+func (s *Store) HotPollWorkCandidates(ctx context.Context, controlChatID string) ([]SessionContext, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.HotPollWorkCandidatesExcludingIdle(ctx, controlChatID, time.Time{})
+}
+
+func (s *Store) HotPollWorkCandidatesExcludingIdle(ctx context.Context, controlChatID string, idleBefore time.Time) ([]SessionContext, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.hotPollWorkCandidatesSQLite(ctx, controlChatID, idleBefore)
+}
+
+func (s *Store) IdleWorkChatParkCandidates(ctx context.Context, controlChatID string, idleBefore time.Time, limit int) ([]IdleWorkChatParkCandidate, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.idleWorkChatParkCandidatesSQLite(ctx, controlChatID, idleBefore, limit)
+}
+
+func (s *Store) SessionsByID(ctx context.Context, ids []string) (map[string]SessionContext, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleaned := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		cleaned = append(cleaned, id)
+	}
+	out := make(map[string]SessionContext, len(cleaned))
+	if len(cleaned) == 0 {
+		return out, nil
+	}
+	if sessions, handled, err := s.sessionsByIDSQLite(ctx, cleaned); handled || err != nil {
+		return sessions, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("sessions"))
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range cleaned {
+		if session, ok := state.Sessions[id]; ok {
+			out[id] = session
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) HasSessions(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if hasSessions, handled, err := s.hasSessionsSQLite(ctx); handled || err != nil {
+		return hasSessions, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("sessions"))
+	if err != nil {
+		return false, err
+	}
+	return len(state.Sessions) > 0, nil
 }
 
 func (s *Store) QueuedTurnStateSnapshot(ctx context.Context) (State, error) {
@@ -1338,6 +1519,61 @@ func (s *Store) TranscriptImportStateSnapshot(ctx context.Context) (State, error
 	return s.loadStateFieldsOrFull(ctx, transcriptImportStateSnapshotFields)
 }
 
+func (s *Store) ImportCheckpoint(ctx context.Context, id string) (ImportCheckpoint, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ImportCheckpoint{}, false, nil
+	}
+	if checkpoint, found, handled, err := s.importCheckpointSQLite(ctx, id); handled || err != nil {
+		return checkpoint, found, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("import_checkpoints"))
+	if err != nil {
+		return ImportCheckpoint{}, false, err
+	}
+	checkpoint, found := state.ImportCheckpoints[id]
+	return checkpoint, found, nil
+}
+
+func (s *Store) UpdateImportCheckpoint(ctx context.Context, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ImportCheckpoint{}, false, fmt.Errorf("import checkpoint id is required")
+	}
+	if fn == nil {
+		return ImportCheckpoint{}, false, fmt.Errorf("import checkpoint update function is required")
+	}
+	if out, changed, handled, err := s.updateImportCheckpointSQLite(ctx, id, fn); handled || err != nil {
+		return out, changed, err
+	}
+	var out ImportCheckpoint
+	changed := false
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		now := time.Now()
+		if state.ImportCheckpoints == nil {
+			state.ImportCheckpoints = make(map[string]ImportCheckpoint)
+		}
+		current, found := state.ImportCheckpoints[id]
+		next, updateChanged, err := fn(current, found, now)
+		if err != nil {
+			return false, err
+		}
+		out = next
+		if !updateChanged {
+			return false, nil
+		}
+		next.ID = id
+		state.ImportCheckpoints[next.ID] = next
+		out = next
+		changed = true
+		return true, nil
+	})
+	return out, changed, err
+}
+
 func (s *Store) WorkflowNotificationStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, workflowNotificationStateSnapshotFields)
 }
@@ -1375,6 +1611,86 @@ func (s *Store) SessionWorkflowEventSnapshot(ctx context.Context, sessionID stri
 			return loadErr
 		}
 		state = filterWorkflowEventSnapshotForSession(selected, sessionID)
+		return nil
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) SessionWorkflowEventSnapshotForTurn(ctx context.Context, sessionID string, turnID string) (State, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	turnID = strings.TrimSpace(turnID)
+	if sessionID == "" {
+		return s.WorkflowEventStateSnapshot(ctx)
+	}
+	if turnID == "" {
+		return s.SessionWorkflowEventSnapshot(ctx, sessionID)
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteSessionWorkflowEventForTurnUnlocked(pointer, sessionID, turnID)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(workflowEventStateSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = filterWorkflowEventSnapshotForTurn(selected, sessionID, turnID)
+			return nil
+		}
+		var loadErr error
+		selected, loadErr = s.loadUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
+		state = filterWorkflowEventSnapshotForTurn(selected, sessionID, turnID)
+		return nil
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) SessionThreadResolutionSnapshot(ctx context.Context, sessionID string) (State, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return s.WorkflowEventStateSnapshot(ctx)
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteSessionThreadResolutionStateUnlocked(pointer, sessionID)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(workflowEventStateSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = filterThreadResolutionSnapshotForSession(selected, sessionID)
+			return nil
+		}
+		var loadErr error
+		selected, loadErr = s.loadUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
+		state = filterThreadResolutionSnapshotForSession(selected, sessionID)
 		return nil
 	})
 	if err != nil {
@@ -1482,6 +1798,33 @@ func (s *Store) TurnByID(ctx context.Context, turnID string) (Turn, bool, error)
 
 func (s *Store) OutboxStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, outboxStateSnapshotFields)
+}
+
+func (s *Store) SentOutboxMessagesForChat(ctx context.Context, chatID string) ([]OutboxMessage, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil, nil
+	}
+	if messages, handled, err := s.sentOutboxMessagesForChatSQLite(ctx, chatID); handled || err != nil {
+		return messages, err
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	messages := make([]OutboxMessage, 0)
+	for _, msg := range state.OutboxMessages {
+		if msg.TeamsChatID == chatID && msg.Status == OutboxStatusSent {
+			messages = append(messages, msg)
+		}
+	}
+	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
+			return messages[i].ID < messages[j].ID
+		}
+		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+	})
+	return messages, nil
 }
 
 func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[string]struct{}) (State, error) {
@@ -3558,7 +3901,7 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 }
 
 func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (OutboxMessage, error) {
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		switch msg.Status {
 		case OutboxStatusSent:
 			return msg, ErrOutboxSendNotClaimed
@@ -3630,7 +3973,7 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 }
 
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.Status = OutboxStatusQueued
 		msg.LastSendError = trimDiagnostic(message, 240)
 		msg.LastSendAttempt = now
@@ -3651,7 +3994,7 @@ func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, messag
 }
 
 func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
 		msg.DriveItemETag = strings.TrimSpace(eTag)
@@ -4056,6 +4399,9 @@ func (s *Store) ChatRateLimit(ctx context.Context, chatID string) (ChatRateLimit
 	if chatID == "" {
 		return ChatRateLimitState{}, false, fmt.Errorf("chat id is required")
 	}
+	if limit, ok, handled, err := s.chatRateLimitSQLite(ctx, chatID); handled || err != nil {
+		return limit, ok, err
+	}
 	state, err := s.loadStateFieldsOrFull(ctx, chatRateLimitStateFields)
 	if err != nil {
 		return ChatRateLimitState{}, false, err
@@ -4123,6 +4469,38 @@ func (s *Store) ChatPoll(ctx context.Context, chatID string) (ChatPollState, boo
 	}
 	poll, ok := state.ChatPolls[chatID]
 	return poll, ok, nil
+}
+
+func (s *Store) ChatSessionActivity(ctx context.Context, chatID string) (bool, bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return false, false, nil
+	}
+	if matched, active, handled, err := s.chatSessionActivitySQLite(ctx, chatID); handled || err != nil {
+		return matched, active, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("sessions"))
+	if err != nil {
+		return false, false, err
+	}
+	matched := false
+	active := false
+	for _, session := range state.Sessions {
+		if strings.TrimSpace(session.TeamsChatID) != chatID {
+			continue
+		}
+		matched = true
+		if sessionStatusIsActive(session.Status) {
+			active = true
+			break
+		}
+	}
+	return matched, active, nil
+}
+
+func sessionStatusIsActive(status SessionStatus) bool {
+	trimmed := strings.TrimSpace(string(status))
+	return trimmed == "" || trimmed == string(SessionStatusActive)
 }
 
 func (s *Store) RecordChatPollSuccess(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int) (ChatPollState, error) {
@@ -4438,6 +4816,9 @@ func (s *Store) MarkChatPollParkNoticeSent(ctx context.Context, chatID string, a
 	}
 	if at.IsZero() {
 		at = time.Now()
+	}
+	if out, handled, err := s.markChatPollParkNoticeSentSQLite(ctx, chatID, at); handled || err != nil {
+		return out, err
 	}
 	var out ChatPollState
 	err := s.Update(ctx, func(state *State) error {

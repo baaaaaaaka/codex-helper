@@ -70,6 +70,28 @@ func TestSaveRegistryWritesChangedFile(t *testing.T) {
 	}
 }
 
+func TestRegistryActiveSessionsForPollFiltersOnlyPollCandidates(t *testing.T) {
+	now := time.Date(2026, 6, 9, 1, 2, 3, 0, time.UTC)
+	reg := Registry{
+		Version: 1,
+		Sessions: []Session{
+			{ID: "s-old", ChatID: "chat-old", Status: "active", UpdatedAt: now.Add(-time.Hour)},
+			{ID: "s-parked", ChatID: "chat-parked", Status: "active", UpdatedAt: now},
+			{ID: "s-closed", ChatID: "chat-closed", Status: "closed", UpdatedAt: now.Add(time.Hour)},
+		},
+	}
+	active := reg.ActiveSessions()
+	if len(active) != 2 || active[0].ID != "s-parked" || active[1].ID != "s-old" {
+		t.Fatalf("ActiveSessions = %#v, want active sessions sorted without poll filtering", active)
+	}
+	pollable := reg.ActiveSessionsForPoll(func(session Session) bool {
+		return session.ChatID == "chat-parked"
+	})
+	if len(pollable) != 1 || pollable[0].ID != "s-old" {
+		t.Fatalf("ActiveSessionsForPoll = %#v, want only non-skipped active poll candidate", pollable)
+	}
+}
+
 func TestSaveRegistryMergesProjectionState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	existing := Registry{

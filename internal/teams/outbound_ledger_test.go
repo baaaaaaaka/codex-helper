@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -84,4 +85,33 @@ func TestGlobalOutboundLedgerRecordLifecycle(t *testing.T) {
 	if item.OutboxID != "outbox-a" || item.MachineID != "machine-a" || item.Origin != teamstore.MessageOriginHelperOutbox {
 		t.Fatalf("merged global outbound item = %#v", item)
 	}
+}
+
+func BenchmarkGlobalOutboundLedgerRecord(b *testing.B) {
+	ctx := context.Background()
+	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	itemFor := func(i int) globalOutboundItem {
+		return globalOutboundItem{
+			ChatID:     "chat-1",
+			MessageID:  fmt.Sprintf("message-%06d", i),
+			ScopeID:    "scope-a",
+			MachineID:  "machine-a",
+			OutboxID:   fmt.Sprintf("outbox-%06d", i),
+			SessionID:  "session-a",
+			TurnID:     "turn-a",
+			Kind:       "helper",
+			Origin:     teamstore.MessageOriginHelperOutbox,
+			RecordedAt: now,
+		}
+	}
+	b.Run("json", func(b *testing.B) {
+		path := filepath.Join(b.TempDir(), "teams", "global-outbound-ledger.json")
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := recordGlobalOutbound(ctx, path, itemFor(i), now); err != nil {
+				b.Fatalf("record JSON global outbound: %v", err)
+			}
+		}
+	})
 }

@@ -233,12 +233,15 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 	if outbox.ID == "" || outbox.TeamsChatID == "" {
 		return WorkflowNotificationEvent{}, false, nil
 	}
-	state, err := b.store.SessionWorkflowEventSnapshot(ctx, outbox.SessionID)
-	if err != nil {
-		return WorkflowNotificationEvent{}, false, err
+	if !outboxHasWorkflowNotificationCandidate(outbox) {
+		return WorkflowNotificationEvent{}, false, nil
 	}
 	if shouldSkipWorkflowNotificationOutbox(outbox) {
 		return WorkflowNotificationEvent{}, false, nil
+	}
+	state, err := b.store.SessionWorkflowEventSnapshotForTurn(ctx, outbox.SessionID, outbox.TurnID)
+	if err != nil {
+		return WorkflowNotificationEvent{}, false, err
 	}
 	session := workflowSessionForOutbox(b, state, outbox)
 	chatTitle := workflowNotificationChatTitle(b, session, outbox)
@@ -395,14 +398,21 @@ func (b *Bridge) workflowCardAvailable(ctx context.Context) bool {
 		return false
 	}
 	cfg, err := b.effectiveWorkflowNotificationConfig(state)
-	if err != nil || !cfg.Enabled {
+	if err != nil {
+		return false
+	}
+	return b.workflowCardAvailableFromState(state, cfg)
+}
+
+func (b *Bridge) workflowCardAvailableFromState(state teamstore.State, cfg teamstore.WorkflowNotificationConfig) bool {
+	if b == nil || !cfg.Enabled {
 		return false
 	}
 	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
 	if !workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
 		return false
 	}
-	_, err = readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
+	_, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile)
 	return err == nil
 }
 
