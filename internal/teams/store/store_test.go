@@ -1161,6 +1161,93 @@ func TestSQLiteExistingDBMissingHotTablesFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSQLiteOpenMigratesLegacyChatPollColumns(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("create sqlite dir: %v", err)
+	}
+	db, err := openSQLiteStore(dbPath, true)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	if err := ensureSQLiteSchema(db); err != nil {
+		_ = db.Close()
+		t.Fatalf("ensure sqlite schema: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE chat_polls`); err != nil {
+		_ = db.Close()
+		t.Fatalf("drop current chat_polls: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, poll_state TEXT, updated_at INTEGER, json BLOB NOT NULL)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create legacy chat_polls: %v", err)
+	}
+	now := time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC)
+	legacyPoll := ChatPollState{
+		ChatID:           "chat-legacy",
+		Seeded:           true,
+		PollState:        "parked",
+		NextPollAt:       now.Add(time.Hour),
+		ParkedAt:         now.Add(-48 * time.Hour),
+		ParkNoticeSentAt: now.Add(-47 * time.Hour),
+		UpdatedAt:        now,
+	}
+	legacyJSON, err := json.Marshal(legacyPoll)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal legacy poll: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_polls(chat_id, next_poll_at, poll_state, updated_at, json) VALUES (?, ?, ?, ?, ?)`,
+		legacyPoll.ChatID, sqliteTime(legacyPoll.NextPollAt), legacyPoll.PollState, sqliteTime(legacyPoll.UpdatedAt), legacyJSON); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert legacy poll: %v", err)
+	}
+	cold, err := json.Marshal(coldSQLiteState(newState()))
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal cold state: %v", err)
+	}
+	if _, err := db.Exec(`INSERT OR REPLACE INTO state_meta(key, value) VALUES ('state_json', ?)`, cold); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert state meta: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy sqlite db: %v", err)
+	}
+	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+
+	if _, _, err := store.HotPollScheduleSnapshot(ctx); err != nil {
+		t.Fatalf("HotPollScheduleSnapshot should migrate legacy chat_polls columns: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-new", now, true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess after legacy chat_polls migration: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	db, err = openSQLiteHandle(dbPath, false)
+	if err != nil {
+		t.Fatalf("reopen sqlite db: %v", err)
+	}
+	defer db.Close()
+	var lastActivity, parkNotice, parkedSkip sql.NullInt64
+	if err := db.QueryRow(`SELECT last_activity_at, park_notice_sent_at, parked_skip_eligible FROM chat_polls WHERE chat_id = ?`, "chat-new").Scan(&lastActivity, &parkNotice, &parkedSkip); err != nil {
+		t.Fatalf("query migrated chat-new derived columns: %v", err)
+	}
+	if !parkedSkip.Valid || parkedSkip.Int64 != 0 {
+		t.Fatalf("chat-new parked_skip_eligible = %#v, want false", parkedSkip)
+	}
+	if err := db.QueryRow(`SELECT parked_skip_eligible FROM chat_polls WHERE chat_id = ?`, "chat-legacy").Scan(&parkedSkip); err != nil {
+		t.Fatalf("query migrated legacy parked_skip_eligible: %v", err)
+	}
+	if !parkedSkip.Valid || parkedSkip.Int64 != 1 {
+		t.Fatalf("chat-legacy parked_skip_eligible = %#v, want true", parkedSkip)
+	}
+}
+
 func TestSQLiteStoreUsesFullSynchronousMode(t *testing.T) {
 	store := newTestStore(t)
 	seedLegacyStateFileForSQLiteMigrationTest(t, store)
