@@ -1111,6 +1111,11 @@ var (
 		"import_checkpoints",
 		"service_owner",
 	)
+	hotPollScheduleBaseFields = stateFieldSet(
+		"control_chat",
+		"chat_polls",
+		"service_owner",
+	)
 	queuedTurnStateSnapshotFields = stateFieldSet(
 		"sessions",
 		"turns",
@@ -1136,6 +1141,15 @@ var (
 	turnQueueStateSnapshotFields = stateFieldSet(
 		"turns",
 		"inbound_events",
+	)
+	transcriptDedupeSnapshotFields = stateFieldSet(
+		"turns",
+		"inbound_events",
+		"outbox_messages",
+		"transcript_deliveries",
+		"helper_deliveries",
+		"import_checkpoints",
+		"service_owner",
 	)
 	deferredInboundStateFields = stateFieldSet(
 		"inbound_events",
@@ -1189,6 +1203,40 @@ func filterTurnQueueSnapshotForSession(state State, sessionID string) State {
 	return out
 }
 
+func filterRecentSessionInboundTurnSnapshot(state State, sessionID string, since time.Time) State {
+	sessionID = strings.TrimSpace(sessionID)
+	out := State{SchemaVersion: SchemaVersion, Turns: map[string]Turn{}, InboundEvents: map[string]InboundEvent{}}
+	for id, inbound := range state.InboundEvents {
+		if strings.TrimSpace(inbound.SessionID) != sessionID {
+			continue
+		}
+		if !since.IsZero() {
+			activity := inboundStoreActivityTime(inbound)
+			if activity.IsZero() || activity.Before(since) {
+				continue
+			}
+		}
+		out.InboundEvents[id] = inbound
+		if turnID := strings.TrimSpace(inbound.TurnID); turnID != "" {
+			if turn, ok := state.Turns[turnID]; ok {
+				out.Turns[turnID] = turn
+			}
+		}
+	}
+	out.ensure(time.Time{})
+	return out
+}
+
+func inboundStoreActivityTime(inbound InboundEvent) time.Time {
+	if !inbound.ReceivedAt.IsZero() {
+		return inbound.ReceivedAt
+	}
+	if !inbound.CreatedAt.IsZero() {
+		return inbound.CreatedAt
+	}
+	return inbound.UpdatedAt
+}
+
 func filterActiveTurnQueueSnapshotForSession(state State, sessionID string) State {
 	sessionID = strings.TrimSpace(sessionID)
 	out := State{SchemaVersion: SchemaVersion, Turns: map[string]Turn{}, InboundEvents: map[string]InboundEvent{}}
@@ -1217,6 +1265,53 @@ func filterWorkflowEventSnapshotForSession(state State, sessionID string) State 
 	out.Sessions = map[string]SessionContext{}
 	if session, ok := state.Sessions[sessionID]; ok {
 		out.Sessions[sessionID] = session
+	}
+	out.ensure(time.Time{})
+	return out
+}
+
+func filterTranscriptDedupeSnapshotForSession(state State, sessionID string, checkpointID string) State {
+	sessionID = strings.TrimSpace(sessionID)
+	checkpointID = strings.TrimSpace(checkpointID)
+	out := State{
+		SchemaVersion:        SchemaVersion,
+		ServiceOwner:         state.ServiceOwner,
+		Turns:                map[string]Turn{},
+		InboundEvents:        map[string]InboundEvent{},
+		OutboxMessages:       map[string]OutboxMessage{},
+		TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
+		HelperDeliveries:     map[string]HelperDeliveryRecord{},
+		ImportCheckpoints:    map[string]ImportCheckpoint{},
+	}
+	for id, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) == sessionID {
+			out.Turns[id] = turn
+		}
+	}
+	for id, inbound := range state.InboundEvents {
+		if strings.TrimSpace(inbound.SessionID) == sessionID {
+			out.InboundEvents[id] = inbound
+		}
+	}
+	for id, outbox := range state.OutboxMessages {
+		if strings.TrimSpace(outbox.SessionID) == sessionID {
+			out.OutboxMessages[id] = outbox
+		}
+	}
+	for id, delivery := range state.TranscriptDeliveries {
+		if strings.TrimSpace(delivery.SessionID) == sessionID {
+			out.TranscriptDeliveries[id] = delivery
+		}
+	}
+	for id, delivery := range state.HelperDeliveries {
+		if strings.TrimSpace(delivery.SessionID) == sessionID {
+			out.HelperDeliveries[id] = delivery
+		}
+	}
+	for id, checkpoint := range state.ImportCheckpoints {
+		if strings.TrimSpace(id) == checkpointID || strings.TrimSpace(checkpoint.SessionID) == sessionID {
+			out.ImportCheckpoints[id] = checkpoint
+		}
 	}
 	out.ensure(time.Time{})
 	return out
@@ -1519,6 +1614,45 @@ func (s *Store) TranscriptImportStateSnapshot(ctx context.Context) (State, error
 	return s.loadStateFieldsOrFull(ctx, transcriptImportStateSnapshotFields)
 }
 
+func (s *Store) SessionTranscriptDedupeSnapshot(ctx context.Context, sessionID string, checkpointID string) (State, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	checkpointID = strings.TrimSpace(checkpointID)
+	if sessionID == "" {
+		return State{SchemaVersion: SchemaVersion}, nil
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer, sessionID, checkpointID)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(transcriptDedupeSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = filterTranscriptDedupeSnapshotForSession(selected, sessionID, checkpointID)
+			return nil
+		}
+		var loadErr error
+		selected, loadErr = s.loadUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
+		state = filterTranscriptDedupeSnapshotForSession(selected, sessionID, checkpointID)
+		return nil
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
 func (s *Store) ImportCheckpoint(ctx context.Context, id string) (ImportCheckpoint, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1733,6 +1867,42 @@ func (s *Store) SessionTurnQueueSnapshot(ctx context.Context, sessionID string) 
 			return loadErr
 		}
 		state = filterTurnQueueSnapshotForSession(selected, sessionID)
+		return nil
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) RecentSessionInboundTurnSnapshot(ctx context.Context, sessionID string, since time.Time) (State, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return State{SchemaVersion: SchemaVersion}, nil
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteRecentSessionInboundTurnStateUnlocked(pointer, sessionID, since)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(turnQueueStateSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			var loadErr error
+			selected, loadErr = s.loadUnlocked()
+			if loadErr != nil {
+				return loadErr
+			}
+		}
+		state = filterRecentSessionInboundTurnSnapshot(selected, sessionID, since)
 		return nil
 	})
 	if err != nil {

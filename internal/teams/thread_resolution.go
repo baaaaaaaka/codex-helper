@@ -149,7 +149,19 @@ func (b *Bridge) bindSessionCodexThreadIfSafe(ctx context.Context, session *Sess
 		session.CodexThreadID = threadID
 		return nil
 	}
-	err := b.store.UpdateSession(ctx, sessionID, func(state *teamstore.State) error {
+	alreadyCurrent, err := b.codexThreadBindingAlreadyCurrent(ctx, sessionID, turnID, threadID, source)
+	if err != nil {
+		return err
+	}
+	if alreadyCurrent {
+		if b.updateSessionCodexThreadProjection(session, sessionID, threadID) && strings.TrimSpace(b.registryPath) != "" {
+			if err := b.Save(); err != nil && b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams registry thread projection save skipped for %s: %v\n", sessionID, err)
+			}
+		}
+		return nil
+	}
+	err = b.store.UpdateSession(ctx, sessionID, func(state *teamstore.State) error {
 		durable := state.Sessions[sessionID]
 		if durable.ID == "" {
 			return fmt.Errorf("session %q not found", sessionID)
@@ -176,13 +188,8 @@ func (b *Bridge) bindSessionCodexThreadIfSafe(ctx context.Context, session *Sess
 	if err != nil {
 		return err
 	}
-	session.CodexThreadID = threadID
-	if current := b.reg.SessionByID(sessionID); current != nil {
-		current.CodexThreadID = threadID
-		current.UpdatedAt = time.Now()
-		b.markRegistryProjectionDirty()
-	}
-	if strings.TrimSpace(b.registryPath) != "" {
+	projectionChanged := b.updateSessionCodexThreadProjection(session, sessionID, threadID)
+	if projectionChanged && strings.TrimSpace(b.registryPath) != "" {
 		if err := b.Save(); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams registry thread projection save skipped for %s: %v\n", sessionID, err)
 		}
@@ -198,6 +205,76 @@ func (b *Bridge) bindSessionCodexThreadIfSafe(ctx context.Context, session *Sess
 		Cwd:           session.Cwd,
 	})
 	return nil
+}
+
+func (b *Bridge) codexThreadBindingAlreadyCurrent(ctx context.Context, sessionID string, turnID string, threadID string, source string) (bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	turnID = strings.TrimSpace(turnID)
+	threadID = strings.TrimSpace(threadID)
+	if b == nil || b.store == nil || sessionID == "" || threadID == "" {
+		return false, nil
+	}
+	var state teamstore.State
+	if turnID != "" {
+		var err error
+		state, err = b.store.SessionWorkflowEventSnapshotForTurn(ctx, sessionID, turnID)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		sessions, err := b.store.SessionsByID(ctx, []string{sessionID})
+		if err != nil {
+			return false, err
+		}
+		state = teamstore.State{
+			SchemaVersion: teamstore.SchemaVersion,
+			Sessions:      sessions,
+			Turns:         map[string]teamstore.Turn{},
+		}
+	}
+	durable, ok := state.Sessions[sessionID]
+	if !ok || durable.ID == "" {
+		return false, nil
+	}
+	existing := strings.TrimSpace(durable.CodexThreadID)
+	if existing != "" && existing != threadID {
+		return false, codexThreadConflictError{SessionID: sessionID, Existing: existing, Observed: threadID, Source: source}
+	}
+	if existing != threadID {
+		return false, nil
+	}
+	if turnID != "" {
+		if turn, ok := state.Turns[turnID]; ok && strings.TrimSpace(turn.SessionID) == sessionID {
+			turnThread := strings.TrimSpace(turn.CodexThreadID)
+			if turnThread != "" && turnThread != threadID {
+				return false, codexThreadConflictError{SessionID: sessionID, Existing: turnThread, Observed: threadID, Source: source}
+			}
+			if turnThread != threadID {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func (b *Bridge) updateSessionCodexThreadProjection(session *Session, sessionID string, threadID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	threadID = strings.TrimSpace(threadID)
+	changed := false
+	if b != nil {
+		if current := b.reg.SessionByID(sessionID); current != nil {
+			if strings.TrimSpace(current.CodexThreadID) != threadID {
+				current.CodexThreadID = threadID
+				current.UpdatedAt = time.Now()
+				b.markRegistryProjectionDirty()
+				changed = true
+			}
+		}
+	}
+	if session != nil {
+		session.CodexThreadID = threadID
+	}
+	return changed
 }
 
 func (b *Bridge) bindObservedCodexThreadOrInterrupt(ctx context.Context, session *Session, turn teamstore.Turn, threadID string, source string) (bool, error) {

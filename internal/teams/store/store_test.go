@@ -778,6 +778,112 @@ func TestSQLiteMigrationCrashStageMatrixLeavesLegacyStateRetryable(t *testing.T)
 	}
 }
 
+func TestRecentSessionInboundTurnSnapshotSQLiteFiltersOldEvents(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	since := now.Add(-3*time.Minute + 500*time.Millisecond)
+	recentReceivedAt := since.Add(250 * time.Millisecond)
+	oldReceivedAt := since.Add(-250 * time.Millisecond)
+	session := testSession()
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions[session.ID] = session
+		recentInbound := testInbound()
+		recentInbound.ID = "recent-inbound"
+		recentInbound.TurnID = "recent-turn"
+		recentInbound.CreatedAt = now.Add(-time.Minute)
+		recentInbound.UpdatedAt = recentInbound.CreatedAt
+		state.InboundEvents[recentInbound.ID] = recentInbound
+		state.Turns["recent-turn"] = Turn{ID: "recent-turn", SessionID: session.ID, InboundEventID: recentInbound.ID, Status: TurnStatusCompleted, CreatedAt: recentInbound.CreatedAt, UpdatedAt: recentInbound.CreatedAt}
+
+		recentReceivedInbound := testInbound()
+		recentReceivedInbound.ID = "recent-received-inbound"
+		recentReceivedInbound.TeamsMessageID = "recent-received-message"
+		recentReceivedInbound.TurnID = "recent-received-turn"
+		recentReceivedInbound.ReceivedAt = recentReceivedAt
+		recentReceivedInbound.CreatedAt = now.Add(-10 * time.Minute)
+		recentReceivedInbound.UpdatedAt = recentReceivedInbound.CreatedAt
+		state.InboundEvents[recentReceivedInbound.ID] = recentReceivedInbound
+		state.Turns["recent-received-turn"] = Turn{ID: "recent-received-turn", SessionID: session.ID, InboundEventID: recentReceivedInbound.ID, Status: TurnStatusCompleted, CreatedAt: recentReceivedInbound.CreatedAt, UpdatedAt: recentReceivedInbound.CreatedAt}
+
+		oldReceivedInbound := testInbound()
+		oldReceivedInbound.ID = "old-received-inbound"
+		oldReceivedInbound.TeamsMessageID = "old-received-message"
+		oldReceivedInbound.TurnID = "old-received-turn"
+		oldReceivedInbound.ReceivedAt = oldReceivedAt
+		oldReceivedInbound.CreatedAt = now.Add(-10 * time.Minute)
+		oldReceivedInbound.UpdatedAt = now.Add(-time.Minute)
+		state.InboundEvents[oldReceivedInbound.ID] = oldReceivedInbound
+		state.Turns["old-received-turn"] = Turn{ID: "old-received-turn", SessionID: session.ID, InboundEventID: oldReceivedInbound.ID, Status: TurnStatusCompleted, CreatedAt: oldReceivedInbound.CreatedAt, UpdatedAt: oldReceivedInbound.UpdatedAt}
+
+		oldInbound := testInbound()
+		oldInbound.ID = "old-inbound"
+		oldInbound.TeamsMessageID = "old-message"
+		oldInbound.TurnID = "old-turn"
+		oldInbound.CreatedAt = now.Add(-10 * time.Minute)
+		oldInbound.UpdatedAt = oldInbound.CreatedAt
+		state.InboundEvents[oldInbound.ID] = oldInbound
+		state.Turns["old-turn"] = Turn{ID: "old-turn", SessionID: session.ID, InboundEventID: oldInbound.ID, Status: TurnStatusCompleted, CreatedAt: oldInbound.CreatedAt, UpdatedAt: oldInbound.CreatedAt}
+
+		otherInbound := testInbound()
+		otherInbound.ID = "other-inbound"
+		otherInbound.SessionID = "other-session"
+		otherInbound.TeamsChatID = "other-chat"
+		otherInbound.TeamsMessageID = "other-message"
+		otherInbound.TurnID = "other-turn"
+		otherInbound.CreatedAt = now.Add(-time.Minute)
+		otherInbound.UpdatedAt = otherInbound.CreatedAt
+		state.InboundEvents[otherInbound.ID] = otherInbound
+		state.Turns["other-turn"] = Turn{ID: "other-turn", SessionID: otherInbound.SessionID, InboundEventID: otherInbound.ID, Status: TurnStatusCompleted, CreatedAt: otherInbound.CreatedAt, UpdatedAt: otherInbound.CreatedAt}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed recent inbound snapshot state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("sqlite pointer not available")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE inbound_events SET received_at = ? WHERE id = ?`, sqliteTime(recentReceivedAt.Truncate(time.Second)), "recent-received-inbound"); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE inbound_events SET received_at = ? WHERE id = ?`, sqliteTime(oldReceivedAt.Truncate(time.Second)), "old-received-inbound"); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("simulate legacy received_at backfill precision: %v", err)
+	}
+
+	snapshot, err := store.RecentSessionInboundTurnSnapshot(ctx, session.ID, since)
+	if err != nil {
+		t.Fatalf("RecentSessionInboundTurnSnapshot sqlite error: %v", err)
+	}
+	if snapshot.InboundEvents["recent-inbound"].ID == "" || snapshot.Turns["recent-turn"].ID == "" {
+		t.Fatalf("recent snapshot missing recent inbound/turn: %#v %#v", snapshot.InboundEvents, snapshot.Turns)
+	}
+	if snapshot.InboundEvents["recent-received-inbound"].ID == "" || snapshot.Turns["recent-received-turn"].ID == "" {
+		t.Fatalf("recent snapshot missing received-at recent inbound/turn: %#v %#v", snapshot.InboundEvents, snapshot.Turns)
+	}
+	if snapshot.InboundEvents["old-inbound"].ID != "" || snapshot.Turns["old-turn"].ID != "" {
+		t.Fatalf("recent snapshot included old inbound/turn: %#v %#v", snapshot.InboundEvents, snapshot.Turns)
+	}
+	if snapshot.InboundEvents["old-received-inbound"].ID != "" || snapshot.Turns["old-received-turn"].ID != "" {
+		t.Fatalf("recent snapshot included received-at old inbound/turn: %#v %#v", snapshot.InboundEvents, snapshot.Turns)
+	}
+	if snapshot.InboundEvents["other-inbound"].ID != "" || snapshot.Turns["other-turn"].ID != "" {
+		t.Fatalf("recent snapshot included other session: %#v %#v", snapshot.InboundEvents, snapshot.Turns)
+	}
+}
+
 func TestSQLiteMigrationProcessBoundaryStressAfterUpgrade(t *testing.T) {
 	store := newTestStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), storeConcurrentTestTimeout(30*time.Second))
@@ -1248,6 +1354,95 @@ func TestSQLiteOpenMigratesLegacyChatPollColumns(t *testing.T) {
 	}
 }
 
+func TestSQLiteOfficialTeamsHelperReleaseStoresUpgradeToCurrent(t *testing.T) {
+	type fixtureKind string
+	const (
+		fixtureLegacyJSONV4 fixtureKind = "legacy-json-v4"
+		fixtureLegacyJSONV5 fixtureKind = "legacy-json-v5"
+		fixtureSQLiteV5     fixtureKind = "sqlite-v5"
+	)
+	cases := []struct {
+		tag  string
+		kind fixtureKind
+	}{
+		// v0.1.0 is the first stable release with Teams helper state.
+		{tag: "v0.1.0", kind: fixtureLegacyJSONV4},
+		{tag: "v0.1.1", kind: fixtureLegacyJSONV5},
+		{tag: "v0.1.2", kind: fixtureLegacyJSONV5},
+		// v0.1.3 is the first stable release whose Teams store can already be
+		// a SQLite sidecar. Later stable releases before v0.1.8 keep the same
+		// pointer version, but this table keeps every stable release explicit so
+		// a regression points at the affected upgrade source version.
+		{tag: "v0.1.3", kind: fixtureSQLiteV5},
+		{tag: "v0.1.4", kind: fixtureSQLiteV5},
+		{tag: "v0.1.5", kind: fixtureSQLiteV5},
+		{tag: "v0.1.6", kind: fixtureSQLiteV5},
+		{tag: "v0.1.7", kind: fixtureSQLiteV5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tag, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			switch tc.kind {
+			case fixtureLegacyJSONV4:
+				seedOfficialReleaseLegacyJSONStoreForTest(t, store, tc.tag, 4)
+			case fixtureLegacyJSONV5:
+				seedOfficialReleaseLegacyJSONStoreForTest(t, store, tc.tag, 5)
+			case fixtureSQLiteV5:
+				seedOfficialReleaseSQLiteStoreForTest(t, store, tc.tag)
+			default:
+				t.Fatalf("unknown official release fixture kind %q", tc.kind)
+			}
+
+			loaded, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load %s fixture: %v", tc.tag, err)
+			}
+			if loaded.SchemaVersion != SchemaVersion {
+				t.Fatalf("Load %s schema = %d, want %d", tc.tag, loaded.SchemaVersion, SchemaVersion)
+			}
+			assertOfficialReleaseFixtureLoaded(t, tc.tag, loaded)
+
+			result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+			if err != nil {
+				t.Fatalf("MigrateLargeStateToSQLite %s fixture: %v", tc.tag, err)
+			}
+			if tc.kind == fixtureSQLiteV5 {
+				if !result.AlreadyDB || result.Migrated {
+					t.Fatalf("%s migration result = %#v, want already-db", tc.tag, result)
+				}
+			} else if !result.Migrated || result.AlreadyDB {
+				t.Fatalf("%s migration result = %#v, want migrated legacy JSON", tc.tag, result)
+			}
+			assertOfficialReleaseSQLiteSchemaForTest(t, store, tc.tag)
+			assertOfficialReleaseHotPathsForTest(t, store, tc.tag)
+		})
+	}
+}
+
+func TestSQLiteOfficialReleaseLegacyOutboxColumnsUpgradeToCurrent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	seedOfficialReleaseSQLiteStoreForTestWithOptions(t, store, "v0.1.7-legacy-outbox-columns", officialReleaseSQLiteFixtureOptions{
+		LegacyOutboxColumns: true,
+	})
+
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load legacy outbox fixture: %v", err)
+	}
+	assertOfficialReleaseFixtureLoaded(t, "v0.1.7-legacy-outbox-columns", loaded)
+	result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite legacy outbox fixture: %v", err)
+	}
+	if !result.AlreadyDB || result.Migrated {
+		t.Fatalf("legacy outbox migration result = %#v, want already-db", result)
+	}
+	assertOfficialReleaseSQLiteSchemaForTest(t, store, "v0.1.7-legacy-outbox-columns")
+	assertOfficialReleaseHotPathsForTest(t, store, "v0.1.7-legacy-outbox-columns")
+}
+
 func TestSQLiteStoreUsesFullSynchronousMode(t *testing.T) {
 	store := newTestStore(t)
 	seedLegacyStateFileForSQLiteMigrationTest(t, store)
@@ -1625,7 +1820,14 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 		state.InboundEvents["inbound-completed"] = InboundEvent{ID: "inbound-completed", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "message-completed", Status: InboundStatusIgnored, TurnID: "turn-completed", CreatedAt: now, UpdatedAt: now}
 		state.InboundEvents["inbound-other"] = InboundEvent{ID: "inbound-other", SessionID: "s2", TeamsChatID: "chat-2", TeamsMessageID: "message-other", Status: InboundStatusQueued, TurnID: "turn-other", CreatedAt: now, UpdatedAt: now}
 		state.OutboxMessages["outbox-1"] = OutboxMessage{ID: "outbox-1", SessionID: "s1", TurnID: "turn-running", TeamsChatID: "chat-1", Kind: "final", Body: "pending", Status: OutboxStatusQueued, CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages["outbox-other"] = OutboxMessage{ID: "outbox-other", SessionID: "s2", TurnID: "turn-other", TeamsChatID: "chat-2", Kind: "final", Body: "other", Status: OutboxStatusSent, CreatedAt: now, UpdatedAt: now}
+		state.ImportCheckpoints["import-active"] = ImportCheckpoint{ID: "import-active", SessionID: "s1", LastRecordID: "record-active", Status: sqliteImportCheckpointImporting, UpdatedAt: now}
 		state.ImportCheckpoints["import-1"] = ImportCheckpoint{ID: "import-1", SessionID: "s1", LastRecordID: "record-1", Status: "complete", UpdatedAt: now}
+		state.ImportCheckpoints["import-other"] = ImportCheckpoint{ID: "import-other", SessionID: "s2", LastRecordID: "record-other", Status: "complete", UpdatedAt: now}
+		state.TranscriptDeliveries["transcript-delivery-1"] = TranscriptDeliveryRecord{ID: "transcript-delivery-1", SessionID: "s1", OutboxID: "outbox-1", Kind: "final", TextHash: "hash-1", Status: TranscriptDeliveryStatusSent, CreatedAt: now, UpdatedAt: now}
+		state.TranscriptDeliveries["transcript-delivery-other"] = TranscriptDeliveryRecord{ID: "transcript-delivery-other", SessionID: "s2", OutboxID: "outbox-other", Kind: "final", TextHash: "hash-other", Status: TranscriptDeliveryStatusSent, CreatedAt: now, UpdatedAt: now}
+		state.HelperDeliveries["helper-delivery-1"] = HelperDeliveryRecord{ID: "helper-delivery-1", SessionID: "s1", TurnID: "turn-running", OutboxID: "outbox-1", Kind: "final", Status: HelperDeliveryStatusSent, CreatedAt: now, UpdatedAt: now}
+		state.HelperDeliveries["helper-delivery-other"] = HelperDeliveryRecord{ID: "helper-delivery-other", SessionID: "s2", TurnID: "turn-other", OutboxID: "outbox-other", Kind: "final", Status: HelperDeliveryStatusSent, CreatedAt: now, UpdatedAt: now}
 		state.ChatPolls["chat-1"] = ChatPollState{ChatID: "chat-1", Seeded: true, PollState: "warm", NextPollAt: now.Add(time.Minute), UpdatedAt: now}
 		state.ChatPolls["chat-parked-clean"] = ChatPollState{ChatID: "chat-parked-clean", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), UpdatedAt: now}
 		state.ChatPolls["chat-parked-stale"] = ChatPollState{ChatID: "chat-parked-stale", Seeded: true, PollState: "parked", ParkedAt: now.Add(-48 * time.Hour), ParkNoticeSentAt: now.Add(-47 * time.Hour), ContinuationPath: "/chats/chat-parked-stale/messages?$skiptoken=stale", UpdatedAt: now}
@@ -1669,6 +1871,12 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	if len(hotPollState.Sessions) != 0 {
 		t.Fatalf("hot poll state should not load sessions eagerly: %d", len(hotPollState.Sessions))
 	}
+	if hotPollState.Turns["turn-queued"].ID == "" || hotPollState.Turns["turn-running"].ID == "" || hotPollState.Turns["turn-other"].ID == "" || hotPollState.Turns["turn-completed"].ID != "" {
+		t.Fatalf("hot poll state should load only active turns: %#v", hotPollState.Turns)
+	}
+	if hotPollState.ImportCheckpoints["import-active"].ID == "" || hotPollState.ImportCheckpoints["import-1"].ID != "" || hotPollState.ImportCheckpoints["import-other"].ID != "" {
+		t.Fatalf("hot poll state should load only importing checkpoints: %#v", hotPollState.ImportCheckpoints)
+	}
 	hotPollSchedule, parkedSkip, err := store.HotPollScheduleSnapshot(ctx)
 	if err != nil {
 		t.Fatalf("HotPollScheduleSnapshot sqlite error: %v", err)
@@ -1684,6 +1892,12 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	}
 	if len(hotPollSchedule.Sessions) != 0 {
 		t.Fatalf("hot poll schedule should not load sessions eagerly: %d", len(hotPollSchedule.Sessions))
+	}
+	if hotPollSchedule.Turns["turn-queued"].ID == "" || hotPollSchedule.Turns["turn-running"].ID == "" || hotPollSchedule.Turns["turn-other"].ID == "" || hotPollSchedule.Turns["turn-completed"].ID != "" {
+		t.Fatalf("hot poll schedule should load only active turns: %#v", hotPollSchedule.Turns)
+	}
+	if hotPollSchedule.ImportCheckpoints["import-active"].ID == "" || hotPollSchedule.ImportCheckpoints["import-1"].ID != "" || hotPollSchedule.ImportCheckpoints["import-other"].ID != "" {
+		t.Fatalf("hot poll schedule should load only importing checkpoints: %#v", hotPollSchedule.ImportCheckpoints)
 	}
 	active, err := store.SessionActiveTurnQueueSnapshot(ctx, "s1")
 	if err != nil {
@@ -1722,6 +1936,25 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	if len(threadResolution.Sessions) != 1 || len(threadResolution.Turns) != 3 || len(threadResolution.InboundEvents) != 0 {
 		t.Fatalf("thread resolution snapshot = sessions %#v turns %#v inbound %#v", threadResolution.Sessions, threadResolution.Turns, threadResolution.InboundEvents)
 	}
+	transcriptDedupe, err := store.SessionTranscriptDedupeSnapshot(ctx, "s1", "import-1")
+	if err != nil {
+		t.Fatalf("SessionTranscriptDedupeSnapshot sqlite error: %v", err)
+	}
+	if transcriptDedupe.ServiceOwner == nil || transcriptDedupe.ImportCheckpoints["import-1"].ID == "" || transcriptDedupe.ImportCheckpoints["import-other"].ID != "" {
+		t.Fatalf("transcript dedupe checkpoint/runtime snapshot = %#v owner=%#v", transcriptDedupe.ImportCheckpoints, transcriptDedupe.ServiceOwner)
+	}
+	if len(transcriptDedupe.Turns) != 3 || transcriptDedupe.Turns["turn-other"].ID != "" || len(transcriptDedupe.InboundEvents) != 3 || transcriptDedupe.InboundEvents["inbound-other"].ID != "" {
+		t.Fatalf("transcript dedupe turn/inbound snapshot = turns %#v inbound %#v", transcriptDedupe.Turns, transcriptDedupe.InboundEvents)
+	}
+	if len(transcriptDedupe.OutboxMessages) != 1 || transcriptDedupe.OutboxMessages["outbox-1"].ID == "" || transcriptDedupe.OutboxMessages["outbox-other"].ID != "" {
+		t.Fatalf("transcript dedupe outbox snapshot = %#v", transcriptDedupe.OutboxMessages)
+	}
+	if len(transcriptDedupe.TranscriptDeliveries) != 1 || transcriptDedupe.TranscriptDeliveries["transcript-delivery-1"].ID == "" || transcriptDedupe.TranscriptDeliveries["transcript-delivery-other"].ID != "" {
+		t.Fatalf("transcript dedupe transcript deliveries = %#v", transcriptDedupe.TranscriptDeliveries)
+	}
+	if len(transcriptDedupe.HelperDeliveries) != 1 || transcriptDedupe.HelperDeliveries["helper-delivery-1"].ID == "" || transcriptDedupe.HelperDeliveries["helper-delivery-other"].ID != "" {
+		t.Fatalf("transcript dedupe helper deliveries = %#v", transcriptDedupe.HelperDeliveries)
+	}
 	workflow, err := store.WorkflowNotificationStateSnapshot(ctx)
 	if err != nil {
 		t.Fatalf("WorkflowNotificationStateSnapshot sqlite error: %v", err)
@@ -1733,7 +1966,7 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OutboxStateSnapshot sqlite error: %v", err)
 	}
-	if len(outbox.OutboxMessages) != 1 || outbox.OutboxMessages["outbox-1"].ID == "" || len(outbox.Turns) != 0 {
+	if len(outbox.OutboxMessages) != 2 || outbox.OutboxMessages["outbox-1"].ID == "" || outbox.OutboxMessages["outbox-other"].ID == "" || len(outbox.Turns) != 0 {
 		t.Fatalf("outbox snapshot = %#v", outbox)
 	}
 	if poll, ok, err := store.ChatPoll(ctx, "chat-1"); err != nil || !ok || poll.PollState != "warm" {
@@ -10379,6 +10612,473 @@ func sqliteTableCountsForTest(t *testing.T, store *Store, tables ...string) map[
 		t.Fatalf("count sqlite tables: %v", err)
 	}
 	return counts
+}
+
+func seedOfficialReleaseLegacyJSONStoreForTest(t *testing.T, store *Store, tag string, schemaVersion int) {
+	t.Helper()
+	state := officialReleaseUpgradeFixtureState(tag, schemaVersion, false)
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal %s legacy JSON fixture: %v", tag, err)
+	}
+	data = append(data, '\n')
+	writeRawStoreStateForTest(t, store, data)
+}
+
+func seedOfficialReleaseSQLiteStoreForTest(t *testing.T, store *Store, tag string) {
+	t.Helper()
+	seedOfficialReleaseSQLiteStoreForTestWithOptions(t, store, tag, officialReleaseSQLiteFixtureOptions{})
+}
+
+type officialReleaseSQLiteFixtureOptions struct {
+	LegacyOutboxColumns bool
+}
+
+func seedOfficialReleaseSQLiteStoreForTestWithOptions(t *testing.T, store *Store, tag string, opts officialReleaseSQLiteFixtureOptions) {
+	t.Helper()
+	state := officialReleaseUpgradeFixtureState(tag, SchemaVersion, true)
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("create %s sqlite dir: %v", tag, err)
+	}
+	db, err := openSQLiteStore(dbPath, true)
+	if err != nil {
+		t.Fatalf("open %s sqlite fixture: %v", tag, err)
+	}
+	if err := createOfficialReleaseSQLiteSchemaForTest(db); err != nil {
+		_ = db.Close()
+		t.Fatalf("create %s sqlite fixture schema: %v", tag, err)
+	}
+	if opts.LegacyOutboxColumns {
+		if err := createOfficialReleaseLegacyOutboxSchemaForTest(db); err != nil {
+			_ = db.Close()
+			t.Fatalf("create %s legacy outbox schema: %v", tag, err)
+		}
+	}
+	if err := insertOfficialReleaseSQLiteStateForTestWithOptions(db, state, opts); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert %s sqlite fixture state: %v", tag, err)
+	}
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("checkpoint %s sqlite fixture: %v", tag, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close %s sqlite fixture: %v", tag, err)
+	}
+	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+}
+
+func officialReleaseUpgradeFixtureState(tag string, schemaVersion int, includeProvenance bool) State {
+	now := time.Date(2026, 6, 10, 10, 30, 0, 0, time.UTC)
+	state := State{
+		SchemaVersion: schemaVersion,
+		CreatedAt:     now.Add(-time.Hour),
+		UpdatedAt:     now,
+		ServiceOwner: &OwnerMetadata{
+			PID:             4242,
+			Hostname:        "official-release-host",
+			ExecutablePath:  "/usr/local/bin/codex-proxy",
+			HelperVersion:   tag,
+			ActiveSessionID: "official-session",
+			ActiveTurnID:    "official-turn",
+			LastHeartbeat:   now,
+		},
+		Sessions:          map[string]SessionContext{},
+		Turns:             map[string]Turn{},
+		InboundEvents:     map[string]InboundEvent{},
+		OutboxMessages:    map[string]OutboxMessage{},
+		MessageProvenance: map[string]MessageProvenanceRecord{},
+		ChatPolls:         map[string]ChatPollState{},
+		ChatRateLimits:    map[string]ChatRateLimitState{},
+	}
+	state.Sessions["official-session"] = SessionContext{
+		ID:            "official-session",
+		Status:        SessionStatusActive,
+		TeamsChatID:   "official-chat",
+		TeamsChatURL:  "https://teams.example/official-chat",
+		TeamsTopic:    "official upgrade fixture",
+		CodexThreadID: "official-thread",
+		LatestTurnID:  "official-turn",
+		Cwd:           "/workspace/official-upgrade",
+		CreatedAt:     now.Add(-50 * time.Minute),
+		UpdatedAt:     now.Add(-5 * time.Minute),
+	}
+	state.InboundEvents["official-inbound"] = InboundEvent{
+		ID:             "official-inbound",
+		SessionID:      "official-session",
+		TeamsChatID:    "official-chat",
+		TeamsMessageID: "official-user-message",
+		Source:         "teams",
+		Status:         InboundStatusQueued,
+		TurnID:         "official-turn",
+		Text:           "upgrade from " + tag,
+		CreatedAt:      now.Add(-45 * time.Minute),
+		UpdatedAt:      now.Add(-45 * time.Minute),
+	}
+	state.Turns["official-turn"] = Turn{
+		ID:             "official-turn",
+		SessionID:      "official-session",
+		InboundEventID: "official-inbound",
+		Status:         TurnStatusCompleted,
+		CodexThreadID:  "official-thread",
+		CodexTurnID:    "official-codex-turn",
+		QueuedAt:       now.Add(-44 * time.Minute),
+		CreatedAt:      now.Add(-44 * time.Minute),
+		CompletedAt:    now.Add(-40 * time.Minute),
+		UpdatedAt:      now.Add(-40 * time.Minute),
+	}
+	state.OutboxMessages["official-outbox"] = OutboxMessage{
+		ID:             "official-outbox",
+		SessionID:      "official-session",
+		TurnID:         "official-turn",
+		CodexThreadID:  "official-thread",
+		TeamsChatID:    "official-chat",
+		TeamsMessageID: "official-helper-message",
+		Kind:           "final",
+		Body:           "legacy answer from " + tag,
+		Status:         OutboxStatusSent,
+		CreatedAt:      now.Add(-39 * time.Minute),
+		UpdatedAt:      now.Add(-39 * time.Minute),
+		SentAt:         now.Add(-39 * time.Minute),
+	}
+	state.ChatPolls["official-chat"] = ChatPollState{
+		ChatID:           "official-chat",
+		Seeded:           true,
+		PollState:        chatPollStateParked,
+		NextPollAt:       now.Add(time.Hour),
+		ParkedAt:         now.Add(-30 * time.Minute),
+		ParkNoticeSentAt: now.Add(-29 * time.Minute),
+		UpdatedAt:        now.Add(-29 * time.Minute),
+	}
+	state.ChatRateLimits["official-chat"] = ChatRateLimitState{
+		ChatID:       "official-chat",
+		BlockedUntil: now.Add(10 * time.Minute),
+		Reason:       "official-release-fixture",
+	}
+	if includeProvenance {
+		state.MessageProvenance["official-provenance-inbound"] = MessageProvenanceRecord{
+			ID:             "official-provenance-inbound",
+			TeamsChatID:    "official-chat",
+			TeamsMessageID: "official-user-message",
+			Origin:         MessageOriginUserInbound,
+			SessionID:      "official-session",
+			TurnID:         "official-turn",
+			InboundID:      "official-inbound",
+			CreatedAt:      now.Add(-45 * time.Minute),
+			UpdatedAt:      now.Add(-45 * time.Minute),
+		}
+		state.MessageProvenance["official-provenance-outbox"] = MessageProvenanceRecord{
+			ID:             "official-provenance-outbox",
+			TeamsChatID:    "official-chat",
+			TeamsMessageID: "official-helper-message",
+			Origin:         MessageOriginHelperOutbox,
+			SessionID:      "official-session",
+			TurnID:         "official-turn",
+			OutboxID:       "official-outbox",
+			CreatedAt:      now.Add(-39 * time.Minute),
+			UpdatedAt:      now.Add(-39 * time.Minute),
+		}
+	}
+	return state
+}
+
+func createOfficialReleaseSQLiteSchemaForTest(db *sql.DB) error {
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, teams_chat_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS sessions_chat_idx ON sessions(teams_chat_id)`,
+		`CREATE TABLE IF NOT EXISTS inbound_events (id TEXT PRIMARY KEY, session_id TEXT, teams_chat_id TEXT, teams_message_id TEXT, status TEXT, created_at INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS inbound_session_idx ON inbound_events(session_id, status, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS inbound_status_idx ON inbound_events(status, teams_chat_id, created_at, teams_message_id)`,
+		`CREATE INDEX IF NOT EXISTS inbound_message_idx ON inbound_events(teams_chat_id, teams_message_id)`,
+		`CREATE TABLE IF NOT EXISTS turns (id TEXT PRIMARY KEY, session_id TEXT, status TEXT, queued_at INTEGER, created_at INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS turns_ready_idx ON turns(status, session_id, queued_at, id)`,
+		`CREATE INDEX IF NOT EXISTS turns_session_status_idx ON turns(session_id, status, queued_at, id)`,
+		`CREATE TABLE IF NOT EXISTS outbox_messages (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, teams_chat_id TEXT, teams_message_id TEXT, status TEXT, sequence INTEGER, created_at INTEGER, deliver_after INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox_messages(status, teams_chat_id, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS outbox_session_idx ON outbox_messages(session_id, status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS message_provenance (id TEXT PRIMARY KEY, teams_chat_id TEXT, teams_message_id TEXT, origin TEXT, session_id TEXT, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS message_provenance_lookup_idx ON message_provenance(teams_chat_id, teams_message_id, origin)`,
+		`CREATE TABLE IF NOT EXISTS chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, poll_state TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS chat_rate_limits (chat_id TEXT PRIMARY KEY, blocked_until INTEGER, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS import_checkpoints (id TEXT PRIMARY KEY, session_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS import_checkpoints_session_idx ON import_checkpoints(session_id, status, updated_at, id)`,
+		`CREATE TABLE IF NOT EXISTS transcript_ledger (id TEXT PRIMARY KEY, session_id TEXT, imported_at INTEGER, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS transcript_ledger_session_idx ON transcript_ledger(session_id, imported_at, id)`,
+		`CREATE TABLE IF NOT EXISTS transcript_deliveries (id TEXT PRIMARY KEY, session_id TEXT, outbox_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS transcript_deliveries_session_idx ON transcript_deliveries(session_id, status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS helper_deliveries (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, outbox_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS helper_deliveries_session_idx ON helper_deliveries(session_id, status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS artifact_records (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, outbox_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS artifact_records_session_idx ON artifact_records(session_id, status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS notifications_session_idx ON notifications(session_id, status, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS notifications_status_idx ON notifications(status, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS outbox_turn_idx ON outbox_messages(turn_id, status, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS outbox_message_lookup_idx ON outbox_messages(teams_chat_id, teams_message_id, status)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func createOfficialReleaseLegacyOutboxSchemaForTest(db *sql.DB) error {
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS outbox_pending_idx`,
+		`DROP INDEX IF EXISTS outbox_session_idx`,
+		`DROP INDEX IF EXISTS outbox_turn_idx`,
+		`DROP INDEX IF EXISTS outbox_message_lookup_idx`,
+		`DROP TABLE IF EXISTS outbox_messages`,
+		`CREATE TABLE outbox_messages (id TEXT PRIMARY KEY, session_id TEXT, teams_chat_id TEXT, status TEXT, sequence INTEGER, created_at INTEGER, deliver_after INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox_messages(status, teams_chat_id, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS outbox_session_idx ON outbox_messages(session_id, status, created_at, id)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertOfficialReleaseSQLiteStateForTest(db *sql.DB, state State) error {
+	return insertOfficialReleaseSQLiteStateForTestWithOptions(db, state, officialReleaseSQLiteFixtureOptions{})
+}
+
+func insertOfficialReleaseSQLiteStateForTestWithOptions(db *sql.DB, state State, opts officialReleaseSQLiteFixtureOptions) error {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	cold, err := json.Marshal(coldSQLiteState(state))
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, cold); err != nil {
+		return err
+	}
+	if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO sessions(id, teams_chat_id, status, updated_at, json) VALUES (?, ?, ?, ?, ?)`, state.Sessions, func(v SessionContext) []any {
+		return []any{v.ID, v.TeamsChatID, string(v.Status), sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO inbound_events(id, session_id, teams_chat_id, teams_message_id, status, created_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, state.InboundEvents, func(v InboundEvent) []any {
+		return []any{v.ID, v.SessionID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), sqliteTime(v.CreatedAt), sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO turns(id, session_id, status, queued_at, created_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)`, state.Turns, func(v Turn) []any {
+		return []any{v.ID, v.SessionID, string(v.Status), sqliteTime(queuedTurnSortTime(v)), sqliteTime(v.CreatedAt), sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	outboxInsert := `INSERT INTO outbox_messages(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	outboxValues := func(v OutboxMessage) []any {
+		return []any{v.ID, v.SessionID, v.TurnID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), int64(0)}
+	}
+	if opts.LegacyOutboxColumns {
+		outboxInsert = `INSERT INTO outbox_messages(id, session_id, teams_chat_id, status, sequence, created_at, deliver_after, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		outboxValues = func(v OutboxMessage) []any {
+			return []any{v.ID, v.SessionID, strings.TrimSpace(v.TeamsChatID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), int64(0)}
+		}
+	}
+	if err := writeSQLiteMap(ctx, tx, outboxInsert, state.OutboxMessages, outboxValues); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO message_provenance(id, teams_chat_id, teams_message_id, origin, session_id, json) VALUES (?, ?, ?, ?, ?, ?)`, state.MessageProvenance, func(v MessageProvenanceRecord) []any {
+		return []any{v.ID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), v.Origin, v.SessionID}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_polls(chat_id, next_poll_at, poll_state, updated_at, json) VALUES (?, ?, ?, ?, ?)`, state.ChatPolls, func(v ChatPollState) []any {
+		return []any{v.ChatID, sqliteTime(v.NextPollAt), v.PollState, sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_rate_limits(chat_id, blocked_until, json) VALUES (?, ?, ?)`, state.ChatRateLimits, func(v ChatRateLimitState) []any {
+		return []any{v.ChatID, sqliteTime(v.BlockedUntil)}
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func assertOfficialReleaseFixtureLoaded(t *testing.T, tag string, state State) {
+	t.Helper()
+	if _, ok := state.Sessions["official-session"]; !ok {
+		t.Fatalf("%s upgraded state missing official session", tag)
+	}
+	if _, ok := state.InboundEvents["official-inbound"]; !ok {
+		t.Fatalf("%s upgraded state missing official inbound", tag)
+	}
+	if turn, ok := state.Turns["official-turn"]; !ok || turn.Status != TurnStatusCompleted {
+		t.Fatalf("%s upgraded turn = %#v ok=%v, want completed", tag, turn, ok)
+	}
+	if _, ok := state.OutboxMessages["official-outbox"]; !ok {
+		t.Fatalf("%s upgraded state missing official outbox", tag)
+	}
+	if poll, ok := state.ChatPolls["official-chat"]; !ok || poll.PollState != chatPollStateParked {
+		t.Fatalf("%s upgraded poll = %#v ok=%v, want parked", tag, poll, ok)
+	}
+}
+
+func assertOfficialReleaseSQLiteSchemaForTest(t *testing.T, store *Store, tag string) {
+	t.Helper()
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read %s sqlite pointer: %v", tag, err)
+	}
+	pointer, ok, err := storeSQLitePointerFromData(data)
+	if err != nil || !ok {
+		t.Fatalf("%s store did not upgrade to sqlite pointer: ok=%v err=%v data=%s", tag, ok, err, string(data))
+	}
+	dbPath, err := store.storeSQLitePath(pointer)
+	if err != nil {
+		t.Fatalf("resolve %s sqlite path: %v", tag, err)
+	}
+	db, err := openSQLiteHandle(dbPath, false)
+	if err != nil {
+		t.Fatalf("open %s upgraded sqlite: %v", tag, err)
+	}
+	defer db.Close()
+	columns := sqliteColumnSetForTest(t, db, "chat_polls")
+	for _, column := range []string{"last_activity_at", "park_notice_sent_at", "parked_skip_eligible"} {
+		if !columns[column] {
+			t.Fatalf("%s upgraded chat_polls missing column %q; columns=%v", tag, column, columns)
+		}
+	}
+	inboundColumns := sqliteColumnSetForTest(t, db, "inbound_events")
+	if !inboundColumns["received_at"] {
+		t.Fatalf("%s upgraded inbound_events missing column received_at; columns=%v", tag, inboundColumns)
+	}
+	indexes := sqliteIndexSetForTest(t, db)
+	for _, index := range []string{"inbound_session_received_idx", "chat_polls_parked_skip_idx", "chat_polls_auto_park_idx", "outbox_chat_sequence_idx"} {
+		if !indexes[index] {
+			t.Fatalf("%s upgraded sqlite missing index %q; indexes=%v", tag, index, indexes)
+		}
+	}
+	var parkedSkip sql.NullInt64
+	if err := db.QueryRow(`SELECT parked_skip_eligible FROM chat_polls WHERE chat_id = ?`, "official-chat").Scan(&parkedSkip); err != nil {
+		t.Fatalf("query %s upgraded parked_skip_eligible: %v", tag, err)
+	}
+	if !parkedSkip.Valid || parkedSkip.Int64 != 1 {
+		t.Fatalf("%s upgraded official-chat parked_skip_eligible = %#v, want true", tag, parkedSkip)
+	}
+}
+
+func sqliteColumnSetForTest(t *testing.T, db *sql.DB, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatalf("pragma table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info(%s): %v", table, err)
+	}
+	return columns
+}
+
+func sqliteIndexSetForTest(t *testing.T, db *sql.DB) map[string]bool {
+	t.Helper()
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'index'`)
+	if err != nil {
+		t.Fatalf("query sqlite indexes: %v", err)
+	}
+	defer rows.Close()
+	indexes := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan sqlite index: %v", err)
+		}
+		indexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate sqlite indexes: %v", err)
+	}
+	return indexes
+}
+
+func assertOfficialReleaseHotPathsForTest(t *testing.T, store *Store, tag string) {
+	t.Helper()
+	ctx := context.Background()
+	if lookup, err := store.MessageLookup(ctx, "official-chat", "official-user-message"); err != nil || !lookup.HasInbound {
+		t.Fatalf("%s upgraded inbound lookup = %#v err=%v, want inbound", tag, lookup, err)
+	}
+	if lookup, err := store.MessageLookup(ctx, "official-chat", "official-helper-message"); err != nil || !lookup.HasDeliveredOutbox {
+		t.Fatalf("%s upgraded outbox lookup = %#v err=%v, want delivered outbox", tag, lookup, err)
+	}
+	now := time.Date(2026, 6, 10, 11, 0, 0, 0, time.UTC)
+	inbound := InboundEvent{
+		ID:             "post-upgrade-inbound",
+		SessionID:      "official-session",
+		TeamsChatID:    "official-chat",
+		TeamsMessageID: "post-upgrade-user-message",
+		Source:         "teams",
+		Status:         InboundStatusQueued,
+		Text:           "post-upgrade prompt",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if _, created, err := store.PersistInbound(ctx, inbound); err != nil || !created {
+		t.Fatalf("%s PersistInbound after upgrade created=%v err=%v", tag, created, err)
+	}
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: "official-session", InboundEventID: inbound.ID, CreatedAt: now, UpdatedAt: now})
+	if err != nil || !created {
+		t.Fatalf("%s QueueTurn after upgrade created=%v err=%v", tag, created, err)
+	}
+	claimed, ok, err := store.ClaimNextQueuedTurn(ctx, "official-session")
+	if err != nil || !ok || claimed.ID != turn.ID {
+		t.Fatalf("%s ClaimNextQueuedTurn after upgrade = %#v ok=%v err=%v, want %q", tag, claimed, ok, err, turn.ID)
+	}
+	outbox, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		SessionID:   "official-session",
+		TurnID:      turn.ID,
+		TeamsChatID: "official-chat",
+		Kind:        "final",
+		Body:        "post-upgrade answer",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	if err != nil || !created {
+		t.Fatalf("%s QueueOutbox after upgrade created=%v err=%v", tag, created, err)
+	}
+	if _, err := store.MarkOutboxAccepted(ctx, outbox.ID, "post-upgrade-helper-message"); err != nil {
+		t.Fatalf("%s MarkOutboxAccepted after upgrade: %v", tag, err)
+	}
+	if _, err := store.MarkOutboxSent(ctx, outbox.ID, "post-upgrade-helper-message"); err != nil {
+		t.Fatalf("%s MarkOutboxSent after upgrade: %v", tag, err)
+	}
+	if lookup, err := store.MessageLookup(ctx, "official-chat", "post-upgrade-helper-message"); err != nil || !lookup.HasDeliveredOutbox {
+		t.Fatalf("%s post-upgrade outbox lookup = %#v err=%v, want delivered outbox", tag, lookup, err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "official-chat", now, true, false, 1); err != nil {
+		t.Fatalf("%s RecordChatPollSuccess after upgrade: %v", tag, err)
+	}
+	if _, _, err := store.HotPollScheduleSnapshot(ctx); err != nil {
+		t.Fatalf("%s HotPollScheduleSnapshot after upgrade: %v", tag, err)
+	}
 }
 
 func newTestStore(t *testing.T) *Store {

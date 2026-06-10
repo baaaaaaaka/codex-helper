@@ -34,6 +34,8 @@ const (
 	ownerPollMessageTop                     = 20
 	outboxRecoveryMessageTop                = 20
 	transcriptSyncMinInterval               = 10 * time.Second
+	transcriptDiscoveryMinInterval          = 5 * time.Minute
+	transcriptDiscoveryFailureMinInterval   = 30 * time.Second
 	historyWatchSyncMinInterval             = 10 * time.Second
 	historyWatchReconcileInterval           = 5 * time.Minute
 	historyWatchRecentDays                  = 3
@@ -397,6 +399,8 @@ type Bridge struct {
 	parkNoticeLookupPreferences       map[string]parkNoticeLookupPreference
 	lastAutoParkSweep                 time.Time
 	lastTranscriptSync                time.Time
+	lastTranscriptDiscovery           time.Time
+	lastTranscriptDiscoveryFailure    time.Time
 	lastHistoryWatchSync              time.Time
 	lastHistoryWatchReconcile         time.Time
 	lastBeaconReconcile               time.Time
@@ -9286,7 +9290,7 @@ func (b *Bridge) recentDuplicateSessionPromptWithSnapshot(ctx context.Context, s
 		state = *snapshot
 	} else {
 		var err error
-		state, err = b.store.SessionTurnQueueSnapshot(ctx, session.ID)
+		state, err = b.store.RecentSessionInboundTurnSnapshot(ctx, session.ID, now.Add(-recentDuplicateSessionPromptWindow))
 		if err != nil {
 			return recentDuplicatePrompt{}, false, err
 		}
@@ -13654,7 +13658,7 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
-	local, ok, err := b.localCodexSessionForTeamsSession(ctx, *session)
+	local, ok, err := b.localCodexSessionForTeamsSessionWithDiscovery(ctx, *session)
 	if err != nil {
 		return err
 	}
@@ -14221,7 +14225,7 @@ func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return localCodexBeforeTeamsGate{}, err
 	}
-	local, ok, err := b.localCodexSessionForTeamsSession(ctx, *session)
+	local, ok, err := b.localCodexSessionForTeamsSessionWithDiscovery(ctx, *session)
 	if err != nil {
 		return localCodexBeforeTeamsGate{}, err
 	}
@@ -14348,31 +14352,47 @@ func (b *Bridge) localCodexSessionForTeamsSession(ctx context.Context, session S
 	if err := b.ensureStore(); err != nil {
 		return codexhistory.Session{}, false, err
 	}
-	state, err := b.store.Load(ctx)
+	checkpoint, _, err := b.store.ImportCheckpoint(ctx, transcriptCheckpointID(session.ID))
 	if err != nil {
 		return codexhistory.Session{}, false, err
 	}
-	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; strings.TrimSpace(checkpoint.SourcePath) != "" {
+	if strings.TrimSpace(checkpoint.SourcePath) != "" {
 		return codexhistory.Session{
 			SessionID:   session.CodexThreadID,
 			ProjectPath: session.Cwd,
 			FilePath:    checkpoint.SourcePath,
 		}, true, nil
 	}
-	projects, err := discoverCodexProjectsForTeams(ctx, "")
+	return codexhistory.Session{}, false, nil
+}
+
+func (b *Bridge) localCodexSessionForTeamsSessionWithDiscovery(ctx context.Context, session Session) (codexhistory.Session, bool, error) {
+	local, ok, err := b.localCodexSessionForTeamsSession(ctx, session)
+	if err != nil || ok {
+		return local, ok, err
+	}
+	return b.discoverLocalCodexSessionForTeamsSession(ctx, session)
+}
+
+func (b *Bridge) discoverLocalCodexSessionForTeamsSession(ctx context.Context, session Session) (codexhistory.Session, bool, error) {
+	threadID := strings.TrimSpace(session.CodexThreadID)
+	if b == nil || threadID == "" {
+		return codexhistory.Session{}, false, nil
+	}
+	projects, err := discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
 	if err != nil {
 		return codexhistory.Session{}, false, nil
 	}
 	for _, project := range projects {
 		for _, local := range project.Sessions {
-			if local.SessionID != session.CodexThreadID {
+			if strings.TrimSpace(local.SessionID) != threadID {
 				continue
 			}
-			if local.ProjectPath == "" {
+			if strings.TrimSpace(local.ProjectPath) == "" {
 				local.ProjectPath = project.Path
 			}
 			if strings.TrimSpace(local.FilePath) == "" {
-				return codexhistory.Session{}, false, nil
+				continue
 			}
 			return local, true, nil
 		}
@@ -14388,11 +14408,12 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 	if err := b.ensureStore(); err != nil {
 		return out, err
 	}
-	state, err := b.store.Load(ctx)
+	checkpointID := transcriptCheckpointID(session.ID)
+	state, err := b.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, checkpointID)
 	if err != nil {
 		return out, err
 	}
-	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	checkpoint := state.ImportCheckpoints[checkpointID]
 	out.CheckpointStatus = checkpoint.Status
 	out.CheckpointOrphaned = transcriptImportCheckpointIsOrphaned(state, checkpoint)
 	out.CheckpointHadRecord = checkpoint.LastRecordID != ""
@@ -14474,11 +14495,12 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 	if err := b.ensureStore(); err != nil {
 		return false, err
 	}
-	state, err := b.store.Load(ctx)
+	checkpointID := transcriptCheckpointID(session.ID)
+	state, err := b.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, checkpointID)
 	if err != nil {
 		return false, err
 	}
-	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	checkpoint := state.ImportCheckpoints[checkpointID]
 	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
 		return false, nil
 	}
@@ -14864,10 +14886,14 @@ func (b *Bridge) syncLinkedTranscriptsIfDue(ctx context.Context, now time.Time) 
 		return nil
 	}
 	b.lastTranscriptSync = now
-	return b.syncLinkedTranscripts(ctx)
+	return b.syncLinkedTranscriptsWithDiscovery(ctx, false, now)
 }
 
 func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
+	return b.syncLinkedTranscriptsWithDiscovery(ctx, true, time.Time{})
+}
+
+func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDiscovery bool, now time.Time) error {
 	if len(b.reg.Sessions) == 0 {
 		return nil
 	}
@@ -14918,20 +14944,29 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 	if len(needsDiscovery) == 0 {
 		return nil
 	}
-	projects, err := discoverCodexProjectsForTeams(ctx, "")
-	if err != nil {
+	if !forceDiscovery && !b.linkedTranscriptDiscoveryDue(now) {
 		return nil
+	}
+	projects, err := discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
+	if err != nil {
+		if !forceDiscovery {
+			b.recordLinkedTranscriptDiscoveryFailure(now)
+		}
+		return nil
+	}
+	if !forceDiscovery {
+		b.recordLinkedTranscriptDiscoverySuccess(now)
 	}
 	byID := make(map[string]codexhistory.Session)
 	for _, project := range projects {
 		for _, session := range project.Sessions {
-			if session.SessionID == "" {
+			if strings.TrimSpace(session.SessionID) == "" || strings.TrimSpace(session.FilePath) == "" {
 				continue
 			}
-			if session.ProjectPath == "" {
+			if strings.TrimSpace(session.ProjectPath) == "" {
 				session.ProjectPath = project.Path
 			}
-			byID[session.SessionID] = session
+			byID[strings.TrimSpace(session.SessionID)] = session
 		}
 	}
 	for _, session := range needsDiscovery {
@@ -14947,6 +14982,43 @@ func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (b *Bridge) linkedTranscriptDiscoveryDue(now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !b.lastTranscriptDiscoveryFailure.IsZero() && now.Sub(b.lastTranscriptDiscoveryFailure) < transcriptDiscoveryFailureMinInterval {
+		return false
+	}
+	if b.lastTranscriptDiscovery.IsZero() || now.Sub(b.lastTranscriptDiscovery) >= transcriptDiscoveryMinInterval {
+		return true
+	}
+	return false
+}
+
+func (b *Bridge) recordLinkedTranscriptDiscoverySuccess(now time.Time) {
+	if b == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.lastTranscriptDiscovery = now
+	b.lastTranscriptDiscoveryFailure = time.Time{}
+}
+
+func (b *Bridge) recordLinkedTranscriptDiscoveryFailure(now time.Time) {
+	if b == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.lastTranscriptDiscoveryFailure = now
 }
 
 func linkedTranscriptLocalFromCheckpoint(session Session, checkpoint teamstore.ImportCheckpoint) (codexhistory.Session, bool) {
@@ -14973,20 +15045,32 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 	if strings.TrimSpace(session.CodexThreadID) == "" {
 		return 0, nil
 	}
-	state, err := b.store.Load(ctx)
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint, _, err := b.store.ImportCheckpoint(ctx, checkpointID)
 	if err != nil {
 		return 0, err
 	}
-	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
 	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
-		return 0, nil
-	}
-	local, ok := linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
-	if !ok {
 		return 0, nil
 	}
 	switch checkpoint.Status {
 	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
+		return 0, nil
+	}
+	state, err := b.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, checkpointID)
+	if err != nil {
+		return 0, err
+	}
+	checkpoint = state.ImportCheckpoints[checkpointID]
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		return 0, nil
+	}
+	switch checkpoint.Status {
+	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
+		return 0, nil
+	}
+	local, ok := linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
+	if !ok {
 		return 0, nil
 	}
 	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
@@ -15267,7 +15351,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	} else if advanced {
 		return nil
 	}
-	state, err = b.store.Load(ctx)
+	state, err = b.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, checkpointID)
 	if err != nil {
 		return err
 	}

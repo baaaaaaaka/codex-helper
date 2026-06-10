@@ -19934,6 +19934,77 @@ func TestBridgeSyncLinkedTranscriptSkipsStoreWhenNoLinkedThreads(t *testing.T) {
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptDiscoveryUsesScopedCodexHome(t *testing.T) {
+	codexRoot := t.TempDir()
+	prevDiscover := discoverCodexProjectsForTeams
+	var gotRoot string
+	var discoverCalls int
+	discoverCodexProjectsForTeams = func(_ context.Context, root string) ([]codexhistory.Project, error) {
+		discoverCalls++
+		gotRoot = root
+		return nil, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(&GraphClient{}, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	session := bridge.reg.SessionByChatID("chat-1")
+	if session == nil {
+		t.Fatal("test bridge missing chat-1 session")
+	}
+	session.CodexThreadID = "thread-needs-discovery"
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("syncLinkedTranscripts error: %v", err)
+	}
+	if discoverCalls != 1 {
+		t.Fatalf("discover calls = %d, want 1", discoverCalls)
+	}
+	if gotRoot != codexRoot {
+		t.Fatalf("discover root = %q, want scoped CodexHome %q", gotRoot, codexRoot)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptDiscoverySkipsEmptyPathCandidate(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "p1",
+			Path: "/home/user/project/alpha",
+			Sessions: []codexhistory.Session{
+				{SessionID: "thread-1"},
+				{SessionID: "thread-1", FilePath: transcriptPath, ModifiedAt: time.Now()},
+			},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("syncLinkedTranscripts error: %v", err)
+	}
+	checkpoint, ok, err := store.ImportCheckpoint(context.Background(), transcriptCheckpointID(session.ID))
+	if err != nil {
+		t.Fatalf("ImportCheckpoint error: %v", err)
+	}
+	if !ok || checkpoint.SourcePath != transcriptPath {
+		t.Fatalf("checkpoint = %#v ok=%v, want source path %q", checkpoint, ok, transcriptPath)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptSeedsThenImportsNewRecords(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := strings.Join([]string{
@@ -22694,6 +22765,274 @@ func TestBridgeClassifyLocalTranscriptCompactOnlyDoesNotBlockTeamsTurn(t *testin
 	}
 }
 
+func TestBridgeLocalCodexSessionUsesCheckpointWithoutDiscovery(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-checkpoint"
+	session.Cwd = "/workspace/checkpoint"
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"type":"session_meta","payload":{"id":"thread-checkpoint"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{ID: session.ID, TeamsChatID: session.ChatID, CodexThreadID: session.CodexThreadID, Cwd: session.Cwd, Status: teamstore.SessionStatusActive}
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:         transcriptCheckpointID(session.ID),
+			SessionID:  session.ID,
+			SourcePath: transcriptPath,
+			UpdatedAt:  time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed checkpoint state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate checkpoint state: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		t.Fatal("discoverCodexProjectsForTeams should not be called when checkpoint has a source path")
+		return nil, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	local, ok, err := bridge.localCodexSessionForTeamsSession(ctx, *session)
+	if err != nil {
+		t.Fatalf("localCodexSessionForTeamsSession error: %v", err)
+	}
+	if !ok || local.FilePath != transcriptPath || local.SessionID != "thread-checkpoint" || local.ProjectPath != "/workspace/checkpoint" {
+		t.Fatalf("local session = %#v ok=%v", local, ok)
+	}
+}
+
+func TestBridgeLocalCodexSessionSkipsDiscoveryWithoutCheckpointSource(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-missing-source"
+	session.Cwd = "/workspace/missing-source"
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{ID: session.ID, TeamsChatID: session.ChatID, CodexThreadID: session.CodexThreadID, Cwd: session.Cwd, Status: teamstore.SessionStatusActive}
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:        transcriptCheckpointID(session.ID),
+			SessionID: session.ID,
+			UpdatedAt: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed checkpoint state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate checkpoint state: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		t.Fatal("discoverCodexProjectsForTeams should not be called when checkpoint has no source path")
+		return nil, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	local, ok, err := bridge.localCodexSessionForTeamsSession(ctx, *session)
+	if err != nil {
+		t.Fatalf("localCodexSessionForTeamsSession error: %v", err)
+	}
+	if ok || local.FilePath != "" {
+		t.Fatalf("local session = %#v ok=%v, want not found without discovery", local, ok)
+	}
+}
+
+func TestBridgeLocalCodexSessionDiscoverySkipsEmptyPathCandidate(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"type":"session_meta","payload":{"id":"thread-duplicate"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Path: "/workspace/project",
+			Sessions: []codexhistory.Session{
+				{SessionID: "thread-duplicate"},
+				{SessionID: "thread-duplicate", FilePath: transcriptPath},
+			},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-duplicate"
+
+	local, ok, err := bridge.localCodexSessionForTeamsSessionWithDiscovery(context.Background(), *session)
+	if err != nil {
+		t.Fatalf("localCodexSessionForTeamsSessionWithDiscovery error: %v", err)
+	}
+	if !ok || local.FilePath != transcriptPath || local.ProjectPath != "/workspace/project" {
+		t.Fatalf("local session = %#v ok=%v", local, ok)
+	}
+}
+
+func TestBridgePrepareLocalCodexBeforeTeamsTurnDiscoversMissingCheckpointSource(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"local tui prompt"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-missing-source", transcriptPath)
+	defer restoreDiscover()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-missing-source"
+	session.Cwd = "/workspace/missing-source"
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{
+			ID:            session.ID,
+			TeamsChatID:   session.ChatID,
+			CodexThreadID: session.CodexThreadID,
+			Cwd:           session.Cwd,
+			Status:        teamstore.SessionStatusActive,
+		}
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:        transcriptCheckpointID(session.ID),
+			SessionID: session.ID,
+			UpdatedAt: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed checkpoint state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate checkpoint state: %v", err)
+	}
+
+	gate, err := bridge.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+	if err != nil {
+		t.Fatalf("prepareLocalCodexBeforeTeamsTurn error: %v", err)
+	}
+	if !gate.Block || !strings.Contains(gate.AckBody, "Codex is active in the CLI") {
+		t.Fatalf("gate = %#v, want active local Codex block from discovered transcript", gate)
+	}
+}
+
+func TestBridgeBindSessionCodexThreadNoopsWhenAlreadyCurrent(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-current"
+	now := time.Date(2026, 6, 10, 2, 3, 4, 0, time.UTC)
+	sessionUpdatedAt := now.Add(-time.Hour)
+	turnUpdatedAt := now.Add(-30 * time.Minute)
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{
+			ID:            session.ID,
+			TeamsChatID:   session.ChatID,
+			CodexThreadID: "thread-current",
+			Status:        teamstore.SessionStatusActive,
+			CreatedAt:     sessionUpdatedAt,
+			UpdatedAt:     sessionUpdatedAt,
+		}
+		state.Turns["turn-current"] = teamstore.Turn{
+			ID:            "turn-current",
+			SessionID:     session.ID,
+			Status:        teamstore.TurnStatusRunning,
+			CodexThreadID: "thread-current",
+			CreatedAt:     turnUpdatedAt,
+			UpdatedAt:     turnUpdatedAt,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed thread state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate thread state: %v", err)
+	}
+
+	if err := bridge.bindSessionCodexThreadIfSafe(ctx, session, "turn-current", "thread-current", "test"); err != nil {
+		t.Fatalf("bindSessionCodexThreadIfSafe no-op error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after no-op bind: %v", err)
+	}
+	if got := state.Sessions[session.ID].UpdatedAt; !got.Equal(sessionUpdatedAt) {
+		t.Fatalf("session UpdatedAt changed on no-op bind: got %s want %s", got, sessionUpdatedAt)
+	}
+	if got := state.Turns["turn-current"].UpdatedAt; !got.Equal(turnUpdatedAt) {
+		t.Fatalf("turn UpdatedAt changed on no-op bind: got %s want %s", got, turnUpdatedAt)
+	}
+}
+
+func TestBridgeBindSessionCodexThreadFillsMissingTurnProjection(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-current"
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{
+			ID:            session.ID,
+			TeamsChatID:   session.ChatID,
+			CodexThreadID: "thread-current",
+			Status:        teamstore.SessionStatusActive,
+			CreatedAt:     time.Now().Add(-time.Hour),
+			UpdatedAt:     time.Now().Add(-time.Hour),
+		}
+		state.Turns["turn-current"] = teamstore.Turn{
+			ID:        "turn-current",
+			SessionID: session.ID,
+			Status:    teamstore.TurnStatusRunning,
+			CreatedAt: time.Now().Add(-30 * time.Minute),
+			UpdatedAt: time.Now().Add(-30 * time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed thread state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate thread state: %v", err)
+	}
+
+	if err := bridge.bindSessionCodexThreadIfSafe(ctx, session, "turn-current", "thread-current", "test"); err != nil {
+		t.Fatalf("bindSessionCodexThreadIfSafe fill turn error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after bind: %v", err)
+	}
+	if got := state.Turns["turn-current"].CodexThreadID; got != "thread-current" {
+		t.Fatalf("turn CodexThreadID = %q, want thread-current", got)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptRetriesRemainingRecordsFromSameLine(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-1"}}` + "\n" +
@@ -23485,8 +23824,59 @@ func TestBridgeSyncLinkedTranscriptsIfDueThrottlesScans(t *testing.T) {
 	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(2*transcriptSyncMinInterval)); err != nil {
 		t.Fatalf("missing-path fallback sync error: %v", err)
 	}
+	if discoverCalls != 1 {
+		t.Fatalf("discoverCalls = %d, want periodic missing-path discovery to wait for discovery throttle", discoverCalls)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("direct missing-path fallback sync error: %v", err)
+	}
 	if discoverCalls != 2 {
-		t.Fatalf("discoverCalls = %d, want discovery fallback when checkpoint source path is missing", discoverCalls)
+		t.Fatalf("discoverCalls = %d, want direct sync to bypass discovery throttle", discoverCalls)
+	}
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(transcriptDiscoveryMinInterval)); err != nil {
+		t.Fatalf("discovery-throttle-expired sync error: %v", err)
+	}
+	if discoverCalls != 3 {
+		t.Fatalf("discoverCalls = %d, want periodic discovery after discovery throttle expires", discoverCalls)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptDiscoveryFailureUsesShortRetryThrottle(t *testing.T) {
+	prevDiscover := discoverCodexProjectsForTeams
+	var discoverCalls int
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		discoverCalls++
+		return nil, errors.New("transient discovery failure")
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-1"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+
+	now := time.Unix(1000, 0)
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now); err != nil {
+		t.Fatalf("first failed sync error: %v", err)
+	}
+	if discoverCalls != 1 {
+		t.Fatalf("discoverCalls = %d, want first failed discovery", discoverCalls)
+	}
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(transcriptSyncMinInterval)); err != nil {
+		t.Fatalf("failure-throttled sync error: %v", err)
+	}
+	if discoverCalls != 1 {
+		t.Fatalf("discoverCalls = %d, want failed discovery to use short retry throttle", discoverCalls)
+	}
+	if err := bridge.syncLinkedTranscriptsIfDue(context.Background(), now.Add(transcriptDiscoveryFailureMinInterval+transcriptSyncMinInterval)); err != nil {
+		t.Fatalf("retry failed sync error: %v", err)
+	}
+	if discoverCalls != 2 {
+		t.Fatalf("discoverCalls = %d, want retry after short failure throttle", discoverCalls)
 	}
 }
 

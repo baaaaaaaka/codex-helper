@@ -24,6 +24,7 @@ const (
 	storeSQLiteVersion              = 1
 	storeSQLiteFileName             = "store.sqlite"
 	storeSQLitePointerSchemaVersion = SchemaVersion + 1
+	sqliteImportCheckpointImporting = "importing"
 
 	DefaultSQLiteStateMigrationMinSize int64 = 1 << 20
 )
@@ -507,10 +508,16 @@ func (s *Store) hotPollScheduleSQLite(ctx context.Context, includeParkedSkip boo
 		if err != nil {
 			return err
 		}
-		selected, err := loadSQLiteSelectedStateWithChatPollQuery(ctx, db, hotPollScheduleSnapshotFields,
+		selected, err := loadSQLiteSelectedStateWithChatPollQuery(ctx, db, hotPollScheduleBaseFields,
 			`SELECT json FROM chat_polls WHERE COALESCE(parked_skip_eligible, 0) = 0`,
 		)
 		if err != nil {
+			return err
+		}
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM turns WHERE status IN (?, ?)`, selected.Turns, func(v Turn) string { return v.ID }, string(TurnStatusQueued), string(TurnStatusRunning)); err != nil {
+			return err
+		}
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM import_checkpoints WHERE status = ?`, selected.ImportCheckpoints, func(v ImportCheckpoint) string { return v.ID }, sqliteImportCheckpointImporting); err != nil {
 			return err
 		}
 		if includeParkedSkip {
@@ -873,7 +880,7 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, teams_chat_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS sessions_chat_idx ON sessions(teams_chat_id)`,
-		`CREATE TABLE IF NOT EXISTS inbound_events (id TEXT PRIMARY KEY, session_id TEXT, teams_chat_id TEXT, teams_message_id TEXT, status TEXT, created_at INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS inbound_events (id TEXT PRIMARY KEY, session_id TEXT, teams_chat_id TEXT, teams_message_id TEXT, status TEXT, created_at INTEGER, updated_at INTEGER, received_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS inbound_session_idx ON inbound_events(session_id, status, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS inbound_status_idx ON inbound_events(status, teams_chat_id, created_at, teams_message_id)`,
 		`CREATE INDEX IF NOT EXISTS inbound_message_idx ON inbound_events(teams_chat_id, teams_message_id)`,
@@ -911,6 +918,9 @@ func ensureSQLiteSchema(db *sql.DB) error {
 	if _, err := db.Exec(`ALTER TABLE outbox_messages ADD COLUMN turn_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
+	if _, err := db.Exec(`ALTER TABLE inbound_events ADD COLUMN received_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
 	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN park_notice_sent_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
@@ -923,7 +933,12 @@ func ensureSQLiteSchema(db *sql.DB) error {
 	if err := backfillSQLiteChatPollDerivedColumns(db); err != nil {
 		return err
 	}
+	if err := backfillSQLiteInboundDerivedColumns(db); err != nil {
+		return err
+	}
 	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS inbound_session_created_idx ON inbound_events(session_id, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS inbound_session_received_idx ON inbound_events(session_id, received_at, id) WHERE received_at > 0`,
 		`CREATE INDEX IF NOT EXISTS outbox_turn_idx ON outbox_messages(turn_id, status, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS outbox_message_lookup_idx ON outbox_messages(teams_chat_id, teams_message_id, status)`,
 		`CREATE INDEX IF NOT EXISTS outbox_chat_sequence_idx ON outbox_messages(teams_chat_id, sequence, status, created_at, id)`,
@@ -985,8 +1000,8 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	}); err != nil {
 		return err
 	}
-	if err := writeSQLiteMap(ctx, tx, `INSERT INTO inbound_events(id, session_id, teams_chat_id, teams_message_id, status, created_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, state.InboundEvents, func(v InboundEvent) []any {
-		return []any{v.ID, v.SessionID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), sqliteTime(v.CreatedAt), sqliteTime(v.UpdatedAt)}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO inbound_events(id, session_id, teams_chat_id, teams_message_id, status, created_at, updated_at, received_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, state.InboundEvents, func(v InboundEvent) []any {
+		return []any{v.ID, v.SessionID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), sqliteTime(v.CreatedAt), sqliteTime(v.UpdatedAt), sqliteTime(v.ReceivedAt)}
 	}); err != nil {
 		return err
 	}
@@ -1134,6 +1149,13 @@ func backfillSQLiteChatPollDerivedColumns(db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func backfillSQLiteInboundDerivedColumns(db *sql.DB) error {
+	_, err := db.Exec(`UPDATE inbound_events
+SET received_at = COALESCE(CAST(strftime('%s', json_extract(json, '$.received_at')) AS INTEGER) * 1000000000, 0)
+WHERE received_at IS NULL`)
+	return err
 }
 
 func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
@@ -1905,9 +1927,9 @@ func upsertSQLiteInboundTx(ctx context.Context, tx *sql.Tx, v InboundEvent) erro
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO inbound_events(id, session_id, teams_chat_id, teams_message_id, status, created_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, teams_chat_id = excluded.teams_chat_id, teams_message_id = excluded.teams_message_id, status = excluded.status, created_at = excluded.created_at, updated_at = excluded.updated_at, json = excluded.json`,
-		v.ID, v.SessionID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), sqliteTime(v.CreatedAt), sqliteTime(v.UpdatedAt), data)
+	_, err = tx.ExecContext(ctx, `INSERT INTO inbound_events(id, session_id, teams_chat_id, teams_message_id, status, created_at, updated_at, received_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, teams_chat_id = excluded.teams_chat_id, teams_message_id = excluded.teams_message_id, status = excluded.status, created_at = excluded.created_at, updated_at = excluded.updated_at, received_at = excluded.received_at, json = excluded.json`,
+		v.ID, v.SessionID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), sqliteTime(v.CreatedAt), sqliteTime(v.UpdatedAt), sqliteTime(v.ReceivedAt), data)
 	return err
 }
 
@@ -2678,6 +2700,57 @@ func (s *Store) loadSQLiteSessionTurnQueueStateUnlocked(pointer storeSQLitePoint
 	return state, nil
 }
 
+func (s *Store) loadSQLiteRecentSessionInboundTurnStateUnlocked(pointer storeSQLitePointer, sessionID string, since time.Time) (State, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return State{}, err
+	}
+	ctx := context.Background()
+	state := State{
+		SchemaVersion: SchemaVersion,
+		Turns:         map[string]Turn{},
+		InboundEvents: map[string]InboundEvent{},
+	}
+	query := `SELECT json FROM inbound_events WHERE session_id = ?`
+	args := []any{sessionID}
+	if !since.IsZero() {
+		sinceSQLite := sqliteTime(since)
+		receivedSinceSQLite := sqliteTime(since.Add(-time.Second))
+		query = `SELECT json FROM inbound_events WHERE session_id = ? AND created_at >= ?
+UNION ALL SELECT json FROM inbound_events WHERE session_id = ? AND received_at > 0 AND received_at >= ?`
+		args = []any{sessionID, sinceSQLite, sessionID, receivedSinceSQLite}
+	}
+	if err := loadSQLiteJSONMap(ctx, db, query, state.InboundEvents, func(v InboundEvent) string { return v.ID }, args...); err != nil {
+		return State{}, err
+	}
+	if !since.IsZero() {
+		filtered := make(map[string]InboundEvent, len(state.InboundEvents))
+		for id, inbound := range state.InboundEvents {
+			activity := inboundStoreActivityTime(inbound)
+			if !activity.IsZero() && !activity.Before(since) {
+				filtered[id] = inbound
+			}
+		}
+		state.InboundEvents = filtered
+	}
+	for _, inbound := range state.InboundEvents {
+		turnID := strings.TrimSpace(inbound.TurnID)
+		if turnID == "" {
+			continue
+		}
+		if _, ok := state.Turns[turnID]; ok {
+			continue
+		}
+		if turn, ok, err := loadSQLiteJSONRow[Turn](ctx, db, `SELECT json FROM turns WHERE id = ?`, turnID); err != nil {
+			return State{}, err
+		} else if ok {
+			state.Turns[turn.ID] = turn
+		}
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
 func (s *Store) loadSQLiteSessionWorkflowEventForTurnUnlocked(pointer storeSQLitePointer, sessionID string, turnID string) (State, error) {
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
@@ -2731,6 +2804,83 @@ func (s *Store) loadSQLiteSessionThreadResolutionStateUnlocked(pointer storeSQLi
 	}
 	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM turns WHERE session_id = ?`, state.Turns, func(v Turn) string { return v.ID }, sessionID); err != nil {
 		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer storeSQLitePointer, sessionID string, checkpointID string) (State, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return State{}, err
+	}
+	ctx := context.Background()
+	state := State{
+		SchemaVersion:        SchemaVersion,
+		Turns:                map[string]Turn{},
+		InboundEvents:        map[string]InboundEvent{},
+		OutboxMessages:       map[string]OutboxMessage{},
+		TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
+		HelperDeliveries:     map[string]HelperDeliveryRecord{},
+		ImportCheckpoints:    map[string]ImportCheckpoint{},
+	}
+	if runtimeState, seen, err := loadSQLiteRuntimeState(ctx, db); err != nil {
+		return State{}, err
+	} else if sqliteRuntimeStateUsable(seen) {
+		state.ServiceOwner = runtimeState.ServiceOwner
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM turns WHERE session_id = ?`, state.Turns, func(v Turn) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM inbound_events WHERE session_id = ?`, state.InboundEvents, func(v InboundEvent) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM outbox_messages WHERE session_id = ?`, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM transcript_deliveries WHERE session_id = ?`, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM helper_deliveries WHERE session_id = ?`, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM import_checkpoints WHERE session_id = ?`, state.ImportCheckpoints, func(v ImportCheckpoint) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if checkpointID != "" {
+		if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+			return State{}, err
+		} else if ok {
+			state.ImportCheckpoints[checkpoint.ID] = checkpoint
+		}
+	}
+	for _, delivery := range state.HelperDeliveries {
+		outboxID := strings.TrimSpace(delivery.OutboxID)
+		if outboxID == "" {
+			continue
+		}
+		if _, ok := state.OutboxMessages[outboxID]; ok {
+			continue
+		}
+		if outbox, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
+			return State{}, err
+		} else if ok {
+			state.OutboxMessages[outbox.ID] = outbox
+		}
+	}
+	for _, delivery := range state.TranscriptDeliveries {
+		outboxID := strings.TrimSpace(delivery.OutboxID)
+		if outboxID == "" {
+			continue
+		}
+		if _, ok := state.OutboxMessages[outboxID]; ok {
+			continue
+		}
+		if outbox, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
+			return State{}, err
+		} else if ok {
+			state.OutboxMessages[outbox.ID] = outbox
+		}
 	}
 	state.ensure(time.Time{})
 	return state, nil

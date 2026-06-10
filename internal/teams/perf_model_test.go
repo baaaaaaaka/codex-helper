@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
@@ -33,6 +34,121 @@ type cxpPerfProfile struct {
 	HistoryFiles    int
 	HistoryLines    int
 	RateLimited     bool
+}
+
+type cxpPerfProcIO struct {
+	rchar               uint64
+	wchar               uint64
+	readBytes           uint64
+	writeBytes          uint64
+	cancelledWriteBytes uint64
+}
+
+func cxpPerfReadProcSelfIO() (cxpPerfProcIO, bool) {
+	data, err := os.ReadFile("/proc/self/io")
+	if err != nil {
+		return cxpPerfProcIO{}, false
+	}
+	var ioState cxpPerfProcIO
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "rchar":
+			ioState.rchar = n
+		case "wchar":
+			ioState.wchar = n
+		case "read_bytes":
+			ioState.readBytes = n
+		case "write_bytes":
+			ioState.writeBytes = n
+		case "cancelled_write_bytes":
+			ioState.cancelledWriteBytes = n
+		}
+	}
+	return ioState, true
+}
+
+func (ioState cxpPerfProcIO) delta(after cxpPerfProcIO) cxpPerfProcIO {
+	return cxpPerfProcIO{
+		rchar:               cxpPerfSaturatingSub(after.rchar, ioState.rchar),
+		wchar:               cxpPerfSaturatingSub(after.wchar, ioState.wchar),
+		readBytes:           cxpPerfSaturatingSub(after.readBytes, ioState.readBytes),
+		writeBytes:          cxpPerfSaturatingSub(after.writeBytes, ioState.writeBytes),
+		cancelledWriteBytes: cxpPerfSaturatingSub(after.cancelledWriteBytes, ioState.cancelledWriteBytes),
+	}
+}
+
+func (ioState *cxpPerfProcIO) add(other cxpPerfProcIO) {
+	ioState.rchar += other.rchar
+	ioState.wchar += other.wchar
+	ioState.readBytes += other.readBytes
+	ioState.writeBytes += other.writeBytes
+	ioState.cancelledWriteBytes += other.cancelledWriteBytes
+}
+
+func cxpPerfSaturatingSub(after, before uint64) uint64 {
+	if after < before {
+		return 0
+	}
+	return after - before
+}
+
+func cxpPerfReportProcIO(b *testing.B, total cxpPerfProcIO, n int) {
+	b.Helper()
+	if n <= 0 {
+		return
+	}
+	denom := float64(n)
+	b.ReportMetric(float64(total.readBytes)/denom, "disk_read_B/op")
+	b.ReportMetric(float64(total.writeBytes)/denom, "disk_write_B/op")
+	b.ReportMetric(float64(total.cancelledWriteBytes)/denom, "cancelled_write_B/op")
+	b.ReportMetric(float64(total.rchar)/denom, "logical_read_B/op")
+	b.ReportMetric(float64(total.wchar)/denom, "logical_write_B/op")
+}
+
+func cxpPerfReportProcIODelta(b *testing.B, before cxpPerfProcIO, beforeOK bool, n int) {
+	b.Helper()
+	if !beforeOK {
+		return
+	}
+	after, afterOK := cxpPerfReadProcSelfIO()
+	if !afterOK {
+		return
+	}
+	cxpPerfReportProcIO(b, before.delta(after), n)
+}
+
+func cxpPerfMeasureProcIO(fn func() error) (cxpPerfProcIO, error) {
+	before, beforeOK := cxpPerfReadProcSelfIO()
+	err := fn()
+	after, afterOK := cxpPerfReadProcSelfIO()
+	if !beforeOK || !afterOK {
+		return cxpPerfProcIO{}, err
+	}
+	return before.delta(after), err
+}
+
+func cxpPerfReportNamedProcIO(b *testing.B, prefix string, total cxpPerfProcIO, n int) {
+	b.Helper()
+	if n <= 0 {
+		return
+	}
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return
+	}
+	denom := float64(n)
+	b.ReportMetric(float64(total.writeBytes)/denom, prefix+"_disk_write_B/op")
+	b.ReportMetric(float64(total.readBytes)/denom, prefix+"_disk_read_B/op")
+	b.ReportMetric(float64(total.rchar)/denom, prefix+"_logical_read_B/op")
+	b.ReportMetric(float64(total.wchar)/denom, prefix+"_logical_write_B/op")
 }
 
 var cxpPerfProfiles = []cxpPerfProfile{
@@ -599,6 +715,7 @@ func benchmarkCXPPerfModelDaemonQueuedTurnDrainProfilesWithBackend(b *testing.B,
 			ctx := context.Background()
 			b.ReportAllocs()
 			b.ResetTimer()
+			var ioTotal cxpPerfProcIO
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				store := newCXPPerfStore(b, profile)
@@ -607,6 +724,7 @@ func benchmarkCXPPerfModelDaemonQueuedTurnDrainProfilesWithBackend(b *testing.B,
 				graph := newCXPPerfGraph(profile)
 				bridge := newCXPPerfBridge(store, graph, profile)
 				bridge.asyncTurns = true
+				beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
 				b.StartTimer()
 				if err := bridge.processQueuedTurns(ctx); err != nil {
 					b.Fatalf("daemon queued turn drain process: %v", err)
@@ -615,7 +733,14 @@ func benchmarkCXPPerfModelDaemonQueuedTurnDrainProfilesWithBackend(b *testing.B,
 					b.Fatalf("daemon queued turn drain wait: %v", err)
 				}
 				b.StopTimer()
+				if beforeIOOK {
+					afterIO, afterIOOK := cxpPerfReadProcSelfIO()
+					if afterIOOK {
+						ioTotal.add(beforeIO.delta(afterIO))
+					}
+				}
 			}
+			cxpPerfReportProcIO(b, ioTotal, b.N)
 		})
 	}
 }
@@ -797,12 +922,15 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUser(b *testing.B) {
 		opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
 		cxpPerfMarkMainLoopMaintenanceFresh(bridge, now)
 		b.ReportAllocs()
+		beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if err := cxpPerfRunMainLoopSteadyIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*3*time.Second)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
 				b.Fatalf("realistic mixed idle tick: %v", err)
 			}
 		}
+		b.StopTimer()
+		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
 		_ = store
 	})
 	b.Run("transcript-sync-due", func(b *testing.B) {
@@ -811,18 +939,22 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUser(b *testing.B) {
 		now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
 		opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
 		b.ReportAllocs()
+		beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if err := cxpPerfRunMainLoopIdleTick(ctx, bridge, opts, now.Add(time.Duration(i)*time.Minute)); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
 				b.Fatalf("realistic mixed transcript sync due tick: %v", err)
 			}
 		}
+		b.StopTimer()
+		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
 	})
 	b.Run("live-progress-update", func(b *testing.B) {
 		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
 		ctx := context.Background()
 		sessionID, chatID, turnID := cxpPerfSeedRealisticRunningTurn(b, bridge.store)
 		b.ReportAllocs()
+		beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if !bridge.canQueueLiveTurnOutbox(ctx, sessionID, turnID) {
@@ -834,11 +966,14 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUser(b *testing.B) {
 				b.Fatalf("realistic mixed live progress update: %v", err)
 			}
 		}
+		b.StopTimer()
+		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
 	})
 	b.Run("single-user-message-drain", func(b *testing.B) {
 		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
 		ctx := context.Background()
 		b.ReportAllocs()
+		beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if err := cxpPerfHandleRealisticUserMessage(ctx, bridge, i); err != nil {
@@ -848,7 +983,482 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUser(b *testing.B) {
 				b.Fatalf("realistic mixed queued turn drain: %v", err)
 			}
 		}
+		b.StopTimer()
+		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
 	})
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainBreakdown(b *testing.B) {
+	b.Run("handle-message-start", func(b *testing.B) {
+		ctx := context.Background()
+		b.ReportAllocs()
+		b.ResetTimer()
+		var ioTotal cxpPerfProcIO
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+			executor := newCXPPerfBlockingExecutor()
+			bridge.executor = executor
+			beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
+			b.StartTimer()
+			if err := cxpPerfHandleRealisticUserMessage(ctx, bridge, i); err != nil {
+				b.Fatalf("realistic mixed user message: %v", err)
+			}
+			executor.waitStarted(b)
+			b.StopTimer()
+			if beforeIOOK {
+				afterIO, afterIOOK := cxpPerfReadProcSelfIO()
+				if afterIOOK {
+					ioTotal.add(beforeIO.delta(afterIO))
+				}
+			}
+			executor.release()
+			if err := cxpPerfDrainAsyncTurns(ctx, bridge); err != nil {
+				b.Fatalf("realistic mixed cleanup drain: %v", err)
+			}
+		}
+		cxpPerfReportProcIO(b, ioTotal, b.N)
+	})
+	b.Run("complete-running-turn", func(b *testing.B) {
+		ctx := context.Background()
+		b.ReportAllocs()
+		b.ResetTimer()
+		var ioTotal cxpPerfProcIO
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+			executor := newCXPPerfBlockingExecutor()
+			bridge.executor = executor
+			if err := cxpPerfHandleRealisticUserMessage(ctx, bridge, i); err != nil {
+				b.Fatalf("realistic mixed user message: %v", err)
+			}
+			executor.waitStarted(b)
+			beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
+			b.StartTimer()
+			executor.release()
+			if err := cxpPerfDrainAsyncTurns(ctx, bridge); err != nil {
+				b.Fatalf("realistic mixed queued turn drain: %v", err)
+			}
+			b.StopTimer()
+			if beforeIOOK {
+				afterIO, afterIOOK := cxpPerfReadProcSelfIO()
+				if afterIOOK {
+					ioTotal.add(beforeIO.delta(afterIO))
+				}
+			}
+		}
+		cxpPerfReportProcIO(b, ioTotal, b.N)
+	})
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainNoCodexDiscovery(b *testing.B) {
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		return nil, nil
+	}
+	b.Cleanup(func() {
+		discoverCodexProjectsForTeams = prevDiscover
+	})
+	_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+	ctx := context.Background()
+	b.ReportAllocs()
+	beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := cxpPerfHandleRealisticUserMessage(ctx, bridge, i); err != nil {
+			b.Fatalf("realistic mixed user message: %v", err)
+		}
+		if err := cxpPerfDrainAsyncTurns(ctx, bridge); err != nil {
+			b.Fatalf("realistic mixed queued turn drain: %v", err)
+		}
+	}
+	b.StopTimer()
+	cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainStageWrites(b *testing.B) {
+	stages := []string{"importing", "service_control", "duplicate", "queue_state", "prepare_local", "ensure", "inbound", "turn", "ack", "start", "complete"}
+	totals := make(map[string]cxpPerfProcIO, len(stages))
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		executor := newCXPPerfBlockingExecutor()
+		bridge.executor = executor
+		chatID, msg, text := cxpPerfRealisticUserMessage(i)
+		session := bridge.reg.SessionByChatID(chatID)
+		if session == nil {
+			b.Fatalf("realistic session for chat %s not found", chatID)
+		}
+		var inbound teamstore.InboundEvent
+		var turn teamstore.Turn
+		runStage := func(name string, fn func() error) {
+			b.Helper()
+			b.StartTimer()
+			delta, err := cxpPerfMeasureProcIO(fn)
+			b.StopTimer()
+			total := totals[name]
+			total.add(delta)
+			totals[name] = total
+			if err != nil {
+				b.Fatalf("%s: %v", name, err)
+			}
+		}
+		runStage("importing", func() error {
+			if importing, err := bridge.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
+				return err
+			} else if importing {
+				return fmt.Errorf("session unexpectedly importing transcript")
+			}
+			return nil
+		})
+		runStage("service_control", func() error {
+			if control, blocked, err := bridge.serviceControlBlocksNewWork(ctx); err != nil {
+				return err
+			} else if blocked {
+				return fmt.Errorf("service control unexpectedly blocked work: %#v", control)
+			}
+			return nil
+		})
+		runStage("duplicate", func() error {
+			if duplicate, err := bridge.ignoreRecentDuplicateSessionPrompt(ctx, session, msg, text); err != nil {
+				return err
+			} else if duplicate {
+				return fmt.Errorf("message unexpectedly classified as duplicate")
+			}
+			return nil
+		})
+		runStage("queue_state", func() error {
+			turns, err := bridge.sessionTurnQueueState(ctx, session.ID)
+			if err != nil {
+				return err
+			}
+			if turns.Running || turns.Queued != 0 {
+				return fmt.Errorf("session unexpectedly has queued/running turns: %#v", turns)
+			}
+			return nil
+		})
+		runStage("prepare_local", func() error {
+			gate, err := bridge.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+			if err != nil {
+				return err
+			}
+			if gate.Block {
+				return fmt.Errorf("local codex gate unexpectedly blocked: %s", gate.AckBody)
+			}
+			return nil
+		})
+		runStage("ensure", func() error {
+			return bridge.ensureDurableSession(ctx, session)
+		})
+		runStage("inbound", func() error {
+			var created bool
+			var err error
+			inbound, created, err = bridge.persistInbound(ctx, session, msg)
+			if err != nil {
+				return err
+			}
+			if !created {
+				return fmt.Errorf("realistic inbound was not created")
+			}
+			return nil
+		})
+		runStage("turn", func() error {
+			var created bool
+			var err error
+			turn, created, err = bridge.queueTurn(ctx, session, inbound)
+			if err != nil {
+				return err
+			}
+			if !created {
+				return fmt.Errorf("realistic turn was not created")
+			}
+			session.UpdatedAt = time.Now()
+			bridge.markRegistryProjectionDirty()
+			return nil
+		})
+		runStage("ack", func() error {
+			return bridge.queueTeamsPromptAckForMessage(ctx, session, turn, msg, false)
+		})
+		runStage("start", func() error {
+			started, err := bridge.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
+				return bridge.runPreparedQueuedTurnFromMessage(runCtx, runSession, claimed, runSession.ChatID, msg, text, bridge.executor)
+			})
+			if err != nil {
+				return err
+			}
+			if !started {
+				return fmt.Errorf("turn was not started")
+			}
+			executor.waitStarted(b)
+			return nil
+		})
+		runStage("complete", func() error {
+			executor.release()
+			return cxpPerfDrainAsyncTurns(ctx, bridge)
+		})
+	}
+	for _, stage := range stages {
+		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserCompleteTurnBreakdown(b *testing.B) {
+	stages := []string{
+		"bind_thread",
+		"transcript_final",
+		"pre_final_status",
+		"queue_final_outbox",
+		"mark_completed",
+		"flush_final_outbox",
+		"title_from_result",
+		"queue_state_fallback",
+		"artifact_scan",
+	}
+	totals := make(map[string]cxpPerfProcIO, len(stages))
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		chatID, msg, text := cxpPerfRealisticUserMessage(i)
+		session := bridge.reg.SessionByChatID(chatID)
+		if session == nil {
+			b.Fatalf("realistic session for chat %s not found", chatID)
+		}
+		if err := bridge.ensureDurableSession(ctx, session); err != nil {
+			b.Fatalf("ensure durable session: %v", err)
+		}
+		inbound, created, err := bridge.persistInbound(ctx, session, msg)
+		if err != nil {
+			b.Fatalf("persist inbound: %v", err)
+		}
+		if !created {
+			b.Fatal("realistic inbound was not created")
+		}
+		turn, turnCreated, err := bridge.queueTurn(ctx, session, inbound)
+		if err != nil {
+			b.Fatalf("queue turn: %v", err)
+		}
+		if !turnCreated {
+			b.Fatal("realistic turn was not created")
+		}
+		if err := bridge.queueTeamsPromptAckForMessage(ctx, session, turn, msg, false); err != nil {
+			b.Fatalf("queue ack: %v", err)
+		}
+		turn, err = bridge.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, "")
+		if err != nil {
+			b.Fatalf("mark running: %v", err)
+		}
+		result := ExecutionResult{
+			Text:             "perf codex result for " + strings.TrimSpace(text),
+			CodexThreadID:    firstNonEmptyString(session.CodexThreadID, "perf-thread-"+session.ID),
+			CodexThreadTitle: "Perf Thread",
+			CodexTurnID:      "perf-codex-turn-" + shortStableID(session.ID+":"+text),
+		}
+		runStage := func(name string, fn func() error) {
+			b.Helper()
+			b.StartTimer()
+			delta, err := cxpPerfMeasureProcIO(fn)
+			b.StopTimer()
+			total := totals[name]
+			total.add(delta)
+			totals[name] = total
+			if err != nil {
+				b.Fatalf("%s: %v", name, err)
+			}
+		}
+		runStage("bind_thread", func() error {
+			blocked, err := bridge.bindObservedCodexThreadOrInterrupt(ctx, session, turn, result.CodexThreadID, "runner_completed")
+			if err != nil {
+				return err
+			}
+			if blocked {
+				return fmt.Errorf("thread bind unexpectedly blocked completion")
+			}
+			return nil
+		})
+		runStage("transcript_final", func() error {
+			if transcriptResult, ok := bridge.completedTurnResultFromLinkedTranscript(ctx, session, turn, result); ok {
+				result = executionResultWithTranscriptFinal(result, transcriptResult)
+			}
+			return nil
+		})
+		runStage("pre_final_status", func() error {
+			_, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+			return err
+		})
+		runStage("queue_final_outbox", func() error {
+			visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
+			if visibleText == "" && len(ExtractArtifactManifestBlocks(result.Text)) > 0 {
+				visibleText = "artifact manifest received; uploading listed files."
+			}
+			_, err := bridge.queueOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "final", visibleText, outboxQueueOptions{
+				MentionOwner:     true,
+				NotificationKind: "turn_completed",
+			})
+			return err
+		})
+		runStage("mark_completed", func() error {
+			session.UpdatedAt = time.Now()
+			bridge.markRegistryProjectionDirty()
+			_, err := bridge.store.MarkTurnCompleted(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID)
+			return err
+		})
+		runStage("flush_final_outbox", func() error {
+			if err := bridge.flushPendingOutboxForChat(ctx, chatID); err != nil {
+				if isOutboxDeliveryDeferred(err) || isGraphTransientServerError(err) {
+					return nil
+				}
+				return err
+			}
+			bridge.boostPolling(time.Now())
+			return nil
+		})
+		updatedTitle := false
+		runStage("title_from_result", func() error {
+			var err error
+			updatedTitle, err = bridge.refreshWorkChatTitleFromExecutionResult(ctx, session, result)
+			return err
+		})
+		runStage("queue_state_fallback", func() error {
+			if updatedTitle {
+				return nil
+			}
+			queueState, err := bridge.sessionTurnQueueState(ctx, session.ID)
+			if err != nil {
+				return err
+			}
+			if queueState.Queued == 0 {
+				return bridge.refreshWorkChatTitleFromCodexHistory(ctx, session)
+			}
+			return nil
+		})
+		runStage("artifact_scan", func() error {
+			return bridge.uploadArtifactsFromResult(ctx, session, turn, result.Text)
+		})
+	}
+	for _, stage := range stages {
+		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserIdleLoopBreakdown(b *testing.B) {
+	stages := []string{
+		"refresh_lease",
+		"flush_outbox",
+		"flush_workflow",
+		"poll_once",
+		"auto_park",
+		"transcript_sync_gate",
+		"history_watch_gate",
+		"helper_auto_update",
+		"upgrade_notice",
+		"codex_upgrade",
+		"beacon_reconcile",
+		"beacon_lease",
+		"drain_complete",
+		"deferred_inbound",
+		"process_queued",
+		"interrupted_notices",
+		"registry_save",
+	}
+	totals := make(map[string]cxpPerfProcIO, len(stages))
+	_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+	opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
+	cxpPerfMarkMainLoopMaintenanceFresh(bridge, now)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tick := now.Add(time.Duration(i) * 3 * time.Second)
+		runStage := func(name string, fn func() error) {
+			b.Helper()
+			delta, err := cxpPerfMeasureProcIO(fn)
+			total := totals[name]
+			total.add(delta)
+			totals[name] = total
+			if err != nil {
+				b.Fatalf("%s: %v", name, err)
+			}
+		}
+		runStage("refresh_lease", func() error {
+			active, err := bridge.refreshControlLease(ctx)
+			if err != nil {
+				return err
+			}
+			if !active {
+				return teamstore.ErrControlLeaseNotHeld
+			}
+			return nil
+		})
+		runStage("flush_outbox", func() error {
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil && !isOutboxDeliveryDeferred(err) {
+				return err
+			}
+			return nil
+		})
+		runStage("flush_workflow", func() error {
+			return bridge.flushPendingWorkflowNotificationsWithLimit(ctx, mainLoopWorkflowFlushMaxNotifications)
+		})
+		runStage("poll_once", func() error {
+			if err := bridge.pollOnce(ctx, opts.Top); err != nil && !isGraphRateLimitError(err) {
+				return err
+			}
+			return nil
+		})
+		runStage("auto_park", func() error {
+			if err := bridge.maybeRunIdleWorkChatAutoPark(ctx, tick); err != nil && !isGraphRateLimitError(err) && !isOutboxDeliveryDeferred(err) {
+				return err
+			}
+			return nil
+		})
+		runStage("transcript_sync_gate", func() error {
+			return bridge.syncLinkedTranscriptsIfDue(ctx, tick)
+		})
+		runStage("history_watch_gate", func() error {
+			return bridge.syncCodexHistoryFinalsIfDue(ctx, tick)
+		})
+		runStage("helper_auto_update", func() error {
+			return bridge.maybeRunHelperAutoUpdate(ctx, opts)
+		})
+		runStage("upgrade_notice", func() error {
+			_, err := bridge.queueCompletedHelperUpgradeNoticeIfNeeded(ctx)
+			return err
+		})
+		runStage("codex_upgrade", func() error {
+			return bridge.maybeRunPendingCodexUpgrade(ctx)
+		})
+		runStage("beacon_reconcile", func() error {
+			return bridge.maybeRunBeaconReconcile(ctx, tick)
+		})
+		runStage("beacon_lease", func() error {
+			return bridge.maybeRunBeaconLeaseMaintenance(ctx, tick)
+		})
+		runStage("drain_complete", func() error {
+			_, err := bridge.drainComplete(ctx)
+			return err
+		})
+		runStage("deferred_inbound", func() error {
+			return bridge.processDeferredInbound(ctx)
+		})
+		runStage("process_queued", func() error {
+			return bridge.processQueuedTurns(ctx)
+		})
+		runStage("interrupted_notices", func() error {
+			return bridge.sendDeferredInterruptedTurnNotices(ctx)
+		})
+		runStage("registry_save", func() error {
+			return bridge.Save()
+		})
+	}
+	for _, stage := range stages {
+		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+	}
 }
 
 func BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles(b *testing.B) {
@@ -2059,18 +2669,18 @@ func cxpPerfDrainAsyncTurns(ctx context.Context, bridge *Bridge) error {
 		if err := bridge.processQueuedTurns(ctx); err != nil {
 			return err
 		}
-		state, err := bridge.store.QueuedTurnStateSnapshot(ctx)
+		hasQueued, err := bridge.store.HasQueuedTurns(ctx)
 		if err != nil {
 			return err
 		}
-		active := false
-		for _, turn := range state.Turns {
-			if turn.Status == teamstore.TurnStatusQueued || turn.Status == teamstore.TurnStatusRunning {
-				active = true
-				break
-			}
+		if hasQueued {
+			continue
 		}
-		if !active {
+		running, err := bridge.store.RunningTurnSessionIDs(ctx)
+		if err != nil {
+			return err
+		}
+		if len(running) == 0 {
 			return nil
 		}
 	}
@@ -2079,6 +2689,62 @@ func cxpPerfDrainAsyncTurns(ctx context.Context, bridge *Bridge) error {
 
 type cxpPerfExecutor struct {
 	mode cxpPerfCodexMode
+}
+
+type cxpPerfBlockingExecutor struct {
+	started     chan struct{}
+	releaseChan chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func newCXPPerfBlockingExecutor() *cxpPerfBlockingExecutor {
+	return &cxpPerfBlockingExecutor{
+		started:     make(chan struct{}),
+		releaseChan: make(chan struct{}),
+	}
+}
+
+func (e *cxpPerfBlockingExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	return e.RunInput(ctx, session, ExecutionInput{Prompt: prompt})
+}
+
+func (e *cxpPerfBlockingExecutor) RunInput(ctx context.Context, session *Session, input ExecutionInput) (ExecutionResult, error) {
+	e.startOnce.Do(func() {
+		close(e.started)
+	})
+	select {
+	case <-ctx.Done():
+		return ExecutionResult{}, ctx.Err()
+	case <-e.releaseChan:
+	}
+	sessionID := "session"
+	threadID := "perf-thread-" + sessionID
+	if session != nil {
+		sessionID = firstNonEmptyString(session.ID, sessionID)
+		threadID = firstNonEmptyString(session.CodexThreadID, "perf-thread-"+sessionID)
+	}
+	return ExecutionResult{
+		Text:             "perf codex result for " + strings.TrimSpace(input.Prompt),
+		CodexThreadID:    threadID,
+		CodexThreadTitle: "Perf Thread",
+		CodexTurnID:      "perf-codex-turn-" + shortStableID(sessionID+":"+input.Prompt),
+	}, nil
+}
+
+func (e *cxpPerfBlockingExecutor) waitStarted(tb testing.TB) {
+	tb.Helper()
+	select {
+	case <-e.started:
+	case <-time.After(5 * time.Second):
+		tb.Fatal("perf blocking executor did not start")
+	}
+}
+
+func (e *cxpPerfBlockingExecutor) release() {
+	e.releaseOnce.Do(func() {
+		close(e.releaseChan)
+	})
 }
 
 func (e cxpPerfExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
@@ -2408,6 +3074,11 @@ func cxpPerfSeedRealisticRunningTurn(tb testing.TB, store *teamstore.Store) (str
 }
 
 func cxpPerfHandleRealisticUserMessage(ctx context.Context, bridge *Bridge, index int) error {
+	chatID, msg, text := cxpPerfRealisticUserMessage(index)
+	return bridge.handleSessionMessage(ctx, chatID, msg, text)
+}
+
+func cxpPerfRealisticUserMessage(index int) (string, ChatMessage, string) {
 	chat := index % 100
 	chatID := cxpPerfChatID(chat)
 	messageID := fmt.Sprintf("realistic-live-message-%06d", index)
@@ -2419,7 +3090,7 @@ func cxpPerfHandleRealisticUserMessage(ctx context.Context, bridge *Bridge, inde
 	}
 	msg.Body.ContentType = "html"
 	msg.Body.Content = "<p>realistic user message</p>"
-	return bridge.handleSessionMessage(ctx, chatID, msg, "realistic user message")
+	return chatID, msg, "realistic user message"
 }
 
 func cxpPerfSeedState(state *teamstore.State, profile cxpPerfProfile) {
