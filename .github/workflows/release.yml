@@ -72,6 +72,12 @@ jobs:
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(EnsureProxyPreference(ServiceDefaultsToDirectWithoutPrompt|NonTerminalDefaultsToDirectWithoutPrompt|NonInteractiveUsesConfiguredProfiles|NonInteractiveResetsIncompleteStateToDirect)|TeamsCodexLauncherModelProfileWithoutSSHServiceDefaultsDirectWhenProxyUnsetCI|RunTeamsUpgradeCodexOnceSkipsIncompleteProxyPreferenceCI|RunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI|CodexInstallerCommandStdinDisabledFor(TeamsService|NonTerminal)|RunCodexInstallerDoesNotPassStdinInTeamsService|RunSystemNpmCodexUpgradeDoesNotPassStdinInTeamsService|ConfirmTeamsServiceUACPromptRejects(TeamsServiceModeWithoutReading|NonTerminalStdinWithoutBlocking)|InitProfileInteractiveRejects(TeamsServiceModeWithoutReading|NonTerminalStdinWithoutBlocking)|HistoryOpenExplicitProfileUsesProxyDespiteDisabledPreference|RunHistoryTuiExplicitProfileUsesProxyDespiteDisabledPreference)$' -v
 
+      - name: Teams Graph proxy diagnostics regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(TeamsGraphProxyLocalStatus(DoesNotProbeTeamsConnect|HonorsCancellation)|TeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams|TeamsServiceStartWarnsOnlyForRegisteredUnhealthyProxyDaemon|TeamsServiceDoctorReportsTeamsGraphProxyLocalStatus)$' -v
+
       - name: Model choice reusable credential regressions
         shell: bash
         run: |

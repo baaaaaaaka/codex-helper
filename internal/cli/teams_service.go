@@ -109,11 +109,11 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 		newTeamsServiceEnableCmd(),
 		newTeamsServiceDisableCmd(),
 		newTeamsServiceStatusCmd(),
-		newTeamsServiceStartCmd(),
+		newTeamsServiceStartCmd(root),
 		newTeamsServiceStopCmd(),
-		newTeamsServiceRestartCmd(),
+		newTeamsServiceRestartCmd(root),
 		newTeamsServiceWatchdogCmd(),
-		newTeamsServiceDoctorCmd(),
+		newTeamsServiceDoctorCmd(root),
 		newTeamsServiceLocalSupervisorCmd(),
 	)
 	return cmd
@@ -299,7 +299,7 @@ func newTeamsServiceStatusCmd() *cobra.Command {
 	}
 }
 
-func newTeamsServiceStartCmd() *cobra.Command {
+func newTeamsServiceStartCmd(root *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",
 		Short: "Start the Teams bridge service",
@@ -311,6 +311,7 @@ func newTeamsServiceStartCmd() *cobra.Command {
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
+			warnTeamsServiceProxyLocalStatus(cmd.Context(), root, cmd.OutOrStdout())
 			if scheduled, err := schedulePendingTeamsServiceActivationBeforeStart(cmd.Context(), cmd.OutOrStdout(), "start"); err != nil {
 				return err
 			} else if scheduled {
@@ -351,7 +352,7 @@ func newTeamsServiceStopCmd() *cobra.Command {
 	}
 }
 
-func newTeamsServiceRestartCmd() *cobra.Command {
+func newTeamsServiceRestartCmd(root *rootOptions) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "restart",
@@ -372,6 +373,7 @@ func newTeamsServiceRestartCmd() *cobra.Command {
 				}
 				printTeamsRecoverSummary(cmd.OutOrStdout(), summary)
 			}
+			warnTeamsServiceProxyLocalStatus(cmd.Context(), root, cmd.OutOrStdout())
 			if scheduled, err := schedulePendingTeamsServiceActivationBeforeStart(cmd.Context(), cmd.OutOrStdout(), "restart"); err != nil {
 				return err
 			} else if scheduled {
@@ -425,7 +427,7 @@ func schedulePendingTeamsServiceActivationBeforeStart(ctx context.Context, out i
 	return true, nil
 }
 
-func newTeamsServiceDoctorCmd() *cobra.Command {
+func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "Check local Teams service supervisor support",
@@ -462,6 +464,7 @@ func newTeamsServiceDoctorCmd() *cobra.Command {
 			} else {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams service auth: ok")
 			}
+			printTeamsServiceProxyLocalStatus(cmd.Context(), root, cmd.OutOrStdout())
 			if teamsServiceGOOS() == "linux" && teamsServiceIsWSL() {
 				if backend.ID() == "wsl-windows-task-scheduler" {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "WSL: detected. Teams service will use a per-user Windows Scheduled Task that launches wsl.exe, so it can survive closing the terminal without root.")

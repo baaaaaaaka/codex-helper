@@ -21,6 +21,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -3152,6 +3153,134 @@ func TestTeamsServiceStartRequiresAuthPreflight(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("service start should not reach supervisor when auth preflight fails: %#v", runner.calls)
+	}
+}
+
+func TestTeamsServiceStartWarnsOnlyForRegisteredUnhealthyProxyDaemon(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  runner,
+	})
+
+	profile := config.Profile{
+		ID:        "p1",
+		Name:      "dev",
+		Host:      "example.com",
+		Port:      22,
+		User:      "alice",
+		CreatedAt: time.Now(),
+	}
+	deadStore := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles:     []config.Profile{profile},
+		Instances: []config.Instance{{
+			ID:        "inst-dead",
+			ProfileID: profile.ID,
+			Kind:      config.InstanceKindDaemon,
+			HTTPPort:  18080,
+			DaemonPID: 0,
+		}},
+	})
+	cmd := newTeamsServiceCmd(&rootOptions{configPath: deadStore.Path()}, stringPtr(""))
+	cmd.SetArgs([]string{"start"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service start with dead proxy: %v\n%s", err, out.String())
+	}
+	if got := out.String(); !strings.Contains(got, "Teams Graph proxy warning: no locally healthy reusable SSH proxy daemon for profile \"dev\" (p1) (registered=1)") {
+		t.Fatalf("start output missing proxy warning:\n%s", got)
+	}
+
+	runner.calls = nil
+	cleanStore := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles:     []config.Profile{profile},
+	})
+	cmd = newTeamsServiceCmd(&rootOptions{configPath: cleanStore.Path()}, stringPtr(""))
+	cmd.SetArgs([]string{"start"})
+	out.Reset()
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service start without registered proxy: %v\n%s", err, out.String())
+	}
+	if got := out.String(); strings.Contains(got, "Teams Graph proxy warning") {
+		t.Fatalf("start should stay quiet when no proxy daemon is registered:\n%s", got)
+	}
+}
+
+func TestTeamsServiceDoctorReportsTeamsGraphProxyLocalStatus(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd", "user"),
+		runner:  runner,
+	})
+
+	directStore := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(false),
+	})
+	cmd := newTeamsServiceCmd(&rootOptions{configPath: directStore.Path()}, stringPtr(""))
+	cmd.SetArgs([]string{"doctor"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service doctor with direct proxy: %v\n%s", err, out.String())
+	}
+	if got := out.String(); !strings.Contains(got, "Teams Graph proxy: direct (disabled)") {
+		t.Fatalf("doctor output missing direct proxy status:\n%s", got)
+	}
+
+	profile := config.Profile{
+		ID:        "p1",
+		Name:      "dev",
+		Host:      "example.com",
+		Port:      22,
+		User:      "alice",
+		CreatedAt: time.Now(),
+	}
+	deadStore := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles:     []config.Profile{profile},
+		Instances: []config.Instance{{
+			ID:        "inst-dead",
+			ProfileID: profile.ID,
+			Kind:      config.InstanceKindDaemon,
+			HTTPPort:  18080,
+			DaemonPID: 0,
+		}},
+	})
+	cmd = newTeamsServiceCmd(&rootOptions{configPath: deadStore.Path()}, stringPtr(""))
+	cmd.SetArgs([]string{"doctor"})
+	out.Reset()
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service doctor with dead proxy: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Teams Graph proxy: SSH profile \"dev\" (p1)",
+		"Teams Graph proxy reusable daemon: registered but no locally healthy daemon (registered=1)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, got)
+		}
 	}
 }
 

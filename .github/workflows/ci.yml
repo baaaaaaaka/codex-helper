@@ -489,6 +489,12 @@ jobs:
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(ProxyReset.*|RunLikeAfterProxyResetPromptsForProxyPreference|TeamsGraphHTTPClientUsesDirectAfterProxyReset|BeaconCLIProfileUsingProxyBecomesNotReadyAfterProxyReset)$' -v
 
+      - name: Teams Graph proxy diagnostics regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(TeamsGraphProxyLocalStatus(DoesNotProbeTeamsConnect|HonorsCancellation)|TeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams|TeamsServiceStartWarnsOnlyForRegisteredUnhealthyProxyDaemon|TeamsServiceDoctorReportsTeamsGraphProxyLocalStatus)$' -v
+
       - name: Teams non-interactive stdin regressions
         shell: bash
         run: |

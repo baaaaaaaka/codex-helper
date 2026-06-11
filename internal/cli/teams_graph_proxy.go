@@ -26,6 +26,8 @@ type teamsGraphHTTPClientLease struct {
 
 var teamsGraphProxyCONNECTTarget = "graph.microsoft.com:443"
 var teamsGraphProxyRetireGrace = 2 * time.Second
+var teamsGraphProxyLocalStatusTimeout = 500 * time.Millisecond
+var teamsGraphProxyLocalStatusOverallTimeout = 2 * time.Second
 
 func (l teamsGraphHTTPClientLease) Close(ctx context.Context) error {
 	if l.close == nil {
@@ -105,7 +107,7 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 				suspects = appendTeamsGraphProxySuspect(suspects, suspect)
 			}
 		}
-		return teamsGraphHTTPClientLease{}, fmt.Errorf("start Teams Graph proxy stack: %w", err)
+		return teamsGraphHTTPClientLease{}, fmt.Errorf("start Teams Graph proxy stack: Teams service could not start the SSH proxy stack; Teams may appear silent because Graph traffic is configured to use that proxy: %w", err)
 	}
 	proxyURL := st.HTTPProxyURL()
 	client, err := newTeamsProxyHTTPClient(proxyURL)
@@ -117,6 +119,126 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 		_, _ = fmt.Fprintf(out, "Teams Graph proxy: using %s\n", proxyURL)
 	}
 	return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-stack", close: st.Close, store: store, suspectReusableProxies: suspects}, nil
+}
+
+type teamsGraphProxyLocalStatus struct {
+	Enabled           bool
+	Profile           config.Profile
+	ProfileErr        error
+	RegisteredDaemons int
+	HealthyInstance   *config.Instance
+}
+
+func loadTeamsGraphProxyLocalStatus(ctx context.Context, root *rootOptions) (teamsGraphProxyLocalStatus, error) {
+	checkCtx := ctx
+	if checkCtx == nil {
+		checkCtx = context.Background()
+	}
+	if _, ok := checkCtx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		checkCtx, cancel = context.WithTimeout(checkCtx, teamsGraphProxyLocalStatusOverallTimeout)
+		defer cancel()
+	}
+	store, _, err := newRootStore(root, "")
+	if err != nil {
+		return teamsGraphProxyLocalStatus{}, err
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return teamsGraphProxyLocalStatus{}, err
+	}
+	hc := manager.HealthClient{Timeout: teamsGraphProxyLocalStatusTimeout}
+	return teamsGraphProxyLocalStatusFromConfig(checkCtx, cfg, hc)
+}
+
+func teamsGraphProxyLocalStatusFromConfig(ctx context.Context, cfg config.Config, hc manager.HealthClient) (teamsGraphProxyLocalStatus, error) {
+	status := teamsGraphProxyLocalStatus{Enabled: teamsGraphProxyEnabled(cfg)}
+	if !status.Enabled {
+		return status, nil
+	}
+	profile, err := selectProfile(cfg, "")
+	if err != nil {
+		status.ProfileErr = err
+		return status, nil
+	}
+	status.Profile = profile
+	status.RegisteredDaemons = countTeamsGraphProxyRegisteredDaemons(cfg.Instances, profile.ID)
+	inst, err := manager.FindReusableInstanceContext(ctx, cfg.Instances, profile.ID, hc)
+	if err != nil {
+		return status, err
+	}
+	status.HealthyInstance = inst
+	return status, nil
+}
+
+func countTeamsGraphProxyRegisteredDaemons(instances []config.Instance, profileID string) int {
+	total := 0
+	for _, inst := range instances {
+		if inst.ProfileID != profileID {
+			continue
+		}
+		if inst.Kind != "" && inst.Kind != config.InstanceKindDaemon {
+			continue
+		}
+		total++
+	}
+	return total
+}
+
+func warnTeamsServiceProxyLocalStatus(ctx context.Context, root *rootOptions, out io.Writer) {
+	if out == nil {
+		return
+	}
+	status, err := loadTeamsGraphProxyLocalStatus(ctx, root)
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy warning: local proxy status unavailable: %v\n", err)
+		return
+	}
+	if !status.Enabled {
+		return
+	}
+	if status.ProfileErr != nil {
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy warning: proxy is enabled but no unambiguous SSH profile is configured: %v\n", status.ProfileErr)
+		return
+	}
+	if status.RegisteredDaemons > 0 && status.HealthyInstance == nil {
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy warning: no locally healthy reusable SSH proxy daemon for profile %s (registered=%d). The service may start a fresh proxy stack; if it stays silent, check the service log.\n", teamsGraphProxyProfileLabel(status.Profile), status.RegisteredDaemons)
+	}
+}
+
+func printTeamsServiceProxyLocalStatus(ctx context.Context, root *rootOptions, out io.Writer) {
+	if out == nil {
+		return
+	}
+	status, err := loadTeamsGraphProxyLocalStatus(ctx, root)
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy: local status unavailable (%v)\n", err)
+		return
+	}
+	if !status.Enabled {
+		_, _ = fmt.Fprintln(out, "Teams Graph proxy: direct (disabled)")
+		return
+	}
+	if status.ProfileErr != nil {
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy: enabled, profile unavailable (%v)\n", status.ProfileErr)
+		return
+	}
+	_, _ = fmt.Fprintf(out, "Teams Graph proxy: SSH profile %s\n", teamsGraphProxyProfileLabel(status.Profile))
+	switch {
+	case status.HealthyInstance != nil:
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy reusable daemon: locally healthy http://127.0.0.1:%d (id=%s registered=%d)\n", status.HealthyInstance.HTTPPort, status.HealthyInstance.ID, status.RegisteredDaemons)
+	case status.RegisteredDaemons == 0:
+		_, _ = fmt.Fprintln(out, "Teams Graph proxy reusable daemon: none registered")
+	default:
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy reusable daemon: registered but no locally healthy daemon (registered=%d)\n", status.RegisteredDaemons)
+	}
+}
+
+func teamsGraphProxyProfileLabel(profile config.Profile) string {
+	if profile.Name != "" {
+		return fmt.Sprintf("%q (%s)", profile.Name, profile.ID)
+	}
+	return fmt.Sprintf("%q", profile.ID)
 }
 
 func reusableTeamsGraphProxyLease(cfg config.Config, profileID string, hc manager.HealthClient) (teamsGraphHTTPClientLease, *config.Instance, bool, error) {

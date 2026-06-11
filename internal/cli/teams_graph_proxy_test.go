@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -270,6 +271,133 @@ func TestTeamsGraphHTTPClientSkipsReusableProxyWhenConnectProbeFails(t *testing.
 	_, err = newTeamsGraphHTTPClientLease(context.Background(), &rootOptions{configPath: store.Path()}, nil)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("newTeamsGraphHTTPClientLease error = %v, want fresh stack sentinel", err)
+	}
+}
+
+func TestTeamsGraphProxyLocalStatusDoesNotProbeTeamsConnect(t *testing.T) {
+	lockCLITestHooks(t)
+
+	instanceID := "inst-local"
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen reusable proxy health server: %v", err)
+	}
+	proxyServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			t.Fatalf("local status check must not probe Teams via CONNECT")
+		}
+		if r.URL.Path != "/_codex_proxy/health" {
+			t.Fatalf("unexpected proxy probe path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "instanceId": instanceID})
+	}))
+	proxyServer.Listener = ln
+	proxyServer.Start()
+	defer proxyServer.Close()
+	_, portText, err := net.SplitHostPort(proxyServer.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split proxy server addr: %v", err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatalf("parse proxy port: %v", err)
+	}
+
+	status, err := teamsGraphProxyLocalStatusFromConfig(context.Background(), config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles: []config.Profile{{
+			ID:        "p1",
+			Name:      "profile",
+			Host:      "example.com",
+			Port:      22,
+			User:      "alice",
+			CreatedAt: time.Now(),
+		}},
+		Instances: []config.Instance{{
+			ID:         instanceID,
+			ProfileID:  "p1",
+			Kind:       config.InstanceKindDaemon,
+			HTTPPort:   port,
+			DaemonPID:  os.Getpid(),
+			StartedAt:  time.Now(),
+			LastSeenAt: time.Now(),
+		}},
+	}, manager.HealthClient{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("teamsGraphProxyLocalStatusFromConfig: %v", err)
+	}
+	if !status.Enabled || status.Profile.ID != "p1" || status.RegisteredDaemons != 1 {
+		t.Fatalf("unexpected local status: %+v", status)
+	}
+	if status.HealthyInstance == nil || status.HealthyInstance.ID != instanceID {
+		t.Fatalf("healthy instance = %+v, want %s", status.HealthyInstance, instanceID)
+	}
+}
+
+func TestTeamsGraphProxyLocalStatusHonorsCancellation(t *testing.T) {
+	lockCLITestHooks(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := teamsGraphProxyLocalStatusFromConfig(ctx, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles: []config.Profile{{
+			ID:        "p1",
+			Name:      "profile",
+			Host:      "example.com",
+			Port:      22,
+			User:      "alice",
+			CreatedAt: time.Now(),
+		}},
+		Instances: []config.Instance{{
+			ID:        "inst-canceled",
+			ProfileID: "p1",
+			Kind:      config.InstanceKindDaemon,
+			HTTPPort:  18080,
+			DaemonPID: os.Getpid(),
+		}},
+	}, manager.HealthClient{Timeout: time.Second})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("teamsGraphProxyLocalStatusFromConfig error = %v, want context canceled", err)
+	}
+}
+
+func TestTeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams(t *testing.T) {
+	lockCLITestHooks(t)
+
+	store := newTeamsGraphProxyTestStore(t, config.Config{
+		Version:      config.CurrentVersion,
+		ProxyEnabled: boolPtr(true),
+		Profiles: []config.Profile{{
+			ID:        "p1",
+			Name:      "profile",
+			Host:      "example.com",
+			Port:      22,
+			User:      "alice",
+			CreatedAt: time.Now(),
+		}},
+	})
+	origStackStart := stackStart
+	t.Cleanup(func() { stackStart = origStackStart })
+	sentinel := errors.New("ssh auth failed")
+	stackStart = func(config.Profile, string, stack.Options) (*stack.Stack, error) {
+		return nil, sentinel
+	}
+
+	_, err := newTeamsGraphHTTPClientLease(context.Background(), &rootOptions{configPath: store.Path()}, nil)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("newTeamsGraphHTTPClientLease error = %v, want sentinel", err)
+	}
+	for _, want := range []string{
+		"start Teams Graph proxy stack",
+		"Teams service could not start the SSH proxy stack",
+		"Teams may appear silent",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error missing %q: %v", want, err)
+		}
 	}
 }
 
