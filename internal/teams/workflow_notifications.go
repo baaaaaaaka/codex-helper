@@ -490,6 +490,15 @@ func (b *Bridge) queueWorkflowNotificationFallbackMention(ctx context.Context, s
 	if err != nil || !queued {
 		return err
 	}
+	if workChatID, ok, err := b.queueWorkflowNotificationWorkChatAttentionNotice(ctx, state, event); err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow work-chat attention notice queue error: %v\n", err)
+		}
+	} else if ok {
+		if err := b.flushPendingOutboxForChat(ctx, workChatID); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow work-chat attention notice send error: %v\n", err)
+		}
+	}
 	if err := b.flushPendingOutboxForChat(ctx, workflowFallbackControlChatID(state)); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams workflow fallback send error: %v\n", err)
 	}
@@ -520,6 +529,62 @@ func (b *Bridge) queueWorkflowNotificationFallbackMentionOnly(ctx context.Contex
 		return false, err
 	}
 	return true, nil
+}
+
+func (b *Bridge) queueWorkflowNotificationWorkChatAttentionNotice(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent) (string, bool, error) {
+	if b == nil || b.store == nil || !workflowNotificationShouldMirrorAttentionToWorkChat(event) {
+		return "", false, nil
+	}
+	eventID := strings.TrimSpace(event.ID)
+	if eventID == "" {
+		return "", false, nil
+	}
+	controlChatID := workflowFallbackControlChatID(state)
+	if controlChatID == "" {
+		return "", false, nil
+	}
+	session, ok := state.Sessions[strings.TrimSpace(event.SessionID)]
+	if !ok {
+		return "", false, nil
+	}
+	workChatID := strings.TrimSpace(session.TeamsChatID)
+	if workChatID == "" || workChatID == controlChatID {
+		return "", false, nil
+	}
+	body := workflowNotificationWorkChatAttentionBody(event)
+	if strings.TrimSpace(body) == "" {
+		return "", false, nil
+	}
+	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:workflow-work-attention:" + shortStableID(eventID),
+		SessionID:   strings.TrimSpace(event.SessionID),
+		TurnID:      strings.TrimSpace(event.TurnID),
+		TeamsChatID: workChatID,
+		Kind:        "helper",
+		Body:        body,
+	})
+	if err != nil {
+		return workChatID, false, err
+	}
+	if strings.TrimSpace(queued.TeamsChatID) != "" {
+		workChatID = strings.TrimSpace(queued.TeamsChatID)
+	}
+	return workChatID, true, nil
+}
+
+func workflowNotificationShouldMirrorAttentionToWorkChat(event WorkflowNotificationEvent) bool {
+	if strings.EqualFold(strings.TrimSpace(event.Kind), "needs_attention") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(event.Title), "⚠️ Codex needs attention")
+}
+
+func workflowNotificationWorkChatAttentionBody(event WorkflowNotificationEvent) string {
+	title := strings.TrimSpace(event.Title)
+	if title == "" {
+		title = "⚠️ Codex needs attention"
+	}
+	return title + "\n\nCodex hit a problem in this work chat. Check the previous status/error message here, or open the control notification for details."
 }
 
 func workflowNotificationFallbackBody(event WorkflowNotificationEvent, reason string) string {

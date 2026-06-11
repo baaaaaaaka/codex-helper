@@ -1348,6 +1348,118 @@ func TestHelperNeedsAttentionQueuesWorkflowCardWithoutOwnerMention(t *testing.T)
 	}
 }
 
+func TestNeedsAttentionFallbackMirrorsWorkChatBeforeControlMentionWhenWorkflowNotificationDisabled(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Use control chat fallback for needs attention")
+
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:legacy-helper-attention",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "helper",
+		Body:             "helper needs attention",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("seed legacy attention outbox: %v", err)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+
+	if len(*sent) != 3 {
+		t.Fatalf("sent Teams messages = %d, want original work, mirrored work, control fallback: %#v", len(*sent), *sent)
+	}
+	if (*sent)[0].ChatID != "chat-1" || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "helper needs attention") {
+		t.Fatalf("first message should be original work-chat outbox: %#v", (*sent)[0])
+	}
+	mirror := (*sent)[1]
+	if mirror.ChatID != "chat-1" || mirror.Mentions != 0 {
+		t.Fatalf("mirrored attention message = %#v, want unmentioned work-chat helper message", mirror)
+	}
+	mirrorPlain := PlainTextFromTeamsHTML(mirror.Content)
+	for _, want := range []string{"⚠️ Codex needs attention", "previous status/error message"} {
+		if !strings.Contains(mirrorPlain, want) {
+			t.Fatalf("mirrored work-chat notice missing %q:\n%s", want, mirrorPlain)
+		}
+	}
+	control := (*sent)[2]
+	if control.ChatID != "control-chat" || control.Mentions == 0 {
+		t.Fatalf("control fallback = %#v, want owner mention in control chat", control)
+	}
+	if plain := PlainTextFromTeamsHTML(control.Content); !strings.Contains(plain, "⚠️ Codex needs attention") || !strings.Contains(plain, "Open chat") {
+		t.Fatalf("control fallback body mismatch:\n%s", plain)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	mirrorID := "outbox:workflow-work-attention:" + shortStableID("workflow:"+shortStableID(queued.ID))
+	mirroredOutbox := state.OutboxMessages[mirrorID]
+	if mirroredOutbox.ID == "" {
+		t.Fatalf("mirrored work-chat outbox %q was not stored", mirrorID)
+	}
+	if mirroredOutbox.MentionOwner || mirroredOutbox.NotificationKind != "" || mirroredOutbox.Kind != "helper" {
+		t.Fatalf("mirrored outbox metadata = %#v, want plain helper outbox without notification recursion", mirroredOutbox)
+	}
+}
+
+func TestNeedsAttentionFallbackWorkChatMirrorIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Deduplicate fallback needs-attention mirror")
+
+	outbox := workflowNotificationTestOutbox("outbox-interrupted-after-restart", "interrupted-after-restart", "needs_attention")
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+
+	if got := countSentPlainContainingForChat(*sent, "chat-1", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("work-chat mirrored attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("control fallback attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+}
+
+func TestNeedsAttentionFallbackDoesNotMirrorWorkChatWithoutControlFallback(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "No control fallback for needs attention")
+	bridge.reg.ControlChatID = ""
+	bridge.reg.ControlChatURL = ""
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{}
+		return nil
+	}); err != nil {
+		t.Fatalf("clear control chat: %v", err)
+	}
+
+	outbox := workflowNotificationTestOutbox("outbox-attention-without-control", "interrupted-after-restart", "needs_attention")
+	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+
+	if len(*sent) != 0 {
+		t.Fatalf("sent fallback messages = %#v, want none without control fallback", *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	mirrorID := "outbox:workflow-work-attention:" + shortStableID("workflow:"+shortStableID(outbox.ID))
+	if mirrored := state.OutboxMessages[mirrorID]; mirrored.ID != "" {
+		t.Fatalf("mirrored work-chat outbox = %#v, want none without control fallback", mirrored)
+	}
+}
+
 func TestQueueOutboxRedirectsOwnerMentionToControlFallbackWhenWorkflowNotificationDisabled(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
