@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const sessionPreviewFilterVersion = "status-answer-v1"
+const sessionPreviewFilterVersion = "status-answer-v2"
 const sessionPreviewPrefixHashBytes int64 = 64 * 1024
 
 type persistentSessionPreviewCache struct {
@@ -23,14 +23,15 @@ type persistentSessionPreviewCache struct {
 }
 
 type persistentSessionPreviewEntry struct {
-	FileCacheKey   fileCacheKey                      `json:"fileCacheKey"`
-	FilterVersion  string                            `json:"filterVersion"`
-	Offset         int64                             `json:"offset"`
-	PrefixTailHash string                            `json:"prefixTailHash,omitempty"`
-	PrefixTailSize int64                             `json:"prefixTailSize,omitempty"`
-	Messages       []persistentSessionPreviewMessage `json:"messages"`
-	FormattedText  string                            `json:"formattedText,omitempty"`
-	SeenSourceIDs  []string                          `json:"seenSourceIds,omitempty"`
+	FileCacheKey         fileCacheKey                              `json:"fileCacheKey"`
+	FilterVersion        string                                    `json:"filterVersion"`
+	Offset               int64                                     `json:"offset"`
+	PrefixTailHash       string                                    `json:"prefixTailHash,omitempty"`
+	PrefixTailSize       int64                                     `json:"prefixTailSize,omitempty"`
+	Messages             []persistentSessionPreviewMessage         `json:"messages"`
+	FormattedText        string                                    `json:"formattedText,omitempty"`
+	SeenSourceIDs        []string                                  `json:"seenSourceIds,omitempty"`
+	SeenFallbackMessages []persistentSessionPreviewFallbackMessage `json:"seenFallbackMessages,omitempty"`
 }
 
 type persistentSessionPreviewMessage struct {
@@ -38,6 +39,11 @@ type persistentSessionPreviewMessage struct {
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp,omitempty"`
 	SourceID  string    `json:"sourceId,omitempty"`
+}
+
+type persistentSessionPreviewFallbackMessage struct {
+	Key       string    `json:"key"`
+	Timestamp time.Time `json:"timestamp,omitempty"`
 }
 
 type sessionPreviewPersistentState struct {
@@ -104,7 +110,7 @@ func readSessionPreviewCacheValue(filePath string, wantMessages bool) ([]Message
 				return readSessionPreviewUncached(filePath)
 			}
 			if completeOffset >= entry.Offset {
-				seen := persistentSessionPreviewSeenSet(entry)
+				seen := persistentSessionPreviewSeenState(entry)
 				tail, err := readSessionMessagesWindow(filePath, entry.Offset, completeOffset-entry.Offset, 0, isPreviewMessage, seen)
 				if err != nil {
 					return nil, "", err
@@ -131,7 +137,7 @@ func readSessionPreviewCacheValue(filePath string, wantMessages bool) ([]Message
 		return nil, "", err
 	}
 	text := FormatPreviewMessages(messages, 0)
-	seen := seenSourceIDsFromMessages(messages)
+	seen := seenStateFromMessages(messages)
 	_ = writePersistentSessionPreviewEntry(cachePath, filePath, info, completeOffset, messages, text, seen)
 	return messages, text, nil
 }
@@ -182,15 +188,16 @@ func loadSessionPreviewPersistentState(cachePath string) (persistentSessionPrevi
 	return cache, nil
 }
 
-func writePersistentSessionPreviewEntry(cachePath string, filePath string, info os.FileInfo, offset int64, messages []Message, text string, seen map[string]bool) error {
+func writePersistentSessionPreviewEntry(cachePath string, filePath string, info os.FileInfo, offset int64, messages []Message, text string, seen *messageSeenState) error {
 	cleanPath := filepath.Clean(filePath)
 	entry := persistentSessionPreviewEntry{
-		FileCacheKey:  newFileCacheKey(filePath, info),
-		FilterVersion: sessionPreviewFilterVersion,
-		Offset:        offset,
-		Messages:      persistentMessagesFromSessionPreview(messages),
-		FormattedText: text,
-		SeenSourceIDs: seenSourceIDsFromSet(seen),
+		FileCacheKey:         newFileCacheKey(filePath, info),
+		FilterVersion:        sessionPreviewFilterVersion,
+		Offset:               offset,
+		Messages:             persistentMessagesFromSessionPreview(messages),
+		FormattedText:        text,
+		SeenSourceIDs:        seenSourceIDsFromMessages(messages),
+		SeenFallbackMessages: seenFallbackMessagesFromState(seen),
 	}
 	entry.PrefixTailHash, entry.PrefixTailSize, _ = sessionPreviewPrefixTailHash(filePath, entry.Offset)
 	return updatePersistentSessionPreviewCache(cachePath, func(cache *persistentSessionPreviewCache) {
@@ -380,41 +387,69 @@ func messagesFromPersistentSessionPreview(messages []persistentSessionPreviewMes
 	return out
 }
 
-func persistentSessionPreviewSeenSet(entry persistentSessionPreviewEntry) map[string]bool {
-	seen := map[string]bool{}
+func persistentSessionPreviewSeenState(entry persistentSessionPreviewEntry) *messageSeenState {
+	seen := newMessageSeenState()
+	for _, msg := range entry.Messages {
+		rememberMessageSeen(Message{
+			Role:      msg.Role,
+			Content:   msg.Content,
+			Timestamp: msg.Timestamp,
+			sourceID:  msg.SourceID,
+		}, seen)
+	}
 	for _, id := range entry.SeenSourceIDs {
-		if id != "" {
-			seen[id] = true
+		if key := sourceMessageDedupKey(id); key != "" {
+			seen.sourceKeys[key] = true
 		}
 	}
-	if len(seen) == 0 {
-		for _, msg := range entry.Messages {
-			if msg.SourceID != "" {
-				seen[msg.SourceID] = true
+	for _, msg := range entry.SeenFallbackMessages {
+		if msg.Key != "" && !msg.Timestamp.IsZero() {
+			if previous, ok := seen.fallbackTimes[msg.Key]; !ok || msg.Timestamp.After(previous) {
+				seen.fallbackTimes[msg.Key] = msg.Timestamp
 			}
 		}
 	}
 	return seen
 }
 
-func seenSourceIDsFromMessages(messages []Message) map[string]bool {
+func seenSourceIDsFromMessages(messages []Message) []string {
 	seen := map[string]bool{}
 	for _, msg := range messages {
 		if msg.sourceID != "" {
 			seen[msg.sourceID] = true
 		}
 	}
-	return seen
-}
-
-func seenSourceIDsFromSet(seen map[string]bool) []string {
-	if len(seen) == 0 {
-		return nil
-	}
 	out := make([]string, 0, len(seen))
 	for id := range seen {
 		out = append(out, id)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func seenStateFromMessages(messages []Message) *messageSeenState {
+	seen := newMessageSeenState()
+	for _, msg := range messages {
+		rememberMessageSeen(msg, seen)
+	}
+	return seen
+}
+
+func seenFallbackMessagesFromState(seen *messageSeenState) []persistentSessionPreviewFallbackMessage {
+	if seen == nil || len(seen.fallbackTimes) == 0 {
+		return nil
+	}
+	out := make([]persistentSessionPreviewFallbackMessage, 0, len(seen.fallbackTimes))
+	for key, ts := range seen.fallbackTimes {
+		if key != "" && !ts.IsZero() {
+			out = append(out, persistentSessionPreviewFallbackMessage{Key: key, Timestamp: ts})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key == out[j].Key {
+			return out[i].Timestamp.Before(out[j].Timestamp)
+		}
+		return out[i].Key < out[j].Key
+	})
 	return out
 }

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -794,6 +795,84 @@ func TestReadSessionPreviewMessagesFiltersToCodexStatusAndAnswer(t *testing.T) {
 	}
 }
 
+func TestReadSessionPreviewMessagesDeduplicatesMirroredCodexEvents(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"working"}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"done"}}`,
+		`{"timestamp":"2026-01-01T00:00:01.004Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-mirrored.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want mirrored status and answer deduplicated", msgs)
+	}
+	want := []struct {
+		role string
+		text string
+	}{
+		{"assistant_commentary", "working"},
+		{"assistant", "done"},
+	}
+	for i := range want {
+		if msgs[i].Role != want[i].role || msgs[i].Content != want[i].text {
+			t.Fatalf("msg[%d] = %#v, want role=%q text=%q", i, msgs[i], want[i].role, want[i].text)
+		}
+	}
+}
+
+func TestReadSessionPreviewMessagesKeepsRepeatedTextAtDifferentTimestamps(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"still running"}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"still running"}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-repeated-text.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want repeated text at different timestamps preserved", msgs)
+	}
+}
+
+func TestReadSessionPreviewMessagesFallbackDedupUsesLastKeptMessage(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"still running"}}`,
+		`{"timestamp":"2026-01-01T00:00:00.050Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"still running"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00.101Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"still running"}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-repeat-after-mirror.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want mirror dropped but later repeated status preserved", msgs)
+	}
+	if !msgs[0].Timestamp.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("first timestamp = %s, want first event", msgs[0].Timestamp.Format(time.RFC3339Nano))
+	}
+	if !msgs[1].Timestamp.Equal(time.Date(2026, 1, 1, 0, 0, 0, int(101*time.Millisecond), time.UTC)) {
+		t.Fatalf("second timestamp = %s, want later repeated event", msgs[1].Timestamp.Format(time.RFC3339Nano))
+	}
+}
+
 func TestReadSessionPreviewMessagesParsesTurnFailedMethodRetryStatus(t *testing.T) {
 	lines := []string{
 		`{"timestamp":"2026-01-01T00:00:00Z","method":"turn/failed","params":{"turnId":"turn-1","willRetry":true}}`,
@@ -988,6 +1067,65 @@ func TestReadSessionPreviewTextUsesFormattedCacheAndAppendsTail(t *testing.T) {
 	}
 	if writes != 2 {
 		t.Fatalf("cache writes after append = %d, want 2", writes)
+	}
+}
+
+func TestReadSessionPreviewTextAppendDeduplicatesMirroredMessage(t *testing.T) {
+	setTestUserCacheDir(t)
+	f := filepath.Join(t.TempDir(), "preview-text-cache-mirror.jsonl")
+	initial := `{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"working"}}` + "\n"
+	if err := os.WriteFile(f, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := ReadSessionPreviewText(f, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewText initial: %v", err)
+	}
+	if strings.Count(first, "working") != 1 {
+		t.Fatalf("initial text = %q, want one status", first)
+	}
+
+	file, err := os.OpenFile(f, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	mirror := `{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}` + "\n"
+	if _, err := file.WriteString(mirror); err != nil {
+		_ = file.Close()
+		t.Fatalf("append: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close append: %v", err)
+	}
+
+	second, err := ReadSessionPreviewText(f, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewText append: %v", err)
+	}
+	if strings.Count(second, "working") != 1 {
+		t.Fatalf("appended text = %q, want mirrored message deduplicated", second)
+	}
+
+	file, err = os.OpenFile(f, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open second append: %v", err)
+	}
+	repeated := `{"timestamp":"2026-01-01T00:00:00.101Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"working"}}` + "\n"
+	if _, err := file.WriteString(repeated); err != nil {
+		_ = file.Close()
+		t.Fatalf("second append: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close second append: %v", err)
+	}
+
+	third, err := ReadSessionPreviewText(f, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewText second append: %v", err)
+	}
+	if strings.Count(third, "working") != 2 {
+		t.Fatalf("second appended text = %q, want later repeated message preserved", third)
 	}
 }
 
@@ -1265,6 +1403,24 @@ func TestReadSessionMessages_SystemInjectedSkipped(t *testing.T) {
 	}
 	if msgs[0].Content != "real question" {
 		t.Errorf("content = %q", msgs[0].Content)
+	}
+}
+
+func TestReadSessionMessagesKeepsRepeatedUserFallbackMessages(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"repeat prompt"}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"repeat prompt"}]}}`,
+	}
+	f := filepath.Join(t.TempDir(), "repeat-user-fallback.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := ReadSessionMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want repeated user text preserved", msgs)
 	}
 }
 

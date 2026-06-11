@@ -3,6 +3,8 @@ package codexhistory
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
@@ -18,6 +20,20 @@ type Message struct {
 }
 
 var sessionPreviewTailInitialBytes int64 = 256 * 1024
+
+const fallbackMessageDedupWindow = 100 * time.Millisecond
+
+type messageSeenState struct {
+	sourceKeys    map[string]bool
+	fallbackTimes map[string]time.Time
+}
+
+func newMessageSeenState() *messageSeenState {
+	return &messageSeenState{
+		sourceKeys:    map[string]bool{},
+		fallbackTimes: map[string]time.Time{},
+	}
+}
 
 func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
 	return readSessionMessages(filePath, maxMessages, nil)
@@ -50,7 +66,7 @@ func readSessionMessages(filePath string, maxMessages int, keep func(Message) bo
 
 	var ring []Message
 	reader := bufio.NewReaderSize(f, 64*1024)
-	seenSourceIDs := map[string]bool{}
+	seenMessages := newMessageSeenState()
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil && err != io.EOF {
@@ -62,11 +78,8 @@ func readSessionMessages(filePath string, maxMessages int, keep func(Message) bo
 				if keep != nil && !keep(msg) {
 					continue
 				}
-				if msg.sourceID != "" {
-					if seenSourceIDs[msg.sourceID] {
-						continue
-					}
-					seenSourceIDs[msg.sourceID] = true
+				if !markMessageSeen(msg, seenMessages) {
+					continue
 				}
 				appendMessage(&ring, msg, maxMessages)
 			}
@@ -117,7 +130,7 @@ func readRecentSessionMessages(filePath string, maxMessages int, keep func(Messa
 	}
 }
 
-func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMessages int, keep func(Message) bool, seenSourceIDs ...map[string]bool) ([]Message, error) {
+func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMessages int, keep func(Message) bool, seenStates ...*messageSeenState) ([]Message, error) {
 	if size <= 0 {
 		return nil, nil
 	}
@@ -150,9 +163,9 @@ func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMes
 	}
 
 	var ring []Message
-	seen := map[string]bool{}
-	if len(seenSourceIDs) > 0 && seenSourceIDs[0] != nil {
-		seen = seenSourceIDs[0]
+	seen := newMessageSeenState()
+	if len(seenStates) > 0 && seenStates[0] != nil {
+		seen = seenStates[0]
 	}
 	for len(buf) > 0 {
 		line := buf
@@ -170,16 +183,89 @@ func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMes
 			if keep != nil && !keep(msg) {
 				continue
 			}
-			if msg.sourceID != "" {
-				if seen[msg.sourceID] {
-					continue
-				}
-				seen[msg.sourceID] = true
+			if !markMessageSeen(msg, seen) {
+				continue
 			}
 			appendMessage(&ring, msg, maxMessages)
 		}
 	}
 	return ring, nil
+}
+
+func markMessageSeen(msg Message, seen *messageSeenState) bool {
+	if seen == nil {
+		return true
+	}
+	if key := sourceMessageDedupKey(msg.sourceID); key != "" {
+		if seen.sourceKeys[key] {
+			return false
+		}
+		seen.sourceKeys[key] = true
+		return true
+	}
+	key := fallbackMessageDedupKey(msg)
+	if key == "" {
+		return true
+	}
+	if previous, ok := seen.fallbackTimes[key]; ok && withinMessageDedupWindow(previous, msg.Timestamp) {
+		return false
+	}
+	seen.fallbackTimes[key] = msg.Timestamp
+	return true
+}
+
+func rememberMessageSeen(msg Message, seen *messageSeenState) {
+	if seen == nil {
+		return
+	}
+	if key := sourceMessageDedupKey(msg.sourceID); key != "" {
+		seen.sourceKeys[key] = true
+		return
+	}
+	key := fallbackMessageDedupKey(msg)
+	if key == "" {
+		return
+	}
+	if previous, ok := seen.fallbackTimes[key]; !ok || msg.Timestamp.After(previous) {
+		seen.fallbackTimes[key] = msg.Timestamp
+	}
+}
+
+func fallbackMessageDedupKey(msg Message) string {
+	if msg.Timestamp.IsZero() {
+		return ""
+	}
+	role := strings.TrimSpace(msg.Role)
+	content := strings.TrimSpace(msg.Content)
+	if role == "" || content == "" {
+		return ""
+	}
+	switch role {
+	case "assistant", "assistant_commentary":
+	default:
+		return ""
+	}
+	sum := sha256.Sum256([]byte(content))
+	return "fallback:" + role + ":" + hex.EncodeToString(sum[:])
+}
+
+func withinMessageDedupWindow(left time.Time, right time.Time) bool {
+	if left.IsZero() || right.IsZero() {
+		return false
+	}
+	delta := right.Sub(left)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= fallbackMessageDedupWindow
+}
+
+func sourceMessageDedupKey(sourceID string) string {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return ""
+	}
+	return "source:" + sourceID
 }
 
 func isPreviewMessage(msg Message) bool {

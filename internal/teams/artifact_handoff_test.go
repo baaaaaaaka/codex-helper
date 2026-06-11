@@ -92,6 +92,8 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Teams helper safety:",
+		"The current Teams request is the `User message` section above.",
+		"Treat earlier Teams requests in resumed Codex history as completed context",
 		"Do not restart, reload, kill, replace, or background the Teams helper",
 		"`helper reload now`",
 		"`helper restart now`",

@@ -102,7 +102,7 @@ type previewEvent struct {
 	err      error
 }
 
-const previewFilterVersion = "status-answer-v1"
+const previewFilterVersion = "status-answer-v2"
 
 type previewCacheMeta struct {
 	path          string

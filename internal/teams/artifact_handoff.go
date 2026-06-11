@@ -32,6 +32,7 @@ func TeamsCodexPrompt(prompt string) string {
 	safety := strings.TrimSpace(`
 Teams helper safety:
 - You are running inside a Codex turn launched by the Teams helper.
+- The current Teams request is the ` + "`User message`" + ` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
 - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
 - If a helper restart or reload is needed, finish the answer and tell the user to send ` + "`helper reload now`" + ` or ` + "`helper restart now`" + ` in the Teams control chat.`)
 	instructions := strings.TrimSpace(`
