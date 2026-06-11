@@ -874,7 +874,39 @@ func validateSQLiteRequiredTables(db *sql.DB) error {
 	return nil
 }
 
+func sqliteTableExists(db *sql.DB, table string) (bool, error) {
+	table = strings.TrimSpace(table)
+	if table == "" {
+		return false, nil
+	}
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return name != "", nil
+}
+
+func sqliteChatSequencesEmpty(db *sql.DB) (bool, error) {
+	var one int
+	err := db.QueryRow(`SELECT 1 FROM chat_sequences LIMIT 1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func ensureSQLiteSchema(db *sql.DB) error {
+	chatSequencesExisted, err := sqliteTableExists(db, "chat_sequences")
+	if err != nil {
+		return err
+	}
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, json BLOB NOT NULL)`,
@@ -893,6 +925,7 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS message_provenance (id TEXT PRIMARY KEY, teams_chat_id TEXT, teams_message_id TEXT, origin TEXT, session_id TEXT, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS message_provenance_lookup_idx ON message_provenance(teams_chat_id, teams_message_id, origin)`,
 		`CREATE TABLE IF NOT EXISTS chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, poll_state TEXT, last_activity_at INTEGER, park_notice_sent_at INTEGER, parked_skip_eligible INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS chat_sequences (chat_id TEXT PRIMARY KEY, next_sequence INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS chat_rate_limits (chat_id TEXT PRIMARY KEY, blocked_until INTEGER, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS import_checkpoints (id TEXT PRIMARY KEY, session_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS import_checkpoints_session_idx ON import_checkpoints(session_id, status, updated_at, id)`,
@@ -936,6 +969,19 @@ func ensureSQLiteSchema(db *sql.DB) error {
 	if err := backfillSQLiteInboundDerivedColumns(db); err != nil {
 		return err
 	}
+	shouldBackfillChatSequences := !chatSequencesExisted
+	if !shouldBackfillChatSequences {
+		chatSequencesEmpty, err := sqliteChatSequencesEmpty(db)
+		if err != nil {
+			return err
+		}
+		shouldBackfillChatSequences = chatSequencesEmpty
+	}
+	if shouldBackfillChatSequences {
+		if err := backfillSQLiteChatSequences(db); err != nil {
+			return err
+		}
+	}
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS inbound_session_created_idx ON inbound_events(session_id, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS inbound_session_received_idx ON inbound_events(session_id, received_at, id) WHERE received_at > 0`,
@@ -963,6 +1009,7 @@ func coldSQLiteState(state State) State {
 	cold.OutboxMessages = nil
 	cold.MessageProvenance = nil
 	cold.ChatPolls = nil
+	cold.ChatSequences = nil
 	cold.ChatRateLimits = nil
 	cold.TranscriptLedger = nil
 	cold.TranscriptDeliveries = nil
@@ -980,7 +1027,7 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"state_meta", "runtime_state", "sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "chat_polls", "chat_rate_limits", "import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications"} {
+	for _, table := range []string{"state_meta", "runtime_state", "sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "chat_polls", "chat_sequences", "chat_rate_limits", "import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			return err
 		}
@@ -1022,6 +1069,11 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	}
 	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_polls(chat_id, next_poll_at, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, state.ChatPolls, func(v ChatPollState) []any {
 		return []any{v.ChatID, sqliteTime(v.NextPollAt), v.PollState, sqliteTime(v.LastActivityAt), sqliteTime(v.ParkNoticeSentAt), sqliteBool(chatPollParkedSkipEligible(v)), sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_sequences(chat_id, next_sequence, updated_at, json) VALUES (?, ?, ?, ?)`, state.ChatSequences, func(v ChatSequenceState) []any {
+		return []any{v.ChatID, v.Next, sqliteTime(v.UpdatedAt)}
 	}); err != nil {
 		return err
 	}
@@ -1156,6 +1208,50 @@ func backfillSQLiteInboundDerivedColumns(db *sql.DB) error {
 SET received_at = COALESCE(CAST(strftime('%s', json_extract(json, '$.received_at')) AS INTEGER) * 1000000000, 0)
 WHERE received_at IS NULL`)
 	return err
+}
+
+func backfillSQLiteChatSequences(db *sql.DB) error {
+	var raw []byte
+	if err := db.QueryRow(`SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	state, err := loadStateData(raw)
+	if err != nil {
+		return err
+	}
+	if len(state.ChatSequences) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO chat_sequences(chat_id, next_sequence, updated_at, json) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, seq := range state.ChatSequences {
+		seq.ChatID = strings.TrimSpace(seq.ChatID)
+		if seq.ChatID == "" {
+			continue
+		}
+		data, err := json.Marshal(seq)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(seq.ChatID, seq.Next, sqliteTime(seq.UpdatedAt), data); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
@@ -1423,7 +1519,22 @@ LIMIT ?`, sqliteTime(idleBefore), sqliteTime(idleBefore), string(SessionStatusAc
 
 func loadSQLiteColdState(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }) (State, error) {
+	return loadSQLiteColdStateWithChatSequences(ctx, q, true)
+}
+
+func loadSQLiteColdStateWithoutChatSequences(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (State, error) {
+	return loadSQLiteColdStateWithChatSequences(ctx, q, false)
+}
+
+func loadSQLiteColdStateWithChatSequences(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, includeChatSequences bool) (State, error) {
 	var raw []byte
 	if err := q.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1439,11 +1550,19 @@ func loadSQLiteColdState(ctx context.Context, q interface {
 		return State{}, err
 	}
 	state.ensure(time.Time{})
+	state.ChatSequences = map[string]ChatSequenceState{}
+	if includeChatSequences {
+		if err := loadSQLiteJSONMap(ctx, q, `SELECT json FROM chat_sequences`, state.ChatSequences, func(v ChatSequenceState) string { return v.ChatID }); err != nil {
+			return State{}, err
+		}
+	}
 	return state, nil
 }
 
-func loadSQLiteJSONMap[T any](ctx context.Context, db *sql.DB, query string, out map[string]T, key func(T) string, args ...any) error {
-	rows, err := db.QueryContext(ctx, query, args...)
+func loadSQLiteJSONMap[T any](ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, query string, out map[string]T, key func(T) string, args ...any) error {
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -1518,6 +1637,9 @@ func loadSQLiteJSONRow[T any](ctx context.Context, q interface {
 
 func saveSQLiteColdStateTx(ctx context.Context, tx *sql.Tx, state State) error {
 	if err := upsertSQLiteSplitStateTx(ctx, tx, state); err != nil {
+		return err
+	}
+	if err := replaceSQLiteChatSequencesTx(ctx, tx, state.ChatSequences); err != nil {
 		return err
 	}
 	cold, err := json.Marshal(coldSQLiteState(state))
@@ -1977,6 +2099,84 @@ ON CONFLICT(chat_id) DO UPDATE SET next_poll_at = excluded.next_poll_at, poll_st
 	return err
 }
 
+func upsertSQLiteChatSequenceTx(ctx context.Context, tx *sql.Tx, v ChatSequenceState) error {
+	v.ChatID = strings.TrimSpace(v.ChatID)
+	if v.ChatID == "" {
+		return fmt.Errorf("chat sequence chat id is required")
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO chat_sequences(chat_id, next_sequence, updated_at, json) VALUES (?, ?, ?, ?)
+ON CONFLICT(chat_id) DO UPDATE SET next_sequence = excluded.next_sequence, updated_at = excluded.updated_at, json = excluded.json`,
+		v.ChatID, v.Next, sqliteTime(v.UpdatedAt), data)
+	return err
+}
+
+func replaceSQLiteChatSequencesTx(ctx context.Context, tx *sql.Tx, values map[string]ChatSequenceState) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chat_sequences`); err != nil {
+		return err
+	}
+	for _, seq := range values {
+		if strings.TrimSpace(seq.ChatID) == "" {
+			continue
+		}
+		if err := upsertSQLiteChatSequenceTx(ctx, tx, seq); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func allocateSQLiteChatSequenceTx(ctx context.Context, tx *sql.Tx, state *State, chatID string, now time.Time) (int64, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return 0, fmt.Errorf("Teams chat id is required")
+	}
+	state.ensure(time.Time{})
+	seq, ok, err := loadSQLiteJSONRow[ChatSequenceState](ctx, tx, `SELECT json FROM chat_sequences WHERE chat_id = ?`, chatID)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		seq = state.ChatSequences[chatID]
+	}
+	if seq.ChatID == "" {
+		seq.ChatID = chatID
+	}
+	if !ok || seq.Next <= 0 {
+		nextFromOutbox, err := nextSQLiteOutboxSequenceFromMessagesTx(ctx, tx, chatID)
+		if err != nil {
+			return 0, err
+		}
+		if seq.Next <= 0 || nextFromOutbox > seq.Next {
+			seq.Next = nextFromOutbox
+		}
+	}
+	value := seq.Next
+	seq.Next++
+	if !now.IsZero() {
+		seq.UpdatedAt = now
+	}
+	if err := upsertSQLiteChatSequenceTx(ctx, tx, seq); err != nil {
+		return 0, err
+	}
+	state.ChatSequences[chatID] = seq
+	return value, nil
+}
+
+func nextSQLiteOutboxSequenceFromMessagesTx(ctx context.Context, tx *sql.Tx, chatID string) (int64, error) {
+	var maxSequence sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(sequence) FROM outbox_messages WHERE teams_chat_id = ?`, chatID).Scan(&maxSequence); err != nil {
+		return 0, err
+	}
+	if maxSequence.Valid && maxSequence.Int64 >= 1 {
+		return maxSequence.Int64 + 1, nil
+	}
+	return 1, nil
+}
+
 func upsertSQLiteChatRateLimitTx(ctx context.Context, tx *sql.Tx, v ChatRateLimitState) error {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -2389,6 +2589,81 @@ func (s *Store) updateNotificationSQLite(ctx context.Context, id string, fn func
 		out = next
 		changed = true
 		return tx.Commit()
+	})
+	return out, changed, handled, err
+}
+
+func (s *Store) bindSessionCodexThreadSQLite(ctx context.Context, sessionID string, turnID string, threadID string) (SessionContext, bool, bool, error) {
+	var out SessionContext
+	changed := false
+	handled := false
+	err := s.withSessionLock(ctx, sessionID, func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, sessionID)
+			if err != nil {
+				return err
+			}
+			handled = true
+			if !ok || session.ID == "" {
+				return fmt.Errorf("session %q not found", sessionID)
+			}
+			if existing := strings.TrimSpace(session.CodexThreadID); existing != "" && existing != threadID {
+				return CodexThreadBindingConflictError{SessionID: sessionID, Existing: existing, Observed: threadID}
+			}
+			var turn Turn
+			turnOK := false
+			if turnID != "" {
+				loaded, ok, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID)
+				if err != nil {
+					return err
+				}
+				if ok && strings.TrimSpace(loaded.SessionID) == sessionID {
+					if existing := strings.TrimSpace(loaded.CodexThreadID); existing != "" && existing != threadID {
+						return CodexThreadBindingConflictError{SessionID: sessionID, Existing: existing, Observed: threadID}
+					}
+					turn = loaded
+					turnOK = true
+				}
+			}
+			sessionNeedsUpdate := strings.TrimSpace(session.CodexThreadID) != threadID
+			turnNeedsUpdate := turnOK && strings.TrimSpace(turn.CodexThreadID) != threadID
+			out = session
+			if !sessionNeedsUpdate && !turnNeedsUpdate {
+				return tx.Commit()
+			}
+			now := time.Now()
+			session.CodexThreadID = threadID
+			session.UpdatedAt = now
+			if err := upsertSQLiteSessionTx(ctx, tx, session); err != nil {
+				return err
+			}
+			if turnNeedsUpdate {
+				turn.CodexThreadID = threadID
+				turn.UpdatedAt = now
+				if err := upsertSQLiteTurnTx(ctx, tx, turn); err != nil {
+					return err
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			out = session
+			changed = true
+			return nil
+		})
 	})
 	return out, changed, handled, err
 }
@@ -3290,7 +3565,7 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 				return err
 			}
 			defer tx.Rollback()
-			state, err := loadSQLiteColdState(ctx, tx)
+			state, err := loadSQLiteColdStateWithoutChatSequences(ctx, tx)
 			if err != nil {
 				return err
 			}
@@ -3345,7 +3620,7 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 				}
 			}
 			if includeOutbox {
-				if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
+				if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
 					return err
 				}
 			}
@@ -3411,6 +3686,17 @@ func (s *Store) queueOutboxSQLite(ctx context.Context, msg OutboxMessage) (Outbo
 				}
 			}
 			now := time.Now()
+			msg.TeamsChatID = strings.TrimSpace(msg.TeamsChatID)
+			if msg.TeamsChatID == "" {
+				return fmt.Errorf("Teams chat id is required")
+			}
+			if msg.Sequence <= 0 {
+				sequence, err := allocateSQLiteChatSequenceTx(ctx, tx, &state, msg.TeamsChatID, now)
+				if err != nil {
+					return err
+				}
+				msg.Sequence = sequence
+			}
 			out, created, err = queueOutboxLocked(&state, msg, now)
 			if err != nil {
 				return err
@@ -3422,7 +3708,7 @@ func (s *Store) queueOutboxSQLite(ctx context.Context, msg OutboxMessage) (Outbo
 			if err := upsertSQLiteOutboxTx(ctx, tx, out); err != nil {
 				return err
 			}
-			if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
+			if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
 				return err
 			}
 			return tx.Commit()

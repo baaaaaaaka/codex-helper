@@ -15083,6 +15083,7 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") || len(transcript.Records) == 0 {
 		return 0, nil
 	}
+	finalCheckpointKey, finalCheckpointLine, finalCheckpointOffset, hasFinalCheckpoint := activeTurnTranscriptFinalCheckpoint(transcript.Records)
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	teamsOriginDisplays := teamsOriginDisplayTexts(state, session.ID)
 	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
@@ -15092,8 +15093,14 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		record.SourceLine = checkpointLine
 		record.SourceOffset = checkpointOffset
-		if record.Kind == TranscriptKindAssistant || transcriptRecordIsTerminal(record) {
-			break
+		if transcriptRecordIsFinalCheckpoint(record) {
+			if hasFinalCheckpoint {
+				return queued, b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, local.FilePath, finalCheckpointKey, finalCheckpointLine, finalCheckpointOffset, checkpointID)
+			}
+			return queued, nil
+		}
+		if hasFinalCheckpoint && record.Kind == TranscriptKindStatus {
+			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
 		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
@@ -15124,6 +15131,27 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 		}
 	}
 	return queued, nil
+}
+
+func activeTurnTranscriptFinalCheckpoint(records []TranscriptRecord) (string, int, int64, bool) {
+	for i, record := range records {
+		if !transcriptRecordIsFinalCheckpoint(record) {
+			continue
+		}
+		key := transcriptRecordCheckpointKey(record)
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		line, offset := transcriptCheckpointPositionForRecord(records, i)
+		return key, line, offset, true
+	}
+	return "", 0, 0, false
+}
+
+func transcriptRecordIsFinalCheckpoint(record TranscriptRecord) bool {
+	return record.Kind == TranscriptKindAssistant ||
+		strings.EqualFold(strings.TrimSpace(record.Phase), "final_answer") ||
+		transcriptRecordIsTerminal(record)
 }
 
 func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, sessionID string, turnID string, chatID string, expectedThreadID string, maxRecords int) (int, error) {
@@ -17708,9 +17736,12 @@ func (b *Bridge) clearControlDashboardView(ctx context.Context) error {
 	if chatID == "" {
 		return nil
 	}
-	return b.store.Update(ctx, func(state *teamstore.State) error {
+	return b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
+		if _, ok := state.DashboardViews[chatID]; !ok {
+			return false, nil
+		}
 		delete(state.DashboardViews, chatID)
-		return nil
+		return true, nil
 	})
 }
 

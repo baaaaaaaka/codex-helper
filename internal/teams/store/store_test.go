@@ -3183,6 +3183,408 @@ func TestMarkTurnCompletedWithEmptyCodexTurnIDPreservesLatestKnownCodexTurnID(t 
 	}
 }
 
+func TestBindSessionCodexThreadSQLiteUpdatesOnlySessionAndTurn(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, created, err := store.CreateSession(ctx, SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	} else if !created {
+		t.Fatal("CreateSession created = false")
+	}
+	inbound, _, err := store.PersistInbound(ctx, testInbound())
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: "s1", InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if !created {
+		t.Fatal("QueueTurn created = false")
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.DashboardNumbers["large"] = DashboardNumberRecord{
+			ID:        "large",
+			ChatID:    "control-chat",
+			Kind:      "workspace",
+			Number:    1,
+			Label:     strings.Repeat("dashboard ", 4096),
+			UpdatedAt: time.Date(2026, 6, 11, 9, 30, 0, 0, time.UTC),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed cold state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	before := sqliteRawStateJSONForTest(t, store)
+
+	session, changed, err := store.BindSessionCodexThread(ctx, "s1", turn.ID, "thread-fast")
+	if err != nil {
+		t.Fatalf("BindSessionCodexThread error: %v", err)
+	}
+	if !changed {
+		t.Fatal("BindSessionCodexThread changed = false")
+	}
+	if session.CodexThreadID != "thread-fast" {
+		t.Fatalf("returned session CodexThreadID = %q, want thread-fast", session.CodexThreadID)
+	}
+	after := sqliteRawStateJSONForTest(t, store)
+	if !bytes.Equal(before, after) {
+		t.Fatalf("BindSessionCodexThread rewrote cold state_json: before=%d after=%d", len(before), len(after))
+	}
+	noOpBefore := sqliteRawStateJSONForTest(t, store)
+	session, changed, err = store.BindSessionCodexThread(ctx, "s1", turn.ID, "thread-fast")
+	if err != nil {
+		t.Fatalf("BindSessionCodexThread no-op error: %v", err)
+	}
+	if changed {
+		t.Fatal("BindSessionCodexThread no-op changed = true")
+	}
+	if session.CodexThreadID != "thread-fast" {
+		t.Fatalf("no-op returned session CodexThreadID = %q, want thread-fast", session.CodexThreadID)
+	}
+	noOpAfter := sqliteRawStateJSONForTest(t, store)
+	if !bytes.Equal(noOpBefore, noOpAfter) {
+		t.Fatalf("BindSessionCodexThread no-op rewrote cold state_json: before=%d after=%d", len(noOpBefore), len(noOpAfter))
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after bind error: %v", err)
+	}
+	if got := state.Sessions["s1"].CodexThreadID; got != "thread-fast" {
+		t.Fatalf("session CodexThreadID = %q, want thread-fast", got)
+	}
+	if got := state.Turns[turn.ID].CodexThreadID; got != "thread-fast" {
+		t.Fatalf("turn CodexThreadID = %q, want thread-fast", got)
+	}
+}
+
+func TestBindSessionCodexThreadSQLiteRejectsConflicts(t *testing.T) {
+	ctx := context.Background()
+	t.Run("session", func(t *testing.T) {
+		store := newTestStore(t)
+		session := SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1", CodexThreadID: "thread-existing"}
+		if _, created, err := store.CreateSession(ctx, session); err != nil {
+			t.Fatalf("CreateSession error: %v", err)
+		} else if !created {
+			t.Fatal("CreateSession created = false")
+		}
+		migrateStoreToSQLiteForTest(t, store)
+
+		_, _, err := store.BindSessionCodexThread(ctx, "s1", "", "thread-new")
+		var conflict CodexThreadBindingConflictError
+		if !errors.As(err, &conflict) {
+			t.Fatalf("BindSessionCodexThread error = %v, want CodexThreadBindingConflictError", err)
+		}
+		state, loadErr := store.Load(ctx)
+		if loadErr != nil {
+			t.Fatalf("Load after conflict error: %v", loadErr)
+		}
+		if got := state.Sessions["s1"].CodexThreadID; got != "thread-existing" {
+			t.Fatalf("session CodexThreadID after conflict = %q, want thread-existing", got)
+		}
+	})
+
+	t.Run("turn", func(t *testing.T) {
+		store := newTestStore(t)
+		if _, created, err := store.CreateSession(ctx, SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+			t.Fatalf("CreateSession error: %v", err)
+		} else if !created {
+			t.Fatal("CreateSession created = false")
+		}
+		inbound, _, err := store.PersistInbound(ctx, testInbound())
+		if err != nil {
+			t.Fatalf("PersistInbound error: %v", err)
+		}
+		turn, created, err := store.QueueTurn(ctx, Turn{SessionID: "s1", InboundEventID: inbound.ID, CodexThreadID: "thread-existing"})
+		if err != nil {
+			t.Fatalf("QueueTurn error: %v", err)
+		}
+		if !created {
+			t.Fatal("QueueTurn created = false")
+		}
+		migrateStoreToSQLiteForTest(t, store)
+
+		_, _, err = store.BindSessionCodexThread(ctx, "s1", turn.ID, "thread-new")
+		var conflict CodexThreadBindingConflictError
+		if !errors.As(err, &conflict) {
+			t.Fatalf("BindSessionCodexThread error = %v, want CodexThreadBindingConflictError", err)
+		}
+		state, loadErr := store.Load(ctx)
+		if loadErr != nil {
+			t.Fatalf("Load after conflict error: %v", loadErr)
+		}
+		if got := state.Sessions["s1"].CodexThreadID; got != "" {
+			t.Fatalf("session CodexThreadID after turn conflict = %q, want empty", got)
+		}
+		if got := state.Turns[turn.ID].CodexThreadID; got != "thread-existing" {
+			t.Fatalf("turn CodexThreadID after conflict = %q, want thread-existing", got)
+		}
+	})
+}
+
+func TestSQLiteQueueOutboxSequenceDoesNotRewriteColdState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 11, 9, 0, 0, 0, time.UTC)
+	if _, _, err := store.CreateSession(ctx, SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ChatSequences["chat-1"] = ChatSequenceState{ChatID: "chat-1", Next: 7, UpdatedAt: now}
+		state.DashboardNumbers["large"] = DashboardNumberRecord{
+			ID:        "large",
+			ChatID:    "control-chat",
+			Kind:      "workspace",
+			Number:    1,
+			Label:     strings.Repeat("dashboard ", 4096),
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state error: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	before := sqliteRawStateJSONForTest(t, store)
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:seq",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-progress-001",
+		Body:        "progress",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox error: %v", err)
+	}
+	if !created {
+		t.Fatal("QueueOutbox created = false")
+	}
+	if msg.Sequence != 7 {
+		t.Fatalf("queued sequence = %d, want 7", msg.Sequence)
+	}
+	after := sqliteRawStateJSONForTest(t, store)
+	if !bytes.Equal(before, after) {
+		t.Fatalf("QueueOutbox rewrote cold state_json: before=%d after=%d", len(before), len(after))
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after QueueOutbox error: %v", err)
+	}
+	if next := state.ChatSequences["chat-1"].Next; next != 8 {
+		t.Fatalf("chat sequence next = %d, want 8", next)
+	}
+	if state.OutboxMessages["outbox:seq"].Sequence != 7 {
+		t.Fatalf("outbox sequence after load = %d, want 7", state.OutboxMessages["outbox:seq"].Sequence)
+	}
+	if len(state.HelperDeliveries) == 0 {
+		t.Fatal("helper delivery ledger was not persisted")
+	}
+}
+
+func TestSQLiteMarkTurnInterruptedPreservesChatSequences(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(ctx, Turn{ID: "turn:streaming", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if _, err := store.MarkTurnRunning(ctx, turn.ID, "thread-1", "codex-turn-1"); err != nil {
+		t.Fatalf("MarkTurnRunning error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:status",
+		SessionID:   "s1",
+		TurnID:      turn.ID,
+		TeamsChatID: "chat-1",
+		Kind:        "codex-status-001",
+		Body:        "stale status",
+	}); err != nil {
+		t.Fatalf("QueueOutbox status error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:final",
+		SessionID:   "s1",
+		TurnID:      turn.ID,
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "protected final",
+	}); err != nil {
+		t.Fatalf("QueueOutbox final error: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	if _, err := store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
+		t.Fatalf("MarkTurnInterrupted error: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after interrupt error: %v", err)
+	}
+	if got := state.OutboxMessages["outbox:status"].Status; got != OutboxStatusSkipped {
+		t.Fatalf("status outbox status = %q, want skipped", got)
+	}
+	if got := state.OutboxMessages["outbox:final"].Status; got != OutboxStatusQueued {
+		t.Fatalf("final outbox status = %q, want queued", got)
+	}
+	if next := state.ChatSequences["chat-1"].Next; next != 3 {
+		t.Fatalf("chat sequence next after interrupt = %d, want 3", next)
+	}
+}
+
+func TestSQLiteOpenBackfillsLegacyChatSequencesTable(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("create sqlite dir: %v", err)
+	}
+	db, err := openSQLiteStore(dbPath, true)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	if err := ensureSQLiteSchema(db); err != nil {
+		_ = db.Close()
+		t.Fatalf("ensure sqlite schema: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE chat_sequences`); err != nil {
+		_ = db.Close()
+		t.Fatalf("drop current chat_sequences: %v", err)
+	}
+	legacy := newState()
+	legacy.ChatSequences["chat-legacy"] = ChatSequenceState{ChatID: "chat-legacy", Next: 42, UpdatedAt: time.Date(2026, 6, 10, 8, 0, 0, 0, time.UTC)}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal legacy state: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, raw); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert legacy state_json: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy sqlite db: %v", err)
+	}
+	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load legacy sqlite with chat sequences error: %v", err)
+	}
+	if next := state.ChatSequences["chat-legacy"].Next; next != 42 {
+		t.Fatalf("loaded legacy chat sequence next = %d, want 42", next)
+	}
+	msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:legacy-seq",
+		TeamsChatID: "chat-legacy",
+		Kind:        "control",
+		Body:        "legacy",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox legacy sequence error: %v", err)
+	}
+	if msg.Sequence != 42 {
+		t.Fatalf("legacy queued sequence = %d, want 42", msg.Sequence)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after legacy QueueOutbox error: %v", err)
+	}
+	if next := state.ChatSequences["chat-legacy"].Next; next != 43 {
+		t.Fatalf("legacy chat sequence next after queue = %d, want 43", next)
+	}
+}
+
+func TestSQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("create sqlite dir: %v", err)
+	}
+	db, err := openSQLiteStore(dbPath, true)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	if err := ensureSQLiteSchema(db); err != nil {
+		_ = db.Close()
+		t.Fatalf("ensure sqlite schema: %v", err)
+	}
+	legacy := newState()
+	legacy.ChatSequences["chat-existing-table"] = ChatSequenceState{ChatID: "chat-existing-table", Next: 17, UpdatedAt: time.Date(2026, 6, 10, 8, 30, 0, 0, time.UTC)}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal legacy state: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, raw); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert legacy state_json: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy sqlite db: %v", err)
+	}
+	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load legacy sqlite with existing chat_sequences table error: %v", err)
+	}
+	if next := state.ChatSequences["chat-existing-table"].Next; next != 17 {
+		t.Fatalf("loaded chat sequence next = %d, want 17", next)
+	}
+}
+
+func TestSQLiteQueueOutboxSelfHealsMissingChatSequenceFromOutbox(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s1"] = SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1", CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages["outbox:existing"] = OutboxMessage{
+			ID:          "outbox:existing",
+			SessionID:   "s1",
+			TeamsChatID: "chat-1",
+			Kind:        "final",
+			Body:        "existing",
+			Status:      OutboxStatusSent,
+			Sequence:    9,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy outbox state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:next",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "next",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox after missing chat sequence error: %v", err)
+	}
+	if !created {
+		t.Fatal("QueueOutbox created = false")
+	}
+	if msg.Sequence != 10 {
+		t.Fatalf("self-healed sequence = %d, want 10", msg.Sequence)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after self-heal error: %v", err)
+	}
+	if next := state.ChatSequences["chat-1"].Next; next != 11 {
+		t.Fatalf("chat sequence next after self-heal = %d, want 11", next)
+	}
+}
+
 func TestQueueOutboxAssignsPerChatSequenceAndMetadata(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -10690,6 +11092,7 @@ func officialReleaseUpgradeFixtureState(tag string, schemaVersion int, includePr
 		OutboxMessages:    map[string]OutboxMessage{},
 		MessageProvenance: map[string]MessageProvenanceRecord{},
 		ChatPolls:         map[string]ChatPollState{},
+		ChatSequences:     map[string]ChatSequenceState{},
 		ChatRateLimits:    map[string]ChatRateLimitState{},
 	}
 	state.Sessions["official-session"] = SessionContext{
@@ -10738,9 +11141,15 @@ func officialReleaseUpgradeFixtureState(tag string, schemaVersion int, includePr
 		Kind:           "final",
 		Body:           "legacy answer from " + tag,
 		Status:         OutboxStatusSent,
+		Sequence:       9,
 		CreatedAt:      now.Add(-39 * time.Minute),
 		UpdatedAt:      now.Add(-39 * time.Minute),
 		SentAt:         now.Add(-39 * time.Minute),
+	}
+	state.ChatSequences["official-chat"] = ChatSequenceState{
+		ChatID:    "official-chat",
+		Next:      10,
+		UpdatedAt: now.Add(-39 * time.Minute),
 	}
 	state.ChatPolls["official-chat"] = ChatPollState{
 		ChatID:           "official-chat",
@@ -10965,6 +11374,12 @@ func assertOfficialReleaseSQLiteSchemaForTest(t *testing.T, store *Store, tag st
 			t.Fatalf("%s upgraded sqlite missing index %q; indexes=%v", tag, index, indexes)
 		}
 	}
+	sequenceColumns := sqliteColumnSetForTest(t, db, "chat_sequences")
+	for _, column := range []string{"chat_id", "next_sequence", "updated_at", "json"} {
+		if !sequenceColumns[column] {
+			t.Fatalf("%s upgraded chat_sequences missing column %q; columns=%v", tag, column, sequenceColumns)
+		}
+	}
 	var parkedSkip sql.NullInt64
 	if err := db.QueryRow(`SELECT parked_skip_eligible FROM chat_polls WHERE chat_id = ?`, "official-chat").Scan(&parkedSkip); err != nil {
 		t.Fatalf("query %s upgraded parked_skip_eligible: %v", tag, err)
@@ -11063,6 +11478,9 @@ func assertOfficialReleaseHotPathsForTest(t *testing.T, store *Store, tag string
 	})
 	if err != nil || !created {
 		t.Fatalf("%s QueueOutbox after upgrade created=%v err=%v", tag, created, err)
+	}
+	if outbox.Sequence != 10 {
+		t.Fatalf("%s QueueOutbox after upgrade sequence = %d, want 10", tag, outbox.Sequence)
 	}
 	if _, err := store.MarkOutboxAccepted(ctx, outbox.ID, "post-upgrade-helper-message"); err != nil {
 		t.Fatalf("%s MarkOutboxAccepted after upgrade: %v", tag, err)
@@ -11319,6 +11737,29 @@ func migrateStoreToSQLiteForTest(t *testing.T, store *Store) StoreSQLiteMigratio
 		t.Fatalf("MigrateLargeStateToSQLite result = %#v, want migrated or already DB", result)
 	}
 	return result
+}
+
+func sqliteRawStateJSONForTest(t *testing.T, store *Store) []byte {
+	t.Helper()
+	ctx := context.Background()
+	var raw []byte
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw)
+	}); err != nil {
+		t.Fatalf("read sqlite state_json: %v", err)
+	}
+	return append([]byte(nil), raw...)
 }
 
 func writeSQLitePointerForTest(t *testing.T, store *Store, path string) {

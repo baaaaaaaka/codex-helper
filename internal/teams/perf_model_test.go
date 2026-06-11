@@ -1079,6 +1079,7 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainNoCodexDiscovery(b
 func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainStageWrites(b *testing.B) {
 	stages := []string{"importing", "service_control", "duplicate", "queue_state", "prepare_local", "ensure", "inbound", "turn", "ack", "start", "complete"}
 	totals := make(map[string]cxpPerfProcIO, len(stages))
+	durations := make(map[string]time.Duration, len(stages))
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -1097,11 +1098,14 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainStageWrites(b *tes
 		runStage := func(name string, fn func() error) {
 			b.Helper()
 			b.StartTimer()
+			start := time.Now()
 			delta, err := cxpPerfMeasureProcIO(fn)
+			elapsed := time.Since(start)
 			b.StopTimer()
 			total := totals[name]
 			total.add(delta)
 			totals[name] = total
+			durations[name] += elapsed
 			if err != nil {
 				b.Fatalf("%s: %v", name, err)
 			}
@@ -1202,6 +1206,317 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainStageWrites(b *tes
 	}
 	for _, stage := range stages {
 		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+		b.ReportMetric(float64(durations[stage])/float64(b.N), stage+"_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites(b *testing.B) {
+	stages := []string{"importing", "service_control", "duplicate", "queue_state", "prepare_local", "ensure", "inbound", "turn", "ack", "start", "complete"}
+	totals := make(map[string]cxpPerfProcIO, len(stages))
+	durations := make(map[string]time.Duration, len(stages))
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		executor := newCXPPerfBlockingExecutor()
+		bridge.executor = executor
+		now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Minute)
+		session := &Session{
+			ID:        fmt.Sprintf("realistic-new-session-%06d", i),
+			ChatID:    fmt.Sprintf("realistic-new-chat-%06d", i),
+			ChatURL:   fmt.Sprintf("https://teams.example/realistic-new-chat-%06d", i),
+			Topic:     "new chat",
+			Status:    "active",
+			Cwd:       "/workspace/new-chat",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		bridge.reg.Sessions = append(bridge.reg.Sessions, *session)
+		msg := ChatMessage{
+			ID:              fmt.Sprintf("realistic-new-message-%06d", i),
+			ChatID:          session.ChatID,
+			CreatedDateTime: now.Format(time.RFC3339),
+		}
+		msg.Body.ContentType = "html"
+		msg.Body.Content = "<p>new chat user message</p>"
+		text := "new chat user message"
+		var inbound teamstore.InboundEvent
+		var turn teamstore.Turn
+		runStage := func(name string, fn func() error) {
+			b.Helper()
+			b.StartTimer()
+			start := time.Now()
+			delta, err := cxpPerfMeasureProcIO(fn)
+			elapsed := time.Since(start)
+			b.StopTimer()
+			total := totals[name]
+			total.add(delta)
+			totals[name] = total
+			durations[name] += elapsed
+			if err != nil {
+				b.Fatalf("%s: %v", name, err)
+			}
+		}
+		runStage("importing", func() error {
+			if importing, err := bridge.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
+				return err
+			} else if importing {
+				return fmt.Errorf("session unexpectedly importing transcript")
+			}
+			return nil
+		})
+		runStage("service_control", func() error {
+			if control, blocked, err := bridge.serviceControlBlocksNewWork(ctx); err != nil {
+				return err
+			} else if blocked {
+				return fmt.Errorf("service control unexpectedly blocked work: %#v", control)
+			}
+			return nil
+		})
+		runStage("duplicate", func() error {
+			if duplicate, err := bridge.ignoreRecentDuplicateSessionPrompt(ctx, session, msg, text); err != nil {
+				return err
+			} else if duplicate {
+				return fmt.Errorf("message unexpectedly classified as duplicate")
+			}
+			return nil
+		})
+		runStage("queue_state", func() error {
+			turns, err := bridge.sessionTurnQueueState(ctx, session.ID)
+			if err != nil {
+				return err
+			}
+			if turns.Running || turns.Queued != 0 {
+				return fmt.Errorf("session unexpectedly has queued/running turns: %#v", turns)
+			}
+			return nil
+		})
+		runStage("prepare_local", func() error {
+			gate, err := bridge.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+			if err != nil {
+				return err
+			}
+			if gate.Block {
+				return fmt.Errorf("local codex gate unexpectedly blocked: %s", gate.AckBody)
+			}
+			return nil
+		})
+		runStage("ensure", func() error {
+			return bridge.ensureDurableSession(ctx, session)
+		})
+		runStage("inbound", func() error {
+			var created bool
+			var err error
+			inbound, created, err = bridge.persistInbound(ctx, session, msg)
+			if err != nil {
+				return err
+			}
+			if !created {
+				return fmt.Errorf("realistic new inbound was not created")
+			}
+			return nil
+		})
+		runStage("turn", func() error {
+			var created bool
+			var err error
+			turn, created, err = bridge.queueTurn(ctx, session, inbound)
+			if err != nil {
+				return err
+			}
+			if !created {
+				return fmt.Errorf("realistic new turn was not created")
+			}
+			session.UpdatedAt = time.Now()
+			bridge.markRegistryProjectionDirty()
+			return nil
+		})
+		runStage("ack", func() error {
+			return bridge.queueTeamsPromptAckForMessage(ctx, session, turn, msg, false)
+		})
+		runStage("start", func() error {
+			started, err := bridge.startQueuedTurn(ctx, session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
+				return bridge.runPreparedQueuedTurnFromMessage(runCtx, runSession, claimed, runSession.ChatID, msg, text, bridge.executor)
+			})
+			if err != nil {
+				return err
+			}
+			if !started {
+				return fmt.Errorf("turn was not started")
+			}
+			executor.waitStarted(b)
+			return nil
+		})
+		runStage("complete", func() error {
+			executor.release()
+			return cxpPerfDrainAsyncTurns(ctx, bridge)
+		})
+	}
+	for _, stage := range stages {
+		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+		b.ReportMetric(float64(durations[stage])/float64(b.N), stage+"_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteNewChatCompleteTurnBreakdown(b *testing.B) {
+	stages := []string{
+		"bind_thread",
+		"transcript_final",
+		"pre_final_status",
+		"queue_final_outbox",
+		"mark_completed",
+		"flush_final_outbox",
+		"title_from_result",
+		"queue_state_fallback",
+		"artifact_scan",
+	}
+	totals := make(map[string]cxpPerfProcIO, len(stages))
+	durations := make(map[string]time.Duration, len(stages))
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Minute)
+		session := &Session{
+			ID:        fmt.Sprintf("realistic-new-complete-session-%06d", i),
+			ChatID:    fmt.Sprintf("realistic-new-complete-chat-%06d", i),
+			ChatURL:   fmt.Sprintf("https://teams.example/realistic-new-complete-chat-%06d", i),
+			Topic:     "new chat",
+			Status:    "active",
+			Cwd:       "/workspace/new-chat",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		bridge.reg.Sessions = append(bridge.reg.Sessions, *session)
+		msg := ChatMessage{
+			ID:              fmt.Sprintf("realistic-new-complete-message-%06d", i),
+			ChatID:          session.ChatID,
+			CreatedDateTime: now.Format(time.RFC3339),
+		}
+		msg.Body.ContentType = "html"
+		msg.Body.Content = "<p>new chat user message</p>"
+		text := "new chat user message"
+		if err := bridge.ensureDurableSession(ctx, session); err != nil {
+			b.Fatalf("ensure durable session: %v", err)
+		}
+		inbound, created, err := bridge.persistInbound(ctx, session, msg)
+		if err != nil {
+			b.Fatalf("persist inbound: %v", err)
+		}
+		if !created {
+			b.Fatal("new inbound was not created")
+		}
+		turn, turnCreated, err := bridge.queueTurn(ctx, session, inbound)
+		if err != nil {
+			b.Fatalf("queue turn: %v", err)
+		}
+		if !turnCreated {
+			b.Fatal("new turn was not created")
+		}
+		if err := bridge.queueTeamsPromptAckForMessage(ctx, session, turn, msg, false); err != nil {
+			b.Fatalf("queue ack: %v", err)
+		}
+		turn, err = bridge.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, "")
+		if err != nil {
+			b.Fatalf("mark running: %v", err)
+		}
+		result := ExecutionResult{
+			Text:             "perf codex result for " + strings.TrimSpace(text),
+			CodexThreadID:    firstNonEmptyString(session.CodexThreadID, "perf-thread-"+session.ID),
+			CodexThreadTitle: "Perf Thread",
+			CodexTurnID:      "perf-codex-turn-" + shortStableID(session.ID+":"+text),
+		}
+		runStage := func(name string, fn func() error) {
+			b.Helper()
+			b.StartTimer()
+			start := time.Now()
+			delta, err := cxpPerfMeasureProcIO(fn)
+			elapsed := time.Since(start)
+			b.StopTimer()
+			total := totals[name]
+			total.add(delta)
+			totals[name] = total
+			durations[name] += elapsed
+			if err != nil {
+				b.Fatalf("%s: %v", name, err)
+			}
+		}
+		runStage("bind_thread", func() error {
+			blocked, err := bridge.bindObservedCodexThreadOrInterrupt(ctx, session, turn, result.CodexThreadID, "runner_completed")
+			if err != nil {
+				return err
+			}
+			if blocked {
+				return fmt.Errorf("thread bind unexpectedly blocked completion")
+			}
+			return nil
+		})
+		runStage("transcript_final", func() error {
+			if transcriptResult, ok := bridge.completedTurnResultFromLinkedTranscript(ctx, session, turn, result); ok {
+				result = executionResultWithTranscriptFinal(result, transcriptResult)
+			}
+			return nil
+		})
+		runStage("pre_final_status", func() error {
+			_, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+			return err
+		})
+		runStage("queue_final_outbox", func() error {
+			visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
+			if visibleText == "" && len(ExtractArtifactManifestBlocks(result.Text)) > 0 {
+				visibleText = "artifact manifest received; uploading listed files."
+			}
+			_, err := bridge.queueOutboxChunksWithOptions(ctx, session.ID, turn.ID, session.ChatID, "final", visibleText, outboxQueueOptions{
+				MentionOwner:     true,
+				NotificationKind: "turn_completed",
+			})
+			return err
+		})
+		runStage("mark_completed", func() error {
+			session.UpdatedAt = time.Now()
+			bridge.markRegistryProjectionDirty()
+			_, err := bridge.store.MarkTurnCompleted(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID)
+			return err
+		})
+		runStage("flush_final_outbox", func() error {
+			if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
+				if isOutboxDeliveryDeferred(err) || isGraphTransientServerError(err) {
+					return nil
+				}
+				return err
+			}
+			bridge.boostPolling(time.Now())
+			return nil
+		})
+		updatedTitle := false
+		runStage("title_from_result", func() error {
+			var err error
+			updatedTitle, err = bridge.refreshWorkChatTitleFromExecutionResult(ctx, session, result)
+			return err
+		})
+		runStage("queue_state_fallback", func() error {
+			if updatedTitle {
+				return nil
+			}
+			queueState, err := bridge.sessionTurnQueueState(ctx, session.ID)
+			if err != nil {
+				return err
+			}
+			if queueState.Queued == 0 {
+				return bridge.refreshWorkChatTitleFromCodexHistory(ctx, session)
+			}
+			return nil
+		})
+		runStage("artifact_scan", func() error {
+			return bridge.uploadArtifactsFromResult(ctx, session, turn, result.Text)
+		})
+	}
+	for _, stage := range stages {
+		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+		b.ReportMetric(float64(durations[stage])/float64(b.N), stage+"_ns/op")
 	}
 }
 
@@ -1343,6 +1658,314 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserCompleteTurnBreakdown(b *testi
 	}
 	for _, stage := range stages {
 		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+	}
+}
+
+// BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival models the failure mode
+// seen in large Teams sessions: the Codex JSONL already contains the final
+// answer, but the helper still has to reconcile a very long linked transcript,
+// a large SQLite store, many active/parked chats, and many live progress
+// messages that were already delivered before the final can be sent.
+func BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival(b *testing.B) {
+	stages := []string{
+		"transcript_final",
+		"pre_final_status",
+		"queue_final_outbox",
+		"mark_completed",
+		"flush_final_outbox",
+	}
+	cases := []struct {
+		name              string
+		observedCodexTurn bool
+	}{
+		{name: "observed-turn-id", observedCodexTurn: true},
+		{name: "missing-turn-id", observedCodexTurn: false},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			ctx := context.Background()
+			totals := make(map[string]cxpPerfProcIO, len(stages))
+			durations := make(map[string]time.Duration, len(stages))
+			var totalQueued int
+			var totalSkipped int
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				_, bridge, session, turn, result := newCXPPerfLongTranscriptFinalArrivalFixture(b, i)
+				if !tc.observedCodexTurn {
+					result.CodexTurnID = ""
+				}
+				preFinalQueued := 0
+				runStage := func(name string, fn func() error) {
+					b.Helper()
+					b.StartTimer()
+					start := time.Now()
+					delta, err := cxpPerfMeasureProcIO(fn)
+					elapsed := time.Since(start)
+					b.StopTimer()
+					total := totals[name]
+					total.add(delta)
+					totals[name] = total
+					durations[name] += elapsed
+					if err != nil {
+						b.Fatalf("%s: %v", name, err)
+					}
+				}
+				runStage("transcript_final", func() error {
+					if transcriptResult, ok := bridge.completedTurnResultFromLinkedTranscript(ctx, session, turn, result); ok {
+						result = executionResultWithTranscriptFinal(result, transcriptResult)
+					}
+					return nil
+				})
+				runStage("pre_final_status", func() error {
+					queued, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+					if err != nil {
+						return err
+					}
+					preFinalQueued = queued
+					return nil
+				})
+				totalQueued += preFinalQueued
+				totalSkipped += cxpPerfCountSessionTranscriptDeliveries(b, bridge.store, session.ID, teamstore.TranscriptDeliveryStatusSkipped)
+				runStage("queue_final_outbox", func() error {
+					visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
+					if visibleText == "" && len(ExtractArtifactManifestBlocks(result.Text)) > 0 {
+						visibleText = "artifact manifest received; uploading listed files."
+					}
+					_, err := bridge.queueOutboxChunksWithOptions(ctx, session.ID, turn.ID, session.ChatID, "final", visibleText, outboxQueueOptions{
+						MentionOwner:     true,
+						NotificationKind: "turn_completed",
+					})
+					return err
+				})
+				runStage("mark_completed", func() error {
+					session.UpdatedAt = time.Now()
+					bridge.markRegistryProjectionDirty()
+					_, err := bridge.store.MarkTurnCompleted(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID)
+					return err
+				})
+				runStage("flush_final_outbox", func() error {
+					if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
+						if isOutboxDeliveryDeferred(err) || isGraphTransientServerError(err) {
+							return nil
+						}
+						return err
+					}
+					bridge.boostPolling(time.Now())
+					return nil
+				})
+			}
+			for _, stage := range stages {
+				cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+				b.ReportMetric(float64(durations[stage])/float64(b.N), stage+"_ns/op")
+			}
+			if b.N > 0 {
+				b.ReportMetric(float64(totalQueued)/float64(b.N), "pre_final_status_queued/op")
+				b.ReportMetric(float64(totalSkipped)/float64(b.N), "skipped_transcript_deliveries/op")
+			}
+		})
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteStatusOnlyFinalArrival(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	var totalQueued int
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, bridge, session, turn := newCXPPerfStatusOnlyFinalArrivalFixture(b, i)
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			queued, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+			totalQueued += queued
+			return err
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		total.add(delta)
+		duration += elapsed
+		if err != nil {
+			b.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
+		}
+		state, err := store.Load(ctx)
+		if err != nil {
+			b.Fatalf("Load state: %v", err)
+		}
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+		if checkpoint.LastRecordID != "perf-status-only-final" {
+			b.Fatalf("checkpoint = %#v, want final", checkpoint)
+		}
+	}
+	cxpPerfReportNamedProcIO(b, "pre_final_status", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "pre_final_status_ns/op")
+		b.ReportMetric(float64(totalQueued)/float64(b.N), "pre_final_status_queued/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteLongTranscriptLegacyPreFinalStatusBreakdown(b *testing.B) {
+	// This intentionally exercises the old final-blocking status backfill path:
+	// queue a handful of stale progress deliveries, then record each checkpoint
+	// separately. The current completion path should be measured by
+	// BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival instead.
+	stages := []string{
+		"load_checkpoint",
+		"dedupe_snapshot",
+		"read_delta",
+		"build_dedupe",
+		"collect_first_8",
+		"queue_delivery_outbox_8",
+		"record_checkpoint_8",
+	}
+	type queuedStatusRecord struct {
+		record TranscriptRecord
+		line   int
+		offset int64
+		kind   string
+		body   string
+	}
+	ctx := context.Background()
+	totals := make(map[string]cxpPerfProcIO, len(stages))
+	durations := make(map[string]time.Duration, len(stages))
+	var totalQueued int
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		_, bridge, session, turn, _ := newCXPPerfLongTranscriptFinalArrivalFixture(b, i)
+		checkpointID := transcriptCheckpointID(session.ID)
+		var checkpoint teamstore.ImportCheckpoint
+		var state teamstore.State
+		var local codexhistory.Session
+		var transcript Transcript
+		var teamsOriginHashes map[string]bool
+		var teamsOriginDisplays map[string]string
+		var known *knownTranscriptOutboxDedupeState
+		var dedupe *transcriptDedupeState
+		var selected []queuedStatusRecord
+		runStage := func(name string, fn func() error) {
+			b.Helper()
+			b.StartTimer()
+			start := time.Now()
+			delta, err := cxpPerfMeasureProcIO(fn)
+			elapsed := time.Since(start)
+			b.StopTimer()
+			total := totals[name]
+			total.add(delta)
+			totals[name] = total
+			durations[name] += elapsed
+			if err != nil {
+				b.Fatalf("%s: %v", name, err)
+			}
+		}
+		runStage("load_checkpoint", func() error {
+			var err error
+			var found bool
+			checkpoint, found, err = bridge.store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil {
+				return err
+			}
+			if !found || strings.TrimSpace(checkpoint.LastRecordID) == "" {
+				return fmt.Errorf("long final checkpoint missing")
+			}
+			return nil
+		})
+		runStage("dedupe_snapshot", func() error {
+			var err error
+			state, err = bridge.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, checkpointID)
+			if err != nil {
+				return err
+			}
+			checkpoint = state.ImportCheckpoints[checkpointID]
+			return nil
+		})
+		runStage("read_delta", func() error {
+			var ok bool
+			local, ok = linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
+			if !ok {
+				return fmt.Errorf("long final linked transcript missing")
+			}
+			var err error
+			transcript, err = bridge.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
+			if err != nil {
+				return err
+			}
+			if len(transcript.Records) == 0 {
+				return fmt.Errorf("long final transcript delta is empty")
+			}
+			return nil
+		})
+		runStage("build_dedupe", func() error {
+			teamsOriginHashes = teamsOriginTextHashes(state, session.ID)
+			teamsOriginDisplays = teamsOriginDisplayTexts(state, session.ID)
+			known = newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
+			dedupe = newTranscriptDedupeState()
+			return nil
+		})
+		runStage("collect_first_8", func() error {
+			for i, record := range transcript.Records {
+				checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
+				record.SourceLine = checkpointLine
+				record.SourceOffset = checkpointOffset
+				if record.Kind == TranscriptKindAssistant || transcriptRecordIsTerminal(record) {
+					break
+				}
+				body := formatTranscriptRecordForTeams(record)
+				body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
+				if strings.TrimSpace(body) == "" || shouldSkipBackgroundTranscriptRecord(record) {
+					continue
+				}
+				if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) || dedupe.shouldSkip(record, body) {
+					continue
+				}
+				kind := transcriptRecordOutboxKind("codex", record, i+1)
+				if known.shouldSkip(record, body) {
+					if record.Kind == TranscriptKindStatus || record.Kind == TranscriptKindCompact {
+						if err := bridge.recordSkippedTranscriptDelivery(ctx, *session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
+							return err
+						}
+					}
+					continue
+				}
+				switch record.Kind {
+				case TranscriptKindStatus, TranscriptKindCompact:
+					selected = append(selected, queuedStatusRecord{record: record, line: checkpointLine, offset: checkpointOffset, kind: kind, body: body})
+					if len(selected) >= transcriptSyncMaxRecordsPerSessionPerCycle {
+						return nil
+					}
+				}
+			}
+			return nil
+		})
+		runStage("queue_delivery_outbox_8", func() error {
+			for _, item := range selected {
+				if _, err := bridge.queueTranscriptDeliveryChunksWithOptions(ctx, *session, local, item.record, item.line, item.offset, item.kind, item.body, outboxQueueOptions{}, turn.ID); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		runStage("record_checkpoint_8", func() error {
+			for _, item := range selected {
+				if err := bridge.recordTranscriptCheckpointDetailedWithID(ctx, *session, local.FilePath, transcriptRecordCheckpointKey(item.record), item.line, item.offset, transcriptCheckpointID(session.ID)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		totalQueued += len(selected)
+	}
+	for _, stage := range stages {
+		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+		b.ReportMetric(float64(durations[stage])/float64(b.N), stage+"_ns/op")
+	}
+	if b.N > 0 {
+		b.ReportMetric(float64(totalQueued)/float64(b.N), "queued/op")
 	}
 }
 
@@ -2894,6 +3517,305 @@ func newCXPPerfRealisticMixedUserFixture(tb testing.TB) (*teamstore.Store, *Brid
 	cxpPerfMigrateStoreToSQLite(tb, store)
 	cxpPerfPrepareActiveOwner(tb, bridge)
 	return store, bridge
+}
+
+const (
+	cxpPerfLongFinalHistoricLines = 40
+	cxpPerfLongFinalHistoricBytes = 128
+	cxpPerfLongFinalStatusRecords = 8
+	cxpPerfLongFinalStatusBytes   = 128
+)
+
+func newCXPPerfLongTranscriptFinalArrivalFixture(tb testing.TB, index int) (*teamstore.Store, *Bridge, *Session, teamstore.Turn, ExecutionResult) {
+	tb.Helper()
+	store, bridge := newCXPPerfRealisticMixedUserFixture(tb)
+	ctx := context.Background()
+	sessionID := cxpPerfSessionID(0)
+	session := bridge.reg.SessionByID(sessionID)
+	if session == nil {
+		tb.Fatalf("realistic session %s not found", sessionID)
+	}
+	threadID := fmt.Sprintf("perf-long-final-thread-%06d", index)
+	codexTurnID := fmt.Sprintf("perf-long-final-codex-turn-%06d", index)
+	turnID := fmt.Sprintf("perf-long-final-turn-%06d", index)
+	root := filepath.Join(tb.TempDir(), "codex-home")
+	transcriptPath, checkpointLine, checkpointOffset, finalText := cxpPerfWriteLongFinalArrivalTranscript(tb, root, threadID, codexTurnID, index)
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		tb.Fatalf("stat long final transcript: %v", err)
+	}
+	now := time.Date(2026, 5, 23, 10, 15, 0, 0, time.UTC).Add(time.Duration(index) * time.Second)
+	session.CodexThreadID = threadID
+	session.Cwd = filepath.Join(root, "project")
+	session.UpdatedAt = now
+	turn := teamstore.Turn{
+		ID:            turnID,
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: threadID,
+		CodexTurnID:   codexTurnID,
+		QueuedAt:      now.Add(-2 * time.Minute),
+		StartedAt:     now.Add(-time.Minute),
+		CreatedAt:     now.Add(-2 * time.Minute),
+		UpdatedAt:     now,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		stored := state.Sessions[session.ID]
+		stored.ID = session.ID
+		stored.Status = teamstore.SessionStatusActive
+		stored.TeamsChatID = session.ChatID
+		stored.TeamsChatURL = session.ChatURL
+		stored.TeamsTopic = session.Topic
+		stored.CodexThreadID = threadID
+		stored.CodexHome = root
+		stored.Cwd = session.Cwd
+		stored.UpdatedAt = now
+		state.Sessions[session.ID] = stored
+		state.Turns[turn.ID] = turn
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID(session.ID),
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "perf-long-final-checkpoint",
+			LastSourceLine: checkpointLine,
+			LastOffset:     checkpointOffset,
+			SourceSize:     checkpointOffset,
+			SourceModTime:  info.ModTime(),
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      now.Add(-30 * time.Second),
+		}
+		for i := 0; i < cxpPerfLongFinalStatusRecords; i++ {
+			body := cxpPerfLongFinalStatusBody(i)
+			created := now.Add(time.Duration(i-cxpPerfLongFinalStatusRecords) * time.Millisecond)
+			outboxID := fmt.Sprintf("perf-long-final-live-progress-%04d", i)
+			state.OutboxMessages[outboxID] = teamstore.OutboxMessage{
+				ID:             outboxID,
+				SessionID:      session.ID,
+				TurnID:         turn.ID,
+				CodexThreadID:  threadID,
+				TeamsChatID:    session.ChatID,
+				ScopeID:        bridge.scope.ID,
+				MachineID:      bridge.machine.ID,
+				Kind:           fmt.Sprintf("codex-progress-%03d", i+1),
+				Body:           body,
+				Sequence:       int64(10000 + i),
+				PartIndex:      1,
+				PartCount:      1,
+				SourceTextHash: normalizedTextHash(body),
+				RenderedHash:   normalizedTextHash(body),
+				RenderedBytes:  len(body),
+				Status:         teamstore.OutboxStatusSent,
+				TeamsMessageID: fmt.Sprintf("teams-long-final-progress-%04d", i),
+				CreatedAt:      created,
+				UpdatedAt:      created,
+				SentAt:         created,
+			}
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed long final arrival fixture: %v", err)
+	}
+	bridge.leaseDuration = time.Hour
+	active, err := bridge.claimControlLease(ctx)
+	if err != nil {
+		tb.Fatalf("refresh long final fixture control lease: %v", err)
+	}
+	if !active {
+		tb.Fatal("long final fixture control lease unexpectedly inactive")
+	}
+	result := ExecutionResult{
+		Text:             finalText,
+		CodexThreadID:    threadID,
+		CodexThreadTitle: "Long Final Arrival",
+		CodexTurnID:      codexTurnID,
+	}
+	return store, bridge, session, turn, result
+}
+
+func newCXPPerfStatusOnlyFinalArrivalFixture(tb testing.TB, index int) (*teamstore.Store, *Bridge, *Session, teamstore.Turn) {
+	tb.Helper()
+	store, err := teamstore.Open(filepath.Join(tb.TempDir(), "state.json"))
+	if err != nil {
+		tb.Fatalf("Open status-only store: %v", err)
+	}
+	tb.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			tb.Fatalf("Close status-only store: %v", err)
+		}
+	})
+	now := time.Now()
+	user := User{ID: "user-1", UserPrincipalName: "user@example.test"}
+	scope := ScopeIdentityForUser(user)
+	scope.ID = "test-scope:" + shortStableID(store.Path())
+	machine := MachineRecordForUser(user, scope)
+	bridge := &Bridge{
+		user:    user,
+		scope:   scope,
+		machine: machine,
+		reg: Registry{
+			Version:       1,
+			UserID:        user.ID,
+			ControlChatID: "control-chat",
+			Sessions: []Session{{
+				ID:        "s001",
+				ChatID:    "chat-1",
+				ChatURL:   "https://teams.example/chat-1",
+				Topic:     "topic",
+				Status:    "active",
+				CreatedAt: now,
+				UpdatedAt: now,
+			}},
+			Chats: map[string]ChatState{},
+		},
+		store: store,
+	}
+	ctx := context.Background()
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		tb.Fatal("missing test session s001")
+	}
+	threadID := fmt.Sprintf("perf-status-only-thread-%06d", index)
+	codexTurnID := fmt.Sprintf("perf-status-only-codex-turn-%06d", index)
+	turnID := fmt.Sprintf("perf-status-only-turn-%06d", index)
+	root := filepath.Join(tb.TempDir(), "codex-home")
+	transcriptPath, checkpointLine, checkpointOffset := cxpPerfWriteStatusOnlyFinalArrivalTranscript(tb, root, threadID, codexTurnID)
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		tb.Fatalf("stat status-only transcript: %v", err)
+	}
+	fixtureNow := time.Date(2026, 5, 23, 10, 15, 0, 0, time.UTC).Add(time.Duration(index) * time.Second)
+	session.CodexThreadID = threadID
+	session.Cwd = filepath.Join(root, "project")
+	turn := teamstore.Turn{
+		ID:            turnID,
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: threadID,
+		CodexTurnID:   codexTurnID,
+		QueuedAt:      fixtureNow.Add(-2 * time.Minute),
+		StartedAt:     fixtureNow.Add(-time.Minute),
+		CreatedAt:     fixtureNow.Add(-2 * time.Minute),
+		UpdatedAt:     fixtureNow,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		stored := state.Sessions[session.ID]
+		stored.ID = session.ID
+		stored.Status = teamstore.SessionStatusActive
+		stored.TeamsChatID = session.ChatID
+		stored.TeamsChatURL = session.ChatURL
+		stored.TeamsTopic = session.Topic
+		stored.CodexThreadID = threadID
+		stored.CodexHome = root
+		stored.Cwd = session.Cwd
+		stored.UpdatedAt = fixtureNow
+		state.Sessions[session.ID] = stored
+		state.Turns[turn.ID] = turn
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID(session.ID),
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "perf-status-only-checkpoint",
+			LastSourceLine: checkpointLine,
+			LastOffset:     checkpointOffset,
+			SourceSize:     checkpointOffset,
+			SourceModTime:  info.ModTime(),
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      fixtureNow.Add(-30 * time.Second),
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed status-only final fixture: %v", err)
+	}
+	cxpPerfMigrateStoreToSQLite(tb, store)
+	return store, bridge, session, turn
+}
+
+func cxpPerfWriteLongFinalArrivalTranscript(tb testing.TB, root string, threadID string, codexTurnID string, index int) (string, int, int64, string) {
+	tb.Helper()
+	dir := filepath.Join(root, "sessions", "2026", "05", "23")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		tb.Fatalf("mkdir long final transcript dir: %v", err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("rollout-2026-05-23T10-15-00-%s.jsonl", threadID))
+	var builder strings.Builder
+	builder.Grow(cxpPerfLongFinalHistoricLines*(cxpPerfLongFinalHistoricBytes+256) + cxpPerfLongFinalStatusRecords*(cxpPerfLongFinalStatusBytes+256))
+	lineNo := 0
+	var offset int64
+	appendLine := func(line string) {
+		lineNo++
+		builder.WriteString(line)
+		builder.WriteByte('\n')
+		offset += int64(len(line) + 1)
+	}
+	appendLine(`{"type":"session_meta","payload":{"id":` + strconv.Quote(threadID) + `}}`)
+	base := time.Date(2026, 5, 23, 9, 0, 0, 0, time.UTC)
+	historicText := cxpPerfText(cxpPerfLongFinalHistoricBytes)
+	for i := 0; i < cxpPerfLongFinalHistoricLines; i++ {
+		appendLine(`{"timestamp":` + strconv.Quote(base.Add(time.Duration(i)*time.Millisecond).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":` + strconv.Quote(fmt.Sprintf("perf-long-final-history-%05d", i)) + `,"thread_id":` + strconv.Quote(threadID) + `,"turn_id":` + strconv.Quote(fmt.Sprintf("perf-long-final-history-turn-%05d", i)) + `,"phase":"final_answer","message":` + strconv.Quote(historicText) + `}}`)
+	}
+	appendLine(`{"timestamp":` + strconv.Quote(base.Add(time.Hour).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"perf-long-final-checkpoint","thread_id":` + strconv.Quote(threadID) + `,"turn_id":"perf-long-final-checkpoint-turn","phase":"final_answer","message":"checkpoint before live statuses"}}`)
+	checkpointLine := lineNo
+	checkpointOffset := offset
+	for i := 0; i < cxpPerfLongFinalStatusRecords; i++ {
+		appendLine(`{"timestamp":` + strconv.Quote(base.Add(time.Hour+time.Duration(i+1)*time.Second).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":` + strconv.Quote(fmt.Sprintf("perf-long-final-status-%04d", i)) + `,"thread_id":` + strconv.Quote(threadID) + `,"turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"commentary","message":` + strconv.Quote(cxpPerfLongFinalStatusBody(i)) + `}}`)
+	}
+	finalText := "long transcript final answer " + cxpPerfText(4096)
+	appendLine(`{"timestamp":` + strconv.Quote(base.Add(2*time.Hour).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"perf-long-final-answer","thread_id":` + strconv.Quote(threadID) + `,"turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(finalText) + `}}`)
+	if err := os.WriteFile(path, []byte(builder.String()), 0o600); err != nil {
+		tb.Fatalf("write long final transcript: %v", err)
+	}
+	return path, checkpointLine, checkpointOffset, finalText
+}
+
+func cxpPerfWriteStatusOnlyFinalArrivalTranscript(tb testing.TB, root string, threadID string, codexTurnID string) (string, int, int64) {
+	tb.Helper()
+	dir := filepath.Join(root, "sessions", "2026", "05", "23")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		tb.Fatalf("mkdir status-only transcript dir: %v", err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("rollout-2026-05-23T10-15-00-%s.jsonl", threadID))
+	var builder strings.Builder
+	builder.Grow(cxpPerfLongFinalStatusRecords * (cxpPerfLongFinalStatusBytes + 256))
+	lineNo := 0
+	var offset int64
+	appendLine := func(line string) {
+		lineNo++
+		builder.WriteString(line)
+		builder.WriteByte('\n')
+		offset += int64(len(line) + 1)
+	}
+	base := time.Date(2026, 5, 23, 9, 0, 0, 0, time.UTC)
+	appendLine(`{"type":"session_meta","payload":{"id":` + strconv.Quote(threadID) + `}}`)
+	appendLine(`{"timestamp":` + strconv.Quote(base.Add(time.Hour).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"perf-status-only-checkpoint","thread_id":` + strconv.Quote(threadID) + `,"turn_id":"perf-status-only-checkpoint-turn","phase":"final_answer","message":"checkpoint before live statuses"}}`)
+	checkpointLine := lineNo
+	checkpointOffset := offset
+	for i := 0; i < cxpPerfLongFinalStatusRecords; i++ {
+		appendLine(`{"timestamp":` + strconv.Quote(base.Add(time.Hour+time.Duration(i+1)*time.Second).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":` + strconv.Quote(fmt.Sprintf("perf-status-only-status-%04d", i)) + `,"thread_id":` + strconv.Quote(threadID) + `,"turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"commentary","message":` + strconv.Quote(cxpPerfLongFinalStatusBody(i)) + `}}`)
+	}
+	appendLine(`{"timestamp":` + strconv.Quote(base.Add(2*time.Hour).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"perf-status-only-final","thread_id":` + strconv.Quote(threadID) + `,"turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":"done"}}`)
+	if err := os.WriteFile(path, []byte(builder.String()), 0o600); err != nil {
+		tb.Fatalf("write status-only transcript: %v", err)
+	}
+	return path, checkpointLine, checkpointOffset
+}
+
+func cxpPerfLongFinalStatusBody(index int) string {
+	return fmt.Sprintf("perf live progress status %04d %s", index, cxpPerfText(cxpPerfLongFinalStatusBytes))
+}
+
+func cxpPerfCountSessionTranscriptDeliveries(tb testing.TB, store *teamstore.Store, sessionID string, status teamstore.TranscriptDeliveryStatus) int {
+	tb.Helper()
+	state, err := store.SessionTranscriptDedupeSnapshot(context.Background(), sessionID, transcriptCheckpointID(sessionID))
+	if err != nil {
+		tb.Fatalf("load transcript delivery count snapshot: %v", err)
+	}
+	count := 0
+	for _, delivery := range state.TranscriptDeliveries {
+		if delivery.SessionID == sessionID && delivery.Status == status {
+			count++
+		}
+	}
+	return count
 }
 
 func cxpPerfSeedRealisticMixedUserState(tb testing.TB, store *teamstore.Store, bridge *Bridge) {

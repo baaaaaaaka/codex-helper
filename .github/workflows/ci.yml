@@ -900,6 +900,9 @@ jobs:
         run: |
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteWorkflowNotificationNoPendingFlushProfiles/many-long-chats$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/many-long-chats/has-pending-workflow-notifications$' -benchtime=1x -count=1
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites$' -benchtime=1x -count=1
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatCompleteTurnBreakdown$' -benchtime=1x -count=1
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLite(LongTranscriptFinalArrival|StatusOnlyFinalArrival)$' -benchtime=1x -count=1
 
       - name: Skills local git smoke (Linux/macOS)
         if: runner.os != 'Windows'

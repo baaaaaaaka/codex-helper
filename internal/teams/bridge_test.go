@@ -8997,6 +8997,112 @@ func TestBridgePublishImportsExistingTranscriptOnDemand(t *testing.T) {
 	}
 }
 
+func TestBridgePreFinalStatusBackfillAdvancesCheckpointToFinal(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-final-checkpoint"
+	session.Cwd = t.TempDir()
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	var lines []string
+	var offset int64
+	appendLine := func(line string) int64 {
+		lines = append(lines, line)
+		offset += int64(len(line) + 1)
+		return offset
+	}
+	checkpointOffset := appendLine(`{"type":"event_msg","payload":{"type":"agent_message","id":"checkpoint-1","thread_id":"thread-final-checkpoint","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`)
+	appendLine(`{"type":"event_msg","payload":{"type":"agent_message","id":"status-1","thread_id":"thread-final-checkpoint","turn_id":"codex-turn-final-checkpoint","phase":"commentary","message":"working"}}`)
+	appendLine(`{"type":"event_msg","payload":{"type":"agent_message","id":"final-1","thread_id":"thread-final-checkpoint","turn_id":"codex-turn-final-checkpoint","phase":"final_answer","message":"done"}}`)
+	if err := os.WriteFile(transcriptPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	turn := teamstore.Turn{
+		ID:            "turn-final-checkpoint",
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: session.CodexThreadID,
+		CodexTurnID:   "codex-turn-final-checkpoint",
+		StartedAt:     time.Now().Add(-time.Minute),
+	}
+	sentAt := time.Now().Add(-30 * time.Second)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		stored := state.Sessions[session.ID]
+		stored.ID = session.ID
+		stored.Status = teamstore.SessionStatusActive
+		stored.TeamsChatID = session.ChatID
+		stored.CodexThreadID = session.CodexThreadID
+		stored.Cwd = session.Cwd
+		state.Sessions[session.ID] = stored
+		state.Turns[turn.ID] = turn
+		state.OutboxMessages["known-live-status"] = teamstore.OutboxMessage{
+			ID:             "known-live-status",
+			SessionID:      session.ID,
+			TurnID:         turn.ID,
+			CodexThreadID:  session.CodexThreadID,
+			TeamsChatID:    session.ChatID,
+			TeamsMessageID: "known-live-status-teams-message",
+			Kind:           "codex-progress-001",
+			Body:           "working",
+			SourceTextHash: normalizedTextHash("working"),
+			RenderedHash:   normalizedTextHash("working"),
+			Status:         teamstore.OutboxStatusSent,
+			CreatedAt:      sentAt,
+			UpdatedAt:      sentAt,
+			SentAt:         sentAt,
+		}
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID(session.ID),
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "checkpoint-1",
+			LastSourceLine: 1,
+			LastOffset:     checkpointOffset,
+			SourceSize:     checkpointOffset,
+			SourceModTime:  info.ModTime(),
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      time.Now().Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	queued, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	if err != nil {
+		t.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
+	}
+	if queued != 0 {
+		t.Fatalf("queued = %d, want no stale pre-final status deliveries", queued)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "final-1" || checkpoint.LastSourceLine != 3 {
+		t.Fatalf("checkpoint = %#v, want final record", checkpoint)
+	}
+	for _, delivery := range state.TranscriptDeliveries {
+		if delivery.SessionID == session.ID {
+			t.Fatalf("unexpected transcript delivery queued: %#v", delivery)
+		}
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.SessionID == session.ID && strings.HasPrefix(outbox.ID, "outbox:transcript-delivery:") {
+			t.Fatalf("unexpected transcript outbox queued: %#v", outbox)
+		}
+	}
+}
+
 func TestBridgePublishClosedLinkedSessionCreatesNewWorkChat(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {

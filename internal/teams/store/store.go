@@ -980,6 +980,16 @@ func (e *OwnerConflictError) Is(target error) bool {
 	return target == ErrOwnerLive
 }
 
+type CodexThreadBindingConflictError struct {
+	SessionID string
+	Existing  string
+	Observed  string
+}
+
+func (e CodexThreadBindingConflictError) Error() string {
+	return fmt.Sprintf("Codex thread binding conflict for session %s: existing=%s observed=%s", e.SessionID, e.Existing, e.Observed)
+}
+
 type Store struct {
 	path                 string
 	mu                   sync.Mutex
@@ -3087,6 +3097,63 @@ func (s *Store) UpdateSession(ctx context.Context, sessionID string, fn func(*St
 	return s.withSessionLock(ctx, sessionID, func() error {
 		return s.Update(ctx, fn)
 	})
+}
+
+func (s *Store) BindSessionCodexThread(ctx context.Context, sessionID string, turnID string, threadID string) (SessionContext, bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	turnID = strings.TrimSpace(turnID)
+	threadID = strings.TrimSpace(threadID)
+	if sessionID == "" {
+		return SessionContext{}, false, fmt.Errorf("session id is required")
+	}
+	if threadID == "" {
+		return SessionContext{}, false, fmt.Errorf("codex thread id is required")
+	}
+	if out, changed, handled, err := s.bindSessionCodexThreadSQLite(ctx, sessionID, turnID, threadID); handled || err != nil {
+		return out, changed, err
+	}
+	var out SessionContext
+	changed := false
+	err := s.UpdateSession(ctx, sessionID, func(state *State) error {
+		durable := state.Sessions[sessionID]
+		if durable.ID == "" {
+			return fmt.Errorf("session %q not found", sessionID)
+		}
+		if existing := strings.TrimSpace(durable.CodexThreadID); existing != "" && existing != threadID {
+			return CodexThreadBindingConflictError{SessionID: sessionID, Existing: existing, Observed: threadID}
+		}
+		var turn Turn
+		turnOK := false
+		if turnID != "" {
+			loaded := state.Turns[turnID]
+			if loaded.ID != "" && strings.TrimSpace(loaded.SessionID) == sessionID {
+				if existing := strings.TrimSpace(loaded.CodexThreadID); existing != "" && existing != threadID {
+					return CodexThreadBindingConflictError{SessionID: sessionID, Existing: existing, Observed: threadID}
+				}
+				turn = loaded
+				turnOK = true
+			}
+		}
+		sessionNeedsUpdate := strings.TrimSpace(durable.CodexThreadID) != threadID
+		turnNeedsUpdate := turnOK && strings.TrimSpace(turn.CodexThreadID) != threadID
+		out = durable
+		if !sessionNeedsUpdate && !turnNeedsUpdate {
+			return errStoreNoChange
+		}
+		now := time.Now()
+		durable.CodexThreadID = threadID
+		durable.UpdatedAt = now
+		state.Sessions[sessionID] = durable
+		if turnNeedsUpdate {
+			turn.CodexThreadID = threadID
+			turn.UpdatedAt = now
+			state.Turns[turn.ID] = turn
+		}
+		out = durable
+		changed = true
+		return nil
+	})
+	return out, changed, err
 }
 
 func (s *Store) CreateSession(ctx context.Context, session SessionContext) (SessionContext, bool, error) {

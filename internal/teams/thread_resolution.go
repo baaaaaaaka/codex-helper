@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -161,31 +162,16 @@ func (b *Bridge) bindSessionCodexThreadIfSafe(ctx context.Context, session *Sess
 		}
 		return nil
 	}
-	err = b.store.UpdateSession(ctx, sessionID, func(state *teamstore.State) error {
-		durable := state.Sessions[sessionID]
-		if durable.ID == "" {
-			return fmt.Errorf("session %q not found", sessionID)
-		}
-		if existing := strings.TrimSpace(durable.CodexThreadID); existing != "" && existing != threadID {
-			return codexThreadConflictError{SessionID: sessionID, Existing: existing, Observed: threadID, Source: source}
-		}
-		durable.CodexThreadID = threadID
-		durable.UpdatedAt = time.Now()
-		state.Sessions[sessionID] = durable
-		if turnID != "" {
-			turn := state.Turns[turnID]
-			if turn.ID != "" && strings.TrimSpace(turn.SessionID) == sessionID {
-				if existing := strings.TrimSpace(turn.CodexThreadID); existing != "" && existing != threadID {
-					return codexThreadConflictError{SessionID: sessionID, Existing: existing, Observed: threadID, Source: source}
-				}
-				turn.CodexThreadID = threadID
-				turn.UpdatedAt = durable.UpdatedAt
-				state.Turns[turn.ID] = turn
-			}
-		}
-		return nil
-	})
+	_, _, err = b.store.BindSessionCodexThread(ctx, sessionID, turnID, threadID)
 	if err != nil {
+		var conflict teamstore.CodexThreadBindingConflictError
+		if errors.As(err, &conflict) {
+			observed := strings.TrimSpace(conflict.Observed)
+			if observed == "" {
+				observed = threadID
+			}
+			return codexThreadConflictError{SessionID: sessionID, Existing: conflict.Existing, Observed: observed, Source: source}
+		}
 		return err
 	}
 	projectionChanged := b.updateSessionCodexThreadProjection(session, sessionID, threadID)
