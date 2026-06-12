@@ -1337,14 +1337,85 @@ func TestHelperNeedsAttentionQueuesWorkflowCardWithoutOwnerMention(t *testing.T)
 	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
 		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("sent Teams messages = %d, want 1: %#v", len(*sent), *sent)
+	if len(*sent) != 2 {
+		t.Fatalf("sent Teams messages = %d, want original work message and mirrored attention notice: %#v", len(*sent), *sent)
 	}
-	if (*sent)[0].Mentions != 0 {
-		t.Fatalf("sent Teams mentions = %d, want 0: %#v", (*sent)[0].Mentions, *sent)
+	if (*sent)[0].ChatID != "chat-1" || (*sent)[0].Mentions != 0 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "helper needs attention") {
+		t.Fatalf("first message should be original unmentioned work-chat outbox: %#v", (*sent)[0])
+	}
+	mirror := (*sent)[1]
+	if mirror.ChatID != "chat-1" || mirror.Mentions != 0 {
+		t.Fatalf("mirrored attention message = %#v, want unmentioned work-chat helper message", mirror)
+	}
+	mirrorPlain := PlainTextFromTeamsHTML(mirror.Content)
+	for _, want := range []string{"⚠️ Codex needs attention", "previous status/error message"} {
+		if !strings.Contains(mirrorPlain, want) {
+			t.Fatalf("mirrored work-chat notice missing %q:\n%s", want, mirrorPlain)
+		}
 	}
 	if got := atomic.LoadInt32(&workflowCalls); got != 1 {
 		t.Fatalf("workflow webhook calls = %d, want 1", got)
+	}
+}
+
+func TestHelperNeedsAttentionQueuesWorkflowCardAndMirrorsWorkChatWithSQLiteSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Notify helper needs-attention via workflow card with SQLite state")
+	var workflowCalls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&workflowCalls, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+
+	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:sqlite-helper-attention-card",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "helper",
+		Body:             "helper needs attention",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("queue helper needs-attention outbox: %v", err)
+	}
+	if queued.MentionOwner {
+		t.Fatalf("queued helper needs-attention MentionOwner = true, want false when workflow card is enabled: %#v", queued)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&workflowCalls); got != 1 {
+		t.Fatalf("workflow webhook calls = %d, want 1", got)
+	}
+	if got := countSentPlainContainingForChat(*sent, "chat-1", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("sqlite workflow-card work-chat mirrored attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "⚠️ Codex needs attention"); got != 0 {
+		t.Fatalf("sqlite workflow-card control fallback attention count = %d, want 0; sent=%#v", got, *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	mirrorID := "outbox:workflow-work-attention:" + shortStableID("workflow:"+shortStableID(queued.ID))
+	mirroredOutbox := state.OutboxMessages[mirrorID]
+	if mirroredOutbox.ID == "" || mirroredOutbox.TeamsChatID != "chat-1" {
+		t.Fatalf("sqlite workflow-card mirrored outbox = %#v, want stored work-chat mirror", mirroredOutbox)
 	}
 }
 
@@ -1407,6 +1478,134 @@ func TestNeedsAttentionFallbackMirrorsWorkChatBeforeControlMentionWhenWorkflowNo
 	}
 	if mirroredOutbox.MentionOwner || mirroredOutbox.NotificationKind != "" || mirroredOutbox.Kind != "helper" {
 		t.Fatalf("mirrored outbox metadata = %#v, want plain helper outbox without notification recursion", mirroredOutbox)
+	}
+}
+
+func TestNeedsAttentionFallbackMirrorsWorkChatWithSQLiteWorkflowSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Use SQLite control chat fallback for needs attention")
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:sqlite-helper-attention",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "helper",
+		Body:             "helper needs attention",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("seed sqlite attention outbox: %v", err)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+
+	if got := countSentPlainContainingForChat(*sent, "chat-1", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("sqlite work-chat mirrored attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("sqlite control fallback attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	mirrorID := "outbox:workflow-work-attention:" + shortStableID("workflow:"+shortStableID(queued.ID))
+	mirroredOutbox := state.OutboxMessages[mirrorID]
+	if mirroredOutbox.ID == "" || mirroredOutbox.TeamsChatID != "chat-1" {
+		t.Fatalf("sqlite mirrored outbox = %#v, want stored work-chat mirror", mirroredOutbox)
+	}
+}
+
+func TestNeedsAttentionWebhookFailureMirrorsWorkChatOnceBeforeControlFallbackWithSQLite(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Fallback after needs-attention webhook failure")
+	var workflowCalls int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&workflowCalls, 1)
+		http.Error(w, "bad workflow payload", http.StatusBadRequest)
+	}))
+	defer server.Close()
+	bridge.httpClient = server.Client()
+	urlFile := writeWorkflowWebhookURLFile(t, server.URL)
+	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
+		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+
+	queued, err := bridge.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:               "outbox:sqlite-helper-attention-card-fails",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "helper",
+		Body:             "helper needs attention",
+		MentionOwner:     true,
+		NotificationKind: "needs_attention",
+	})
+	if err != nil {
+		t.Fatalf("queue helper needs-attention outbox: %v", err)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{}); err != nil {
+		t.Fatalf("sendQueuedOutboxWithOptions: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&workflowCalls); got != 1 {
+		t.Fatalf("workflow webhook calls = %d, want 1", got)
+	}
+	if got := countSentPlainContainingForChat(*sent, "chat-1", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("sqlite webhook-failure work-chat mirrored attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("sqlite webhook-failure control fallback attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+	if got := countSentPlainContainingForChat(*sent, "control-chat", "Workflow card send failed"); got != 1 {
+		t.Fatalf("sqlite webhook-failure control fallback failure count = %d, want 1; sent=%#v", got, *sent)
+	}
+}
+
+func TestNeedsAttentionMirrorUsesEventWorkChatIDWithoutSessionSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	state := teamstore.State{
+		ControlChat: teamstore.ControlChatBinding{TeamsChatID: "control-chat"},
+	}
+
+	bridge.queueAndFlushWorkflowNotificationWorkChatAttentionNotice(ctx, state, WorkflowNotificationEvent{
+		ID:         "workflow:direct-work-chat",
+		SessionID:  "missing-session",
+		TurnID:     "turn-1",
+		WorkChatID: "chat-1",
+		Kind:       "needs_attention",
+		Title:      "⚠️ Codex needs attention",
+	})
+
+	if got := countSentPlainContainingForChat(*sent, "chat-1", "⚠️ Codex needs attention"); got != 1 {
+		t.Fatalf("event work-chat mirrored attention count = %d, want 1; sent=%#v", got, *sent)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	mirrorID := "outbox:workflow-work-attention:" + shortStableID("workflow:direct-work-chat")
+	mirroredOutbox := state.OutboxMessages[mirrorID]
+	if mirroredOutbox.ID == "" || mirroredOutbox.TeamsChatID != "chat-1" || mirroredOutbox.SessionID != "missing-session" {
+		t.Fatalf("event work-chat mirrored outbox = %#v, want stored work-chat mirror without durable session", mirroredOutbox)
 	}
 }
 

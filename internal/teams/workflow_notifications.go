@@ -28,6 +28,7 @@ type WorkflowNotificationEvent struct {
 	SessionID      string
 	TurnID         string
 	OutboxID       string
+	WorkChatID     string
 	Kind           string
 	Title          string
 	ChatTitle      string
@@ -255,6 +256,7 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 		SessionID:      outbox.SessionID,
 		TurnID:         outbox.TurnID,
 		OutboxID:       outbox.ID,
+		WorkChatID:     outbox.TeamsChatID,
 		Kind:           "workflow",
 		ChatTitle:      chatTitle,
 		RequestSummary: requestSummary,
@@ -450,6 +452,7 @@ func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event Workf
 	if err := b.queueWorkflowNotification(ctx, event); err != nil {
 		return err
 	}
+	b.queueAndFlushWorkflowNotificationWorkChatAttentionNotice(ctx, state, event)
 	if err := b.flushPendingWorkflowNotifications(ctx); err != nil {
 		if fallbackErr := b.queueWorkflowNotificationFallbackForDefiniteSendFailure(ctx, event, err); fallbackErr != nil {
 			if b.out != nil {
@@ -490,6 +493,14 @@ func (b *Bridge) queueWorkflowNotificationFallbackMention(ctx context.Context, s
 	if err != nil || !queued {
 		return err
 	}
+	b.queueAndFlushWorkflowNotificationWorkChatAttentionNotice(ctx, state, event)
+	if err := b.flushPendingOutboxForChat(ctx, workflowFallbackControlChatID(state)); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams workflow fallback send error: %v\n", err)
+	}
+	return nil
+}
+
+func (b *Bridge) queueAndFlushWorkflowNotificationWorkChatAttentionNotice(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent) {
 	if workChatID, ok, err := b.queueWorkflowNotificationWorkChatAttentionNotice(ctx, state, event); err != nil {
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow work-chat attention notice queue error: %v\n", err)
@@ -499,10 +510,6 @@ func (b *Bridge) queueWorkflowNotificationFallbackMention(ctx context.Context, s
 			_, _ = fmt.Fprintf(b.out, "Teams workflow work-chat attention notice send error: %v\n", err)
 		}
 	}
-	if err := b.flushPendingOutboxForChat(ctx, workflowFallbackControlChatID(state)); err != nil && b.out != nil {
-		_, _ = fmt.Fprintf(b.out, "Teams workflow fallback send error: %v\n", err)
-	}
-	return nil
 }
 
 func (b *Bridge) queueWorkflowNotificationFallbackMentionOnly(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent, reason string) (bool, error) {
@@ -543,11 +550,13 @@ func (b *Bridge) queueWorkflowNotificationWorkChatAttentionNotice(ctx context.Co
 	if controlChatID == "" {
 		return "", false, nil
 	}
-	session, ok := state.Sessions[strings.TrimSpace(event.SessionID)]
+	workChatID, ok, err := b.workflowNotificationWorkChatID(ctx, state, event)
+	if err != nil {
+		return "", false, err
+	}
 	if !ok {
 		return "", false, nil
 	}
-	workChatID := strings.TrimSpace(session.TeamsChatID)
 	if workChatID == "" || workChatID == controlChatID {
 		return "", false, nil
 	}
@@ -570,6 +579,36 @@ func (b *Bridge) queueWorkflowNotificationWorkChatAttentionNotice(ctx context.Co
 		workChatID = strings.TrimSpace(queued.TeamsChatID)
 	}
 	return workChatID, true, nil
+}
+
+func (b *Bridge) workflowNotificationWorkChatID(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent) (string, bool, error) {
+	if workChatID := strings.TrimSpace(event.WorkChatID); workChatID != "" {
+		return workChatID, true, nil
+	}
+	session, ok, err := b.workflowNotificationWorkChatSession(ctx, state, event)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	return strings.TrimSpace(session.TeamsChatID), true, nil
+}
+
+func (b *Bridge) workflowNotificationWorkChatSession(ctx context.Context, state teamstore.State, event WorkflowNotificationEvent) (teamstore.SessionContext, bool, error) {
+	sessionID := strings.TrimSpace(event.SessionID)
+	if sessionID == "" {
+		return teamstore.SessionContext{}, false, nil
+	}
+	if session, ok := state.Sessions[sessionID]; ok {
+		return session, true, nil
+	}
+	if b == nil || b.store == nil {
+		return teamstore.SessionContext{}, false, nil
+	}
+	sessions, err := b.store.SessionsByID(ctx, []string{sessionID})
+	if err != nil {
+		return teamstore.SessionContext{}, false, err
+	}
+	session, ok := sessions[sessionID]
+	return session, ok, nil
 }
 
 func workflowNotificationShouldMirrorAttentionToWorkChat(event WorkflowNotificationEvent) bool {
