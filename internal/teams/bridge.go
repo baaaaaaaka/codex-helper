@@ -13122,6 +13122,9 @@ func (b *Bridge) recordGraphRateLimit(ctx context.Context, chatID string, outbox
 
 func (b *Bridge) formatSessionList() string {
 	active := b.reg.ActiveSessions()
+	for i, j := 0, len(active)-1; i < j; i, j = i+1, j-1 {
+		active[i], active[j] = active[j], active[i]
+	}
 	closedCount := 0
 	for _, session := range b.reg.Sessions {
 		if !isActiveSessionStatus(session.Status) {

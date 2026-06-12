@@ -134,6 +134,12 @@ jobs:
           go test ./internal/teams -count=1 -run 'TestBridge(EnsureControlChatDoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding))$' -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
+      - name: Teams control status display regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'TestBridgeControlStatus(ShowsNewestActiveChatLast|ChunkingKeepsNewestActiveChatLast)$' -v
+
       - name: Teams manual park and continuation regressions
         shell: bash
         run: |

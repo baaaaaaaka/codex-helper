@@ -6799,6 +6799,93 @@ func TestBridgeControlRecognizedCommandWritesControlHistory(t *testing.T) {
 	}
 }
 
+func TestBridgeControlStatusShowsNewestActiveChatLast(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	now := time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC)
+	bridge.reg.Sessions = []Session{
+		{
+			ID:        "s001",
+			ChatID:    "chat-old",
+			ChatURL:   "https://teams.example/old",
+			Topic:     "old chat",
+			Status:    "active",
+			UpdatedAt: now.Add(-3 * time.Hour),
+		},
+		{
+			ID:        "s002",
+			ChatID:    "chat-middle",
+			ChatURL:   "https://teams.example/middle",
+			Topic:     "middle chat",
+			Status:    "active",
+			UpdatedAt: now.Add(-2 * time.Hour),
+		},
+		{
+			ID:        "s003",
+			ChatID:    "chat-new",
+			ChatURL:   "https://teams.example/new",
+			Topic:     "new chat",
+			Status:    "active",
+			UpdatedAt: now.Add(-1 * time.Hour),
+		},
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-status-order", "2026-04-30T01:00:00Z", "status"), "status"); err != nil {
+		t.Fatalf("handleControlMessage status error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1: %#v", len(*sent), *sent)
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	requirePlainTextInOrder(t, got, "old chat", "middle chat", "new chat")
+}
+
+func TestBridgeControlStatusChunkingKeepsNewestActiveChatLast(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	now := time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC)
+	const sessionCount = 90
+	bridge.reg.Sessions = make([]Session, 0, sessionCount)
+	for i := 1; i <= sessionCount; i++ {
+		topic := fmt.Sprintf("status-order-chat-%03d %s", i, strings.Repeat("details ", 45))
+		if i == 1 {
+			topic = "oldest visible status chat " + strings.Repeat("details ", 45)
+		}
+		if i == sessionCount {
+			topic = "newest visible status chat " + strings.Repeat("details ", 45)
+		}
+		bridge.reg.Sessions = append(bridge.reg.Sessions, Session{
+			ID:        fmt.Sprintf("s%03d", i),
+			ChatID:    fmt.Sprintf("chat-%03d", i),
+			ChatURL:   fmt.Sprintf("https://teams.example/chat-%03d", i),
+			Topic:     topic,
+			Status:    "active",
+			UpdatedAt: now.Add(time.Duration(i) * time.Minute),
+		})
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-status-chunked-order", "2026-04-30T01:00:00Z", "status"), "status"); err != nil {
+		t.Fatalf("handleControlMessage chunked status error: %v", err)
+	}
+	if len(*sent) < 2 {
+		t.Fatalf("sent messages = %d, want chunked status output", len(*sent))
+	}
+	first := PlainTextFromTeamsHTML((*sent)[0].Content)
+	last := PlainTextFromTeamsHTML((*sent)[len(*sent)-1].Content)
+	if !strings.Contains(first, "oldest visible status chat") {
+		t.Fatalf("first chunk missing oldest chat:\n%s", first)
+	}
+	if strings.Contains(first, "newest visible status chat") {
+		t.Fatalf("first chunk unexpectedly contains newest chat:\n%s", first)
+	}
+	if !strings.Contains(last, "newest visible status chat") {
+		t.Fatalf("last chunk missing newest chat:\n%s", last)
+	}
+	requirePlainTextInOrder(t, sentPlainJoined(*sent), "oldest visible status chat", "newest visible status chat")
+}
+
 func TestBridgeControlHistoryRedactsSecretsBeforePrompt(t *testing.T) {
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
