@@ -16980,6 +16980,7 @@ func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T
 func TestBridgePollOnceParksIdleWorkChatAndAppendsFreezeNoticeToLatestMessage(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-49 * time.Hour)
+	legacyResumeCommand := "r " + resumeKeyForSession(Session{ID: "s001", ChatID: "chat-1"})
 	lastAnswer := bridgePollMessage("last-answer-before-park", oldActivity.Format(time.RFC3339Nano), "")
 	lastAnswer.Body.Content = renderFinalOutboxBodyHTML(teamstore.OutboxMessage{Kind: "final", Body: "last answer before idle"})
 	latestHelper := bridgePollMessage("latest-helper-before-park", oldActivity.Add(time.Minute).Format(time.RFC3339Nano), "")
@@ -17006,10 +17007,13 @@ func TestBridgePollOnceParksIdleWorkChatAndAppendsFreezeNoticeToLatestMessage(t 
 				t.Fatalf("decode patch payload: %v", err)
 			}
 			plain := PlainTextFromTeamsHTML(payload.Body.Content)
-			for _, want := range []string{"helper status before idle", "This chat is paused", "Step 2: Send: r "} {
+			for _, want := range []string{"helper status before idle", "This chat is paused", "Step 2: Send: r 1"} {
 				if !strings.Contains(plain, want) {
 					t.Fatalf("patched freeze notice missing %q in:\n%s", want, plain)
 				}
+			}
+			if strings.Contains(plain, legacyResumeCommand) {
+				t.Fatalf("patched freeze notice should not show legacy resume hash %q in:\n%s", legacyResumeCommand, plain)
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return w.Result(), nil
@@ -17125,6 +17129,7 @@ func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenLatestMessagePatchRejected
 	bridge.readGraph = readGraph
 	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+	legacyResumeCommand := "r " + resumeKeyForSession(bridge.reg.Sessions[0])
 
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
@@ -17132,8 +17137,11 @@ func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenLatestMessagePatchRejected
 	if got := strings.Join(patched, ","); got != "newer-helper-before-park" {
 		t.Fatalf("patched targets = %q", got)
 	}
-	if len(sent) != 1 || !strings.Contains(sent[0].Content, "This chat is paused") || !strings.Contains(sent[0].Content, "Step 2: Send: <code>r ") {
+	if len(sent) != 1 || !strings.Contains(sent[0].Content, "This chat is paused") || !strings.Contains(sent[0].Content, "Step 2: Send: <code>r 1</code>") {
 		t.Fatalf("standalone freeze notice sent = %#v", sent)
+	}
+	if strings.Contains(PlainTextFromTeamsHTML(sent[0].Content), legacyResumeCommand) {
+		t.Fatalf("standalone freeze notice should not show legacy resume hash %q in:\n%s", legacyResumeCommand, PlainTextFromTeamsHTML(sent[0].Content))
 	}
 }
 
@@ -17151,12 +17159,16 @@ func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenNoLatestMessageTarget(t *t
 	bridge.readGraph = readGraph
 	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+	legacyResumeCommand := "r " + resumeKeyForSession(bridge.reg.Sessions[0])
 
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
 	}
-	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" || !strings.Contains((*sent)[0].Content, "This chat is paused") || !strings.Contains((*sent)[0].Content, "Step 2: Send: <code>r ") {
+	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" || !strings.Contains((*sent)[0].Content, "This chat is paused") || !strings.Contains((*sent)[0].Content, "Step 2: Send: <code>r 1</code>") {
 		t.Fatalf("freeze notice sent = %#v", *sent)
+	}
+	if strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), legacyResumeCommand) {
+		t.Fatalf("freeze notice should not show legacy resume hash %q in:\n%s", legacyResumeCommand, PlainTextFromTeamsHTML((*sent)[0].Content))
 	}
 	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
 	if err != nil || !ok {
@@ -17543,12 +17555,16 @@ func TestBridgePollOnceSendsStandaloneFreezeNoticeWhenLatestMessageIsNotEditable
 	bridge.readGraph = readGraph
 	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+	legacyResumeCommand := "r " + resumeKeyForSession(bridge.reg.Sessions[0])
 
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
 	}
-	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" || !strings.Contains((*sent)[0].Content, "This chat is paused") || !strings.Contains((*sent)[0].Content, "Step 2: Send: <code>r ") {
+	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" || !strings.Contains((*sent)[0].Content, "This chat is paused") || !strings.Contains((*sent)[0].Content, "Step 2: Send: <code>r 1</code>") {
 		t.Fatalf("freeze notice sent = %#v", *sent)
+	}
+	if strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), legacyResumeCommand) {
+		t.Fatalf("freeze notice should not show legacy resume hash %q in:\n%s", legacyResumeCommand, PlainTextFromTeamsHTML((*sent)[0].Content))
 	}
 }
 
@@ -17771,7 +17787,7 @@ func TestBridgeEditedFreezeNoticeHelperMessageIsIgnoredByPoller(t *testing.T) {
 	bridge := newBridgeTestBridge(&GraphClient{}, newBridgeTestStore(t), &recordingExecutor{})
 	msg := bridgePollMessage("helper-with-freeze-notice", time.Now().Format(time.RFC3339Nano), "")
 	msg.Body.Content = renderTeamsHTMLPart(TeamsRenderInput{Surface: TeamsRenderSurfaceOutbox, Kind: TeamsRenderHelper, Text: "helper status before idle"}, 1, 1)
-	updated, ok := appendFreezeNoticeToMessageHTML(msg, "r abcdef12", renderTeamsFreezeNoticeHTML("https://teams.example/control", "r abcdef12", "Your Codex work is safe. Paused after 48h idle."))
+	updated, ok := appendFreezeNoticeToMessageHTML(msg, "r 1", renderTeamsFreezeNoticeHTML("https://teams.example/control", "r 1", "Your Codex work is safe. Paused after 48h idle."))
 	if !ok {
 		t.Fatal("appendFreezeNoticeToMessageHTML returned false")
 	}
@@ -18479,6 +18495,95 @@ func TestBridgeControlResumeKeyReactivatesParkedWorkChat(t *testing.T) {
 	}
 	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || poll.LastActivityAt.IsZero() {
 		t.Fatalf("resume did not make chat hot and due: %#v", poll)
+	}
+}
+
+func TestBridgeControlResumeSessionNumberReactivatesParkedWorkChat(t *testing.T) {
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateParked,
+		LastActivityAt: time.Now().Add(-49 * time.Hour),
+	}); err != nil {
+		t.Fatalf("park chat: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("resume-number", "2026-05-02T01:05:00Z", "r 1"), "r 1"); err != nil {
+		t.Fatalf("resume command error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat has been resumed") != 1 {
+		t.Fatalf("work-chat resume notice = %#v", *sent)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "Resumed s001") != 1 {
+		t.Fatalf("resume response = %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateHot || poll.NextPollAt.After(time.Now().Add(time.Second)) || poll.LastActivityAt.IsZero() {
+		t.Fatalf("resume did not make chat hot and due: %#v", poll)
+	}
+}
+
+func TestResumeCommandForSessionUsesNumberWithoutHashFallback(t *testing.T) {
+	session := Session{ID: "s001", ChatID: "chat-1"}
+	got := resumeCommandForSession(session)
+	if got != "r 1" {
+		t.Fatalf("resumeCommandForSession = %q, want r 1", got)
+	}
+	if key := resumeKeyForSession(session); strings.Contains(got, key) {
+		t.Fatalf("resume command should not expose legacy hash %q: %q", key, got)
+	}
+	withoutID := Session{ChatID: "chat-1"}
+	got = resumeCommandForSession(withoutID)
+	if got != "r <session-number>" {
+		t.Fatalf("resumeCommandForSession without ID = %q, want placeholder", got)
+	}
+	if key := resumeKeyForSession(withoutID); key != "" && strings.Contains(got, key) {
+		t.Fatalf("resume command without ID should not expose legacy hash %q: %q", key, got)
+	}
+}
+
+func TestFreezeNoticeResumeCommandMatchingRequiresWholeCommand(t *testing.T) {
+	if !freezeNoticeTextContainsAnyResumeCommand("This chat is paused\nStep 2: Send: r 1", []string{"r 1"}) {
+		t.Fatal("expected exact session-number resume command to match")
+	}
+	if freezeNoticeTextContainsAnyResumeCommand("This chat is paused\nStep 2: Send: r 10", []string{"r 1"}) {
+		t.Fatal("r 1 should not match r 10")
+	}
+	if freezeNoticeTextContainsAnyResumeCommand("This chat is paused\nStep 2: Send: br 1", []string{"r 1"}) {
+		t.Fatal("r 1 should not match inside another token")
+	}
+	if !freezeNoticeTextContainsAnyResumeCommand("This chat is paused\nStep 2: Send: r abcdef12", []string{"r abcdef12"}) {
+		t.Fatal("expected exact legacy hash resume command to match")
+	}
+	if freezeNoticeTextContainsAnyResumeCommand("This chat is paused\nStep 2: Send: r abcdef123", []string{"r abcdef12"}) {
+		t.Fatal("legacy hash command should not match a longer hash")
+	}
+	if freezeNoticeTextContainsAnyResumeCommand("Step 2: Send: r 1", []string{"r 1"}) {
+		t.Fatal("resume command without freeze notice marker should not count as a freeze notice")
+	}
+}
+
+func TestSentFreezeNoticeExistsRequiresExactResumeCommand(t *testing.T) {
+	now := time.Now()
+	messages := []teamstore.OutboxMessage{{
+		ID:          "notice-s010",
+		TeamsChatID: "chat-1",
+		Kind:        "freeze-notice",
+		Body:        renderTeamsFreezeNoticeHTML("https://teams.example/control", "r 10", "Your Codex work is safe. Paused after 48h idle."),
+		Status:      teamstore.OutboxStatusSent,
+		SentAt:      now,
+	}}
+	if sentFreezeNoticeExists(messages, "chat-1", "notice-s001", []string{"r 1"}, now.Add(-time.Minute)) {
+		t.Fatal("r 10 freeze notice should not deduplicate r 1")
+	}
+	if !sentFreezeNoticeExists(messages, "chat-1", "notice-new-s010", []string{"r 10"}, now.Add(-time.Minute)) {
+		t.Fatal("expected exact r 10 freeze notice to deduplicate r 10")
 	}
 }
 

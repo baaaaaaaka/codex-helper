@@ -2238,7 +2238,7 @@ func (b *Bridge) parkIdleWorkChat(ctx context.Context, session Session, decision
 	if !decision.ShouldNotifyPark {
 		return nil
 	}
-	resumeCommand := "r " + resumeKeyForSession(session)
+	resumeCommand := resumeCommandForSession(session)
 	poll, _, err := b.store.ChatPoll(ctx, session.ChatID)
 	if err != nil {
 		return err
@@ -2503,16 +2503,17 @@ func (b *Bridge) parkNoticeAlreadySent(ctx context.Context, session Session, not
 	if err != nil {
 		return false, err
 	}
-	if sentFreezeNoticeExists(messages, session.ChatID, noticeID, resumeCommand, parkedAt) {
+	resumeCommands := freezeNoticeResumeCommands(session, resumeCommand)
+	if sentFreezeNoticeExists(messages, session.ChatID, noticeID, resumeCommands, parkedAt) {
 		return true, nil
 	}
-	if b.recentGraphFreezeNoticeExists(ctx, session.ChatID, resumeCommand, parkedAt) {
+	if b.recentGraphFreezeNoticeExists(ctx, session.ChatID, resumeCommands, parkedAt) {
 		return true, nil
 	}
 	return false, nil
 }
 
-func sentFreezeNoticeExists(messages []teamstore.OutboxMessage, chatID string, noticeID string, resumeCommand string, since time.Time) bool {
+func sentFreezeNoticeExists(messages []teamstore.OutboxMessage, chatID string, noticeID string, resumeCommands []string, since time.Time) bool {
 	for _, msg := range messages {
 		if msg.TeamsChatID != chatID || msg.Status != teamstore.OutboxStatusSent {
 			continue
@@ -2530,7 +2531,7 @@ func sentFreezeNoticeExists(messages []teamstore.OutboxMessage, chatID string, n
 			continue
 		}
 		bodyText := PlainTextFromTeamsHTML(msg.Body)
-		if strings.Contains(bodyText, "This chat is paused") && strings.Contains(bodyText, resumeCommand) {
+		if freezeNoticeTextContainsAnyResumeCommand(bodyText, resumeCommands) {
 			return true
 		}
 	}
@@ -2546,8 +2547,8 @@ func outboxMessageActivityTime(msg teamstore.OutboxMessage) time.Time {
 	return time.Time{}
 }
 
-func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID string, resumeCommand string, since time.Time) bool {
-	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(resumeCommand) == "" {
+func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID string, resumeCommands []string, since time.Time) bool {
+	if b == nil || b.readGraph == nil || strings.TrimSpace(chatID) == "" || len(resumeCommands) == 0 {
 		return false
 	}
 	messages, err := b.listParkNoticeMessages(ctx, chatID)
@@ -2561,7 +2562,7 @@ func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID strin
 				continue
 			}
 		}
-		if graphMessageContainsFreezeNotice(msg, resumeCommand) {
+		if graphMessageContainsAnyFreezeNoticeCommand(msg, resumeCommands) {
 			return true
 		}
 	}
@@ -2571,6 +2572,49 @@ func (b *Bridge) recentGraphFreezeNoticeExists(ctx context.Context, chatID strin
 func graphMessageContainsFreezeNotice(msg ChatMessage, resumeCommand string) bool {
 	text := PlainTextFromTeamsHTML(msg.Body.Content)
 	return strings.Contains(text, "This chat is paused") && (strings.TrimSpace(resumeCommand) == "" || strings.Contains(text, resumeCommand))
+}
+
+func graphMessageContainsAnyFreezeNoticeCommand(msg ChatMessage, resumeCommands []string) bool {
+	return freezeNoticeTextContainsAnyResumeCommand(PlainTextFromTeamsHTML(msg.Body.Content), resumeCommands)
+}
+
+func freezeNoticeTextContainsAnyResumeCommand(text string, resumeCommands []string) bool {
+	if !strings.Contains(text, "This chat is paused") {
+		return false
+	}
+	for _, command := range resumeCommands {
+		if freezeNoticeTextContainsResumeCommand(text, command) {
+			return true
+		}
+	}
+	return false
+}
+
+func freezeNoticeTextContainsResumeCommand(text string, command string) bool {
+	text = strings.Join(strings.Fields(text), " ")
+	command = strings.Join(strings.Fields(strings.TrimSpace(command)), " ")
+	if text == "" || command == "" {
+		return false
+	}
+	start := 0
+	for {
+		idx := strings.Index(text[start:], command)
+		if idx < 0 {
+			return false
+		}
+		idx += start
+		after := idx + len(command)
+		beforeOK := idx == 0 || isResumeCommandBoundary(text[idx-1])
+		afterOK := after == len(text) || isResumeCommandBoundary(text[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = idx + 1
+	}
+}
+
+func isResumeCommandBoundary(b byte) bool {
+	return !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '-')
 }
 
 func chatMessageActivityTime(msg ChatMessage) time.Time {
@@ -2591,6 +2635,68 @@ func resumeKeyForSession(session Session) string {
 	}
 	sum := sha256.Sum256([]byte(seed))
 	return hex.EncodeToString(sum[:])[:8]
+}
+
+func resumeCommandForSession(session Session) string {
+	if number := sessionNumberForResume(session); number != "" {
+		return "r " + number
+	}
+	if id := strings.TrimSpace(session.ID); id != "" {
+		return "r " + id
+	}
+	return "r <session-number>"
+}
+
+func freezeNoticeResumeCommands(session Session, current string) []string {
+	var commands []string
+	add := func(command string) {
+		command = strings.TrimSpace(command)
+		if command == "" {
+			return
+		}
+		for _, existing := range commands {
+			if strings.EqualFold(existing, command) {
+				return
+			}
+		}
+		commands = append(commands, command)
+	}
+	add(current)
+	if key := resumeKeyForSession(session); key != "" {
+		add("r " + key)
+	}
+	return commands
+}
+
+func sessionNumberForResume(session Session) string {
+	id := strings.TrimSpace(session.ID)
+	if len(id) < 2 || (id[0] != 's' && id[0] != 'S') {
+		return ""
+	}
+	number, ok := parseBarePositiveInt(id[1:])
+	if !ok {
+		return ""
+	}
+	return strconvItoa(number)
+}
+
+func sessionMatchesResumeKey(session Session, key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	if strings.EqualFold(session.ID, key) || strings.EqualFold(resumeKeyForSession(session), key) {
+		return true
+	}
+	if number := sessionNumberForResume(session); number != "" {
+		if strings.EqualFold(number, key) {
+			return true
+		}
+		if parsed, ok := parseBarePositiveInt(key); ok {
+			return number == strconvItoa(parsed)
+		}
+	}
+	return false
 }
 
 func parseGraphTime(value string) time.Time {
@@ -4026,7 +4132,7 @@ func controlAdvancedHelpText() string {
 		"Other control commands:",
 		"- `st` / `status` - list active Teams work chats",
 		"- `d <number>` / `details <number>` - show technical IDs and details",
-		"- `park <session-id>` / `resume <session-id>` / `unpark <session-id>` - manually pause or resume polling for a Work chat",
+		"- `park <session-number-or-id>` / `resume <session-number-or-id>` / `unpark <session-number-or-id>` - manually pause or resume polling for a Work chat",
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
 		"- `helper cancel last` / `helper cancel queued` / `helper cancel running` / `helper cancel all` - stop queued/running Codex question(s) in this Control chat",
@@ -4106,7 +4212,7 @@ func sessionAdvancedHelpText() string {
 		"`helper rename hostname <name>` - rename this machine in all related chat titles",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
-		"`helper park <session-id>` / `helper resume <session-id>` / `helper unpark <session-id>` - manually pause or resume polling for a Work chat",
+		"`helper park <session-number-or-id>` / `helper resume <session-number-or-id>` / `helper unpark <session-number-or-id>` - manually pause or resume polling for a Work chat",
 		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
 		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding; it never overwrites a different existing binding",
 		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
@@ -17402,10 +17508,9 @@ func (b *Bridge) resolveManualWorkChatTarget(arg string, command string) (*Sessi
 		if !isActiveSessionStatus(session.Status) {
 			continue
 		}
-		if strings.EqualFold(session.ID, key) ||
+		if sessionMatchesResumeKey(*session, key) ||
 			strings.EqualFold(session.ChatID, key) ||
-			strings.EqualFold(session.CodexThreadID, key) ||
-			strings.EqualFold(resumeKeyForSession(*session), key) {
+			strings.EqualFold(session.CodexThreadID, key) {
 			addMatch(session)
 		}
 	}
@@ -17498,7 +17603,7 @@ func (b *Bridge) resumeWorkChat(ctx context.Context, session *Session, now time.
 func (b *Bridge) resumeParkedWorkChat(ctx context.Context, arg string) (string, error) {
 	key := strings.ToLower(strings.TrimSpace(arg))
 	if key == "" {
-		return "", fmt.Errorf("usage: `r <resume-key>`")
+		return "", fmt.Errorf("usage: `r <session-number>`")
 	}
 	var match *Session
 	for i := range b.reg.Sessions {
@@ -17506,13 +17611,13 @@ func (b *Bridge) resumeParkedWorkChat(ctx context.Context, arg string) (string, 
 		if !isActiveSessionStatus(session.Status) {
 			continue
 		}
-		if strings.EqualFold(session.ID, key) || strings.EqualFold(resumeKeyForSession(*session), key) {
+		if sessionMatchesResumeKey(*session, key) {
 			match = session
 			break
 		}
 	}
 	if match == nil {
-		return "", fmt.Errorf("resume key not found: %s", key)
+		return "", fmt.Errorf("resume target not found: %s", key)
 	}
 	now := time.Now()
 	if err := b.resumeWorkChat(ctx, match, now); err != nil {

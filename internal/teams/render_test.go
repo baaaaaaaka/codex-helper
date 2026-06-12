@@ -303,18 +303,21 @@ func TestRenderTeamsHTMLUsesParagraphsForBlankLines(t *testing.T) {
 }
 
 func TestRenderTeamsFreezeNoticeHTML(t *testing.T) {
-	got := renderTeamsFreezeNoticeHTML("https://teams.microsoft.com/l/chat/chat-id/conversations", "r 8f3c9a2d", "Your Codex work is safe. Paused after 6h idle.")
+	got := renderTeamsFreezeNoticeHTML("https://teams.microsoft.com/l/chat/chat-id/conversations", "r 1", "Your Codex work is safe. Paused after 6h idle.")
 	for _, want := range []string{
 		`<strong>🔧 Helper:</strong><br>🧊 This chat is paused`,
 		`⚠ <strong>Messages here will not get a reply.</strong>`,
 		`<p>&nbsp;</p>`,
 		`▶️ <strong>Continue chat:</strong>`,
 		`Step 1: Open <a href="https://teams.microsoft.com/l/chat/chat-id/conversations">Control chat</a>`,
-		`Step 2: Send: <code>r 8f3c9a2d</code>`,
+		`Step 2: Send: <code>r 1</code>`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("freeze notice missing %q in:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "r 8f3c9a2d") {
+		t.Fatalf("freeze notice should not show legacy resume hash:\n%s", got)
 	}
 	plain := PlainTextFromTeamsHTML(got)
 	if strings.Contains(plain, "https://teams.microsoft.com") {
@@ -325,7 +328,7 @@ func TestRenderTeamsFreezeNoticeHTML(t *testing.T) {
 		"⚠ Messages here will not get a reply.",
 		"▶️ Continue chat:",
 		"Step 1: Open Control chat",
-		"Step 2: Send: r 8f3c9a2d",
+		"Step 2: Send: r 1",
 	} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("freeze notice plain text missing %q in:\n%s", want, plain)

@@ -62,7 +62,7 @@ func renderTeamsFreezeNoticeHTML(controlLink string, resumeCommand string, safeL
 	controlLink = strings.TrimSpace(controlLink)
 	resumeCommand = strings.TrimSpace(resumeCommand)
 	if resumeCommand == "" {
-		resumeCommand = "r <resume-key>"
+		resumeCommand = "r <session-number>"
 	}
 	safeLine = strings.TrimSpace(safeLine)
 	if safeLine == "" {
