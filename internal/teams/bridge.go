@@ -84,9 +84,9 @@ var codexIdleStatusInitialDelay = 2 * time.Minute
 var codexIdleStatusRepeatDelay = 5 * time.Minute
 var codexIdleStatusCancelHintAfter = 7 * time.Minute
 var codexIdleStatusMessage = "Still working. No new Codex update yet."
-var codexIdleStatusCancelHint = "This is taking longer than usual. To stop the current request, send `helper cancel last` in this chat."
+var codexIdleStatusCancelHint = "This is taking longer than usual. To stop the running request, send `helper cancel running` in this chat."
 var codexSuspectedStuckAfter = 15 * time.Minute
-var codexSuspectedStuckMessage = "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the current request, send `helper cancel last` in this chat."
+var codexSuspectedStuckMessage = "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the running request, send `helper cancel running` in this chat."
 var codexStreamRetryStatusRepeatDelay = 5 * time.Minute
 var queuedTurnAttentionDelay = 10 * time.Minute
 var queuedTurnAttentionRepeatDelay = 10 * time.Minute
@@ -4029,7 +4029,7 @@ func controlAdvancedHelpText() string {
 		"- `park <session-id>` / `resume <session-id>` / `unpark <session-id>` - manually pause or resume polling for a Work chat",
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
-		"- `helper cancel last` / `helper cancel all` - stop queued/running Codex question(s) in this Control chat",
+		"- `helper cancel last` / `helper cancel queued` / `helper cancel running` / `helper cancel all` - stop queued/running Codex question(s) in this Control chat",
 		"- `model list`, `model setup <model>`, `model doctor <model>`, `model use <model>` - manage models",
 		"- `helper rename <title>` - rename this Control chat",
 		"- `helper rename hostname <name>` - rename this machine in the Control chat and all linked Work chats",
@@ -4109,7 +4109,7 @@ func sessionAdvancedHelpText() string {
 		"`helper park <session-id>` / `helper resume <session-id>` / `helper unpark <session-id>` - manually pause or resume polling for a Work chat",
 		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
 		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding; it never overwrites a different existing binding",
-		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
+		"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
 		"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
 		"Other text, including unknown slash-prefixed text, is sent to Codex.",
 	}, "\n")
@@ -6108,7 +6108,7 @@ func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, 
 		TeamsChatID: session.ChatID,
 		Kind:        "ack",
 		AckKind:     "control_prompt",
-		Body:        "❓ **Codex received your control-chat question.**\n\nThis message is not a helper command, so **Codex will answer it here after helper-local preparation succeeds**. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.\n\nTo stop this control-chat request, send `helper cancel last` here. For project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
+		Body:        "❓ **Codex received your control-chat question.**\n\nThis message is not a helper command, so **Codex will answer it here after helper-local preparation succeeds**. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.\n\nTo stop this control-chat request, send `helper cancel " + turn.ID + "` here. For project work, send `new <directory>`, then send the task inside the new 💬 Work chat.",
 	})
 	if err != nil {
 		return err
@@ -6990,15 +6990,15 @@ func blockedAckOptionLines(gate localCodexBeforeTeamsGate) []string {
 		return []string{
 			"**Other options:**",
 			"- Need this request immediately: send it in a different 💬 Work chat.",
-			"- Drop this queued request: `helper cancel last`.",
+			"- Drop the newest queued request: `helper cancel queued`.",
 		}
 	}
 	return []string{
 		"**Options:**",
 		"- Run this request next: do nothing. It is already submitted.",
 		"- Need it immediately: send it in a different 💬 Work chat.",
-		"- Drop this queued request: `helper cancel last`.",
-		"- Interrupt the request ahead only if it looks stuck: open the 🏠 Control chat and send `helper restart force`.",
+		"- Drop the newest queued request: `helper cancel queued`.",
+		"- Interrupt the request ahead only if it looks stuck: `helper cancel running`.",
 	}
 }
 
@@ -7639,7 +7639,7 @@ func (b *Bridge) sendQueuedTurnAttentionIfDue(ctx context.Context, session *Sess
 		queuedTurnBlockedReason(gate),
 		"",
 		"Your Teams message is queued and will run after this clears.",
-		"If this looks stale, send `helper status` here. To drop the queued message, send `helper cancel last`.",
+		"If this looks stale, send `helper status` here. To drop this queued message, send `helper cancel " + turn.ID + "`.",
 	}, "\n")
 	if queueLines := b.sessionTurnQueueSnapshotLines(ctx, session, gate); len(queueLines) > 0 {
 		body += "\n\n---\n\n" + strings.Join(queueLines, "\n")
@@ -8010,7 +8010,7 @@ func (b *Bridge) cancelTurnCommand(ctx context.Context, session *Session, turnID
 
 func (b *Bridge) cancelControlFallbackCommand(ctx context.Context, turnID string) error {
 	if strings.TrimSpace(turnID) == "" {
-		return b.sendControl(ctx, "usage: `helper cancel last`, `helper cancel all`, or `helper cancel <turn-id>`\n\nThese commands apply to the current Control chat Codex question.")
+		return b.sendControl(ctx, "usage: `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, or `helper cancel <turn-id>`\n\nThese commands apply to the current Control chat Codex question.")
 	}
 	session, err := b.ensureControlFallbackSession(ctx)
 	if err != nil {
@@ -8029,7 +8029,7 @@ func (b *Bridge) cancelTurnCommandForScope(ctx context.Context, session *Session
 	}
 	scopeRef := cancelScopeReference(scopeLabel)
 	if turnID == "" {
-		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel last`, `helper cancel all`, `helper cancel <turn-id>`, or `!cancel <turn-id>`\n\nThese commands apply to this "+scopeLabel+".")
+		return b.sendToChat(ctx, session.ChatID, "usage: `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>`, or `!cancel <turn-id>`\n\nThese commands apply to this "+scopeLabel+".")
 	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
@@ -8045,6 +8045,18 @@ func (b *Bridge) cancelTurnCommandForScope(ctx context.Context, session *Session
 		resolved, ok := latestCancelableTurnID(state, session.ID)
 		if !ok {
 			return b.sendToChat(ctx, session.ChatID, "no running or queued turn is available to cancel in this "+scopeRef+".")
+		}
+		turnID = resolved
+	case "queued":
+		resolved, ok := latestCancelableTurnIDByStatus(cancelableTurnsForSession(state, session.ID), teamstore.TurnStatusQueued)
+		if !ok {
+			return b.sendToChat(ctx, session.ChatID, "no queued turn is available to cancel in this "+scopeRef+".")
+		}
+		turnID = resolved
+	case "running":
+		resolved, ok := latestCancelableTurnIDByStatus(cancelableTurnsForSession(state, session.ID), teamstore.TurnStatusRunning)
+		if !ok {
+			return b.sendToChat(ctx, session.ChatID, "no running turn is available to cancel in this "+scopeRef+".")
 		}
 		turnID = resolved
 	}
@@ -8123,13 +8135,21 @@ func (b *Bridge) cancelAllTurnsCommand(ctx context.Context, session *Session, st
 }
 
 func latestCancelableTurnID(state teamstore.State, sessionID string) (string, bool) {
+	turns := cancelableTurnsForSession(state, sessionID)
+	if latest, ok := latestCancelableTurnIDByStatus(turns, teamstore.TurnStatusQueued); ok {
+		return latest, true
+	}
+	return latestCancelableTurnIDByStatus(turns, teamstore.TurnStatusRunning)
+}
+
+func latestCancelableTurnIDByStatus(turns []teamstore.Turn, status teamstore.TurnStatus) (string, bool) {
 	var latest teamstore.Turn
-	latestRank := 0
-	for _, turn := range cancelableTurnsForSession(state, sessionID) {
-		rank := cancelableTurnRank(turn)
-		if latest.ID == "" || rank > latestRank || (rank == latestRank && turnSortTime(turn).After(turnSortTime(latest))) {
+	for _, turn := range turns {
+		if turn.Status != status {
+			continue
+		}
+		if latest.ID == "" || turnSortTime(turn).After(turnSortTime(latest)) {
 			latest = turn
-			latestRank = rank
 		}
 	}
 	if latest.ID == "" {
@@ -13089,7 +13109,7 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 		}
 		switch latest.Status {
 		case teamstore.TurnStatusQueued:
-			lines = append(lines, "Queued request: waiting for local Codex history or the current Codex run to clear. Send `helper cancel last` if you want to drop the queued request.")
+			lines = append(lines, "Queued request: waiting for local Codex history or the current Codex run to clear. Send `helper cancel queued` if you want to drop the newest queued request.")
 		case teamstore.TurnStatusRunning:
 			lines = append(lines, "Running request: Codex is currently working. If no status appears for a while, the helper will send a waiting update.")
 		case teamstore.TurnStatusFailed, teamstore.TurnStatusInterrupted:
@@ -13108,7 +13128,7 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 	if firstNonEmptyString(session.Status, "active") == string(teamstore.SessionStatusClosed) {
 		lines = append(lines, "Next: this chat is closed. Use the 🏠 control chat to open or create another work chat.")
 	} else if hasLatest && latest.Status == teamstore.TurnStatusQueued {
-		lines = append(lines, "Next: wait for the queued request, or send `helper cancel last` to drop it.")
+		lines = append(lines, "Next: wait for the queued request, or send `helper cancel queued` to drop the newest queued request.")
 	} else if hasLatest && latest.Status == teamstore.TurnStatusRunning {
 		lines = append(lines, "Next: wait for Codex to finish. Send a new task only after the final answer if you want strict ordering.")
 	} else if hasLatest && (latest.Status == teamstore.TurnStatusFailed || latest.Status == teamstore.TurnStatusInterrupted) {
@@ -17318,7 +17338,7 @@ func (b *Bridge) parkWorkChatSession(ctx context.Context, session *Session) (str
 		return "", err
 	}
 	if turns.Running || turns.Queued > 0 {
-		return "", fmt.Errorf("cannot park %s: a Codex request is queued or running; wait for it to finish or cancel it with `helper cancel last` in that Work chat", session.ID)
+		return "", fmt.Errorf("cannot park %s: a Codex request is queued or running; wait for it to finish or cancel it with `helper cancel queued`, `helper cancel running`, or `helper cancel all` in that Work chat", session.ID)
 	}
 	now := time.Now()
 	if err := b.ensureDurableSession(ctx, session); err != nil {

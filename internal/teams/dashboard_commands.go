@@ -337,9 +337,12 @@ func helperCancelCommandArgLooksExplicit(arg string) bool {
 	if arg == "" {
 		return true
 	}
-	first, _ := splitDashboardCommandBody(arg)
+	first, rest := splitDashboardCommandBody(arg)
 	first = strings.ToLower(strings.TrimSpace(first))
 	if first == "last" || first == "all" {
+		return true
+	}
+	if (first == "queued" || first == "running") && strings.TrimSpace(rest) == "" {
 		return true
 	}
 	return strings.HasPrefix(first, "turn:") || strings.HasPrefix(first, "turn-")

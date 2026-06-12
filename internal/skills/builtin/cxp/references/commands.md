@@ -124,7 +124,7 @@ Control chat commands:
 - `continue <number-or-session-id>` or `c <...>`: create or open a Work chat for an existing session.
 - `open <number>`: show an existing linked Work chat.
 - `status` or `st`: list active Work chats.
-- `helper cancel last` or `helper cancel all`: cancel or drop queued/running control-chat Codex question(s).
+- `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running control-chat Codex question(s).
 - `helper update now`: update to the latest stable helper release.
 - `helper update prerelease`: update to the newest eligible release or pre-release.
 - `helper reload now`: load the latest helper code after update.
@@ -135,7 +135,7 @@ Work chat commands:
 - Regular text: send a task to Codex.
 - `helper status`: check current request state.
 - `helper retry last`: retry the last failed or interrupted request.
-- `helper cancel last` or `helper cancel all`: cancel or drop queued/running work.
+- `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running work.
 - `helper file <relative-path>`: upload a generated file from the Teams outbound folder.
 - `helper close`: close the Work chat binding.
 

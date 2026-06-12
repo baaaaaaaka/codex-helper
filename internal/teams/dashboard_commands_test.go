@@ -185,7 +185,7 @@ func TestParseControlUnknownInputForwardsOnlyPlainTextToCodex(t *testing.T) {
 }
 
 func TestParseControlCancelTargetsControlFallback(t *testing.T) {
-	for _, text := range []string{"helper cancel", "helper cancel last", "helper cancel all", "helper cancel turn:inbound:control:message", "helper stop turn-123", "helper stop last", "!cancel last", "/cancel last"} {
+	for _, text := range []string{"helper cancel", "helper cancel last", "helper cancel queued", "helper cancel running", "helper cancel all", "helper cancel turn:inbound:control:message", "helper stop turn-123", "helper stop last", "helper stop queued", "helper stop running", "!cancel last", "!cancel running", "/cancel last", "/cancel queued"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeControl, text)
 			if !cmd.HelperCommand || cmd.Name != DashboardCommandCancel {
@@ -203,6 +203,8 @@ func TestParseControlCancelNaturalLanguageFallsBackToCodex(t *testing.T) {
 		"helper cancel 为什么不能取消",
 		"helper stop should explain the stuck request",
 		"helper cancel can you tell me how this works",
+		"helper cancel queued please",
+		"helper cancel running 为什么没停",
 	} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeControl, text)

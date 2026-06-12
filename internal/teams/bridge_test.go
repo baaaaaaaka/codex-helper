@@ -792,6 +792,20 @@ func TestBridgeWorkChatBareHelpAdvancedDoesNotRunCodex(t *testing.T) {
 	}
 }
 
+func TestControlAdvancedHelpListsCancelSelectors(t *testing.T) {
+	plain := controlAdvancedHelpText()
+	for _, want := range []string{
+		"helper cancel last",
+		"helper cancel queued",
+		"helper cancel running",
+		"helper cancel all",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("control advanced help missing %q:\n%s", want, plain)
+		}
+	}
+}
+
 func TestBridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -1524,7 +1538,7 @@ func TestBridgeAddsCancelHintAfterLongCodexIdleStatus(t *testing.T) {
 	codexIdleStatusRepeatDelay = 10 * time.Millisecond
 	codexIdleStatusCancelHintAfter = 15 * time.Millisecond
 	codexIdleStatusMessage = "Still working. No new Codex update yet."
-	codexIdleStatusCancelHint = "This is taking longer than usual. To stop the current request, send `helper cancel last` in this chat."
+	codexIdleStatusCancelHint = "This is taking longer than usual. To stop the running request, send `helper cancel running` in this chat."
 	defer func() {
 		codexIdleStatusInitialDelay = oldInitial
 		codexIdleStatusRepeatDelay = oldRepeat
@@ -1555,7 +1569,7 @@ func TestBridgeAddsCancelHintAfterLongCodexIdleStatus(t *testing.T) {
 	case <-time.After(bridgeAsyncTestTimeout):
 		t.Fatal("streaming executor did not start")
 	}
-	waitForOutboxBody(t, store, "helper cancel last")
+	waitForOutboxBody(t, store, "helper cancel running")
 	close(executor.release)
 	select {
 	case err := <-done:
@@ -1571,7 +1585,7 @@ func TestBridgeAddsCancelHintAfterLongCodexIdleStatus(t *testing.T) {
 		joined.WriteString(PlainTextFromTeamsHTML(msg.Content))
 		joined.WriteString("\n")
 	}
-	if !strings.Contains(joined.String(), "Still working. No new Codex update yet.") || !strings.Contains(joined.String(), "helper cancel last") {
+	if !strings.Contains(joined.String(), "Still working. No new Codex update yet.") || !strings.Contains(joined.String(), "helper cancel running") {
 		t.Fatalf("long idle status missing cancel hint:\n%s", joined.String())
 	}
 	if !strings.Contains(joined.String(), "done after cancel hint") {
@@ -1593,7 +1607,7 @@ func TestBridgeWarnsWhenCodexIdleMayBeStuck(t *testing.T) {
 	codexIdleStatusMessage = "Still working. No new Codex update yet."
 	codexIdleStatusCancelHint = "cancel hint should not be used"
 	codexSuspectedStuckAfter = 15 * time.Millisecond
-	codexSuspectedStuckMessage = "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the current request, send `helper cancel last` in this chat."
+	codexSuspectedStuckMessage = "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the running request, send `helper cancel running` in this chat."
 	defer func() {
 		codexIdleStatusInitialDelay = oldInitial
 		codexIdleStatusRepeatDelay = oldRepeat
@@ -1642,7 +1656,7 @@ func TestBridgeWarnsWhenCodexIdleMayBeStuck(t *testing.T) {
 		joined.WriteString(PlainTextFromTeamsHTML(msg.Content))
 		joined.WriteString("\n")
 	}
-	for _, want := range []string{"Codex has not produced any update", "may be stuck", "helper cancel last", "done after suspected stuck warning"} {
+	for _, want := range []string{"Codex has not produced any update", "may be stuck", "helper cancel running", "done after suspected stuck warning"} {
 		if !strings.Contains(joined.String(), want) {
 			t.Fatalf("suspected stuck transcript missing %q:\n%s", want, joined.String())
 		}
@@ -1792,7 +1806,8 @@ func TestBridgeAsyncTurnsQueuesTeamsInputWhileCodexIsRunning(t *testing.T) {
 		"⏳ Queued requests:",
 		"first prompt",
 		"second prompt",
-		"helper cancel last",
+		"helper cancel queued",
+		"helper cancel running",
 		"🤖 ✅ Codex answer:\ndone 1",
 		"🤖 ✅ Codex answer:\ndone 2",
 	} {
@@ -2817,7 +2832,7 @@ func TestBridgeControlCancelLastRunningFallbackCancelsExecutor(t *testing.T) {
 	}
 	waitForNoActiveTurnsOrOutbox(t, store, controlFallbackSessionID)
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Codex received your control-chat question", "helper cancel last", "cancel requested for running turn", "Codex request canceled."} {
+	for _, want := range []string{"Codex received your control-chat question", "helper cancel turn:", "cancel requested for running turn", "Codex request canceled."} {
 		if !strings.Contains(joined, want) {
 			close(executor.release)
 			t.Fatalf("control cancel transcript missing %q in:\n%s", want, joined)
@@ -10997,6 +11012,201 @@ func TestBridgeSessionCancelLastQueuedTurnMarksInterrupted(t *testing.T) {
 	}
 }
 
+func TestBridgeSessionCancelLastDropsQueuedTurnBeforeRunningTurn(t *testing.T) {
+	graph, sent := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &serialStreamingExecutor{
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("first", "2026-05-03T01:00:00Z", "first prompt"), "first prompt"); err != nil {
+		t.Fatalf("handle first message error: %v", err)
+	}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "first prompt") {
+			t.Fatalf("first started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("first Codex turn did not start")
+	}
+
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("second", "2026-05-03T01:00:05Z", "second prompt"), "second prompt"); err != nil {
+		t.Fatalf("handle queued message error: %v", err)
+	}
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("cancel-queued", "2026-05-03T01:00:06Z", "helper cancel last"), "helper cancel last"); err != nil {
+		t.Fatalf("cancel queued turn error: %v", err)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after cancel queued error: %v", err)
+	}
+	var runningTurn, queuedTurn teamstore.Turn
+	for _, turn := range state.Turns {
+		switch turn.InboundEventID {
+		case "inbound:chat-1:first":
+			runningTurn = turn
+		case "inbound:chat-1:second":
+			queuedTurn = turn
+		}
+	}
+	if runningTurn.ID == "" || queuedTurn.ID == "" {
+		t.Fatalf("missing test turns: running=%#v queued=%#v turns=%#v", runningTurn, queuedTurn, state.Turns)
+	}
+	if got := runningTurn.Status; got != teamstore.TurnStatusRunning {
+		t.Fatalf("running turn status = %q, want running", got)
+	}
+	if got := queuedTurn.Status; got != teamstore.TurnStatusInterrupted {
+		t.Fatalf("queued turn status = %q, want interrupted", got)
+	}
+
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, "s001", 1)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	select {
+	case got := <-executor.started:
+		t.Fatalf("canceled queued turn started unexpectedly: %q", got)
+	default:
+	}
+
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Your request is queued", "turn canceled", "second prompt", "done 1: first prompt"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("cancel queued transcript missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "cancel requested for running turn") {
+		t.Fatalf("cancel last targeted running turn instead of queued turn:\n%s", joined)
+	}
+}
+
+func TestBridgeSessionCancelQueuedSelectorLeavesRunningTurn(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	base := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
+	running := queueBridgeTestTurnWithPrompt(t, store, session, "running-selector", "running selector prompt", teamstore.TurnStatusRunning, base)
+	queued := queueBridgeTestTurnWithPrompt(t, store, session, "queued-selector", "queued selector prompt", teamstore.TurnStatusQueued, base.Add(time.Second))
+	runningCancelCalled := false
+	unregister := bridge.registerRunningTurnCancel(session.ID, running.ID, func() {
+		runningCancelCalled = true
+	})
+	defer unregister()
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("cancel-queued-selector-command"), "helper cancel queued"); err != nil {
+		t.Fatalf("cancel queued selector error: %v", err)
+	}
+	if runningCancelCalled {
+		t.Fatal("queued selector canceled the running turn")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns[queued.ID].Status; got != teamstore.TurnStatusInterrupted {
+		t.Fatalf("queued turn status = %q, want interrupted", got)
+	}
+	if got := state.Turns[running.ID].Status; got != teamstore.TurnStatusRunning {
+		t.Fatalf("running turn status = %q, want still running", got)
+	}
+	got := sentPlainJoined(*sent)
+	for _, want := range []string{"turn canceled", "queued selector prompt"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("queued selector response missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "cancel requested for running turn") {
+		t.Fatalf("queued selector response targeted running turn:\n%s", got)
+	}
+}
+
+func TestBridgeSessionCancelRunningSelectorLeavesQueuedTurn(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	base := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
+	running := queueBridgeTestTurnWithPrompt(t, store, session, "running-selector", "running selector prompt", teamstore.TurnStatusRunning, base)
+	queued := queueBridgeTestTurnWithPrompt(t, store, session, "queued-selector", "queued selector prompt", teamstore.TurnStatusQueued, base.Add(time.Second))
+	runningCancelCalled := false
+	unregister := bridge.registerRunningTurnCancel(session.ID, running.ID, func() {
+		runningCancelCalled = true
+	})
+	defer unregister()
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("cancel-running-selector-command"), "helper cancel running"); err != nil {
+		t.Fatalf("cancel running selector error: %v", err)
+	}
+	if !runningCancelCalled {
+		t.Fatal("running selector did not request running turn cancel")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns[running.ID].Status; got != teamstore.TurnStatusRunning {
+		t.Fatalf("running turn status = %q, want still running until executor observes cancellation", got)
+	}
+	if got := state.Turns[queued.ID].Status; got != teamstore.TurnStatusQueued {
+		t.Fatalf("queued turn status = %q, want still queued", got)
+	}
+	got := sentPlainJoined(*sent)
+	for _, want := range []string{"cancel requested for running turn", "running selector prompt", "Still queued", "queued selector prompt"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("running selector response missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestBridgeSessionCancelSelectorsReportMissingStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		command    string
+		seedStatus teamstore.TurnStatus
+		want       string
+	}{
+		{name: "queued selector with only running", command: "helper cancel queued", seedStatus: teamstore.TurnStatusRunning, want: "no queued turn is available"},
+		{name: "running selector with only queued", command: "helper cancel running", seedStatus: teamstore.TurnStatusQueued, want: "no running turn is available"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			session := bridge.reg.SessionByChatID("chat-1")
+			if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+				t.Fatalf("ensureDurableSession error: %v", err)
+			}
+			turn := queueBridgeTestTurnWithPrompt(t, store, session, "selector-missing", "selector missing prompt", tc.seedStatus, time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC))
+
+			if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("cancel-selector-missing-command"), tc.command); err != nil {
+				t.Fatalf("cancel selector missing error: %v", err)
+			}
+			state, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatalf("Load error: %v", err)
+			}
+			if got := state.Turns[turn.ID].Status; got != tc.seedStatus {
+				t.Fatalf("turn status = %q, want unchanged %q", got, tc.seedStatus)
+			}
+			if got := sentPlainJoined(*sent); !strings.Contains(got, tc.want) {
+				t.Fatalf("missing selector response = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBridgeSessionCancelQueuedBeaconTurnTombstonesRemoteJob(t *testing.T) {
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
 	graph, sent := newBridgeTestGraph(t)
@@ -11504,7 +11714,7 @@ func TestBridgeSessionCancelRunningTurnWithoutLiveHandleExplainsLimit(t *testing
 	}
 }
 
-func TestLatestCancelableTurnIDPrefersRunningOverQueued(t *testing.T) {
+func TestLatestCancelableTurnIDPrefersQueuedOverRunning(t *testing.T) {
 	now := time.Now()
 	state := teamstore.State{Turns: map[string]teamstore.Turn{
 		"turn:queued-newer": {
@@ -11521,8 +11731,8 @@ func TestLatestCancelableTurnIDPrefersRunningOverQueued(t *testing.T) {
 		},
 	}}
 	got, ok := latestCancelableTurnID(state, "s001")
-	if !ok || got != "turn:running-older" {
-		t.Fatalf("latestCancelableTurnID = %q,%v; want running turn", got, ok)
+	if !ok || got != "turn:queued-newer" {
+		t.Fatalf("latestCancelableTurnID = %q,%v; want queued turn", got, ok)
 	}
 }
 
@@ -18116,8 +18326,10 @@ func TestBridgeControlParkRejectsQueuedOrRunningSession(t *testing.T) {
 				t.Fatalf("blocked park command error: %v", err)
 			}
 			joined := sentPlainJoined(*sent)
-			if !strings.Contains(joined, "cannot park s001") || !strings.Contains(joined, "queued or running") {
-				t.Fatalf("blocked park response:\n%s", joined)
+			for _, want := range []string{"cannot park s001", "queued or running", "helper cancel queued", "helper cancel running", "helper cancel all"} {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("blocked park response missing %q:\n%s", want, joined)
+				}
 			}
 			if poll, ok, err := store.ChatPoll(context.Background(), session.ChatID); err != nil {
 				t.Fatalf("ChatPoll: %v", err)
@@ -23724,7 +23936,8 @@ func TestBlockedTeamsPromptAckNextStepsMatchGateReasons(t *testing.T) {
 			want: []string{
 				"wait. I will run your request after the current Codex request finishes.",
 				"Another Codex request is already running",
-				"helper restart force",
+				"helper cancel queued",
+				"helper cancel running",
 			},
 		},
 		{
@@ -26718,7 +26931,7 @@ func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
 	if got := strings.Count(joined, "Still waiting"); got != 1 {
 		t.Fatalf("queued wait reminder count = %d, want one in:\n%s", got, joined)
 	}
-	for _, want := range []string{"Local Codex is still active for this chat", "helper cancel last", "Queued requests:", "teams prompt during local", "second teams prompt during local"} {
+	for _, want := range []string{"Local Codex is still active for this chat", "helper cancel turn:inbound:chat-1:teams-during-local", "Queued requests:", "teams prompt during local", "second teams prompt during local"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("queued wait reminder missing %q in:\n%s", want, joined)
 		}

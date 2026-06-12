@@ -105,7 +105,7 @@ Desktop forms like !continue 1 and codex continue 1 are also accepted. Legacy sl
 Work chat helper commands:
 - helper status: check progress
 - helper retry last or helper retry <turn-id>: retry a failed or interrupted Teams request
-- helper cancel last, helper cancel all, or helper cancel <turn-id>: cancel or drop queued/running request(s)
+- helper cancel last, helper cancel queued, helper cancel running, helper cancel all, or helper cancel <turn-id>: cancel or drop queued/running request(s)
 - helper file <relative-path>: upload a generated file from the Teams outbound folder
 - helper skills list, helper skills add <url>, helper skills sync [name], or helper skills push [name]: inspect or sync skill subscriptions
 - helper close: close the Work chat binding
