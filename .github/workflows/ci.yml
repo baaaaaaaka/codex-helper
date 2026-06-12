@@ -166,7 +166,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr|LlamaOptInInvokesConfiguredRuntime|AutoFallsBackToTransformers|AutoDoesNotFallbackFromLlamaRuntimeFailure|DefaultDownloadsManagedLlamaRuntime|ExplicitLlamaRejectsConfiguredMissingBinary)|ASR(ParseLlamaOutputHandlesLanguageColon|Llama(ConfigUsesLightweightDiskPreflight|ModelMarkerRejectsCorruptCachedFile|RuntimeConcurrentSetupReusesSingleInstall|BinaryInstall(FallsBackToCPUAssetWhenAcceleratedValidationFails|HonorsExplicitCPUDevice)|AssetMatrixCoversExpectedAccelerationFallbacks)|FFmpegWheelAssetMatrixCoversExpectedPlatforms|DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadsExtractsAndMarksRuntime)))|EnsureManagedASRFFmpegInstallsAndReusesManagedWheel|DownloadManagedASRLlamaFile(RejectsSizeAndHashMismatch|RetriesAndReplacesExistingTarget)|ExtractManagedASRZipRejectsUnsafePath|PrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOrigin(TextHashesIncludesControlFallbackSource|TranscriptUserDisplayBodyUsesOriginalTeamsPrompt)|BridgeSyncLinkedTranscript(MirrorsTeamsOriginUserPromptWithoutASRContext|SkipsASROnlyTeamsOriginUserPrompt)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
+          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr|LlamaOptInInvokesConfiguredRuntime|AutoFallsBackToTransformers|AutoDoesNotInstallTransformersFallbackByDefault|AutoDoesNotFallbackFromLlamaRuntimeFailure|DefaultDownloadsManagedLlamaRuntime|ExplicitLlamaRejectsConfiguredMissingBinary)|ASR(ParseLlamaOutputHandlesLanguageColon|Llama(ConfigUsesLightweightDiskPreflight|ModelMarkerRejectsCorruptCachedFile|RuntimeConcurrentSetupReusesSingleInstall|BinaryInstall(FallsBackToCPUAssetWhenAcceleratedValidationFails|HonorsExplicitCPUDevice)|AssetMatrixCoversExpectedAccelerationFallbacks)|FFmpegWheelAssetMatrixCoversExpectedPlatforms|DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadsExtractsAndMarksRuntime)))|EnsureManagedASRFFmpegInstallsAndReusesManagedWheel|DownloadManagedASRLlamaFile(RejectsSizeAndHashMismatch|RetriesAndReplacesExistingTarget)|ExtractManagedASRZipRejectsUnsafePath|PrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOrigin(TextHashesIncludesControlFallbackSource|TranscriptUserDisplayBodyUsesOriginalTeamsPrompt)|BridgeSyncLinkedTranscript(MirrorsTeamsOriginUserPromptWithoutASRContext|SkipsASROnlyTeamsOriginUserPrompt)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
@@ -1375,13 +1375,13 @@ jobs:
         include:
           - label: CentOS7
             image: centos:7
-            package_args: ca-certificates curl xz tar procps-ng util-linux
+            package_args: ca-certificates curl xz tar procps-ng util-linux python36 binutils
           - label: Rocky8
             image: rockylinux:8
-            package_args: ca-certificates curl xz tar procps-ng util-linux
+            package_args: ca-certificates curl xz tar procps-ng util-linux python3 binutils
           - label: Ubuntu20.04
             image: ubuntu:20.04
-            package_args: ca-certificates curl xz-utils tar procps util-linux
+            package_args: ca-certificates curl xz-utils tar procps util-linux python3 binutils
     env:
       DISTRO_IMAGE: ${{ matrix.image }}
       DISTRO_PACKAGE_ARGS: ${{ matrix.package_args }}
@@ -1399,6 +1399,131 @@ jobs:
       - name: Restore executable bits
         shell: bash
         run: chmod +x dist/codex-proxy dist/codex_cli_test dist/codex_cloudgate_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
+
+      - name: Teams managed ASR native dependency scan
+        id: teams_asr_dependency_scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          img="$DISTRO_IMAGE"
+          report_label="$(printf '%s' "${{ matrix.label }}" | tr '[:upper:]' '[:lower:]')"
+          mkdir -p teams-asr-dependency-scan
+          echo "==> $img (Teams managed ASR native dependency scan)"
+          docker run --rm \
+            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS" \
+            -e REPORT_LABEL="$report_label" \
+            -e ASR_SCAN_PYTHON_PROBE="${ASR_SCAN_PYTHON_PROBE:-audio}" \
+            -v "$PWD/scripts/ci:/ci:ro" \
+            -v "$PWD/teams-asr-dependency-scan:/reports" \
+            "$img" bash -lc '
+              set -euo pipefail
+              report_json="/reports/${REPORT_LABEL}.json"
+              report_text="/reports/${REPORT_LABEL}.txt"
+              write_setup_failure_report() {
+                local detail="$1"
+                cat > "$report_json" <<EOF
+          {
+            "issues": [
+              {
+                "component": "ci-setup",
+                "detail": "$detail",
+                "kind": "setup_failed",
+                "library": "",
+                "path": "${REPORT_LABEL}",
+                "required_version": ""
+              }
+            ],
+            "missing_libraries": [],
+            "missing_symbol_versions": [],
+            "native_files": [],
+            "native_files_scanned": 0,
+            "needed_libraries": [],
+            "required_versions": [],
+            "scanner_version": 1
+          }
+          EOF
+                cat > "$report_text" <<EOF
+          Teams ASR dependency scan
+          status: FAILED
+          native files scanned: 0
+
+          Setup failed before the scanner could write a full report:
+            $detail
+          EOF
+              }
+              if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                # shellcheck disable=SC2086
+                if ! bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS; then
+                  write_setup_failure_report "package installation failed"
+                  exit 1
+                fi
+              else
+                echo "unsupported package manager for Teams ASR dependency scan"
+                write_setup_failure_report "unsupported package manager"
+                exit 1
+              fi
+              python_bin="$(command -v python3 || true)"
+              if [ -z "$python_bin" ]; then
+                python_bin="$(command -v python3.6 || true)"
+              fi
+              if [ -z "$python_bin" ]; then
+                echo "python3 is required to run Teams ASR dependency scan"
+                write_setup_failure_report "python3 is required"
+                exit 1
+              fi
+              set +e
+              "$python_bin" /ci/teams_asr_dependency_scan.py \
+                --work-dir /tmp/teams-asr-dependency-scan \
+                --report-json "$report_json" \
+                --report-text "$report_text" \
+                --python-probe "${ASR_SCAN_PYTHON_PROBE:-audio}"
+              scan_status="$?"
+              set -e
+              if [ ! -s "$report_json" ] || [ ! -s "$report_text" ]; then
+                write_setup_failure_report "scanner exited with status ${scan_status} before writing reports"
+              fi
+              exit "$scan_status"
+            '
+
+      - name: Upload Teams managed ASR dependency scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: teams-asr-dependency-scan-${{ matrix.label }}
+          path: teams-asr-dependency-scan/
+          if-no-files-found: warn
+
+      - name: Assert Teams managed ASR dependency scan coverage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_label="$(printf '%s' "${{ matrix.label }}" | tr '[:upper:]' '[:lower:]')"
+          python3 scripts/ci/assert_teams_asr_dependency_report.py \
+            --report-json "teams-asr-dependency-scan/${report_label}.json" \
+            --label "${{ matrix.label }}" \
+            --expected-cpu-plan-status repairable
+
+      - name: Teams managed ASR native compatibility repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          img="$DISTRO_IMAGE"
+          docker run --rm \
+            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS" \
+            -e CODEX_HELPER_ASR_REAL_NATIVE_COMPAT_TEST=1 \
+            -e CODEX_HELPER_ASR_EXPECT_NATIVE_COMPAT=1 \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/scripts/ci:/ci:ro" \
+            "$img" bash -lc '
+              set -euo pipefail
+              if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                # shellcheck disable=SC2086
+                bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
+              fi
+              /dist/codex_teams_test -test.v -test.count=1 -test.run="TestManagedASRRealLlamaNativeCompatRepairsPinnedCPUAsset$"
+            '
 
       - name: Smoke test in container (doctor)
         shell: bash

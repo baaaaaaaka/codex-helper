@@ -25,16 +25,17 @@ import (
 )
 
 const (
-	defaultTeamsOwnerStaleAfter       = 5 * time.Minute
-	defaultTeamsChatRecreateDrainTime = 2 * time.Minute
-	envTeamsASRCommand                = "CODEX_HELPER_TEAMS_ASR_COMMAND"
-	envTeamsASRArgsJSON               = "CODEX_HELPER_TEAMS_ASR_ARGS_JSON"
-	envTeamsASRBackend                = "CODEX_HELPER_TEAMS_ASR_BACKEND"
-	envTeamsASRLlamaBinary            = "CODEX_HELPER_TEAMS_ASR_LLAMA_BINARY"
-	envTeamsASRLlamaModel             = "CODEX_HELPER_TEAMS_ASR_LLAMA_MODEL"
-	envTeamsASRLlamaMMProj            = "CODEX_HELPER_TEAMS_ASR_LLAMA_MMPROJ"
-	envTeamsASRLlamaDevice            = "CODEX_HELPER_TEAMS_ASR_LLAMA_DEVICE"
-	envTeamsASRFFmpeg                 = "CODEX_HELPER_TEAMS_ASR_FFMPEG"
+	defaultTeamsOwnerStaleAfter          = 5 * time.Minute
+	defaultTeamsChatRecreateDrainTime    = 2 * time.Minute
+	envTeamsASRCommand                   = "CODEX_HELPER_TEAMS_ASR_COMMAND"
+	envTeamsASRArgsJSON                  = "CODEX_HELPER_TEAMS_ASR_ARGS_JSON"
+	envTeamsASRBackend                   = "CODEX_HELPER_TEAMS_ASR_BACKEND"
+	envTeamsASRLlamaBinary               = "CODEX_HELPER_TEAMS_ASR_LLAMA_BINARY"
+	envTeamsASRLlamaModel                = "CODEX_HELPER_TEAMS_ASR_LLAMA_MODEL"
+	envTeamsASRLlamaMMProj               = "CODEX_HELPER_TEAMS_ASR_LLAMA_MMPROJ"
+	envTeamsASRLlamaDevice               = "CODEX_HELPER_TEAMS_ASR_LLAMA_DEVICE"
+	envTeamsASRFFmpeg                    = "CODEX_HELPER_TEAMS_ASR_FFMPEG"
+	envTeamsASRAllowTransformersFallback = "CODEX_HELPER_TEAMS_ASR_ALLOW_TRANSFORMERS_FALLBACK"
 )
 
 var (
@@ -837,12 +838,13 @@ func teamsASRServiceEnvironmentOverrides(command string, args []string) map[stri
 
 func teamsASRManagedConfigFromEnv() teams.ManagedASRConfig {
 	return teams.ManagedASRConfig{
-		Backend:         strings.TrimSpace(os.Getenv(envTeamsASRBackend)),
-		LlamaBinaryPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaBinary)),
-		LlamaModelPath:  strings.TrimSpace(os.Getenv(envTeamsASRLlamaModel)),
-		LlamaMMProjPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaMMProj)),
-		LlamaDevice:     strings.TrimSpace(os.Getenv(envTeamsASRLlamaDevice)),
-		FFmpegPath:      strings.TrimSpace(os.Getenv(envTeamsASRFFmpeg)),
+		Backend:                   strings.TrimSpace(os.Getenv(envTeamsASRBackend)),
+		LlamaBinaryPath:           strings.TrimSpace(os.Getenv(envTeamsASRLlamaBinary)),
+		LlamaModelPath:            strings.TrimSpace(os.Getenv(envTeamsASRLlamaModel)),
+		LlamaMMProjPath:           strings.TrimSpace(os.Getenv(envTeamsASRLlamaMMProj)),
+		LlamaDevice:               firstNonEmptyString(strings.TrimSpace(os.Getenv(envTeamsASRLlamaDevice)), "cpu"),
+		FFmpegPath:                strings.TrimSpace(os.Getenv(envTeamsASRFFmpeg)),
+		AllowTransformersFallback: teamsASREnvTruthy(os.Getenv(envTeamsASRAllowTransformersFallback)),
 	}
 }
 
@@ -854,6 +856,16 @@ func teamsASRManagedEnvironmentKeys() []string {
 		envTeamsASRLlamaMMProj,
 		envTeamsASRLlamaDevice,
 		envTeamsASRFFmpeg,
+		envTeamsASRAllowTransformersFallback,
+	}
+}
+
+func teamsASREnvTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
 	}
 }
 

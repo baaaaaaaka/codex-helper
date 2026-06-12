@@ -3449,12 +3449,17 @@ func TestTeamsASRArgsFromEnvAndServiceOverrides(t *testing.T) {
 	t.Setenv(envTeamsASRBackend, "llama")
 	t.Setenv(envTeamsASRLlamaModel, filepath.Join(tmp, "models", "qwen.gguf"))
 	t.Setenv(envTeamsASRLlamaMMProj, filepath.Join(tmp, "models", "mmproj.gguf"))
+	t.Setenv(envTeamsASRAllowTransformersFallback, "1")
 	args, err := teamsASRArgsFromFlagsOrEnv(nil, true)
 	if err != nil {
 		t.Fatalf("teamsASRArgsFromFlagsOrEnv: %v", err)
 	}
 	if strings.Join(args, "\n") != "--input={input}\n--prefix=  keep spaces  \n--threads={threads}" {
 		t.Fatalf("ASR args = %#v", args)
+	}
+	asrOverrides := teamsASRServiceEnvironmentOverrides(filepath.Join(tmp, "asr"), []string{"--input={input}", "--threads={threads}"})
+	if asrOverrides[envTeamsASRAllowTransformersFallback] != "1" {
+		t.Fatalf("ASR overrides = %#v, want transformers fallback opt-in preserved", asrOverrides)
 	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
@@ -3465,7 +3470,7 @@ func TestTeamsASRArgsFromEnvAndServiceOverrides(t *testing.T) {
 	})
 	spec, err := buildTeamsServiceSpec(
 		stringPtr("registry.json"),
-		teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(filepath.Join(tmp, "asr"), []string{"--input={input}", "--threads={threads}"})),
+		teamsServiceSpecEnvironmentOverrides(asrOverrides),
 	)
 	if err != nil {
 		t.Fatalf("buildTeamsServiceSpec: %v", err)
@@ -3478,7 +3483,8 @@ func TestTeamsASRArgsFromEnvAndServiceOverrides(t *testing.T) {
 	}
 	if spec.Environment[envTeamsASRBackend] != "llama" ||
 		spec.Environment[envTeamsASRLlamaModel] != filepath.Join(tmp, "models", "qwen.gguf") ||
-		spec.Environment[envTeamsASRLlamaMMProj] != filepath.Join(tmp, "models", "mmproj.gguf") {
+		spec.Environment[envTeamsASRLlamaMMProj] != filepath.Join(tmp, "models", "mmproj.gguf") ||
+		spec.Environment[envTeamsASRAllowTransformersFallback] != "1" {
 		t.Fatalf("managed ASR env = %#v", spec.Environment)
 	}
 }

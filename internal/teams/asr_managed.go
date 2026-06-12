@@ -57,6 +57,8 @@ type ManagedASRConfig struct {
 	LlamaMMProjPath string
 	LlamaDevice     string
 	FFmpegPath      string
+
+	AllowTransformersFallback bool
 }
 
 type ManagedASRTranscriber struct {
@@ -114,6 +116,21 @@ func (e managedASRDiskSpaceError) Error() string {
 	)
 }
 
+type managedASRTransformersFallbackDisabledError struct {
+	Err error
+}
+
+func (e managedASRTransformersFallbackDisabledError) Error() string {
+	return fmt.Sprintf(
+		"llama ASR backend failed (%v); qwen-asr-transformers fallback is disabled by default to avoid downloading the large qwen-asr/torch runtime. Set CODEX_HELPER_TEAMS_ASR_ALLOW_TRANSFORMERS_FALLBACK=1 to opt in, or set CODEX_HELPER_TEAMS_ASR_BACKEND=transformers to choose that runtime explicitly",
+		e.Err,
+	)
+}
+
+func (e managedASRTransformersFallbackDisabledError) Unwrap() error {
+	return e.Err
+}
+
 func NewManagedQwenASRTranscriber(config ...ManagedASRConfig) *ManagedASRTranscriber {
 	var cfg ManagedASRConfig
 	if len(config) > 0 {
@@ -146,6 +163,9 @@ func (t *ManagedASRTranscriber) TranscribeTeamsMedia(ctx context.Context, input 
 		}
 		if !managedASRCanFallbackFromLlama(err) {
 			return ASRTranscript{}, err
+		}
+		if !t.Config.AllowTransformersFallback {
+			return ASRTranscript{}, managedASRTransformersFallbackDisabledError{Err: err}
 		}
 		fallback, fallbackErr := t.transcribeTeamsMediaTransformers(ctx, input)
 		if fallbackErr != nil {

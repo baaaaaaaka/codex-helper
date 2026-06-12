@@ -218,6 +218,9 @@ func TestTeamsASRTranscriberDefaultsToManagedQwenRuntime(t *testing.T) {
 	if managed == nil || managed.Config.ModelID != "" {
 		t.Fatalf("managed ASR config = %#v, want default model resolved lazily", managed)
 	}
+	if managed.Config.LlamaDevice != "cpu" || managed.Config.AllowTransformersFallback {
+		t.Fatalf("default managed ASR config = %#v, want CPU llama without transformers fallback opt-in", managed.Config)
+	}
 
 	override := teamsASRTranscriberFromConfig("/tmp/custom-asr", []string{"--input={input}"})
 	command, ok := override.(*teams.CommandASRTranscriber)
@@ -234,8 +237,9 @@ func TestTeamsASRTranscriberReadsManagedLlamaEnv(t *testing.T) {
 	t.Setenv(envTeamsASRLlamaBinary, "/opt/llama/llama-mtmd-cli")
 	t.Setenv(envTeamsASRLlamaModel, "/models/qwen.gguf")
 	t.Setenv(envTeamsASRLlamaMMProj, "/models/mmproj.gguf")
-	t.Setenv(envTeamsASRLlamaDevice, "cpu")
+	t.Setenv(envTeamsASRLlamaDevice, "auto")
 	t.Setenv(envTeamsASRFFmpeg, "/opt/ffmpeg")
+	t.Setenv(envTeamsASRAllowTransformersFallback, "yes")
 
 	transcriber := teamsASRTranscriberFromConfig("", nil)
 	managed, ok := transcriber.(*teams.ManagedASRTranscriber)
@@ -246,8 +250,9 @@ func TestTeamsASRTranscriberReadsManagedLlamaEnv(t *testing.T) {
 		managed.Config.LlamaBinaryPath != "/opt/llama/llama-mtmd-cli" ||
 		managed.Config.LlamaModelPath != "/models/qwen.gguf" ||
 		managed.Config.LlamaMMProjPath != "/models/mmproj.gguf" ||
-		managed.Config.LlamaDevice != "cpu" ||
-		managed.Config.FFmpegPath != "/opt/ffmpeg" {
+		managed.Config.LlamaDevice != "auto" ||
+		managed.Config.FFmpegPath != "/opt/ffmpeg" ||
+		!managed.Config.AllowTransformersFallback {
 		t.Fatalf("managed ASR config from env = %#v", managed.Config)
 	}
 }

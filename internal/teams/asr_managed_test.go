@@ -192,9 +192,10 @@ func TestManagedASRParseLlamaOutputHandlesLanguageColon(t *testing.T) {
 func TestManagedQwenASRTranscriberAutoFallsBackToTransformers(t *testing.T) {
 	cacheRoot := t.TempDir()
 	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
-		CacheRoot:    cacheRoot,
-		Backend:      managedASRBackendAuto,
-		MinFreeBytes: 1,
+		CacheRoot:                 cacheRoot,
+		Backend:                   managedASRBackendAuto,
+		MinFreeBytes:              1,
+		AllowTransformersFallback: true,
 	})
 	transcriber.ensureLlamaRuntime = func(context.Context, ManagedASRConfig) (managedASRLlamaRuntime, error) {
 		return managedASRLlamaRuntime{}, managedASRLlamaFallbackError{Err: errors.New("managed llama runtime unavailable on this platform")}
@@ -217,6 +218,42 @@ func TestManagedQwenASRTranscriberAutoFallsBackToTransformers(t *testing.T) {
 	}
 	if transcript.Text != "fallback text" || transcript.Backend != managedASRBackendTransformers || !strings.Contains(transcript.Warning, "llama ASR backend failed") {
 		t.Fatalf("fallback transcript = %#v", transcript)
+	}
+}
+
+func TestManagedQwenASRTranscriberAutoDoesNotInstallTransformersFallbackByDefault(t *testing.T) {
+	cacheRoot := t.TempDir()
+	transcriber := NewManagedQwenASRTranscriber(ManagedASRConfig{
+		CacheRoot:    cacheRoot,
+		Backend:      managedASRBackendAuto,
+		MinFreeBytes: 1,
+	})
+	transcriber.ensureLlamaRuntime = func(context.Context, ManagedASRConfig) (managedASRLlamaRuntime, error) {
+		return managedASRLlamaRuntime{}, managedASRLlamaFallbackError{Err: errors.New("managed llama runtime needs GLIBC_2.34")}
+	}
+	transcriber.ensureRuntime = func(context.Context, ManagedASRConfig) (managedASRRuntime, error) {
+		t.Fatal("default auto backend should not prepare transformers/torch fallback")
+		return managedASRRuntime{}, nil
+	}
+
+	_, err := transcriber.TranscribeTeamsMedia(context.Background(), ASRTranscribeInput{
+		File:     LocalAttachment{Path: "/tmp/input.wav", ContentType: "audio/wav"},
+		Language: defaultASRLanguage,
+		Speed:    "1x",
+	})
+	if err == nil {
+		t.Fatal("auto backend should report disabled transformers fallback")
+	}
+	for _, want := range []string{
+		"GLIBC_2.34",
+		"disabled by default",
+		"qwen-asr/torch",
+		"CODEX_HELPER_TEAMS_ASR_ALLOW_TRANSFORMERS_FALLBACK=1",
+		"CODEX_HELPER_TEAMS_ASR_BACKEND=transformers",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("fallback disabled error missing %q:\n%v", want, err)
+		}
 	}
 }
 
@@ -632,6 +669,132 @@ func TestManagedASRLlamaBinaryInstallFallsBackToCPUAssetWhenAcceleratedValidatio
 	}
 }
 
+func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithPatchelf(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native compatibility patchelf repair is Linux-only")
+	}
+	cacheRoot := t.TempDir()
+	binaryArchive := buildManagedASRLlamaTestArchive(t)
+	glibcArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2": []byte("loader"),
+		"usr/lib/x86_64-linux-gnu/libc.so.6":            []byte("libc"),
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30":  []byte("libstdc++"),
+	}, map[string]string{
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6": "libstdc++.so.6.0.30",
+	})
+	libgompArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"lib/libgomp.so.1": []byte("libgomp"),
+	}, nil)
+	patchelfArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"bin/patchelf": []byte("#!/bin/sh\nexit 0\n"),
+	}, nil)
+	downloads := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads[r.URL.Path]++
+		switch r.URL.Path {
+		case "/llama.tar.gz":
+			_, _ = w.Write(binaryArchive)
+		case "/glibc.tar.gz":
+			_, _ = w.Write(glibcArchive)
+		case "/libgomp.tar.gz":
+			_, _ = w.Write(libgompArchive)
+		case "/patchelf.tar.gz":
+			_, _ = w.Write(patchelfArchive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	prevHTTPClient := managedASRLlamaHTTPClient
+	prevAssets := managedASRLlamaBinaryAssetsFn
+	prevCompatAssets := managedASRLlamaNativeCompatAssetsFn
+	prevApply := applyManagedASRLlamaNativeCompatFn
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() {
+		managedASRLlamaHTTPClient = prevHTTPClient
+		managedASRLlamaBinaryAssetsFn = prevAssets
+		managedASRLlamaNativeCompatAssetsFn = prevCompatAssets
+		applyManagedASRLlamaNativeCompatFn = prevApply
+		validateManagedASRLlamaBinaryFn = prevValidate
+	})
+	managedASRLlamaHTTPClient = server.Client()
+	managedASRLlamaBinaryAssetsFn = func(string, string) ([]managedASRLlamaAsset, error) {
+		return []managedASRLlamaAsset{{
+			Name:         "llama-test.tar.gz",
+			URL:          server.URL + "/llama.tar.gz",
+			SHA256:       managedASRTestSHA256(binaryArchive),
+			Size:         int64(len(binaryArchive)),
+			ArchiveKind:  "tar.gz",
+			Acceleration: "cpu",
+		}}, nil
+	}
+	managedASRLlamaNativeCompatAssetsFn = func(string, string) ([]managedASRNativeCompatAsset, error) {
+		return []managedASRNativeCompatAsset{
+			{Name: "glibc.tar.gz", URL: server.URL + "/glibc.tar.gz", SHA256: managedASRTestSHA256(glibcArchive), Size: int64(len(glibcArchive)), ArchiveKind: "tar.gz", ExtractMode: "ubuntu-base-glibc"},
+			{Name: "libgomp.tar.gz", URL: server.URL + "/libgomp.tar.gz", SHA256: managedASRTestSHA256(libgompArchive), Size: int64(len(libgompArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+			{Name: "patchelf.tar.gz", URL: server.URL + "/patchelf.tar.gz", SHA256: managedASRTestSHA256(patchelfArchive), Size: int64(len(patchelfArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+		}, nil
+	}
+	var patchedCommand string
+	applyManagedASRLlamaNativeCompatFn = func(_ context.Context, command string, compat managedASRNativeCompatRuntime) error {
+		patchedCommand = command
+		for _, path := range []string{
+			compat.Interpreter,
+			compat.Patchelf,
+			filepath.Join(compat.LibDir, "libc.so.6"),
+			filepath.Join(compat.LibDir, "libstdc++.so.6"),
+			filepath.Join(compat.LibDir, "libgomp.so.1"),
+		} {
+			if info, err := os.Stat(path); err != nil || info.IsDir() {
+				t.Fatalf("compat file %s missing before patch: %v", path, err)
+			}
+		}
+		return nil
+	}
+	validateCalls := 0
+	validateManagedASRLlamaBinaryFn = func(_ context.Context, _ string, env []string) error {
+		validateCalls++
+		if validateCalls == 1 {
+			return errors.New("/lib64/libc.so.6: version `GLIBC_2.34' not found; /lib64/libstdc++.so.6: version `GLIBCXX_3.4.29' not found")
+		}
+		if !strings.Contains(strings.Join(env, string(os.PathListSeparator)), filepath.Join(managedASRNativeCompatDirName, "lib")) {
+			t.Fatalf("revalidated env missing native compat lib dir: %#v", env)
+		}
+		return nil
+	}
+
+	command, env, acceleration, err := ensureManagedASRLlamaBinary(context.Background(), filepath.Join(cacheRoot, "llama"), ManagedASRConfig{LlamaDevice: "cpu"})
+	if err != nil {
+		t.Fatalf("native compat repair install error: %v", err)
+	}
+	if patchedCommand == "" || !strings.Contains(patchedCommand, ".llama-staging-") || !strings.HasSuffix(patchedCommand, filepath.Join("llama", "bin", "llama-mtmd-cli")) {
+		t.Fatalf("patched command = %q, want staging llama command", patchedCommand)
+	}
+	if validateCalls != 2 {
+		t.Fatalf("validate calls = %d, want original failure plus repaired retry", validateCalls)
+	}
+	if acceleration != "cpu" {
+		t.Fatalf("acceleration = %q, want cpu", acceleration)
+	}
+	if downloads["/llama.tar.gz"] != 1 || downloads["/glibc.tar.gz"] != 1 || downloads["/libgomp.tar.gz"] != 1 || downloads["/patchelf.tar.gz"] != 1 {
+		t.Fatalf("downloads = %#v, want llama and each native compat asset once", downloads)
+	}
+	if !strings.Contains(strings.Join(env, string(os.PathListSeparator)), filepath.Join(managedASRNativeCompatDirName, "lib")) {
+		t.Fatalf("final env missing native compat lib dir: %#v", env)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(command), managedASRNativeCompatDirName, "lib", "libc.so.6")); err != nil {
+		t.Fatalf("final native compat bundle missing: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(cacheRoot, "llama", "runtime", "runtime.json"))
+	if err != nil {
+		t.Fatalf("read runtime marker: %v", err)
+	}
+	if !strings.Contains(string(data), `"native_compat": true`) {
+		t.Fatalf("runtime marker did not record native compatibility repair:\n%s", data)
+	}
+}
+
 func TestManagedASRLlamaBinaryInstallHonorsExplicitCPUDevice(t *testing.T) {
 	cacheRoot := t.TempDir()
 	vulkanArchive := buildManagedASRLlamaTestArchiveWithRoot(t, "vulkan")
@@ -690,6 +853,39 @@ func TestManagedASRLlamaBinaryInstallHonorsExplicitCPUDevice(t *testing.T) {
 	}
 	if downloads["/vulkan.tar.gz"] != 0 || downloads["/cpu.tar.gz"] != 1 {
 		t.Fatalf("downloads = %#v, want only cpu asset", downloads)
+	}
+}
+
+func TestManagedASRRealLlamaNativeCompatRepairsPinnedCPUAsset(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_ASR_REAL_NATIVE_COMPAT_TEST") != "1" {
+		t.Skip("set CODEX_HELPER_ASR_REAL_NATIVE_COMPAT_TEST=1 to download and validate pinned llama/native compat assets")
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skipf("native compat real test only covers linux/amd64, got %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	cacheRoot := t.TempDir()
+	command, env, acceleration, err := ensureManagedASRLlamaBinary(context.Background(), filepath.Join(cacheRoot, "llama"), ManagedASRConfig{
+		LlamaDevice:  "cpu",
+		MinFreeBytes: 1,
+	})
+	if err != nil {
+		t.Fatalf("real native compat install: %v", err)
+	}
+	if acceleration != "cpu" {
+		t.Fatalf("acceleration = %q, want cpu", acceleration)
+	}
+	if command == "" {
+		t.Fatal("real native compat install returned empty command")
+	}
+	if !strings.Contains(strings.Join(env, string(os.PathListSeparator)), filepath.Join(managedASRNativeCompatDirName, "lib")) && os.Getenv("CODEX_HELPER_ASR_EXPECT_NATIVE_COMPAT") == "1" {
+		t.Fatalf("expected native compat env on this distro, got %#v", env)
+	}
+	data, err := os.ReadFile(filepath.Join(cacheRoot, "llama", "runtime", "runtime.json"))
+	if err != nil {
+		t.Fatalf("read runtime marker: %v", err)
+	}
+	if os.Getenv("CODEX_HELPER_ASR_EXPECT_NATIVE_COMPAT") == "1" && !strings.Contains(string(data), `"native_compat": true`) {
+		t.Fatalf("runtime marker did not record native compat on old distro:\n%s", data)
 	}
 }
 
@@ -1355,6 +1551,65 @@ func buildManagedASRLlamaTestArchiveWithRoot(t *testing.T, root string) []byte {
 	}
 	if err := gz.Close(); err != nil {
 		t.Fatalf("close llama gzip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func buildManagedASRNativeCompatTestArchive(t *testing.T, files map[string][]byte, symlinks map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	writtenDirs := map[string]bool{}
+	writeDir := func(name string) {
+		t.Helper()
+		name = strings.Trim(strings.TrimSpace(filepath.ToSlash(name)), "/")
+		if name == "" || writtenDirs[name] {
+			return
+		}
+		parts := strings.Split(name, "/")
+		cur := ""
+		for _, part := range parts {
+			if cur == "" {
+				cur = part
+			} else {
+				cur += "/" + part
+			}
+			if writtenDirs[cur] {
+				continue
+			}
+			if err := tw.WriteHeader(&tar.Header{Name: cur + "/", Mode: 0o700, Typeflag: tar.TypeDir}); err != nil {
+				t.Fatalf("write native compat dir header: %v", err)
+			}
+			writtenDirs[cur] = true
+		}
+	}
+	for name, body := range files {
+		name = strings.TrimPrefix(filepath.ToSlash(name), "/")
+		writeDir(filepath.Dir(name))
+		mode := int64(0o600)
+		if strings.HasPrefix(name, "bin/") {
+			mode = 0o700
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: mode, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("write native compat file header: %v", err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatalf("write native compat file body: %v", err)
+		}
+	}
+	for name, target := range symlinks {
+		name = strings.TrimPrefix(filepath.ToSlash(name), "/")
+		writeDir(filepath.Dir(name))
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o777, Typeflag: tar.TypeSymlink, Linkname: target}); err != nil {
+			t.Fatalf("write native compat symlink header: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close native compat tar: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close native compat gzip: %v", err)
 	}
 	return buf.Bytes()
 }
