@@ -1400,7 +1400,45 @@ jobs:
 
       - name: Restore executable bits
         shell: bash
-        run: chmod +x dist/codex-proxy dist/codex_cli_test dist/codex_cloudgate_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          required=(
+            dist/codex-proxy
+            dist/codex_cli_test
+            dist/codex_cloudgate_test
+            dist/codex_proc_test
+            dist/codex_teams_test
+            dist/codex_teams_store_test
+          )
+          missing_required() {
+            local missing=0
+            for file in "${required[@]}"; do
+              if [ ! -f "$file" ]; then
+                echo "missing artifact file: $file" >&2
+                missing=1
+              fi
+            done
+            return "$missing"
+          }
+          if ! missing_required; then
+            echo "::warning::download-artifact completed without all expected distro smoke binaries; retrying with gh run download"
+            rm -rf dist
+            for attempt in 1 2 3; do
+              mkdir -p dist
+              if gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name linux-distro-smoke-dist --dir dist && missing_required; then
+                break
+              fi
+              rm -rf dist
+              if [ "$attempt" = 3 ]; then
+                echo "linux-distro-smoke-dist artifact is still incomplete after retries" >&2
+                exit 1
+              fi
+              sleep $((attempt * 5))
+            done
+          fi
+          chmod +x "${required[@]}"
 
       - name: Smoke test in container (doctor)
         shell: bash
