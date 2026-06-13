@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	managedASRLlamaRuntimeVersion = "llama-cpp-qwen3-asr-runtime-v2"
+	managedASRLlamaRuntimeVersion = "llama-cpp-qwen3-asr-runtime-v3"
 	managedASRLlamaReleaseTag     = "b9437"
 	managedASRLlamaDownloadBase   = "https://github.com/ggml-org/llama.cpp/releases/download"
 	managedASRLlamaBinaryFileName = "llama-mtmd-cli"
@@ -46,6 +46,8 @@ var (
 	managedASRLlamaBinaryAssetsFn       = managedASRLlamaBinaryAssets
 	managedASRLlamaManagedModelAssetsFn = managedASRLlamaManagedModelAssets
 	managedASRFFmpegWheelAssetFn        = managedASRFFmpegWheelAsset
+	managedASRLlamaNativeCompatAssetsFn = managedASRLlamaNativeCompatAssets
+	applyManagedASRLlamaNativeCompatFn  = applyManagedASRLlamaNativeCompat
 	validateManagedASRFFmpegBinaryFn    = validateManagedASRFFmpegBinary
 	validateManagedASRLlamaBinaryFn     = validateManagedASRLlamaBinary
 	managedASRLlamaDownloadBackoff      = time.Second
@@ -77,6 +79,7 @@ type managedASRLlamaBinaryMarker struct {
 	BinaryRel    string `json:"binary_rel"`
 	BinarySize   int64  `json:"binary_size,omitempty"`
 	Acceleration string `json:"acceleration"`
+	NativeCompat bool   `json:"native_compat,omitempty"`
 	UpdatedAt    string `json:"updated_at"`
 }
 
@@ -357,9 +360,28 @@ func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset
 		return "", nil, err
 	}
 	env := managedASRLlamaInstallEnvForCommand(staging, command)
+	nativeCompat := false
 	if validateManagedASRLlamaBinaryFn != nil {
 		if err := validateManagedASRLlamaBinaryFn(ctx, command, env); err != nil {
-			return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable: %w", err)}
+			if !managedASRLlamaNativeCompatCanRepair(err) {
+				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable: %w", err)}
+			}
+			compat, compatErr := ensureManagedASRLlamaNativeCompat(ctx, command)
+			if compatErr != nil {
+				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable (%w); native compatibility setup failed: %v", err, compatErr)}
+			}
+			apply := applyManagedASRLlamaNativeCompatFn
+			if apply == nil {
+				apply = applyManagedASRLlamaNativeCompat
+			}
+			if patchErr := apply(ctx, command, compat); patchErr != nil {
+				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable (%w); native compatibility patch failed: %v", err, patchErr)}
+			}
+			env = managedASRLlamaInstallEnvForCommand(staging, command)
+			if retryErr := validateManagedASRLlamaBinaryFn(ctx, command, env); retryErr != nil {
+				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable after native compatibility patch: %w", retryErr)}
+			}
+			nativeCompat = true
 		}
 	}
 	rel, err := filepath.Rel(staging, command)
@@ -379,6 +401,7 @@ func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset
 		BinaryRel:    filepath.ToSlash(rel),
 		BinarySize:   info.Size(),
 		Acceleration: asset.Acceleration,
+		NativeCompat: nativeCompat,
 		UpdatedAt:    time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	markerData, err := json.MarshalIndent(marker, "", "  ")
@@ -994,6 +1017,9 @@ func managedASRLlamaInstallEnvForCommand(root string, command string) []string {
 	if command != "" {
 		commandDir := filepath.Dir(command)
 		addDir(commandDir)
+		if compat, ok := managedASRNativeCompatFromMarker(filepath.Join(commandDir, managedASRNativeCompatDirName)); ok {
+			addDir(compat.LibDir)
+		}
 		addDir(filepath.Join(commandDir, "bin"))
 		addDir(filepath.Join(commandDir, "lib"))
 		parent := filepath.Dir(commandDir)
