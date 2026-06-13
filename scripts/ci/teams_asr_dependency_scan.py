@@ -114,15 +114,32 @@ NATIVE_COMPAT_REPAIRABLE_LIBRARIES = set(
         "libgomp.so.1",
         "libssl.so.3",
         "libcrypto.so.3",
+        "libnss_files.so.2",
+        "libnss_dns.so.2",
     ]
 )
-NATIVE_COMPAT_REPAIRABLE_VERSION_LIMITS = {
-    "GLIBC_": (2, 35),
-    "GLIBCXX_": (3, 4, 30),
-    "CXXABI_": (1, 3, 13),
-    "OPENSSL_": (3, 0, 0),
-    "GCC_": (12, 0, 0),
-}
+NATIVE_COMPAT_REPAIR_PROFILES = [
+    {
+        "name": "linux-x64-glibc-2.35-conda-runtime-v1",
+        "limits": {
+            "GLIBC_": (2, 35),
+            "GLIBCXX_": (3, 4, 30),
+            "CXXABI_": (1, 3, 13),
+            "OPENSSL_": (3, 0, 0),
+            "GCC_": (12, 0, 0),
+        },
+    },
+    {
+        "name": "linux-x64-glibc-2.39-conda-runtime-v1",
+        "limits": {
+            "GLIBC_": (2, 39),
+            "GLIBCXX_": (3, 4, 33),
+            "CXXABI_": (1, 3, 15),
+            "OPENSSL_": (3, 0, 0),
+            "GCC_": (14, 0, 0),
+        },
+    },
+]
 
 RUNTIME_CANDIDATES = [
     {
@@ -131,7 +148,7 @@ RUNTIME_CANDIDATES = [
         "device": "cpu",
         "components": ["llama-cpu-linux-x64", "imageio-ffmpeg-linux-x64"],
         "description": "CPU llama.cpp runtime plus managed ffmpeg for Teams f4a/video/speed conversion.",
-        "download_scope": "llama CPU binary and managed ffmpeg only; excludes Vulkan and transformers/torch wheels. On old Linux hosts, native compat repair adds a pinned glibc/libstdc++/libgomp/patchelf bundle.",
+        "download_scope": "llama CPU binary and managed ffmpeg only; excludes Vulkan and transformers/torch wheels. On old Linux hosts, native compat repair adds the smallest pinned glibc/libstdc++/libgomp/patchelf profile that satisfies the missing symbols.",
     },
     {
         "name": "llama-vulkan-teams-media",
@@ -714,21 +731,32 @@ def blocking_issues(items):
 
 
 def native_compat_repairable_issue(item):
-    kind = item.get("kind", "")
-    if kind == "missing_library":
-        return os.path.basename(item.get("library", "")) in NATIVE_COMPAT_REPAIRABLE_LIBRARIES
-    if kind == "missing_symbol_version":
-        return native_compat_repairable_symbol_version(item.get("required_version", ""))
-    return False
+    return native_compat_repair_profile([item]) is not None
 
 
 def native_compat_repairable_symbol_version(version):
-    for prefix, limit in NATIVE_COMPAT_REPAIRABLE_VERSION_LIMITS.items():
+    return any(native_compat_profile_repairs_symbol_version(profile, version) for profile in NATIVE_COMPAT_REPAIR_PROFILES)
+
+
+def native_compat_profile_repairs_symbol_version(profile, version):
+    for prefix, limit in profile["limits"].items():
         if not version.startswith(prefix):
             continue
         parsed = parse_symbol_version_tuple(version[len(prefix) :])
-        return bool(parsed) and parsed <= limit
+        return bool(parsed) and version_tuple_at_most(parsed, limit)
     return False
+
+
+def version_tuple_at_most(parsed, limit):
+    parsed = tuple(parsed)
+    limit = tuple(limit)
+    if len(parsed) > len(limit):
+        if any(part != 0 for part in parsed[len(limit) :]):
+            return False
+        parsed = parsed[: len(limit)]
+    while len(parsed) < len(limit):
+        parsed = parsed + (0,)
+    return parsed <= limit
 
 
 def parse_symbol_version_tuple(value):
@@ -743,12 +771,34 @@ def parse_symbol_version_tuple(value):
     return tuple(parts)
 
 
-def native_compat_repairable_candidate(candidate, issues):
-    if candidate.get("backend") != "llama":
-        return False
+def native_compat_repair_profile(issues):
     if not issues:
-        return False
-    return all(native_compat_repairable_issue(item) for item in issues)
+        return None
+    for profile in NATIVE_COMPAT_REPAIR_PROFILES:
+        if all(native_compat_issue_matches_repair_profile(profile, item) for item in issues):
+            return profile
+    return None
+
+
+def native_compat_issue_matches_repair_profile(profile, item):
+    kind = item.get("kind", "")
+    if kind == "missing_library":
+        return os.path.basename(item.get("library", "")) in NATIVE_COMPAT_REPAIRABLE_LIBRARIES
+    if kind == "missing_symbol_version":
+        return native_compat_profile_repairs_symbol_version(profile, item.get("required_version", ""))
+    return False
+
+
+def native_compat_repairable_candidate(candidate, issues):
+    return native_compat_candidate_repair_profile(candidate, issues) is not None
+
+
+def native_compat_candidate_repair_profile(candidate, issues):
+    if candidate.get("backend") != "llama":
+        return None
+    if not issues:
+        return None
+    return native_compat_repair_profile(issues)
 
 
 def evaluate_runtime_candidate(report, candidate, python_probe):
@@ -787,10 +837,12 @@ def evaluate_runtime_candidate(report, candidate, python_probe):
 
     issues = blocking_issues(candidate_issues(report, candidate))
     if issues:
-        if native_compat_repairable_candidate(candidate, issues):
+        repair_profile = native_compat_candidate_repair_profile(candidate, issues)
+        if repair_profile:
             result["status"] = "repairable"
             result["usable"] = True
             result["repair"] = "native_compat_patchelf"
+            result["repair_profile"] = repair_profile["name"]
             result["repairable_issues"] = issues[:25]
         else:
             result["status"] = "blocked"

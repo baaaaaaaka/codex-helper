@@ -186,7 +186,33 @@ class TeamsASRDependencyScanTests(unittest.TestCase):
         self.assertEqual(plans["cpu-only-teams-media"]["selected_candidate"], "llama-cpu-teams-media")
         candidates = {candidate["name"]: candidate for candidate in report["runtime_candidates"]}
         self.assertEqual(candidates["llama-cpu-teams-media"]["repair"], "native_compat_patchelf")
+        self.assertEqual(candidates["llama-cpu-teams-media"]["repair_profile"], "linux-x64-glibc-2.35-conda-runtime-v1")
         self.assertEqual(candidates["llama-cpu-teams-media"]["repairable_issues"][0]["required_version"], "GLIBC_2.34")
+
+    def test_minimal_cpu_plan_repairs_glibc238_with_glibc239_profile(self) -> None:
+        report = self.scanner.build_report()
+        report["components"]["llama-cpu-linux-x64"] = {"native_files_scanned": 1}
+        report["components"]["imageio-ffmpeg-linux-x64"] = {"native_files_scanned": 1}
+        report["issues"].append(
+            self.scanner.issue(
+                "llama-cpu-linux-x64",
+                "llama-mtmd-cli",
+                "missing_symbol_version",
+                "/lib64/libc.so.6",
+                "GLIBC_2.38",
+                "detail",
+            )
+        )
+
+        self.scanner.finalize_runtime_plans(report, "audio")
+
+        plans = {plan["name"]: plan for plan in report["minimal_runtime_plans"]}
+        self.assertTrue(plans["cpu-only-teams-media"]["usable"])
+        self.assertEqual(plans["cpu-only-teams-media"]["status"], "repairable")
+        candidates = {candidate["name"]: candidate for candidate in report["runtime_candidates"]}
+        self.assertTrue(candidates["llama-cpu-teams-media"]["usable"])
+        self.assertEqual(candidates["llama-cpu-teams-media"]["status"], "repairable")
+        self.assertEqual(candidates["llama-cpu-teams-media"]["repair_profile"], "linux-x64-glibc-2.39-conda-runtime-v1")
 
     def test_minimal_cpu_plan_repairs_full_path_runtime_library_issue(self) -> None:
         report = self.scanner.build_report()
@@ -209,8 +235,64 @@ class TeamsASRDependencyScanTests(unittest.TestCase):
         self.assertTrue(candidates["llama-cpu-teams-media"]["usable"])
         self.assertEqual(candidates["llama-cpu-teams-media"]["status"], "repairable")
 
+    def test_minimal_cpu_plan_repairs_nss_runtime_library_issue(self) -> None:
+        report = self.scanner.build_report()
+        report["components"]["llama-cpu-linux-x64"] = {"native_files_scanned": 1}
+        report["components"]["imageio-ffmpeg-linux-x64"] = {"native_files_scanned": 1}
+        report["issues"].append(
+            self.scanner.issue(
+                "llama-cpu-linux-x64",
+                "llama-mtmd-cli",
+                "missing_library",
+                "libnss_files.so.2",
+                "",
+                "detail",
+            )
+        )
+
+        self.scanner.finalize_runtime_plans(report, "audio")
+
+        candidates = {candidate["name"]: candidate for candidate in report["runtime_candidates"]}
+        self.assertTrue(candidates["llama-cpu-teams-media"]["usable"])
+        self.assertEqual(candidates["llama-cpu-teams-media"]["repair_profile"], "linux-x64-glibc-2.35-conda-runtime-v1")
+
+    def test_minimal_cpu_plan_blocks_mixed_unrepairable_library_with_repairable_symbol(self) -> None:
+        report = self.scanner.build_report()
+        report["components"]["llama-cpu-linux-x64"] = {"native_files_scanned": 1}
+        report["components"]["imageio-ffmpeg-linux-x64"] = {"native_files_scanned": 1}
+        report["issues"].append(
+            self.scanner.issue(
+                "llama-cpu-linux-x64",
+                "llama-mtmd-cli",
+                "missing_library",
+                "libvulkan.so.1",
+                "",
+                "detail",
+            )
+        )
+        report["issues"].append(
+            self.scanner.issue(
+                "llama-cpu-linux-x64",
+                "llama-mtmd-cli",
+                "missing_symbol_version",
+                "/lib64/libc.so.6",
+                "GLIBC_2.38",
+                "detail",
+            )
+        )
+
+        self.scanner.finalize_runtime_plans(report, "audio")
+
+        candidates = {candidate["name"]: candidate for candidate in report["runtime_candidates"]}
+        self.assertFalse(candidates["llama-cpu-teams-media"]["usable"])
+        self.assertEqual(candidates["llama-cpu-teams-media"]["status"], "blocked")
+
     def test_minimal_cpu_plan_blocks_unrepairable_runtime_issue(self) -> None:
-        for library, version in (("libvulkan.so.1", ""), ("/lib64/libc.so.6", "GLIBC_2.38")):
+        for library, version in (
+            ("libvulkan.so.1", ""),
+            ("/lib64/libc.so.6", "GLIBC_2.40"),
+            ("/lib64/libc.so.6", "GLIBC_2.35.1"),
+        ):
             with self.subTest(library=library, version=version):
                 report = self.scanner.build_report()
                 report["components"]["llama-cpu-linux-x64"] = {"native_files_scanned": 1}

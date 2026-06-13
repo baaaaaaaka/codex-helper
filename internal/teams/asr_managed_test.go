@@ -637,7 +637,7 @@ func TestManagedASRLlamaBinaryInstallFallsBackToCPUAssetWhenAcceleratedValidatio
 			},
 		}, nil
 	}
-	managedASRLlamaNativeCompatAssetsFn = func(string, string) ([]managedASRNativeCompatAsset, error) {
+	managedASRLlamaNativeCompatAssetsFn = func(string, string, string) ([]managedASRNativeCompatAsset, error) {
 		t.Fatal("missing Vulkan loader should fall back to CPU without downloading native glibc compat assets")
 		return nil, nil
 	}
@@ -694,19 +694,28 @@ func TestManagedASRLlamaInstallEnvIgnoresInvalidNativeCompatMarker(t *testing.T)
 
 func TestManagedASRLlamaNativeCompatCanRepairOnlyKnownBundleIssues(t *testing.T) {
 	tests := []struct {
-		name string
-		err  string
-		want bool
+		name        string
+		err         string
+		want        bool
+		wantProfile string
 	}{
 		{
-			name: "glibc symbol within bundle",
-			err:  "/lib64/libc.so.6: version `GLIBC_2.34' not found",
-			want: true,
+			name:        "glibc symbol within 2.35 bundle",
+			err:         "/lib64/libc.so.6: version `GLIBC_2.34' not found",
+			want:        true,
+			wantProfile: managedASRNativeCompatProfileGlibc235,
 		},
 		{
-			name: "libstdc++ full path missing",
-			err:  "/lib64/libstdc++.so.6: cannot open shared object file: No such file or directory",
-			want: true,
+			name:        "libstdc++ full path missing uses minimal bundle",
+			err:         "/lib64/libstdc++.so.6: cannot open shared object file: No such file or directory",
+			want:        true,
+			wantProfile: managedASRNativeCompatProfileGlibc235,
+		},
+		{
+			name:        "nss direct missing library uses minimal bundle",
+			err:         "libnss_files.so.2: cannot open shared object file: No such file or directory",
+			want:        true,
+			wantProfile: managedASRNativeCompatProfileGlibc235,
 		},
 		{
 			name: "vulkan loader is not repaired by glibc bundle",
@@ -714,23 +723,36 @@ func TestManagedASRLlamaNativeCompatCanRepairOnlyKnownBundleIssues(t *testing.T)
 			want: false,
 		},
 		{
-			name: "glibc symbol newer than bundle",
-			err:  "/lib64/libc.so.6: version `GLIBC_2.38' not found",
+			name: "mixed unrepairable library blocks otherwise repairable glibc symbol",
+			err:  "libvulkan.so.1: cannot open shared object file: No such file or directory\n/lib64/libc.so.6: version `GLIBC_2.38' not found",
 			want: false,
 		},
 		{
-			name: "extra nonzero version segment newer than bundle",
+			name:        "glibc symbol within 2.39 bundle",
+			err:         "/lib64/libc.so.6: version `GLIBC_2.38' not found",
+			want:        true,
+			wantProfile: managedASRNativeCompatProfileGlibc239,
+		},
+		{
+			name: "extra nonzero glibc version segment is not a real bundle symbol",
 			err:  "/lib64/libc.so.6: version `GLIBC_2.35.1' not found",
 			want: false,
 		},
 		{
-			name: "extra zero version segment matches bundle",
-			err:  "/lib64/libc.so.6: version `GLIBC_2.35.0' not found",
-			want: true,
+			name:        "extra zero version segment matches bundle",
+			err:         "/lib64/libc.so.6: version `GLIBC_2.35.0' not found",
+			want:        true,
+			wantProfile: managedASRNativeCompatProfileGlibc235,
 		},
 		{
-			name: "libstdc++ symbol newer than bundle",
-			err:  "/lib64/libstdc++.so.6: version `GLIBCXX_3.4.31' not found",
+			name:        "libstdc++ symbol within 2.39 bundle",
+			err:         "/lib64/libstdc++.so.6: version `GLIBCXX_3.4.31' not found",
+			want:        true,
+			wantProfile: managedASRNativeCompatProfileGlibc239,
+		},
+		{
+			name: "glibc symbol newer than 2.39 bundle",
+			err:  "/lib64/libc.so.6: version `GLIBC_2.40' not found",
 			want: false,
 		},
 	}
@@ -738,6 +760,13 @@ func TestManagedASRLlamaNativeCompatCanRepairOnlyKnownBundleIssues(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			if got := managedASRLlamaNativeCompatCanRepair(errors.New(tt.err)); got != tt.want {
 				t.Fatalf("managedASRLlamaNativeCompatCanRepair(%q) = %v, want %v", tt.err, got, tt.want)
+			}
+			profile, ok := managedASRLlamaNativeCompatProfileForError(errors.New(tt.err))
+			if ok != tt.want {
+				t.Fatalf("managedASRLlamaNativeCompatProfileForError(%q) ok = %v, want %v", tt.err, ok, tt.want)
+			}
+			if tt.want && profile.Version != tt.wantProfile {
+				t.Fatalf("repair profile = %q, want %q", profile.Version, tt.wantProfile)
 			}
 		})
 	}
@@ -803,7 +832,10 @@ func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithPatchelf(t *testing.
 			Acceleration: "cpu",
 		}}, nil
 	}
-	managedASRLlamaNativeCompatAssetsFn = func(string, string) ([]managedASRNativeCompatAsset, error) {
+	managedASRLlamaNativeCompatAssetsFn = func(_, _ string, profile string) ([]managedASRNativeCompatAsset, error) {
+		if profile != managedASRNativeCompatProfileGlibc235 {
+			t.Fatalf("native compat profile = %q, want %q", profile, managedASRNativeCompatProfileGlibc235)
+		}
 		return []managedASRNativeCompatAsset{
 			{Name: "glibc.tar.gz", URL: server.URL + "/glibc.tar.gz", SHA256: managedASRTestSHA256(glibcArchive), Size: int64(len(glibcArchive)), ArchiveKind: "tar.gz", ExtractMode: "ubuntu-base-glibc"},
 			{Name: "libgomp.tar.gz", URL: server.URL + "/libgomp.tar.gz", SHA256: managedASRTestSHA256(libgompArchive), Size: int64(len(libgompArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
@@ -866,6 +898,252 @@ func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithPatchelf(t *testing.
 	}
 	if !strings.Contains(string(data), `"native_compat": true`) {
 		t.Fatalf("runtime marker did not record native compatibility repair:\n%s", data)
+	}
+}
+
+func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithGlibc239Profile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native compatibility patchelf repair is Linux-only")
+	}
+	cacheRoot := t.TempDir()
+	binaryArchive := buildManagedASRLlamaTestArchive(t)
+	glibc239Archive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2": []byte("loader"),
+		"usr/lib/x86_64-linux-gnu/libc.so.6":            []byte("libc"),
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33":  []byte("libstdc++"),
+		"usr/lib/x86_64-linux-gnu/libnss_files.so.2":    []byte("nss-files"),
+		"usr/lib/x86_64-linux-gnu/libnss_dns.so.2":      []byte("nss-dns"),
+	}, map[string]string{
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6": "libstdc++.so.6.0.33",
+	})
+	libgompArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"lib/libgomp.so.1": []byte("libgomp"),
+	}, nil)
+	patchelfArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"bin/patchelf": []byte("#!/bin/sh\nexit 0\n"),
+	}, nil)
+	downloads := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads[r.URL.Path]++
+		switch r.URL.Path {
+		case "/llama.tar.gz":
+			_, _ = w.Write(binaryArchive)
+		case "/glibc239.tar.gz":
+			_, _ = w.Write(glibc239Archive)
+		case "/libgomp.tar.gz":
+			_, _ = w.Write(libgompArchive)
+		case "/patchelf.tar.gz":
+			_, _ = w.Write(patchelfArchive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	prevHTTPClient := managedASRLlamaHTTPClient
+	prevAssets := managedASRLlamaBinaryAssetsFn
+	prevCompatAssets := managedASRLlamaNativeCompatAssetsFn
+	prevApply := applyManagedASRLlamaNativeCompatFn
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() {
+		managedASRLlamaHTTPClient = prevHTTPClient
+		managedASRLlamaBinaryAssetsFn = prevAssets
+		managedASRLlamaNativeCompatAssetsFn = prevCompatAssets
+		applyManagedASRLlamaNativeCompatFn = prevApply
+		validateManagedASRLlamaBinaryFn = prevValidate
+	})
+	managedASRLlamaHTTPClient = server.Client()
+	managedASRLlamaBinaryAssetsFn = func(string, string) ([]managedASRLlamaAsset, error) {
+		return []managedASRLlamaAsset{{
+			Name:         "llama-test.tar.gz",
+			URL:          server.URL + "/llama.tar.gz",
+			SHA256:       managedASRTestSHA256(binaryArchive),
+			Size:         int64(len(binaryArchive)),
+			ArchiveKind:  "tar.gz",
+			Acceleration: "cpu",
+		}}, nil
+	}
+	managedASRLlamaNativeCompatAssetsFn = func(_, _ string, profile string) ([]managedASRNativeCompatAsset, error) {
+		if profile != managedASRNativeCompatProfileGlibc239 {
+			t.Fatalf("native compat profile = %q, want %q", profile, managedASRNativeCompatProfileGlibc239)
+		}
+		return []managedASRNativeCompatAsset{
+			{Name: "glibc239.tar.gz", URL: server.URL + "/glibc239.tar.gz", SHA256: managedASRTestSHA256(glibc239Archive), Size: int64(len(glibc239Archive)), ArchiveKind: "tar.gz", ExtractMode: "ubuntu-base-glibc"},
+			{Name: "libgomp.tar.gz", URL: server.URL + "/libgomp.tar.gz", SHA256: managedASRTestSHA256(libgompArchive), Size: int64(len(libgompArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+			{Name: "patchelf.tar.gz", URL: server.URL + "/patchelf.tar.gz", SHA256: managedASRTestSHA256(patchelfArchive), Size: int64(len(patchelfArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+		}, nil
+	}
+	applyManagedASRLlamaNativeCompatFn = func(_ context.Context, _ string, compat managedASRNativeCompatRuntime) error {
+		for _, path := range []string{
+			filepath.Join(compat.LibDir, "libstdc++.so.6.0.33"),
+			filepath.Join(compat.LibDir, "libnss_files.so.2"),
+			filepath.Join(compat.LibDir, "libnss_dns.so.2"),
+		} {
+			if info, err := os.Stat(path); err != nil || info.IsDir() {
+				t.Fatalf("compat file %s missing before patch: %v", path, err)
+			}
+		}
+		return nil
+	}
+	validateCalls := 0
+	validateManagedASRLlamaBinaryFn = func(_ context.Context, _ string, _ []string) error {
+		validateCalls++
+		if validateCalls == 1 {
+			return errors.New("/lib64/libc.so.6: version `GLIBC_2.38' not found; /lib64/libstdc++.so.6: version `GLIBCXX_3.4.31' not found")
+		}
+		return nil
+	}
+
+	command, _, _, err := ensureManagedASRLlamaBinary(context.Background(), filepath.Join(cacheRoot, "llama"), ManagedASRConfig{LlamaDevice: "cpu"})
+	if err != nil {
+		t.Fatalf("native compat 2.39 repair install error: %v", err)
+	}
+	if validateCalls != 2 {
+		t.Fatalf("validate calls = %d, want original failure plus repaired retry", validateCalls)
+	}
+	if downloads["/llama.tar.gz"] != 1 || downloads["/glibc239.tar.gz"] != 1 || downloads["/libgomp.tar.gz"] != 1 || downloads["/patchelf.tar.gz"] != 1 {
+		t.Fatalf("downloads = %#v, want llama and each 2.39 native compat asset once", downloads)
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(command), managedASRNativeCompatDirName, "runtime.json"))
+	if err != nil {
+		t.Fatalf("read native compat marker: %v", err)
+	}
+	if !strings.Contains(string(data), managedASRNativeCompatProfileGlibc239) {
+		t.Fatalf("native compat marker did not record 2.39 profile:\n%s", data)
+	}
+}
+
+func TestManagedASRLlamaBinaryInstallEscalatesNativeCompatProfileAfterRetry(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native compatibility patchelf repair is Linux-only")
+	}
+	cacheRoot := t.TempDir()
+	binaryArchive := buildManagedASRLlamaTestArchive(t)
+	glibc235Archive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2": []byte("loader"),
+		"usr/lib/x86_64-linux-gnu/libc.so.6":            []byte("libc"),
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30":  []byte("libstdc++"),
+	}, map[string]string{
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6": "libstdc++.so.6.0.30",
+	})
+	glibc239Archive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2": []byte("loader"),
+		"usr/lib/x86_64-linux-gnu/libc.so.6":            []byte("libc"),
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33":  []byte("libstdc++"),
+		"usr/lib/x86_64-linux-gnu/libnss_files.so.2":    []byte("nss-files"),
+		"usr/lib/x86_64-linux-gnu/libnss_dns.so.2":      []byte("nss-dns"),
+	}, map[string]string{
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6": "libstdc++.so.6.0.33",
+	})
+	libgompArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"lib/libgomp.so.1": []byte("libgomp"),
+	}, nil)
+	patchelfArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"bin/patchelf": []byte("#!/bin/sh\nexit 0\n"),
+	}, nil)
+	downloads := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads[r.URL.Path]++
+		switch r.URL.Path {
+		case "/llama.tar.gz":
+			_, _ = w.Write(binaryArchive)
+		case "/glibc235.tar.gz":
+			_, _ = w.Write(glibc235Archive)
+		case "/glibc239.tar.gz":
+			_, _ = w.Write(glibc239Archive)
+		case "/libgomp.tar.gz":
+			_, _ = w.Write(libgompArchive)
+		case "/patchelf.tar.gz":
+			_, _ = w.Write(patchelfArchive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	prevHTTPClient := managedASRLlamaHTTPClient
+	prevAssets := managedASRLlamaBinaryAssetsFn
+	prevCompatAssets := managedASRLlamaNativeCompatAssetsFn
+	prevApply := applyManagedASRLlamaNativeCompatFn
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() {
+		managedASRLlamaHTTPClient = prevHTTPClient
+		managedASRLlamaBinaryAssetsFn = prevAssets
+		managedASRLlamaNativeCompatAssetsFn = prevCompatAssets
+		applyManagedASRLlamaNativeCompatFn = prevApply
+		validateManagedASRLlamaBinaryFn = prevValidate
+	})
+	managedASRLlamaHTTPClient = server.Client()
+	managedASRLlamaBinaryAssetsFn = func(string, string) ([]managedASRLlamaAsset, error) {
+		return []managedASRLlamaAsset{{
+			Name:         "llama-test.tar.gz",
+			URL:          server.URL + "/llama.tar.gz",
+			SHA256:       managedASRTestSHA256(binaryArchive),
+			Size:         int64(len(binaryArchive)),
+			ArchiveKind:  "tar.gz",
+			Acceleration: "cpu",
+		}}, nil
+	}
+	var requestedProfiles []string
+	managedASRLlamaNativeCompatAssetsFn = func(_, _ string, profile string) ([]managedASRNativeCompatAsset, error) {
+		requestedProfiles = append(requestedProfiles, profile)
+		glibcName := "glibc235.tar.gz"
+		glibcArchive := glibc235Archive
+		if profile == managedASRNativeCompatProfileGlibc239 {
+			glibcName = "glibc239.tar.gz"
+			glibcArchive = glibc239Archive
+		}
+		return []managedASRNativeCompatAsset{
+			{Name: glibcName, URL: server.URL + "/" + glibcName, SHA256: managedASRTestSHA256(glibcArchive), Size: int64(len(glibcArchive)), ArchiveKind: "tar.gz", ExtractMode: "ubuntu-base-glibc"},
+			{Name: "libgomp.tar.gz", URL: server.URL + "/libgomp.tar.gz", SHA256: managedASRTestSHA256(libgompArchive), Size: int64(len(libgompArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+			{Name: "patchelf.tar.gz", URL: server.URL + "/patchelf.tar.gz", SHA256: managedASRTestSHA256(patchelfArchive), Size: int64(len(patchelfArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+		}, nil
+	}
+	var appliedProfiles []string
+	applyManagedASRLlamaNativeCompatFn = func(_ context.Context, _ string, compat managedASRNativeCompatRuntime) error {
+		marker, err := os.ReadFile(filepath.Join(compat.Root, "runtime.json"))
+		if err != nil {
+			t.Fatalf("read native compat marker during apply: %v", err)
+		}
+		switch {
+		case strings.Contains(string(marker), managedASRNativeCompatProfileGlibc235):
+			appliedProfiles = append(appliedProfiles, managedASRNativeCompatProfileGlibc235)
+		case strings.Contains(string(marker), managedASRNativeCompatProfileGlibc239):
+			appliedProfiles = append(appliedProfiles, managedASRNativeCompatProfileGlibc239)
+		default:
+			t.Fatalf("unexpected native compat marker during apply:\n%s", marker)
+		}
+		return nil
+	}
+	validateCalls := 0
+	validateManagedASRLlamaBinaryFn = func(_ context.Context, _ string, _ []string) error {
+		validateCalls++
+		switch validateCalls {
+		case 1:
+			return errors.New("/lib64/libstdc++.so.6: cannot open shared object file: No such file or directory")
+		case 2:
+			return errors.New("/lib64/libc.so.6: version `GLIBC_2.38' not found")
+		default:
+			return nil
+		}
+	}
+
+	_, _, _, err := ensureManagedASRLlamaBinary(context.Background(), filepath.Join(cacheRoot, "llama"), ManagedASRConfig{LlamaDevice: "cpu"})
+	if err != nil {
+		t.Fatalf("native compat profile escalation install error: %v", err)
+	}
+	if validateCalls != 3 {
+		t.Fatalf("validate calls = %d, want missing-library failure, upgraded-symbol failure, success", validateCalls)
+	}
+	wantProfiles := []string{managedASRNativeCompatProfileGlibc235, managedASRNativeCompatProfileGlibc239}
+	if !reflect.DeepEqual(requestedProfiles, wantProfiles) {
+		t.Fatalf("requested profiles = %#v, want %#v", requestedProfiles, wantProfiles)
+	}
+	if !reflect.DeepEqual(appliedProfiles, wantProfiles) {
+		t.Fatalf("applied profiles = %#v, want %#v", appliedProfiles, wantProfiles)
+	}
+	if downloads["/glibc235.tar.gz"] != 1 || downloads["/glibc239.tar.gz"] != 1 {
+		t.Fatalf("downloads = %#v, want both native compat profiles once", downloads)
 	}
 }
 
@@ -960,6 +1238,64 @@ func TestManagedASRRealLlamaNativeCompatRepairsPinnedCPUAsset(t *testing.T) {
 	}
 	if os.Getenv("CODEX_HELPER_ASR_EXPECT_NATIVE_COMPAT") == "1" && !strings.Contains(string(data), `"native_compat": true`) {
 		t.Fatalf("runtime marker did not record native compat on old distro:\n%s", data)
+	}
+}
+
+func TestManagedASRRealNativeCompatRepairsGLIBC238SmokeBinary(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_ASR_REAL_GLIBC239_COMPAT_TEST") != "1" {
+		t.Skip("set CODEX_HELPER_ASR_REAL_GLIBC239_COMPAT_TEST=1 to download and validate the glibc 2.39 native compat profile")
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skipf("native compat real test only covers linux/amd64, got %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	source := strings.TrimSpace(os.Getenv("CODEX_HELPER_ASR_GLIBC238_SMOKE_BINARY"))
+	if source == "" {
+		t.Fatal("CODEX_HELPER_ASR_GLIBC238_SMOKE_BINARY is required")
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read smoke binary: %v", err)
+	}
+	root := t.TempDir()
+	command := filepath.Join(root, "glibc238-smoke")
+	if err := os.WriteFile(command, data, 0o700); err != nil {
+		t.Fatalf("write smoke binary copy: %v", err)
+	}
+	profile, ok := managedASRLlamaNativeCompatProfileForError(errors.New("/lib64/libc.so.6: version `GLIBC_2.38' not found"))
+	if !ok {
+		t.Fatal("GLIBC_2.38 should select a repair profile")
+	}
+	if profile.Version != managedASRNativeCompatProfileGlibc239 {
+		t.Fatalf("profile = %q, want %q", profile.Version, managedASRNativeCompatProfileGlibc239)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	compat, err := ensureManagedASRLlamaNativeCompat(ctx, command, profile)
+	if err != nil {
+		t.Fatalf("ensure glibc 2.39 native compat: %v", err)
+	}
+	apply := applyManagedASRLlamaNativeCompatFn
+	if apply == nil {
+		apply = applyManagedASRLlamaNativeCompat
+	}
+	if err := apply(ctx, command, compat); err != nil {
+		t.Fatalf("patch GLIBC_2.38 smoke binary: %v", err)
+	}
+	cmd := exec.CommandContext(ctx, command)
+	cmd.Env = append(managedASRSetupBaseEnv(), managedASRLlamaInstallEnvForCommand(root, command)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run patched GLIBC_2.38 smoke binary: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "glibc23") {
+		t.Fatalf("unexpected smoke output: %q", out)
+	}
+	marker, err := os.ReadFile(filepath.Join(filepath.Dir(command), managedASRNativeCompatDirName, "runtime.json"))
+	if err != nil {
+		t.Fatalf("read native compat marker: %v", err)
+	}
+	if !strings.Contains(string(marker), managedASRNativeCompatProfileGlibc239) {
+		t.Fatalf("native compat marker did not record 2.39 profile:\n%s", marker)
 	}
 }
 

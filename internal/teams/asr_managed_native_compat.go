@@ -21,11 +21,16 @@ import (
 )
 
 const (
-	managedASRNativeCompatDirName = ".cxp-native"
-	managedASRNativeCompatVersion = "linux-x64-glibc-2.35-conda-runtime-v1"
+	managedASRNativeCompatDirName           = ".cxp-native"
+	managedASRNativeCompatProfileGlibc235   = "linux-x64-glibc-2.35-conda-runtime-v1"
+	managedASRNativeCompatProfileGlibc239   = "linux-x64-glibc-2.39-conda-runtime-v1"
+	managedASRNativeCompatDefaultProfile    = managedASRNativeCompatProfileGlibc235
+	managedASRNativeCompatUnsupportedOSArch = "managed llama native compatibility bundle is not available for %s/%s"
 )
 
 var managedASRNativeCompatSymbolVersionRE = regexp.MustCompile(`\b(?:GLIBC|GLIBCXX|CXXABI|GCC|OPENSSL)_[0-9][A-Za-z0-9_.]*`)
+var managedASRNativeCompatCannotOpenLibraryRE = regexp.MustCompile(`(?m)(?:^|\s)((?:/[^:\s]+/)?lib[^\s:'"]+\.so(?:\.[0-9]+)*)[^:\n]*:\s+cannot open shared object file`)
+var managedASRNativeCompatNotFoundLibraryRE = regexp.MustCompile(`(?m)^\s*(\S+)\s+=>\s+not found\b`)
 
 var managedASRNativeCompatRepairableLibraries = []string{
 	"ld-linux-x86-64.so.2",
@@ -40,6 +45,8 @@ var managedASRNativeCompatRepairableLibraries = []string{
 	"libgomp.so.1",
 	"libssl.so.3",
 	"libcrypto.so.3",
+	"libnss_files.so.2",
+	"libnss_dns.so.2",
 }
 
 type managedASRNativeCompatAsset struct {
@@ -51,6 +58,16 @@ type managedASRNativeCompatAsset struct {
 	ExtractMode string
 }
 
+type managedASRNativeCompatProfile struct {
+	Version    string
+	GLIBCMax   []int
+	GLIBCXXMax []int
+	CXXABIMax  []int
+	OpenSSLMax []int
+	GCCMax     []int
+	Assets     []managedASRNativeCompatAsset
+}
+
 type managedASRNativeCompatRuntime struct {
 	Root        string
 	LibDir      string
@@ -60,20 +77,68 @@ type managedASRNativeCompatRuntime struct {
 }
 
 func managedASRLlamaNativeCompatCanRepair(err error) bool {
+	_, ok := managedASRLlamaNativeCompatProfileForError(err)
+	return ok
+}
+
+func managedASRLlamaNativeCompatProfileForError(err error) (managedASRNativeCompatProfile, bool) {
 	if err == nil {
-		return false
+		return managedASRNativeCompatProfile{}, false
 	}
 	text := err.Error()
+	profiles := managedASRNativeCompatProfiles()
+	missingLibraries := managedASRNativeCompatMissingLibraries(text)
+	for _, library := range missingLibraries {
+		if !managedASRNativeCompatLibraryCanRepair(library) {
+			return managedASRNativeCompatProfile{}, false
+		}
+	}
 	versions := managedASRNativeCompatSymbolVersionRE.FindAllString(text, -1)
-	for _, version := range versions {
-		if managedASRNativeCompatSymbolVersionCanRepair(version) {
+	if len(versions) > 0 {
+		for _, profile := range profiles {
+			if managedASRNativeCompatProfileCanRepairSymbolVersions(profile, versions) {
+				return profile, true
+			}
+		}
+		return managedASRNativeCompatProfile{}, false
+	}
+	if len(missingLibraries) > 0 || managedASRNativeCompatErrorMentionsRepairableLibrary(text) {
+		return profiles[0], true
+	}
+	return managedASRNativeCompatProfile{}, false
+}
+
+func managedASRNativeCompatMissingLibraries(text string) []string {
+	seen := map[string]bool{}
+	var libraries []string
+	for _, re := range []*regexp.Regexp{managedASRNativeCompatCannotOpenLibraryRE, managedASRNativeCompatNotFoundLibraryRE} {
+		for _, match := range re.FindAllStringSubmatch(text, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			library := strings.TrimSpace(match[1])
+			if library == "" {
+				continue
+			}
+			base := pathBase(library)
+			if seen[base] {
+				continue
+			}
+			seen[base] = true
+			libraries = append(libraries, base)
+		}
+	}
+	return libraries
+}
+
+func managedASRNativeCompatLibraryCanRepair(library string) bool {
+	base := pathBase(library)
+	for _, candidate := range managedASRNativeCompatRepairableLibraries {
+		if base == candidate {
 			return true
 		}
 	}
-	if len(versions) > 0 {
-		return false
-	}
-	return managedASRNativeCompatErrorMentionsRepairableLibrary(text)
+	return false
 }
 
 func managedASRNativeCompatErrorMentionsRepairableLibrary(text string) bool {
@@ -92,17 +157,38 @@ func managedASRNativeCompatErrorMentionsRepairableLibrary(text string) bool {
 }
 
 func managedASRNativeCompatSymbolVersionCanRepair(version string) bool {
+	for _, profile := range managedASRNativeCompatProfiles() {
+		if managedASRNativeCompatProfileCanRepairSymbolVersion(profile, version) {
+			return true
+		}
+	}
+	return false
+}
+
+func managedASRNativeCompatProfileCanRepairSymbolVersions(profile managedASRNativeCompatProfile, versions []string) bool {
+	if len(versions) == 0 {
+		return false
+	}
+	for _, version := range versions {
+		if !managedASRNativeCompatProfileCanRepairSymbolVersion(profile, version) {
+			return false
+		}
+	}
+	return true
+}
+
+func managedASRNativeCompatProfileCanRepairSymbolVersion(profile managedASRNativeCompatProfile, version string) bool {
 	switch {
 	case strings.HasPrefix(version, "GLIBC_"):
-		return managedASRNativeCompatVersionAtMost(version, "GLIBC_", []int{2, 35})
+		return managedASRNativeCompatVersionAtMost(version, "GLIBC_", profile.GLIBCMax)
 	case strings.HasPrefix(version, "GLIBCXX_"):
-		return managedASRNativeCompatVersionAtMost(version, "GLIBCXX_", []int{3, 4, 30})
+		return managedASRNativeCompatVersionAtMost(version, "GLIBCXX_", profile.GLIBCXXMax)
 	case strings.HasPrefix(version, "CXXABI_"):
-		return managedASRNativeCompatVersionAtMost(version, "CXXABI_", []int{1, 3, 13})
+		return managedASRNativeCompatVersionAtMost(version, "CXXABI_", profile.CXXABIMax)
 	case strings.HasPrefix(version, "OPENSSL_"):
-		return managedASRNativeCompatVersionAtMost(version, "OPENSSL_", []int{3, 0, 0})
+		return managedASRNativeCompatVersionAtMost(version, "OPENSSL_", profile.OpenSSLMax)
 	case strings.HasPrefix(version, "GCC_"):
-		return managedASRNativeCompatVersionAtMost(version, "GCC_", []int{12, 0, 0})
+		return managedASRNativeCompatVersionAtMost(version, "GCC_", profile.GCCMax)
 	default:
 		return false
 	}
@@ -110,11 +196,16 @@ func managedASRNativeCompatSymbolVersionCanRepair(version string) bool {
 
 func managedASRNativeCompatVersionAtMost(version string, prefix string, max []int) bool {
 	got := managedASRNativeCompatVersionNumbers(strings.TrimPrefix(version, prefix))
-	if len(got) == 0 {
+	if len(got) == 0 || len(max) == 0 {
 		return false
 	}
-	for len(max) < len(got) {
-		max = append(max, 0)
+	if len(got) > len(max) {
+		for _, extra := range got[len(max):] {
+			if extra != 0 {
+				return false
+			}
+		}
+		got = got[:len(max)]
 	}
 	for len(got) < len(max) {
 		got = append(got, 0)
@@ -160,19 +251,8 @@ func managedASRNativeCompatVersionNumbers(value string) []int {
 	return numbers
 }
 
-func managedASRLlamaNativeCompatAssets(goos string, goarch string) ([]managedASRNativeCompatAsset, error) {
-	if goos != "linux" || goarch != "amd64" {
-		return nil, fmt.Errorf("managed llama native compatibility bundle is not available for %s/%s", goos, goarch)
-	}
-	return []managedASRNativeCompatAsset{
-		{
-			Name:        "ubuntu-base-22.04.5-base-amd64.tar.gz",
-			URL:         "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz",
-			SHA256:      "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a",
-			Size:        29832285,
-			ArchiveKind: "tar.gz",
-			ExtractMode: "ubuntu-base-glibc",
-		},
+func managedASRNativeCompatProfiles() []managedASRNativeCompatProfile {
+	common := []managedASRNativeCompatAsset{
 		{
 			Name:        "libgomp-9.3.0-h5101ec6_17.tar.bz2",
 			URL:         "https://repo.anaconda.com/pkgs/main/linux-64/libgomp-9.3.0-h5101ec6_17.tar.bz2",
@@ -189,10 +269,71 @@ func managedASRLlamaNativeCompatAssets(goos string, goarch string) ([]managedASR
 			ArchiveKind: "tar.bz2",
 			ExtractMode: "conda-runtime",
 		},
-	}, nil
+	}
+	withCommon := func(assets ...managedASRNativeCompatAsset) []managedASRNativeCompatAsset {
+		out := append([]managedASRNativeCompatAsset{}, assets...)
+		return append(out, common...)
+	}
+	return []managedASRNativeCompatProfile{
+		{
+			Version:    managedASRNativeCompatProfileGlibc235,
+			GLIBCMax:   []int{2, 35},
+			GLIBCXXMax: []int{3, 4, 30},
+			CXXABIMax:  []int{1, 3, 13},
+			OpenSSLMax: []int{3, 0, 0},
+			GCCMax:     []int{12, 0, 0},
+			Assets: withCommon(managedASRNativeCompatAsset{
+				Name:        "ubuntu-base-22.04.5-base-amd64.tar.gz",
+				URL:         "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz",
+				SHA256:      "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a",
+				Size:        29832285,
+				ArchiveKind: "tar.gz",
+				ExtractMode: "ubuntu-base-glibc",
+			}),
+		},
+		{
+			Version:    managedASRNativeCompatProfileGlibc239,
+			GLIBCMax:   []int{2, 39},
+			GLIBCXXMax: []int{3, 4, 33},
+			CXXABIMax:  []int{1, 3, 15},
+			OpenSSLMax: []int{3, 0, 0},
+			GCCMax:     []int{14, 0, 0},
+			Assets: withCommon(managedASRNativeCompatAsset{
+				Name:        "ubuntu-base-24.04.4-base-amd64.tar.gz",
+				URL:         "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz",
+				SHA256:      "c1e67ef7b17a6300e136118bd1dc04725009cb376c1aad10abcf8cd453628d58",
+				Size:        29989394,
+				ArchiveKind: "tar.gz",
+				ExtractMode: "ubuntu-base-glibc",
+			}),
+		},
+	}
 }
 
-func ensureManagedASRLlamaNativeCompat(ctx context.Context, command string) (managedASRNativeCompatRuntime, error) {
+func managedASRNativeCompatProfileByVersion(version string) (managedASRNativeCompatProfile, bool) {
+	for _, profile := range managedASRNativeCompatProfiles() {
+		if profile.Version == version {
+			return profile, true
+		}
+	}
+	return managedASRNativeCompatProfile{}, false
+}
+
+func managedASRLlamaNativeCompatAssets(goos string, goarch string, profileVersion string) ([]managedASRNativeCompatAsset, error) {
+	if goos != "linux" || goarch != "amd64" {
+		return nil, fmt.Errorf(managedASRNativeCompatUnsupportedOSArch, goos, goarch)
+	}
+	if profileVersion == "" {
+		profileVersion = managedASRNativeCompatDefaultProfile
+	}
+	profile, ok := managedASRNativeCompatProfileByVersion(profileVersion)
+	if !ok {
+		return nil, fmt.Errorf("managed llama native compatibility profile %q is not available", profileVersion)
+	}
+	return append([]managedASRNativeCompatAsset{}, profile.Assets...), nil
+}
+
+func ensureManagedASRLlamaNativeCompat(ctx context.Context, command string, profile managedASRNativeCompatProfile) (managedASRNativeCompatRuntime, error) {
 	if runtime.GOOS != "linux" {
 		return managedASRNativeCompatRuntime{}, fmt.Errorf("native compatibility patching is only supported on Linux")
 	}
@@ -200,15 +341,18 @@ func ensureManagedASRLlamaNativeCompat(ctx context.Context, command string) (man
 	if command == "" {
 		return managedASRNativeCompatRuntime{}, fmt.Errorf("llama binary path is empty")
 	}
+	if profile.Version == "" {
+		profile, _ = managedASRNativeCompatProfileByVersion(managedASRNativeCompatDefaultProfile)
+	}
 	root := filepath.Join(filepath.Dir(command), managedASRNativeCompatDirName)
-	if rt, ok := managedASRNativeCompatFromMarker(root); ok {
+	if rt, ok := managedASRNativeCompatFromMarker(root, profile.Version); ok {
 		return rt, nil
 	}
 	assetsFn := managedASRLlamaNativeCompatAssetsFn
 	if assetsFn == nil {
 		assetsFn = managedASRLlamaNativeCompatAssets
 	}
-	assets, err := assetsFn(runtime.GOOS, runtime.GOARCH)
+	assets, err := assetsFn(runtime.GOOS, runtime.GOARCH, profile.Version)
 	if err != nil {
 		return managedASRNativeCompatRuntime{}, err
 	}
@@ -254,7 +398,7 @@ func ensureManagedASRLlamaNativeCompat(ctx context.Context, command string) (man
 	if err := validateManagedASRNativeCompatRuntime(rt); err != nil {
 		return managedASRNativeCompatRuntime{}, err
 	}
-	if err := writeManagedASRNativeCompatMarker(staging); err != nil {
+	if err := writeManagedASRNativeCompatMarker(staging, profile.Version); err != nil {
 		return managedASRNativeCompatRuntime{}, err
 	}
 	if err := os.RemoveAll(root); err != nil {
@@ -291,7 +435,7 @@ func ensureManagedASRNativeCompatSymlinks(libDir string) error {
 	return nil
 }
 
-func managedASRNativeCompatFromMarker(root string) (managedASRNativeCompatRuntime, bool) {
+func managedASRNativeCompatFromMarker(root string, expectedVersions ...string) (managedASRNativeCompatRuntime, bool) {
 	data, err := os.ReadFile(filepath.Join(root, "runtime.json"))
 	if err != nil {
 		return managedASRNativeCompatRuntime{}, false
@@ -299,7 +443,21 @@ func managedASRNativeCompatFromMarker(root string) (managedASRNativeCompatRuntim
 	var marker struct {
 		Version string `json:"version"`
 	}
-	if err := json.Unmarshal(data, &marker); err != nil || marker.Version != managedASRNativeCompatVersion {
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return managedASRNativeCompatRuntime{}, false
+	}
+	if len(expectedVersions) > 0 {
+		found := false
+		for _, expected := range expectedVersions {
+			if marker.Version == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return managedASRNativeCompatRuntime{}, false
+		}
+	} else if _, ok := managedASRNativeCompatProfileByVersion(marker.Version); !ok {
 		return managedASRNativeCompatRuntime{}, false
 	}
 	rt := managedASRNativeCompatRuntime{
@@ -315,8 +473,11 @@ func managedASRNativeCompatFromMarker(root string) (managedASRNativeCompatRuntim
 	return rt, true
 }
 
-func writeManagedASRNativeCompatMarker(root string) error {
-	data := fmt.Sprintf("{\n  \"version\": %q,\n  \"updated_at\": %q\n}\n", managedASRNativeCompatVersion, time.Now().UTC().Format(time.RFC3339Nano))
+func writeManagedASRNativeCompatMarker(root string, profileVersion string) error {
+	if profileVersion == "" {
+		profileVersion = managedASRNativeCompatDefaultProfile
+	}
+	data := fmt.Sprintf("{\n  \"version\": %q,\n  \"updated_at\": %q\n}\n", profileVersion, time.Now().UTC().Format(time.RFC3339Nano))
 	return writePrivateFileReplacing(filepath.Join(root, "runtime.json"), []byte(data), 0o600)
 }
 
@@ -419,8 +580,11 @@ func managedASRNativeCompatUbuntuLib(base string) bool {
 		"libgcc_s.so.1",
 		"libstdc++.so.6",
 		"libstdc++.so.6.0.30",
+		"libstdc++.so.6.0.33",
 		"libssl.so.3",
-		"libcrypto.so.3":
+		"libcrypto.so.3",
+		"libnss_files.so.2",
+		"libnss_dns.so.2":
 		return true
 	default:
 		return false

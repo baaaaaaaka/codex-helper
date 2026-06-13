@@ -168,7 +168,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr|LlamaOptInInvokesConfiguredRuntime|AutoFallsBackToTransformers|AutoDoesNotInstallTransformersFallbackByDefault|AutoDoesNotFallbackFromLlamaRuntimeFailure|DefaultDownloadsManagedLlamaRuntime|ExplicitLlamaRejectsConfiguredMissingBinary)|ASR(ParseLlamaOutputHandlesLanguageColon|Llama(ConfigUsesLightweightDiskPreflight|ModelMarkerRejectsCorruptCachedFile|RuntimeConcurrentSetupReusesSingleInstall|BinaryInstall(FallsBackToCPUAssetWhenAcceleratedValidationFails|HonorsExplicitCPUDevice)|AssetMatrixCoversExpectedAccelerationFallbacks)|FFmpegWheelAssetMatrixCoversExpectedPlatforms|DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadsExtractsAndMarksRuntime)))|EnsureManagedASRFFmpegInstallsAndReusesManagedWheel|DownloadManagedASRLlamaFile(RejectsSizeAndHashMismatch|RetriesAndReplacesExistingTarget)|ExtractManagedASRZipRejectsUnsafePath|PrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOrigin(TextHashesIncludesControlFallbackSource|TranscriptUserDisplayBodyUsesOriginalTeamsPrompt)|BridgeSyncLinkedTranscript(MirrorsTeamsOriginUserPromptWithoutASRContext|SkipsASROnlyTeamsOriginUserPrompt)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
+          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr|LlamaOptInInvokesConfiguredRuntime|AutoFallsBackToTransformers|AutoDoesNotInstallTransformersFallbackByDefault|AutoDoesNotFallbackFromLlamaRuntimeFailure|DefaultDownloadsManagedLlamaRuntime|ExplicitLlamaRejectsConfiguredMissingBinary)|ASR(ParseLlamaOutputHandlesLanguageColon|Llama(ConfigUsesLightweightDiskPreflight|ModelMarkerRejectsCorruptCachedFile|RuntimeConcurrentSetupReusesSingleInstall|NativeCompatCanRepairOnlyKnownBundleIssues|BinaryInstall(FallsBackToCPUAssetWhenAcceleratedValidationFails|RepairsNativeCompatWithPatchelf|RepairsNativeCompatWithGlibc239Profile|EscalatesNativeCompatProfileAfterRetry|HonorsExplicitCPUDevice)|AssetMatrixCoversExpectedAccelerationFallbacks)|FFmpegWheelAssetMatrixCoversExpectedPlatforms|DiskPreflightReportsActionableSpace|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadsExtractsAndMarksRuntime)))|EnsureManagedASRFFmpegInstallsAndReusesManagedWheel|DownloadManagedASRLlamaFile(RejectsSizeAndHashMismatch|RetriesAndReplacesExistingTarget)|ExtractManagedASRZipRejectsUnsafePath|PrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg|ASRCommandEnvCapsCPUThreadVariables|TeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOrigin(TextHashesIncludesControlFallbackSource|TranscriptUserDisplayBodyUsesOriginalTeamsPrompt)|BridgeSyncLinkedTranscript(MirrorsTeamsOriginUserPromptWithoutASRContext|SkipsASROnlyTeamsOriginUserPrompt)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
@@ -1563,6 +1563,63 @@ jobs:
                 bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
               fi
               /dist/codex_teams_test -test.v -test.count=1 -test.run="TestManagedASRRealLlamaNativeCompatRepairsPinnedCPUAsset$"
+            '
+
+      - name: Teams managed ASR glibc 2.39 native compatibility repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          img="$DISTRO_IMAGE"
+          rm -rf glibc239-smoke
+          mkdir -p glibc239-smoke
+          docker run --rm \
+            -v "$PWD/glibc239-smoke:/out" \
+            ubuntu:24.04 bash -lc '
+              set -euo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev binutils
+              cat > /tmp/glibc238.c <<'"'"'EOF'"'"'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <string.h>
+          int main(void) {
+            char buf[8];
+            size_t n = strlcpy(buf, "glibc238", sizeof(buf));
+            printf("%zu:%s\n", n, buf);
+            return 0;
+          }
+          EOF
+              gcc -O2 /tmp/glibc238.c -o /out/glibc238-smoke
+              readelf --version-info /out/glibc238-smoke | grep -q "GLIBC_2.38"
+            '
+          docker run --rm \
+            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS" \
+            -e CODEX_HELPER_ASR_REAL_GLIBC239_COMPAT_TEST=1 \
+            -e CODEX_HELPER_ASR_GLIBC238_SMOKE_BINARY=/smoke/glibc238-smoke \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/scripts/ci:/ci:ro" \
+            -v "$PWD/glibc239-smoke:/smoke:ro" \
+            "$img" bash -lc '
+              set -euo pipefail
+              if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                # shellcheck disable=SC2086
+                bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
+              fi
+              set +e
+              /smoke/glibc238-smoke >/tmp/glibc238-no-compat.out 2>/tmp/glibc238-no-compat.err
+              no_compat_status="$?"
+              set -e
+              if [ "$no_compat_status" = 0 ]; then
+                echo "GLIBC_2.38 smoke unexpectedly ran without native compat on $img" >&2
+                cat /tmp/glibc238-no-compat.out >&2
+                exit 1
+              fi
+              if ! grep -q "GLIBC_2.38" /tmp/glibc238-no-compat.err; then
+                echo "GLIBC_2.38 smoke failed for an unexpected reason before native compat:" >&2
+                cat /tmp/glibc238-no-compat.err >&2
+                exit 1
+              fi
+              /dist/codex_teams_test -test.v -test.count=1 -test.run="TestManagedASRRealNativeCompatRepairsGLIBC238SmokeBinary$"
             '
 
       - name: Smoke test in container (doctor)

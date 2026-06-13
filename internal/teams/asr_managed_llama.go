@@ -363,23 +363,34 @@ func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset
 	nativeCompat := false
 	if validateManagedASRLlamaBinaryFn != nil {
 		if err := validateManagedASRLlamaBinaryFn(ctx, command, env); err != nil {
-			if !managedASRLlamaNativeCompatCanRepair(err) {
-				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable: %w", err)}
-			}
-			compat, compatErr := ensureManagedASRLlamaNativeCompat(ctx, command)
-			if compatErr != nil {
-				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable (%w); native compatibility setup failed: %v", err, compatErr)}
-			}
-			apply := applyManagedASRLlamaNativeCompatFn
-			if apply == nil {
-				apply = applyManagedASRLlamaNativeCompat
-			}
-			if patchErr := apply(ctx, command, compat); patchErr != nil {
-				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable (%w); native compatibility patch failed: %v", err, patchErr)}
-			}
-			env = managedASRLlamaInstallEnvForCommand(staging, command)
-			if retryErr := validateManagedASRLlamaBinaryFn(ctx, command, env); retryErr != nil {
-				return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable after native compatibility patch: %w", retryErr)}
+			validationErr := err
+			attemptedProfiles := map[string]bool{}
+			for {
+				profile, ok := managedASRLlamaNativeCompatProfileForError(validationErr)
+				if !ok {
+					return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable: %w", validationErr)}
+				}
+				if attemptedProfiles[profile.Version] {
+					return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable after native compatibility patch: %w", validationErr)}
+				}
+				attemptedProfiles[profile.Version] = true
+				compat, compatErr := ensureManagedASRLlamaNativeCompat(ctx, command, profile)
+				if compatErr != nil {
+					return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable (%w); native compatibility setup failed: %v", validationErr, compatErr)}
+				}
+				apply := applyManagedASRLlamaNativeCompatFn
+				if apply == nil {
+					apply = applyManagedASRLlamaNativeCompat
+				}
+				if patchErr := apply(ctx, command, compat); patchErr != nil {
+					return "", nil, managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable (%w); native compatibility patch failed: %v", validationErr, patchErr)}
+				}
+				env = managedASRLlamaInstallEnvForCommand(staging, command)
+				if retryErr := validateManagedASRLlamaBinaryFn(ctx, command, env); retryErr != nil {
+					validationErr = retryErr
+					continue
+				}
+				break
 			}
 			nativeCompat = true
 		}
