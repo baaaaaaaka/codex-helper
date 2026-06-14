@@ -154,7 +154,7 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
-			spec, err := buildTeamsServiceSpec(registryPath)
+			spec, err := buildTeamsServiceSpec(registryPath, teamsServiceSpecMaterializeManagedTarget())
 			if err != nil {
 				return err
 			}
@@ -459,6 +459,21 @@ func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 					}
 				}
 			}
+			if target, err := resolveManagedTeamsInstallTarget("", false, false); err != nil {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service managed install target: unresolved (%v)\n", err)
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service managed install target: %s\n", target.Path)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service managed install source: %s", target.Source)
+				if strings.TrimSpace(target.Reason) != "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), " (%s)", target.Reason)
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout())
+				for _, warning := range target.Warnings {
+					if strings.TrimSpace(warning) != "" {
+						_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service managed install warning: %s\n", warning)
+					}
+				}
+			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service auth: not ready (%v)\n", err)
 			} else {
@@ -500,7 +515,7 @@ func installTeamsService(ctx context.Context, registryPath *string, opts teamsSe
 	if err != nil {
 		return "", err
 	}
-	spec, err := buildTeamsServiceSpec(registryPath)
+	spec, err := buildTeamsServiceSpec(registryPath, teamsServiceSpecMaterializeManagedTarget())
 	if err != nil {
 		return "", err
 	}
@@ -525,6 +540,7 @@ func repairTeamsService(ctx context.Context, registryPath *string, opts teamsSer
 	if err != nil {
 		return "", err
 	}
+	buildOptions = append(buildOptions, teamsServiceSpecMaterializeManagedTarget())
 	spec, err := buildTeamsServiceSpec(registryPath, buildOptions...)
 	if err != nil {
 		return "", err
@@ -826,7 +842,7 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 	if err != nil {
 		return teamsServiceBootstrapResult{}, err
 	}
-	spec, err := buildTeamsServiceSpec(registryPath)
+	spec, err := buildTeamsServiceSpec(registryPath, teamsServiceSpecMaterializeManagedTarget())
 	if err != nil {
 		return teamsServiceBootstrapResult{}, err
 	}
@@ -1006,7 +1022,8 @@ type teamsServiceSpec struct {
 }
 
 type teamsServiceSpecBuildOptions struct {
-	Environment map[string]string
+	Environment              map[string]string
+	MaterializeManagedTarget bool
 }
 
 type teamsServiceSpecBuildOption func(*teamsServiceSpecBuildOptions)
@@ -1022,6 +1039,12 @@ func teamsServiceSpecEnvironmentOverrides(env map[string]string) teamsServiceSpe
 		for key, value := range env {
 			opts.Environment[key] = value
 		}
+	}
+}
+
+func teamsServiceSpecMaterializeManagedTarget() teamsServiceSpecBuildOption {
+	return func(opts *teamsServiceSpecBuildOptions) {
+		opts.MaterializeManagedTarget = true
 	}
 }
 
@@ -2827,15 +2850,17 @@ func teamsServiceRunCommandDirect(ctx context.Context, name string, args ...stri
 }
 
 func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpecBuildOption) (teamsServiceSpec, error) {
-	exe, err := teamsServiceExecutable()
+	var opts teamsServiceSpecBuildOptions
+	for _, apply := range buildOptions {
+		if apply != nil {
+			apply(&opts)
+		}
+	}
+	resolvedExe, err := resolveManagedTeamsServiceExecutable(!opts.MaterializeManagedTarget)
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
-	resolvedExe, err := helperpath.StableRunnablePathFromSources(exe, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
-	if err != nil {
-		return teamsServiceSpec{}, err
-	}
-	exe = resolvedExe.Path
+	exe := resolvedExe.Path
 	if err := validateTeamsServiceExecutable(exe); err != nil {
 		return teamsServiceSpec{}, err
 	}
@@ -2862,10 +2887,13 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
-	var opts teamsServiceSpecBuildOptions
-	for _, apply := range buildOptions {
-		if apply != nil {
-			apply(&opts)
+	if opts.MaterializeManagedTarget {
+		if err := materializeManagedTeamsInstallTarget(context.Background(), resolvedExe); err != nil {
+			return teamsServiceSpec{}, err
+		}
+		probe := helperpath.ProbePath(exe, helperpath.Options{GOOS: teamsServiceGOOS()})
+		if resolvedExe.State == "managed" && (!probe.Exists || probe.IsDir || !probe.Executable) {
+			return teamsServiceSpec{}, fmt.Errorf("managed Teams service executable %s is not available after materialization", exe)
 		}
 	}
 	for name, value := range opts.Environment {
@@ -2876,7 +2904,8 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 		}
 		env[name] = value
 	}
-	env[update.EnvInstallDir] = exe
+	delete(env, update.EnvInstallDir)
+	env[update.EnvInstallPath] = exe
 	return teamsServiceSpec{
 		Executable:   exe,
 		WorkingDir:   cwd,
@@ -3196,6 +3225,7 @@ func teamsServiceEnvironmentAllowlist() []string {
 		beacon.BeaconLSFRenewCommandEnv,
 		beacon.BeaconProviderShellModeEnv,
 		update.EnvRepo,
+		update.EnvInstallPath,
 		update.EnvUpdateIndexURL,
 		"HTTP_PROXY",
 		"HTTPS_PROXY",

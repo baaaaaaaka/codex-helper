@@ -15,6 +15,7 @@ $ErrorActionPreference = "Stop"
 
 $script:InstallFailureReason = $null
 $script:InstallSuccessDetails = @()
+$script:InstallRecordDetail = ""
 $script:InstallShowSummary = $true
 $installMinFreeKB = 131072
 if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PROXY_INSTALL_MIN_FREE_KB)) {
@@ -41,6 +42,40 @@ trap {
     Write-Host ("Reason: " + $script:InstallFailureReason)
   }
   exit 1
+}
+
+function Write-InstallRecord([string]$targetPath, [string]$shimPath, [string]$repo, [string]$version, [string]$goarch) {
+  try {
+    $configBase = $env:APPDATA
+    if ([string]::IsNullOrWhiteSpace($configBase)) {
+      $configBase = [Environment]::GetFolderPath('ApplicationData')
+    }
+    if ([string]::IsNullOrWhiteSpace($configBase)) {
+      Write-Warning "Could not write install record: ApplicationData is unavailable"
+      return
+    }
+    $recordDir = Join-Path $configBase "codex-helper"
+    $recordPath = Join-Path $recordDir "install.json"
+    New-Item -ItemType Directory -Force -Path $recordDir | Out-Null
+    $record = [ordered]@{
+      schema_version = 1
+      target_path = $targetPath
+      target_source = "installer"
+      target_state = "managed"
+      repo = $repo
+      version = $version
+      goos = "windows"
+      goarch = $goarch
+      shims = @($shimPath)
+      updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+    $tmpRecord = $recordPath + ".tmp." + [Guid]::NewGuid().ToString("N")
+    $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tmpRecord -Encoding UTF8
+    Move-Item -Force -LiteralPath $tmpRecord -Destination $recordPath -ErrorAction Stop
+    $script:InstallRecordDetail = "Install record: $recordPath"
+  } catch {
+    Write-Warning "Could not write install record: $($_.Exception.Message)"
+  }
 }
 
 $apiBase = $env:CODEX_PROXY_API_BASE
@@ -586,6 +621,8 @@ if ($profileUpdated) {
   }
 }
 
+Write-InstallRecord -targetPath $dst -shimPath $cxpCmd -repo $Repo -version $tag -goarch $arch
+
 # Clean up legacy command names when they can be positively identified as
 # codex-proxy-owned leftovers from earlier installs.
 $legacyClaudeProxyExe = Join-Path $installDirResolved "claude-proxy.exe"
@@ -634,6 +671,7 @@ foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
 
 $script:InstallSuccessDetails = @(
   "Installed: $dst",
+  $script:InstallRecordDetail,
   "Shell profile and user PATH checked for install/managed CLI directories (reload attempted):",
   "  $profilePath",
   $builtinSkillDetail

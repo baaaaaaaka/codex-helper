@@ -775,7 +775,7 @@ func teamsServiceLocalSupervisorIdentityEnvironment(env map[string]string) map[s
 		if key == "" {
 			continue
 		}
-		if key == "CODEX_PROXY_INSTALL_DIR" || strings.HasPrefix(key, "CODEX_HELPER_TEAMS_") {
+		if key == "CODEX_PROXY_INSTALL_DIR" || key == "CODEX_PROXY_INSTALL_PATH" || strings.HasPrefix(key, "CODEX_HELPER_TEAMS_") {
 			out[key] = value
 		}
 	}

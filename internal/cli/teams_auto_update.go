@@ -18,7 +18,7 @@ type teamsReleaseAutoUpdater struct {
 	includePrerelease bool
 }
 
-var teamsAutoUpdateResolveInstallPath = update.ResolveInstallPath
+var teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeams
 var teamsAutoUpdateListReleases = update.ListReleases
 var teamsAutoUpdateFetchReleaseIndex = update.FetchReleaseIndex
 var teamsAutoUpdateExecutable = func() (string, error) { return teamsServiceExecutable() }

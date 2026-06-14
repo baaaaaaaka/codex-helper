@@ -30,6 +30,10 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				return err
 			}
 			ctx := cmd.Context()
+			resolvedInstallPath, err := resolveInstallPathForCLI(installPath)
+			if err != nil {
+				return err
+			}
 
 			requested := update.ResolveVersion(versionOverride)
 			if strings.EqualFold(requested, "latest") {
@@ -40,7 +44,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 					IncludePrerelease: includePrerelease,
 				})
 				if status.Supported && !status.UpdateAvailable {
-					if err := rescueTeamsForNoopHelperUpgrade(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), teamsDrainTimeout, installPath); err != nil {
+					if err := rescueTeamsForNoopHelperUpgrade(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), teamsDrainTimeout, resolvedInstallPath); err != nil {
 						return err
 					}
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Already up to date.")
@@ -50,7 +54,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 
 			var finishTeams teamsUpgradeFinalizer
 			var res update.ApplyResult
-			err := withTeamsHelperUpgradeInstallLock(ctx, installPath, func() error {
+			err = withTeamsHelperUpgradeInstallLock(ctx, resolvedInstallPath, func() error {
 				var prepareErr error
 				finishTeams, prepareErr = prepareTeamsForHelperUpgrade(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), teamsDrainTimeout, nil)
 				if prepareErr != nil {
@@ -59,7 +63,7 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				res, prepareErr = performUpdate(ctx, update.UpdateOptions{
 					Repo:              repo,
 					Version:           versionOverride,
-					InstallPath:       installPath,
+					InstallPath:       resolvedInstallPath,
 					Timeout:           120 * time.Second,
 					ValidateBinary:    true,
 					IncludePrerelease: includePrerelease,

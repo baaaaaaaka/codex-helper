@@ -319,7 +319,7 @@ func TestCommandProviderAdapterCanRunThroughUserShell(t *testing.T) {
 		SlurmSubmitCommand: "/opt/cxp/submit-slurm",
 		ShellMode:          ProviderCommandShellUser,
 	}
-	shellEnv := "startup banner\n" + providerShellEnvBegin + "\x00PATH=/opt/site/bin:/usr/bin\x00SUBMIT_ACCOUNT=acct\x00CODEX_HELPER_CLI_PATH=/tmp/.nfs802014de01c482a800000492\x00CODEX_PROXY_INSTALL_DIR=/tmp/codex-proxy\x00" + providerShellEnvEnd + "\x00trailing output\n"
+	shellEnv := "startup banner\n" + providerShellEnvBegin + "\x00PATH=/opt/site/bin:/usr/bin\x00SUBMIT_ACCOUNT=acct\x00CODEX_HELPER_CLI_PATH=/tmp/.nfs802014de01c482a800000492\x00CODEX_PROXY_INSTALL_DIR=/tmp/codex-proxy\x00CODEX_PROXY_INSTALL_PATH=/tmp/codex-proxy\x00" + providerShellEnvEnd + "\x00trailing output\n"
 	runner := &recordingProviderRunner{outputByCommand: map[string]string{
 		"/bin/zsh":              shellEnv,
 		"/opt/cxp/submit-slurm": `{"provider_job_id":"shell-1","raw_state":"PD"}`,
@@ -357,7 +357,7 @@ func TestCommandProviderAdapterCanRunThroughUserShell(t *testing.T) {
 			t.Fatalf("adapter env missing %q: %#v", want, adapterCall.env)
 		}
 	}
-	for _, blocked := range []string{"CODEX_HELPER_CLI_PATH=/tmp/.nfs802014de01c482a800000492", "CODEX_PROXY_INSTALL_DIR=/tmp/codex-proxy"} {
+	for _, blocked := range []string{"CODEX_HELPER_CLI_PATH=/tmp/.nfs802014de01c482a800000492", "CODEX_PROXY_INSTALL_DIR=/tmp/codex-proxy", "CODEX_PROXY_INSTALL_PATH=/tmp/codex-proxy"} {
 		if containsProviderArg(adapterCall.env, blocked) {
 			t.Fatalf("adapter env should not include shell volatile helper env %q: %#v", blocked, adapterCall.env)
 		}

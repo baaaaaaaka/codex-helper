@@ -5,6 +5,7 @@ package installtest
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -387,6 +388,8 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	installDir := t.TempDir()
 	managedPrefix := t.TempDir()
 	tempDir := t.TempDir()
+	userProfile := t.TempDir()
+	appData := filepath.Join(userProfile, "AppData", "Roaming")
 	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
 	legacyClaudeProxyExe := filepath.Join(installDir, "claude-proxy.exe")
 	legacyClaudeProxyExeData := []byte("external claude-proxy exe")
@@ -425,6 +428,8 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 		"CODEX_NPM_PREFIX="+managedPrefix,
 		"Path="+pathValue,
 		"TEMP="+tempDir,
+		"USERPROFILE="+userProfile,
+		"APPDATA="+appData,
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -455,6 +460,37 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	wantCxpCmd := "@echo off\n\"%~dp0codex-proxy.exe\" %*"
 	if cmdText != wantCxpCmd {
 		t.Fatalf("cxp.cmd content mismatch\ngot:\n%q\nwant:\n%q", cmdText, wantCxpCmd)
+	}
+	recordData, err := os.ReadFile(filepath.Join(appData, "codex-helper", "install.json"))
+	if err != nil {
+		t.Fatalf("read install record: %v", err)
+	}
+	var record struct {
+		SchemaVersion int      `json:"schema_version"`
+		TargetPath    string   `json:"target_path"`
+		TargetSource  string   `json:"target_source"`
+		TargetState   string   `json:"target_state"`
+		Repo          string   `json:"repo"`
+		Version       string   `json:"version"`
+		GOOS          string   `json:"goos"`
+		GOARCH        string   `json:"goarch"`
+		Shims         []string `json:"shims"`
+	}
+	if err := json.Unmarshal(recordData, &record); err != nil {
+		t.Fatalf("parse install record: %v\n%s", err, recordData)
+	}
+	expectedTarget := filepath.Join(installDirResolved, "codex-proxy.exe")
+	expectedShim := filepath.Join(installDirResolved, "cxp.cmd")
+	if record.SchemaVersion != 1 ||
+		record.TargetPath != expectedTarget ||
+		record.TargetSource != "installer" ||
+		record.TargetState != "managed" ||
+		record.Repo != "owner/name" ||
+		record.Version != "v1.2.3" ||
+		record.GOOS != "windows" ||
+		record.GOARCH != "amd64" ||
+		!stringSliceContains(record.Shims, expectedShim) {
+		t.Fatalf("unexpected install record: %#v", record)
 	}
 	claudeProxyExeData, err := os.ReadFile(legacyClaudeProxyExe)
 	if err != nil {
@@ -502,6 +538,15 @@ func hasPathLineForDir(profileText, installDir string) bool {
 			continue
 		}
 		if strings.Contains(strings.ToLower(line), strings.ToLower(installDir)) {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
 			return true
 		}
 	}

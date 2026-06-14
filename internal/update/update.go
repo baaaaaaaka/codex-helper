@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 )
 
 const (
 	EnvRepo           = "CODEX_PROXY_REPO"
 	EnvVersion        = "CODEX_PROXY_VERSION"
-	EnvInstallDir     = "CODEX_PROXY_INSTALL_DIR"
+	EnvInstallPath    = managedinstall.EnvInstallPath
+	EnvInstallDir     = managedinstall.EnvInstallDir
 	EnvUpdateIndexURL = "CODEX_PROXY_UPDATE_INDEX_URL"
 
 	DefaultRepo = "baaaaaaaka/codex-helper"
@@ -119,6 +121,15 @@ func ResolveVersion(explicit string) string {
 }
 
 func ResolveInstallPath(explicit string) (string, error) {
+	if strings.TrimSpace(explicit) == "" {
+		if envPath := strings.TrimSpace(os.Getenv(EnvInstallPath)); envPath != "" {
+			resolved, err := helperpath.StableInstallTargetFromSources(envPath, "", "", argv0Path(), helperpath.Options{})
+			if err != nil {
+				return "", err
+			}
+			return resolved.Path, nil
+		}
+	}
 	var exe string
 	if strings.TrimSpace(explicit) == "" && strings.TrimSpace(os.Getenv(EnvInstallDir)) == "" {
 		var err error

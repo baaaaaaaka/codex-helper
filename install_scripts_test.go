@@ -4,6 +4,7 @@ package installtest
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -708,6 +709,35 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if !strings.Contains(string(cxpVersion), "codex-proxy 1.2.3") {
 		t.Fatalf("unexpected cxp --version output: %s", string(cxpVersion))
 	}
+	recordData, err := os.ReadFile(filepath.Join(homeDir, ".config", "codex-helper", "install.json"))
+	if err != nil {
+		t.Fatalf("read install record: %v", err)
+	}
+	var record struct {
+		SchemaVersion int      `json:"schema_version"`
+		TargetPath    string   `json:"target_path"`
+		TargetSource  string   `json:"target_source"`
+		TargetState   string   `json:"target_state"`
+		Repo          string   `json:"repo"`
+		Version       string   `json:"version"`
+		GOOS          string   `json:"goos"`
+		GOARCH        string   `json:"goarch"`
+		Shims         []string `json:"shims"`
+	}
+	if err := json.Unmarshal(recordData, &record); err != nil {
+		t.Fatalf("parse install record: %v\n%s", err, recordData)
+	}
+	if record.SchemaVersion != 1 ||
+		record.TargetPath != installed ||
+		record.TargetSource != "installer" ||
+		record.TargetState != "managed" ||
+		record.Repo != "owner/name" ||
+		record.Version != "v1.2.3" ||
+		record.GOOS != runtime.GOOS ||
+		record.GOARCH != runtime.GOARCH ||
+		!stringSliceContains(record.Shims, cxpPath) {
+		t.Fatalf("unexpected install record: %#v", record)
+	}
 	clpPath := filepath.Join(installDir, "clp")
 	clpData, err := os.ReadFile(clpPath)
 	if err != nil {
@@ -852,6 +882,15 @@ func boolEnv(v bool) string {
 		return "1"
 	}
 	return "0"
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func envValueForTest(env []string, key string) string {

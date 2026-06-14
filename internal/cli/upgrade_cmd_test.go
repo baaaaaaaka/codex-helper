@@ -163,6 +163,59 @@ func TestUpgradeCmdExplicitVersionCallsPerformUpdate(t *testing.T) {
 	}
 }
 
+func TestUpgradeCmdUsesManagedDefaultWhenLaunchedAsCXP(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX cxp entry simulation")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	prevResolve := resolveInstallPathForCLI
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+		resolveInstallPathForCLI = prevResolve
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	helperScript := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ]; then exit 0; fi\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'codex-proxy version 1.2.2 (test)'; exit 0; fi\n" +
+		"exit 0\n"
+	writeCLIFile(t, managed, helperScript, 0o755)
+	writeCLIFile(t, cxp, helperScript, 0o755)
+	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
+	executablePath = func() (string, error) { return cxp, nil }
+	restartArgv0 = func() string { return cxp }
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		return update.ApplyResult{Version: "1.2.3", InstallPath: opts.InstallPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v", err)
+	}
+	if got.InstallPath != managed {
+		t.Fatalf("upgrade install path = %q, want managed codex-proxy %q", got.InstallPath, managed)
+	}
+}
+
 func TestUpgradeCmdInstallsBundledSkillsWithUpdatedBinary(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script helper stub is POSIX-only")

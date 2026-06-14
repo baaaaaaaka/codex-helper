@@ -93,6 +93,15 @@ jobs:
             exit 1
           fi
 
+      - name: Managed install convergence regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/managedinstall -count=1 -v
+          go test ./internal/update -count=1 -run 'TestResolveInstallPathUsesExactEnvInstallPathBeforeLegacyDir$' -v
+          go test ./internal/cli -count=1 -run 'Test(UpgradeCmdUsesManagedDefaultWhenLaunchedAsCXP|Teams(ServiceInstall(UsesManagedDefaultInsteadOfGoBinExecutable|MaterializesManagedDefaultBeforeRepointingFromGoBin|CreatesMissingManagedDefaultBeforeRepointingFromGoBin|DoesNotTreatBlockedManagedDefaultAsInstallDir|RepairsCorruptManagedDefaultBeforeRepointingFromGoBin)|ServiceBootstrapDryRunDoesNotWriteOrStart|ReleaseAutoUpdaterApplyUsesManagedDefaultWhenServiceRunsFromGoBin))$' -v
+          go test . -count=1 -run 'TestInstall(Sh|Ps1)KeepsPathSetupWhenInstallDirAlreadySet$' -v
+
       - name: Local proxy self-loop regressions
         shell: bash
         run: |

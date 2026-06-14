@@ -206,6 +206,22 @@ func TestResolveInstallPathFallsBackToStableArgv0Last(t *testing.T) {
 	}
 }
 
+func TestResolveInstallPathUsesExactEnvInstallPathBeforeLegacyDir(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "exact-helper")
+	legacyDir := filepath.Join(dir, "legacy")
+	t.Setenv(EnvInstallPath, envPath)
+	t.Setenv(EnvInstallDir, legacyDir)
+
+	got, err := ResolveInstallPath("")
+	if err != nil {
+		t.Fatalf("ResolveInstallPath error: %v", err)
+	}
+	if got != envPath {
+		t.Fatalf("ResolveInstallPath = %q, want exact env path %q", got, envPath)
+	}
+}
+
 func TestResolveInstallPathRejectsExplicitNFSSillyRename(t *testing.T) {
 	dir := t.TempDir()
 	stable := filepath.Join(dir, binaryName())

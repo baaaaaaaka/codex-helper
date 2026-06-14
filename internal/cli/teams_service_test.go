@@ -22,6 +22,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -237,7 +238,7 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"Environment=NO_COLOR=1",
-		"Environment=" + systemdQuoteArg(update.EnvInstallDir+"="+exePath),
+		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+exePath),
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"[Install]",
 		"WantedBy=default.target",
@@ -2964,7 +2965,7 @@ func TestTeamsServiceInstallUsesStablePathWhenExecutableIsNFSSillyRename(t *test
 	unit := string(data)
 	for _, want := range []string{
 		"ExecStart=" + systemdQuoteArg(stable) + " teams run --owner-stale-after 1m30s --auto-service=false",
-		"Environment=" + systemdQuoteArg(update.EnvInstallDir+"="+stable),
+		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+stable),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing %q:\n%s", want, unit)
@@ -2973,6 +2974,269 @@ func TestTeamsServiceInstallUsesStablePathWhenExecutableIsNFSSillyRename(t *test
 	if strings.Contains(unit, running) {
 		t.Fatalf("unit should not retain NFS silly-renamed path %q:\n%s", running, unit)
 	}
+}
+
+func TestTeamsServiceInstallUsesManagedDefaultInsteadOfGoBinExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd unit rendering is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	for _, path := range []string{managed, goBin} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("stable"), 0o755); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     goBin,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	for _, want := range []string{
+		"ExecStart=" + systemdQuoteArg(managed) + " teams run --owner-stale-after 1m30s --auto-service=false",
+		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+managed),
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit missing %q:\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, goBin) {
+		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
+	}
+}
+
+func TestTeamsServiceInstallMaterializesManagedDefaultBeforeRepointingFromGoBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, managed, "1.2.3")
+	if err := os.Symlink(managed, cxp); err != nil {
+		t.Fatalf("symlink cxp: %v", err)
+	}
+	writeVersionedHelperForServiceTest(t, goBin, "1.2.4")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     goBin,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	managedVersion, err := exec.Command(managed, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed helper --version failed: %v\n%s", err, managedVersion)
+	}
+	if !strings.Contains(string(managedVersion), "1.2.4") {
+		t.Fatalf("managed helper was not materialized from upgraded go/bin helper: %s", managedVersion)
+	}
+	cxpVersion, err := exec.Command(cxp, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed cxp --version failed: %v\n%s", err, cxpVersion)
+	}
+	if !strings.Contains(string(cxpVersion), "1.2.4") {
+		t.Fatalf("managed cxp shim was not materialized from upgraded go/bin helper: %s", cxpVersion)
+	}
+	if info, err := os.Lstat(cxp); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("managed cxp shim should remain a symlink after materialization, info=%v err=%v", info, err)
+	}
+	record, err := managedinstall.LoadRecord(filepath.Join(tmp, "config", "codex-helper", "install.json"))
+	if err != nil {
+		t.Fatalf("load install record: %v", err)
+	}
+	if record.TargetPath != managed || record.TargetState != string(managedinstall.StateManaged) || record.Version != "1.2.4" {
+		t.Fatalf("install record = %#v, want managed target %s at 1.2.4", record, managed)
+	}
+	if !slices.Contains(record.Shims, cxp) {
+		t.Fatalf("install record shims = %#v, want %s", record.Shims, cxp)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit did not point at managed helper:\n%s", unit)
+	}
+	if strings.Contains(unit, goBin) {
+		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
+	}
+}
+
+func TestTeamsServiceInstallCreatesMissingManagedDefaultBeforeRepointingFromGoBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, goBin, "1.2.4")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     goBin,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	managedVersion, err := exec.Command(managed, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed helper --version failed after creation: %v\n%s", err, managedVersion)
+	}
+	if !strings.Contains(string(managedVersion), "1.2.4") {
+		t.Fatalf("managed helper was not created from upgraded go/bin helper: %s", managedVersion)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit did not point at managed helper:\n%s", unit)
+	}
+	if strings.Contains(unit, goBin) {
+		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
+	}
+	record, err := managedinstall.LoadRecord(filepath.Join(tmp, "config", "codex-helper", "install.json"))
+	if err != nil {
+		t.Fatalf("load install record: %v", err)
+	}
+	if record.TargetPath != managed || record.TargetState != string(managedinstall.StateManaged) || record.Version != "1.2.4" {
+		t.Fatalf("install record = %#v, want managed target %s at 1.2.4", record, managed)
+	}
+}
+
+func TestTeamsServiceInstallDoesNotTreatBlockedManagedDefaultAsInstallDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	if err := os.MkdirAll(managed, 0o755); err != nil {
+		t.Fatalf("mkdir managed target as directory: %v", err)
+	}
+	writeVersionedHelperForServiceTest(t, goBin, "1.2.4")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     goBin,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(goBin)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit should fall back to current executable when managed target is blocked:\n%s", unit)
+	}
+	nested := filepath.Join(managed, "codex-proxy")
+	if strings.Contains(unit, nested) {
+		t.Fatalf("unit should not treat blocked managed file target as an install directory %q:\n%s", nested, unit)
+	}
+}
+
+func TestTeamsServiceInstallRepairsCorruptManagedDefaultBeforeRepointingFromGoBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	writeCLIFile(t, managed, "#!/bin/sh\nexit 42\n", 0o755)
+	writeCLIFile(t, cxp, "#!/bin/sh\nexit 42\n", 0o755)
+	writeVersionedHelperForServiceTest(t, goBin, "1.2.4")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     goBin,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	for _, path := range []string{managed, cxp} {
+		versionOut, err := exec.Command(path, "--version").CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s --version failed after materialization: %v\n%s", path, err, versionOut)
+		}
+		if !strings.Contains(string(versionOut), "1.2.4") {
+			t.Fatalf("%s was not repaired from upgraded go/bin helper: %s", path, versionOut)
+		}
+	}
+}
+
+func writeVersionedHelperForServiceTest(t *testing.T, path string, version string) {
+	t.Helper()
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-proxy version " + version + " (test)'; exit 0; fi\nexit 0\n"
+	writeCLIFile(t, path, script, 0o755)
 }
 
 func TestTeamsServiceBootstrapDryRunDoesNotWriteOrStart(t *testing.T) {
@@ -2997,6 +3261,14 @@ func TestTeamsServiceBootstrapDryRunDoesNotWriteOrStart(t *testing.T) {
 		cwd:     tmp,
 		unitDir: unitDir,
 		runner:  runner,
+	})
+	prevMaterialize := materializeManagedTeamsInstallTarget
+	materializeManagedTeamsInstallTarget = func(context.Context, managedinstall.Target) error {
+		t.Fatal("bootstrap --dry-run must not materialize managed install target")
+		return nil
+	}
+	t.Cleanup(func() {
+		materializeManagedTeamsInstallTarget = prevMaterialize
 	})
 
 	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
@@ -3493,6 +3765,7 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(tmp, "beacon.json"))
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", filepath.Join(tmp, "auth.json"))
 	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", filepath.Join(tmp, "full-token.json"))
@@ -3506,12 +3779,15 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 	t.Setenv(envTeamsHelperCLIDir, "/tmp")
 	t.Setenv(envCodexProxyWrapperExe, "/tmp/.nfswrapper")
 	t.Setenv(update.EnvInstallDir, "/tmp/.nfsbad")
+	t.Setenv(update.EnvInstallPath, "/tmp/stale-install-path")
 	t.Setenv(update.EnvVersion, "v0.0.0-bad")
 	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_SECRET", "secret")
 	t.Setenv("CODEX_HELPER_TEAMS_BEARER_TOKEN", "token")
 
 	unitDir := filepath.Join(tmp, "systemd", "user")
 	exePath := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, exePath, "1.2.4")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     exePath,
@@ -3539,7 +3815,7 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 		"Environment=" + systemdQuoteArg(beacon.BeaconLSFCancelCommandEnv+"="+filepath.Join(tmp, "lsf-cancel")),
 		"Environment=" + systemdQuoteArg(update.EnvRepo+"=owner/name"),
 		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://example.test/releases.json"),
-		"Environment=" + systemdQuoteArg(update.EnvInstallDir+"="+exePath),
+		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+managed),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing env %q:\n%s", want, unit)
@@ -3550,6 +3826,7 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 		envTeamsHelperCLIDir + "=",
 		envCodexProxyWrapperExe + "=",
 		update.EnvInstallDir + "=/tmp/.nfsbad",
+		update.EnvInstallPath + "=/tmp/stale-install-path",
 		update.EnvVersion + "=",
 		"CODEX_HELPER_TEAMS_CLIENT_SECRET=",
 		"CODEX_HELPER_TEAMS_BEARER_TOKEN=",

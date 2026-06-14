@@ -524,6 +524,51 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	}
 }
 
+func TestTeamsReleaseAutoUpdaterApplyUsesManagedDefaultWhenServiceRunsFromGoBin(t *testing.T) {
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+	})
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	for _, path := range []string{managed, goBin} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("stable"), 0o755); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  goBin,
+		cwd:  tmp,
+	})
+	teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeams
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if got.InstallPath != managed || res.InstallPath != managed {
+		t.Fatalf("install path got options=%q result=%q, want managed %q", got.InstallPath, res.InstallPath, managed)
+	}
+	if !res.ActivationPending || !strings.Contains(res.ActivationReason, goBin) {
+		t.Fatalf("activation = pending %v reason %q, want pending because service runs from go/bin", res.ActivationPending, res.ActivationReason)
+	}
+}
+
 func TestTeamsReleaseAutoUpdaterApplyWithOptionsReturnsWindowsPendingReplacementToCaller(t *testing.T) {
 	lockCLITestHooks(t)
 	prevPerform := performUpdate

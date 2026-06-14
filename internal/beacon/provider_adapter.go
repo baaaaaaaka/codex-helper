@@ -538,7 +538,7 @@ func filterProviderShellEnv(env []string) []string {
 func providerShellEnvNameAllowed(name string) bool {
 	name = strings.TrimSpace(name)
 	switch name {
-	case "CODEX_HELPER_CLI_PATH", "CODEX_HELPER_CLI_DIR", "CODEX_PROXY_INSTALL_DIR", "CODEX_PROXY_NPM_WRAPPER_EXE", "CODEX_PROXY_VERSION":
+	case "CODEX_HELPER_CLI_PATH", "CODEX_HELPER_CLI_DIR", "CODEX_PROXY_INSTALL_DIR", "CODEX_PROXY_INSTALL_PATH", "CODEX_PROXY_NPM_WRAPPER_EXE", "CODEX_PROXY_VERSION":
 		return false
 	}
 	return !strings.HasPrefix(name, "CODEX_PROXY_")

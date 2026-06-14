@@ -20,7 +20,7 @@ import (
 var (
 	performUpdate            = update.PerformUpdate
 	checkForUpdate           = update.CheckForUpdate
-	resolveInstallPathForCLI = update.ResolveInstallPath
+	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
 	executablePath           = helperpath.RawExecutable
 	restartArgv0             = func() string {
 		if len(os.Args) == 0 {
