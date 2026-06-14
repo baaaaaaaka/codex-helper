@@ -70,7 +70,9 @@ function Write-InstallRecord([string]$targetPath, [string]$shimPath, [string]$re
       updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
     $tmpRecord = $recordPath + ".tmp." + [Guid]::NewGuid().ToString("N")
-    $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tmpRecord -Encoding UTF8
+    $recordJson = ($record | ConvertTo-Json -Depth 4) + [Environment]::NewLine
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmpRecord, $recordJson, $utf8NoBom)
     Move-Item -Force -LiteralPath $tmpRecord -Destination $recordPath -ErrorAction Stop
     $script:InstallRecordDetail = "Install record: $recordPath"
   } catch {

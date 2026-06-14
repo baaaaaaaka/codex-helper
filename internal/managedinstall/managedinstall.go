@@ -1,6 +1,7 @@
 package managedinstall
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,6 +192,7 @@ func LoadRecord(path string) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
 	var record Record
 	if err := json.Unmarshal(data, &record); err != nil {
 		return Record{}, fmt.Errorf("read install record %s: %w", path, err)

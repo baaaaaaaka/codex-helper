@@ -1,6 +1,7 @@
 package managedinstall
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -248,6 +249,40 @@ func TestResolveWindowsDefaultUsesExeBasename(t *testing.T) {
 	}
 }
 
+func TestLoadRecordToleratesUTF8BOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "install.json")
+	data := append([]byte{0xef, 0xbb, 0xbf}, []byte(`{"schema_version":1,"target_path":"/tmp/codex-proxy"}`)...)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+
+	record, err := LoadRecord(path)
+	if err != nil {
+		t.Fatalf("LoadRecord with BOM error: %v", err)
+	}
+	if record.TargetPath != "/tmp/codex-proxy" {
+		t.Fatalf("record = %#v, want target path", record)
+	}
+}
+
+func TestSaveRecordWritesJSONWithoutBOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "install.json")
+	if err := SaveRecord(path, Record{TargetPath: "/tmp/codex-proxy"}); err != nil {
+		t.Fatalf("SaveRecord: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	if hasUTF8BOM(data) {
+		t.Fatalf("SaveRecord wrote UTF-8 BOM: % x", data[:3])
+	}
+	var record Record
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("saved record is not plain JSON: %v\n%s", err, data)
+	}
+}
+
 func writeExecutable(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -272,4 +307,8 @@ func executableStatForTest(path string) (os.FileInfo, error) {
 		return info, err
 	}
 	return executableFileInfoForTest{FileInfo: info}, nil
+}
+
+func hasUTF8BOM(data []byte) bool {
+	return len(data) >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf
 }

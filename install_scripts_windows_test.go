@@ -465,6 +465,9 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if err != nil {
 		t.Fatalf("read install record: %v", err)
 	}
+	if len(recordData) >= 3 && recordData[0] == 0xef && recordData[1] == 0xbb && recordData[2] == 0xbf {
+		t.Fatalf("install record should be UTF-8 without BOM")
+	}
 	var record struct {
 		SchemaVersion int      `json:"schema_version"`
 		TargetPath    string   `json:"target_path"`
