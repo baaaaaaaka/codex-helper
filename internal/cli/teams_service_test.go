@@ -3075,10 +3075,7 @@ func TestTeamsServiceInstallMaterializesManagedDefaultBeforeRepointingFromGoBin(
 	if info, err := os.Lstat(cxp); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("managed cxp shim should remain a symlink after materialization, info=%v err=%v", info, err)
 	}
-	record, err := managedinstall.LoadRecord(filepath.Join(tmp, "config", "codex-helper", "install.json"))
-	if err != nil {
-		t.Fatalf("load install record: %v", err)
-	}
+	record := loadManagedInstallRecordForServiceTest(t)
 	if record.TargetPath != managed || record.TargetState != string(managedinstall.StateManaged) || record.Version != "1.2.4" {
 		t.Fatalf("install record = %#v, want managed target %s at 1.2.4", record, managed)
 	}
@@ -3142,10 +3139,7 @@ func TestTeamsServiceInstallCreatesMissingManagedDefaultBeforeRepointingFromGoBi
 	if strings.Contains(unit, goBin) {
 		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
 	}
-	record, err := managedinstall.LoadRecord(filepath.Join(tmp, "config", "codex-helper", "install.json"))
-	if err != nil {
-		t.Fatalf("load install record: %v", err)
-	}
+	record := loadManagedInstallRecordForServiceTest(t)
 	if record.TargetPath != managed || record.TargetState != string(managedinstall.StateManaged) || record.Version != "1.2.4" {
 		t.Fatalf("install record = %#v, want managed target %s at 1.2.4", record, managed)
 	}
@@ -3237,6 +3231,19 @@ func writeVersionedHelperForServiceTest(t *testing.T, path string, version strin
 	t.Helper()
 	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-proxy version " + version + " (test)'; exit 0; fi\nexit 0\n"
 	writeCLIFile(t, path, script, 0o755)
+}
+
+func loadManagedInstallRecordForServiceTest(t *testing.T) managedinstall.Record {
+	t.Helper()
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default install record path: %v", err)
+	}
+	record, err := managedinstall.LoadRecord(recordPath)
+	if err != nil {
+		t.Fatalf("load install record %s: %v", recordPath, err)
+	}
+	return record
 }
 
 func TestTeamsServiceBootstrapDryRunDoesNotWriteOrStart(t *testing.T) {
