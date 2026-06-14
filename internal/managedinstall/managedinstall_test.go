@@ -200,6 +200,32 @@ func TestResolveCLIHonorsLegacyEnvDirBeforeRecord(t *testing.T) {
 	}
 }
 
+func TestResolveTeamsModeRequiresExistingLegacyEnvDir(t *testing.T) {
+	home := t.TempDir()
+	currentTarget := filepath.Join(home, "go", "bin", "codex-proxy")
+	writeExecutable(t, currentTarget)
+	missingEnvDir := filepath.Join(home, "missing-bin")
+
+	target, err := Resolve(Options{
+		EnvDir:                      missingEnvDir,
+		RawExecutable:               currentTarget,
+		HomeDir:                     home,
+		ConfigDir:                   filepath.Join(home, ".config"),
+		GOOS:                        "linux",
+		PreferRecordBeforeLegacyEnv: true,
+		Stat:                        executableStatForTest,
+	})
+	if err != nil {
+		t.Fatalf("Resolve error: %v", err)
+	}
+	if target.Path != currentTarget || target.Source != SourceCurrentExecutable {
+		t.Fatalf("target = %#v, want current executable fallback %q", target, currentTarget)
+	}
+	if len(target.Warnings) == 0 {
+		t.Fatalf("target warnings empty, want missing legacy env warning")
+	}
+}
+
 func TestResolveRequireExistingRejectsMissingRecordAndUsesDefault(t *testing.T) {
 	home := t.TempDir()
 	defaultTarget := filepath.Join(home, ".local", "bin", "codex-proxy")

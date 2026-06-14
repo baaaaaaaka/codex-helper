@@ -148,7 +148,7 @@ func Resolve(opts Options) (Target, error) {
 	}
 
 	if opts.PreferRecordBeforeLegacyEnv && strings.TrimSpace(opts.EnvDir) != "" {
-		if target, ok := try(resolveLegacyInstallDirCandidate(opts.EnvDir, opts), SourceEnvInstallDir, StateExplicit, EnvInstallDir, true); ok {
+		if target, ok := try(resolveLegacyInstallDirCandidate(opts.EnvDir, opts), SourceEnvInstallDir, StateExplicit, EnvInstallDir, false); ok {
 			return target, nil
 		}
 	}

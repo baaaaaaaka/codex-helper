@@ -3795,6 +3795,13 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 	exePath := filepath.Join(tmp, "bin", "codex-proxy")
 	writeVersionedHelperForServiceTest(t, exePath, "1.2.4")
 	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default install record path: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{TargetPath: managed}); err != nil {
+		t.Fatalf("save install record: %v", err)
+	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     exePath,
