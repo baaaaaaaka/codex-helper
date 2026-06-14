@@ -141,15 +141,16 @@ func TestUpgradeCmdExplicitVersionCallsPerformUpdate(t *testing.T) {
 		return update.ApplyResult{Version: "1.2.3"}, nil
 	}
 
+	explicitInstallPath := "/tmp/codex-proxy"
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--repo", "owner/name", "--version", "v1.2.3", "--install-path", "/tmp/codex-proxy"})
+	cmd.SetArgs([]string{"--repo", "owner/name", "--version", "v1.2.3", "--install-path", explicitInstallPath})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade: %v", err)
 	}
 
-	if got.Repo != "owner/name" || got.Version != "v1.2.3" || got.InstallPath != "/tmp/codex-proxy" {
+	if got.Repo != "owner/name" || got.Version != "v1.2.3" || got.InstallPath != filepath.Clean(explicitInstallPath) {
 		t.Fatalf("unexpected update options: %+v", got)
 	}
 	if got.Timeout != 120*time.Second {
