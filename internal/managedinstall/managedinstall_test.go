@@ -19,6 +19,7 @@ func TestResolveUsesExistingDefaultBeforeCurrentExecutable(t *testing.T) {
 		HomeDir:       home,
 		ConfigDir:     configDir,
 		GOOS:          "linux",
+		Stat:          executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -38,6 +39,7 @@ func TestResolveFallsBackToCurrentExecutableWhenDefaultMissing(t *testing.T) {
 		HomeDir:       home,
 		ConfigDir:     filepath.Join(home, ".config"),
 		GOOS:          "linux",
+		Stat:          executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -59,6 +61,7 @@ func TestResolveCanReturnMissingDefaultWhenCallerCanMaterialize(t *testing.T) {
 		ConfigDir:           filepath.Join(home, ".config"),
 		GOOS:                "linux",
 		AllowMissingDefault: true,
+		Stat:                executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -79,6 +82,7 @@ func TestResolveCanIgnoreStaleEnvInstallPath(t *testing.T) {
 		ConfigDir:                filepath.Join(home, ".config"),
 		GOOS:                     "linux",
 		FallbackOnInvalidEnvPath: true,
+		Stat:                     executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -106,6 +110,7 @@ func TestResolveSkipsDefaultPathOccupiedByDirectory(t *testing.T) {
 		ConfigDir:           filepath.Join(home, ".config"),
 		GOOS:                "linux",
 		AllowMissingDefault: true,
+		Stat:                executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -127,6 +132,7 @@ func TestResolveAllowsExplicitNonStandardBasename(t *testing.T) {
 		HomeDir:      home,
 		ConfigDir:    filepath.Join(home, ".config"),
 		GOOS:         "linux",
+		Stat:         executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve explicit non-standard basename error: %v", err)
@@ -155,6 +161,7 @@ func TestResolveTeamsModePrefersRecordBeforeLegacyEnvDir(t *testing.T) {
 		RecordPath:                  recordPath,
 		GOOS:                        "linux",
 		PreferRecordBeforeLegacyEnv: true,
+		Stat:                        executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -182,6 +189,7 @@ func TestResolveCLIHonorsLegacyEnvDirBeforeRecord(t *testing.T) {
 		ConfigDir:  filepath.Join(home, ".config"),
 		RecordPath: recordPath,
 		GOOS:       "linux",
+		Stat:       executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -206,6 +214,7 @@ func TestResolveRequireExistingRejectsMissingRecordAndUsesDefault(t *testing.T) 
 		RecordPath:      recordPath,
 		GOOS:            "linux",
 		RequireExisting: true,
+		Stat:            executableStatForTest,
 	})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
@@ -218,6 +227,27 @@ func TestResolveRequireExistingRejectsMissingRecordAndUsesDefault(t *testing.T) 
 	}
 }
 
+func TestResolveWindowsDefaultUsesExeBasename(t *testing.T) {
+	home := t.TempDir()
+	defaultTarget := filepath.Join(home, ".local", "bin", "codex-proxy.exe")
+	goBinTarget := filepath.Join(home, "go", "bin", "codex-proxy.exe")
+	writeExecutable(t, defaultTarget)
+	writeExecutable(t, goBinTarget)
+
+	target, err := Resolve(Options{
+		RawExecutable: goBinTarget,
+		HomeDir:       home,
+		ConfigDir:     filepath.Join(home, ".config"),
+		GOOS:          "windows",
+	})
+	if err != nil {
+		t.Fatalf("Resolve error: %v", err)
+	}
+	if target.Path != defaultTarget || target.Source != SourceDefault || target.State != StateManaged {
+		t.Fatalf("target = %#v, want Windows default managed %q", target, defaultTarget)
+	}
+}
+
 func writeExecutable(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -226,4 +256,20 @@ func writeExecutable(t *testing.T, path string) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
 	}
+}
+
+type executableFileInfoForTest struct {
+	os.FileInfo
+}
+
+func (info executableFileInfoForTest) Mode() os.FileMode {
+	return info.FileInfo.Mode() | 0o111
+}
+
+func executableStatForTest(path string) (os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return info, err
+	}
+	return executableFileInfoForTest{FileInfo: info}, nil
 }
