@@ -59,11 +59,11 @@ func managedTeamsMaterializationSourceAvailable() bool {
 	if err != nil || strings.TrimSpace(raw) == "" {
 		return false
 	}
-	running, err := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	running, err := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 	if err != nil {
 		return false
 	}
-	probe := helperpath.ProbePath(running.Path, helperpath.Options{GOOS: teamsServiceGOOS()})
+	probe := helperpath.ProbePath(running.Path, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 	if !probe.Exists || probe.IsDir || !probe.Executable || !probe.PlausibleHelperEntry {
 		return false
 	}
@@ -86,6 +86,7 @@ func resolveManagedTeamsInstallTarget(explicit string, requireExisting bool, all
 		AllowMissingDefault:         allowMissingDefault,
 		FallbackOnInvalidEnvPath:    true,
 		PreferRecordBeforeLegacyEnv: true,
+		Stat:                        teamsServiceStat,
 	})
 }
 
@@ -103,18 +104,18 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 	if err != nil || strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	running, err := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	running, err := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 	if err != nil {
 		return nil
 	}
 	if sameHelperExecutablePath(running.Path, target.Path, teamsServiceGOOS()) {
 		return nil
 	}
-	runningProbe := helperpath.ProbePath(running.Path, helperpath.Options{GOOS: teamsServiceGOOS()})
+	runningProbe := helperpath.ProbePath(running.Path, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 	if !runningProbe.Exists || runningProbe.IsDir || !runningProbe.Executable || !runningProbe.PlausibleHelperEntry {
 		return nil
 	}
-	targetProbe := helperpath.ProbePath(target.Path, helperpath.Options{GOOS: teamsServiceGOOS()})
+	targetProbe := helperpath.ProbePath(target.Path, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 	if targetProbe.IsDir || !targetProbe.PlausibleHelperEntry {
 		return nil
 	}
@@ -160,7 +161,7 @@ func materializeManagedInstallShim(ctx context.Context, runningPath string, shim
 	if info, err := os.Lstat(shimPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
-	probe := helperpath.ProbePath(shimPath, helperpath.Options{GOOS: teamsServiceGOOS()})
+	probe := helperpath.ProbePath(shimPath, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 	if !probe.Exists {
 		return nil
 	}
@@ -206,7 +207,7 @@ func existingManagedInstallShims(shims []string) []string {
 		if strings.TrimSpace(shim) == "" {
 			continue
 		}
-		if probe := helperpath.ProbePath(shim, helperpath.Options{GOOS: teamsServiceGOOS()}); probe.Exists && !probe.IsDir && probe.PlausibleHelperEntry {
+		if probe := helperpath.ProbePath(shim, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat}); probe.Exists && !probe.IsDir && probe.PlausibleHelperEntry {
 			out = append(out, shim)
 		}
 	}

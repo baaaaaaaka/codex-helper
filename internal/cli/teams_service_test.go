@@ -3233,6 +3233,22 @@ func writeVersionedHelperForServiceTest(t *testing.T, path string, version strin
 	writeCLIFile(t, path, script, 0o755)
 }
 
+type serviceExecutableFileInfoForTest struct {
+	os.FileInfo
+}
+
+func (info serviceExecutableFileInfoForTest) Mode() os.FileMode {
+	return info.FileInfo.Mode() | 0o111
+}
+
+func serviceExecutableStatForTest(path string) (os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return info, err
+	}
+	return serviceExecutableFileInfoForTest{FileInfo: info}, nil
+}
+
 func loadManagedInstallRecordForServiceTest(t *testing.T) managedinstall.Record {
 	t.Helper()
 	recordPath, err := managedinstall.DefaultRecordPath()
@@ -3682,6 +3698,7 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     exePath,
+		stat:    serviceExecutableStatForTest,
 		cwd:     tmp,
 		unitDir: unitDir,
 		runner:  &recordingTeamsServiceRunner{},
@@ -3805,6 +3822,7 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     exePath,
+		stat:    serviceExecutableStatForTest,
 		cwd:     tmp,
 		unitDir: unitDir,
 		runner:  &recordingTeamsServiceRunner{},
@@ -6670,6 +6688,7 @@ type teamsServiceTestHooks struct {
 	goos                       string
 	exe                        string
 	argv0                      string
+	stat                       func(string) (os.FileInfo, error)
 	cwd                        string
 	unitDir                    string
 	launchAgentDir             string
@@ -6703,6 +6722,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	t.Setenv("CODEX_HELPER_TEAMS_AUTO_SERVICE", "")
 	prevGOOS := teamsServiceGOOS
 	prevExecutable := teamsServiceExecutable
+	prevStat := teamsServiceStat
 	prevArgv0 := teamsServiceArgv0
 	prevGetwd := teamsServiceGetwd
 	prevSystemdUserDir := teamsServiceSystemdUserDir
@@ -6737,6 +6757,9 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	teamsParentProcessID = os.Getppid
 	teamsServiceGOOS = func() string { return hooks.goos }
 	teamsServiceExecutable = func() (string, error) { return hooks.exe, nil }
+	if hooks.stat != nil {
+		teamsServiceStat = hooks.stat
+	}
 	teamsServiceArgv0 = func() string { return hooks.argv0 }
 	teamsServiceGetwd = func() (string, error) { return hooks.cwd, nil }
 	teamsServiceSystemdUserDir = func() (string, error) { return hooks.unitDir, nil }
@@ -6826,6 +6849,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	t.Cleanup(func() {
 		teamsServiceGOOS = prevGOOS
 		teamsServiceExecutable = prevExecutable
+		teamsServiceStat = prevStat
 		teamsServiceArgv0 = prevArgv0
 		teamsServiceGetwd = prevGetwd
 		teamsServiceSystemdUserDir = prevSystemdUserDir

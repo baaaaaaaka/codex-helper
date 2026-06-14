@@ -73,6 +73,7 @@ func (teamsServiceExecRunner) Run(ctx context.Context, name string, args ...stri
 var (
 	teamsServiceGOOS       = func() string { return runtime.GOOS }
 	teamsServiceExecutable = helperpath.RawExecutable
+	teamsServiceStat       = os.Stat
 	teamsServiceArgv0      = func() string {
 		if len(os.Args) == 0 {
 			return ""
@@ -402,7 +403,7 @@ func schedulePendingTeamsServiceActivationBeforeStart(ctx context.Context, out i
 	if err != nil {
 		return false, err
 	}
-	resolved, resolveErr := helperpath.StableRunnablePathFromSources(installPath, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+	resolved, resolveErr := helperpath.StableRunnablePathFromSources(installPath, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 	if resolveErr != nil {
 		return false, resolveErr
 	}
@@ -448,7 +449,7 @@ func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service executable: unavailable (%v)\n", err)
 			} else {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service raw executable: %s\n", exe)
-				if resolved, resolveErr := helperpath.StableRunnablePathFromSources(exe, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()}); resolveErr != nil {
+				if resolved, resolveErr := helperpath.StableRunnablePathFromSources(exe, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat}); resolveErr != nil {
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service stable executable: unresolved (%v)\n", resolveErr)
 				} else if err := validateTeamsServiceExecutable(resolved.Path); err != nil {
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service stable executable: not installable (%v)\n", err)
@@ -2891,7 +2892,7 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 		if err := materializeManagedTeamsInstallTarget(context.Background(), resolvedExe); err != nil {
 			return teamsServiceSpec{}, err
 		}
-		probe := helperpath.ProbePath(exe, helperpath.Options{GOOS: teamsServiceGOOS()})
+		probe := helperpath.ProbePath(exe, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 		if resolvedExe.State == "managed" && (!probe.Exists || probe.IsDir || !probe.Executable) {
 			return teamsServiceSpec{}, fmt.Errorf("managed Teams service executable %s is not available after materialization", exe)
 		}
