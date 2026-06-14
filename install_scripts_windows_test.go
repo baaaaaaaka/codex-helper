@@ -65,7 +65,7 @@ func TestInstallPs1ChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
 		"-Version", "latest",
 		"-InstallDir", installDir,
 	)
-	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = isolatedWindowsInstallEnv(t, filterEnvWithoutKey(os.Environ(), "Path"))
 	cmd.Env = append(cmd.Env,
 		"CODEX_PROXY_API_BASE="+server.URL,
 		"CODEX_PROXY_RELEASE_BASE="+server.URL,
@@ -120,7 +120,7 @@ func TestInstallPs1DiskSpaceFailureBanner(t *testing.T) {
 		"-Version", "v1.2.3",
 		"-InstallDir", installDir,
 	)
-	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = isolatedWindowsInstallEnv(t, filterEnvWithoutKey(os.Environ(), "Path"))
 	cmd.Env = append(cmd.Env,
 		"CODEX_PROXY_PROFILE_PATH="+profilePath,
 		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
@@ -190,7 +190,7 @@ func TestInstallPs1RemovesLegacyCodexClpExe(t *testing.T) {
 		"-Version", "latest",
 		"-InstallDir", installDir,
 	)
-	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = isolatedWindowsInstallEnv(t, filterEnvWithoutKey(os.Environ(), "Path"))
 	cmd.Env = append(cmd.Env,
 		"CODEX_PROXY_API_BASE="+server.URL,
 		"CODEX_PROXY_RELEASE_BASE="+server.URL,
@@ -261,7 +261,7 @@ func TestInstallPs1RemovesLegacyCodexClaudeProxyAndClpCmd(t *testing.T) {
 		"-Version", "latest",
 		"-InstallDir", installDir,
 	)
-	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = isolatedWindowsInstallEnv(t, filterEnvWithoutKey(os.Environ(), "Path"))
 	cmd.Env = append(cmd.Env,
 		"CODEX_PROXY_API_BASE="+server.URL,
 		"CODEX_PROXY_RELEASE_BASE="+server.URL,
@@ -332,7 +332,7 @@ func TestInstallPs1PreservesExternalClpCmdReferencingClaudeProxy(t *testing.T) {
 		"-Version", "latest",
 		"-InstallDir", installDir,
 	)
-	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = isolatedWindowsInstallEnv(t, filterEnvWithoutKey(os.Environ(), "Path"))
 	cmd.Env = append(cmd.Env,
 		"CODEX_PROXY_API_BASE="+server.URL,
 		"CODEX_PROXY_RELEASE_BASE="+server.URL,
@@ -390,6 +390,7 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	tempDir := t.TempDir()
 	userProfile := t.TempDir()
 	appData := filepath.Join(userProfile, "AppData", "Roaming")
+	localAppData := filepath.Join(userProfile, "AppData", "Local")
 	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
 	legacyClaudeProxyExe := filepath.Join(installDir, "claude-proxy.exe")
 	legacyClaudeProxyExeData := []byte("external claude-proxy exe")
@@ -419,7 +420,7 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 		"-Version", "latest",
 		"-InstallDir", installDir,
 	)
-	cmd.Env = append([]string{}, filterEnvWithoutKey(os.Environ(), "Path")...)
+	cmd.Env = filterEnvWithoutKeys(os.Environ(), "Path", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
 	cmd.Env = append(cmd.Env,
 		"CODEX_PROXY_API_BASE="+server.URL,
 		"CODEX_PROXY_RELEASE_BASE="+server.URL,
@@ -430,6 +431,7 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 		"TEMP="+tempDir,
 		"USERPROFILE="+userProfile,
 		"APPDATA="+appData,
+		"LOCALAPPDATA="+localAppData,
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -569,14 +571,32 @@ func resolvePathViaPowerShell(t *testing.T, env []string, installDir string) str
 	return strings.TrimSpace(string(out))
 }
 
+func isolatedWindowsInstallEnv(t *testing.T, env []string) []string {
+	t.Helper()
+	userProfile := t.TempDir()
+	return append(filterEnvWithoutKeys(env, "USERPROFILE", "APPDATA", "LOCALAPPDATA"),
+		"USERPROFILE="+userProfile,
+		"APPDATA="+filepath.Join(userProfile, "AppData", "Roaming"),
+		"LOCALAPPDATA="+filepath.Join(userProfile, "AppData", "Local"),
+	)
+}
+
 func filterEnvWithoutKey(env []string, key string) []string {
+	return filterEnvWithoutKeys(env, key)
+}
+
+func filterEnvWithoutKeys(env []string, keys ...string) []string {
+	blocked := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		blocked[strings.ToLower(key)] = struct{}{}
+	}
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
 		k, _, ok := strings.Cut(kv, "=")
 		if !ok {
 			continue
 		}
-		if strings.EqualFold(k, key) {
+		if _, ok := blocked[strings.ToLower(k)]; ok {
 			continue
 		}
 		out = append(out, kv)
