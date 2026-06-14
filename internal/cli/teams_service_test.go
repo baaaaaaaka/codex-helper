@@ -3819,6 +3819,14 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{TargetPath: managed}); err != nil {
 		t.Fatalf("save install record: %v", err)
 	}
+	prevMaterialize := materializeManagedTeamsInstallTarget
+	materializeManagedTeamsInstallTarget = func(_ context.Context, target managedinstall.Target) error {
+		writeVersionedHelperForServiceTest(t, target.Path, "1.2.4")
+		return nil
+	}
+	t.Cleanup(func() {
+		materializeManagedTeamsInstallTarget = prevMaterialize
+	})
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     exePath,
