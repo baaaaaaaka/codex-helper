@@ -100,7 +100,7 @@ if ($version -ne "codex-proxy 1.2.3") {
 	}
 }
 
-func TestInstallPs1NewPowerShellProfileAllowsBareCxp(t *testing.T) {
+func TestInstallPs1ProfileScriptAllowsBareCxpInNewPowerShell(t *testing.T) {
 	if _, err := exec.LookPath("powershell"); err != nil {
 		t.Skip("powershell not available")
 	}
@@ -127,6 +127,7 @@ func TestInstallPs1NewPowerShellProfileAllowsBareCxp(t *testing.T) {
 	userProfile := t.TempDir()
 	appData := filepath.Join(userProfile, "AppData", "Roaming")
 	localAppData := filepath.Join(userProfile, "AppData", "Local")
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
 
 	basePath := os.Getenv("SystemRoot")
 	if basePath == "" {
@@ -138,6 +139,7 @@ func TestInstallPs1NewPowerShellProfileAllowsBareCxp(t *testing.T) {
 	baseEnv = append(baseEnv,
 		"CODEX_PROXY_API_BASE="+server.URL,
 		"CODEX_PROXY_RELEASE_BASE="+server.URL,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
 		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
 		"CODEX_NPM_PREFIX="+managedPrefix,
 		"Path="+pathValue,
@@ -160,17 +162,19 @@ func TestInstallPs1NewPowerShellProfileAllowsBareCxp(t *testing.T) {
 
 	psScript := `
 $ErrorActionPreference = "Stop"
+. $env:TEST_PROFILE_PATH
 $cmd = Get-Command cxp -ErrorAction Stop
 $version = (& cxp --version | Out-String).Trim()
 if ($version -ne "codex-proxy 1.2.3") {
   throw "unexpected cxp version output: $version"
 }
 `
-	profileCmd := exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-Command", psScript)
-	profileCmd.Env = baseEnv
+	profileCmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	profileCmd.Env = append([]string{}, baseEnv...)
+	profileCmd.Env = append(profileCmd.Env, "TEST_PROFILE_PATH="+profilePath)
 	output, err = profileCmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("new PowerShell profile should make cxp available: %v\n%s", err, string(output))
+		t.Fatalf("installer-written PowerShell profile should make cxp available in a new process: %v\n%s", err, string(output))
 	}
 }
 
