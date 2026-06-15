@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -692,6 +693,147 @@ func TestManagedASRLlamaInstallEnvIgnoresInvalidNativeCompatMarker(t *testing.T)
 	}
 }
 
+func TestManagedASRLlamaBinaryMarkerRejectsMissingNativeCompatRuntime(t *testing.T) {
+	llamaRoot := t.TempDir()
+	installRoot := filepath.Join(llamaRoot, "runtime")
+	command := writeManagedASRTestFile(t, installRoot, "llama-b9437/llama-mtmd-cli", 0o700)
+	info, err := os.Stat(command)
+	if err != nil {
+		t.Fatalf("stat test command: %v", err)
+	}
+	rel, err := filepath.Rel(installRoot, command)
+	if err != nil {
+		t.Fatalf("relative command path: %v", err)
+	}
+	marker := fmt.Sprintf(`{
+  "version": %q,
+  "release_tag": %q,
+  "asset_name": "llama-test.tar.gz",
+  "asset_url": "https://example.invalid/llama-test.tar.gz",
+  "asset_sha256": "test",
+  "binary_rel": %q,
+  "binary_size": %d,
+  "acceleration": "cpu",
+  "native_compat": true,
+  "updated_at": "2026-06-15T00:00:00Z"
+}
+`, managedASRLlamaRuntimeVersion, managedASRLlamaReleaseTag, filepath.ToSlash(rel), info.Size())
+	if err := os.WriteFile(filepath.Join(installRoot, "runtime.json"), []byte(marker), 0o600); err != nil {
+		t.Fatalf("write runtime marker: %v", err)
+	}
+
+	gotCommand, _, _, ok := managedASRLlamaBinaryFromMarker(context.Background(), installRoot)
+	if ok {
+		t.Fatalf("marker with missing native compat runtime was reused as %s", gotCommand)
+	}
+
+	binaryArchive := buildManagedASRLlamaTestArchive(t)
+	downloads := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads[r.URL.Path]++
+		switch r.URL.Path {
+		case "/llama.tar.gz":
+			_, _ = w.Write(binaryArchive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	prevHTTPClient := managedASRLlamaHTTPClient
+	prevAssets := managedASRLlamaBinaryAssetsFn
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() {
+		managedASRLlamaHTTPClient = prevHTTPClient
+		managedASRLlamaBinaryAssetsFn = prevAssets
+		validateManagedASRLlamaBinaryFn = prevValidate
+	})
+	managedASRLlamaHTTPClient = server.Client()
+	managedASRLlamaBinaryAssetsFn = func(string, string) ([]managedASRLlamaAsset, error) {
+		return []managedASRLlamaAsset{{
+			Name:         "llama-test.tar.gz",
+			URL:          server.URL + "/llama.tar.gz",
+			SHA256:       managedASRTestSHA256(binaryArchive),
+			Size:         int64(len(binaryArchive)),
+			ArchiveKind:  "tar.gz",
+			Acceleration: "cpu",
+		}}, nil
+	}
+	validateManagedASRLlamaBinaryFn = func(context.Context, string, []string) error {
+		return nil
+	}
+
+	repairedCommand, _, _, err := ensureManagedASRLlamaBinary(context.Background(), llamaRoot, ManagedASRConfig{LlamaDevice: "cpu"})
+	if err != nil {
+		t.Fatalf("repair missing native compat runtime: %v", err)
+	}
+	if repairedCommand == command {
+		t.Fatalf("stale patched command was reused after native compat runtime disappeared")
+	}
+	if downloads["/llama.tar.gz"] != 1 {
+		t.Fatalf("downloads = %#v, want stale native compat marker to trigger runtime reinstall", downloads)
+	}
+}
+
+func TestManagedASRLlamaBinaryMarkerRejectsStaleNativeCompatInterpreter(t *testing.T) {
+	installRoot := t.TempDir()
+	command := filepath.Join(installRoot, "llama-b9437", "llama-mtmd-cli")
+	if err := os.MkdirAll(filepath.Dir(command), 0o700); err != nil {
+		t.Fatalf("mkdir command dir: %v", err)
+	}
+	if err := os.WriteFile(command, []byte{0x7f, 'E', 'L', 'F', 1, 2, 3, 4}, 0o700); err != nil {
+		t.Fatalf("write fake ELF command: %v", err)
+	}
+	info, err := os.Stat(command)
+	if err != nil {
+		t.Fatalf("stat test command: %v", err)
+	}
+	rel, err := filepath.Rel(installRoot, command)
+	if err != nil {
+		t.Fatalf("relative command path: %v", err)
+	}
+	compatRoot := filepath.Join(filepath.Dir(command), managedASRNativeCompatDirName)
+	for _, dir := range []string{filepath.Join(compatRoot, "bin"), filepath.Join(compatRoot, "lib")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir compat dir: %v", err)
+		}
+	}
+	patchelf := filepath.Join(compatRoot, "bin", "patchelf")
+	staleInterpreter := filepath.Join(filepath.Dir(installRoot), ".llama-staging-stale", "llama-b9437", managedASRNativeCompatDirName, "lib", "ld-linux-x86-64.so.2")
+	if err := os.WriteFile(patchelf, []byte("#!/bin/sh\nprintf '%s\\n' '"+staleInterpreter+"'\n"), 0o700); err != nil {
+		t.Fatalf("write fake patchelf: %v", err)
+	}
+	for _, name := range []string{"ld-linux-x86-64.so.2", "libc.so.6", "libstdc++.so.6", "libgomp.so.1"} {
+		if err := os.WriteFile(filepath.Join(compatRoot, "lib", name), []byte(name), 0o600); err != nil {
+			t.Fatalf("write compat %s: %v", name, err)
+		}
+	}
+	if err := writeManagedASRNativeCompatMarker(compatRoot, managedASRNativeCompatProfileGlibc235); err != nil {
+		t.Fatalf("write compat marker: %v", err)
+	}
+	marker := fmt.Sprintf(`{
+  "version": %q,
+  "release_tag": %q,
+  "asset_name": "llama-test.tar.gz",
+  "asset_url": "https://example.invalid/llama-test.tar.gz",
+  "asset_sha256": "test",
+  "binary_rel": %q,
+  "binary_size": %d,
+  "acceleration": "cpu",
+  "native_compat": true,
+  "updated_at": "2026-06-15T00:00:00Z"
+}
+`, managedASRLlamaRuntimeVersion, managedASRLlamaReleaseTag, filepath.ToSlash(rel), info.Size())
+	if err := os.WriteFile(filepath.Join(installRoot, "runtime.json"), []byte(marker), 0o600); err != nil {
+		t.Fatalf("write runtime marker: %v", err)
+	}
+
+	gotCommand, _, _, ok := managedASRLlamaBinaryFromMarker(context.Background(), installRoot)
+	if ok {
+		t.Fatalf("marker with stale native compat interpreter was reused as %s", gotCommand)
+	}
+}
+
 func TestManagedASRLlamaNativeCompatCanRepairOnlyKnownBundleIssues(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -842,9 +984,9 @@ func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithPatchelf(t *testing.
 			{Name: "patchelf.tar.gz", URL: server.URL + "/patchelf.tar.gz", SHA256: managedASRTestSHA256(patchelfArchive), Size: int64(len(patchelfArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
 		}, nil
 	}
-	var patchedCommand string
+	var patchedCommands []string
 	applyManagedASRLlamaNativeCompatFn = func(_ context.Context, command string, compat managedASRNativeCompatRuntime) error {
-		patchedCommand = command
+		patchedCommands = append(patchedCommands, command)
 		for _, path := range []string{
 			compat.Interpreter,
 			compat.Patchelf,
@@ -874,11 +1016,17 @@ func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithPatchelf(t *testing.
 	if err != nil {
 		t.Fatalf("native compat repair install error: %v", err)
 	}
-	if patchedCommand == "" || !strings.Contains(patchedCommand, ".llama-staging-") || !strings.HasSuffix(patchedCommand, filepath.Join("llama", "bin", "llama-mtmd-cli")) {
-		t.Fatalf("patched command = %q, want staging llama command", patchedCommand)
+	if len(patchedCommands) != 2 {
+		t.Fatalf("patched commands = %#v, want staging and final native compat patches", patchedCommands)
 	}
-	if validateCalls != 2 {
-		t.Fatalf("validate calls = %d, want original failure plus repaired retry", validateCalls)
+	if !strings.Contains(patchedCommands[0], ".llama-staging-") || !strings.HasSuffix(patchedCommands[0], filepath.Join("llama", "bin", "llama-mtmd-cli")) {
+		t.Fatalf("first patched command = %q, want staging llama command", patchedCommands[0])
+	}
+	if patchedCommands[1] != command {
+		t.Fatalf("second patched command = %q, want final command %q", patchedCommands[1], command)
+	}
+	if validateCalls != 3 {
+		t.Fatalf("validate calls = %d, want original failure, staging retry, final retry", validateCalls)
 	}
 	if acceleration != "cpu" {
 		t.Fatalf("acceleration = %q, want cpu", acceleration)
@@ -898,6 +1046,139 @@ func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithPatchelf(t *testing.
 	}
 	if !strings.Contains(string(data), `"native_compat": true`) {
 		t.Fatalf("runtime marker did not record native compatibility repair:\n%s", data)
+	}
+}
+
+func TestManagedASRLlamaBinaryInstallRestoresOldRuntimeWhenFinalNativeCompatValidationFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native compatibility patchelf repair is Linux-only")
+	}
+	cacheRoot := t.TempDir()
+	installRoot := filepath.Join(cacheRoot, "llama", "runtime")
+	oldSentinel := filepath.Join(installRoot, "old", "sentinel")
+	if err := os.MkdirAll(filepath.Dir(oldSentinel), 0o700); err != nil {
+		t.Fatalf("mkdir old runtime: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(installRoot, "runtime.json"), []byte("old marker"), 0o600); err != nil {
+		t.Fatalf("write old marker: %v", err)
+	}
+	if err := os.WriteFile(oldSentinel, []byte("old runtime"), 0o600); err != nil {
+		t.Fatalf("write old sentinel: %v", err)
+	}
+
+	binaryArchive := buildManagedASRLlamaTestArchive(t)
+	glibcArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2": []byte("loader"),
+		"usr/lib/x86_64-linux-gnu/libc.so.6":            []byte("libc"),
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30":  []byte("libstdc++"),
+	}, map[string]string{
+		"usr/lib/x86_64-linux-gnu/libstdc++.so.6": "libstdc++.so.6.0.30",
+	})
+	libgompArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"lib/libgomp.so.1": []byte("libgomp"),
+	}, nil)
+	patchelfArchive := buildManagedASRNativeCompatTestArchive(t, map[string][]byte{
+		"bin/patchelf": []byte("#!/bin/sh\nexit 0\n"),
+	}, nil)
+	downloads := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads[r.URL.Path]++
+		switch r.URL.Path {
+		case "/llama.tar.gz":
+			_, _ = w.Write(binaryArchive)
+		case "/glibc.tar.gz":
+			_, _ = w.Write(glibcArchive)
+		case "/libgomp.tar.gz":
+			_, _ = w.Write(libgompArchive)
+		case "/patchelf.tar.gz":
+			_, _ = w.Write(patchelfArchive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	prevHTTPClient := managedASRLlamaHTTPClient
+	prevCompatAssets := managedASRLlamaNativeCompatAssetsFn
+	prevApply := applyManagedASRLlamaNativeCompatFn
+	prevValidate := validateManagedASRLlamaBinaryFn
+	t.Cleanup(func() {
+		managedASRLlamaHTTPClient = prevHTTPClient
+		managedASRLlamaNativeCompatAssetsFn = prevCompatAssets
+		applyManagedASRLlamaNativeCompatFn = prevApply
+		validateManagedASRLlamaBinaryFn = prevValidate
+	})
+	managedASRLlamaHTTPClient = server.Client()
+	managedASRLlamaNativeCompatAssetsFn = func(_, _ string, profile string) ([]managedASRNativeCompatAsset, error) {
+		if profile != managedASRNativeCompatProfileGlibc235 {
+			t.Fatalf("native compat profile = %q, want %q", profile, managedASRNativeCompatProfileGlibc235)
+		}
+		return []managedASRNativeCompatAsset{
+			{Name: "glibc.tar.gz", URL: server.URL + "/glibc.tar.gz", SHA256: managedASRTestSHA256(glibcArchive), Size: int64(len(glibcArchive)), ArchiveKind: "tar.gz", ExtractMode: "ubuntu-base-glibc"},
+			{Name: "libgomp.tar.gz", URL: server.URL + "/libgomp.tar.gz", SHA256: managedASRTestSHA256(libgompArchive), Size: int64(len(libgompArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+			{Name: "patchelf.tar.gz", URL: server.URL + "/patchelf.tar.gz", SHA256: managedASRTestSHA256(patchelfArchive), Size: int64(len(patchelfArchive)), ArchiveKind: "tar.gz", ExtractMode: "conda-runtime"},
+		}, nil
+	}
+	var patchedCommands []string
+	applyManagedASRLlamaNativeCompatFn = func(_ context.Context, command string, _ managedASRNativeCompatRuntime) error {
+		patchedCommands = append(patchedCommands, command)
+		return nil
+	}
+	finalErr := errors.New("final runtime validation failed")
+	validateCalls := 0
+	validateManagedASRLlamaBinaryFn = func(_ context.Context, command string, _ []string) error {
+		validateCalls++
+		if validateCalls == 1 {
+			return errors.New("/lib64/libc.so.6: version `GLIBC_2.34' not found")
+		}
+		if strings.HasPrefix(command, installRoot+string(os.PathSeparator)) {
+			return finalErr
+		}
+		return nil
+	}
+
+	_, _, err := installManagedASRLlamaBinary(context.Background(), installRoot, managedASRLlamaAsset{
+		Name:         "llama-test.tar.gz",
+		URL:          server.URL + "/llama.tar.gz",
+		SHA256:       managedASRTestSHA256(binaryArchive),
+		Size:         int64(len(binaryArchive)),
+		ArchiveKind:  "tar.gz",
+		Acceleration: "cpu",
+	})
+	if !errors.Is(err, finalErr) {
+		t.Fatalf("install error = %v, want final validation error", err)
+	}
+	var validationErr managedASRLlamaValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("install error type = %T, want managedASRLlamaValidationError", err)
+	}
+	if validateCalls != 3 {
+		t.Fatalf("validate calls = %d, want original failure, staging success, final failure", validateCalls)
+	}
+	if len(patchedCommands) != 2 {
+		t.Fatalf("patched commands = %#v, want staging and final native compat patches", patchedCommands)
+	}
+	if !strings.Contains(patchedCommands[0], ".llama-staging-") {
+		t.Fatalf("first patched command = %q, want staging command", patchedCommands[0])
+	}
+	if !strings.HasPrefix(patchedCommands[1], installRoot+string(os.PathSeparator)) {
+		t.Fatalf("second patched command = %q, want final command under %q", patchedCommands[1], installRoot)
+	}
+	data, readErr := os.ReadFile(filepath.Join(installRoot, "runtime.json"))
+	if readErr != nil {
+		t.Fatalf("read restored old marker: %v", readErr)
+	}
+	if string(data) != "old marker" {
+		t.Fatalf("runtime marker after rollback = %q, want old marker", data)
+	}
+	if _, err := os.Stat(oldSentinel); err != nil {
+		t.Fatalf("old runtime sentinel was not restored: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(installRoot, "llama", "bin", "llama-mtmd-cli")); !os.IsNotExist(err) {
+		t.Fatalf("new runtime binary stat error = %v, want rollback to remove failed publish", err)
+	}
+	if downloads["/llama.tar.gz"] != 1 || downloads["/glibc.tar.gz"] != 1 || downloads["/libgomp.tar.gz"] != 1 || downloads["/patchelf.tar.gz"] != 1 {
+		t.Fatalf("downloads = %#v, want llama and each native compat asset once", downloads)
 	}
 }
 
@@ -998,8 +1279,8 @@ func TestManagedASRLlamaBinaryInstallRepairsNativeCompatWithGlibc239Profile(t *t
 	if err != nil {
 		t.Fatalf("native compat 2.39 repair install error: %v", err)
 	}
-	if validateCalls != 2 {
-		t.Fatalf("validate calls = %d, want original failure plus repaired retry", validateCalls)
+	if validateCalls != 3 {
+		t.Fatalf("validate calls = %d, want original failure, staging retry, final retry", validateCalls)
 	}
 	if downloads["/llama.tar.gz"] != 1 || downloads["/glibc239.tar.gz"] != 1 || downloads["/libgomp.tar.gz"] != 1 || downloads["/patchelf.tar.gz"] != 1 {
 		t.Fatalf("downloads = %#v, want llama and each 2.39 native compat asset once", downloads)
@@ -1132,15 +1413,16 @@ func TestManagedASRLlamaBinaryInstallEscalatesNativeCompatProfileAfterRetry(t *t
 	if err != nil {
 		t.Fatalf("native compat profile escalation install error: %v", err)
 	}
-	if validateCalls != 3 {
-		t.Fatalf("validate calls = %d, want missing-library failure, upgraded-symbol failure, success", validateCalls)
+	if validateCalls != 4 {
+		t.Fatalf("validate calls = %d, want missing-library failure, upgraded-symbol failure, staging success, final success", validateCalls)
 	}
 	wantProfiles := []string{managedASRNativeCompatProfileGlibc235, managedASRNativeCompatProfileGlibc239}
 	if !reflect.DeepEqual(requestedProfiles, wantProfiles) {
 		t.Fatalf("requested profiles = %#v, want %#v", requestedProfiles, wantProfiles)
 	}
-	if !reflect.DeepEqual(appliedProfiles, wantProfiles) {
-		t.Fatalf("applied profiles = %#v, want %#v", appliedProfiles, wantProfiles)
+	wantAppliedProfiles := []string{managedASRNativeCompatProfileGlibc235, managedASRNativeCompatProfileGlibc239, managedASRNativeCompatProfileGlibc239}
+	if !reflect.DeepEqual(appliedProfiles, wantAppliedProfiles) {
+		t.Fatalf("applied profiles = %#v, want %#v", appliedProfiles, wantAppliedProfiles)
 	}
 	if downloads["/glibc235.tar.gz"] != 1 || downloads["/glibc239.tar.gz"] != 1 {
 		t.Fatalf("downloads = %#v, want both native compat profiles once", downloads)
@@ -1406,6 +1688,10 @@ func TestDownloadManagedASRLlamaFileRejectsSizeAndHashMismatch(t *testing.T) {
 	if sizeErr == nil || !strings.Contains(sizeErr.Error(), "downloaded 11 bytes, want 999") {
 		t.Fatalf("size mismatch error = %v", sizeErr)
 	}
+	var sizeIntegrityErr managedASRDownloadIntegrityError
+	if !errors.As(sizeErr, &sizeIntegrityErr) {
+		t.Fatalf("size mismatch error type = %T, want managedASRDownloadIntegrityError", sizeErr)
+	}
 	hashErr := downloadManagedASRLlamaFile(context.Background(), managedASRLlamaFileAsset{
 		Name:   "asset.bin",
 		URL:    server.URL + "/asset.bin",
@@ -1414,6 +1700,10 @@ func TestDownloadManagedASRLlamaFileRejectsSizeAndHashMismatch(t *testing.T) {
 	}, filepath.Join(tmp, "hash.bin"), "test asset")
 	if hashErr == nil || !strings.Contains(hashErr.Error(), "sha256") {
 		t.Fatalf("hash mismatch error = %v", hashErr)
+	}
+	var hashIntegrityErr managedASRDownloadIntegrityError
+	if !errors.As(hashErr, &hashIntegrityErr) {
+		t.Fatalf("hash mismatch error type = %T, want managedASRDownloadIntegrityError", hashErr)
 	}
 }
 
@@ -1661,6 +1951,106 @@ func TestManagedASRDiskPreflightReportsActionableSpace(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "512.0 MiB available") || !strings.Contains(err.Error(), "8192.0 MiB") {
 		t.Fatalf("disk preflight message = %q", err.Error())
+	}
+}
+
+func TestManagedASRPublishDirRestoresOldTargetOnPublishFailure(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "runtime")
+	staging := filepath.Join(root, ".runtime-staging")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "runtime.json"), []byte("old"), 0o600); err != nil {
+		t.Fatalf("write old marker: %v", err)
+	}
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "runtime.json"), []byte("new"), 0o600); err != nil {
+		t.Fatalf("write new marker: %v", err)
+	}
+
+	prevRename := managedASRPublishRename
+	prevRemoveAll := managedASRPublishRemoveAll
+	t.Cleanup(func() {
+		managedASRPublishRename = prevRename
+		managedASRPublishRemoveAll = prevRemoveAll
+	})
+	managedASRPublishRename = func(src, dst string) error {
+		if src == staging && dst == target {
+			return errors.New("publish failed")
+		}
+		return os.Rename(src, dst)
+	}
+	managedASRPublishRemoveAll = os.RemoveAll
+
+	err := managedASRPublishDir("test runtime", staging, target)
+	if err == nil {
+		t.Fatal("publish succeeded, want injected failure")
+	}
+	var cacheErr managedASRCacheError
+	if !errors.As(err, &cacheErr) {
+		t.Fatalf("publish error type = %T, want managedASRCacheError", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(target, "runtime.json"))
+	if readErr != nil {
+		t.Fatalf("read restored marker: %v", readErr)
+	}
+	if string(data) != "old" {
+		t.Fatalf("restored marker = %q, want old runtime preserved", data)
+	}
+	if _, statErr := os.Stat(staging); statErr != nil {
+		t.Fatalf("staging should remain for caller cleanup after failed publish: %v", statErr)
+	}
+}
+
+func TestManagedASRPublishDirRestoresOldTargetOnPostPublishFailure(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "runtime")
+	staging := filepath.Join(root, ".runtime-staging")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "runtime.json"), []byte("old"), 0o600); err != nil {
+		t.Fatalf("write old marker: %v", err)
+	}
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "runtime.json"), []byte("new"), 0o600); err != nil {
+		t.Fatalf("write new marker: %v", err)
+	}
+
+	postErr := errors.New("final validation failed")
+	err := managedASRPublishDirWithPostPublish("test runtime", staging, target, func() error {
+		return postErr
+	})
+	if !errors.Is(err, postErr) {
+		t.Fatalf("publish error = %v, want post-publish error", err)
+	}
+	var cacheErr managedASRCacheError
+	if errors.As(err, &cacheErr) {
+		t.Fatalf("publish error type = %T, want original validation error when rollback succeeds", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(target, "runtime.json"))
+	if readErr != nil {
+		t.Fatalf("read restored marker: %v", readErr)
+	}
+	if string(data) != "old" {
+		t.Fatalf("restored marker = %q, want old runtime preserved", data)
+	}
+	if _, statErr := os.Stat(staging); !os.IsNotExist(statErr) {
+		t.Fatalf("staging after post-publish rollback stat error = %v, want removed staging", statErr)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read root entries: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".runtime.backup-") {
+			t.Fatalf("rollback left backup directory %q", entry.Name())
+		}
 	}
 }
 

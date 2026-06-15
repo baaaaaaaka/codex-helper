@@ -151,10 +151,7 @@ func installManagedASRStandalonePython(ctx context.Context, installRoot string, 
 	if err := writePrivateFileReplacing(filepath.Join(staging, "runtime.json"), append(markerData, '\n'), 0o600); err != nil {
 		return managedASRBootstrapPython{}, err
 	}
-	if err := os.RemoveAll(installRoot); err != nil {
-		return managedASRBootstrapPython{}, err
-	}
-	if err := os.Rename(staging, installRoot); err != nil {
+	if err := managedASRPublishDir("managed Python runtime", staging, installRoot); err != nil {
 		return managedASRBootstrapPython{}, err
 	}
 	finalPython := filepath.Join(installRoot, rel)
@@ -205,8 +202,8 @@ func downloadManagedASRStandalonePythonArchive(ctx context.Context, url string, 
 	if err := os.Chmod(tmpPath, 0o600); err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return "", err
+	if err := durableReplaceFile(tmpPath, path); err != nil {
+		return "", managedASRCacheError{Op: "publish downloaded managed Python archive", Path: path, Err: err}
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }

@@ -166,7 +166,72 @@ func splitTeamsRenderText(input TeamsRenderInput, text string, limitBytes int, p
 			return parts
 		}
 	}
+	if parts, ok := splitTeamsRenderTextByLines(input, text, limitBytes, plannedCount); ok {
+		return parts
+	}
 	return splitTeamsRenderTextGeneric(input, text, limitBytes, plannedCount)
+}
+
+func splitTeamsRenderTextByLines(input TeamsRenderInput, text string, limitBytes int, plannedCount int) ([]string, bool) {
+	if !strings.Contains(text, "\n") {
+		return nil, false
+	}
+	lines := strings.SplitAfter(text, "\n")
+	if len(lines) <= 1 {
+		return nil, false
+	}
+	fits := func(candidate string, partIndex int) bool {
+		partInput := input
+		partInput.Text = candidate
+		return len(renderTeamsHTMLPart(partInput, partIndex, plannedCount)) <= limitBytes
+	}
+	var parts []string
+	var current strings.Builder
+	flushCurrent := func() {
+		if current.Len() == 0 {
+			return
+		}
+		parts = append(parts, current.String())
+		current.Reset()
+	}
+	appendOversizedLine := func(line string) {
+		for _, part := range splitTeamsRenderTextGeneric(input, line, limitBytes, plannedCount) {
+			if part == "" {
+				continue
+			}
+			parts = append(parts, part)
+		}
+	}
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		if current.Len() == 0 {
+			if fits(line, len(parts)+1) {
+				current.WriteString(line)
+				continue
+			}
+			appendOversizedLine(line)
+			continue
+		}
+		candidate := current.String() + line
+		if fits(candidate, len(parts)+1) {
+			current.WriteString(line)
+			continue
+		}
+		flushCurrent()
+		if fits(line, len(parts)+1) {
+			current.WriteString(line)
+			continue
+		}
+		appendOversizedLine(line)
+	}
+	flushCurrent()
+	if len(parts) == 0 {
+		return []string{""}, true
+	}
+	return parts, true
 }
 
 func splitTeamsRenderTextGeneric(input TeamsRenderInput, text string, limitBytes int, plannedCount int) []string {

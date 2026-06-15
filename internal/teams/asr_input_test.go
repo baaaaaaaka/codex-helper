@@ -221,6 +221,80 @@ func TestTranscribeTeamsMediaAttachmentsTreatsEmptyCommandASRAsUnconfigured(t *t
 	}
 }
 
+func TestTeamsASRFailureUserMessageClassifiesActionableFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantKind  teamsASRFailureKind
+		wantParts []string
+	}{
+		{
+			name:     "disk",
+			err:      managedASRDiskSpaceError{Path: "/cache/asr", NeedBytes: 2 * 1024 * 1024 * 1024, FreeBytes: 128 * 1024 * 1024},
+			wantKind: teamsASRFailureInsufficientDisk,
+			wantParts: []string{
+				"not enough free disk space",
+				"Next:",
+				"free space",
+				"Diagnostic:",
+			},
+		},
+		{
+			name:     "setup busy",
+			err:      managedASRSetupBusyError{Scope: "Teams speech recognition"},
+			wantKind: teamsASRFailureSetupBusy,
+			wantParts: []string{
+				"already running",
+				"retry",
+				"Diagnostic:",
+			},
+		},
+		{
+			name:     "download integrity",
+			err:      managedASRDownloadIntegrityError{Label: "llama.cpp runtime", Err: errors.New("sha256 bad")},
+			wantKind: teamsASRFailureDownloadIntegrity,
+			wantParts: []string{
+				"failed integrity verification",
+				"discard",
+				"sha256 bad",
+			},
+		},
+		{
+			name:     "native compat exhausted",
+			err:      managedASRLlamaValidationError{Err: errors.New("/lib64/libc.so.6: version `GLIBC_2.38' not found")},
+			wantKind: teamsASRFailureNativeCompatFailed,
+			wantParts: []string{
+				"native library or loader compatibility",
+				"GLIBC_2.38",
+			},
+		},
+		{
+			name:     "missing managed binary",
+			err:      errors.New("run llama.cpp Teams speech recognition: fork/exec /home/user/.cache/codex-helper/teams-asr/qwen_qwen3-asr-0.6b/llama/runtime/llama-b9437/llama-mtmd-cli: no such file or directory"),
+			wantKind: teamsASRFailureCachePreparation,
+			wantParts: []string{
+				"managed ASR runtime cache is incomplete",
+				"reinstall the managed runtime",
+				"llama-mtmd-cli",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			notice := classifyTeamsASRFailure(tc.err)
+			if notice.Kind != tc.wantKind {
+				t.Fatalf("kind = %q, want %q; notice=%#v", notice.Kind, tc.wantKind, notice)
+			}
+			message := teamsASRFailureUserMessage(tc.err)
+			for _, want := range tc.wantParts {
+				if !strings.Contains(message, want) {
+					t.Fatalf("message missing %q:\n%s", want, message)
+				}
+			}
+		})
+	}
+}
+
 func TestTeamsASRStatusLineIsUserLevelAndDoesNotLeakConfiguration(t *testing.T) {
 	cases := []struct {
 		name        string

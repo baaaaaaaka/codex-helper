@@ -116,6 +116,83 @@ func (e managedASRDiskSpaceError) Error() string {
 	)
 }
 
+type teamsASRFailureKind string
+
+const (
+	teamsASRFailureUnknown            teamsASRFailureKind = "unknown"
+	teamsASRFailureNotConfigured      teamsASRFailureKind = "not_configured"
+	teamsASRFailureSetupBusy          teamsASRFailureKind = "setup_busy"
+	teamsASRFailureInsufficientDisk   teamsASRFailureKind = "insufficient_disk"
+	teamsASRFailureDownloadTransient  teamsASRFailureKind = "download_transient"
+	teamsASRFailureDownloadIntegrity  teamsASRFailureKind = "download_integrity"
+	teamsASRFailureUnsupportedRuntime teamsASRFailureKind = "unsupported_runtime"
+	teamsASRFailureInvalidUserConfig  teamsASRFailureKind = "invalid_user_config"
+	teamsASRFailureFallbackDisabled   teamsASRFailureKind = "fallback_disabled"
+	teamsASRFailureNativeCompatFailed teamsASRFailureKind = "native_compat_failed"
+	teamsASRFailureMediaPreprocess    teamsASRFailureKind = "media_preprocess_failed"
+	teamsASRFailureRuntimeFailed      teamsASRFailureKind = "runtime_failed"
+	teamsASRFailureCanceledOrTimeout  teamsASRFailureKind = "canceled_or_timeout"
+	teamsASRFailureCachePreparation   teamsASRFailureKind = "cache_preparation"
+)
+
+type teamsASRFailureNotice struct {
+	Kind       teamsASRFailureKind
+	Summary    string
+	Action     string
+	Diagnostic string
+}
+
+type managedASRSetupBusyError struct {
+	Scope string
+}
+
+func (e managedASRSetupBusyError) Error() string {
+	scope := strings.TrimSpace(e.Scope)
+	if scope == "" {
+		scope = "Teams speech recognition"
+	}
+	return scope + " setup is already running in another helper process"
+}
+
+type managedASRCacheError struct {
+	Op   string
+	Path string
+	Err  error
+}
+
+func (e managedASRCacheError) Error() string {
+	op := firstNonEmptyString(strings.TrimSpace(e.Op), "prepare")
+	path := strings.TrimSpace(e.Path)
+	if path == "" {
+		path = "ASR cache"
+	}
+	if e.Err == nil {
+		return fmt.Sprintf("could not %s Teams speech recognition cache at %s", op, path)
+	}
+	return fmt.Sprintf("could not %s Teams speech recognition cache at %s: %v", op, path, e.Err)
+}
+
+func (e managedASRCacheError) Unwrap() error {
+	return e.Err
+}
+
+type managedASRDownloadIntegrityError struct {
+	Label string
+	Err   error
+}
+
+func (e managedASRDownloadIntegrityError) Error() string {
+	label := firstNonEmptyString(strings.TrimSpace(e.Label), "ASR artifact")
+	if e.Err == nil {
+		return "download " + label + ": integrity verification failed"
+	}
+	return fmt.Sprintf("download %s: integrity verification failed: %v", label, e.Err)
+}
+
+func (e managedASRDownloadIntegrityError) Unwrap() error {
+	return e.Err
+}
+
 type managedASRTransformersFallbackDisabledError struct {
 	Err error
 }
@@ -537,7 +614,7 @@ func ensureManagedASRRuntime(ctx context.Context, cfg ManagedASRConfig) (managed
 		return managedASRRuntime{}, err
 	}
 	if !locked {
-		return managedASRRuntime{}, fmt.Errorf("Teams speech recognition setup is already running in another helper process")
+		return managedASRRuntime{}, managedASRSetupBusyError{Scope: "Teams speech recognition"}
 	}
 	defer func() { _ = lock.Unlock() }()
 
@@ -655,8 +732,7 @@ func createManagedASRVenv(ctx context.Context, cacheRoot string) error {
 	if err := runManagedASRSetupCommand(ctx, python.Command, args, managedASRSetupBaseEnv()); err != nil {
 		return fmt.Errorf("create isolated Teams speech recognition Python environment: %w", err)
 	}
-	_ = os.RemoveAll(venvDir)
-	return os.Rename(staging, venvDir)
+	return managedASRPublishDir("Teams speech recognition Python environment", staging, venvDir)
 }
 
 func installManagedASRPackages(ctx context.Context, python string) error {
@@ -841,34 +917,81 @@ func cleanupManagedASRTemp(cacheRoot string, now time.Time, maxAge time.Duration
 }
 
 func writePrivateFileReplacing(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+	if err := durableWriteFile(path, data, mode); err != nil {
+		return managedASRCacheError{Op: "write", Path: path, Err: err}
 	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpPath, mode); err != nil {
-		return err
-	}
-	return replaceFile(tmpPath, path)
+	return nil
 }
 
-func replaceFile(oldPath string, newPath string) error {
-	if runtime.GOOS == "windows" {
-		_ = os.Remove(newPath)
+var managedASRPublishRename = os.Rename
+var managedASRPublishRemoveAll = os.RemoveAll
+
+func managedASRPublishDir(label string, staging string, target string) error {
+	return managedASRPublishDirWithPostPublish(label, staging, target, nil)
+}
+
+func managedASRPublishDirWithPostPublish(label string, staging string, target string, postPublish func() error) error {
+	label = firstNonEmptyString(strings.TrimSpace(label), "Teams speech recognition runtime")
+	staging = strings.TrimSpace(staging)
+	target = strings.TrimSpace(target)
+	if staging == "" || target == "" {
+		return managedASRCacheError{Op: "publish " + label, Path: target, Err: fmt.Errorf("staging and target paths are required")}
 	}
-	return os.Rename(oldPath, newPath)
+	if _, err := os.Stat(staging); err != nil {
+		return managedASRCacheError{Op: "publish " + label, Path: staging, Err: err}
+	}
+	parent := filepath.Dir(target)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return managedASRCacheError{Op: "prepare", Path: parent, Err: err}
+	}
+	backup := filepath.Join(parent, "."+filepath.Base(target)+".backup-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	backupCreated := false
+	if _, err := os.Stat(target); err == nil {
+		if err := managedASRPublishRename(target, backup); err != nil {
+			return managedASRCacheError{Op: "backup " + label, Path: target, Err: err}
+		}
+		backupCreated = true
+	} else if !os.IsNotExist(err) {
+		return managedASRCacheError{Op: "inspect " + label, Path: target, Err: err}
+	}
+	if err := managedASRPublishRename(staging, target); err != nil {
+		if backupCreated {
+			if restoreErr := restoreManagedASRPublishBackup(label, target, backup); restoreErr != nil {
+				return managedASRCacheError{Op: "restore " + label, Path: target, Err: fmt.Errorf("publish failed: %w; restore failed: %v", err, restoreErr)}
+			}
+		}
+		return managedASRCacheError{Op: "publish " + label, Path: target, Err: err}
+	}
+	if postPublish != nil {
+		if err := postPublish(); err != nil {
+			if backupCreated {
+				if restoreErr := restoreManagedASRPublishBackup(label, target, backup); restoreErr != nil {
+					return managedASRCacheError{Op: "restore " + label, Path: target, Err: fmt.Errorf("post-publish validation failed: %w; restore failed: %v", err, restoreErr)}
+				}
+			} else if removeErr := managedASRPublishRemoveAll(target); removeErr != nil {
+				return managedASRCacheError{Op: "remove failed " + label, Path: target, Err: fmt.Errorf("post-publish validation failed: %w; remove failed: %v", err, removeErr)}
+			} else {
+				_ = syncParentDir(target)
+			}
+			return err
+		}
+	}
+	if backupCreated {
+		_ = managedASRPublishRemoveAll(backup)
+	}
+	_ = syncParentDir(target)
+	return nil
+}
+
+func restoreManagedASRPublishBackup(label string, target string, backup string) error {
+	if removeErr := managedASRPublishRemoveAll(target); removeErr != nil {
+		return fmt.Errorf("remove partial %s at %s: %w", label, target, removeErr)
+	}
+	if renameErr := managedASRPublishRename(backup, target); renameErr != nil {
+		return fmt.Errorf("restore backup %s to %s: %w", backup, target, renameErr)
+	}
+	_ = syncParentDir(target)
+	return nil
 }
 
 func formatASRBytes(bytes uint64) string {

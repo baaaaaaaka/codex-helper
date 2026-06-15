@@ -401,10 +401,7 @@ func ensureManagedASRLlamaNativeCompat(ctx context.Context, command string, prof
 	if err := writeManagedASRNativeCompatMarker(staging, profile.Version); err != nil {
 		return managedASRNativeCompatRuntime{}, err
 	}
-	if err := os.RemoveAll(root); err != nil {
-		return managedASRNativeCompatRuntime{}, err
-	}
-	if err := os.Rename(staging, root); err != nil {
+	if err := managedASRPublishDir("native compatibility runtime", staging, root); err != nil {
 		return managedASRNativeCompatRuntime{}, err
 	}
 	return managedASRNativeCompatRuntime{
@@ -655,13 +652,36 @@ func applyManagedASRLlamaNativeCompat(ctx context.Context, command string, compa
 	})
 }
 
+func managedASRNativeCompatCommandUsesCurrentInterpreter(ctx context.Context, command string, compat managedASRNativeCompatRuntime) bool {
+	if compat.Patchelf == "" || compat.Interpreter == "" {
+		return false
+	}
+	ok, err := managedASRFileLooksELF(command)
+	if err != nil {
+		return false
+	}
+	if !ok {
+		return true
+	}
+	interpreter, ok := managedASRELFInterpreter(ctx, compat.Patchelf, command)
+	return ok && interpreter == compat.Interpreter
+}
+
 func managedASRELFHasInterpreter(ctx context.Context, patchelf string, path string) bool {
+	interpreter, ok := managedASRELFInterpreter(ctx, patchelf, path)
+	return ok && interpreter != ""
+}
+
+func managedASRELFInterpreter(ctx context.Context, patchelf string, path string) (string, bool) {
 	validateCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(validateCtx, patchelf, "--print-interpreter", path)
 	cmd.Env = managedASRSetupBaseEnv()
 	out, err := cmd.Output()
-	return err == nil && strings.TrimSpace(string(out)) != ""
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
 }
 
 func runManagedASRPatchelf(ctx context.Context, patchelf string, args ...string) error {

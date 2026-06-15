@@ -233,7 +233,153 @@ func teamsASRFailureUserMessage(err error) string {
 	if errors.Is(err, errASRCommandNotConfigured) {
 		return "Teams voice/video transcription is not ready on this helper yet. I received Teams media, but I did not send the raw audio/video to Codex. cxp should prepare local speech recognition automatically; please update/reload the helper and try again."
 	}
-	return "Teams media transcription failed: " + err.Error()
+	notice := classifyTeamsASRFailure(err)
+	var parts []string
+	parts = append(parts, "Teams media transcription failed: "+notice.Summary)
+	if strings.TrimSpace(notice.Action) != "" {
+		parts = append(parts, "Next: "+strings.TrimSpace(notice.Action))
+	}
+	if strings.TrimSpace(notice.Diagnostic) != "" {
+		parts = append(parts, "Diagnostic: "+shortenTeamsLine(strings.TrimSpace(notice.Diagnostic), 600))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func classifyTeamsASRFailure(err error) teamsASRFailureNotice {
+	if err == nil {
+		return teamsASRFailureNotice{Kind: teamsASRFailureUnknown, Summary: "unknown ASR failure"}
+	}
+	raw := err.Error()
+	lower := strings.ToLower(raw)
+	notice := teamsASRFailureNotice{
+		Kind:       teamsASRFailureUnknown,
+		Summary:    "local speech recognition failed after setup and repair attempts were exhausted.",
+		Action:     "check the diagnostic detail below; if the issue persists, update the helper and retry.",
+		Diagnostic: raw,
+	}
+	var busy managedASRSetupBusyError
+	if errors.As(err, &busy) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureSetupBusy,
+			Summary:    "local speech recognition setup is already running in another helper process.",
+			Action:     "wait for the other Teams ASR setup to finish, then retry the message.",
+			Diagnostic: raw,
+		}
+	}
+	var disk managedASRDiskSpaceError
+	if errors.As(err, &disk) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureInsufficientDisk,
+			Summary:    disk.Error(),
+			Action:     "free space in that cache filesystem or move the Teams ASR cache to a larger disk.",
+			Diagnostic: raw,
+		}
+	}
+	var cache managedASRCacheError
+	if errors.As(err, &cache) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureCachePreparation,
+			Summary:    "the helper could not prepare the local Teams ASR cache.",
+			Action:     "check cache permissions, read-only/noexec mounts, antivirus/file locks, and available disk space.",
+			Diagnostic: raw,
+		}
+	}
+	var integrity managedASRDownloadIntegrityError
+	if errors.As(err, &integrity) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureDownloadIntegrity,
+			Summary:    "a downloaded Teams ASR artifact failed integrity verification.",
+			Action:     "retry later; the helper will discard the partial or corrupt download instead of using it.",
+			Diagnostic: raw,
+		}
+	}
+	var transient managedASRLlamaDownloadTransientError
+	if errors.As(err, &transient) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureDownloadTransient,
+			Summary:    "a Teams ASR runtime download failed due to a transient network or I/O error.",
+			Action:     "retry after the network or cache filesystem is stable.",
+			Diagnostic: raw,
+		}
+	}
+	var httpErr managedASRLlamaDownloadHTTPError
+	if errors.As(err, &httpErr) {
+		kind := teamsASRFailureDownloadTransient
+		action := "retry later or check access to the ASR artifact host."
+		if httpErr.StatusCode == 403 || httpErr.StatusCode == 404 {
+			kind = teamsASRFailureDownloadIntegrity
+			action = "check that the pinned ASR artifact is still available from this environment."
+		}
+		return teamsASRFailureNotice{
+			Kind:       kind,
+			Summary:    "a Teams ASR runtime download failed with HTTP " + fmt.Sprint(httpErr.StatusCode) + ".",
+			Action:     action,
+			Diagnostic: raw,
+		}
+	}
+	var fallback managedASRTransformersFallbackDisabledError
+	if errors.As(err, &fallback) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureFallbackDisabled,
+			Summary:    "the lightweight llama ASR backend failed, and the larger transformers fallback is disabled by default.",
+			Action:     "fix the lightweight runtime issue, or explicitly opt in to transformers fallback if the larger download is acceptable.",
+			Diagnostic: raw,
+		}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureCanceledOrTimeout,
+			Summary:    "local speech recognition was canceled or timed out.",
+			Action:     "retry the message when the helper is not being interrupted.",
+			Diagnostic: raw,
+		}
+	}
+	if managedASRLlamaNativeCompatCanRepair(err) ||
+		strings.Contains(lower, "native compatibility") ||
+		strings.Contains(lower, "glibc") ||
+		strings.Contains(lower, "glibcxx") ||
+		strings.Contains(lower, "cannot open shared object file") {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureNativeCompatFailed,
+			Summary:    "the managed ASR runtime still has an unresolved native library or loader compatibility problem after repair attempts.",
+			Action:     "update the helper; if this persists, the host may need a newer supported native compatibility profile.",
+			Diagnostic: raw,
+		}
+	}
+	if (strings.Contains(lower, "no such file or directory") || strings.Contains(lower, "permission denied")) &&
+		(strings.Contains(lower, "teams-asr") || strings.Contains(lower, "llama-mtmd-cli") || strings.Contains(lower, "managed ffmpeg")) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureCachePreparation,
+			Summary:    "the managed ASR runtime cache is incomplete or not executable.",
+			Action:     "retry so the helper can reinstall the managed runtime; if it persists, update the helper and remove the stale Teams ASR cache.",
+			Diagnostic: raw,
+		}
+	}
+	if strings.Contains(lower, "configured ") && strings.Contains(lower, " is not usable at ") {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureInvalidUserConfig,
+			Summary:    "a user-configured Teams ASR path is not usable.",
+			Action:     "fix the configured path or remove the override so the helper can use the managed runtime.",
+			Diagnostic: raw,
+		}
+	}
+	if strings.Contains(lower, "managed ffmpeg is not available") ||
+		strings.Contains(lower, "unsupported") {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureUnsupportedRuntime,
+			Summary:    "this platform or ASR runtime option is not supported by the managed setup.",
+			Action:     "use a supported platform/backend or configure a known-good external ASR command.",
+			Diagnostic: raw,
+		}
+	}
+	if strings.Contains(lower, "ffmpeg") || strings.Contains(lower, "audio") || strings.Contains(lower, "decode") {
+		notice.Kind = teamsASRFailureMediaPreprocess
+		notice.Summary = "the helper could not decode or prepare the Teams media for local speech recognition."
+		notice.Action = "retry with a valid Teams audio/video attachment, or check ffmpeg availability for this platform."
+		return notice
+	}
+	notice.Kind = teamsASRFailureRuntimeFailed
+	return notice
 }
 
 func teamsASRStatusLine(transcriber ASRTranscriber) string {

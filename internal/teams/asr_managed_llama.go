@@ -165,7 +165,7 @@ func ensureManagedASRLlamaRuntime(ctx context.Context, cfg ManagedASRConfig) (ma
 		return managedASRLlamaRuntime{}, err
 	}
 	if !locked {
-		return managedASRLlamaRuntime{}, fmt.Errorf("Teams speech recognition setup is already running in another helper process")
+		return managedASRLlamaRuntime{}, managedASRSetupBusyError{Scope: "Teams speech recognition"}
 	}
 	defer func() { _ = lock.Unlock() }()
 
@@ -255,7 +255,7 @@ func ensureManagedASRLlamaBinary(ctx context.Context, llamaRoot string, cfg Mana
 	}
 
 	installRoot := filepath.Join(llamaRoot, "runtime")
-	if command, env, acceleration, ok := managedASRLlamaBinaryFromMarker(installRoot); ok {
+	if command, env, acceleration, ok := managedASRLlamaBinaryFromMarker(ctx, installRoot); ok {
 		if managedASRLlamaAccelerationMatchesDevice(acceleration, cfg.LlamaDevice) {
 			return command, env, acceleration, nil
 		}
@@ -294,7 +294,7 @@ func ensureManagedASRLlamaBinary(ctx context.Context, llamaRoot string, cfg Mana
 	return "", nil, "", err
 }
 
-func managedASRLlamaBinaryFromMarker(installRoot string) (string, []string, string, bool) {
+func managedASRLlamaBinaryFromMarker(ctx context.Context, installRoot string) (string, []string, string, bool) {
 	markerPath := filepath.Join(installRoot, "runtime.json")
 	data, err := os.ReadFile(markerPath)
 	if err != nil {
@@ -314,6 +314,12 @@ func managedASRLlamaBinaryFromMarker(installRoot string) (string, []string, stri
 	}
 	if marker.BinarySize > 0 && info.Size() != marker.BinarySize {
 		return "", nil, "", false
+	}
+	if marker.NativeCompat {
+		compat, ok := managedASRNativeCompatFromMarker(filepath.Join(filepath.Dir(command), managedASRNativeCompatDirName))
+		if !ok || !managedASRNativeCompatCommandUsesCurrentInterpreter(ctx, command, compat) {
+			return "", nil, "", false
+		}
 	}
 	return command, managedASRLlamaInstallEnvForCommand(installRoot, command), strings.TrimSpace(marker.Acceleration), true
 }
@@ -422,14 +428,35 @@ func installManagedASRLlamaBinary(ctx context.Context, installRoot string, asset
 	if err := writePrivateFileReplacing(filepath.Join(staging, "runtime.json"), append(markerData, '\n'), 0o600); err != nil {
 		return "", nil, err
 	}
-	if err := os.RemoveAll(installRoot); err != nil {
-		return "", nil, err
-	}
-	if err := os.Rename(staging, installRoot); err != nil {
-		return "", nil, err
-	}
 	finalCommand := filepath.Join(installRoot, rel)
-	return finalCommand, managedASRLlamaInstallEnvForCommand(installRoot, finalCommand), nil
+	finalEnv := managedASRLlamaInstallEnvForCommand(installRoot, finalCommand)
+	var postPublish func() error
+	if nativeCompat {
+		postPublish = func() error {
+			compat, ok := managedASRNativeCompatFromMarker(filepath.Join(filepath.Dir(finalCommand), managedASRNativeCompatDirName))
+			if !ok {
+				return managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime native compatibility marker is not usable after install")}
+			}
+			apply := applyManagedASRLlamaNativeCompatFn
+			if apply == nil {
+				apply = applyManagedASRLlamaNativeCompat
+			}
+			if err := apply(ctx, finalCommand, compat); err != nil {
+				return managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime native compatibility final patch failed: %w", err)}
+			}
+			finalEnv = managedASRLlamaInstallEnvForCommand(installRoot, finalCommand)
+			if validateManagedASRLlamaBinaryFn != nil {
+				if err := validateManagedASRLlamaBinaryFn(ctx, finalCommand, finalEnv); err != nil {
+					return managedASRLlamaValidationError{Err: fmt.Errorf("downloaded llama.cpp runtime is not usable after native compatibility final patch: %w", err)}
+				}
+			}
+			return nil
+		}
+	}
+	if err := managedASRPublishDirWithPostPublish("llama.cpp runtime", staging, installRoot, postPublish); err != nil {
+		return "", nil, err
+	}
+	return finalCommand, finalEnv, nil
 }
 
 func ensureManagedASRLlamaModelFiles(ctx context.Context, llamaRoot string, cfg ManagedASRConfig) (string, string, error) {
@@ -599,7 +626,7 @@ func ensureManagedASRFFmpeg(ctx context.Context, installRoot string) (string, er
 		return "", err
 	}
 	if !locked {
-		return "", fmt.Errorf("Teams speech recognition ffmpeg setup is already running in another helper process")
+		return "", managedASRSetupBusyError{Scope: "Teams speech recognition ffmpeg"}
 	}
 	defer func() { _ = lock.Unlock() }()
 	if path, ok := managedASRFFmpegFromMarker(installRoot); ok {
@@ -683,10 +710,7 @@ func installManagedASRFFmpeg(ctx context.Context, installRoot string, asset mana
 	if err := writePrivateFileReplacing(filepath.Join(staging, "runtime.json"), append(data, '\n'), 0o600); err != nil {
 		return "", err
 	}
-	if err := os.RemoveAll(installRoot); err != nil {
-		return "", err
-	}
-	if err := os.Rename(staging, installRoot); err != nil {
+	if err := managedASRPublishDir("ffmpeg runtime", staging, installRoot); err != nil {
 		return "", err
 	}
 	return filepath.Join(installRoot, rel), nil
@@ -909,16 +933,19 @@ func downloadManagedASRLlamaFileOnce(ctx context.Context, asset managedASRLlamaF
 		return err
 	}
 	if asset.Size > 0 && written != asset.Size {
-		return fmt.Errorf("download %s: downloaded %d bytes, want %d", label, written, asset.Size)
+		return managedASRDownloadIntegrityError{Label: label, Err: fmt.Errorf("downloaded %d bytes, want %d", written, asset.Size)}
 	}
 	gotSHA := hex.EncodeToString(hash.Sum(nil))
 	if strings.TrimSpace(asset.SHA256) != "" && !strings.EqualFold(gotSHA, asset.SHA256) {
-		return fmt.Errorf("download %s: sha256 %s, want %s", label, gotSHA, asset.SHA256)
+		return managedASRDownloadIntegrityError{Label: label, Err: fmt.Errorf("sha256 %s, want %s", gotSHA, asset.SHA256)}
 	}
 	if err := os.Chmod(tmpPath, 0o600); err != nil {
 		return err
 	}
-	return replaceFile(tmpPath, path)
+	if err := durableReplaceFile(tmpPath, path); err != nil {
+		return managedASRCacheError{Op: "publish downloaded " + label, Path: path, Err: err}
+	}
+	return nil
 }
 
 func extractManagedASRZip(archivePath string, dest string) error {

@@ -228,6 +228,100 @@ func TestPlanTeamsHTMLChunksStaysUnderHardLimitAndOrdersParts(t *testing.T) {
 	}
 }
 
+func TestPlanTeamsHTMLChunksPreservesStatusListItemLines(t *testing.T) {
+	var lines []string
+	for i := 1; i <= 18; i++ {
+		lines = append(lines, strconvItoa(i)+". request-"+strconvItoa(i)+" "+strings.Repeat("detail ", 14))
+	}
+	text := strings.Join(lines, "\n")
+	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
+		Surface: TeamsRenderSurfaceOutbox,
+		Kind:    TeamsRenderHelper,
+		Text:    text,
+	}, TeamsRenderOptions{
+		TargetLimitBytes: 430,
+		HardLimitBytes:   520,
+	})
+	if len(chunks) < 2 {
+		t.Fatalf("expected status list to split, got %d chunk", len(chunks))
+	}
+	var joined strings.Builder
+	for i, chunk := range chunks {
+		if chunk.ByteLength > 520 {
+			t.Fatalf("chunk %d rendered to %d bytes", i, chunk.ByteLength)
+		}
+		if i < len(chunks)-1 && !strings.HasSuffix(chunk.Text, "\n") {
+			t.Fatalf("chunk %d split a status item instead of ending on a line boundary:\n%q", i, chunk.Text)
+		}
+		if i > 0 {
+			firstLine := strings.SplitN(chunk.Text, "\n", 2)[0]
+			if !strings.Contains(firstLine, ". request-") {
+				t.Fatalf("chunk %d starts with a partial status item:\n%q", i, chunk.Text)
+			}
+		}
+		joined.WriteString(chunk.Text)
+	}
+	if joined.String() != normalizeTeamsRenderTextForKind(TeamsRenderHelper, text) {
+		t.Fatalf("chunk text did not conserve status list\nwant: %q\n got: %q", normalizeTeamsRenderTextForKind(TeamsRenderHelper, text), joined.String())
+	}
+}
+
+func TestPlanTeamsHTMLChunksPreservesLineBoundariesAcrossLimits(t *testing.T) {
+	var lines []string
+	lineSet := map[string]bool{}
+	for i := 1; i <= 32; i++ {
+		line := strconvItoa(i) + ". status-item-" + strconvItoa(i) + " <&> " + strings.Repeat("payload ", 3+i%5)
+		lines = append(lines, line)
+		lineSet[line] = true
+	}
+	text := strings.Join(lines, "\n")
+	normalized := normalizeTeamsRenderTextForKind(TeamsRenderHelper, text)
+	for _, tc := range []struct {
+		name   string
+		target int
+		hard   int
+	}{
+		{name: "tight", target: 420, hard: 520},
+		{name: "medium", target: 640, hard: 760},
+		{name: "wide", target: 920, hard: 1040},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
+				Surface: TeamsRenderSurfaceOutbox,
+				Kind:    TeamsRenderHelper,
+				Text:    text,
+			}, TeamsRenderOptions{
+				TargetLimitBytes: tc.target,
+				HardLimitBytes:   tc.hard,
+			})
+			if len(chunks) < 2 {
+				t.Fatalf("expected multiple chunks, got %d", len(chunks))
+			}
+			var joined strings.Builder
+			for i, chunk := range chunks {
+				if chunk.ByteLength > tc.hard {
+					t.Fatalf("chunk %d rendered to %d bytes, want <= %d", i, chunk.ByteLength, tc.hard)
+				}
+				if i < len(chunks)-1 && !strings.HasSuffix(chunk.Text, "\n") {
+					t.Fatalf("chunk %d split a line instead of ending at a newline:\n%q", i, chunk.Text)
+				}
+				for _, line := range strings.Split(strings.TrimSuffix(chunk.Text, "\n"), "\n") {
+					if line == "" {
+						continue
+					}
+					if !lineSet[line] {
+						t.Fatalf("chunk %d contains partial or reordered line %q in:\n%q", i, line, chunk.Text)
+					}
+				}
+				joined.WriteString(chunk.Text)
+			}
+			if got := joined.String(); got != normalized {
+				t.Fatalf("chunk text did not conserve full lines\nwant: %q\n got: %q", normalized, got)
+			}
+		})
+	}
+}
+
 func TestDefaultTeamsChunkLimitsAreClientConservative(t *testing.T) {
 	if TeamsRenderHardLimitBytes != 32*1024 {
 		t.Fatalf("TeamsRenderHardLimitBytes = %d, want %d", TeamsRenderHardLimitBytes, 32*1024)
