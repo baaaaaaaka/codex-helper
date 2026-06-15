@@ -53,14 +53,15 @@ PYTHON_ASSET = {
     "component": "python-build-standalone-linux-x64",
     "name": "cpython-3.10.20+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
     "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.10.20+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
-    "sha256": "",
+    "sha256": "dc734bdd388975c0b093fe730b272af741a2e192475d38bc6845a687b6405922",
+    "size": 29324796,
     "archive": "tar.gz",
 }
 
 # Default probe avoids torch-sized downloads while covering the audio/native
 # closure that has produced libsndfile/FFmpeg-style failures.
 AUDIO_PROBE_PACKAGES = [
-    ("soundfile", True),
+    ("soundfile==0.13.1", True),
     ("soxr", True),
     ("av", True),
     ("librosa", True),
@@ -363,7 +364,10 @@ def download(asset, downloads_dir, issues, seen):
     ensure_dir(downloads_dir)
     dest = os.path.join(downloads_dir, asset["name"])
     expected = asset.get("sha256", "").strip()
-    if os.path.exists(dest) and (not expected or sha256_file(dest) == expected):
+    expected_size = int(asset.get("size") or 0)
+    if os.path.exists(dest) and (not expected_size or os.path.getsize(dest) == expected_size) and (
+        not expected or sha256_file(dest) == expected
+    ):
         return dest
 
     tmp = dest + ".tmp"
@@ -373,6 +377,7 @@ def download(asset, downloads_dir, issues, seen):
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
                 h = hashlib.sha256()
+                written = 0
                 with open(tmp, "wb") as fh:
                     while True:
                         chunk = response.read(1024 * 1024)
@@ -380,10 +385,13 @@ def download(asset, downloads_dir, issues, seen):
                             break
                         h.update(chunk)
                         fh.write(chunk)
+                        written += len(chunk)
+            if expected_size and written != expected_size:
+                raise RuntimeError("size mismatch: got {0}, want {1}".format(written, expected_size))
             got = h.hexdigest()
             if expected and got != expected:
                 raise RuntimeError("sha256 mismatch: got {0}, want {1}".format(got, expected))
-            os.rename(tmp, dest)
+            os.replace(tmp, dest)
             return dest
         except Exception as exc:  # noqa: BLE001 - CI diagnostic should keep going.
             last_error = exc

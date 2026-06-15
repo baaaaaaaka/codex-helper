@@ -2129,6 +2129,7 @@ func TestManagedASRPackageInstallPlanIncludesTorchAndPinnedRuntimeTools(t *testi
 		"--only-binary=:all:",
 		"qwen-asr==0.0.6",
 		"imageio-ffmpeg==0.6.0",
+		"soundfile==0.13.1",
 		"torch>=2.4,<2.13",
 	)
 }
@@ -2228,6 +2229,79 @@ func TestManagedASRStandalonePythonPinnedAssetUsesDirectDownloadURL(t *testing.T
 			t.Fatalf("asset = %#v, missing %q", got, want)
 		}
 	}
+	if got.Size <= 0 || strings.TrimSpace(got.SHA256) == "" {
+		t.Fatalf("asset = %#v, want pinned size and sha256", got)
+	}
+	for _, platform := range []struct {
+		goos   string
+		goarch string
+	}{
+		{goos: "linux", goarch: "amd64"},
+		{goos: "linux", goarch: "arm64"},
+		{goos: "darwin", goarch: "amd64"},
+		{goos: "darwin", goarch: "arm64"},
+		{goos: "windows", goarch: "amd64"},
+	} {
+		assets, err := managedASRStandalonePythonAssets(platform.goos, platform.goarch)
+		if err != nil {
+			t.Fatalf("assets for %s/%s: %v", platform.goos, platform.goarch, err)
+		}
+		if len(assets) != 2 {
+			t.Fatalf("assets for %s/%s = %d, want stripped and unstripped", platform.goos, platform.goarch, len(assets))
+		}
+		for _, asset := range assets {
+			if asset.Size <= 0 || strings.TrimSpace(asset.SHA256) == "" {
+				t.Fatalf("asset for %s/%s = %#v, want pinned size and sha256", platform.goos, platform.goarch, asset)
+			}
+		}
+	}
+}
+
+func TestManagedASRStandalonePythonDownloadRejectsSizeAndHashMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("actual data"))
+	}))
+	defer server.Close()
+	prevHTTPClient := managedASRStandalonePythonHTTPClient
+	t.Cleanup(func() { managedASRStandalonePythonHTTPClient = prevHTTPClient })
+	managedASRStandalonePythonHTTPClient = server.Client()
+
+	tmp := t.TempDir()
+	sizeTarget := filepath.Join(tmp, "size.tar.gz")
+	_, sizeErr := downloadManagedASRStandalonePythonArchive(context.Background(), managedASRStandalonePythonAsset{
+		Name:   "python.tar.gz",
+		URL:    server.URL + "/python.tar.gz",
+		Size:   999,
+		SHA256: managedASRTestSHA256([]byte("actual data")),
+	}, sizeTarget)
+	if sizeErr == nil || !strings.Contains(sizeErr.Error(), "downloaded 11 bytes, want 999") {
+		t.Fatalf("size mismatch error = %v", sizeErr)
+	}
+	var sizeIntegrityErr managedASRDownloadIntegrityError
+	if !errors.As(sizeErr, &sizeIntegrityErr) {
+		t.Fatalf("size mismatch error type = %T, want managedASRDownloadIntegrityError", sizeErr)
+	}
+	if _, statErr := os.Stat(sizeTarget); !os.IsNotExist(statErr) {
+		t.Fatalf("size mismatch target stat = %v, want no published archive", statErr)
+	}
+
+	hashTarget := filepath.Join(tmp, "hash.tar.gz")
+	_, hashErr := downloadManagedASRStandalonePythonArchive(context.Background(), managedASRStandalonePythonAsset{
+		Name:   "python.tar.gz",
+		URL:    server.URL + "/python.tar.gz",
+		Size:   int64(len("actual data")),
+		SHA256: strings.Repeat("0", 64),
+	}, hashTarget)
+	if hashErr == nil || !strings.Contains(hashErr.Error(), "sha256") {
+		t.Fatalf("hash mismatch error = %v", hashErr)
+	}
+	var hashIntegrityErr managedASRDownloadIntegrityError
+	if !errors.As(hashErr, &hashIntegrityErr) {
+		t.Fatalf("hash mismatch error type = %T, want managedASRDownloadIntegrityError", hashErr)
+	}
+	if _, statErr := os.Stat(hashTarget); !os.IsNotExist(statErr) {
+		t.Fatalf("hash mismatch target stat = %v, want no published archive", statErr)
+	}
 }
 
 func TestManagedASRStandalonePythonDownloadsExtractsAndMarksRuntime(t *testing.T) {
@@ -2266,6 +2340,8 @@ func TestManagedASRStandalonePythonDownloadsExtractsAndMarksRuntime(t *testing.T
 		ReleaseTag: managedASRStandalonePythonReleaseTag,
 		Name:       "cpython-" + managedASRStandalonePythonVersion + "+" + managedASRStandalonePythonReleaseTag + "-" + target + "-install_only_stripped.tar.gz",
 		URL:        server.URL + "/asset.tar.gz",
+		SHA256:     managedASRTestSHA256(archive),
+		Size:       int64(len(archive)),
 		Target:     target,
 	})
 	if err != nil {

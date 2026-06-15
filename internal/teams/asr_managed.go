@@ -37,6 +37,7 @@ const (
 var managedASRRuntimePackages = []string{
 	"qwen-asr==0.0.6",
 	"imageio-ffmpeg==0.6.0",
+	"soundfile==0.13.1",
 	"torch>=2.4,<2.13",
 }
 

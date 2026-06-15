@@ -334,6 +334,14 @@ func classifyTeamsASRFailure(err error) teamsASRFailureNotice {
 			Diagnostic: raw,
 		}
 	}
+	if versions := managedASRNativeCompatSymbolVersionRE.FindAllString(raw, -1); len(versions) > 0 && !managedASRNativeCompatSymbolVersionsCanRepair(versions) {
+		return teamsASRFailureNotice{
+			Kind:       teamsASRFailureUnsupportedRuntime,
+			Summary:    "this host or ASR binary requires native symbol versions newer than the managed compatibility profiles support.",
+			Action:     "update the helper when a newer compatibility profile is available, or use a host/runtime with older native symbol requirements.",
+			Diagnostic: raw,
+		}
+	}
 	if managedASRLlamaNativeCompatCanRepair(err) ||
 		strings.Contains(lower, "native compatibility") ||
 		strings.Contains(lower, "glibc") ||

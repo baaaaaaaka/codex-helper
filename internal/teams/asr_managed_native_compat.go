@@ -165,6 +165,18 @@ func managedASRNativeCompatSymbolVersionCanRepair(version string) bool {
 	return false
 }
 
+func managedASRNativeCompatSymbolVersionsCanRepair(versions []string) bool {
+	if len(versions) == 0 {
+		return false
+	}
+	for _, profile := range managedASRNativeCompatProfiles() {
+		if managedASRNativeCompatProfileCanRepairSymbolVersions(profile, versions) {
+			return true
+		}
+	}
+	return false
+}
+
 func managedASRNativeCompatProfileCanRepairSymbolVersions(profile managedASRNativeCompatProfile, versions []string) bool {
 	if len(versions) == 0 {
 		return false

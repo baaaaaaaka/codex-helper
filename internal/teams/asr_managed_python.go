@@ -34,6 +34,7 @@ type managedASRStandalonePythonAsset struct {
 	ReleaseTag string
 	Name       string
 	URL        string
+	SHA256     string
 	Size       int64
 	Target     string
 }
@@ -113,7 +114,7 @@ func installManagedASRStandalonePython(ctx context.Context, installRoot string, 
 	if err := os.MkdirAll(staging, 0o700); err != nil {
 		return managedASRBootstrapPython{}, err
 	}
-	sum, err := downloadManagedASRStandalonePythonArchive(ctx, asset.URL, archivePath)
+	sum, err := downloadManagedASRStandalonePythonArchive(ctx, asset, archivePath)
 	if err != nil {
 		return managedASRBootstrapPython{}, err
 	}
@@ -161,8 +162,8 @@ func installManagedASRStandalonePython(ctx context.Context, installRoot string, 
 	}, nil
 }
 
-func downloadManagedASRStandalonePythonArchive(ctx context.Context, url string, path string) (string, error) {
-	url = strings.TrimSpace(url)
+func downloadManagedASRStandalonePythonArchive(ctx context.Context, asset managedASRStandalonePythonAsset, path string) (string, error) {
+	url := strings.TrimSpace(asset.URL)
 	if url == "" {
 		return "", fmt.Errorf("managed Python download URL is empty")
 	}
@@ -192,12 +193,20 @@ func downloadManagedASRStandalonePythonArchive(ctx context.Context, url string, 
 	tmpPath := tmp.Name()
 	defer func() { _ = os.Remove(tmpPath) }()
 	hash := sha256.New()
-	if _, err := io.Copy(tmp, io.TeeReader(resp.Body, hash)); err != nil {
+	written, err := io.Copy(tmp, io.TeeReader(resp.Body, hash))
+	if err != nil {
 		_ = tmp.Close()
 		return "", err
 	}
 	if err := tmp.Close(); err != nil {
 		return "", err
+	}
+	if asset.Size > 0 && written != asset.Size {
+		return "", managedASRDownloadIntegrityError{Label: "managed Python archive", Err: fmt.Errorf("downloaded %d bytes, want %d", written, asset.Size)}
+	}
+	gotSHA := hex.EncodeToString(hash.Sum(nil))
+	if strings.TrimSpace(asset.SHA256) != "" && !strings.EqualFold(gotSHA, asset.SHA256) {
+		return "", managedASRDownloadIntegrityError{Label: "managed Python archive", Err: fmt.Errorf("sha256 %s, want %s", gotSHA, asset.SHA256)}
 	}
 	if err := os.Chmod(tmpPath, 0o600); err != nil {
 		return "", err
@@ -205,7 +214,7 @@ func downloadManagedASRStandalonePythonArchive(ctx context.Context, url string, 
 	if err := durableReplaceFile(tmpPath, path); err != nil {
 		return "", managedASRCacheError{Op: "publish downloaded managed Python archive", Path: path, Err: err}
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return gotSHA, nil
 }
 
 func resolveManagedASRStandalonePythonAsset(_ context.Context, goos string, goarch string) (managedASRStandalonePythonAsset, error) {
@@ -224,14 +233,41 @@ func managedASRStandalonePythonAssets(goos string, goarch string) ([]managedASRS
 	var out []managedASRStandalonePythonAsset
 	for _, suffix := range []string{"install_only_stripped", "install_only"} {
 		name := fmt.Sprintf("cpython-%s+%s-%s-%s.tar.gz", managedASRStandalonePythonVersion, managedASRStandalonePythonReleaseTag, target, suffix)
+		size, sha256, ok := managedASRStandalonePythonAssetIntegrity(name)
+		if !ok {
+			return nil, fmt.Errorf("managed Teams speech recognition Python asset %q has no pinned integrity metadata", name)
+		}
 		out = append(out, managedASRStandalonePythonAsset{
 			ReleaseTag: managedASRStandalonePythonReleaseTag,
 			Name:       name,
 			URL:        managedASRStandalonePythonDownloadBase + "/" + managedASRStandalonePythonReleaseTag + "/" + name,
+			SHA256:     sha256,
+			Size:       size,
 			Target:     target,
 		})
 	}
 	return out, nil
+}
+
+func managedASRStandalonePythonAssetIntegrity(name string) (int64, string, bool) {
+	type integrity struct {
+		size   int64
+		sha256 string
+	}
+	assets := map[string]integrity{
+		"cpython-3.10.20+20260510-aarch64-apple-darwin-install_only.tar.gz":               {size: 25921421, sha256: "22f02aa2458efa28029f91800c3d85a270ae308a2d8450f3f6cef49f56abfa48"},
+		"cpython-3.10.20+20260510-aarch64-apple-darwin-install_only_stripped.tar.gz":      {size: 25826007, sha256: "36b7364a5cd75e5b8591c4dc6cc30d84d9112b62a2b8199c406d63f2ca2f981f"},
+		"cpython-3.10.20+20260510-aarch64-unknown-linux-gnu-install_only.tar.gz":          {size: 43843105, sha256: "e204550daa63afd113519feb71732f77b5ff56e4a383acf26d0b5aa2c79dadff"},
+		"cpython-3.10.20+20260510-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz": {size: 29734163, sha256: "9f0becaa10fff71a455dcc9f4343cd784ee506a63d770d87fe92030cb376feee"},
+		"cpython-3.10.20+20260510-x86_64-apple-darwin-install_only.tar.gz":                {size: 25634496, sha256: "9a48464592efe7a1d8a0df9a1868f0b1bf36cbf72997f503b4bbdca26ff9d96a"},
+		"cpython-3.10.20+20260510-x86_64-apple-darwin-install_only_stripped.tar.gz":       {size: 25559363, sha256: "e7ce16965714c05b2cc4515f20cd0c1f8d4fef037bd34daf18d924677f6545b8"},
+		"cpython-3.10.20+20260510-x86_64-pc-windows-msvc-install_only.tar.gz":             {size: 39591215, sha256: "b64ea8bb067d9dbcaf197818dd57e56173033d302dcd0be29020088827529224"},
+		"cpython-3.10.20+20260510-x86_64-pc-windows-msvc-install_only_stripped.tar.gz":    {size: 22259051, sha256: "d1e8fb30cba04e6bb5a703e0186da77f833957de027562fa4df9fd0424ae5f7e"},
+		"cpython-3.10.20+20260510-x86_64-unknown-linux-gnu-install_only.tar.gz":           {size: 43672750, sha256: "338ae9e6916c85a354ba0258ac0eaaef63c0389b30d82d2467e90a1a32b1789b"},
+		"cpython-3.10.20+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz":  {size: 29324796, sha256: "dc734bdd388975c0b093fe730b272af741a2e192475d38bc6845a687b6405922"},
+	}
+	item, ok := assets[name]
+	return item.size, item.sha256, ok
 }
 
 func managedASRStandalonePythonTarget(goos string, goarch string) (string, error) {

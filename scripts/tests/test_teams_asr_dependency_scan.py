@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import tempfile
 import unittest
@@ -67,6 +68,60 @@ class TeamsASRDependencyScanTests(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0]["library"], "libsndfile")
 
+    def test_download_rejects_cached_and_downloaded_size_mismatch(self) -> None:
+        class FakeResponse:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+                self.offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                if self.offset:
+                    return b""
+                self.offset = len(self.body)
+                return self.body
+
+        original_urlopen = self.scanner.urllib.request.urlopen
+        original_sleep = self.scanner.time.sleep
+        bodies = [b"good"]
+
+        def fake_urlopen(_request, timeout=120):
+            return FakeResponse(bodies[-1])
+
+        self.scanner.urllib.request.urlopen = fake_urlopen
+        self.scanner.time.sleep = lambda _seconds: None
+        self.addCleanup(lambda: setattr(self.scanner.urllib.request, "urlopen", original_urlopen))
+        self.addCleanup(lambda: setattr(self.scanner.time, "sleep", original_sleep))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asset = {
+                "component": "asset",
+                "name": "asset.bin",
+                "url": "https://example.invalid/asset.bin",
+                "sha256": hashlib.sha256(b"good").hexdigest(),
+                "size": 4,
+            }
+            stale = Path(temp_dir) / "asset.bin"
+            stale.write_bytes(b"bad")
+            issues = []
+            got = self.scanner.download(asset, temp_dir, issues, set())
+            self.assertEqual(Path(got).read_bytes(), b"good")
+            self.assertEqual(issues, [])
+
+            bodies.append(b"bad")
+            asset["name"] = "bad-size.bin"
+            asset["sha256"] = hashlib.sha256(b"bad").hexdigest()
+            issues = []
+            got = self.scanner.download(asset, temp_dir, issues, set())
+            self.assertIsNone(got)
+            self.assertEqual(issues[0]["kind"], "download_failed")
+            self.assertIn("size mismatch", issues[0]["detail"])
+
     def test_render_text_groups_all_issues(self) -> None:
         report = self.scanner.build_report()
         report["native_files_scanned"] = 2
@@ -132,6 +187,7 @@ class TeamsASRDependencyScanTests(unittest.TestCase):
         packages = [entry[0] if isinstance(entry, tuple) else entry for entry in self.scanner.AUDIO_PROBE_PACKAGES]
         joined = " ".join(packages).lower()
 
+        self.assertIn("soundfile==0.13.1", packages)
         self.assertNotIn("torch", joined)
         for marker in ("cuda", "cudnn", "cublas", "nccl"):
             self.assertNotIn(marker, joined)

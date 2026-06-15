@@ -269,6 +269,15 @@ func TestTeamsASRFailureUserMessageClassifiesActionableFailures(t *testing.T) {
 			},
 		},
 		{
+			name:     "native symbol newer than managed profiles",
+			err:      managedASRLlamaValidationError{Err: errors.New("/lib64/libc.so.6: version `GLIBC_2.40' not found")},
+			wantKind: teamsASRFailureUnsupportedRuntime,
+			wantParts: []string{
+				"newer than the managed compatibility profiles",
+				"GLIBC_2.40",
+			},
+		},
+		{
 			name:     "missing managed binary",
 			err:      errors.New("run llama.cpp Teams speech recognition: fork/exec /home/user/.cache/codex-helper/teams-asr/qwen_qwen3-asr-0.6b/llama/runtime/llama-b9437/llama-mtmd-cli: no such file or directory"),
 			wantKind: teamsASRFailureCachePreparation,
