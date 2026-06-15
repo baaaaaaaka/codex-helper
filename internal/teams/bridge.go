@@ -1310,8 +1310,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		s := session
 		turns := queueStateBySession[s.ID]
 		pollOptions := pollChatWithRoleOptions{
-			AllowBacklogDrain: decision.State != inboundPollStateCold && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0,
-			MaxBacklogActions: 1,
+			AllowBacklogDrain:        decision.State != inboundPollStateCold && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0,
+			MaxBacklogActions:        1,
+			RecoverStaleContinuation: true,
 		}
 		if _, err := b.pollChatWithRoleStateOptions(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], pollOptions, func(ctx context.Context, msg ChatMessage, text string) error {
 			return b.handleSessionMessageWithQueueState(ctx, s.ChatID, msg, text, &turns, nil)
@@ -1566,8 +1567,9 @@ func (b *Bridge) pollChatWithRoleState(ctx context.Context, chatID string, top i
 }
 
 type pollChatWithRoleOptions struct {
-	AllowBacklogDrain bool
-	MaxBacklogActions int
+	AllowBacklogDrain        bool
+	MaxBacklogActions        int
+	RecoverStaleContinuation bool
 }
 
 func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, opts pollChatWithRoleOptions, handle func(context.Context, ChatMessage, string) error) (bool, error) {
@@ -1601,30 +1603,45 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 			continuationPath = headContinuationPath
 		}
 	}
+	clearedStaleTerminalHeadContinuation := false
 	if seeded && role != inboundPollRoleControl && !handled && opts.AllowBacklogDrain && strings.TrimSpace(poll.ContinuationPath) != "" {
 		backlogWindow, backlogErr := b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, poll.ContinuationPath)
 		if backlogErr != nil {
-			_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, backlogErr.Error(), inboundPollBlockedUntil(poll, backlogErr, time.Now()))
-			return handled, backlogErr
-		}
-		backlogResult, backlogErr := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll, backlogWindow, top, opts.MaxBacklogActions, handle)
-		if backlogErr != nil {
-			return handled || backlogResult.Handled, backlogErr
-		}
-		handled = handled || backlogResult.Handled
-		activityAt = latestTime(activityAt, backlogResult.ActivityAt)
-		maxModified = latestTime(maxModified, backlogResult.MaxModified)
-		windowFull = windowFull || backlogResult.WindowFull
-		fetched += backlogResult.Fetched
-		if !backlogResult.ActionLimitReached {
-			if backlogWindow.Truncated {
-				continuationPath = backlogWindow.NextPath
-			} else if headContinuationPath != "" {
-				continuationPath = headContinuationPath
+			if opts.RecoverStaleContinuation && stalePollContinuationError(backlogErr) {
+				if headContinuationPath != "" && shouldKeepTerminalHeadContinuation(poll, headResult) {
+					continuationPath = headContinuationPath
+				} else {
+					continuationPath = ""
+					clearedStaleTerminalHeadContinuation = headContinuationPath != ""
+				}
 			} else {
-				continuationPath = ""
+				_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, backlogErr.Error(), inboundPollBlockedUntil(poll, backlogErr, time.Now()))
+				return handled, backlogErr
+			}
+		} else {
+			backlogResult, backlogErr := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll, backlogWindow, top, opts.MaxBacklogActions, handle)
+			if backlogErr != nil {
+				return handled || backlogResult.Handled, backlogErr
+			}
+			handled = handled || backlogResult.Handled
+			activityAt = latestTime(activityAt, backlogResult.ActivityAt)
+			maxModified = latestTime(maxModified, backlogResult.MaxModified)
+			windowFull = windowFull || backlogResult.WindowFull
+			fetched += backlogResult.Fetched
+			if !backlogResult.ActionLimitReached {
+				if backlogWindow.Truncated {
+					continuationPath = backlogWindow.NextPath
+				} else if headContinuationPath != "" && shouldKeepTerminalHeadContinuation(poll, headResult) {
+					continuationPath = headContinuationPath
+				} else {
+					continuationPath = ""
+					clearedStaleTerminalHeadContinuation = headContinuationPath != ""
+				}
 			}
 		}
+	}
+	if clearedStaleTerminalHeadContinuation {
+		windowFull = false
 	}
 	if headContinuationPath != "" && strings.TrimSpace(poll.ContinuationPath) != "" && strings.TrimSpace(continuationPath) != headContinuationPath {
 		maxModified = poll.LastModifiedCursor
@@ -1740,6 +1757,43 @@ func existingWorkContinuationPath(role inboundPollRole, poll teamstore.ChatPollS
 		return ""
 	}
 	return strings.TrimSpace(poll.ContinuationPath)
+}
+
+func shouldKeepTerminalHeadContinuation(poll teamstore.ChatPollState, head pollMessageWindowResult) bool {
+	if poll.LastModifiedCursor.IsZero() {
+		return true
+	}
+	return head.MaxModified.After(poll.LastModifiedCursor)
+}
+
+func stalePollContinuationError(err error) bool {
+	var graphErr *GraphStatusError
+	if !errors.As(err, &graphErr) {
+		return false
+	}
+	switch graphErr.StatusCode {
+	case http.StatusGone:
+		return true
+	case http.StatusNotFound:
+		return true
+	case http.StatusBadRequest:
+		return graphContinuationTokenError(graphErr)
+	default:
+		return false
+	}
+}
+
+func graphContinuationTokenError(err *GraphStatusError) bool {
+	if err == nil {
+		return false
+	}
+	joined := strings.ToLower(strings.Join([]string{err.Code, err.Message, err.Error()}, " "))
+	for _, token := range []string{"skiptoken", "skip token", "continuation", "syncstate", "sync state"} {
+		if strings.Contains(joined, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bridge) recordChatPollHandlerError(ctx context.Context, chatID string, poll teamstore.ChatPollState, err error) {
@@ -1894,7 +1948,7 @@ func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) e
 	}
 	processed := 0
 	for _, candidate := range candidates {
-		session, decision, ok := b.idleWorkChatAutoParkDecision(state, candidate, now)
+		session, poll, decision, ok := b.idleWorkChatAutoParkDecision(state, candidate, now)
 		if !ok {
 			continue
 		}
@@ -1903,12 +1957,45 @@ func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) e
 		if autoParkSweepGraphTimeout > 0 {
 			parkCtx, cancel = context.WithTimeout(ctx, autoParkSweepGraphTimeout)
 		}
+		countedCandidate := false
+		if strings.TrimSpace(poll.ContinuationPath) != "" {
+			handled, err := b.recoverIdleWorkChatContinuationBeforePark(parkCtx, state, session, poll)
+			if err != nil {
+				cancel()
+				return err
+			}
+			processed++
+			countedCandidate = true
+			if handled {
+				cancel()
+				if processed >= autoParkCandidatesPerSweep {
+					break
+				}
+				continue
+			}
+			latestState, err := b.store.HotPollScheduleState(ctx)
+			if err != nil {
+				cancel()
+				return err
+			}
+			state = latestState
+			session, poll, decision, ok = b.idleWorkChatAutoParkDecision(state, candidate, now)
+			if !ok || strings.TrimSpace(poll.ContinuationPath) != "" {
+				cancel()
+				if processed >= autoParkCandidatesPerSweep {
+					break
+				}
+				continue
+			}
+		}
 		err := b.parkIdleWorkChat(parkCtx, session, decision)
 		cancel()
 		if err != nil {
 			return err
 		}
-		processed++
+		if !countedCandidate {
+			processed++
+		}
 		if processed >= autoParkCandidatesPerSweep {
 			break
 		}
@@ -1916,7 +2003,21 @@ func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) e
 	return nil
 }
 
-func (b *Bridge) idleWorkChatAutoParkDecision(state teamstore.State, candidate teamstore.IdleWorkChatParkCandidate, now time.Time) (Session, inboundPollDecision, bool) {
+func (b *Bridge) recoverIdleWorkChatContinuationBeforePark(ctx context.Context, state teamstore.State, session Session, poll teamstore.ChatPollState) (bool, error) {
+	if strings.TrimSpace(poll.ContinuationPath) == "" {
+		return false, nil
+	}
+	turns := pollSessionTurnQueueStates(state)[session.ID]
+	return b.pollChatWithRoleStateOptions(ctx, session.ChatID, effectiveOwnerPollTop(ownerPollMessageTop), inboundPollRoleWork, false, poll, true, pollChatWithRoleOptions{
+		AllowBacklogDrain:        true,
+		MaxBacklogActions:        1,
+		RecoverStaleContinuation: true,
+	}, func(ctx context.Context, msg ChatMessage, text string) error {
+		return b.handleSessionMessageWithQueueState(ctx, session.ChatID, msg, text, &turns, &state)
+	})
+}
+
+func (b *Bridge) idleWorkChatAutoParkDecision(state teamstore.State, candidate teamstore.IdleWorkChatParkCandidate, now time.Time) (Session, teamstore.ChatPollState, inboundPollDecision, bool) {
 	durable := candidate.Session
 	session := registrySessionFromDurable(durable)
 	durableSessions := map[string]teamstore.SessionContext{}
@@ -1925,11 +2026,11 @@ func (b *Bridge) idleWorkChatAutoParkDecision(state teamstore.State, candidate t
 	}
 	pollable, ok := pollableWorkSessionFromRegistryOptions(durableSessions, session, b.reg.ControlChatID, true)
 	if !ok {
-		return Session{}, inboundPollDecision{}, false
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
 	session = pollable
 	if transcriptImportIsActive(state, session.ID) {
-		return Session{}, inboundPollDecision{}, false
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
 	poll := candidate.Poll
 	hasPoll := strings.TrimSpace(poll.ChatID) != ""
@@ -1938,21 +2039,21 @@ func (b *Bridge) idleWorkChatAutoParkDecision(state teamstore.State, candidate t
 		hasPoll = true
 	}
 	if !hasPoll || !poll.Seeded || explicitParkedWorkPollShouldSkip(poll, hasPoll) {
-		return Session{}, inboundPollDecision{}, false
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
 	switch strings.TrimSpace(poll.PollState) {
 	case inboundPollStateBlocked, inboundPollStateCatchup:
-		return Session{}, inboundPollDecision{}, false
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
-	if poll.BlockedUntil.After(now) || strings.TrimSpace(poll.ContinuationPath) != "" {
-		return Session{}, inboundPollDecision{}, false
+	if poll.BlockedUntil.After(now) {
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
 	turns := pollSessionTurnQueueStates(state)[session.ID]
 	if turns.Running || turns.Queued > 0 {
-		return Session{}, inboundPollDecision{}, false
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
 	if latestTime(poll.LastActivityAt, session.UpdatedAt).After(now.Add(-inboundPollParkAfter)) {
-		return Session{}, inboundPollDecision{}, false
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
 	decision := decideInboundPoll(inboundPollInput{
 		ChatID:           session.ChatID,
@@ -1964,9 +2065,9 @@ func (b *Bridge) idleWorkChatAutoParkDecision(state teamstore.State, candidate t
 		Now:              now,
 	})
 	if !decision.ShouldPark || !decision.ShouldNotifyPark {
-		return Session{}, inboundPollDecision{}, false
+		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
-	return session, decision, true
+	return session, poll, decision, true
 }
 
 func (b *Bridge) persistInboundPollDecision(ctx context.Context, decision inboundPollDecision) error {
@@ -12525,6 +12626,7 @@ func (b *Bridge) recordOutboxMessageProvenance(ctx context.Context, outbox teams
 func (b *Bridge) handleSentOutboxSideEffects(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {
 	b.queueWorkflowNotificationForSentOutbox(ctx, outbox)
 	b.markChatUnreadForSentAnswer(ctx, outbox, msg)
+	b.boostWorkPollAfterSentLiveFinalAnswer(ctx, outbox, msg)
 }
 
 func (b *Bridge) markChatUnreadForSentAnswer(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {
@@ -12540,6 +12642,25 @@ func (b *Bridge) markChatUnreadForSentAnswer(ctx context.Context, outbox teamsto
 			_, _ = fmt.Fprintf(b.out, "Teams mark-unread after Codex answer failed: %v\n", err)
 			b.markAnswerUnreadWarned = true
 		}
+	}
+}
+
+func (b *Bridge) boostWorkPollAfterSentLiveFinalAnswer(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {
+	if b == nil || b.store == nil || !isLiveFinalAnswerOutbox(outbox) {
+		return
+	}
+	now := time.Now()
+	activityAt := parseGraphTime(msg.CreatedDateTime)
+	if activityAt.IsZero() {
+		activityAt = firstNonZeroTime(outbox.SentAt, outbox.UpdatedAt, outbox.CreatedAt)
+	}
+	if _, _, err := b.store.BoostChatPollAfterFinalAnswer(ctx, teamstore.FinalAnswerPollBoostRequest{
+		SessionID:      outbox.SessionID,
+		TeamsChatID:    outbox.TeamsChatID,
+		NextPollAt:     now,
+		LastActivityAt: activityAt,
+	}); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams final answer poll boost update error: %v\n", err)
 	}
 }
 
@@ -12943,6 +13064,22 @@ func isFinalOutboxCompletionPart(outbox teamstore.OutboxMessage) bool {
 		return false
 	}
 	return normalizedPartIndex(outbox) >= normalizedPartCount(outbox)
+}
+
+func isLiveFinalAnswerOutbox(outbox teamstore.OutboxMessage) bool {
+	if !isFinalOutboxCompletionPart(outbox) {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(outbox.NotificationKind), "turn_completed") {
+		return false
+	}
+	if strings.TrimSpace(outbox.SessionID) == "" || strings.TrimSpace(outbox.TurnID) == "" || strings.TrimSpace(outbox.TeamsChatID) == "" {
+		return false
+	}
+	if strings.HasPrefix(strings.TrimSpace(outbox.TurnID), "sync:") {
+		return false
+	}
+	return !strings.HasPrefix(strings.TrimSpace(outbox.ID), "outbox:transcript-delivery:")
 }
 
 func isCompletionNotificationOutbox(outbox teamstore.OutboxMessage) bool {

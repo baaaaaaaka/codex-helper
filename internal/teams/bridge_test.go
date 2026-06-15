@@ -4374,6 +4374,177 @@ func TestBridgeDoesNotMarkUnreadForProgressOutbox(t *testing.T) {
 	}
 }
 
+func TestBridgeFinalAnswerPollBoostsLiveFinalAnswer(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	oldActivity := time.Date(2026, 5, 11, 8, 0, 0, 0, time.UTC)
+	nextPoll := time.Now().Add(30 * time.Minute)
+	seedFinalAnswerPollBoostState(t, store, inboundPollStateCold, oldActivity, nextPoll, "", time.Time{})
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	answerAt := time.Date(2026, 5, 11, 12, 34, 56, 789000000, time.UTC)
+
+	before := time.Now()
+	bridge.handleSentOutboxSideEffects(ctx, finalAnswerPollBoostOutbox(), ChatMessage{
+		ID:              "teams-final",
+		CreatedDateTime: answerAt.Format(time.RFC3339Nano),
+	})
+	after := time.Now().Add(time.Second)
+
+	poll := loadBridgeTestChatPoll(t, store, "chat-1")
+	if poll.PollState != inboundPollStateHot {
+		t.Fatalf("poll state = %q, want hot", poll.PollState)
+	}
+	if poll.NextPollAt.Before(before.Add(-time.Second)) || poll.NextPollAt.After(after) {
+		t.Fatalf("NextPollAt = %s, want due around now", poll.NextPollAt.Format(time.RFC3339Nano))
+	}
+	if !poll.LastActivityAt.Equal(answerAt) {
+		t.Fatalf("LastActivityAt = %s, want %s", poll.LastActivityAt.Format(time.RFC3339Nano), answerAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestBridgeFinalAnswerPollBoostPreservesContinuation(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	oldActivity := time.Date(2026, 5, 11, 8, 0, 0, 0, time.UTC)
+	nextPoll := time.Now().Add(time.Hour)
+	continuation := "/chats/chat-1/messages?$skiptoken=keep-me"
+	seedFinalAnswerPollBoostState(t, store, inboundPollStateCold, oldActivity, nextPoll, continuation, time.Time{})
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+
+	bridge.handleSentOutboxSideEffects(ctx, finalAnswerPollBoostOutbox(), ChatMessage{ID: "teams-final"})
+
+	poll := loadBridgeTestChatPoll(t, store, "chat-1")
+	if poll.PollState != inboundPollStateHot {
+		t.Fatalf("poll state = %q, want hot", poll.PollState)
+	}
+	if poll.ContinuationPath != continuation {
+		t.Fatalf("ContinuationPath = %q, want %q", poll.ContinuationPath, continuation)
+	}
+}
+
+func TestBridgeFinalAnswerPollBoostSkipsTranscriptDelivery(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	oldActivity := time.Date(2026, 5, 11, 8, 0, 0, 0, time.UTC)
+	nextPoll := time.Now().Add(time.Hour)
+	seedFinalAnswerPollBoostState(t, store, inboundPollStateCold, oldActivity, nextPoll, "", time.Time{})
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	outbox := finalAnswerPollBoostOutbox()
+	outbox.ID = transcriptDeliveryOutboxID("transcript-delivery:s001:final")
+	outbox.TurnID = "sync:s001"
+
+	bridge.handleSentOutboxSideEffects(ctx, outbox, ChatMessage{
+		ID:              "teams-sync-final",
+		CreatedDateTime: time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+	})
+
+	poll := loadBridgeTestChatPoll(t, store, "chat-1")
+	if poll.PollState != inboundPollStateCold {
+		t.Fatalf("poll state = %q, want cold", poll.PollState)
+	}
+	if !poll.NextPollAt.Equal(nextPoll) {
+		t.Fatalf("NextPollAt = %s, want unchanged %s", poll.NextPollAt.Format(time.RFC3339Nano), nextPoll.Format(time.RFC3339Nano))
+	}
+	if !poll.LastActivityAt.Equal(oldActivity) {
+		t.Fatalf("LastActivityAt = %s, want unchanged %s", poll.LastActivityAt.Format(time.RFC3339Nano), oldActivity.Format(time.RFC3339Nano))
+	}
+}
+
+func TestBridgeFinalAnswerPollBoostSkipsParkedAndBlockedChats(t *testing.T) {
+	tests := []struct {
+		name         string
+		state        string
+		blockedUntil time.Time
+	}{
+		{name: "parked", state: inboundPollStateParked},
+		{name: "blocked", state: inboundPollStateBlocked, blockedUntil: time.Now().Add(time.Hour)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			ctx := context.Background()
+			oldActivity := time.Date(2026, 5, 11, 8, 0, 0, 0, time.UTC)
+			nextPoll := time.Now().Add(time.Hour)
+			seedFinalAnswerPollBoostState(t, store, tc.state, oldActivity, nextPoll, "", tc.blockedUntil)
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+
+			bridge.handleSentOutboxSideEffects(ctx, finalAnswerPollBoostOutbox(), ChatMessage{ID: "teams-final"})
+
+			poll := loadBridgeTestChatPoll(t, store, "chat-1")
+			if poll.PollState != tc.state {
+				t.Fatalf("poll state = %q, want %q", poll.PollState, tc.state)
+			}
+			if !poll.NextPollAt.Equal(nextPoll) {
+				t.Fatalf("NextPollAt = %s, want unchanged %s", poll.NextPollAt.Format(time.RFC3339Nano), nextPoll.Format(time.RFC3339Nano))
+			}
+			if tc.state == inboundPollStateParked && poll.ParkedAt.IsZero() {
+				t.Fatal("parked poll lost ParkedAt")
+			}
+			if !tc.blockedUntil.IsZero() && !poll.BlockedUntil.Equal(tc.blockedUntil) {
+				t.Fatalf("BlockedUntil = %s, want %s", poll.BlockedUntil.Format(time.RFC3339Nano), tc.blockedUntil.Format(time.RFC3339Nano))
+			}
+		})
+	}
+}
+
+func seedFinalAnswerPollBoostState(t *testing.T, store *teamstore.Store, pollState string, oldActivity time.Time, nextPoll time.Time, continuation string, blockedUntil time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{
+		ID:          "s001",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "chat-1",
+		UpdatedAt:   oldActivity,
+	}); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	var err error
+	if continuation == "" {
+		_, err = store.RecordChatPollSuccess(ctx, "chat-1", oldActivity, true, false, 1)
+	} else {
+		_, err = store.RecordChatPollSuccessWithContinuation(ctx, "chat-1", oldActivity, true, true, 20, continuation)
+	}
+	if err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	_, err = store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      pollState,
+		NextPollAt:     nextPoll,
+		LastActivityAt: oldActivity,
+		BlockedUntil:   blockedUntil,
+	})
+	if err != nil {
+		t.Fatalf("UpdateChatPollSchedule error: %v", err)
+	}
+}
+
+func finalAnswerPollBoostOutbox() teamstore.OutboxMessage {
+	return teamstore.OutboxMessage{
+		ID:               "outbox:final",
+		SessionID:        "s001",
+		TurnID:           "turn-1",
+		TeamsChatID:      "chat-1",
+		Kind:             "final",
+		NotificationKind: "turn_completed",
+		PartIndex:        1,
+		PartCount:        1,
+	}
+}
+
+func loadBridgeTestChatPoll(t *testing.T, store *teamstore.Store, chatID string) teamstore.ChatPollState {
+	t.Helper()
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	poll, ok := state.ChatPolls[chatID]
+	if !ok {
+		t.Fatalf("missing chat poll %q", chatID)
+	}
+	return poll
+}
+
 func TestBridgeQueuedTurnErrorMentionsOwnerWhenWorkflowDisabled(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -17500,6 +17671,418 @@ func TestBridgeIdleWorkChatAutoParkSweeperProcessesOneSQLiteCandidatePerInterval
 	}
 }
 
+func TestBridgeIdleWorkChatAutoParkSweeperDrainsIdleContinuationThenParksAndResumes(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	cursor := now.Add(-49*time.Hour + time.Minute)
+	headSeen := bridgePollMessage("head-seen", cursor.Add(-10*time.Second).Format(time.RFC3339Nano), "already handled head")
+	backlogSeen := bridgePollMessage("backlog-seen", cursor.Add(-20*time.Second).Format(time.RFC3339Nano), "already handled backlog")
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{
+			messages: []ChatMessage{headSeen},
+			nextLink: "/chats/chat-1/messages?$skiptoken=head-stale",
+			assert: func(t *testing.T, r *http.Request) {
+				t.Helper()
+				if got := r.URL.Query().Get("$skiptoken"); got != "" {
+					t.Fatalf("recovery head poll followed continuation skiptoken %q", got)
+				}
+			},
+		},
+		{
+			messages: []ChatMessage{backlogSeen},
+			assert: func(t *testing.T, r *http.Request) {
+				t.Helper()
+				if got := r.URL.Query().Get("$skiptoken"); got != "old" {
+					t.Fatalf("recovery backlog skiptoken = %q, want old", got)
+				}
+			},
+		},
+		{messages: nil},
+		{messages: nil},
+	})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:           "s001",
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  "chat-1",
+		TeamsChatURL: "https://teams.example/chat-1",
+		UpdatedAt:    oldActivity,
+	}); err != nil {
+		t.Fatalf("create durable session: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "chat-1", cursor, true, true, 20, "/chats/chat-1/messages?$skiptoken=old"); err != nil {
+		t.Fatalf("seed continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateCold,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+	bridge.reg.Chats["chat-1"] = ChatState{SeenMessageIDs: []string{"head-seen", "backlog-seen"}}
+
+	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
+		t.Fatalf("auto-park sweep error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, "chat-1", "This chat is paused") != 1 {
+		t.Fatalf("freeze notice not sent after continuation recovery: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ContinuationPath != "" || poll.ParkNoticeSentAt.IsZero() || poll.LastWindowFullMessage != "" {
+		t.Fatalf("idle continuation was not recovered into a clean parked notice state: %#v", poll)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("resume-1", now.Add(time.Minute).Format(time.RFC3339Nano), "r 1"), "r 1"); err != nil {
+		t.Fatalf("resume command error: %v", err)
+	}
+	resumed, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll after resume ok=%v err=%v", ok, err)
+	}
+	if resumed.PollState != inboundPollStateHot || resumed.ContinuationPath != "" || !resumed.ParkedAt.IsZero() || !resumed.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("resume did not reactivate recovered parked chat cleanly: %#v", resumed)
+	}
+}
+
+func TestBridgeIdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuationWithoutParking(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	cursor := now.Add(-49*time.Hour + time.Minute)
+	userMessage := bridgePollMessage("backlog-user", cursor.Add(time.Minute).Format(time.RFC3339Nano), "new work from backlog")
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{messages: nil},
+		{
+			messages: []ChatMessage{userMessage},
+			assert: func(t *testing.T, r *http.Request) {
+				t.Helper()
+				if got := r.URL.Query().Get("$skiptoken"); got != "old" {
+					t.Fatalf("recovery backlog skiptoken = %q, want old", got)
+				}
+			},
+		},
+	})
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:           "s001",
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  "chat-1",
+		TeamsChatURL: "https://teams.example/chat-1",
+		UpdatedAt:    oldActivity,
+	}); err != nil {
+		t.Fatalf("create durable session: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "chat-1", cursor, true, true, 20, "/chats/chat-1/messages?$skiptoken=old"); err != nil {
+		t.Fatalf("seed continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateCold,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(writeGraph, store, executor)
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
+		t.Fatalf("auto-park sweep error: %v", err)
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "new work from backlog") {
+		t.Fatalf("executor prompts = %#v, want backlog user message", executor.prompts)
+	}
+	if countSentPlainContainingForChat(*sent, "chat-1", "This chat is paused") != 0 {
+		t.Fatalf("user backlog message should not park chat: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState == inboundPollStateParked || !poll.ParkNoticeSentAt.IsZero() || !poll.LastActivityAt.After(oldActivity) {
+		t.Fatalf("backlog user message did not keep chat active: %#v", poll)
+	}
+}
+
+func TestBridgeIdleWorkChatAutoParkSweeperRecoversStaleContinuationErrorWithTerminalHead(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	cursor := now.Add(-49*time.Hour + time.Minute)
+	readGraph := newIdleContinuationErrorRecoveryGraph(t, []bridgePollPage{
+		{messages: nil},
+		{messages: nil},
+		{messages: nil},
+	}, http.StatusBadRequest, false)
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:           "s001",
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  "chat-1",
+		TeamsChatURL: "https://teams.example/chat-1",
+		UpdatedAt:    oldActivity,
+	}); err != nil {
+		t.Fatalf("create durable session: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "chat-1", cursor, true, true, 20, "/chats/chat-1/messages?$skiptoken=old"); err != nil {
+		t.Fatalf("seed continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateCold,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
+		t.Fatalf("auto-park sweep error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, "chat-1", "This chat is paused") != 1 {
+		t.Fatalf("freeze notice not sent after stale continuation recovery: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateParked || poll.ContinuationPath != "" || poll.ParkNoticeSentAt.IsZero() || poll.LastError != "" {
+		t.Fatalf("stale continuation error was not recovered into parked state: %#v", poll)
+	}
+}
+
+func TestBridgeIdleWorkChatAutoParkSweeperPreservesFreshHeadContinuationAfterStaleContinuationError(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	cursor := now.Add(-49*time.Hour + time.Minute)
+	freshSeen := bridgePollMessage("fresh-seen", cursor.Add(time.Minute).Format(time.RFC3339Nano), "fresh already handled head")
+	readGraph := newIdleContinuationErrorRecoveryGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{freshSeen},
+		nextLink: "/chats/chat-1/messages?$skiptoken=fresh-head",
+	}}, http.StatusBadRequest, true)
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:           "s001",
+		Status:       teamstore.SessionStatusActive,
+		TeamsChatID:  "chat-1",
+		TeamsChatURL: "https://teams.example/chat-1",
+		UpdatedAt:    oldActivity,
+	}); err != nil {
+		t.Fatalf("create durable session: %v", err)
+	}
+	seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "chat-1", cursor, true, true, 20, "/chats/chat-1/messages?$skiptoken=old"); err != nil {
+		t.Fatalf("seed continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateCold,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+	bridge.reg.Chats["chat-1"] = ChatState{SeenMessageIDs: []string{"fresh-seen"}}
+
+	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
+		t.Fatalf("auto-park sweep error: %v", err)
+	}
+	if countSentPlainContainingForChat(*sent, "chat-1", "This chat is paused") != 0 {
+		t.Fatalf("fresh head continuation should not park chat yet: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(poll.ContinuationPath, "$skiptoken=fresh-head") || !poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("fresh head continuation was not preserved for next recovery sweep: %#v", poll)
+	}
+}
+
+func TestBridgeIdleWorkChatAutoParkSweeperDoesNotRecoverContinuationForQueuedOrRunningSessions(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		turnStatus teamstore.TurnStatus
+	}{
+		{name: "queued", turnStatus: teamstore.TurnStatusQueued},
+		{name: "running", turnStatus: teamstore.TurnStatusRunning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			oldActivity := now.Add(-49 * time.Hour)
+			readGraph := &GraphClient{
+				auth: &fakeGraphAuth{token: "access"},
+				client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					t.Fatalf("queued/running idle continuation should not issue Graph requests: %s %s", r.Method, r.URL.String())
+					return httptest.NewRecorder().Result(), nil
+				})},
+				baseURL: "https://graph.example.test",
+			}
+			writeGraph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+				ID:           "s001",
+				Status:       teamstore.SessionStatusActive,
+				TeamsChatID:  "chat-1",
+				TeamsChatURL: "https://teams.example/chat-1",
+				UpdatedAt:    oldActivity,
+			}); err != nil {
+				t.Fatalf("create durable session: %v", err)
+			}
+			seedIdleWorkPoll(t, store, "control-chat", "chat-1", oldActivity)
+			if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "chat-1", oldActivity, true, true, 20, "/chats/chat-1/messages?$skiptoken=old"); err != nil {
+				t.Fatalf("seed continuation: %v", err)
+			}
+			if err := store.Update(context.Background(), func(state *teamstore.State) error {
+				state.Turns["turn-1"] = teamstore.Turn{
+					ID:        "turn-1",
+					SessionID: "s001",
+					Status:    tc.turnStatus,
+					CreatedAt: now.Add(-time.Minute),
+					StartedAt: now.Add(-time.Minute),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed turn: %v", err)
+			}
+			if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+				t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+			}
+			bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+			bridge.readGraph = readGraph
+			bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+			if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
+				t.Fatalf("auto-park sweep error: %v", err)
+			}
+			if len(*sent) != 0 {
+				t.Fatalf("queued/running idle continuation should not send notices: %#v", *sent)
+			}
+			poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+			if err != nil || !ok {
+				t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+			}
+			if poll.PollState == inboundPollStateParked || poll.ContinuationPath == "" || !poll.ParkNoticeSentAt.IsZero() {
+				t.Fatalf("queued/running session was recovered or parked unexpectedly: %#v", poll)
+			}
+		})
+	}
+}
+
+func TestBridgePollOnceRecoversStaleWorkContinuationErrorWithTerminalHead(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-time.Hour)
+	readGraph := newIdleContinuationErrorRecoveryGraph(t, []bridgePollPage{
+		{messages: nil},
+	}, http.StatusBadRequest, false)
+	writeGraph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	session := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), session.ChatID, oldActivity, true, true, 20, "/chats/chat-1/messages?$skiptoken=old"); err != nil {
+		t.Fatalf("seed continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule work poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("stale continuation recovery should not send messages: %#v", *sent)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), session.ChatID)
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.ContinuationPath != "" || poll.LastError != "" || !poll.BlockedUntil.IsZero() || poll.FailureCount != 0 {
+		t.Fatalf("stale continuation was not cleared without backoff: %#v", poll)
+	}
+}
+
+func TestStalePollContinuationErrorRequiresContinuationTokenSignal(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "invalid skip token 400", err: &GraphStatusError{StatusCode: http.StatusBadRequest, Code: "InvalidSkipToken", Message: "old skip token expired"}, want: true},
+		{name: "generic bad request", err: &GraphStatusError{StatusCode: http.StatusBadRequest, Code: "BadRequest", Message: "invalid filter syntax"}, want: false},
+		{name: "continuation gone", err: &GraphStatusError{StatusCode: http.StatusGone, Code: "Gone"}, want: true},
+		{name: "continuation not found", err: &GraphStatusError{StatusCode: http.StatusNotFound, Code: "ItemNotFound"}, want: true},
+		{name: "server error", err: &GraphStatusError{StatusCode: http.StatusInternalServerError, Code: "InternalServerError"}, want: false},
+		{name: "plain error", err: errors.New("skiptoken expired"), want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stalePollContinuationError(tc.err); got != tc.want {
+				t.Fatalf("stalePollContinuationError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBridgePollOnceDoesNotSendStandaloneFreezeNoticeWhenAppendReadRateLimited(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-49 * time.Hour)
@@ -29341,6 +29924,61 @@ func newBridgePollGraph(t *testing.T, pages []bridgePollPage) *GraphClient {
 	t.Cleanup(func() {
 		if nextPage != len(pages) {
 			t.Fatalf("Graph poll count = %d, want %d", nextPage, len(pages))
+		}
+	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     client,
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+}
+
+func newIdleContinuationErrorRecoveryGraph(t *testing.T, pages []bridgePollPage, continuationStatus int, expectFreshContinuation bool) *GraphClient {
+	t.Helper()
+	nextPage := 0
+	sawContinuationError := false
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		if r.URL.Query().Get("$skiptoken") == "old" {
+			sawContinuationError = true
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(continuationStatus)
+			_, _ = fmt.Fprint(w, `{"error":{"code":"InvalidSkipToken","message":"old continuation expired"}}`)
+			return w.Result(), nil
+		}
+		if nextPage >= len(pages) {
+			t.Fatalf("unexpected extra Graph poll: %s", r.URL.String())
+		}
+		page := pages[nextPage]
+		nextPage++
+		if page.assert != nil {
+			page.assert(t, r)
+		}
+		payload := map[string]any{"value": page.messages}
+		if page.nextLink != "" {
+			payload["@odata.nextLink"] = page.nextLink
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			t.Fatalf("encode poll response: %v", err)
+		}
+		return w.Result(), nil
+	})}
+	t.Cleanup(func() {
+		if !sawContinuationError {
+			t.Fatal("Graph poll did not exercise stale continuation error")
+		}
+		if nextPage != len(pages) {
+			t.Fatalf("Graph poll count = %d, want %d", nextPage, len(pages))
+		}
+		if expectFreshContinuation && nextPage == 0 {
+			t.Fatal("fresh continuation test did not read the head page")
 		}
 	})
 	return &GraphClient{

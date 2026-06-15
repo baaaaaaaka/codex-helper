@@ -4357,6 +4357,90 @@ func (s *Store) updateChatPollSchedulesSQLite(ctx context.Context, updates []Cha
 	return out, handled, err
 }
 
+func (s *Store) boostChatPollAfterFinalAnswerSQLite(ctx context.Context, req FinalAnswerPollBoostRequest) (ChatPollState, bool, bool, error) {
+	var out ChatPollState
+	changed := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state := State{
+			SchemaVersion:     SchemaVersion,
+			Sessions:          map[string]SessionContext{},
+			ChatPolls:         map[string]ChatPollState{},
+			ImportCheckpoints: map[string]ImportCheckpoint{},
+		}
+		if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, req.SessionID); err != nil {
+			return err
+		} else if ok {
+			state.Sessions[session.ID] = session
+		}
+		if poll, ok, err := loadSQLiteJSONRow[ChatPollState](ctx, tx, `SELECT json FROM chat_polls WHERE chat_id = ?`, req.TeamsChatID); err != nil {
+			return err
+		} else if ok {
+			state.ChatPolls[poll.ChatID] = poll
+			out = poll
+		}
+		if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ? AND status = ?`, transcriptCheckpointIDForSession(req.SessionID), importCheckpointStatusImporting); err != nil {
+			return err
+		} else if ok {
+			state.ImportCheckpoints[checkpoint.ID] = checkpoint
+		}
+		if checkpoint := state.ImportCheckpoints[transcriptCheckpointIDForSession(req.SessionID)]; checkpoint.Status == importCheckpointStatusImporting {
+			owner, err := loadSQLiteServiceOwnerTx(ctx, tx)
+			if err != nil {
+				return err
+			}
+			state.ServiceOwner = owner
+		}
+		handled = true
+		poll, ok := state.ChatPolls[req.TeamsChatID]
+		if !ok || !finalAnswerPollBoostGuardAllows(&state, req, poll, req.NextPollAt) {
+			return nil
+		}
+		next, updateChanged, err := applyChatPollScheduleUpdateLocked(&state, finalAnswerPollBoostScheduleUpdate(req), req.NextPollAt)
+		if err != nil {
+			return err
+		}
+		out = next
+		changed = updateChanged
+		if !updateChanged {
+			return nil
+		}
+		if err := upsertSQLiteChatPollTx(ctx, tx, next); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	return out, changed, handled, err
+}
+
+func loadSQLiteServiceOwnerTx(ctx context.Context, tx *sql.Tx) (*OwnerMetadata, error) {
+	var raw []byte
+	if err := tx.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyServiceOwner).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var owner *OwnerMetadata
+	if err := json.Unmarshal(raw, &owner); err != nil {
+		return nil, err
+	}
+	return owner, nil
+}
+
 func (s *Store) setChatRateLimitSQLite(ctx context.Context, chatID string, blockedUntil time.Time, reason string, outboxID string) (ChatRateLimitState, bool, error) {
 	var out ChatRateLimitState
 	handled := false

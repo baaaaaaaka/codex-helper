@@ -8339,6 +8339,228 @@ func TestChatPollScheduleCanClearContinuationPath(t *testing.T) {
 	}
 }
 
+func TestBoostChatPollAfterFinalAnswerGuardsAndSQLiteParity(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 6, 15, 8, 0, 0, 0, time.UTC)
+	boostAt := now.Add(3 * time.Minute)
+	answerAt := now.Add(2 * time.Minute)
+	cases := []struct {
+		name        string
+		mutate      func(*State)
+		wantChanged bool
+	}{
+		{
+			name:        "eligible cold continuation",
+			wantChanged: true,
+		},
+		{
+			name: "parked poll",
+			mutate: func(state *State) {
+				poll := state.ChatPolls["chat-1"]
+				poll.PollState = chatPollStateParked
+				poll.ParkedAt = now.Add(-49 * time.Hour)
+				poll.ParkNoticeSentAt = now.Add(-48 * time.Hour)
+				state.ChatPolls["chat-1"] = poll
+			},
+		},
+		{
+			name: "blocked poll state",
+			mutate: func(state *State) {
+				poll := state.ChatPolls["chat-1"]
+				poll.PollState = chatPollStateBlocked
+				poll.BlockedUntil = now.Add(10 * time.Minute)
+				state.ChatPolls["chat-1"] = poll
+			},
+		},
+		{
+			name: "blocked until future",
+			mutate: func(state *State) {
+				poll := state.ChatPolls["chat-1"]
+				poll.BlockedUntil = now.Add(10 * time.Minute)
+				state.ChatPolls["chat-1"] = poll
+			},
+		},
+		{
+			name: "catchup poll",
+			mutate: func(state *State) {
+				poll := state.ChatPolls["chat-1"]
+				poll.PollState = chatPollStateCatchup
+				state.ChatPolls["chat-1"] = poll
+			},
+		},
+		{
+			name: "active transcript import",
+			mutate: func(state *State) {
+				state.ServiceOwner = &OwnerMetadata{StartedAt: now.Add(-time.Hour), LastHeartbeat: now}
+				state.ImportCheckpoints[transcriptCheckpointIDForSession("s001")] = ImportCheckpoint{
+					ID:        transcriptCheckpointIDForSession("s001"),
+					SessionID: "s001",
+					Status:    importCheckpointStatusImporting,
+					UpdatedAt: now.Add(-time.Minute),
+				}
+			},
+		},
+		{
+			name: "orphan transcript import",
+			mutate: func(state *State) {
+				state.ServiceOwner = &OwnerMetadata{StartedAt: now.Add(time.Minute), LastHeartbeat: now.Add(time.Minute)}
+				state.ImportCheckpoints[transcriptCheckpointIDForSession("s001")] = ImportCheckpoint{
+					ID:        transcriptCheckpointIDForSession("s001"),
+					SessionID: "s001",
+					Status:    importCheckpointStatusImporting,
+					UpdatedAt: now.Add(-time.Minute),
+				}
+			},
+			wantChanged: true,
+		},
+		{
+			name: "closed session",
+			mutate: func(state *State) {
+				session := state.Sessions["s001"]
+				session.Status = SessionStatusClosed
+				state.Sessions["s001"] = session
+			},
+		},
+		{
+			name: "session chat mismatch",
+			mutate: func(state *State) {
+				session := state.Sessions["s001"]
+				session.TeamsChatID = "chat-other"
+				state.Sessions["s001"] = session
+			},
+		},
+		{
+			name: "unseeded poll",
+			mutate: func(state *State) {
+				poll := state.ChatPolls["chat-1"]
+				poll.Seeded = false
+				state.ChatPolls["chat-1"] = poll
+			},
+		},
+	}
+	for _, tc := range cases {
+		for _, backend := range []string{"json", "sqlite"} {
+			t.Run(tc.name+"/"+backend, func(t *testing.T) {
+				store := newTestStore(t)
+				seedFinalAnswerPollBoostState(t, store, now, tc.mutate)
+				if backend == "sqlite" {
+					migrateStoreToSQLiteForTest(t, store)
+				}
+				before, ok, err := store.ChatPoll(ctx, "chat-1")
+				if err != nil || !ok {
+					t.Fatalf("ChatPoll before boost ok=%v err=%v", ok, err)
+				}
+
+				got, changed, err := store.BoostChatPollAfterFinalAnswer(ctx, FinalAnswerPollBoostRequest{
+					SessionID:      "s001",
+					TeamsChatID:    "chat-1",
+					NextPollAt:     boostAt,
+					LastActivityAt: answerAt,
+				})
+				if err != nil {
+					t.Fatalf("BoostChatPollAfterFinalAnswer error: %v", err)
+				}
+				if changed != tc.wantChanged {
+					t.Fatalf("BoostChatPollAfterFinalAnswer changed=%v, want %v; got=%#v", changed, tc.wantChanged, got)
+				}
+				after, ok, err := store.ChatPoll(ctx, "chat-1")
+				if err != nil || !ok {
+					t.Fatalf("ChatPoll after boost ok=%v err=%v", ok, err)
+				}
+				if !tc.wantChanged {
+					if !reflect.DeepEqual(after, before) {
+						t.Fatalf("no-op boost changed poll:\nbefore=%#v\nafter=%#v", before, after)
+					}
+					return
+				}
+				if got != after {
+					t.Fatalf("returned poll differs from stored poll:\ngot=%#v\nafter=%#v", got, after)
+				}
+				if after.PollState != chatPollStateHot || !after.NextPollAt.Equal(boostAt) || !after.LastActivityAt.Equal(answerAt) || !after.UpdatedAt.Equal(boostAt) {
+					t.Fatalf("boosted poll schedule mismatch: %#v", after)
+				}
+				if after.ContinuationPath != before.ContinuationPath || after.ContinuationPath == "" {
+					t.Fatalf("boost should preserve continuation path: before=%#v after=%#v", before, after)
+				}
+				if !after.ParkedAt.IsZero() || !after.ParkNoticeSentAt.IsZero() {
+					t.Fatalf("boost should not leave park markers: %#v", after)
+				}
+			})
+		}
+	}
+}
+
+func TestBoostChatPollAfterFinalAnswerSQLiteUsesNarrowRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 15, 9, 0, 0, 0, time.UTC)
+	seedFinalAnswerPollBoostState(t, store, now, func(state *State) {
+		state.Sessions["broken"] = SessionContext{ID: "broken", Status: SessionStatusActive, TeamsChatID: "chat-broken", UpdatedAt: now}
+		state.ChatPolls["chat-broken"] = ChatPollState{ChatID: "chat-broken", Seeded: true, PollState: chatPollStateCold, UpdatedAt: now}
+		state.ImportCheckpoints["transcript:broken"] = ImportCheckpoint{ID: "transcript:broken", SessionID: "broken", Status: "complete", UpdatedAt: now}
+	})
+	migrateStoreToSQLiteForTest(t, store)
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE chat_polls SET json = ? WHERE chat_id = ?`, []byte(`{"broken"`), "chat-broken"); err != nil {
+		t.Fatalf("corrupt unrelated chat poll: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE import_checkpoints SET json = ? WHERE id = ?`, []byte(`{"broken"`), "transcript:broken"); err != nil {
+		t.Fatalf("corrupt unrelated import checkpoint: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, []byte(`{"broken"`), sqliteRuntimeKeyServiceOwner); err != nil {
+		t.Fatalf("corrupt service owner: %v", err)
+	}
+
+	boostAt := now.Add(3 * time.Minute)
+	answerAt := now.Add(2 * time.Minute)
+	got, changed, err := store.BoostChatPollAfterFinalAnswer(ctx, FinalAnswerPollBoostRequest{
+		SessionID:      "s001",
+		TeamsChatID:    "chat-1",
+		NextPollAt:     boostAt,
+		LastActivityAt: answerAt,
+	})
+	if err != nil {
+		t.Fatalf("BoostChatPollAfterFinalAnswer narrow sqlite error: %v", err)
+	}
+	if !changed || got.PollState != chatPollStateHot || !got.NextPollAt.Equal(boostAt) || got.ContinuationPath == "" {
+		t.Fatalf("narrow sqlite boost result = %#v changed=%v", got, changed)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt unrelated rows")
+	}
+}
+
+func seedFinalAnswerPollBoostState(t *testing.T, store *Store, now time.Time, mutate func(*State)) {
+	t.Helper()
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.Sessions["s001"] = SessionContext{
+			ID:          "s001",
+			Status:      SessionStatusActive,
+			TeamsChatID: "chat-1",
+			UpdatedAt:   now.Add(-time.Hour),
+		}
+		state.ChatPolls["chat-1"] = ChatPollState{
+			ChatID:           "chat-1",
+			Seeded:           true,
+			PollState:        chatPollStateCold,
+			NextPollAt:       now.Add(time.Hour),
+			LastActivityAt:   now.Add(-time.Hour),
+			ContinuationPath: "/chats/chat-1/messages?$skiptoken=old",
+			UpdatedAt:        now.Add(-time.Hour),
+		}
+		if mutate != nil {
+			mutate(state)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed final answer poll boost state: %v", err)
+	}
+}
+
 func TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

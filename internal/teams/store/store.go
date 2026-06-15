@@ -126,7 +126,11 @@ const (
 	chatPollStateWarm    = "warm"
 	chatPollStateCool    = "cool"
 	chatPollStateCold    = "cold"
+	chatPollStateBlocked = "blocked"
+	chatPollStateCatchup = "catchup"
 	chatPollStateParked  = "parked"
+
+	importCheckpointStatusImporting = "importing"
 )
 
 type State struct {
@@ -649,6 +653,13 @@ type ChatPollScheduleUpdate struct {
 	ClearBlockedUntil     bool
 	ClearContinuationPath bool
 	ResetFailures         bool
+}
+
+type FinalAnswerPollBoostRequest struct {
+	SessionID      string
+	TeamsChatID    string
+	NextPollAt     time.Time
+	LastActivityAt time.Time
 }
 
 type OwnerMetadata struct {
@@ -4947,6 +4958,40 @@ func (s *Store) UpdateChatPollSchedules(ctx context.Context, updates []ChatPollS
 	return out, nil
 }
 
+func (s *Store) BoostChatPollAfterFinalAnswer(ctx context.Context, req FinalAnswerPollBoostRequest) (ChatPollState, bool, error) {
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	req.TeamsChatID = strings.TrimSpace(req.TeamsChatID)
+	if req.SessionID == "" || req.TeamsChatID == "" {
+		return ChatPollState{}, false, nil
+	}
+	if req.NextPollAt.IsZero() {
+		req.NextPollAt = time.Now()
+	}
+	if out, changed, handled, err := s.boostChatPollAfterFinalAnswerSQLite(ctx, req); handled || err != nil {
+		return out, changed, err
+	}
+	var out ChatPollState
+	changed := false
+	err := s.Update(ctx, func(state *State) error {
+		poll, ok := state.ChatPolls[req.TeamsChatID]
+		if !ok || !finalAnswerPollBoostGuardAllows(state, req, poll, req.NextPollAt) {
+			out = poll
+			return errStoreNoChange
+		}
+		next, updateChanged, err := applyChatPollScheduleUpdateLocked(state, finalAnswerPollBoostScheduleUpdate(req), req.NextPollAt)
+		if err != nil {
+			return err
+		}
+		out = next
+		changed = updateChanged
+		if !updateChanged {
+			return errStoreNoChange
+		}
+		return nil
+	})
+	return out, changed, err
+}
+
 func (s *Store) ClearChatPollContinuationBackoffAndError(ctx context.Context, chatID string) (ChatPollState, error) {
 	return s.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
 		ChatID:                chatID,
@@ -4954,6 +4999,55 @@ func (s *Store) ClearChatPollContinuationBackoffAndError(ctx context.Context, ch
 		ClearContinuationPath: true,
 		ResetFailures:         true,
 	})
+}
+
+func finalAnswerPollBoostScheduleUpdate(req FinalAnswerPollBoostRequest) ChatPollScheduleUpdate {
+	return ChatPollScheduleUpdate{
+		ChatID:         strings.TrimSpace(req.TeamsChatID),
+		PollState:      chatPollStateHot,
+		NextPollAt:     req.NextPollAt,
+		LastActivityAt: req.LastActivityAt,
+	}
+}
+
+func finalAnswerPollBoostGuardAllows(state *State, req FinalAnswerPollBoostRequest, poll ChatPollState, now time.Time) bool {
+	session, ok := state.Sessions[strings.TrimSpace(req.SessionID)]
+	if !ok || !sessionStatusIsActive(session.Status) || strings.TrimSpace(session.TeamsChatID) != strings.TrimSpace(req.TeamsChatID) {
+		return false
+	}
+	if strings.TrimSpace(poll.ChatID) != strings.TrimSpace(req.TeamsChatID) || !poll.Seeded {
+		return false
+	}
+	switch strings.TrimSpace(poll.PollState) {
+	case chatPollStateParked, chatPollStateBlocked, chatPollStateCatchup:
+		return false
+	}
+	if poll.BlockedUntil.After(now) {
+		return false
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointIDForSession(req.SessionID)]
+	return !transcriptImportCheckpointIsActive(state, checkpoint)
+}
+
+func transcriptCheckpointIDForSession(sessionID string) string {
+	return "transcript:" + strings.TrimSpace(sessionID)
+}
+
+func transcriptImportCheckpointIsActive(state *State, checkpoint ImportCheckpoint) bool {
+	return checkpoint.Status == importCheckpointStatusImporting && !transcriptImportCheckpointIsOrphaned(state, checkpoint)
+}
+
+func transcriptImportCheckpointIsOrphaned(state *State, checkpoint ImportCheckpoint) bool {
+	if checkpoint.Status != importCheckpointStatusImporting {
+		return false
+	}
+	if state.ServiceOwner == nil || state.ServiceOwner.StartedAt.IsZero() {
+		return false
+	}
+	if checkpoint.UpdatedAt.IsZero() {
+		return true
+	}
+	return state.ServiceOwner.StartedAt.After(checkpoint.UpdatedAt)
 }
 
 func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpdate, now time.Time) (ChatPollState, bool, error) {
