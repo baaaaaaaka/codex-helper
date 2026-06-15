@@ -340,26 +340,7 @@ http_get() {
 }
 
 CONFIG_UPDATED=0
-SOURCE_FILES=""
-
-add_source_file() {
-  file="$1"
-  case "
-$SOURCE_FILES
-" in
-    *"
-$file
-"*) ;;
-    *)
-      if [ -n "$SOURCE_FILES" ]; then
-        SOURCE_FILES="$SOURCE_FILES
-$file"
-      else
-        SOURCE_FILES="$file"
-      fi
-      ;;
-  esac
-}
+INSTALL_ACTIVATION_DETAIL=""
 
 remove_line() {
   file="$1"
@@ -380,7 +361,6 @@ remove_line() {
     ensure_write_space "shell profile update" "$file"
     cat "$tmp" >"$file" || fail_write_or_disk "shell profile update" "$file" "Failed to update shell profile: $file"
     CONFIG_UPDATED=1
-    add_source_file "$file"
   fi
   rm -f "$tmp"
 }
@@ -404,13 +384,28 @@ ensure_line() {
     ensure_write_space "shell profile" "$file"
     printf "\n%s\n" "$line" >> "$file" || fail_write_or_disk "shell profile" "$file" "Failed to update shell profile: $file"
     CONFIG_UPDATED=1
-    add_source_file "$file"
   fi
 }
 
 escape_double_quotes() {
   if have_cmd sed; then
     printf '%s' "$1" | sed 's/[\\\"`$]/\\&/g'
+    return 0
+  fi
+  printf '%s' "$1"
+}
+
+escape_fish_double_quotes() {
+  if have_cmd sed; then
+    printf '%s' "$1" | sed 's/[\\\"$]/\\&/g'
+    return 0
+  fi
+  printf '%s' "$1"
+}
+
+escape_single_quotes() {
+  if have_cmd sed; then
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
     return 0
   fi
   printf '%s' "$1"
@@ -464,6 +459,8 @@ esac
 EOF
     fi
     printf '\n%s\n' 'export PATH'
+    printf '%s\n' 'hash -r 2>/dev/null || true'
+    printf '%s\n' 'rehash 2>/dev/null || true'
     printf '%s\n' 'unset _path_entry'
   } >"$tmp"; then
     fail_write_or_disk "shell PATH snippet" "$tmp" "Failed to write shell PATH snippet: $tmp"
@@ -473,7 +470,6 @@ EOF
     ensure_write_space "shell PATH snippet" "$file"
     cat "$tmp" >"$file" || fail_write_or_disk "shell PATH snippet" "$file" "Failed to install shell PATH snippet: $file"
     CONFIG_UPDATED=1
-    add_source_file "$file"
   fi
   rm -f "$tmp"
 }
@@ -488,8 +484,8 @@ write_fish_path_snippet() {
   mkdir -p "$dir" 2>/dev/null || fail_write_or_disk "fish PATH snippet directory" "$dir" "Failed to create fish PATH snippet directory: $dir"
 
   tmp="$file.codex-proxy.$$"
-  install_escaped="$(escape_double_quotes "$install_path")"
-  managed_escaped="$(escape_double_quotes "$managed_path")"
+  install_escaped="$(escape_fish_double_quotes "$install_path")"
+  managed_escaped="$(escape_fish_double_quotes "$managed_path")"
   ensure_write_space "fish PATH snippet" "$tmp"
   if ! {
     printf '%s\n' "# added by codex-proxy installer"
@@ -510,7 +506,6 @@ write_fish_path_snippet() {
     ensure_write_space "fish PATH snippet" "$file"
     cat "$tmp" >"$file" || fail_write_or_disk "fish PATH snippet" "$file" "Failed to install fish PATH snippet: $file"
     CONFIG_UPDATED=1
-    add_source_file "$file"
   fi
   rm -f "$tmp"
 }
@@ -525,34 +520,31 @@ write_csh_path_snippet() {
   mkdir -p "$dir" 2>/dev/null || fail_write_or_disk "csh PATH snippet directory" "$dir" "Failed to create csh PATH snippet directory: $dir"
 
   tmp="$file.codex-proxy.$$"
-  install_escaped="$(escape_double_quotes "$install_path")"
-  managed_escaped="$(escape_double_quotes "$managed_path")"
+  install_escaped="$(escape_single_quotes "$install_path")"
+  managed_escaped="$(escape_single_quotes "$managed_path")"
   ensure_write_space "csh PATH snippet" "$tmp"
   if ! {
     printf '%s\n' "# added by codex-proxy installer"
-    printf 'set _path_entry = "%s"\n' "$install_escaped"
+    printf "set _path_entry = '%s'\n" "$install_escaped"
     cat <<'EOF'
-if ( $?PATH ) then
-  if ( ":$PATH:" !~ *":$_path_entry:"* ) then
-    setenv PATH "$_path_entry:$PATH"
-  endif
+if ( $?path ) then
+  set path = ( "$_path_entry" $path:q )
 else
-  setenv PATH "$_path_entry"
+  set path = ( "$_path_entry" )
 endif
 EOF
     if [ -n "${managed_path:-}" ]; then
       printf '\n'
-      printf 'set _path_entry = "%s"\n' "$managed_escaped"
+      printf "set _path_entry = '%s'\n" "$managed_escaped"
       cat <<'EOF'
-if ( $?PATH ) then
-  if ( ":$PATH:" !~ *":$_path_entry:"* ) then
-    setenv PATH "$_path_entry:$PATH"
-  endif
+if ( $?path ) then
+  set path = ( "$_path_entry" $path:q )
 else
-  setenv PATH "$_path_entry"
+  set path = ( "$_path_entry" )
 endif
 EOF
     fi
+    printf '\n%s\n' 'rehash'
     printf '\n%s\n' 'unset _path_entry'
   } >"$tmp"; then
     fail_write_or_disk "csh PATH snippet" "$tmp" "Failed to write csh PATH snippet: $tmp"
@@ -562,48 +554,8 @@ EOF
     ensure_write_space "csh PATH snippet" "$file"
     cat "$tmp" >"$file" || fail_write_or_disk "csh PATH snippet" "$file" "Failed to install csh PATH snippet: $file"
     CONFIG_UPDATED=1
-    add_source_file "$file"
   fi
   rm -f "$tmp"
-}
-
-source_config_file() {
-  file="$1"
-  if [ -z "${file:-}" ] || [ ! -f "$file" ]; then
-    return 0
-  fi
-  case "$shell_name" in
-    bash)
-      if have_cmd bash; then
-        bash -c ". \"$file\"" >/dev/null 2>&1 || true
-      fi
-      ;;
-    zsh)
-      if have_cmd zsh; then
-        zsh -c "source \"$file\"" >/dev/null 2>&1 || true
-      fi
-      ;;
-    fish)
-      if have_cmd fish; then
-        fish -c "source \"$file\"" >/dev/null 2>&1 || true
-      fi
-      ;;
-    csh)
-      if have_cmd csh; then
-        csh -c "source \"$file\"" >/dev/null 2>&1 || true
-      fi
-      ;;
-    tcsh)
-      if have_cmd tcsh; then
-        tcsh -c "source \"$file\"" >/dev/null 2>&1 || true
-      elif have_cmd csh; then
-        csh -c "source \"$file\"" >/dev/null 2>&1 || true
-      fi
-      ;;
-    *)
-      . "$file" >/dev/null 2>&1 || true
-      ;;
-  esac
 }
 
 update_shell_config() {
@@ -619,8 +571,10 @@ update_shell_config() {
   posix_path_snippet="$config_root/codex-proxy/shell/path.sh"
   csh_path_snippet="$config_root/codex-proxy/shell/path.csh"
   fish_path_snippet="$config_root/fish/conf.d/codex-proxy-path.fish"
-  posix_source_line="[ -f \"$posix_path_snippet\" ] && . \"$posix_path_snippet\""
-  csh_source_line="source \"$csh_path_snippet\""
+  posix_path_snippet_escaped="$(escape_double_quotes "$posix_path_snippet")"
+  csh_path_snippet_escaped="$(escape_single_quotes "$csh_path_snippet")"
+  posix_source_line="[ -f \"$posix_path_snippet_escaped\" ] && . \"$posix_path_snippet_escaped\""
+  csh_source_line="source '$csh_path_snippet_escaped'"
   legacy_path_line="export PATH=\"$install_dir:\$PATH\""
   legacy_path_line_resolved="export PATH=\"$install_dir_resolved:\$PATH\""
   legacy_fish_path_line="set -gx PATH \"$install_dir\" \$PATH"
@@ -695,18 +649,20 @@ update_shell_config() {
       ;;
   esac
 
-  ensure_line "$alias_file" "$alias_line"
+  case "$shell_name" in
+    fish)
+      fish_path_snippet_escaped="$(escape_fish_double_quotes "$fish_path_snippet")"
+      INSTALL_ACTIVATION_DETAIL="Activate current fish session: source \"$fish_path_snippet_escaped\""
+      ;;
+    csh|tcsh)
+      INSTALL_ACTIVATION_DETAIL="Activate current $shell_name session: source '$csh_path_snippet_escaped'"
+      ;;
+    *)
+      INSTALL_ACTIVATION_DETAIL="Activate current shell: . \"$posix_path_snippet_escaped\""
+      ;;
+  esac
 
-  if [ "$CONFIG_UPDATED" -eq 1 ]; then
-    old_ifs="$IFS"
-    IFS='
-'
-    for file in $SOURCE_FILES; do
-      [ -n "${file:-}" ] || continue
-      source_config_file "$file"
-    done
-    IFS="$old_ifs"
-  fi
+  ensure_line "$alias_file" "$alias_line"
 }
 
 install_builtin_skills() {
@@ -929,7 +885,8 @@ INSTALL_SUCCESS_DETAILS="$(cat <<EOF
 Installed: $dst
 ${INSTALL_RECORD_DETAIL:-}
 Run: $dst proxy doctor
-Shell config checked for install/managed CLI PATH and alias 'cxp' (reload attempted)
+Shell config checked for future sessions; current shell PATH was not reloaded automatically.
+${INSTALL_ACTIVATION_DETAIL:-Open a new shell to use 'cxp' directly.}
 $BUILTIN_SKILL_DETAILS
 EOF
 )"

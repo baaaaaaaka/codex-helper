@@ -28,6 +28,152 @@ func TestInstallPs1KeepsPathSetupWhenInstallDirAlreadySet(t *testing.T) {
 	runInstallPs1(t, false, true)
 }
 
+func TestInstallPs1CurrentPowerShellPathAllowsBareCxp(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+
+	repo := "owner/name"
+	tag := "v1.2.3"
+	verNoV := strings.TrimPrefix(tag, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
+	assetData := buildWindowsCodexProxyAsset(t)
+	checksum := sha256.Sum256(assetData)
+
+	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
+	tempDir := t.TempDir()
+	userProfile := t.TempDir()
+	appData := filepath.Join(userProfile, "AppData", "Roaming")
+	localAppData := filepath.Join(userProfile, "AppData", "Local")
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	pathValue := filepath.Join(basePath, "System32")
+
+	psScript := `
+$ErrorActionPreference = "Stop"
+& $env:TEST_INSTALL_SCRIPT -Repo $env:TEST_REPO -Version latest -InstallDir $env:TEST_INSTALL_DIR
+$cmd = Get-Command cxp -ErrorAction Stop
+$expected = [IO.Path]::GetFullPath((Join-Path $env:TEST_INSTALL_DIR "cxp.cmd"))
+$actual = [IO.Path]::GetFullPath($cmd.Source)
+if ($actual -ine $expected) {
+  throw "cxp resolved to $actual, expected $expected"
+}
+$version = (& cxp --version | Out-String).Trim()
+if ($version -ne "codex-proxy 1.2.3") {
+  throw "unexpected cxp version output: $version"
+}
+`
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	cmd.Env = filterEnvWithoutKeys(os.Environ(), "Path", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
+	cmd.Env = append(cmd.Env,
+		"CODEX_PROXY_API_BASE="+server.URL,
+		"CODEX_PROXY_RELEASE_BASE="+server.URL,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"Path="+pathValue,
+		"TEMP="+tempDir,
+		"USERPROFILE="+userProfile,
+		"APPDATA="+appData,
+		"LOCALAPPDATA="+localAppData,
+		"TEST_INSTALL_SCRIPT="+scriptPath,
+		"TEST_REPO="+repo,
+		"TEST_INSTALL_DIR="+installDir,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.ps1 should make cxp available in the current PowerShell process: %v\n%s", err, string(output))
+	}
+}
+
+func TestInstallPs1NewPowerShellProfileAllowsBareCxp(t *testing.T) {
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "install.ps1")
+
+	repo := "owner/name"
+	tag := "v1.2.3"
+	verNoV := strings.TrimPrefix(tag, "v")
+	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
+	assetData := buildWindowsCodexProxyAsset(t)
+	checksum := sha256.Sum256(assetData)
+
+	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	managedPrefix := t.TempDir()
+	tempDir := t.TempDir()
+	userProfile := t.TempDir()
+	appData := filepath.Join(userProfile, "AppData", "Roaming")
+	localAppData := filepath.Join(userProfile, "AppData", "Local")
+
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	pathValue := filepath.Join(basePath, "System32")
+
+	baseEnv := filterEnvWithoutKeys(os.Environ(), "Path", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
+	baseEnv = append(baseEnv,
+		"CODEX_PROXY_API_BASE="+server.URL,
+		"CODEX_PROXY_RELEASE_BASE="+server.URL,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+managedPrefix,
+		"Path="+pathValue,
+		"TEMP="+tempDir,
+		"USERPROFILE="+userProfile,
+		"APPDATA="+appData,
+		"LOCALAPPDATA="+localAppData,
+	)
+
+	installCmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+		"-Repo", repo,
+		"-Version", "latest",
+		"-InstallDir", installDir,
+	)
+	installCmd.Env = baseEnv
+	output, err := installCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.ps1 failed before profile startup smoke: %v\n%s", err, string(output))
+	}
+
+	psScript := `
+$ErrorActionPreference = "Stop"
+$cmd = Get-Command cxp -ErrorAction Stop
+$version = (& cxp --version | Out-String).Trim()
+if ($version -ne "codex-proxy 1.2.3") {
+  throw "unexpected cxp version output: $version"
+}
+`
+	profileCmd := exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	profileCmd.Env = baseEnv
+	output, err = profileCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("new PowerShell profile should make cxp available: %v\n%s", err, string(output))
+	}
+}
+
 func TestInstallPs1ChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
 	if _, err := exec.LookPath("powershell"); err != nil {
 		t.Skip("powershell not available")
@@ -361,6 +507,39 @@ func TestInstallPs1PreservesExternalClpCmdReferencingClaudeProxy(t *testing.T) {
 	if !bytes.Equal(clpCmdData, legacyClpCmdData) {
 		t.Fatalf("expected clp.cmd referencing external claude-proxy.exe preserved")
 	}
+}
+
+func buildWindowsCodexProxyAsset(t *testing.T) []byte {
+	t.Helper()
+	workDir := t.TempDir()
+	sourcePath := filepath.Join(workDir, "main.go")
+	exePath := filepath.Join(workDir, "codex-proxy.exe")
+	source := `package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Println("codex-proxy 1.2.3")
+	}
+}
+`
+	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
+		t.Fatalf("write fake codex-proxy source: %v", err)
+	}
+	cmd := exec.Command("go", "build", "-o", exePath, sourcePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build fake codex-proxy.exe: %v\n%s", err, string(output))
+	}
+	data, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read fake codex-proxy.exe: %v", err)
+	}
+	return data
 }
 
 func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {

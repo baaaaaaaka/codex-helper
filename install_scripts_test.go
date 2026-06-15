@@ -81,6 +81,12 @@ func TestInstallShSuccessBanner(t *testing.T) {
 	if !strings.Contains(text, "Installed: "+filepath.Join(run.installDir, "codex-proxy")) {
 		t.Fatalf("expected installed path in success output, got %s", text)
 	}
+	if strings.Contains(text, "reload attempted") {
+		t.Fatalf("success output should not claim shell config reload was attempted, got %s", text)
+	}
+	if !strings.Contains(text, "current shell PATH was not reloaded automatically") {
+		t.Fatalf("expected current-shell activation guidance, got %s", text)
+	}
 }
 
 func TestInstallShBuiltinSkillFailureWarnsButInstallSucceeds(t *testing.T) {
@@ -231,6 +237,30 @@ func TestInstallPs1ChecksumDownloadRemainsBestEffort(t *testing.T) {
 	}
 }
 
+func TestInstallPs1DoesNotDotSourceProfile(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(repoRoot, "install.ps1"))
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	text := string(data)
+	for _, forbidden := range []string{
+		". $profilePath",
+		"$profileUpdated",
+		"Failed to reload profile",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("install.ps1 should not dot-source or reload the user profile, found %q", forbidden)
+		}
+	}
+	if !strings.Contains(text, "$env:Path = Prepend-PathEntries -pathText $env:Path -pathValues $pathEntries") {
+		t.Fatalf("install.ps1 should still refresh the current PowerShell process PATH")
+	}
+}
+
 func TestReadmeWindowsInstallAvoidsDownloadAndExecuteOneLiner(t *testing.T) {
 	repoRoot, err := os.Getwd()
 	if err != nil {
@@ -284,7 +314,7 @@ func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
 	assertUnixPathSnippet(t, run.homeDir, run.installDir)
 }
 
-func TestInstallShReloadsPathWhenHomeContainsSpaces(t *testing.T) {
+func TestInstallShPathSnippetActivatesWhenHomeContainsSpaces(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 
 	root := t.TempDir()
@@ -295,12 +325,14 @@ func TestInstallShReloadsPathWhenHomeContainsSpaces(t *testing.T) {
 	run.env = overrideEnv(run.env, "CODEX_PROXY_INSTALL_DIR", run.installDir)
 	run.env = overrideEnv(run.env, "SHELL", "")
 
+	runInstallShCommand(t, run)
+
 	outFile := filepath.Join(t.TempDir(), "path.txt")
-	cmd := exec.Command("sh", "-c", `. "$SCRIPT_PATH" >/dev/null 2>&1; printf '%s' "$PATH" > "$OUT_FILE"`)
+	cmd := exec.Command("sh", "-c", `. "$PATH_SNIPPET"; printf '%s' "$PATH" > "$OUT_FILE"`)
 	cmd.Dir = run.repoRoot
 	cmd.Env = append([]string{}, run.env...)
 	cmd.Env = append(cmd.Env,
-		"SCRIPT_PATH="+run.scriptPath,
+		"PATH_SNIPPET="+expectedPosixPathSnippetPath(run.homeDir),
 		"OUT_FILE="+outFile,
 	)
 	runInstallShCommandWithCmd(t, cmd)
@@ -315,6 +347,28 @@ func TestInstallShReloadsPathWhenHomeContainsSpaces(t *testing.T) {
 	}
 	if !containsPathEntry(pathValue, defaultManagedBinDir(run.homeDir)) {
 		t.Fatalf("expected PATH to include managed CLI dir %q, got %q", defaultManagedBinDir(run.homeDir), pathValue)
+	}
+}
+
+func TestInstallShDoesNotSourceUserShellConfigsDuringInstall(t *testing.T) {
+	run := newInstallShRun(t, false, false)
+	run.env = overrideEnv(run.env, "SHELL", "/bin/bash")
+
+	markerPath := filepath.Join(t.TempDir(), "profile-sourced")
+	markerLine := fmt.Sprintf("printf sourced > \"%s\"\n", strings.ReplaceAll(markerPath, `"`, `\"`))
+	for _, path := range []string{
+		filepath.Join(run.homeDir, ".bash_profile"),
+		filepath.Join(run.homeDir, ".bashrc"),
+	} {
+		if err := os.WriteFile(path, []byte(markerLine), 0o644); err != nil {
+			t.Fatalf("write poison shell config %s: %v", path, err)
+		}
+	}
+
+	runInstallShCommand(t, run)
+
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("installer should not source user shell configs during install, stat err=%v", err)
 	}
 }
 
@@ -1090,7 +1144,7 @@ func expectedCshPathSnippetPath(home string) string {
 }
 
 func expectedCshSourceLine(home string) string {
-	return fmt.Sprintf("source \"%s\"", expectedCshPathSnippetPath(home))
+	return fmt.Sprintf("source '%s'", expectedCshPathSnippetPath(home))
 }
 
 func defaultManagedBinDir(home string) string {
@@ -1114,6 +1168,12 @@ func assertUnixPathSnippet(t *testing.T, home, installDir string) {
 	if strings.Count(text, installDir) != 1 {
 		t.Fatalf("expected install dir once in PATH snippet, got %q", text)
 	}
+	if !strings.Contains(text, "hash -r 2>/dev/null || true") {
+		t.Fatalf("missing POSIX command cache refresh in PATH snippet")
+	}
+	if !strings.Contains(text, "rehash 2>/dev/null || true") {
+		t.Fatalf("missing zsh command cache refresh in PATH snippet")
+	}
 }
 
 func assertCshPathSnippet(t *testing.T, home, installDir string) {
@@ -1129,5 +1189,24 @@ func assertCshPathSnippet(t *testing.T, home, installDir string) {
 	}
 	if !strings.Contains(text, defaultManagedBinDir(home)) {
 		t.Fatalf("missing managed CLI dir in csh PATH snippet")
+	}
+	for _, forbidden := range []string{
+		`":$PATH:"`,
+		`":$_path_entry:"`,
+		`setenv PATH`,
+		`!~`,
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("csh PATH snippet should avoid PATH string/glob matching, found %q in:\n%s", forbidden, text)
+		}
+	}
+	for _, want := range []string{
+		`set path = ( "$_path_entry" $path:q )`,
+		`set path = ( "$_path_entry" )`,
+		"rehash",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in csh PATH snippet:\n%s", want, text)
+		}
 	}
 }

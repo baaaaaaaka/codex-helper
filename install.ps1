@@ -600,28 +600,15 @@ if ([string]::IsNullOrWhiteSpace($profilePath)) {
 }
 $aliasLine = 'Set-Alias -Name cxp -Value codex-proxy'
 
-$profileUpdated = $false
 foreach ($pathValue in $pathEntries) {
   $legacyLine = '$env:Path = "' + (Normalize-PathEntry $pathValue) + ';$env:Path"'
-  if (Remove-ProfileLine -path $profilePath -line $legacyLine) {
-    $profileUpdated = $true
-  }
+  $null = Remove-ProfileLine -path $profilePath -line $legacyLine
   $pathLine = New-ProfilePathLine -pathValue $pathValue
-  if (-not [string]::IsNullOrWhiteSpace($pathLine) -and (Ensure-ProfileLine -path $profilePath -line $pathLine)) {
-    $profileUpdated = $true
+  if (-not [string]::IsNullOrWhiteSpace($pathLine)) {
+    $null = Ensure-ProfileLine -path $profilePath -line $pathLine
   }
 }
-if (Ensure-ProfileLine -path $profilePath -line $aliasLine) {
-  $profileUpdated = $true
-}
-
-if ($profileUpdated) {
-  try {
-    . $profilePath
-  } catch {
-    Write-Warning "Failed to reload profile: $_"
-  }
-}
+$null = Ensure-ProfileLine -path $profilePath -line $aliasLine
 
 Write-InstallRecord -targetPath $dst -shimPath $cxpCmd -repo $Repo -version $tag -goarch $arch
 
@@ -674,7 +661,7 @@ foreach ($legacyName in @("claude-proxy.exe", "clp.exe", "clp.cmd")) {
 $script:InstallSuccessDetails = @(
   "Installed: $dst",
   $script:InstallRecordDetail,
-  "Shell profile and user PATH checked for install/managed CLI directories (reload attempted):",
+  "Current PowerShell session PATH updated; profile and user PATH checked for future sessions:",
   "  $profilePath",
   $builtinSkillDetail
 )

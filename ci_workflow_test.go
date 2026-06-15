@@ -25,6 +25,19 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"Coverage gate (Linux only)",
 		"Upload coverage artifact (Linux only)",
 	)
+	pathActivation := workflowStepBlock(t, targetedJob, "Install PATH activation matrix (Linux only)")
+	requireStepContains(t, pathActivation,
+		"if: runner.os == 'Linux'",
+		"apt-get install -y --no-install-recommends zsh fish csh tcsh",
+		"CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh",
+	)
+	macPathActivation := workflowStepBlock(t, targetedJob, "Install PATH activation matrix (macOS only)")
+	requireStepContains(t, macPathActivation,
+		"if: runner.os == 'macOS'",
+		"HOMEBREW_NO_AUTO_UPDATE=1 brew install fish",
+		"for attempt in 1 2 3",
+		"CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh",
+	)
 
 	fullJob := workflowJobBlock(t, workflow, "full-go-test")
 	requireStepContains(t, fullJob,
@@ -59,6 +72,20 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, raceJob,
 		"name: Race test (ubuntu-latest)",
 		"go test -race ./...",
+	)
+
+	distroJob := workflowJobBlock(t, workflow, "linux-distro-smoke")
+	requireStepContains(t, distroJob,
+		"path_activation_package_args: zsh tcsh",
+		"path_activation_package_args: zsh fish csh tcsh",
+		"PATH_ACTIVATION_PACKAGE_ARGS: ${{ matrix.path_activation_package_args }}",
+		"PATH_ACTIVATION_CASES: ${{ matrix.path_activation_cases }}",
+	)
+	distroPathActivation := workflowStepBlock(t, distroJob, "Installer PATH activation matrix in container")
+	requireStepContains(t, distroPathActivation,
+		"CODEX_PROXY_REQUIRE_SHELL_MATRIX=1",
+		"CODEX_PROXY_SHELL_MATRIX_CASES=\"$PATH_ACTIVATION_CASES\"",
+		"bash /repo/scripts/ci/install_path_activation_matrix.sh",
 	)
 
 	aggregateJob := workflowJobBlock(t, workflow, "test")

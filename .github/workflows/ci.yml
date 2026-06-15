@@ -50,6 +50,33 @@ jobs:
           set -euo pipefail
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      - name: Install PATH activation matrix (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo bash scripts/ci/retry.sh 5 5 apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive bash scripts/ci/retry.sh 5 5 apt-get install -y --no-install-recommends zsh fish csh tcsh
+          CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh
+
+      - name: Install PATH activation matrix (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v fish >/dev/null 2>&1; then
+            for attempt in 1 2 3; do
+              if HOMEBREW_NO_AUTO_UPDATE=1 brew install fish; then
+                break
+              fi
+              if [ "$attempt" = "3" ]; then
+                exit 1
+              fi
+              sleep $((attempt * 10))
+            done
+          fi
+          CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh
+
       - name: Teams auth bootstrap dry-run (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -1387,15 +1414,23 @@ jobs:
           - label: CentOS7
             image: centos:7
             package_args: ca-certificates curl xz tar procps-ng util-linux python36 binutils
+            path_activation_package_args: zsh tcsh
+            path_activation_cases: sh bash zsh csh tcsh
           - label: Rocky8
             image: rockylinux:8
             package_args: ca-certificates curl xz tar procps-ng util-linux python3 binutils
+            path_activation_package_args: zsh tcsh
+            path_activation_cases: sh bash zsh csh tcsh
           - label: Ubuntu20.04
             image: ubuntu:20.04
             package_args: ca-certificates curl xz-utils tar procps util-linux python3 binutils
+            path_activation_package_args: zsh fish csh tcsh
+            path_activation_cases: sh bash zsh fish csh tcsh
     env:
       DISTRO_IMAGE: ${{ matrix.image }}
       DISTRO_PACKAGE_ARGS: ${{ matrix.package_args }}
+      PATH_ACTIVATION_PACKAGE_ARGS: ${{ matrix.path_activation_package_args }}
+      PATH_ACTIVATION_CASES: ${{ matrix.path_activation_cases }}
 
     steps:
       - name: Checkout
@@ -1645,6 +1680,26 @@ jobs:
           else
             docker run --rm -v "$PWD/dist:/dist:ro" "$img" /dist/codex-proxy proxy doctor
           fi
+
+      - name: Installer PATH activation matrix in container
+        shell: bash
+        run: |
+          set -euo pipefail
+          img="$DISTRO_IMAGE"
+          docker run --rm \
+            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS $PATH_ACTIVATION_PACKAGE_ARGS" \
+            -e CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 \
+            -e CODEX_PROXY_SHELL_MATRIX_CASES="$PATH_ACTIVATION_CASES" \
+            -v "$PWD:/repo:ro" \
+            -v "$PWD/scripts/ci:/ci:ro" \
+            "$img" bash -lc '
+              set -euo pipefail
+              if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                # shellcheck disable=SC2086
+                bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
+              fi
+              bash /repo/scripts/ci/install_path_activation_matrix.sh
+            '
 
       - name: Run tests in containers
         shell: bash
