@@ -411,7 +411,6 @@ type Bridge struct {
 	dashboardProjectsCache            []codexhistory.Project
 	dashboardProjectsCachedAt         time.Time
 	annotateUserMessages              bool
-	annotationDisabled                bool
 	annotationWarned                  bool
 	markAnswerChatsUnread             bool
 	markAnswerUnreadWarned            bool
@@ -3296,7 +3295,7 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 		b.annotateIncomingUserMessageWithAttachmentContext(ctx, chatID, msg)
 		return
 	}
-	if messageAuthoredByCurrentUser(msg, b.user) && !b.annotationDisabled && b.graph != nil {
+	if messageAuthoredByCurrentUser(msg, b.user) && b.graph != nil {
 		annotated, ok := userAnnotatedMessageHTML(msg, b.user)
 		if !ok {
 			return
@@ -3304,11 +3303,8 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 		if err := b.graph.UpdateChatMessageHTML(ctx, chatID, msg.ID, annotated); err == nil {
 			return
 		} else {
-			if shouldDisableUserMessageAnnotation(err) {
-				b.annotationDisabled = true
-			}
 			if !b.annotationWarned && b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "Teams user message annotation disabled or unavailable: %v\n", err)
+				_, _ = fmt.Fprintf(b.out, "Teams user message annotation failed; using marker fallback for this message: %v\n", err)
 				b.annotationWarned = true
 			}
 		}
@@ -3319,7 +3315,7 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 }
 
 func (b *Bridge) annotateIncomingUserMessageWithASRTranscripts(ctx context.Context, chatID string, msg ChatMessage, transcripts []ASRTranscript) {
-	if b == nil || !b.annotateUserMessages || b.graph == nil || b.annotationDisabled || len(transcripts) == 0 {
+	if b == nil || !b.annotateUserMessages || b.graph == nil || len(transcripts) == 0 {
 		return
 	}
 	if strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" || !messageAuthoredByCurrentUser(msg, b.user) {
@@ -3330,18 +3326,15 @@ func (b *Bridge) annotateIncomingUserMessageWithASRTranscripts(ctx context.Conte
 		return
 	}
 	if err := b.graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, msg, annotated); err != nil {
-		if shouldDisableAttachmentPreservingUserMessageAnnotation(err) {
-			b.annotationDisabled = true
-		}
 		if !b.annotationWarned && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams user ASR transcript annotation disabled or unavailable: %v\n", err)
+			_, _ = fmt.Fprintf(b.out, "Teams user ASR transcript annotation failed for this message: %v\n", err)
 			b.annotationWarned = true
 		}
 	}
 }
 
 func (b *Bridge) annotateIncomingUserMessageWithAttachmentContext(ctx context.Context, chatID string, msg ChatMessage) {
-	if b == nil || b.graph == nil || b.annotationDisabled || !messageAuthoredByCurrentUser(msg, b.user) {
+	if b == nil || b.graph == nil || !messageAuthoredByCurrentUser(msg, b.user) {
 		return
 	}
 	annotated, ok := userAnnotatedAttachmentMessageHTML(msg, b.user)
@@ -3349,11 +3342,8 @@ func (b *Bridge) annotateIncomingUserMessageWithAttachmentContext(ctx context.Co
 		return
 	}
 	if err := b.graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, msg, annotated); err != nil {
-		if shouldDisableAttachmentPreservingUserMessageAnnotation(err) {
-			b.annotationDisabled = true
-		}
 		if !b.annotationWarned && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams user message attachment-preserving annotation disabled or unavailable: %v\n", err)
+			_, _ = fmt.Fprintf(b.out, "Teams user message attachment-preserving annotation failed for this message: %v\n", err)
 			b.annotationWarned = true
 		}
 	}
@@ -3429,32 +3419,6 @@ func teamsAttachmentPlaceholderIDSet(content string) map[string]bool {
 	}
 	walk(root)
 	return ids
-}
-
-func shouldDisableAttachmentPreservingUserMessageAnnotation(err error) bool {
-	var graphErr *GraphStatusError
-	if !errors.As(err, &graphErr) {
-		return false
-	}
-	switch graphErr.StatusCode {
-	case 401, 403, 405:
-		return true
-	default:
-		return false
-	}
-}
-
-func shouldDisableUserMessageAnnotation(err error) bool {
-	var graphErr *GraphStatusError
-	if !errors.As(err, &graphErr) {
-		return false
-	}
-	switch graphErr.StatusCode {
-	case 400, 401, 403, 404, 405:
-		return true
-	default:
-		return false
-	}
 }
 
 func userAnnotatedMessageHTML(msg ChatMessage, _ User) (string, bool) {

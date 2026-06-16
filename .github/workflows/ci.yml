@@ -151,6 +151,12 @@ jobs:
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'Test(ChatTitlesUseDistinctLeadingEmoji|ParseControlDashboardCommandsDoNotRequireCodex|ParseRenameHostnameArgumentPreservesRegularRenameTitles|Bridge(ControlRenameUpdatesTeamsTopicAndDurableState|RenameHostnameUpdatesControlAndWorkChatTopics|EnsureControlChat(DoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|PreservesUserControlTitle|RestoresPersistedUserControlTitle|BackfillsUserControlTitleIntoPartialDurableBinding|RenamesOldControlTopic)|SessionRenameUpdatesTeamsTopicAndDurableState))$' -v
 
+      - name: Teams user annotation failure isolation regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'TestBridgeAnnotate(IncomingUserMessageFallsBackOnlyForFailedMessage|AttachmentPatchFailureDoesNotDisableTextAnnotationsOrMirror|ASRPatchFailureDoesNotDisableTextAnnotations)$' -v
+
       - name: Responses adapter provider compatibility regressions
         shell: bash
         run: |

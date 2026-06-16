@@ -3569,19 +3569,35 @@ func TestStripUserAnnotationPrefixStripsExactlyOneHelperUserMarker(t *testing.T)
 	}
 }
 
-func TestBridgeAnnotateIncomingUserMessageFallsBackWhenGraphUpdateFails(t *testing.T) {
+func TestBridgeAnnotateIncomingUserMessageFallsBackOnlyForFailedMessage(t *testing.T) {
 	var sent []bridgeSentMessage
-	var patches int
+	var failedPatches int
+	var nextPatches int
 	graph := &GraphClient{
 		auth: &fakeGraphAuth{token: "access"},
 		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			w := httptest.NewRecorder()
 			switch {
 			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/message-1":
-				patches++
+				failedPatches++
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				_, _ = w.Write([]byte(`{"error":{"code":"Forbidden","message":"cannot edit message"}}`))
+			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/message-2":
+				nextPatches++
+				var body struct {
+					Body struct {
+						Content string `json:"content"`
+					} `json:"body"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode next patch: %v", err)
+				}
+				plain := PlainTextFromTeamsHTML(body.Body.Content)
+				if !strings.Contains(plain, "🧑‍💻 User:") || !strings.Contains(plain, "second request") {
+					t.Fatalf("next patch plain = %q, want annotated second request", plain)
+				}
+				w.WriteHeader(http.StatusNoContent)
 			case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
 				var body struct {
 					Body struct {
@@ -3613,15 +3629,16 @@ func TestBridgeAnnotateIncomingUserMessageFallsBackWhenGraphUpdateFails(t *testi
 		t.Fatalf("ensureDurableSession error: %v", err)
 	}
 	msg := bridgePollMessage("message-1", "2026-04-30T01:00:00Z", "fix this")
+	next := bridgePollMessage("message-2", "2026-04-30T01:00:01Z", "second request")
 
 	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", msg)
-	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", msg)
+	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", next)
 
-	if patches != 1 {
-		t.Fatalf("patch attempts = %d, want one before annotation is disabled", patches)
+	if failedPatches != 1 || nextPatches != 1 {
+		t.Fatalf("patch attempts failed=%d next=%d, want 1/1", failedPatches, nextPatches)
 	}
 	if len(sent) != 1 {
-		t.Fatalf("sent fallback mirrors = %#v, want one idempotent mirror", sent)
+		t.Fatalf("sent fallback mirrors = %#v, want one mirror for failed message only", sent)
 	}
 	if plain := PlainTextFromTeamsHTML(sent[0].Content); !strings.Contains(plain, "🧑‍💻 User:\nfix this") {
 		t.Fatalf("fallback mirror plain = %q, want visible User marker", plain)
@@ -3709,7 +3726,7 @@ func TestBridgeAnnotateFileAttachmentPatchesWithAttachmentsAndNoMirror(t *testin
 	}
 }
 
-func TestBridgeAnnotateAttachmentPatchBadRequestDoesNotDisableTextAnnotationsOrMirror(t *testing.T) {
+func TestBridgeAnnotateAttachmentPatchFailureDoesNotDisableTextAnnotationsOrMirror(t *testing.T) {
 	var attachmentPatchAttempts int
 	var textPatchAttempts int
 	graph := &GraphClient{
@@ -3720,8 +3737,8 @@ func TestBridgeAnnotateAttachmentPatchBadRequestDoesNotDisableTextAnnotationsOrM
 			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/quoted-message":
 				attachmentPatchAttempts++
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"error":{"code":"BadRequest","message":"attachment payload rejected for this message"}}`))
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":{"code":"Forbidden","message":"attachment payload rejected for this message"}}`))
 			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/text-message":
 				textPatchAttempts++
 				var payload struct {
@@ -3764,25 +3781,60 @@ func TestBridgeAnnotateAttachmentPatchBadRequestDoesNotDisableTextAnnotationsOrM
 	}
 }
 
-func TestShouldDisableAttachmentPreservingAnnotationOnlyForCapabilityErrors(t *testing.T) {
-	tests := []struct {
-		status int
-		want   bool
-	}{
-		{status: http.StatusBadRequest, want: false},
-		{status: http.StatusUnauthorized, want: true},
-		{status: http.StatusForbidden, want: true},
-		{status: http.StatusNotFound, want: false},
-		{status: http.StatusMethodNotAllowed, want: true},
-		{status: http.StatusTooManyRequests, want: false},
-	}
-	for _, tt := range tests {
-		t.Run(strconv.Itoa(tt.status), func(t *testing.T) {
-			err := &GraphStatusError{StatusCode: tt.status}
-			if got := shouldDisableAttachmentPreservingUserMessageAnnotation(err); got != tt.want {
-				t.Fatalf("shouldDisableAttachmentPreservingUserMessageAnnotation(%d) = %v, want %v", tt.status, got, tt.want)
+func TestBridgeAnnotateASRPatchFailureDoesNotDisableTextAnnotations(t *testing.T) {
+	var asrPatchAttempts int
+	var textPatchAttempts int
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			switch {
+			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/asr-message":
+				asrPatchAttempts++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":{"code":"Forbidden","message":"ASR annotation rejected for this message"}}`))
+			case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/text-message":
+				textPatchAttempts++
+				var payload struct {
+					Body struct {
+						Content string `json:"content"`
+					} `json:"body"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode text patch: %v", err)
+				}
+				if !strings.Contains(PlainTextFromTeamsHTML(payload.Body.Content), "🧑‍💻 User:") || !strings.Contains(payload.Body.Content, "plain follow-up") {
+					t.Fatalf("unexpected text patch body: %#v", payload.Body)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
+				t.Fatalf("ASR annotation failure should not queue a visible mirror: %s", r.URL.String())
+			default:
+				t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 			}
-		})
+			return w.Result(), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.annotateUserMessages = true
+
+	asr := bridgeTestMessageWithText("asr-message", `<p>voice request</p>`)
+	bridge.annotateIncomingUserMessageWithASRTranscripts(context.Background(), "chat-1", asr, []ASRTranscript{{
+		SourceName: "voice.m4a",
+		Text:       "spoken request",
+	}})
+
+	text := bridgeTestMessageWithText("text-message", `<p>plain follow-up</p>`)
+	bridge.annotateIncomingUserMessage(context.Background(), "chat-1", text)
+
+	if asrPatchAttempts != 1 || textPatchAttempts != 1 {
+		t.Fatalf("patch attempts ASR=%d text=%d, want 1/1", asrPatchAttempts, textPatchAttempts)
 	}
 }
 
