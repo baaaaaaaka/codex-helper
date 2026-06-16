@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-16T02:25:00Z",
+  "generated_at": "2026-06-16T02:33:25Z",
   "releases": [
     {
       "assets": [
@@ -37,7 +37,7 @@
       "draft": false,
       "name": "v0.1.10-rc.22",
       "prerelease": true,
-      "priority": "p2",
+      "priority": "p1",
       "published_at": "2026-06-16T02:24:05Z",
       "tag_name": "v0.1.10-rc.22",
       "version": "0.1.10-rc.22"
