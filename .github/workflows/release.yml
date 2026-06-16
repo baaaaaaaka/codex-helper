@@ -151,6 +151,15 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed$' -v
           go test ./internal/cli -count=1 -run 'TestTeamsStatus(SeparatesCatchupBacklogAndInactiveRows|ShowsRunningTurnDetails)$' -v
 
+      - name: Teams message edit engine regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          lossless_annotation_pattern='Test(UserAnnotated(MessageHTMLSkipsTeamsAttachmentContext|AttachmentMessageHTMLPreservesComplexBodyShape)|BridgeAnnotate(MessageReferencePatchesWithAttachmentsAndNoMirror|FileAttachmentPatchesWithAttachmentsAndNoMirror|AttachmentPatchFailureDoesNotDisableTextAnnotationsOrMirror)|GraphUpdateChatMessageHTMLPreservingAttachments|HelperAttachmentMessageIsSelfIgnoring|BridgePollDropsPersistedInboundAfterUserAnnotation)$'
+          edit_engine_pattern='Test(TeamsMessageEditExecutor(PreservesPayloadAndDoesNotFetchMessageAgain|SkipsUnsafeAttachmentContext|ClassifiesGraphFailures)|TeamsNonHTMLBodyAsHTMLPreservesLineBreaks|UserAnnotated(MessageHTMLConvertsNonHTMLContentToEscapedHTML|ASRTranscriptMessageHTMLConvertsNonHTMLContentToEscapedHTML|ASRTranscriptMessageHTMLHandlesMultipleMediaAndIsIdempotent)|BridgeAnnotate(IncomingUserMessageDoesNotMirrorWhenGraphUpdateFails|PlainSelfMessageUsesBodyOnlyPatchAndNoMirror|MentionOnlySelfMessagePreserves(MentionPayloadAndNoMirror|MismatchedMentionPayload)|ForwardedMessageReferencePatchesWithAttachmentsAndNoMirror|MixedAttachmentContextPreservesPayloadMentionsAndNoMirror|AttachmentPayloadOrderMayDifferFromPlaceholderOrder|UnsafeAttachmentContextSkipsGraphWriteAndMirror|LiteralAttachmentTagTextSkipsConservatively|IncomingUserMessageSkipsMediaCardUntilASRTranscript|ASRTranscriptPreservesMediaAttachmentMentionsAndNoMirror|ASRTranscriptBadRequestDoesNotDisableTextAnnotationsOrMirror|ASRPatchFailureDoesNotDisableTextAnnotations|ExternalAttachmentContextDoesNotPatchOrMirror)|BridgeFreezeNoticePatch(PreservesAttachments|PreservesMentions|SkipsUnsafeAttachmentContext)|AppendFreezeNoticeToMessageHTMLConvertsNonHTMLContentToEscapedHTML|BridgePollOnce(ParksIdleWorkChatAndAppendsFreezeNoticeToLatestMessage|SendsStandaloneFreezeNoticeWhenLatestMessage(PatchRejected|UnsafeToPatch)))$'
+          go test ./internal/teams -count=1 -run "$lossless_annotation_pattern" -v
+          go test ./internal/teams -count=1 -run "$edit_engine_pattern" -v
+
       - name: Helper auto-update activation and cxp upgrade regressions
         shell: bash
         run: |

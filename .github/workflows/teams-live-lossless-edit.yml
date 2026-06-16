@@ -1,0 +1,75 @@
+name: Teams live lossless edit
+
+on:
+  workflow_dispatch:
+    inputs:
+      nonce:
+        description: Unique one-shot marker for the live Teams write run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  live-lossless-edit:
+    name: Live Graph lossless edit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CODEX_HELPER_TEAMS_LIVE_LOSSLESS_EDIT: "1"
+      CODEX_HELPER_TEAMS_LIVE_JASON_WEI_ONLY: jason-wei-only
+      CODEX_HELPER_TEAMS_LIVE_WRITE_ONCE: ${{ inputs.nonce }}
+      CODEX_HELPER_TEAMS_TENANT_ID: ${{ secrets.CODEX_HELPER_TEAMS_TENANT_ID }}
+      CODEX_HELPER_TEAMS_CLIENT_ID: ${{ secrets.CODEX_HELPER_TEAMS_CLIENT_ID }}
+      CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID: ${{ secrets.CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID }}
+      CODEX_HELPER_TEAMS_TOKEN_CACHE_JSON: ${{ secrets.CODEX_HELPER_TEAMS_TOKEN_CACHE_JSON }}
+      CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE_JSON: ${{ secrets.CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE_JSON }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Prepare Teams token caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODEX_HELPER_TEAMS_TOKEN_CACHE="$RUNNER_TEMP/teams-token.json"
+          CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE="$RUNNER_TEMP/teams-file-write-token.json"
+          missing=()
+          for name in \
+            CODEX_HELPER_TEAMS_TENANT_ID \
+            CODEX_HELPER_TEAMS_CLIENT_ID \
+            CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID \
+            CODEX_HELPER_TEAMS_TOKEN_CACHE_JSON \
+            CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE_JSON
+          do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing required live Teams secret/env values:\n' >&2
+            printf '  %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+          install -d -m 700 "$(dirname "$CODEX_HELPER_TEAMS_TOKEN_CACHE")"
+          printf '%s' "$CODEX_HELPER_TEAMS_TOKEN_CACHE_JSON" > "$CODEX_HELPER_TEAMS_TOKEN_CACHE"
+          printf '%s' "$CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE_JSON" > "$CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE"
+          chmod 600 "$CODEX_HELPER_TEAMS_TOKEN_CACHE" "$CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE"
+          {
+            echo "CODEX_HELPER_TEAMS_TOKEN_CACHE=$CODEX_HELPER_TEAMS_TOKEN_CACHE"
+            echo "CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=$CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE"
+          } >> "$GITHUB_ENV"
+
+      - name: Run live Teams lossless edit test
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -run TestLiveGraphLosslessAttachmentEditOptIn -count=1 -v

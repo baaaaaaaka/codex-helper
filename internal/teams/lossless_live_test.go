@@ -340,8 +340,12 @@ func verifyLiveLosslessEdit(ctx context.Context, t *testing.T, graph *GraphClien
 	originalPlain := normalizeLivePlainForFormat(PlainTextFromTeamsHTML(originalBody))
 	updatedBody := `<p><strong>` + htmlText(incomingUserLabel()) + `:</strong></p>` + originalBody
 	original.Body.ContentType = "html"
-	if err := graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, original, updatedBody); err != nil {
-		t.Fatalf("%s lossless PATCH failed: %v", label, err)
+	bridge := &Bridge{graph: graph}
+	outcome := bridge.applyTeamsMessageEdit(ctx, chatID, original, updatedBody, teamsMessageEditOptions{
+		ProtectAttachmentContext: true,
+	})
+	if !outcome.Applied {
+		t.Fatalf("%s lossless PATCH outcome = %#v, want applied", label, outcome)
 	}
 	after, err := graph.GetMessage(ctx, chatID, messageID)
 	if err != nil {

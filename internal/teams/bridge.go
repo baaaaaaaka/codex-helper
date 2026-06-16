@@ -2422,13 +2422,20 @@ func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, session 
 	if !ok {
 		return freezeNoticeAppendResult{}, nil
 	}
-	if err := b.graph.UpdateChatMessageHTML(ctx, session.ChatID, msg.ID, updated); err != nil {
-		if nonRetryableFreezeNoticePatchTargetError(err) {
-			return freezeNoticeAppendResult{}, nil
-		}
-		return freezeNoticeAppendResult{}, err
+	outcome := b.applyTeamsMessageEdit(ctx, session.ChatID, msg, updated, teamsMessageEditOptions{
+		ProtectAttachmentContext: true,
+		NonRetryable:             nonRetryableFreezeNoticePatchTargetError,
+	})
+	if outcome.Applied {
+		return freezeNoticeAppendResult{Appended: true}, nil
 	}
-	return freezeNoticeAppendResult{Appended: true}, nil
+	if outcome.SkippedUnsafe || outcome.NonRetryableFailure {
+		return freezeNoticeAppendResult{}, nil
+	}
+	if outcome.Err != nil {
+		return freezeNoticeAppendResult{}, outcome.Err
+	}
+	return freezeNoticeAppendResult{}, nil
 }
 
 func (b *Bridge) latestMessageForFreezeNotice(ctx context.Context, session Session) (ChatMessage, bool, error) {
@@ -2550,9 +2557,17 @@ func appendFreezeNoticeToMessageHTML(msg ChatMessage, resumeCommand string, noti
 		return "", false
 	}
 	if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
-		content = "<p>" + html.EscapeString(PlainTextFromTeamsHTML(content)) + "</p>"
+		content = teamsNonHTMLBodyAsHTML(content)
 	}
 	return content + `<p>&nbsp;</p>` + noticeHTML, true
+}
+
+func teamsNonHTMLBodyAsHTML(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	escaped := html.EscapeString(content)
+	escaped = strings.ReplaceAll(escaped, "\n", "<br>")
+	return "<p>" + escaped + "</p>"
 }
 
 func freezeNoticeVisibleMessage(msg ChatMessage) bool {
@@ -3278,6 +3293,45 @@ func comparableTeamsPlainText(text string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
 }
 
+type teamsMessageEditOptions struct {
+	ProtectAttachmentContext bool
+	NonRetryable             func(error) bool
+}
+
+type teamsMessageEditOutcome struct {
+	Applied             bool
+	SkippedUnsafe       bool
+	RetryableFailure    bool
+	NonRetryableFailure bool
+	Err                 error
+}
+
+func (b *Bridge) applyTeamsMessageEdit(ctx context.Context, chatID string, msg ChatMessage, html string, opts teamsMessageEditOptions) teamsMessageEditOutcome {
+	if b == nil || b.graph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" || strings.TrimSpace(html) == "" {
+		return teamsMessageEditOutcome{SkippedUnsafe: true}
+	}
+	if opts.ProtectAttachmentContext && messageHasTeamsAttachmentContext(msg) && !messageAttachmentContextLosslessPatchable(msg) {
+		return teamsMessageEditOutcome{SkippedUnsafe: true}
+	}
+	var err error
+	if teamsMessageEditNeedsPreservingPayload(msg) {
+		err = b.graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, msg, html)
+	} else {
+		err = b.graph.UpdateChatMessageHTML(ctx, chatID, msg.ID, html)
+	}
+	if err == nil {
+		return teamsMessageEditOutcome{Applied: true}
+	}
+	if opts.NonRetryable != nil && opts.NonRetryable(err) {
+		return teamsMessageEditOutcome{NonRetryableFailure: true, Err: err}
+	}
+	return teamsMessageEditOutcome{RetryableFailure: true, Err: err}
+}
+
+func teamsMessageEditNeedsPreservingPayload(msg ChatMessage) bool {
+	return len(msg.Attachments) > 0 || len(msg.Mentions) > 0
+}
+
 func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string, msg ChatMessage) {
 	if !b.annotateUserMessages {
 		return
@@ -3291,26 +3345,43 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	if strings.TrimSpace(msg.Body.Content) == "" && !messageHasTeamsAttachmentContext(msg) {
 		return
 	}
-	if messageHasTeamsAttachmentContext(msg) {
-		b.annotateIncomingUserMessageWithAttachmentContext(ctx, chatID, msg)
+	if messageAuthoredByCurrentUser(msg, b.user) {
+		b.annotateIncomingUserMessageWithUserMarker(ctx, chatID, msg)
 		return
 	}
-	if messageAuthoredByCurrentUser(msg, b.user) && b.graph != nil {
-		annotated, ok := userAnnotatedMessageHTML(msg, b.user)
-		if !ok {
-			return
-		}
-		if err := b.graph.UpdateChatMessageHTML(ctx, chatID, msg.ID, annotated); err == nil {
-			return
-		} else {
-			if !b.annotationWarned && b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "Teams user message annotation failed; using marker fallback for this message: %v\n", err)
-				b.annotationWarned = true
-			}
-		}
+	if messageHasTeamsAttachmentContext(msg) {
+		return
 	}
 	if err := b.queueIncomingUserMarkerMirror(ctx, chatID, msg); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams user message marker fallback failed: %v\n", err)
+	}
+}
+
+func (b *Bridge) annotateIncomingUserMessageWithUserMarker(ctx context.Context, chatID string, msg ChatMessage) {
+	if b == nil || b.graph == nil {
+		return
+	}
+	annotated, ok := userMarkerPrependMessageHTML(msg, b.user)
+	if !ok {
+		return
+	}
+	attachmentContext := messageHasTeamsAttachmentContext(msg)
+	outcome := b.applyTeamsMessageEdit(ctx, chatID, msg, annotated, teamsMessageEditOptions{
+		ProtectAttachmentContext: true,
+	})
+	if outcome.Applied || outcome.SkippedUnsafe || outcome.Err == nil {
+		return
+	}
+	if attachmentContext {
+		if !b.annotationWarned && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams user message attachment-preserving annotation failed for this message: %v\n", outcome.Err)
+			b.annotationWarned = true
+		}
+		return
+	}
+	if !b.annotationWarned && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams user message annotation failed for this message: %v\n", outcome.Err)
+		b.annotationWarned = true
 	}
 }
 
@@ -3325,25 +3396,10 @@ func (b *Bridge) annotateIncomingUserMessageWithASRTranscripts(ctx context.Conte
 	if !ok {
 		return
 	}
-	if err := b.graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, msg, annotated); err != nil {
+	outcome := b.applyTeamsMessageEdit(ctx, chatID, msg, annotated, teamsMessageEditOptions{})
+	if outcome.Err != nil {
 		if !b.annotationWarned && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams user ASR transcript annotation failed for this message: %v\n", err)
-			b.annotationWarned = true
-		}
-	}
-}
-
-func (b *Bridge) annotateIncomingUserMessageWithAttachmentContext(ctx context.Context, chatID string, msg ChatMessage) {
-	if b == nil || b.graph == nil || !messageAuthoredByCurrentUser(msg, b.user) {
-		return
-	}
-	annotated, ok := userAnnotatedAttachmentMessageHTML(msg, b.user)
-	if !ok {
-		return
-	}
-	if err := b.graph.UpdateChatMessageHTMLPreservingAttachments(ctx, chatID, msg, annotated); err != nil {
-		if !b.annotationWarned && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams user message attachment-preserving annotation failed for this message: %v\n", err)
+			_, _ = fmt.Fprintf(b.out, "Teams user ASR transcript annotation failed for this message: %v\n", outcome.Err)
 			b.annotationWarned = true
 		}
 	}
@@ -3376,19 +3432,26 @@ func messageHasTeamsAttachmentContext(msg ChatMessage) bool {
 }
 
 func messageAttachmentContextLosslessPatchable(msg ChatMessage) bool {
-	if len(msg.Attachments) == 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 || hasAdaptiveCardAttachment(msg.Attachments) {
+	if len(msg.Attachments) == 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 || hasTeamsCardAttachment(msg.Attachments) || attachmentContentHasHostedContentRef(msg.Attachments) {
 		return false
 	}
-	ids := teamsAttachmentPlaceholderIDSet(msg.Body.Content)
+	ids := teamsAttachmentPlaceholderIDsInOrder(msg.Body.Content)
 	if len(ids) == 0 {
 		return false
 	}
 	if len(ids) != len(msg.Attachments) {
 		return false
 	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
 	for _, attachment := range msg.Attachments {
 		id := strings.TrimSpace(attachment.ID)
-		if id == "" || !ids[id] || strings.TrimSpace(attachment.ContentType) == "" {
+		if id == "" || !seen[id] || !losslessPatchableAttachmentContentType(attachment) {
 			return false
 		}
 	}
@@ -3421,25 +3484,60 @@ func teamsAttachmentPlaceholderIDSet(content string) map[string]bool {
 	return ids
 }
 
+func teamsAttachmentPlaceholderIDsInOrder(content string) []string {
+	root, err := xhtml.Parse(strings.NewReader("<div>" + content + "</div>"))
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.EqualFold(n.Data, "attachment") {
+			for _, attr := range n.Attr {
+				if strings.EqualFold(attr.Key, "id") && strings.TrimSpace(attr.Val) != "" {
+					ids = append(ids, strings.TrimSpace(attr.Val))
+				}
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return ids
+}
+
 func userAnnotatedMessageHTML(msg ChatMessage, _ User) (string, bool) {
-	content := strings.TrimSpace(msg.Body.Content)
-	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) || messageHasTeamsAttachmentContext(msg) {
+	if messageHasTeamsAttachmentContext(msg) {
 		return "", false
 	}
-	label := incomingUserLabel()
-	if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
-		content = "<p>" + html.EscapeString(PlainTextFromTeamsHTML(content)) + "</p>"
-	}
-	return `<p><strong>` + html.EscapeString(label) + `:</strong></p>` + content, true
+	return userMarkerPrependMessageHTML(msg, User{})
 }
 
 func userAnnotatedAttachmentMessageHTML(msg ChatMessage, _ User) (string, bool) {
-	content := strings.TrimSpace(msg.Body.Content)
-	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) || !messageAttachmentContextLosslessPatchable(msg) {
+	if !messageHasTeamsAttachmentContext(msg) {
 		return "", false
 	}
-	if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
+	return userMarkerPrependMessageHTML(msg, User{})
+}
+
+func userMarkerPrependMessageHTML(msg ChatMessage, _ User) (string, bool) {
+	content := strings.TrimSpace(msg.Body.Content)
+	if content == "" || hasUserAnnotationPrefix(content) || isPromptlessTeamsAttachmentPlaceholderMessage(msg) || isHelperAttachmentEchoMessage(msg) {
 		return "", false
+	}
+	if messageHasTeamsAttachmentContext(msg) {
+		if !messageAttachmentContextLosslessPatchable(msg) {
+			return "", false
+		}
+		if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
+			return "", false
+		}
+	} else if strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
+		content = teamsNonHTMLBodyAsHTML(content)
 	}
 	label := incomingUserLabel()
 	return `<p><strong>` + html.EscapeString(label) + `:</strong></p>` + content, true
@@ -3451,7 +3549,7 @@ func userAnnotatedASRTranscriptMessageHTML(msg ChatMessage, transcripts []ASRTra
 	}
 	content := strings.TrimSpace(msg.Body.Content)
 	if content != "" && strings.TrimSpace(msg.Body.ContentType) != "" && !strings.EqualFold(strings.TrimSpace(msg.Body.ContentType), "html") {
-		content = "<p>" + html.EscapeString(PlainTextFromTeamsHTML(content)) + "</p>"
+		content = teamsNonHTMLBodyAsHTML(content)
 	}
 	if strings.Contains(PlainTextFromTeamsHTML(content), teamsASRTranscriptAnnotationLabel) {
 		return "", false
@@ -3646,6 +3744,35 @@ func hasAdaptiveCardAttachment(attachments []MessageAttachment) bool {
 		}
 	}
 	return false
+}
+
+func hasTeamsCardAttachment(attachments []MessageAttachment) bool {
+	for _, attachment := range attachments {
+		contentType := strings.ToLower(strings.TrimSpace(strings.Split(attachment.ContentType, ";")[0]))
+		if strings.HasPrefix(contentType, "application/vnd.microsoft.card.") {
+			return true
+		}
+	}
+	return false
+}
+
+func attachmentContentHasHostedContentRef(attachments []MessageAttachment) bool {
+	for _, attachment := range attachments {
+		if len(HostedContentIDsFromHTML(attachment.Content)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func losslessPatchableAttachmentContentType(attachment MessageAttachment) bool {
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(attachment.ContentType, ";")[0]))
+	switch contentType {
+	case "reference", "messagereference", "forwardedmessagereference":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasTeamsAttachmentPlaceholder(content string) bool {
