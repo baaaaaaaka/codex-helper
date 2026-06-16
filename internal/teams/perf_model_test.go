@@ -1210,6 +1210,321 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserMessageDrainStageWrites(b *tes
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserChatPollErrorStageWrites(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, _ := newCXPPerfRealisticMixedUserFixture(b)
+		chatID := cxpPerfChatID(i % 100)
+		blockedUntil := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC).Add(time.Duration(i+1) * time.Minute)
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			return store.RecordChatPollErrorWithBlock(ctx, chatID, "Graph 429 Too Many Requests", blockedUntil)
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("RecordChatPollErrorWithBlock: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+	}
+	cxpPerfReportNamedProcIO(b, "chat_poll_error", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "chat_poll_error_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserOutboxSendErrorStageWrites(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+		if session == nil {
+			b.Fatalf("realistic session missing")
+		}
+		msg, created, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+			ID:                   fmt.Sprintf("realistic-send-error-outbox-%06d", i),
+			SessionID:            session.ID,
+			TeamsChatID:          session.ChatID,
+			Kind:                 "status-progress",
+			Body:                 "uploading artifact before send error",
+			ArtifactIDs:          []string{fmt.Sprintf("artifact:send-error:%06d", i)},
+			AttachmentName:       "report.txt",
+			AttachmentUploadName: "report-upload.txt",
+			DriveItemID:          "drive-item-1",
+			Status:               teamstore.OutboxStatusSending,
+		})
+		if err != nil || !created {
+			b.Fatalf("QueueOutbox setup created=%v err=%v", created, err)
+		}
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			_, err := store.MarkOutboxSendError(ctx, msg.ID, "Graph 502 Bad Gateway while posting Teams message")
+			return err
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("MarkOutboxSendError: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+	}
+	cxpPerfReportNamedProcIO(b, "outbox_send_error", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "outbox_send_error_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserOutboxDriveItemStageWrites(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+		if session == nil {
+			b.Fatalf("realistic session missing")
+		}
+		msg, created, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+			ID:                   fmt.Sprintf("realistic-drive-item-outbox-%06d", i),
+			SessionID:            session.ID,
+			TeamsChatID:          session.ChatID,
+			Kind:                 "status-progress",
+			Body:                 "uploading artifact before drive item update",
+			ArtifactIDs:          []string{fmt.Sprintf("artifact:drive-item:%06d", i)},
+			AttachmentName:       "report.txt",
+			AttachmentUploadName: "report-upload.txt",
+			Status:               teamstore.OutboxStatusSending,
+		})
+		if err != nil || !created {
+			b.Fatalf("QueueOutbox setup created=%v err=%v", created, err)
+		}
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			_, err := store.MarkOutboxDriveItem(ctx, msg.ID, "drive-item-1", "report.txt", "etag-1", "https://sharepoint/report", "dav://report")
+			return err
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("MarkOutboxDriveItem: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+	}
+	cxpPerfReportNamedProcIO(b, "outbox_drive_item", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "outbox_drive_item_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserArtifactUpsertStageWrites(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, _ := newCXPPerfRealisticMixedUserFixture(b)
+		artifactID := fmt.Sprintf("realistic-artifact-upsert-%06d", i)
+		if _, err := store.UpsertArtifactRecord(ctx, teamstore.ArtifactRecord{
+			ID:          artifactID,
+			SessionID:   cxpPerfSessionID(i % 100),
+			TurnID:      fmt.Sprintf("realistic-turn-%03d-%05d", i%100, 0),
+			Path:        "artifact.txt",
+			UploadName:  "codex-artifact.txt",
+			OutboxID:    fmt.Sprintf("realistic-outbox-%03d-%04d", i%100, 0),
+			DriveItemID: "drive-item-existing",
+			Status:      "uploaded",
+			UploadedAt:  time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC),
+		}); err != nil {
+			b.Fatalf("seed UpsertArtifactRecord: %v", err)
+		}
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			_, err := store.UpsertArtifactRecord(ctx, teamstore.ArtifactRecord{
+				ID:        artifactID,
+				SessionID: cxpPerfSessionID(i % 100),
+				Status:    "message_failed",
+				Error:     "Graph post failed after upload",
+			})
+			return err
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("UpsertArtifactRecord: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+	}
+	cxpPerfReportNamedProcIO(b, "artifact_upsert", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "artifact_upsert_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptDeliveryStageWrites(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, _ := newCXPPerfRealisticMixedUserFixture(b)
+		sessionID := cxpPerfSessionID(i % 100)
+		checkpointID := transcriptCheckpointID(sessionID)
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			_, _, err := store.RecordTranscriptDelivery(ctx, teamstore.TranscriptDeliveryRecord{
+				ID:             fmt.Sprintf("realistic-transcript-delivery-%06d", i),
+				SessionID:      sessionID,
+				OutboxID:       fmt.Sprintf("realistic-outbox-%03d-%04d", i%100, 0),
+				SourceRecordID: fmt.Sprintf("record-%06d", i),
+				Status:         teamstore.TranscriptDeliveryStatusSkipped,
+			}, teamstore.ImportCheckpoint{
+				ID:             checkpointID,
+				SessionID:      sessionID,
+				SourcePath:     fmt.Sprintf("/tmp/cxp-perf/history/session-%03d.jsonl", i%100),
+				LastRecordID:   fmt.Sprintf("record-%06d", i),
+				LastSourceLine: 10_000 + i,
+				LastOffset:     int64(1_000_000 + i),
+				Status:         importCheckpointStatusComplete,
+			})
+			return err
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("RecordTranscriptDelivery: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+	}
+	cxpPerfReportNamedProcIO(b, "transcript_delivery", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "transcript_delivery_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptCheckpointStageWrites(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+		if session == nil {
+			b.Fatalf("realistic session missing")
+		}
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			return bridge.recordTranscriptCheckpointDetailedWithID(
+				ctx,
+				*session,
+				fmt.Sprintf("/tmp/cxp-perf/history/session-%03d.jsonl", i%100),
+				fmt.Sprintf("record-%06d", i),
+				10_000+i,
+				int64(1_000_000+i),
+				transcriptCheckpointID(session.ID),
+			)
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("recordTranscriptCheckpointDetailedWithID: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+	}
+	cxpPerfReportNamedProcIO(b, "transcript_checkpoint", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "transcript_checkpoint_ns/op")
+	}
+}
+
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptQueueStageWrites(b *testing.B) {
+	ctx := context.Background()
+	var total cxpPerfProcIO
+	var duration time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+		if session == nil {
+			b.Fatalf("realistic session missing")
+		}
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			_, _, _, err := store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
+				Message: teamstore.OutboxMessage{
+					ID:              fmt.Sprintf("realistic-transcript-queue-outbox-%06d", i),
+					SessionID:       session.ID,
+					TurnID:          fmt.Sprintf("realistic-turn-%03d-%05d", i%100, 0),
+					TeamsChatID:     session.ChatID,
+					ScopeID:         bridge.scope.ID,
+					MachineID:       bridge.machine.ID,
+					LeaseGeneration: bridge.currentLeaseGeneration(),
+					Kind:            "final",
+					Body:            "final answer from transcript queue benchmark",
+					SourceTextHash:  fmt.Sprintf("hash-%06d", i),
+					RenderedBytes:   42,
+				},
+				Delivery: teamstore.TranscriptDeliveryRecord{
+					ID:             fmt.Sprintf("realistic-transcript-queue-delivery-%06d", i),
+					SessionID:      session.ID,
+					SourcePath:     fmt.Sprintf("/tmp/cxp-perf/history/session-%03d.jsonl", i%100),
+					SourceLine:     10_000 + i,
+					SourceRecordID: fmt.Sprintf("record-%06d", i),
+					Kind:           "final",
+					TextHash:       fmt.Sprintf("hash-%06d", i),
+					Status:         teamstore.TranscriptDeliveryStatusQueued,
+				},
+			})
+			return err
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("QueueTranscriptDeliveryOutbox: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+	}
+	cxpPerfReportNamedProcIO(b, "transcript_queue", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "transcript_queue_ns/op")
+	}
+}
+
 func BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites(b *testing.B) {
 	stages := []string{"importing", "service_control", "duplicate", "queue_state", "prepare_local", "ensure", "inbound", "turn", "ack", "start", "complete"}
 	totals := make(map[string]cxpPerfProcIO, len(stages))

@@ -1370,14 +1370,15 @@ func TestSQLiteOfficialTeamsHelperReleaseStoresUpgradeToCurrent(t *testing.T) {
 		{tag: "v0.1.1", kind: fixtureLegacyJSONV5},
 		{tag: "v0.1.2", kind: fixtureLegacyJSONV5},
 		// v0.1.3 is the first stable release whose Teams store can already be
-		// a SQLite sidecar. Later stable releases before v0.1.8 keep the same
-		// pointer version, but this table keeps every stable release explicit so
-		// a regression points at the affected upgrade source version.
+		// a SQLite sidecar. Keep every stable Teams-helper release explicit so a
+		// regression points at the affected upgrade source version.
 		{tag: "v0.1.3", kind: fixtureSQLiteV5},
 		{tag: "v0.1.4", kind: fixtureSQLiteV5},
 		{tag: "v0.1.5", kind: fixtureSQLiteV5},
 		{tag: "v0.1.6", kind: fixtureSQLiteV5},
 		{tag: "v0.1.7", kind: fixtureSQLiteV5},
+		{tag: "v0.1.8", kind: fixtureSQLiteV5},
+		{tag: "v0.1.9", kind: fixtureSQLiteV5},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tag, func(t *testing.T) {
@@ -1798,6 +1799,202 @@ func TestSQLiteOutboxErrorDriveArtifactAndHelperSideEffects(t *testing.T) {
 	}
 	if lookup, err := store.MessageLookup(ctx, session.TeamsChatID, "teams-side-effect"); err != nil || !lookup.HasDeliveredOutbox || lookup.Provenance.OutboxID != msg.ID {
 		t.Fatalf("MessageLookup sent side-effect = %#v err=%v", lookup, err)
+	}
+}
+
+func TestSQLiteMarkOutboxSendErrorDoesNotLoadColdState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	session := testSession()
+	session.ID = "send-error-session"
+	session.TeamsChatID = "send-error-chat"
+	session.CodexThreadID = "send-error-thread"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	artifactCreatedAt := time.Date(2026, 6, 16, 7, 45, 0, 0, time.UTC)
+	if _, err := store.UpsertArtifactRecord(ctx, ArtifactRecord{
+		ID:         "artifact:send-error",
+		SessionID:  session.ID,
+		TurnID:     "turn:artifact-preplan",
+		Path:       "canonical/send-error.txt",
+		UploadName: "canonical-send-error-upload.txt",
+		Status:     "queued",
+		CreatedAt:  artifactCreatedAt,
+		UpdatedAt:  artifactCreatedAt,
+	}); err != nil {
+		t.Fatalf("seed preplanned artifact: %v", err)
+	}
+	inbound := testInbound()
+	inbound.ID = "send-error-inbound"
+	inbound.SessionID = session.ID
+	inbound.TeamsChatID = session.TeamsChatID
+	inbound.TeamsMessageID = "send-error-user-message"
+	if _, created, err := store.PersistInbound(ctx, inbound); err != nil || !created {
+		t.Fatalf("PersistInbound created=%v err=%v", created, err)
+	}
+	turn, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil || !created {
+		t.Fatalf("QueueTurn created=%v err=%v", created, err)
+	}
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:                   "send-error-outbox",
+		SessionID:            session.ID,
+		TurnID:               turn.ID,
+		TeamsChatID:          session.TeamsChatID,
+		Kind:                 "status-progress",
+		Body:                 "uploading",
+		ArtifactIDs:          []string{"artifact:send-error"},
+		AttachmentName:       "report.txt",
+		AttachmentUploadName: "report-upload.txt",
+		DriveItemID:          "drive-item-1",
+		Status:               OutboxStatusSending,
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox created=%v err=%v", created, err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	sqliteWriteRawStateJSONForTest(t, store, []byte(`{"broken"`))
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	errored, err := store.MarkOutboxSendError(ctx, msg.ID, strings.Repeat("x", 300))
+	if err != nil {
+		t.Fatalf("MarkOutboxSendError sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("MarkOutboxSendError loaded full state %d times", got)
+	}
+	if errored.Status != OutboxStatusQueued || len(errored.LastSendError) != 240 || errored.LastSendAttempt.IsZero() {
+		t.Fatalf("errored outbox = %#v", errored)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+	outboxRaw := sqliteRawOutboxJSONForTest(t, store, msg.ID)
+	var outbox OutboxMessage
+	if err := json.Unmarshal(outboxRaw, &outbox); err != nil {
+		t.Fatalf("unmarshal outbox: %v", err)
+	}
+	if outbox.Status != OutboxStatusQueued || outbox.LastSendError == "" {
+		t.Fatalf("stored outbox after send error = %#v", outbox)
+	}
+	helperRaw := sqliteRawHelperDeliveryByOutboxForTest(t, store, msg.ID)
+	var helper HelperDeliveryRecord
+	if err := json.Unmarshal(helperRaw, &helper); err != nil {
+		t.Fatalf("unmarshal helper delivery: %v", err)
+	}
+	if helper.Status != HelperDeliveryStatusFailed || helper.OutboxID != msg.ID {
+		t.Fatalf("helper delivery after send error = %#v", helper)
+	}
+	artifactRaw := sqliteRawArtifactRecordForTest(t, store, "artifact:send-error")
+	var artifact ArtifactRecord
+	if err := json.Unmarshal(artifactRaw, &artifact); err != nil {
+		t.Fatalf("unmarshal artifact: %v", err)
+	}
+	if artifact.Status != "message_failed" || artifact.OutboxID != msg.ID || artifact.DriveItemID != "drive-item-1" || artifact.Error == "" {
+		t.Fatalf("artifact after send error = %#v", artifact)
+	}
+	if artifact.Path != "canonical/send-error.txt" || artifact.UploadName != "canonical-send-error-upload.txt" || !artifact.CreatedAt.Equal(artifactCreatedAt) {
+		t.Fatalf("artifact preplanned fields were not preserved after send error: %#v", artifact)
+	}
+}
+
+func TestSQLiteMarkOutboxDriveItemDoesNotLoadColdState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	session := testSession()
+	session.ID = "drive-item-session"
+	session.TeamsChatID = "drive-item-chat"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	artifactCreatedAt := time.Date(2026, 6, 16, 7, 45, 0, 0, time.UTC)
+	if _, err := store.UpsertArtifactRecord(ctx, ArtifactRecord{
+		ID:         "artifact:drive-item",
+		SessionID:  session.ID,
+		TurnID:     "turn:artifact-preplan",
+		Path:       "canonical/drive-item.txt",
+		UploadName: "canonical-drive-item-upload.txt",
+		Status:     "queued",
+		CreatedAt:  artifactCreatedAt,
+		UpdatedAt:  artifactCreatedAt,
+	}); err != nil {
+		t.Fatalf("seed preplanned artifact: %v", err)
+	}
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:                   "drive-item-outbox",
+		SessionID:            session.ID,
+		TeamsChatID:          session.TeamsChatID,
+		Kind:                 "status-progress",
+		Body:                 "uploading",
+		ArtifactIDs:          []string{"artifact:drive-item"},
+		AttachmentName:       "report.txt",
+		AttachmentUploadName: "report-upload.txt",
+		Status:               OutboxStatusSending,
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox created=%v err=%v", created, err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	sqliteWriteRawStateJSONForTest(t, store, []byte(`{"broken"`))
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	updated, err := store.MarkOutboxDriveItem(ctx, msg.ID, " drive-item-2 ", " report.txt ", " etag-2 ", " https://sharepoint/report ", " dav://report ")
+	if err != nil {
+		t.Fatalf("MarkOutboxDriveItem sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("MarkOutboxDriveItem loaded full state %d times", got)
+	}
+	if updated.DriveItemID != "drive-item-2" || updated.DriveItemName != "report.txt" || updated.DriveItemETag != "etag-2" || updated.LastSendError != "" {
+		t.Fatalf("updated outbox = %#v", updated)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+	atomic.StoreInt64(&loads, 0)
+	artifactRaw := sqliteRawArtifactRecordForTest(t, store, "artifact:drive-item")
+	var artifact ArtifactRecord
+	if err := json.Unmarshal(artifactRaw, &artifact); err != nil {
+		t.Fatalf("unmarshal artifact: %v", err)
+	}
+	if artifact.Status != "drive_uploaded" || artifact.OutboxID != msg.ID || artifact.DriveItemID != "drive-item-2" || artifact.UploadedAt.IsZero() || artifact.Error != "" {
+		t.Fatalf("artifact after drive item update = %#v", artifact)
+	}
+	if artifact.Path != "canonical/drive-item.txt" || artifact.UploadName != "canonical-drive-item-upload.txt" || !artifact.CreatedAt.Equal(artifactCreatedAt) {
+		t.Fatalf("artifact preplanned fields were not preserved after drive item update: %#v", artifact)
+	}
+	if _, err := store.MarkOutboxSent(ctx, msg.ID, "teams-drive-item"); err != nil {
+		t.Fatalf("MarkOutboxSent sqlite artifact error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("artifact outbox send path loaded full state %d times", got)
+	}
+	artifactRaw = sqliteRawArtifactRecordForTest(t, store, "artifact:drive-item")
+	if err := json.Unmarshal(artifactRaw, &artifact); err != nil {
+		t.Fatalf("unmarshal sent artifact: %v", err)
+	}
+	if artifact.Status != "uploaded" || artifact.TeamsMessageID != "teams-drive-item" || artifact.SentAt.IsZero() || artifact.Error != "" {
+		t.Fatalf("artifact after sent = %#v", artifact)
+	}
+	if artifact.Path != "canonical/drive-item.txt" || artifact.UploadName != "canonical-drive-item-upload.txt" || !artifact.CreatedAt.Equal(artifactCreatedAt) {
+		t.Fatalf("artifact preplanned fields were not preserved after sent: %#v", artifact)
 	}
 }
 
@@ -3429,8 +3626,83 @@ func TestSQLiteMarkTurnInterruptedPreservesChatSequences(t *testing.T) {
 	if got := state.OutboxMessages["outbox:final"].Status; got != OutboxStatusQueued {
 		t.Fatalf("final outbox status = %q, want queued", got)
 	}
+	statusHelper := helperDeliveryForOutboxForTest(state, "outbox:status")
+	if statusHelper.Status != HelperDeliveryStatusSkipped {
+		t.Fatalf("status helper delivery = %#v, want skipped", statusHelper)
+	}
+	if finalHelper := helperDeliveryForOutboxForTest(state, "outbox:final"); finalHelper.ID != "" {
+		t.Fatalf("final helper delivery = %#v, want no synthesized ledger for protected final", finalHelper)
+	}
 	if next := state.ChatSequences["chat-1"].Next; next != 3 {
 		t.Fatalf("chat sequence next after interrupt = %d, want 3", next)
+	}
+}
+
+func TestSQLiteMarkTurnLifecycleDoesNotLoadColdState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	inbound, _, err := store.PersistInbound(ctx, testInbound())
+	if err != nil {
+		t.Fatalf("PersistInbound error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(ctx, Turn{ID: "turn:lifecycle", SessionID: "s1", InboundEventID: inbound.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+		state.DashboardNumbers["cold"] = DashboardNumberRecord{ID: "cold", ChatID: "control-chat", Kind: "session", Number: 1, Label: strings.Repeat("cold ", 4096)}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed cold state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	corruptState := []byte(`{"broken"`)
+	sqliteWriteRawStateJSONForTest(t, store, corruptState)
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	if _, err := store.MarkTurnRunning(ctx, turn.ID, "thread-1", "codex-turn-started"); err != nil {
+		t.Fatalf("MarkTurnRunning error: %v", err)
+	}
+	completed, err := store.MarkTurnCompleted(ctx, turn.ID, "thread-1", "codex-turn-completed")
+	if err != nil {
+		t.Fatalf("MarkTurnCompleted error: %v", err)
+	}
+	if completed.Status != TurnStatusCompleted || completed.CodexTurnID != "codex-turn-completed" {
+		t.Fatalf("completed turn = %#v", completed)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("turn lifecycle loaded full state %d times", got)
+	}
+	if afterState := sqliteRawStateJSONForTest(t, store); !bytes.Equal(corruptState, afterState) {
+		t.Fatalf("turn lifecycle rewrote cold state_json: %s", afterState)
+	}
+	var rawTurn Turn
+	if raw := sqliteRawTurnJSONForTest(t, store, turn.ID); json.Unmarshal(raw, &rawTurn) != nil {
+		t.Fatalf("unmarshal raw turn")
+	}
+	if rawTurn.Status != TurnStatusCompleted || rawTurn.CodexThreadID != "thread-1" || rawTurn.CodexTurnID != "codex-turn-completed" {
+		t.Fatalf("raw turn = %#v", rawTurn)
+	}
+	var session SessionContext
+	if raw := sqliteRawSessionJSONForTest(t, store, "s1"); json.Unmarshal(raw, &session) != nil {
+		t.Fatalf("unmarshal raw session")
+	}
+	if session.CodexThreadID != "thread-1" || session.LatestCodexTurnID != "codex-turn-completed" || session.LatestTurnID != turn.ID {
+		t.Fatalf("raw session = %#v", session)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
 	}
 }
 
@@ -3737,6 +4009,77 @@ func TestOutboxArtifactRecordsFollowOutboxSendState(t *testing.T) {
 	artifact = state.ArtifactRecords["artifact:one"]
 	if artifact.Status != "uploaded" || artifact.TeamsMessageID != "teams-artifact" || artifact.Error != "" || artifact.SentAt.IsZero() {
 		t.Fatalf("artifact after sent mismatch: %#v", artifact)
+	}
+}
+
+func TestSQLiteUpsertArtifactRecordDoesNotLoadColdStateAndPreservesMergeFields(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	createdAt := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	uploadedAt := createdAt.Add(time.Minute)
+	sentAt := createdAt.Add(2 * time.Minute)
+	if _, err := store.UpsertArtifactRecord(ctx, ArtifactRecord{
+		ID:             "artifact:merge",
+		SessionID:      "s1",
+		TurnID:         "turn-1",
+		Path:           "artifact.txt",
+		UploadName:     "codex-artifact.txt",
+		OutboxID:       "outbox-1",
+		DriveItemID:    "drive-item-1",
+		TeamsMessageID: "teams-message-1",
+		Status:         "uploaded",
+		UploadedAt:     uploadedAt,
+		SentAt:         sentAt,
+		CreatedAt:      createdAt,
+		UpdatedAt:      createdAt,
+	}); err != nil {
+		t.Fatalf("seed UpsertArtifactRecord error: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	sqliteWriteRawStateJSONForTest(t, store, []byte(`{"broken"`))
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	updated, err := store.UpsertArtifactRecord(ctx, ArtifactRecord{
+		ID:        "artifact:merge",
+		SessionID: "s1",
+		Status:    "failed",
+		Error:     strings.Repeat("e", 300),
+	})
+	if err != nil {
+		t.Fatalf("UpsertArtifactRecord sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("UpsertArtifactRecord loaded full state %d times", got)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+	if !updated.CreatedAt.Equal(createdAt) || updated.OutboxID != "outbox-1" || updated.DriveItemID != "drive-item-1" || updated.TeamsMessageID != "teams-message-1" || !updated.UploadedAt.Equal(uploadedAt) || !updated.SentAt.Equal(sentAt) {
+		t.Fatalf("updated artifact did not preserve merge fields: %#v", updated)
+	}
+	if updated.Status != "failed" || len(updated.Error) != 240 {
+		t.Fatalf("updated artifact status/error mismatch: %#v", updated)
+	}
+	raw := sqliteRawArtifactRecordForTest(t, store, "artifact:merge")
+	var stored ArtifactRecord
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("unmarshal stored artifact: %v", err)
+	}
+	if stored.ID != updated.ID || stored.SessionID != updated.SessionID || stored.Status != updated.Status || stored.Error != updated.Error ||
+		stored.OutboxID != updated.OutboxID || stored.DriveItemID != updated.DriveItemID || stored.TeamsMessageID != updated.TeamsMessageID ||
+		!stored.CreatedAt.Equal(updated.CreatedAt) || !stored.UpdatedAt.Equal(updated.UpdatedAt) || !stored.UploadedAt.Equal(updated.UploadedAt) || !stored.SentAt.Equal(updated.SentAt) {
+		t.Fatalf("stored artifact differs from returned artifact:\nstored=%#v\nupdated=%#v", stored, updated)
 	}
 }
 
@@ -5956,6 +6299,576 @@ func TestRecordTranscriptDeliveryAdvancesCheckpointPosition(t *testing.T) {
 	}
 }
 
+func TestSQLiteRecordTranscriptDeliveryDoesNotLoadColdStateAndPreservesDedupe(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	checkpointID := "checkpoint:s1"
+	if _, created, err := store.RecordTranscriptDelivery(ctx, TranscriptDeliveryRecord{
+		ID:             "delivery:s1:r1",
+		SessionID:      "s1",
+		OutboxID:       "outbox-1",
+		TeamsMessageID: "teams-message-original",
+		Status:         TranscriptDeliveryStatusSent,
+		CreatedAt:      time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC),
+	}, ImportCheckpoint{
+		ID:             checkpointID,
+		SessionID:      "s1",
+		SourcePath:     "/tmp/session.jsonl",
+		LastRecordID:   "r1",
+		LastSourceLine: 42,
+		LastOffset:     2048,
+		Status:         "complete",
+	}); err != nil || !created {
+		t.Fatalf("seed RecordTranscriptDelivery created=%v err=%v", created, err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeDeliveryRaw := sqliteRawTranscriptDeliveryJSONForTest(t, store, "delivery:s1:r1")
+	sqliteWriteRawStateJSONForTest(t, store, []byte(`{"broken"`))
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	delivery, created, err := store.RecordTranscriptDelivery(ctx, TranscriptDeliveryRecord{
+		ID:             "delivery:s1:r1",
+		SessionID:      "s1",
+		OutboxID:       "outbox-overwrite",
+		TeamsMessageID: "teams-message-overwrite",
+		Status:         TranscriptDeliveryStatusSkipped,
+	}, ImportCheckpoint{
+		ID:             checkpointID,
+		SessionID:      "s1",
+		SourcePath:     "/tmp/session.jsonl",
+		LastRecordID:   "r2",
+		LastSourceLine: 84,
+		LastOffset:     4096,
+		Status:         "complete",
+	})
+	if err != nil {
+		t.Fatalf("RecordTranscriptDelivery sqlite duplicate error: %v", err)
+	}
+	if created {
+		t.Fatal("duplicate transcript delivery was reported as created")
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("RecordTranscriptDelivery loaded full state %d times", got)
+	}
+	if delivery.OutboxID != "outbox-1" || delivery.TeamsMessageID != "teams-message-original" || delivery.Status != TranscriptDeliveryStatusSent {
+		t.Fatalf("duplicate returned overwritten delivery: %#v", delivery)
+	}
+	if afterDeliveryRaw := sqliteRawTranscriptDeliveryJSONForTest(t, store, "delivery:s1:r1"); !bytes.Equal(beforeDeliveryRaw, afterDeliveryRaw) {
+		t.Fatalf("duplicate transcript delivery rewrote delivery row:\nbefore=%s\nafter=%s", beforeDeliveryRaw, afterDeliveryRaw)
+	}
+	var checkpoint ImportCheckpoint
+	if raw := sqliteRawImportCheckpointJSONForTest(t, store, checkpointID); json.Unmarshal(raw, &checkpoint) != nil {
+		t.Fatalf("unmarshal checkpoint from raw %s", raw)
+	}
+	if checkpoint.LastRecordID != "r2" || checkpoint.LastSourceLine != 84 || checkpoint.LastOffset != 4096 {
+		t.Fatalf("checkpoint did not advance on duplicate delivery: %#v", checkpoint)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+	atomic.StoreInt64(&loads, 0)
+
+	newDelivery, created, err := store.RecordTranscriptDelivery(ctx, TranscriptDeliveryRecord{
+		ID:        "delivery:s1:r3",
+		SessionID: "s1",
+		Status:    TranscriptDeliveryStatusSkipped,
+	}, ImportCheckpoint{
+		ID:             checkpointID,
+		SessionID:      "s1",
+		SourcePath:     "/tmp/session.jsonl",
+		LastRecordID:   "r3",
+		LastSourceLine: 126,
+		LastOffset:     8192,
+		Status:         "complete",
+	})
+	if err != nil || !created {
+		t.Fatalf("RecordTranscriptDelivery sqlite new delivery created=%v err=%v", created, err)
+	}
+	if newDelivery.ID != "delivery:s1:r3" || newDelivery.Status != TranscriptDeliveryStatusSkipped || newDelivery.CreatedAt.IsZero() {
+		t.Fatalf("new delivery mismatch: %#v", newDelivery)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("RecordTranscriptDelivery loaded full state after new delivery %d times", got)
+	}
+	if raw := sqliteRawTranscriptDeliveryJSONForTest(t, store, "delivery:s1:r3"); len(raw) == 0 {
+		t.Fatal("new transcript delivery row missing")
+	}
+	if raw := sqliteRawImportCheckpointJSONForTest(t, store, checkpointID); json.Unmarshal(raw, &checkpoint) != nil {
+		t.Fatalf("unmarshal final checkpoint from raw %s", raw)
+	}
+	if checkpoint.LastRecordID != "r3" || checkpoint.LastSourceLine != 126 || checkpoint.LastOffset != 8192 {
+		t.Fatalf("checkpoint did not advance on new delivery: %#v", checkpoint)
+	}
+}
+
+func TestRecordTranscriptCheckpointPreservesLegacySemantics(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	previousMod := time.Date(2026, 6, 16, 7, 30, 0, 0, time.UTC)
+	if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+		state.ImportCheckpoints["checkpoint:s1"] = ImportCheckpoint{
+			ID:             "checkpoint:s1",
+			SessionID:      "s1",
+			SourcePath:     "/tmp/old.jsonl",
+			LastRecordID:   "old-record",
+			LastSourceLine: 12,
+			LastOffset:     4096,
+			SourceSize:     8192,
+			SourceModTime:  previousMod,
+			ImportTurnID:   "import-turn-1",
+			KindPrefix:     "assistant",
+			Status:         importCheckpointStatusBlocked,
+			UpdatedAt:      previousMod,
+		}
+		state.ImportCheckpoints["checkpoint:failed"] = ImportCheckpoint{
+			ID:             "checkpoint:failed",
+			SessionID:      "s1",
+			LastRecordID:   "failed-record",
+			LastSourceLine: 3,
+			Status:         "failed",
+			UpdatedAt:      previousMod,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed checkpoints: %v", err)
+	}
+
+	newMod := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+		ID:             "checkpoint:s1",
+		SessionID:      "s1",
+		SourcePath:     "/tmp/new.jsonl",
+		LastRecordID:   "new-record",
+		LastSourceLine: 24,
+		LastOffset:     0,
+		SourceSize:     16384,
+		SourceModTime:  newMod,
+	}, TranscriptLedgerRecord{
+		ID:             "ledger:s1:new-record",
+		SessionID:      "s1",
+		CodexThreadID:  "thread-1",
+		SourcePath:     "/tmp/new.jsonl",
+		SourceLine:     24,
+		SourceRecordID: "new-record",
+	}); err != nil {
+		t.Fatalf("RecordTranscriptCheckpoint error: %v", err)
+	}
+	if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+		ID:             "checkpoint:failed",
+		SessionID:      "s1",
+		SourcePath:     "/tmp/failed.jsonl",
+		LastRecordID:   "new-failed-record",
+		LastSourceLine: 4,
+		LastOffset:     128,
+		SourceSize:     256,
+		SourceModTime:  newMod,
+	}, TranscriptLedgerRecord{
+		ID:             "ledger:s1:new-failed-record",
+		SessionID:      "s1",
+		SourcePath:     "/tmp/failed.jsonl",
+		SourceLine:     4,
+		SourceRecordID: "new-failed-record",
+	}); err != nil {
+		t.Fatalf("RecordTranscriptCheckpoint failed status error: %v", err)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints["checkpoint:s1"]
+	if checkpoint.LastRecordID != "new-record" || checkpoint.LastSourceLine != 24 || checkpoint.LastOffset != 4096 {
+		t.Fatalf("checkpoint position = %#v, want new record/line and previous nonzero offset", checkpoint)
+	}
+	if checkpoint.SourcePath != "/tmp/new.jsonl" || checkpoint.SourceSize != 16384 || !checkpoint.SourceModTime.Equal(newMod) {
+		t.Fatalf("checkpoint source metadata = %#v, want new source metadata", checkpoint)
+	}
+	if checkpoint.ImportTurnID != "import-turn-1" || checkpoint.KindPrefix != "assistant" || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint preserved fields/status = %#v", checkpoint)
+	}
+	if ledger := state.TranscriptLedger["ledger:s1:new-record"]; ledger.ID == "" || ledger.SourceRecordID != "new-record" || ledger.ImportedAt.IsZero() || ledger.CreatedAt.IsZero() || ledger.UpdatedAt.IsZero() {
+		t.Fatalf("ledger not recorded with timestamps: %#v", ledger)
+	}
+	if failed := state.ImportCheckpoints["checkpoint:failed"]; failed.Status != "failed" || failed.LastRecordID != "new-failed-record" {
+		t.Fatalf("failed checkpoint status should be preserved while advancing position: %#v", failed)
+	}
+}
+
+func TestSQLiteRecordTranscriptCheckpointDoesNotLoadColdStateAndTouchesOnlyCheckpointAndLedger(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	previousMod := time.Date(2026, 6, 16, 7, 30, 0, 0, time.UTC)
+	if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+		state.ImportCheckpoints["checkpoint:s1"] = ImportCheckpoint{
+			ID:             "checkpoint:s1",
+			SessionID:      "s1",
+			SourcePath:     "/tmp/old.jsonl",
+			LastRecordID:   "old-record",
+			LastSourceLine: 12,
+			LastOffset:     4096,
+			SourceSize:     8192,
+			SourceModTime:  previousMod,
+			ImportTurnID:   "import-turn-1",
+			KindPrefix:     "assistant",
+			Status:         importCheckpointStatusBlocked,
+			UpdatedAt:      previousMod,
+		}
+		state.TranscriptLedger["ledger:unrelated"] = TranscriptLedgerRecord{
+			ID:             "ledger:unrelated",
+			SessionID:      "s-other",
+			SourcePath:     "/tmp/other.jsonl",
+			SourceLine:     1,
+			SourceRecordID: "other-record",
+			ImportedAt:     previousMod,
+			CreatedAt:      previousMod,
+			UpdatedAt:      previousMod,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeUnrelated := sqliteRawTranscriptLedgerJSONForTest(t, store, "ledger:unrelated")
+	corruptState := []byte(`{"broken"`)
+	sqliteWriteRawStateJSONForTest(t, store, corruptState)
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	newMod := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+		ID:             "checkpoint:s1",
+		SessionID:      "s1",
+		SourcePath:     "/tmp/new.jsonl",
+		LastRecordID:   "new-record",
+		LastSourceLine: 24,
+		LastOffset:     0,
+		SourceSize:     16384,
+		SourceModTime:  newMod,
+	}, TranscriptLedgerRecord{
+		ID:             "ledger:s1:new-record",
+		SessionID:      "s1",
+		CodexThreadID:  "thread-1",
+		SourcePath:     "/tmp/new.jsonl",
+		SourceLine:     24,
+		SourceRecordID: "new-record",
+	})
+	if err != nil {
+		t.Fatalf("RecordTranscriptCheckpoint sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("RecordTranscriptCheckpoint loaded full state %d times", got)
+	}
+	if afterState := sqliteRawStateJSONForTest(t, store); !bytes.Equal(corruptState, afterState) {
+		t.Fatalf("RecordTranscriptCheckpoint rewrote cold state_json: %s", afterState)
+	}
+	if afterUnrelated := sqliteRawTranscriptLedgerJSONForTest(t, store, "ledger:unrelated"); !bytes.Equal(beforeUnrelated, afterUnrelated) {
+		t.Fatalf("RecordTranscriptCheckpoint rewrote unrelated ledger row:\nbefore=%s\nafter=%s", beforeUnrelated, afterUnrelated)
+	}
+	var checkpoint ImportCheckpoint
+	if raw := sqliteRawImportCheckpointJSONForTest(t, store, "checkpoint:s1"); json.Unmarshal(raw, &checkpoint) != nil {
+		t.Fatalf("unmarshal checkpoint raw %s", raw)
+	}
+	if checkpoint.LastRecordID != "new-record" || checkpoint.LastSourceLine != 24 || checkpoint.LastOffset != 4096 {
+		t.Fatalf("checkpoint position = %#v, want new record/line and previous nonzero offset", checkpoint)
+	}
+	if checkpoint.ImportTurnID != "import-turn-1" || checkpoint.KindPrefix != "assistant" || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint preserved fields/status = %#v", checkpoint)
+	}
+	if checkpoint.SourcePath != "/tmp/new.jsonl" || checkpoint.SourceSize != 16384 || !checkpoint.SourceModTime.Equal(newMod) {
+		t.Fatalf("checkpoint source metadata = %#v, want new source metadata", checkpoint)
+	}
+	var ledger TranscriptLedgerRecord
+	if raw := sqliteRawTranscriptLedgerJSONForTest(t, store, "ledger:s1:new-record"); json.Unmarshal(raw, &ledger) != nil {
+		t.Fatalf("unmarshal ledger raw %s", raw)
+	}
+	if ledger.SourceRecordID != "new-record" || ledger.SourceLine != 24 || ledger.CodexThreadID != "thread-1" || ledger.ImportedAt.IsZero() {
+		t.Fatalf("ledger = %#v, want inserted record with timestamps", ledger)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+}
+
+func TestSQLiteQueueTranscriptDeliveryOutboxDoesNotLoadColdStateAndTouchesOnlyQueueRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+		state.ChatSequences["chat-1"] = ChatSequenceState{ChatID: "chat-1", Next: 7, UpdatedAt: time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)}
+		state.DashboardNumbers["cold"] = DashboardNumberRecord{ID: "cold", ChatID: "control-chat", Kind: "session", Number: 1, Label: strings.Repeat("cold ", 4096)}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed chat sequence: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	corruptState := []byte(`{"broken"`)
+	sqliteWriteRawStateJSONForTest(t, store, corruptState)
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	out, created, alreadyDelivered, err := store.QueueTranscriptDeliveryOutbox(ctx, TranscriptDeliveryQueueRequest{
+		Message: OutboxMessage{
+			ID:          "outbox:transcript:s1:r1",
+			SessionID:   "s1",
+			TurnID:      "turn-sync",
+			TeamsChatID: "chat-1",
+			Kind:        "status-progress",
+			Body:        "status update text",
+		},
+		Delivery: TranscriptDeliveryRecord{
+			ID:             "delivery:s1:r1",
+			SessionID:      "s1",
+			SourcePath:     "/tmp/session.jsonl",
+			SourceLine:     100,
+			SourceRecordID: "r1",
+			Kind:           "status-progress",
+			TextHash:       "hash-r1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("QueueTranscriptDeliveryOutbox sqlite error: %v", err)
+	}
+	if !created || alreadyDelivered {
+		t.Fatalf("QueueTranscriptDeliveryOutbox created=%v alreadyDelivered=%v, want true false", created, alreadyDelivered)
+	}
+	if out.ID != "outbox:transcript:s1:r1" || out.Sequence != 7 || out.CodexThreadID != "thread-0" {
+		t.Fatalf("queued outbox = %#v, want existing sequence and session codex thread", out)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("QueueTranscriptDeliveryOutbox loaded full state %d times", got)
+	}
+	if afterState := sqliteRawStateJSONForTest(t, store); !bytes.Equal(corruptState, afterState) {
+		t.Fatalf("QueueTranscriptDeliveryOutbox rewrote cold state_json: %s", afterState)
+	}
+	var delivery TranscriptDeliveryRecord
+	if raw := sqliteRawTranscriptDeliveryJSONForTest(t, store, "delivery:s1:r1"); json.Unmarshal(raw, &delivery) != nil {
+		t.Fatalf("unmarshal transcript delivery raw")
+	}
+	if delivery.OutboxID != out.ID || delivery.Status != TranscriptDeliveryStatusQueued || delivery.SourceRecordID != "r1" {
+		t.Fatalf("delivery row = %#v, want queued row linked to outbox", delivery)
+	}
+	var helper HelperDeliveryRecord
+	if raw := sqliteRawHelperDeliveryByOutboxForTest(t, store, out.ID); json.Unmarshal(raw, &helper) != nil {
+		t.Fatalf("unmarshal helper delivery raw")
+	}
+	if helper.OutboxID != out.ID || helper.CodexThreadID != "thread-0" || helper.Status != HelperDeliveryStatusQueued {
+		t.Fatalf("helper delivery row = %#v, want queued helper delivery", helper)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+}
+
+func TestSQLiteQueueTranscriptDeliveryOutboxLinksExistingOutboxWithoutAllocatingSequence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	existing, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:existing-transcript",
+		SessionID:   "s1",
+		TeamsChatID: "chat-1",
+		Kind:        "status-progress",
+		Body:        "already queued status",
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox seed created=%v err=%v", created, err)
+	}
+	if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+		state.TranscriptDeliveries["delivery:s1:pending-link"] = TranscriptDeliveryRecord{
+			ID:             "delivery:s1:pending-link",
+			SessionID:      "s1",
+			SourceRecordID: "r1",
+			Status:         TranscriptDeliveryStatusQueued,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed pending-link delivery: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeSequence := sqliteRawChatSequenceJSONForTest(t, store, "chat-1")
+	beforeOutbox := sqliteRawOutboxJSONForTest(t, store, existing.ID)
+	corruptState := []byte(`{"broken"`)
+	sqliteWriteRawStateJSONForTest(t, store, corruptState)
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	out, created, alreadyDelivered, err := store.QueueTranscriptDeliveryOutbox(ctx, TranscriptDeliveryQueueRequest{
+		Message: OutboxMessage{
+			ID:          existing.ID,
+			SessionID:   "s1",
+			TeamsChatID: "chat-1",
+			Kind:        "status-progress",
+			Body:        "already queued status",
+		},
+		Delivery: TranscriptDeliveryRecord{
+			ID:        "delivery:s1:pending-link",
+			SessionID: "s1",
+			Status:    TranscriptDeliveryStatusQueued,
+		},
+	})
+	if err != nil {
+		t.Fatalf("QueueTranscriptDeliveryOutbox existing outbox error: %v", err)
+	}
+	if out.ID != existing.ID || created || alreadyDelivered {
+		t.Fatalf("QueueTranscriptDeliveryOutbox existing outbox out=%#v created=%v alreadyDelivered=%v", out, created, alreadyDelivered)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("QueueTranscriptDeliveryOutbox existing outbox loaded full state %d times", got)
+	}
+	if afterSequence := sqliteRawChatSequenceJSONForTest(t, store, "chat-1"); !bytes.Equal(beforeSequence, afterSequence) {
+		t.Fatalf("existing outbox path allocated chat sequence:\nbefore=%s\nafter=%s", beforeSequence, afterSequence)
+	}
+	if afterOutbox := sqliteRawOutboxJSONForTest(t, store, existing.ID); !bytes.Equal(beforeOutbox, afterOutbox) {
+		t.Fatalf("existing outbox path rewrote outbox:\nbefore=%s\nafter=%s", beforeOutbox, afterOutbox)
+	}
+	var delivery TranscriptDeliveryRecord
+	if raw := sqliteRawTranscriptDeliveryJSONForTest(t, store, "delivery:s1:pending-link"); json.Unmarshal(raw, &delivery) != nil {
+		t.Fatalf("unmarshal pending-link delivery raw")
+	}
+	if delivery.OutboxID != existing.ID || delivery.Status != TranscriptDeliveryStatusQueued {
+		t.Fatalf("pending-link delivery = %#v, want linked to existing outbox", delivery)
+	}
+	if afterState := sqliteRawStateJSONForTest(t, store); !bytes.Equal(corruptState, afterState) {
+		t.Fatalf("QueueTranscriptDeliveryOutbox existing outbox rewrote cold state_json: %s", afterState)
+	}
+}
+
+func TestSQLiteQueueTranscriptDeliveryOutboxSuppressesDeliveredWithoutColdLoad(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	now := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+		state.TranscriptDeliveries["delivery:s1:sent"] = TranscriptDeliveryRecord{
+			ID:             "delivery:s1:sent",
+			SessionID:      "s1",
+			SourceRecordID: "r1",
+			Status:         TranscriptDeliveryStatusSent,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			SentAt:         now,
+		}
+		state.ImportCheckpoints["checkpoint:s1"] = ImportCheckpoint{
+			ID:             "checkpoint:s1",
+			SessionID:      "s1",
+			LastRecordID:   "r1",
+			LastSourceLine: 10,
+			LastOffset:     256,
+			Status:         importCheckpointStatusBlocked,
+			UpdatedAt:      now,
+		}
+		state.ChatSequences["chat-1"] = ChatSequenceState{ChatID: "chat-1", Next: 11, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed delivered transcript: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeDelivery := sqliteRawTranscriptDeliveryJSONForTest(t, store, "delivery:s1:sent")
+	corruptState := []byte(`{"broken"`)
+	sqliteWriteRawStateJSONForTest(t, store, corruptState)
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	out, created, alreadyDelivered, err := store.QueueTranscriptDeliveryOutbox(ctx, TranscriptDeliveryQueueRequest{
+		Message: OutboxMessage{
+			ID:          "outbox:should-not-be-created",
+			SessionID:   "s1",
+			TeamsChatID: "chat-1",
+			Kind:        "final",
+			Body:        "duplicate final answer text",
+		},
+		Delivery: TranscriptDeliveryRecord{
+			ID:        "delivery:s1:sent",
+			SessionID: "s1",
+			Status:    TranscriptDeliveryStatusQueued,
+		},
+		Checkpoint: ImportCheckpoint{
+			ID:             "checkpoint:s1",
+			SessionID:      "s1",
+			SourcePath:     "/tmp/session.jsonl",
+			LastRecordID:   "r2",
+			LastSourceLine: 20,
+			LastOffset:     512,
+		},
+	})
+	if err != nil {
+		t.Fatalf("QueueTranscriptDeliveryOutbox suppress sqlite error: %v", err)
+	}
+	if out.ID != "" || created || !alreadyDelivered {
+		t.Fatalf("QueueTranscriptDeliveryOutbox suppress out=%#v created=%v alreadyDelivered=%v, want empty false true", out, created, alreadyDelivered)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("QueueTranscriptDeliveryOutbox suppress loaded full state %d times", got)
+	}
+	if afterDelivery := sqliteRawTranscriptDeliveryJSONForTest(t, store, "delivery:s1:sent"); !bytes.Equal(beforeDelivery, afterDelivery) {
+		t.Fatalf("suppress rewrote delivered transcript delivery:\nbefore=%s\nafter=%s", beforeDelivery, afterDelivery)
+	}
+	var checkpoint ImportCheckpoint
+	if raw := sqliteRawImportCheckpointJSONForTest(t, store, "checkpoint:s1"); json.Unmarshal(raw, &checkpoint) != nil {
+		t.Fatalf("unmarshal checkpoint raw")
+	}
+	if checkpoint.LastRecordID != "r2" || checkpoint.LastSourceLine != 20 || checkpoint.LastOffset != 512 || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint after suppress = %#v, want advanced complete checkpoint", checkpoint)
+	}
+	if afterState := sqliteRawStateJSONForTest(t, store); !bytes.Equal(corruptState, afterState) {
+		t.Fatalf("QueueTranscriptDeliveryOutbox suppress rewrote cold state_json: %s", afterState)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+}
+
 func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -7859,6 +8772,104 @@ func TestSavePrunesOldTranscriptLedgerRecords(t *testing.T) {
 	}
 }
 
+func TestSQLiteRecordTranscriptCheckpointPrunesSplitTranscriptLedger(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	base := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < maxRetainedTranscriptLedgerRecords+20; i++ {
+			record := TranscriptLedgerRecord{
+				ID:             fmt.Sprintf("ledger:old:%04d", i),
+				SessionID:      "s1",
+				SourceRecordID: fmt.Sprintf("old-record-%04d", i),
+				ImportedAt:     base.Add(time.Duration(i) * time.Second),
+				CreatedAt:      base.Add(time.Duration(i) * time.Second),
+				UpdatedAt:      base.Add(time.Duration(i) * time.Second),
+			}
+			if err := upsertSQLiteTranscriptLedgerTx(ctx, tx, record); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if got := sqliteTableRowCountForTest(t, store, "transcript_ledger"); got != maxRetainedTranscriptLedgerRecords+20 {
+		t.Fatalf("seeded transcript_ledger rows = %d, want %d", got, maxRetainedTranscriptLedgerRecords+20)
+	}
+
+	if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+		ID:             "checkpoint:s1",
+		SessionID:      "s1",
+		SourcePath:     "/tmp/session.jsonl",
+		LastRecordID:   "new-record",
+		LastSourceLine: 99,
+		LastOffset:     12345,
+		Status:         importCheckpointStatusComplete,
+	}, TranscriptLedgerRecord{
+		ID:             "ledger:new",
+		SessionID:      "s1",
+		SourcePath:     "/tmp/session.jsonl",
+		SourceLine:     99,
+		SourceRecordID: "new-record",
+		ImportedAt:     base.Add(24 * time.Hour),
+		CreatedAt:      base.Add(24 * time.Hour),
+		UpdatedAt:      base.Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("RecordTranscriptCheckpoint error: %v", err)
+	}
+	if got := sqliteTableRowCountForTest(t, store, "transcript_ledger"); got != maxRetainedTranscriptLedgerRecords {
+		t.Fatalf("pruned transcript_ledger rows = %d, want %d", got, maxRetainedTranscriptLedgerRecords)
+	}
+	if sqliteRowExistsForTest(t, store, "transcript_ledger", "ledger:old:0000") {
+		t.Fatal("oldest transcript ledger row was not pruned")
+	}
+	if !sqliteRowExistsForTest(t, store, "transcript_ledger", "ledger:new") {
+		t.Fatal("new transcript ledger row was pruned")
+	}
+}
+
+func TestSQLiteTranscriptDeliveryPruneKeepsNewestRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	base := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < 5; i++ {
+			delivery := TranscriptDeliveryRecord{
+				ID:             fmt.Sprintf("delivery:prune:%02d", i),
+				SessionID:      "s1",
+				SourceRecordID: fmt.Sprintf("record-%02d", i),
+				Status:         TranscriptDeliveryStatusSkipped,
+				CreatedAt:      base.Add(time.Duration(i) * time.Second),
+				UpdatedAt:      base.Add(time.Duration(i) * time.Second),
+			}
+			if err := upsertSQLiteTranscriptDeliveryTx(ctx, tx, delivery); err != nil {
+				return err
+			}
+		}
+		return pruneSQLiteTranscriptDeliveriesTx(ctx, tx, 3)
+	})
+	if got := sqliteTableRowCountForTest(t, store, "transcript_deliveries"); got != 3 {
+		t.Fatalf("pruned transcript_deliveries rows = %d, want 3", got)
+	}
+	for _, id := range []string{"delivery:prune:00", "delivery:prune:01"} {
+		if sqliteRowExistsForTest(t, store, "transcript_deliveries", id) {
+			t.Fatalf("old delivery row %q was not pruned", id)
+		}
+	}
+	for _, id := range []string{"delivery:prune:02", "delivery:prune:03", "delivery:prune:04"} {
+		if !sqliteRowExistsForTest(t, store, "transcript_deliveries", id) {
+			t.Fatalf("new delivery row %q was pruned", id)
+		}
+	}
+}
+
 func TestTeamsBackgroundKeepaliveClockSkewOutboxAndRateLimitCI(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -8713,6 +9724,72 @@ func TestChatPollScheduleStatePersistsParkAndBlock(t *testing.T) {
 	}
 	if poll.PollState != "hot" || !poll.ParkedAt.IsZero() || !poll.ParkNoticeSentAt.IsZero() {
 		t.Fatalf("resume should clear park markers: %#v", poll)
+	}
+}
+
+func TestRecordChatPollErrorWithBlockSQLiteUsesNarrowRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC().Add(time.Hour)
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      chatPollStateHot,
+		NextPollAt:     now.Add(time.Second),
+		LastActivityAt: now,
+		ResetFailures:  true,
+	}); err != nil {
+		t.Fatalf("seed target poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:         "chat-unrelated",
+		PollState:      chatPollStateWarm,
+		NextPollAt:     now.Add(10 * time.Minute),
+		LastActivityAt: now.Add(-time.Hour),
+		ResetFailures:  true,
+	}); err != nil {
+		t.Fatalf("seed unrelated poll: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeStateJSON := sqliteRawStateJSONForTest(t, store)
+	beforeUnrelated := sqliteRawChatPollJSONForTest(t, store, "chat-unrelated")
+	corruptUnrelated := []byte(`{"broken"`)
+	sqliteWriteRawChatPollJSONForTest(t, store, "chat-unrelated", corruptUnrelated)
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	blockedUntil := now.Add(time.Minute)
+	if err := store.RecordChatPollErrorWithBlock(ctx, "chat-1", "429 Too Many Requests", blockedUntil); err != nil {
+		t.Fatalf("RecordChatPollErrorWithBlock sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("RecordChatPollErrorWithBlock loaded full state %d times", got)
+	}
+	if afterStateJSON := sqliteRawStateJSONForTest(t, store); !bytes.Equal(beforeStateJSON, afterStateJSON) {
+		t.Fatal("RecordChatPollErrorWithBlock rewrote cold state_json")
+	}
+	if afterUnrelated := sqliteRawChatPollJSONForTest(t, store, "chat-unrelated"); !bytes.Equal(corruptUnrelated, afterUnrelated) {
+		t.Fatalf("RecordChatPollErrorWithBlock rewrote unrelated chat poll:\nbefore=%q\nafter=%q\noriginal=%q", corruptUnrelated, afterUnrelated, beforeUnrelated)
+	}
+
+	poll, ok, err := store.ChatPoll(ctx, "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll target after error ok=%v err=%v", ok, err)
+	}
+	if poll.ChatID != "chat-1" || poll.LastError != "429 Too Many Requests" || poll.FailureCount != 1 || poll.LastErrorAt.IsZero() {
+		t.Fatalf("target poll error fields mismatch: %#v", poll)
+	}
+	if poll.PollState != chatPollStateBlocked || poll.PreviousPollState != chatPollStateHot || !poll.BlockedUntil.Equal(blockedUntil) || !poll.NextPollAt.Equal(blockedUntil) {
+		t.Fatalf("target poll block fields mismatch: %#v", poll)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt unrelated chat poll row")
 	}
 }
 
@@ -11308,14 +12385,20 @@ func officialReleaseUpgradeFixtureState(tag string, schemaVersion int, includePr
 			ActiveTurnID:    "official-turn",
 			LastHeartbeat:   now,
 		},
-		Sessions:          map[string]SessionContext{},
-		Turns:             map[string]Turn{},
-		InboundEvents:     map[string]InboundEvent{},
-		OutboxMessages:    map[string]OutboxMessage{},
-		MessageProvenance: map[string]MessageProvenanceRecord{},
-		ChatPolls:         map[string]ChatPollState{},
-		ChatSequences:     map[string]ChatSequenceState{},
-		ChatRateLimits:    map[string]ChatRateLimitState{},
+		Sessions:             map[string]SessionContext{},
+		Turns:                map[string]Turn{},
+		InboundEvents:        map[string]InboundEvent{},
+		OutboxMessages:       map[string]OutboxMessage{},
+		MessageProvenance:    map[string]MessageProvenanceRecord{},
+		ChatPolls:            map[string]ChatPollState{},
+		ChatSequences:        map[string]ChatSequenceState{},
+		ChatRateLimits:       map[string]ChatRateLimitState{},
+		TranscriptLedger:     map[string]TranscriptLedgerRecord{},
+		TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
+		HelperDeliveries:     map[string]HelperDeliveryRecord{},
+		ImportCheckpoints:    map[string]ImportCheckpoint{},
+		ArtifactRecords:      map[string]ArtifactRecord{},
+		Notifications:        map[string]NotificationRecord{},
 	}
 	state.Sessions["official-session"] = SessionContext{
 		ID:            "official-session",
@@ -11364,9 +12447,93 @@ func officialReleaseUpgradeFixtureState(tag string, schemaVersion int, includePr
 		Body:           "legacy answer from " + tag,
 		Status:         OutboxStatusSent,
 		Sequence:       9,
+		ArtifactIDs:    []string{"official-artifact"},
 		CreatedAt:      now.Add(-39 * time.Minute),
 		UpdatedAt:      now.Add(-39 * time.Minute),
 		SentAt:         now.Add(-39 * time.Minute),
+	}
+	state.ImportCheckpoints[transcriptCheckpointIDForSession("official-session")] = ImportCheckpoint{
+		ID:             transcriptCheckpointIDForSession("official-session"),
+		SessionID:      "official-session",
+		SourcePath:     "/tmp/official-session.jsonl",
+		LastRecordID:   "official-record",
+		LastSourceLine: 77,
+		LastOffset:     4096,
+		ImportTurnID:   "official-import-turn",
+		KindPrefix:     "assistant",
+		Status:         importCheckpointStatusComplete,
+		UpdatedAt:      now.Add(-38 * time.Minute),
+	}
+	state.TranscriptLedger["official-ledger"] = TranscriptLedgerRecord{
+		ID:             "official-ledger",
+		SessionID:      "official-session",
+		CodexThreadID:  "official-thread",
+		SourcePath:     "/tmp/official-session.jsonl",
+		SourceLine:     77,
+		SourceRecordID: "official-record",
+		Kind:           "final",
+		TeamsOriginID:  "official-helper-message",
+		OutboxID:       "official-outbox",
+		ImportedAt:     now.Add(-38 * time.Minute),
+		CreatedAt:      now.Add(-38 * time.Minute),
+		UpdatedAt:      now.Add(-38 * time.Minute),
+	}
+	state.TranscriptDeliveries["official-delivery"] = TranscriptDeliveryRecord{
+		ID:             "official-delivery",
+		SessionID:      "official-session",
+		CodexThreadID:  "official-thread",
+		SourcePath:     "/tmp/official-session.jsonl",
+		SourceLine:     77,
+		SourceRecordID: "official-record",
+		Kind:           "final",
+		TextHash:       "official-text-hash",
+		OutboxID:       "official-outbox",
+		TeamsMessageID: "official-helper-message",
+		Status:         TranscriptDeliveryStatusSent,
+		CreatedAt:      now.Add(-38 * time.Minute),
+		UpdatedAt:      now.Add(-38 * time.Minute),
+		SentAt:         now.Add(-38 * time.Minute),
+	}
+	state.HelperDeliveries["official-helper-delivery"] = HelperDeliveryRecord{
+		ID:             "official-helper-delivery",
+		SessionID:      "official-session",
+		TeamsChatID:    "official-chat",
+		CodexThreadID:  "official-thread",
+		TurnID:         "official-turn",
+		Kind:           "final",
+		KindFamily:     "final",
+		OutboxID:       "official-outbox",
+		TeamsMessageID: "official-helper-message",
+		Status:         HelperDeliveryStatusSent,
+		CreatedAt:      now.Add(-39 * time.Minute),
+		UpdatedAt:      now.Add(-39 * time.Minute),
+		SentAt:         now.Add(-39 * time.Minute),
+	}
+	state.ArtifactRecords["official-artifact"] = ArtifactRecord{
+		ID:             "official-artifact",
+		SessionID:      "official-session",
+		TurnID:         "official-turn",
+		Path:           "official-report.txt",
+		UploadName:     "official-report-upload.txt",
+		DriveItemID:    "official-drive-item",
+		OutboxID:       "official-outbox",
+		TeamsMessageID: "official-helper-message",
+		Status:         "uploaded",
+		UploadedAt:     now.Add(-39 * time.Minute),
+		SentAt:         now.Add(-39 * time.Minute),
+		CreatedAt:      now.Add(-40 * time.Minute),
+		UpdatedAt:      now.Add(-39 * time.Minute),
+	}
+	state.Notifications["official-notification"] = NotificationRecord{
+		ID:        "official-notification",
+		SessionID: "official-session",
+		TurnID:    "official-turn",
+		Kind:      "turn_completed",
+		Status:    NotificationStatusSent,
+		Title:     "official notification",
+		CreatedAt: now.Add(-39 * time.Minute),
+		UpdatedAt: now.Add(-39 * time.Minute),
+		SentAt:    now.Add(-39 * time.Minute),
 	}
 	state.ChatSequences["official-chat"] = ChatSequenceState{
 		ChatID:    "official-chat",
@@ -11539,6 +12706,36 @@ func insertOfficialReleaseSQLiteStateForTestWithOptions(db *sql.DB, state State,
 	}); err != nil {
 		return err
 	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO import_checkpoints(id, session_id, status, updated_at, json) VALUES (?, ?, ?, ?, ?)`, state.ImportCheckpoints, func(v ImportCheckpoint) []any {
+		return []any{v.ID, v.SessionID, v.Status, sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO transcript_ledger(id, session_id, imported_at, created_at, json) VALUES (?, ?, ?, ?, ?)`, state.TranscriptLedger, func(v TranscriptLedgerRecord) []any {
+		return []any{v.ID, v.SessionID, sqliteTime(v.ImportedAt), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO transcript_deliveries(id, session_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?)`, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) []any {
+		return []any{v.ID, v.SessionID, v.OutboxID, string(v.Status), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO helper_deliveries(id, session_id, turn_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)`, state.HelperDeliveries, func(v HelperDeliveryRecord) []any {
+		return []any{v.ID, v.SessionID, v.TurnID, v.OutboxID, string(v.Status), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO artifact_records(id, session_id, turn_id, outbox_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)`, state.ArtifactRecords, func(v ArtifactRecord) []any {
+		return []any{v.ID, v.SessionID, v.TurnID, v.OutboxID, v.Status, sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO notifications(id, session_id, turn_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?)`, state.Notifications, func(v NotificationRecord) []any {
+		return []any{v.ID, v.SessionID, v.TurnID, string(v.Status), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -11558,6 +12755,24 @@ func assertOfficialReleaseFixtureLoaded(t *testing.T, tag string, state State) {
 	}
 	if poll, ok := state.ChatPolls["official-chat"]; !ok || poll.PollState != chatPollStateParked {
 		t.Fatalf("%s upgraded poll = %#v ok=%v, want parked", tag, poll, ok)
+	}
+	if checkpoint, ok := state.ImportCheckpoints[transcriptCheckpointIDForSession("official-session")]; !ok || checkpoint.LastRecordID != "official-record" || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("%s upgraded checkpoint = %#v ok=%v, want complete official checkpoint", tag, checkpoint, ok)
+	}
+	if ledger, ok := state.TranscriptLedger["official-ledger"]; !ok || ledger.SourceRecordID != "official-record" {
+		t.Fatalf("%s upgraded transcript ledger = %#v ok=%v, want official ledger", tag, ledger, ok)
+	}
+	if delivery, ok := state.TranscriptDeliveries["official-delivery"]; !ok || delivery.Status != TranscriptDeliveryStatusSent || delivery.OutboxID != "official-outbox" {
+		t.Fatalf("%s upgraded transcript delivery = %#v ok=%v, want sent official delivery", tag, delivery, ok)
+	}
+	if helper, ok := state.HelperDeliveries["official-helper-delivery"]; !ok || helper.Status != HelperDeliveryStatusSent || helper.OutboxID != "official-outbox" {
+		t.Fatalf("%s upgraded helper delivery = %#v ok=%v, want sent official helper delivery", tag, helper, ok)
+	}
+	if artifact, ok := state.ArtifactRecords["official-artifact"]; !ok || artifact.Status != "uploaded" || artifact.OutboxID != "official-outbox" {
+		t.Fatalf("%s upgraded artifact = %#v ok=%v, want uploaded official artifact", tag, artifact, ok)
+	}
+	if notification, ok := state.Notifications["official-notification"]; !ok || notification.Status != NotificationStatusSent {
+		t.Fatalf("%s upgraded notification = %#v ok=%v, want sent official notification", tag, notification, ok)
 	}
 }
 
@@ -11591,7 +12806,7 @@ func assertOfficialReleaseSQLiteSchemaForTest(t *testing.T, store *Store, tag st
 		t.Fatalf("%s upgraded inbound_events missing column received_at; columns=%v", tag, inboundColumns)
 	}
 	indexes := sqliteIndexSetForTest(t, db)
-	for _, index := range []string{"inbound_session_received_idx", "chat_polls_parked_skip_idx", "chat_polls_auto_park_idx", "outbox_chat_sequence_idx"} {
+	for _, index := range []string{"inbound_session_received_idx", "chat_polls_parked_skip_idx", "chat_polls_auto_park_idx", "outbox_chat_sequence_idx", "transcript_deliveries_outbox_idx", "helper_deliveries_outbox_idx", "artifact_records_outbox_idx"} {
 		if !indexes[index] {
 			t.Fatalf("%s upgraded sqlite missing index %q; indexes=%v", tag, index, indexes)
 		}
@@ -11718,6 +12933,143 @@ func assertOfficialReleaseHotPathsForTest(t *testing.T, store *Store, tag string
 	}
 	if _, _, err := store.HotPollScheduleSnapshot(ctx); err != nil {
 		t.Fatalf("%s HotPollScheduleSnapshot after upgrade: %v", tag, err)
+	}
+	if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+		ID:             transcriptCheckpointIDForSession("official-session"),
+		SessionID:      "official-session",
+		SourcePath:     "/tmp/official-session.jsonl",
+		LastRecordID:   "post-upgrade-record",
+		LastSourceLine: 101,
+		LastOffset:     8192,
+		Status:         importCheckpointStatusBlocked,
+	}, TranscriptLedgerRecord{
+		ID:             "post-upgrade-ledger",
+		SessionID:      "official-session",
+		CodexThreadID:  "official-thread",
+		SourcePath:     "/tmp/official-session.jsonl",
+		SourceLine:     101,
+		SourceRecordID: "post-upgrade-record",
+		Kind:           "final",
+	}); err != nil {
+		t.Fatalf("%s RecordTranscriptCheckpoint after upgrade: %v", tag, err)
+	}
+	if delivery, created, err := store.RecordTranscriptDelivery(ctx, TranscriptDeliveryRecord{
+		ID:             "post-upgrade-skipped-delivery",
+		SessionID:      "official-session",
+		CodexThreadID:  "official-thread",
+		SourcePath:     "/tmp/official-session.jsonl",
+		SourceLine:     102,
+		SourceRecordID: "post-upgrade-skipped",
+		Kind:           "status-progress",
+		TextHash:       "post-upgrade-skipped-hash",
+		Status:         TranscriptDeliveryStatusSkipped,
+	}, ImportCheckpoint{
+		ID:             transcriptCheckpointIDForSession("official-session"),
+		SessionID:      "official-session",
+		SourcePath:     "/tmp/official-session.jsonl",
+		LastRecordID:   "post-upgrade-skipped",
+		LastSourceLine: 102,
+		LastOffset:     9000,
+	}); err != nil || !created || delivery.Status != TranscriptDeliveryStatusSkipped {
+		t.Fatalf("%s RecordTranscriptDelivery after upgrade = %#v created=%v err=%v, want skipped created", tag, delivery, created, err)
+	}
+	transcriptOutbox, created, alreadyDelivered, err := store.QueueTranscriptDeliveryOutbox(ctx, TranscriptDeliveryQueueRequest{
+		Message: OutboxMessage{
+			ID:          "post-upgrade-transcript-outbox",
+			SessionID:   "official-session",
+			TurnID:      turn.ID,
+			TeamsChatID: "official-chat",
+			Kind:        "status-progress",
+			Body:        "post-upgrade transcript delivery",
+		},
+		Delivery: TranscriptDeliveryRecord{
+			ID:             "post-upgrade-queued-delivery",
+			SessionID:      "official-session",
+			CodexThreadID:  "official-thread",
+			SourcePath:     "/tmp/official-session.jsonl",
+			SourceLine:     103,
+			SourceRecordID: "post-upgrade-queued",
+			Kind:           "status-progress",
+			TextHash:       "post-upgrade-queued-hash",
+			Status:         TranscriptDeliveryStatusQueued,
+		},
+		Checkpoint: ImportCheckpoint{
+			ID:             transcriptCheckpointIDForSession("official-session"),
+			SessionID:      "official-session",
+			SourcePath:     "/tmp/official-session.jsonl",
+			LastRecordID:   "post-upgrade-queued",
+			LastSourceLine: 103,
+			LastOffset:     10000,
+		},
+	})
+	if err != nil || !created || alreadyDelivered || transcriptOutbox.ID == "" {
+		t.Fatalf("%s QueueTranscriptDeliveryOutbox after upgrade out=%#v created=%v alreadyDelivered=%v err=%v", tag, transcriptOutbox, created, alreadyDelivered, err)
+	}
+	if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+		ID:             transcriptCheckpointIDForSession("official-session"),
+		SessionID:      "official-session",
+		SourcePath:     "/tmp/official-session.jsonl",
+		LastRecordID:   "post-upgrade-queued",
+		LastSourceLine: 103,
+		LastOffset:     10000,
+	}, TranscriptLedgerRecord{
+		ID:             "post-upgrade-queued-ledger",
+		SessionID:      "official-session",
+		CodexThreadID:  "official-thread",
+		SourcePath:     "/tmp/official-session.jsonl",
+		SourceLine:     103,
+		SourceRecordID: "post-upgrade-queued",
+		Kind:           "status-progress",
+		OutboxID:       transcriptOutbox.ID,
+	}); err != nil {
+		t.Fatalf("%s RecordTranscriptCheckpoint queued after upgrade: %v", tag, err)
+	}
+	if _, err := store.UpsertArtifactRecord(ctx, ArtifactRecord{
+		ID:         "post-upgrade-artifact",
+		SessionID:  "official-session",
+		TurnID:     turn.ID,
+		Path:       "post-upgrade-artifact.txt",
+		UploadName: "post-upgrade-artifact-upload.txt",
+		Status:     "queued",
+	}); err != nil {
+		t.Fatalf("%s UpsertArtifactRecord after upgrade: %v", tag, err)
+	}
+	artifactOutbox, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:                   "post-upgrade-artifact-outbox",
+		SessionID:            "official-session",
+		TurnID:               turn.ID,
+		TeamsChatID:          "official-chat",
+		Kind:                 "artifact",
+		Body:                 "post-upgrade artifact",
+		AttachmentName:       "outbox-fallback-name.txt",
+		AttachmentUploadName: "outbox-fallback-upload.txt",
+		ArtifactIDs:          []string{"post-upgrade-artifact"},
+	})
+	if err != nil || !created {
+		t.Fatalf("%s QueueOutbox artifact after upgrade created=%v err=%v", tag, created, err)
+	}
+	if _, err := store.MarkOutboxDriveItem(ctx, artifactOutbox.ID, "post-upgrade-drive-item", "artifact.txt", "etag", "https://sharepoint.example/artifact", "dav://artifact"); err != nil {
+		t.Fatalf("%s MarkOutboxDriveItem after upgrade: %v", tag, err)
+	}
+	if _, err := store.MarkOutboxSendError(ctx, artifactOutbox.ID, "post-upgrade send retry"); err != nil {
+		t.Fatalf("%s MarkOutboxSendError after upgrade: %v", tag, err)
+	}
+	finalState, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("%s Load after post-upgrade hot paths: %v", tag, err)
+	}
+	if checkpoint := finalState.ImportCheckpoints[transcriptCheckpointIDForSession("official-session")]; checkpoint.LastRecordID != "post-upgrade-queued" || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("%s final checkpoint = %#v, want queued record complete", tag, checkpoint)
+	}
+	if _, ok := finalState.TranscriptLedger["post-upgrade-ledger"]; !ok {
+		t.Fatalf("%s post-upgrade ledger missing: %#v", tag, finalState.TranscriptLedger)
+	}
+	if delivery := finalState.TranscriptDeliveries["post-upgrade-queued-delivery"]; delivery.OutboxID != transcriptOutbox.ID || delivery.Status != TranscriptDeliveryStatusQueued {
+		t.Fatalf("%s queued transcript delivery = %#v", tag, delivery)
+	}
+	artifact := finalState.ArtifactRecords["post-upgrade-artifact"]
+	if artifact.OutboxID != artifactOutbox.ID || artifact.DriveItemID != "post-upgrade-drive-item" || artifact.Status != "message_failed" || artifact.Path != "post-upgrade-artifact.txt" || artifact.UploadName != "post-upgrade-artifact-upload.txt" {
+		t.Fatalf("%s post-upgrade artifact side effects = %#v", tag, artifact)
 	}
 }
 
@@ -11980,6 +13332,243 @@ func sqliteRawStateJSONForTest(t *testing.T, store *Store) []byte {
 		return db.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw)
 	}); err != nil {
 		t.Fatalf("read sqlite state_json: %v", err)
+	}
+	return append([]byte(nil), raw...)
+}
+
+func withSQLiteTxForTest(t *testing.T, store *Store, fn func(*sql.Tx) error) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}); err != nil {
+		t.Fatalf("with sqlite tx: %v", err)
+	}
+}
+
+func sqliteTableRowCountForTest(t *testing.T, store *Store, table string) int {
+	t.Helper()
+	ctx := context.Background()
+	var count int
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, query).Scan(&count)
+	}); err != nil {
+		t.Fatalf("count sqlite table %s: %v", table, err)
+	}
+	return count
+}
+
+func sqliteRowExistsForTest(t *testing.T, store *Store, table string, id string) bool {
+	t.Helper()
+	ctx := context.Background()
+	var count int
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, table)
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, query, id).Scan(&count)
+	}); err != nil {
+		t.Fatalf("query sqlite row %s.%s: %v", table, id, err)
+	}
+	return count > 0
+}
+
+func sqliteRawChatPollJSONForTest(t *testing.T, store *Store, chatID string) []byte {
+	t.Helper()
+	ctx := context.Background()
+	var raw []byte
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID).Scan(&raw)
+	}); err != nil {
+		t.Fatalf("read sqlite chat poll %q: %v", chatID, err)
+	}
+	return append([]byte(nil), raw...)
+}
+
+func sqliteWriteRawChatPollJSONForTest(t *testing.T, store *Store, chatID string, raw []byte) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		result, err := db.ExecContext(ctx, `UPDATE chat_polls SET json = ? WHERE chat_id = ?`, raw, chatID)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil {
+			return err
+		} else if rows != 1 {
+			return fmt.Errorf("updated %d chat_polls rows, want 1", rows)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("write sqlite chat poll %q: %v", chatID, err)
+	}
+}
+
+func sqliteWriteRawStateJSONForTest(t *testing.T, store *Store, raw []byte) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		result, err := db.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, raw)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil {
+			return err
+		} else if rows != 1 {
+			return fmt.Errorf("updated %d state_meta rows, want 1", rows)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("write sqlite state_json: %v", err)
+	}
+}
+
+func sqliteRawOutboxJSONForTest(t *testing.T, store *Store, outboxID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID, "outbox "+outboxID)
+}
+
+func sqliteRawSessionJSONForTest(t *testing.T, store *Store, sessionID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM sessions WHERE id = ?`, sessionID, "session "+sessionID)
+}
+
+func sqliteRawTurnJSONForTest(t *testing.T, store *Store, turnID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM turns WHERE id = ?`, turnID, "turn "+turnID)
+}
+
+func sqliteRawHelperDeliveryByOutboxForTest(t *testing.T, store *Store, outboxID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM helper_deliveries WHERE outbox_id = ?`, outboxID, "helper delivery for outbox "+outboxID)
+}
+
+func helperDeliveryForOutboxForTest(state State, outboxID string) HelperDeliveryRecord {
+	for _, delivery := range state.HelperDeliveries {
+		if delivery.OutboxID == outboxID {
+			return delivery
+		}
+	}
+	return HelperDeliveryRecord{}
+}
+
+func sqliteRawArtifactRecordForTest(t *testing.T, store *Store, artifactID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM artifact_records WHERE id = ?`, artifactID, "artifact "+artifactID)
+}
+
+func sqliteRawTranscriptDeliveryJSONForTest(t *testing.T, store *Store, deliveryID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM transcript_deliveries WHERE id = ?`, deliveryID, "transcript delivery "+deliveryID)
+}
+
+func sqliteRawImportCheckpointJSONForTest(t *testing.T, store *Store, checkpointID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID, "import checkpoint "+checkpointID)
+}
+
+func sqliteRawChatSequenceJSONForTest(t *testing.T, store *Store, chatID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM chat_sequences WHERE chat_id = ?`, chatID, "chat sequence "+chatID)
+}
+
+func sqliteRawTranscriptLedgerJSONForTest(t *testing.T, store *Store, ledgerID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM transcript_ledger WHERE id = ?`, ledgerID, "transcript ledger "+ledgerID)
+}
+
+func sqliteRawJSONByKeyForTest(t *testing.T, store *Store, query string, arg string, label string) []byte {
+	t.Helper()
+	ctx := context.Background()
+	var raw []byte
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, query, arg).Scan(&raw)
+	}); err != nil {
+		t.Fatalf("read sqlite %s: %v", label, err)
 	}
 	return append([]byte(nil), raw...)
 }

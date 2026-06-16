@@ -209,6 +209,14 @@ class CXPPerfModelScriptTests(unittest.TestCase):
                 "sqlite-has-pending-workflow-notifications",
                 "BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/many-long-chats/has-pending-workflow-notifications$",
             ),
+            (
+                "sqlite-realistic-transcript-queue",
+                "BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptQueueStageWrites",
+            ),
+            (
+                "sqlite-realistic-outbox-send-error",
+                "BenchmarkCXPPerfModelSQLiteRealisticMixedUserOutboxSendErrorStageWrites",
+            ),
         ]:
             with self.subTest(target=target):
                 with mock.patch.object(model.subprocess, "run", return_value=completed) as run:
@@ -230,6 +238,8 @@ class CXPPerfModelScriptTests(unittest.TestCase):
                 cmd = run.call_args.args[0]
                 self.assertEqual(code, 0)
                 self.assertIn(benchmark, cmd)
+                if target.startswith("sqlite-realistic-"):
+                    self.assertNotIn(f"{benchmark}/many-long-chats$", cmd)
 
 
 if __name__ == "__main__":

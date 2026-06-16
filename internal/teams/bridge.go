@@ -17094,41 +17094,23 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithID(ctx context.Context, s
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
-	return b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		now := time.Now()
-		id := checkpointID
-		previous := state.ImportCheckpoints[id]
-		status := previous.Status
-		if status == "" || status == importCheckpointStatusBlocked {
-			status = importCheckpointStatusComplete
-		}
-		state.ImportCheckpoints[id] = teamstore.ImportCheckpoint{
-			ID:             id,
-			SessionID:      session.ID,
-			SourcePath:     sourcePath,
-			LastRecordID:   lastRecordID,
-			LastSourceLine: lastLine,
-			LastOffset:     firstNonZeroInt64(lastOffset, previous.LastOffset),
-			SourceSize:     sourceSize,
-			SourceModTime:  sourceModTime,
-			ImportTurnID:   previous.ImportTurnID,
-			KindPrefix:     previous.KindPrefix,
-			Status:         status,
-			UpdatedAt:      now,
-		}
-		ledgerID := transcriptLedgerID(session.ID, id, lastRecordID)
-		state.TranscriptLedger[ledgerID] = teamstore.TranscriptLedgerRecord{
-			ID:             ledgerID,
-			SessionID:      session.ID,
-			CodexThreadID:  session.CodexThreadID,
-			SourcePath:     sourcePath,
-			SourceLine:     lastLine,
-			SourceRecordID: lastRecordID,
-			ImportedAt:     now,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}
-		return nil
+	ledgerID := transcriptLedgerID(session.ID, checkpointID, lastRecordID)
+	return b.store.RecordTranscriptCheckpoint(ctx, teamstore.ImportCheckpoint{
+		ID:             checkpointID,
+		SessionID:      session.ID,
+		SourcePath:     sourcePath,
+		LastRecordID:   lastRecordID,
+		LastSourceLine: lastLine,
+		LastOffset:     lastOffset,
+		SourceSize:     sourceSize,
+		SourceModTime:  sourceModTime,
+	}, teamstore.TranscriptLedgerRecord{
+		ID:             ledgerID,
+		SessionID:      session.ID,
+		CodexThreadID:  session.CodexThreadID,
+		SourcePath:     sourcePath,
+		SourceLine:     lastLine,
+		SourceRecordID: lastRecordID,
 	})
 }
 

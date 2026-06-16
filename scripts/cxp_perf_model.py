@@ -440,6 +440,13 @@ BENCH_TARGETS = {
     "sqlite-helper-auto-update-not-due": "BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles",
     "sqlite-codex-upgrade-no-pending": "BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles",
     "sqlite-new-chat-first-message": "BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites",
+    "sqlite-realistic-chat-poll-error": "BenchmarkCXPPerfModelSQLiteRealisticMixedUserChatPollErrorStageWrites",
+    "sqlite-realistic-outbox-send-error": "BenchmarkCXPPerfModelSQLiteRealisticMixedUserOutboxSendErrorStageWrites",
+    "sqlite-realistic-outbox-drive-item": "BenchmarkCXPPerfModelSQLiteRealisticMixedUserOutboxDriveItemStageWrites",
+    "sqlite-realistic-artifact-upsert": "BenchmarkCXPPerfModelSQLiteRealisticMixedUserArtifactUpsertStageWrites",
+    "sqlite-realistic-transcript-delivery": "BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptDeliveryStageWrites",
+    "sqlite-realistic-transcript-checkpoint": "BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptCheckpointStageWrites",
+    "sqlite-realistic-transcript-queue": "BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptQueueStageWrites",
     "sqlite-new-chat-complete-breakdown": "BenchmarkCXPPerfModelSQLiteNewChatCompleteTurnBreakdown",
     "sqlite-long-transcript-final-arrival": "BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival",
     "sqlite-status-only-final-arrival": "BenchmarkCXPPerfModelSQLiteStatusOnlyFinalArrival",
@@ -449,6 +456,20 @@ BENCH_TARGETS = {
     "external": "BenchmarkCXPPerfModelExternalScenarios",
 }
 
+PROFILELESS_BENCH_TARGETS = {
+    "sqlite-new-chat-first-message",
+    "sqlite-realistic-chat-poll-error",
+    "sqlite-realistic-outbox-send-error",
+    "sqlite-realistic-outbox-drive-item",
+    "sqlite-realistic-artifact-upsert",
+    "sqlite-realistic-transcript-delivery",
+    "sqlite-realistic-transcript-checkpoint",
+    "sqlite-realistic-transcript-queue",
+    "sqlite-new-chat-complete-breakdown",
+    "sqlite-long-transcript-final-arrival",
+    "sqlite-status-only-final-arrival",
+}
+
 
 def bench_regex(target: str, profile_name: str, scenario_name: str) -> str:
     prefix = BENCH_TARGETS[target]
@@ -456,6 +477,8 @@ def bench_regex(target: str, profile_name: str, scenario_name: str) -> str:
         if scenario_name == "all":
             return prefix
         return f"{prefix}/{scenario_name}$"
+    if target in PROFILELESS_BENCH_TARGETS:
+        return prefix
     if target == "sqlite-pending-workflow-notifications":
         if profile_name == "all":
             return f"{prefix}/.*/pending-workflow-notifications$"

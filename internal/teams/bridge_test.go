@@ -23726,6 +23726,15 @@ func TestBridgeSyncLinkedTranscriptKeepsAgentMessageWithoutRecentMirrorEvidence(
 }
 
 func TestBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T) {
+	testBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t, false)
+}
+
+func TestBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegressionSQLite(t *testing.T) {
+	testBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t, true)
+}
+
+func testBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression(t *testing.T, sqlite bool) {
+	t.Helper()
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -23737,6 +23746,11 @@ func TestBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneA
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	if sqlite {
+		if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+			t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+		}
+	}
 	beforeState, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load before sync error: %v", err)
@@ -23760,6 +23774,9 @@ func TestBridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneA
 	}
 	if got := len(state.TranscriptDeliveries); got == 0 {
 		t.Fatal("first sync did not record transcript delivery")
+	}
+	if got := len(state.TranscriptLedger); got == 0 {
+		t.Fatal("first sync did not record transcript ledger")
 	}
 
 	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {

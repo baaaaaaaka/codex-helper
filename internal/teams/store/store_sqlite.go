@@ -1895,6 +1895,58 @@ func (s *Store) updateImportCheckpointSQLite(ctx context.Context, id string, fn 
 	return out, changed, handled, err
 }
 
+func (s *Store) recordTranscriptCheckpointSQLite(ctx context.Context, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) (bool, error) {
+	handled := false
+	run := func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			state := State{
+				SchemaVersion:     SchemaVersion,
+				ImportCheckpoints: map[string]ImportCheckpoint{},
+				TranscriptLedger:  map[string]TranscriptLedgerRecord{},
+			}
+			if existing, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpoint.ID); err != nil {
+				return err
+			} else if ok {
+				state.ImportCheckpoints[existing.ID] = existing
+			}
+			nextCheckpoint, nextLedger := applyRecordTranscriptCheckpointLocked(&state, checkpoint, ledger, time.Now())
+			if err := upsertSQLiteImportCheckpointTx(ctx, tx, nextCheckpoint); err != nil {
+				return err
+			}
+			if err := upsertSQLiteTranscriptLedgerTx(ctx, tx, nextLedger); err != nil {
+				return err
+			}
+			if err := pruneSQLiteTranscriptLedgerTx(ctx, tx, maxRetainedTranscriptLedgerRecords); err != nil {
+				return err
+			}
+			if err := pruneSQLiteTranscriptDeliveriesTx(ctx, tx, maxRetainedTranscriptDeliveries); err != nil {
+				return err
+			}
+			handled = true
+			return tx.Commit()
+		})
+	}
+	if sessionID := strings.TrimSpace(checkpoint.SessionID); sessionID != "" {
+		err := s.withSessionLock(ctx, sessionID, run)
+		return handled, err
+	}
+	err := run()
+	return handled, err
+}
+
 func (s *Store) updateSQLiteColdState(ctx context.Context, fn func(*State) error) (bool, error) {
 	handled := false
 	err := s.withStateLock(ctx, func() error {
@@ -2314,6 +2366,49 @@ func loadSQLiteOutboxLinkedRecordsTx(ctx context.Context, tx *sql.Tx, state *Sta
 	return nil
 }
 
+func loadSQLiteArtifactRecordsByIDTx(ctx context.Context, tx *sql.Tx, state *State, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if state.ArtifactRecords == nil {
+		state.ArtifactRecords = map[string]ArtifactRecord{}
+	}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := state.ArtifactRecords[id]; ok {
+			continue
+		}
+		record, ok, err := loadSQLiteJSONRow[ArtifactRecord](ctx, tx, `SELECT json FROM artifact_records WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state.ArtifactRecords[record.ID] = record
+		}
+	}
+	return nil
+}
+
+func pruneSQLiteTranscriptLedgerTx(ctx context.Context, tx *sql.Tx, keep int) error {
+	return pruneSQLiteRowsByNewestTx(ctx, tx, "transcript_ledger", "imported_at DESC, created_at DESC, id DESC", keep)
+}
+
+func pruneSQLiteTranscriptDeliveriesTx(ctx context.Context, tx *sql.Tx, keep int) error {
+	return pruneSQLiteRowsByNewestTx(ctx, tx, "transcript_deliveries", "created_at DESC, id DESC", keep)
+}
+
+func pruneSQLiteRowsByNewestTx(ctx context.Context, tx *sql.Tx, table string, orderBy string, keep int) error {
+	if keep <= 0 {
+		return nil
+	}
+	query := fmt.Sprintf(`DELETE FROM %s WHERE id NOT IN (SELECT id FROM %s ORDER BY %s LIMIT ?)`, table, table, orderBy)
+	_, err := tx.ExecContext(ctx, query, keep)
+	return err
+}
+
 func upsertSQLiteOutboxLinkedRecordsTx(ctx context.Context, tx *sql.Tx, state State) error {
 	for _, delivery := range state.TranscriptDeliveries {
 		if err := upsertSQLiteTranscriptDeliveryTx(ctx, tx, delivery); err != nil {
@@ -2591,6 +2686,107 @@ func (s *Store) updateNotificationSQLite(ctx context.Context, id string, fn func
 		return tx.Commit()
 	})
 	return out, changed, handled, err
+}
+
+func (s *Store) upsertArtifactRecordSQLite(ctx context.Context, record ArtifactRecord) (ArtifactRecord, bool, error) {
+	var out ArtifactRecord
+	handled := false
+	run := func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			state := State{SchemaVersion: SchemaVersion, ArtifactRecords: map[string]ArtifactRecord{}}
+			if existing, ok, err := loadSQLiteJSONRow[ArtifactRecord](ctx, tx, `SELECT json FROM artifact_records WHERE id = ?`, strings.TrimSpace(record.ID)); err != nil {
+				return err
+			} else if ok {
+				state.ArtifactRecords[existing.ID] = existing
+			}
+			out = applyUpsertArtifactRecordLocked(&state, record, time.Now())
+			if err := upsertSQLiteArtifactRecordTx(ctx, tx, out); err != nil {
+				return err
+			}
+			handled = true
+			return tx.Commit()
+		})
+	}
+	if sessionID := strings.TrimSpace(record.SessionID); sessionID != "" {
+		err := s.withSessionLock(ctx, sessionID, run)
+		return out, handled, err
+	}
+	err := run()
+	return out, handled, err
+}
+
+func (s *Store) recordTranscriptDeliverySQLite(ctx context.Context, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, bool, error) {
+	var out TranscriptDeliveryRecord
+	created := false
+	handled := false
+	run := func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			state := State{
+				SchemaVersion:        SchemaVersion,
+				TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
+				ImportCheckpoints:    map[string]ImportCheckpoint{},
+			}
+			if existing, ok, err := loadSQLiteJSONRow[TranscriptDeliveryRecord](ctx, tx, `SELECT json FROM transcript_deliveries WHERE id = ?`, strings.TrimSpace(delivery.ID)); err != nil {
+				return err
+			} else if ok {
+				state.TranscriptDeliveries[existing.ID] = existing
+			}
+			checkpointID := strings.TrimSpace(checkpoint.ID)
+			if checkpointID != "" && strings.TrimSpace(checkpoint.LastRecordID) != "" {
+				if existing, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+					return err
+				} else if ok {
+					state.ImportCheckpoints[existing.ID] = existing
+				}
+			}
+			beforeCheckpoint, hadCheckpoint := state.ImportCheckpoints[checkpointID]
+			out, created = applyRecordTranscriptDeliveryLocked(&state, delivery, checkpoint, time.Now())
+			if created {
+				if err := upsertSQLiteTranscriptDeliveryTx(ctx, tx, out); err != nil {
+					return err
+				}
+			}
+			if afterCheckpoint, ok := state.ImportCheckpoints[checkpointID]; ok && (!hadCheckpoint || afterCheckpoint != beforeCheckpoint) {
+				if err := upsertSQLiteImportCheckpointTx(ctx, tx, afterCheckpoint); err != nil {
+					return err
+				}
+			}
+			handled = true
+			return tx.Commit()
+		})
+	}
+	if sessionID := strings.TrimSpace(delivery.SessionID); sessionID != "" {
+		err := s.withSessionLock(ctx, sessionID, run)
+		return out, created, handled, err
+	}
+	err := run()
+	return out, created, handled, err
 }
 
 func (s *Store) bindSessionCodexThreadSQLite(ctx context.Context, sessionID string, turnID string, threadID string) (SessionContext, bool, bool, error) {
@@ -3565,14 +3761,16 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 				return err
 			}
 			defer tx.Rollback()
-			state, err := loadSQLiteColdStateWithoutChatSequences(ctx, tx)
-			if err != nil {
-				return err
+			state := State{
+				SchemaVersion:        SchemaVersion,
+				Sessions:             map[string]SessionContext{},
+				Turns:                map[string]Turn{turnID: current},
+				InboundEvents:        map[string]InboundEvent{},
+				OutboxMessages:       map[string]OutboxMessage{},
+				TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
+				HelperDeliveries:     map[string]HelperDeliveryRecord{},
+				ArtifactRecords:      map[string]ArtifactRecord{},
 			}
-			state.Sessions = map[string]SessionContext{}
-			state.Turns = map[string]Turn{turnID: current}
-			state.InboundEvents = map[string]InboundEvent{}
-			state.OutboxMessages = map[string]OutboxMessage{}
 			if current.SessionID != "" {
 				if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, current.SessionID); err != nil {
 					return err
@@ -3590,6 +3788,11 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 			if includeOutbox {
 				if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM outbox_messages WHERE turn_id = ?`, []any{turnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
 					return err
+				}
+				for outboxID := range state.OutboxMessages {
+					if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
+						return err
+					}
 				}
 			}
 			now := time.Now()
@@ -3722,6 +3925,159 @@ func (s *Store) queueOutboxSQLite(ctx context.Context, msg OutboxMessage) (Outbo
 	return out, created, handled, err
 }
 
+func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req TranscriptDeliveryQueueRequest) (OutboxMessage, bool, bool, bool, error) {
+	var out OutboxMessage
+	created := false
+	alreadyDelivered := false
+	handled := false
+	run := func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			state := State{
+				SchemaVersion:        SchemaVersion,
+				Sessions:             map[string]SessionContext{},
+				Turns:                map[string]Turn{},
+				OutboxMessages:       map[string]OutboxMessage{},
+				TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
+				HelperDeliveries:     map[string]HelperDeliveryRecord{},
+				ArtifactRecords:      map[string]ArtifactRecord{},
+				ImportCheckpoints:    map[string]ImportCheckpoint{},
+				ChatSequences:        map[string]ChatSequenceState{},
+			}
+			msg := req.Message
+			delivery := req.Delivery
+			if turnID := strings.TrimSpace(msg.TurnID); turnID != "" {
+				if turn, ok, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID); err != nil {
+					return err
+				} else if ok {
+					state.Turns[turnID] = turn
+				}
+			}
+			if sessionID := strings.TrimSpace(firstStoreNonEmptyString(msg.SessionID, delivery.SessionID)); sessionID != "" {
+				if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, sessionID); err != nil {
+					return err
+				} else if ok {
+					state.Sessions[sessionID] = session
+				}
+			}
+			deliveryID := strings.TrimSpace(delivery.ID)
+			existingDelivery, deliveryFound, err := loadSQLiteJSONRow[TranscriptDeliveryRecord](ctx, tx, `SELECT json FROM transcript_deliveries WHERE id = ?`, deliveryID)
+			if err != nil {
+				return err
+			}
+			if deliveryFound {
+				state.TranscriptDeliveries[existingDelivery.ID] = existingDelivery
+				if outboxID := strings.TrimSpace(existingDelivery.OutboxID); outboxID != "" {
+					if existing, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
+						return err
+					} else if ok {
+						state.OutboxMessages[existing.ID] = existing
+					}
+					if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
+						return err
+					}
+				}
+			}
+			if msgID := strings.TrimSpace(msg.ID); msgID != "" {
+				if existing, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, msgID); err != nil {
+					return err
+				} else if ok {
+					state.OutboxMessages[existing.ID] = existing
+				}
+				if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, msgID); err != nil {
+					return err
+				}
+			}
+			if checkpointID := strings.TrimSpace(req.Checkpoint.ID); checkpointID != "" {
+				if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+					return err
+				} else if ok {
+					state.ImportCheckpoints[checkpoint.ID] = checkpoint
+				}
+			}
+
+			needCreateOutbox := false
+			switch {
+			case deliveryFound && transcriptDeliverySuppressesQueue(existingDelivery):
+				needCreateOutbox = false
+			case deliveryFound:
+				outboxID := strings.TrimSpace(existingDelivery.OutboxID)
+				if outboxID != "" {
+					msg.ID = outboxID
+					needCreateOutbox = state.OutboxMessages[outboxID].ID == ""
+				} else {
+					needCreateOutbox = state.OutboxMessages[strings.TrimSpace(msg.ID)].ID == ""
+				}
+			default:
+				needCreateOutbox = state.OutboxMessages[strings.TrimSpace(msg.ID)].ID == ""
+			}
+			if needCreateOutbox && msg.Sequence <= 0 && strings.TrimSpace(msg.TeamsChatID) != "" {
+				sequence, err := allocateSQLiteChatSequenceTx(ctx, tx, &state, strings.TrimSpace(msg.TeamsChatID), time.Now())
+				if err != nil {
+					return err
+				}
+				msg.Sequence = sequence
+			}
+
+			beforeDelivery, hadDelivery := state.TranscriptDeliveries[deliveryID]
+			beforeCheckpoint, hadCheckpoint := state.ImportCheckpoints[strings.TrimSpace(req.Checkpoint.ID)]
+			beforeHelpers := make(map[string]HelperDeliveryRecord, len(state.HelperDeliveries))
+			for id, record := range state.HelperDeliveries {
+				beforeHelpers[id] = record
+			}
+			out, created, alreadyDelivered, err = applyQueueTranscriptDeliveryOutboxLocked(&state, msg, delivery, req.Checkpoint, time.Now())
+			if err != nil {
+				return err
+			}
+			handled = true
+			if created {
+				if err := upsertSQLiteOutboxTx(ctx, tx, out); err != nil {
+					return err
+				}
+			}
+			if after, ok := state.TranscriptDeliveries[deliveryID]; ok && (!hadDelivery || !reflect.DeepEqual(beforeDelivery, after)) {
+				if err := upsertSQLiteTranscriptDeliveryTx(ctx, tx, after); err != nil {
+					return err
+				}
+			}
+			if checkpointID := strings.TrimSpace(req.Checkpoint.ID); checkpointID != "" {
+				if after, ok := state.ImportCheckpoints[checkpointID]; ok && (!hadCheckpoint || !reflect.DeepEqual(beforeCheckpoint, after)) {
+					if err := upsertSQLiteImportCheckpointTx(ctx, tx, after); err != nil {
+						return err
+					}
+				}
+			}
+			for id, record := range state.HelperDeliveries {
+				if before, ok := beforeHelpers[id]; !ok || !reflect.DeepEqual(before, record) {
+					if err := upsertSQLiteHelperDeliveryTx(ctx, tx, record); err != nil {
+						return err
+					}
+				}
+			}
+			return tx.Commit()
+		})
+	}
+	sessionID := strings.TrimSpace(firstStoreNonEmptyString(req.Message.SessionID, req.Delivery.SessionID))
+	if sessionID != "" {
+		err := s.withSessionLock(ctx, sessionID, run)
+		return out, created, alreadyDelivered, handled, err
+	}
+	err := run()
+	return out, created, alreadyDelivered, handled, err
+}
+
 func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCold bool, loadLinked bool, fn func(*State, OutboxMessage, time.Time) (OutboxMessage, error)) (OutboxMessage, bool, error) {
 	var out OutboxMessage
 	handled := false
@@ -3795,6 +4151,9 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 			}
 			if loadCold || loadLinked {
 				if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
+					return err
+				}
+				if err := loadSQLiteArtifactRecordsByIDTx(ctx, tx, &state, current.ArtifactIDs); err != nil {
 					return err
 				}
 			}
@@ -3918,6 +4277,9 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 				}
 			}
 			if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
+				return err
+			}
+			if err := loadSQLiteArtifactRecordsByIDTx(ctx, tx, &state, current.ArtifactIDs); err != nil {
 				return err
 			}
 			now := time.Now()
@@ -4245,6 +4607,38 @@ func (s *Store) recordChatPollSuccessWithContinuationAndScheduleSQLite(ctx conte
 		return tx.Commit()
 	})
 	return out, handled, err
+}
+
+func (s *Store) recordChatPollErrorWithBlockSQLite(ctx context.Context, chatID string, message string, blockedUntil time.Time) (bool, error) {
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state := State{SchemaVersion: SchemaVersion, ChatPolls: map[string]ChatPollState{}}
+		if poll, ok, err := loadSQLiteJSONRow[ChatPollState](ctx, tx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID); err != nil {
+			return err
+		} else if ok {
+			state.ChatPolls[chatID] = poll
+		}
+		poll := applyChatPollErrorWithBlockLocked(&state, chatID, message, blockedUntil, time.Now())
+		if err := upsertSQLiteChatPollTx(ctx, tx, poll); err != nil {
+			return err
+		}
+		handled = true
+		return tx.Commit()
+	})
+	return handled, err
 }
 
 func (s *Store) markChatPollParkNoticeSentSQLite(ctx context.Context, chatID string, at time.Time) (ChatPollState, bool, error) {

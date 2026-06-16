@@ -131,6 +131,8 @@ const (
 	chatPollStateParked  = "parked"
 
 	importCheckpointStatusImporting = "importing"
+	importCheckpointStatusComplete  = "complete"
+	importCheckpointStatusBlocked   = "blocked"
 )
 
 type State struct {
@@ -1727,6 +1729,96 @@ func (s *Store) UpdateImportCheckpoint(ctx context.Context, id string, fn func(I
 		return true, nil
 	})
 	return out, changed, err
+}
+
+func (s *Store) RecordTranscriptCheckpoint(ctx context.Context, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) error {
+	checkpoint.ID = strings.TrimSpace(checkpoint.ID)
+	checkpoint.SessionID = strings.TrimSpace(checkpoint.SessionID)
+	checkpoint.LastRecordID = strings.TrimSpace(checkpoint.LastRecordID)
+	ledger.ID = strings.TrimSpace(ledger.ID)
+	if checkpoint.ID == "" {
+		return fmt.Errorf("import checkpoint id is required")
+	}
+	if checkpoint.LastRecordID == "" {
+		return nil
+	}
+	if ledger.ID == "" {
+		return fmt.Errorf("transcript ledger id is required")
+	}
+	if handled, err := s.recordTranscriptCheckpointSQLite(ctx, checkpoint, ledger); handled || err != nil {
+		return err
+	}
+	update := s.Update
+	if checkpoint.SessionID != "" {
+		update = func(ctx context.Context, fn func(*State) error) error {
+			return s.UpdateSession(ctx, checkpoint.SessionID, fn)
+		}
+	}
+	return update(ctx, func(state *State) error {
+		applyRecordTranscriptCheckpointLocked(state, checkpoint, ledger, time.Now())
+		return nil
+	})
+}
+
+func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord, now time.Time) (ImportCheckpoint, TranscriptLedgerRecord) {
+	if state.ImportCheckpoints == nil {
+		state.ImportCheckpoints = make(map[string]ImportCheckpoint)
+	}
+	if state.TranscriptLedger == nil {
+		state.TranscriptLedger = make(map[string]TranscriptLedgerRecord)
+	}
+	id := strings.TrimSpace(checkpoint.ID)
+	previous := state.ImportCheckpoints[id]
+	status := previous.Status
+	if status == "" {
+		status = strings.TrimSpace(checkpoint.Status)
+	}
+	if status == "" || status == importCheckpointStatusBlocked {
+		status = importCheckpointStatusComplete
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	outCheckpoint := ImportCheckpoint{
+		ID:             id,
+		SessionID:      strings.TrimSpace(checkpoint.SessionID),
+		SourcePath:     strings.TrimSpace(checkpoint.SourcePath),
+		LastRecordID:   strings.TrimSpace(checkpoint.LastRecordID),
+		LastSourceLine: checkpoint.LastSourceLine,
+		LastOffset:     firstStoreNonZeroInt64(checkpoint.LastOffset, previous.LastOffset),
+		SourceSize:     checkpoint.SourceSize,
+		SourceModTime:  checkpoint.SourceModTime,
+		ImportTurnID:   previous.ImportTurnID,
+		KindPrefix:     previous.KindPrefix,
+		Status:         status,
+		UpdatedAt:      now,
+	}
+	state.ImportCheckpoints[id] = outCheckpoint
+
+	outLedger := ledger
+	outLedger.ID = strings.TrimSpace(outLedger.ID)
+	outLedger.SessionID = strings.TrimSpace(outLedger.SessionID)
+	outLedger.CodexThreadID = strings.TrimSpace(outLedger.CodexThreadID)
+	outLedger.SourcePath = strings.TrimSpace(outLedger.SourcePath)
+	outLedger.SourceRecordID = strings.TrimSpace(outLedger.SourceRecordID)
+	if outLedger.ImportedAt.IsZero() {
+		outLedger.ImportedAt = now
+	}
+	if outLedger.CreatedAt.IsZero() {
+		outLedger.CreatedAt = now
+	}
+	outLedger.UpdatedAt = now
+	state.TranscriptLedger[outLedger.ID] = outLedger
+	return outCheckpoint, outLedger
+}
+
+func firstStoreNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func (s *Store) WorkflowNotificationStateSnapshot(ctx context.Context) (State, error) {
@@ -3918,6 +4010,10 @@ func (s *Store) QueueTranscriptDeliveryOutbox(ctx context.Context, req Transcrip
 	if req.Delivery.Status == "" {
 		req.Delivery.Status = TranscriptDeliveryStatusQueued
 	}
+	req.Message = msg
+	if out, created, alreadyDelivered, handled, err := s.queueTranscriptDeliveryOutboxSQLite(ctx, req); handled || err != nil {
+		return out, created, alreadyDelivered, err
+	}
 	update := s.Update
 	if msg.SessionID != "" {
 		update = func(ctx context.Context, fn func(*State) error) error {
@@ -3929,51 +4025,66 @@ func (s *Store) QueueTranscriptDeliveryOutbox(ctx context.Context, req Transcrip
 	alreadyDelivered := false
 	err := update(ctx, func(state *State) error {
 		now := time.Now()
-		if existingDelivery, ok := state.TranscriptDeliveries[req.Delivery.ID]; ok {
-			if strings.TrimSpace(existingDelivery.OutboxID) != "" {
-				if existing, ok := state.OutboxMessages[existingDelivery.OutboxID]; ok {
-					out = existing
-				}
-			}
-			if transcriptDeliverySuppressesQueue(existingDelivery) {
-				alreadyDelivered = true
-				out = OutboxMessage{}
-				applyTranscriptCheckpointLocked(state, req.Checkpoint, now)
-				return nil
-			}
-			if out.ID != "" {
-				return nil
-			}
-			if existingDelivery.OutboxID != "" {
-				msg.ID = existingDelivery.OutboxID
-			}
-			var err error
-			out, created, err = queueOutboxLocked(state, msg, now)
-			if err != nil {
-				return err
-			}
-			existingDelivery.OutboxID = out.ID
-			if existingDelivery.Status == "" {
-				existingDelivery.Status = TranscriptDeliveryStatusQueued
-			}
-			existingDelivery.UpdatedAt = now
-			state.TranscriptDeliveries[req.Delivery.ID] = existingDelivery
-			return nil
-		}
 		var err error
-		out, created, err = queueOutboxLocked(state, msg, now)
-		if err != nil {
-			return err
-		}
-		delivery := normalizeTranscriptDeliveryRecord(req.Delivery, now)
-		delivery.OutboxID = out.ID
-		if delivery.Status == "" {
-			delivery.Status = TranscriptDeliveryStatusQueued
-		}
-		state.TranscriptDeliveries[delivery.ID] = delivery
-		return nil
+		out, created, alreadyDelivered, err = applyQueueTranscriptDeliveryOutboxLocked(state, req.Message, req.Delivery, req.Checkpoint, now)
+		return err
 	})
 	return out, created, alreadyDelivered, err
+}
+
+func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint, now time.Time) (OutboxMessage, bool, bool, error) {
+	if state == nil {
+		return OutboxMessage{}, false, false, fmt.Errorf("state is required")
+	}
+	if state.OutboxMessages == nil {
+		state.OutboxMessages = map[string]OutboxMessage{}
+	}
+	if state.TranscriptDeliveries == nil {
+		state.TranscriptDeliveries = map[string]TranscriptDeliveryRecord{}
+	}
+	if state.ImportCheckpoints == nil {
+		state.ImportCheckpoints = map[string]ImportCheckpoint{}
+	}
+	if existingDelivery, ok := state.TranscriptDeliveries[delivery.ID]; ok {
+		var out OutboxMessage
+		if strings.TrimSpace(existingDelivery.OutboxID) != "" {
+			if existing, ok := state.OutboxMessages[existingDelivery.OutboxID]; ok {
+				out = existing
+			}
+		}
+		if transcriptDeliverySuppressesQueue(existingDelivery) {
+			applyTranscriptCheckpointLocked(state, checkpoint, now)
+			return OutboxMessage{}, false, true, nil
+		}
+		if out.ID != "" {
+			return out, false, false, nil
+		}
+		if existingDelivery.OutboxID != "" {
+			msg.ID = existingDelivery.OutboxID
+		}
+		out, created, err := queueOutboxLocked(state, msg, now)
+		if err != nil {
+			return OutboxMessage{}, false, false, err
+		}
+		existingDelivery.OutboxID = out.ID
+		if existingDelivery.Status == "" {
+			existingDelivery.Status = TranscriptDeliveryStatusQueued
+		}
+		existingDelivery.UpdatedAt = now
+		state.TranscriptDeliveries[delivery.ID] = existingDelivery
+		return out, created, false, nil
+	}
+	out, created, err := queueOutboxLocked(state, msg, now)
+	if err != nil {
+		return OutboxMessage{}, false, false, err
+	}
+	normalized := normalizeTranscriptDeliveryRecord(delivery, now)
+	normalized.OutboxID = out.ID
+	if normalized.Status == "" {
+		normalized.Status = TranscriptDeliveryStatusQueued
+	}
+	state.TranscriptDeliveries[normalized.ID] = normalized
+	return out, created, false, nil
 }
 
 func transcriptDeliverySuppressesQueue(record TranscriptDeliveryRecord) bool {
@@ -3994,6 +4105,9 @@ func (s *Store) RecordTranscriptDelivery(ctx context.Context, delivery Transcrip
 	if delivery.Status == "" {
 		delivery.Status = TranscriptDeliveryStatusSkipped
 	}
+	if out, created, handled, err := s.recordTranscriptDeliverySQLite(ctx, delivery, checkpoint); handled || err != nil {
+		return out, created, err
+	}
 	update := s.Update
 	if delivery.SessionID != "" {
 		update = func(ctx context.Context, fn func(*State) error) error {
@@ -4004,18 +4118,27 @@ func (s *Store) RecordTranscriptDelivery(ctx context.Context, delivery Transcrip
 	created := false
 	err := update(ctx, func(state *State) error {
 		now := time.Now()
-		if existing, ok := state.TranscriptDeliveries[delivery.ID]; ok {
-			out = existing
-			applyTranscriptCheckpointLocked(state, checkpoint, now)
-			return nil
-		}
-		out = normalizeTranscriptDeliveryRecord(delivery, now)
-		state.TranscriptDeliveries[out.ID] = out
-		created = true
-		applyTranscriptCheckpointLocked(state, checkpoint, now)
+		out, created = applyRecordTranscriptDeliveryLocked(state, delivery, checkpoint, now)
 		return nil
 	})
 	return out, created, err
+}
+
+func applyRecordTranscriptDeliveryLocked(state *State, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint, now time.Time) (TranscriptDeliveryRecord, bool) {
+	if state.TranscriptDeliveries == nil {
+		state.TranscriptDeliveries = make(map[string]TranscriptDeliveryRecord)
+	}
+	if state.ImportCheckpoints == nil {
+		state.ImportCheckpoints = make(map[string]ImportCheckpoint)
+	}
+	if existing, ok := state.TranscriptDeliveries[delivery.ID]; ok {
+		applyTranscriptCheckpointLocked(state, checkpoint, now)
+		return existing, false
+	}
+	out := normalizeTranscriptDeliveryRecord(delivery, now)
+	state.TranscriptDeliveries[out.ID] = out
+	applyTranscriptCheckpointLocked(state, checkpoint, now)
+	return out, true
 }
 
 func normalizeTranscriptDeliveryRecord(record TranscriptDeliveryRecord, now time.Time) TranscriptDeliveryRecord {
@@ -4045,6 +4168,9 @@ func (s *Store) UpsertArtifactRecord(ctx context.Context, record ArtifactRecord)
 	if strings.TrimSpace(record.ID) == "" {
 		return ArtifactRecord{}, fmt.Errorf("artifact id is required")
 	}
+	if out, handled, err := s.upsertArtifactRecordSQLite(ctx, record); handled || err != nil {
+		return out, err
+	}
 	update := s.Update
 	if strings.TrimSpace(record.SessionID) != "" {
 		update = func(ctx context.Context, fn func(*State) error) error {
@@ -4054,32 +4180,39 @@ func (s *Store) UpsertArtifactRecord(ctx context.Context, record ArtifactRecord)
 	var out ArtifactRecord
 	err := update(ctx, func(state *State) error {
 		now := time.Now()
-		record = normalizeArtifactRecord(record, now)
-		if existing, ok := state.ArtifactRecords[record.ID]; ok {
-			if !existing.CreatedAt.IsZero() {
-				record.CreatedAt = existing.CreatedAt
-			}
-			if record.OutboxID == "" {
-				record.OutboxID = existing.OutboxID
-			}
-			if record.DriveItemID == "" {
-				record.DriveItemID = existing.DriveItemID
-			}
-			if record.TeamsMessageID == "" {
-				record.TeamsMessageID = existing.TeamsMessageID
-			}
-			if record.UploadedAt.IsZero() {
-				record.UploadedAt = existing.UploadedAt
-			}
-			if record.SentAt.IsZero() {
-				record.SentAt = existing.SentAt
-			}
-		}
-		state.ArtifactRecords[record.ID] = record
-		out = record
+		out = applyUpsertArtifactRecordLocked(state, record, now)
 		return nil
 	})
 	return out, err
+}
+
+func applyUpsertArtifactRecordLocked(state *State, record ArtifactRecord, now time.Time) ArtifactRecord {
+	if state.ArtifactRecords == nil {
+		state.ArtifactRecords = make(map[string]ArtifactRecord)
+	}
+	record = normalizeArtifactRecord(record, now)
+	if existing, ok := state.ArtifactRecords[record.ID]; ok {
+		if !existing.CreatedAt.IsZero() {
+			record.CreatedAt = existing.CreatedAt
+		}
+		if record.OutboxID == "" {
+			record.OutboxID = existing.OutboxID
+		}
+		if record.DriveItemID == "" {
+			record.DriveItemID = existing.DriveItemID
+		}
+		if record.TeamsMessageID == "" {
+			record.TeamsMessageID = existing.TeamsMessageID
+		}
+		if record.UploadedAt.IsZero() {
+			record.UploadedAt = existing.UploadedAt
+		}
+		if record.SentAt.IsZero() {
+			record.SentAt = existing.SentAt
+		}
+	}
+	state.ArtifactRecords[record.ID] = record
+	return record
 }
 
 func normalizeArtifactRecord(record ArtifactRecord, now time.Time) ArtifactRecord {
@@ -4221,7 +4354,7 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 }
 
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.Status = OutboxStatusQueued
 		msg.LastSendError = trimDiagnostic(message, 240)
 		msg.LastSendAttempt = now
@@ -4242,7 +4375,7 @@ func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, messag
 }
 
 func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), true, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
 		msg.DriveItemETag = strings.TrimSpace(eTag)
@@ -4884,25 +5017,36 @@ func (s *Store) RecordChatPollErrorWithBlock(ctx context.Context, chatID string,
 		return fmt.Errorf("chat id is required")
 	}
 	message = trimDiagnostic(message, 240)
+	if handled, err := s.recordChatPollErrorWithBlockSQLite(ctx, chatID, message, blockedUntil); handled || err != nil {
+		return err
+	}
 	return s.Update(ctx, func(state *State) error {
 		now := time.Now()
-		poll := state.ChatPolls[chatID]
-		poll.ChatID = chatID
-		poll.LastError = message
-		poll.LastErrorAt = now
-		poll.FailureCount++
-		if blockedUntil.After(now) {
-			if poll.PollState != "" && poll.PollState != "blocked" {
-				poll.PreviousPollState = poll.PollState
-			}
-			poll.PollState = "blocked"
-			poll.BlockedUntil = blockedUntil
-			poll.NextPollAt = blockedUntil
-		}
-		poll.UpdatedAt = now
-		state.ChatPolls[chatID] = poll
+		applyChatPollErrorWithBlockLocked(state, chatID, message, blockedUntil, now)
 		return nil
 	})
+}
+
+func applyChatPollErrorWithBlockLocked(state *State, chatID string, message string, blockedUntil time.Time, now time.Time) ChatPollState {
+	if state.ChatPolls == nil {
+		state.ChatPolls = make(map[string]ChatPollState)
+	}
+	poll := state.ChatPolls[chatID]
+	poll.ChatID = chatID
+	poll.LastError = message
+	poll.LastErrorAt = now
+	poll.FailureCount++
+	if blockedUntil.After(now) {
+		if poll.PollState != "" && poll.PollState != chatPollStateBlocked {
+			poll.PreviousPollState = poll.PollState
+		}
+		poll.PollState = chatPollStateBlocked
+		poll.BlockedUntil = blockedUntil
+		poll.NextPollAt = blockedUntil
+	}
+	poll.UpdatedAt = now
+	state.ChatPolls[chatID] = poll
+	return poll
 }
 
 func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollScheduleUpdate) (ChatPollState, error) {
