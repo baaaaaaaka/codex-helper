@@ -67,7 +67,7 @@ fetch_url() {
   local out="$2"
   case "$fetcher" in
     curl)
-      retry 5 5 curl --connect-timeout 30 -fsSL -o "$out" "$url"
+      retry 5 5 curl --connect-timeout 30 --max-time 180 -fsSL -o "$out" "$url"
       ;;
     wget)
       retry 5 5 wget --tries=1 --timeout=30 -q -O "$out" "$url"
@@ -216,6 +216,14 @@ run_upgrade_convergence_scenario() {
   export MANAGED_TARGET="$managed"
   export MANAGED_CXP="$managed_cxp"
   export TARGET_VERSION="$(version_no_v "$target_tag")"
+  case "$os" in
+    darwin)
+      export CODEX_HELPER_CONFIG_HOME="$HOME/Library/Application Support"
+      ;;
+    *)
+      export CODEX_HELPER_CONFIG_HOME="$XDG_CONFIG_HOME"
+      ;;
+  esac
   python3 - <<'PY'
 import json
 import os
@@ -224,7 +232,7 @@ from pathlib import Path
 managed = os.environ["MANAGED_TARGET"]
 cxp = os.environ["MANAGED_CXP"]
 target_version = os.environ["TARGET_VERSION"]
-config_home = Path(os.environ["XDG_CONFIG_HOME"])
+config_home = Path(os.environ["CODEX_HELPER_CONFIG_HOME"])
 
 record_path = config_home / "codex-helper" / "install.json"
 record = json.loads(record_path.read_text())
