@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -522,6 +523,135 @@ func TestBridgeControlHelperUpdatePrereleaseRunsManualUpdate(t *testing.T) {
 	}
 	if got := strings.Count(joined, "Helper update completed"); got != 1 {
 		t.Fatalf("manual helper update completion count = %d, want 1 in:\n%s", got, joined)
+	}
+}
+
+func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestartsInstalledPath(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	bridge.helperVersion = "v1.2.3"
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	managed := "/home/me/.local/bin/codex-proxy"
+	goBin := "/home/me/go/bin/codex-proxy"
+	updater := &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			NextCheckAt: now.Add(30 * time.Minute),
+			Candidate: &HelperAutoUpdateCandidate{
+				TagName:     "v1.2.4-rc.1",
+				Version:     "1.2.4-rc.1",
+				Priority:    "p2",
+				PublishedAt: now.Add(-time.Hour),
+				EligibleAt:  now.Add(-time.Hour),
+				Asset:       "codex-proxy_1.2.4-rc.1_linux_amd64",
+			},
+		},
+		applyResult: HelperAutoUpdateApplyResult{
+			Version:           "1.2.4-rc.1",
+			InstallPath:       managed,
+			ActivationPending: true,
+			ActivationReason:  "helper update installed to " + managed + ", but activation is pending because the running helper executable is " + goBin,
+		},
+	}
+	bridge.helperAutoUpdater = updater
+	var pendingRestartPath string
+	var pendingRestartInstallPath string
+	bridge.helperPendingRestarter = func(_ context.Context, path string, installPath string) error {
+		pendingRestartPath = path
+		pendingRestartInstallPath = installPath
+		return nil
+	}
+	bridge.helperRestarter = func(context.Context) error {
+		t.Fatal("activation-pending helper update must restart through the installed helper path")
+		return nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-update-pre-pending"), "helper update prerelease"); err != nil {
+		t.Fatalf("handleControlMessage update prerelease error: %v", err)
+	}
+	if updater.applyCalls != 1 {
+		t.Fatalf("applyCalls=%d, want 1", updater.applyCalls)
+	}
+	if pendingRestartPath != "" || pendingRestartInstallPath != managed {
+		t.Fatalf("pending restart path/install = %q/%q, want empty/%q", pendingRestartPath, pendingRestartInstallPath, managed)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Helper update scheduled", "Helper update activation pending", "v1.2.4-rc.1", "I will restart through the installed helper"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("manual pending activation messages missing %q in:\n%s", want, joined)
+		}
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "" {
+		t.Fatalf("LastInstalledTag = %q, want empty until restarted helper verifies target", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, goBin) {
+		t.Fatalf("upgrade = %#v, want aborted with running executable reason", state.Upgrade)
+	}
+	noticePath, err := bridge.pendingHelperRestartNoticePath()
+	if err != nil {
+		t.Fatalf("pending notice path: %v", err)
+	}
+	data, err := os.ReadFile(noticePath)
+	if err != nil {
+		t.Fatalf("read pending notice: %v", err)
+	}
+	var notice helperRestartNotice
+	if err := json.Unmarshal(data, &notice); err != nil {
+		t.Fatalf("unmarshal pending notice: %v", err)
+	}
+	if notice.InstallPath != managed || notice.PendingReplacePath != "" || !notice.Manual {
+		t.Fatalf("pending notice = %#v, want install path and manual activation", notice)
+	}
+}
+
+func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestarterFailureKeepsNotice(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	bridge.helperVersion = "v1.2.3"
+	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	managed := "/home/me/.local/bin/codex-proxy"
+	updater := &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			NextCheckAt: now.Add(30 * time.Minute),
+			Candidate: &HelperAutoUpdateCandidate{
+				TagName: "v1.2.4-rc.1",
+				Version: "1.2.4-rc.1",
+			},
+		},
+		applyResult: HelperAutoUpdateApplyResult{
+			Version:           "1.2.4-rc.1",
+			InstallPath:       managed,
+			ActivationPending: true,
+			ActivationReason:  "running helper executable differs",
+		},
+	}
+	bridge.helperAutoUpdater = updater
+	bridge.helperPendingRestarter = func(context.Context, string, string) error {
+		return errors.New("restart failed")
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-update-pre-pending-fail"), "helper update prerelease"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	noticePath, err := bridge.pendingHelperRestartNoticePath()
+	if err != nil {
+		t.Fatalf("pending notice path: %v", err)
+	}
+	data, err := os.ReadFile(noticePath)
+	if err != nil {
+		t.Fatalf("read pending notice after restart failure: %v", err)
+	}
+	var notice helperRestartNotice
+	if err := json.Unmarshal(data, &notice); err != nil {
+		t.Fatalf("unmarshal pending notice: %v", err)
+	}
+	if notice.InstallPath != managed || notice.Tag != "v1.2.4-rc.1" {
+		t.Fatalf("pending notice after restart failure = %#v, want install path and tag retained", notice)
 	}
 }
 

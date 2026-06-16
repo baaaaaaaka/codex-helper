@@ -2892,6 +2892,11 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 		if err := materializeManagedTeamsInstallTarget(context.Background(), resolvedExe); err != nil {
 			return teamsServiceSpec{}, err
 		}
+		if resolvedExe.State == "managed" {
+			if err := ensureCXPShimForInstallPathForGOOS(exe, teamsServiceGOOS()); err != nil {
+				return teamsServiceSpec{}, err
+			}
+		}
 		probe := helperpath.ProbePath(exe, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
 		if resolvedExe.State == "managed" && (!probe.Exists || probe.IsDir || !probe.Executable) {
 			return teamsServiceSpec{}, fmt.Errorf("managed Teams service executable %s is not available after materialization", exe)

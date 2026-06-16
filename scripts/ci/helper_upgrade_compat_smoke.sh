@@ -18,8 +18,9 @@ fi
 
 case "$(uname -s)" in
   Linux) os="linux" ;;
+  Darwin) os="darwin" ;;
   *)
-    echo "helper upgrade compatibility smoke currently supports Linux only" >&2
+    echo "helper upgrade compatibility smoke currently supports Linux and macOS only" >&2
     exit 2
     ;;
 esac
@@ -101,7 +102,7 @@ assert_version() {
 
 run_upgrade_convergence_scenario() {
   local scenario="$1"
-  local seed_managed="$2"
+  local seed_mode="$2"
   local scenario_base="$base_root/$scenario"
   rm -rf "$scenario_base"
   mkdir -p "$scenario_base"
@@ -124,41 +125,96 @@ run_upgrade_convergence_scenario() {
   local managed_cxp="$HOME/.local/bin/cxp"
   local go_bin="$HOME/go/bin/codex-proxy"
 
-  echo "helper upgrade compatibility smoke: scenario=$scenario repo=$repo old=$old_tag target=$target_tag"
+  echo "helper upgrade compatibility smoke: scenario=$scenario mode=$seed_mode os=$os repo=$repo old=$old_tag target=$target_tag"
   download_binary "$old_tag" "$go_bin"
-  if [[ "$seed_managed" == "1" ]]; then
-    mkdir -p "$(dirname "$managed")"
-    cp -f "$go_bin" "$managed"
-    cp -f "$go_bin" "$managed_cxp"
-    chmod 0755 "$managed" "$managed_cxp"
-    assert_version "$managed" "$old_tag"
-    assert_version "$managed_cxp" "$old_tag"
-  else
-    [[ ! -e "$managed" ]]
-    [[ ! -e "$managed_cxp" ]]
-  fi
+  case "$seed_mode" in
+    copy)
+      mkdir -p "$(dirname "$managed")"
+      cp -f "$go_bin" "$managed"
+      cp -f "$go_bin" "$managed_cxp"
+      chmod 0755 "$managed" "$managed_cxp"
+      assert_version "$managed" "$old_tag"
+      assert_version "$managed_cxp" "$old_tag"
+      ;;
+    symlink)
+      mkdir -p "$(dirname "$managed")"
+      cp -f "$go_bin" "$managed"
+      chmod 0755 "$managed"
+      ln -s "$managed" "$managed_cxp"
+      assert_version "$managed" "$old_tag"
+      assert_version "$managed_cxp" "$old_tag"
+      ;;
+    stale-symlink)
+      mkdir -p "$(dirname "$managed")"
+      cp -f "$go_bin" "$managed"
+      chmod 0755 "$managed"
+      ln -s "$go_bin" "$managed_cxp"
+      assert_version "$managed" "$old_tag"
+      assert_version "$managed_cxp" "$old_tag"
+      ;;
+    missing|current-missing-cxp)
+      [[ ! -e "$managed" ]]
+      [[ ! -e "$managed_cxp" ]]
+      ;;
+    *)
+      echo "unknown helper upgrade compatibility seed mode: $seed_mode" >&2
+      exit 2
+      ;;
+  esac
   assert_version "$go_bin" "$old_tag"
 
   retry 5 10 "$go_bin" upgrade --repo "$repo" --version "$target_tag" --install-path "$go_bin"
 
   assert_version "$go_bin" "$target_tag"
-  if [[ "$seed_managed" == "1" ]]; then
-    assert_version "$managed" "$old_tag"
-    assert_version "$managed_cxp" "$old_tag"
-  else
-    [[ ! -e "$managed" ]]
-  fi
+  case "$seed_mode" in
+    copy|symlink)
+      assert_version "$managed" "$old_tag"
+      assert_version "$managed_cxp" "$old_tag"
+      ;;
+    stale-symlink)
+      assert_version "$managed" "$old_tag"
+      assert_version "$managed_cxp" "$target_tag"
+      ;;
+    missing)
+      [[ ! -e "$managed" ]]
+      [[ ! -e "$managed_cxp" ]]
+      ;;
+    current-missing-cxp)
+      mkdir -p "$(dirname "$managed")"
+      cp -f "$go_bin" "$managed"
+      chmod 0755 "$managed"
+      rm -f "$managed_cxp"
+      assert_version "$managed" "$target_tag"
+      [[ ! -e "$managed_cxp" ]]
+      ;;
+  esac
 
   "$go_bin" teams service install
 
   assert_version "$managed" "$target_tag"
-  if [[ -e "$managed_cxp" ]]; then
-    assert_version "$managed_cxp" "$target_tag"
-  fi
+  assert_version "$managed_cxp" "$target_tag"
+  case "$seed_mode" in
+    symlink|stale-symlink|missing|current-missing-cxp)
+      if [[ ! -L "$managed_cxp" ]]; then
+        echo "managed cxp should be a symlink for seed mode $seed_mode" >&2
+        ls -l "$managed_cxp" >&2 || true
+        exit 1
+      fi
+      if [[ "$(readlink "$managed_cxp")" != "$managed" ]]; then
+        echo "managed cxp symlink should point to $managed for seed mode $seed_mode" >&2
+        ls -l "$managed_cxp" >&2 || true
+        exit 1
+      fi
+      ;;
+  esac
+
+  echo "helper upgrade compatibility smoke: scenario=$scenario second-hop via managed cxp"
+  retry 5 10 "$managed_cxp" upgrade --repo "$repo" --version "$target_tag"
+  assert_version "$managed" "$target_tag"
+  assert_version "$managed_cxp" "$target_tag"
 
   export MANAGED_TARGET="$managed"
   export MANAGED_CXP="$managed_cxp"
-  export EXPECT_MANAGED_CXP="$seed_managed"
   export TARGET_VERSION="$(version_no_v "$target_tag")"
   python3 - <<'PY'
 import json
@@ -167,7 +223,6 @@ from pathlib import Path
 
 managed = os.environ["MANAGED_TARGET"]
 cxp = os.environ["MANAGED_CXP"]
-expect_cxp = os.environ["EXPECT_MANAGED_CXP"] == "1"
 target_version = os.environ["TARGET_VERSION"]
 config_home = Path(os.environ["XDG_CONFIG_HOME"])
 
@@ -177,11 +232,19 @@ assert record["schema_version"] == 1, record
 assert record["target_path"] == managed, record
 assert record["target_state"] == "managed", record
 assert record["version"].lstrip("v") == target_version, record
-if expect_cxp:
-    assert cxp in record.get("shims", []), record
-else:
-    assert cxp not in record.get("shims", []), record
+assert cxp in record.get("shims", []), record
+PY
 
+  case "$os" in
+    linux)
+      export MANAGED_TARGET="$managed"
+      python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+managed = os.environ["MANAGED_TARGET"]
+config_home = Path(os.environ["XDG_CONFIG_HOME"])
 supervisor_path = config_home / "codex-helper" / "teams" / "local-supervisor.json"
 supervisor = json.loads(supervisor_path.read_text())
 spec = supervisor["spec"]
@@ -190,6 +253,19 @@ env = spec.get("Environment") or {}
 assert env.get("CODEX_PROXY_INSTALL_PATH") == managed, supervisor
 assert "CODEX_PROXY_INSTALL_DIR" not in env, supervisor
 PY
+      ;;
+    darwin)
+      local plist="$HOME/Library/LaunchAgents/com.codex-helper.teams.plist"
+      test -f "$plist"
+      grep -Fq "<string>$managed</string>" "$plist"
+      grep -Fq "<key>CODEX_PROXY_INSTALL_PATH</key>" "$plist"
+      if grep -Fq "CODEX_PROXY_INSTALL_DIR" "$plist"; then
+        echo "LaunchAgent plist should not preserve CODEX_PROXY_INSTALL_DIR" >&2
+        cat "$plist" >&2
+        exit 1
+      fi
+      ;;
+  esac
 }
 
 safe_old="${old_tag//[^A-Za-z0-9._-]/_}"
@@ -198,7 +274,10 @@ base_root="${RUNNER_TEMP:-/tmp}/codex-helper-upgrade-compat-${safe_old}-to-${saf
 rm -rf "$base_root"
 mkdir -p "$base_root"
 
-run_upgrade_convergence_scenario "existing-managed" "1"
-run_upgrade_convergence_scenario "missing-managed" "0"
+run_upgrade_convergence_scenario "existing-managed-copy" "copy"
+run_upgrade_convergence_scenario "existing-managed-symlink" "symlink"
+run_upgrade_convergence_scenario "stale-managed-symlink" "stale-symlink"
+run_upgrade_convergence_scenario "missing-managed" "missing"
+run_upgrade_convergence_scenario "current-managed-missing-cxp" "current-missing-cxp"
 
 echo "helper upgrade compatibility smoke passed"

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -214,6 +215,193 @@ func TestUpgradeCmdUsesManagedDefaultWhenLaunchedAsCXP(t *testing.T) {
 	}
 	if got.InstallPath != managed {
 		t.Fatalf("upgrade install path = %q, want managed codex-proxy %q", got.InstallPath, managed)
+	}
+}
+
+func TestUpgradeCmdCreatesMissingCXPShimForManagedDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX cxp shim creation")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	prevResolve := resolveInstallPathForCLI
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+		resolveInstallPathForCLI = prevResolve
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	writeCLIFile(t, managed, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
+	executablePath = func() (string, error) { return managed, nil }
+	restartArgv0 = func() string { return managed }
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.4"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v", err)
+	}
+	if target, err := os.Readlink(cxp); err != nil || target != managed {
+		t.Fatalf("cxp shim = %q err=%v, want symlink to %s", target, err, managed)
+	}
+}
+
+func TestUpgradeCmdRepairsStaleCXPRegularFileForManagedDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX cxp shim repair")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	prevResolve := resolveInstallPathForCLI
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+		resolveInstallPathForCLI = prevResolve
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	writeCLIFile(t, managed, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	writeCLIFile(t, cxp, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
+	executablePath = func() (string, error) { return cxp, nil }
+	restartArgv0 = func() string { return cxp }
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.4"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v", err)
+	}
+	if out, err := exec.Command(cxp, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("cxp version after repair = %q err=%v, want 1.2.4", out, err)
+	}
+	if info, err := os.Lstat(cxp); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("cxp repair should keep a regular executable copy, info=%v err=%v", info, err)
+	}
+}
+
+func TestEnsureCXPShimForInstallPathRepairsStalePOSIXSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlink repair")
+	}
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy")
+	stalePath := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	shimPath := filepath.Join(tmp, "cxp")
+	writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	writeCLIFile(t, stalePath, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(stalePath, shimPath); err != nil {
+		t.Fatalf("create stale cxp symlink: %v", err)
+	}
+
+	if err := ensureCXPShimForInstallPathForGOOS(installPath, "linux"); err != nil {
+		t.Fatalf("ensure cxp shim: %v", err)
+	}
+	target, err := os.Readlink(shimPath)
+	if err != nil {
+		t.Fatalf("read repaired cxp symlink: %v", err)
+	}
+	if target != installPath {
+		t.Fatalf("cxp symlink = %q, want %q", target, installPath)
+	}
+}
+
+func upgradeCXPShimTestScript(version string) string {
+	return "#!/bin/sh\n" +
+		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ]; then exit 0; fi\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'codex-proxy version " + version + " (test)'; exit 0; fi\n" +
+		"exit 0\n"
+}
+
+func TestEnsureCXPShimForInstallPathCreatesWindowsCmdShim(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	writeCLIFile(t, installPath, "binary", 0o755)
+
+	if err := ensureCXPShimForInstallPathForGOOS(installPath, "windows"); err != nil {
+		t.Fatalf("ensure windows cxp shim: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, "cxp.cmd"))
+	if err != nil {
+		t.Fatalf("read cxp.cmd: %v", err)
+	}
+	if string(data) != windowsCXPShimContent() {
+		t.Fatalf("cxp.cmd = %q, want %q", data, windowsCXPShimContent())
+	}
+}
+
+func TestEnsureCXPShimForInstallPathRepairsWindowsCmdShim(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	writeCLIFile(t, installPath, "binary", 0o755)
+	writeCLIFile(t, shimPath, "@echo off\r\n\"C:\\old\\codex-proxy.exe\" %*\r\n", 0o755)
+
+	if err := ensureCXPShimForInstallPathForGOOS(installPath, "windows"); err != nil {
+		t.Fatalf("ensure windows cxp shim: %v", err)
+	}
+	data, err := os.ReadFile(shimPath)
+	if err != nil {
+		t.Fatalf("read cxp.cmd: %v", err)
+	}
+	if string(data) != windowsCXPShimContent() {
+		t.Fatalf("cxp.cmd = %q, want %q", data, windowsCXPShimContent())
+	}
+}
+
+func TestEnsureCXPShimForInstallPathKeepsNonHelperWindowsCmd(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	custom := "@echo off\r\necho custom\r\n"
+	writeCLIFile(t, installPath, "binary", 0o755)
+	writeCLIFile(t, shimPath, custom, 0o755)
+
+	if err := ensureCXPShimForInstallPathForGOOS(installPath, "windows"); err != nil {
+		t.Fatalf("ensure windows cxp shim: %v", err)
+	}
+	data, err := os.ReadFile(shimPath)
+	if err != nil {
+		t.Fatalf("read cxp.cmd: %v", err)
+	}
+	if string(data) != custom {
+		t.Fatalf("cxp.cmd = %q, want custom content unchanged", data)
 	}
 }
 

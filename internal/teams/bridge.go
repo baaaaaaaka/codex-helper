@@ -5218,6 +5218,54 @@ func (b *Bridge) queuePendingHelperActivationAttentionNotice(ctx context.Context
 	return true, nil
 }
 
+func (b *Bridge) queueHelperUpgradeActivationPendingNotice(ctx context.Context, chatID string, commandMessageID string, tag string, reason string, installPath string, restartScheduled bool) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil
+	}
+	seed := strings.Join([]string{
+		strings.TrimSpace(commandMessageID),
+		strings.TrimSpace(tag),
+		strings.TrimSpace(installPath),
+		strings.TrimSpace(reason),
+	}, "\x00")
+	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
+		ID:           "outbox:control:helper-upgrade-activation-pending:" + shortStableID(seed),
+		TeamsChatID:  chatID,
+		Kind:         "control-helper-upgrade-activation-pending",
+		Body:         helperUpgradeActivationPendingNoticeBody(tag, reason, installPath, restartScheduled),
+		MentionOwner: true,
+	})
+	if err != nil {
+		return err
+	}
+	if queued.Status != teamstore.OutboxStatusSent {
+		if err := b.flushPendingOutboxForChat(ctx, queued.TeamsChatID); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
+		}
+	}
+	return nil
+}
+
+func helperUpgradeActivationPendingNoticeBody(tag string, reason string, installPath string, restartScheduled bool) string {
+	lines := []string{"⚠️ Helper update activation pending"}
+	if tag := strings.TrimSpace(tag); tag != "" {
+		lines = append(lines, "", "Target: `"+tag+"`")
+	}
+	if installPath := strings.TrimSpace(installPath); installPath != "" {
+		lines = append(lines, "", "Installed helper: `"+installPath+"`")
+	}
+	if reason := strings.TrimSpace(reason); reason != "" {
+		lines = append(lines, "", "Reason: "+reason)
+	}
+	if restartScheduled {
+		lines = append(lines, "", "I will restart through the installed helper and verify the version after it comes back.")
+	} else {
+		lines = append(lines, "", "Send `helper restart now` after active work is idle, then send `st` to verify the running helper version.")
+	}
+	return strings.Join(lines, "\n")
+}
+
 func helperActivationNoticeAlreadyQueued(notice helperRestartNotice, statusName string, outboxID string) bool {
 	key := helperActivationNoticeKey(statusName)
 	if key == "" || strings.TrimSpace(outboxID) == "" || notice.ActivationNotices == nil {
@@ -5900,7 +5948,17 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
 		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 		if completionChatID != "" {
-			if err := b.writePendingHelperUpgradeNotice(completionChatID, completionCommandID, tag, manualNotice); err != nil {
+			if err := b.writePendingHelperUpgradeNoticeWithReplacement(completionChatID, completionCommandID, tag, manualNotice, "", res.InstallPath); err != nil {
+				return err
+			}
+			if manualNotice {
+				if err := b.queueHelperUpgradeActivationPendingNotice(ctx, completionChatID, completionCommandID, tag, pendingReason, res.InstallPath, opts.HelperPendingRestarter != nil && strings.TrimSpace(res.InstallPath) != ""); err != nil {
+					return err
+				}
+			}
+		}
+		if opts.HelperPendingRestarter != nil && strings.TrimSpace(res.InstallPath) != "" {
+			if err := opts.HelperPendingRestarter(ctx, "", res.InstallPath); err != nil {
 				return err
 			}
 		}

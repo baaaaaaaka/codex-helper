@@ -569,6 +569,43 @@ func TestTeamsReleaseAutoUpdaterApplyUsesManagedDefaultWhenServiceRunsFromGoBin(
 	}
 }
 
+func TestTeamsReleaseAutoUpdaterApplyCreatesMissingCXPShim(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX cxp shim creation")
+	}
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) {
+		return managed, nil
+	}
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return managed, nil
+	}
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, opts.InstallPath, "#!/bin/sh\nexit 0\n", 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	if _, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"}); err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if target, err := os.Readlink(cxp); err != nil || target != managed {
+		t.Fatalf("cxp shim = %q err=%v, want symlink to %s", target, err, managed)
+	}
+}
+
 func TestTeamsReleaseAutoUpdaterApplyWithOptionsReturnsWindowsPendingReplacementToCaller(t *testing.T) {
 	lockCLITestHooks(t)
 	prevPerform := performUpdate

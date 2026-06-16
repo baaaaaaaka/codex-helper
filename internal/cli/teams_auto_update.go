@@ -179,6 +179,9 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
+	if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
+		return teams.HelperAutoUpdateApplyResult{}, err
+	}
 	installBundledSkillsFromHelper(ctx, firstNonEmptyString(res.PendingReplacePath, res.InstallPath), io.Discard)
 	return teams.HelperAutoUpdateApplyResult{
 		Version:            res.Version,

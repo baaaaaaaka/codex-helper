@@ -1131,6 +1131,9 @@ func localSupervisorActivationAttentionBody(activation teamsServiceLocalSupervis
 
 func restartTeamsHelperFromTeamsAfterPendingReplacement(ctx context.Context, pendingReplacePath string, installPath string) error {
 	if strings.TrimSpace(pendingReplacePath) == "" {
+		if strings.TrimSpace(installPath) != "" {
+			return restartTeamsHelperFromTeamsUsingInstallPath(ctx, installPath)
+		}
 		return restartTeamsHelperFromTeams(ctx)
 	}
 	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
@@ -1153,6 +1156,16 @@ func restartTeamsHelperFromTeamsAfterPendingReplacement(ctx context.Context, pen
 		return nil
 	}
 	return restartTeamsHelperFromTeams(ctx)
+}
+
+func restartTeamsHelperFromTeamsUsingInstallPath(_ context.Context, installPath string) error {
+	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
+		return err
+	}
+	if err := helperRestartBeaconBlockerError(); err != nil {
+		return err
+	}
+	return restartSelfWithExecutable(installPath)
 }
 
 func newTeamsStatusCmd(registryPath *string) *cobra.Command {

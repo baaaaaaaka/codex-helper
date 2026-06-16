@@ -57,10 +57,16 @@ func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 	}
 
 	if res.RestartRequired {
+		if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to install cxp shim after update: %v\n", err)
+		}
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update replacement for v%s is pending. Restart `codex-proxy`, then verify `codex-proxy --version` before treating the update as installed.\n", res.Version)
 		return nil
 	}
 
+	if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to install cxp shim after update: %v\n", err)
+	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s. Restarting...\n", res.Version)
 	return restartSelf()
 }
@@ -74,6 +80,22 @@ func restartSelf() error {
 	if err != nil {
 		return err
 	}
+	return restartSelfWithResolvedExecutable(exe)
+}
+
+func restartSelfWithExecutable(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return restartSelf()
+	}
+	exe, err := resolveRestartExecutablePathFromSources(path, "")
+	if err != nil {
+		return err
+	}
+	return restartSelfWithResolvedExecutable(exe)
+}
+
+func restartSelfWithResolvedExecutable(exe string) error {
 	args := append([]string{exe}, os.Args[1:]...)
 	if runtime.GOOS == "windows" {
 		if err := startSelf(exe, args[1:]); err != nil {

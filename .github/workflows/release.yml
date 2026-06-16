@@ -151,6 +151,15 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed$' -v
           go test ./internal/cli -count=1 -run 'TestTeamsStatus(SeparatesCatchupBacklogAndInactiveRows|ShowsRunningTurnDetails)$' -v
 
+      - name: Helper auto-update activation and cxp upgrade regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli_pattern='Test(UpgradeCmdCreatesMissingCXPShimForManagedDefault|UpgradeCmdRepairsStaleCXPRegularFileForManagedDefault|EnsureCXPShimForInstallPath(RepairsStalePOSIXSymlink|CreatesWindowsCmdShim|RepairsWindowsCmdShim|KeepsNonHelperWindowsCmd)|TeamsReleaseAutoUpdaterApplyCreatesMissingCXPShim|TeamsServiceInstallCreatesMissingManagedDefaultBeforeRepointingFromGoBin|TeamsServiceInstallCreatesMissingCXPShimWhenManagedTargetCurrent|RestartTeamsHelperAfterActivationPendingUsesInstalledPath)$'
+          teams_pattern='TestBridgeControlHelperUpdatePrereleaseActivationPending(RestartsInstalledPath|RestarterFailureKeepsNotice)$'
+          go test ./internal/cli -count=1 -run "$cli_pattern" -v
+          go test ./internal/teams -count=1 -run "$teams_pattern" -v
+
   goreleaser:
     runs-on: ubuntu-latest
     needs: [asr-preflight, teams-model-profile-preflight, teams-runtime-preflight]
@@ -388,19 +397,36 @@ jobs:
           if (Test-Path -LiteralPath $legacyGitSkill) { throw "upgrade did not hide legacy git subscription directory" }
 
   helper-upgrade-compat-smoke:
-    name: Helper upgrade compat (${{ matrix.old_tag }} -> current)
-    runs-on: ubuntu-latest
+    name: Helper upgrade compat (${{ matrix.os }}, ${{ matrix.old_tag }} -> current)
+    runs-on: ${{ matrix.os }}
     needs: [goreleaser]
     strategy:
       fail-fast: false
       matrix:
-        old_tag: [v0.0.48, v0.1.8, v0.1.9]
+        include:
+          - os: ubuntu-latest
+            old_tag: v0.0.48
+          - os: ubuntu-latest
+            old_tag: v0.1.8
+          - os: ubuntu-latest
+            old_tag: v0.1.9
+          - os: ubuntu-latest
+            old_tag: v0.1.10-rc.17
+          - os: macos-latest
+            old_tag: v0.1.9
+          - os: macos-latest
+            old_tag: v0.1.10-rc.17
+          - os: windows-latest
+            old_tag: v0.1.9
+          - os: windows-latest
+            old_tag: v0.1.10-rc.17
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Split-entry upgrade convergence
+      - name: Split-entry upgrade convergence (Linux/macOS)
+        if: runner.os != 'Windows'
         shell: bash
         env:
           REPO: ${{ github.repository }}
@@ -410,6 +436,18 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/ci/helper_upgrade_compat_smoke.sh
+
+      - name: Split-entry upgrade convergence (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          REPO: ${{ github.repository }}
+          OLD_TAG: ${{ matrix.old_tag }}
+          TARGET_TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          .\scripts\ci\helper_upgrade_compat_smoke.ps1
 
   install-container-smoke:
     name: Install smoke (containers)

@@ -92,11 +92,17 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 			}
 
 			if res.RestartRequired {
+				if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to install cxp shim after upgrade: %v\n", err)
+				}
 				installBundledSkillsFromHelper(ctx, firstNonEmptyString(res.PendingReplacePath, res.InstallPath), cmd.ErrOrStderr())
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update replacement for v%s is pending. Restart `codex-proxy`, then verify `codex-proxy --version` before treating the update as installed.\n", res.Version)
 				return nil
 			}
 
+			if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to install cxp shim after upgrade: %v\n", err)
+			}
 			installBundledSkillsFromHelper(ctx, res.InstallPath, cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s.\n", res.Version)
 			return nil

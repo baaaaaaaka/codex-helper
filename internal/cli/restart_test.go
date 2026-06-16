@@ -196,6 +196,59 @@ func TestHandleUpdateAndRestartUsesSharedInstallLock(t *testing.T) {
 	}
 }
 
+func TestRestartTeamsHelperAfterActivationPendingUsesInstalledPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("non-Windows restart uses exec; Windows is covered by process start tests")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	installPath := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	if err := os.MkdirAll(filepath.Dir(installPath), 0o755); err != nil {
+		t.Fatalf("mkdir install dir: %v", err)
+	}
+	if err := os.WriteFile(installPath, []byte("updated"), 0o755); err != nil {
+		t.Fatalf("write install path: %v", err)
+	}
+
+	prevExecSelf := execSelf
+	prevStartSelf := startSelf
+	t.Cleanup(func() {
+		execSelf = prevExecSelf
+		startSelf = prevStartSelf
+	})
+	startSelf = func(string, []string) error {
+		t.Fatal("startSelf should not be used on non-Windows restart")
+		return nil
+	}
+
+	wantErr := errors.New("stop before real exec")
+	var gotExe string
+	var gotArgs []string
+	execSelf = func(exe string, args []string, env []string) error {
+		gotExe = exe
+		gotArgs = append([]string{}, args...)
+		return wantErr
+	}
+
+	prevArgs := os.Args
+	os.Args = []string{"old-codex-proxy", "teams", "run", "--auto-service=false"}
+	t.Cleanup(func() { os.Args = prevArgs })
+
+	err := restartTeamsHelperFromTeamsAfterPendingReplacement(context.Background(), "", installPath)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("restart error = %v, want %v", err, wantErr)
+	}
+	if gotExe != installPath {
+		t.Fatalf("exec exe = %q, want installed path %q", gotExe, installPath)
+	}
+	wantArgs := []string{installPath, "teams", "run", "--auto-service=false"}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("exec args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}
+
 func TestRestartSelfUsesStablePathWhenRunningReloadBackup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("non-Windows restart uses exec; Windows is covered by service restart tests")
