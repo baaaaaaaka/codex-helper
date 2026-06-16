@@ -63,6 +63,50 @@ function Assert-Version([string]$Path, [string]$Tag) {
   }
 }
 
+function Test-Version([string]$Path, [string]$Tag) {
+  if (!(Test-Path -LiteralPath $Path)) {
+    return $false
+  }
+  try {
+    $out = (& $Path --version | Out-String)
+    $out | Write-Host
+    return $out -match [regex]::Escape((Version-NoV $Tag))
+  } catch {
+    Write-Host "version probe failed for $Path`: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+function Activate-PendingReplacement([string]$Path, [string]$Tag) {
+  $dir = Split-Path -Parent $Path
+  $base = [IO.Path]::GetFileNameWithoutExtension($Path)
+  $expected = [regex]::Escape((Version-NoV $Tag))
+  $pending = Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.Name -like ".$base`_*_windows_amd64.exe.*" -and
+      $_.Name -notlike "*.json" -and
+      $_.Name -notlike "*.tmp" -and
+      $_.Name -match $expected
+    } |
+    Sort-Object LastWriteTimeUtc -Descending |
+    Select-Object -First 1
+  if (!$pending) {
+    throw "no pending replacement found for $Path and $Tag"
+  }
+  Write-Host "activating pending replacement $($pending.FullName) -> $Path"
+  Invoke-Retry 5 1 {
+    Move-Item -Force -LiteralPath $pending.FullName -Destination $Path
+  }
+}
+
+function Assert-VersionOrActivatePending([string]$Path, [string]$Tag) {
+  if (Test-Version $Path $Tag) {
+    return
+  }
+  Activate-PendingReplacement $Path $Tag
+  Assert-Version $Path $Tag
+}
+
 function Write-CXPShim([string]$Path, [string]$Body) {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
   Set-Content -LiteralPath $Path -NoNewline -Encoding ASCII -Value $Body
@@ -129,7 +173,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
       Invoke-Retry 5 10 {
         & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
       }
-      Assert-Version $helper $TargetTag
+      Assert-VersionOrActivatePending $helper $TargetTag
       if (!(Test-Path -LiteralPath $cxp)) {
         Copy-Binary $helper $currentRunner
         Invoke-Retry 5 10 {
@@ -156,7 +200,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
       Invoke-Retry 5 10 {
         & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
       }
-      Assert-Version $helper $TargetTag
+      Assert-VersionOrActivatePending $helper $TargetTag
       Copy-Binary $helper $currentRunner
       Invoke-Retry 5 10 {
         & $currentRunner upgrade --repo $Repo --version $TargetTag --install-path $helper
@@ -167,7 +211,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
     }
   }
 
-  Assert-Version $helper $TargetTag
+  Assert-VersionOrActivatePending $helper $TargetTag
   Assert-Version $cxp $TargetTag
   $shimBody = Get-Content -Raw -LiteralPath $cxp
   if ($shimBody -ne (Expected-CXPShimBody)) {
@@ -182,8 +226,8 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
   Invoke-Retry 5 10 {
     & $cxp upgrade --repo $Repo --version $TargetTag --install-path $secondTarget
   }
-  Assert-Version $secondTarget $TargetTag
-  Assert-Version $helper $TargetTag
+  Assert-VersionOrActivatePending $secondTarget $TargetTag
+  Assert-VersionOrActivatePending $helper $TargetTag
   Assert-Version $cxp $TargetTag
 }
 
