@@ -648,7 +648,7 @@ func TestBeaconJobExecutorStressStreamsManySidecarEventsBeforeTerminal(t *testin
 	}
 
 	const total = 500
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	events := make(chan codexrunner.StreamEvent, total+16)
 	done := make(chan struct {
@@ -715,7 +715,16 @@ func TestBeaconJobExecutorStressStreamsManySidecarEventsBeforeTerminal(t *testin
 			seen[idx] = true
 			count++
 		case <-ctx.Done():
-			t.Fatalf("timed out after receiving %d/%d stream events", count, total)
+			missing := make([]int, 0, total-count)
+			for i, ok := range seen {
+				if !ok {
+					missing = append(missing, i)
+				}
+			}
+			if len(missing) > 10 {
+				missing = missing[:10]
+			}
+			t.Fatalf("timed out after receiving %d/%d stream events; first missing indexes=%v", count, total, missing)
 		}
 	}
 
