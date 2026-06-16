@@ -18,19 +18,225 @@ import (
 var materializeManagedTeamsInstallTarget = defaultMaterializeManagedTeamsInstallTarget
 
 func resolveManagedInstallPathForCLI(explicit string) (string, error) {
-	raw, _ := executablePath()
-	target, err := managedinstall.Resolve(managedinstall.Options{
-		ExplicitPath:  explicit,
-		EnvPath:       os.Getenv(update.EnvInstallPath),
-		EnvDir:        os.Getenv(update.EnvInstallDir),
-		RawExecutable: raw,
-		Argv0:         restartArgv0(),
-		GOOS:          runtime.GOOS,
-	})
+	target, err := resolveManagedInstallTargetForCLI(explicit)
 	if err != nil {
 		return "", err
 	}
 	return target.Path, nil
+}
+
+func resolveManagedInstallTargetForCLI(explicit string) (managedinstall.Target, error) {
+	raw, _ := executablePath()
+	recordPath, _ := managedinstall.DefaultRecordPath()
+	if strings.TrimSpace(explicit) != "" {
+		target, err := managedinstall.Resolve(managedinstall.Options{
+			ExplicitPath:  explicit,
+			RawExecutable: raw,
+			Argv0:         restartArgv0(),
+			GOOS:          runtime.GOOS,
+		})
+		if err != nil {
+			return managedinstall.Target{}, err
+		}
+		return target, nil
+	}
+
+	var warnings []string
+	if target, ok := resolveCurrentHelperInstallTargetForCLI(raw, restartArgv0(), recordPath, &warnings); ok {
+		return target, nil
+	}
+	if target, ok := resolveKnownHelperInstallCandidateForCLI(os.Getenv(update.EnvInstallPath), managedinstall.SourceEnvInstallPath, managedinstall.StateExplicit, update.EnvInstallPath, false, recordPath, &warnings); ok {
+		return target, nil
+	}
+	if envDirCandidate := legacyInstallDirCandidateForCLI(os.Getenv(update.EnvInstallDir)); strings.TrimSpace(envDirCandidate) != "" {
+		if target, ok := resolveKnownHelperInstallCandidateForCLI(envDirCandidate, managedinstall.SourceEnvInstallDir, managedinstall.StateExplicit, update.EnvInstallDir, false, recordPath, &warnings); ok {
+			return target, nil
+		}
+	}
+	if strings.TrimSpace(recordPath) != "" {
+		if record, err := managedinstall.LoadRecord(recordPath); err == nil && strings.TrimSpace(record.TargetPath) != "" {
+			if target, ok := resolveKnownHelperInstallCandidateForCLI(record.TargetPath, managedinstall.SourceRecord, managedinstall.StateManaged, "install record", false, recordPath, &warnings); ok {
+				return target, nil
+			}
+		} else if err != nil && !os.IsNotExist(err) {
+			warnings = append(warnings, "install record ignored: "+err.Error())
+		}
+	}
+	defaultPath, defaultErr := managedinstall.DefaultInstallPath(managedinstall.Options{GOOS: runtime.GOOS})
+	if defaultErr == nil {
+		if target, ok := resolveKnownHelperInstallCandidateForCLI(defaultPath, managedinstall.SourceDefault, managedinstall.StateManaged, "default per-user install target", true, recordPath, &warnings); ok {
+			return target, nil
+		}
+	} else {
+		warnings = append(warnings, "default install target unavailable: "+defaultErr.Error())
+	}
+
+	if len(warnings) > 0 {
+		return managedinstall.Target{}, fmt.Errorf("resolve managed install target: %s", strings.Join(warnings, "; "))
+	}
+	return managedinstall.Target{}, fmt.Errorf("resolve managed install target: no candidate paths")
+}
+
+func resolveCurrentHelperInstallTargetForCLI(raw string, argv0 string, recordPath string, warnings *[]string) (managedinstall.Target, bool) {
+	for _, source := range []struct {
+		path   string
+		reason string
+	}{
+		{path: raw, reason: "current executable"},
+		{path: argv0, reason: "argv0 fallback"},
+	} {
+		for _, candidate := range currentHelperInstallCandidatesForCLI(source.path) {
+			if target, ok := resolveKnownHelperInstallCandidateForCLI(candidate, managedinstall.SourceCurrentExecutable, managedinstall.StateUnmanagedCurrentExec, source.reason, false, recordPath, warnings); ok {
+				return target, true
+			}
+		}
+	}
+	return managedinstall.Target{}, false
+}
+
+func currentHelperInstallCandidatesForCLI(path string) []string {
+	return currentHelperInstallCandidatesForGOOS(path, runtime.GOOS, os.Stat)
+}
+
+func currentHelperInstallCandidatesForGOOS(path string, goos string, stat func(string) (os.FileInfo, error)) []string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	resolved, err := helperpath.StableRunnablePathFromSources(path, "", helperpath.Options{GOOS: goos, Stat: stat})
+	if err != nil {
+		return []string{path}
+	}
+	candidate := resolved.Path
+	var out []string
+	base := filepath.Base(candidate)
+	if strings.EqualFold(base, "cxp") || strings.EqualFold(base, "cxp.exe") {
+		out = append(out, filepath.Join(filepath.Dir(candidate), helperpath.BinaryName(goos)))
+	}
+	out = append(out, candidate)
+	return dedupeStringsForGOOS(out, goos)
+}
+
+func resolveKnownHelperInstallCandidateForCLI(path string, source managedinstall.Source, state managedinstall.TargetState, reason string, allowMissing bool, recordPath string, warnings *[]string) (managedinstall.Target, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return managedinstall.Target{}, false
+	}
+	resolved, err := helperpath.StableInstallTargetFromSources(path, "", "", "", helperpath.Options{GOOS: runtime.GOOS})
+	if err != nil {
+		*warnings = append(*warnings, err.Error())
+		return managedinstall.Target{}, false
+	}
+	probe := helperpath.ProbePath(resolved.Path, helperpath.Options{GOOS: runtime.GOOS})
+	if !probe.Exists {
+		if !allowMissing {
+			*warnings = append(*warnings, fmt.Sprintf("install target %s does not exist", resolved.Path))
+			return managedinstall.Target{}, false
+		}
+		return managedinstall.Target{
+			Path:          resolved.Path,
+			Source:        source,
+			State:         state,
+			Reason:        reason,
+			ComparisonKey: managedinstall.ComparisonKey(resolved.Path, runtime.GOOS),
+			RecordPath:    recordPath,
+			Warnings:      append([]string(nil), (*warnings)...),
+		}, true
+	}
+	if probe.IsDir {
+		*warnings = append(*warnings, fmt.Sprintf("install target %s is a directory", resolved.Path))
+		return managedinstall.Target{}, false
+	}
+	if !probe.Executable {
+		*warnings = append(*warnings, fmt.Sprintf("install target %s is not executable", resolved.Path))
+		return managedinstall.Target{}, false
+	}
+	if !probe.PlausibleHelperEntry {
+		*warnings = append(*warnings, fmt.Sprintf("install target %s is not a known helper entry", resolved.Path))
+		return managedinstall.Target{}, false
+	}
+	target, err := resolveRunnableHelperInstallCandidate(resolved.Path, source, state, reason, recordPath, runtime.GOOS, os.Stat)
+	if err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("install target %s is not a runnable codex-helper binary: %v", resolved.Path, err))
+		return managedinstall.Target{}, false
+	}
+	target.Warnings = append([]string(nil), (*warnings)...)
+	return target, true
+}
+
+func resolveRunnableHelperInstallCandidate(path string, source managedinstall.Source, state managedinstall.TargetState, reason string, recordPath string, goos string, stat func(string) (os.FileInfo, error)) (managedinstall.Target, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return managedinstall.Target{}, fmt.Errorf("empty install target")
+	}
+	resolved, err := helperpath.StableInstallTargetFromSources(path, "", "", "", helperpath.Options{GOOS: goos, Stat: stat})
+	if err != nil {
+		return managedinstall.Target{}, err
+	}
+	probe := helperpath.ProbePath(resolved.Path, helperpath.Options{GOOS: goos, Stat: stat})
+	if !probe.Exists {
+		return managedinstall.Target{}, fmt.Errorf("install target %s does not exist", resolved.Path)
+	}
+	if probe.IsDir {
+		return managedinstall.Target{}, fmt.Errorf("install target %s is a directory", resolved.Path)
+	}
+	if !probe.Executable {
+		return managedinstall.Target{}, fmt.Errorf("install target %s is not executable", resolved.Path)
+	}
+	if !probe.PlausibleHelperEntry {
+		return managedinstall.Target{}, fmt.Errorf("install target %s is not a known helper entry", resolved.Path)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := update.ProbeBinaryVersion(ctx, resolved.Path, 5*time.Second); err != nil {
+		return managedinstall.Target{}, err
+	}
+	return managedinstall.Target{
+		Path:          resolved.Path,
+		Source:        source,
+		State:         state,
+		Reason:        reason,
+		ComparisonKey: managedinstall.ComparisonKey(resolved.Path, goos),
+		RecordPath:    recordPath,
+	}, nil
+}
+
+func legacyInstallDirCandidateForCLI(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	base := filepath.Base(filepath.Clean(value))
+	probe := helperpath.ProbePath(value, helperpath.Options{GOOS: runtime.GOOS})
+	if probe.PlausibleHelperEntry ||
+		strings.EqualFold(base, helperpath.BinaryName(runtime.GOOS)) ||
+		strings.EqualFold(base, "cxp") ||
+		strings.EqualFold(base, "cxp.exe") {
+		return value
+	}
+	return filepath.Join(value, helperpath.BinaryName(runtime.GOOS))
+}
+
+func dedupeStrings(values []string) []string {
+	return dedupeStringsForGOOS(values, runtime.GOOS)
+}
+
+func dedupeStringsForGOOS(values []string, goos string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := managedinstall.ComparisonKey(value, goos)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func resolveManagedInstallPathForTeams(explicit string) (string, error) {
@@ -39,6 +245,39 @@ func resolveManagedInstallPathForTeams(explicit string) (string, error) {
 		return "", err
 	}
 	return target.Path, nil
+}
+
+func resolveManagedInstallPathForTeamsAutoUpdate(explicit string) (string, error) {
+	if strings.TrimSpace(explicit) != "" {
+		return resolveManagedInstallPathForTeams(explicit)
+	}
+	if target, ok := resolveCurrentHelperInstallTargetForTeamsAutoUpdate(); ok {
+		return target.Path, nil
+	}
+	return resolveManagedInstallPathForTeams(explicit)
+}
+
+func resolveCurrentHelperInstallTargetForTeamsAutoUpdate() (managedinstall.Target, bool) {
+	raw, _ := teamsServiceExecutable()
+	argv0 := teamsServiceArgv0()
+	goos := teamsServiceGOOS()
+	stat := teamsServiceStat
+	recordPath, _ := managedinstall.DefaultRecordPath()
+	for _, source := range []struct {
+		path   string
+		reason string
+	}{
+		{path: raw, reason: "running Teams helper executable"},
+		{path: argv0, reason: "Teams helper argv0 fallback"},
+	} {
+		for _, candidate := range currentHelperInstallCandidatesForGOOS(source.path, goos, stat) {
+			target, err := resolveRunnableHelperInstallCandidate(candidate, managedinstall.SourceCurrentExecutable, managedinstall.StateUnmanagedCurrentExec, source.reason, recordPath, goos, stat)
+			if err == nil {
+				return target, true
+			}
+		}
+	}
+	return managedinstall.Target{}, false
 }
 
 func resolveManagedTeamsServiceExecutable(requireExisting bool) (managedinstall.Target, error) {
@@ -75,7 +314,7 @@ func managedTeamsMaterializationSourceAvailable() bool {
 
 func resolveManagedTeamsInstallTarget(explicit string, requireExisting bool, allowMissingDefault bool) (managedinstall.Target, error) {
 	raw, _ := teamsServiceExecutable()
-	return managedinstall.Resolve(managedinstall.Options{
+	opts := managedinstall.Options{
 		ExplicitPath:                explicit,
 		EnvPath:                     os.Getenv(update.EnvInstallPath),
 		EnvDir:                      os.Getenv(update.EnvInstallDir),
@@ -87,7 +326,28 @@ func resolveManagedTeamsInstallTarget(explicit string, requireExisting bool, all
 		FallbackOnInvalidEnvPath:    true,
 		PreferRecordBeforeLegacyEnv: true,
 		Stat:                        teamsServiceStat,
-	})
+	}
+	target, err := managedinstall.Resolve(opts)
+	if err != nil {
+		return managedinstall.Target{}, err
+	}
+	if teamsManagedInstallTargetShouldSkipNonRunnableEnv(target, explicit) {
+		opts.EnvPath = ""
+		opts.EnvDir = ""
+		return managedinstall.Resolve(opts)
+	}
+	return target, nil
+}
+
+func teamsManagedInstallTargetShouldSkipNonRunnableEnv(target managedinstall.Target, explicit string) bool {
+	if strings.TrimSpace(explicit) != "" {
+		return false
+	}
+	if target.Source != managedinstall.SourceEnvInstallPath && target.Source != managedinstall.SourceEnvInstallDir {
+		return false
+	}
+	_, err := resolveRunnableHelperInstallCandidate(target.Path, target.Source, target.State, target.Reason, target.RecordPath, teamsServiceGOOS(), teamsServiceStat)
+	return err != nil
 }
 
 func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target managedinstall.Target) error {
@@ -163,6 +423,168 @@ func materializedManagedInstallShims(targetPath string) []string {
 		return nil
 	}
 	return []string{filepath.Join(filepath.Dir(targetPath), "cxp")}
+}
+
+func finalizeHelperEntrypointsAfterUpgrade(installPath string, version string, out io.Writer) {
+	if err := ensureCXPShimForInstallPath(installPath); err != nil {
+		_, _ = fmt.Fprintf(out, "Warning: failed to install cxp shim after upgrade: %v\n", err)
+	}
+	for _, err := range repairKnownHelperEntrypointsForInstallPath(installPath) {
+		_, _ = fmt.Fprintf(out, "Warning: failed to unify helper entrypoint after upgrade: %v\n", err)
+	}
+	saveCLIManagedInstallRecordBestEffort(installPath, version)
+}
+
+type helperEntrypointAlias struct {
+	path        string
+	description string
+	create      bool
+}
+
+func repairKnownHelperEntrypointsForInstallPath(installPath string) []error {
+	installPath = strings.TrimSpace(installPath)
+	if installPath == "" {
+		return nil
+	}
+	var errs []error
+	for _, alias := range knownHelperEntrypointAliasesForInstallPath(installPath) {
+		if err := repairHelperEntrypointAlias(installPath, alias); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+func knownHelperEntrypointAliasesForInstallPath(installPath string) []helperEntrypointAlias {
+	var out []helperEntrypointAlias
+	add := func(path string, description string, create bool) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		if sameHelperExecutablePath(path, installPath, runtime.GOOS) {
+			return
+		}
+		out = append(out, helperEntrypointAlias{path: path, description: description, create: create})
+		if strings.EqualFold(filepath.Base(path), helperpath.BinaryName(runtime.GOOS)) {
+			shimName := "cxp"
+			if strings.EqualFold(runtime.GOOS, "windows") {
+				shimName = "cxp.cmd"
+			}
+			shimPath := filepath.Join(filepath.Dir(path), shimName)
+			if !sameHelperExecutablePath(shimPath, installPath, runtime.GOOS) {
+				out = append(out, helperEntrypointAlias{path: shimPath, description: description + " shim", create: create})
+			}
+		}
+	}
+	add(os.Getenv(update.EnvInstallPath), update.EnvInstallPath, true)
+	if envDirCandidate := legacyInstallDirCandidateForCLI(os.Getenv(update.EnvInstallDir)); envDirCandidate != "" {
+		add(envDirCandidate, update.EnvInstallDir, true)
+	}
+	if recordPath, err := managedinstall.DefaultRecordPath(); err == nil {
+		if record, err := managedinstall.LoadRecord(recordPath); err == nil {
+			add(record.TargetPath, "install record", true)
+			for _, shim := range record.Shims {
+				add(shim, "install record shim", true)
+			}
+		}
+	}
+	if defaultPath, err := managedinstall.DefaultInstallPath(managedinstall.Options{GOOS: runtime.GOOS}); err == nil {
+		add(defaultPath, "default per-user install target", true)
+	}
+	if raw, err := executablePath(); err == nil {
+		for _, candidate := range currentHelperInstallCandidatesForCLI(raw) {
+			add(candidate, "current executable", false)
+		}
+	}
+	for _, candidate := range currentHelperInstallCandidatesForCLI(restartArgv0()) {
+		add(candidate, "argv0 fallback", false)
+	}
+	return dedupeHelperEntrypointAliases(out)
+}
+
+func dedupeHelperEntrypointAliases(values []helperEntrypointAlias) []helperEntrypointAlias {
+	seen := map[string]bool{}
+	var out []helperEntrypointAlias
+	for _, value := range values {
+		key := managedinstall.ComparisonKey(value.path, runtime.GOOS)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func repairHelperEntrypointAlias(installPath string, alias helperEntrypointAlias) error {
+	path := strings.TrimSpace(alias.path)
+	if path == "" || sameHelperExecutablePath(path, installPath, runtime.GOOS) {
+		return nil
+	}
+	probe := helperpath.ProbePath(path, helperpath.Options{GOOS: runtime.GOOS})
+	if probe.Exists && (probe.IsDir || !probe.PlausibleHelperEntry) {
+		return nil
+	}
+	if !probe.Exists && !alias.create {
+		return nil
+	}
+	if probe.Exists && !probe.Executable {
+		return nil
+	}
+	if strings.EqualFold(runtime.GOOS, "windows") {
+		return repairWindowsHelperEntrypointAlias(installPath, path)
+	}
+	if err := replaceSymlinkAtomically(path, installPath); err != nil {
+		if copyErr := copyExecutableAtomically(installPath, path); copyErr != nil {
+			return fmt.Errorf("%s %s -> %s: symlink failed: %v; copy failed: %w", alias.description, path, installPath, err, copyErr)
+		}
+	}
+	return nil
+}
+
+func repairWindowsHelperEntrypointAlias(installPath string, path string) error {
+	base := filepath.Base(path)
+	if strings.EqualFold(base, "cxp.cmd") {
+		return os.WriteFile(path, []byte(windowsCXPShimContent()), 0o755)
+	}
+	return copyExecutableAtomically(installPath, path)
+}
+
+func saveCLIManagedInstallRecordBestEffort(installPath string, version string) {
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		return
+	}
+	shims := []string{}
+	if !strings.EqualFold(runtime.GOOS, "windows") {
+		shims = append(shims, filepath.Join(filepath.Dir(installPath), "cxp"))
+	} else {
+		shims = append(shims, filepath.Join(filepath.Dir(installPath), "cxp.cmd"))
+	}
+	record := managedinstall.Record{
+		TargetPath:   installPath,
+		TargetSource: string(managedinstall.SourceCurrentExecutable),
+		TargetState:  string(managedinstall.StateManaged),
+		Version:      strings.TrimPrefix(strings.TrimSpace(version), "v"),
+		GOOS:         runtime.GOOS,
+		GOARCH:       runtime.GOARCH,
+		Shims:        existingManagedInstallShimsForGOOS(shims, runtime.GOOS),
+	}
+	_ = managedinstall.SaveRecord(recordPath, record)
+}
+
+func existingManagedInstallShimsForGOOS(shims []string, goos string) []string {
+	var out []string
+	for _, shim := range shims {
+		if strings.TrimSpace(shim) == "" {
+			continue
+		}
+		if probe := helperpath.ProbePath(shim, helperpath.Options{GOOS: goos}); probe.Exists && !probe.IsDir && probe.PlausibleHelperEntry {
+			out = append(out, shim)
+		}
+	}
+	return out
 }
 
 func ensureCXPShimForInstallPath(installPath string) error {

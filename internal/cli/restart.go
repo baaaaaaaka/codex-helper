@@ -64,9 +64,7 @@ func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 		return nil
 	}
 
-	if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to install cxp shim after update: %v\n", err)
-	}
+	finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, cmd.ErrOrStderr())
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s. Restarting...\n", res.Version)
 	return restartSelf()
 }

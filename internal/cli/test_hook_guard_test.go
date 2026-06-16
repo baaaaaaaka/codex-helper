@@ -25,6 +25,23 @@ func lockCLITestHooks(t testing.TB) {
 	prevRestartArgv0 := restartArgv0
 	prevTeamsServiceArgv0 := teamsServiceArgv0
 	prevTeamsUpdatePendingHelperActivationOwned := teamsUpdatePendingHelperActivationOwned
+	type envValue struct {
+		value string
+		set   bool
+	}
+	prevEnv := map[string]envValue{}
+	for _, key := range []string{
+		update.EnvInstallPath,
+		update.EnvInstallDir,
+		update.EnvRepo,
+		update.EnvVersion,
+	} {
+		value, set := os.LookupEnv(key)
+		prevEnv[key] = envValue{value: value, set: set}
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
+	}
 	resolveInstallPathForCLI = func(path string) (string, error) {
 		if path != "" {
 			return update.ResolveInstallPath(path)
@@ -39,6 +56,19 @@ func lockCLITestHooks(t testing.TB) {
 		restartArgv0 = prevRestartArgv0
 		teamsServiceArgv0 = prevTeamsServiceArgv0
 		teamsUpdatePendingHelperActivationOwned = prevTeamsUpdatePendingHelperActivationOwned
+		for _, key := range []string{
+			update.EnvInstallPath,
+			update.EnvInstallDir,
+			update.EnvRepo,
+			update.EnvVersion,
+		} {
+			prev := prevEnv[key]
+			if prev.set {
+				_ = os.Setenv(key, prev.value)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
 		cliTestHookGuard.Unlock()
 	})
 }

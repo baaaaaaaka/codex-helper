@@ -36,6 +36,10 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
 	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv(update.EnvInstallPath, "")
+	t.Setenv(update.EnvInstallDir, "")
+	t.Setenv(update.EnvRepo, "")
+	t.Setenv(update.EnvVersion, "")
 	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
 	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "chat-client")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client")
@@ -3285,6 +3289,59 @@ func TestTeamsServiceInstallRepairsCorruptManagedDefaultBeforeRepointingFromGoBi
 		if !strings.Contains(string(versionOut), "1.2.4") {
 			t.Fatalf("%s was not repaired from upgraded go/bin helper: %s", path, versionOut)
 		}
+	}
+}
+
+func TestTeamsServiceInstallSkipsBrokenEnvInstallPathAndRepairsManagedDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	writeCLIFile(t, managed, "#!/bin/sh\necho binary-payload >&2\nexit 127\n", 0o755)
+	writeCLIFile(t, cxp, "#!/bin/sh\nexit 42\n", 0o755)
+	writeVersionedHelperForServiceTest(t, goBin, "1.2.4")
+	t.Setenv(update.EnvInstallPath, managed)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     goBin,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	for _, path := range []string{managed, cxp} {
+		versionOut, err := exec.Command(path, "--version").CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s --version failed after env-path repair: %v\n%s", path, err, versionOut)
+		}
+		if !strings.Contains(string(versionOut), "1.2.4") {
+			t.Fatalf("%s was not repaired from upgraded go/bin helper: %s", path, versionOut)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit should point to repaired managed helper, not broken env target:\n%s", unit)
+	}
+	record := loadManagedInstallRecordForServiceTest(t)
+	if record.TargetPath != managed || record.TargetState != string(managedinstall.StateManaged) || record.Version != "1.2.4" {
+		t.Fatalf("install record = %#v, want managed target %s at 1.2.4", record, managed)
 	}
 }
 

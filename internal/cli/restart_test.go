@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -193,6 +194,94 @@ func TestHandleUpdateAndRestartUsesSharedInstallLock(t *testing.T) {
 	err = handleUpdateAndRestart(context.Background(), cmd)
 	if err == nil || !strings.Contains(err.Error(), "another codex-helper upgrade is already using install path") {
 		t.Fatalf("expected shared install lock error, got %v stderr=%q", err, stderr.String())
+	}
+}
+
+func TestHandleUpdateAndRestartUnifiesCXPShimBeforeExec(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX cxp shim repair")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	installPath := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxpPath := filepath.Join(tmp, ".local", "bin", "cxp")
+	writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.2"), 0o755)
+	writeCLIFile(t, cxpPath, upgradeCXPShimTestScript("1.2.1"), 0o755)
+
+	prevExecutablePath := executablePath
+	prevArgv0 := restartArgv0
+	prevResolve := resolveInstallPathForCLI
+	prevPerform := performUpdate
+	prevExecSelf := execSelf
+	prevStartSelf := startSelf
+	t.Cleanup(func() {
+		executablePath = prevExecutablePath
+		restartArgv0 = prevArgv0
+		resolveInstallPathForCLI = prevResolve
+		performUpdate = prevPerform
+		execSelf = prevExecSelf
+		startSelf = prevStartSelf
+	})
+	executablePath = func() (string, error) { return installPath, nil }
+	restartArgv0 = func() string { return cxpPath }
+	resolveInstallPathForCLI = func(path string) (string, error) {
+		if path != "" {
+			return update.ResolveInstallPath(path)
+		}
+		return installPath, nil
+	}
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		if opts.InstallPath != installPath {
+			t.Fatalf("InstallPath = %q, want %q", opts.InstallPath, installPath)
+		}
+		if !opts.ValidateBinary {
+			t.Fatal("TUI update must validate the downloaded binary before activation")
+		}
+		writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: installPath}, nil
+	}
+	startSelf = func(string, []string) error {
+		t.Fatal("startSelf should not be used on non-Windows restart")
+		return nil
+	}
+
+	wantErr := errors.New("stop before real exec")
+	var gotExe string
+	var gotArgs []string
+	execSelf = func(exe string, args []string, env []string) error {
+		gotExe = exe
+		gotArgs = append([]string{}, args...)
+		return wantErr
+	}
+	prevArgs := os.Args
+	os.Args = []string{cxpPath, "tui"}
+	t.Cleanup(func() { os.Args = prevArgs })
+
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := handleUpdateAndRestart(context.Background(), cmd)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("handleUpdateAndRestart error = %v, want %v", err, wantErr)
+	}
+	if !strings.Contains(out.String(), "Updated to v1.2.4. Restarting...") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+	versionOut, err := exec.Command(cxpPath, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("cxp --version failed: %v\n%s", err, versionOut)
+	}
+	if !strings.Contains(string(versionOut), "1.2.4") {
+		t.Fatalf("cxp version output = %q, want updated version", versionOut)
+	}
+	if gotExe != installPath {
+		t.Fatalf("exec exe = %q, want installed path %q", gotExe, installPath)
+	}
+	wantArgs := []string{installPath, "tui"}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("exec args = %#v, want %#v", gotArgs, wantArgs)
 	}
 }
 

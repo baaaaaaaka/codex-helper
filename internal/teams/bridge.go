@@ -4235,7 +4235,7 @@ func controlAdvancedHelpText() string {
 		"work chat commands:",
 		"Inside a 💬 Work chat, send your task as a regular Teams message. Use `helper help`, `helper status`, `helper stats`, `helper retry last`, `helper file <relative-path>`, or `helper close` for helper actions.",
 		"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
-		"If this chat stops replying for about a minute, send `helper status`. From the control chat, `helper reload now` loads the latest helper code and `helper restart now` restarts the helper.",
+		"If this chat stops replying for about a minute, send `helper status`. From the control chat, `helper restart now` restarts the installed helper; `helper reload now` is for source-checkout development reloads.",
 		"",
 		"copy-ready examples:",
 		"`p`",

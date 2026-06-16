@@ -20,6 +20,10 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
+func upgradeArgsWithTeamsRestart(args ...string) []string {
+	return append([]string{"--restart-teams-service"}, args...)
+}
+
 func TestUpgradeCmdAlreadyUpToDateSkipsDownload(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)
@@ -99,6 +103,7 @@ func TestUpgradeCmdAlreadyUpToDateRescuesStaleTeamsState(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart())
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -311,8 +316,145 @@ func TestUpgradeCmdRepairsStaleCXPRegularFileForManagedDefault(t *testing.T) {
 	if out, err := exec.Command(cxp, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
 		t.Fatalf("cxp version after repair = %q err=%v, want 1.2.4", out, err)
 	}
-	if info, err := os.Lstat(cxp); err != nil || info.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("cxp repair should keep a regular executable copy, info=%v err=%v", info, err)
+	if target, err := os.Readlink(cxp); err != nil || target != managed {
+		t.Fatalf("cxp repair should unify regular executable copy as symlink to %s, target=%q err=%v", managed, target, err)
+	}
+}
+
+func TestUpgradeCmdIgnoresBrokenEnvInstallPathAndUnifiesAliases(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX alias unification")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	prevResolve := resolveInstallPathForCLI
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+		resolveInstallPathForCLI = prevResolve
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	current := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	currentCXP := filepath.Join(tmp, "go", "bin", "cxp")
+	envTarget := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	envCXP := filepath.Join(tmp, ".local", "bin", "cxp")
+	writeCLIFile(t, current, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(current, currentCXP); err != nil {
+		t.Fatalf("create current cxp symlink: %v", err)
+	}
+	writeCLIFile(t, envTarget, "#!/bin/sh\necho binary-payload >&2\nexit 127\n", 0o755)
+	writeCLIFile(t, envCXP, upgradeCXPShimTestScript("1.2.2"), 0o755)
+	t.Setenv(update.EnvInstallPath, envTarget)
+	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
+	executablePath = func() (string, error) { return current, nil }
+	restartArgv0 = func() string { return currentCXP }
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.4"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v", err)
+	}
+	if got.InstallPath != current {
+		t.Fatalf("upgrade install path = %q, want current helper %q", got.InstallPath, current)
+	}
+	if out, err := exec.Command(envTarget, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("env install path after unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(envTarget); err != nil || target != current {
+		t.Fatalf("env install path should be symlink to current helper, target=%q err=%v", target, err)
+	}
+	if out, err := exec.Command(envCXP, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("env cxp after unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(envCXP); err != nil || target != current {
+		t.Fatalf("env cxp should be symlink to current helper, target=%q err=%v", target, err)
+	}
+}
+
+func TestUpgradeCmdUnifiesDefaultInstallAliasWhenCurrentGoBinWins(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX alias unification")
+	}
+	lockCLITestHooks(t)
+	isolateUpgradeTeamsServiceForTest(t)
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	prevResolve := resolveInstallPathForCLI
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+		resolveInstallPathForCLI = prevResolve
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	current := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	currentCXP := filepath.Join(tmp, "go", "bin", "cxp")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	managedCXP := filepath.Join(tmp, ".local", "bin", "cxp")
+	writeCLIFile(t, current, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(current, currentCXP); err != nil {
+		t.Fatalf("create current cxp symlink: %v", err)
+	}
+	writeCLIFile(t, managed, upgradeCXPShimTestScript("1.2.2"), 0o755)
+	writeCLIFile(t, managedCXP, upgradeCXPShimTestScript("1.2.2"), 0o755)
+	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
+	executablePath = func() (string, error) { return current, nil }
+	restartArgv0 = func() string { return currentCXP }
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.4"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute upgrade: %v", err)
+	}
+	if got.InstallPath != current {
+		t.Fatalf("upgrade install path = %q, want current helper %q", got.InstallPath, current)
+	}
+	if out, err := exec.Command(managed, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("managed default after unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(managed); err != nil || target != current {
+		t.Fatalf("managed default should be symlink to current helper, target=%q err=%v", target, err)
+	}
+	if out, err := exec.Command(managedCXP, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("managed cxp after unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(managedCXP); err != nil || target != current {
+		t.Fatalf("managed cxp should be symlink to current helper, target=%q err=%v", target, err)
 	}
 }
 
@@ -605,7 +747,7 @@ func TestUpgradeCmdAllowsOrphanQueuedTurn(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("upgrade should preserve orphan queued turn without manual recover: %v", err)
 	}
@@ -663,7 +805,7 @@ func TestUpgradeCmdRescuesOrphanRunningTurnAndTransientOutbox(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -734,7 +876,7 @@ func TestUpgradeCmdRescuesStaleOwnerBeforeUpdate(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -799,7 +941,7 @@ func TestUpgradeCmdPausesOnProtectedOutboxDuringRescue(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	err = cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "Teams upgrade paused") || !strings.Contains(err.Error(), "outbox s1 outbox:answer status=queued kind=answer") {
 		t.Fatalf("expected protected outbox pause, got %v", err)
@@ -925,6 +1067,119 @@ func TestUpgradeCmdPropagatesUpdateError(t *testing.T) {
 	}
 }
 
+func TestUpgradeCmdDefaultDoesNotTouchTeamsServiceOrRequestUAC(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	helperPath := filepath.Join(tmp, "codex-proxy")
+	runner := &scriptedTeamsServiceRunner{
+		errs: []error{
+			errTeamsKeepaliveAccessDeniedForTest{},
+		},
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            helperPath,
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{Version: "1.2.3", InstallPath: helperPath}, nil
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3", "--install-path", helperPath})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute default upgrade: %v\n%s", err, out.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("default upgrade must not query, stop, refresh, or restart Teams service, calls=%#v", runner.calls)
+	}
+	for _, unexpected := range []string{
+		"Stopping Teams service before upgrade",
+		"Refreshing Teams service config before restart",
+		"Restarting Teams service after upgrade",
+		"NEXT STEP: TYPE yes TO CONTINUE",
+	} {
+		if strings.Contains(out.String(), unexpected) {
+			t.Fatalf("default upgrade output should not contain %q:\n%s", unexpected, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "Updated to v1.2.3.") ||
+		!strings.Contains(out.String(), "helper restart now") {
+		t.Fatalf("default upgrade output missing update result and manual activation hint:\n%s", out.String())
+	}
+}
+
+func TestUpgradeCmdDefaultDoesNotRestartTeamsServiceAfterUpdateError(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatalf("mkdir unit dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte("unit"), 0o600); err != nil {
+		t.Fatalf("write unit file: %v", err)
+	}
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+	})
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
+		t.Fatal("CheckForUpdate should not run for explicit versions")
+		return update.Status{}
+	}
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{}, errors.New("context deadline exceeded (Client.Timeout or context cancellation while reading body)")
+	}
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("execute default upgrade error = %v, want context deadline exceeded\n%s", err, out.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("failed default upgrade must not stop or restart Teams service, calls=%#v", runner.calls)
+	}
+	if strings.Contains(out.String(), "Stopping Teams service") || strings.Contains(out.String(), "Restarting Teams service") {
+		t.Fatalf("failed default upgrade output should not include service lifecycle messages:\n%s", out.String())
+	}
+}
+
 func isolateUpgradeTeamsServiceForTest(t *testing.T) *recordingTeamsServiceRunner {
 	t.Helper()
 	tmp := t.TempDir()
@@ -944,6 +1199,10 @@ func isolateUpgradeTeamsStateForTest(t *testing.T, tmp string) {
 	t.Helper()
 	t.Setenv(envTeamsCodexChild, "")
 	t.Setenv(envTeamsCodexParentPID, "")
+	t.Setenv(update.EnvInstallPath, "")
+	t.Setenv(update.EnvInstallDir, "")
+	t.Setenv(update.EnvRepo, "")
+	t.Setenv(update.EnvVersion, "")
 	isolateTeamsUserDirsForTest(t, tmp)
 }
 
@@ -1008,7 +1267,7 @@ func TestUpgradeCmdDrainsLiveTeamsOwnerBeforeUpdate(t *testing.T) {
 	}()
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3", "--teams-drain-timeout", "1s"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -1074,7 +1333,7 @@ func TestUpgradeCmdDrainsScopedTeamsStateBeforeUpdate(t *testing.T) {
 	}()
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3", "--teams-drain-timeout", "1s"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade: %v", err)
 	}
@@ -1131,7 +1390,7 @@ func TestUpgradeCmdAllowsDeferredTeamsInboundWithoutOwner(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade: %v", err)
 	}
@@ -1170,7 +1429,7 @@ func TestUpgradeCmdBlocksOnActiveBeaconJobWithoutTeamsStore(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "Beacon state has upgrade-blocking work") || !strings.Contains(err.Error(), "beacon_job job-1") {
 		t.Fatalf("expected active beacon blocker, got %v", err)
@@ -1212,7 +1471,7 @@ func TestUpgradeCmdReconcilesGoneBeaconAllocationBeforeBlocking(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("stale gone allocation should be reconciled before upgrade blocking: %v", err)
 	}
@@ -1264,7 +1523,7 @@ func TestUpgradeCmdBlocksOnUnreadableBeaconState(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "beacon_state") || !strings.Contains(err.Error(), "unreadable") {
 		t.Fatalf("expected unreadable beacon state blocker, got %v", err)
@@ -1331,7 +1590,7 @@ func TestUpgradeCmdAllowsOrphanedTranscriptImportCheckpointWithoutOwner(t *testi
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade with orphaned import checkpoint: %v", err)
 	}
@@ -1396,7 +1655,7 @@ func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) 
 	}()
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3", "--teams-drain-timeout", "1s"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -1475,7 +1734,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshUsesUACRepair(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	cmd.SetIn(strings.NewReader("yes\n"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
@@ -1535,7 +1794,7 @@ func TestUpgradeCmdWSLMatchingTaskRefreshSkipsRepairAndUAC(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -1626,7 +1885,7 @@ func TestUpgradeCmdWSLMismatchRefreshRepairsWithoutUACWhenAllowed(t *testing.T) 
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	cmd.SetIn(strings.NewReader("yes\n"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
@@ -1690,7 +1949,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWithoutUACWhenCleanupIsAllowed
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	cmd.SetIn(strings.NewReader(""))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
@@ -1896,7 +2155,7 @@ func TestUpgradeCmdDelaysTeamsServiceRestartWhenUpdateNeedsProcessExit(t *testin
 	}()
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3", "--teams-drain-timeout", "1s"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -1962,7 +2221,7 @@ func TestUpgradeCmdDoesNotUpdateWhenTeamsServiceStopFails(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	err := cmd.Execute()
@@ -2016,7 +2275,7 @@ func TestUpgradeCmdRestartsTeamsServiceAfterUpdateFailure(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	err := cmd.Execute()
@@ -2074,7 +2333,7 @@ func TestUpgradeCmdReturnsDelayedTeamsRestartFailure(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	err := cmd.Execute()
@@ -2534,7 +2793,7 @@ func TestUpgradeCmdStopsActiveTeamsServiceWithoutStateFile(t *testing.T) {
 	}
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -2591,7 +2850,7 @@ func TestUpgradeCmdPreservesExistingTeamsDrain(t *testing.T) {
 	}()
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3", "--teams-drain-timeout", "1s"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	if err := cmd.Execute(); err != nil {
@@ -2628,7 +2887,7 @@ func TestUpgradeCmdRestoresTeamsDrainOnTimeout(t *testing.T) {
 
 	st := seedLiveTeamsOwnerForUpgradeTest(t)
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3", "--teams-drain-timeout", "1ms"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1ms"))
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "timed out waiting for Teams bridge to drain") {
 		t.Fatalf("expected drain timeout, got %v", err)
@@ -2671,7 +2930,7 @@ func TestUpgradeCmdTimesOutBeforeUpdatingWhenTeamsOwnerStaysLive(t *testing.T) {
 	st := seedLiveTeamsOwnerForUpgradeTest(t)
 
 	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs([]string{"--version", "v1.2.3", "--teams-drain-timeout", "1ms"})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1ms"))
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "timed out waiting for Teams bridge to drain") {
 		t.Fatalf("expected drain timeout, got %v", err)

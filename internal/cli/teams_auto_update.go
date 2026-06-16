@@ -18,7 +18,7 @@ type teamsReleaseAutoUpdater struct {
 	includePrerelease bool
 }
 
-var teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeams
+var teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeamsAutoUpdate
 var teamsAutoUpdateListReleases = update.ListReleases
 var teamsAutoUpdateFetchReleaseIndex = update.FetchReleaseIndex
 var teamsAutoUpdateExecutable = func() (string, error) { return teamsServiceExecutable() }
@@ -179,8 +179,12 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
-	if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
-		return teams.HelperAutoUpdateApplyResult{}, err
+	if res.RestartRequired {
+		if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
+			return teams.HelperAutoUpdateApplyResult{}, err
+		}
+	} else {
+		finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, io.Discard)
 	}
 	installBundledSkillsFromHelper(ctx, firstNonEmptyString(res.PendingReplacePath, res.InstallPath), io.Discard)
 	return teams.HelperAutoUpdateApplyResult{

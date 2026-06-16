@@ -5,6 +5,8 @@ repo="${REPO:-${GITHUB_REPOSITORY:-}}"
 old_tag="${OLD_TAG:-}"
 target_tag="${TARGET_TAG:-${TAG:-${GITHUB_REF_NAME:-}}}"
 fetcher="${FETCHER:-curl}"
+service_backend="${SERVICE_BACKEND:-local-supervisor}"
+original_path="$PATH"
 
 if [[ -z "$repo" || -z "$old_tag" || -z "$target_tag" ]]; then
   echo "REPO, OLD_TAG, and TARGET_TAG are required" >&2
@@ -112,7 +114,8 @@ run_upgrade_convergence_scenario() {
   export XDG_CACHE_HOME="$HOME/.cache"
   export CODEX_HOME="$HOME/.codex"
   export CODEX_PROXY_SKIP_BUILTIN_SKILLS=1
-  export CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND=local-supervisor
+  export PATH="$original_path"
+  export CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND="$service_backend"
   export CODEX_HELPER_TEAMS_TENANT_ID=ci-tenant
   export CODEX_HELPER_TEAMS_CLIENT_ID=ci-client
   export CODEX_HELPER_TEAMS_READ_CLIENT_ID=ci-read-client
@@ -125,7 +128,32 @@ run_upgrade_convergence_scenario() {
   local managed_cxp="$HOME/.local/bin/cxp"
   local go_bin="$HOME/go/bin/codex-proxy"
 
-  echo "helper upgrade compatibility smoke: scenario=$scenario mode=$seed_mode os=$os repo=$repo old=$old_tag target=$target_tag"
+  case "$os:$service_backend" in
+    linux:local-supervisor)
+      ;;
+    linux:systemd|linux:systemd-user)
+      local fake_bin="$scenario_base/fake-bin"
+      mkdir -p "$fake_bin"
+      cat > "$fake_bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${CODEX_HELPER_FAKE_SYSTEMCTL_LOG:?}"
+exit 0
+SH
+      chmod +x "$fake_bin/systemctl"
+      export CODEX_HELPER_FAKE_SYSTEMCTL_LOG="$scenario_base/systemctl.log"
+      : > "$CODEX_HELPER_FAKE_SYSTEMCTL_LOG"
+      export PATH="$fake_bin:$PATH"
+      ;;
+    darwin:*)
+      ;;
+    linux:*)
+      echo "unsupported Linux service backend for helper upgrade compatibility smoke: $service_backend" >&2
+      exit 2
+      ;;
+  esac
+
+  echo "helper upgrade compatibility smoke: scenario=$scenario mode=$seed_mode os=$os service_backend=$service_backend repo=$repo old=$old_tag target=$target_tag"
   download_binary "$old_tag" "$go_bin"
   case "$seed_mode" in
     copy)
@@ -166,6 +194,8 @@ run_upgrade_convergence_scenario() {
   retry 5 10 "$go_bin" upgrade --repo "$repo" --version "$target_tag" --install-path "$go_bin"
 
   assert_version "$go_bin" "$target_tag"
+  # This first hop is executed by the old release binary, so only the invoked
+  # install path is guaranteed to be current before the new helper runs.
   case "$seed_mode" in
     copy|symlink)
       assert_version "$managed" "$old_tag"
@@ -246,7 +276,9 @@ PY
   case "$os" in
     linux)
       export MANAGED_TARGET="$managed"
-      python3 - <<'PY'
+      case "$service_backend" in
+        local-supervisor)
+          python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -261,6 +293,24 @@ env = spec.get("Environment") or {}
 assert env.get("CODEX_PROXY_INSTALL_PATH") == managed, supervisor
 assert "CODEX_PROXY_INSTALL_DIR" not in env, supervisor
 PY
+          ;;
+        systemd|systemd-user)
+          unit="$XDG_CONFIG_HOME/systemd/user/codex-helper-teams.service"
+          watchdog_unit="$XDG_CONFIG_HOME/systemd/user/codex-helper-teams-watchdog.service"
+          watchdog_timer="$XDG_CONFIG_HOME/systemd/user/codex-helper-teams-watchdog.timer"
+          test -f "$unit"
+          test -f "$watchdog_unit"
+          test -f "$watchdog_timer"
+          grep -Fq "ExecStart=$managed teams run --owner-stale-after 1m30s --auto-service=false" "$unit"
+          grep -Fq "Environment=CODEX_PROXY_INSTALL_PATH=$managed" "$unit"
+          if grep -Fq "CODEX_PROXY_INSTALL_DIR" "$unit"; then
+            echo "systemd unit should not preserve CODEX_PROXY_INSTALL_DIR" >&2
+            cat "$unit" >&2
+            exit 1
+          fi
+          grep -Fxq -- "--user daemon-reload" "$CODEX_HELPER_FAKE_SYSTEMCTL_LOG"
+          ;;
+      esac
       ;;
     darwin)
       local plist="$HOME/Library/LaunchAgents/com.codex-helper.teams.plist"

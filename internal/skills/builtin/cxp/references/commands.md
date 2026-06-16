@@ -127,8 +127,8 @@ Control chat commands:
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running control-chat Codex question(s).
 - `helper update now`: update to the latest stable helper release.
 - `helper update prerelease`: update to the newest eligible release or pre-release.
-- `helper reload now`: load the latest helper code after update.
-- `helper restart now`: restart the Teams helper.
+- `helper restart now`: restart the installed Teams helper, including after a release update.
+- `helper reload now`: rebuild and reload from a local source checkout for development.
 
 Work chat commands:
 

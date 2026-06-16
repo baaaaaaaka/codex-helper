@@ -670,9 +670,12 @@ not necessarily your interactive shell. If it needs to inspect the local helper
 binary, the child process receives `CODEX_HELPER_CLI_PATH`; a missing `cxp`
 alias in that environment does not mean the installed helper is missing.
 
-If you update the helper while Teams work is active, the helper drains current
-work first, restarts the service when needed, and then sends a completion or
-failure notice back to Teams.
+If you update the helper from the Teams control chat, the helper drains current
+work first and sends a completion or failure notice back to Teams. A local
+`codex-proxy upgrade` only installs the helper binary and matching `cxp` entry
+points; it does not repair, stop, or restart the Teams service by default. After
+a local helper upgrade, send `helper restart now` in the Teams control chat to
+run the installed helper update.
 
 For a deeper deployment and troubleshooting guide, see
 [`docs/teams_source_deployment_guide.md`](docs/teams_source_deployment_guide.md).
@@ -691,10 +694,23 @@ Optional flags:
 - `--version vX.Y.Z` (install a specific version)
 - `--include-prerelease` (allow latest to resolve to the newest pre-release)
 - `--install-path /path/to/codex-proxy` (override install path; file or directory)
+- `--restart-teams-service` (opt in to the legacy drain/stop/refresh/restart
+  path; on WSL this may request Windows permission if service repair is needed)
+
+By default, `codex-proxy upgrade` downloads, validates, installs, and unifies
+known helper entry points without touching the Teams service. If older installs
+left `cxp` or `codex-proxy` in multiple known locations, the upgrade keeps the
+currently invoked helper as the canonical target when it is runnable, ignores
+broken stale install-path hints, and repairs known managed/env/default entries
+to point at the canonical helper. This keeps a network timeout or Windows
+service repair problem from interrupting a running helper. Use `helper restart
+now` in the Teams control chat to run the installed helper update.
 
 Teams background mode also checks `codex-helper` GitHub Releases every 30
 minutes and silently applies eligible helper updates after current Teams/Codex
-work drains:
+work drains. Background helper auto-update uses the running stable helper path
+when it is a runnable helper binary, then repairs known managed/env/default
+entry points to the installed helper before restarting the bridge:
 
 - `p0`: update as soon as the release is detected.
 - `p1`: update after the release has been published for 48 hours.

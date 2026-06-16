@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -475,6 +476,7 @@ func teamsAutoUpdateReleaseForTest(tag string, priority update.AutoUpdatePriorit
 
 func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsUserDirsForTest(t, t.TempDir())
 	prevPerform := performUpdate
 	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
 	t.Cleanup(func() {
@@ -524,7 +526,10 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	}
 }
 
-func TestTeamsReleaseAutoUpdaterApplyUsesManagedDefaultWhenServiceRunsFromGoBin(t *testing.T) {
+func TestTeamsReleaseAutoUpdaterApplyUsesRunningGoBinAndUnifiesManagedDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX alias unification")
+	}
 	lockCLITestHooks(t)
 	prevPerform := performUpdate
 	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
@@ -535,24 +540,21 @@ func TestTeamsReleaseAutoUpdaterApplyUsesManagedDefaultWhenServiceRunsFromGoBin(
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
 	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	managedCXP := filepath.Join(tmp, ".local", "bin", "cxp")
 	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
-	for _, path := range []string{managed, goBin} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
-		}
-		if err := os.WriteFile(path, []byte("stable"), 0o755); err != nil {
-			t.Fatalf("write %s: %v", path, err)
-		}
-	}
+	writeCLIFile(t, managed, upgradeCXPShimTestScript("1.2.2"), 0o755)
+	writeCLIFile(t, managedCXP, upgradeCXPShimTestScript("1.2.2"), 0o755)
+	writeCLIFile(t, goBin, upgradeCXPShimTestScript("1.2.3"), 0o755)
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos: "linux",
 		exe:  goBin,
 		cwd:  tmp,
 	})
-	teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeams
+	teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeamsAutoUpdate
 	var got update.UpdateOptions
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
 		got = opts
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 
@@ -561,11 +563,23 @@ func TestTeamsReleaseAutoUpdaterApplyUsesManagedDefaultWhenServiceRunsFromGoBin(
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
-	if got.InstallPath != managed || res.InstallPath != managed {
-		t.Fatalf("install path got options=%q result=%q, want managed %q", got.InstallPath, res.InstallPath, managed)
+	if got.InstallPath != goBin || res.InstallPath != goBin {
+		t.Fatalf("install path got options=%q result=%q, want running helper %q", got.InstallPath, res.InstallPath, goBin)
 	}
-	if !res.ActivationPending || !strings.Contains(res.ActivationReason, goBin) {
-		t.Fatalf("activation = pending %v reason %q, want pending because service runs from go/bin", res.ActivationPending, res.ActivationReason)
+	if res.ActivationPending || res.ActivationReason != "" {
+		t.Fatalf("activation = pending %v reason %q, want immediate activation for running helper path", res.ActivationPending, res.ActivationReason)
+	}
+	if out, err := exec.Command(managed, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("managed default after auto-update unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(managed); err != nil || target != goBin {
+		t.Fatalf("managed default should be symlink to running helper, target=%q err=%v", target, err)
+	}
+	if out, err := exec.Command(managedCXP, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("managed cxp after auto-update unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(managedCXP); err != nil || target != goBin {
+		t.Fatalf("managed cxp should be symlink to running helper, target=%q err=%v", target, err)
 	}
 }
 
@@ -606,8 +620,76 @@ func TestTeamsReleaseAutoUpdaterApplyCreatesMissingCXPShim(t *testing.T) {
 	}
 }
 
+func TestTeamsReleaseAutoUpdaterApplyUnifiesBrokenEnvAliases(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX alias unification")
+	}
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevTeamsExecutable := teamsAutoUpdateExecutable
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevTeamsExecutable
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	current := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	currentCXP := filepath.Join(tmp, "go", "bin", "cxp")
+	envTarget := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	envCXP := filepath.Join(tmp, ".local", "bin", "cxp")
+	writeCLIFile(t, current, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(current, currentCXP); err != nil {
+		t.Fatalf("create current cxp symlink: %v", err)
+	}
+	writeCLIFile(t, envTarget, "#!/bin/sh\necho binary-payload >&2\nexit 127\n", 0o755)
+	writeCLIFile(t, envCXP, upgradeCXPShimTestScript("1.2.2"), 0o755)
+	t.Setenv(update.EnvInstallPath, envTarget)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  current,
+		cwd:  tmp,
+	})
+	teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeamsAutoUpdate
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return current, nil
+	}
+	executablePath = func() (string, error) { return current, nil }
+	restartArgv0 = func() string { return currentCXP }
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	if _, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"}); err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if out, err := exec.Command(current, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("current helper after auto-update = %q err=%v, want 1.2.4", out, err)
+	}
+	if out, err := exec.Command(envTarget, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("env install path after auto-update unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(envTarget); err != nil || target != current {
+		t.Fatalf("env install path should be symlink to current helper, target=%q err=%v", target, err)
+	}
+	if out, err := exec.Command(envCXP, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("env cxp after auto-update unification = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(envCXP); err != nil || target != current {
+		t.Fatalf("env cxp should be symlink to current helper, target=%q err=%v", target, err)
+	}
+}
+
 func TestTeamsReleaseAutoUpdaterApplyWithOptionsReturnsWindowsPendingReplacementToCaller(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsUserDirsForTest(t, t.TempDir())
 	prevPerform := performUpdate
 	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
 	prevExecutable := teamsAutoUpdateExecutable
@@ -652,6 +734,7 @@ func TestTeamsReleaseAutoUpdaterApplyWithOptionsReturnsWindowsPendingReplacement
 
 func TestTeamsReleaseAutoUpdaterApplyDefersActivationFromTransientExecutable(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsUserDirsForTest(t, t.TempDir())
 	prevPerform := performUpdate
 	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
 	prevExecutable := teamsAutoUpdateExecutable
@@ -684,6 +767,7 @@ func TestTeamsReleaseAutoUpdaterApplyDefersActivationFromTransientExecutable(t *
 
 func TestTeamsReleaseAutoUpdaterApplyKeepsImmediateActivationForStableExecutable(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsUserDirsForTest(t, t.TempDir())
 	prevPerform := performUpdate
 	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
 	prevExecutable := teamsAutoUpdateExecutable
@@ -714,6 +798,7 @@ func TestTeamsReleaseAutoUpdaterApplyKeepsImmediateActivationForStableExecutable
 
 func TestTeamsReleaseAutoUpdaterChecksActivationBeforeReplacingStableExecutable(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsUserDirsForTest(t, t.TempDir())
 	prevPerform := performUpdate
 	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
 	prevExecutable := teamsAutoUpdateExecutable
@@ -766,6 +851,7 @@ func TestTeamsAutoUpdateActivationComparesWindowsPathsCaseInsensitively(t *testi
 
 func TestTeamsReleaseAutoUpdaterApplyUsesSharedInstallLock(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsUserDirsForTest(t, t.TempDir())
 	prevPerform := performUpdate
 	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
 	t.Cleanup(func() {
