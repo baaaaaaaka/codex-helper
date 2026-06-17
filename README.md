@@ -21,8 +21,14 @@ sh -c 'url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/insta
 Windows (PowerShell):
 
 ```powershell
-$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $p; if ($LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" } } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
+
+The Windows command downloads the installer to a temporary file before running
+it. It avoids piping remote script text into PowerShell while using a
+process-scoped `RemoteSigned` policy so default script restrictions can still
+run the local temporary file. Group Policy script restrictions can still block
+execution.
 
 The installer drops a `cxp` shim alongside `codex-proxy`, tries to add the
 install directory plus the managed CLI directory to PATH, and also adds a `cxp`
@@ -71,7 +77,7 @@ sh -c 'set -e; url="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/ma
 Windows (PowerShell):
 
 ```powershell
-$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"; $p=Join-Path $env:TEMP "teams-auth-bootstrap.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/scripts/teams-auth-bootstrap.ps1"; $p=Join-Path $env:TEMP "teams-auth-bootstrap.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $p; if ($LASTEXITCODE -ne 0) { throw "teams auth bootstrap exited with code $LASTEXITCODE" } } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
 
 When setup finishes, open the Teams control chat shown by bootstrap and send
@@ -801,7 +807,7 @@ curl -fsSL https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/instal
 ### Windows (PowerShell)
 
 ```powershell
-$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $p; if ($LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" } } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
 
 By default it installs to `%USERPROFILE%\.local\bin\codex-proxy.exe`.
@@ -819,7 +825,7 @@ or `prompt` to ask in the terminal before showing the UAC prompt.
 Install a specific version:
 
 ```powershell
-$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & $p -Version vX.Y.Z } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
+$ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"; $p=Join-Path $env:TEMP "codex-proxy-install.ps1"; try { Invoke-WebRequest -UseBasicParsing $u -OutFile $p; Unblock-File -LiteralPath $p; & powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $p -Version vX.Y.Z; if ($LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" } } finally { Remove-Item -Force $p -ErrorAction SilentlyContinue }
 ```
 
 ### Environment variables

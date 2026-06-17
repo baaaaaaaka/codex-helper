@@ -33,7 +33,12 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
             readme,
         )
         self.assertIn("Unblock-File -LiteralPath $p", readme)
-        self.assertIn("& $p", readme)
+        self.assertIn(
+            "& powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $p",
+            readme,
+        )
+        self.assertNotIn("-ExecutionPolicy Bypass", readme)
+        self.assertNotIn("Invoke-Expression", readme)
 
     def test_bash_script_interactive_flow_configures_all_client_slots(self) -> None:
         bash = shutil.which("bash")

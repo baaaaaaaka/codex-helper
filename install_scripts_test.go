@@ -276,6 +276,7 @@ func TestReadmeWindowsInstallAvoidsDownloadAndExecuteOneLiner(t *testing.T) {
 		"install.ps1 | iex",
 		"install.ps1 | invoke-expression",
 		"invoke-expression",
+		"-executionpolicy bypass",
 	} {
 		if strings.Contains(lower, forbidden) {
 			t.Fatalf("README should not recommend Defender-prone PowerShell download-and-execute pattern %q", forbidden)
@@ -285,7 +286,7 @@ func TestReadmeWindowsInstallAvoidsDownloadAndExecuteOneLiner(t *testing.T) {
 		`$u="https://raw.githubusercontent.com/baaaaaaaka/codex-helper/main/install.ps1"`,
 		"Invoke-WebRequest -UseBasicParsing $u -OutFile $p",
 		"Unblock-File -LiteralPath $p",
-		"& $p",
+		"& powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $p",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("README missing safer Windows install step %q", required)
