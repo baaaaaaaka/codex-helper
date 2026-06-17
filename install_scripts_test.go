@@ -294,6 +294,38 @@ func TestReadmeWindowsInstallAvoidsDownloadAndExecuteOneLiner(t *testing.T) {
 	}
 }
 
+func TestReadmeTeamsSetupDoesNotRequirePrerelease(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(repoRoot, "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	text := string(data)
+	lower := strings.ToLower(text)
+	for _, forbidden := range []string{
+		"pre-release builds only",
+		"pre-release-only",
+		"v0.1.0-rc",
+	} {
+		if strings.Contains(lower, forbidden) {
+			t.Fatalf("README should not tell stable Teams users to move to prerelease-only setup, found %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"Teams helper is available in stable releases.",
+		"codex-proxy upgrade",
+		"helper update now",
+		"Use `helper update prerelease` only when you intentionally want the newest\npre-release.",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("README missing stable Teams setup guidance %q", required)
+		}
+	}
+}
+
 func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	run.env = overrideEnv(run.env, "SHELL", "")

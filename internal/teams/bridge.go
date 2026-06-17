@@ -4370,7 +4370,7 @@ func controlAdvancedHelpText() string {
 		"- `beacon profile update <name> ...` - create a new profile revision",
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>` - inspect, restore, and prune revisions",
 		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",
-		"- `beacon profile confirm <name>` - confirm a reviewed profile",
+		"- `beacon profile confirm <name>` - confirm review; incomplete profiles remain draft until doctor requirements pass",
 		"- `beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]` - preview and release a beacon resource",
 		"- advanced: `beacon allocation ...` and `beacon machine ...` inspect internal state",
 		"- `new <directory> --beacon <profile>` - create a Work chat on a ready beacon profile",

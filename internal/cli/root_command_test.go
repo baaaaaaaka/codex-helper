@@ -460,6 +460,10 @@ func TestTeamsServiceStopRefusesTeamsCodexChild(t *testing.T) {
 }
 
 func TestTeamsServiceMutationsRefuseTeamsCodexChild(t *testing.T) {
+	localAdvice := map[string]string{
+		"teams service install":   "run `cxp teams service install` in a local terminal",
+		"teams service bootstrap": "run `cxp teams service bootstrap` in a local terminal",
+	}
 	for _, args := range [][]string{
 		{"teams", "service", "install"},
 		{"teams", "service", "bootstrap"},
@@ -482,6 +486,9 @@ func TestTeamsServiceMutationsRefuseTeamsCodexChild(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "launched by Teams helper") {
 				t.Fatalf("%v error = %v, want Teams child refusal", args, err)
+			}
+			if want := localAdvice[strings.Join(args, " ")]; want != "" && !strings.Contains(err.Error(), want) {
+				t.Fatalf("%v error = %v, want local terminal advice %q", args, err, want)
 			}
 		})
 	}

@@ -34,7 +34,7 @@ Use `cxp proxy` only when the user is asking about SSH/network routing. If the u
 
 ## Beacon Execution Profiles
 
-Beacon profiles describe where future Codex work executes. Create and confirm a profile before switching a conversation to it.
+Beacon profiles describe where future Codex work executes. Create, doctor, and confirm a profile before switching a conversation to it; confirmation records review, but incomplete profiles remain draft until doctor requirements pass.
 
 - `cxp beacon profile list`: list beacon profiles.
 - `cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration> --shared-path <path>`: create a Slurm draft profile. The shared path must be absolute and visible to the control machine and allocated workers.
@@ -50,7 +50,7 @@ Beacon profiles describe where future Codex work executes. Create and confirm a 
 - `cxp beacon profile create <name> ... --isolation shared|exclusive`: set the default lease sharing mode.
 - `cxp beacon profile doctor <name>`: validate profile fields, shared-path access, and the query/submit/cancel/renew adapter commands visible to cxp without touching the scheduler.
 - `cxp beacon profile doctor <name> --smoke`: submit, query, and cancel one real scheduler allocation to verify adapter output and cleanup.
-- `cxp beacon profile confirm <name>`: confirm a reviewed profile so it can be used.
+- `cxp beacon profile confirm <name>`: confirm a reviewed profile; incomplete profiles remain draft until doctor requirements pass.
 - `cxp beacon profile status <name>`: inspect one profile.
 - `cxp beacon status --session <session-id>`: inspect a conversation's current, pending, and queued target state.
 - `cxp beacon switch-profile <name> --session <session-id>`: switch immediately when no Codex work is queued or running.
@@ -110,7 +110,7 @@ Scheduler-capable CI can opt in to the real adapter test with `CODEX_HELPER_BEAC
 - `cxp teams auth full`: refresh full Teams auth locally.
 - `cxp teams auth full-status`: inspect auth cache expiry without printing tokens.
 
-From a Teams-launched Codex child turn, do not restart or reload the running helper directly. Tell the user to send `helper reload now` or `helper restart now` in the control chat.
+From a Teams-launched Codex child turn, do not restart, reload, update, kill, replace, or background the running helper directly. For normal installed helpers, tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates. Use `helper reload now` only for source-checkout development reloads when the helper has access to a local `codex-helper` source tree.
 
 ## Teams Chat Commands
 
@@ -128,7 +128,7 @@ Control chat commands:
 - `helper update now`: update to the latest stable helper release.
 - `helper update prerelease`: update to the newest eligible release or pre-release.
 - `helper restart now`: restart the installed Teams helper, including after a release update.
-- `helper reload now`: rebuild and reload from a local source checkout for development.
+- `helper reload now`: development/source-checkout only; rebuild and reload from a local `codex-helper` source checkout.
 
 Work chat commands:
 
@@ -163,4 +163,4 @@ Built-in skills are installed into `$HOME/.agents/skills`, but they are not git 
 - `cxp upgrade --version <tag>`: install a specific release.
 - `cxp upgrade --include-prerelease`: allow latest resolution to include prereleases.
 
-From a Teams child turn, do not self-manage the running helper process. Use control chat update/reload/restart commands as directed by the helper safety rules.
+From a Teams child turn, do not self-manage the running helper process. Use control chat update or restart commands for installed helpers; use reload only for source-checkout development as directed by the helper safety rules.

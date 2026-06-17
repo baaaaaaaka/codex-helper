@@ -34,7 +34,9 @@ Teams helper safety:
 - You are running inside a Codex turn launched by the Teams helper.
 - The current Teams request is the ` + "`User message`" + ` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
 - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
-- If a helper restart or reload is needed, finish the answer and tell the user to send ` + "`helper reload now`" + ` or ` + "`helper restart now`" + ` in the Teams control chat.`)
+- If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send ` + "`helper restart now`" + ` in the Teams control chat.
+- If the helper needs a release update, tell the user to send ` + "`helper update now`" + `, or ` + "`helper update prerelease`" + ` only when they asked for prereleases.
+- Tell the user to send ` + "`helper reload now`" + ` only for source-checkout development reloads when a local ` + "`codex-helper`" + ` source tree is available.`)
 	instructions := strings.TrimSpace(`
 If you need to return generated files or images to the Teams user, write them under this local directory:
 ` + root + `
@@ -125,7 +127,7 @@ Local cxp beacon commands:
 - cxp beacon profile create <name> --provider local: create a local draft profile
 - cxp beacon profile doctor <name>: validate profile fields and query/submit/cancel/renew adapters without touching the scheduler
 - cxp beacon profile doctor <name> --smoke: submit, query, and cancel one real scheduler allocation to verify adapter output and cleanup
-- cxp beacon profile confirm <name>: confirm a reviewed profile so it can be selected
+- cxp beacon profile confirm <name>: confirm review; incomplete profiles remain draft until doctor requirements pass
 - cxp beacon profile status <name> and cxp beacon status --session <id>: inspect profile or target state
 - cxp beacon switch-profile <name> --session <id>: switch a conversation target after the profile is ready
 - cxp beacon switch-profile <name> --session <id> --after-current-turn: defer a switch so an active Codex turn can finish before future turns use the new profile
@@ -232,7 +234,7 @@ func defaultControlFallbackHelpDigest() string {
 		"`cxp beacon profile create <name> --provider lsf --queue <queue>` - create an LSF draft profile",
 		"`cxp beacon profile doctor <name>` - validate profile fields and provider adapters without touching the scheduler",
 		"`cxp beacon profile doctor <name> --smoke` - submit, query, and cancel one real scheduler allocation",
-		"`cxp beacon profile confirm <name>` - confirm a reviewed profile",
+		"`cxp beacon profile confirm <name>` - confirm review; incomplete profiles remain draft until doctor requirements pass",
 		"`cxp beacon profile status <name>` / `cxp beacon profile list` - inspect beacon profiles",
 		"`cxp beacon switch-profile <name> --session <id>` - switch a conversation target after the profile is ready",
 		"`cxp beacon switch-profile <name> --session <id> --after-current-turn` - defer a beacon switch until the active Codex turn finishes",

@@ -95,8 +95,9 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 		"The current Teams request is the `User message` section above.",
 		"Treat earlier Teams requests in resumed Codex history as completed context",
 		"Do not restart, reload, kill, replace, or background the Teams helper",
-		"`helper reload now`",
 		"`helper restart now`",
+		"`helper update now`",
+		"`helper reload now` only for source-checkout development reloads",
 		artifactHandoffInstructionLead,
 	} {
 		if !strings.Contains(got, want) {

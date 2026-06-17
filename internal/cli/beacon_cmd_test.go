@@ -15,6 +15,40 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
+func TestBeaconHelpShowsRequiredOperationalFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "switch profile session",
+			args: []string{"beacon", "switch-profile", "--help"},
+			want: "Usage:\n  codex-proxy beacon switch-profile <name> --session <session-id>",
+		},
+		{
+			name: "worker run once identity",
+			args: []string{"beacon", "worker", "run-once", "--help"},
+			want: "Usage:\n  codex-proxy beacon worker run-once (--machine <machine-id> | --allocation <request-id>)",
+		},
+		{
+			name: "worker serve allocation",
+			args: []string{"beacon", "worker", "serve", "--help"},
+			want: "Usage:\n  codex-proxy beacon worker serve --allocation <request-id>",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runBeaconRootCommand(t, tc.args...)
+			if err != nil {
+				t.Fatalf("%v: %v\n%s", tc.args, err, out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("%v help missing %q:\n%s", tc.args, tc.want, out)
+			}
+		})
+	}
+}
+
 func TestRunBeaconWorkerJobTreatsFinalAnswerCanceledLaunchAsSuccess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture uses POSIX sh")

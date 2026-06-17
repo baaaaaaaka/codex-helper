@@ -51,18 +51,16 @@ To discard saved proxy setup, attempt to stop known proxy daemons, and see this 
 
 ### 3) Optional: initialize Teams helper
 
-Teams helper is currently available from **pre-release builds only**. After the
-normal install, switch `codex-proxy` to the newest pre-release:
+Teams helper is available in stable releases. A fresh install uses the current
+stable helper. If this machine has an older `codex-proxy`, update to the latest
+stable release first:
 
 ```bash
-codex-proxy upgrade --include-prerelease
+codex-proxy upgrade
 ```
 
-If your installed stable version does not recognize `--include-prerelease`,
-install the newest `v0.1.0-rc.*` tag from GitHub Releases explicitly with the
-installer `--version` option once. After that, future pre-release updates can
-use `codex-proxy upgrade --include-prerelease`. The detailed install section
-below shows the exact `--version` installer commands.
+Use `codex-proxy upgrade --include-prerelease` only when you intentionally want
+to test the newest pre-release.
 
 Then run the interactive Teams setup script. It asks for the required Teams
 auth metadata, starts Microsoft device login, verifies the local auth cache,
@@ -153,7 +151,7 @@ codex-proxy proxy doctor
 | `codex-proxy beacon profile gc <name>` | Prune historical revisions no active target/allocation still references |
 | `codex-proxy beacon profile doctor <name>` | Validate profile fields and provider adapter commands without touching the scheduler |
 | `codex-proxy beacon profile doctor <name> --smoke` | Submit, query, and cancel one scheduler allocation to verify adapters |
-| `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review |
+| `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review; incomplete profiles remain draft |
 | `codex-proxy beacon status [--session <id>]` | Show beacon target state |
 | `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | Preview and release a beacon resource by profile, allocation id, provider job id, or machine id |
 | `codex-proxy beacon switch-profile <name> --session <id>` | Switch a conversation to a ready beacon profile |
@@ -570,24 +568,23 @@ on your own machine. A local `codex-proxy teams run` listener reads Teams
 messages, starts or resumes Codex sessions in the selected project directory,
 and sends status, answer, artifact, and notification updates back to Teams.
 
-Teams helper is currently a **pre-release-only** feature. Install the normal
-binary first, then update to the newest pre-release before setup:
+Teams helper is available in stable releases. Install the normal binary first;
+if this machine has an older helper, update to the latest stable release before
+setup:
 
 ```bash
-codex-proxy upgrade --include-prerelease
+codex-proxy upgrade
 ```
-
-If the installed stable binary is too old to support `--include-prerelease`,
-install the newest `v0.1.0-rc.*` tag explicitly with the installer `--version`
-option once, then use `codex-proxy upgrade --include-prerelease` for later
-pre-release updates.
 
 From an existing Teams control chat, you can ask the helper itself to move to
-the newest release or pre-release:
+the latest stable release:
 
 ```text
-helper update prerelease
+helper update now
 ```
+
+Use `helper update prerelease` only when you intentionally want the newest
+pre-release.
 
 ### Fast setup
 
@@ -610,7 +607,8 @@ environment variables or script flags.
 The helper creates a **control chat** for machine-level commands and separate
 work chats for Codex sessions. Use the control chat to list projects, choose a
 project/session, start new Codex work, check status, recover stuck state,
-restart or reload the helper, and update the helper.
+restart or update the installed helper, and reload only a source-checkout
+development helper.
 
 When a Teams work chat message is routed to Codex, the helper queues it,
 starts Codex with the selected session working directory, streams progress as

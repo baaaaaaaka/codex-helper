@@ -30,17 +30,22 @@ machine separately.
 
 ## 2. Build From Source
 
-Clone and build:
+Clone and build. The public HTTPS URL works without GitHub SSH keys; use the
+`git@github.com:...` form only when SSH auth is already configured.
 
 ```sh
 mkdir -p "$HOME/project"
 cd "$HOME/project"
-git clone git@github.com:baaaaaaaka/codex-helper.git
+git clone https://github.com/baaaaaaaka/codex-helper.git
 cd codex-helper
 git checkout <branch-or-commit>
 go test ./internal/teams ./internal/cli
 go build -o "$HOME/.local/bin/codex-proxy" ./cmd/codex-proxy
 ```
+
+These source-build commands are written for Linux, macOS, or WSL. On Windows,
+prefer the release installer from the README, or adapt the source-build path to
+PowerShell and build `codex-proxy.exe`.
 
 Make sure the binary is on `PATH`:
 
@@ -383,8 +388,22 @@ On the target machine:
 ```sh
 cd "$HOME/project/codex-helper"
 git fetch origin
-git checkout <branch-or-commit>
+git switch <branch>
 git pull --ff-only
+go test ./internal/teams ./internal/cli
+go build -o "$HOME/.local/bin/codex-proxy.new" ./cmd/codex-proxy
+mv "$HOME/.local/bin/codex-proxy.new" "$HOME/.local/bin/codex-proxy"
+codex-proxy teams service restart
+codex-proxy teams status
+```
+
+For a pinned commit instead of a branch, do not run `git pull` from detached
+HEAD:
+
+```sh
+cd "$HOME/project/codex-helper"
+git fetch origin
+git checkout <commit>
 go test ./internal/teams ./internal/cli
 go build -o "$HOME/.local/bin/codex-proxy.new" ./cmd/codex-proxy
 mv "$HOME/.local/bin/codex-proxy.new" "$HOME/.local/bin/codex-proxy"

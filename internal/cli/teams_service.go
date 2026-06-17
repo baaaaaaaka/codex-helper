@@ -133,7 +133,7 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 		Long:  "Install or repair the Teams bridge background service. Bootstrap prepares the Teams control chat, prints the link in this terminal, and tries to open it automatically. On WSL, this first tries a current-user Windows Scheduled Task. If Windows blocks that path, it can ask before opening a UAC prompt and then falls back to a current-user Startup watchdog.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := rejectTeamsHelperSelfManagementFromChild("bootstrap the Teams service", "helper reload now"); err != nil {
+			if err := rejectTeamsHelperSelfManagementFromChildWithAdvice("bootstrap the Teams service", "run `cxp teams service bootstrap` in a local terminal"); err != nil {
 				return err
 			}
 			if dryRun {
@@ -196,7 +196,7 @@ func newTeamsServiceInstallCmd(registryPath *string) *cobra.Command {
 		Short: "Install the Teams bridge user service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := rejectTeamsHelperSelfManagementFromChild("install the Teams service", "helper reload now"); err != nil {
+			if err := rejectTeamsHelperSelfManagementFromChildWithAdvice("install the Teams service", "run `cxp teams service install` in a local terminal"); err != nil {
 				return err
 			}
 			path, err := installTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{

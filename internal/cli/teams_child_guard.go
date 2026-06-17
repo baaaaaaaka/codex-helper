@@ -72,6 +72,14 @@ func runningInsideTeamsCodexChild() bool {
 }
 
 func rejectTeamsHelperSelfManagementFromChild(action string, controlCommand string) error {
+	controlCommand = strings.TrimSpace(controlCommand)
+	if controlCommand == "" {
+		controlCommand = "helper status"
+	}
+	return rejectTeamsHelperSelfManagementFromChildWithAdvice(action, "send `"+controlCommand+"` in the Teams control chat")
+}
+
+func rejectTeamsHelperSelfManagementFromChildWithAdvice(action string, advice string) error {
 	if !runningInsideTeamsCodexChild() {
 		return nil
 	}
@@ -79,9 +87,9 @@ func rejectTeamsHelperSelfManagementFromChild(action string, controlCommand stri
 	if action == "" {
 		action = "manage the Teams helper"
 	}
-	controlCommand = strings.TrimSpace(controlCommand)
-	if controlCommand == "" {
-		controlCommand = "helper status"
+	advice = strings.TrimSpace(advice)
+	if advice == "" {
+		advice = "send `helper status` in the Teams control chat"
 	}
-	return fmt.Errorf("refusing to %s from a Codex turn launched by Teams helper; finish this turn first, then send `%s` in the Teams control chat", action, controlCommand)
+	return fmt.Errorf("refusing to %s from a Codex turn launched by Teams helper; finish this turn first, then %s", action, advice)
 }

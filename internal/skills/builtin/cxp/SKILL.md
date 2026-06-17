@@ -23,6 +23,6 @@ cxp beacon switch-profile <profile> --session <session-id> --after-current-turn
 
 If the current session id is unknown, inspect `cxp beacon status --session <id>` when the id is available, or ask the user for the session/work chat to switch. If the command reports an incompatible execution signature, ask whether to fork before using `--fork`.
 
-For Teams helper reloads or restarts, finish the answer and tell the user to send `helper reload now` or `helper restart now` in the Teams control chat. Do not restart the helper from a child Codex turn.
+For Teams helper lifecycle work, do not restart, reload, update, kill, replace, or background the helper from a child Codex turn. For normal installed helpers, tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates. Tell the user to send `helper reload now` only when they explicitly want a source-checkout development reload and the helper has access to a local `codex-helper` source tree.
 
 For auth prompts, destructive confirmations, and skill pushes, direct the user to run the local `cxp ...` command in their terminal unless the helper explicitly provides a safe Teams command.

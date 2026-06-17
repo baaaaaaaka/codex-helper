@@ -231,7 +231,7 @@ func teamsASRTranscriberConfigured(transcriber ASRTranscriber) bool {
 
 func teamsASRFailureUserMessage(err error) string {
 	if errors.Is(err, errASRCommandNotConfigured) {
-		return "Teams voice/video transcription is not ready on this helper yet. I received Teams media, but I did not send the raw audio/video to Codex. cxp should prepare local speech recognition automatically; please update/reload the helper and try again."
+		return "Teams voice/video transcription is not ready on this helper yet. I received Teams media, but I did not send the raw audio/video to Codex. cxp should prepare local speech recognition automatically; please update or restart the installed helper and try again. Use reload only for source-checkout development."
 	}
 	notice := classifyTeamsASRFailure(err)
 	var parts []string
@@ -410,7 +410,7 @@ func teamsASRStatusLine(transcriber ASRTranscriber) string {
 	if teamsASRTranscriberConfigured(transcriber) {
 		return "Speech recognition: configured."
 	}
-	return "Speech recognition: not ready in this helper process; update/reload the helper to enable automatic local ASR."
+	return "Speech recognition: not ready in this helper process; update or restart the installed helper to enable automatic local ASR. Use reload only for source-checkout development."
 }
 
 func (b *Bridge) startTeamsASRProgressLoop(ctx context.Context, session *Session, turnID string, sourceIndex int, file LocalAttachment) func() {

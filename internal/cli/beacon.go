@@ -615,7 +615,7 @@ func newBeaconSwitchProfileCmd(root *rootOptions, storePath *string) *cobra.Comm
 	var signature string
 	var signatureCompatible bool
 	cmd := &cobra.Command{
-		Use:   "switch-profile <name>",
+		Use:   "switch-profile <name> --session <session-id>",
 		Short: "Switch a conversation to another beacon profile",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -924,7 +924,7 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 	var noYolo bool
 	var waitDuration time.Duration
 	cmd := &cobra.Command{
-		Use:   "run-once",
+		Use:   "run-once (--machine <machine-id> | --allocation <request-id>)",
 		Short: "Claim one queued beacon job, run Codex, and publish a terminal result",
 		Long: strings.TrimSpace(`Claim one queued beacon job, run Codex, and publish a terminal result.
 
@@ -1023,7 +1023,7 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 	var idleTimeout time.Duration
 	var maxJobs int
 	cmd := &cobra.Command{
-		Use:   "serve",
+		Use:   "serve --allocation <request-id>",
 		Short: "Register a beacon worker and serve queued jobs until idle or stopped",
 		Long: strings.TrimSpace(`Register a beacon worker and serve queued jobs until idle or stopped.
 

@@ -103,7 +103,8 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp beacon switch-profile <profile> --session <session-id> --after-current-turn",
 		"helper reload now",
 		"helper restart now",
-		"Do not restart the helper from a child Codex turn",
+		"do not restart, reload, update, kill, replace, or background the helper from a child Codex turn",
+		"source-checkout development reload",
 	} {
 		if !strings.Contains(skill, want) {
 			t.Fatalf("SKILL.md missing %q:\n%s", want, skill)
@@ -234,8 +235,9 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 			required: []string{
 				"helper reload now",
 				"helper restart now",
-				"Do not restart the helper from a child Codex turn",
-				"do not restart or reload the running helper directly",
+				"helper update now",
+				"do not restart, reload, update, kill, replace, or background the helper from a child Codex turn",
+				"source-checkout development",
 			},
 		},
 		{
@@ -259,7 +261,7 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 			required: []string{
 				"cxp upgrade --include-prerelease",
 				"From a Teams child turn, do not self-manage the running helper process",
-				"Use control chat update/reload/restart commands",
+				"Use control chat update or restart commands for installed helpers",
 			},
 		},
 	}
