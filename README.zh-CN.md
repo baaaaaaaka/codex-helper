@@ -1,6 +1,6 @@
 # codex-proxy
 
-[English](README.md)
+Languages: [English](README.md) | 中文
 
 通过基于 SSH 的本地代理栈运行 `codex`（或任何命令）：
 

@@ -1,6 +1,6 @@
 # codex-proxy
 
-[中文](README.zh-CN.md)
+Languages: English | [中文](README.zh-CN.md)
 
 Run `codex` (or any command) through an SSH-backed local proxy stack:
 
