@@ -2210,7 +2210,7 @@ func (s *Store) HistoryWatchState(ctx context.Context) (State, error) {
 
 func (s *Store) SetPaused(ctx context.Context, paused bool, reason string) (ServiceControl, error) {
 	var out ServiceControl
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		next := state.ServiceControl
 		reason = strings.TrimSpace(reason)
 		desiredReason := next.Reason
@@ -2232,13 +2232,17 @@ func (s *Store) SetPaused(ctx context.Context, paused bool, reason string) (Serv
 		state.ServiceControl = next
 		out = next
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 
 func (s *Store) SetDraining(ctx context.Context, reason string) (ServiceControl, error) {
 	var out ServiceControl
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		next := state.ServiceControl
 		reason = strings.TrimSpace(reason)
 		if next.Draining && next.Reason == reason {
@@ -2251,13 +2255,17 @@ func (s *Store) SetDraining(ctx context.Context, reason string) (ServiceControl,
 		state.ServiceControl = next
 		out = next
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 
 func (s *Store) ClearDrain(ctx context.Context) (ServiceControl, error) {
 	var out ServiceControl
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		next := state.ServiceControl
 		if !next.Draining {
 			out = next
@@ -2271,7 +2279,11 @@ func (s *Store) ClearDrain(ctx context.Context) (ServiceControl, error) {
 		state.ServiceControl = next
 		out = next
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 
@@ -2525,7 +2537,7 @@ func (s *Store) BeginUpgrade(ctx context.Context, reason string, timeout time.Du
 		reason = HelperUpgradeReason
 	}
 	var out UpgradeRequest
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		now := time.Now()
 		if activeUpgrade(state.Upgrade) {
 			out = *state.Upgrade
@@ -2554,7 +2566,11 @@ func (s *Store) BeginUpgrade(ctx context.Context, reason string, timeout time.Du
 		state.Upgrade = &req
 		out = req
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 
@@ -2733,7 +2749,7 @@ func (s *Store) RecordAutoUpdateCheck(ctx context.Context, record AutoUpdateReco
 		now = time.Now()
 	}
 	var out AutoUpdateState
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		next := state.AutoUpdate
 		next.LastCheckAt = now
 		next.NextCheckAt = record.NextCheckAt
@@ -2754,7 +2770,11 @@ func (s *Store) RecordAutoUpdateCheck(ctx context.Context, record AutoUpdateReco
 		state.AutoUpdate = next
 		out = next
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 
@@ -2763,14 +2783,18 @@ func (s *Store) RecordAutoUpdateAttempt(ctx context.Context, tag string, now tim
 		now = time.Now()
 	}
 	var out AutoUpdateState
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		next := state.AutoUpdate
 		next.LastAttemptTag = strings.TrimSpace(tag)
 		next.LastAttemptAt = now
 		state.AutoUpdate = next
 		out = next
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 
@@ -2779,7 +2803,7 @@ func (s *Store) RecordAutoUpdateInstalled(ctx context.Context, tag string, now t
 		now = time.Now()
 	}
 	var out AutoUpdateState
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		next := state.AutoUpdate
 		next.LastInstalledTag = strings.TrimSpace(tag)
 		next.LastInstalledAt = now
@@ -2792,7 +2816,11 @@ func (s *Store) RecordAutoUpdateInstalled(ctx context.Context, tag string, now t
 		state.AutoUpdate = next
 		out = next
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 
@@ -2898,7 +2926,7 @@ func (s *Store) AbortExpiredHelperUpgradeDrain(ctx context.Context, upgradeID st
 	}
 	var out UpgradeRequest
 	changed := false
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		if !state.ServiceControl.Draining || state.ServiceControl.Reason != HelperUpgradeReason {
 			return nil
 		}
@@ -2926,7 +2954,11 @@ func (s *Store) AbortExpiredHelperUpgradeDrain(ctx context.Context, upgradeID st
 		out = next
 		changed = true
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, changed, err
+	}
+	err := s.Update(ctx, update)
 	return out, changed, err
 }
 
@@ -2939,7 +2971,7 @@ func (s *Store) ClearStaleHelperReloadDrain(ctx context.Context, now time.Time, 
 	}
 	var out ServiceControl
 	changed := false
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		if !HelperReloadDrainStale(*state, now, staleAfter) {
 			out = state.ServiceControl
 			return nil
@@ -2961,7 +2993,11 @@ func (s *Store) ClearStaleHelperReloadDrain(ctx context.Context, now time.Time, 
 		out = next
 		changed = true
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, changed, err
+	}
+	err := s.Update(ctx, update)
 	return out, changed, err
 }
 
@@ -4317,6 +4353,12 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 }
 
 func (s *Store) SuppressOutboxOwnerMention(ctx context.Context, outboxID string) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, false, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		msg.MentionOwner = false
+		return msg, nil
+	}); handled || err != nil {
+		return out, err
+	}
 	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.MentionOwner = false
 		return msg, nil
@@ -5443,7 +5485,7 @@ func (s *Store) updateUpgrade(ctx context.Context, upgradeID string, fn func(Upg
 		return UpgradeRequest{}, fmt.Errorf("upgrade id is required")
 	}
 	var out UpgradeRequest
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		if state.Upgrade == nil || state.Upgrade.ID != upgradeID {
 			return fmt.Errorf("upgrade request %q not found", upgradeID)
 		}
@@ -5459,7 +5501,11 @@ func (s *Store) updateUpgrade(ctx context.Context, upgradeID string, fn func(Upg
 		}
 		out = next
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
 	return out, err
 }
 

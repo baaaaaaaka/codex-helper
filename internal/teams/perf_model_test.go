@@ -2657,6 +2657,53 @@ func BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles(b *testing.B) {
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteHelperAutoUpdateDueRecordWrites(b *testing.B) {
+	profile := cxpPerfRealisticMixedUserProfile()
+	b.Run(profile.Name, func(b *testing.B) {
+		store := newCXPPerfStore(b, profile)
+		cxpPerfSeedColdRuntimeMetadata(b, store, profile)
+		cxpPerfMigrateStoreToSQLite(b, store)
+		ctx := context.Background()
+		now := time.Date(2026, 6, 17, 11, 0, 0, 0, time.UTC)
+		benchRecord := func(name string, fn func(int) error) {
+			b.Run(name, func(b *testing.B) {
+				b.ReportAllocs()
+				var total cxpPerfProcIO
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					ioDelta, err := cxpPerfMeasureProcIO(func() error {
+						return fn(i)
+					})
+					if err != nil {
+						b.Fatalf("%s: %v", name, err)
+					}
+					total.add(ioDelta)
+				}
+				b.StopTimer()
+				cxpPerfReportProcIO(b, total, b.N)
+			})
+		}
+		benchRecord("check", func(i int) error {
+			_, err := store.RecordAutoUpdateCheck(ctx, teamstore.AutoUpdateRecord{
+				Now:              now.Add(time.Duration(i) * time.Minute),
+				NextCheckAt:      now.Add(time.Duration(i+30) * time.Minute),
+				CandidateTag:     "v9.9.9",
+				CandidateVersion: "9.9.9",
+				CandidateAsset:   "codex-proxy_9.9.9_linux_amd64",
+			})
+			return err
+		})
+		benchRecord("attempt", func(i int) error {
+			_, err := store.RecordAutoUpdateAttempt(ctx, "v9.9.9", now.Add(time.Duration(i)*time.Minute))
+			return err
+		})
+		benchRecord("installed", func(i int) error {
+			_, err := store.RecordAutoUpdateInstalled(ctx, "v9.9.9", now.Add(time.Duration(i)*time.Minute))
+			return err
+		})
+	})
+}
+
 func BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles(b *testing.B) {
 	for _, profile := range cxpPerfProfiles {
 		profile := profile

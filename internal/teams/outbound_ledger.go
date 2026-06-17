@@ -2,7 +2,9 @@ package teams
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -87,15 +89,7 @@ func (b *Bridge) hasGlobalOutboundMessage(ctx context.Context, chatID string, me
 	if err := b.ensureGlobalOutboundBackfilled(ctx, path); err != nil {
 		return false, err
 	}
-	ledger, err := readGlobalOutboundLedger(path)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	_, exists := ledger.Items[globalOutboundKey(chatID, messageID)]
-	return exists, nil
+	return hasGlobalOutboundLedgerItem(ctx, path, chatID, messageID)
 }
 
 func (b *Bridge) recordGlobalOutboundMessage(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) error {
@@ -160,11 +154,7 @@ func (b *Bridge) ensureGlobalOutboundBackfilled(ctx context.Context, path string
 		b.globalOutboundBackfilled = true
 		return nil
 	}
-	if err := updateGlobalOutboundLedger(ctx, path, func(ledger *globalOutboundLedger, now time.Time) {
-		for _, item := range records {
-			upsertGlobalOutboundItem(ledger, item, now)
-		}
-	}); err != nil {
+	if err := recordGlobalOutboundBatch(ctx, path, records, time.Now()); err != nil {
 		return err
 	}
 	b.globalOutboundBackfilled = true
@@ -301,12 +291,13 @@ func recordGlobalOutbound(ctx context.Context, path string, item globalOutboundI
 	if strings.TrimSpace(path) == "" || strings.TrimSpace(item.ChatID) == "" || strings.TrimSpace(item.MessageID) == "" {
 		return nil
 	}
-	return updateGlobalOutboundLedger(ctx, path, func(ledger *globalOutboundLedger, _ time.Time) {
-		upsertGlobalOutboundItem(ledger, item, now)
-	})
+	return recordGlobalOutboundBatch(ctx, path, []globalOutboundItem{item}, now)
 }
 
-func updateGlobalOutboundLedger(ctx context.Context, path string, fn func(*globalOutboundLedger, time.Time)) error {
+func recordGlobalOutboundBatch(ctx context.Context, path string, items []globalOutboundItem, now time.Time) error {
+	if strings.TrimSpace(path) == "" || len(items) == 0 {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -322,18 +313,37 @@ func updateGlobalOutboundLedger(ctx context.Context, path string, fn func(*globa
 		return fmt.Errorf("global Teams outbound ledger is locked: %s", path)
 	}
 	defer func() { _ = lock.Unlock() }()
-	ledger, err := readGlobalOutboundLedger(path)
+	db, err := openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
 	if err != nil {
 		return err
 	}
-	now := time.Now()
-	pruneGlobalOutboundLedger(&ledger, now)
-	fn(&ledger, now)
-	pruneGlobalOutboundLedger(&ledger, now)
-	return writeGlobalOutboundLedger(path, ledger)
+	defer func() { _ = db.Close() }()
+	if err := ensureGlobalOutboundSQLite(ctx, db); err != nil {
+		return err
+	}
+	if err := importLegacyGlobalOutboundJSON(ctx, db, path, now); err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, item := range items {
+		if err := upsertGlobalOutboundSQLiteTx(ctx, tx, item, now); err != nil {
+			return err
+		}
+	}
+	if err := pruneGlobalOutboundSQLiteTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func readGlobalOutboundLedger(path string) (globalOutboundLedger, error) {
+	if ledger, ok, err := readGlobalOutboundSQLite(path); ok || err != nil {
+		return ledger, err
+	}
 	var ledger globalOutboundLedger
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -358,18 +368,238 @@ func readGlobalOutboundLedger(path string) (globalOutboundLedger, error) {
 	return ledger, nil
 }
 
-func writeGlobalOutboundLedger(path string, ledger globalOutboundLedger) error {
+func hasGlobalOutboundLedgerItem(ctx context.Context, path string, chatID string, messageID string) (bool, error) {
+	path = strings.TrimSpace(path)
+	chatID = strings.TrimSpace(chatID)
+	messageID = strings.TrimSpace(messageID)
+	if path == "" || chatID == "" || messageID == "" {
+		return false, nil
+	}
+	lock := flock.New(path + ".lock")
+	ok, err := lock.TryLockContext(ctx, globalOutboundLockTimeout)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, fmt.Errorf("global Teams outbound ledger is locked: %s", path)
+	}
+	defer func() { _ = lock.Unlock() }()
+	db, err := openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+	if err := ensureGlobalOutboundSQLite(ctx, db); err != nil {
+		return false, err
+	}
+	if err := importLegacyGlobalOutboundJSON(ctx, db, path, time.Now()); err != nil {
+		return false, err
+	}
+	var raw []byte
+	err = db.QueryRowContext(ctx, `SELECT json FROM outbound_ledger WHERE key = ?`, globalOutboundKey(chatID, messageID)).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func readGlobalOutboundSQLite(path string) (globalOutboundLedger, bool, error) {
+	var ledger globalOutboundLedger
+	sqlitePath := teamsLedgerSQLitePath(path)
+	if sqlitePath == "" {
+		return ledger, false, nil
+	}
+	if _, err := os.Stat(sqlitePath); os.IsNotExist(err) {
+		return ledger, false, nil
+	} else if err != nil {
+		return ledger, false, err
+	}
+	db, err := openTeamsLedgerSQLite(sqlitePath)
+	if err != nil {
+		return ledger, false, err
+	}
+	defer func() { _ = db.Close() }()
+	if err := ensureGlobalOutboundSQLite(context.Background(), db); err != nil {
+		return ledger, false, err
+	}
+	if err := importLegacyGlobalOutboundJSON(context.Background(), db, path, time.Now()); err != nil {
+		return ledger, false, err
+	}
+	rows, err := db.Query(`SELECT json FROM outbound_ledger`)
+	if err != nil {
+		return ledger, false, err
+	}
+	defer rows.Close()
+	ledger.Version = 1
+	ledger.Items = map[string]globalOutboundItem{}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return ledger, false, err
+		}
+		var item globalOutboundItem
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return ledger, false, err
+		}
+		if strings.TrimSpace(item.ChatID) == "" || strings.TrimSpace(item.MessageID) == "" {
+			continue
+		}
+		ledger.Items[globalOutboundKey(item.ChatID, item.MessageID)] = item
+	}
+	if err := rows.Err(); err != nil {
+		return ledger, false, err
+	}
+	return ledger, true, nil
+}
+
+func ensureGlobalOutboundSQLite(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS outbound_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS outbound_ledger (key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id TEXT NOT NULL, updated_at INTEGER NOT NULL, recorded_at INTEGER NOT NULL, teams_created_at INTEGER NOT NULL, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS outbound_ledger_prune_idx ON outbound_ledger(updated_at, recorded_at, teams_created_at, key)`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func importLegacyGlobalOutboundJSON(ctx context.Context, db *sql.DB, path string, now time.Time) error {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		_, err = db.ExecContext(ctx, `INSERT INTO outbound_meta(key, value) VALUES ('legacy_json_token', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	token := fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
+	var existing string
+	err = db.QueryRowContext(ctx, `SELECT value FROM outbound_meta WHERE key = 'legacy_json_token'`).Scan(&existing)
+	if err == nil && existing == token {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	legacy, err := readGlobalOutboundJSON(path)
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, item := range legacy.Items {
+		if err := upsertGlobalOutboundSQLiteTx(ctx, tx, item, now); err != nil {
+			return err
+		}
+	}
+	if err := pruneGlobalOutboundSQLiteTx(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO outbound_meta(key, value) VALUES ('legacy_json_token', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, token); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func readGlobalOutboundJSON(path string) (globalOutboundLedger, error) {
+	var ledger globalOutboundLedger
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		ledger.Version = 1
+		ledger.Items = map[string]globalOutboundItem{}
+		return ledger, nil
+	}
+	if err != nil {
+		return ledger, err
+	}
+	if len(strings.TrimSpace(string(data))) > 0 {
+		if err := json.Unmarshal(data, &ledger); err != nil {
+			return ledger, err
+		}
+	}
 	if ledger.Version == 0 {
 		ledger.Version = 1
 	}
 	if ledger.Items == nil {
 		ledger.Items = map[string]globalOutboundItem{}
 	}
-	data, err := json.MarshalIndent(ledger, "", "  ")
+	return ledger, nil
+}
+
+func upsertGlobalOutboundSQLiteTx(ctx context.Context, tx *sql.Tx, item globalOutboundItem, now time.Time) error {
+	item.ChatID = strings.TrimSpace(item.ChatID)
+	item.MessageID = strings.TrimSpace(item.MessageID)
+	if item.ChatID == "" || item.MessageID == "" {
+		return nil
+	}
+	key := globalOutboundKey(item.ChatID, item.MessageID)
+	if item.RecordedAt.IsZero() {
+		item.RecordedAt = now
+	}
+	if item.UpdatedAt.IsZero() {
+		item.UpdatedAt = now
+	}
+	raw, err := json.Marshal(item)
 	if err != nil {
 		return err
 	}
-	return durableWriteFile(path, data, 0o600)
+	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO outbound_ledger(key, chat_id, message_id, updated_at, recorded_at, teams_created_at, json)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		key, item.ChatID, item.MessageID, item.UpdatedAt.UnixNano(), item.RecordedAt.UnixNano(), item.TeamsCreatedAt.UnixNano(), raw)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 1 {
+		return nil
+	}
+	err = tx.QueryRowContext(ctx, `SELECT json FROM outbound_ledger WHERE key = ?`, key).Scan(&raw)
+	if err == nil {
+		var existing globalOutboundItem
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			return err
+		}
+		item = mergeGlobalOutboundItem(existing, item)
+		item.UpdatedAt = now
+	} else if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	} else {
+		return err
+	}
+	raw, err = json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO outbound_ledger(key, chat_id, message_id, updated_at, recorded_at, teams_created_at, json)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id, updated_at = excluded.updated_at, recorded_at = excluded.recorded_at, teams_created_at = excluded.teams_created_at, json = excluded.json`,
+		key, item.ChatID, item.MessageID, item.UpdatedAt.UnixNano(), item.RecordedAt.UnixNano(), item.TeamsCreatedAt.UnixNano(), raw)
+	return err
+}
+
+func pruneGlobalOutboundSQLiteTx(ctx context.Context, tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM outbound_ledger`).Scan(&count); err != nil {
+		return err
+	}
+	over := count - maxGlobalOutboundLedgerIDs
+	if over <= 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM outbound_ledger WHERE key IN (
+SELECT key FROM outbound_ledger ORDER BY updated_at ASC, recorded_at ASC, teams_created_at ASC, key ASC LIMIT ?
+)`, over)
+	return err
 }
 
 func upsertGlobalOutboundItem(ledger *globalOutboundLedger, item globalOutboundItem, now time.Time) {

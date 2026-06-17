@@ -9,9 +9,13 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1354,42 +1358,56 @@ func TestSQLiteOpenMigratesLegacyChatPollColumns(t *testing.T) {
 	}
 }
 
-func TestSQLiteOfficialTeamsHelperReleaseStoresUpgradeToCurrent(t *testing.T) {
-	type fixtureKind string
-	const (
-		fixtureLegacyJSONV4 fixtureKind = "legacy-json-v4"
-		fixtureLegacyJSONV5 fixtureKind = "legacy-json-v5"
-		fixtureSQLiteV5     fixtureKind = "sqlite-v5"
-	)
-	cases := []struct {
-		tag  string
-		kind fixtureKind
-	}{
-		// v0.1.0 is the first stable release with Teams helper state.
-		{tag: "v0.1.0", kind: fixtureLegacyJSONV4},
-		{tag: "v0.1.1", kind: fixtureLegacyJSONV5},
-		{tag: "v0.1.2", kind: fixtureLegacyJSONV5},
-		// v0.1.3 is the first stable release whose Teams store can already be
-		// a SQLite sidecar. Keep every stable Teams-helper release explicit so a
-		// regression points at the affected upgrade source version.
-		{tag: "v0.1.3", kind: fixtureSQLiteV5},
-		{tag: "v0.1.4", kind: fixtureSQLiteV5},
-		{tag: "v0.1.5", kind: fixtureSQLiteV5},
-		{tag: "v0.1.6", kind: fixtureSQLiteV5},
-		{tag: "v0.1.7", kind: fixtureSQLiteV5},
-		{tag: "v0.1.8", kind: fixtureSQLiteV5},
-		{tag: "v0.1.9", kind: fixtureSQLiteV5},
+type officialReleaseFixtureKind string
+
+const (
+	officialReleaseFixtureNoTeamsStore officialReleaseFixtureKind = "no-teams-store"
+	officialReleaseFixtureLegacyJSONV4 officialReleaseFixtureKind = "legacy-json-v4"
+	officialReleaseFixtureLegacyJSONV5 officialReleaseFixtureKind = "legacy-json-v5"
+	officialReleaseFixtureSQLiteV5     officialReleaseFixtureKind = "sqlite-v5"
+)
+
+type officialReleaseFixtureCase struct {
+	tag  string
+	kind officialReleaseFixtureKind
+}
+
+func officialReleaseUpgradeFixtureCasesForTest() []officialReleaseFixtureCase {
+	return []officialReleaseFixtureCase{
+		// v0.0.48 is the last stable release before the Teams helper store existed.
+		{tag: "v0.0.48", kind: officialReleaseFixtureNoTeamsStore},
+		// Cover every stable Teams-helper release from v0.1.0 onward. Keep the
+		// list explicit so a regression points at the affected upgrade source
+		// version, and add each new final release here when it ships.
+		{tag: "v0.1.0", kind: officialReleaseFixtureLegacyJSONV4},
+		{tag: "v0.1.1", kind: officialReleaseFixtureLegacyJSONV5},
+		{tag: "v0.1.2", kind: officialReleaseFixtureLegacyJSONV5},
+		// v0.1.3 is the first stable release whose Teams store can already be a
+		// SQLite sidecar.
+		{tag: "v0.1.3", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.4", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.5", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.6", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.7", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.8", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.9", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.10", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.11", kind: officialReleaseFixtureSQLiteV5},
 	}
-	for _, tc := range cases {
+}
+
+func TestSQLiteOfficialReleaseStoresUpgradeToCurrent(t *testing.T) {
+	for _, tc := range officialReleaseUpgradeFixtureCasesForTest() {
 		t.Run(tc.tag, func(t *testing.T) {
 			store := newTestStore(t)
 			ctx := context.Background()
 			switch tc.kind {
-			case fixtureLegacyJSONV4:
+			case officialReleaseFixtureNoTeamsStore:
+			case officialReleaseFixtureLegacyJSONV4:
 				seedOfficialReleaseLegacyJSONStoreForTest(t, store, tc.tag, 4)
-			case fixtureLegacyJSONV5:
+			case officialReleaseFixtureLegacyJSONV5:
 				seedOfficialReleaseLegacyJSONStoreForTest(t, store, tc.tag, 5)
-			case fixtureSQLiteV5:
+			case officialReleaseFixtureSQLiteV5:
 				seedOfficialReleaseSQLiteStoreForTest(t, store, tc.tag)
 			default:
 				t.Fatalf("unknown official release fixture kind %q", tc.kind)
@@ -1402,13 +1420,26 @@ func TestSQLiteOfficialTeamsHelperReleaseStoresUpgradeToCurrent(t *testing.T) {
 			if loaded.SchemaVersion != SchemaVersion {
 				t.Fatalf("Load %s schema = %d, want %d", tc.tag, loaded.SchemaVersion, SchemaVersion)
 			}
-			assertOfficialReleaseFixtureLoaded(t, tc.tag, loaded)
+			if tc.kind == officialReleaseFixtureNoTeamsStore {
+				assertOfficialReleaseNoTeamsStoreLoaded(t, tc.tag, loaded)
+			} else {
+				assertOfficialReleaseFixtureLoaded(t, tc.tag, loaded)
+			}
 
 			result, err := store.MigrateLargeStateToSQLite(ctx, 0)
 			if err != nil {
 				t.Fatalf("MigrateLargeStateToSQLite %s fixture: %v", tc.tag, err)
 			}
-			if tc.kind == fixtureSQLiteV5 {
+			if tc.kind == officialReleaseFixtureNoTeamsStore {
+				if result.Migrated || result.AlreadyDB || result.Path != "" || result.MigrationID != "" {
+					t.Fatalf("%s migration result = %#v, want no migration for absent Teams store", tc.tag, result)
+				}
+				if _, err := os.Stat(store.Path()); !os.IsNotExist(err) {
+					t.Fatalf("%s absent Teams store migration created state pointer, stat err = %v", tc.tag, err)
+				}
+				return
+			}
+			if tc.kind == officialReleaseFixtureSQLiteV5 {
 				if !result.AlreadyDB || result.Migrated {
 					t.Fatalf("%s migration result = %#v, want already-db", tc.tag, result)
 				}
@@ -1418,6 +1449,28 @@ func TestSQLiteOfficialTeamsHelperReleaseStoresUpgradeToCurrent(t *testing.T) {
 			assertOfficialReleaseSQLiteSchemaForTest(t, store, tc.tag)
 			assertOfficialReleaseHotPathsForTest(t, store, tc.tag)
 		})
+	}
+}
+
+func TestSQLiteOfficialReleaseFixtureListCoversStableTags(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES") != "1" {
+		t.Skip("set CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1 in CI after fetching tags")
+	}
+	tags := gitStableReleaseTagsForTest(t)
+	want := officialReleaseUpgradeFixtureTagsForStableTags(tags)
+	got := map[string]bool{}
+	for _, tc := range officialReleaseUpgradeFixtureCasesForTest() {
+		got[tc.tag] = true
+	}
+	var missing []string
+	for _, tag := range want {
+		if !got[tag] {
+			missing = append(missing, tag)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("official release upgrade fixtures missing stable tags: %v", missing)
 	}
 }
 
@@ -2078,6 +2131,62 @@ func TestSQLiteMarkOutboxSendErrorDoesNotLoadColdState(t *testing.T) {
 	}
 	if artifact.Path != "canonical/send-error.txt" || artifact.UploadName != "canonical-send-error-upload.txt" || !artifact.CreatedAt.Equal(artifactCreatedAt) {
 		t.Fatalf("artifact preplanned fields were not preserved after send error: %#v", artifact)
+	}
+}
+
+func TestSQLiteSuppressOutboxOwnerMentionDoesNotLoadColdState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	session := testSession()
+	session.ID = "suppress-owner-session"
+	session.TeamsChatID = "suppress-owner-chat"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:           "suppress-owner-outbox",
+		SessionID:    session.ID,
+		TeamsChatID:  session.TeamsChatID,
+		Kind:         "workflow-notification",
+		Body:         "workflow update",
+		Status:       OutboxStatusQueued,
+		MentionOwner: true,
+	})
+	if err != nil || !created {
+		t.Fatalf("QueueOutbox created=%v err=%v", created, err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	sqliteWriteRawStateJSONForTest(t, store, []byte(`{"broken"`))
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	updated, err := store.SuppressOutboxOwnerMention(ctx, msg.ID)
+	if err != nil {
+		t.Fatalf("SuppressOutboxOwnerMention sqlite error: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("SuppressOutboxOwnerMention loaded full state %d times", got)
+	}
+	if updated.MentionOwner {
+		t.Fatalf("updated outbox still mentions owner: %#v", updated)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+	outboxRaw := sqliteRawOutboxJSONForTest(t, store, msg.ID)
+	var outbox OutboxMessage
+	if err := json.Unmarshal(outboxRaw, &outbox); err != nil {
+		t.Fatalf("unmarshal outbox: %v", err)
+	}
+	if outbox.MentionOwner {
+		t.Fatalf("stored outbox still mentions owner: %#v", outbox)
 	}
 }
 
@@ -5756,6 +5865,177 @@ func TestReadAutoUpdateControlSQLiteDoesNotLoadHotTables(t *testing.T) {
 	}
 	if _, err := store.ReadAutoUpdate(ctx); err != nil {
 		t.Fatalf("ReadAutoUpdate should not load corrupt hot inbound row: %v", err)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt hot inbound row")
+	}
+}
+
+func TestSQLiteAutoUpdateRecordsUseRuntimeRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 17, 9, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.AutoUpdate = AutoUpdateState{
+			NextCheckAt: now.Add(-time.Minute),
+			LastCheckAt: now.Add(-time.Hour),
+		}
+		state.InboundEvents["auto-update-hot"] = InboundEvent{
+			ID:        "auto-update-hot",
+			SessionID: "s001",
+			Text:      strings.Repeat("hot payload ", 512),
+			Status:    InboundStatusPersisted,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed auto-update runtime state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeStateJSON := sqliteRawStateJSONForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyAutoUpdate); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"broken"`), "auto-update-hot")
+		if err != nil {
+			return err
+		}
+		if rows, err := res.RowsAffected(); err != nil {
+			return err
+		} else if rows != 1 {
+			return fmt.Errorf("corrupt hot rows = %d, want 1", rows)
+		}
+		return nil
+	})
+
+	checked, err := store.RecordAutoUpdateCheck(ctx, AutoUpdateRecord{
+		Now:              now,
+		NextCheckAt:      now.Add(30 * time.Minute),
+		CandidateTag:     " v9.9.9 ",
+		CandidateVersion: " 9.9.9 ",
+		CandidateAsset:   " asset ",
+	})
+	if err != nil {
+		t.Fatalf("RecordAutoUpdateCheck should not load corrupt hot rows: %v", err)
+	}
+	if checked.CandidateTag != "v9.9.9" || !checked.NextCheckAt.Equal(now.Add(30*time.Minute)) {
+		t.Fatalf("checked auto-update state mismatch: %#v", checked)
+	}
+	if _, err := store.RecordAutoUpdateAttempt(ctx, " v9.9.9 ", now.Add(time.Minute)); err != nil {
+		t.Fatalf("RecordAutoUpdateAttempt should not load corrupt hot rows: %v", err)
+	}
+	installed, err := store.RecordAutoUpdateInstalled(ctx, " v9.9.9 ", now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("RecordAutoUpdateInstalled should not load corrupt hot rows: %v", err)
+	}
+	if installed.LastInstalledTag != "v9.9.9" || installed.CandidateTag != "" {
+		t.Fatalf("installed auto-update state mismatch: %#v", installed)
+	}
+	afterStateJSON := sqliteRawStateJSONForTest(t, store)
+	if !bytes.Equal(afterStateJSON, beforeStateJSON) {
+		t.Fatal("auto-update runtime row update rewrote state_meta state_json")
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyAutoUpdate).Scan(&count); err != nil {
+			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("auto_update runtime rows = %d, want 1", count)
+		}
+		return nil
+	})
+	read, err := store.ReadAutoUpdate(ctx)
+	if err != nil {
+		t.Fatalf("ReadAutoUpdate should not load corrupt hot rows: %v", err)
+	}
+	if read.LastInstalledTag != "v9.9.9" || read.LastAttemptTag != "v9.9.9" {
+		t.Fatalf("read auto-update state mismatch: %#v", read)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt hot inbound row")
+	}
+}
+
+func TestSQLiteServiceControlAndUpgradeUseRuntimeRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 6, 17, 10, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceControl = ServiceControl{Paused: true, Reason: "seeded maintenance", UpdatedAt: now.Add(-time.Hour)}
+		state.InboundEvents["upgrade-hot"] = InboundEvent{
+			ID:        "upgrade-hot",
+			SessionID: "s001",
+			Text:      strings.Repeat("hot payload ", 512),
+			Status:    InboundStatusPersisted,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed service control runtime state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeStateJSON := sqliteRawStateJSONForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_state WHERE key IN (?, ?)`, sqliteRuntimeKeyServiceControl, sqliteRuntimeKeyUpgrade); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"broken"`), "upgrade-hot")
+		if err != nil {
+			return err
+		}
+		if rows, err := res.RowsAffected(); err != nil {
+			return err
+		} else if rows != 1 {
+			return fmt.Errorf("corrupt hot rows = %d, want 1", rows)
+		}
+		return nil
+	})
+
+	control, err := store.SetDraining(ctx, "manual drain")
+	if err != nil {
+		t.Fatalf("SetDraining should not load corrupt hot rows: %v", err)
+	}
+	if !control.Paused || !control.Draining || control.Reason != "manual drain" {
+		t.Fatalf("draining control mismatch: %#v", control)
+	}
+	req, err := store.BeginUpgrade(ctx, HelperUpgradeReason, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("BeginUpgrade should not load corrupt hot rows: %v", err)
+	}
+	if req.ID == "" || req.Phase != UpgradePhaseDraining || req.PreviousControl.Reason != "manual drain" {
+		t.Fatalf("upgrade request mismatch after begin: %#v", req)
+	}
+	if _, err := store.MarkUpgradeReady(ctx, req.ID); err != nil {
+		t.Fatalf("MarkUpgradeReady should not load corrupt hot rows: %v", err)
+	}
+	completed, err := store.CompleteUpgrade(ctx, req.ID, "v9.9.9")
+	if err != nil {
+		t.Fatalf("CompleteUpgrade should not load corrupt hot rows: %v", err)
+	}
+	if completed.Phase != UpgradePhaseCompleted || completed.InstalledTag != "v9.9.9" {
+		t.Fatalf("completed upgrade mismatch: %#v", completed)
+	}
+	afterStateJSON := sqliteRawStateJSONForTest(t, store)
+	if !bytes.Equal(afterStateJSON, beforeStateJSON) {
+		t.Fatal("service-control/upgrade runtime row update rewrote state_meta state_json")
+	}
+	control, err = store.ReadControl(ctx)
+	if err != nil {
+		t.Fatalf("ReadControl should not load corrupt hot rows: %v", err)
+	}
+	if !control.Paused || !control.Draining || control.Reason != "manual drain" {
+		t.Fatalf("restored control mismatch after complete: %#v", control)
+	}
+	readUpgrade, ok, err := store.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade should not load corrupt hot rows: %v", err)
+	}
+	if !ok || readUpgrade.Phase != UpgradePhaseCompleted || readUpgrade.InstalledTag != "v9.9.9" {
+		t.Fatalf("read upgrade mismatch: %#v ok=%v", readUpgrade, ok)
 	}
 	if _, err := store.Load(ctx); err == nil {
 		t.Fatal("full Load unexpectedly succeeded with corrupt hot inbound row")
@@ -12544,6 +12824,99 @@ func seedOfficialReleaseSQLiteStoreForTestWithOptions(t *testing.T, store *Store
 	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
 }
 
+var stableReleaseTagPatternForTest = regexp.MustCompile(`^v([0-9]+)\.([0-9]+)\.([0-9]+)$`)
+
+type stableReleaseVersionForTest struct {
+	major int
+	minor int
+	patch int
+}
+
+func gitStableReleaseTagsForTest(t *testing.T) []string {
+	t.Helper()
+	cmd := exec.Command("git", "tag", "--list", "v*")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("list git tags: %v", err)
+	}
+	var tags []string
+	for _, line := range strings.Split(string(out), "\n") {
+		tag := strings.TrimSpace(line)
+		if tag == "" {
+			continue
+		}
+		if _, ok := parseStableReleaseTagForTest(tag); ok {
+			tags = append(tags, tag)
+		}
+	}
+	if len(tags) == 0 {
+		t.Fatal("no stable release tags found; CI must fetch release tags before running this test")
+	}
+	sort.Strings(tags)
+	return tags
+}
+
+func officialReleaseUpgradeFixtureTagsForStableTags(tags []string) []string {
+	var lastV00 string
+	var lastV00Version stableReleaseVersionForTest
+	include := map[string]bool{}
+	for _, tag := range tags {
+		version, ok := parseStableReleaseTagForTest(tag)
+		if !ok {
+			continue
+		}
+		if version.major == 0 && version.minor == 0 {
+			if lastV00 == "" || stableReleaseVersionLessForTest(lastV00Version, version) {
+				lastV00 = tag
+				lastV00Version = version
+			}
+			continue
+		}
+		if !stableReleaseVersionLessForTest(version, stableReleaseVersionForTest{major: 0, minor: 1, patch: 0}) {
+			include[tag] = true
+		}
+	}
+	if lastV00 != "" {
+		include[lastV00] = true
+	}
+	out := make([]string, 0, len(include))
+	for tag := range include {
+		out = append(out, tag)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func parseStableReleaseTagForTest(tag string) (stableReleaseVersionForTest, bool) {
+	match := stableReleaseTagPatternForTest.FindStringSubmatch(tag)
+	if match == nil {
+		return stableReleaseVersionForTest{}, false
+	}
+	major, err := strconv.Atoi(match[1])
+	if err != nil {
+		return stableReleaseVersionForTest{}, false
+	}
+	minor, err := strconv.Atoi(match[2])
+	if err != nil {
+		return stableReleaseVersionForTest{}, false
+	}
+	patch, err := strconv.Atoi(match[3])
+	if err != nil {
+		return stableReleaseVersionForTest{}, false
+	}
+	return stableReleaseVersionForTest{major: major, minor: minor, patch: patch}, true
+}
+
+func stableReleaseVersionLessForTest(a, b stableReleaseVersionForTest) bool {
+	if a.major != b.major {
+		return a.major < b.major
+	}
+	if a.minor != b.minor {
+		return a.minor < b.minor
+	}
+	return a.patch < b.patch
+}
+
 func officialReleaseUpgradeFixtureState(tag string, schemaVersion int, includeProvenance bool) State {
 	now := time.Date(2026, 6, 10, 10, 30, 0, 0, time.UTC)
 	state := State{
@@ -12911,6 +13284,16 @@ func insertOfficialReleaseSQLiteStateForTestWithOptions(db *sql.DB, state State,
 		return err
 	}
 	return tx.Commit()
+}
+
+func assertOfficialReleaseNoTeamsStoreLoaded(t *testing.T, tag string, state State) {
+	t.Helper()
+	if len(state.Sessions) != 0 || len(state.Turns) != 0 || len(state.InboundEvents) != 0 || len(state.OutboxMessages) != 0 {
+		t.Fatalf("%s should load as empty Teams state before Teams helper existed: %#v", tag, state)
+	}
+	if len(state.ChatPolls) != 0 || len(state.ImportCheckpoints) != 0 || len(state.TranscriptLedger) != 0 || len(state.ArtifactRecords) != 0 {
+		t.Fatalf("%s should not fabricate Teams hot state before Teams helper existed: %#v", tag, state)
+	}
 }
 
 func assertOfficialReleaseFixtureLoaded(t *testing.T, tag string, state State) {

@@ -1712,6 +1712,9 @@ const (
 	sqliteRuntimeKeyControlLease    = "control_lease"
 	sqliteRuntimeKeyServiceOwner    = "service_owner"
 	sqliteRuntimeKeyLockOwner       = "lock_owner"
+	sqliteRuntimeKeyServiceControl  = "service_control"
+	sqliteRuntimeKeyUpgrade         = "upgrade"
+	sqliteRuntimeKeyAutoUpdate      = "auto_update"
 )
 
 var sqliteRuntimeRequiredKeys = []string{
@@ -1723,6 +1726,12 @@ var sqliteRuntimeRequiredKeys = []string{
 	sqliteRuntimeKeyLockOwner,
 }
 
+var sqliteRuntimePersistedKeys = append(append([]string{}, sqliteRuntimeRequiredKeys...),
+	sqliteRuntimeKeyServiceControl,
+	sqliteRuntimeKeyUpgrade,
+	sqliteRuntimeKeyAutoUpdate,
+)
+
 func saveSQLiteRuntimeStateTx(ctx context.Context, tx *sql.Tx, state State) error {
 	values := map[string]any{
 		sqliteRuntimeKeyScope:           state.Scope,
@@ -1731,6 +1740,9 @@ func saveSQLiteRuntimeStateTx(ctx context.Context, tx *sql.Tx, state State) erro
 		sqliteRuntimeKeyControlLease:    state.ControlLease,
 		sqliteRuntimeKeyServiceOwner:    state.ServiceOwner,
 		sqliteRuntimeKeyLockOwner:       state.LockOwner,
+		sqliteRuntimeKeyServiceControl:  state.ServiceControl,
+		sqliteRuntimeKeyUpgrade:         state.Upgrade,
+		sqliteRuntimeKeyAutoUpdate:      state.AutoUpdate,
 	}
 	stmt, err := tx.PrepareContext(ctx, `INSERT INTO runtime_state(key, json) VALUES (?, ?)
 ON CONFLICT(key) DO UPDATE SET json = excluded.json`)
@@ -1738,7 +1750,7 @@ ON CONFLICT(key) DO UPDATE SET json = excluded.json`)
 		return err
 	}
 	defer stmt.Close()
-	for _, key := range sqliteRuntimeRequiredKeys {
+	for _, key := range sqliteRuntimePersistedKeys {
 		data, err := json.Marshal(values[key])
 		if err != nil {
 			return err
@@ -1798,6 +1810,18 @@ func loadSQLiteRuntimeState(ctx context.Context, q interface {
 			if err := json.Unmarshal(raw, &state.LockOwner); err != nil {
 				return State{}, nil, err
 			}
+		case sqliteRuntimeKeyServiceControl:
+			if err := json.Unmarshal(raw, &state.ServiceControl); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyUpgrade:
+			if err := json.Unmarshal(raw, &state.Upgrade); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyAutoUpdate:
+			if err := json.Unmarshal(raw, &state.AutoUpdate); err != nil {
+				return State{}, nil, err
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -1832,7 +1856,39 @@ func overlaySQLiteRuntimeState(ctx context.Context, q interface {
 	state.ControlLease = runtimeState.ControlLease
 	state.ServiceOwner = runtimeState.ServiceOwner
 	state.LockOwner = runtimeState.LockOwner
+	if seen[sqliteRuntimeKeyServiceControl] {
+		state.ServiceControl = runtimeState.ServiceControl
+	}
+	if seen[sqliteRuntimeKeyUpgrade] {
+		state.Upgrade = runtimeState.Upgrade
+	}
+	if seen[sqliteRuntimeKeyAutoUpdate] {
+		state.AutoUpdate = runtimeState.AutoUpdate
+	}
 	state.ensure(time.Time{})
+	return nil
+}
+
+func seedMissingSQLiteRuntimeOptionalState(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, state *State, seen map[string]bool) error {
+	if seen[sqliteRuntimeKeyServiceControl] && seen[sqliteRuntimeKeyUpgrade] && seen[sqliteRuntimeKeyAutoUpdate] {
+		return nil
+	}
+	cold, err := loadSQLiteColdState(ctx, q)
+	if err != nil {
+		return err
+	}
+	if !seen[sqliteRuntimeKeyServiceControl] {
+		state.ServiceControl = cold.ServiceControl
+	}
+	if !seen[sqliteRuntimeKeyUpgrade] {
+		state.Upgrade = cold.Upgrade
+	}
+	if !seen[sqliteRuntimeKeyAutoUpdate] {
+		state.AutoUpdate = cold.AutoUpdate
+	}
 	return nil
 }
 
@@ -1858,14 +1914,17 @@ func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) er
 			return err
 		}
 		seedRuntime := !sqliteRuntimeStateUsable(seen)
+		seedOptional := !seen[sqliteRuntimeKeyServiceControl] || !seen[sqliteRuntimeKeyUpgrade] || !seen[sqliteRuntimeKeyAutoUpdate]
 		if seedRuntime {
 			state, err = loadSQLiteColdState(ctx, tx)
 			if err != nil {
 				return err
 			}
+		} else if err := seedMissingSQLiteRuntimeOptionalState(ctx, tx, &state, seen); err != nil {
+			return err
 		}
 		if err := fn(&state); err != nil {
-			if errors.Is(err, errStoreNoChange) && seedRuntime {
+			if errors.Is(err, errStoreNoChange) && (seedRuntime || seedOptional) {
 				state.ensure(time.Now())
 				if saveErr := saveSQLiteRuntimeStateTx(ctx, tx, state); saveErr != nil {
 					return saveErr

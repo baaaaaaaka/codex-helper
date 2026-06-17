@@ -2,7 +2,9 @@ package teams
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -87,6 +89,122 @@ func TestGlobalOutboundLedgerRecordLifecycle(t *testing.T) {
 	}
 }
 
+func TestGlobalOutboundLedgerMigratesLegacyJSONWithoutRewrite(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "teams", "global-outbound-ledger.json")
+	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	legacy := globalOutboundLedger{
+		Version: 1,
+		Items: map[string]globalOutboundItem{
+			globalOutboundKey("control-chat", "legacy-message"): {
+				ChatID:     "control-chat",
+				MessageID:  "legacy-message",
+				ScopeID:    "scope-a",
+				OutboxID:   "legacy-outbox",
+				Kind:       "final",
+				Origin:     teamstore.MessageOriginHelperOutbox,
+				RecordedAt: now.Add(-time.Hour),
+				UpdatedAt:  now.Add(-time.Hour),
+			},
+		},
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir legacy outbound ledger: %v", err)
+	}
+	raw, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal legacy outbound ledger: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write legacy outbound ledger: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read legacy outbound before: %v", err)
+	}
+
+	if err := recordGlobalOutbound(ctx, path, globalOutboundItem{
+		ChatID:     "control-chat",
+		MessageID:  "new-message",
+		ScopeID:    "scope-a",
+		OutboxID:   "new-outbox",
+		Kind:       "progress",
+		Origin:     teamstore.MessageOriginHelperOutbox,
+		RecordedAt: now,
+	}, now); err != nil {
+		t.Fatalf("record migrated outbound ledger: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read legacy outbound after: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("recording outbound ledger rewrote legacy JSON")
+	}
+	if _, err := os.Stat(teamsLedgerSQLitePath(path)); err != nil {
+		t.Fatalf("stat outbound sqlite sidecar: %v", err)
+	}
+	got, err := readGlobalOutboundLedger(path)
+	if err != nil {
+		t.Fatalf("read migrated outbound ledger: %v", err)
+	}
+	if _, ok := got.Items[globalOutboundKey("control-chat", "legacy-message")]; !ok {
+		t.Fatalf("migrated ledger missing legacy item: %#v", got.Items)
+	}
+	if _, ok := got.Items[globalOutboundKey("control-chat", "new-message")]; !ok {
+		t.Fatalf("migrated ledger missing new item: %#v", got.Items)
+	}
+}
+
+func TestGlobalOutboundLedgerReadRecoversPartialSQLiteSidecar(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "teams", "global-outbound-ledger.json")
+	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	legacy := globalOutboundLedger{
+		Version: 1,
+		Items: map[string]globalOutboundItem{
+			globalOutboundKey("control-chat", "legacy-message"): {
+				ChatID:     "control-chat",
+				MessageID:  "legacy-message",
+				ScopeID:    "scope-a",
+				OutboxID:   "legacy-outbox",
+				Kind:       "final",
+				Origin:     teamstore.MessageOriginHelperOutbox,
+				RecordedAt: now,
+				UpdatedAt:  now,
+			},
+		},
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir legacy outbound ledger: %v", err)
+	}
+	raw, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal legacy outbound ledger: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write legacy outbound ledger: %v", err)
+	}
+	db, err := openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
+	if err != nil {
+		t.Fatalf("open partial outbound sqlite sidecar: %v", err)
+	}
+	if err := ensureGlobalOutboundSQLite(context.Background(), db); err != nil {
+		_ = db.Close()
+		t.Fatalf("create partial outbound sqlite sidecar: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close partial outbound sqlite sidecar: %v", err)
+	}
+
+	got, err := readGlobalOutboundLedger(path)
+	if err != nil {
+		t.Fatalf("read partial outbound sqlite sidecar: %v", err)
+	}
+	if _, ok := got.Items[globalOutboundKey("control-chat", "legacy-message")]; !ok {
+		t.Fatalf("partial outbound sqlite read did not recover legacy item: %#v", got.Items)
+	}
+}
+
 func BenchmarkGlobalOutboundLedgerRecord(b *testing.B) {
 	ctx := context.Background()
 	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
@@ -104,14 +222,37 @@ func BenchmarkGlobalOutboundLedgerRecord(b *testing.B) {
 			RecordedAt: now,
 		}
 	}
-	b.Run("json", func(b *testing.B) {
+	b.Run("sqlite-empty", func(b *testing.B) {
 		path := filepath.Join(b.TempDir(), "teams", "global-outbound-ledger.json")
 		b.ReportAllocs()
+		beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if err := recordGlobalOutbound(ctx, path, itemFor(i), now); err != nil {
-				b.Fatalf("record JSON global outbound: %v", err)
+				b.Fatalf("record SQLite global outbound: %v", err)
 			}
 		}
+		b.StopTimer()
+		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
+	})
+	b.Run("sqlite-full", func(b *testing.B) {
+		path := filepath.Join(b.TempDir(), "teams", "global-outbound-ledger.json")
+		var seed []globalOutboundItem
+		for i := 0; i < maxGlobalOutboundLedgerIDs; i++ {
+			seed = append(seed, itemFor(i))
+		}
+		if err := recordGlobalOutboundBatch(ctx, path, seed, now); err != nil {
+			b.Fatalf("seed full global outbound ledger: %v", err)
+		}
+		b.ReportAllocs()
+		beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := recordGlobalOutbound(ctx, path, itemFor(maxGlobalOutboundLedgerIDs+i), now.Add(time.Duration(i)*time.Second)); err != nil {
+				b.Fatalf("record full SQLite global outbound: %v", err)
+			}
+		}
+		b.StopTimer()
+		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
 	})
 }

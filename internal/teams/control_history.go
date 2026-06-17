@@ -3,10 +3,13 @@ package teams
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,18 +118,18 @@ func appendControlChatHistoryEntry(ctx context.Context, path string, entry contr
 	}
 	defer func() { _ = lock.Unlock() }()
 
-	entries, err := readControlChatHistoryEntries(path)
+	db, err := openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
 	if err != nil {
 		return err
 	}
-	for _, existing := range entries {
-		if controlChatHistorySameMessage(existing, entry) {
-			return nil
-		}
+	defer func() { _ = db.Close() }()
+	if err := ensureControlChatHistorySQLite(ctx, db); err != nil {
+		return err
 	}
-	entries = append(entries, entry)
-	entries = pruneControlChatHistoryEntries(entries)
-	return writeControlChatHistoryEntries(path, entries)
+	if err := importLegacyControlChatHistoryJSONL(ctx, db, path); err != nil {
+		return err
+	}
+	return appendControlChatHistorySQLite(ctx, db, entry)
 }
 
 func normalizeControlChatHistoryEntry(entry controlChatHistoryEntry) controlChatHistoryEntry {
@@ -163,6 +166,13 @@ func readControlChatHistoryEntries(path string) ([]controlChatHistoryEntry, erro
 	if path == "" {
 		return nil, nil
 	}
+	if entries, ok, err := readControlChatHistorySQLite(path); ok || err != nil {
+		return entries, err
+	}
+	return readControlChatHistoryJSONL(path)
+}
+
+func readControlChatHistoryJSONL(path string) ([]controlChatHistoryEntry, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -192,23 +202,164 @@ func readControlChatHistoryEntries(path string) ([]controlChatHistoryEntry, erro
 	return entries, nil
 }
 
-func writeControlChatHistoryEntries(path string, entries []controlChatHistoryEntry) error {
-	var b strings.Builder
-	enc := json.NewEncoder(&b)
-	enc.SetEscapeHTML(false)
-	for _, entry := range entries {
-		if err := enc.Encode(normalizeControlChatHistoryEntry(entry)); err != nil {
+func readControlChatHistorySQLite(path string) ([]controlChatHistoryEntry, bool, error) {
+	sqlitePath := teamsLedgerSQLitePath(path)
+	if sqlitePath == "" {
+		return nil, false, nil
+	}
+	if _, err := os.Stat(sqlitePath); os.IsNotExist(err) {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, false, err
+	}
+	db, err := openTeamsLedgerSQLite(sqlitePath)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = db.Close() }()
+	if err := ensureControlChatHistorySQLite(context.Background(), db); err != nil {
+		return nil, false, err
+	}
+	if err := importLegacyControlChatHistoryJSONL(context.Background(), db, path); err != nil {
+		return nil, false, err
+	}
+	rows, err := db.Query(`SELECT json FROM control_history ORDER BY created_at ASC, rowid ASC`)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	var entries []controlChatHistoryEntry
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, false, err
+		}
+		var entry controlChatHistoryEntry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return nil, false, err
+		}
+		entries = append(entries, normalizeControlChatHistoryEntry(entry))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return entries, true, nil
+}
+
+func ensureControlChatHistorySQLite(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS control_history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS control_history (key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id TEXT NOT NULL, direction TEXT NOT NULL, kind TEXT NOT NULL, created_at INTEGER NOT NULL, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS control_history_created_idx ON control_history(created_at, key)`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
-	return durableWriteFile(path, []byte(b.String()), 0o600)
+	return nil
 }
 
-func pruneControlChatHistoryEntries(entries []controlChatHistoryEntry) []controlChatHistoryEntry {
-	if len(entries) <= maxControlChatHistoryEntries {
-		return entries
+func importLegacyControlChatHistoryJSONL(ctx context.Context, db *sql.DB, path string) error {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		_, err = db.ExecContext(ctx, `INSERT INTO control_history_meta(key, value) VALUES ('legacy_jsonl_token', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+		return err
 	}
-	return append([]controlChatHistoryEntry(nil), entries[len(entries)-maxControlChatHistoryEntries:]...)
+	if err != nil {
+		return err
+	}
+	token := fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
+	var existing string
+	err = db.QueryRowContext(ctx, `SELECT value FROM control_history_meta WHERE key = 'legacy_jsonl_token'`).Scan(&existing)
+	if err == nil && existing == token {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	entries, err := readControlChatHistoryJSONL(path)
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, entry := range entries {
+		if err := upsertControlChatHistorySQLiteTx(ctx, tx, entry); err != nil {
+			return err
+		}
+	}
+	if err := pruneControlChatHistorySQLiteTx(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO control_history_meta(key, value) VALUES ('legacy_jsonl_token', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, token); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func appendControlChatHistorySQLite(ctx context.Context, db *sql.DB, entry controlChatHistoryEntry) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if strings.TrimSpace(entry.MessageID) != "" {
+		var raw []byte
+		err := tx.QueryRowContext(ctx, `SELECT json FROM control_history WHERE key = ?`, controlChatHistoryEntryKey(entry)).Scan(&raw)
+		if err == nil {
+			return nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	if err := upsertControlChatHistorySQLiteTx(ctx, tx, entry); err != nil {
+		return err
+	}
+	if err := pruneControlChatHistorySQLiteTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertControlChatHistorySQLiteTx(ctx context.Context, tx *sql.Tx, entry controlChatHistoryEntry) error {
+	entry = normalizeControlChatHistoryEntry(entry)
+	key := controlChatHistoryEntryKey(entry)
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO control_history(key, chat_id, message_id, direction, kind, created_at, json)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id, direction = excluded.direction, kind = excluded.kind, created_at = excluded.created_at, json = excluded.json`,
+		key, entry.ChatID, entry.MessageID, entry.Direction, entry.Kind, entry.CreatedAt.UnixNano(), raw)
+	return err
+}
+
+func pruneControlChatHistorySQLiteTx(ctx context.Context, tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM control_history`).Scan(&count); err != nil {
+		return err
+	}
+	over := count - maxControlChatHistoryEntries
+	if over <= 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM control_history WHERE key IN (
+SELECT key FROM control_history ORDER BY created_at ASC, rowid ASC LIMIT ?
+)`, over)
+	return err
+}
+
+func controlChatHistoryEntryKey(entry controlChatHistoryEntry) string {
+	entry = normalizeControlChatHistoryEntry(entry)
+	if strings.TrimSpace(entry.MessageID) != "" {
+		return strings.Join([]string{entry.ChatID, entry.MessageID, entry.Direction, entry.Kind}, "\x00")
+	}
+	return strings.Join([]string{"anonymous", entry.ChatID, entry.Direction, entry.Kind, strconv.FormatInt(entry.CreatedAt.UnixNano(), 10), normalizedTextHash(entry.Text)}, "\x00")
 }
 
 func (b *Bridge) controlChatHistoryPromptContext(excludeMessageID string) (string, string) {
