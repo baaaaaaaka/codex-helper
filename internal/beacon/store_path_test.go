@@ -8,17 +8,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 )
 
 func TestDefaultStorePathMigratesLegacyStateWhenNewDirExists(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", filepath.Join(tmp, "home"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
-	t.Setenv("CODEX_HELPER_BEACON_STORE", "")
+	legacyPath, newPath := isolateBeaconStoreDirsForTest(t, tmp)
 
-	legacyPath := filepath.Join(tmp, "cache", "codex-helper", "beacon", "state.json")
-	newDir := filepath.Join(tmp, "state", "codex-helper", "beacon")
+	newDir := filepath.Dir(newPath)
 	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
 		t.Fatalf("mkdir legacy: %v", err)
 	}
@@ -33,24 +31,17 @@ func TestDefaultStorePathMigratesLegacyStateWhenNewDirExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultStorePath: %v", err)
 	}
-	want := filepath.Join(newDir, "state.json")
-	if got != want {
-		t.Fatalf("DefaultStorePath = %q, want %q", got, want)
+	if got != newPath {
+		t.Fatalf("DefaultStorePath = %q, want %q", got, newPath)
 	}
-	if data, err := os.ReadFile(want); err != nil || string(data) != `{"version":1}` {
+	if data, err := os.ReadFile(newPath); err != nil || string(data) != `{"version":1}` {
 		t.Fatalf("migrated state = %q err=%v", data, err)
 	}
 }
 
 func TestDefaultStorePathRefreshesStaleMigratedStateCI(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", filepath.Join(tmp, "home"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
-	t.Setenv("CODEX_HELPER_BEACON_STORE", "")
-
-	legacyPath := filepath.Join(tmp, "cache", "codex-helper", "beacon", "state.json")
-	newPath := filepath.Join(tmp, "state", "codex-helper", "beacon", "state.json")
+	legacyPath, newPath := isolateBeaconStoreDirsForTest(t, tmp)
 	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
 		t.Fatalf("mkdir legacy: %v", err)
 	}
@@ -84,13 +75,7 @@ func TestDefaultStorePathRefreshesStaleMigratedStateCI(t *testing.T) {
 
 func TestDefaultStorePathRefreshesCorruptNewStateCI(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", filepath.Join(tmp, "home"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
-	t.Setenv("CODEX_HELPER_BEACON_STORE", "")
-
-	legacyPath := filepath.Join(tmp, "cache", "codex-helper", "beacon", "state.json")
-	newPath := filepath.Join(tmp, "state", "codex-helper", "beacon", "state.json")
+	legacyPath, newPath := isolateBeaconStoreDirsForTest(t, tmp)
 	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
 		t.Fatalf("mkdir legacy: %v", err)
 	}
@@ -118,13 +103,7 @@ func TestDefaultStorePathRefreshesCorruptNewStateCI(t *testing.T) {
 
 func TestDefaultStorePathRefreshesEqualMTimeDivergentStateCI(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", filepath.Join(tmp, "home"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
-	t.Setenv("CODEX_HELPER_BEACON_STORE", "")
-
-	legacyPath := filepath.Join(tmp, "cache", "codex-helper", "beacon", "state.json")
-	newPath := filepath.Join(tmp, "state", "codex-helper", "beacon", "state.json")
+	legacyPath, newPath := isolateBeaconStoreDirsForTest(t, tmp)
 	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
 		t.Fatalf("mkdir legacy: %v", err)
 	}
@@ -161,11 +140,7 @@ func TestDefaultStorePathSubprocessMigrationStressCI(t *testing.T) {
 		t.Skip("parent stress only")
 	}
 	tmp := t.TempDir()
-	t.Setenv("HOME", filepath.Join(tmp, "home"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
-	t.Setenv("CODEX_HELPER_BEACON_STORE", "")
-	legacyPath := filepath.Join(tmp, "cache", "codex-helper", "beacon", "state.json")
+	legacyPath, newPath := isolateBeaconStoreDirsForTest(t, tmp)
 	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
 		t.Fatalf("mkdir legacy: %v", err)
 	}
@@ -193,8 +168,7 @@ func TestDefaultStorePathSubprocessMigrationStressCI(t *testing.T) {
 			t.Fatalf("worker %d failed: %v\n%s", i, err, procs[i].out.String())
 		}
 	}
-	want := filepath.Join(tmp, "state", "codex-helper", "beacon", "state.json")
-	if data, err := os.ReadFile(want); err != nil || !strings.Contains(string(data), `"worker"`) {
+	if data, err := os.ReadFile(newPath); err != nil || !strings.Contains(string(data), `"worker"`) {
 		t.Fatalf("migrated beacon state = %q err=%v", data, err)
 	}
 }
@@ -217,4 +191,26 @@ func TestDefaultStorePathSubprocessMigrationWorkerCI(t *testing.T) {
 	if !strings.Contains(string(data), `"worker"`) {
 		t.Fatalf("migrated beacon state = %q, want worker profile", data)
 	}
+}
+
+func isolateBeaconStoreDirsForTest(t *testing.T, tmp string) (string, string) {
+	t.Helper()
+	home := filepath.Join(tmp, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "localappdata"))
+	t.Setenv("APPDATA", filepath.Join(tmp, "appdata"))
+	t.Setenv("CODEX_HELPER_BEACON_STORE", "")
+
+	legacyPath, err := appdirs.LegacyCachePath("beacon", "state.json")
+	if err != nil {
+		t.Fatalf("legacy beacon path: %v", err)
+	}
+	newPath, err := appdirs.StatePath("beacon", "state.json")
+	if err != nil {
+		t.Fatalf("state beacon path: %v", err)
+	}
+	return legacyPath, newPath
 }
