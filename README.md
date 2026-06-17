@@ -1,5 +1,8 @@
 # codex-proxy
 
+> Chinese readers: [中文快速入口](README.zh-CN.md). The English README remains
+> the default and complete reference.
+
 Run `codex` (or any command) through an SSH-backed local proxy stack:
 
 - **Upstream**: `ssh -D 127.0.0.1:<port>` SOCKS5 tunnel
