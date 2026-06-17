@@ -79,16 +79,26 @@ func TestTeamsStoreAndRegistryPathsSkipMigratedLegacyMirrors(t *testing.T) {
 	legacyScopedStore := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_dup", "state.json")
 	newScopedStore := cliStatePathForTest(t, "teams", "scopes", "scope_dup", "state.json")
 	migratedStoreBody := `{"version":1}`
-	for path, body := range map[string]string{
-		legacyStore:       migratedStoreBody,
-		legacyScopedStore: migratedStoreBody,
-		newScopedStore:    migratedStoreBody,
+	for _, fixture := range []struct {
+		path string
+		body string
+	}{
+		{path: legacyStore, body: migratedStoreBody},
+		{path: legacyScopedStore, body: migratedStoreBody},
+		{path: newScopedStore, body: migratedStoreBody},
 	} {
+		path := fixture.path
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(fixture.body), 0o600); err != nil {
 			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	migratedMTime := time.Unix(1_700_000_001, 0)
+	for _, path := range []string{legacyScopedStore, newScopedStore} {
+		if err := os.Chtimes(path, migratedMTime, migratedMTime); err != nil {
+			t.Fatalf("chtime migrated store %s: %v", path, err)
 		}
 	}
 	storePaths, err := teamsStorePaths()
@@ -104,16 +114,26 @@ func TestTeamsStoreAndRegistryPathsSkipMigratedLegacyMirrors(t *testing.T) {
 	legacyRegistry := filepath.Join(cacheBase, "codex-helper", "teams-registry.json")
 	legacyScopedRegistry := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", "scope_dup", "registry.json")
 	newScopedRegistry := cliStatePathForTest(t, "teams", "scopes", "scope_dup", "registry.json")
-	for path, body := range map[string]string{
-		legacyRegistry:       `{"version":1}`,
-		legacyScopedRegistry: `{"version":1,"legacy":true}`,
-		newScopedRegistry:    `{"version":1,"new":true}`,
+	migratedRegistryBody := `{"version":1,"scope":"dup"}`
+	for _, fixture := range []struct {
+		path string
+		body string
+	}{
+		{path: legacyRegistry, body: `{"version":1}`},
+		{path: legacyScopedRegistry, body: migratedRegistryBody},
+		{path: newScopedRegistry, body: migratedRegistryBody},
 	} {
+		path := fixture.path
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(fixture.body), 0o600); err != nil {
 			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	for _, path := range []string{legacyScopedRegistry, newScopedRegistry} {
+		if err := os.Chtimes(path, migratedMTime, migratedMTime); err != nil {
+			t.Fatalf("chtime migrated registry %s: %v", path, err)
 		}
 	}
 	registryPaths, err := teamsRegistryPaths("")
