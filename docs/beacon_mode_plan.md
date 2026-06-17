@@ -89,15 +89,15 @@ right scope and, when safe, a read-only status summary.
 Minimum command surface:
 
 - `new`: local execution on the current `cxp` or Teams service machine unless
-  `--beacon-profile` is explicitly provided.
-- `new --beacon-profile <name> [--beacon-isolation shared|exclusive]`: create a
+  `--beacon` is explicitly provided.
+- `new --beacon <name> [--beacon-isolation shared|exclusive]`: create a
   conversation with an explicit beacon target.
 - `beacon profile list|create|status|edit|delete|doctor|confirm`: profile
   lifecycle, including drafts.
 - `beacon status`: current target, pending target, turn snapshot, proxy route,
   allocation/lease/job ids, provider state/reason, and next action.
 - `beacon machine list|status|release|kill`: machine/lease operations.
-- `beacon switch-profile <name> [--fork]`: change the current conversation's
+- `beacon switch <name> [--fork]`: change the current conversation's
   default target for future turns, or fork when the execution signature is
   incompatible.
 
@@ -143,7 +143,7 @@ Profile-switch acknowledgement must be explicit:
 
 - current/running turn stays on the original target
 - turns queued before the switch keep their original snapshot
-- a normal compatible `beacon switch-profile <name>` while work is queued or
+- a normal compatible `beacon switch <name>` while work is queued or
   running schedules the pending target by default; no hidden mode is required
 - turns queued after the switch use the pending target
 - status shows current target, pending target, and per-turn snapshot

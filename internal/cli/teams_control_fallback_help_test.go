@@ -12,9 +12,23 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 	for _, want := range []string{
 		"cxp / codex-proxy CLI digest:",
 		"`cxp proxy reset`",
+		"`cxp run --yolo -- codex`",
+		"`cxp run --model-profile <name> -- codex`",
+		"`cxp model` and `cxp model-profile`",
+		"`cxp model list`",
+		"`cxp model-profile setup [name]",
+		"`cxp responses serve`",
+		"`cxp app --model-profile <name>`",
+		"`Ctrl+Y`",
+		"`Ctrl+K`",
 		"`cxp teams status`",
 		"`cxp teams doctor`",
 		"`cxp teams service bootstrap`",
+		"`cxp teams workflow status|enable|disable|test`",
+		"`cxp teams send-file <path> --session <session-id>`",
+		"`cxp teams probe-chat --chat <teams-chat-id-or-link>`",
+		"`cxp teams pause|resume|drain|recover`",
+		"`cxp teams chat recreate <session-id> --yes`",
 		"`cxp beacon profile create <name>",
 		"`cxp beacon profile update <name>",
 		"`cxp beacon profile history <name>`",
@@ -49,6 +63,9 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`helper skills add <github/gitlab/git-url>`",
 		"`helper skills sync [name]`",
 		"`helper skills push [name]`",
+		"`new <directory> --model <profile>`",
+		"`model list`",
+		"`model status`",
 		"`helper update prerelease`",
 		"`helper cancel last`",
 		"`helper cancel all`",
@@ -87,6 +104,16 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 		fallback []string
 		docs     []string
 	}{
+		{
+			name:     "model profiles and yolo",
+			fallback: []string{"run --yolo -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+Y", "Ctrl+K"},
+			docs:     []string{"run --yolo -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+Y", "Ctrl+K"},
+		},
+		{
+			name:     "teams model commands",
+			fallback: []string{"new <directory> --model <profile>", "model list", "model status", "model switch <profile>", "model fork <profile>"},
+			docs:     []string{"new <directory> --model", "model list", "model status", "model switch", "model fork"},
+		},
 		{
 			name:     "profile lifecycle",
 			fallback: []string{"beacon profile create <name>", "beacon profile update <name>", "beacon profile history <name>", "beacon profile rollback <name> <revision>", "beacon profile gc <name>", "beacon profile doctor <name>", "beacon profile confirm <name>"},

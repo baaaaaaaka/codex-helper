@@ -12,11 +12,29 @@
 ## Codex Launching
 
 - `cxp`: open the local Codex history TUI.
-- `cxp tui`: open the local Codex history TUI explicitly.
+- `cxp tui`: open the local Codex history TUI explicitly. Press `Ctrl+Y` before opening/starting a session to toggle YOLO mode, and `Ctrl+K` to open the skills menu.
 - `cxp app [profile]`: install the Codex desktop app if needed, use or configure proxy mode, and launch the desktop app on macOS, Windows, or WSL. Linux outside WSL has no official Codex desktop app. If a proxy profile is literally named `app` or `auth`, use `cxp tui app`, `cxp app --profile auth`, or `cxp app auth --profile auth` to avoid command-name ambiguity.
 - `cxp app auth [profile]`: complete ChatGPT auth for the Codex desktop app through a temporary Codex app-server using the same CODEX_HOME and proxy setup as `cxp app`.
+- `cxp app --model-profile <name>`: launch the desktop app with a saved model profile through an isolated CODEX_HOME; quit an already-running app first so the setting takes effect.
 - `cxp run [profile] -- <cmd args...>`: run a command through the selected proxy profile and helper runtime handling.
+- `cxp run --yolo -- codex`: launch Codex with YOLO mode enabled for this run.
+- `cxp run --model-profile <name> -- codex`: launch Codex with a saved model profile for this run.
 - `cxp init`: create or repair local proxy configuration interactively.
+
+## Model Profiles And Responses Adapter
+
+- `cxp model list`: list built-in model choices and setup status.
+- `cxp model setup <model> --api-key-stdin`: configure a built-in third-party model choice using an API key read from stdin.
+- `cxp model setup <model> --api-key-env <ENV>`: configure a built-in model choice using an API key environment variable.
+- `cxp model use <model>`: make a configured model the default for future Codex launches.
+- `cxp model doctor [model]`: validate the profile backing a built-in model choice.
+- `cxp model-profile setup [name] --provider deepseek|mimo|kimi|glm|minimax|qwen --model <provider-model> --api-key-stdin --set-default`: create or update a named profile.
+- `cxp model-profile setup [name] ... --ssh-proxy <proxy-profile>`: route a model profile through an existing SSH proxy profile.
+- `cxp model-profile list`: list saved model profiles.
+- `cxp model-profile doctor [name]`: validate a saved model profile.
+- `cxp model-profile set-default <name>`: set the default model profile.
+- `cxp model-profile delete <name>`: delete a non-default model profile.
+- `cxp responses serve --base-url <openai-compatible-url> --api-key-env <ENV> --model <model>`: run a local `/v1/responses` adapter backed by an OpenAI-compatible chat upstream.
 
 ## Proxy Profiles
 
@@ -109,6 +127,11 @@ Scheduler-capable CI can opt in to the real adapter test with `CODEX_HELPER_BEAC
 - On Linux, service auto mode prefers `systemd --user`; if no user manager is usable, it falls back to `local-supervisor`, which survives terminal close and helper crashes but not machine/container reboot. Enabled or active local-supervisor installs stay sticky to avoid backend flapping; in WSL, the Windows Task backend remains preferred unless local-supervisor is sticky or explicitly selected.
 - `cxp teams auth full`: refresh full Teams auth locally.
 - `cxp teams auth full-status`: inspect auth cache expiry without printing tokens.
+- `cxp teams workflow status|enable|disable|test`: configure optional Teams Workflow notification cards; store the webhook URL in a private local file and pass that file path.
+- `cxp teams send-file <path> --session <session-id>`: upload a local outbound file and send it as a Teams attachment.
+- `cxp teams probe-chat --chat <teams-chat-id-or-link>`: read-only probe of an external Teams chat without binding helper state unless `--send-test` is used.
+- `cxp teams pause`, `cxp teams resume`, `cxp teams drain`, and `cxp teams recover`: local helper lifecycle controls for diagnosis and recovery.
+- `cxp teams chat recreate <session-id> --yes`: create and bind a fresh Work chat for an existing helper session.
 
 From a Teams-launched Codex child turn, do not restart, reload, update, kill, replace, or background the running helper directly. For normal installed helpers, tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates. Use `helper reload now` only for source-checkout development reloads when the helper has access to a local `codex-helper` source tree.
 
@@ -120,10 +143,12 @@ Control chat commands:
 - `project <number>` or `p <number>`: open a workspace.
 - `sessions`, `s`, or `history`: list local Codex sessions.
 - `new <directory>` or `n <directory>`: create a Work chat for a directory.
+- `new <directory> --model <profile>` or `new <directory> --model-profile <profile>`: create a Work chat pinned to a model profile.
 - `new` or `n`: create a Work chat for the currently selected workspace.
 - `continue <number-or-session-id>` or `c <...>`: create or open a Work chat for an existing session.
 - `open <number>`: show an existing linked Work chat.
 - `status` or `st`: list active Work chats.
+- `model list`, `model setup <model>`, `model use <model>`, and `model doctor <model>`: list, configure, select, or validate model profiles from Teams.
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running control-chat Codex question(s).
 - `helper update now`: update to the latest stable helper release.
 - `helper update prerelease`: update to the newest eligible release or pre-release.
@@ -137,6 +162,7 @@ Work chat commands:
 - `helper retry last`: retry the last failed or interrupted request.
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running work.
 - `helper file <relative-path>`: upload a generated file from the Teams outbound folder.
+- `model status`, `model switch <profile>`, and `model fork <profile>`: inspect, switch when compatible, or fork the Work chat with another model profile.
 - `helper close`: close the Work chat binding.
 
 ## Skills

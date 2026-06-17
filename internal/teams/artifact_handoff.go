@@ -93,11 +93,13 @@ Control chat commands the helper understands:
 - project <number>: list sessions in a workspace shown by projects
 - sessions or history: list known Codex sessions
 - new <directory>: create a new Teams work chat for a directory
+- new <directory> --model <profile>: create a new Teams work chat pinned to a model profile
 - new: create a Teams work chat for the currently selected workspace
 - mkdir <directory>: create a workspace directory
 - continue <number-or-session-id>: create a Teams work chat for an existing Codex session and import history
 - open <number>: show the linked Teams work chat for a session
 - status: show current helper sessions
+- model list, model setup <model>, model use <model>, model doctor <model>: manage model profiles from the control chat
 - skills or helper skills list: list installed skill subscriptions
 - helper skills add <github/gitlab/git-url>: install skills from a git source and keep them updated in the user agents skills directory
 - helper skills sync [name]: sync one skill source, or all sources when no name is given
@@ -110,11 +112,20 @@ Work chat helper commands:
 - helper cancel last, helper cancel queued, helper cancel running, helper cancel all, or helper cancel <turn-id>: cancel or drop queued/running request(s)
 - helper file <relative-path>: upload a generated file from the Teams outbound folder
 - helper skills list, helper skills add <url>, helper skills sync [name], or helper skills push [name]: inspect or sync skill subscriptions
+- model status, model switch <profile>, or model fork <profile>: inspect, switch when compatible, or fork the Work chat with another model profile
 - helper close: close the Work chat binding
 
 Local cxp skills commands:
 - cxp skills install-builtin: install or repair bundled local skills such as the cxp usage skill in $HOME/.agents/skills
 - cxp skills migrate: migrate managed legacy skills from ~/.codex/skills to $HOME/.agents/skills
+
+Local cxp model/profile commands:
+- cxp run --yolo -- codex: launch Codex with YOLO mode enabled for one run
+- cxp run --model-profile <name> -- codex: launch Codex with a saved model profile for one run
+- cxp model list/setup/use/doctor: list, configure, select, or validate built-in model choices
+- cxp model-profile setup/list/doctor/set-default/delete: create and manage named model profiles
+- cxp responses serve --base-url <url> --api-key-env <ENV> --model <model>: run a local Responses adapter for an OpenAI-compatible chat upstream
+- cxp app --model-profile <name>: launch the Codex desktop app with a saved model profile
 
 Local cxp beacon commands:
 - cxp beacon profile list: list beacon profiles
@@ -224,6 +235,14 @@ func defaultControlFallbackHelpDigest() string {
 	return strings.Join([]string{
 		"Control chat quick help:",
 		controlAdvancedHelpText(),
+		"",
+		"Model/profile quick help:",
+		"`cxp run --yolo -- codex` - launch Codex with YOLO mode enabled for one run",
+		"`cxp run --model-profile <name> -- codex` - launch Codex with a saved model profile for one run",
+		"`cxp model list` / `setup <model>` / `use <model>` / `doctor <model>` - manage built-in model choices",
+		"`cxp model-profile setup [name] --provider <provider> --model <model> --api-key-stdin --set-default` - create or update a named model profile",
+		"`cxp responses serve --base-url <url> --api-key-env <ENV> --model <model>` - run a local Responses adapter",
+		"Teams control `model list|setup|use|doctor`, `new <dir> --model <profile>`, and Work chat `model status|switch|fork` manage pinned model profiles.",
 		"",
 		"Beacon CLI quick help:",
 		"`cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration>` - create a Slurm draft profile",

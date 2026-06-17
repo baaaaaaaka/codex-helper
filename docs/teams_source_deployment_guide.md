@@ -311,7 +311,7 @@ Platform notes:
 
 ## 9. Daily Teams Commands
 
-Control chat:
+Basic control chat:
 
 ```text
 help
@@ -327,7 +327,7 @@ st
 status
 ```
 
-Work chat:
+Basic Work chat:
 
 ```text
 helper help
@@ -336,6 +336,36 @@ helper retry last
 helper close
 helper file relative/path.ext
 ```
+
+Model/profile commands:
+
+```text
+model list
+model setup deepseek
+model use deepseek
+new /absolute/path --model deepseek
+model status
+model switch deepseek
+model fork deepseek
+```
+
+Advanced maintenance and recovery:
+
+```text
+helper cancel running
+helper update now
+helper update prerelease
+helper restart now
+helper reload now
+beacon status
+beacon switch <profile>
+beacon release
+```
+
+`helper reload now` only applies to source-checkout development helpers that can
+rebuild from a local `codex-helper` source tree. Normal installed helpers should
+use `helper restart now` after a local binary repair or `helper update now` for
+a release update.
 
 Normal work chat messages are sent to Codex. Helper commands start with
 `helper` or the supported short command form shown by `helper help`.

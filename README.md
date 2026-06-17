@@ -94,6 +94,22 @@ When setup finishes, open the Teams control chat shown by bootstrap and send
 - If no proxy profile exists yet, `run` will guide you through creating one.
 - Example: `codex-proxy run pdx -- curl https://example.com`.
 
+### Usage levels
+
+Most users only need the quick start above plus the common commands below:
+
+- **Basic local use**: install, run `cxp`, choose direct or SSH proxy mode, and
+  open sessions from the history TUI.
+- **Daily options**: run commands through the selected proxy, choose a model
+  profile, open the Codex desktop app, or drive Codex from Teams.
+- **Advanced operations**: skills maintenance, beacon scheduler execution,
+  Teams service recovery, workflow webhooks, and source-checkout deployment.
+
+The rest of this README is grouped with that split in mind: common commands
+come first, then optional model/desktop/Teams flows, then advanced execution
+and maintenance references. For a map of all docs by audience and depth, see
+[`docs/README.md`](docs/README.md).
+
 ### Optional: preconfigure a proxy profile
 
 ```bash
@@ -119,22 +135,55 @@ copies later):
 codex-proxy proxy doctor
 ```
 
-## Commands
+## Common commands
+
+These are the commands a normal install most often needs:
+
+| Command | Description |
+|---------|-------------|
+| `codex-proxy` or `cxp` | Open the local Codex history TUI |
+| `codex-proxy run -- <cmd> [args...]` | Run a command using the current direct/proxy mode |
+| `codex-proxy run --yolo -- codex` | Launch Codex with YOLO mode enabled for this run |
+| `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
+| `codex-proxy model list` | Show built-in and configured model choices |
+| `codex-proxy model setup <model>` | Configure a built-in model choice such as `deepseek`, `mimo`, `kimi`, `glm`, `minimax`, or `qwen` |
+| `codex-proxy proxy doctor` | Check local proxy/Codex prerequisites |
+| `codex-proxy proxy reset` | Clear saved proxy setup and ask again on next launch |
+| `codex-proxy app` | Launch the Codex desktop app on macOS, Windows, or WSL |
+| `codex-proxy teams status` | Check Teams helper status after setup |
+| `codex-proxy upgrade` | Update `codex-proxy` / `cxp` from GitHub Releases |
+
+## Command reference
+
+This table includes advanced and maintenance commands as well as daily ones.
 
 | Command | Description |
 |---------|-------------|
 | `codex-proxy [profile]` | Open the TUI (default) |
 | `codex-proxy app [profile]` | Install if needed, use or configure proxy mode, and launch the Codex desktop app on macOS, Windows, or WSL |
 | `codex-proxy app auth [profile]` | Complete ChatGPT auth for the Codex desktop app using the same `CODEX_HOME` and proxy setup |
+| `codex-proxy app --model-profile <name>` | Launch the Codex desktop app with a saved model profile through an isolated `CODEX_HOME` |
 | `codex-proxy --upgrade-codex` | Reinstall Codex CLI using detected install source |
 | `codex-proxy completion <shell>` | Generate shell completion |
 | `codex-proxy init` | Create an SSH profile |
 | `codex-proxy run [profile] -- <cmd> [args...]` | Run a command using the current mode, or force proxy when a profile is given (`codex` by default) |
+| `codex-proxy run --yolo -- codex` | Launch Codex with YOLO mode enabled for this run |
+| `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
 | `codex-proxy tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
 | `codex-proxy history show <session-id>` | Print full history for a session |
 | `codex-proxy history open <session-id>` | Open a session in Codex |
+| `codex-proxy model list` | List built-in model choices and setup status |
+| `codex-proxy model setup <model>` | Set up a built-in model choice and optionally make it the default |
+| `codex-proxy model use <model>` | Make an already configured model the default for future Codex launches |
+| `codex-proxy model doctor [model]` | Validate the model profile backing a built-in model choice |
+| `codex-proxy model-profile setup [name]` | Create or update a named model profile |
+| `codex-proxy model-profile list` | List saved model profiles |
+| `codex-proxy model-profile doctor [name]` | Validate a saved model profile |
+| `codex-proxy model-profile set-default <name>` | Set the default model profile |
+| `codex-proxy model-profile delete <name>` | Delete a non-default model profile |
+| `codex-proxy responses serve` | Run a local `/v1/responses` adapter backed by an OpenAI-compatible chat upstream |
 | `codex-proxy skills install-builtin` | Install or repair bundled skills in `$HOME/.agents/skills`, including the built-in `cxp` usage skill |
 | `codex-proxy skills add <git-url>` | Install skills from a git source and keep them updated |
 | `codex-proxy skills migrate` | Migrate managed legacy skills from `~/.codex/skills` to `$HOME/.agents/skills` |
@@ -152,6 +201,8 @@ codex-proxy proxy doctor
 | `codex-proxy beacon profile doctor <name>` | Validate profile fields and provider adapter commands without touching the scheduler |
 | `codex-proxy beacon profile doctor <name> --smoke` | Submit, query, and cancel one scheduler allocation to verify adapters |
 | `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review; incomplete profiles remain draft |
+| `codex-proxy beacon profile status <name>` | Inspect one beacon profile |
+| `codex-proxy beacon profile delete <name>` | Archive a beacon profile when it is not in active use |
 | `codex-proxy beacon status [--session <id>]` | Show beacon target state |
 | `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | Preview and release a beacon resource by profile, allocation id, provider job id, or machine id |
 | `codex-proxy beacon switch-profile <name> --session <id>` | Switch a conversation to a ready beacon profile |
@@ -166,6 +217,10 @@ codex-proxy proxy doctor
 | `codex-proxy beacon worker run-once --machine <id>` | Claim one queued beacon job on an allocated worker and publish its terminal result |
 | `codex-proxy beacon worker run-once --allocation <id> --wait 30m` | Register the current scheduler worker, wait for its Teams job, and publish the terminal result |
 | `codex-proxy beacon worker serve --allocation <id>` | Register a long-lived worker with bootstrap diagnostics and serve jobs until idle or stopped |
+| `codex-proxy beacon machine list` | List beacon machines |
+| `codex-proxy beacon machine status <machine-or-lease>` | Inspect a beacon machine or lease and get confirmation tokens |
+| `codex-proxy beacon machine release <machine-or-lease>` | Drain or release a beacon machine |
+| `codex-proxy beacon machine kill <machine-or-lease-or-job> --confirm <token>` | Hard-kill a beacon machine only with the exact token from status |
 | `codex-proxy proxy start [profile]` | Start a long-lived proxy daemon |
 | `codex-proxy proxy list` | List known proxy instances |
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
@@ -174,6 +229,12 @@ codex-proxy proxy doctor
 | `codex-proxy proxy doctor` | Report environment issues and installation hints |
 | `codex-proxy teams status` | Show Teams helper state, control chat, service, owner, and queue status |
 | `codex-proxy teams doctor` | Check local Teams helper auth and service readiness |
+| `codex-proxy teams workflow status` | Show optional Teams Workflow notification configuration |
+| `codex-proxy teams workflow enable --webhook-url-file <path>` | Enable Workflow cards using a private local webhook URL file |
+| `codex-proxy teams send-file <path> --session <id>` | Upload a local outbound file and send it as a Teams attachment |
+| `codex-proxy teams probe-chat --chat <chat-id-or-link>` | Read-only probe of an external Teams chat without binding helper state |
+| `codex-proxy teams pause` / `resume` / `drain` / `recover` | Pause, resume, drain, or recover Teams helper state from a terminal |
+| `codex-proxy teams chat recreate <session-id> --yes` | Create and bind a fresh Teams Work chat for an existing helper session |
 | `codex-proxy teams service bootstrap` | Install or repair the background Teams helper service |
 | `codex-proxy teams service restart --force` | Recover local active Teams state, then force a service restart from a terminal |
 | `codex-proxy teams control --print` | Print the configured Teams control chat link |
@@ -182,11 +243,87 @@ codex-proxy proxy doctor
 Common flags:
 
 - `--config /path/to/config.json` overrides the config file location
+- `run` supports `--yolo` for per-launch YOLO mode and `--model-profile <name>`
+  for per-launch model selection when the command is Codex
+- `app` supports `--model-profile <name>` for desktop-app launches that should
+  use a saved model profile
 - `tui` / `history tui` support `--codex-dir`, `--codex-path`, `--profile`, and `--refresh-interval` (default `5s`, use `0` to disable)
 - `history open` supports `--codex-dir`, `--codex-path`, and `--profile`
 - `history list` / `history show` support `--codex-dir`
 - `skills` supports `--codex-dir`
 - `beacon` supports `--store /path/to/beacon.json` to override the beacon state file
+
+## Model selection and YOLO mode
+
+### YOLO mode
+
+YOLO mode can be enabled per Codex launch:
+
+```bash
+codex-proxy run --yolo -- codex
+```
+
+If you are using the history TUI, press `Ctrl+Y` before opening or starting a
+session. The status bar shows whether YOLO mode is on; press `Ctrl+Y` again to
+turn it off for the next launch.
+
+Beacon workers enable YOLO mode by default because scheduler/container devices
+and mounts usually need to remain visible inside the Codex turn. Local users
+only need the explicit `run --yolo` flag or the TUI `Ctrl+Y` toggle.
+
+### Built-in model choices
+
+Use `model` when you want to choose from the built-in model/provider presets:
+
+```bash
+codex-proxy model list
+printf '%s' "$DEEPSEEK_API_KEY" | codex-proxy model setup deepseek --api-key-stdin
+codex-proxy model use deepseek
+codex-proxy model doctor deepseek
+```
+
+The built-in choices include `default` plus third-party choices such as
+`deepseek`, `mimo`, `kimi`, `glm`, `minimax`, and `qwen`. Third-party choices
+store a model profile locally and run Codex through the local Responses adapter.
+
+Use a saved model profile for one launch without changing the default:
+
+```bash
+codex-proxy run --model-profile deepseek -- codex
+codex-proxy app --model-profile deepseek
+```
+
+In the Teams control chat, use `model list`, `model setup <model>`,
+`model use <model>`, or `model doctor <model>`. To create a new Work chat with
+a model profile, send `new <directory> --model <model>`. In a Work chat, use
+`model status`, `model switch <model>`, or `model fork <model>`.
+
+### Custom model profiles and Responses adapter
+
+Use `model-profile` when you need a named profile with explicit provider,
+model, API-key source, or SSH proxy route:
+
+```bash
+codex-proxy model-profile setup work-deepseek \
+  --provider deepseek \
+  --model deepseek/deepseek-v4-pro \
+  --api-key-env DEEPSEEK_API_KEY \
+  --set-default
+
+codex-proxy model-profile list
+codex-proxy model-profile doctor work-deepseek
+codex-proxy model-profile set-default work-deepseek
+```
+
+For lower-level experiments or integrations, `responses serve` exposes a local
+`/v1/responses` facade backed by an OpenAI-compatible chat upstream:
+
+```bash
+codex-proxy responses serve \
+  --base-url https://api.example.com/v1 \
+  --api-key-env PROVIDER_API_KEY \
+  --model provider-model
+```
 
 ## Beacon execution profiles
 
@@ -484,6 +621,8 @@ Controls:
 - New session: `(New Agent)` entry or `Ctrl+N` (in selected project or current dir)
 - Expand/collapse subagents: `Ctrl+O`
 - Proxy mode: `Ctrl+P` toggle (status shows `Proxy mode (Ctrl+P): on/off`)
+- YOLO mode: `Ctrl+Y` toggle before opening or starting a Codex session
+- Skills menu: `Ctrl+K`
 - Refresh: `r` (or `Ctrl+R`)
 - Quit: `q`, `Esc`, `Ctrl+C`
 - In-app update: `Ctrl+U` (when an update is available)
@@ -529,6 +668,10 @@ Use `codex-proxy app <profile>` to force a proxy profile. If proxy mode is
 enabled, the command passes proxy environment variables to the desktop app and
 prints a warning for WSL/AppX cases where the desktop app may not inherit or
 reach that environment directly.
+
+Use `codex-proxy app --model-profile <name>` when the desktop app should launch
+with a saved model profile. If the desktop app is already running, quit it first
+so the model profile configuration takes effect.
 
 Authenticate the Codex desktop app without relying on the desktop UI to show a
 device code:
@@ -641,24 +784,60 @@ or active local-supervisor install is also sticky unless
 
 ### Common Teams commands
 
-Run these locally when diagnosing setup:
+Daily local checks:
 
 ```bash
 codex-proxy teams status
 codex-proxy teams doctor --live
 codex-proxy teams control --print
-codex-proxy teams service doctor
-codex-proxy teams service status
-codex-proxy teams service bootstrap
 ```
 
-In the Teams control chat, start with:
+Daily control-chat commands:
 
 ```text
 help
 projects
+new /absolute/path
+sessions
+continue 1
 status
+model list
+model use deepseek
 ```
+
+Daily Work chat commands:
+
+```text
+helper status
+helper retry last
+helper cancel running
+helper file relative/path.ext
+model status
+model switch deepseek
+model fork deepseek
+```
+
+Advanced local checks and maintenance:
+
+```bash
+codex-proxy teams service doctor
+codex-proxy teams service status
+codex-proxy teams service bootstrap
+codex-proxy teams workflow status
+codex-proxy teams send-file relative/path.ext --session <session-id>
+codex-proxy teams probe-chat --chat <teams-chat-id-or-link>
+codex-proxy teams pause
+codex-proxy teams resume
+codex-proxy teams drain
+codex-proxy teams recover
+codex-proxy teams chat recreate <session-id> --yes
+```
+
+In the Teams control chat, `helper reload now` is for source-checkout
+development reloads only. Normal installed helpers should use `helper restart
+now` after a local repair or `helper update now` for a release update. Use
+`helper update prerelease` only when you intentionally want the newest
+pre-release.
 
 If a quick Codex question sent in the control chat gets stuck, send
 `helper cancel running` in that same control chat. Work chat requests are still
