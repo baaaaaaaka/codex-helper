@@ -8,12 +8,12 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
 )
 
@@ -263,9 +263,17 @@ func parseResponsesProxyKeys(raw string) (map[string]string, error) {
 }
 
 func defaultResponsesStorePath() string {
-	cacheDir, err := os.UserCacheDir()
-	if err != nil || strings.TrimSpace(cacheDir) == "" {
+	path, err := appdirs.StatePath("responses", "adapter.sqlite")
+	if err != nil || strings.TrimSpace(path) == "" {
 		return ""
 	}
-	return filepath.Join(cacheDir, "codex-helper", "responses-adapter.sqlite")
+	legacyPath, legacyErr := appdirs.LegacyCachePath("responses-adapter.sqlite")
+	if legacyErr != nil {
+		return path
+	}
+	resolvedPath, err := appdirs.ResolveMigratedRelatedFiles(path, legacyPath, "-wal", "-shm")
+	if err != nil {
+		return path
+	}
+	return resolvedPath
 }

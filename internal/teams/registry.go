@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/gofrs/flock"
 )
@@ -51,11 +52,24 @@ type ChatState struct {
 }
 
 func DefaultRegistryPath() (string, error) {
-	base, err := os.UserCacheDir()
+	path, err := appdirs.StatePath("teams", "registry.json")
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "codex-helper", "teams-registry.json"), nil
+	legacyPath, legacyErr := appdirs.LegacyCachePath("teams-registry.json")
+	if legacyErr != nil {
+		return path, nil
+	}
+	resolved, err := appdirs.ResolveMigratedFile(path, legacyPath)
+	if err != nil {
+		return "", err
+	}
+	if sameRegistryPath(resolved, path) && !sameRegistryPath(path, legacyPath) && !registryFileValid(path) && registryFileValid(legacyPath) {
+		if err := appdirs.CopyFileReplacing(path, legacyPath); err != nil {
+			return legacyPath, nil
+		}
+	}
+	return resolved, nil
 }
 
 func LoadRegistry(path string) (Registry, error) {
@@ -132,6 +146,18 @@ func loadRegistryNoDefault(path string) (Registry, error) {
 	}
 	reg.ensureMaps()
 	return reg, nil
+}
+
+func registryFileValid(path string) bool {
+	_, err := loadRegistryNoDefault(path)
+	return err == nil
+}
+
+func sameRegistryPath(a string, b string) bool {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 func mergeRegistryProjection(existing Registry, next Registry) Registry {

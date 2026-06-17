@@ -17,6 +17,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
@@ -1019,11 +1020,170 @@ type Store struct {
 }
 
 func DefaultPath() (string, error) {
-	base, err := os.UserConfigDir()
+	path, err := appdirs.StatePath("teams", "state.json")
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "codex-helper", "teams", "state.json"), nil
+	legacyPath, legacyErr := appdirs.LegacyConfigPath("teams", "state.json")
+	if legacyErr != nil {
+		return path, nil
+	}
+	return resolveMigratedDefaultPath(path, legacyPath), nil
+}
+
+func resolveMigratedDefaultPath(path string, legacyPath string) string {
+	if defaultPathMigrationComplete(path, legacyPath) {
+		return path
+	}
+	if ok, err := storePathExists(legacyPath); err != nil || !ok {
+		return path
+	}
+	lock := flock.New(legacyPath + ".lock")
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	locked, err := lock.TryLockContext(ctx, 25*time.Millisecond)
+	if err != nil || !locked {
+		return legacyPath
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	sqlitePath := filepath.Join(filepath.Dir(path), storeSQLiteFileName)
+	legacySQLitePath := filepath.Join(filepath.Dir(legacyPath), storeSQLiteFileName)
+	if resolved, err := appdirs.ResolveMigratedRelatedFiles(sqlitePath, legacySQLitePath, "-wal", "-shm"); err != nil || resolved != sqlitePath {
+		return legacyPath
+	}
+	for _, name := range []string{
+		"helper-restart-pending.json",
+		"workflow-notifications.json",
+		"workflow-webhook-url",
+	} {
+		legacySidecar := filepath.Join(filepath.Dir(legacyPath), name)
+		if ok, err := storePathExists(legacySidecar); err != nil || !ok {
+			continue
+		}
+		if err := appdirs.CopyFileIfMissing(filepath.Join(filepath.Dir(path), name), legacySidecar); err != nil {
+			return legacyPath
+		}
+	}
+	if err := appdirs.CopyFileReplacing(path, legacyPath); err != nil {
+		return legacyPath
+	}
+	if !defaultPathMigrationComplete(path, legacyPath) {
+		return legacyPath
+	}
+	return path
+}
+
+func defaultPathMigrationComplete(path string, legacyPath string) bool {
+	if ok, err := storePathExists(path); err != nil || !ok {
+		return false
+	}
+	if !defaultStorePathLoadable(path) {
+		return false
+	}
+	if defaultPathStateNeedsRefresh(path, legacyPath) && defaultStorePathLoadable(legacyPath) {
+		return false
+	}
+	sqlitePath := filepath.Join(filepath.Dir(path), storeSQLiteFileName)
+	legacySQLitePath := filepath.Join(filepath.Dir(legacyPath), storeSQLiteFileName)
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		legacyExists, legacyErr := storePathExists(legacySQLitePath + suffix)
+		if legacyErr != nil {
+			return false
+		}
+		if !legacyExists {
+			continue
+		}
+		if ok, err := storePathExists(sqlitePath + suffix); err != nil || !ok {
+			return false
+		}
+	}
+	for _, name := range []string{
+		"helper-restart-pending.json",
+		"workflow-notifications.json",
+		"workflow-webhook-url",
+	} {
+		legacySidecar := filepath.Join(filepath.Dir(legacyPath), name)
+		legacyExists, legacyErr := storePathExists(legacySidecar)
+		if legacyErr != nil {
+			return false
+		}
+		if !legacyExists {
+			continue
+		}
+		if ok, err := storePathExists(filepath.Join(filepath.Dir(path), name)); err != nil || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func defaultPathStateNeedsRefresh(path string, legacyPath string) bool {
+	legacyInfo, legacyOK := storeRegularFileInfo(legacyPath)
+	if !legacyOK {
+		return false
+	}
+	newInfo, newOK := storeRegularFileInfo(path)
+	if !newOK {
+		return true
+	}
+	if os.SameFile(legacyInfo, newInfo) {
+		return false
+	}
+	if legacyInfo.ModTime().After(newInfo.ModTime()) {
+		return true
+	}
+	if legacyInfo.ModTime().Equal(newInfo.ModTime()) {
+		sameContent, err := storeFileContentsEqual(legacyPath, path, legacyInfo, newInfo)
+		return err != nil || !sameContent
+	}
+	return false
+}
+
+func storeRegularFileInfo(path string) (os.FileInfo, bool) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, false
+	}
+	return info, true
+}
+
+func storeFileContentsEqual(a string, b string, aInfo os.FileInfo, bInfo os.FileInfo) (bool, error) {
+	if aInfo.Size() != bInfo.Size() {
+		return false, nil
+	}
+	aBytes, err := os.ReadFile(a)
+	if err != nil {
+		return false, err
+	}
+	bBytes, err := os.ReadFile(b)
+	if err != nil {
+		return false, err
+	}
+	return string(aBytes) == string(bBytes), nil
+}
+
+func defaultStorePathLoadable(path string) bool {
+	st, err := Open(path)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	_, loadErr := st.Load(ctx)
+	cancel()
+	closeErr := st.Close()
+	return loadErr == nil && closeErr == nil
+}
+
+func storePathExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func Open(path string) (*Store, error) {

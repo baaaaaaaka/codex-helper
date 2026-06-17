@@ -8,8 +8,151 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
+
+func TestDefaultRegistryPathMigratesLegacyCacheRegistry(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	legacyPath := filepath.Join(cacheBase, "codex-helper", "teams-registry.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy registry: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"version":1,"user_id":"legacy-user"}`), 0o600); err != nil {
+		t.Fatalf("write legacy registry: %v", err)
+	}
+
+	got, err := DefaultRegistryPath()
+	if err != nil {
+		t.Fatalf("DefaultRegistryPath error: %v", err)
+	}
+	want := filepath.Join(tmp, "state", "codex-helper", "teams", "registry.json")
+	if got != want {
+		t.Fatalf("DefaultRegistryPath = %q, want %q", got, want)
+	}
+	assertTeamsFileContent(t, want, `{"version":1,"user_id":"legacy-user"}`)
+	assertTeamsFileContent(t, legacyPath, `{"version":1,"user_id":"legacy-user"}`)
+}
+
+func TestDefaultRegistryPathRefreshesCorruptNewRegistryCI(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	legacyPath := filepath.Join(cacheBase, "codex-helper", "teams-registry.json")
+	newPath, err := appdirs.StatePath("teams", "registry.json")
+	if err != nil {
+		t.Fatalf("StatePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy registry: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
+		t.Fatalf("mkdir new registry: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"version":1,"control_chat_id":"legacy-control"}`), 0o600); err != nil {
+		t.Fatalf("write legacy registry: %v", err)
+	}
+	if err := os.WriteFile(newPath, []byte(`{"version":`), 0o600); err != nil {
+		t.Fatalf("write corrupt new registry: %v", err)
+	}
+
+	got, err := DefaultRegistryPath()
+	if err != nil {
+		t.Fatalf("DefaultRegistryPath error: %v", err)
+	}
+	if got != newPath {
+		t.Fatalf("DefaultRegistryPath = %q, want %q", got, newPath)
+	}
+	reg, err := LoadRegistry(got)
+	if err != nil {
+		t.Fatalf("LoadRegistry after refresh: %v", err)
+	}
+	if reg.ControlChatID != "legacy-control" {
+		t.Fatalf("registry control chat = %q, want legacy-control", reg.ControlChatID)
+	}
+}
+
+func TestDefaultRegistryPathRefreshesEqualMTimeDivergentRegistryCI(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	legacyPath := filepath.Join(cacheBase, "codex-helper", "teams-registry.json")
+	newPath, err := appdirs.StatePath("teams", "registry.json")
+	if err != nil {
+		t.Fatalf("StatePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy registry: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
+		t.Fatalf("mkdir new registry: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"version":1,"control_chat_id":"legacy-control"}`), 0o600); err != nil {
+		t.Fatalf("write legacy registry: %v", err)
+	}
+	if err := os.WriteFile(newPath, []byte(`{"version":1,"control_chat_id":"stale-control"}`), 0o600); err != nil {
+		t.Fatalf("write stale new registry: %v", err)
+	}
+	sameTime := time.Unix(200, 0)
+	for _, path := range []string{legacyPath, newPath} {
+		if err := os.Chtimes(path, sameTime, sameTime); err != nil {
+			t.Fatalf("chtimes %s: %v", path, err)
+		}
+	}
+
+	got, err := DefaultRegistryPath()
+	if err != nil {
+		t.Fatalf("DefaultRegistryPath error: %v", err)
+	}
+	if got != newPath {
+		t.Fatalf("DefaultRegistryPath = %q, want %q", got, newPath)
+	}
+	reg, err := LoadRegistry(got)
+	if err != nil {
+		t.Fatalf("LoadRegistry after refresh: %v", err)
+	}
+	if reg.ControlChatID != "legacy-control" {
+		t.Fatalf("registry control chat = %q, want legacy-control", reg.ControlChatID)
+	}
+}
+
+func TestDefaultRegistryPathForScopeRefreshesCorruptNewRegistryCI(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	scopeID := "scope:registry-corrupt"
+	scopePart := safeScopePathPart(scopeID)
+	legacyPath := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", scopePart, "registry.json")
+	newPath, err := appdirs.StatePath("teams", "scopes", scopePart, "registry.json")
+	if err != nil {
+		t.Fatalf("StatePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy registry: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
+		t.Fatalf("mkdir new registry: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"version":1,"control_chat_id":"legacy-control"}`), 0o600); err != nil {
+		t.Fatalf("write legacy registry: %v", err)
+	}
+	if err := os.WriteFile(newPath, []byte(`{"version":`), 0o600); err != nil {
+		t.Fatalf("write corrupt new registry: %v", err)
+	}
+
+	got, err := DefaultRegistryPathForScope(scopeID)
+	if err != nil {
+		t.Fatalf("DefaultRegistryPathForScope error: %v", err)
+	}
+	if got != newPath {
+		t.Fatalf("DefaultRegistryPathForScope = %q, want %q", got, newPath)
+	}
+	reg, err := LoadRegistry(got)
+	if err != nil {
+		t.Fatalf("LoadRegistry after scoped refresh: %v", err)
+	}
+	if reg.ControlChatID != "legacy-control" {
+		t.Fatalf("registry control chat = %q, want legacy-control", reg.ControlChatID)
+	}
+}
 
 func TestSaveRegistryNoopDoesNotRewriteFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
@@ -296,5 +439,16 @@ func TestSaveRegistryDoesNotResurrectRemovedProjectionChats(t *testing.T) {
 	}
 	if !merged.HasSeen("chat-new", "seen-new") || !merged.HasSent("chat-new", "sent-new") {
 		t.Fatalf("new chat seen/sent missing: %#v", merged.Chats["chat-new"])
+	}
+}
+
+func assertTeamsFileContent(t *testing.T, path string, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if string(got) != want {
+		t.Fatalf("content for %s = %q, want %q", path, got, want)
 	}
 }

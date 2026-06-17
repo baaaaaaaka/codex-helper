@@ -20,6 +20,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
@@ -35,6 +36,7 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "AppData", "Local"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv(update.EnvInstallPath, "")
 	t.Setenv(update.EnvInstallDir, "")
@@ -53,6 +55,15 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 		t.Fatalf("os.UserCacheDir: %v", err)
 	}
 	return configBase, cacheBase
+}
+
+func cliStatePathForTest(t *testing.T, parts ...string) string {
+	t.Helper()
+	path, err := appdirs.StatePath(parts...)
+	if err != nil {
+		t.Fatalf("appdirs.StatePath: %v", err)
+	}
+	return path
 }
 
 func setTeamsAuthIDsForCLITest(t *testing.T) {
@@ -1078,6 +1089,7 @@ func TestTeamsServiceLocalSupervisorStartPreflightFailureDoesNotRetireSystemd(t 
 	}
 	t.Setenv("HOME", badHome)
 	t.Setenv("XDG_CACHE_HOME", badCacheHome)
+	t.Setenv("XDG_STATE_HOME", badCacheHome)
 	t.Setenv("LOCALAPPDATA", badCacheHome)
 	_, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start")
 	if err == nil {
@@ -1205,7 +1217,7 @@ func TestTeamsServiceLocalSupervisorEnableStartStatus(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	exePath := filepath.Join(tmp, "bin", "codex-proxy")
 	systemdUnavailable := false
 	var startedConfigPath string
@@ -1274,7 +1286,7 @@ func TestTeamsServiceLocalSupervisorEnableStartStatus(t *testing.T) {
 		"Active: true",
 		"SupervisorPID:",
 		"Autostart: not guaranteed after machine/container reboot",
-		filepath.Join(configBase, "codex-helper", "teams", "run", "local-supervisor", teamsServiceLocalSupervisorStatusName),
+		cliStatePathForTest(t, "teams", "service", "local-supervisor", "run", teamsServiceLocalSupervisorStatusName),
 	} {
 		if !strings.Contains(statusOut.String(), want) {
 			t.Fatalf("status output missing %q:\n%s", want, statusOut.String())
@@ -1695,17 +1707,117 @@ func TestTeamsServiceLocalSupervisorActiveRejectsCurrentStatusWithoutHeartbeat(t
 
 func TestTeamsServiceLocalSupervisorRuntimeDirIgnoresXDGRuntimeDir(t *testing.T) {
 	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(tmp, "runtime"))
 
 	statusPath, err := teamsServiceLocalSupervisorStatusPath()
 	if err != nil {
 		t.Fatalf("status path: %v", err)
 	}
-	want := filepath.Join(configBase, "codex-helper", "teams", "run", "local-supervisor", teamsServiceLocalSupervisorStatusName)
+	want := cliStatePathForTest(t, "teams", "service", "local-supervisor", "run", teamsServiceLocalSupervisorStatusName)
 	if statusPath != want {
-		t.Fatalf("status path = %q, want stable config-root path %q", statusPath, want)
+		t.Fatalf("status path = %q, want stable state-root path %q", statusPath, want)
 	}
+}
+
+func TestTeamsServiceLocalSupervisorRuntimeDirMigratesLegacyStatusWhenNewDirExists(t *testing.T) {
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	legacyDir := filepath.Join(configBase, "codex-helper", "teams", "run", "local-supervisor")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy runtime: %v", err)
+	}
+	legacyStatus := filepath.Join(legacyDir, teamsServiceLocalSupervisorStatusName)
+	if err := os.WriteFile(legacyStatus, []byte(`{"version":1,"state":"running"}`), 0o600); err != nil {
+		t.Fatalf("write legacy status: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, teamsServiceLocalSupervisorLockName), []byte(""), 0o600); err != nil {
+		t.Fatalf("write legacy lock: %v", err)
+	}
+	newDir := cliStatePathForTest(t, "teams", "service", "local-supervisor", "run")
+	if err := os.MkdirAll(newDir, 0o700); err != nil {
+		t.Fatalf("mkdir new runtime: %v", err)
+	}
+
+	statusPath, err := teamsServiceLocalSupervisorStatusPath()
+	if err != nil {
+		t.Fatalf("status path: %v", err)
+	}
+	wantStatus := filepath.Join(newDir, teamsServiceLocalSupervisorStatusName)
+	if statusPath != wantStatus {
+		t.Fatalf("status path = %q, want %q", statusPath, wantStatus)
+	}
+	assertCLIFileContent(t, wantStatus, `{"version":1,"state":"running"}`)
+	assertCLIFileContent(t, legacyStatus, `{"version":1,"state":"running"}`)
+	if _, err := os.Stat(filepath.Join(newDir, teamsServiceLocalSupervisorLockName)); !os.IsNotExist(err) {
+		t.Fatalf("lock file should not be copied, stat err = %v", err)
+	}
+}
+
+func TestTeamsServiceLocalSupervisorRuntimeDirRefreshesStaleNewStatusCI(t *testing.T) {
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	legacyDir := filepath.Join(configBase, "codex-helper", "teams", "run", "local-supervisor")
+	newDir := cliStatePathForTest(t, "teams", "service", "local-supervisor", "run")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy runtime: %v", err)
+	}
+	if err := os.MkdirAll(newDir, 0o700); err != nil {
+		t.Fatalf("mkdir new runtime: %v", err)
+	}
+	legacyStatus := filepath.Join(legacyDir, teamsServiceLocalSupervisorStatusName)
+	newStatus := filepath.Join(newDir, teamsServiceLocalSupervisorStatusName)
+	if err := os.WriteFile(legacyStatus, []byte(`{"version":1,"state":"running","supervisor_pid":222}`), 0o600); err != nil {
+		t.Fatalf("write legacy status: %v", err)
+	}
+	if err := os.WriteFile(newStatus, []byte(`{"version":1,"state":"running","supervisor_pid":111}`), 0o600); err != nil {
+		t.Fatalf("write stale new status: %v", err)
+	}
+	if err := os.Chtimes(newStatus, time.Unix(100, 0), time.Unix(100, 0)); err != nil {
+		t.Fatalf("chtimes new status: %v", err)
+	}
+	if err := os.Chtimes(legacyStatus, time.Unix(200, 0), time.Unix(200, 0)); err != nil {
+		t.Fatalf("chtimes legacy status: %v", err)
+	}
+
+	statusPath, err := teamsServiceLocalSupervisorStatusPath()
+	if err != nil {
+		t.Fatalf("status path: %v", err)
+	}
+	if statusPath != newStatus {
+		t.Fatalf("status path = %q, want %q", statusPath, newStatus)
+	}
+	assertCLIFileContent(t, newStatus, `{"version":1,"state":"running","supervisor_pid":222}`)
+}
+
+func TestTeamsServiceLocalSupervisorRuntimeDirRefreshesCorruptNewStatusCI(t *testing.T) {
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	legacyDir := filepath.Join(configBase, "codex-helper", "teams", "run", "local-supervisor")
+	newDir := cliStatePathForTest(t, "teams", "service", "local-supervisor", "run")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy runtime: %v", err)
+	}
+	if err := os.MkdirAll(newDir, 0o700); err != nil {
+		t.Fatalf("mkdir new runtime: %v", err)
+	}
+	legacyStatus := filepath.Join(legacyDir, teamsServiceLocalSupervisorStatusName)
+	newStatus := filepath.Join(newDir, teamsServiceLocalSupervisorStatusName)
+	if err := os.WriteFile(legacyStatus, []byte(`{"version":1,"state":"running","supervisor_pid":222}`), 0o600); err != nil {
+		t.Fatalf("write legacy status: %v", err)
+	}
+	if err := os.WriteFile(newStatus, []byte(`{"version":`), 0o600); err != nil {
+		t.Fatalf("write corrupt new status: %v", err)
+	}
+
+	statusPath, err := teamsServiceLocalSupervisorStatusPath()
+	if err != nil {
+		t.Fatalf("status path: %v", err)
+	}
+	if statusPath != newStatus {
+		t.Fatalf("status path = %q, want %q", statusPath, newStatus)
+	}
+	assertCLIFileContent(t, newStatus, `{"version":1,"state":"running","supervisor_pid":222}`)
 }
 
 func TestTeamsServiceLocalSupervisorStartRequiresReadyStatus(t *testing.T) {
@@ -2250,6 +2362,7 @@ func TestTeamsServiceLocalSupervisorProcessEnvUsesControlledEnvironment(t *testi
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9999")
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "runtime"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
 	specHome := filepath.Join(t.TempDir(), "spec-home")
 	env := teamsServiceLocalSupervisorProcessEnv(map[string]string{
 		"CODEX_HOME":                 specHome,
@@ -2276,6 +2389,9 @@ func TestTeamsServiceLocalSupervisorProcessEnvUsesControlledEnvironment(t *testi
 	}
 	if got, ok := testEnvValue(env, "XDG_CONFIG_HOME"); !ok || got == "" {
 		t.Fatalf("XDG_CONFIG_HOME env = %q ok=%v, want preserved", got, ok)
+	}
+	if got, ok := testEnvValue(env, "XDG_STATE_HOME"); !ok || got == "" {
+		t.Fatalf("XDG_STATE_HOME env = %q ok=%v, want preserved", got, ok)
 	}
 }
 
@@ -3800,6 +3916,7 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("CODEX_HOME", filepath.Join(tmp, "codex home"))
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "work-profile")
+	t.Setenv(appdirs.EnvStateDir, filepath.Join(tmp, "state root"))
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "1")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", filepath.Join(tmp, "read-token.json"))
 	t.Setenv(envTeamsASRCommand, filepath.Join(tmp, "bin", "teams-asr"))
@@ -3835,6 +3952,7 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	unit := string(data)
 	for _, want := range []string{
 		"Environment=" + systemdQuoteArg("CODEX_HOME="+filepath.Join(tmp, "codex home")),
+		"Environment=" + systemdQuoteArg(appdirs.EnvStateDir+"="+filepath.Join(tmp, "state root")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=work-profile"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE="+filepath.Join(tmp, "read-token.json")),

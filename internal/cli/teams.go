@@ -17,6 +17,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
@@ -2958,26 +2959,36 @@ func teamsRegistryPaths(registryPath string) ([]string, error) {
 	if strings.TrimSpace(registryPath) != "" {
 		return []string{registryPath}, nil
 	}
-	legacy, err := teams.DefaultRegistryPath()
+	defaultPath, err := teams.DefaultRegistryPath()
 	if err != nil {
 		return nil, err
 	}
-	paths := []string{legacy}
-	base := filepath.Dir(legacy)
-	matches, err := filepath.Glob(filepath.Join(base, "teams", "scopes", "*", "registry.json"))
-	if err != nil {
-		return nil, err
+	paths := []string{defaultPath}
+	if legacyPath, legacyErr := appdirs.LegacyCachePath("teams-registry.json"); legacyErr == nil {
+		paths = appendLegacyPathIfMirrorMissing(paths, legacyPath, defaultPath)
 	}
-	sort.Strings(matches)
-	seen := map[string]struct{}{legacy: {}}
-	for _, path := range matches {
-		if _, ok := seen[path]; ok {
-			continue
+	for _, globPath := range []string{mustPathForGlob(appdirs.StatePath("teams", "scopes", "*", "registry.json"))} {
+		paths, err = appendGlobMatches(paths, globPath)
+		if err != nil {
+			return nil, err
 		}
-		seen[path] = struct{}{}
-		paths = append(paths, path)
 	}
-	return paths, nil
+	for _, globPath := range []string{mustPathForGlob(appdirs.LegacyCachePath("teams", "scopes", "*", "registry.json"))} {
+		matches, err := globPathMatches(globPath)
+		if err != nil {
+			return nil, err
+		}
+		sort.Strings(matches)
+		for _, match := range matches {
+			mirrorPath, ok := stateScopedRegistryPathForLegacyRegistry(match)
+			if !ok {
+				paths = append(paths, match)
+				continue
+			}
+			paths = appendLegacyRegistryPathIfMigrationIncomplete(paths, match, mirrorPath)
+		}
+	}
+	return uniquePaths(paths), nil
 }
 
 func existingTeamsRegistryPaths() ([]string, error) {
@@ -3002,26 +3013,147 @@ func teamsStorePath() (string, error) {
 }
 
 func teamsStorePaths() ([]string, error) {
-	legacy, err := teamsstore.DefaultPath()
+	defaultPath, err := teamsstore.DefaultPath()
 	if err != nil {
 		return nil, err
 	}
-	paths := []string{legacy}
-	base := filepath.Dir(legacy)
-	matches, err := filepath.Glob(filepath.Join(base, "scopes", "*", "state.json"))
+	paths := []string{defaultPath}
+	if legacyPath, legacyErr := appdirs.LegacyConfigPath("teams", "state.json"); legacyErr == nil {
+		paths = appendLegacyPathIfMirrorMissing(paths, legacyPath, defaultPath)
+	}
+	for _, globPath := range []string{mustPathForGlob(appdirs.StatePath("teams", "scopes", "*", "state.json"))} {
+		paths, err = appendGlobMatches(paths, globPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, globPath := range []string{mustPathForGlob(appdirs.LegacyConfigPath("teams", "scopes", "*", "state.json"))} {
+		matches, err := globPathMatches(globPath)
+		if err != nil {
+			return nil, err
+		}
+		sort.Strings(matches)
+		for _, match := range matches {
+			mirrorPath, ok := stateScopedStorePathForLegacyStore(match)
+			if !ok {
+				paths = append(paths, match)
+				continue
+			}
+			paths = appendLegacyStorePathIfMigrationIncomplete(paths, match, mirrorPath)
+		}
+	}
+	return uniquePaths(paths), nil
+}
+
+func appendGlobMatches(paths []string, globPath string) ([]string, error) {
+	matches, err := globPathMatches(globPath)
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(matches)
-	seen := map[string]struct{}{legacy: {}}
-	for _, path := range matches {
-		if _, ok := seen[path]; ok {
+	return append(paths, matches...), nil
+}
+
+func globPathMatches(globPath string) ([]string, error) {
+	if globPath == "" {
+		return nil, nil
+	}
+	return filepath.Glob(globPath)
+}
+
+func appendLegacyPathIfMirrorMissing(paths []string, legacyPath string, mirrorPath string) []string {
+	if strings.TrimSpace(legacyPath) == "" {
+		return paths
+	}
+	if migratedMirrorPathExists(mirrorPath) {
+		return paths
+	}
+	return append(paths, legacyPath)
+}
+
+func appendLegacyStorePathIfMigrationIncomplete(paths []string, legacyPath string, mirrorPath string) []string {
+	if strings.TrimSpace(legacyPath) == "" {
+		return paths
+	}
+	scopePart := filepath.Base(filepath.Dir(filepath.Clean(legacyPath)))
+	if strings.TrimSpace(scopePart) != "" && teams.StoreMigrationCompleteForPath(scopePart, mirrorPath, legacyPath) {
+		return paths
+	}
+	return append(paths, legacyPath)
+}
+
+func appendLegacyRegistryPathIfMigrationIncomplete(paths []string, legacyPath string, mirrorPath string) []string {
+	if strings.TrimSpace(legacyPath) == "" {
+		return paths
+	}
+	if teams.RegistryMigrationCompleteForPath(mirrorPath, legacyPath) {
+		return paths
+	}
+	return append(paths, legacyPath)
+}
+
+func migratedMirrorPathExists(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func stateScopedStorePathForLegacyStore(legacyPath string) (string, bool) {
+	if filepath.Base(filepath.Clean(legacyPath)) != "state.json" {
+		return "", false
+	}
+	scopePart := filepath.Base(filepath.Dir(filepath.Clean(legacyPath)))
+	if strings.TrimSpace(scopePart) == "" || scopePart == "." {
+		return "", false
+	}
+	path, err := appdirs.StatePath("teams", "scopes", scopePart, "state.json")
+	if err != nil {
+		return "", false
+	}
+	return path, true
+}
+
+func stateScopedRegistryPathForLegacyRegistry(legacyPath string) (string, bool) {
+	if filepath.Base(filepath.Clean(legacyPath)) != "registry.json" {
+		return "", false
+	}
+	scopePart := filepath.Base(filepath.Dir(filepath.Clean(legacyPath)))
+	if strings.TrimSpace(scopePart) == "" || scopePart == "." {
+		return "", false
+	}
+	path, err := appdirs.StatePath("teams", "scopes", scopePart, "registry.json")
+	if err != nil {
+		return "", false
+	}
+	return path, true
+}
+
+func mustPathForGlob(path string, err error) string {
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+func uniquePaths(paths []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
 			continue
 		}
-		seen[path] = struct{}{}
-		paths = append(paths, path)
+		clean := filepath.Clean(path)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, path)
 	}
-	return paths, nil
+	return out
 }
 
 func existingTeamsStorePaths() ([]string, error) {

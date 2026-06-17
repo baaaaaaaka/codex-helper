@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 )
 
 const (
@@ -45,11 +47,15 @@ type OutboundAttachmentResult struct {
 }
 
 func DefaultOutboundRoot() (string, error) {
-	base, err := os.UserCacheDir()
+	root, err := appdirs.StatePath("teams", "outbound")
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "codex-helper", "teams-outbound"), nil
+	legacyRoot, legacyErr := appdirs.LegacyCachePath("teams-outbound")
+	if legacyErr != nil {
+		return root, nil
+	}
+	return appdirs.ResolveMigratedDir(root, legacyRoot)
 }
 
 func DefaultOutboundUploadFolder() string {

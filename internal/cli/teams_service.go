@@ -22,6 +22,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
@@ -3186,6 +3187,8 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HOME",
 		"CODEX_DIR",
 		"CODEX_HELPER_CONFIG",
+		appdirs.EnvStateDir,
+		"XDG_STATE_HOME",
 		"CODEX_HELPER_TEAMS_AUTH_CONFIG",
 		"CODEX_HELPER_TEAMS_PROFILE",
 		"CODEX_HELPER_TEAMS_AUTH_PROFILE",

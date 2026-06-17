@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 )
 
 const (
@@ -1133,22 +1135,43 @@ func defaultFullTokenCachePath() (string, error) {
 }
 
 func defaultTeamsTokenCachePath(fileName string) (string, error) {
-	base, err := os.UserCacheDir()
+	profile := defaultTeamsAuthProfile()
+	scopedPath, err := appdirs.StatePath("teams", "profiles", safeScopePathPart(profile), fileName)
 	if err != nil {
 		return "", err
 	}
-	profile := defaultTeamsAuthProfile()
-	scopedPath := filepath.Join(base, "codex-helper", "teams", "profiles", safeScopePathPart(profile), fileName)
+	legacyScopedPath, legacyScopedErr := appdirs.LegacyCachePath("teams", "profiles", safeScopePathPart(profile), fileName)
+	if legacyScopedErr == nil {
+		resolvedPath, err := appdirs.ResolveMigratedFile(scopedPath, legacyScopedPath)
+		if err != nil {
+			return "", err
+		}
+		if resolvedPath == scopedPath && !samePath(scopedPath, legacyScopedPath) && !tokenCacheFileJSONValid(scopedPath) && tokenCacheFileJSONValid(legacyScopedPath) {
+			if err := appdirs.CopyFileReplacing(scopedPath, legacyScopedPath); err != nil {
+				return legacyScopedPath, nil
+			}
+		}
+		if profile != "default" || resolvedPath != scopedPath || tokenCacheFileJSONValid(scopedPath) {
+			return resolvedPath, nil
+		}
+	}
 
 	// Preserve existing default-profile logins from pre-scoped builds. New
 	// profiles never fall back to the legacy shared cache path.
 	if profile == "default" {
-		if _, err := os.Stat(scopedPath); err == nil {
+		legacyPath, legacyErr := appdirs.LegacyCachePath(fileName)
+		if legacyErr != nil {
 			return scopedPath, nil
 		}
-		legacyPath := filepath.Join(base, "codex-helper", fileName)
 		if _, err := os.Stat(legacyPath); err == nil {
 			if _, err := readTokenCache(legacyPath); err == nil || unsafeTeamsScopesAllowed() {
+				copyErr := appdirs.CopyFileIfMissing(scopedPath, legacyPath)
+				if !tokenCacheFileJSONValid(scopedPath) {
+					copyErr = appdirs.CopyFileReplacing(scopedPath, legacyPath)
+				}
+				if copyErr == nil {
+					return scopedPath, nil
+				}
 				return legacyPath, nil
 			}
 			if tok, err := readLegacyRefreshTokenCache(legacyPath); err == nil {
@@ -1159,6 +1182,15 @@ func defaultTeamsTokenCachePath(fileName string) (string, error) {
 		}
 	}
 	return scopedPath, nil
+}
+
+func tokenCacheFileJSONValid(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var raw map[string]json.RawMessage
+	return json.Unmarshal(data, &raw) == nil
 }
 
 func defaultTeamsAuthProfile() string {

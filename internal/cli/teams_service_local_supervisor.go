@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
@@ -775,7 +776,7 @@ func teamsServiceLocalSupervisorIdentityEnvironment(env map[string]string) map[s
 		if key == "" {
 			continue
 		}
-		if key == "CODEX_PROXY_INSTALL_DIR" || key == "CODEX_PROXY_INSTALL_PATH" || strings.HasPrefix(key, "CODEX_HELPER_TEAMS_") {
+		if key == appdirs.EnvStateDir || key == "CODEX_PROXY_INSTALL_DIR" || key == "CODEX_PROXY_INSTALL_PATH" || strings.HasPrefix(key, "CODEX_HELPER_TEAMS_") {
 			out[key] = value
 		}
 	}
@@ -849,7 +850,7 @@ func teamsServiceLocalSupervisorArgsContainSequence(args []string, want []string
 func teamsServiceLocalSupervisorBaseEnvAllowed(key string) bool {
 	switch key {
 	case "HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "TMPDIR", "TEMP", "TMP",
-		"XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME":
+		"XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME":
 		return true
 	}
 	return strings.HasPrefix(key, "LC_")
@@ -1640,17 +1641,49 @@ func teamsServiceLocalSupervisorConfigDir() (string, error) {
 }
 
 func teamsServiceLocalSupervisorRuntimeDir() (string, error) {
-	base, err := teamsServiceLocalSupervisorConfigDir()
+	dir, err := appdirs.StatePath("teams", "service", "local-supervisor", "run")
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "run", "local-supervisor"), nil
+	configBase, configErr := teamsServiceLocalSupervisorConfigDir()
+	if configErr != nil {
+		return dir, nil
+	}
+	legacyDir := filepath.Join(configBase, "run", "local-supervisor")
+	resolvedDir, err := appdirs.ResolveMigratedDirWithRequired(dir, legacyDir, teamsServiceLocalSupervisorStatusName)
+	if err != nil {
+		return "", err
+	}
+	statusPath := filepath.Join(resolvedDir, teamsServiceLocalSupervisorStatusName)
+	legacyStatusPath := filepath.Join(legacyDir, teamsServiceLocalSupervisorStatusName)
+	if filepath.Clean(resolvedDir) == filepath.Clean(dir) && filepath.Clean(dir) != filepath.Clean(legacyDir) && !teamsServiceLocalSupervisorStatusFileValid(statusPath) && teamsServiceLocalSupervisorStatusFileValid(legacyStatusPath) {
+		if err := appdirs.CopyFileReplacing(statusPath, legacyStatusPath); err != nil {
+			return legacyDir, nil
+		}
+	}
+	return resolvedDir, nil
+}
+
+func teamsServiceLocalSupervisorStatusFileValid(path string) bool {
+	if err := validateTeamsServiceLocalSupervisorRegularFile(path, "local supervisor status", true); err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var status teamsServiceLocalSupervisorStatus
+	return json.Unmarshal(data, &status) == nil
 }
 
 func teamsServiceLocalSupervisorLogDir() (string, error) {
-	base, err := os.UserCacheDir()
-	if err == nil {
-		return filepath.Join(base, "codex-helper", "teams", "local-supervisor"), nil
+	dir, err := appdirs.StatePath("teams", "service", "local-supervisor", "logs")
+	if err != nil {
+		return teamsServiceLocalSupervisorRuntimeDir()
 	}
-	return teamsServiceLocalSupervisorRuntimeDir()
+	legacyDir, legacyErr := appdirs.LegacyCachePath("teams", "local-supervisor")
+	if legacyErr != nil {
+		return dir, nil
+	}
+	return appdirs.ResolveMigratedDir(dir, legacyDir)
 }

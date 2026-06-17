@@ -11361,9 +11361,14 @@ func (b *Bridge) ensureStore() error {
 	if b.scope.ID == "" {
 		b.scope = ScopeIdentityForUser(b.user)
 	}
-	storePath, err := DefaultStorePathForScope(b.scope.ID)
+	resolvedScope, storePath, err := ResolveStorePathForScope(b.scope)
 	if err != nil {
 		return err
+	}
+	if resolvedScope.ID != b.scope.ID {
+		b.scope = resolvedScope
+		b.machine = MachineRecordForUser(b.user, b.scope)
+		b.applyRegistryMachineHostnameOverride()
 	}
 	store, err := teamstore.Open(storePath)
 	if err != nil {

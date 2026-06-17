@@ -1,14 +1,177 @@
 package cli
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
 )
+
+func TestDefaultResponsesStorePathMigratesSQLiteFamily(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
+	legacyBase := filepath.Join(tmp, "cache", "codex-helper", "responses-adapter.sqlite")
+	if err := os.MkdirAll(filepath.Dir(legacyBase), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	for suffix, body := range map[string]string{
+		"":     "db",
+		"-wal": "wal",
+		"-shm": "shm",
+	} {
+		if err := os.WriteFile(legacyBase+suffix, []byte(body), 0o600); err != nil {
+			t.Fatalf("write legacy sqlite%s: %v", suffix, err)
+		}
+	}
+
+	got := defaultResponsesStorePath()
+	want := filepath.Join(tmp, "state", "codex-helper", "responses", "adapter.sqlite")
+	if got != want {
+		t.Fatalf("defaultResponsesStorePath = %q, want %q", got, want)
+	}
+	for suffix, body := range map[string]string{"": "db", "-wal": "wal", "-shm": "shm"} {
+		data, err := os.ReadFile(want + suffix)
+		if err != nil {
+			t.Fatalf("read migrated sqlite%s: %v", suffix, err)
+		}
+		if string(data) != body {
+			t.Fatalf("migrated sqlite%s = %q, want %q", suffix, data, body)
+		}
+	}
+}
+
+func TestDefaultResponsesStorePathFallsBackWhenNewSidecarIsNonRegularCI(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
+	legacyBase := filepath.Join(tmp, "cache", "codex-helper", "responses-adapter.sqlite")
+	newBase := filepath.Join(tmp, "state", "codex-helper", "responses", "adapter.sqlite")
+	if err := os.MkdirAll(filepath.Dir(legacyBase), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newBase), 0o700); err != nil {
+		t.Fatalf("mkdir new: %v", err)
+	}
+	for suffix, body := range map[string]string{
+		"":     "db",
+		"-wal": "wal",
+	} {
+		if err := os.WriteFile(legacyBase+suffix, []byte(body), 0o600); err != nil {
+			t.Fatalf("write legacy sqlite%s: %v", suffix, err)
+		}
+	}
+	if err := os.WriteFile(newBase, []byte("db"), 0o600); err != nil {
+		t.Fatalf("write new base: %v", err)
+	}
+	if err := os.MkdirAll(newBase+"-wal", 0o700); err != nil {
+		t.Fatalf("mkdir non-regular new wal: %v", err)
+	}
+
+	got := defaultResponsesStorePath()
+	if got != legacyBase {
+		t.Fatalf("defaultResponsesStorePath = %q, want legacy fallback %q", got, legacyBase)
+	}
+}
+
+func TestDefaultResponsesStorePathSubprocessMigrationStressCI(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_RESPONSES_MIGRATION_WORKER") == "1" {
+		t.Skip("parent stress only")
+	}
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	cacheHome := filepath.Join(tmp, "cache")
+	stateHome := filepath.Join(tmp, "state")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	legacyBase := filepath.Join(tmp, "cache", "codex-helper", "responses-adapter.sqlite")
+	if err := os.MkdirAll(filepath.Dir(legacyBase), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	for suffix, body := range map[string]string{
+		"":     "db",
+		"-wal": "wal",
+		"-shm": "shm",
+	} {
+		if err := os.WriteFile(legacyBase+suffix, []byte(body), 0o600); err != nil {
+			t.Fatalf("write legacy sqlite%s: %v", suffix, err)
+		}
+	}
+
+	type proc struct {
+		cmd *exec.Cmd
+		out bytes.Buffer
+	}
+	procs := make([]proc, 6)
+	for i := range procs {
+		cmd := exec.Command(os.Args[0], "-test.run=TestDefaultResponsesStorePathSubprocessMigrationWorkerCI", "-test.v")
+		cmd.Env = append(os.Environ(),
+			"CODEX_HELPER_RESPONSES_MIGRATION_WORKER=1",
+			"CODEX_HELPER_RESPONSES_TEST_HOME="+home,
+			"CODEX_HELPER_RESPONSES_TEST_CACHE_HOME="+cacheHome,
+			"CODEX_HELPER_RESPONSES_TEST_STATE_HOME="+stateHome,
+		)
+		cmd.Stdout = &procs[i].out
+		cmd.Stderr = &procs[i].out
+		procs[i].cmd = cmd
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start worker %d: %v", i, err)
+		}
+	}
+	for i := range procs {
+		if err := procs[i].cmd.Wait(); err != nil {
+			t.Fatalf("worker %d failed: %v\n%s", i, err, procs[i].out.String())
+		}
+	}
+	want := filepath.Join(tmp, "state", "codex-helper", "responses", "adapter.sqlite")
+	for suffix, body := range map[string]string{"": "db", "-wal": "wal", "-shm": "shm"} {
+		data, err := os.ReadFile(want + suffix)
+		if err != nil || string(data) != body {
+			t.Fatalf("migrated sqlite%s = %q err=%v", suffix, data, err)
+		}
+	}
+}
+
+func TestDefaultResponsesStorePathSubprocessMigrationWorkerCI(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_RESPONSES_MIGRATION_WORKER") != "1" {
+		t.Skip("subprocess worker only")
+	}
+	if home := os.Getenv("CODEX_HELPER_RESPONSES_TEST_HOME"); home != "" {
+		if err := os.Setenv("HOME", home); err != nil {
+			t.Fatalf("set HOME: %v", err)
+		}
+	}
+	if cacheHome := os.Getenv("CODEX_HELPER_RESPONSES_TEST_CACHE_HOME"); cacheHome != "" {
+		if err := os.Setenv("XDG_CACHE_HOME", cacheHome); err != nil {
+			t.Fatalf("set XDG_CACHE_HOME: %v", err)
+		}
+	}
+	if stateHome := os.Getenv("CODEX_HELPER_RESPONSES_TEST_STATE_HOME"); stateHome != "" {
+		if err := os.Setenv("XDG_STATE_HOME", stateHome); err != nil {
+			t.Fatalf("set XDG_STATE_HOME: %v", err)
+		}
+	}
+	got := defaultResponsesStorePath()
+	if !strings.HasSuffix(filepath.ToSlash(got), "/state/codex-helper/responses/adapter.sqlite") {
+		t.Fatalf("defaultResponsesStorePath = %q, want migrated responses path", got)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, err := os.Stat(got + suffix); err != nil {
+			legacy := filepath.Join(os.Getenv("XDG_CACHE_HOME"), "codex-helper", "responses-adapter.sqlite") + suffix
+			_, legacyErr := os.Stat(legacy)
+			t.Fatalf("migrated sqlite%s missing: %v; got=%q XDG_CACHE_HOME=%q XDG_STATE_HOME=%q legacy=%q legacyErr=%v", suffix, err, got, os.Getenv("XDG_CACHE_HOME"), os.Getenv("XDG_STATE_HOME"), legacy, legacyErr)
+		}
+	}
+}
 
 func TestResponsesRegistryFromFileLoadsProvidersAndProxyKeys(t *testing.T) {
 	t.Setenv("MIMO_TEST_KEY", "tp-mimo")

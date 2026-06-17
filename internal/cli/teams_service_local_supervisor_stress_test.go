@@ -680,6 +680,7 @@ func TestTeamsServiceLocalSupervisorProcessEnvStressSanitizesInheritedEnv(t *tes
 	t.Setenv("PATH", "/usr/bin")
 	t.Setenv("LC_ALL", "C.UTF-8")
 	t.Setenv("XDG_CONFIG_HOME", "/home/stress/.config")
+	t.Setenv("XDG_STATE_HOME", "/home/stress/.local/state")
 
 	env := teamsServiceLocalSupervisorProcessEnv(map[string]string{
 		"CODEX_HELPER_TEAMS_SERVICE_MODE": "local-supervisor",
@@ -702,6 +703,7 @@ func TestTeamsServiceLocalSupervisorProcessEnvStressSanitizesInheritedEnv(t *tes
 		"PATH":                            "/usr/bin",
 		"LC_ALL":                          "C.UTF-8",
 		"XDG_CONFIG_HOME":                 "/home/stress/.config",
+		"XDG_STATE_HOME":                  "/home/stress/.local/state",
 		"CODEX_HELPER_TEAMS_SERVICE_MODE": "local-supervisor",
 		"CODEX_PROXY_INSTALL_DIR":         "/opt/codex-proxy",
 	} {

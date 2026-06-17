@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/gofrs/flock"
 )
 
@@ -24,11 +25,25 @@ func DefaultStorePath() (string, error) {
 	if override := strings.TrimSpace(os.Getenv("CODEX_HELPER_BEACON_STORE")); override != "" {
 		return override, nil
 	}
-	base, err := os.UserCacheDir()
+	path, err := appdirs.StatePath("beacon", "state.json")
 	if err != nil {
-		return "", fmt.Errorf("get user cache dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(base, "codex-helper", "beacon", "state.json"), nil
+	legacyPath, legacyErr := appdirs.LegacyCachePath("beacon", "state.json")
+	if legacyErr != nil {
+		return path, nil
+	}
+	dir, err := appdirs.ResolveMigratedDirWithRequired(filepath.Dir(path), filepath.Dir(legacyPath), "state.json")
+	if err != nil {
+		return "", err
+	}
+	resolvedPath := filepath.Join(dir, "state.json")
+	if sameBeaconStorePath(resolvedPath, path) && !sameBeaconStorePath(path, legacyPath) && !beaconStateFileValid(path) && beaconStateFileValid(legacyPath) {
+		if err := appdirs.CopyFileReplacing(path, legacyPath); err != nil {
+			return legacyPath, nil
+		}
+	}
+	return resolvedPath, nil
 }
 
 func NewStore(path string) (*Store, error) {
@@ -102,6 +117,28 @@ func (s *Store) withFileLockUnlocked(fn func() error) error {
 func beaconStoreProcessLock(path string) *sync.Mutex {
 	actual, _ := storeProcessLocks.LoadOrStore(filepath.Clean(path), &sync.Mutex{})
 	return actual.(*sync.Mutex)
+}
+
+func beaconStateFileValid(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var st State
+	if err := json.Unmarshal(b, &st); err != nil {
+		return false
+	}
+	if st.Version == 0 {
+		st.Version = StateVersion
+	}
+	return st.Version == StateVersion
+}
+
+func sameBeaconStorePath(a string, b string) bool {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 func (s *Store) loadUnlocked() (State, error) {

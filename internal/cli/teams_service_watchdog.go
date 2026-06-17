@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -548,14 +549,18 @@ func saveTeamsServiceWatchdogState(state teamsServiceWatchdogState) error {
 }
 
 func defaultTeamsServiceWatchdogStatePath() (string, error) {
-	base, err := os.UserCacheDir()
-	if err != nil || strings.TrimSpace(base) == "" {
-		base, err = os.UserConfigDir()
-		if err != nil {
-			return "", err
-		}
+	path, err := appdirs.StatePath("teams", "service", "service-watchdog.json")
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(base, "codex-helper", "teams", "service-watchdog.json"), nil
+	var legacyPaths []string
+	if legacyPath, legacyErr := appdirs.LegacyCachePath("teams", "service-watchdog.json"); legacyErr == nil {
+		legacyPaths = append(legacyPaths, legacyPath)
+	}
+	if legacyPath, legacyErr := appdirs.LegacyConfigPath("teams", "service-watchdog.json"); legacyErr == nil {
+		legacyPaths = append(legacyPaths, legacyPath)
+	}
+	return appdirs.ResolveMigratedFile(path, legacyPaths...)
 }
 
 func printTeamsServiceWatchdogResult(out io.Writer, result teamsServiceWatchdogResult) {

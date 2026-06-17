@@ -46,6 +46,66 @@ func TestPrepareOutboundAttachmentRestrictsToRootAndAllowedFiles(t *testing.T) {
 	}
 }
 
+func TestDefaultOutboundRootMigratesLegacyCacheRoot(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	legacyRoot := filepath.Join(cacheBase, "codex-helper", "teams-outbound")
+	legacyFile := filepath.Join(legacyRoot, "reports", "result.txt")
+	if err := os.MkdirAll(filepath.Dir(legacyFile), 0o700); err != nil {
+		t.Fatalf("mkdir legacy outbound: %v", err)
+	}
+	if err := os.WriteFile(legacyFile, []byte("legacy result"), 0o600); err != nil {
+		t.Fatalf("write legacy outbound file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "result.txt.lock"), []byte(""), 0o600); err != nil {
+		t.Fatalf("write legacy lock: %v", err)
+	}
+
+	got, err := DefaultOutboundRoot()
+	if err != nil {
+		t.Fatalf("DefaultOutboundRoot error: %v", err)
+	}
+	want := filepath.Join(tmp, "state", "codex-helper", "teams", "outbound")
+	if got != want {
+		t.Fatalf("DefaultOutboundRoot = %q, want %q", got, want)
+	}
+	assertTeamsFileContent(t, filepath.Join(want, "reports", "result.txt"), "legacy result")
+	assertTeamsFileContent(t, legacyFile, "legacy result")
+	if _, err := os.Stat(filepath.Join(want, "result.txt.lock")); !os.IsNotExist(err) {
+		t.Fatalf("lock file should not be copied, stat err = %v", err)
+	}
+}
+
+func TestDefaultOutboundRootFallsBackWhenLegacyContainsSymlinkCI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on some Windows CI images")
+	}
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	legacyRoot := filepath.Join(cacheBase, "codex-helper", "teams-outbound")
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatalf("mkdir legacy outbound: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "result.txt"), []byte("legacy result"), 0o600); err != nil {
+		t.Fatalf("write legacy outbound file: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(tmp, "outside.txt"), filepath.Join(legacyRoot, "unsafe-link")); err != nil {
+		t.Fatalf("create legacy symlink: %v", err)
+	}
+
+	got, err := DefaultOutboundRoot()
+	if err != nil {
+		t.Fatalf("DefaultOutboundRoot error: %v", err)
+	}
+	if got != legacyRoot {
+		t.Fatalf("DefaultOutboundRoot = %q, want legacy fallback %q", got, legacyRoot)
+	}
+	newRoot := filepath.Join(tmp, "state", "codex-helper", "teams", "outbound")
+	if _, err := os.Stat(newRoot); !os.IsNotExist(err) {
+		t.Fatalf("new outbound root should not be exposed after symlink failure, stat err = %v", err)
+	}
+}
+
 func TestPrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "malware.exe"), []byte("no"), 0o600); err != nil {

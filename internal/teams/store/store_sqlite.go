@@ -30,6 +30,8 @@ const (
 	DefaultSQLiteStateMigrationMinSize int64 = 1 << 20
 )
 
+const SQLiteFileName = storeSQLiteFileName
+
 const (
 	sqliteMigrationStageAfterBackup       = "after-backup"
 	sqliteMigrationStageAfterTempVerified = "after-temp-verified"

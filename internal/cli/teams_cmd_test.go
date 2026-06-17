@@ -71,6 +71,140 @@ func TestTeamsStatusReportsLocalStateWithoutCreatingDefaultState(t *testing.T) {
 	}
 }
 
+func TestTeamsStoreAndRegistryPathsSkipMigratedLegacyMirrors(t *testing.T) {
+	tmp := t.TempDir()
+	configBase, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+
+	legacyStore := filepath.Join(configBase, "codex-helper", "teams", "state.json")
+	legacyScopedStore := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_dup", "state.json")
+	newScopedStore := cliStatePathForTest(t, "teams", "scopes", "scope_dup", "state.json")
+	migratedStoreBody := `{"version":1}`
+	for path, body := range map[string]string{
+		legacyStore:       migratedStoreBody,
+		legacyScopedStore: migratedStoreBody,
+		newScopedStore:    migratedStoreBody,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	storePaths, err := teamsStorePaths()
+	if err != nil {
+		t.Fatalf("teamsStorePaths error: %v", err)
+	}
+	newStore := cliStatePathForTest(t, "teams", "state.json")
+	assertCLIPathInList(t, storePaths, newStore)
+	assertCLIPathNotInList(t, storePaths, legacyStore)
+	assertCLIPathInList(t, storePaths, newScopedStore)
+	assertCLIPathNotInList(t, storePaths, legacyScopedStore)
+
+	legacyRegistry := filepath.Join(cacheBase, "codex-helper", "teams-registry.json")
+	legacyScopedRegistry := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", "scope_dup", "registry.json")
+	newScopedRegistry := cliStatePathForTest(t, "teams", "scopes", "scope_dup", "registry.json")
+	for path, body := range map[string]string{
+		legacyRegistry:       `{"version":1}`,
+		legacyScopedRegistry: `{"version":1,"legacy":true}`,
+		newScopedRegistry:    `{"version":1,"new":true}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	registryPaths, err := teamsRegistryPaths("")
+	if err != nil {
+		t.Fatalf("teamsRegistryPaths error: %v", err)
+	}
+	newRegistry := cliStatePathForTest(t, "teams", "registry.json")
+	assertCLIPathInList(t, registryPaths, newRegistry)
+	assertCLIPathNotInList(t, registryPaths, legacyRegistry)
+	assertCLIPathInList(t, registryPaths, newScopedRegistry)
+	assertCLIPathNotInList(t, registryPaths, legacyScopedRegistry)
+}
+
+func TestTeamsStorePathsKeepLegacyWhenScopedStoreNeedsRefreshCI(t *testing.T) {
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+
+	legacyScopedStore := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_stale", "state.json")
+	newScopedStore := cliStatePathForTest(t, "teams", "scopes", "scope_stale", "state.json")
+	for path, body := range map[string]string{
+		legacyScopedStore: `{"version":1,"legacy":true}`,
+		newScopedStore:    `{"version":1,"new":true}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	sameMTime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(legacyScopedStore, sameMTime, sameMTime); err != nil {
+		t.Fatalf("chtime legacy scoped store: %v", err)
+	}
+	if err := os.Chtimes(newScopedStore, sameMTime, sameMTime); err != nil {
+		t.Fatalf("chtime new scoped store: %v", err)
+	}
+
+	storePaths, err := teamsStorePaths()
+	if err != nil {
+		t.Fatalf("teamsStorePaths error: %v", err)
+	}
+	assertCLIPathInList(t, storePaths, newScopedStore)
+	assertCLIPathInList(t, storePaths, legacyScopedStore)
+}
+
+func TestTeamsStoreAndRegistryPathsKeepLegacyWhenScopedMigrationIncomplete(t *testing.T) {
+	tmp := t.TempDir()
+	configBase, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+
+	legacyScopedStore := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_partial", "state.json")
+	newScopedStore := cliStatePathForTest(t, "teams", "scopes", "scope_partial", "state.json")
+	legacyScopedRegistry := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", "scope_partial", "registry.json")
+	for path, body := range map[string]string{
+		legacyScopedStore:    `{"version":1,"legacy":true}`,
+		newScopedStore:       `{"version":1,"new":true}`,
+		legacyScopedRegistry: `{"version":1,"legacy":true}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	storePaths, err := teamsStorePaths()
+	if err != nil {
+		t.Fatalf("teamsStorePaths error: %v", err)
+	}
+	assertCLIPathInList(t, storePaths, newScopedStore)
+	assertCLIPathInList(t, storePaths, legacyScopedStore)
+
+	newScopedRegistry := cliStatePathForTest(t, "teams", "scopes", "scope_partial", "registry.json")
+	if err := os.MkdirAll(filepath.Dir(newScopedRegistry), 0o700); err != nil {
+		t.Fatalf("mkdir new scoped registry: %v", err)
+	}
+	if err := os.WriteFile(newScopedRegistry, []byte(`{"version":1,"new":true}`), 0o600); err != nil {
+		t.Fatalf("write new scoped registry: %v", err)
+	}
+	legacyLedger := filepath.Join(cacheBase, "codex-helper", "teams", "global-outbound-ledger.json")
+	if err := os.WriteFile(legacyLedger, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatalf("write legacy ledger: %v", err)
+	}
+	registryPaths, err := teamsRegistryPaths("")
+	if err != nil {
+		t.Fatalf("teamsRegistryPaths error: %v", err)
+	}
+	assertCLIPathInList(t, registryPaths, newScopedRegistry)
+	assertCLIPathInList(t, registryPaths, legacyScopedRegistry)
+}
+
 func TestRunTeamsServiceRetryLoopRetriesRecoverableErrors(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -302,6 +436,36 @@ func TestTeamsWorkflowStatusRedactsWebhookURL(t *testing.T) {
 	}
 	if strings.Contains(got, secretURL) {
 		t.Fatalf("teams workflow status leaked raw webhook URL:\n%s", got)
+	}
+}
+
+func assertCLIPathInList(t *testing.T, paths []string, want string) {
+	t.Helper()
+	for _, path := range paths {
+		if filepath.Clean(path) == filepath.Clean(want) {
+			return
+		}
+	}
+	t.Fatalf("path %q missing from %#v", want, paths)
+}
+
+func assertCLIPathNotInList(t *testing.T, paths []string, want string) {
+	t.Helper()
+	for _, path := range paths {
+		if filepath.Clean(path) == filepath.Clean(want) {
+			t.Fatalf("path %q unexpectedly present in %#v", want, paths)
+		}
+	}
+}
+
+func assertCLIFileContent(t *testing.T, path string, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if string(got) != want {
+		t.Fatalf("content for %s = %q, want %q", path, got, want)
 	}
 }
 
