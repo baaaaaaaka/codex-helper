@@ -23,6 +23,10 @@ type TunnelConfig struct {
 	// ExtraArgs are appended before the destination argument.
 	ExtraArgs []string
 
+	// ConfigTarget treats Host as an OpenSSH config alias and avoids overriding
+	// the config file's User or Port with command-line destination flags.
+	ConfigTarget bool
+
 	// BatchMode enables non-interactive SSH behavior (recommended for tunnels).
 	BatchMode bool
 
@@ -53,11 +57,18 @@ func HostKeyArgsForTarget(host string, port int, extraArgs []string) ([]string, 
 	if err := validateHostKeyTarget(host, port); err != nil {
 		return nil, err
 	}
+	return hostKeyArgsForTarget(host, port, extraArgs, false)
+}
+
+func hostKeyArgsForTarget(host string, port int, extraArgs []string, configTarget bool) ([]string, error) {
 	if extraArgsSetStrictHostKeyChecking(extraArgs) {
 		return nil, nil
 	}
 	if sshAcceptNewSupported() {
 		return DefaultHostKeyArgs(), nil
+	}
+	if configTarget {
+		return nil, nil
 	}
 	if err := ensureLegacyKnownHost(host, port, extraArgs); err != nil {
 		return nil, err
@@ -290,10 +301,23 @@ func knownHostsLookupHost(host string, port int) string {
 }
 
 func (c TunnelConfig) destination() string {
-	if c.User == "" {
+	if c.ConfigTarget || c.User == "" {
 		return c.Host
 	}
 	return c.User + "@" + c.Host
+}
+
+func ArgsUseConfigFile(args []string) bool {
+	for i, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "-F" && i+1 < len(args) && strings.TrimSpace(args[i+1]) != "" {
+			return true
+		}
+		if strings.HasPrefix(arg, "-F") && len(arg) > 2 {
+			return true
+		}
+	}
+	return false
 }
 
 func BuildArgs(c TunnelConfig) ([]string, error) {
@@ -327,10 +351,10 @@ func buildArgs(c TunnelConfig, hostKeyArgs []string) ([]string, error) {
 		"-o", "TCPKeepAlive=yes",
 	}
 	args = append(args, hostKeyArgs...)
-	args = append(args,
-		"-p", strconv.Itoa(c.Port),
-		"-D", "127.0.0.1:"+strconv.Itoa(c.SocksPort),
-	)
+	if !c.ConfigTarget {
+		args = append(args, "-p", strconv.Itoa(c.Port))
+	}
+	args = append(args, "-D", "127.0.0.1:"+strconv.Itoa(c.SocksPort))
 
 	if c.BatchMode {
 		args = append(args, "-o", "BatchMode=yes")
@@ -354,7 +378,7 @@ func NewTunnel(cfg TunnelConfig) (*Tunnel, error) {
 	if err := validateTunnelConfig(cfg); err != nil {
 		return nil, err
 	}
-	hostKeyArgs, err := HostKeyArgsForTarget(cfg.Host, cfg.Port, cfg.ExtraArgs)
+	hostKeyArgs, err := hostKeyArgsForTarget(cfg.Host, cfg.Port, cfg.ExtraArgs, cfg.ConfigTarget)
 	if err != nil {
 		return nil, err
 	}

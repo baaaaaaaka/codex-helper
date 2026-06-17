@@ -19,7 +19,7 @@
 - `cxp run [profile] -- <cmd args...>`: run a command through the selected proxy profile and helper runtime handling.
 - `cxp run --yolo -- codex`: launch Codex with YOLO mode enabled for this run.
 - `cxp run --model-profile <name> -- codex`: launch Codex with a saved model profile for this run.
-- `cxp init`: create or repair local proxy configuration interactively.
+- `cxp init`: create or repair local proxy configuration interactively; when `~/.ssh/config` contains concrete `Host` entries, it can reuse and validate one before falling back to manual SSH host details.
 
 ## Model Profiles And Responses Adapter
 

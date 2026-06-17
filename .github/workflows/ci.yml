@@ -468,6 +468,7 @@ jobs:
           set -euo pipefail
           SSH_TEST_ENABLED=1 go test ./internal/ssh -count=1 -run 'TestTunnelIntegration(StartStop|AcceptsNewHostKey)$' -v
           SSH_TEST_ENABLED=1 SSH_STACK_INTEGRATION_TEST=1 go test ./internal/stack -count=1 -run 'TestStackIntegrationHTTPProxyConnectThroughSSHTunnel$' -v
+          SSH_TEST_ENABLED=1 SSH_CONFIG_PROFILE_INIT_TEST=1 go test ./internal/cli -count=1 -run 'TestInitProfileSSHConfigProfileIntegration$' -v
 
       - name: SSH accept-new client support
         shell: bash

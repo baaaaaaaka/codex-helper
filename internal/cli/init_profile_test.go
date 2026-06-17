@@ -57,7 +57,329 @@ func (f *fakeSSHOps) installPublicKey(_ context.Context, _ config.Profile, pubKe
 	return f.installErr
 }
 
+func withSSHConfigInitTestHooks(t *testing.T, path string, user string) {
+	t.Helper()
+	prevPath := sshConfigPathForInit
+	prevUser := sshConfigCurrentUserName
+	prevResolver := resolveSSHConfigProfileForInit
+	t.Cleanup(func() {
+		sshConfigPathForInit = prevPath
+		sshConfigCurrentUserName = prevUser
+		resolveSSHConfigProfileForInit = prevResolver
+	})
+	sshConfigPathForInit = func() (string, error) { return path, nil }
+	sshConfigCurrentUserName = func() string { return user }
+	resolveSSHConfigProfileForInit = func(prof sshConfigProfile) (sshConfigProfile, error) {
+		return prof, nil
+	}
+}
+
+func writeSSHConfigForInitTest(t *testing.T, text string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), ".ssh")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir ssh dir: %v", err)
+	}
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		t.Fatalf("write ssh config: %v", err)
+	}
+	return path
+}
+
+func withoutSSHConfigProfilesForInitTest(t *testing.T) {
+	t.Helper()
+	withSSHConfigInitTestHooks(t, filepath.Join(t.TempDir(), ".ssh", "missing-config"), "fallback-user")
+}
+
+func TestParseSSHConfigProfilesListsConcreteHosts(t *testing.T) {
+	prevUser := sshConfigCurrentUserName
+	t.Cleanup(func() { sshConfigCurrentUserName = prevUser })
+	sshConfigCurrentUserName = func() string { return "fallback-user" }
+
+	got := parseSSHConfigProfiles(`
+Host shared-defaults
+  Port 2022
+  User global-user
+
+Host work *.internal !blocked
+  HostName work.example.com
+  User alice
+  Port 2222
+
+Host no-user
+  HostName no-user.example.com
+
+Host *
+  User star-user
+  Port 2023
+
+Match host special
+  User ignored
+
+Host work
+  User duplicate
+`, "/tmp/ssh-config")
+
+	if len(got) != 3 {
+		t.Fatalf("profiles = %#v, want 3 concrete deduped hosts", got)
+	}
+	if got[0].Alias != "shared-defaults" || got[0].User != "global-user" || got[0].Port != 2022 {
+		t.Fatalf("first profile = %#v", got[0])
+	}
+	if got[1].Alias != "work" || got[1].User != "alice" || got[1].Port != 2222 {
+		t.Fatalf("work profile = %#v", got[1])
+	}
+	if got[2].Alias != "no-user" || got[2].User != "star-user" || got[2].Port != 2023 {
+		t.Fatalf("no-user profile = %#v", got[2])
+	}
+}
+
+func TestParseSSHConfigProfilesMatchesOpenSSHFirstWinsAndNegation(t *testing.T) {
+	prevUser := sshConfigCurrentUserName
+	t.Cleanup(func() { sshConfigCurrentUserName = prevUser })
+	sshConfigCurrentUserName = func() string { return "fallback-user" }
+
+	got := parseSSHConfigProfiles(`
+Host repeat
+  User first-user
+  User second-user
+  Port 2201
+  Port 2202
+
+Host good blocked !blocked
+  User visible-user
+
+Host=equals
+  User=equals-user
+  Port=2203
+`, "/tmp/ssh-config")
+
+	if len(got) != 3 {
+		t.Fatalf("profiles = %#v, want repeat, good, and equals only", got)
+	}
+	if got[0].Alias != "repeat" || got[0].User != "first-user" || got[0].Port != 2201 {
+		t.Fatalf("repeat profile = %#v, want first values", got[0])
+	}
+	if got[1].Alias != "good" {
+		t.Fatalf("second profile = %#v, want good and not blocked", got[1])
+	}
+	if got[2].Alias != "equals" || got[2].User != "equals-user" || got[2].Port != 2203 {
+		t.Fatalf("equals profile = %#v, want keyword=value support", got[2])
+	}
+}
+
+func TestInitProfileInteractiveWithDepsUsesSSHConfigProfile(t *testing.T) {
+	store := newTempStore(t)
+	sshConfigPath := writeSSHConfigForInitTest(t, `
+Host work
+  HostName work.example.com
+  User alice
+  Port 2222
+  IdentityFile ~/.ssh/id_work
+`)
+	withSSHConfigInitTestHooks(t, sshConfigPath, "fallback-user")
+	reader := bufio.NewReader(strings.NewReader("y\n1\n"))
+	ops := &fakeSSHOps{}
+	var out bytes.Buffer
+
+	prof, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, &out)
+	if err != nil {
+		t.Fatalf("initProfileInteractiveWithDeps error: %v", err)
+	}
+
+	if prof.Name != "work" || prof.Host != "work" || prof.User != "alice" || prof.Port != 2222 {
+		t.Fatalf("unexpected ssh config profile: %+v", prof)
+	}
+	if got := prof.SSHArgs; len(got) != 2 || got[0] != "-F" || got[1] != sshConfigPath {
+		t.Fatalf("SSHArgs = %#v, want -F config", got)
+	}
+	if len(ops.probes) != 1 || ops.probes[0].Name != "work" {
+		t.Fatalf("probes = %#v, want selected ssh config profile probe", ops.probes)
+	}
+
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "work" {
+		t.Fatalf("saved profiles = %#v", cfg.Profiles)
+	}
+	if !strings.Contains(out.String(), "Found 1 SSH config host entries") {
+		t.Fatalf("expected ssh config discovery output, got %q", out.String())
+	}
+}
+
+func TestInitProfileInteractiveWithDepsRetriesSSHConfigProfileAfterProbeFailure(t *testing.T) {
+	store := newTempStore(t)
+	sshConfigPath := writeSSHConfigForInitTest(t, `
+Host bad
+  User alice
+
+Host good
+  User bob
+  Port 2202
+`)
+	withSSHConfigInitTestHooks(t, sshConfigPath, "fallback-user")
+	reader := bufio.NewReader(strings.NewReader("y\n1\n2\n"))
+	ops := &fakeSSHOps{probeErrs: []error{errors.New("connection refused")}}
+	var out bytes.Buffer
+
+	prof, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, &out)
+	if err != nil {
+		t.Fatalf("initProfileInteractiveWithDeps error: %v", err)
+	}
+
+	if prof.Name != "good" || prof.User != "bob" || prof.Port != 2202 {
+		t.Fatalf("profile = %+v, want good ssh config profile", prof)
+	}
+	if len(ops.probes) != 2 || ops.probes[0].Name != "bad" || ops.probes[1].Name != "good" {
+		t.Fatalf("probes = %#v, want bad then good", ops.probes)
+	}
+	if !strings.Contains(out.String(), "is not reachable") || !strings.Contains(out.String(), "Choose another SSH config host") {
+		t.Fatalf("expected retry guidance, got %q", out.String())
+	}
+}
+
+func TestInitProfileInteractiveWithDepsSSHConfigProbeFailureThenEOFDoesNotSave(t *testing.T) {
+	store := newTempStore(t)
+	sshConfigPath := writeSSHConfigForInitTest(t, `
+Host bad
+  User alice
+`)
+	withSSHConfigInitTestHooks(t, sshConfigPath, "fallback-user")
+	reader := bufio.NewReader(strings.NewReader("y\n1\n"))
+	ops := &fakeSSHOps{probeErrs: []error{errors.New("connection refused")}}
+	var out bytes.Buffer
+
+	_, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, &out)
+	if err == nil {
+		t.Fatal("expected EOF after failed ssh config probe")
+	}
+	if !strings.Contains(err.Error(), "input ended while reading Choose SSH config host") {
+		t.Fatalf("expected EOF prompt error, got %v", err)
+	}
+
+	cfg, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("load config: %v", loadErr)
+	}
+	if len(cfg.Profiles) != 0 {
+		t.Fatalf("expected no saved profiles after failed probe and EOF, got %+v", cfg.Profiles)
+	}
+}
+
+func TestInitProfileInteractiveWithDepsProbeFailureThenManualDoesNotSaveFailedConfigProfile(t *testing.T) {
+	store := newTempStore(t)
+	sshConfigPath := writeSSHConfigForInitTest(t, `
+Host bad
+  User alice
+`)
+	withSSHConfigInitTestHooks(t, sshConfigPath, "fallback-user")
+	reader := bufio.NewReader(strings.NewReader("y\n1\nmanual\nmanual.example.com\n2222\ncarol\n"))
+	ops := &fakeSSHOps{probeErrs: []error{errors.New("connection refused")}}
+
+	prof, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, ioDiscard{})
+	if err != nil {
+		t.Fatalf("initProfileInteractiveWithDeps error: %v", err)
+	}
+	if prof.Host != "manual.example.com" || prof.User != "carol" || prof.Port != 2222 {
+		t.Fatalf("profile = %+v, want manual profile after failed config probe", prof)
+	}
+
+	cfg, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("load config: %v", loadErr)
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "carol@manual.example.com" {
+		t.Fatalf("saved profiles = %#v, want only manual profile", cfg.Profiles)
+	}
+	if len(ops.probes) != 2 || ops.probes[0].Name != "bad" || ops.probes[1].Host != "manual.example.com" {
+		t.Fatalf("probes = %#v, want failed config then manual", ops.probes)
+	}
+}
+
+func TestInitProfileInteractiveWithDepsSSHConfigEOFDoesNotAcceptDefaults(t *testing.T) {
+	store := newTempStore(t)
+	sshConfigPath := writeSSHConfigForInitTest(t, `
+Host work
+  User alice
+`)
+	withSSHConfigInitTestHooks(t, sshConfigPath, "fallback-user")
+	reader := bufio.NewReader(strings.NewReader(""))
+	ops := &fakeSSHOps{}
+
+	_, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, ioDiscard{})
+	if err == nil {
+		t.Fatal("expected EOF before ssh config prompt choice")
+	}
+	if len(ops.probes) != 0 {
+		t.Fatalf("expected no probe when input ends before explicit choice, got %#v", ops.probes)
+	}
+
+	cfg, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("load config: %v", loadErr)
+	}
+	if len(cfg.Profiles) != 0 {
+		t.Fatalf("expected no saved profiles after EOF, got %+v", cfg.Profiles)
+	}
+}
+
+func TestInitProfileInteractiveWithDepsUsesResolvedSSHConfigUserAndPort(t *testing.T) {
+	store := newTempStore(t)
+	sshConfigPath := writeSSHConfigForInitTest(t, `
+Host work
+  HostName work.example.com
+`)
+	withSSHConfigInitTestHooks(t, sshConfigPath, "fallback-user")
+	resolveSSHConfigProfileForInit = func(prof sshConfigProfile) (sshConfigProfile, error) {
+		if prof.Alias != "work" {
+			t.Fatalf("resolver got profile %#v, want work", prof)
+		}
+		prof.User = "resolved-user"
+		prof.Port = 2209
+		return prof, nil
+	}
+	reader := bufio.NewReader(strings.NewReader("y\n1\n"))
+	ops := &fakeSSHOps{}
+
+	prof, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, ioDiscard{})
+	if err != nil {
+		t.Fatalf("initProfileInteractiveWithDeps error: %v", err)
+	}
+	if prof.User != "resolved-user" || prof.Port != 2209 {
+		t.Fatalf("profile = %+v, want resolved user/port", prof)
+	}
+	if len(ops.probes) != 1 || ops.probes[0].User != "resolved-user" || ops.probes[0].Port != 2209 {
+		t.Fatalf("probes = %#v, want resolved user/port", ops.probes)
+	}
+}
+
+func TestInitProfileInteractiveWithDepsCanDeclineSSHConfigProfile(t *testing.T) {
+	store := newTempStore(t)
+	sshConfigPath := writeSSHConfigForInitTest(t, `
+Host work
+  User alice
+`)
+	withSSHConfigInitTestHooks(t, sshConfigPath, "fallback-user")
+	reader := bufio.NewReader(strings.NewReader("n\nmanual.example.com\n22\ncarol\n"))
+	ops := &fakeSSHOps{}
+
+	prof, err := initProfileInteractiveWithDeps(context.Background(), store, reader, ops, ioDiscard{})
+	if err != nil {
+		t.Fatalf("initProfileInteractiveWithDeps error: %v", err)
+	}
+	if prof.Host != "manual.example.com" || prof.User != "carol" || prof.Name != "carol@manual.example.com" {
+		t.Fatalf("profile = %+v, want manual profile", prof)
+	}
+	if len(ops.probes) != 1 || ops.probes[0].Host != "manual.example.com" {
+		t.Fatalf("probes = %#v, want manual probe only", ops.probes)
+	}
+}
+
 func TestInitProfileInteractiveWithDepsDirectSSHSuccess(t *testing.T) {
+	withoutSSHConfigProfilesForInitTest(t)
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("\nexample.com\n0\n70000\n2222\n\nalice\n"))
 	ops := &fakeSSHOps{}
@@ -97,6 +419,7 @@ func TestInitProfileInteractiveWithDepsDirectSSHSuccess(t *testing.T) {
 }
 
 func TestInitProfileInteractiveWithDepsFallsBackToManagedKey(t *testing.T) {
+	withoutSSHConfigProfilesForInitTest(t)
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("host.example\n22\ncarol\n"))
 	ops := &fakeSSHOps{
@@ -131,6 +454,7 @@ func TestInitProfileInteractiveWithDepsFallsBackToManagedKey(t *testing.T) {
 }
 
 func TestInitProfileInteractiveWithDepsReturnsWrappedKeyProbeError(t *testing.T) {
+	withoutSSHConfigProfilesForInitTest(t)
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("host.example\n22\ndana\n"))
 	ops := &fakeSSHOps{
@@ -159,6 +483,7 @@ func TestInitProfileInteractiveWithDepsReturnsWrappedKeyProbeError(t *testing.T)
 }
 
 func TestInitProfileInteractiveWithDepsDoesNotInstallManagedKeyForNonAuthProbeErrors(t *testing.T) {
+	withoutSSHConfigProfilesForInitTest(t)
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("host.example\n22\nerin\n"))
 	ops := &fakeSSHOps{
@@ -184,6 +509,7 @@ func TestInitProfileInteractiveWithDepsDoesNotInstallManagedKeyForNonAuthProbeEr
 }
 
 func TestInitProfileInteractiveWithDepsDoesNotPromptForHostKeyConfirmation(t *testing.T) {
+	withoutSSHConfigProfilesForInitTest(t)
 	store := newTempStore(t)
 	reader := bufio.NewReader(strings.NewReader("host.example\n22\nfrank\n"))
 	ops := &fakeSSHOps{
@@ -246,6 +572,34 @@ func TestSSHProbeUsesTunnelReadinessForNonInteractiveChecks(t *testing.T) {
 	}
 	if !gotCfg.BatchMode {
 		t.Fatalf("expected batch mode for probe tunnel, got %+v", gotCfg)
+	}
+	if gotCfg.ConfigTarget {
+		t.Fatalf("expected regular profile probe not to use config target, got %+v", gotCfg)
+	}
+}
+
+func TestSSHProbeUsesConfigTargetForSSHConfigProfile(t *testing.T) {
+	lockCLITestHooks(t)
+	prevNewSSHTunnel := newSSHTunnel
+	t.Cleanup(func() { newSSHTunnel = prevNewSSHTunnel })
+
+	var gotCfg internalssh.TunnelConfig
+	newSSHTunnel = func(cfg internalssh.TunnelConfig) (sshTunnel, error) {
+		gotCfg = cfg
+		return newFakeReadyTunnel(cfg)
+	}
+
+	err := sshProbe(context.Background(), config.Profile{
+		Host:    "work",
+		Port:    2222,
+		User:    "alice",
+		SSHArgs: []string{"-F", "/tmp/ssh_config"},
+	}, false, nil)
+	if err != nil {
+		t.Fatalf("sshProbe error: %v", err)
+	}
+	if !gotCfg.ConfigTarget {
+		t.Fatalf("expected ssh config profile probe to use config target, got %+v", gotCfg)
 	}
 }
 

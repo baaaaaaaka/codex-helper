@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -77,6 +78,10 @@ var newSSHTunnel = func(cfg internalssh.TunnelConfig) (sshTunnel, error) {
 	return internalssh.NewTunnel(cfg)
 }
 
+var sshConfigPathForInit = defaultSSHConfigPathForInit
+var sshConfigCurrentUserName = defaultSSHConfigCurrentUserName
+var resolveSSHConfigProfileForInit = defaultResolveSSHConfigProfileForInit
+
 var interactiveSSHProfileSetupAllowed = func() bool {
 	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
 		return false
@@ -121,12 +126,27 @@ func initProfileInteractiveWithDeps(
 ) (config.Profile, error) {
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "Proxy mode uses an SSH tunnel to reach Codex through your network.")
-		_, _ = fmt.Fprintln(out, "Enter your SSH host, port, and username to establish that tunnel.")
+		_, _ = fmt.Fprintln(out, "You can use an existing SSH config host or enter SSH host, port, and username manually.")
 	}
 
-	host := promptRequired(reader, "SSH host (required)")
-	port := promptInt(reader, "SSH port", 22)
-	user := promptRequired(reader, "SSH user (required)")
+	if prof, ok, err := initProfileFromSSHConfig(ctx, store, reader, ops, out); err != nil {
+		return config.Profile{}, err
+	} else if ok {
+		return prof, nil
+	}
+
+	host, err := promptRequiredForInit(reader, "SSH host (required)")
+	if err != nil {
+		return config.Profile{}, err
+	}
+	port, err := promptIntForInit(reader, "SSH port", 22)
+	if err != nil {
+		return config.Profile{}, err
+	}
+	user, err := promptRequiredForInit(reader, "SSH user (required)")
+	if err != nil {
+		return config.Profile{}, err
+	}
 
 	id, err := ids.New()
 	if err != nil {
@@ -172,6 +192,428 @@ func initProfileInteractiveWithDeps(
 	}
 
 	return prof, nil
+}
+
+type sshConfigProfile struct {
+	Alias      string
+	User       string
+	Port       int
+	ConfigPath string
+}
+
+type sshConfigProfileOptions struct {
+	User    string
+	Port    int
+	UserSet bool
+	PortSet bool
+}
+
+type sshConfigHostBlock struct {
+	Patterns []string
+	Options  sshConfigProfileOptions
+}
+
+func initProfileFromSSHConfig(
+	ctx context.Context,
+	store *config.Store,
+	reader *bufio.Reader,
+	ops sshOps,
+	out io.Writer,
+) (config.Profile, bool, error) {
+	configPath, err := sshConfigPathForInit()
+	if err != nil || strings.TrimSpace(configPath) == "" {
+		return config.Profile{}, false, nil
+	}
+	profiles, err := readSSHConfigProfiles(configPath)
+	if err != nil {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "Could not read SSH config %s: %v\n", configPath, err)
+		}
+		return config.Profile{}, false, nil
+	}
+	if len(profiles) == 0 {
+		return config.Profile{}, false, nil
+	}
+	if out != nil {
+		_, _ = fmt.Fprintf(out, "Found %d SSH config host entries in %s.\n", len(profiles), configPath)
+	}
+	useConfig, err := promptYesNoForInit(reader, "Use an existing SSH config host?", true)
+	if err != nil {
+		return config.Profile{}, false, err
+	}
+	if !useConfig {
+		return config.Profile{}, false, nil
+	}
+	for {
+		selected, manual, err := promptSSHConfigProfile(reader, profiles, out)
+		if err != nil {
+			return config.Profile{}, false, err
+		}
+		if manual {
+			return config.Profile{}, false, nil
+		}
+		if resolved, err := resolveSSHConfigProfileForInit(selected); err == nil {
+			selected = resolved
+		}
+		prof, err := profileFromSSHConfigProfile(selected)
+		if err != nil {
+			return config.Profile{}, false, err
+		}
+		if err := ops.probe(ctx, prof, false, nil); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return config.Profile{}, false, err
+			}
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "SSH config host %q is not reachable: %v\n", selected.Alias, err)
+				_, _ = fmt.Fprintln(out, "Choose another SSH config host, or choose 0 to enter SSH details manually.")
+			}
+			continue
+		}
+		if err := store.Update(func(cfg *config.Config) error {
+			cfg.UpsertProfile(prof)
+			return nil
+		}); err != nil {
+			return config.Profile{}, false, err
+		}
+		return prof, true, nil
+	}
+}
+
+func defaultSSHConfigPathForInit() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return "", err
+	}
+	return filepath.Join(home, ".ssh", "config"), nil
+}
+
+func readSSHConfigProfiles(path string) ([]sshConfigProfile, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return parseSSHConfigProfiles(string(raw), path), nil
+}
+
+func defaultResolveSSHConfigProfileForInit(prof sshConfigProfile) (sshConfigProfile, error) {
+	if strings.TrimSpace(prof.ConfigPath) == "" || strings.TrimSpace(prof.Alias) == "" {
+		return prof, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ssh", "-G", "-F", prof.ConfigPath, prof.Alias).Output()
+	if ctx.Err() != nil {
+		return prof, ctx.Err()
+	}
+	if err != nil {
+		return prof, err
+	}
+	resolved := prof
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		switch strings.ToLower(fields[0]) {
+		case "user":
+			if fields[1] != "" {
+				resolved.User = fields[1]
+			}
+		case "port":
+			port, err := strconv.Atoi(fields[1])
+			if err == nil && port > 0 && port <= 65535 {
+				resolved.Port = port
+			}
+		}
+	}
+	return resolved, nil
+}
+
+func parseSSHConfigProfiles(text string, path string) []sshConfigProfile {
+	var blocks []sshConfigHostBlock
+	global := sshConfigProfileOptions{}
+	var current *sshConfigHostBlock
+	beforeFirstSection := true
+
+	commit := func() {
+		if current == nil {
+			return
+		}
+		blocks = append(blocks, *current)
+		current = nil
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	for scanner.Scan() {
+		line := strings.TrimSpace(stripSSHConfigComment(scanner.Text()))
+		if line == "" {
+			continue
+		}
+		fields := sshConfigLineFields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		key := strings.ToLower(fields[0])
+		values := fields[1:]
+		switch key {
+		case "host":
+			commit()
+			current = &sshConfigHostBlock{Patterns: append([]string{}, values...)}
+			beforeFirstSection = false
+		case "match":
+			commit()
+			beforeFirstSection = false
+		case "user":
+			if len(values) == 0 {
+				continue
+			}
+			if current != nil && !current.Options.UserSet {
+				current.Options.User = strings.Trim(values[0], `"`)
+				current.Options.UserSet = current.Options.User != ""
+			} else if current == nil && beforeFirstSection && !global.UserSet {
+				global.User = strings.Trim(values[0], `"`)
+				global.UserSet = global.User != ""
+			}
+		case "port":
+			if len(values) == 0 {
+				continue
+			}
+			port, err := strconv.Atoi(strings.Trim(values[0], `"`))
+			if err != nil || port <= 0 || port > 65535 {
+				continue
+			}
+			if current != nil && !current.Options.PortSet {
+				current.Options.Port = port
+				current.Options.PortSet = true
+			} else if current == nil && beforeFirstSection && !global.PortSet {
+				global.Port = port
+				global.PortSet = true
+			}
+		}
+	}
+	commit()
+	var profiles []sshConfigProfile
+	for _, alias := range sshConfigConcreteHostAliases(blocks) {
+		options := effectiveSSHConfigOptions(alias, global, blocks)
+		user := strings.TrimSpace(options.User)
+		if user == "" {
+			user = sshConfigCurrentUserName()
+		}
+		port := options.Port
+		if port <= 0 {
+			port = 22
+		}
+		profiles = append(profiles, sshConfigProfile{
+			Alias:      alias,
+			User:       user,
+			Port:       port,
+			ConfigPath: path,
+		})
+	}
+	return dedupeSSHConfigProfiles(profiles)
+}
+
+func sshConfigConcreteHostAliases(blocks []sshConfigHostBlock) []string {
+	var aliases []string
+	for _, block := range blocks {
+		for _, pattern := range block.Patterns {
+			pattern = strings.TrimSpace(pattern)
+			if pattern == "" || sshConfigHostPatternIgnored(pattern) {
+				continue
+			}
+			if !sshConfigHostBlockMatches(pattern, block.Patterns) {
+				continue
+			}
+			aliases = append(aliases, pattern)
+		}
+	}
+	return aliases
+}
+
+func sshConfigLineFields(line string) []string {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return nil
+	}
+	key, value, ok := strings.Cut(fields[0], "=")
+	if !ok {
+		return fields
+	}
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if key == "" {
+		return fields
+	}
+	out := []string{key}
+	if value != "" {
+		out = append(out, value)
+	}
+	return append(out, fields[1:]...)
+}
+
+func effectiveSSHConfigOptions(alias string, global sshConfigProfileOptions, blocks []sshConfigHostBlock) sshConfigProfileOptions {
+	out := sshConfigProfileOptions{}
+	if global.UserSet {
+		out.User = global.User
+		out.UserSet = true
+	}
+	if global.PortSet {
+		out.Port = global.Port
+		out.PortSet = true
+	}
+	for _, block := range blocks {
+		if !sshConfigHostBlockMatches(alias, block.Patterns) {
+			continue
+		}
+		if !out.UserSet && block.Options.UserSet {
+			out.User = block.Options.User
+			out.UserSet = true
+		}
+		if !out.PortSet && block.Options.PortSet {
+			out.Port = block.Options.Port
+			out.PortSet = true
+		}
+	}
+	return out
+}
+
+func sshConfigHostBlockMatches(alias string, patterns []string) bool {
+	matched := false
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		negated := strings.HasPrefix(pattern, "!")
+		if negated {
+			pattern = strings.TrimPrefix(pattern, "!")
+		}
+		if sshConfigHostPatternMatches(pattern, alias) {
+			if negated {
+				return false
+			}
+			matched = true
+		}
+	}
+	return matched
+}
+
+func sshConfigHostPatternMatches(pattern string, alias string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	alias = strings.ToLower(strings.TrimSpace(alias))
+	if pattern == alias {
+		return true
+	}
+	if strings.ContainsAny(pattern, "*?") {
+		ok, err := path.Match(pattern, alias)
+		return err == nil && ok
+	}
+	return false
+}
+
+func stripSSHConfigComment(line string) string {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "#") {
+		return ""
+	}
+	if idx := strings.Index(line, " #"); idx >= 0 {
+		return line[:idx]
+	}
+	return line
+}
+
+func sshConfigHostPatternIgnored(pattern string) bool {
+	pattern = strings.TrimSpace(pattern)
+	return strings.HasPrefix(pattern, "!") ||
+		strings.ContainsAny(pattern, "*?") ||
+		strings.EqualFold(pattern, "none")
+}
+
+func dedupeSSHConfigProfiles(in []sshConfigProfile) []sshConfigProfile {
+	seen := map[string]bool{}
+	out := make([]sshConfigProfile, 0, len(in))
+	for _, prof := range in {
+		key := strings.ToLower(strings.TrimSpace(prof.Alias))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, prof)
+	}
+	return out
+}
+
+func defaultSSHConfigCurrentUserName() string {
+	for _, key := range []string{"USER", "USERNAME"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return "user"
+}
+
+func promptSSHConfigProfile(reader *bufio.Reader, profiles []sshConfigProfile, out io.Writer) (sshConfigProfile, bool, error) {
+	for {
+		if out != nil {
+			_, _ = fmt.Fprintln(out, "SSH config hosts:")
+			_, _ = fmt.Fprintln(out, "  0) Enter SSH details manually")
+			for i, prof := range profiles {
+				_, _ = fmt.Fprintf(out, "  %d) %s (%s@%s:%d)\n", i+1, prof.Alias, prof.User, prof.Alias, prof.Port)
+			}
+		}
+		choice, err := promptForInit(reader, "Choose SSH config host", "1")
+		if err != nil {
+			return sshConfigProfile{}, false, err
+		}
+		choice = strings.TrimSpace(choice)
+		switch strings.ToLower(choice) {
+		case "m", "manual":
+			return sshConfigProfile{}, true, nil
+		}
+		n, err := strconv.Atoi(choice)
+		if err != nil || n < 0 || n > len(profiles) {
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "Enter a number from 0 to %d, or manual.\n", len(profiles))
+			}
+			continue
+		}
+		if n == 0 {
+			return sshConfigProfile{}, true, nil
+		}
+		return profiles[n-1], false, nil
+	}
+}
+
+func profileFromSSHConfigProfile(selected sshConfigProfile) (config.Profile, error) {
+	id, err := ids.New()
+	if err != nil {
+		return config.Profile{}, err
+	}
+	alias := strings.TrimSpace(selected.Alias)
+	user := strings.TrimSpace(selected.User)
+	if user == "" {
+		user = sshConfigCurrentUserName()
+	}
+	port := selected.Port
+	if port <= 0 {
+		port = 22
+	}
+	args := []string{}
+	if path := strings.TrimSpace(selected.ConfigPath); path != "" {
+		args = append(args, "-F", path)
+	}
+	return config.Profile{
+		ID:        id,
+		Name:      alias,
+		Host:      alias,
+		Port:      port,
+		User:      user,
+		SSHArgs:   args,
+		CreatedAt: time.Now(),
+	}, nil
 }
 
 func initialSSHProbe(
@@ -235,6 +677,72 @@ func promptYesNo(r *bufio.Reader, label string, def bool) bool {
 	}
 }
 
+func promptForInit(r *bufio.Reader, label, def string) (string, error) {
+	if def != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "%s [%s]: ", label, def)
+	} else {
+		_, _ = fmt.Fprintf(os.Stderr, "%s: ", label)
+	}
+	s, err := r.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("read %s: %w", label, err)
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		if errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("input ended while reading %s", label)
+		}
+		return def, nil
+	}
+	return s, nil
+}
+
+func promptRequiredForInit(r *bufio.Reader, label string) (string, error) {
+	for {
+		v, err := promptForInit(r, label, "")
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(v) != "" {
+			return v, nil
+		}
+	}
+}
+
+func promptIntForInit(r *bufio.Reader, label string, def int) (int, error) {
+	for {
+		v, err := promptForInit(r, label, strconv.Itoa(def))
+		if err != nil {
+			return 0, err
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil && n > 0 && n <= 65535 {
+			return n, nil
+		}
+	}
+}
+
+func promptYesNoForInit(r *bufio.Reader, label string, def bool) (bool, error) {
+	defStr := "n"
+	if def {
+		defStr = "y"
+	}
+
+	for {
+		s, err := promptForInit(r, label+" (y/n)", defStr)
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "y", "yes":
+			return true, nil
+		case "n", "no":
+			return false, nil
+		default:
+		}
+	}
+}
+
 func sshProbe(ctx context.Context, prof config.Profile, interactive bool, stdin io.Reader) error {
 	_ = stdin
 	if interactive {
@@ -248,14 +756,15 @@ func sshProbe(ctx context.Context, prof config.Profile, interactive bool, stdin 
 
 	var out bytes.Buffer
 	tun, err := newSSHTunnel(internalssh.TunnelConfig{
-		Host:      prof.Host,
-		Port:      prof.Port,
-		User:      prof.User,
-		SocksPort: probePort,
-		ExtraArgs: prof.SSHArgs,
-		BatchMode: true,
-		Stdout:    &out,
-		Stderr:    &out,
+		Host:         prof.Host,
+		Port:         prof.Port,
+		User:         prof.User,
+		SocksPort:    probePort,
+		ExtraArgs:    prof.SSHArgs,
+		ConfigTarget: internalssh.ArgsUseConfigFile(prof.SSHArgs),
+		BatchMode:    true,
+		Stdout:       &out,
+		Stderr:       &out,
 	})
 	if err != nil {
 		return newSSHProbeError(err, out.String())

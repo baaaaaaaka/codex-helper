@@ -381,14 +381,15 @@ func (s *Stack) reportFatal(err error) {
 
 func newTunnel(profile config.Profile, socksPort int) (*ssh.Tunnel, error) {
 	return ssh.NewTunnel(ssh.TunnelConfig{
-		Host:      profile.Host,
-		Port:      profile.Port,
-		User:      profile.User,
-		SocksPort: socksPort,
-		ExtraArgs: profile.SSHArgs,
-		BatchMode: true,
-		Stdout:    os.Stderr,
-		Stderr:    os.Stderr,
+		Host:         profile.Host,
+		Port:         profile.Port,
+		User:         profile.User,
+		SocksPort:    socksPort,
+		ExtraArgs:    profile.SSHArgs,
+		ConfigTarget: ssh.ArgsUseConfigFile(profile.SSHArgs),
+		BatchMode:    true,
+		Stdout:       os.Stderr,
+		Stderr:       os.Stderr,
 	})
 }
 

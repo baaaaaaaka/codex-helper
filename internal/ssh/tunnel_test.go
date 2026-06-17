@@ -67,6 +67,32 @@ func TestBuildArgs_UsesHostDestinationWithoutUserOrBatchMode(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_UsesConfigTargetWithoutOverridingUserOrPort(t *testing.T) {
+	args, err := BuildArgs(TunnelConfig{
+		Host:         "work",
+		Port:         2222,
+		User:         "alice",
+		SocksPort:    12345,
+		ExtraArgs:    []string{"-F", "/tmp/ssh_config"},
+		ConfigTarget: true,
+		BatchMode:    true,
+	})
+	if err != nil {
+		t.Fatalf("BuildArgs error: %v", err)
+	}
+	if args[len(args)-1] != "work" {
+		t.Fatalf("expected config alias destination, got %q in %#v", args[len(args)-1], args)
+	}
+	for i, arg := range args {
+		if arg == "-p" {
+			t.Fatalf("config target should not add command-line port, got %#v", args[i:])
+		}
+		if strings.Contains(arg, "@work") {
+			t.Fatalf("config target should not add command-line user, got %#v", args)
+		}
+	}
+}
+
 func TestBuildArgs_ValidatesPorts(t *testing.T) {
 	_, err := BuildArgs(TunnelConfig{
 		Host:      "h",
@@ -152,6 +178,36 @@ func TestHostKeyArgsForTargetLegacySeedsKnownHosts(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "[legacy.example]:2222 ssh-ed25519 AAAAlegacy") {
 		t.Fatalf("known_hosts missing scanned key: %q", string(data))
+	}
+}
+
+func TestNewTunnelConfigTargetSkipsLegacyKnownHostScan(t *testing.T) {
+	setAcceptNewSupportForTest(t, false)
+	setSSHKeyCommandsForTest(t,
+		func(path, host string) bool {
+			t.Fatalf("ssh-keygen should not inspect config alias target path=%q host=%q", path, host)
+			return false
+		},
+		func(args []string) ([]byte, error) {
+			t.Fatalf("ssh-keyscan should not run for config alias target: %#v", args)
+			return nil, nil
+		},
+	)
+
+	tun, err := NewTunnel(TunnelConfig{
+		Host:         "work",
+		Port:         2222,
+		User:         "alice",
+		SocksPort:    12345,
+		ExtraArgs:    []string{"-F", "/tmp/ssh_config"},
+		ConfigTarget: true,
+		BatchMode:    true,
+	})
+	if err != nil {
+		t.Fatalf("NewTunnel error: %v", err)
+	}
+	if tun == nil {
+		t.Fatal("expected tunnel")
 	}
 }
 
