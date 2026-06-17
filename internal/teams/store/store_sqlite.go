@@ -25,6 +25,7 @@ const (
 	storeSQLiteFileName             = "store.sqlite"
 	storeSQLitePointerSchemaVersion = SchemaVersion + 1
 	sqliteImportCheckpointImporting = "importing"
+	sqliteWALAutocheckpointPages    = 0
 
 	DefaultSQLiteStateMigrationMinSize int64 = 1 << 20
 )
@@ -666,6 +667,58 @@ func (s *Store) sqliteDBUnlocked(pointer storeSQLitePointer) (*sql.DB, error) {
 	return db, nil
 }
 
+type SQLiteWALCheckpointResult struct {
+	SQLite             bool
+	Attempted          bool
+	WALPath            string
+	WALSize            int64
+	Busy               int
+	LogFrames          int
+	CheckpointedFrames int
+}
+
+func (s *Store) CheckpointSQLiteWAL(ctx context.Context, minSizeBytes int64) (SQLiteWALCheckpointResult, error) {
+	if minSizeBytes < 0 {
+		minSizeBytes = 0
+	}
+	var result SQLiteWALCheckpointResult
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		dbPath, err := s.storeSQLitePath(pointer)
+		if err != nil {
+			return err
+		}
+		walPath := dbPath + "-wal"
+		result.SQLite = true
+		result.WALPath = walPath
+		info, err := os.Stat(walPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		result.WALSize = info.Size()
+		if result.WALSize < minSizeBytes {
+			return nil
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		result.Attempted = true
+		return db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(
+			&result.Busy,
+			&result.LogFrames,
+			&result.CheckpointedFrames,
+		)
+	})
+	return result, err
+}
+
 func loadSQLiteStateFile(path string) (State, error) {
 	db, err := openExistingSQLiteStore(path)
 	if err != nil {
@@ -813,7 +866,8 @@ func sqliteWindowsFileURL(path string) url.URL {
 func configureSQLiteStore(db *sql.DB, path string) error {
 	for _, stmt := range []string{
 		`PRAGMA journal_mode = WAL`,
-		`PRAGMA synchronous = FULL`,
+		`PRAGMA synchronous = NORMAL`,
+		fmt.Sprintf(`PRAGMA wal_autocheckpoint = %d`, sqliteWALAutocheckpointPages),
 		`PRAGMA temp_store = MEMORY`,
 		`PRAGMA busy_timeout = 5000`,
 	} {

@@ -68,6 +68,8 @@ const (
 	autoParkSweepGraphTimeout                  = 10 * time.Second
 	parkNoticeGraphFallbackLookupTTL           = 5 * time.Minute
 	graphOutboxSendMinInterval                 = 1200 * time.Millisecond
+	sqliteWALCheckpointMinInterval             = 5 * time.Minute
+	sqliteWALCheckpointMinBytes                = 64 * 1024 * 1024
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
 	// body content. Split far below that to reduce Teams client rendering
@@ -405,6 +407,7 @@ type Bridge struct {
 	lastHistoryWatchReconcile         time.Time
 	lastBeaconReconcile               time.Time
 	lastBeaconLeaseMaintenance        time.Time
+	lastSQLiteWALCheckpoint           time.Time
 	maxWorkChatPollsPerCycle          int
 	maxQueuedTurnStartsPerCycle       int
 	dashboardProjectsMu               sync.Mutex
@@ -963,6 +966,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		if opts.Once {
 			return nil
 		}
+		if err := b.maybeCheckpointSQLiteWAL(ctx, time.Now()); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams sqlite WAL checkpoint skipped: %v\n", err)
+		}
 		sleepInterval := b.nextPollInterval(opts.Interval, time.Now())
 		select {
 		case <-ctx.Done():
@@ -1035,6 +1041,21 @@ func (b *Bridge) nextPollInterval(base time.Duration, now time.Time) time.Durati
 		return fastPollInterval
 	}
 	return base
+}
+
+func (b *Bridge) maybeCheckpointSQLiteWAL(ctx context.Context, now time.Time) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !b.lastSQLiteWALCheckpoint.IsZero() && now.Sub(b.lastSQLiteWALCheckpoint) < sqliteWALCheckpointMinInterval {
+		return nil
+	}
+	b.lastSQLiteWALCheckpoint = now
+	_, err := b.store.CheckpointSQLiteWAL(ctx, sqliteWALCheckpointMinBytes)
+	return err
 }
 
 func (b *Bridge) helperAutoUpdateProbeDue(now time.Time) bool {

@@ -1444,22 +1444,196 @@ func TestSQLiteOfficialReleaseLegacyOutboxColumnsUpgradeToCurrent(t *testing.T) 
 	assertOfficialReleaseHotPathsForTest(t, store, "v0.1.7-legacy-outbox-columns")
 }
 
-func TestSQLiteStoreUsesFullSynchronousMode(t *testing.T) {
+func TestSQLiteStoreUsesNormalSynchronousModeAndManualWALCheckpoint(t *testing.T) {
 	store := newTestStore(t)
 	seedLegacyStateFileForSQLiteMigrationTest(t, store)
 	result := migrateStoreToSQLiteForTest(t, store)
-	db, err := openExistingSQLiteStore(result.Path)
+
+	ctx := context.Background()
+	err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		var synchronous string
+		if err := db.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&synchronous); err != nil {
+			return fmt.Errorf("read synchronous pragma: %w", err)
+		}
+		if synchronous != "1" && !strings.EqualFold(synchronous, "NORMAL") {
+			return fmt.Errorf("PRAGMA synchronous = %q, want NORMAL/1", synchronous)
+		}
+		var autocheckpoint int
+		if err := db.QueryRowContext(ctx, `PRAGMA wal_autocheckpoint`).Scan(&autocheckpoint); err != nil {
+			return fmt.Errorf("read wal_autocheckpoint pragma: %w", err)
+		}
+		if autocheckpoint != sqliteWALAutocheckpointPages {
+			return fmt.Errorf("PRAGMA wal_autocheckpoint = %d, want %d", autocheckpoint, sqliteWALAutocheckpointPages)
+		}
+		return seedLargeSQLiteWALTxForTest(ctx, db, 512, 4096)
+	})
 	if err != nil {
-		t.Fatalf("open migrated sqlite db: %v", err)
+		t.Fatalf("seed sqlite WAL: %v", err)
 	}
-	defer db.Close()
-	var synchronous string
-	if err := db.QueryRow(`PRAGMA synchronous`).Scan(&synchronous); err != nil {
-		t.Fatalf("read synchronous pragma: %v", err)
+	walPath := result.Path + "-wal"
+	beforeInfo, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL before checkpoint: %v", err)
 	}
-	if synchronous != "2" && !strings.EqualFold(synchronous, "FULL") {
-		t.Fatalf("PRAGMA synchronous = %q, want FULL/2", synchronous)
+	if beforeInfo.Size() < 512*1024 {
+		t.Fatalf("seeded WAL size = %d, want at least 512 KiB", beforeInfo.Size())
 	}
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		_, err = db.ExecContext(ctx, `INSERT OR REPLACE INTO state_meta(key, value) VALUES ('wal_checkpoint_test_hot_write', ?)`, []byte(`{"ok":true}`))
+		return err
+	}); err != nil {
+		t.Fatalf("small hot write after large WAL: %v", err)
+	}
+	hotInfo, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL after hot write: %v", err)
+	}
+	if hotInfo.Size() < beforeInfo.Size() {
+		t.Fatalf("small hot write checkpointed WAL from %d to %d bytes", beforeInfo.Size(), hotInfo.Size())
+	}
+	if growth := hotInfo.Size() - beforeInfo.Size(); growth > 256*1024 {
+		t.Fatalf("small hot write grew WAL by %d bytes, want <= 256 KiB", growth)
+	}
+	skipped, err := store.CheckpointSQLiteWAL(ctx, hotInfo.Size()+1)
+	if err != nil {
+		t.Fatalf("skip manual checkpoint: %v", err)
+	}
+	if !skipped.SQLite || skipped.Attempted {
+		t.Fatalf("checkpoint below threshold = %#v, want sqlite skip without attempt", skipped)
+	}
+	ran, err := store.CheckpointSQLiteWAL(ctx, 1)
+	if err != nil {
+		t.Fatalf("manual checkpoint: %v", err)
+	}
+	if !ran.SQLite || !ran.Attempted || ran.Busy != 0 {
+		t.Fatalf("checkpoint result = %#v, want successful attempt", ran)
+	}
+	afterSize := int64(0)
+	if afterInfo, err := os.Stat(walPath); err == nil {
+		afterSize = afterInfo.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat WAL after checkpoint: %v", err)
+	}
+	if afterSize > 32*1024 {
+		t.Fatalf("WAL size after checkpoint = %d, want <= 32 KiB", afterSize)
+	}
+}
+
+func BenchmarkSQLiteManualWALCheckpointHotWrite(b *testing.B) {
+	ctx := context.Background()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, err := Open(filepath.Join(b.TempDir(), "teams-state", "state.json"))
+		if err != nil {
+			b.Fatalf("Open error: %v", err)
+		}
+		if _, err := store.SetPaused(ctx, true, "seed sqlite benchmark"); err != nil {
+			_ = store.Close()
+			b.Fatalf("seed legacy state: %v", err)
+		}
+		result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+		if err != nil {
+			_ = store.Close()
+			b.Fatalf("migrate sqlite state: %v", err)
+		}
+		if err := store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			return seedLargeSQLiteWALTxForTest(ctx, db, 512, 4096)
+		}); err != nil {
+			_ = store.Close()
+			b.Fatalf("seed sqlite WAL: %v", err)
+		}
+		walPath := result.Path + "-wal"
+		beforeInfo, err := os.Stat(walPath)
+		if err != nil {
+			_ = store.Close()
+			b.Fatalf("stat WAL before hot write: %v", err)
+		}
+		b.StartTimer()
+		if err := store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			_, err = db.ExecContext(ctx, `INSERT OR REPLACE INTO state_meta(key, value) VALUES ('wal_checkpoint_benchmark_hot_write', ?)`, []byte(`{"ok":true}`))
+			return err
+		}); err != nil {
+			b.Fatalf("small hot write after large WAL: %v", err)
+		}
+		b.StopTimer()
+		hotInfo, err := os.Stat(walPath)
+		if err != nil {
+			_ = store.Close()
+			b.Fatalf("stat WAL after hot write: %v", err)
+		}
+		if hotInfo.Size() < beforeInfo.Size() {
+			_ = store.Close()
+			b.Fatalf("small hot write checkpointed WAL from %d to %d bytes", beforeInfo.Size(), hotInfo.Size())
+		}
+		b.ReportMetric(float64(beforeInfo.Size()), "wal_before_bytes")
+		b.ReportMetric(float64(hotInfo.Size()-beforeInfo.Size()), "hot_wal_growth_bytes")
+		ran, err := store.CheckpointSQLiteWAL(ctx, 1)
+		if err != nil {
+			_ = store.Close()
+			b.Fatalf("manual checkpoint: %v", err)
+		}
+		if !ran.Attempted || ran.Busy != 0 {
+			_ = store.Close()
+			b.Fatalf("checkpoint result = %#v, want successful attempt", ran)
+		}
+		_ = store.Close()
+	}
+}
+
+func seedLargeSQLiteWALTxForTest(ctx context.Context, db *sql.DB, rows int, payloadBytes int) error {
+	if rows <= 0 {
+		rows = 1
+	}
+	if payloadBytes <= 0 {
+		payloadBytes = 1
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS wal_checkpoint_test(id INTEGER PRIMARY KEY, payload TEXT)`); err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	payload := strings.Repeat("x", payloadBytes)
+	for i := 0; i < rows; i++ {
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO wal_checkpoint_test(id, payload) VALUES (?, ?)`, i, payload); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func TestSQLiteFileURIWindowsPaths(t *testing.T) {
