@@ -183,6 +183,7 @@ local_supervisor_smoke() {
   local home="$smoke/home"
   local config_home="$smoke/config"
   local cache_home="$smoke/cache"
+  local state_home="$smoke/state"
   local runtime_dir="$smoke/runtime"
   local other_runtime_dir="$smoke/other-runtime"
   local runs="$smoke/child-runs.log"
@@ -190,8 +191,8 @@ local_supervisor_smoke() {
   local fake="$smoke/fake-cxp"
   local supervisor_log="$smoke/supervisor.log"
   local duplicate_log="$smoke/duplicate.log"
-  local status="$config_home/codex-helper/teams/run/local-supervisor/local-supervisor-status.json"
-  mkdir -p "$home" "$config_home" "$cache_home" "$runtime_dir" "$other_runtime_dir"
+  local status="$state_home/codex-helper/teams/service/local-supervisor/run/local-supervisor-status.json"
+  mkdir -p "$home" "$config_home" "$cache_home" "$state_home" "$runtime_dir" "$other_runtime_dir"
 
   cat >"$fake" <<'EOS'
 #!/usr/bin/env bash
@@ -227,7 +228,7 @@ EOS
 }
 EOF
 
-  HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_RUNTIME_DIR="$runtime_dir" \
+  HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_STATE_HOME="$state_home" XDG_RUNTIME_DIR="$runtime_dir" \
     setsid "$cxp" teams service local-supervisor --config "$config" >"$supervisor_log" 2>&1 &
   local supervisor_pid="$!"
   cleanup_pids+=("$supervisor_pid")
@@ -235,7 +236,7 @@ EOF
   wait_for_file_pattern "$status" '"supervisor_pid"'
   wait_for_lines "$runs" 2
 
-  if HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_RUNTIME_DIR="$other_runtime_dir" \
+  if HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_STATE_HOME="$state_home" XDG_RUNTIME_DIR="$other_runtime_dir" \
     setsid "$cxp" teams service local-supervisor --config "$config" >"$duplicate_log" 2>&1; then
     log "duplicate local supervisor unexpectedly acquired the lock"
     return 1
@@ -304,13 +305,14 @@ local_supervisor_public_lifecycle_smoke() {
   local home="$smoke/home"
   local config_home="$smoke/config"
   local cache_home="$smoke/cache"
+  local state_home="$smoke/state"
   local runtime_dir="$smoke/runtime"
   local runs="$smoke/public-child-runs.log"
   local child_env="$smoke/public-child-env.log"
   local fake="$smoke/fake-cxp"
   local config="$config_home/codex-helper/teams/local-supervisor.json"
-  local status="$config_home/codex-helper/teams/run/local-supervisor/local-supervisor-status.json"
-  mkdir -p "$home" "$config_home" "$cache_home" "$runtime_dir"
+  local status="$state_home/codex-helper/teams/service/local-supervisor/run/local-supervisor-status.json"
+  mkdir -p "$home" "$config_home" "$cache_home" "$state_home" "$runtime_dir"
   write_token_cache "$cache_home/read-token.json"
   write_token_cache "$cache_home/write-token.json"
 
@@ -337,6 +339,7 @@ EOF
     "HOME=$home"
     "XDG_CONFIG_HOME=$config_home"
     "XDG_CACHE_HOME=$cache_home"
+    "XDG_STATE_HOME=$state_home"
     "XDG_RUNTIME_DIR=$runtime_dir"
     "DBUS_SESSION_BUS_ADDRESS=unix:path=$smoke/no-user-bus"
     "CODEX_PROXY_DEBUG=1"
@@ -364,7 +367,7 @@ EOF
   fi
   wait_for_lines "$runs" 1
   wait_for_file_pattern "$child_env" 'CODEX_HELPER_TEAMS_SERVICE=1'
-  for expected_env in "HTTP_PROXY=http://127.0.0.1:9" "HTTPS_PROXY=http://127.0.0.1:9" "NO_PROXY=*"; do
+  for expected_env in "HTTP_PROXY=http://127.0.0.1:9" "HTTPS_PROXY=http://127.0.0.1:9" "NO_PROXY=*" "XDG_STATE_HOME=$state_home"; do
     if ! grep -qxF "$expected_env" "$child_env"; then
       log "public lifecycle child did not preserve configured service env $expected_env"
       sed 's/^/[public-child-env] /' "$child_env" || true
@@ -464,13 +467,15 @@ local_supervisor_bootstrap_auto_fallback_smoke() {
   local home="$smoke/home"
   local config_home="$smoke/config"
   local cache_home="$smoke/cache"
+  local state_home="$smoke/state"
   local runtime_dir="$smoke/runtime"
-  mkdir -p "$home" "$config_home" "$cache_home" "$runtime_dir"
+  mkdir -p "$home" "$config_home" "$cache_home" "$state_home" "$runtime_dir"
   local bootstrap_env=(
     "PATH=$PATH"
     "HOME=$home"
     "XDG_CONFIG_HOME=$config_home"
     "XDG_CACHE_HOME=$cache_home"
+    "XDG_STATE_HOME=$state_home"
     "XDG_RUNTIME_DIR=$runtime_dir"
     "DBUS_SESSION_BUS_ADDRESS=unix:path=$smoke/no-user-bus"
   )

@@ -15,6 +15,7 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CACHE_HOME", tmp)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
+	t.Setenv("CODEX_HELPER_STATE_DIR", "")
 	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
 	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "chat-client")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client")
